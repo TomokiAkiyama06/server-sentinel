@@ -1,0 +1,52 @@
+# Environment / secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.mobileprovision
+*.cer
+*.provisionprofile
+
+# Recordings / user data
+recordings/
+data/
+diagnostics/
+*.sqlite
+*.sqlite3
+*.db
+*.mp4
+*.mov
+*.m4a
+*.heic
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Node
+node_modules/
+dist/
+build/
+coverage/
+.vite/
+
+# Swift / Xcode
+DerivedData/
+.build/
+*.xcuserstate
+xcuserdata/
+*.xccheckout
+
+# macOS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
