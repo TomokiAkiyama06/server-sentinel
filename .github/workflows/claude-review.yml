@@ -165,14 +165,15 @@ jobs:
             --json-schema '{"type":"object","properties":{"highest_severity":{"type":"string","enum":["none","proposal","important","critical"]},"review_markdown":{"type":"string","minLength":1}},"required":["highest_severity","review_markdown"],"additionalProperties":false}'
 
   post-claude-review:
-    name: Claudeレビュー投稿・gate検証
+    name: ServerSentinel / Claude Review Gate
     needs: claude-review
     if: needs.claude-review.result == 'success'
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      pull-requests: read
+      pull-requests: write
       issues: write
+      checks: write
     env:
       GH_TOKEN: ${{ github.token }}
       PR_NUMBER: ${{ needs.claude-review.outputs.pr_number }}
@@ -238,7 +239,33 @@ jobs:
           fi
 
           if [ "$severity" = "critical" ] || [ "$severity" = "important" ]; then
-            echo "Claudeレビューにブロッキング指摘があります: $severity" >&2
+            conclusion="failure"
+            summary="Claudeレビューにブロッキング指摘があります。PRコメントを確認し、修正後に最新HEADで再レビューしてください。"
+          else
+            conclusion="success"
+            summary="Claudeレビューは現在のPR HEADに固定され、重大・重要な未解決指摘はありません。"
+          fi
+
+          check_payload="$(jq -n \
+            --arg name "ServerSentinel / Claude Review Gate" \
+            --arg head_sha "$PR_HEAD_SHA" \
+            --arg conclusion "$conclusion" \
+            --arg title "Claudeレビュー: $severity" \
+            --arg summary "$summary" \
+            '{name:$name,head_sha:$head_sha,status:"completed",conclusion:$conclusion,output:{title:$title,summary:$summary}}')"
+          printf '%s' "$check_payload" |
+            gh api --method POST -H "Accept: application/vnd.github+json" "repos/$GITHUB_REPOSITORY/check-runs" --input - > "$RUNNER_TEMP/check-response.json"
+
+          check_name="$(jq -r '.name' "$RUNNER_TEMP/check-response.json")"
+          check_head="$(jq -r '.head_sha' "$RUNNER_TEMP/check-response.json")"
+          check_conclusion="$(jq -r '.conclusion' "$RUNNER_TEMP/check-response.json")"
+          if [ "$check_name" != "ServerSentinel / Claude Review Gate" ] || [ "$check_head" != "$PR_HEAD_SHA" ] || [ "$check_conclusion" != "$conclusion" ]; then
+            echo "Claude review check runを検証できませんでした。" >&2
+            exit 1
+          fi
+
+          if [ "$conclusion" != "success" ]; then
+            echo "$summary" >&2
             exit 1
           fi
 
