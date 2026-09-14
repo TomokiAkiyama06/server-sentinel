@@ -22,6 +22,7 @@ Closes #
 ## 実機確認
 
 - [ ] 不要
+- [ ] `hardware-required`
 - [ ] `iphone-required`
 - [ ] `server-required`
 - [ ] `manual-test-required`
