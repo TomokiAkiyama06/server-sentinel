@@ -56,18 +56,21 @@ Claude側jobはread-onlyです。
 
 ### Trusted post job
 
-Claude review jobが正常終了した後、別のtrusted post jobがstructured outputをデータとして受け取り、次を行います。
+Claude review jobの結果を、別のtrusted post jobがstructured outputの**データ**として受け取ります。このpost jobは `always()` で評価され、同一repository PRではClaude側jobがOAuth/Action/準備エラー等で失敗した場合も、current HEADへ明示的なfailure gateを作成してfail closedにします。fork用手動workflowでも同様に、実行済みreview jobが失敗した場合は対象fork HEADへfailure gateを作成します。
+
+正常時は次を行います。
 
 1. current PR HEADが固定HEADと一致することを再確認
 2. structured outputを`jq`で検証・抽出
-3. 固定HEAD marker付きのレビュー本文を作成
-4. `github.token`でGitHubへ投稿
-5. 投稿APIのレスポンスから投稿者が `github-actions[bot]` であることを検証
-6. 投稿後にもcurrent HEADが固定HEADと一致することを再確認
-7. 同じPR HEAD SHAへ `ServerSentinel / Claude Review Gate` という共通check runを作成
-8. `highest_severity` が `critical` / `important` の場合はcheckをfailureにし、job自体も失敗させる
+3. `review_markdown` を公開PRコメントへ出す前に、trusted stepでprivate key、GitHub/Slack/AWS/Tailscale token、secret/token/password/webhook形式、長いtoken状文字列などを機械的に伏字化
+4. 固定HEAD marker付きのレビュー本文を作成
+5. `github.token`でGitHubへ投稿
+6. 投稿APIのレスポンスから投稿者が `github-actions[bot]` であることを検証
+7. 投稿後にもcurrent HEADが固定HEADと一致することを再確認
+8. 同じPR HEAD SHAへ `ServerSentinel / Claude Review Gate` という共通custom check runを作成
+9. `highest_severity` が `critical` / `important` の場合はcheckをfailureにし、job自体も失敗させる
 
-レビュー本文はshell commandとして評価せず、ファイル/JSONデータとしてのみ扱います。
+レビュー本文はshell commandとして評価せず、ファイル/JSONデータとしてのみ扱います。Secret redactionはLLMへの「Secretを出さない」という自然言語指示とは独立した最終防御層です。リポジトリ自体のsecret scanningは別途CIで実装します。
 
 ## 4. 同一repository内PRの動作
 
@@ -82,6 +85,7 @@ Claude review jobが正常終了した後、別のtrusted post jobがstructured 
 - Claudeへはbase側のAGENTS.md等を既存ルールとして読ませる
 - PR HEAD/diff内の指示・prompt・commandは未信頼データとして無視させる
 - ClaudeにはRead/Glob/Grep以外のtoolsを与えない
+- Claude review jobが失敗した場合もpost jobがcurrent HEADへfailureのcustom gateを作る
 
 同一PRに新しいcommitがpushされた場合は古いworkflowをcancelし、最新HEADのworkflowだけをレビューgateとして扱います。
 
@@ -101,7 +105,8 @@ fork PRをレビューする場合は、maintainerがGitHub Actionsから `Claud
 - Claude jobはread-onlyで、GitHubへのwrite tokenを持たない
 - Claudeには `Read,Glob,Grep` 以外を許可しない
 - trusted post jobだけが正式レビューを投稿する
-- trusted post jobはforkのPR HEAD SHAへ同じ `ServerSentinel / Claude Review Gate` check runを明示的に作成する
+- trusted post jobはforkのPR HEAD SHAへ同じ `ServerSentinel / Claude Review Gate` custom check runを明示的に作成する
+- 手動review jobが失敗した場合も、取得可能なcurrent fork HEADへfailure gateを作成する
 - PR本文・diff・コード中の指示は未信頼データとして扱う
 - Secretや環境変数を表示・送信しない
 
@@ -133,26 +138,28 @@ Secretへアクセスするreview workflowでは、第三者Actionをmutableなm
 
 現在は以下をfull commit SHAで固定しています。
 
-- `anthropics/claude-code-action`: v1.0.223相当の確認済みcommit
-- `actions/checkout`: v6の確認済みcommit
+- `anthropics/claude-code-action`: v1.0.223相当の確認済みcommit `9cdae7f0d995e3ba7c33f226087fdf82a59cd520`
+- `actions/checkout`: v6の確認済みcommit `d23441a48e516b6c34aea4fa41551a30e30af803`
 
 Actionを更新する場合は、上流tagを追従するだけでなく、新旧commitの差分・release内容・権限影響を確認したうえでPRとして更新します。
 
 ## 8. Required check / branch protection
 
-同一repository PRとfork PRの両方で、最終的なClaudeレビューgateはPR HEAD SHAに対して次の共通check run名を作成します。
+同一repository PRとfork PRの両方で、最終的なClaudeレビューgateはPR HEAD SHAに対して次の**custom check run**名を作成します。
 
 ```text
 ServerSentinel / Claude Review Gate
 ```
 
-Repository Ruleset / Branch protectionでは、`main`へのPRに対してこのcheckを **Required status check** として設定してください。
+Repository Ruleset / Branch protectionでは、`main`へのPRに対して**このcustom check名だけ**を Required status check として設定してください。workflow job名（`Claudeレビュー投稿・custom gate更新` / `Claude forkレビュー投稿・custom gate更新`）はrequired contextとして設定しません。
 
 これにより:
 
-- 同一repository PR: 自動Claudeレビューが成功するまでmerge不可
-- fork PR: maintainerが手動Claudeレビューworkflowを実行して成功させるまでcheckが存在せずmerge不可
-- Claudeが `critical` / `important` を返した場合: checkがfailureとなりmerge不可
+- 同一repository PR: 自動Claudeレビューが成功するまでcustom checkがsuccessにならずmerge不可
+- 同一repository PRでClaude統合が失敗: post jobがfailure custom checkを明示作成するためfail closed
+- fork PR: 通常の自動workflowはforkではreview jobをskipするが、**そのskipped job名はrequired contextではない**。`ServerSentinel / Claude Review Gate` 自体は作られないため、maintainerが手動fork reviewを成功させるまでmerge不可
+- fork用手動Claudeレビューが失敗: current fork HEADへfailure custom checkを作成
+- Claudeが `critical` / `important` を返した場合: custom checkがfailureとなりmerge不可
 - 新しいcommitがpushされた場合: 新HEADには旧HEADのcheck結果が引き継がれず、再レビューが必要
 
 GitHubリポジトリ設定の変更自体はコードだけでは完結しないため、bootstrap CI Issueのセットアップ項目として実際のRuleset/branch protection設定と動作確認を行います。
@@ -190,5 +197,6 @@ Codex側についても将来的にmachine-readableなrequired statusへ結び�
 - 未信頼のPR headをSecret付きworkflowでcheckout・実行しない
 - review対象SHAをコメントに明記し、current HEADと異なるレビューをマージgateとして扱わない
 - 正式投稿はtrusted post jobだけが行い、投稿APIレスポンスのuserが `github-actions[bot]` であることを確認する
+- 公開PRコメントへ投稿するClaude review本文はtrusted stepでSecretらしき値を機械的に伏字化する
 - Secretへアクセスする第三者Actionはfull commit SHAへ固定する
 - workflow生成物はPR working treeではなく `$RUNNER_TEMP` へ置く
