@@ -148,8 +148,9 @@ jobs:
           review_file="$RUNNER_TEMP/claude-review.md"
           printf '%s' "$REVIEW_JSON" | jq -r '.review_markdown' > "$review_file"
 
-          # LLM出力は信頼しない。Job Summaryへ永続化する前にSecretらしき値を機械的に伏字化する。
+          # LLM出力は信頼しない。Job Summaryへ永続化する前に、既知のSecret形式を機械的に伏字化する。
           # 例外にする40桁hexは、このrunがGitHub eventから固定したHEAD/base commit SHAだけ。
+          # 一般的な長文字列はファイルパス・URL等との誤判定を避けるため一律伏字化しない。
           python3 - "$review_file" "$PR_HEAD_SHA" "$PR_BASE_SHA" <<'PY'
           import re
           import sys
@@ -181,12 +182,6 @@ jobs:
           ]
           for pattern, replacement in patterns:
               text = re.sub(pattern, replacement, text)
-
-          text = re.sub(
-              r"(?<![A-Za-z0-9_-])(?=[A-Za-z0-9_+=./:-]{32,}(?![A-Za-z0-9_-]))(?=[^\s]*[A-Za-z])(?=[^\s]*\d)[A-Za-z0-9_+=./:-]{32,}(?![A-Za-z0-9_-])",
-              "[REDACTED_LONG_TOKEN]",
-              text,
-          )
 
           for placeholder, sha in placeholders.items():
               text = text.replace(placeholder, sha)
