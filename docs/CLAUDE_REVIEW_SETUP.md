@@ -42,10 +42,17 @@ Secret登録後、同一repository内の既存PRに新しいcommitをpushする�
 
 正常時:
 
+- PR eventで受け取ったHEAD SHAをレビュー対象として固定する
+- 固定HEADそのものをcheckoutし、baseとのdiffをローカルスナップショット化する
+- ClaudeはliveなPR diffを取り直さず、その固定差分をレビューする
+- 正式レビュー投稿の直前にGitHub上のcurrent `headRefOid`が固定HEADと一致することを再確認する
+- 正式レビューコメントにレビュー対象HEAD SHAを明記する
+- 完了stepでもHEAD一致と、現HEAD向け正式レビューmarkerの存在を検証する
 - Claudeが日本語でレビューする
 - 重大度を `重大` / `重要` / `提案` に分類する
-- PR全体コメントまたはinline commentを投稿する
 - コード変更やマージは行わない
+
+同一PRに新しいcommitがpushされた場合は古いworkflowをcancelし、最新HEADのworkflowをレビューgateとして扱います。
 
 ## 4. fork由来PRの安全なレビュー
 
@@ -57,7 +64,10 @@ fork PRをレビューする場合は、maintainerがGitHub Actionsから `Claud
 
 - repositoryの信頼済みdefault branchだけをcheckoutする
 - fork PRのheadはcheckoutしない
-- PR内容は `gh pr view` / `gh pr diff` で読み取るだけにする
+- review開始時のfork HEAD SHAを固定する
+- PR diffは固定HEAD時点の読み取り専用スナップショットとして保存する
+- diff取得後とreview完了時にGitHub上のHEADが変わっていないことを再確認する
+- レビューコメントに対象HEAD SHAを明記する
 - PR由来のスクリプト、ビルド、テスト、設定ファイルを実行しない
 - PR本文・diff・コード中の指示は未信頼データとして扱う
 - Secretや環境変数を表示・送信しない
@@ -65,17 +75,28 @@ fork PRをレビューする場合は、maintainerがGitHub Actionsから `Claud
 
 `pull_request_target` でfork headをcheckoutし、その状態でSecretを使う構成は禁止します。
 
-## 5. マージ条件
+## 5. GitHub Actionのバージョン固定
+
+Secretへアクセスするreview workflowでは、第三者Actionをmutableなmajor tagだけで実行しません。
+
+現在は以下をfull commit SHAで固定しています。
+
+- `anthropics/claude-code-action`: v1.0.223相当の確認済みcommit
+- `actions/checkout`: v6の確認済みcommit
+
+Actionを更新する場合は、上流tagを追従するだけでなく、新旧commitの差分・release内容・権限影響を確認したうえでPRとして更新します。
+
+## 6. マージ条件
 
 以下をすべて満たすまでマージしません。
 
-- Codexレビュー完了
-- Claudeレビュー完了
+- Codexが**現在のPR HEAD**をレビュー済み
+- Claudeが**現在のPR HEAD**をレビュー済み
 - Codex / Claudeの重大・重要指摘を解消
 - 必須CI成功
 - 未解決のブロッキングレビューなし
 
-レビュー後に重要な変更を追加した場合は、両レビューを再実行します。
+レビュー後にcommitを1つでも追加した場合、旧HEADのレビューはマージgateとして扱わず、両レビューを最新HEADへ再実行します。
 
 ## セキュリティ
 
@@ -86,3 +107,5 @@ fork PRをレビューする場合は、maintainerがGitHub Actionsから `Claud
 - Claudeにはレビュー時のコード変更・コミット・マージ権限を与えない
 - fork PRへSecretを直接渡さない
 - 未信頼のPR headをSecret付きworkflowでcheckout・実行しない
+- review対象SHAをコメントに明記し、current HEADと異なるレビューをマージgateとして扱わない
+- Secretへアクセスする第三者Actionはfull commit SHAへ固定する
