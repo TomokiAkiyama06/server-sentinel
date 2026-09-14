@@ -117,13 +117,59 @@ Physical power-button guard remains a separate hardware consideration.
 
 ## F. Local emergency evidence
 
+Basic behavior:
 - [ ] Critical event creates local clip.
 - [ ] Local data survives Ubuntu network disconnect.
 - [ ] Data syncs after Ubuntu returns.
 - [ ] Duplicate sync is idempotent.
-- [ ] 500 MB limit/ring behavior works.
-- [ ] Old unprotected local data is evicted first.
-- [ ] Critical unsynced data is not silently lost before policy requires it.
+- [ ] 500 MB configured local-store limit/ring behavior works.
+- [ ] Old synchronized/unprotected local data is evicted first.
+- [ ] Critical unsynchronized data is not silently evicted.
+
+### F-1. Unsynchronized local-store hard stop
+
+Precondition:
+- use a dedicated test device/test build;
+- disable or block Ubuntu synchronization long enough to accumulate unsynchronized critical clips;
+- do not delete unrelated personal data to create the condition.
+
+Procedure and acceptance:
+1. [ ] Repeatedly generate critical test events until only unsynchronized critical clips remain and the next local clip would exceed the configured ServerSentinel local-store bound.
+2. [ ] Verify existing unsynchronized critical clips are still present and their metadata/checksums remain unchanged.
+3. [ ] Trigger one additional critical event.
+4. [ ] Verify Camera Node enters `LOCAL_EVIDENCE_HARD_STOP` instead of overwriting an existing unsynchronized clip.
+5. [ ] Verify the new iPhone-local clip is explicitly rejected and no UI/API claims that a clip exists.
+6. [ ] Verify a persistent warning is visible and an audit/event entry records the rejection reason.
+7. [ ] Verify critical detection remains active while the local store is hard-stopped.
+8. [ ] Where a direct server path is available, verify direct server upload can continue even while local admission is rejected.
+9. [ ] Restore synchronization/free local-store headroom and verify queued clips synchronize without duplication.
+10. [ ] Verify `LOCAL_EVIDENCE_HARD_STOP` clears automatically only after the recovery threshold is satisfied and does not flap around the threshold.
+
+### F-2. Device-wide free-space safety reserve
+
+This test verifies the case where ServerSentinel itself is well below its configured 500 MB local bound but the iPhone filesystem is nearly full because of unrelated data.
+
+Use a non-destructive test-only storage-pressure harness or disposable filler data on the dedicated test device. Never intentionally drive iOS to 0 bytes free and never erase unrelated user data.
+
+Procedure and acceptance:
+1. [ ] Start with ServerSentinel local emergency usage well below 500 MB and record the OS-reported available capacity.
+2. [ ] Reduce device-wide free space until a projected emergency write would violate the configured device safety reserve.
+3. [ ] Trigger a critical event and verify the app does not attempt a write expected to exhaust the filesystem.
+4. [ ] Verify `LOCAL_EVIDENCE_HARD_STOP`/degraded state is entered even though ServerSentinel's own local-store bound is not full.
+5. [ ] Verify warning/audit metadata distinguishes unsafe device free space from exhaustion of the ServerSentinel local-store bound.
+6. [ ] Verify existing unsynchronized clips are not deleted to compensate for unrelated device storage pressure.
+7. [ ] Free device-wide space above the recovery threshold and verify local evidence admission automatically resumes with hysteresis.
+8. [ ] Repeat around the threshold to confirm state does not rapidly flap.
+
+Record for both F-1/F-2:
+- configured local-store limit;
+- actual ServerSentinel local usage;
+- OS-reported available capacity;
+- device safety reserve/recovery threshold;
+- event timestamps;
+- state transitions;
+- rejected-admission reason;
+- whether direct server upload was available/successful.
 
 ## G. Network interruption
 
