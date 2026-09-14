@@ -139,7 +139,8 @@ jobs:
           review_file="$RUNNER_TEMP/claude-review.md"
           printf '%s' "$REVIEW_JSON" | jq -r '.review_markdown' > "$review_file"
 
-          # fork側もLLM出力をそのまま永続化しない。既知のPR HEAD SHAだけを40桁hex伏字化の例外とする。
+          # fork側もLLM出力をそのまま永続化しない。既知のSecret形式を機械的に伏字化する。
+          # 既知のPR HEAD SHAだけを40桁hex伏字化の例外とし、一般的な長文字列はパス/URL誤判定を避けて一律伏字化しない。
           python3 - "$review_file" "$PR_HEAD_SHA" <<'PY'
           import re
           import sys
@@ -171,12 +172,6 @@ jobs:
           ]
           for pattern, replacement in patterns:
               text = re.sub(pattern, replacement, text)
-
-          text = re.sub(
-              r"(?<![A-Za-z0-9_-])(?=[A-Za-z0-9_+=./:-]{32,}(?![A-Za-z0-9_-]))(?=[^\s]*[A-Za-z])(?=[^\s]*\d)[A-Za-z0-9_+=./:-]{32,}(?![A-Za-z0-9_-])",
-              "[REDACTED_LONG_TOKEN]",
-              text,
-          )
 
           for placeholder, sha in placeholders.items():
               text = text.replace(placeholder, sha)
