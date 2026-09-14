@@ -21,6 +21,10 @@ diagnostics/
 *.m4a
 *.heic
 
+# Logs / local diagnostics
+*.log
+logs/
+
 # Python
 __pycache__/
 *.py[cod]
