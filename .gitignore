@@ -21,6 +21,12 @@ diagnostics/
 *.m4a
 *.heic
 
+# Synthetic/generated test media is allowed only in the dedicated fixture subtree.
+!tests/fixtures/synthetic/**/*.mp4
+!tests/fixtures/synthetic/**/*.mov
+!tests/fixtures/synthetic/**/*.m4a
+!tests/fixtures/synthetic/**/*.heic
+
 # Logs / local diagnostics
 *.log
 logs/
