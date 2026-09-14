@@ -1,6 +1,8 @@
 # Test Fixtures
 
-Only synthetic, generated, or explicitly consented media may be committed.
+Only synthetic or generated media may be committed. Do not commit real monitoring footage, real person images/video, or recordings captured from an actual deployment, even with consent.
+
+Media fixtures that need to be version-controlled belong under `tests/fixtures/synthetic/`; `.gitignore` keeps ordinary media files blocked elsewhere in the repository.
 
 Planned fixture classes:
 - empty scene;
