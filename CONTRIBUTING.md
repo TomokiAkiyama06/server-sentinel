@@ -10,7 +10,10 @@ Read:
 2. `SPECIFICATION.md`
 3. `AGENTS.md`
 4. `SECURITY.md`
-5. `docs/THIRD_PARTY_POLICY.md`
+5. `PRIVACY.md`
+6. `CLAUDE.md` if present
+7. `docs/THIRD_PARTY_POLICY.md`
+8. `docs/CLAUDE_REVIEW_SETUP.md`
 
 ## Workflow
 
@@ -19,20 +22,26 @@ Read:
 - Create a focused branch.
 - Add tests.
 - Open a PR.
-- Wait for CI and automated review.
-- Resolve review findings before merge.
+- Wait for CI and both Codex + Claude review of the current PR HEAD.
+- Resolve blocking review findings before merge.
+- If the PR HEAD changes materially after review, request both reviews again.
+
+Until Issue #4 establishes hardened repository-level review enforcement, same-repository write access is reserved for trusted maintainers. External/untrusted contributors should submit from a fork.
 
 ## Privacy
 
-Never attach:
+Never attach or commit:
 - real monitoring footage;
 - non-consenting person images;
-- private server IPs;
+- private server IPs/hostnames;
 - private Tailnet names;
 - Slack webhook URLs;
-- credentials.
+- credentials or tokens;
+- private deployment configuration.
 
 Use synthetic fixtures.
+
+Automated Claude PR review sends the fixed PR diff and repository context needed for review to Anthropic's Claude service. This is a development-process integration, not ServerSentinel product telemetry. Do not include user monitoring data or secrets in PR content.
 
 ## New dependencies
 
