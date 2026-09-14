@@ -166,8 +166,8 @@ jobs:
 
   post-claude-review:
     # このjob名はbranch protectionのrequired contextに使わない。
-    # required contextは下記stepが明示作成する custom check run のみ。
-    name: Claudeレビュー投稿・custom gate更新
+    # required contextは下記stepが明示作成するcommit statusのみ。
+    name: Claudeレビュー投稿・status gate更新
     needs: claude-review
     if: ${{ always() && github.event.pull_request.draft == false && github.event.pull_request.head.repo.full_name == github.repository }}
     runs-on: ubuntu-latest
@@ -175,7 +175,7 @@ jobs:
       contents: read
       pull-requests: read
       issues: write
-      checks: write
+      statuses: write
     env:
       GH_TOKEN: ${{ github.token }}
       PR_NUMBER: ${{ github.event.pull_request.number }}
@@ -184,7 +184,7 @@ jobs:
       REVIEW_JSON: ${{ needs.claude-review.outputs.review_json }}
 
     steps:
-      - name: 固定HEADのレビューを投稿してcustom gateを検証
+      - name: 固定HEADのレビューを投稿してstatus gateを検証
         run: |
           set -euo pipefail
 
@@ -193,28 +193,26 @@ jobs:
             exit 1
           fi
 
-          publish_check() {
-            local conclusion="$1"
-            local title="$2"
-            local summary="$3"
-            local request="$RUNNER_TEMP/check-request.json"
-            local response="$RUNNER_TEMP/check-response.json"
+          publish_status() {
+            local state="$1"
+            local description="$2"
+            local request="$RUNNER_TEMP/status-request.json"
+            local response="$RUNNER_TEMP/status-response.json"
+            local target_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
 
             jq -n \
-              --arg name "ServerSentinel / Claude Review Gate" \
-              --arg head_sha "$PR_HEAD_SHA" \
-              --arg conclusion "$conclusion" \
-              --arg title "$title" \
-              --arg summary "$summary" \
-              '{name:$name,head_sha:$head_sha,status:"completed",conclusion:$conclusion,output:{title:$title,summary:$summary}}' \
+              --arg state "$state" \
+              --arg target_url "$target_url" \
+              --arg description "$description" \
+              --arg context "ServerSentinel / Claude Review Gate" \
+              '{state:$state,target_url:$target_url,description:$description,context:$context}' \
               > "$request"
 
             gh api --method POST -H "Accept: application/vnd.github+json" \
-              "repos/$GITHUB_REPOSITORY/check-runs" --input "$request" > "$response"
+              "repos/$GITHUB_REPOSITORY/statuses/$PR_HEAD_SHA" --input "$request" > "$response"
 
-            [ "$(jq -r '.name' "$response")" = "ServerSentinel / Claude Review Gate" ]
-            [ "$(jq -r '.head_sha' "$response")" = "$PR_HEAD_SHA" ]
-            [ "$(jq -r '.conclusion' "$response")" = "$conclusion" ]
+            [ "$(jq -r '.context' "$response")" = "ServerSentinel / Claude Review Gate" ]
+            [ "$(jq -r '.state' "$response")" = "$state" ]
           }
 
           current_head="$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json headRefOid --jq '.headRefOid')"
@@ -224,34 +222,37 @@ jobs:
           fi
 
           # Claude jobがOAuth/Action/準備エラー等で失敗しても、skippedを成功扱いにせず
-          # current HEADへ明示的なfailure checkを作る。
+          # current HEADへ明示的なfailure statusを作る。
           if [ "$CLAUDE_RESULT" != "success" ]; then
-            summary="Claude review jobが正常完了しませんでした（result: $CLAUDE_RESULT）。最新HEADで再実行してください。"
-            publish_check "failure" "Claudeレビュー実行失敗" "$summary"
+            summary="Claude review jobが正常完了しませんでした。最新HEADで再実行してください。"
+            publish_status "failure" "$summary"
             echo "$summary" >&2
             exit 1
           fi
 
-          if [ -z "$REVIEW_JSON" ] || ! printf '%s' "$REVIEW_JSON" | jq -e . >/dev/null 2>&1; then
-            summary="Claude review jobは終了しましたが、検証可能なstructured outputを取得できませんでした。"
-            publish_check "failure" "Claudeレビュー出力不正" "$summary"
-            echo "$summary" >&2
-            exit 1
-          fi
-
-          severity="$(printf '%s' "$REVIEW_JSON" | jq -er '.highest_severity')"
-          review_file="$RUNNER_TEMP/claude-review.md"
-          printf '%s' "$REVIEW_JSON" | jq -er '.review_markdown' > "$review_file"
-
-          case "$severity" in
-            none|proposal|important|critical) ;;
-            *)
-              summary="Claudeレビューのseverityが不正です。"
-              publish_check "failure" "Claudeレビュー出力不正" "$summary"
+          if [ -z "$REVIEW_JSON" ] || ! printf '%s' "$REVIEW_JSON" | jq -e '
+            type == "object" and
+            (.highest_severity | type == "string") and
+            (.review_markdown | type == "string") and
+            (.review_markdown | length > 0) and
+            (["none","proposal","important","critical"] | index(input_filename)) == null
+          ' >/dev/null 2>&1; then
+            # 上のjqは構造存在確認だけではseverity値を扱いにくいため、次で明示検証する。
+            if ! printf '%s' "$REVIEW_JSON" | jq -e '
+              type == "object" and
+              (.highest_severity == "none" or .highest_severity == "proposal" or .highest_severity == "important" or .highest_severity == "critical") and
+              (.review_markdown | type == "string" and length > 0)
+            ' >/dev/null 2>&1; then
+              summary="Claude review jobは終了しましたが、structured outputが不正です。"
+              publish_status "failure" "$summary"
               echo "$summary" >&2
               exit 1
-              ;;
-          esac
+            fi
+          fi
+
+          severity="$(printf '%s' "$REVIEW_JSON" | jq -r '.highest_severity')"
+          review_file="$RUNNER_TEMP/claude-review.md"
+          printf '%s' "$REVIEW_JSON" | jq -r '.review_markdown' > "$review_file"
 
           # LLMの自然言語指示だけに依存せず、公開PRコメントへ出す直前に
           # Secretらしい値をtrusted stepで機械的に伏字化する。
@@ -273,7 +274,7 @@ jobs:
               (r"-----BEGIN [^-\n]*PRIVATE KEY-----[\s\S]*?-----END [^-\n]*PRIVATE KEY-----", "[REDACTED PRIVATE KEY]"),
               (r"-----BEGIN [^-\n]*PRIVATE KEY-----[\s\S]*$", "[REDACTED PRIVATE KEY]"),
               (r"\bgithub_pat_[A-Za-z0-9_]{20,}\b", "github_pat_[REDACTED]"),
-              (r"\bgh[pousr]_[A-Za-z0-9_]{20,}\b", "gh*_ [REDACTED]".replace(" ", "")),
+              (r"\bgh[pousr]_[A-Za-z0-9_]{20,}\b", "gh*_[REDACTED]"),
               (r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b", "xox*-REDACTED"),
               (r"https://hooks\.slack\.com/services/[A-Za-z0-9/_-]+", "https://hooks.slack.com/services/[REDACTED]"),
               (r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b", "AWS_ACCESS_KEY_[REDACTED]"),
@@ -284,7 +285,6 @@ jobs:
           for pattern, replacement in patterns:
               text = re.sub(pattern, replacement, text)
 
-          # 典型パターンに含まれない長いtoken状文字列も保守的に伏字化する。
           text = re.sub(
               r"(?<![A-Za-z0-9_-])(?=[A-Za-z0-9_+=./:-]{32,}(?![A-Za-z0-9_-]))(?=[^\s]*[A-Za-z])(?=[^\s]*\d)[A-Za-z0-9_+=./:-]{32,}(?![A-Za-z0-9_-])",
               "[REDACTED_LONG_TOKEN]",
@@ -338,18 +338,18 @@ jobs:
           fi
 
           if [ "$severity" = "critical" ] || [ "$severity" = "important" ]; then
-            conclusion="failure"
-            summary="Claudeレビューにブロッキング指摘があります。PRコメントを確認し、修正後に最新HEADで再レビューしてください。"
+            state="failure"
+            summary="Claudeレビューに重大・重要指摘があります。修正後に再レビューしてください。"
           else
-            conclusion="success"
-            summary="Claudeレビューは現在のPR HEADに固定され、重大・重要な未解決指摘はありません。"
+            state="success"
+            summary="Claudeレビュー済み。重大・重要な未解決指摘はありません。"
           fi
 
-          publish_check "$conclusion" "Claudeレビュー: $severity" "$summary"
+          publish_status "$state" "$summary"
 
-          if [ "$conclusion" != "success" ]; then
+          if [ "$state" != "success" ]; then
             echo "$summary" >&2
             exit 1
           fi
 
-          echo "ClaudeレビューはHEAD $PR_HEAD_SHA に固定され、read-only review jobとtrusted post jobを分離したcustom gateを通過しました。"
+          echo "ClaudeレビューはHEAD $PR_HEAD_SHA に固定され、commit status gateを通過しました。"
