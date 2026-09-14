@@ -42,9 +42,9 @@ Agent workflow:
 7. Run required checks.
 8. Open a PR referencing the Issue.
 9. Wait for CI.
-10. Wait for the configured automated review.
-11. Resolve all actionable review findings.
-12. Re-run checks after fixes.
+10. Wait for both configured automated reviews: Codex and Claude.
+11. Resolve all actionable findings from both reviews.
+12. Re-run checks after fixes and request re-review when the PR head changed materially.
 13. Merge only when all merge gates are satisfied.
 
 ## 4. Branch and merge rules
@@ -57,7 +57,7 @@ Agent workflow:
   - `docs/<issue>-<slug>`
   - `chore/<issue>-<slug>`
 - PR is mandatory.
-- Automated review MUST be present before merge.
+- Both Codex and Claude automated review MUST be present before merge.
 - All required CI checks MUST pass.
 - No unresolved blocking review threads.
 - Agent may merge after all gates pass.
@@ -388,14 +388,19 @@ If CI is unavailable for a platform, document the gap.
 
 ## 26. Automated review merge gate
 
-The owner uses an automated review.
+The owner requires two independent automated review passes: **Codex** and **Claude**.
 
 Agent MUST:
-- wait until automated review is posted;
-- read it;
-- fix actionable issues;
-- respond/resolve as appropriate;
-- re-run checks.
+- wait until Codex review is posted for the current PR head;
+- wait until Claude review is posted/completed for the current PR head;
+- read findings from both reviewers;
+- fix all actionable `重大` / `重要` findings, or explicitly document why a finding is not applicable;
+- respond to and resolve review threads where appropriate;
+- re-run tests/checks after fixes;
+- request/retrigger both reviewers when material changes were made after their last review;
+- verify there are no unresolved blocking findings before merge.
+
+If either review integration is unavailable, missing credentials, failing, or has not completed, the PR MUST NOT be merged. Create/update a GitHub Issue for the integration problem and continue only work that is independent of the merge.
 
 No "review hasn't arrived yet, so merge anyway."
 
@@ -406,6 +411,15 @@ Commits:
 - no generated secrets;
 - no unrelated formatting floods.
 
+GitHub content intended for the repository owner to review MUST be written primarily in Japanese:
+- Issue titles and bodies;
+- PR titles and bodies;
+- agent-authored PR conversation comments;
+- responses to review findings;
+- merge summaries.
+
+Technical terms, code identifiers, commands, API names, library names, and quoted upstream text may remain in English.
+
 PR body should include:
 - Issue link;
 - what changed;
@@ -414,7 +428,9 @@ PR body should include:
 - screenshots for UI changes where useful;
 - security/privacy impact;
 - hardware test needed? yes/no;
-- known limitations.
+- known limitations;
+- Codex review status;
+- Claude review status.
 
 ## 28. App Store constraints
 
