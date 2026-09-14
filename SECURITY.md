@@ -34,6 +34,20 @@ Out of scope as a guaranteed prevention:
 - compromise of the user's Apple ID/Tailnet/admin host;
 - nation-state level endpoint compromise.
 
+## Development-repository trust boundary
+
+The product threat model above is separate from the GitHub development workflow.
+
+Until Issue #4 establishes hardened repository-level enforcement:
+- same-repository write access is treated as a trusted-maintainer capability;
+- external/untrusted contributors use fork PRs;
+- Codex + Claude current-HEAD review is a mandatory merge policy enforced by the repository owner / merge agent;
+- a status/check emitted with an ordinary repository `GITHUB_TOKEN` is not treated as an unforgeable boundary against a malicious or compromised same-repository writer;
+- the merge actor explicitly verifies that both reviews cover the current PR HEAD;
+- before additional write collaborators are granted access, a Ruleset Required workflow or dedicated GitHub App/issuer that PR branches cannot impersonate must be evaluated and configured under Issue #4.
+
+Claude review receives PR diff/repository review context as part of the GitHub development process. Contributors must never place product-user recordings, real monitoring images, secrets, or private deployment data in PR content.
+
 ## Network defaults
 
 - Do not recommend router port forwarding as normal setup.
