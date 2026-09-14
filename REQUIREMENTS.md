@@ -141,7 +141,7 @@ Default automatic event window:
 - maximum event duration: 20 minutes.
 
 ### MEDIA-006 Live while presence mode is active
-Live viewing and manual recording shall remain available even when automatic security monitoring is paused due to presence mode.
+Live viewing and manual recording shall remain available while presence mode suppresses ordinary person/general-motion security automation. Presence mode does not disable critical server-movement or camera-tamper detection/evidence handling.
 
 ## 7. Detection requirements
 
@@ -284,12 +284,18 @@ Slack messages shall be sent from the user's own ServerSentinel server to the us
 The web dashboard shall provide a one-click `Present / 在室` action.
 
 ### PRES-002 Presence effects
-Presence mode pauses:
-- automatic security recording;
+Presence mode pauses only ordinary occupancy-related automation:
+- automatic person/general-motion security recordings;
 - automatic person/general-motion security events;
-- normal security notifications.
+- ordinary person/general-motion notifications.
 
-Presence mode does not disable:
+Presence mode does **not** disable critical security behavior. The following remain armed and active:
+- confirmed server-movement detection;
+- confirmed camera-tamper detection;
+- critical-event evidence capture/preservation for those event types;
+- configured immediate critical alerts for those event types.
+
+Presence mode also does not disable:
 - live view;
 - manual recording;
 - camera/server health status.
