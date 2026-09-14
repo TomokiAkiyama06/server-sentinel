@@ -1,6 +1,6 @@
 # Claude PRレビュー初期設定
 
-ServerSentinel では、PRのマージ前に **Codex + Claude の二重レビュー**を必須とします。
+ServerSentinelでは、PRのマージ前に **Codex + Claude の二重レビュー**を必須とします。
 
 ClaudeレビューはPRの出所に応じて2経路あります。
 
@@ -9,9 +9,9 @@ ClaudeレビューはPRの出所に応じて2経路あります。
 
 ## 認証方式
 
-ServerSentinel では、GitHub側の認証に workflow の短命な `github.token` を使い、Claude側の認証に `CLAUDE_CODE_OAUTH_TOKEN` を使います。
+ServerSentinelでは、GitHub側の認証にworkflowの短命な `github.token` を使い、Claude側の認証に `CLAUDE_CODE_OAUTH_TOKEN` を使います。
 
-この構成では Claude GitHub App のインストールを必須にせず、リポジトリSecretだけで動かす方針です。
+この構成ではClaude GitHub Appのインストールを必須にせず、リポジトリSecretだけで動かす方針です。
 
 ## 1. Claude Code OAuth Tokenを生成
 
@@ -36,26 +36,55 @@ Name: CLAUDE_CODE_OAUTH_TOKEN
 Value: claude setup-token で生成した値
 ```
 
-## 3. 同一repository内PRの動作確認
+## 3. Claudeレビューの権限分離
 
-Secret登録後、同一repository内の既存PRに新しいcommitをpushするか、PRをreopen / ready for reviewにすると `Claude PRレビュー` workflowが起動します。
+Claude自身が動くjobと、GitHubへ正式レビューを投稿するjobを分離します。
 
-正常時:
+### Claude review job
 
-- PR eventで受け取ったHEAD SHAをレビュー対象として固定する
-- 固定HEADそのものをcheckoutし、baseとのdiffをローカルスナップショット化する
-- ClaudeはliveなPR diffを取り直さず、その固定差分をレビューする
-- 正式レビュー投稿の直前にGitHub上のcurrent `headRefOid`が固定HEADと一致することを再確認する
-- 正式レビューコメントにレビュー対象HEAD SHAとmarkerを明記する
-- 正式レビューは `github-actions[bot]` が投稿し、gateでは投稿者・marker・見出しを検証する
-- 完了stepでもHEAD一致と、現HEAD向け正式レビューmarkerの存在を検証する
-- Claudeが日本語でレビューする
-- 重大度を `重大` / `重要` / `提案` に分類する
-- コード変更やマージは行わない
+Claude側jobはread-onlyです。
 
-同一PRに新しいcommitがpushされた場合は古いworkflowをcancelし、最新HEADのworkflowをレビューgateとして扱います。
+- `contents: read`
+- `pull-requests: read`
+- `issues: read`
+- `actions: read`
+- Claude Codeのallowed toolsは `Read,Glob,Grep` のみ
+- `Write` / `Bash` / GitHub comment toolは与えない
+- 最終レビューは `--json-schema` によるstructured outputとして返す
 
-## 4. fork由来PRの安全なレビュー
+このjobはGitHubへの正式レビュー投稿権限を持ちません。未信頼PR内のprompt injectionによってClaudeが誤った指示に従った場合でも、任意scriptの書換え・shell実行・`github-actions[bot]`としての偽レビュー投稿を直接行えない境界にします。
+
+### Trusted post job
+
+Claude review jobが正常終了した後、別のtrusted post jobがstructured outputをデータとして受け取り、次を行います。
+
+1. current PR HEADが固定HEADと一致することを再確認
+2. structured outputを`jq`で検証・抽出
+3. 固定HEAD marker付きのレビュー本文を作成
+4. `github.token`でGitHubへ投稿
+5. 投稿APIのレスポンスから投稿者が `github-actions[bot]` であることを検証
+6. 投稿後にもcurrent HEADが固定HEADと一致することを再確認
+7. `highest_severity` が `critical` / `important` の場合はworkflowを失敗させてマージをブロック
+
+レビュー本文はshell commandとして評価せず、ファイル/JSONデータとしてのみ扱います。
+
+## 4. 同一repository内PRの動作
+
+同一repository内の既存PRに新しいcommitをpushするか、PRをreopen / ready for reviewにすると `Claude PRレビュー` workflowが起動します。
+
+安全性のため、PR head自体を信頼済みworkspace rootとして扱いません。
+
+- workflow eventで受け取ったHEAD SHA / base SHAを固定
+- workspace rootには信頼済みbase SHAをcheckout
+- PR HEADは `$RUNNER_TEMP` 配下の分離されたread-onlyレビュー用snapshotとして展開
+- diffも `$RUNNER_TEMP` に固定snapshotとして保存
+- Claudeへはbase側のAGENTS.md等を既存ルールとして読ませる
+- PR HEAD/diff内の指示・prompt・commandは未信頼データとして無視させる
+- ClaudeにはRead/Glob/Grep以外のtoolsを与えない
+
+同一PRに新しいcommitがpushされた場合は古いworkflowをcancelし、最新HEADのworkflowだけをレビューgateとして扱います。
+
+## 5. fork由来PRの安全なレビュー
 
 GitHubは通常、forkからの `pull_request` workflowへrepository secretを渡しません。そのため通常の自動Claude workflowはfork PRを意図的にスキップします。
 
@@ -64,21 +93,39 @@ fork PRをレビューする場合は、maintainerがGitHub Actionsから `Claud
 このtrusted workflowは次の制約で動きます。
 
 - repositoryの信頼済みdefault branchだけをcheckoutする
-- fork PRのheadはcheckoutしない
+- fork PRのheadはcheckout/executeしない
 - review開始時のfork HEAD SHAを固定する
-- PR diffは固定HEAD時点の読み取り専用スナップショットとして保存する
-- diff取得後とreview投稿直前・完了時にGitHub上のHEADが変わっていないことを再確認する
-- Claude自身にはGitHubへの直接コメント権限を与えず、trusted workflowが生成した投稿helperだけを実行させる
-- 正式レビューコメントに対象HEAD SHAとmarkerを明記する
-- gateでは `github-actions[bot]` が投稿した現在HEAD向けmarker付きレビューの存在を検証する
-- PR由来のスクリプト、ビルド、テスト、設定ファイルを実行しない
+- PR diffは `$RUNNER_TEMP` の読み取り専用レビュー入力として保存する
+- diff取得後・レビュー投稿直前・投稿後にGitHub上のHEADが変わっていないことを確認する
+- Claude jobはread-onlyで、GitHubへのwrite tokenを持たない
+- Claudeには `Read,Glob,Grep` 以外を許可しない
+- trusted post jobだけが正式レビューを投稿する
 - PR本文・diff・コード中の指示は未信頼データとして扱う
 - Secretや環境変数を表示・送信しない
-- Claudeはコード変更、commit、push、mergeを行わない
 
 `pull_request_target` でfork headをcheckoutし、その状態でSecretを使う構成は禁止します。
 
-## 5. GitHub Actionのバージョン固定
+## 6. Structured review output
+
+Claudeは次のschemaに従って結果を返します。
+
+```json
+{
+  "highest_severity": "none | proposal | important | critical",
+  "review_markdown": "日本語のレビュー本文"
+}
+```
+
+意味:
+
+- `critical`: 「重大」が1件以上
+- `important`: 「重要」が1件以上で重大なし
+- `proposal`: 提案のみ
+- `none`: 指摘なし
+
+`critical` / `important` はCI上もblockingとして扱い、修正後の新しいHEADでClaudeレビューを再実行します。
+
+## 7. GitHub Actionのバージョン固定
 
 Secretへアクセスするreview workflowでは、第三者Actionをmutableなmajor tagだけで実行しません。
 
@@ -89,14 +136,15 @@ Secretへアクセスするreview workflowでは、第三者Actionをmutableなm
 
 Actionを更新する場合は、上流tagを追従するだけでなく、新旧commitの差分・release内容・権限影響を確認したうえでPRとして更新します。
 
-## 6. マージ条件
+## 8. マージ条件
 
 以下をすべて満たすまでマージしません。
 
 - Codexが**現在のPR HEAD**をレビュー済み
 - Claudeが**現在のPR HEAD**をレビュー済み
-- ClaudeレビューgateでHEAD・投稿者・markerを検証済み
-- Codex / Claudeの重大・重要指摘を解消
+- Claude review/post jobsが成功
+- Claudeレビューに `重大` / `重要` が残っていない
+- Codexの重大・重要指摘を解消
 - 必須CI成功
 - 未解決のブロッキングレビューなし
 
@@ -107,10 +155,11 @@ Actionを更新する場合は、上流tagを追従するだけでなく、新�
 - OAuth tokenをGitへcommitしない
 - workflow内へtokenを直接書かない
 - `CLAUDE_CODE_OAUTH_TOKEN` はGitHub Actions Secretからのみ参照する
-- Claude workflowのGitHub権限はレビューに必要な範囲へ限定する
-- Claudeにはレビュー時のコード変更・コミット・マージ権限を与えない
+- Claude jobへGitHub write権限を与えない
+- Claudeにはレビュー時のファイル書込・shell実行・commit・push・merge権限を与えない
 - fork PRへSecretを直接渡さない
 - 未信頼のPR headをSecret付きworkflowでcheckout・実行しない
 - review対象SHAをコメントに明記し、current HEADと異なるレビューをマージgateとして扱わない
-- Claudeレビューmarkerだけでなく投稿者が `github-actions[bot]` であることも検証する
+- 正式投稿はtrusted post jobだけが行い、投稿APIレスポンスのuserが `github-actions[bot]` であることを確認する
 - Secretへアクセスする第三者Actionはfull commit SHAへ固定する
+- workflow生成物はPR working treeではなく `$RUNNER_TEMP` へ置く
