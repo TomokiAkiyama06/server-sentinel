@@ -64,7 +64,8 @@ Claude review jobが正常終了した後、別のtrusted post jobがstructured 
 4. `github.token`でGitHubへ投稿
 5. 投稿APIのレスポンスから投稿者が `github-actions[bot]` であることを検証
 6. 投稿後にもcurrent HEADが固定HEADと一致することを再確認
-7. `highest_severity` が `critical` / `important` の場合はworkflowを失敗させてマージをブロック
+7. 同じPR HEAD SHAへ `ServerSentinel / Claude Review Gate` という共通check runを作成
+8. `highest_severity` が `critical` / `important` の場合はcheckをfailureにし、job自体も失敗させる
 
 レビュー本文はshell commandとして評価せず、ファイル/JSONデータとしてのみ扱います。
 
@@ -100,6 +101,7 @@ fork PRをレビューする場合は、maintainerがGitHub Actionsから `Claud
 - Claude jobはread-onlyで、GitHubへのwrite tokenを持たない
 - Claudeには `Read,Glob,Grep` 以外を許可しない
 - trusted post jobだけが正式レビューを投稿する
+- trusted post jobはforkのPR HEAD SHAへ同じ `ServerSentinel / Claude Review Gate` check runを明示的に作成する
 - PR本文・diff・コード中の指示は未信頼データとして扱う
 - Secretや環境変数を表示・送信しない
 
@@ -136,13 +138,40 @@ Secretへアクセスするreview workflowでは、第三者Actionをmutableなm
 
 Actionを更新する場合は、上流tagを追従するだけでなく、新旧commitの差分・release内容・権限影響を確認したうえでPRとして更新します。
 
-## 8. マージ条件
+## 8. Required check / branch protection
+
+同一repository PRとfork PRの両方で、最終的なClaudeレビューgateはPR HEAD SHAに対して次の共通check run名を作成します。
+
+```text
+ServerSentinel / Claude Review Gate
+```
+
+Repository Ruleset / Branch protectionでは、`main`へのPRに対してこのcheckを **Required status check** として設定してください。
+
+これにより:
+
+- 同一repository PR: 自動Claudeレビューが成功するまでmerge不可
+- fork PR: maintainerが手動Claudeレビューworkflowを実行して成功させるまでcheckが存在せずmerge不可
+- Claudeが `critical` / `important` を返した場合: checkがfailureとなりmerge不可
+- 新しいcommitがpushされた場合: 新HEADには旧HEADのcheck結果が引き継がれず、再レビューが必要
+
+GitHubリポジトリ設定の変更自体はコードだけでは完結しないため、bootstrap CI Issueのセットアップ項目として実際のRuleset/branch protection設定と動作確認を行います。
+
+## 9. Codexレビュー
+
+CodexはGitHub側のCodex連携からレビューを実行します。レビュー依頼はPRをReadyにする、または `@codex review` コメントで行います。
+
+現時点ではClaudeのようなrepository内独自gate workflowを持たないため、各PRではCodexが**現在のHEAD**をレビューしたことと、未解決の重大・重要指摘がないことを確認してからmergeします。
+
+Codex側についても将来的にmachine-readableなrequired statusへ結び付けられる場合は、その方式をbootstrap CI Issueで評価します。それまでは `AGENTS.md` のmerge ruleに従い、人間/エージェントがHEAD一致を明示確認します。
+
+## 10. マージ条件
 
 以下をすべて満たすまでマージしません。
 
 - Codexが**現在のPR HEAD**をレビュー済み
 - Claudeが**現在のPR HEAD**をレビュー済み
-- Claude review/post jobsが成功
+- `ServerSentinel / Claude Review Gate` が現在のHEADでsuccess
 - Claudeレビューに `重大` / `重要` が残っていない
 - Codexの重大・重要指摘を解消
 - 必須CI成功
