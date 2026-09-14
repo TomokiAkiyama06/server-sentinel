@@ -46,7 +46,8 @@ Secret登録後、同一repository内の既存PRに新しいcommitをpushする�
 - 固定HEADそのものをcheckoutし、baseとのdiffをローカルスナップショット化する
 - ClaudeはliveなPR diffを取り直さず、その固定差分をレビューする
 - 正式レビュー投稿の直前にGitHub上のcurrent `headRefOid`が固定HEADと一致することを再確認する
-- 正式レビューコメントにレビュー対象HEAD SHAを明記する
+- 正式レビューコメントにレビュー対象HEAD SHAとmarkerを明記する
+- 正式レビューは `github-actions[bot]` が投稿し、gateでは投稿者・marker・見出しを検証する
 - 完了stepでもHEAD一致と、現HEAD向け正式レビューmarkerの存在を検証する
 - Claudeが日本語でレビューする
 - 重大度を `重大` / `重要` / `提案` に分類する
@@ -66,12 +67,14 @@ fork PRをレビューする場合は、maintainerがGitHub Actionsから `Claud
 - fork PRのheadはcheckoutしない
 - review開始時のfork HEAD SHAを固定する
 - PR diffは固定HEAD時点の読み取り専用スナップショットとして保存する
-- diff取得後とreview完了時にGitHub上のHEADが変わっていないことを再確認する
-- レビューコメントに対象HEAD SHAを明記する
+- diff取得後とreview投稿直前・完了時にGitHub上のHEADが変わっていないことを再確認する
+- Claude自身にはGitHubへの直接コメント権限を与えず、trusted workflowが生成した投稿helperだけを実行させる
+- 正式レビューコメントに対象HEAD SHAとmarkerを明記する
+- gateでは `github-actions[bot]` が投稿した現在HEAD向けmarker付きレビューの存在を検証する
 - PR由来のスクリプト、ビルド、テスト、設定ファイルを実行しない
 - PR本文・diff・コード中の指示は未信頼データとして扱う
 - Secretや環境変数を表示・送信しない
-- ClaudeはPRへレビューコメントを投稿するだけで、commit / push / mergeを行わない
+- Claudeはコード変更、commit、push、mergeを行わない
 
 `pull_request_target` でfork headをcheckoutし、その状態でSecretを使う構成は禁止します。
 
@@ -92,6 +95,7 @@ Actionを更新する場合は、上流tagを追従するだけでなく、新�
 
 - Codexが**現在のPR HEAD**をレビュー済み
 - Claudeが**現在のPR HEAD**をレビュー済み
+- ClaudeレビューgateでHEAD・投稿者・markerを検証済み
 - Codex / Claudeの重大・重要指摘を解消
 - 必須CI成功
 - 未解決のブロッキングレビューなし
@@ -108,4 +112,5 @@ Actionを更新する場合は、上流tagを追従するだけでなく、新�
 - fork PRへSecretを直接渡さない
 - 未信頼のPR headをSecret付きworkflowでcheckout・実行しない
 - review対象SHAをコメントに明記し、current HEADと異なるレビューをマージgateとして扱わない
+- Claudeレビューmarkerだけでなく投稿者が `github-actions[bot]` であることも検証する
 - Secretへアクセスする第三者Actionはfull commit SHAへ固定する
