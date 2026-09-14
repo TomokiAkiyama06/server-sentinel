@@ -92,21 +92,53 @@ Acceptance:
 - non-hardware logic unit-tested;
 - real capture verification deferred to manual test Issue.
 
+## Blocking prerequisite before #5 — Deployment-owner authorization ADR/bootstrap
+
+Labels: `architecture`, `security`, `backend`, `web`, `decision-needed`
+
+This work MUST be completed before the pairing protocol is considered implementable/complete. Tailnet membership provides reachability only and is not sufficient owner authorization.
+
+Scope:
+- choose the MVP deployment-owner authorization mechanism by ADR;
+- compare a locally managed owner credential/session against explicit binding to one verified Tailscale identity/ACL or another self-hosted equivalent;
+- define trusted local bootstrap flow;
+- define remote privileged-operation authorization checks;
+- define recovery/revocation;
+- define session lifetime/rotation and CSRF/browser considerations where applicable;
+- define how pairing approval/revocation proves deployment-owner authorization;
+- update setup documentation and API contracts.
+
+Acceptance:
+- ADR accepted before pairing implementation is merged;
+- privileged dashboard/API operations fail closed when owner authorization is absent/invalid;
+- another member of the same Tailnet is denied unless explicitly bound/authorized as the deployment owner by the selected mechanism;
+- pairing approval and Camera Node revocation require deployment-owner authorization;
+- recovery/revocation path is tested;
+- no developer-operated account/cloud service is introduced;
+- negative authorization tests run without real hardware.
+
+Blocking relationship:
+- `#5 Pairing protocol` MUST depend on this prerequisite and MUST NOT be closed until the selected owner authorization boundary is enforced in pairing approval/revocation.
+
 ## #5 Pairing protocol
 
 Scope:
 - one-time token;
 - 5-minute expiry;
 - QR payload schema;
-- approval/revocation;
+- owner-authorized approval/revocation;
 - iOS Keychain abstraction;
 - mDNS discovery proposal/implementation if suitable.
 
 Acceptance:
+- deployment-owner authorization prerequisite/ADR is complete;
 - expired token rejected;
 - token reuse rejected;
 - token redacted from logs;
-- mock iOS client pairs/revokes.
+- pairing approval without valid deployment-owner authorization is rejected;
+- Camera Node revocation without valid deployment-owner authorization is rejected;
+- a non-owner Tailnet member cannot approve/revoke pairing merely because network reachability exists;
+- mock iOS client pairs/revokes when valid owner authorization is present.
 
 ## #6 Live media transport PoC + ADR
 
