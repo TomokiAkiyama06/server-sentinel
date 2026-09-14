@@ -116,6 +116,7 @@ jobs:
             - PR由来のスクリプト、テスト、ビルド、設定ファイル、実行可能ファイルを実行・sourceしない。
             - liveなGitHub PR情報を取り直さない。内容確認は固定済みPINNED DIFF FILEをReadする。
             - Secret、環境変数、tokenを表示・推測・送信しない。
+            - Secretらしき値を発見した場合は値そのものを引用せず、種類・ファイル・場所だけを説明する。
             - コード変更、commit、push、mergeを行わない。
 
             ServerSentinelのプルリクエストをレビューしてください。
@@ -152,28 +153,99 @@ jobs:
             --json-schema '{"type":"object","properties":{"highest_severity":{"type":"string","enum":["none","proposal","important","critical"]},"review_markdown":{"type":"string","minLength":1}},"required":["highest_severity","review_markdown"],"additionalProperties":false}'
 
   post-claude-review:
-    name: ServerSentinel / Claude Review Gate
+    # workflow_dispatch自体のjob statusはfork PR HEADへ必ずしも結び付かないため、
+    # branch protectionはこのjob名ではなくcustom check runだけをrequiredにする。
+    name: Claude forkレビュー投稿・custom gate更新
     needs: claude-review
-    if: needs.claude-review.result == 'success'
+    if: ${{ always() }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      pull-requests: write
+      pull-requests: read
       issues: write
       checks: write
     env:
       GH_TOKEN: ${{ github.token }}
-      PR_NUMBER: ${{ needs.claude-review.outputs.pr_number }}
-      PR_HEAD_SHA: ${{ needs.claude-review.outputs.pr_head_sha }}
+      PR_NUMBER: ${{ inputs.pr_number }}
+      PINNED_HEAD_SHA: ${{ needs.claude-review.outputs.pr_head_sha }}
+      CLAUDE_RESULT: ${{ needs.claude-review.result }}
       REVIEW_JSON: ${{ needs.claude-review.outputs.review_json }}
 
     steps:
-      - name: 固定HEADのforkレビューを投稿してgateを検証
+      - name: 固定HEADのforkレビューを投稿してcustom gateを検証
         run: |
           set -euo pipefail
 
-          if ! [[ "$PR_NUMBER" =~ ^[0-9]+$ ]] || ! [[ "$PR_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]; then
-            echo "PR番号または固定HEADが不正です。" >&2
+          if ! [[ "$PR_NUMBER" =~ ^[0-9]+$ ]]; then
+            echo "PR番号が不正です。" >&2
+            exit 1
+          fi
+
+          gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" \
+            --json state,isCrossRepository,headRefOid > "$RUNNER_TEMP/pr-current.json"
+          state="$(jq -r '.state' "$RUNNER_TEMP/pr-current.json")"
+          is_cross_repository="$(jq -r '.isCrossRepository' "$RUNNER_TEMP/pr-current.json")"
+          current_head="$(jq -r '.headRefOid' "$RUNNER_TEMP/pr-current.json")"
+
+          if [ "$state" != "OPEN" ] || [ "$is_cross_repository" != "true" ]; then
+            echo "対象はOPENなfork PRではありません。" >&2
+            exit 1
+          fi
+          if ! [[ "$current_head" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "current fork HEADを取得できませんでした。" >&2
+            exit 1
+          fi
+
+          if [[ "$PINNED_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            PR_HEAD_SHA="$PINNED_HEAD_SHA"
+          else
+            # upstream review jobがpin前に失敗した場合でも、現在HEADへfailure gateを出す。
+            PR_HEAD_SHA="$current_head"
+          fi
+          export PR_HEAD_SHA
+
+          publish_check() {
+            local conclusion="$1"
+            local title="$2"
+            local summary="$3"
+            local request="$RUNNER_TEMP/check-request.json"
+            local response="$RUNNER_TEMP/check-response.json"
+
+            jq -n \
+              --arg name "ServerSentinel / Claude Review Gate" \
+              --arg head_sha "$PR_HEAD_SHA" \
+              --arg conclusion "$conclusion" \
+              --arg title "$title" \
+              --arg summary "$summary" \
+              '{name:$name,head_sha:$head_sha,status:"completed",conclusion:$conclusion,output:{title:$title,summary:$summary}}' \
+              > "$request"
+
+            gh api --method POST -H "Accept: application/vnd.github+json" \
+              "repos/$GITHUB_REPOSITORY/check-runs" --input "$request" > "$response"
+
+            [ "$(jq -r '.name' "$response")" = "ServerSentinel / Claude Review Gate" ]
+            [ "$(jq -r '.head_sha' "$response")" = "$PR_HEAD_SHA" ]
+            [ "$(jq -r '.conclusion' "$response")" = "$conclusion" ]
+          }
+
+          if [ "$CLAUDE_RESULT" != "success" ]; then
+            PR_HEAD_SHA="$current_head"
+            export PR_HEAD_SHA
+            summary="Claude fork review jobが正常完了しませんでした（result: $CLAUDE_RESULT）。maintainerが最新HEADで再実行してください。"
+            publish_check "failure" "Claude forkレビュー実行失敗" "$summary"
+            echo "$summary" >&2
+            exit 1
+          fi
+
+          if [ "$current_head" != "$PR_HEAD_SHA" ]; then
+            echo "レビュー中にfork PR HEADが変更されました: $PR_HEAD_SHA -> $current_head。最新HEADで再実行してください。" >&2
+            exit 1
+          fi
+
+          if [ -z "$REVIEW_JSON" ] || ! printf '%s' "$REVIEW_JSON" | jq -e . >/dev/null 2>&1; then
+            summary="Claude fork review jobは終了しましたが、検証可能なstructured outputを取得できませんでした。"
+            publish_check "failure" "Claude forkレビュー出力不正" "$summary"
+            echo "$summary" >&2
             exit 1
           fi
 
@@ -183,8 +255,55 @@ jobs:
 
           case "$severity" in
             none|proposal|important|critical) ;;
-            *) echo "Claudeレビューのseverityが不正です: $severity" >&2; exit 1 ;;
+            *)
+              summary="Claude forkレビューのseverityが不正です。"
+              publish_check "failure" "Claude forkレビュー出力不正" "$summary"
+              echo "$summary" >&2
+              exit 1
+              ;;
           esac
+
+          PR_HEAD_SHA="$PR_HEAD_SHA" python3 - "$review_file" <<'PY'
+          import os
+          import re
+          import sys
+          from pathlib import Path
+
+          path = Path(sys.argv[1])
+          text = path.read_text(encoding="utf-8")
+          original = text
+          head = os.environ.get("PR_HEAD_SHA", "")
+          marker = "__SERVERSENTINEL_REVIEWED_HEAD__"
+          if head:
+              text = text.replace(head, marker)
+
+          patterns = [
+              (r"-----BEGIN [^-\n]*PRIVATE KEY-----[\s\S]*?-----END [^-\n]*PRIVATE KEY-----", "[REDACTED PRIVATE KEY]"),
+              (r"-----BEGIN [^-\n]*PRIVATE KEY-----[\s\S]*$", "[REDACTED PRIVATE KEY]"),
+              (r"\bgithub_pat_[A-Za-z0-9_]{20,}\b", "github_pat_[REDACTED]"),
+              (r"\bgh[pousr]_[A-Za-z0-9_]{20,}\b", "gh*_[REDACTED]"),
+              (r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b", "xox*-REDACTED"),
+              (r"https://hooks\.slack\.com/services/[A-Za-z0-9/_-]+", "https://hooks.slack.com/services/[REDACTED]"),
+              (r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b", "AWS_ACCESS_KEY_[REDACTED]"),
+              (r"\btskey-[A-Za-z0-9_-]{10,}\b", "tskey-[REDACTED]"),
+              (r"(?i)([?&](?:token|key|secret|signature|password)=)[^&\s)]+", r"\1[REDACTED]"),
+              (r"(?im)^(\s*[A-Z0-9_.-]*(?:TOKEN|SECRET|PASSWORD|PASSWD|API[_-]?KEY|WEBHOOK)[A-Z0-9_.-]*\s*[:=]\s*)(?!\$\{\{)[^\s#]+", r"\1[REDACTED]"),
+          ]
+          for pattern, replacement in patterns:
+              text = re.sub(pattern, replacement, text)
+
+          text = re.sub(
+              r"(?<![A-Za-z0-9_-])(?=[A-Za-z0-9_+=./:-]{32,}(?![A-Za-z0-9_-]))(?=[^\s]*[A-Za-z])(?=[^\s]*\d)[A-Za-z0-9_+=./:-]{32,}(?![A-Za-z0-9_-])",
+              "[REDACTED_LONG_TOKEN]",
+              text,
+          )
+
+          if head:
+              text = text.replace(marker, head)
+          if text != original:
+              text += "\n\n> ⚠️ 自動安全フィルタによりSecretらしき文字列を伏字化しました。\n"
+          path.write_text(text, encoding="utf-8")
+          PY
 
           current_head="$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json headRefOid --jq '.headRefOid')"
           if [ "$current_head" != "$PR_HEAD_SHA" ]; then
@@ -221,7 +340,7 @@ jobs:
 
           current_head_after="$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json headRefOid --jq '.headRefOid')"
           if [ "$current_head_after" != "$PR_HEAD_SHA" ]; then
-            echo "レビュー投稿中にfork PR HEADが変更されました: $PR_HEAD_SHA -> $current_head_after。今回のレビューはマージgateとして無効です。" >&2
+            echo "レビュー投稿中にfork PR HEADが変更されました: $PR_HEAD_SHA -> $current_head_after。今回のレビューは無効です。" >&2
             exit 1
           fi
 
@@ -233,27 +352,11 @@ jobs:
             summary="Claudeレビューは現在のfork PR HEADに固定され、重大・重要な未解決指摘はありません。"
           fi
 
-          check_payload="$(jq -n \
-            --arg name "ServerSentinel / Claude Review Gate" \
-            --arg head_sha "$PR_HEAD_SHA" \
-            --arg conclusion "$conclusion" \
-            --arg title "Claudeレビュー: $severity" \
-            --arg summary "$summary" \
-            '{name:$name,head_sha:$head_sha,status:"completed",conclusion:$conclusion,output:{title:$title,summary:$summary}}')"
-          printf '%s' "$check_payload" |
-            gh api --method POST -H "Accept: application/vnd.github+json" "repos/$GITHUB_REPOSITORY/check-runs" --input - > "$RUNNER_TEMP/check-response.json"
-
-          check_name="$(jq -r '.name' "$RUNNER_TEMP/check-response.json")"
-          check_head="$(jq -r '.head_sha' "$RUNNER_TEMP/check-response.json")"
-          check_conclusion="$(jq -r '.conclusion' "$RUNNER_TEMP/check-response.json")"
-          if [ "$check_name" != "ServerSentinel / Claude Review Gate" ] || [ "$check_head" != "$PR_HEAD_SHA" ] || [ "$check_conclusion" != "$conclusion" ]; then
-            echo "Claude fork review check runを検証できませんでした。" >&2
-            exit 1
-          fi
+          publish_check "$conclusion" "Claudeレビュー: $severity" "$summary"
 
           if [ "$conclusion" != "success" ]; then
             echo "$summary" >&2
             exit 1
           fi
 
-          echo "Claude forkレビューはHEAD $PR_HEAD_SHA に固定され、共通required checkへ成功を記録しました。"
+          echo "Claude forkレビューはHEAD $PR_HEAD_SHA に固定され、共通custom required checkへ成功を記録しました。"
