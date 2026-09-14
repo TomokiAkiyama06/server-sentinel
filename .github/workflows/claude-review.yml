@@ -193,9 +193,19 @@ jobs:
           fi
 
           marker="<!-- claude-reviewed-head:$PR_HEAD_SHA -->"
-          if ! gh api --paginate "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments?per_page=100" --jq '.[].body' | grep -Fq "$marker"; then
-            echo "現在のHEADに固定された正式Claudeレビューコメントが見つかりません。" >&2
+          valid_review_ids="$(
+            gh api --paginate "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments?per_page=100" |
+              jq -r --arg marker "$marker" '
+                .[]
+                | select(.user.login == "github-actions[bot]")
+                | select((.body // "") | contains($marker))
+                | select((.body // "") | contains("### Claude PRレビュー"))
+                | .id
+              '
+          )"
+          if [ -z "$valid_review_ids" ]; then
+            echo "github-actions[bot] が投稿した、現在のHEADに固定された正式Claudeレビューコメントが見つかりません。" >&2
             exit 1
           fi
 
-          echo "ClaudeレビューはPR HEAD $PR_HEAD_SHA に固定され、投稿直前・完了時とも同一HEADであることを確認しました。"
+          echo "ClaudeレビューはPR HEAD $PR_HEAD_SHA に固定され、投稿者・marker・投稿直前/完了時HEADを検証しました。"
