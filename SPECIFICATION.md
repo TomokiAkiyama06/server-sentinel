@@ -428,29 +428,32 @@ Important constraints:
 
 ## 10. Retention algorithm
 
-ServerSentinel must distinguish between the configured recording allocation and a hard filesystem safety reserve. Starred recordings are protected from automatic deletion, but protection must never imply that ServerSentinel will intentionally fill the filesystem to 100%.
+ServerSentinel must distinguish between the configured recording allocation and a hard filesystem safety reserve. Starred recordings are protected from automatic deletion, but protection must never imply that ServerSentinel will intentionally fill the filesystem to 100%. Filesystem pressure can be caused by ServerSentinel or by unrelated services sharing the same volume, so admission decisions MUST consider actual filesystem free space independently of ServerSentinel's configured allocation.
 
-At scheduled intervals:
+At scheduled intervals and before admitting a new recording:
 
-1. Calculate total recording usage, starred/preserved usage, filesystem free space, and the configured hard safety reserve.
+1. Calculate total recording usage, starred/preserved usage, filesystem free space, the configured recording maximum, the critical-evidence allowance, and the hard safety reserve.
 2. Delete expired unstarred recordings older than retention.
-3. Recompute allocation and free space.
-4. If still above the configured recording maximum, delete oldest unstarred recordings until below target or no deletable recordings remain.
+3. Recompute recording usage and filesystem free space.
+4. Reclaim oldest unstarred recordings when **either** condition is true:
+   - ServerSentinel recording usage exceeds the configured recording maximum; or
+   - actual filesystem free space is below the normal recording-admission target required to preserve both the bounded critical-evidence allowance and the hard safety reserve.
+   Continue oldest-unstarred cleanup until both admission conditions are safe again or no deletable unstarred recordings remain. This cleanup applies even when low free space was caused by another process/service on the shared filesystem.
 5. Never auto-delete starred recordings.
-6. If protected/starred usage leaves insufficient room for normal recording while the hard safety reserve is still intact, enter `STORAGE_PRESSURE`:
-   - reject new non-critical/manual recordings before they consume the reserve;
+6. Only after step 4 reclamation has been attempted, if there is still insufficient room for normal recording while the hard safety reserve remains intact, enter `STORAGE_PRESSURE`:
+   - reject new non-critical/manual recordings before they consume the protected capacity;
    - continue live viewing and detection;
    - keep critical-event detection armed;
-   - show a persistent UI warning and audit event requiring the owner to unstar/delete/offload data or increase storage.
+   - show a persistent UI warning and audit event requiring the owner to unstar/delete/offload data, free space used by other services, or increase storage.
 7. Maintain a separately budgeted critical-evidence allowance above the normal recording-admission threshold so a limited amount of new `server_movement` / `camera_tamper` evidence can still be written during `STORAGE_PRESSURE`. This allowance must be bounded and must not consume the hard filesystem safety reserve.
-8. If the critical-evidence allowance is exhausted or the hard filesystem safety reserve would be crossed, enter `STORAGE_HARD_STOP`:
+8. Before entering `STORAGE_HARD_STOP`, re-evaluate filesystem free space and confirm that no eligible unstarred recording can be reclaimed to restore the required reserve. If the critical-evidence allowance is exhausted or any new disk write would cross the hard filesystem safety reserve, enter `STORAGE_HARD_STOP`:
    - refuse all new disk recordings rather than intentionally filling the filesystem;
    - continue live view/detection where possible;
    - preserve any iPhone local emergency evidence and retry server synchronization after capacity is restored;
    - raise the highest local storage warning state and audit the transition.
 9. Automatically leave pressure/stop states only after free space is safely above the corresponding recovery threshold (use hysteresis to avoid state flapping).
 
-The hard safety reserve, critical-evidence allowance, and recovery thresholds shall be configurable within safe bounds and finalized from storage/bitrate benchmarks. The implementation must test the case where starred data alone exceeds the normal configured recording allocation.
+The hard safety reserve, critical-evidence allowance, normal admission target, and recovery thresholds shall be configurable within safe bounds and finalized from storage/bitrate benchmarks. The implementation must test both (a) starred data alone exceeding the normal configured recording allocation and (b) an unrelated service consuming shared-filesystem space while reclaimable unstarred ServerSentinel recordings still exist.
 
 ## 11. Pairing
 
