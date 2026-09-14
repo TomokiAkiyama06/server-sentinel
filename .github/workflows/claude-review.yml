@@ -12,7 +12,9 @@ permissions:
 
 jobs:
   claude-review:
-    if: github.event.pull_request.draft == false
+    # fork PR では repository secret が渡らないため、この自動経路は同一repository内PR専用。
+    # fork PR は claude-review-fork.yml の信頼済み手動経路を使う。
+    if: github.event.pull_request.draft == false && github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
 
     steps:

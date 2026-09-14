@@ -96,8 +96,11 @@ For critical events (server movement or camera tamper), the iPhone shall preserv
 
 Initial target emergency storage:
 - 500 MB maximum;
-- oldest unprotected emergency data overwritten first;
-- critical clips synchronized to Ubuntu when possible.
+- synchronized/unprotected emergency data is reclaimed before unsynchronized critical evidence;
+- unsynchronized critical clips must not be silently overwritten merely because the local ring reaches capacity;
+- if no reclaimable synchronized/unprotected data remains and a new local critical clip would exceed the bound, local evidence admission shall enter an explicit hard-stop/degraded state rather than silently deleting existing unsynchronized evidence;
+- the UI/audit state shall clearly report that new local evidence could not be admitted, while detection and any available direct server upload continue;
+- local evidence admission shall recover automatically after synchronization or free-space recovery.
 
 ### CAM-010 Reconnection
 If communication with Ubuntu fails:
@@ -219,6 +222,8 @@ Deletion triggers on whichever is reached first:
 - retention limit;
 - capacity limit.
 
+Capacity enforcement shall also consider actual filesystem free space so an unrelated process sharing the volume cannot drive ServerSentinel past its safety margin.
+
 ### STORE-006 Starred recordings
 Users may star/preserve recordings.
 
@@ -226,6 +231,8 @@ Starred recordings:
 - are excluded from automatic retention/capacity deletion;
 - count toward disk use;
 - trigger warnings if preserved data threatens usable capacity.
+
+Starred protection must not cause the filesystem to be intentionally filled to 100%.
 
 ### STORE-007 Manual deletion
 The owner may explicitly delete recordings through the UI.
@@ -239,6 +246,18 @@ Audit logs:
 
 ### STORE-009 Benchmark-derived defaults
 Storage-capacity recommendations and bitrate defaults shall be based on actual benchmark data rather than guessed values.
+
+### STORE-010 Filesystem safety reserve and critical-evidence allowance
+ServerSentinel shall preserve a hard filesystem safety reserve independently of the normal recording allocation.
+
+When free space becomes unsafe:
+- reclaim eligible unstarred recordings before refusing new writes;
+- stop/reject ordinary non-critical and manual recordings before consuming protected capacity;
+- reserve a bounded critical-evidence allowance for a limited amount of new confirmed server-movement/camera-tamper evidence;
+- never allow the bounded allowance to consume the hard filesystem safety reserve;
+- enter an explicit hard-stop state before a new write would cross the reserve;
+- surface pressure/hard-stop state in the UI and audit log;
+- recover with hysteresis after sufficient free space returns.
 
 ## 9. Notifications and Slack requirements
 
@@ -381,12 +400,19 @@ Documentation shall not recommend opening the ServerSentinel web/API port direct
 ### REMOTE-003 Single-owner model
 MVP assumes one owner per deployment.
 
-### REMOTE-004 Web login
-No separate ServerSentinel cloud identity is required.
+### REMOTE-004 No developer cloud identity
+No separate ServerSentinel developer-operated cloud identity is required.
 
-When Tailscale is used, Tailnet membership is the primary remote-access gate for MVP.
+### REMOTE-005 Deployment-owner authorization
+Tailnet membership is a network-reachability boundary, not sufficient proof that the caller is the deployment owner.
 
-Future local multi-user authorization may be proposed separately.
+MVP shall enforce a deployment-owner authorization boundary for privileged dashboard/API operations such as live-media access, recording playback/deletion, pairing/revocation, presence/security settings, retention/storage settings, and Slack integration.
+
+Acceptable implementation families include:
+- a locally managed owner credential/session; or
+- an explicitly configured binding to one verified Tailscale identity/ACL.
+
+The exact mechanism must be selected and documented by ADR before implementation. It must not require a developer-operated account service, and it must support owner credential/binding recovery or revocation.
 
 ## 13. Web dashboard requirements
 

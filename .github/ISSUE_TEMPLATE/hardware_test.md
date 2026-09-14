@@ -1,31 +1,31 @@
 ---
-name: Hardware / manual validation
-about: Track real-device checks that cannot be completed by agents alone
-title: "[Hardware] "
+name: 実機・手動検証
+about: エージェントだけでは完了できない実機確認を管理する
+title: "[実機] "
 labels: hardware-required,manual-test-required
 ---
 
-## What must be verified
+## 確認する内容
 
-## Required hardware
+## 必要な実機・環境
 
 - [ ] iPhone
-- [ ] Ubuntu server
-- [ ] Physical installation
-- [ ] External mobile network
+- [ ] Ubuntuサーバー
+- [ ] 物理設置環境
+- [ ] 外部モバイルネットワーク
 
-## Preconditions
+## 事前条件
 
-## Procedure
+## 手順
 
 1.
 2.
 3.
 
-## Acceptance criteria
+## 完了条件
 
 - [ ]
 
-## Results
+## 結果
 
-Do not mark complete until real hardware has been used.
+実機で確認するまで完了扱いにしないでください。

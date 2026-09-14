@@ -1,34 +1,34 @@
 ---
-name: Bug report
-about: Report a reproducible ServerSentinel defect
-title: "[Bug] "
+name: 不具合報告
+about: 再現可能なServerSentinelの不具合を報告する
+title: "[不具合] "
 labels: bug
 ---
 
-## Environment
+## 環境
 
-ServerSentinel version/commit:
-iOS version/device:
-Ubuntu version:
-Browser:
+ServerSentinelのバージョン/commit:
+iOSバージョン/端末:
+Ubuntuバージョン:
+ブラウザ:
 
-## Expected
+## 期待する動作
 
-## Actual
+## 実際の動作
 
-## Reproduction
+## 再現手順
 
 1.
 2.
 3.
 
-## Logs
+## ログ
 
-Redact all secrets and personal data.
+Secretや個人情報は必ず伏せてください。
 
-## Hardware required?
+## 実機が必要ですか？
 
-- [ ] No
+- [ ] 不要
 - [ ] iPhone
-- [ ] Ubuntu server
-- [ ] Both
+- [ ] Ubuntuサーバー
+- [ ] 両方

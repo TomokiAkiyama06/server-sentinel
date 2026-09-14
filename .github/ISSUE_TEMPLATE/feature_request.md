@@ -1,24 +1,24 @@
 ---
-name: Feature / proposal
-about: Propose scoped new behavior
-title: "[Feature] "
+name: 機能提案
+about: 範囲を限定した新しい機能や挙動を提案する
+title: "[機能] "
 labels: enhancement
 ---
 
-## Problem
+## 解決したい問題
 
-## Proposed behavior
+## 提案する挙動
 
-## Acceptance criteria
+## 完了条件
 
 - [ ]
 
-## Privacy impact
+## プライバシーへの影響
 
-## Security impact
+## セキュリティへの影響
 
-## Dependency/license impact
+## 依存関係・ライセンスへの影響
 
-## Hardware test required?
+## 実機テストは必要ですか？
 
-## Alternatives
+## 代替案

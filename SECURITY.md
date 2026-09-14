@@ -10,6 +10,7 @@ The safest default is:
 - no public Internet exposure;
 - least privilege;
 - explicit pairing;
+- explicit deployment-owner authorization;
 - no secrets in source control.
 
 ## Threat model
@@ -40,6 +41,19 @@ Out of scope as a guaranteed prevention:
 - Camera/server traffic should remain local where possible.
 - Bind services to the smallest necessary interfaces.
 - Document firewall requirements instead of disabling firewalls.
+
+## Deployment-owner authorization
+
+Tailscale/Tailnet membership provides network reachability; it is **not by itself sufficient authorization** to operate a ServerSentinel deployment.
+
+MVP requirements:
+- privileged dashboard/API operations must verify the deployment owner, not merely that a request came from a Tailnet member;
+- acceptable implementation families include a locally managed owner credential/session or an explicitly configured binding to a specific verified Tailscale identity/ACL;
+- the exact mechanism must be locked by ADR before implementation;
+- first-run bootstrap must establish the owner boundary before remote privileged access is enabled;
+- destructive operations such as recording deletion, retention changes, pairing/revocation, Slack configuration, and security settings require owner authorization;
+- owner credentials/bindings must support revocation or recovery without a developer-operated account system;
+- do not trust identity headers forwarded by arbitrary clients; any proxy-derived identity must be accepted only from a verified trusted proxy/path.
 
 ## Pairing
 
@@ -82,6 +96,7 @@ Server must enforce:
 ## Web/API
 
 - typed validation;
+- deployment-owner authorization for privileged operations;
 - CSRF considerations for browser mutating actions;
 - safe CORS configuration;
 - no wildcard credentials policy;

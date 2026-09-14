@@ -176,10 +176,24 @@ Critical event classes:
 Behavior:
 - preserve pre-event data if feasible;
 - preserve post-event data;
-- mark unsynchronized critical clips;
+- mark unsynchronized critical clips explicitly;
 - retry upload after reconnect;
-- delete only after successful synchronization and policy conditions, or as required by ring capacity;
+- reclaim synchronized/unprotected emergency data before any unsynchronized critical evidence;
+- never silently overwrite an unsynchronized critical clip solely because local capacity was reached;
 - avoid storing ordinary motion events locally unless needed by the media architecture.
+
+Overflow policy:
+1. Reclaim the oldest synchronized/unprotected local emergency data first.
+2. If only unsynchronized critical clips remain and admitting a new local critical clip would exceed the configured local bound, enter `LOCAL_EVIDENCE_HARD_STOP` rather than deleting existing unsynchronized evidence.
+3. While `LOCAL_EVIDENCE_HARD_STOP` is active:
+   - continue critical detection;
+   - continue live transport and direct server upload when available;
+   - refuse only new **iPhone-local** emergency clip admission that would exceed the bound;
+   - surface a persistent local/UI warning and audit state;
+   - record minimal metadata for rejected local evidence when safely possible, including event type/time and reason `local_evidence_capacity_exhausted`, without claiming a clip exists.
+4. Automatically leave `LOCAL_EVIDENCE_HARD_STOP` after successful synchronization or other free-space recovery provides sufficient headroom; use hysteresis to avoid state flapping.
+
+The exact local recovery threshold and any reserved metadata budget shall be finalized through real-device storage/thermal testing, but unsynchronized evidence loss must never be silent.
 
 ### 3.6 Monitoring UI
 
@@ -360,6 +374,13 @@ manual_recording_started
 manual_recording_stopped
 thermal_degraded
 storage_warning
+storage_pressure_entered
+storage_pressure_cleared
+storage_hard_stop_entered
+storage_hard_stop_cleared
+local_evidence_hard_stop_entered
+local_evidence_hard_stop_cleared
+local_evidence_capture_rejected
 slack_error
 pairing_created
 pairing_revoked
@@ -367,6 +388,8 @@ presence_started
 presence_ended
 settings_changed
 ```
+
+Storage state events must remain distinguishable in audit/UI. In particular, `storage_pressure_entered` and `storage_hard_stop_entered` are not interchangeable: the latter means new server-side recording writes are being refused. `local_evidence_capture_rejected` records an iPhone-local evidence admission failure and must not imply that the corresponding server-side event or detection failed.
 
 Each event:
 - UUID
@@ -444,14 +467,14 @@ At scheduled intervals and before admitting a new recording:
    - reject new non-critical/manual recordings before they consume the protected capacity;
    - continue live viewing and detection;
    - keep critical-event detection armed;
-   - show a persistent UI warning and audit event requiring the owner to unstar/delete/offload data, free space used by other services, or increase storage.
+   - emit `storage_pressure_entered` on transition and show a persistent UI warning requiring the owner to unstar/delete/offload data, free space used by other services, or increase storage.
 7. Maintain a separately budgeted critical-evidence allowance above the normal recording-admission threshold so a limited amount of new `server_movement` / `camera_tamper` evidence can still be written during `STORAGE_PRESSURE`. This allowance must be bounded and must not consume the hard filesystem safety reserve.
 8. Before entering `STORAGE_HARD_STOP`, re-evaluate filesystem free space and confirm that no eligible unstarred recording can be reclaimed to restore the required reserve. If the critical-evidence allowance is exhausted or any new disk write would cross the hard filesystem safety reserve, enter `STORAGE_HARD_STOP`:
    - refuse all new disk recordings rather than intentionally filling the filesystem;
    - continue live view/detection where possible;
    - preserve any iPhone local emergency evidence and retry server synchronization after capacity is restored;
-   - raise the highest local storage warning state and audit the transition.
-9. Automatically leave pressure/stop states only after free space is safely above the corresponding recovery threshold (use hysteresis to avoid state flapping).
+   - emit `storage_hard_stop_entered`, raise the highest local storage warning state, and audit the transition.
+9. Automatically leave pressure/stop states only after free space is safely above the corresponding recovery threshold (use hysteresis to avoid state flapping). Emit the matching `*_cleared` event on recovery.
 
 The hard safety reserve, critical-evidence allowance, normal admission target, and recovery thresholds shall be configurable within safe bounds and finalized from storage/bitrate benchmarks. The implementation must test both (a) starred data alone exceeding the normal configured recording allocation and (b) an unrelated service consuming shared-filesystem space while reclaimable unstarred ServerSentinel recordings still exist.
 
@@ -498,6 +521,7 @@ Support revocation.
 - Validate filenames/paths server-side.
 - No arbitrary filesystem path APIs.
 - Destructive actions require explicit scoped request.
+- Privileged dashboard/API operations require deployment-owner authorization; Tailnet membership alone is not sufficient authorization.
 - Return machine-readable error codes.
 
 Indicative resource groups:
@@ -597,6 +621,8 @@ See `SECURITY.md`.
 
 Mandatory highlights:
 - no public-port default;
+- Tailscale provides network reachability but not sufficient deployment-owner authorization by itself;
+- privileged operations require an explicit owner authorization boundary selected by ADR;
 - no secrets in Git;
 - no personal deployment values in example files;
 - no shell command injection through paths/settings;
@@ -704,5 +730,6 @@ The following require PoC/real-device data before final lock:
 6. Camera-tamper confidence model.
 7. Recommended storage allocation from observed recording sizes.
 8. Final person detector/model/weights after license and performance review.
+9. Deployment-owner authorization mechanism (local credential/session vs explicit Tailscale identity binding or another self-hosted equivalent).
 
 Each locked decision should receive an ADR.
