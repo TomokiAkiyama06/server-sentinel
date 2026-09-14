@@ -36,7 +36,9 @@ Primary trusted authority for:
 - local settings.
 
 ### Remote browser
-Trusted through user's remote-access layer (Tailscale in MVP).
+Tailscale is the recommended MVP remote-access layer and provides network reachability, but Tailnet membership alone is not sufficient deployment-owner authorization.
+
+Privileged dashboard/API access must also pass the deployment-owner authorization boundary defined by `REQUIREMENTS.md` REMOTE-005 and `SECURITY.md`. The exact self-hosted authorization mechanism is selected by ADR before implementation.
 
 ### Slack
 Optional external sink chosen by user.
