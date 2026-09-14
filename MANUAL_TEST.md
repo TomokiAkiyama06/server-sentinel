@@ -198,7 +198,9 @@ Audio default must be OFF.
 - [ ] Quick-duration selection works.
 - [ ] "Until time" works.
 - [ ] Presence expiry automatically restores monitoring.
-- [ ] Presence pauses automatic security recordings/events.
+- [ ] Presence pauses ordinary person/general-motion automatic security recordings/events.
+- [ ] Confirmed server movement remains armed during presence, preserves evidence, and can still send its critical alert.
+- [ ] Confirmed camera tamper remains armed during presence, preserves evidence, and can still send its critical alert.
 - [ ] Live view still works.
 - [ ] Manual recording still works.
 - [ ] Weekly schedule works.
