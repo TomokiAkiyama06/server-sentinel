@@ -98,9 +98,11 @@ Initial target emergency storage:
 - 500 MB maximum;
 - synchronized/unprotected emergency data is reclaimed before unsynchronized critical evidence;
 - unsynchronized critical clips must not be silently overwritten merely because the local ring reaches capacity;
-- if no reclaimable synchronized/unprotected data remains and a new local critical clip would exceed the bound, local evidence admission shall enter an explicit hard-stop/degraded state rather than silently deleting existing unsynchronized evidence;
+- local-evidence admission must consider both the configured ServerSentinel local-store limit and the iPhone's actual OS-reported available storage;
+- ServerSentinel shall preserve a device-level storage safety reserve and shall not intentionally exhaust the iPhone filesystem merely because its own 500 MB local-store budget has room remaining;
+- if no reclaimable synchronized/unprotected data remains and a new local critical clip would exceed the configured bound **or** violate the device-level safety reserve, local evidence admission shall enter an explicit hard-stop/degraded state rather than silently deleting existing unsynchronized evidence or attempting an unsafe write;
 - the UI/audit state shall clearly report that new local evidence could not be admitted, while detection and any available direct server upload continue;
-- local evidence admission shall recover automatically after synchronization or free-space recovery.
+- local evidence admission shall recover automatically only after both local-store headroom and device-wide free space return above safe recovery thresholds.
 
 ### CAM-010 Reconnection
 If communication with Ubuntu fails:
