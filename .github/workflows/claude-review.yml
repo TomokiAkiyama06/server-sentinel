@@ -221,8 +221,6 @@ jobs:
             exit 1
           fi
 
-          # Claude jobがOAuth/Action/準備エラー等で失敗しても、skippedを成功扱いにせず
-          # current HEADへ明示的なfailure statusを作る。
           if [ "$CLAUDE_RESULT" != "success" ]; then
             summary="Claude review jobが正常完了しませんでした。最新HEADで再実行してください。"
             publish_status "failure" "$summary"
@@ -232,22 +230,13 @@ jobs:
 
           if [ -z "$REVIEW_JSON" ] || ! printf '%s' "$REVIEW_JSON" | jq -e '
             type == "object" and
-            (.highest_severity | type == "string") and
-            (.review_markdown | type == "string") and
-            (.review_markdown | length > 0) and
-            (["none","proposal","important","critical"] | index(input_filename)) == null
+            (.highest_severity == "none" or .highest_severity == "proposal" or .highest_severity == "important" or .highest_severity == "critical") and
+            (.review_markdown | type == "string" and length > 0)
           ' >/dev/null 2>&1; then
-            # 上のjqは構造存在確認だけではseverity値を扱いにくいため、次で明示検証する。
-            if ! printf '%s' "$REVIEW_JSON" | jq -e '
-              type == "object" and
-              (.highest_severity == "none" or .highest_severity == "proposal" or .highest_severity == "important" or .highest_severity == "critical") and
-              (.review_markdown | type == "string" and length > 0)
-            ' >/dev/null 2>&1; then
-              summary="Claude review jobは終了しましたが、structured outputが不正です。"
-              publish_status "failure" "$summary"
-              echo "$summary" >&2
-              exit 1
-            fi
+            summary="Claude review jobは終了しましたが、structured outputが不正です。"
+            publish_status "failure" "$summary"
+            echo "$summary" >&2
+            exit 1
           fi
 
           severity="$(printf '%s' "$REVIEW_JSON" | jq -r '.highest_severity')"
