@@ -428,17 +428,29 @@ Important constraints:
 
 ## 10. Retention algorithm
 
+ServerSentinel must distinguish between the configured recording allocation and a hard filesystem safety reserve. Starred recordings are protected from automatic deletion, but protection must never imply that ServerSentinel will intentionally fill the filesystem to 100%.
+
 At scheduled intervals:
 
-1. Calculate starred/preserved usage.
+1. Calculate total recording usage, starred/preserved usage, filesystem free space, and the configured hard safety reserve.
 2. Delete expired unstarred recordings older than retention.
-3. Recompute allocation.
-4. If still above configured maximum, delete oldest unstarred recordings until below target.
+3. Recompute allocation and free space.
+4. If still above the configured recording maximum, delete oldest unstarred recordings until below target or no deletable recordings remain.
 5. Never auto-delete starred recordings.
-6. Raise warnings if protected usage threatens disk safety.
-7. Keep a safety reserve so the filesystem is not driven to 100%.
+6. If protected/starred usage leaves insufficient room for normal recording while the hard safety reserve is still intact, enter `STORAGE_PRESSURE`:
+   - reject new non-critical/manual recordings before they consume the reserve;
+   - continue live viewing and detection;
+   - keep critical-event detection armed;
+   - show a persistent UI warning and audit event requiring the owner to unstar/delete/offload data or increase storage.
+7. Maintain a separately budgeted critical-evidence allowance above the normal recording-admission threshold so a limited amount of new `server_movement` / `camera_tamper` evidence can still be written during `STORAGE_PRESSURE`. This allowance must be bounded and must not consume the hard filesystem safety reserve.
+8. If the critical-evidence allowance is exhausted or the hard filesystem safety reserve would be crossed, enter `STORAGE_HARD_STOP`:
+   - refuse all new disk recordings rather than intentionally filling the filesystem;
+   - continue live view/detection where possible;
+   - preserve any iPhone local emergency evidence and retry server synchronization after capacity is restored;
+   - raise the highest local storage warning state and audit the transition.
+9. Automatically leave pressure/stop states only after free space is safely above the corresponding recovery threshold (use hysteresis to avoid state flapping).
 
-Exact safety reserve shall be configurable and benchmarked.
+The hard safety reserve, critical-evidence allowance, and recovery thresholds shall be configurable within safe bounds and finalized from storage/bitrate benchmarks. The implementation must test the case where starred data alone exceeds the normal configured recording allocation.
 
 ## 11. Pairing
 
