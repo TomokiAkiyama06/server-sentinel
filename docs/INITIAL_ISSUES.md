@@ -2,6 +2,10 @@
 
 This file is a bootstrap plan. Once Issues are created, GitHub becomes the execution source of truth.
 
+> **Important:** The `Plan N` headings below are planning sequence labels, **not GitHub Issue numbers**. Do not assume `Plan 4 == Issue #4` or preserve these numbers when creating Issues. Actual GitHub Issue numbers are assigned by GitHub and are the source of truth after creation.
+>
+> Repository review-gate hardening is already tracked in **GitHub Issue #4 — `Ruleset / 専用GitHub Appで自動レビューゲートを強制する`**. Do not create a duplicate from this plan. Issue #4 must be completed before granting same-repository write access to additional collaborators.
+
 ## Recommended labels
 
 Type:
@@ -32,7 +36,7 @@ Decision:
 - `decision-needed`
 - `proposal`
 
-## #1 Bootstrap CI and repository quality gates
+## Plan 1 — Bootstrap CI and repository quality gates
 
 Scope:
 - formatting/lint skeleton;
@@ -46,7 +50,7 @@ Acceptance:
 - direct implementation does not require real hardware;
 - secret scan catches a known test pattern in an isolated test.
 
-## #2 Backend foundation
+## Plan 2 — Backend foundation
 
 Scope:
 - FastAPI project;
@@ -62,7 +66,7 @@ Acceptance:
 - no secret logging;
 - container starts in CI.
 
-## #3 React dashboard foundation
+## Plan 3 — React dashboard foundation
 
 Scope:
 - React/TypeScript;
@@ -75,7 +79,7 @@ Acceptance:
 - build/typecheck/test;
 - mocked health state shown.
 
-## #4 iOS Camera Node foundation
+## Plan 4 — iOS Camera Node foundation
 
 Labels: `ios`, `iphone-required`, `manual-test-required`
 
@@ -92,7 +96,7 @@ Acceptance:
 - non-hardware logic unit-tested;
 - real capture verification deferred to manual test Issue.
 
-## Blocking prerequisite before #5 — Deployment-owner authorization ADR/bootstrap
+## Blocking prerequisite before Pairing protocol — Deployment-owner authorization ADR/bootstrap
 
 Labels: `architecture`, `security`, `backend`, `web`, `decision-needed`
 
@@ -118,9 +122,9 @@ Acceptance:
 - negative authorization tests run without real hardware.
 
 Blocking relationship:
-- `#5 Pairing protocol` MUST depend on this prerequisite and MUST NOT be closed until the selected owner authorization boundary is enforced in pairing approval/revocation.
+- the **Pairing protocol** Issue MUST depend on this prerequisite and MUST NOT be closed until the selected owner authorization boundary is enforced in pairing approval/revocation.
 
-## #5 Pairing protocol
+## Plan 5 — Pairing protocol
 
 Scope:
 - one-time token;
@@ -140,7 +144,7 @@ Acceptance:
 - a non-owner Tailnet member cannot approve/revoke pairing merely because network reachability exists;
 - mock iOS client pairs/revokes when valid owner authorization is present.
 
-## #6 Live media transport PoC + ADR
+## Plan 6 — Live media transport PoC + ADR
 
 Labels: `architecture`, `media`, `iphone-required`, `server-required`
 
@@ -159,7 +163,7 @@ Acceptance:
 - ADR committed;
 - selected transport justified by measurements/constraints.
 
-## #7 Durable recording chunk protocol
+## Plan 7 — Durable recording chunk protocol
 
 Scope:
 - chunk metadata;
@@ -175,7 +179,7 @@ Acceptance:
 - interrupted upload resumes safely;
 - integrity failure detected.
 
-## #8 Person/motion detector evaluation
+## Plan 8 — Person/motion detector evaluation
 
 Labels: `detection`, `architecture`
 
@@ -193,7 +197,7 @@ Acceptance:
 - detector interface remains pluggable;
 - synthetic fixture tests.
 
-## #9 Server ROI calibration and movement detection
+## Plan 9 — Server ROI calibration and movement detection
 
 Scope:
 - ROI setup UI/API;
@@ -207,7 +211,7 @@ Acceptance:
 - fixture for server displacement does;
 - threshold configuration documented.
 
-## #10 Camera tamper detection
+## Plan 10 — Camera tamper detection
 
 Scope:
 - IMU telemetry;
@@ -222,7 +226,7 @@ Acceptance:
 - false-positive guard tests;
 - real-device behavior left in MANUAL_TEST.
 
-## #11 Recording/event/storage UX
+## Plan 11 — Recording/event/storage UX
 
 Scope:
 - event list;
@@ -240,7 +244,7 @@ Acceptance:
 - oldest eligible recordings cleaned first;
 - storage-full tests.
 
-## #12 Presence and schedule
+## Plan 12 — Presence and schedule
 
 Scope:
 - one-click presence;
@@ -254,7 +258,7 @@ Acceptance:
 - live/manual recording remain available during presence;
 - automatic monitoring resumes at expiry.
 
-## #13 Slack integration
+## Plan 13 — Slack integration
 
 Scope:
 - optional configuration;
@@ -268,7 +272,7 @@ Acceptance:
 - Slack failure never blocks recording;
 - secrets redacted.
 
-## #14 Thermal/quality policy
+## Plan 14 — Thermal/quality policy
 
 Labels: `ios`, `iphone-required`, `manual-test-required`
 
@@ -284,7 +288,7 @@ Software acceptance:
 Manual acceptance:
 - 1h/8h/24h iPhone 14 runs documented.
 
-## #15 Full mock E2E and failure tests
+## Plan 15 — Full mock E2E and failure tests
 
 Scope:
 - mock camera pair;
@@ -301,7 +305,7 @@ Scope:
 Acceptance:
 - end-to-end test reproducible in CI without real hardware.
 
-## #16 Real-device acceptance
+## Plan 16 — Real-device acceptance
 
 Labels: `hardware-required`, `iphone-required`, `server-required`, `manual-test-required`
 
