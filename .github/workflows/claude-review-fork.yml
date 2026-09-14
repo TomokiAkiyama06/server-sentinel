@@ -14,9 +14,15 @@ permissions:
   issues: write
   actions: read
 
+concurrency:
+  group: claude-fork-review-${{ inputs.pr_number }}
+  cancel-in-progress: true
+
 jobs:
   trusted-fork-review:
     runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
 
     steps:
       - name: 信頼済みベースブランチのみチェックアウト
@@ -24,10 +30,10 @@ jobs:
         with:
           ref: ${{ github.event.repository.default_branch }}
           fetch-depth: 1
+          persist-credentials: false
 
       - name: 対象PRとレビュー対象HEADを固定
         env:
-          GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ inputs.pr_number }}
         run: |
           set -euo pipefail
@@ -73,6 +79,41 @@ jobs:
           echo "PR_NUMBER=$PR_NUMBER" >> "$GITHUB_ENV"
           echo "PR #$PR_NUMBER のhead $head_before を固定してレビューします。"
 
+      - name: 安全なレビュー投稿helperを準備
+        run: |
+          set -euo pipefail
+
+          cat > .claude-review/post-review.sh <<'SCRIPT'
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          review_file="${1:-.claude-review/review.md}"
+          if [ ! -s "$review_file" ]; then
+            echo "Claudeレビュー本文が空または存在しません: $review_file" >&2
+            exit 1
+          fi
+
+          current_head="$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json headRefOid --jq '.headRefOid')"
+          if [ "$current_head" != "$PR_HEAD_SHA" ]; then
+            echo "レビュー投稿直前にPR HEADが変更されました: $PR_HEAD_SHA -> $current_head。投稿しません。" >&2
+            exit 1
+          fi
+
+          payload="$(mktemp)"
+          {
+            echo "<!-- claude-reviewed-head:$PR_HEAD_SHA -->"
+            echo "### Claude PRレビュー"
+            echo
+            echo "**レビュー対象HEAD:** \`$PR_HEAD_SHA\`"
+            echo
+            cat "$review_file"
+          } > "$payload"
+
+          gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --body-file "$payload"
+          rm -f "$payload"
+          SCRIPT
+          chmod 700 .claude-review/post-review.sh
+
       - name: Claudeでfork PRを安全にレビュー
         id: claude
         # v1.0.223相当。mutableな@v1ではなく、確認済みのfull commit SHAへ固定。
@@ -81,6 +122,7 @@ jobs:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           github_token: ${{ github.token }}
           track_progress: false
+          include_fix_links: false
           additional_permissions: |
             actions: read
           prompt: |
@@ -103,7 +145,7 @@ jobs:
             - コード変更、commit、push、mergeは行わない。
 
             ServerSentinel のプルリクエストをレビューしてください。
-            出力・GitHubへのコメントは原則として日本語にしてください。
+            出力は原則として日本語にしてください。
             必ず信頼済みdefault branch側の AGENTS.md、REQUIREMENTS.md、SPECIFICATION.md、SECURITY.md、PRIVACY.md を基準として、固定済みPR diffとの整合性を確認してください。
 
             特に以下を重点的に確認してください。
@@ -119,18 +161,19 @@ jobs:
             - App Store審査上の問題
 
             指摘は重要度を「重大」「重要」「提案」に分類してください。
-            PRへ投稿するレビュー本文の冒頭に、必ず `レビュー対象HEAD: ${{ env.PR_HEAD_SHA }}` と明記してください。
-            最後に `gh pr comment ${{ env.PR_NUMBER }} --repo ${{ github.repository }} --body ...` を使って、レビュー結果をPRの全体コメントとして1件投稿してください。
-            inline commentは不要です。
+            重大または重要な問題がない場合は、その旨を明示してください。
+
+            GitHubへ直接コメントしないでください。inline commentも作成しません。
+            最終レビュー本文だけを `.claude-review/review.md` にWriteしてください。
+            書き込み後、**必ず最後に** `./.claude-review/post-review.sh .claude-review/review.md` を実行してください。
+            このhelperが投稿直前にPR HEADを再確認し、固定HEADと一致する場合だけgithub-actions[bot]としてmarker付きレビューを投稿します。
 
           claude_args: |
-            --allowedTools "Read,Glob,Grep,Bash(gh pr comment:*)"
+            --allowedTools "Read,Glob,Grep,Write,Bash(./.claude-review/post-review.sh:*)"
 
-      - name: レビュー完了時にPR headが変わっていないことを確認
+      - name: レビュー完了時にPR headと正式コメントを検証
         if: always()
         env:
-          GH_TOKEN: ${{ github.token }}
-          PR_NUMBER: ${{ env.PR_NUMBER }}
           PINNED_HEAD_SHA: ${{ env.PR_HEAD_SHA }}
           CLAUDE_OUTCOME: ${{ steps.claude.outcome }}
         run: |
@@ -153,4 +196,20 @@ jobs:
             exit 1
           fi
 
-          echo "ClaudeレビューはPR head $PINNED_HEAD_SHA に固定され、完了時点でも同一HEADです。"
+          marker="<!-- claude-reviewed-head:$PINNED_HEAD_SHA -->"
+          valid_review_ids="$(
+            gh api --paginate "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/comments?per_page=100" |
+              jq -r --arg marker "$marker" '
+                .[]
+                | select(.user.login == "github-actions[bot]")
+                | select((.body // "") | contains($marker))
+                | select((.body // "") | contains("### Claude PRレビュー"))
+                | .id
+              '
+          )"
+          if [ -z "$valid_review_ids" ]; then
+            echo "github-actions[bot] が投稿した、固定HEADに対応する正式Claudeレビューコメントが見つかりません。" >&2
+            exit 1
+          fi
+
+          echo "Claude forkレビューはPR head $PINNED_HEAD_SHA に固定され、正式botコメントの存在も確認しました。"
