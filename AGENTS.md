@@ -22,17 +22,13 @@ Priority order when requirements conflict:
 5. `AGENTS.md`
 6. Existing implementation details
 
-If a conflict cannot be resolved safely:
-- create/update a GitHub Issue describing the ambiguity;
-- do not invent a product decision;
-- continue unrelated work that is not blocked.
+If a conflict cannot be resolved safely, create/update a GitHub Issue, do not invent a product decision, and continue unrelated work.
 
 ## 3. Work unit policy
 
 Every non-trivial change MUST map to a GitHub Issue.
 
 Agent workflow:
-
 1. Read the Issue and relevant specs.
 2. Confirm acceptance criteria.
 3. Create/use a feature branch.
@@ -43,317 +39,220 @@ Agent workflow:
 8. Open a PR referencing the Issue.
 9. Wait for CI.
 10. Wait for both configured automated reviews: Codex and Claude.
-11. Resolve all actionable findings from both reviews.
-12. Re-run checks after fixes and request re-review when the PR head changed materially.
+11. Resolve actionable findings from both reviews.
+12. Re-run checks and re-request both reviews after material HEAD changes.
 13. Merge only when all merge gates are satisfied.
 
 ## 4. Branch and merge rules
 
 - NEVER commit directly to `main`.
 - One Issue per feature/fix unit unless explicitly grouped.
-- Preferred branch names:
-  - `feat/<issue>-<slug>`
-  - `fix/<issue>-<slug>`
-  - `docs/<issue>-<slug>`
-  - `chore/<issue>-<slug>`
+- Preferred branches: `feat/<issue>-<slug>`, `fix/<issue>-<slug>`, `docs/<issue>-<slug>`, `chore/<issue>-<slug>`.
 - PR is mandatory.
-- Both Codex and Claude automated review MUST be present before merge.
+- Codex and Claude review MUST both cover the current PR HEAD before merge.
 - All required CI checks MUST pass.
 - No unresolved blocking review threads.
-- Agent may merge after all gates pass.
-- Prefer squash merge unless repository policy later specifies otherwise.
+- Prefer squash merge.
 - NEVER rewrite `main` history.
+
+### Current trust model for review gates
+
+Until Issue #4 (`Ruleset / 専用GitHub Appで自動レビューゲートを強制する`) is completed:
+
+- the Codex + Claude requirement is a **mandatory operational merge policy**, enforced by the repository owner / merge agent;
+- same-repository write access MUST be limited to trusted maintainers;
+- untrusted/external contributors MUST use fork PRs;
+- a workflow job name, commit status, or check run emitted with an ordinary repository `GITHUB_TOKEN` MUST NOT be treated as an unforgeable security boundary against a malicious or compromised same-repository writer;
+- the merge actor MUST explicitly compare the PR current HEAD SHA with the HEAD reviewed by Codex and Claude before merge;
+- if a new commit is added after either review, that review is stale and MUST be rerun;
+- before granting write access to additional collaborators, Issue #4 MUST establish stronger repository-level enforcement such as Ruleset Required workflows or a dedicated issuer/GitHub App that a PR branch cannot impersonate.
+
+This clarification does **not** weaken the requirement to obtain both reviews. It defines who enforces it until hardened repository-level enforcement exists.
 
 ## 5. Scope discipline
 
-Agents MUST NOT implement features merely because they appear useful.
+Do not implement unrequested nice-to-have features. Track them in `docs/proposals/` and/or an Issue with motivation, cost, risks, privacy impact, and alternatives.
 
-If a useful unrequested feature is discovered:
-1. create a proposal in `docs/proposals/` and/or GitHub Issue;
-2. explain motivation, cost, risks, privacy impact, and alternatives;
-3. continue the requested scope without silently adding the feature.
-
-Refactors are allowed only when necessary for the Issue or when separately tracked.
+Refactors are allowed only when necessary for the current Issue or separately tracked.
 
 ## 6. Unknown requirements
 
 When behavior is unspecified:
-
-- Do not guess user intent for security/privacy-sensitive behavior.
-- Create an Issue marked as a decision/question.
-- Use the safest non-destructive temporary behavior if implementation must proceed.
-- Add TODO references to the Issue only where needed.
-- Continue other independent tasks.
+- do not guess security/privacy-sensitive product intent;
+- create a decision/question Issue;
+- use the safest non-destructive temporary behavior if implementation must proceed;
+- continue independent work.
 
 ## 7. Hardware-unavailable policy
 
-Lack of a real iPhone/Ubuntu target MUST NOT become an excuse to stop all work.
+Hardware unavailability MUST NOT block all software work.
 
-When hardware is required:
-- create/use mocks, fixtures, dependency injection, simulators where meaningful;
-- complete all software-verifiable work;
-- add the exact real-device steps to `MANUAL_TEST.md`;
-- create an Issue with the appropriate hardware label.
-
-Expected labels:
+Use mocks, fixtures, dependency injection, and simulators where meaningful. Complete software-verifiable work, add exact real-device steps to `MANUAL_TEST.md`, and track hardware work with appropriate labels:
 - `hardware-required`
 - `iphone-required`
 - `server-required`
 - `manual-test-required`
 
-Do not claim hardware behavior was verified when it was not.
+Never claim hardware behavior was verified when it was not.
 
 ## 8. Definition of software-side done
 
-Before marking an implementation Issue complete, as applicable:
-
+As applicable before closing an implementation Issue:
 - unit tests pass;
 - backend/API integration tests pass;
 - web typecheck/lint/tests pass;
-- iOS testable non-hardware logic passes;
+- iOS non-hardware logic tests pass;
 - Docker build/Compose validation passes;
 - core mock E2E passes;
-- documentation updated;
-- security/privacy implications reviewed;
-- hardware items moved to explicit manual-test tasks.
+- docs are updated;
+- security/privacy implications are reviewed;
+- hardware-only checks are explicit manual-test tasks.
 
-## 9. Dependency rules
+## 9. Dependency and model license rules
 
-OSS dependencies may be added when justified.
-
-Before adding any dependency:
+Before adding a dependency:
 1. verify active upstream source;
-2. verify exact license;
-3. verify transitive/license implications;
-4. explain why stdlib/existing dependencies are insufficient;
-5. pin/lock appropriately;
-6. record material dependencies.
+2. verify exact license and relevant transitive obligations;
+3. justify the dependency;
+4. pin/lock appropriately;
+5. record material dependencies.
 
-Preferred licenses:
-- Apache-2.0
-- MIT
-- BSD-2-Clause / BSD-3-Clause
-- similarly permissive licenses after review.
+Preferred: Apache-2.0, MIT, BSD-2/3-Clause, similarly permissive licenses after review.
 
-Blocked by default without explicit owner approval:
-- AGPL
-- GPL when linkage/distribution obligations could affect this project
-- SSPL
-- Business Source License
-- source-available/non-OSI terms
-- unknown/ambiguous licenses
+Blocked by default without explicit owner approval: AGPL, GPL where obligations could affect distribution, SSPL, BSL/source-available/non-OSI terms, unknown/ambiguous licenses.
 
-### Model/weight rule
+Model code and model weights MUST be reviewed separately.
 
-Model code license and model-weight license MUST be reviewed independently.
+The initial person-detector evaluation candidate is **YOLOX** because its source implementation is Apache-2.0. Exact pretrained weight/model licenses MUST be independently verified before bundling or redistribution.
 
-Do not assume pretrained weights inherit the repository license.
+Do NOT introduce Ultralytics YOLO or other AGPL/GPL/unclear-licensed detector packages/models without explicit owner approval and a documented license decision. The detector interface MUST remain pluggable.
 
-### Detection-model licensing rule
+## 10. Privacy invariants
 
-The initial person-detector evaluation candidate is **YOLOX**, because its source implementation is Apache-2.0. This is not blanket approval for arbitrary pretrained weights: the exact weight/model license MUST be verified and documented independently before bundling or redistribution.
-
-Do NOT introduce Ultralytics YOLO packages/models, or any other AGPL/GPL/unclear-licensed detector, without explicit owner approval and a documented license decision. The repository remains Apache-2.0 by default.
-
-The detector architecture MUST remain pluggable so a different permissively licensed implementation/model can replace YOLOX if benchmarks or licensing require it.
-
-## 10. Privacy rules
-
-The following are product invariants:
-
-- no developer-operated user account system;
+Default product invariants:
+- no developer-operated user account service;
 - no developer video/audio storage;
 - no telemetry;
 - no analytics;
-- no advertising SDK;
-- no tracking SDK;
+- no advertising/tracking SDK;
 - no developer relay for Slack;
 - no hidden data upload.
 
-Any change that would violate an invariant requires an explicit architecture decision and owner approval before implementation.
+Violating an invariant requires an explicit architecture decision and owner approval.
+
+Development tooling is separate from product telemetry: automated Claude review may send PR diff/repository review context to Anthropic as documented in `docs/CLAUDE_REVIEW_SETUP.md`. Contributors MUST NOT place user recordings, real monitoring images, secrets, or private infrastructure data in PRs.
 
 ## 11. Secret handling
 
-NEVER commit or log:
-- `.env`
-- Slack webhook/token
-- Tailscale auth key
-- Apple signing certificates
-- `.p12`
-- `.mobileprovision`
-- private keys
-- real access tokens
-- real Wi-Fi SSIDs when private
-- private hostnames
-- real deployment IPs
-- recordings
-- real person images used for monitoring
-- Apple device identifiers if not explicitly intended for public documentation
+NEVER commit or log real:
+- `.env`;
+- Slack webhook/token;
+- Tailscale auth key;
+- Apple signing certificates, `.p12`, `.mobileprovision`;
+- private keys or access tokens;
+- private Wi-Fi SSIDs/hostnames/deployment IPs;
+- recordings or real person monitoring images;
+- Apple device identifiers unless explicitly intended for public documentation.
 
-Use:
-- `.env.example`
-- obvious fake example values
-- iOS Keychain for persistent Camera Node credentials
-- redaction in logs
+Use `.env.example`, obvious fake values, iOS Keychain for persistent Camera Node credentials, and redaction in logs.
 
 Secrets discovered in repository history are a security incident. Stop normal work and report.
 
 ## 12. Personal-data rules
 
-Public examples must use synthetic values.
-
-Do not insert the repository owner's:
-- legal name;
-- student ID;
-- school details;
-- physical location;
-- private server IP;
-- Tailnet name;
-- Slack workspace;
-- personal email unless explicitly requested.
+Public examples must use synthetic values. Do not insert the repository owner's legal name, student ID, school details, physical location, private server IP, Tailnet, Slack workspace, or personal email unless explicitly requested.
 
 ## 13. Destructive-operation policy
 
-Agents are allowed to use the Ubuntu environment, Docker, systemd, Tailscale commands, and `sudo` when the task requires it, but destructive actions are tightly restricted.
-
-Without explicit owner approval, NEVER:
-
-- run broad `rm -rf` operations;
-- wipe disks/partitions;
-- format filesystems;
-- delete all recordings;
-- delete the SQLite database;
-- drop all tables;
-- destroy Docker volumes containing user data;
-- disable firewall globally;
-- expose the service publicly;
+Agents may use Ubuntu, Docker, systemd, Tailscale commands, and `sudo` when required, but without explicit owner approval NEVER:
+- run broad `rm -rf`;
+- wipe/format disks;
+- delete all recordings/database/tables;
+- destroy data-bearing Docker volumes;
+- disable firewall globally or expose the service publicly;
 - modify Tailscale ACLs;
-- rotate/revoke unrelated credentials;
-- reset network configuration;
-- change SSH access rules in a way that could lock out the owner;
-- force-push protected/shared branches;
-- rewrite repository history.
+- rotate unrelated credentials;
+- reset networking;
+- change SSH rules that can lock out the owner;
+- force-push shared/protected branches;
+- rewrite history.
 
-When deleting project-owned temporary files:
-- use exact paths;
-- verify path is inside the project/temp area;
-- log the intended scope before executing.
+Temporary-file deletion must use verified exact project/temp paths.
 
-## 14. Database changes
+## 14. Database/API changes
 
-Agents MAY change the DB schema/API when needed.
+DB schema/API may evolve before 1.0. Use migrations, preserve data where reasonable, document breaking changes, test migrations, version public routes, update typed schemas/tests/clients, and avoid destructive migration by default.
 
-Requirements:
-- use migrations;
-- preserve existing user data where reasonable;
-- document breaking changes;
-- add migration tests;
-- no destructive migration by default;
-- provide rollback/recovery guidance for risky changes.
+## 15. Security defaults
 
-## 15. API changes
-
-APIs may evolve before 1.0, but:
-- version public routes;
-- update typed schemas;
-- update tests;
-- update iOS/web clients in the same PR or provide compatibility;
-- document any temporary incompatibility.
-
-## 16. Security requirements
-
-Default stance:
-- no public Internet listener exposure;
-- Tailscale recommended for remote use;
-- pairing tokens are one-time and short-lived;
+- no public Internet listener exposure by default;
+- Tailscale recommended for reachability, but Tailnet membership alone is not deployment-owner authorization;
+- one-time short-lived pairing tokens;
 - no arbitrary shell execution from API;
-- no user-controlled raw filesystem access;
-- sanitize upload names;
-- validate media size/content;
+- no user-controlled raw filesystem paths;
+- sanitize upload names and validate media size/content;
 - rate-limit pairing/auth-sensitive endpoints;
-- secrets redacted.
+- redact secrets.
 
-Read `SECURITY.md` before implementing networking/pairing/storage.
+Read `SECURITY.md` before networking/pairing/storage work.
 
-## 17. Logging rules
+## 16. Logging
 
-Logs MUST be structured where practical and MUST NOT contain:
-- raw pairing token;
-- auth token;
-- Slack secret;
-- media content;
-- microphone content;
-- private key;
-- unredacted sensitive headers.
+Logs should be structured and MUST NOT contain raw pairing/auth tokens, Slack secrets, media/microphone content, private keys, or sensitive headers. Use stable event/error codes.
 
-Use stable event/error codes so the UI can show Japanese messages while logs remain machine-readable.
+## 17. User-facing language
 
-## 18. User-facing language
+Primary UI language is Japanese, with localization-friendly architecture. Do not bind logic to Japanese string comparisons. Owner-facing errors should be understandable Japanese by default.
 
-Primary intended UI language: Japanese.
+Repository owner-facing Issue/PR content MUST also be primarily Japanese, except technical identifiers/quoted upstream text.
 
-Architecture should allow localization. Do not hard-wire operational logic to Japanese string comparisons.
+## 18. Notifications
 
-Errors shown to the owner should be understandable Japanese by default.
+Avoid alert fatigue. Default Slack behavior:
+- immediate: confirmed server movement / camera tamper;
+- daily parent summary: 23:00 default;
+- event details/thumbnails: thread replies;
+- ordinary person/motion: summarized, not individual main-channel alerts.
 
-## 19. Notifications
+Frequency increases require explicit acceptance criteria.
 
-Do not create noisy immediate alerts.
+## 19. iOS rules
 
-Default Slack behavior:
-- immediate: confirmed server movement, confirmed camera tamper;
-- daily parent summary at 23:00 default;
-- event thumbnails/details in thread replies;
-- normal person/motion events summarized, not individually blasted to the main channel.
+- capability-check before MultiCam;
+- do not hard-code iPhone 14 as the only device;
+- audio default OFF;
+- monitoring/recording state visible;
+- do not claim survival after app kill/device shutdown;
+- Keychain for long-lived credentials;
+- hardware APIs behind protocols where practical;
+- carefully restore brightness/idle state;
+- thermal state observable/tested;
+- heavy CV inference on Ubuntu unless benchmarks justify local work.
 
-A change that increases notification frequency needs explicit Issue acceptance criteria.
+## 20. Detection rules
 
-## 20. iOS-specific rules
+- person detection != server movement proof;
+- compensate camera-global motion;
+- consider occlusion;
+- benchmark/document thresholds;
+- confidence is not certainty; UI must not overclaim.
 
-- Check capabilities before MultiCam.
-- Do not assume iPhone 14 is the only device.
-- Audio default OFF.
-- Monitoring/recording state must remain visible.
-- Do not claim capture can survive app kill/device shutdown.
-- Use Keychain for long-lived credentials.
-- Abstract hardware APIs behind protocols so logic is testable.
-- Preserve/recover screen-brightness/idle state carefully.
-- Thermal state must be observable and tested.
-- Heavy CV inference belongs on Ubuntu unless a benchmark proves a local operation is justified.
+## 21. Media and storage rules
 
-## 21. Detection-specific rules
-
-- Person detection and server movement are separate problems.
-- Generic person/object detection must not be treated as proof the server moved.
-- Camera global movement must not be confused with server movement.
-- Occlusion must be considered.
-- Thresholds must be benchmarked and documented.
-- Confidence values are not certainty; UI language must not overclaim.
-
-## 22. Media rules
-
-- Live viewing and durable recording must not share a single point of failure unnecessarily.
-- Evidence upload must retry.
-- Chunk uploads must be idempotent.
-- Use checksums/integrity metadata.
-- Manual recording has a 20-minute maximum by default.
-- Automatic events use 30s pre + 120s post, max 20 min, unless settings/spec later change.
-
-## 23. Retention rules
-
-Automatic cleanup:
-- may delete unstarred data;
-- MUST NOT auto-delete starred recordings;
-- audit retention defaults to 90 days;
+- live view and durable recording should not share an unnecessary single point of failure;
+- uploads retry, are idempotent, and use integrity metadata;
+- manual recording max 20 minutes by default;
+- automatic event: 30s pre + 120s post, max 20 min unless spec changes;
+- auto-cleanup may delete unstarred data but MUST NOT auto-delete starred recordings;
 - recording retention defaults to 20 days;
+- audit retention defaults to 90 days;
 - capacity ceiling configurable;
-- preserve a disk safety margin.
+- preserve filesystem safety margin;
+- bulk-delete implementations require dedicated tests.
 
-Any bulk-delete implementation requires dedicated tests.
+## 22. Testing
 
-## 24. Testing rules
-
-Minimum testing categories:
+Minimum categories as applicable:
 - unit;
 - API integration;
 - web component/integration;
@@ -362,105 +261,64 @@ Minimum testing categories:
 - retention;
 - pairing expiry;
 - reconnect;
-- detection fixture tests;
+- detection fixtures;
 - permission/capability logic;
-- migration tests.
+- migrations.
 
-Real hardware:
-- documented in `MANUAL_TEST.md`.
+Real hardware checks live in `MANUAL_TEST.md`. Do not use real non-consenting person recordings as fixtures.
 
-Do not use real non-consenting person recordings as repository fixtures.
+## 23. CI
 
-## 25. CI requirements
+CI should eventually cover formatting/lint, Python static checks/tests, React typecheck/lint/tests/build, Docker/Compose validation, secret scan, dependency/license checks, and iOS build/test where practical. Document unavailable platform checks.
 
-CI should eventually run:
-- formatting/lint;
-- Python type/static checks;
-- Python tests;
-- React typecheck/lint/tests/build;
-- Docker build;
-- Compose config validation;
-- secret scan;
-- dependency/license checks where practical;
-- iOS build/test on macOS runner where practical.
+## 24. Automated review merge policy
 
-If CI is unavailable for a platform, document the gap.
-
-## 26. Automated review merge gate
-
-The owner requires two independent automated review passes: **Codex** and **Claude**.
+The owner requires two independent automated review passes: **Codex and Claude**.
 
 Agent MUST:
-- wait until Codex review is posted for the current PR head;
-- wait until Claude review is posted/completed for the current PR head;
-- read findings from both reviewers;
-- fix all actionable `重大` / `重要` findings, or explicitly document why a finding is not applicable;
-- respond to and resolve review threads where appropriate;
-- re-run tests/checks after fixes;
-- request/retrigger both reviewers when material changes were made after their last review;
-- verify there are no unresolved blocking findings before merge.
+- wait for Codex review of the current PR HEAD;
+- wait for Claude review of the current PR HEAD;
+- read both findings;
+- fix all actionable `重大` / `重要` findings or explicitly document why a finding is not applicable;
+- respond to/resolve relevant review threads;
+- rerun checks and both reviews after material HEAD changes;
+- verify no unresolved blocking finding before merge.
 
-If either review integration is unavailable, missing credentials, failing, or has not completed, the PR MUST NOT be merged. Create/update a GitHub Issue for the integration problem and continue only work that is independent of the merge.
+Until Issue #4 is complete, this policy is enforced by explicit current-HEAD verification by the merge actor, not by claiming an ordinary workflow status/check is unforgeable.
+
+If either integration is unavailable, credentials are missing, it fails, or the current HEAD review has not completed, the PR MUST NOT be merged. Track the integration problem in an Issue and continue only independent work.
 
 No "review hasn't arrived yet, so merge anyway."
 
-## 27. Commit/PR quality
+## 25. Commit/PR quality
 
-Commits:
-- concise imperative messages;
-- no generated secrets;
-- no unrelated formatting floods.
+Commits: concise messages, no secrets, no unrelated formatting floods.
 
-GitHub content intended for the repository owner to review MUST be written primarily in Japanese:
-- Issue titles and bodies;
-- PR titles and bodies;
-- agent-authored PR conversation comments;
-- responses to review findings;
-- merge summaries.
+Issue titles/bodies, PR titles/bodies, agent-authored PR comments, review responses, and merge summaries should be primarily Japanese.
 
-Technical terms, code identifiers, commands, API names, library names, and quoted upstream text may remain in English.
+PR body should include Issue link, what/why, tests, screenshots where useful, security/privacy impact, hardware-test need, limitations, Codex status, Claude status.
 
-PR body should include:
-- Issue link;
-- what changed;
-- why;
-- tests run;
-- screenshots for UI changes where useful;
-- security/privacy impact;
-- hardware test needed? yes/no;
-- known limitations;
-- Codex review status;
-- Claude review status.
+## 26. App Store constraints
 
-## 28. App Store constraints
+Do not implement hidden surveillance behavior. Explain permissions, show monitoring state, support Demo Mode/review flow, keep privacy docs accurate, and do not create secret review-only behavior.
 
-Do not implement hidden surveillance behavior.
+## 27. Documentation discipline
 
-The app must:
-- explain permissions;
-- show monitoring state;
-- support review/demo flow;
-- keep privacy documentation accurate;
-- avoid code paths that differ secretly only for review.
+When behavior changes, update the appropriate source of truth:
+- `REQUIREMENTS.md` for product decisions;
+- `SPECIFICATION.md` for technical contracts;
+- ADR for meaningful architecture decisions;
+- `MANUAL_TEST.md` for real-device validation;
+- `PRIVACY.md` / `SECURITY.md` for data/security behavior.
 
-## 29. Documentation discipline
-
-When behavior changes, update:
-- REQUIREMENTS if product decision changed;
-- SPECIFICATION if technical contract changed;
-- ADR for meaningful architecture choice;
-- MANUAL_TEST for real-device validation;
-- PRIVACY/SECURITY if data/security behavior changed.
-
-## 30. Stop conditions
+## 28. Stop conditions
 
 Stop and request owner decision before:
-- introducing developer-hosted cloud;
-- adding analytics/ads;
-- adding payment;
-- changing project license;
-- choosing a dependency with incompatible/uncertain license;
-- exposing a public Internet service by default;
+- developer-hosted cloud;
+- analytics/ads/payment;
+- project license change;
+- incompatible/uncertain dependency license;
+- default public Internet exposure;
 - destructive migration;
 - weakening pairing/authentication;
 - deleting protected recordings;
