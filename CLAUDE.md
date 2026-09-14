@@ -32,7 +32,9 @@ GitHub上でリポジトリ所有者が確認する以下の内容は、原則�
 
 指摘は `重大`、`重要`、`提案` に分類してください。
 
-レビュー時はコードを変更せず、レビューコメントのみ投稿してください。修正を依頼された場合のみ、`AGENTS.md` のIssue/branch/PRルールに従って変更してください。
+インタラクティブにClaude Codeへレビューを依頼する場合は、レビュー時にコードを変更せず、レビューコメントのみ投稿してください。修正を依頼された場合のみ、`AGENTS.md` のIssue/branch/PRルールに従って変更してください。
+
+**例外:** `.github/workflows/claude-review.yml` と `.github/workflows/claude-review-fork.yml` による自動PRレビューでは、workflow自身のより厳しい制約を優先します。自動レビューのClaude jobはread-onlyで動作し、GitHubへ直接コメントせず、コード・設定・スクリプトを変更または実行せず、指定されたstructured outputだけを返します。
 
 ## マージ
 
