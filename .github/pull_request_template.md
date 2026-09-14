@@ -1,46 +1,54 @@
-## Issue
+## 関連 Issue
 
 Closes #
 
-## What changed
+## 変更内容
 
 -
 
-## Why
+## 変更理由
 
 -
 
-## Tests
+## テスト
 
 - [ ] Unit
-- [ ] Integration/API
+- [ ] Integration / API
 - [ ] Web checks
 - [ ] Mock E2E
-- [ ] Docker/build
-- [ ] Other:
+- [ ] Docker / build
+- [ ] その他:
 
-## Hardware validation
+## 実機確認
 
-- [ ] Not required
+- [ ] 不要
 - [ ] `iphone-required`
 - [ ] `server-required`
 - [ ] `manual-test-required`
 
-Manual-test details:
+実機確認の詳細:
 
-## Security / privacy impact
+## セキュリティ / プライバシー影響
 
-- [ ] No new data leaves the user's environment
-- [ ] No new secret handling
-- [ ] Dependency licenses checked
-- [ ] Relevant docs updated
+- [ ] 新たにユーザー環境外へ送信されるデータはない
+- [ ] 新しい Secret の取り扱いはない、または安全に管理している
+- [ ] 追加依存関係・モデル・weights のライセンスを確認した
+- [ ] 必要な仕様・セキュリティ・プライバシー文書を更新した
 
-Notes:
+補足:
 
-## Screenshots
+## スクリーンショット
 
-If applicable.
+UI変更がある場合に添付。
 
-## Automated review
+## 自動レビュー
 
-Do not merge until the configured automated review has completed and blocking findings are resolved.
+マージ前に以下を必須とする。
+
+- [ ] Codex レビュー完了
+- [ ] Claude レビュー完了
+- [ ] 両レビューの重大・重要な指摘を解消
+- [ ] 必須CI成功
+- [ ] 未解決のブロッキングレビューがない
+
+PRタイトル・本文、およびエージェントが投稿するレビュー対応コメントは原則日本語で記載する。技術用語、識別子、コード、固有名詞は英語のままでよい。
