@@ -25,29 +25,39 @@ Then open the local setup page.
 Step 1 — Welcome  
 Explain self-hosted/no-cloud architecture.
 
-Step 2 — Storage  
+Step 2 — Deployment owner authorization  
+- establish the deployment-owner authorization boundary before privileged remote access is enabled;
+- bootstrap through a trusted local setup context;
+- use either a locally managed owner credential/session or an explicitly configured binding to one verified Tailscale identity/ACL, according to the accepted ADR;
+- configure owner credential/binding recovery and revocation;
+- do not treat Tailnet membership alone as owner authorization;
+- until this step is complete, privileged dashboard/API operations remain unavailable remotely.
+
+Step 3 — Storage  
 - choose recording path;
 - test write permission;
 - display free space;
 - retention default 20 days;
 - capacity allocation recommendation after benchmark logic exists.
 
-Step 3 — Locale/time  
+Step 4 — Locale/time  
 - timezone;
 - daily summary default 23:00.
 
-Step 4 — Slack (optional)  
+Step 5 — Slack (optional)  
 - skip allowed;
 - test safely.
 
-Step 5 — Remote access guidance  
-- Tailscale recommended;
-- no port-forwarding default.
+Step 6 — Remote access guidance  
+- Tailscale recommended for network reachability;
+- no port-forwarding default;
+- remote privileged operations still require the deployment-owner authorization established in Step 2.
 
-Step 6 — Add Camera Node  
+Step 7 — Add Camera Node  
 - QR;
 - local discovery;
-- manual fallback.
+- manual fallback;
+- pairing approval requires the deployment-owner authorization boundary.
 
 ## iOS onboarding
 
