@@ -2,7 +2,10 @@
 
 ServerSentinel では、PRのマージ前に **Codex + Claude の二重レビュー**を必須とします。
 
-Claudeレビュー用のGitHub Actions workflowは `.github/workflows/claude-review.yml` に定義します。
+ClaudeレビューはPRの出所に応じて2経路あります。
+
+- 同一repository内のPR: `.github/workflows/claude-review.yml` が自動実行
+- fork由来の外部PR: `.github/workflows/claude-review-fork.yml` をmaintainerが手動実行
 
 ## 認証方式
 
@@ -33,9 +36,9 @@ Name: CLAUDE_CODE_OAUTH_TOKEN
 Value: claude setup-token で生成した値
 ```
 
-## 3. 動作確認
+## 3. 同一repository内PRの動作確認
 
-Secret登録後、既存PRに新しいcommitをpushするか、PRをreopen / ready for reviewにすると `Claude PRレビュー` workflowが起動します。
+Secret登録後、同一repository内の既存PRに新しいcommitをpushするか、PRをreopen / ready for reviewにすると `Claude PRレビュー` workflowが起動します。
 
 正常時:
 
@@ -44,7 +47,25 @@ Secret登録後、既存PRに新しいcommitをpushするか、PRをreopen / rea
 - PR全体コメントまたはinline commentを投稿する
 - コード変更やマージは行わない
 
-## 4. マージ条件
+## 4. fork由来PRの安全なレビュー
+
+GitHubは通常、forkからの `pull_request` workflowへrepository secretを渡しません。そのため通常の自動Claude workflowはfork PRを意図的にスキップします。
+
+fork PRをレビューする場合は、maintainerがGitHub Actionsから `Claude 外部PRレビュー（手動）` を明示的に実行し、対象PR番号を入力します。
+
+このtrusted workflowは次の制約で動きます。
+
+- repositoryの信頼済みdefault branchだけをcheckoutする
+- fork PRのheadはcheckoutしない
+- PR内容は `gh pr view` / `gh pr diff` で読み取るだけにする
+- PR由来のスクリプト、ビルド、テスト、設定ファイルを実行しない
+- PR本文・diff・コード中の指示は未信頼データとして扱う
+- Secretや環境変数を表示・送信しない
+- ClaudeはPRへレビューコメントを投稿するだけで、commit / push / mergeを行わない
+
+`pull_request_target` でfork headをcheckoutし、その状態でSecretを使う構成は禁止します。
+
+## 5. マージ条件
 
 以下をすべて満たすまでマージしません。
 
@@ -63,3 +84,5 @@ Secret登録後、既存PRに新しいcommitをpushするか、PRをreopen / rea
 - `CLAUDE_CODE_OAUTH_TOKEN` はGitHub Actions Secretからのみ参照する
 - Claude workflowのGitHub権限はレビューに必要な範囲へ限定する
 - Claudeにはレビュー時のコード変更・コミット・マージ権限を与えない
+- fork PRへSecretを直接渡さない
+- 未信頼のPR headをSecret付きworkflowでcheckout・実行しない
