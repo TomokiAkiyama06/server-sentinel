@@ -180,20 +180,30 @@ Behavior:
 - retry upload after reconnect;
 - reclaim synchronized/unprotected emergency data before any unsynchronized critical evidence;
 - never silently overwrite an unsynchronized critical clip solely because local capacity was reached;
+- evaluate **both** the configured ServerSentinel local-store bound and the iPhone's OS-reported currently available storage before admitting a new local clip;
+- preserve a device-level safety reserve outside the ServerSentinel local-store budget so emergency evidence cannot intentionally drive the iPhone filesystem to exhaustion;
 - avoid storing ordinary motion events locally unless needed by the media architecture.
 
-Overflow policy:
+Admission policy:
+1. Before opening or extending a local emergency clip, estimate a conservative write budget for the next segment/clip finalization, including media, metadata, and container-finalization overhead.
+2. Admission succeeds only when that projected write fits both:
+   - the remaining configured ServerSentinel local-emergency-store budget; and
+   - the current OS-reported available device capacity after subtracting the device safety reserve.
+3. A low device-wide free-space condition can therefore block local evidence admission even when ServerSentinel itself is far below its 500 MB configured bound.
+4. Storage-capacity queries and write failures are treated as security-relevant state; a failed capacity query must not be interpreted as unlimited free space.
+
+Overflow / low-device-space policy:
 1. Reclaim the oldest synchronized/unprotected local emergency data first.
-2. If only unsynchronized critical clips remain and admitting a new local critical clip would exceed the configured local bound, enter `LOCAL_EVIDENCE_HARD_STOP` rather than deleting existing unsynchronized evidence.
+2. If only unsynchronized critical clips remain and admitting a new local critical clip would exceed the configured local bound **or** violate the device-level safety reserve, enter `LOCAL_EVIDENCE_HARD_STOP` rather than deleting existing unsynchronized evidence or attempting a write expected to exhaust the filesystem.
 3. While `LOCAL_EVIDENCE_HARD_STOP` is active:
    - continue critical detection;
    - continue live transport and direct server upload when available;
-   - refuse only new **iPhone-local** emergency clip admission that would exceed the bound;
+   - refuse only new **iPhone-local** emergency clip admission that cannot satisfy both storage constraints;
    - surface a persistent local/UI warning and audit state;
-   - record minimal metadata for rejected local evidence when safely possible, including event type/time and reason `local_evidence_capacity_exhausted`, without claiming a clip exists.
-4. Automatically leave `LOCAL_EVIDENCE_HARD_STOP` after successful synchronization or other free-space recovery provides sufficient headroom; use hysteresis to avoid state flapping.
+   - record minimal metadata for rejected local evidence when safely possible, including event type/time and reason (`local_evidence_capacity_exhausted` or `device_free_space_unsafe`), without claiming a clip exists.
+4. Automatically leave `LOCAL_EVIDENCE_HARD_STOP` only after both the configured local-store headroom and OS-reported device free space are safely above their respective recovery thresholds; use hysteresis to avoid state flapping.
 
-The exact local recovery threshold and any reserved metadata budget shall be finalized through real-device storage/thermal testing, but unsynchronized evidence loss must never be silent.
+The exact device safety reserve, conservative projected-write budget, local recovery threshold, and any reserved metadata budget shall be finalized through real-device storage/thermal testing. Tests must include the case where ServerSentinel local usage is low but unrelated apps/system data consume most of the iPhone storage. Unsynchronized evidence loss must never be silent.
 
 ### 3.6 Monitoring UI
 
