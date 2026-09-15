@@ -256,7 +256,10 @@ Scope:
 
 Acceptance:
 - live/manual recording remain available during presence;
-- automatic monitoring resumes at expiry.
+- ordinary person/general-motion automatic security recording/events/normal alerts are suppressed during presence;
+- `server_movement` and `camera_tamper` detection remain armed during presence;
+- critical evidence preservation and configured critical alerts continue during presence;
+- automatic ordinary monitoring resumes at expiry.
 
 ## Plan 13 — Slack integration
 
