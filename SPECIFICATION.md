@@ -675,7 +675,7 @@ Server shall abstract:
 - CameraSession
 
 ### 18.2 Fixture video
-Use synthetic/consented test assets only.
+Use synthetic or generated test assets only. Real-person or real-environment monitoring media must not be committed as repository fixtures, even with consent.
 
 Fixtures should cover:
 - empty scene;
