@@ -511,235 +511,235 @@ Never include:
 - filesystem credentials.
 
 ### 11.3 Pairing token
-- CSPRNG-generated;
-- target expiry: 5 minutes;
-- one-time use;
-- hashed at rest when practical;
-- redacted from logs.
++- CSPRNG-generated;
++- target expiry: 5 minutes;
++- one-time use;
++- hashed at rest when practical;
++- redacted from logs.
 
 ### 11.4 Long-term credential
-After pairing, issue/establish per-device credentials stored in iOS Keychain and server-side secure configuration/DB.
-
-Support revocation.
-
-## 12. API design principles
-
-- Version APIs (`/api/v1/...`).
-- Use typed request/response schemas.
-- Idempotency for retryable media/control operations.
-- Never log secrets.
-- Validate filenames/paths server-side.
-- No arbitrary filesystem path APIs.
-- Destructive actions require explicit scoped request.
-- Privileged dashboard/API operations require deployment-owner authorization; Tailnet membership alone is not sufficient authorization.
-- Return machine-readable error codes.
-
-Indicative resource groups:
-
-```text
-/api/v1/health
-/api/v1/setup
-/api/v1/pairing
-/api/v1/nodes
-/api/v1/events
-/api/v1/recordings
-/api/v1/live
-/api/v1/control
-/api/v1/presence
-/api/v1/schedules
-/api/v1/settings
-/api/v1/integrations/slack
-/api/v1/audit
-/api/v1/shortcuts
-```
-
-Exact endpoints are an implementation detail and may evolve through schema migrations/ADR.
-
-## 13. Web dashboard
-
-React + TypeScript.
-
-Mobile-first screens:
-
-1. Dashboard
-2. Live
-3. Events
-4. Recording detail
-5. Camera Node
-6. Presence/schedule
-7. Storage
-8. Slack
-9. Audit/logs
-10. Settings
-11. Setup/pairing
-
-### Dashboard critical status
-
-At a glance:
-- ServerSentinel service online
-- Camera online
-- Monitoring active
-- Presence active
-- rear/front/mic state
-- thermal state
-- storage remaining
-- last critical event
-- manual intervention required indicator
-
-## 14. Presence state machine
-
-Conceptual priority:
-
-```text
-manual override (until expiry)
-        >
-explicit immediate state
-        >
-configured schedule
-        >
-default monitoring state
-```
-
-Presence mode does not block:
-- live view;
-- manual recording;
-- health checks.
-
-## 15. Slack integration
-
-Server-side only.
-
-Daily:
-- one parent summary at configured time (default 23:00);
-- thread replies containing selected event entries/thumbnails.
-
-Immediate:
-- confirmed server movement;
-- confirmed camera tamper;
-- other immediate alert types only if later explicitly approved.
-
-Do not turn every motion event into a channel notification.
-
-Slack failures:
-- recorded in audit/event state;
-- retry with bounded backoff;
-- never block recording.
-
-## 16. Security controls
-
-See `SECURITY.md`.
-
-Mandatory highlights:
-- no public-port default;
-- Tailscale provides network reachability but not sufficient deployment-owner authorization by itself;
-- privileged operations require an explicit owner authorization boundary selected by ADR;
-- no secrets in Git;
-- no personal deployment values in example files;
-- no shell command injection through paths/settings;
-- no direct user-supplied path concatenation;
-- strict upload size/type limits;
-- pairing rate limits;
-- session credential rotation/revocation;
-- safe Docker permissions;
-- least privilege.
-
-## 17. App Review mode
-
-Demo Mode shall:
-- be visible/documented;
-- not require a private Tailnet;
-- let reviewer explore onboarding and main UI;
-- show capability checks;
-- exercise camera permission flow where possible;
-- use clearly labelled synthetic/server-demo data for server-only functionality.
-
-Demo Mode must not pretend synthetic data is real evidence.
-
-## 18. Testing architecture
-
-### 18.1 Mockable interfaces
-iOS shall abstract:
-- CameraSource
-- AudioSource
-- MotionSource
-- ThermalSource
-- ServerTransport
-- LocalEvidenceStore
-
-Server shall abstract:
-- Detector
-- MediaStore
-- Notifier
-- Clock where useful
-- StorageStats
-- CameraSession
-
-### 18.2 Fixture video
-Use synthetic/consented test assets only.
-
-Fixtures should cover:
-- empty scene;
-- person enters;
-- server occluded;
-- server displaced;
-- camera shifts;
-- low light;
-- abrupt disconnection.
-
-### 18.3 E2E
-Mock Camera Node:
-1. pair;
-2. send heartbeat;
-3. stream fixture;
-4. trigger detection;
-5. produce event;
-6. store recording;
-7. generate thumbnail;
-8. show web event;
-9. send Slack request to stub;
-10. enforce retention.
-
-## 19. Observability
-
-Local only by default.
-
-Structured logs:
-- JSON preferred on server;
-- redact secrets;
-- rotate logs.
-
-Metrics shown locally:
-- active camera;
-- stream FPS/bitrate;
-- dropped chunks;
-- queue depth;
-- detector latency;
-- disk use;
-- thermal state;
-- reconnect count.
-
-No metrics are sent to the developer.
-
-## 20. Versioning
-
-- Semantic Versioning where practical.
-- Protocol version independently declared.
-- GitHub Releases for server release notes.
-- App Store for iOS distribution.
-- Optional update-check may query public GitHub release metadata only; no telemetry payload.
-
-## 21. Open technical decisions
-
-The following require PoC/real-device data before final lock:
-
-1. Live transport implementation.
-2. Final recording codec/bitrate.
-3. Rear/front capture profile.
-4. Thermal thresholds and degradation curves.
-5. Server-movement algorithm and thresholds.
-6. Camera-tamper confidence model.
-7. Recommended storage allocation from observed recording sizes.
-8. Final person detector/model/weights after license and performance review.
-9. Deployment-owner authorization mechanism (local credential/session vs explicit Tailscale identity binding or another self-hosted equivalent).
-
-Each locked decision should receive an ADR.
++After pairing, issue/establish per-device credentials stored in iOS Keychain and server-side secure configuration/DB.
++
++Support revocation.
++
++## 12. API design principles
++
++- Version APIs (`/api/v1/...`).
++- Use typed request/response schemas.
++- Idempotency for retryable media/control operations.
++- Never log secrets.
++- Validate filenames/paths server-side.
++- No arbitrary filesystem path APIs.
++- Destructive actions require explicit scoped request.
++- Privileged dashboard/API operations require deployment-owner authorization; Tailnet membership alone is not sufficient authorization.
++- Return machine-readable error codes.
++
++Indicative resource groups:
++
++```text
++/api/v1/health
++/api/v1/setup
++/api/v1/pairing
++/api/v1/nodes
++/api/v1/events
++/api/v1/recordings
++/api/v1/live
++/api/v1/control
++/api/v1/presence
++/api/v1/schedules
++/api/v1/settings
++/api/v1/integrations/slack
++/api/v1/audit
++/api/v1/shortcuts
++```
++
++Exact endpoints are an implementation detail and may evolve through schema migrations/ADR.
++
++## 13. Web dashboard
++
++React + TypeScript.
++
++Mobile-first screens:
++
++1. Dashboard
++2. Live
++3. Events
++4. Recording detail
++5. Camera Node
++6. Presence/schedule
++7. Storage
++8. Slack
++9. Audit/logs
++10. Settings
++11. Setup/pairing
++
++### Dashboard critical status
++
++At a glance:
++- ServerSentinel service online
++- Camera online
++- Monitoring active
++- Presence active
++- rear/front/mic state
++- thermal state
++- storage remaining
++- last critical event
++- manual intervention required indicator
++
++## 14. Presence state machine
++
++Conceptual priority:
++
++```text
++manual override (until expiry)
++        >
++explicit immediate state
++        >
++configured schedule
++        >
++default monitoring state
++```
++
++Presence mode does not block:
++- live view;
++- manual recording;
++- health checks.
++
++## 15. Slack integration
++
++Server-side only.
++
++Daily:
++- one parent summary at configured time (default 23:00);
++- thread replies containing selected event entries/thumbnails.
++
++Immediate:
++- confirmed server movement;
++- confirmed camera tamper;
++- other immediate alert types only if later explicitly approved.
++
++Do not turn every motion event into a channel notification.
++
++Slack failures:
++- recorded in audit/event state;
++- retry with bounded backoff;
++- never block recording.
++
++## 16. Security controls
++
++See `SECURITY.md`.
++
++Mandatory highlights:
++- no public-port default;
++- Tailscale provides network reachability but not sufficient deployment-owner authorization by itself;
++- privileged operations require an explicit owner authorization boundary selected by ADR;
++- no secrets in Git;
++- no personal deployment values in example files;
++- no shell command injection through paths/settings;
++- no direct user-supplied path concatenation;
++- strict upload size/type limits;
++- pairing rate limits;
++- session credential rotation/revocation;
++- safe Docker permissions;
++- least privilege.
++
++## 17. App Review mode
++
++Demo Mode shall:
++- be visible/documented;
++- not require a private Tailnet;
++- let reviewer explore onboarding and main UI;
++- show capability checks;
++- exercise camera permission flow where possible;
++- use clearly labelled synthetic/server-demo data for server-only functionality.
++
++Demo Mode must not pretend synthetic data is real evidence.
++
++## 18. Testing architecture
++
++### 18.1 Mockable interfaces
++iOS shall abstract:
++- CameraSource
++- AudioSource
++- MotionSource
++- ThermalSource
++- ServerTransport
++- LocalEvidenceStore
++
++Server shall abstract:
++- Detector
++- MediaStore
++- Notifier
++- Clock where useful
++- StorageStats
++- CameraSession
++
++### 18.2 Fixture video
++Use synthetic or generated test assets only. Real-person or real-environment monitoring media must not be committed as repository fixtures, even with consent.
++
++Fixtures should cover:
++- empty scene;
++- person enters;
++- server occluded;
++- server displaced;
++- camera shifts;
++- low light;
++- abrupt disconnection.
++
++### 18.3 E2E
++Mock Camera Node:
++1. pair;
++2. send heartbeat;
++3. stream fixture;
++4. trigger detection;
++5. produce event;
++6. store recording;
++7. generate thumbnail;
++8. show web event;
++9. send Slack request to stub;
++10. enforce retention.
++
++## 19. Observability
++
++Local only by default.
++
++Structured logs:
++- JSON preferred on server;
++- redact secrets;
++- rotate logs.
++
++Metrics shown locally:
++- active camera;
++- stream FPS/bitrate;
++- dropped chunks;
++- queue depth;
++- detector latency;
++- disk use;
++- thermal state;
++- reconnect count.
++
++No metrics are sent to the developer.
++
++## 20. Versioning
++
++- Semantic Versioning where practical.
++- Protocol version independently declared.
++- GitHub Releases for server release notes.
++- App Store for iOS distribution.
++- Optional update-check may query public GitHub release metadata only; no telemetry payload.
++
++## 21. Open technical decisions
++
++The following require PoC/real-device data before final lock:
++
++1. Live transport implementation.
++2. Final recording codec/bitrate.
++3. Rear/front capture profile.
++4. Thermal thresholds and degradation curves.
++5. Server-movement algorithm and thresholds.
++6. Camera-tamper confidence model.
++7. Recommended storage allocation from observed recording sizes.
++8. Final person detector/model/weights after license and performance review.
++9. Deployment-owner authorization mechanism (local credential/session vs explicit Tailscale identity binding or another self-hosted equivalent).
++
++Each locked decision should receive an ADR.
