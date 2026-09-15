@@ -30,7 +30,7 @@ jobs:
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ github.event.repository.default_branch }}
-          fetch-depth: 1
+          fetch-depth: 0
           persist-credentials: false
 
       - name: 対象fork PRを固定
@@ -44,12 +44,13 @@ jobs:
           [[ "$PR_NUMBER" =~ ^[0-9]+$ ]]
 
           gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" \
-            --json state,isCrossRepository,headRefOid,baseRefName > "$RUNNER_TEMP/pr-before.json"
+            --json state,isCrossRepository,headRefOid,baseRefName,baseRefOid > "$RUNNER_TEMP/pr-before.json"
 
           state="$(jq -r '.state' "$RUNNER_TEMP/pr-before.json")"
           is_cross_repository="$(jq -r '.isCrossRepository' "$RUNNER_TEMP/pr-before.json")"
           head_before="$(jq -r '.headRefOid' "$RUNNER_TEMP/pr-before.json")"
           base_ref="$(jq -r '.baseRefName' "$RUNNER_TEMP/pr-before.json")"
+          base_before="$(jq -r '.baseRefOid' "$RUNNER_TEMP/pr-before.json")"
 
           [ "$state" = "OPEN" ]
           [ "$is_cross_repository" = "true" ]
@@ -58,21 +59,44 @@ jobs:
             exit 1
           }
           [[ "$head_before" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$base_before" =~ ^[0-9a-f]{40}$ ]]
 
           review_dir="$RUNNER_TEMP/claude-review"
           rm -rf -- "$review_dir"
           mkdir -m 700 -p "$review_dir"
-          # fork headはcheckout/executeせず、固定時点のdiffだけをレビュー入力にする。
-          gh pr diff "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" > "$review_dir/pinned-pr.diff"
 
-          head_after="$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json headRefOid --jq '.headRefOid')"
+          # liveなPR番号に対する `gh pr diff` は使わない。
+          # GitHubのbase repositoryが公開する固定PR head refをfetchし、取得したOIDが
+          # 開始時に固定したheadRefOidと完全一致することを確認してから、そのimmutable OID同士でdiffを作る。
+          git cat-file -e "$base_before^{commit}" || {
+            echo "固定したbase commitをtrusted default branch履歴から解決できません。" >&2
+            exit 1
+          }
+          git fetch --no-tags --no-recurse-submodules origin "refs/pull/$PR_NUMBER/head"
+          fetched_head="$(git rev-parse FETCH_HEAD)"
+          [ "$fetched_head" = "$head_before" ] || {
+            echo "fork PR head refが固定HEADと一致しません。最新状態で再実行してください。" >&2
+            exit 1
+          }
+          git cat-file -e "$head_before^{commit}"
+          git diff --no-ext-diff --no-textconv "$base_before...$head_before" > "$review_dir/pinned-pr.diff"
+
+          gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" \
+            --json headRefOid,baseRefOid > "$RUNNER_TEMP/pr-after.json"
+          head_after="$(jq -r '.headRefOid' "$RUNNER_TEMP/pr-after.json")"
+          base_after="$(jq -r '.baseRefOid' "$RUNNER_TEMP/pr-after.json")"
           [ "$head_after" = "$head_before" ] || {
-            echo "diff取得中にfork PR HEADが変更されました。再実行してください。" >&2
+            echo "diff生成中にfork PR HEADが変更されました。再実行してください。" >&2
+            exit 1
+          }
+          [ "$base_after" = "$base_before" ] || {
+            echo "diff生成中にbase HEADが変更されました。最新baseで再実行してください。" >&2
             exit 1
           }
 
           echo "pr_number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
           echo "head_sha=$head_before" >> "$GITHUB_OUTPUT"
+          echo "base_sha=$base_before" >> "$GITHUB_OUTPUT"
           echo "diff_path=$review_dir/pinned-pr.diff" >> "$GITHUB_OUTPUT"
 
       - name: Claudeでfork PRをレビュー
@@ -89,6 +113,7 @@ jobs:
             REPO: ${{ github.repository }}
             PR NUMBER: ${{ steps.pin.outputs.pr_number }}
             PINNED HEAD SHA: ${{ steps.pin.outputs.head_sha }}
+            PINNED BASE SHA: ${{ steps.pin.outputs.base_sha }}
             PINNED DIFF FILE: ${{ steps.pin.outputs.diff_path }}
 
             これはmaintainerが明示実行したfork由来外部PRのレビューです。checkout済みなのは信頼済みdefault branchだけで、fork headはcheckoutしていません。
@@ -116,13 +141,17 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ steps.pin.outputs.pr_number }}
           PR_HEAD_SHA: ${{ steps.pin.outputs.head_sha }}
+          PR_BASE_SHA: ${{ steps.pin.outputs.base_sha }}
           REVIEW_JSON: ${{ steps.claude.outputs.structured_output }}
         run: |
           set -euo pipefail
 
-          current_head="$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json headRefOid --jq '.headRefOid')"
-          if [ "$current_head" != "$PR_HEAD_SHA" ]; then
-            echo "レビュー中にfork PR HEADが変更されました。最新HEADで再実行してください。" >&2
+          gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" \
+            --json headRefOid,baseRefOid > "$RUNNER_TEMP/pr-final.json"
+          current_head="$(jq -r '.headRefOid' "$RUNNER_TEMP/pr-final.json")"
+          current_base="$(jq -r '.baseRefOid' "$RUNNER_TEMP/pr-final.json")"
+          if [ "$current_head" != "$PR_HEAD_SHA" ] || [ "$current_base" != "$PR_BASE_SHA" ]; then
+            echo "レビュー中にfork PR HEADまたはbase HEADが変更されました。最新状態で再実行してください。" >&2
             exit 1
           fi
 
@@ -140,8 +169,8 @@ jobs:
           printf '%s' "$REVIEW_JSON" | jq -r '.review_markdown' > "$review_file"
 
           # fork側もLLM出力をそのまま永続化しない。既知のSecret形式を機械的に伏字化する。
-          # 既知のPR HEAD SHAだけを40桁hex伏字化の例外とし、一般的な長文字列はパス/URL誤判定を避けて一律伏字化しない。
-          python3 - "$review_file" "$PR_HEAD_SHA" <<'PY'
+          # 固定したPR HEAD/base SHAだけを40桁hex伏字化の例外とし、一般的な長文字列はパス/URL誤判定を避けて一律伏字化しない。
+          python3 - "$review_file" "$PR_HEAD_SHA" "$PR_BASE_SHA" <<'PY'
           import re
           import sys
           from pathlib import Path
@@ -189,6 +218,7 @@ jobs:
             echo "### Claude fork PRレビュー"
             echo
             echo "**レビュー対象HEAD:** \`$PR_HEAD_SHA\`"
+            echo "**比較対象base:** \`$PR_BASE_SHA\`"
             echo "**最高重要度:** \`$severity\`"
             echo
             cat "$review_file"
