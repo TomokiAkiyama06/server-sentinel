@@ -32,14 +32,15 @@ Until Issue #4 establishes hardened repository-level review enforcement, same-re
 
 Never attach or commit:
 - real monitoring footage;
-- non-consenting person images;
+- any real-person image, video, or audio fixture, even when the subject has consented;
+- any real-environment monitoring media fixture;
 - private server IPs/hostnames;
 - private Tailnet names;
 - Slack webhook URLs;
 - credentials or tokens;
 - private deployment configuration.
 
-Use synthetic fixtures.
+Repository test fixtures must be synthetic or generated. Real-device/manual tests that necessarily involve real people or real environments must keep those media artifacts local and must not attach or commit them to the repository.
 
 Automated Claude PR review sends the fixed PR diff and repository context needed for review to Anthropic's Claude service. This is a development-process integration, not ServerSentinel product telemetry. Do not include user monitoring data or secrets in PR content.
 
