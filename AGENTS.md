@@ -265,7 +265,7 @@ Minimum categories as applicable:
 - permission/capability logic;
 - migrations.
 
-Real hardware checks live in `MANUAL_TEST.md`. Do not use real non-consenting person recordings as fixtures.
+Real hardware checks live in `MANUAL_TEST.md`. Repository fixtures MUST be synthetic/generated only; do not commit real-person or real-environment monitoring media as fixtures, even with consent. Real-device/manual-test media must remain local and must not be attached to PRs or committed.
 
 ## 23. CI
 
