@@ -21,11 +21,47 @@ diagnostics/
 *.m4a
 *.heic
 
+# Test fixture media: real-person / real-environment media must not be committed.
+# Common image/video/audio formats are ignored anywhere under tests/fixtures/,
+# then explicitly re-enabled only for synthetic/generated fixtures.
+tests/fixtures/**/*.jpg
+tests/fixtures/**/*.jpeg
+tests/fixtures/**/*.png
+tests/fixtures/**/*.webp
+tests/fixtures/**/*.gif
+tests/fixtures/**/*.bmp
+tests/fixtures/**/*.tif
+tests/fixtures/**/*.tiff
+tests/fixtures/**/*.heif
+tests/fixtures/**/*.webm
+tests/fixtures/**/*.m4v
+tests/fixtures/**/*.mkv
+tests/fixtures/**/*.avi
+tests/fixtures/**/*.aac
+tests/fixtures/**/*.wav
+tests/fixtures/**/*.mp3
+
 # Synthetic/generated test media is allowed only in the dedicated fixture subtree.
+!tests/fixtures/synthetic/**/*.jpg
+!tests/fixtures/synthetic/**/*.jpeg
+!tests/fixtures/synthetic/**/*.png
+!tests/fixtures/synthetic/**/*.webp
+!tests/fixtures/synthetic/**/*.gif
+!tests/fixtures/synthetic/**/*.bmp
+!tests/fixtures/synthetic/**/*.tif
+!tests/fixtures/synthetic/**/*.tiff
 !tests/fixtures/synthetic/**/*.mp4
 !tests/fixtures/synthetic/**/*.mov
+!tests/fixtures/synthetic/**/*.m4v
+!tests/fixtures/synthetic/**/*.mkv
+!tests/fixtures/synthetic/**/*.avi
+!tests/fixtures/synthetic/**/*.webm
 !tests/fixtures/synthetic/**/*.m4a
+!tests/fixtures/synthetic/**/*.aac
+!tests/fixtures/synthetic/**/*.wav
+!tests/fixtures/synthetic/**/*.mp3
 !tests/fixtures/synthetic/**/*.heic
+!tests/fixtures/synthetic/**/*.heif
 
 # Logs / local diagnostics
 *.log
