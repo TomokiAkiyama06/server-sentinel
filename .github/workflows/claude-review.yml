@@ -108,7 +108,7 @@ jobs:
             PR HEAD確認が必要な場合だけUNTRUSTED PR HEAD SNAPSHOTをRead/Glob/Grepしてください。
             変更差分はPINNED DIFF FILEを読み、liveなPR情報を取り直さないでください。
 
-            出力は原則日本語。仕様整合性、バグ/境界条件、セキュリティ、認証/Secret、prompt injection、プライバシー、データ破壊、容量枯渇、並行処理、テスト、依存/モデル/weightsライセンス、iOS/Ubuntu/Web間契約、App Store審査、保守性を重点確認してください。
+            出力は原則日本語。仕様整合性、バグ/境界条件、セキュリティ、認証/Secret、prompt injection、プライバシー/biometric境界、データ破壊、容量枯渇、並行処理、テスト、依存/モデル/weightsライセンス、Camera Source/UVC/Web Camera Node/Ubuntu/Web間契約、secure context/browser lifecycle、保守性を重点確認してください。
 
             review_markdownにはレビュー本文のみを書き、指摘を「重大」「重要」「提案」に分類してください。重大/重要がない場合は明示してください。
             highest_severityは critical / important / proposal / none のいずれかです。
