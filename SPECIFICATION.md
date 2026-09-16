@@ -2,43 +2,45 @@
 
 ## 1. Architecture overview
 
-ServerSentinel consists of three primary runtime components:
+ServerSentinel consists of three logical runtime areas:
 
-1. **iOS Camera Node**
-2. **Ubuntu Server**
-3. **Web Dashboard**
+1. **Ubuntu ServerSentinel Host** — authoritative configuration, recording, analysis, event correlation, retention, notifications.
+2. **Camera Sources** — local UVC devices and remote browser-based Web Camera Nodes.
+3. **Web UI** — dashboard, setup, live view, and the Web Camera Node capture page.
 
 Optional integrations:
-- Tailscale
-- Slack
-- iOS Shortcuts
+- Tailscale or equivalent private remote reachability;
+- Slack.
 
 ```text
-+----------------------+          +-----------------------------+
-| iOS Camera Node      |          | Ubuntu ServerSentinel       |
-|----------------------|   LAN    |-----------------------------|
-| AVFoundation         |<-------->| API / Session Controller    |
-| Front + Rear camera  |          | Recorder                    |
-| Microphone           |          | Detection Workers           |
-| CoreMotion           |          | SQLite                      |
-| Thermal/Power state  |          | File Storage                |
-| Local emergency buf  |          | Slack Integration           |
-+----------------------+          +---------------+-------------+
-                                                 |
-                                                 | local HTTP(S)
-                                                 v
-                                      +--------------------------+
-                                      | React Dashboard          |
-                                      +--------------------------+
-                                                 |
-                                                 | Tailscale
-                                                 v
-                                      +--------------------------+
-                                      | Remote owner browser     |
-                                      +--------------------------+
+Local UVC cameras                       Remote Web Camera Nodes
+┌───────────────┐                       ┌─────────────────────────┐
+│ USB Webcam A  │                       │ iPhone / Android / PC   │
+│ USB Webcam B  │                       │ Browser + getUserMedia  │
+└───────┬───────┘                       └────────────┬────────────┘
+        │ V4L2/UVC                                    │ secure session
+        └──────────────────────┬──────────────────────┘
+                               v
+                  ┌───────────────────────────────┐
+                  │ Ubuntu ServerSentinel        │
+                  │ API / source registry        │
+                  │ recorder / ring buffers      │
+                  │ detection workers            │
+                  │ event/timeline correlator    │
+                  │ SQLite / file storage        │
+                  │ Slack integration            │
+                  └───────────────┬───────────────┘
+                                  │
+                                  v
+                  ┌───────────────────────────────┐
+                  │ React Web UI                 │
+                  │ dashboard + camera-node UI  │
+                  └───────────────────────────────┘
 ```
 
-## 2. Proposed repository layout
+A deployment may contain 1–4 active video sources in any supported composition. No algorithm, schema, or filesystem layout may assume an iPhone `front`/`rear` pair.
+
+## 2. Repository layout
 
 ```text
 server-sentinel/
@@ -46,6 +48,7 @@ server-sentinel/
 ├── REQUIREMENTS.md
 ├── SPECIFICATION.md
 ├── AGENTS.md
+├── CLAUDE.md
 ├── MANUAL_TEST.md
 ├── SECURITY.md
 ├── PRIVACY.md
@@ -55,8 +58,6 @@ server-sentinel/
 ├── NOTICE
 ├── .gitignore
 ├── .env.example
-├── ios/
-│   └── README.md
 ├── server/
 │   └── README.md
 ├── web/
@@ -69,677 +70,672 @@ server-sentinel/
 ├── docs/
 │   ├── ARCHITECTURE.md
 │   ├── SETUP.md
-│   ├── APP_REVIEW.md
+│   ├── CLAUDE_REVIEW_SETUP.md
 │   ├── THIRD_PARTY_POLICY.md
+│   ├── INITIAL_ISSUES.md
 │   ├── ADR/
 │   │   ├── README.md
 │   │   └── 0001-project-foundations.md
 │   └── proposals/
 │       └── README.md
 └── .github/
+    ├── workflows/
     ├── pull_request_template.md
     └── ISSUE_TEMPLATE/
-        ├── bug_report.md
-        ├── feature_request.md
-        └── hardware_test.md
 ```
 
 Expected implementation expansion:
 
 ```text
-server/
-├── app/
-│   ├── api/
-│   ├── core/
-│   ├── db/
-│   ├── detection/
-│   ├── media/
-│   ├── notifications/
-│   ├── pairing/
-│   └── storage/
-├── migrations/
-└── tests/
+server/app/
+├── api/
+├── auth/
+├── cameras/
+│   ├── registry/
+│   ├── uvc/
+│   └── remote_web/
+├── detection/
+├── events/
+├── media/
+├── notifications/
+└── storage/
 
-web/
-├── src/
-└── tests/
-
-ios/
-├── ServerSentinelCamera/
-├── ServerSentinelCameraTests/
-└── ServerSentinelCameraUITests/
+web/src/
+├── dashboard/
+├── camera-node/
+├── setup/
+└── shared/
 ```
 
-## 3. iOS Camera Node
+## 3. Camera Source domain model
 
-### 3.1 Technology
+### 3.1 Source types
 
-- Swift
-- SwiftUI
-- AVFoundation
-- CoreMotion
-- Network framework as appropriate
-- Keychain for long-lived credentials
-- File protection APIs for emergency local clips
-
-### 3.2 Capture graph
-
-Preferred full-capability mode:
+MVP enum:
 
 ```text
-Rear camera  --------\
-                      +--> Encoder / Session transport
-Front camera --------/
-Microphone ---------/
-
-Accelerometer ------\
-Gyroscope -----------+--> Tamper telemetry
-Thermal state -------/
+local_uvc
+remote_web
 ```
 
-The implementation MUST call/check MultiCam capability before attempting simultaneous capture.
+Future types must fit the same logical source/event model, e.g. `rtsp`, `pi_node`.
 
-### 3.3 Capture profile
+### 3.2 Source record
 
-Initial targets, not hard guarantees:
+Logical schema:
 
-- Rear: up to 1080p, target 15–30 fps
-- Front: lower-cost profile, initially 720p / 5–15 fps
-- Remote dashboard live target: 720p / 15–30 fps
+```text
+camera_source
+- id: UUID
+- node_id: nullable UUID
+- source_type
+- name
+- role_label
+- enabled
+- desired_capture_profile
+- negotiated_capture_profile
+- health_state
+- last_seen_at
+- created_at
+- updated_at
+```
 
-Exact profiles shall be benchmarked on iPhone 14 and adjusted by thermal/load policy.
+`role_label` is descriptive metadata, not a replacement for explicit detection-profile configuration.
 
-### 3.4 Thermal policy
+### 3.3 Capabilities
 
-Suggested degradation order:
+Capabilities are data, not assumptions derived from device name.
 
-1. Lower front-camera FPS.
-2. Lower front-camera resolution.
-3. Reduce non-critical analysis preview rate.
-4. Lower rear live-stream bitrate/FPS while preserving evidence recording.
-5. Disable non-essential preview rendering.
-6. If critical thermal state persists, surface degraded state and preserve the most important capture path possible.
+Examples:
 
-Every thermal transition shall create an audit event.
+```text
+video
+microphone
+camera_switch
+resolution_controls
+frame_rate_controls
+browser_wake_lock
+local_direct_capture
+```
 
-### 3.5 Local emergency buffer
+No MVP detector requires IMU or torch capabilities.
 
-Maintain a bounded local critical-event store.
+### 3.4 Detection profile bindings
 
-Initial target:
-- 500 MB.
+A source may have zero or more profiles:
 
-Critical event classes:
-- server movement;
-- camera tamper.
+```text
+motion
+person
+server_roi
+camera_tamper
+entrance_crossing
+owner_verification
+image_quality
+```
 
-Behavior:
-- preserve pre-event data if feasible;
-- preserve post-event data;
-- mark unsynchronized critical clips explicitly;
-- retry upload after reconnect;
-- reclaim synchronized/unprotected emergency data before any unsynchronized critical evidence;
-- never silently overwrite an unsynchronized critical clip solely because local capacity was reached;
-- evaluate **both** the configured ServerSentinel local-store bound and the iPhone's OS-reported currently available storage before admitting a new local clip;
-- preserve a device-level safety reserve outside the ServerSentinel local-store budget so emergency evidence cannot intentionally drive the iPhone filesystem to exhaustion;
-- avoid storing ordinary motion events locally unless needed by the media architecture.
+A profile contains its own config, version, thresholds, and enabled state.
 
-Admission policy:
-1. Before opening or extending a local emergency clip, estimate a conservative write budget for the next segment/clip finalization, including media, metadata, and container-finalization overhead.
-2. Admission succeeds only when that projected write fits both:
-   - the remaining configured ServerSentinel local-emergency-store budget; and
-   - the current OS-reported available device capacity after subtracting the device safety reserve.
-3. A low device-wide free-space condition can therefore block local evidence admission even when ServerSentinel itself is far below its 500 MB configured bound.
-4. Storage-capacity queries and write failures are treated as security-relevant state; a failed capacity query must not be interpreted as unlimited free space.
+### 3.5 Active-source limit
 
-Overflow / low-device-space policy:
-1. Reclaim the oldest synchronized/unprotected local emergency data first.
-2. If only unsynchronized critical clips remain and admitting a new local critical clip would exceed the configured local bound **or** violate the device-level safety reserve, enter `LOCAL_EVIDENCE_HARD_STOP` rather than deleting existing unsynchronized evidence or attempting a write expected to exhaust the filesystem.
-3. While `LOCAL_EVIDENCE_HARD_STOP` is active:
-   - continue critical detection;
-   - continue live transport and direct server upload when available;
-   - refuse only new **iPhone-local** emergency clip admission that cannot satisfy both storage constraints;
-   - surface a persistent local/UI warning and audit state;
-   - record minimal metadata for rejected local evidence when safely possible, including event type/time and reason (`local_evidence_capacity_exhausted` or `device_free_space_unsafe`), without claiming a clip exists.
-4. Automatically leave `LOCAL_EVIDENCE_HARD_STOP` only after both the configured local-store headroom and OS-reported device free space are safely above their respective recovery thresholds; use hysteresis to avoid state flapping.
+Initial `max_active_video_sources = 4`.
 
-The exact device safety reserve, conservative projected-write budget, local recovery threshold, and any reserved metadata budget shall be finalized through real-device storage/thermal testing. Tests must include the case where ServerSentinel local usage is low but unrelated apps/system data consume most of the iPhone storage. Unsynchronized evidence loss must never be silent.
+This is a configurable product limit. Database/API collection types must not encode four fixed columns or four fixed source names.
 
-### 3.6 Monitoring UI
+If enabling a source would exceed the configured limit, reject the activation with an explicit validation error rather than silently replacing another source.
 
-Armed screen:
-- near-black background;
-- visible monitoring state;
-- visible recording state;
-- visible microphone state;
-- visible server connection state.
+## 4. Local UVC / USB ingest
 
-Tap:
-- show controls;
-- optionally raise brightness to a configured working level;
-- auto-return to dim state after configurable timeout.
+### 4.1 Discovery
 
-When app stops monitoring:
-- restore prior brightness where safe;
-- re-enable normal idle behavior.
+On Linux, enumerate V4L2/UVC-compatible devices. Prefer stable hardware identity where available:
+- `/dev/v4l/by-id/` or equivalent stable symlink;
+- USB vendor/product/serial metadata;
+- negotiated video capabilities.
 
-### 3.7 Foreground expectation
+Do not persist `/dev/video0` alone as durable identity because enumeration order can change after reboot/replug.
 
-The dedicated Camera Node is expected to remain foreground/active during monitoring.
+### 4.2 Activation
 
-The implementation must not assume that iOS permits indefinite camera capture after:
-- app kill;
-- device shutdown;
-- unsupported background transition.
+Discovery does not automatically activate recording. The deployment owner explicitly selects the device, names it, chooses capture settings, and assigns detection profiles.
 
-If capture cannot continue, state becomes disconnected/manual-intervention as appropriate.
+### 4.3 Container boundary
 
-## 4. Media transport
+Do not require privileged Docker solely to access webcams. Mount/pass only explicitly configured video devices or use a narrowly scoped host capture design documented by ADR.
 
-### 4.1 Separation of concerns
+### 4.4 Disconnect/reconnect
 
-Live video and evidence recording are separate reliability problems.
+A disappearing UVC device transitions to `offline` and emits a source-health event. Reappearance is matched by stable identity where possible and does not silently bind a different physical camera to the old source.
 
-- **Live transport**: low latency.
-- **Recording transport**: durable, retryable, integrity-checked.
-
-The implementation shall not make successful evidence retention depend solely on an uninterrupted live-view session.
-
-### 4.2 Live transport decision
-
-The first implementation Issue shall create a PoC comparing candidate transports, with WebRTC expected to be evaluated first.
-
-The ADR shall record:
-- measured LAN latency;
-- reconnect behavior;
-- CPU/GPU usage;
-- iPhone thermal impact;
-- browser compatibility;
-- NAT/Tailscale behavior;
-- maintenance burden;
-- dependency licensing.
-
-### 4.3 Recording chunks
-
-Recommended behavior:
-- media segmented into bounded chunks;
-- chunk identifier;
-- event/session identifier;
-- start/end timestamps;
-- sequence number;
-- checksum;
-- codec metadata;
-- camera source;
-- retry count.
-
-Upload must be idempotent.
-
-### 4.4 Codec
-
-Do not hard-code final codec until iPhone and Ubuntu measurements exist.
-
-Selection criteria:
-- iOS hardware encode support;
-- browser playback;
-- storage size;
-- Ubuntu decode/AI pipeline cost;
-- license/patent considerations;
-- App Store feasibility.
-
-## 5. Server backend
+## 5. Remote Web Camera Node
 
 ### 5.1 Technology
 
-- Python
-- FastAPI
-- SQLite
-- background workers/processes for media/detection
-- Docker Compose deployment
+MVP implementation target:
+- React/TypeScript UI shared with the web application where practical;
+- browser `navigator.mediaDevices.getUserMedia()`;
+- WebRTC evaluated first for low-latency media;
+- Web Crypto / browser-appropriate credential storage for paired identity;
+- Screen Wake Lock API as optional best-effort support where available.
 
-Heavy detection work should not run inside latency-sensitive API request handlers.
+No native iOS/Android package is required.
 
-### 5.2 Logical services
+### 5.2 Secure context
 
-- API service
-- Pairing/session service
-- Recorder
-- Detection worker
-- Event correlator
-- Retention worker
-- Thumbnail generator
-- Slack notifier
-- Audit logger
-- Health/status aggregator
+Camera/microphone capture requires a browser secure context except browser-defined localhost exceptions. Production/setup UX must provide a valid secure-origin path; it must not instruct the user to bypass browser TLS/security warnings as the normal solution.
 
-They may initially share one deployable service if separation would add unnecessary complexity, but internal interfaces should remain clear.
+The exact local HTTPS/Tailscale/reverse-proxy certificate approach shall be documented by setup/transport ADR work.
 
-## 6. Detection pipeline
+### 5.3 Camera selection
 
-### 6.1 General motion
+A browser node may expose one selected video track as one Camera Source. Device camera switching may be offered where the browser exposes multiple cameras, but the MVP does not require simultaneous front/rear capture from one phone.
 
-Use lightweight temporal image difference/flow/background methods as appropriate.
+### 5.4 Audio
 
-### 6.2 Person detection
+Microphone capture is separate from video permission/state and defaults to OFF.
 
-Use a pluggable model/backend.
+### 5.5 No automatic illumination
+
+Do not call browser constraints or device APIs to automatically enable torch/flash/screen light on motion or low light. Low light is handled through quality gating and explicit degraded state.
+
+### 5.6 Foreground/lifecycle model
+
+The web node is expected to remain active and foreground while used as a camera source.
+
+The implementation must surface/recover from:
+- visibility/background suspension;
+- track ended/muted;
+- permission revocation;
+- browser reload;
+- network interruption;
+- device sleep/lock where detectable.
+
+No claim of uninterrupted background recording is allowed.
+
+### 5.7 Browser-local buffer
+
+Any MediaRecorder/IndexedDB/browser-side buffer is best-effort and non-authoritative in MVP. It may improve reconnect behavior, but MUST NOT be described as guaranteed independent critical-evidence storage.
+
+## 6. Pairing and node trust
+
+### 6.1 Local UVC
+
+Local UVC sources are host-local devices selected by an owner-authorized dashboard session. They do not use remote pairing tokens.
+
+### 6.2 Web Camera Node pairing
+
+Preferred flow:
+
+```text
+Owner dashboard -> Add Web Camera
+        |
+        +-- one-time QR / short token (~5 min)
+        |
+Camera browser opens secure camera-node page
+        |
+server validates token + current owner approval
+        |
+revocable per-node identity/session established
+```
+
+Pairing token:
+- cryptographically random;
+- one-time;
+- short-lived;
+- never logged plaintext.
+
+### 6.3 Browser credential
+
+Prefer a browser-origin-bound, revocable credential. Where practical use Web Crypto-generated non-exportable key material persisted through IndexedDB rather than a long-lived bearer token in `localStorage`.
+
+Exact authentication protocol must be covered by the deployment-owner authorization/pairing ADR before implementation.
+
+## 7. Media architecture
+
+### 7.1 Separation of concerns
+
+Live video and durable recording are separate reliability problems.
+
+- **Live**: optimize latency and recovery.
+- **Recording**: optimize durability, ordering, retry, integrity, source attribution.
+
+### 7.2 Local source path
+
+Local UVC capture may feed both live-view encoder and recorder directly on the Ubuntu host.
+
+### 7.3 Remote source path
+
+The transport PoC shall compare realistic browser-compatible options, with WebRTC evaluated first.
+
+Measure:
+- LAN/Tailscale latency;
+- reconnect behavior;
+- browser compatibility;
+- CPU/GPU cost;
+- bitrate;
+- four-source behavior;
+- recording extraction/chunking options;
+- dependency/license burden.
+
+### 7.4 Recording segments
+
+Logical chunk metadata:
+
+```text
+chunk_id
+source_id
+session_id
+recording_id
+event_id (optional)
+sequence_number
+started_at
+ended_at
+codec/container
+byte_length
+checksum
+retry_count
+```
+
+Remote uploads must be idempotent.
+
+### 7.5 Server ring buffers
+
+Maintain recent per-source media on the server for pre-event capture. Memory/disk implementation is chosen by benchmark/ADR. The buffer must have explicit bounds.
+
+### 7.6 Capture vs inference FPS
+
+Do not couple inference rate to capture FPS. Each detector/profile can sample a source at a lower cadence.
+
+Example benchmark starting points only:
+- capture: 15 fps;
+- person detector: 2–5 fps;
+- server ROI/movement: 2–5 fps;
+- owner verification: event/person-triggered rather than every frame.
+
+Final values are benchmark-derived.
+
+## 8. Detection pipeline
+
+### 8.1 General motion
+
+Use lightweight temporal difference/flow/background methods as appropriate.
+
+### 8.2 Person detection
+
+Use a pluggable backend.
 
 Requirements:
 - permissive project-compatible license;
-- server-side inference;
 - CPU fallback;
 - optional GPU acceleration;
-- model/version recorded in metadata.
+- model/version in metadata;
+- source and pretrained weight licenses verified separately.
 
-YOLOX is the initial evaluation candidate because its source implementation is Apache-2.0. The exact pretrained model/weight license MUST still be verified separately before bundling or redistribution. The detector remains replaceable.
+YOLOX is the initial person-detector evaluation candidate because its source implementation is Apache-2.0. This does not pre-approve every weight artifact.
 
-Do not default to an AGPL component merely because it is popular.
+### 8.3 Server movement
 
-### 6.3 Server movement
-
-Calibration stores:
+Per source/profile calibration stores:
 - server ROI/polygon;
-- reference visual descriptors;
+- reference frame/descriptors;
 - background context;
-- expected camera pose;
-- thresholds.
+- thresholds;
+- calibration version/time.
 
-Runtime correlation may use:
+Runtime may combine:
 - feature points;
-- homography/global scene transform;
+- global transform/homography compensation;
 - edges/contours;
 - ROI similarity;
 - temporal persistence;
-- person occlusion mask;
-- optional object detector/tracker.
+- person/occlusion mask.
 
-A movement event should require temporal confirmation to reduce false positives.
-
-### 6.4 Camera tamper
+### 8.4 Camera tamper
 
 Candidate signals:
-- IMU delta;
 - global optical transform;
-- abrupt focus/exposure/occlusion shift;
-- camera orientation change;
-- stream loss immediately following motion.
+- persistent occlusion/near-black lens cover;
+- abrupt focus/exposure change;
+- source disconnect closely following scene movement;
+- impossible/large scene pose shift.
 
-Tamper confidence should combine multiple inputs rather than using one fixed threshold when practical.
+UVC/Web Camera Node implementations do not depend on IMU.
 
-## 7. Events
+### 8.5 Image-quality / low-light gate
 
-Suggested event types:
+Before identity-sensitive inference, derive quality indicators such as:
+- luminance distribution;
+- blur/sharpness;
+- visible face size;
+- detector confidence;
+- excessive saturation/underexposure.
+
+A profile returns `sufficient`, `degraded`, or `insufficient` plus metrics/reason. `insufficient` prevents owner match/non-match from being treated as reliable.
+
+No motion-triggered torch operation exists in MVP.
+
+### 8.6 Owner-only face verification
+
+This is 1:1 verification against one explicitly enrolled deployment owner, not general named face identification.
+
+Logical flow:
 
 ```text
-person_detected
+person/face candidate
+      -> quality gate
+      -> owner embedding comparison
+      -> match / no-match / unknown
+```
+
+Requirements:
+- owner enrollment requires owner-authorized UI action;
+- template/model metadata stored locally;
+- threshold chosen through synthetic/public benchmark + real-device manual validation;
+- result contains confidence/distance + quality state;
+- low-quality result becomes `unknown`;
+- enrollment can be deleted/replaced;
+- model implementation/weights need license review.
+
+Do not create persistent named templates for other people.
+
+### 8.7 Anonymous tracking
+
+Use ephemeral identifiers for non-owner observations, e.g. `anon_track_<uuid>`.
+
+The initial tracking scope should be limited enough to avoid silently becoming a biometric re-identification system. Same-camera temporal tracking is allowed. Cross-camera re-identification is not an MVP requirement and requires a new privacy/architecture decision.
+
+### 8.8 Entrance crossing
+
+Entrance profile config:
+- line or polygon;
+- `inside` and `outside` side/direction;
+- debounce/persistence threshold;
+- optional owner-verification requirement.
+
+Emitted observations may include:
+- `anonymous_person_entered`;
+- `anonymous_person_exited`;
+- `owner_entered`;
+- `owner_exited`.
+
+## 9. Presence engine
+
+Logical states:
+
+```text
+PRESENT
+PROBABLY_PRESENT
+ABSENT
+UNKNOWN
+```
+
+Inputs may include:
+- owner entrance/exit observations;
+- recency/consistency;
+- manual owner override;
+- configured schedule hints.
+
+Precedence:
+1. explicit manual override;
+2. high-confidence entrance-derived state;
+3. schedule/hints;
+4. otherwise unknown.
+
+Only `PRESENT` suppresses ordinary occupancy automation by default. `PROBABLY_PRESENT`/`UNKNOWN` are displayed but do not silently disarm ordinary security automation.
+
+Critical server movement/camera tamper remains armed in every presence state.
+
+## 10. Event and timeline model
+
+Suggested event/observation types:
+
+```text
 motion_detected
+person_detected
+anonymous_person_entered
+anonymous_person_exited
+owner_match
+owner_entered
+owner_exited
+image_quality_degraded
+image_quality_recovered
 server_movement
 camera_tamper
 camera_offline
 camera_online
+web_camera_suspended
+web_camera_reconnected
 server_started
 server_stopped
 recording_started
 recording_stopped
 manual_recording_started
 manual_recording_stopped
-thermal_degraded
 storage_warning
 storage_pressure_entered
 storage_pressure_cleared
 storage_hard_stop_entered
 storage_hard_stop_cleared
-local_evidence_hard_stop_entered
-local_evidence_hard_stop_cleared
-local_evidence_capture_rejected
+presence_changed
 slack_error
 pairing_created
 pairing_revoked
-presence_started
-presence_ended
 settings_changed
 ```
 
-Storage state events must remain distinguishable in audit/UI. In particular, `storage_pressure_entered` and `storage_hard_stop_entered` are not interchangeable: the latter means new server-side recording writes are being refused. `local_evidence_capture_rejected` records an iPhone-local evidence admission failure and must not imply that the corresponding server-side event or detection failed.
-
 Each event:
-- UUID
-- type
-- severity
-- started_at
-- ended_at
-- source_node
-- confidence where applicable
-- recording reference
-- thumbnail reference
-- metadata JSON
-- acknowledged/starred state as applicable
+- UUID;
+- type;
+- severity;
+- started_at / ended_at;
+- source_id / node_id where applicable;
+- confidence/quality where applicable;
+- recording references;
+- thumbnail references;
+- metadata JSON;
+- acknowledged/starred state where applicable.
 
-## 8. Recording layout
+### 10.1 Correlation
 
-Example filesystem structure:
+Critical-event view may query a configurable time window around the event and show relevant entry/exit/person/camera/server observations.
+
+Correlation output MUST be phrased as observations, e.g. `Observed in relevant window`, not `suspect`/`culprit`.
+
+## 11. Recording layout
+
+Example:
 
 ```text
 <recording_root>/
 ├── recordings/
-│   └── 2026/
-│       └── 09/
-│           └── 14/
-│               └── <event_uuid>/
-│                   ├── rear.mp4
-│                   ├── front.mp4
-│                   ├── thumbnail.jpg
-│                   └── manifest.json
+│   └── 2026/09/17/<event_uuid>/
+│       ├── source_<uuid-a>.mp4
+│       ├── source_<uuid-b>.mp4
+│       ├── thumbnail_<uuid-a>.jpg
+│       └── manifest.json
 ├── manual/
 ├── temp/
 └── diagnostics/
 ```
 
-Exact naming may change. Filesystem paths must never include user secrets.
+No `rear.mp4` / `front.mp4` contract.
 
-## 9. SQLite data model
+Manifest records source IDs, source names at capture time, codecs, time ranges, checksums, gaps, and event links.
+
+Filesystem paths must never contain secrets or raw user-provided traversal components.
+
+## 12. SQLite logical model
 
 Initial logical tables:
 
-- `camera_nodes`
-- `pairings`
-- `events`
-- `recordings`
-- `recording_files`
-- `settings`
-- `schedules`
-- `presence_sessions`
-- `audit_logs`
-- `notification_deliveries`
-- `schema_migrations`
+- `nodes`;
+- `camera_sources`;
+- `camera_capabilities`;
+- `camera_profiles`;
+- `pairings`;
+- `owner_biometric_profile` (0 or 1 active logical owner profile in MVP);
+- `person_tracks` / `person_observations`;
+- `events`;
+- `event_links`;
+- `recordings`;
+- `recording_files`;
+- `settings`;
+- `schedules`;
+- `presence_state_history`;
+- `audit_logs`;
+- `notification_deliveries`;
+- `schema_migrations`.
 
 Important constraints:
-- UUIDs preferred for externally referenced objects.
-- Timestamps stored in UTC; UI renders local time.
-- Settings changes audited.
-- Audit logs immutable through normal API except retention worker.
-- Destructive cascade behavior must be explicit.
+- externally referenced objects use UUIDs where practical;
+- timestamps stored UTC; UI renders local time;
+- settings/biometric enrollment/deletion audited;
+- audit logs immutable through normal API except retention worker;
+- cascade/destructive behavior explicit;
+- non-owner named identity schema is intentionally absent.
 
-## 10. Retention algorithm
+## 13. Retention and storage admission
 
-ServerSentinel must distinguish between the configured recording allocation and a hard filesystem safety reserve. Starred recordings are protected from automatic deletion, but protection must never imply that ServerSentinel will intentionally fill the filesystem to 100%. Filesystem pressure can be caused by ServerSentinel or by unrelated services sharing the same volume, so admission decisions MUST consider actual filesystem free space independently of ServerSentinel's configured allocation.
+ServerSentinel distinguishes configured recording allocation from hard filesystem safety reserve.
 
-At scheduled intervals and before admitting a new recording:
+At scheduled intervals and before a new recording admission:
 
-1. Calculate total recording usage, starred/preserved usage, filesystem free space, the configured recording maximum, the critical-evidence allowance, and the hard safety reserve.
-2. Delete expired unstarred recordings older than retention.
-3. Recompute recording usage and filesystem free space.
-4. Reclaim oldest unstarred recordings when **either** condition is true:
-   - ServerSentinel recording usage exceeds the configured recording maximum; or
-   - actual filesystem free space is below the normal recording-admission target required to preserve both the bounded critical-evidence allowance and the hard safety reserve.
-   Continue oldest-unstarred cleanup until both admission conditions are safe again or no deletable unstarred recordings remain. This cleanup applies even when low free space was caused by another process/service on the shared filesystem.
-5. Never auto-delete starred recordings.
-6. Only after step 4 reclamation has been attempted, if there is still insufficient room for normal recording while the hard safety reserve remains intact, enter `STORAGE_PRESSURE`:
-   - reject new non-critical/manual recordings before they consume the protected capacity;
-   - continue live viewing and detection;
-   - keep critical-event detection armed;
-   - emit `storage_pressure_entered` on transition and show a persistent UI warning requiring the owner to unstar/delete/offload data, free space used by other services, or increase storage.
-7. Maintain a separately budgeted critical-evidence allowance above the normal recording-admission threshold so a limited amount of new `server_movement` / `camera_tamper` evidence can still be written during `STORAGE_PRESSURE`. This allowance must be bounded and must not consume the hard filesystem safety reserve.
-8. Before entering `STORAGE_HARD_STOP`, re-evaluate filesystem free space and confirm that no eligible unstarred recording can be reclaimed to restore the required reserve. If the critical-evidence allowance is exhausted or any new disk write would cross the hard filesystem safety reserve, enter `STORAGE_HARD_STOP`:
-   - refuse all new disk recordings rather than intentionally filling the filesystem;
-   - continue live view/detection where possible;
-   - preserve any iPhone local emergency evidence and retry server synchronization after capacity is restored;
-   - emit `storage_hard_stop_entered`, raise the highest local storage warning state, and audit the transition.
-9. Automatically leave pressure/stop states only after free space is safely above the corresponding recovery threshold (use hysteresis to avoid state flapping). Emit the matching `*_cleared` event on recovery.
+1. calculate recording use, starred use, filesystem free space, configured maximum, bounded critical allowance, hard reserve;
+2. delete expired unstarred recordings;
+3. if allocation/free-space admission remains unsafe, reclaim oldest eligible unstarred recordings even if they have not expired;
+4. if normal admission is still unsafe, enter `STORAGE_PRESSURE` and suppress new non-critical/manual disk recordings;
+5. confirmed critical server-movement/camera-tamper evidence may use only a bounded critical allowance that does not cross the hard reserve;
+6. before any write that would cross the hard reserve, enter `STORAGE_HARD_STOP` and refuse the write;
+7. starred recordings are never auto-deleted but also never justify intentional filesystem exhaustion;
+8. emit audit/UI state events;
+9. recover with hysteresis after free space is safely above recovery thresholds.
 
-The hard safety reserve, critical-evidence allowance, normal admission target, and recovery thresholds shall be configurable within safe bounds and finalized from storage/bitrate benchmarks. The implementation must test both (a) starred data alone exceeding the normal configured recording allocation and (b) an unrelated service consuming shared-filesystem space while reclaimable unstarred ServerSentinel recordings still exist.
+Exact thresholds are benchmark/config decisions, not hard-coded personal disk values.
 
-## 11. Pairing
+## 14. Dashboard UI
 
-### 11.1 Discovery
-- mDNS/Bonjour service advertisement on local network.
-- QR pairing as primary deterministic flow.
-- Manual URL/host fallback.
+Primary views:
+- Overview/status;
+- Camera Sources;
+- Live Grid;
+- Events/Timeline;
+- Recordings;
+- Presence;
+- Owner Verification settings;
+- Storage;
+- Slack;
+- Audit;
+- Setup/security.
 
-### 11.2 QR contents
+### 14.1 Live grid
 
-QR payload should contain only what is needed, for example:
-- server local endpoint;
-- one-time pairing token;
-- server public-key/fingerprint identifier;
-- token expiry;
-- protocol version.
+Layout adapts to source count:
+- 1 source: single view;
+- 2 sources: two-up responsive layout;
+- 3–4 sources: responsive 2×2-style grid where screen size permits.
 
-Never include:
-- Slack secret;
-- Tailscale auth key;
-- server admin secrets;
-- filesystem credentials.
+Do not render empty hard-coded camera slots as a product assumption.
 
-### 11.3 Pairing token
-- CSPRNG-generated;
-- target expiry: 5 minutes;
-- one-time use;
-- hashed at rest when practical;
-- redacted from logs.
+### 14.2 Camera source card
 
-### 11.4 Long-term credential
-After pairing, issue/establish per-device credentials stored in iOS Keychain and server-side secure configuration/DB.
+Display:
+- source name/type/role;
+- online/degraded/offline state;
+- negotiated resolution/FPS;
+- audio state;
+- active detection profiles;
+- low-light/image-quality state;
+- reconnect/manual-intervention state.
 
-Support revocation.
+## 15. Security boundaries
 
-## 12. API design principles
+### 15.1 Deployment owner
 
-- Version APIs (`/api/v1/...`).
-- Use typed request/response schemas.
-- Idempotency for retryable media/control operations.
-- Never log secrets.
-- Validate filenames/paths server-side.
-- No arbitrary filesystem path APIs.
-- Destructive actions require explicit scoped request.
-- Privileged dashboard/API operations require deployment-owner authorization; Tailnet membership alone is not sufficient authorization.
-- Return machine-readable error codes.
+Tailscale membership is reachability only. Privileged dashboard/API actions require separate deployment-owner authorization selected by ADR.
 
-Indicative resource groups:
+### 15.2 Media uploads
 
-```text
-/api/v1/health
-/api/v1/setup
-/api/v1/pairing
-/api/v1/nodes
-/api/v1/events
-/api/v1/recordings
-/api/v1/live
-/api/v1/control
-/api/v1/presence
-/api/v1/schedules
-/api/v1/settings
-/api/v1/integrations/slack
-/api/v1/audit
-/api/v1/shortcuts
-```
+Validate:
+- authenticated node;
+- expected source/session;
+- size/rate limits;
+- allowed media/container;
+- generated safe filenames;
+- checksum/integrity;
+- no arbitrary output paths.
 
-Exact endpoints are an implementation detail and may evolve through schema migrations/ADR.
+### 15.3 Biometric data
 
-## 13. Web dashboard
+Owner biometric template:
+- treated as sensitive secret-adjacent data;
+- excluded from logs/diagnostics by default;
+- not returned from general settings APIs;
+- deletion audited;
+- access limited to required verification worker/config path.
 
-React + TypeScript.
+Non-owner persistent biometric templates are prohibited by requirement.
 
-Mobile-first screens:
+## 16. Failure/health behavior
 
-1. Dashboard
-2. Live
-3. Events
-4. Recording detail
-5. Camera Node
-6. Presence/schedule
-7. Storage
-8. Slack
-9. Audit/logs
-10. Settings
-11. Setup/pairing
+Explicit states should distinguish:
+- UVC device disconnected;
+- remote browser node offline;
+- browser capture track ended;
+- low-light/quality degradation;
+- detector worker degraded;
+- storage pressure/hard stop;
+- server-side source overload;
+- owner verification unavailable;
+- manual intervention required.
 
-### Dashboard critical status
+A failed owner verifier does not disable unrelated server movement/tamper monitoring.
 
-At a glance:
-- ServerSentinel service online
-- Camera online
-- Monitoring active
-- Presence active
-- rear/front/mic state
-- thermal state
-- storage remaining
-- last critical event
-- manual intervention required indicator
+## 17. Performance and overload policy
 
-## 14. Presence state machine
+Four active sources are a supported test target, not a promise that every camera can run its maximum advertised mode simultaneously on every host/USB topology.
 
-Conceptual priority:
+Resource policy:
+1. keep source health/heartbeat visible;
+2. preserve critical server movement/tamper processing where configured;
+3. reduce expensive analysis cadence;
+4. reduce live preview bitrate/FPS/resolution where necessary;
+5. report degraded state;
+6. do not silently drop a source while claiming healthy monitoring.
 
-```text
-manual override (until expiry)
-        >
-explicit immediate state
-        >
-configured schedule
-        >
-default monitoring state
-```
+USB controller bandwidth, CPU, GPU, encoder capacity, and network bandwidth must be measured.
 
-Presence mode does not block:
-- live view;
-- manual recording;
-- health checks.
+## 18. Testing and fixtures
 
-## 15. Slack integration
+Repository media fixtures must be synthetic/generated only. Real monitoring footage, real-person media, and real-environment footage are not committed or attached to PRs even with consent.
 
-Server-side only.
+Required test families include:
+- source registry 1–4 cameras;
+- UVC stable-device mapping/reconnect;
+- remote Web Camera Node pairing/reconnect;
+- media chunk retry/idempotency;
+- multi-source event linkage;
+- low-light gating;
+- owner-verification match/no-match/unknown using synthetic/generated/publicly licensed fixtures where appropriate;
+- anonymous tracking without named identities;
+- entrance crossing/presence state;
+- server ROI movement/occlusion;
+- camera tamper;
+- retention/storage pressure;
+- owner authorization;
+- migrations;
+- mock E2E.
 
-Daily:
-- one parent summary at configured time (default 23:00);
-- thread replies containing selected event entries/thumbnails.
+Real browser/hardware validation lives in `MANUAL_TEST.md`.
 
-Immediate:
-- confirmed server movement;
-- confirmed camera tamper;
-- other immediate alert types only if later explicitly approved.
+## 19. Deliberately deferred decisions
 
-Do not turn every motion event into a channel notification.
-
-Slack failures:
-- recorded in audit/event state;
-- retry with bounded backoff;
-- never block recording.
-
-## 16. Security controls
-
-See `SECURITY.md`.
-
-Mandatory highlights:
-- no public-port default;
-- Tailscale provides network reachability but not sufficient deployment-owner authorization by itself;
-- privileged operations require an explicit owner authorization boundary selected by ADR;
-- no secrets in Git;
-- no personal deployment values in example files;
-- no shell command injection through paths/settings;
-- no direct user-supplied path concatenation;
-- strict upload size/type limits;
-- pairing rate limits;
-- session credential rotation/revocation;
-- safe Docker permissions;
-- least privilege.
-
-## 17. App Review mode
-
-Demo Mode shall:
-- be visible/documented;
-- not require a private Tailnet;
-- let reviewer explore onboarding and main UI;
-- show capability checks;
-- exercise camera permission flow where possible;
-- use clearly labelled synthetic/server-demo data for server-only functionality.
-
-Demo Mode must not pretend synthetic data is real evidence.
-
-## 18. Testing architecture
-
-### 18.1 Mockable interfaces
-iOS shall abstract:
-- CameraSource
-- AudioSource
-- MotionSource
-- ThermalSource
-- ServerTransport
-- LocalEvidenceStore
-
-Server shall abstract:
-- Detector
-- MediaStore
-- Notifier
-- Clock where useful
-- StorageStats
-- CameraSession
-
-### 18.2 Fixture video
-Use synthetic or generated test assets only. Real-person or real-environment monitoring media must not be committed as repository fixtures, even with consent.
-
-Fixtures should cover:
-- empty scene;
-- person enters;
-- server occluded;
-- server displaced;
-- camera shifts;
-- low light;
-- abrupt disconnection.
-
-### 18.3 E2E
-Mock Camera Node:
-1. pair;
-2. send heartbeat;
-3. stream fixture;
-4. trigger detection;
-5. produce event;
-6. store recording;
-7. generate thumbnail;
-8. show web event;
-9. send Slack request to stub;
-10. enforce retention.
-
-## 19. Observability
-
-Local only by default.
-
-Structured logs:
-- JSON preferred on server;
-- redact secrets;
-- rotate logs.
-
-Metrics shown locally:
-- active camera;
-- stream FPS/bitrate;
-- dropped chunks;
-- queue depth;
-- detector latency;
-- disk use;
-- thermal state;
-- reconnect count.
-
-No metrics are sent to the developer.
-
-## 20. Versioning
-
-- Semantic Versioning where practical.
-- Protocol version independently declared.
-- GitHub Releases for server release notes.
-- App Store for iOS distribution.
-- Optional update-check may query public GitHub release metadata only; no telemetry payload.
-
-## 21. Open technical decisions
-
-The following require PoC/real-device data before final lock:
-
-1. Live transport implementation.
-2. Final recording codec/bitrate.
-3. Rear/front capture profile.
-4. Thermal thresholds and degradation curves.
-5. Server-movement algorithm and thresholds.
-6. Camera-tamper confidence model.
-7. Recommended storage allocation from observed recording sizes.
-8. Final person detector/model/weights after license and performance review.
-9. Deployment-owner authorization mechanism (local credential/session vs explicit Tailscale identity binding or another self-hosted equivalent).
-
-Each locked decision should receive an ADR.
+Require ADR/Issue before implementation where material:
+- exact low-latency media transport;
+- local HTTPS/certificate setup UX for Web Camera Node;
+- final codecs/bitrates;
+- final owner face-verification model/weights/license;
+- exact owner-verification threshold/calibration method;
+- cross-camera re-identification (not MVP);
+- strong independent/off-host evidence storage;
+- RTSP/IP/Raspberry Pi source support;
+- any future native mobile application.

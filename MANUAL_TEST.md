@@ -1,8 +1,8 @@
-# ServerSentinel Manual / Real-Device Test Plan
+# ServerSentinel Manual / Real-Hardware Test Plan
 
-This document contains tests that cannot be truthfully completed with software mocks alone.
+This document contains checks that cannot be truthfully completed using software mocks alone.
 
-Do not mark an item PASS without performing it on the stated hardware/environment.
+Do not mark an item PASS without performing it on the stated hardware/browser/environment. Do not commit or attach real monitoring footage, real-person images/video/audio, owner biometric templates, or private deployment values to GitHub.
 
 ## Test metadata template
 
@@ -10,329 +10,323 @@ Do not mark an item PASS without performing it on the stated hardware/environmen
 Date:
 ServerSentinel version:
 Git commit:
-iPhone model:
-iOS version:
 Ubuntu version:
 Server hardware:
+Camera source(s):
+Webcam model(s):
+Web Camera device/browser/OS:
 Network:
 Recording disk:
 Tester:
 ```
 
-## A. iPhone capability
+## A. Local UVC / USB camera
 
-- [ ] App launches on target iPhone.
-- [ ] Rear camera permission flow works.
-- [ ] Front camera permission flow works.
-- [ ] Microphone permission flow works.
-- [ ] Motion sensor permission/availability handled.
-- [ ] MultiCam support reported correctly.
-- [ ] Rear + front simultaneous capture works on iPhone 14.
-- [ ] Unsupported-capability fallback is understandable.
-- [ ] Torch capability is detected correctly.
-- [ ] Charging state shown correctly where available.
-- [ ] Thermal state shown correctly.
+For each tested webcam:
+- [ ] device is discovered;
+- [ ] stable identity information is shown where available;
+- [ ] owner can enable/disable source;
+- [ ] preview works;
+- [ ] negotiated resolution/FPS is reported;
+- [ ] reconnect works after unplug/replug;
+- [ ] offline/online events are generated;
+- [ ] reboot does not silently attach a different physical camera because `/dev/videoN` ordering changed;
+- [ ] container/service does not require unnecessary privileged mode.
 
-## B. Long-duration thermal test
+Multi-camera checks:
+- [ ] one UVC camera works;
+- [ ] two UVC cameras work simultaneously;
+- [ ] three/four active UVC or mixed sources are tested where hardware/USB topology permits;
+- [ ] insufficient USB/controller bandwidth becomes explicit degraded state rather than silent loss.
 
-Run at least:
+Record USB controller/topology when investigating bandwidth limits.
 
-- [ ] 1 hour
-- [ ] 8 hours
-- [ ] 24 hours
+## B. Web Camera Node
 
-Record:
-- ambient temperature;
-- case/no-case;
-- charger type;
-- rear resolution/FPS;
-- front resolution/FPS;
-- bitrate;
-- device thermal-state transitions;
-- app crashes;
-- dropped frames;
-- reconnects;
-- battery percentage trend while plugged in;
-- phone surface temperature if independently measurable.
+Test at minimum on the intended phone/browser. iPhone Safari is an important real deployment target but not the only valid client.
 
-Acceptance target:
-- monitoring remains operational;
-- thermal degradation is graceful;
-- no uncontrolled restart loop;
-- no silent capture stop.
+- [ ] Camera Node page loads over a valid secure context;
+- [ ] camera permission flow is understandable;
+- [ ] microphone remains OFF on first use;
+- [ ] microphone denial does not prevent video-only monitoring;
+- [ ] front/back camera selector works where browser exposes multiple cameras;
+- [ ] only the selected camera is required; simultaneous front/rear capture is not assumed;
+- [ ] monitoring state is visible;
+- [ ] connection state is visible;
+- [ ] Screen Wake Lock is requested/handled where supported;
+- [ ] unsupported Wake Lock fails gracefully;
+- [ ] browser reload reconnects appropriately;
+- [ ] network interruption reconnects appropriately;
+- [ ] permission revocation is reported;
+- [ ] media track end/mute is reported;
+- [ ] screen lock/background/browser suspension behavior is measured and documented;
+- [ ] the UI never claims uninterrupted background capture when it stopped;
+- [ ] no Apple Developer Program/App Store/native install is required.
 
-Final capture defaults MUST be based on these measurements.
+If available, repeat core checks on at least one non-iPhone browser/device.
 
-## C. Physical installation / field of view
+## C. Source registry / mixed topology
 
-Target installation:
-- dedicated iPhone mounted under desk near cable opening using MagSafe-style mount;
-- floor-mounted server;
-- camera positioned approximately toward the server's left-rear side relative to a seated user, adjusted to actual room geometry.
+Validate configurations:
+- [ ] 1 active source;
+- [ ] 2 active sources;
+- [ ] 3 active sources;
+- [ ] 4 active sources;
+- [ ] fifth activation is rejected cleanly under default limit;
+- [ ] mixture of UVC + Web Camera sources works;
+- [ ] source rename works;
+- [ ] role label change works;
+- [ ] detection profiles are independent of source type;
+- [ ] removing one source does not corrupt recordings/events for the others.
 
-Validate:
-- [ ] server is visible with surrounding floor/context;
-- [ ] rear camera sees enough server geometry for movement detection;
-- [ ] person interacting with server is captured as well as desk geometry permits;
-- [ ] desk underside does not make monitoring useless;
-- [ ] front camera sees likely approach/tamper area;
-- [ ] mount does not obstruct camera lenses;
-- [ ] phone can be charged continuously;
-- [ ] phone cannot be trivially bumped by normal chair/leg movement.
+## D. Physical installation / field of view
 
-Document actual angle and screenshots.
+Server-monitoring camera(s):
+- [ ] server body/ROI visible;
+- [ ] sufficient background/context exists for camera-global-transform detection;
+- [ ] rear/cable view is usable if configured;
+- [ ] normal movement around the area does not constantly occlude the target;
+- [ ] mounts are stable.
 
-## D. Server ROI calibration
+Entrance camera if used:
+- [ ] entrance line/zone visible;
+- [ ] incoming/outgoing direction can be distinguished;
+- [ ] normal doorway occlusion is manageable;
+- [ ] owner face is sometimes visible at sufficient size/angle when entering/exiting;
+- [ ] camera placement complies with local/institutional rules.
 
-- [ ] Setup UI allows ROI placement.
-- [ ] Reference frame saved.
-- [ ] Recalibration works.
-- [ ] Small lighting changes do not trigger movement.
-- [ ] Person standing in front of server does not immediately trigger server movement.
-- [ ] Partial occlusion clears without false critical alert.
-- [ ] Server moved several centimeters triggers event.
-- [ ] Server rotation triggers event.
-- [ ] Server returned to original location produces sensible state.
+Document geometry privately; do not upload real room imagery to GitHub.
 
-Threshold values must be recorded.
+## E. Server ROI calibration and movement
 
-## E. Camera tamper
+Per configured server source:
+- [ ] ROI/polygon placement works;
+- [ ] reference frame saved;
+- [ ] recalibration works;
+- [ ] small lighting changes do not trigger movement;
+- [ ] person standing in front of server does not immediately trigger server movement;
+- [ ] partial occlusion clears without false critical event;
+- [ ] server moved several centimeters triggers event;
+- [ ] server rotation triggers event;
+- [ ] camera itself moved is distinguished from server-only movement where practical;
+- [ ] event can link evidence from additional active sources.
 
-Test:
-- [ ] gently touch mount;
-- [ ] rotate phone;
-- [ ] remove from MagSafe;
-- [ ] cover rear lens;
-- [ ] cover front lens;
-- [ ] unplug charging cable;
-- [ ] move entire stand;
-- [ ] attempt to reach side/power button with minimal phone movement.
+Record thresholds/quality metrics without publishing real media.
+
+## F. Camera tamper and source health
+
+For local webcam(s):
+- [ ] gently move mount;
+- [ ] rotate/reposition camera;
+- [ ] cover lens;
+- [ ] disconnect USB;
+- [ ] reconnect USB;
+- [ ] confirm scene shift/occlusion/disconnect signals are represented correctly.
+
+For Web Camera Node:
+- [ ] cover lens;
+- [ ] move device/stand enough to change scene;
+- [ ] close/reload camera page;
+- [ ] disable Wi-Fi briefly;
+- [ ] revoke camera permission;
+- [ ] lock/suspend browser where OS allows testing.
 
 Expected:
-- meaningful tamper actions generate an event;
-- trivial vibration does not flood alerts;
-- critical local evidence is preserved where possible.
-
-Physical power-button guard remains a separate hardware consideration.
-
-## F. Local emergency evidence
-
-Basic behavior:
-- [ ] Critical event creates local clip.
-- [ ] Local data survives Ubuntu network disconnect.
-- [ ] Data syncs after Ubuntu returns.
-- [ ] Duplicate sync is idempotent.
-- [ ] 500 MB configured local-store limit/ring behavior works.
-- [ ] Old synchronized/unprotected local data is evicted first.
-- [ ] Critical unsynchronized data is not silently evicted.
-
-### F-1. Unsynchronized local-store hard stop
-
-Precondition:
-- use a dedicated test device/test build;
-- disable or block Ubuntu synchronization long enough to accumulate unsynchronized critical clips;
-- do not delete unrelated personal data to create the condition.
-
-Procedure and acceptance:
-1. [ ] Repeatedly generate critical test events until only unsynchronized critical clips remain and the next local clip would exceed the configured ServerSentinel local-store bound.
-2. [ ] Verify existing unsynchronized critical clips are still present and their metadata/checksums remain unchanged.
-3. [ ] Trigger one additional critical event.
-4. [ ] Verify Camera Node enters `LOCAL_EVIDENCE_HARD_STOP` instead of overwriting an existing unsynchronized clip.
-5. [ ] Verify the new iPhone-local clip is explicitly rejected and no UI/API claims that a clip exists.
-6. [ ] Verify a persistent warning is visible and an audit/event entry records the rejection reason.
-7. [ ] Verify critical detection remains active while the local store is hard-stopped.
-8. [ ] Where a direct server path is available, verify direct server upload can continue even while local admission is rejected.
-9. [ ] Restore synchronization/free local-store headroom and verify queued clips synchronize without duplication.
-10. [ ] Verify `LOCAL_EVIDENCE_HARD_STOP` clears automatically only after the recovery threshold is satisfied and does not flap around the threshold.
-
-### F-2. Device-wide free-space safety reserve
-
-This test verifies the case where ServerSentinel itself is well below its configured 500 MB local bound but the iPhone filesystem is nearly full because of unrelated data.
-
-Use a non-destructive test-only storage-pressure harness or disposable filler data on the dedicated test device. Never intentionally drive iOS to 0 bytes free and never erase unrelated user data.
-
-Procedure and acceptance:
-1. [ ] Start with ServerSentinel local emergency usage well below 500 MB and record the OS-reported available capacity.
-2. [ ] Reduce device-wide free space until a projected emergency write would violate the configured device safety reserve.
-3. [ ] Trigger a critical event and verify the app does not attempt a write expected to exhaust the filesystem.
-4. [ ] Verify `LOCAL_EVIDENCE_HARD_STOP`/degraded state is entered even though ServerSentinel's own local-store bound is not full.
-5. [ ] Verify warning/audit metadata distinguishes unsafe device free space from exhaustion of the ServerSentinel local-store bound.
-6. [ ] Verify existing unsynchronized clips are not deleted to compensate for unrelated device storage pressure.
-7. [ ] Free device-wide space above the recovery threshold and verify local evidence admission automatically resumes with hysteresis.
-8. [ ] Repeat around the threshold to confirm state does not rapidly flap.
-
-Record for both F-1/F-2:
-- configured local-store limit;
-- actual ServerSentinel local usage;
-- OS-reported available capacity;
-- device safety reserve/recovery threshold;
-- event timestamps;
-- state transitions;
-- rejected-admission reason;
-- whether direct server upload was available/successful.
+- meaningful tamper/health changes are visible/audited;
+- trivial scene vibration does not flood critical alerts;
+- browser/UVC limitations are not hidden.
 
 ## G. Network interruption
 
-Scenarios:
-- [ ] Wi-Fi off 10 seconds;
-- [ ] Wi-Fi off 2 minutes;
+Remote Web Camera Node scenarios:
+- [ ] network off 10 seconds;
+- [ ] network off 2 minutes;
 - [ ] AP restart;
-- [ ] Ubuntu service restart;
-- [ ] Ubuntu full reboot;
-- [ ] Tailscale remote path interruption.
+- [ ] server service restart;
+- [ ] Ubuntu reboot;
+- [ ] Tailscale/private remote-path interruption where applicable.
 
 Check:
-- UI state;
-- local buffering;
+- state transition;
 - reconnect time;
+- recording gaps;
 - duplicated chunks;
 - missing media;
 - audit event;
-- manual-intervention state if recovery fails.
+- manual-intervention state if automatic recovery fails.
 
-## H. Live view
+## H. Live multi-camera view
 
-From local network:
-- [ ] 720p-class target view usable.
-- [ ] 15–30 fps target behavior measured.
-- [ ] audio when enabled.
-- [ ] rear/front selection where supported.
+Local network:
+- [ ] 1 source usable;
+- [ ] 2-source layout usable;
+- [ ] 3–4 source layout usable;
+- [ ] per-source health/quality visible;
+- [ ] selected camera can be expanded;
+- [ ] audio plays only when explicitly enabled.
 
-From outside network over Tailscale:
-- [ ] mobile data connection works;
+Remote/private-network path:
 - [ ] live start time measured;
 - [ ] latency measured;
 - [ ] reconnect works;
-- [ ] adaptive degradation works.
+- [ ] adaptive quality degradation works;
+- [ ] one degraded source does not hide healthy-source state.
 
-## I. Manual recording
+## I. Manual and event recording
 
-- [ ] Start remotely.
-- [ ] Stop remotely.
-- [ ] Audio follows configured state.
-- [ ] Recording appears in event/history UI.
-- [ ] 20-minute maximum enforced.
-- [ ] Forgetting to stop does not record indefinitely.
-- [ ] Ring-buffer pre-roll is included if designed for manual start.
+- [ ] start selected-source manual recording;
+- [ ] stop manually;
+- [ ] 20-minute maximum enforced;
+- [ ] forgetting to stop does not record indefinitely;
+- [ ] event recording includes configured pre-roll/post-roll;
+- [ ] one event can contain multiple source recordings;
+- [ ] recording manifest uses source IDs, not fixed front/rear names;
+- [ ] audio follows per-source setting;
+- [ ] playback/source labels are correct.
 
-## J. Low light / torch
+## J. Low light / image-quality gating
 
-- [ ] Low-light detection works reasonably.
-- [ ] Motion in low light triggers torch in Auto mode.
-- [ ] Torch turns off 30 seconds after last qualifying motion.
-- [ ] New motion resets timer.
-- [ ] Manual On works.
-- [ ] Manual Off works.
-- [ ] Unsupported torch fails gracefully.
-- [ ] Torch behavior does not crash MultiCam session.
+Test entrance and server sources under progressively darker conditions.
+
+- [ ] quality state transitions `sufficient -> degraded -> insufficient` appropriately;
+- [ ] live/recording remains available when the camera still produces frames;
+- [ ] owner verification becomes `unknown/unavailable` before quality is too poor for reliable identity judgement;
+- [ ] person detection degradation is visible where applicable;
+- [ ] recovery after lighting returns is automatic/hysteretic;
+- [ ] **no phone torch/flash/screen-light auto-activation occurs**;
+- [ ] motion does not trigger visible illumination.
+
+Document whether the deployment requires a low-light/IR-capable camera rather than forcing phone illumination.
 
 ## K. Audio
 
 Audio default must be OFF.
 
-- [ ] First-run default is OFF.
-- [ ] Explicit enable is required.
-- [ ] UI clearly shows enabled state.
-- [ ] Live audio works.
-- [ ] Recorded audio works.
-- [ ] Disabling takes effect promptly.
-- [ ] Permission denial handled cleanly.
+- [ ] first-use default OFF;
+- [ ] explicit enable required;
+- [ ] enabled state visible;
+- [ ] live audio works where supported;
+- [ ] recorded audio works where supported;
+- [ ] disabling takes effect promptly;
+- [ ] permission denial handled cleanly;
+- [ ] enabling audio on one source does not implicitly enable others.
 
-## L. Presence
+## L. Owner-only face verification
 
-- [ ] One-tap presence works on mobile dashboard.
-- [ ] Quick-duration selection works.
-- [ ] "Until time" works.
-- [ ] Presence expiry automatically restores monitoring.
-- [ ] Presence pauses ordinary person/general-motion automatic security recordings/events.
-- [ ] Confirmed server movement remains armed during presence, preserves evidence, and can still send its critical alert.
-- [ ] Confirmed camera tamper remains armed during presence, preserves evidence, and can still send its critical alert.
-- [ ] Live view still works.
-- [ ] Manual recording still works.
-- [ ] Weekly schedule works.
-- [ ] Manual override wins over schedule until expiry.
+Use only the deployment owner's own enrollment during manual testing. Do not upload enrollment/reference images or resulting real-person clips to GitHub.
 
-Optional Shortcuts:
-- [ ] check-in endpoint works;
-- [ ] check-out endpoint works;
-- [ ] Tailscale/local conditions documented.
+Enrollment:
+- [ ] explicit biometric explanation shown;
+- [ ] owner can enroll;
+- [ ] poor enrollment image rejected/asks for retry;
+- [ ] owner template remains local;
+- [ ] delete/re-enroll works;
+- [ ] raw template does not appear in logs/normal diagnostics.
 
-## M. Slack
+Verification conditions:
+- [ ] normal frontal view;
+- [ ] side angle;
+- [ ] different distance;
+- [ ] glasses/appearance variation where relevant;
+- [ ] mask/partial occlusion;
+- [ ] low light;
+- [ ] deliberately poor/blurred frame;
+- [ ] another consenting test person or synthetic display test is not incorrectly asserted as owner within the documented test setup.
 
-- [ ] Slack setup validates credentials/webhook safely.
-- [ ] Server movement immediate message.
-- [ ] Camera tamper immediate message.
-- [ ] Ordinary person/motion does not spam channel.
-- [ ] Daily summary at default 23:00.
-- [ ] Daily time configurable.
-- [ ] Thread replies include thumbnails.
-- [ ] Slack outage does not stop recording.
-- [ ] No secret appears in log.
+Expected:
+- [ ] result includes confidence/quality;
+- [ ] ambiguous/poor-quality result becomes `unknown`;
+- [ ] UI never describes verification as certainty;
+- [ ] no named enrollment feature exists for other people.
 
-## N. Storage / retention
+## M. Entrance crossing and anonymous tracking
 
-Using test allocation:
-- [ ] 20-day retention logic.
-- [ ] configured capacity ceiling.
-- [ ] oldest unstarred removed first.
-- [ ] starred item survives.
-- [ ] star/unstar works.
-- [ ] UI warns when starred data threatens capacity.
-- [ ] manual delete works.
-- [ ] no path traversal.
-- [ ] disk-full safety behavior prevents uncontrolled corruption.
+Test with owner and consenting participants without retaining/sharing test media externally.
 
-## O. Audit logs
+- [ ] owner enters alone;
+- [ ] owner exits alone;
+- [ ] anonymous person enters/exits;
+- [ ] two people enter close together;
+- [ ] owner + another person enter together;
+- [ ] one person partially occludes another;
+- [ ] person reverses direction at doorway;
+- [ ] loitering near line does not generate repeated entry/exit spam;
+- [ ] same-camera anonymous track behavior is understandable;
+- [ ] unknown people are not assigned real names;
+- [ ] no cross-camera biometric re-identification is claimed.
 
-- [ ] settings changes recorded;
-- [ ] monitoring state changes recorded;
-- [ ] pairing/revocation recorded;
-- [ ] critical events recorded;
-- [ ] logs not individually deletable via normal UI;
-- [ ] 90-day expiry logic testable with accelerated clock/test environment;
-- [ ] secrets are redacted.
+## N. Presence inference
 
-## P. Screen/brightness behavior
+- [ ] high-confidence owner entry can reach `PRESENT`;
+- [ ] high-confidence owner exit can reach `ABSENT` when context supports it;
+- [ ] ambiguous observation becomes `PROBABLY_PRESENT`/`UNKNOWN` rather than forced state;
+- [ ] low-light owner verification does not force state;
+- [ ] manual override wins over inference;
+- [ ] schedule does not override active manual override;
+- [ ] returning to automatic inference works;
+- [ ] only `PRESENT` suppresses ordinary person/general-motion automation by default;
+- [ ] `PROBABLY_PRESENT` and `UNKNOWN` do not silently disarm ordinary security automation;
+- [ ] server movement remains armed during presence;
+- [ ] camera tamper remains armed during presence;
+- [ ] live/manual recording remain available.
 
-- [ ] Monitoring screen is near-black but status remains visible.
-- [ ] Tap reveals controls.
-- [ ] temporary brighter interaction state works.
-- [ ] app returns to dim state.
-- [ ] original brightness restoration behaves acceptably.
-- [ ] auto-lock prevention works while monitoring.
-- [ ] leaving/stopping app does not leave device in surprising brightness state.
+## O. Unified security timeline
 
-## Q. App Store review readiness
+Create a controlled synthetic/manual scenario such as:
 
-On a clean device/account:
-- [ ] onboarding understandable;
-- [ ] all permission rationales clear;
-- [ ] privacy policy accessible;
-- [ ] monitoring state visible;
-- [ ] audio default OFF;
-- [ ] Demo Mode works without Ubuntu;
-- [ ] Demo Mode clearly labels synthetic/demo data;
-- [ ] no reviewer-only hidden behavior;
-- [ ] no developer private hostname/IP appears.
+```text
+Owner exits
+Anonymous person enters
+Server movement occurs
+One camera disconnects
+Anonymous person exits
+```
 
-## R. 24-hour acceptance run
+Check:
+- [ ] timestamps are ordered correctly;
+- [ ] source attribution correct;
+- [ ] linked recordings/thumbnails correct;
+- [ ] relevant-window view shows useful context;
+- [ ] confidence/quality is shown where applicable;
+- [ ] the system does not label the person as culprit/thief/attacker;
+- [ ] missing/offline-source gaps are visible rather than inferred away.
 
-Final real-device acceptance:
+## P. Storage pressure / hard stop
 
-1. Pair clean installation.
-2. Calibrate.
-3. Monitor for 24 hours.
-4. View remotely at least three times.
-5. Trigger person event.
-6. Trigger general motion.
-7. Trigger server movement.
-8. Trigger camera tamper.
-9. Disconnect network.
-10. Recover.
-11. Trigger manual recording.
-12. Verify Slack daily summary.
-13. Verify recordings/playback.
-14. Verify audit log.
-15. Verify storage accounting.
+Use a disposable/test recording volume or controlled fixture environment.
 
-Record all defects as GitHub Issues.
+- [ ] retention deletes expired unstarred data;
+- [ ] allocation pressure reclaims oldest eligible unstarred data;
+- [ ] unrelated filesystem consumption also triggers admission pressure;
+- [ ] starred data is not auto-deleted;
+- [ ] `STORAGE_PRESSURE` suppresses non-critical/manual admission as specified;
+- [ ] bounded critical allowance does not cross hard reserve;
+- [ ] `STORAGE_HARD_STOP` occurs before unsafe write;
+- [ ] warnings/audit events visible;
+- [ ] recovery uses hysteresis.
+
+Never intentionally fill the production filesystem to 0 bytes free.
+
+## Q. Long-duration / performance
+
+Run at least:
+- [ ] 1 hour;
+- [ ] 8 hours;
+- [ ] 24 hours.
+
+Record:
+- number/type of active sources;
+- per-source resolution/FPS/bitrate;
+- inference cadence per profile;
+- CPU/GPU utilization;
+- memory;
+- disk write rate;
+- USB controller topology/bandwidth where relevant;
+- network throughput;
+- browser/device temperature subjectively or with safe independent measurement if available;
+- disconnects/reconnects;
+- dropped frames;
+- service/browser crashes;
+- false source-health states.
+
+Include a four-active-source run where available. Final defaults must be based on measurements rather than assumptions.

@@ -3,13 +3,18 @@
 Use ADRs for decisions that materially affect:
 - protocol;
 - storage;
-- privacy;
+- privacy/biometrics;
 - security;
 - licensing;
+- Camera Source architecture;
 - media transport;
 - cross-component architecture.
 
-Template:
+## Current ADRs
+
+- `0001-project-foundations.md` — Accepted. Defines the current heterogeneous Camera Source + browser Camera Node foundation and replaces the earlier iOS-first bootstrap concept within this pre-1.0 specification work.
+
+## Template
 
 ```markdown
 # ADR-NNNN: Title

@@ -14,20 +14,45 @@ GitHub上でリポジトリ所有者が確認する以下の内容は、原則�
 
 コード、識別子、API名、ライブラリ名、コマンドなどは英語のままで構いません。
 
+## 現在の製品前提
+
+レビュー時に旧iOS-first仕様を前提にしないでください。
+
+MVPの基本構成は次です。
+
+- Ubuntu ServerSentinel backend
+- React Web UI
+- 1〜4個のCamera Source
+- `local_uvc` USB Webcam
+- `remote_web` browser-based Web Camera Node
+- iPhoneはWeb Camera Nodeとして利用可能だが、native iOS/App StoreアプリはMVP要件ではない
+- Camera Sourceの種類と役割/Detection Profileは分離
+- owner-only face verificationは任意
+- non-ownerのnamed face databaseは禁止
+- motion/low-lightによる自動torch/light点灯は行わない
+
 ## PRレビュー
 
 レビューでは少なくとも以下を確認してください。
 
-- 要件・仕様・受け入れ条件との整合性
+- 要件・仕様・受入条件との整合性
 - バグ、境界条件、エラー処理
 - セキュリティとSecret管理
-- プライバシー不変条件
+- プライバシー/biometric不変条件
 - データ破壊や容量枯渇時の安全性
 - 再接続、再試行、冪等性、競合状態
+- 1〜4 Camera Source構成で固定2台前提が混入していないか
+- UVCの`/dev/videoN`だけをstable identityとしていないか
+- Web Camera Nodeのsecure context / permission / browser lifecycle
+- browser background captureやlocal storageを過剰保証していないか
+- audioがsourceごとにdefault OFFか
+- automatic torch/lightが再導入されていないか
+- low-light時にowner match/non-matchを強制していないか
+- owner-only verificationがnon-owner identity DBへ拡張されていないか
+- timelineが人物をculprit/attackerと断定していないか
 - テスト不足と実機確認の切り分け
-- 依存関係、AIモデル、weights のライセンス
-- iOS / Ubuntu / Web 間の契約不整合
-- App Store審査上の問題
+- 依存関係、AIモデル、weightsのライセンス
+- Ubuntu / Web / Camera Source間の契約不整合
 - 不要な複雑化や保守性低下
 
 指摘は `重大`、`重要`、`提案` に分類してください。
@@ -38,4 +63,4 @@ GitHub上でリポジトリ所有者が確認する以下の内容は、原則�
 
 ## マージ
 
-Claude単独のレビューでマージ可否を決めないでください。ServerSentinelでは Codex と Claude の両方のレビュー完了、必須CI成功、ブロッキング指摘解消がマージ条件です。
+Claude単独のレビューでマージ可否を決めないでください。ServerSentinelでは Codex と Claude の両方のcurrent-HEADレビュー完了、必須CI成功、ブロッキング指摘解消がマージ条件です。

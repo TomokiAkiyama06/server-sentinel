@@ -1,6 +1,6 @@
 # Intended Setup Experience
 
-This describes the target user experience, not necessarily the first implementation state.
+This describes the target user experience. Exact commands/transport choices may change during implementation ADRs.
 
 ## Ubuntu setup
 
@@ -20,131 +20,256 @@ docker compose up -d
 
 Then open the local setup page.
 
-## Server wizard
+## First-run server wizard
 
-Step 1 — Welcome  
-Explain self-hosted/no-cloud architecture.
+### Step 1 — Welcome
 
-Step 2 — Deployment owner authorization  
-- establish the deployment-owner authorization boundary before privileged remote access is enabled;
-- bootstrap through a trusted local setup context;
-- use either a locally managed owner credential/session or an explicitly configured binding to one verified Tailscale identity/ACL, according to the accepted ADR;
-- configure owner credential/binding recovery and revocation;
-- do not treat Tailnet membership alone as owner authorization;
-- until this step is complete, privileged dashboard/API operations remain unavailable remotely.
+Explain:
+- self-hosted/no-developer-cloud architecture;
+- camera/recording privacy responsibility;
+- MVP supports local USB cameras and browser-based Web Camera Nodes;
+- no native iOS/App Store application is required.
 
-Step 3 — Storage  
-- choose recording path;
-- test write permission;
-- display free space;
-- retention default 20 days;
-- capacity allocation recommendation after benchmark logic exists.
+### Step 2 — Deployment-owner authorization
 
-Step 4 — Locale/time  
+Before privileged remote access:
+- bootstrap owner authorization from a trusted local context;
+- choose the mechanism accepted by ADR;
+- configure recovery/revocation;
+- do not treat Tailnet membership alone as owner authorization.
+
+Until complete, remote privileged dashboard/API operations remain unavailable.
+
+### Step 3 — Storage
+
+- choose recording root;
+- verify write permission;
+- display filesystem free space;
+- default retention 20 days;
+- configure recording allocation;
+- explain hard filesystem safety reserve.
+
+### Step 4 — Locale/time
+
 - timezone;
 - daily summary default 23:00.
 
-Step 5 — Slack (optional)  
-- skip allowed;
-- test safely.
+### Step 5 — Add Camera Sources
 
-Step 6 — Remote access guidance  
-- Tailscale recommended for network reachability;
-- no port-forwarding default;
-- remote privileged operations still require the deployment-owner authorization established in Step 2.
+The product must allow completion with **one** camera source and up to **four active** sources.
 
-Step 7 — Add Camera Node  
-- QR;
-- local discovery;
-- manual fallback;
-- pairing approval requires the deployment-owner authorization boundary.
+Camera list starts empty; no fixed `front/rear` slots.
 
-## iOS onboarding
-
-1. Welcome/privacy explanation.
-2. Camera permission.
-3. Microphone explanation; default remains OFF.
-4. Local network access.
-5. Motion-sensor capability.
-6. Find/pair server.
-7. Capability diagnostic.
-8. Camera preview.
-9. Server ROI setup.
-10. Tamper/orientation calibration.
-11. Monitoring screen.
-
-## Pairing UX
-
-Preferred:
+Options:
 
 ```text
-Ubuntu Dashboard
-  Add Camera
-      |
-      +-- QR code (5 min)
-      |
-iPhone scans
-      |
-Ubuntu shows:
-  "New Camera Node: iPhone"
-  [Approve]
-      |
-paired
+[ Add local USB camera ]
+[ Add Web Camera Node ]
 ```
 
-mDNS discovery can reduce typing but must not silently pair without confirmation.
+### Step 6 — Detection profiles
+
+For each source:
+- name;
+- optional role label;
+- preview;
+- desired quality;
+- audio state (default OFF);
+- detection profiles;
+- ROI/entrance line calibration as relevant.
+
+### Step 7 — Owner verification (optional)
+
+If desired:
+- explain biometric processing;
+- enroll the deployment owner only;
+- validate image quality;
+- store template locally;
+- provide delete/re-enroll controls.
+
+Skipping owner verification must not prevent basic monitoring.
+
+### Step 8 — Slack (optional)
+
+- disabled by default;
+- skip allowed;
+- safe test message.
+
+### Step 9 — Remote access guidance
+
+- Tailscale/private networking recommended;
+- no public port-forwarding default;
+- remote privileged actions still require Step 2 authorization.
+
+## Add local USB camera
+
+Flow:
+
+```text
+Camera Sources
+  -> Add local USB camera
+  -> discovered devices
+  -> choose physical device
+  -> preview
+  -> name + role
+  -> capture profile
+  -> detection profiles
+  -> Save
+```
+
+Show stable hardware identity information where available, not only `/dev/video0`.
+
+If the device disappears/reappears, ServerSentinel must not silently substitute a different physical camera merely because numeric device ordering changed.
+
+## Add Web Camera Node
+
+### Owner/dashboard side
+
+```text
+Camera Sources
+  -> Add Web Camera Node
+  -> one-time QR / short code (~5 min)
+```
+
+### Camera-device side
+
+Open the ServerSentinel Camera Node page in a supported secure browser context.
+
+Target UX:
+
+```text
+ServerSentinel Camera Node
+
+Camera: [Back Camera v]
+Microphone: OFF
+Quality: Auto / 720p ...
+
+[Pair / Connect]
+```
+
+After pairing:
+
+```text
+● Monitoring
+● Server connected
+Camera: ON
+Mic: OFF
+Quality: 720p / 15 fps
+Image quality: Good
+
+[Stop]
+```
+
+The page must clearly show monitoring/connection state.
+
+PWA/home-screen installation can be offered where supported, but ordinary browser use remains supported.
+
+## Web Camera Node operational guidance
+
+Because the MVP is browser-based:
+- keep the camera page active/foreground;
+- request Screen Wake Lock where supported;
+- explain that screen lock/browser suspension/OS termination can stop capture;
+- if capture stops, the server marks the source offline/degraded;
+- reconnect automatically where browser/session state permits;
+- otherwise show `手動操作が必要です`.
+
+No Apple Developer Program/App Store setup is required.
+
+## Secure context / HTTPS
+
+`getUserMedia()` normally requires a secure context. Setup must provide/document a legitimate secure-origin method (for example an accepted local TLS/private-network approach selected by ADR).
+
+Do not make `ignore the certificate warning` or disabling browser security the normal onboarding path.
+
+## Detection-profile setup examples
+
+### Server camera
+
+```text
+✓ Person detection
+✓ Motion
+✓ Server ROI movement
+✓ Camera tamper
+✓ Image quality
+```
+
+### Entrance camera
+
+```text
+✓ Person detection
+✓ Entrance crossing
+✓ Owner verification (optional)
+✓ Camera tamper
+✓ Image quality
+```
+
+A webcam or Web Camera Node can use either profile. Role is not tied to hardware type.
+
+## Entrance calibration
+
+If entrance crossing is enabled:
+1. preview camera;
+2. draw entrance line/zone;
+3. mark `inside` and `outside` direction;
+4. test entry/exit;
+5. tune debounce/threshold if needed.
+
+If owner verification is enabled, test owner entry/exit after enrollment.
+
+## Low-light setup
+
+Do **not** configure motion-triggered torch/light.
+
+Show a quality diagnostic such as:
+- Good;
+- Degraded;
+- Insufficient for owner verification.
+
+If the environment is too dark, recommend changing camera placement/ambient lighting or using a camera intended for low-light/IR operation rather than automatically illuminating the area with the phone.
 
 ## Presence UX
 
-Dashboard top-level button:
+Top-level display:
+
+```text
+Presence: PRESENT / PROBABLY_PRESENT / ABSENT / UNKNOWN
+Source: Entrance camera / Manual / Schedule
+```
+
+Manual action remains available:
 
 ```text
 [ 在室にする ]
+[ 不在にする ]
+[ 自動判定へ戻す ]
 ```
 
-After tap:
+Manual override has priority until cancelled/expired.
+
+Critical server-movement/camera-tamper monitoring remains active in all presence modes.
+
+## Live dashboard
+
+Adapt to 1–4 active sources:
 
 ```text
-1 hour
-2 hours
-3 hours
-Until 18:00
-Choose time...
+1 source -> one large tile
+2 sources -> two responsive tiles
+3–4 sources -> responsive grid
 ```
 
-When active:
-
-```text
-在室中 — 18:00に監視再開
-[今すぐ監視再開]
-```
-
-## Camera screen
-
-Armed:
-
-```text
-ServerSentinel
-
-● 監視中
-● Server Connected
-Rear: ON
-Front: ON
-Mic: OFF
-
-(tap for controls)
-```
-
-Use a near-black presentation.
+Each tile shows source name, type, health, negotiated quality, audio state, and degraded/low-light status.
 
 ## Failure UX
 
-Prefer explicit states:
-
-- `再接続中`
-- `サーバーに接続できません`
-- `手動操作が必要です`
-- `端末温度のため画質を下げています`
+Prefer explicit Japanese states:
+- `カメラが切断されました`
+- `Web Camera Nodeを再接続中`
+- `ブラウザ側で手動操作が必要です`
+- `映像が暗いため人物/Owner判定を停止しています`
+- `処理負荷のため解析頻度を下げています`
 - `ストレージ残量が少なくなっています`
+- `新しい録画を保存できません`
 
 Avoid silent degradation.

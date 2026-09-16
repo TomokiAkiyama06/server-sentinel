@@ -11,7 +11,7 @@ Read:
 3. `AGENTS.md`
 4. `SECURITY.md`
 5. `PRIVACY.md`
-6. `CLAUDE.md` if present
+6. `CLAUDE.md`
 7. `docs/THIRD_PARTY_POLICY.md`
 8. `docs/CLAUDE_REVIEW_SETUP.md`
 
@@ -24,49 +24,70 @@ Read:
 - Open a PR.
 - Wait for CI and both Codex + Claude review of the current PR HEAD.
 - Resolve blocking review findings before merge.
-- If the PR HEAD changes materially after review, request both reviews again.
+- If PR HEAD changes materially after review, request both reviews again.
 
 Until Issue #4 establishes hardened repository-level review enforcement, same-repository write access is reserved for trusted maintainers. External/untrusted contributors should submit from a fork.
+
+## Current architecture assumptions
+
+Do not reintroduce the superseded iOS-first design without an explicit owner/ADR decision.
+
+MVP assumptions:
+- 1–4 active Camera Sources;
+- source types `local_uvc` and `remote_web`;
+- no fixed front/rear camera pair;
+- Web Camera Node runs in a browser and requires a secure context;
+- no native App Store client required;
+- audio default OFF per source;
+- no automatic motion/low-light torch/light activation;
+- optional owner-only face verification;
+- no named non-owner face database;
+- no cross-camera biometric re-identification or culprit inference in MVP.
 
 ## Privacy
 
 Never attach or commit:
 - real monitoring footage;
-- any real-person image, video, or audio fixture, even when the subject has consented;
+- any real-person image/video/audio fixture, even with consent;
 - any real-environment monitoring media fixture;
+- owner face template/embedding;
 - private server IPs/hostnames;
-- private Tailnet names;
+- private Tailnet/SSID names;
 - Slack webhook URLs;
-- credentials or tokens;
+- credentials/tokens;
 - private deployment configuration.
 
-Repository test fixtures must be synthetic or generated. Real-device/manual tests that necessarily involve real people or real environments must keep those media artifacts local and must not attach or commit them to the repository.
+Repository fixtures must be synthetic/generated. Real-device/manual tests involving real people/environments keep media artifacts local and do not attach/commit them.
 
-Automated Claude PR review sends the fixed PR diff and repository context needed for review to Anthropic's Claude service. This is a development-process integration, not ServerSentinel product telemetry. Do not include user monitoring data or secrets in PR content.
+Automated Claude review sends the fixed PR diff and repository context needed for review to Anthropic's Claude service. This is development tooling, not product telemetry. Do not include user monitoring data or secrets in PR content.
 
-## New dependencies
+## New dependencies / AI models
 
 Include in the PR:
-- package/project URL;
-- exact license;
+- package/model project URL;
+- exact source-code license;
+- exact model/weight license where separate;
 - reason;
 - alternatives considered;
-- whether model weights have a separate license.
+- security/privacy implications.
 
 ## Architecture changes
 
-Add an ADR for changes that affect:
+Add/update an ADR for material changes affecting:
+- Camera Source model/source types;
 - media transport;
 - authentication/pairing;
 - persistent storage;
+- biometric/identity behavior;
 - privacy model;
 - license strategy;
 - remote-access model;
 - cross-component protocol.
 
-## Hardware changes
+## Hardware/browser changes
 
-If verification requires hardware you do not have:
+If verification requires hardware/browser conditions you do not have:
 - finish mockable work;
-- add to `MANUAL_TEST.md`;
-- open a hardware/manual-test Issue.
+- add exact checks to `MANUAL_TEST.md`;
+- open/use a hardware/manual-test Issue;
+- never claim the unperformed real-device check passed.

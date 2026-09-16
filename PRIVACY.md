@@ -1,106 +1,138 @@
 # ServerSentinel Privacy Model
 
-> Draft project privacy document. A final App Store privacy policy should be reviewed before publication and hosted at a stable public URL.
+ServerSentinel is designed so that the project developer does not operate infrastructure that receives normal monitoring data.
 
 ## Summary
 
-ServerSentinel is designed so that the project developer does not operate a backend that receives users' monitoring data.
-
-Normal data path:
+Normal data paths:
 
 ```text
-User's iPhone -> User's Ubuntu Server -> User's storage
+Local USB camera -> User's Ubuntu ServerSentinel host -> User-selected storage
+
+User-owned browser camera -> User's Ubuntu ServerSentinel host -> User-selected storage
 ```
 
-Optional:
+Optional third-party paths:
 
 ```text
-User's Ubuntu Server -> User's Slack workspace
-User's remote device -> Tailscale -> User's Ubuntu Server
+User's Ubuntu host -> User's Slack workspace
+User's remote browser -> Tailscale/private network -> User's Ubuntu host
 ```
+
+There is no required ServerSentinel developer cloud/account/data plane.
 
 ## Developer data collection
 
-The intended official build does not include:
+The intended official deployment does not include:
 - advertising SDKs;
-- analytics SDKs;
-- telemetry;
+- analytics/telemetry;
 - developer-operated crash upload;
 - developer-operated account service;
-- developer-operated video/audio storage.
+- developer-operated media/biometric storage;
+- developer relay for Slack.
 
-The project developer should not receive, in normal operation:
-- video;
-- audio;
-- motion events;
+The project developer should not receive during normal operation:
+- video or audio;
+- face templates/embeddings;
+- person/presence events;
 - server addresses;
 - Tailscale information;
 - Slack credentials;
-- recordings;
-- audit logs.
+- recordings/thumbnails;
+- audit logs;
+- deployment configuration.
 
 ## Camera and microphone
 
-Camera access is required for monitoring.
+Local UVC cameras are enabled explicitly by the deployment owner.
 
-Microphone access is optional and OFF by default.
+Remote Web Camera Nodes use normal browser camera/microphone permission flows. Camera monitoring state must remain visible in the Camera Node UI.
 
-The app must clearly indicate monitoring/recording state and must request permissions using understandable explanations.
+Microphone capture is optional and **OFF by default**. Audio must not be enabled merely because a camera is enabled.
 
-## Local storage
+## Owner-only face verification
 
-The iPhone may temporarily store critical evidence for server-movement/camera-tamper events.
+ServerSentinel may optionally verify whether a detected face matches the explicitly enrolled deployment owner.
+
+This is biometric processing. Therefore:
+- enrollment requires explicit owner action;
+- the owner template/embedding stays inside the deployment by default;
+- the template is not sent to the ServerSentinel developer;
+- owner enrollment can be deleted/replaced;
+- template data is excluded from normal diagnostics/export unless specifically and explicitly requested;
+- logs/audit records may state that enrollment/verification occurred but must not contain the raw template.
+
+Face verification is probabilistic. Low-quality/low-light observations may be reported as `unknown` rather than match/non-match.
+
+## Other observed people
+
+The MVP does **not** maintain a named facial identity database for non-owner people.
+
+Other people may be represented by anonymous, non-name identifiers such as `Person #A` / ephemeral track UUIDs for limited event correlation. The system must not present an anonymous observation as a real-world identity.
+
+Cross-camera biometric re-identification of anonymous people is outside MVP scope and requires a separate privacy/architecture decision.
+
+The system must not label a person as a thief, attacker, or culprit merely because they appeared near a critical event. The dashboard presents observations and timing for human review.
+
+## Recordings and retention
 
 Ubuntu stores:
 - recordings;
 - thumbnails;
-- metadata;
+- event/timeline metadata;
 - audit logs;
-- configuration.
-
-Retention is controlled by the deployment owner.
+- configuration;
+- optional owner biometric template.
 
 Defaults:
 - recordings: 20 days;
 - audit logs: 90 days.
 
-Starred recordings can outlive the normal recording retention period.
+Starred recordings may outlive normal recording retention.
+
+Non-owner face crops/templates are not stored as a separate persistent identity library by default. People may still appear in ordinary configured video recordings.
+
+## Web Camera Node local storage
+
+Browser/PWA local storage is not treated as guaranteed durable evidence storage in the MVP. Browser implementations may use bounded best-effort buffering for reconnect behavior, but browser eviction/lifecycle rules prevent ServerSentinel from promising that evidence survives device/browser shutdown or loss of the Ubuntu recorder.
+
+## Low light and illumination
+
+ServerSentinel does not automatically turn on a phone torch/screen light in response to motion or low light in the MVP. If visual quality is insufficient, affected computer-vision results become degraded/unknown.
 
 ## Slack
 
-If the user enables Slack:
-- event information and thumbnails may be sent to the user's configured Slack workspace;
-- this is a user-configured third-party data destination;
-- ServerSentinel's developer does not relay the message.
+If the owner enables Slack:
+- configured event information/thumbnails may be sent to the owner's Slack workspace;
+- Slack is a user-selected third-party destination;
+- the ServerSentinel developer does not relay the message.
 
-## Tailscale
+## Tailscale / private remote access
 
-If the user enables Tailscale, network metadata and traffic handling are subject to Tailscale's service and the user's Tailnet configuration.
+If the owner uses Tailscale or another private-access provider, network metadata/traffic are subject to that provider and the user's configuration.
 
-ServerSentinel does not require the developer to receive Tailnet credentials.
+Tailnet membership is not by itself deployment-owner authorization.
 
 ## Diagnostics
 
-Diagnostics stay local unless the user explicitly exports/shares them.
+Diagnostics remain local unless explicitly exported/shared.
 
-Diagnostic export should redact:
-- credentials;
-- pairing tokens;
-- Slack secrets;
+Diagnostic export should redact or exclude:
+- credentials/tokens;
+- pairing secrets;
 - private keys;
-- sensitive headers.
+- sensitive headers;
+- owner biometric templates;
+- raw monitoring media unless the owner explicitly chooses to include it.
 
 ## Public repository safety
 
-Examples must not contain real deployment values.
+Repository examples and tests use synthetic/generated media only. Real-person or real-environment monitoring media is not committed or attached to PRs even with consent.
 
-See `AGENTS.md` and `SECURITY.md`.
+## Deployment responsibility
+
+ServerSentinel is a tool. The deployment owner is responsible for deciding where cameras are placed and for complying with applicable law, institutional policy, notice/consent requirements, and biometric/camera rules.
 
 ## Future changes
 
-Any future feature that would cause data to be sent to infrastructure operated by the ServerSentinel developer is a fundamental privacy-model change and requires:
-- explicit product decision;
-- updated requirements;
-- updated privacy policy;
-- App Store privacy disclosure review;
-- user-visible disclosure.
+Any feature that sends monitoring or biometric data to infrastructure operated by the ServerSentinel developer is a fundamental privacy-model change and requires explicit owner approval, updated requirements/security/privacy documentation, and user-visible disclosure before implementation.
