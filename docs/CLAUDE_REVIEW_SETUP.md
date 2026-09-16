@@ -65,11 +65,12 @@ fork PRにはrepository secretを渡さないため、自動workflowは意図的
 
 制約:
 
-- 信頼済みdefault branchだけをcheckout
+- 信頼済みdefault branchだけをcheckoutし、履歴確認と固定OID間diff生成のため `fetch-depth: 0` を使用する
 - fork headをcheckout/executeしない
-- fork HEAD SHAを開始時に固定
-- `gh pr diff` の固定diffだけを `$RUNNER_TEMP` へ保存してClaudeへ渡す
-- review完了時にHEAD一致を再確認
+- 開始時にPRの `headRefOid` と `baseRefOid` を取得して固定する
+- GitHubのbase repositoryが公開する `refs/pull/<PR>/head` をfetchし、取得したOIDが固定済み `headRefOid` と完全一致することを確認する
+- liveなPR番号を参照する `gh pr diff` は使用せず、固定済みbase/head OIDに対して `git diff --no-ext-diff --no-textconv <base OID>...<head OID>` を実行し、immutableなレビュー差分を `$RUNNER_TEMP` へ保存する
+- diff生成直後とreview完了時にcurrent `headRefOid` / `baseRefOid` が固定OIDと一致することを再確認し、不一致ならfailする
 - Claude jobはread-only
 - 現在は**default branch向けfork PRのみ**サポートし、その他のbase branchはfailする
 - review結果はActions Job Summaryへ表示し、`critical` / `important` はworkflow failure
