@@ -1,0 +1,98 @@
+# Environment / secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.mobileprovision
+*.cer
+*.provisionprofile
+
+# Recordings / user data
+recordings/
+data/
+diagnostics/
+*.sqlite
+*.sqlite3
+*.db
+*.mp4
+*.mov
+*.m4a
+*.heic
+
+# Test fixture media: real-person / real-environment media must not be committed.
+# Common image/video/audio formats are ignored anywhere under tests/fixtures/,
+# then explicitly re-enabled only for synthetic/generated fixtures.
+tests/fixtures/**/*.jpg
+tests/fixtures/**/*.jpeg
+tests/fixtures/**/*.png
+tests/fixtures/**/*.webp
+tests/fixtures/**/*.gif
+tests/fixtures/**/*.bmp
+tests/fixtures/**/*.tif
+tests/fixtures/**/*.tiff
+tests/fixtures/**/*.heif
+tests/fixtures/**/*.webm
+tests/fixtures/**/*.m4v
+tests/fixtures/**/*.mkv
+tests/fixtures/**/*.avi
+tests/fixtures/**/*.aac
+tests/fixtures/**/*.wav
+tests/fixtures/**/*.mp3
+
+# Synthetic/generated test media is allowed only in the dedicated fixture subtree.
+!tests/fixtures/synthetic/**/*.jpg
+!tests/fixtures/synthetic/**/*.jpeg
+!tests/fixtures/synthetic/**/*.png
+!tests/fixtures/synthetic/**/*.webp
+!tests/fixtures/synthetic/**/*.gif
+!tests/fixtures/synthetic/**/*.bmp
+!tests/fixtures/synthetic/**/*.tif
+!tests/fixtures/synthetic/**/*.tiff
+!tests/fixtures/synthetic/**/*.mp4
+!tests/fixtures/synthetic/**/*.mov
+!tests/fixtures/synthetic/**/*.m4v
+!tests/fixtures/synthetic/**/*.mkv
+!tests/fixtures/synthetic/**/*.avi
+!tests/fixtures/synthetic/**/*.webm
+!tests/fixtures/synthetic/**/*.m4a
+!tests/fixtures/synthetic/**/*.aac
+!tests/fixtures/synthetic/**/*.wav
+!tests/fixtures/synthetic/**/*.mp3
+!tests/fixtures/synthetic/**/*.heic
+!tests/fixtures/synthetic/**/*.heif
+
+# Logs / local diagnostics
+*.log
+logs/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Node
+node_modules/
+dist/
+build/
+coverage/
+.vite/
+
+# Swift / Xcode
+DerivedData/
+.build/
+*.xcuserstate
+xcuserdata/
+*.xccheckout
+
+# macOS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
