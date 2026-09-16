@@ -6,9 +6,11 @@ Each proposal should include:
 - problem;
 - proposed behavior;
 - user value;
-- privacy impact;
+- privacy/biometric impact;
 - security impact;
 - maintenance cost;
 - alternatives;
-- whether it changes App Store disclosures;
-- whether hardware testing is needed.
+- whether it changes the self-hosted/no-cloud data boundary;
+- whether it changes Camera Source types/protocols;
+- whether it introduces native mobile distribution or external services;
+- whether hardware/browser testing is needed.
