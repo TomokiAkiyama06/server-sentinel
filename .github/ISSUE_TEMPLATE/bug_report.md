@@ -8,9 +8,11 @@ labels: bug
 ## 環境
 
 ServerSentinelのバージョン/commit:
-iOSバージョン/端末:
 Ubuntuバージョン:
-ブラウザ:
+ブラウザ/OS:
+Camera Source構成:
+- `local_uvc`:
+- `remote_web`:
 
 ## 期待する動作
 
@@ -24,11 +26,21 @@ Ubuntuバージョン:
 
 ## ログ
 
-Secretや個人情報は必ず伏せてください。
+Secret、private network情報、owner biometric template、実監視メディアは貼らないでください。必要なログは必ず伏字化してください。
 
-## 実機が必要ですか？
+## 実機・ブラウザ確認が必要ですか？
 
 - [ ] 不要
-- [ ] iPhone
+- [ ] USB/UVC Webcam
+- [ ] Web Camera Node（iPhone / Android / PC等）
 - [ ] Ubuntuサーバー
-- [ ] 両方
+- [ ] 複数Camera Source構成
+- [ ] その他:
+
+## セキュリティ / プライバシー影響
+
+- [ ] なし/不明
+- [ ] pairing/authentication
+- [ ] recording/storage
+- [ ] owner face verification / biometric
+- [ ] monitoring media/privacy
