@@ -73,7 +73,7 @@ The MVP shall support:
 - `local_uvc`: UVC/V4L2-compatible camera attached to the main Ubuntu host;
 - `remote_agent`: UVC/V4L2-compatible camera attached to another owner-authorized Linux host running `media-capture-agent`.
 
-A future browser camera source such as `remote_web` may be added later without changing the core event/storage model, but it is not required for MVP completion.
+Browser/iPhone camera capture is outside the current MVP. Human phones/Macs/desktops are viewer clients.
 
 ### CAM-003 Source count
 The MVP shall work with **one active video source** and support **up to four active video sources**. Four is a configurable MVP limit; data models/APIs shall not assume exactly two or four sources.
@@ -130,7 +130,7 @@ The capture agent shall be able to operate over the same private LAN without bei
 The main host's LAN ingest endpoint for capture agents shall be separate from the dashboard/API exposure used by human viewers. The ingest endpoint shall not expose dashboard routes.
 
 ### AGENT-008 Narrow network exposure
-The ingest endpoint requires node authentication regardless of LAN location. Source-address firewall restriction is additionally recommended/required where stable network addressing permits, but IP address alone is never sufficient authentication.
+The ingest endpoint requires node authentication regardless of LAN location. Source-address firewall restriction is additionally recommended where stable network addressing permits, but IP address alone is never sufficient authentication.
 
 ### AGENT-009 Health and reconnect
 Agent heartbeat/health and physical camera health are separate. A healthy agent may report its camera `offline`. Reconnect and substitution handling follows CAM-008/CAM-009.
@@ -141,8 +141,25 @@ The main host and capture agent shall monitor clock synchronization/offset suffi
 ### AGENT-011 Installation lifecycle
 Development may run the agent from a Git clone. Stable releases should provide a standalone versioned artifact/installer (for example GitHub Releases) and systemd unit so production operation does not depend on a mutable development checkout.
 
-### AGENT-012 Local recovery buffer undecided
-Whether `media-capture-agent` retains a short local recovery ring buffer during main-host/network outages, its duration, storage medium (RAM/tmpfs vs disk), and privacy behavior require a separate decision before implementation. No durable agent-side recording guarantee is implied yet.
+### AGENT-012 Configurable disk recovery ring buffer
+`media-capture-agent` shall maintain a bounded ring buffer of **compressed video on disk**, not decoded frame history. The deployment owner controls the normal ring-buffer duration through ServerSentinel settings, subject to implementation-defined safety limits and available disk space.
+
+Changing this setting is an owner-only operation. The UI shall show the estimated/actual disk footprint and must reject unsafe values rather than allowing unbounded growth.
+
+### AGENT-013 Main-host-loss temporary protection
+When the agent loses its authenticated connection/heartbeat to the main ServerSentinel host unexpectedly, it shall automatically protect a local incident window covering:
+- **10 minutes immediately before loss of communication**; and
+- **10 minutes after loss of communication**.
+
+The default protected window is therefore **20 minutes**. The pre-loss portion is pinned from the rolling disk buffer and the post-loss portion continues locally even though the main host is unavailable.
+
+This behavior is intended to preserve room-overview evidence when the main server is moved, disconnected, powered off, or removed before it can send a preserve command.
+
+### AGENT-014 Critical-event preservation
+When the main host confirms a critical server-movement/camera-tamper event and communication remains available, it may explicitly instruct paired agents to preserve the relevant local ring-buffer interval as incident evidence. Agent-side preserved evidence is an exception for critical resilience, not a general duplicate of all main-host recordings.
+
+### AGENT-015 Protected-evidence lifecycle
+Protected agent evidence must have explicit retention/deletion policy, capacity bounds, status reporting, and owner-authorized deletion/export behavior. Running out of agent disk space must be surfaced and must not silently overwrite a currently protected critical incident.
 
 ## 7. Capture, encode, and streaming requirements
 
@@ -162,10 +179,12 @@ Authorized users with `live:view` shall be able to view active sources from phon
 Viewer-only transcoding/packaging should be started or scaled only when needed. No viewer should require a direct connection to a capture agent.
 
 ### MEDIA-006 Live transport decision
-Agent-to-main and main-to-browser low-latency transports must be selected through measured PoC/ADR work. Correct authentication/reconnect/backpressure semantics are more important than committing prematurely to WebRTC/SRT/QUIC/another protocol.
+Agent-to-main and main-to-browser low-latency transports must be selected through measured PoC/ADR work. **Near-real-time viewing is the product goal, but stability/reconnect behavior takes priority over minimizing latency by a specific number of seconds.**
+
+Correct authentication, reconnection, bounded buffering/backpressure, and truthful degradation are more important than committing prematurely to WebRTC/SRT/QUIC/another protocol.
 
 ### MEDIA-007 Durable recording
-Durable recording is main-host authoritative. Remote source handling must preserve source identity, timestamps, bounded queues/backpressure, and integrity. If chunk retry is used it must be idempotent.
+Durable recording is main-host authoritative during normal operation. Remote source handling must preserve source identity, timestamps, bounded queues/backpressure, and integrity. Agent-side protected incident evidence defined above is a deliberate resilience exception.
 
 ### MEDIA-008 Manual recording
 The owner may start/stop manual recording for selected sources. Default maximum: **20 minutes**.
@@ -193,7 +212,7 @@ Person/face implementations remain replaceable. Code and model/weight licenses a
 One or more sources may have server ROI/polygon/reference geometry. Meaningful displacement/rotation requires temporal/scene confirmation; person presence alone is not proof of movement.
 
 ### DET-005 Camera tamper
-Detect probable tamper using available signals such as global scene transform, persistent occlusion/near-black view, stream interruption, abrupt pose/exposure change, and source-health changes correlated with movement.
+Detect probable camera tampering using signals available to the source, including where applicable sudden global scene transform, camera occlusion, stream interruption, abrupt orientation/pose change visible in the scene, and source-health changes correlated with motion.
 
 ### DET-006 Occlusion tolerance
 Temporary person occlusion of a server ROI shall not immediately become confirmed server movement.
@@ -281,40 +300,34 @@ Slack delivery goes directly from the user's deployment to the user's configured
 Public Internet port exposure is not the default. Human remote access should use Tailscale or an equivalent private network.
 
 ### AUTH-002 Tailnet membership is not authorization
-Being a Tailnet member does not grant ServerSentinel access.
+Being a Tailnet member does not grant ServerSentinel application access.
 
-### AUTH-003 Network-level concealment for uninvited ordinary members
-The deployment shall use restrictive Tailscale access policy/Grants so ordinary Tailnet members who are not authorized for ServerSentinel receive no network grant to the ServerSentinel main node. Where supported by Tailscale peer-map behavior, they should not normally discover the node through peer visibility/status.
+### AUTH-003 No mandatory Tailnet policy modification
+The MVP shall **not require ServerSentinel to modify or manage Tailscale ACLs/Grants** and shall not require storing Tailscale administrative credentials. Existing Tailnet policy may remain unchanged.
 
-This requirement does **not** claim concealment from Tailnet Owners/Admins, infrastructure administrators, or other principals that inherently manage the Tailnet/network.
+Because of this choice, ServerSentinel does **not** guarantee that an uninvited Tailnet member cannot discover that the main Tailscale node exists. Hiding the node itself requires an external Tailscale policy/architecture choice outside the application authorization layer.
 
-### AUTH-004 Separate ServerSentinel allowlist
-Even if a user can reach the node, ServerSentinel checks an owner-managed allowlist/invitation before serving any dashboard/media data. Unauthorized users receive no camera names, counts, thumbnails, recordings, or deployment metadata.
+### AUTH-004 ServerSentinel invitation/allowlist is authoritative for application data
+ServerSentinel checks an owner-managed invitation/allowlist before serving dashboard/media data. A Tailnet user who is not invited receives no camera names, counts, thumbnails, recordings, timeline data, or ServerSentinel deployment metadata from the application.
 
 ### AUTH-005 Trusted Tailscale identity path
 When Tailscale Serve or an equivalent trusted proxy supplies user identity, the backend accepts those identity headers only from the trusted local proxy path. The dashboard/API should bind to loopback or another non-bypassable local boundary so arbitrary LAN clients cannot spoof proxy identity headers.
 
 ### AUTH-006 Granular invited-user permissions
 At minimum support independent permissions:
-- `live:view` — browser live view;
-- `recordings:view` — browser recording list/playback.
+- `live:view` — browser live view and current source health needed for live viewing;
+- `recordings:view` — browser recording list/playback **plus historical event/timeline access associated with recordings/events**.
 
-Granting one does not imply the other.
+Granting one does not imply the other. `live:view` alone shall not expose historical timeline/event data.
 
 ### AUTH-007 Browser-only non-owner playback
 Non-owner invited users do not receive an official recording download/export endpoint/button in the MVP. The product must state that browser playback cannot technically prevent screen recording or advanced client-side capture.
 
 ### AUTH-008 Owner operations
-Only the owner (or a future explicitly defined privileged role) may add/revoke users, change permissions, register/revoke capture agents/cameras, enroll/delete owner biometrics, alter retention/security settings, or delete recordings.
+Only the owner (or a future explicitly defined privileged role) may add/revoke users, change permissions, register/revoke capture agents/cameras, configure agent recovery-buffer duration, enroll/delete owner biometrics, alter retention/security settings, or delete recordings.
 
-### AUTH-009 Grant-management boundary
-Automatic mutation of Tailscale Grants from ServerSentinel is **not required** for MVP because it would introduce Tailscale administrative credentials. The owner may manage the Tailnet-level permission separately. ServerSentinel must clearly show that both Tailnet permission and application invitation are required.
-
-### AUTH-010 Immediate revocation
-Application permission revocation shall invalidate active authorization promptly. Tailnet-level access revocation remains a separate network-policy action unless a future approved integration automates it.
-
-### AUTH-011 Timeline permission unresolved
-Whether invited users with only `live:view` or `recordings:view` may access historical event/timeline metadata requires a separate explicit decision. Implementations shall not implicitly expose historical timeline data through live-view authorization.
+### AUTH-009 Immediate application revocation
+Application permission revocation shall invalidate active ServerSentinel authorization promptly. Tailnet membership/policy remains separately administered outside ServerSentinel.
 
 ## 13. Dashboard requirements
 
@@ -325,7 +338,10 @@ Support phone/Mac/desktop browsers. One source uses a large tile, two use split 
 Show source name/type/role, camera/agent online state, negotiated capture/view profile, image-quality state, and any `manual_intervention_required` condition.
 
 ### UI-003 Access management
-Owner UI shall show invited identities, independent `live:view` / `recordings:view` permissions, active/revoked state, and the fact that Tailscale network permission is separately required.
+Owner UI shall show invited identities, independent `live:view` / `recordings:view` permissions, active/revoked state, and clearly state that Tailnet membership by itself does not grant application access.
+
+### UI-004 Agent evidence/buffer settings
+Owner UI shall expose the agent disk ring-buffer duration, current disk usage/limit, protected-incident status, and any storage pressure/error affecting agent-side protection.
 
 ## 14. Performance and overload requirements
 
@@ -349,7 +365,7 @@ Public or privately licensed real-person benchmark datasets, if legally/ethicall
 Real hardware/room/owner tests are documented in `MANUAL_TEST.md`; results may record measurements and PASS/FAIL without uploading real monitoring media or biometric templates.
 
 ### TEST-003 Required source/agent tests
-Cover local UVC and remote-agent discovery, ambiguous identical-device reconnect, agent pairing/revocation, clock offset, LAN outage/reconnect, source health, 1–4 mixed topology, and capture-vs-inference/view profiles.
+Cover local UVC and remote-agent discovery, ambiguous identical-device reconnect, agent pairing/revocation, clock offset, LAN outage/reconnect, source health, 1–4 mixed topology, capture-vs-inference/view profiles, bounded disk ring-buffer behavior, 10-minute pre-loss pinning, 10-minute post-loss continuation, and protected-evidence capacity handling.
 
 ## 16. Development/review requirements
 
@@ -372,7 +388,8 @@ Not required for MVP unless separately approved:
 - named non-owner face database;
 - public Internet dashboard exposure;
 - automatic Tailscale admin-policy mutation;
+- guaranteed network-level concealment from ordinary Tailnet members when Tailnet policy is left unchanged;
 - guaranteed DRM/prevention of viewer screen capture;
 - guaranteed concealment from Tailnet/network administrators;
-- independent developer cloud/off-host evidence service;
-- exact agent-local recovery-buffer policy until its ADR/Issue is decided.
+- independent general-purpose off-host recording replication;
+- final camera/codec/FPS defaults before real-hardware measurement.
