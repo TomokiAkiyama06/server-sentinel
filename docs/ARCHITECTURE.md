@@ -2,79 +2,135 @@
 
 ## Boundary principle
 
-ServerSentinel has no central developer backend. A deployment boundary is one owner's self-hosted environment plus that owner's explicitly paired camera devices and optional third-party services.
+ServerSentinel has no central developer backend. A deployment consists of the owner's main Ubuntu host, explicitly approved camera/capture nodes, invited human viewers, and optional third-party services such as Tailscale or Slack.
 
 ```text
-Deployment A                                  Deployment B
-Local/Web cameras -> Ubuntu A                 Local/Web cameras -> Ubuntu B
-                       \ /                                            \ /
-                      owner A                                        owner B
-
-No shared ServerSentinel developer data plane.
+Camera / Capture Nodes  --->  Main ServerSentinel  --->  invited browser viewers
+        private LAN                 self-hosted              Tailscale/private
 ```
 
 ## Runtime model
 
 ```text
-                    Camera Sources
-          ┌────────────────────────────┐
-          │ Local UVC / USB cameras    │
-          │ Remote Web Camera Nodes    │
-          └─────────────┬──────────────┘
-                        │
-                        v
-          ┌────────────────────────────┐
-          │ Ubuntu ServerSentinel      │
-          │ source registry            │
-          │ media/recording            │
-          │ detection                  │
-          │ event correlation          │
-          │ storage                    │
-          │ notifications              │
-          └─────────────┬──────────────┘
-                        │
-                        v
-          ┌────────────────────────────┐
-          │ React Web UI              │
-          │ dashboard + camera node   │
-          └─────────────┬──────────────┘
-                        │
-                        v
-              owner-authorized browser
+Local UVC cameras
+      │
+      ├───────────────────────────────┐
+      │                               │
+Remote room camera                    │
+      │ USB                           │
+      v                               │
+Linux capture machine                 │
+media-capture-agent                   │
+      │ private LAN + mTLS            │
+      └───────────────────────────────┤
+                                      v
+                           Main ServerSentinel
+                           ├─ source/node registry
+                           ├─ media ingest/recording
+                           ├─ detection
+                           ├─ event/presence correlation
+                           ├─ storage
+                           ├─ access control
+                           └─ notifications
+                                      │
+                                trusted local proxy
+                                      │
+                                Tailscale Serve
+                                      │
+                           invited phone / Mac / PC
 ```
 
 ## Camera-source abstraction
 
-The system is deliberately not an `iPhone front/rear camera` architecture.
-
 MVP source types:
-- `local_uvc` — host-attached UVC/V4L2 camera;
-- `remote_web` — camera capture from a paired browser.
 
-The deployment supports 1–4 active sources. Camera count/type/role are configuration, not topology constants.
+- `local_uvc` — camera attached to the main host;
+- `remote_agent` — camera attached to an approved Linux capture node.
+
+A future `remote_web` browser camera may be added later. The current MVP does not require an iPhone as a camera source.
+
+The deployment supports 1–4 active sources. Camera count/type/role are configuration, never topology constants.
 
 ### Node vs source
 
-A node is a computing endpoint/trust identity. A source is one logical video source.
-
-Examples:
+A **capture node** is a computing/trust endpoint. A **Camera Source** is one logical video input.
 
 ```text
-Ubuntu local node
-├─ USB Camera A
-└─ USB Camera B
+Main host
+├─ Local Camera A
+└─ Local Camera B
 
-Phone browser node
-└─ Camera Source C
+Capture Node A
+└─ Room Overview Camera
 ```
 
-Future nodes could expose additional source types without changing event/recording semantics.
+A node credential does not grant human dashboard/admin rights.
+
+## `media-capture-agent` boundary
+
+The remote Linux agent:
+
+- runs as `media-capture-agent` under a dedicated non-root account;
+- captures video through V4L2/UVC;
+- does not require a GUI/tray;
+- does not capture audio in MVP;
+- initiates outbound/private-LAN connectivity toward the main host;
+- uses owner-approved one-time pairing followed by revocable mutually authenticated encrypted identity;
+- reports node health separately from camera health;
+- does not need Tailscale merely to forward a camera over the same LAN.
+
+The main host exposes a narrow LAN ingest boundary for agents, distinct from the human dashboard listener.
+
+## Human-access boundary
+
+Human remote access has two gates:
+
+```text
+Tailscale/private-network permission
+             AND
+ServerSentinel owner invitation/permission
+```
+
+Tailnet membership alone grants nothing.
+
+The recommended human path is:
+
+```text
+invited browser
+    -> Tailscale
+    -> Tailscale Serve / trusted proxy
+    -> loopback-only ServerSentinel dashboard/API
+```
+
+Ordinary uninvited Tailnet members should receive no Grant to the main ServerSentinel node and therefore no normal peer visibility/connectivity where Tailscale policy trimming applies. ServerSentinel does not claim to hide the machine from Tailnet Owners/Admins or infrastructure administrators.
+
+The application independently checks an allowlist and granular permissions such as `live:view` and `recordings:view`.
+
+## Media architecture
+
+Capture, recording, inference, and viewer outputs are separate profiles.
+
+```text
+high-resolution source
+      ├─ durable recording
+      ├─ downscaled/sampled inference
+      └─ adaptive browser live profile
+```
+
+This keeps a wide room-overview camera useful without forcing full-resolution AI inference or live delivery to every phone/Mac viewer.
+
+Viewer traffic always terminates at the main host. Human clients never connect directly to `media-capture-agent`.
+
+## UVC identity boundary
+
+A source's logical identity is not `/dev/videoN`.
+
+Use the strongest available stable physical evidence. When multiple identical devices cannot be distinguished safely after reconnect, ServerSentinel fails closed to `manual_intervention_required` rather than selecting one arbitrarily.
 
 ## Detection-profile model
 
-Hardware type and analysis behavior are independent.
+Hardware type and analysis behavior are independent. Profiles may include:
 
-A Camera Source can bind profiles such as:
 - motion;
 - person;
 - server ROI/movement;
@@ -83,149 +139,58 @@ A Camera Source can bind profiles such as:
 - entrance crossing;
 - owner verification.
 
-This allows one webcam to do everything in a small deployment or several cameras to divide responsibilities.
-
-## Trust boundaries
-
-### Local UVC device
-
-Trusted for media only after the deployment owner explicitly enables/configures the discovered physical device.
-
-Stable hardware identity should be used where available so `/dev/videoN` reordering cannot silently swap cameras.
-
-### Remote Web Camera Node
-
-Trusted only after owner-authorized pairing.
-
-Can submit:
-- heartbeat/health;
-- negotiated capability state;
-- media/recording chunks;
-- browser lifecycle state relevant to monitoring.
-
-A paired camera node is not automatically authorized to use privileged dashboard/admin APIs.
-
-### Ubuntu
-
-Primary trusted authority for:
-- deployment-owner authorization;
-- source registry;
-- pair/revoke;
-- recording/retention;
-- owner biometric template;
-- event/timeline generation;
-- dashboard API;
-- notifications;
-- local settings/audit.
-
-### Remote owner browser
-
-Tailscale/private networking provides reachability, not ownership proof.
-
-Privileged dashboard/API access also passes the deployment-owner authorization boundary defined by `REQUIREMENTS.md` / `SECURITY.md`.
-
-### Slack
-
-Optional external sink explicitly configured by the owner.
+Every dependent detector has its own quality prerequisites. Insufficient quality produces `unknown`/unavailable, including for person detection negatives.
 
 ## Owner verification boundary
 
-Owner verification is a narrow 1:1 biometric feature:
+Owner verification is narrow 1:1 biometric verification:
 
 ```text
 Observed face
     -> quality gate
-    -> compare to explicitly enrolled owner template
+    -> compare with explicitly enrolled owner template
     -> match / no-match / unknown
 ```
 
-The architecture intentionally omits a named non-owner face database.
-
-Anonymous people may receive temporary track IDs for timeline correlation, but cross-camera biometric re-identification is not part of MVP.
+No named non-owner face database is part of MVP. Anonymous same-camera tracking may be used for timeline context. Cross-camera biometric re-identification is deferred.
 
 ## Presence architecture
 
-Presence is a derived state, not a direct face-detector output.
-
-Potential inputs:
-- owner-verified entrance crossing;
-- direction (`entered` / `exited`);
-- manual override;
-- schedule hints;
-- recency/quality.
-
 States:
+
 - `PRESENT`;
 - `PROBABLY_PRESENT`;
 - `ABSENT`;
 - `UNKNOWN`.
 
-Manual override has highest precedence. Ambiguous visual evidence becomes uncertain rather than silently disarming monitoring.
+Manual override has highest precedence. Ambiguous or poor-quality visual evidence stays uncertain. Server movement and camera-tamper monitoring remain armed in all states.
 
-## Security-event interpretation
+## Evidence and timeline
 
-Separate observations from conclusions.
-
-Example:
-
-```text
-Observations:
-- Owner last observed exiting at 17:20
-- Anonymous person entered at 17:43
-- Server ROI shifted at 17:55
-- Rear camera disconnected at 17:56
-
-Correlator:
-- build a chronological event context
-- link relevant media/observations
-- do NOT assert culprit/guilt
-```
-
-## Evidence priority
+The correlator links observations and recordings but does not assert culprit/guilt/causality.
 
 When resources are constrained:
 
-1. Keep source health and failure state truthful.
-2. Preserve configured critical server-movement/camera-tamper evidence where storage safety allows.
-3. Preserve recording integrity and bounded queues.
-4. Reduce expensive detector cadence.
-5. Reduce live preview quality/FPS.
-6. Prefer explicit degraded state over silent loss.
+1. keep node/source health truthful;
+2. preserve critical movement/tamper evidence where safe;
+3. preserve recording integrity/backpressure;
+4. reduce expensive detector cadence;
+5. reduce live-view quality;
+6. surface explicit degraded state.
 
-Browser Camera Nodes do not provide guaranteed independent durable storage in MVP; Ubuntu is primary evidence storage.
-
-## Low-light architecture
-
-No automatic phone torch/light is used in MVP.
-
-Low light is handled by:
-- frame-quality metrics;
-- detector-specific gating;
-- `degraded` / `insufficient` state;
-- `unknown` identity/presence results where appropriate.
-
-A future IR/night-vision camera can be added as another source rather than forcing visible illumination from a phone.
+Ubuntu main storage is authoritative. Agent-side recovery buffering is a separate pending decision and is not currently a durable-evidence guarantee.
 
 ## Privacy architecture
 
-All default features remain useful without:
-- ServerSentinel developer account;
-- developer cloud/API;
-- analytics/telemetry;
-- native App Store application.
+Default operation has:
 
-Owner biometric material remains deployment-local. Non-owner named biometric identities are not part of MVP.
+- no ServerSentinel developer account;
+- no developer cloud/API;
+- no analytics/telemetry;
+- no audio surveillance in MVP;
+- no native App Store requirement;
+- no named non-owner biometric identities.
 
 ## Extensibility
 
-Possible future components:
-- RTSP/IP camera source;
-- Raspberry Pi/remote edge node;
-- independent/off-host evidence storage;
-- native mobile client if later justified;
-- host CPU/GPU metrics;
-- environment sensors;
-- NAS target;
-- local notification integrations.
-
-These are not MVP requirements.
+Potential future additions include RTSP/IP cameras, browser camera nodes, Raspberry Pi/edge nodes, off-host evidence storage, host metrics, environment sensors, and NAS targets. They are not MVP requirements.

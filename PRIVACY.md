@@ -7,16 +7,11 @@ ServerSentinel is designed so that the project developer does not operate infras
 Normal data paths:
 
 ```text
-Local USB camera -> User's Ubuntu ServerSentinel host -> User-selected storage
+Local USB camera -> Main Ubuntu ServerSentinel -> user-selected storage
 
-User-owned browser camera -> User's Ubuntu ServerSentinel host -> User-selected storage
-```
+Remote room camera -> media-capture-agent -> private LAN -> Main Ubuntu ServerSentinel -> storage
 
-Optional third-party paths:
-
-```text
-User's Ubuntu host -> User's Slack workspace
-User's remote browser -> Tailscale/private network -> User's Ubuntu host
+Invited phone/Mac browser -> Tailscale/private network -> Main Ubuntu ServerSentinel
 ```
 
 There is no required ServerSentinel developer cloud/account/data plane.
@@ -35,20 +30,46 @@ The project developer should not receive during normal operation:
 - video or audio;
 - face templates/embeddings;
 - person/presence events;
-- server addresses;
+- server/capture-node addresses;
 - Tailscale information;
 - Slack credentials;
 - recordings/thumbnails;
 - audit logs;
 - deployment configuration.
 
-## Camera and microphone
+## Video-only MVP
 
-Local UVC cameras are enabled explicitly by the deployment owner.
+The MVP is video-only for monitoring. Camera microphones are not required and `media-capture-agent` must not open audio devices by default.
 
-Remote Web Camera Nodes use normal browser camera/microphone permission flows. Camera monitoring state must remain visible in the Camera Node UI.
+## Camera sources
 
-Microphone capture is optional and **OFF by default**. Audio must not be enabled merely because a camera is enabled.
+Local UVC cameras and remote-agent UVC cameras are enabled explicitly by the deployment owner.
+
+A remote capture node is a media source identity, not a human account. Pairing it does not grant dashboard/admin rights.
+
+## Human viewers
+
+Invited human viewers may receive only the permissions explicitly assigned by the owner.
+
+Initial permissions:
+- `live:view` — current live video;
+- `recordings:view` — recording list/browser playback.
+
+They are independent.
+
+Non-owner recording access is browser playback only in MVP. ServerSentinel does not offer them a download/export button or route, but this is not DRM: a person who can view video may still screen-record or use advanced client tooling.
+
+Historical timeline access is not implicitly exposed through `live:view`; its exact invited-user permission model remains a separate decision.
+
+## Tailscale/private remote access
+
+Tailnet membership is not authorization.
+
+The deployment should use restrictive Tailscale access policy so ordinary Tailnet members who are not intended ServerSentinel users receive no grant to the ServerSentinel node and, where Tailscale peer-map trimming applies, do not normally discover it through ordinary peer visibility.
+
+This is not a guarantee of concealment from Tailnet Owners/Admins or infrastructure administrators.
+
+Even a network-reachable identity must still pass the ServerSentinel application allowlist/permission check before receiving camera names, media, recordings, or other deployment metadata.
 
 ## Owner-only face verification
 
@@ -56,27 +77,30 @@ ServerSentinel may optionally verify whether a detected face matches the explici
 
 This is biometric processing. Therefore:
 - enrollment requires explicit owner action;
-- the owner template/embedding stays inside the deployment by default;
-- the template is not sent to the ServerSentinel developer;
-- owner enrollment can be deleted/replaced;
-- template data is excluded from normal diagnostics/export unless specifically and explicitly requested;
-- logs/audit records may state that enrollment/verification occurred but must not contain the raw template.
-
-Face verification is probabilistic. Low-quality/low-light observations may be reported as `unknown` rather than match/non-match.
+- owner template/embedding stays inside the deployment by default;
+- template is not sent to the ServerSentinel developer;
+- enrollment can be deleted/replaced;
+- raw template is excluded from logs/normal diagnostics;
+- verification is probabilistic;
+- insufficient visual quality returns `unknown` rather than a forced match/non-match.
 
 ## Other observed people
 
 The MVP does **not** maintain a named facial identity database for non-owner people.
 
-Other people may be represented by anonymous, non-name identifiers such as `Person #A` / ephemeral track UUIDs for limited event correlation. The system must not present an anonymous observation as a real-world identity.
+Other people may receive anonymous/ephemeral track IDs for limited event correlation. Cross-camera biometric re-identification is outside MVP scope.
 
-Cross-camera biometric re-identification of anonymous people is outside MVP scope and requires a separate privacy/architecture decision.
+The system must not label a person as thief, attacker, culprit, or cause merely because they appeared near a critical event.
 
-The system must not label a person as a thief, attacker, or culprit merely because they appeared near a critical event. The dashboard presents observations and timing for human review.
+## Image-quality honesty
+
+If a detector cannot operate reliably because of darkness, blur, obstruction, low target resolution, or similar quality limitations, dependent conclusions become `unknown`/unavailable.
+
+In particular, a skipped/failed person detector must not be translated into `no person` and then used to infer absence.
 
 ## Recordings and retention
 
-Ubuntu stores:
+The main Ubuntu deployment stores:
 - recordings;
 - thumbnails;
 - event/timeline metadata;
@@ -92,47 +116,28 @@ Starred recordings may outlive normal recording retention.
 
 Non-owner face crops/templates are not stored as a separate persistent identity library by default. People may still appear in ordinary configured video recordings.
 
-## Web Camera Node local storage
+## Capture-agent local storage
 
-Browser/PWA local storage is not treated as guaranteed durable evidence storage in the MVP. Browser implementations may use bounded best-effort buffering for reconnect behavior, but browser eviction/lifecycle rules prevent ServerSentinel from promising that evidence survives device/browser shutdown or loss of the Ubuntu recorder.
-
-## Low light and illumination
-
-ServerSentinel does not automatically turn on a phone torch/screen light in response to motion or low light in the MVP. If visual quality is insufficient, affected computer-vision results become degraded/unknown.
+The policy for a short outage-recovery buffer on `media-capture-agent` is not yet decided. Until an explicit ADR/Issue defines duration, RAM/tmpfs vs disk, encryption/deletion, and retry semantics, the agent must not be described as a second durable evidence store.
 
 ## Slack
 
-If the owner enables Slack:
-- configured event information/thumbnails may be sent to the owner's Slack workspace;
-- Slack is a user-selected third-party destination;
-- the ServerSentinel developer does not relay the message.
-
-## Tailscale / private remote access
-
-If the owner uses Tailscale or another private-access provider, network metadata/traffic are subject to that provider and the user's configuration.
-
-Tailnet membership is not by itself deployment-owner authorization.
+If the owner enables Slack, configured event information/thumbnails may be sent directly from the deployment to the owner's Slack workspace. The ServerSentinel developer does not relay the message.
 
 ## Diagnostics
 
 Diagnostics remain local unless explicitly exported/shared.
 
-Diagnostic export should redact or exclude:
-- credentials/tokens;
-- pairing secrets;
-- private keys;
-- sensitive headers;
-- owner biometric templates;
-- raw monitoring media unless the owner explicitly chooses to include it.
+Exports should redact/exclude credentials, pairing secrets, private keys, sensitive headers, owner biometric templates, and raw monitoring media unless the owner explicitly chooses otherwise.
 
 ## Public repository safety
 
-Repository examples and tests use synthetic/generated media only. Real-person or real-environment monitoring media is not committed or attached to PRs even with consent.
+Repository/CI media fixtures are synthetic/generated only. Real-person or real-environment monitoring media is not committed or attached to GitHub, including merely publicly licensed real-person media. External benchmark datasets may be used locally under their own terms and are not repository fixtures.
 
 ## Deployment responsibility
 
-ServerSentinel is a tool. The deployment owner is responsible for deciding where cameras are placed and for complying with applicable law, institutional policy, notice/consent requirements, and biometric/camera rules.
+The deployment owner is responsible for camera placement and compliance with applicable law, institutional policy, notice/consent requirements, and biometric/camera rules.
 
 ## Future changes
 
-Any feature that sends monitoring or biometric data to infrastructure operated by the ServerSentinel developer is a fundamental privacy-model change and requires explicit owner approval, updated requirements/security/privacy documentation, and user-visible disclosure before implementation.
+Any feature that sends monitoring/biometric data to infrastructure operated by the ServerSentinel developer is a fundamental privacy-model change and requires explicit owner approval plus updated requirements/security/privacy documentation before implementation.

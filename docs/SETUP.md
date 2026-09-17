@@ -1,10 +1,10 @@
 # Intended Setup Experience
 
-This describes the target user experience. Exact commands/transport choices may change during implementation ADRs.
+This document describes target UX. Exact transport commands and packaging may change through ADR/implementation.
 
-## Ubuntu setup
+## Main Ubuntu setup
 
-Target easy path:
+Development target:
 
 ```bash
 git clone <repo-url>
@@ -12,13 +12,9 @@ cd server-sentinel
 ./install.sh
 ```
 
-or:
+or the documented Docker Compose path where appropriate.
 
-```bash
-docker compose up -d
-```
-
-Then open the local setup page.
+Stable releases should provide versioned release artifacts/installers rather than requiring production operation from a development checkout.
 
 ## First-run server wizard
 
@@ -26,46 +22,39 @@ Then open the local setup page.
 
 Explain:
 - self-hosted/no-developer-cloud architecture;
-- camera/recording privacy responsibility;
-- MVP supports local USB cameras and browser-based Web Camera Nodes;
-- no native iOS/App Store application is required.
+- video-only MVP;
+- local UVC and remote Linux capture-agent source types;
+- phone/Mac are supported as browser viewers;
+- no native iOS/App Store camera application is required.
 
-### Step 2 — Deployment-owner authorization
+### Step 2 — Deployment owner
 
-Before privileged remote access:
-- bootstrap owner authorization from a trusted local context;
-- choose the mechanism accepted by ADR;
-- configure recovery/revocation;
-- do not treat Tailnet membership alone as owner authorization.
-
-Until complete, remote privileged dashboard/API operations remain unavailable.
+Bootstrap the deployment owner from a trusted local context. Configure recovery/revocation. Tailnet membership alone is never owner authorization.
 
 ### Step 3 — Storage
 
 - choose recording root;
-- verify write permission;
-- display filesystem free space;
+- verify write permission/free space;
 - default retention 20 days;
 - configure recording allocation;
-- explain hard filesystem safety reserve.
+- explain hard filesystem safety reserve and pressure/hard-stop states.
 
 ### Step 4 — Locale/time
 
 - timezone;
-- daily summary default 23:00.
+- daily summary default 23:00;
+- verify main-host time synchronization.
 
 ### Step 5 — Add Camera Sources
 
-The product must allow completion with **one** camera source and up to **four active** sources.
-
-Camera list starts empty; no fixed `front/rear` slots.
-
-Options:
+The product can complete setup with one source and supports up to four active sources.
 
 ```text
 [ Add local USB camera ]
-[ Add Web Camera Node ]
+[ Add remote Linux capture node ]
 ```
+
+No fixed front/rear slots.
 
 ### Step 6 — Detection profiles
 
@@ -73,37 +62,30 @@ For each source:
 - name;
 - optional role label;
 - preview;
-- desired quality;
-- audio state (default OFF);
+- desired capture profile;
 - detection profiles;
-- ROI/entrance line calibration as relevant.
+- ROI/entrance/zone calibration where relevant.
+
+Audio controls are omitted in the MVP because monitoring is video-only.
 
 ### Step 7 — Owner verification (optional)
 
-If desired:
-- explain biometric processing;
-- enroll the deployment owner only;
-- validate image quality;
-- store template locally;
-- provide delete/re-enroll controls.
-
-Skipping owner verification must not prevent basic monitoring.
+Explain biometric processing, enroll only the deployment owner, validate quality, store template locally, and provide delete/re-enroll controls.
 
 ### Step 8 — Slack (optional)
 
-- disabled by default;
-- skip allowed;
-- safe test message.
+Disabled by default; skip allowed; provide a safe test message.
 
-### Step 9 — Remote access guidance
+### Step 9 — Human remote access
 
-- Tailscale/private networking recommended;
-- no public port-forwarding default;
-- remote privileged actions still require Step 2 authorization.
+Explain that two separate approvals are required:
+
+1. Tailscale/private-network permission to the main node;
+2. ServerSentinel invitation/permissions.
+
+Public port forwarding is not the normal setup.
 
 ## Add local USB camera
-
-Flow:
 
 ```text
 Camera Sources
@@ -117,141 +99,84 @@ Camera Sources
   -> Save
 ```
 
-Show stable hardware identity information where available, not only `/dev/video0`.
+Show stable identity evidence where available, not only `/dev/video0`.
 
-If the device disappears/reappears, ServerSentinel must not silently substitute a different physical camera merely because numeric device ordering changed.
+If reconnect cannot be matched unambiguously—such as multiple identical devices without unique serials—show `手動確認が必要です` and require owner re-approval.
 
-## Add Web Camera Node
+## Add remote Linux capture node
 
-### Owner/dashboard side
+### Main/dashboard side
 
 ```text
-Camera Sources
-  -> Add Web Camera Node
-  -> one-time QR / short code (~5 min)
+Capture Nodes
+  -> Add Capture Node
+  -> generate short-lived one-time pairing code
+  -> show main-host private-LAN address/port
 ```
 
-### Camera-device side
+### Capture-machine side
 
-Open the ServerSentinel Camera Node page in a supported secure browser context.
+During development the repository may be cloned locally and the agent run from that checkout. Stable releases should install only the versioned `media-capture-agent` artifact.
 
-Target UX:
+Target command/UX shape:
 
-```text
-ServerSentinel Camera Node
-
-Camera: [Back Camera v]
-Microphone: OFF
-Quality: Auto / 720p ...
-
-[Pair / Connect]
+```bash
+sudo ./scripts/install-agent.sh
+sudo media-capture-agent pair --server <private-lan-host> --code <one-time-code>
 ```
 
 After pairing:
 
 ```text
-● Monitoring
-● Server connected
-Camera: ON
-Mic: OFF
-Quality: 720p / 15 fps
-Image quality: Good
-
-[Stop]
+media-capture-agent.service: active
+Node: Research Room Capture Node
+Camera: selected UVC device
+Agent: online
+Camera: online
+Audio: not captured
 ```
 
-The page must clearly show monitoring/connection state.
+Normal operation has no desktop window/tray requirement.
 
-PWA/home-screen installation can be offered where supported, but ordinary browser use remains supported.
+### USB unplug behavior
 
-## Web Camera Node operational guidance
-
-Because the MVP is browser-based:
-- keep the camera page active/foreground;
-- request Screen Wake Lock where supported;
-- explain that screen lock/browser suspension/OS termination can stop capture;
-- if capture stops, the server marks the source offline/degraded;
-- reconnect automatically where browser/session state permits;
-- otherwise show `手動操作が必要です`.
-
-No Apple Developer Program/App Store setup is required.
-
-## Secure context / HTTPS
-
-`getUserMedia()` normally requires a secure context. Setup must provide/document a legitimate secure-origin method (for example an accepted local TLS/private-network approach selected by ADR).
-
-Do not make `ignore the certificate warning` or disabling browser security the normal onboarding path.
-
-## Detection-profile setup examples
-
-### Server camera
+When a camera is unplugged:
 
 ```text
-✓ Person detection
-✓ Motion
-✓ Server ROI movement
-✓ Camera tamper
-✓ Image quality
+Agent: ONLINE
+Camera: OFFLINE
+Event: camera_offline
 ```
 
-### Entrance camera
+If the same physical camera later reconnects unambiguously, return online automatically. Ambiguous identity requires manual approval. Intentional unplugging is still recorded; alert severity is configurable separately.
+
+## Room-overview camera setup
+
+A remote-agent source can be assigned role `room_overview` or `entrance` while covering the full room.
+
+Calibration may include:
+- room/entrance geometry;
+- person/zone profile;
+- owner-verification feasibility;
+- server area if visible;
+- image-quality thresholds.
+
+Do not assume that a wide room view provides enough pixels for reliable owner face verification. Enable biometric-dependent behavior only after real placement tests demonstrate sufficient quality.
+
+## Live dashboard on phone/Mac
+
+Invited users access only the main ServerSentinel host.
 
 ```text
-✓ Person detection
-✓ Entrance crossing
-✓ Owner verification (optional)
-✓ Camera tamper
-✓ Image quality
+phone / Mac
+    -> Tailscale/private network
+    -> trusted proxy/Tailscale Serve
+    -> ServerSentinel dashboard
 ```
 
-A webcam or Web Camera Node can use either profile. Role is not tied to hardware type.
+The capture node is never directly exposed to viewers.
 
-## Entrance calibration
-
-If entrance crossing is enabled:
-1. preview camera;
-2. draw entrance line/zone;
-3. mark `inside` and `outside` direction;
-4. test entry/exit;
-5. tune debounce/threshold if needed.
-
-If owner verification is enabled, test owner entry/exit after enrollment.
-
-## Low-light setup
-
-Do **not** configure motion-triggered torch/light.
-
-Show a quality diagnostic such as:
-- Good;
-- Degraded;
-- Insufficient for owner verification.
-
-If the environment is too dark, recommend changing camera placement/ambient lighting or using a camera intended for low-light/IR operation rather than automatically illuminating the area with the phone.
-
-## Presence UX
-
-Top-level display:
-
-```text
-Presence: PRESENT / PROBABLY_PRESENT / ABSENT / UNKNOWN
-Source: Entrance camera / Manual / Schedule
-```
-
-Manual action remains available:
-
-```text
-[ 在室にする ]
-[ 不在にする ]
-[ 自動判定へ戻す ]
-```
-
-Manual override has priority until cancelled/expired.
-
-Critical server-movement/camera-tamper monitoring remains active in all presence modes.
-
-## Live dashboard
-
-Adapt to 1–4 active sources:
+Responsive layout:
 
 ```text
 1 source -> one large tile
@@ -259,15 +184,92 @@ Adapt to 1–4 active sources:
 3–4 sources -> responsive grid
 ```
 
-Each tile shows source name, type, health, negotiated quality, audio state, and degraded/low-light status.
+Each tile shows source name/type/role, source health, capture-node health where applicable, negotiated viewer quality, image-quality state, and reconnect/manual-intervention state.
+
+Viewer-only transcoding should not remain active unnecessarily when there are no subscribers.
+
+## Access-management UX
+
+Owner-only access screen:
+
+```text
+Access
+
+User A   identity@example.com
+[x] Live view
+[ ] Recordings
+Status: Active
+
+User B   another@example.com
+[x] Live view
+[x] Recordings
+Status: Active
+```
+
+Minimum permissions:
+
+- `live:view` — current live streams;
+- `recordings:view` — recording list/browser playback.
+
+Permissions are independent.
+
+Non-owner users receive no official recording download/export control in MVP. The UI must not promise that browser playback prevents screen recording/client-side capture.
+
+The screen must clearly state that Tailscale-level network permission is managed separately unless a future approved integration automates it.
+
+## Tailscale/private-network setup
+
+Recommended boundary:
+
+- dashboard/backend listener used by humans binds only to loopback or another trusted non-bypassable local proxy path;
+- Tailscale Serve/equivalent exposes it privately;
+- restrictive Tailscale Grants/access policy allows only intended ServerSentinel viewers;
+- ordinary uninvited Tailnet members receive no Grant to the ServerSentinel main node;
+- ServerSentinel still checks its own invitation/permission list.
+
+Do not promise invisibility from Tailnet Owners/Admins or infrastructure administrators.
+
+## LAN capture-ingest setup
+
+Remote agents use a separate LAN-facing ingest endpoint.
+
+- mTLS/revocable node credential required;
+- dashboard routes unavailable on that listener;
+- bind/firewall exposure narrowed to the private LAN and, where practical, known capture-node addresses;
+- IP address is never sufficient authentication.
+
+## Low-light/image-quality UX
+
+Show detector-specific quality, for example:
+
+```text
+Person detection: Insufficient (too dark)
+Owner verification: Unavailable (face too small)
+Recording: Active
+```
+
+Never translate a skipped person detector into `人はいません`.
+
+## Presence UX
+
+```text
+Presence: PRESENT / PROBABLY_PRESENT / ABSENT / UNKNOWN
+Source: entrance inference / manual / schedule
+
+[ 在室にする ] [ 不在にする ] [ 自動判定へ戻す ]
+```
+
+Server movement/camera tamper remains active regardless of presence state.
 
 ## Failure UX
 
 Prefer explicit Japanese states:
+
 - `カメラが切断されました`
-- `Web Camera Nodeを再接続中`
-- `ブラウザ側で手動操作が必要です`
-- `映像が暗いため人物/Owner判定を停止しています`
+- `Capture Nodeとの接続が切れました`
+- `カメラを一意に確認できないため手動確認が必要です`
+- `時刻同期のずれが大きいためイベント時刻の信頼性が低下しています`
+- `映像品質不足のため人物判定は不明です`
 - `処理負荷のため解析頻度を下げています`
 - `ストレージ残量が少なくなっています`
 - `新しい録画を保存できません`

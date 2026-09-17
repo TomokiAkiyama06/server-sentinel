@@ -2,25 +2,23 @@
 
 ## 1. Purpose
 
-ServerSentinel shall provide a self-hosted physical-security monitoring system for valuable servers/workstations using one or more heterogeneous camera sources and an Ubuntu host for storage, analysis, event correlation, and the web dashboard.
+ServerSentinel shall provide a self-hosted physical-security monitoring system for valuable servers/workstations using one or more heterogeneous camera sources and an Ubuntu main host for storage, analysis, event correlation, and the web dashboard.
 
-The system is optimized for a single deployment owner while remaining installable by unrelated users without developer assistance.
+The system is optimized for one deployment owner who may explicitly invite additional viewers. It must remain installable by unrelated users without developer assistance.
 
-No specific phone model, webcam model, room layout, IP address, filesystem path, or camera count is required.
+No specific camera model, room layout, IP address, filesystem path, or exact camera count is required.
 
 ## 2. Product priorities
 
 Priority order:
 
-1. **Remote multi-camera live viewing**
+1. **Private remote multi-camera live viewing**
 2. **Evidence preservation for theft/tampering while the recorder is available**
 3. **Server movement and camera-tamper detection**
-4. **Entrance/person/presence timeline correlation**
+4. **Room/entrance/person/presence timeline correlation**
 5. **Unified ServerSentinel operational status**
 
-Continuity and trustworthy state reporting are more important than maximum image quality.
-
-ServerSentinel MUST NOT claim that browser-origin footage is durably preserved after the Ubuntu recording host/storage is physically stolen, destroyed, or powered off. Strong independent off-host evidence storage is outside the MVP unless separately specified.
+Continuity and truthful state reporting are more important than maximum image quality.
 
 ## 3. Privacy and ownership requirements
 
@@ -28,7 +26,7 @@ ServerSentinel MUST NOT claim that browser-origin footage is durably preserved a
 The project shall not require a ServerSentinel-operated cloud service.
 
 ### PRIV-002 No developer-side user data
-The developer shall not receive or retain users' video, audio, biometric templates, IP addresses, hostnames, Slack credentials, Tailscale information, event metadata, recordings, audit logs, or deployment configuration as part of normal operation.
+The developer shall not receive or retain users' video, biometric templates, private network information, event metadata, recordings, audit logs, or deployment configuration as part of normal operation.
 
 ### PRIV-003 No telemetry/analytics
 The official project shall not include analytics, advertising SDKs, telemetry, developer-operated crash upload, or tracking SDKs by default.
@@ -36,33 +34,25 @@ The official project shall not include analytics, advertising SDKs, telemetry, d
 ### PRIV-004 Explicit diagnostic export
 Diagnostics may leave the user's environment only after an explicit export/share action initiated by the deployment owner.
 
-### PRIV-005 Self-hosted camera data path
-Camera data shall flow directly from local cameras or user-owned Web Camera Nodes to the user's ServerSentinel host, except for explicitly enabled third-party services such as Tailscale or Slack.
+### PRIV-005 Self-hosted media path
+Camera media shall flow only inside the user's deployment/private network path, except for explicitly enabled third-party infrastructure such as Tailscale or Slack.
 
 ### PRIV-006 Owner biometric data
-Owner face verification is optional and requires explicit enrollment.
-
-The enrolled owner face template/embedding:
-- is sensitive biometric data;
-- shall stay inside the deployment by default;
-- shall not be sent to the ServerSentinel developer;
-- shall be deletable and re-enrollable by the owner;
-- shall not be included in diagnostics by default.
+Owner face verification is optional and requires explicit enrollment. The owner template/embedding is sensitive biometric data, stays deployment-local by default, is deletable/re-enrollable, and is excluded from normal diagnostics.
 
 ### PRIV-007 Non-owner identity minimization
-The MVP shall not maintain a named biometric identity database for other observed people.
-
-Non-owner observations may use anonymous tracking identifiers for event correlation. The system shall not assign real names to non-owner people unless a future explicit product decision changes this requirement.
+The MVP shall not maintain a named biometric identity database for other observed people. Anonymous tracking identifiers may be used only for scoped event correlation.
 
 ### PRIV-008 Deployment responsibility
-The deployment owner is responsible for complying with applicable laws, institutional policies, notice requirements, and rules governing camera/biometric use in the deployment environment.
+The deployment owner is responsible for applicable laws, institutional policies, notice requirements, and camera/biometric rules in the deployment environment.
+
+### PRIV-009 Video-only MVP
+Audio capture/surveillance is not required for the MVP. Camera microphones shall not be used by default and no security decision may depend on audio.
 
 ## 4. Distribution and licensing requirements
 
-### DIST-001 Web/self-hosted distribution
-The MVP shall be distributed as self-hosted server/web software. A native iOS application and App Store distribution are not required.
-
-The MVP shall not require Apple Developer Program membership.
+### DIST-001 Self-hosted distribution
+The MVP is self-hosted server/web software plus an optional Linux capture agent. A native iOS application, App Store distribution, and Apple Developer Program membership are not required.
 
 ### DIST-002 Open-source repository
 The project repository shall be suitable for public GitHub hosting.
@@ -70,481 +60,319 @@ The project repository shall be suitable for public GitHub hosting.
 ### DIST-003 License
 Project source shall be licensed under Apache-2.0.
 
-### DIST-004 Dependency compatibility
-Dependencies, models, and weights must have licenses compatible with the project's distribution goals. Source-code licenses and model/weight licenses must be reviewed separately.
-
-AGPL/GPL/SSPL/source-available/unclear components are blocked by default unless explicitly approved and documented.
+### DIST-004 Dependency/model compatibility
+Dependencies, models, and weights must have licenses compatible with the project's distribution goals. Source-code and model/weight licenses are reviewed separately. AGPL/GPL/SSPL/source-available/unclear components are blocked by default unless explicitly approved and documented.
 
 ## 5. Camera-source requirements
 
 ### CAM-001 Camera-source abstraction
-All video inputs shall be represented through a common Camera Source abstraction rather than hard-coded `front`/`rear` iPhone cameras.
+All video inputs shall use a common Camera Source abstraction rather than fixed `front`/`rear` or fixed-camera schemas.
 
 ### CAM-002 MVP source types
 The MVP shall support:
-- `local_uvc`: UVC/V4L2-compatible USB camera attached to the Ubuntu host;
-- `remote_web`: camera exposed by a user-owned browser through the Web Camera Node.
+- `local_uvc`: UVC/V4L2-compatible camera attached to the main Ubuntu host;
+- `remote_agent`: UVC/V4L2-compatible camera attached to another owner-authorized Linux host running `media-capture-agent`.
 
-Future source types such as RTSP/IP cameras or Raspberry Pi nodes may be added without changing the core event/storage model.
+A future browser camera source such as `remote_web` may be added later without changing the core event/storage model, but it is not required for MVP completion.
 
 ### CAM-003 Source count
-The MVP shall work with **one active video source** and shall support **up to four active video sources** in one deployment.
-
-The limit of four is an MVP/configuration limit. Internal data models and APIs shall not assume exactly two or exactly four cameras.
+The MVP shall work with **one active video source** and support **up to four active video sources**. Four is a configurable MVP limit; data models/APIs shall not assume exactly two or four sources.
 
 ### CAM-004 Free composition
-Any supported source types may be mixed within the active-source limit. Valid examples include:
-- one USB webcam;
-- two USB webcams;
-- one Web Camera Node only;
-- two USB webcams + one phone browser;
-- four mixed sources.
+Any supported source types may be mixed within the active-source limit. Examples include one local webcam, two local webcams, one remote agent camera, or mixed local/remote-agent sources.
 
-### CAM-005 User-defined source metadata
-Each source shall have:
-- stable source identifier;
-- user-visible name;
-- source type;
-- enabled/disabled state;
-- optional semantic role label;
-- capabilities;
-- health state;
-- assigned detection profiles.
+### CAM-005 Source metadata
+Each source shall have a stable logical source ID, user-visible name, source type, enabled state, optional role label, capabilities, health state, capture profile, and assigned detection profiles.
 
 ### CAM-006 Role is not hardware type
-Role labels such as `server_overview`, `server_rear`, `entrance`, `room_overview`, or custom labels shall not be tied to a specific source type.
+Role labels such as `server_overview`, `server_rear`, `room_overview`, `entrance`, or custom values shall not be tied to source type.
 
-### CAM-007 Detection profiles are configurable
-Detection behavior shall be assigned per source/profile, not inferred only from role or hardware.
+### CAM-007 Configurable detection profiles
+Detection behavior is configured per source/profile, including motion, person, server ROI/movement, camera tamper, entrance/zone logic, owner verification, and image-quality gating.
 
-Examples:
-- motion;
-- person;
-- server ROI/movement;
-- camera tamper;
-- entrance crossing;
-- owner verification;
-- low-light/image-quality gating.
+### CAM-008 Stable UVC identity
+The system shall not use `/dev/videoN` alone as durable physical-camera identity.
 
-### CAM-008 Local UVC discovery
-The server shall enumerate compatible local camera devices and allow the deployment owner to explicitly enable/configure them. Device ordering such as `/dev/video0` alone shall not be treated as a stable identity when better stable device identifiers are available.
+Where available, identity may use `/dev/v4l/by-id`, serial numbers, USB topology/physical path, udev metadata, vendor/product information, and capabilities.
 
-### CAM-009 Remote Web Camera Node
-A remote Web Camera Node shall run in a supported browser on a camera-capable device such as an iPhone, Android phone, tablet, laptop, or desktop.
+If a reconnect cannot be matched unambiguously to the previously approved physical camera—especially with multiple identical devices lacking unique serials—the system shall **not** auto-bind it. The source becomes `manual_intervention_required` until the owner explicitly re-approves the mapping.
 
-The implementation shall not hard-code iPhone 14 or Safari as the only supported device/browser.
+### CAM-009 Camera unplug/replug
+A disconnected physical camera becomes `offline` and generates a health/audit event. The capture service remains alive. A uniquely identifiable reconnect may return to `online` automatically. Intentional unplugging is still recorded as an offline event; immediate notification policy may be configurable.
 
-### CAM-010 Secure browser context
-Web Camera Node camera/microphone access shall use a secure browser context as required by browser APIs. The normal setup shall not instruct users to disable browser security controls.
+### CAM-010 Camera health
+At minimum support `online`, `degraded`, `offline`, and `manual_intervention_required` where applicable.
 
-### CAM-011 Audio default OFF
-Audio capture may be supported, but shall be OFF by default per source. Enabling it requires explicit deployment-owner action and visible state.
+### CAM-011 Room-overview support
+A wide room-overview camera may be located physically closer to a separate Linux machine than to the main host. The architecture shall support forwarding that camera over the private LAN through `media-capture-agent` without requiring that capture machine to join Tailscale.
 
-### CAM-012 No automatic torch/light
-The MVP shall not automatically activate a phone torch, screen flash, or other visible light in response to motion or low light.
+## 6. `media-capture-agent` requirements
 
-Torch control is not an MVP requirement.
+### AGENT-001 Functional identity
+The Linux capture service shall use the truthful functional name `media-capture-agent` (including the intended systemd service name). It shall not impersonate unrelated system software.
 
-### CAM-013 Browser lifecycle honesty
-Web Camera Node monitoring is expected to remain foreground/active. ServerSentinel shall not claim guaranteed capture after browser suspension, tab termination, screen lock, OS process termination, device shutdown, or unsupported background transition.
+### AGENT-002 Background service
+The agent shall run without a desktop window/tray requirement and should run under a dedicated non-root service account during normal operation. Root/admin privileges are limited to installation and narrowly required device/service configuration.
 
-Where wake-lock APIs are available they may be used as best-effort assistance, but capture correctness shall not depend on an unsupported background assumption.
+### AGENT-003 Video-only capture
+The MVP agent captures video only. Microphones are not required and should not be opened.
 
-### CAM-014 Camera health
-The system shall report at minimum `online`, `degraded`, `offline`, and `manual_intervention_required` states where applicable and shall record camera disconnect/reconnect events.
+### AGENT-004 Outbound connection model
+The agent initiates its connection toward the main ServerSentinel host. The main host does not require SSH/admin access to the capture machine merely to receive video.
 
-### CAM-015 Browser-local evidence is non-authoritative
-The MVP may experiment with short browser-side buffering, but browser storage shall not be described as guaranteed durable critical-evidence storage. Primary durable recording remains Ubuntu-side.
+### AGENT-005 Pairing
+Initial agent enrollment uses an owner-approved, short-lived, single-use pairing credential/code. The agent generates or receives a unique revocable node identity. Long-lived media/control traffic shall use authenticated encryption, with mTLS as the default design target unless an ADR selects an equivalent design.
 
-## 6. Capture and streaming requirements
+### AGENT-006 No Tailnet requirement
+The capture agent shall be able to operate over the same private LAN without being enrolled in the owner's Tailnet.
 
-### MEDIA-001 Multi-source live view
-The owner shall be able to view all active camera sources from the web dashboard.
+### AGENT-007 Separate ingest boundary
+The main host's LAN ingest endpoint for capture agents shall be separate from the dashboard/API exposure used by human viewers. The ingest endpoint shall not expose dashboard routes.
 
-The UI shall adapt for 1–4 sources rather than assuming a fixed two-camera layout.
+### AGENT-008 Narrow network exposure
+The ingest endpoint requires node authentication regardless of LAN location. Source-address firewall restriction is additionally recommended/required where stable network addressing permits, but IP address alone is never sufficient authentication.
 
-### MEDIA-002 Initial live profile
-Initial live targets per source:
-- 720p-class output where practical;
-- approximately 15 fps normal target;
-- optional higher FPS/quality when resources permit;
-- adaptive degradation allowed under CPU/GPU/network/USB/browser constraints.
+### AGENT-009 Health and reconnect
+Agent heartbeat/health and physical camera health are separate. A healthy agent may report its camera `offline`. Reconnect and substitution handling follows CAM-008/CAM-009.
 
-Exact defaults shall be benchmark-derived.
+### AGENT-010 Time synchronization
+The main host and capture agent shall monitor clock synchronization/offset sufficiently to keep event ordering trustworthy. Excessive offset becomes an explicit degraded condition rather than silently producing misleading timelines.
 
-### MEDIA-003 Low-latency live transport
-Low-latency remote Web Camera Node/live-dashboard transport shall be selected through a documented PoC/ADR. WebRTC is an expected candidate, not a pre-approved final answer.
+### AGENT-011 Installation lifecycle
+Development may run the agent from a Git clone. Stable releases should provide a standalone versioned artifact/installer (for example GitHub Releases) and systemd unit so production operation does not depend on a mutable development checkout.
 
-### MEDIA-004 Durable recording transport
-Durable recording shall not depend solely on an uninterrupted live-view session.
+### AGENT-012 Local recovery buffer undecided
+Whether `media-capture-agent` retains a short local recovery ring buffer during main-host/network outages, its duration, storage medium (RAM/tmpfs vs disk), and privacy behavior require a separate decision before implementation. No durable agent-side recording guarantee is implied yet.
 
-Remote-source recording transport shall support bounded chunks/segments, retry, idempotency, integrity metadata, and source identity.
+## 7. Capture, encode, and streaming requirements
 
-Local UVC recording may use a direct server capture path while producing the same logical recording/event model.
+### MEDIA-001 Capture/record/inference/view separation
+Capture quality, durable-recording quality, inference cadence, and browser-view quality shall be independently configurable/adaptive. A high-resolution room-overview source must not force every inference or remote viewer to process the full source resolution/FPS.
 
-### MEDIA-005 Manual recording
-The owner shall be able to start/stop manual recording for a selected source set.
+### MEDIA-002 Benchmark-derived source profiles
+Exact source defaults are chosen from real measurements. Candidate room-overview tests may compare high-resolution 10–15 fps capture with 1080p/15 fps and lower viewer/inference profiles.
 
-Default maximum manual session: **20 minutes**.
+### MEDIA-003 Codec efficiency
+Prefer passthrough/stream-copy when source codec/profile is suitable. Otherwise use bounded software or hardware encode/decode resources. Remote-agent hardware acceleration may be used when available but is not a correctness requirement.
 
-### MEDIA-006 Ring buffer
-The server shall maintain enough recent media to preserve pre-event footage for configured sources where resource constraints permit.
+### MEDIA-004 Multi-source live view
+Authorized users with `live:view` shall be able to view active sources from phone/Mac/desktop browsers through the main ServerSentinel dashboard. The UI adapts for 1–4 sources.
 
-Default automatic event window:
-- pre-event: 30 seconds;
-- post-event: 120 seconds;
-- extend while qualifying activity continues;
-- maximum event duration: 20 minutes.
+### MEDIA-005 Demand-driven viewer processing
+Viewer-only transcoding/packaging should be started or scaled only when needed. No viewer should require a direct connection to a capture agent.
 
-### MEDIA-007 Multi-source event evidence
-A single event may reference media from multiple camera sources. Recording filenames/schema shall use source IDs rather than semantic assumptions such as `rear.mp4` / `front.mp4`.
+### MEDIA-006 Live transport decision
+Agent-to-main and main-to-browser low-latency transports must be selected through measured PoC/ADR work. Correct authentication/reconnect/backpressure semantics are more important than committing prematurely to WebRTC/SRT/QUIC/another protocol.
 
-## 7. Detection requirements
+### MEDIA-007 Durable recording
+Durable recording is main-host authoritative. Remote source handling must preserve source identity, timestamps, bounded queues/backpressure, and integrity. If chunk retry is used it must be idempotent.
+
+### MEDIA-008 Manual recording
+The owner may start/stop manual recording for selected sources. Default maximum: **20 minutes**.
+
+### MEDIA-009 Event ring buffer
+The main host maintains bounded recent compressed media for configured sources where resources permit. Default automatic event target is 30 seconds pre-event + 120 seconds post-event, extendable while qualifying activity continues, maximum 20 minutes.
+
+Decoded frame histories shall not be retained unnecessarily when compressed media can satisfy pre-roll requirements.
+
+### MEDIA-010 Multi-source event evidence
+One event may reference media from multiple sources. Filenames/schema use source IDs rather than role-specific fixed names.
+
+## 8. Detection requirements
 
 ### DET-001 General motion
 General motion detection shall be available per configured source.
 
 ### DET-002 Person detection
-Person detection shall be available per configured source from the initial release.
-
-Heavy inference should run on Ubuntu by default.
+Person detection shall be available per configured source. Heavy inference runs on the main Ubuntu host by default; capture agents should remain lightweight unless a future architecture decision introduces edge inference.
 
 ### DET-003 Pluggable detector
-Person/face-related detection implementations shall remain replaceable. Source-code and model-weight licensing must be verified separately.
+Person/face implementations remain replaceable. Code and model/weight licenses are verified separately. YOLOX is an initial person-detector evaluation candidate, not a mandated final model.
 
-YOLOX remains an initial permissively licensed person-detector evaluation candidate; it is not mandated as the final model.
+### DET-004 Server ROI/movement
+One or more sources may have server ROI/polygon/reference geometry. Meaningful displacement/rotation requires temporal/scene confirmation; person presence alone is not proof of movement.
 
-### DET-004 Server ROI calibration
-One or more sources may be configured with a server ROI/polygon/reference geometry for server movement/tamper analysis.
+### DET-005 Camera tamper
+Detect probable tamper using available signals such as global scene transform, persistent occlusion/near-black view, stream interruption, abrupt pose/exposure change, and source-health changes correlated with movement.
 
-### DET-005 Server movement
-The system shall detect meaningful displacement/rotation of the monitored server using configured ROI/scene information and temporal confirmation.
+### DET-006 Occlusion tolerance
+Temporary person occlusion of a server ROI shall not immediately become confirmed server movement.
 
-A generic person detector alone is insufficient proof of server movement.
+### DET-007 Detector-specific quality gating
+Each detector shall define the visual-quality prerequisites needed for a trustworthy positive **and negative** result.
 
-### DET-006 Camera tamper
-The system shall detect probable camera tampering using signals available to the source, including where applicable:
-- sudden global scene transform;
-- camera occlusion;
-- stream interruption;
-- abrupt orientation/pose change visible in the scene;
-- source-health changes correlated with motion.
+If a frame/source is too dark, blurred, saturated, obstructed, too low-resolution, or otherwise inadequate for a dependent detector:
+- report `degraded`/`insufficient` quality with reason/metrics;
+- skip or mark that detector `unknown`/unavailable;
+- **do not interpret skipped/failed person inference as `no person`**;
+- do not force owner match/non-match;
+- do not force presence from absent evidence;
+- live/recording may continue if frames still exist.
 
-IMU is not required for the MVP because Web Camera Nodes are browser-based and UVC cameras generally do not expose it.
+### DET-008 Owner-only face verification
+The MVP may verify whether a detected face matches one explicitly enrolled deployment owner. Enrollment is explicit/optional; result is probabilistic; low-quality/ambiguous inputs become `unknown`; template remains local and deletable/re-enrollable.
 
-### DET-007 Occlusion tolerance
-Temporary person occlusion of a server ROI shall not immediately become a confirmed server-movement event.
+### DET-009 No named non-owner face database
+The MVP shall not enroll, name, or persist facial identity profiles for other observed people.
 
-### DET-008 Low-light/image-quality gating
-The system shall estimate whether a source/frame has sufficient visual quality for each dependent detector.
+### DET-010 Anonymous tracking
+Non-owner people may receive anonymous track/session IDs within a configured scope. Cross-camera biometric re-identification is not an MVP feature.
 
-If conditions are too dark or otherwise inadequate:
-- report a degraded/insufficient-quality state;
-- dependent identity/presence conclusions shall become `unknown` or unavailable rather than forced positive/negative results;
-- automatic torch/light activation shall not occur;
-- recording/live view may continue if technically possible.
+### DET-011 Entrance/zone crossing
+A room-overview/entrance source may use a line/zone and direction when geometry supports it. Owner entry/exit is emitted only when owner verification quality is sufficient; anonymous entry/exit does not name the person.
 
-### DET-009 Owner-only face verification
-The MVP may verify whether an observed face matches the explicitly enrolled deployment owner.
-
-Requirements:
-- enrollment is explicit and optional;
-- threshold/confidence behavior is documented and benchmarked;
-- low-quality/ambiguous frames do not force a match/non-match;
-- owner template is stored locally under the privacy requirements;
-- owner can delete/re-enroll the template;
-- the feature shall be described as probabilistic verification, not certainty.
-
-### DET-010 No named non-owner face database
-The MVP shall not enroll, name, or persist a facial identity profile for other observed people.
-
-### DET-011 Anonymous person tracking
-Non-owner people may receive anonymous track/session identifiers to connect observations over time within a configured tracking scope.
-
-The system shall not assert cross-camera identity equivalence unless an explicit future re-identification design is approved and documented.
-
-### DET-012 Entrance crossing
-A camera source may be configured with an entrance/exit line or zone and direction. When owner verification quality is sufficient, the system may emit `owner_entered` / `owner_exited` observations.
-
-Anonymous entry/exit observations may be emitted without naming the person.
-
-## 8. Event correlation and timeline requirements
+## 9. Event/presence requirements
 
 ### EVENT-001 Unified timeline
-The dashboard shall correlate camera and server observations into one chronological security timeline.
+Correlate camera/server observations chronologically: person/motion, anonymous/owner entry-exit, server movement, camera health, agent health, recording/storage state, presence, configuration changes.
 
-Initial event/observation classes include:
-- person/motion;
-- anonymous entrance/exit;
-- owner entrance/exit;
-- server movement;
-- camera tamper/occlusion;
-- camera online/offline;
-- server service start/stop/reachability state;
-- recording events;
-- storage state;
-- presence state;
-- configuration changes.
+### EVENT-002 No culprit inference
+Do not label an observed person as thief, attacker, culprit, or cause based solely on temporal/camera correlation.
 
-### EVENT-002 Relevant observation window
-For a critical event, the UI may show people/entry/exit observations within a configurable relevant time window to help the owner review context.
+### EVENT-003 Confidence/source attribution
+Derived observations include source attribution and confidence/quality where applicable.
 
-### EVENT-003 No culprit inference
-ServerSentinel shall not label a person as a thief, attacker, culprit, or cause of an event based solely on temporal/camera correlation. The UI shall distinguish observations from human conclusions.
+### PRES-001 Presence states
+Support `PRESENT`, `PROBABLY_PRESENT`, `ABSENT`, `UNKNOWN`.
 
-### EVENT-004 Confidence/source attribution
-Derived events shall include source attribution and confidence/quality metadata where applicable.
+### PRES-002 Manual override
+Manual owner override has precedence over inferred state/schedules until cancelled/expired.
 
-## 9. Recording and storage requirements
+### PRES-003 Suppression safety
+Only explicit/high-confidence `PRESENT` suppresses ordinary person/general-motion automation by default. `PROBABLY_PRESENT`/`UNKNOWN` do not silently disarm monitoring. Server movement and camera tamper remain armed in every presence state.
+
+## 10. Storage requirements
 
 ### STORE-001 Ubuntu primary storage
-Recordings, thumbnails, metadata, audit logs, and owner biometric templates shall reside primarily on the self-hosted Ubuntu deployment, with biometric material logically separated/protected as sensitive configuration data.
+Recordings, thumbnails, metadata, audit logs, and owner biometric template reside primarily on the self-hosted main Ubuntu deployment.
 
 ### STORE-002 Configurable recording root
-No recording path may be hard-coded to a specific personal disk/mount.
+No recording path is hard-coded to a personal disk/mount.
 
-### STORE-003 Arbitrary valid user storage
-The system shall support arbitrary valid user-selected recording volumes rather than requiring a particular HDD capacity.
+### STORE-003 Retention
+Default recording retention: **20 days**. Default audit-log retention: **90 days**.
 
-### STORE-004 Retention
-Default recording retention: **20 days**.
+### STORE-004 Capacity ceiling
+The owner configures maximum recording allocation. Cleanup reacts to retention, configured allocation, and actual filesystem safety pressure.
 
-### STORE-005 Capacity ceiling
-The owner shall configure a maximum recording-storage allocation. Cleanup triggers on whichever applies first:
-- retention limit;
-- allocation limit;
-- actual filesystem safety pressure.
+### STORE-005 Starred recordings
+Starred recordings are excluded from automatic deletion but count toward disk usage. They never justify intentionally filling the filesystem.
 
-### STORE-006 Starred recordings
-Starred recordings are excluded from automatic retention/capacity deletion but count toward disk usage. Starred protection must not intentionally fill the filesystem to 100%.
+### STORE-006 Filesystem safety reserve
+Preserve a hard filesystem safety reserve independent of normal recording allocation. Reclaim eligible unstarred recordings first, then suppress ordinary/manual recording under `STORAGE_PRESSURE`; bounded critical evidence may use only a safe allowance; refuse writes before crossing the hard reserve under `STORAGE_HARD_STOP`; recover with hysteresis.
 
-### STORE-007 Manual deletion
-The deployment owner may explicitly delete recordings through the UI after authorization.
-
-### STORE-008 Audit retention
-Audit logs:
-- default 90-day retention;
-- append-only through normal application APIs;
-- not individually deletable from normal UI;
-- automatically expire by policy.
-
-### STORE-009 Benchmark-derived defaults
-Storage/bitrate/source-count recommendations shall be based on actual benchmarks rather than guessed constants.
-
-### STORE-010 Filesystem safety reserve
-ServerSentinel shall preserve a hard filesystem safety reserve independent of normal recording allocation.
-
-When free space becomes unsafe:
-1. reclaim eligible unstarred recordings;
-2. reject/suppress ordinary non-critical/manual recording admission before protected capacity is exhausted;
-3. retain a bounded critical-evidence allowance where safe;
-4. never consume the hard safety reserve;
-5. enter explicit `STORAGE_PRESSURE` / `STORAGE_HARD_STOP` states before unsafe writes;
-6. warn/audit state changes;
-7. recover with hysteresis after sufficient space returns.
-
-### STORE-011 Non-owner biometric minimization
-ServerSentinel shall not create a separate persistent library of non-owner face crops/templates by default. Ordinary recordings may still contain people as part of the configured video evidence.
-
-## 10. Notifications and Slack requirements
+## 11. Notifications
 
 ### NOTIFY-001 Slack optional
-Slack integration is optional and OFF until configured.
+Slack is optional and disabled until configured.
 
-### NOTIFY-002 Immediate notifications
-Immediate Slack alerts shall remain intentionally sparse. Initial candidates:
-- confirmed server movement;
-- confirmed camera tamper.
-
-Ordinary person/motion/anonymous-entry events shall not create individual main-channel alerts by default.
+### NOTIFY-002 Sparse immediate alerts
+Immediate alerts default to confirmed server movement/camera tamper. Ordinary person/motion/entry and ordinary camera unplug events are summarized unless the owner configures otherwise.
 
 ### NOTIFY-003 Daily summary
-Default daily summary time: 23:00 local time, configurable.
+Default daily summary: 23:00 local time, configurable. Include monitored duration, source/agent health, degraded/offline counts, person/motion/entry counts, critical events, recordings, storage, and errors.
 
-Summary shall include at minimum:
-- monitored duration;
-- active/available camera count;
-- per-source health/degraded states;
-- person/general-motion counts;
-- entrance/exit observations;
-- server movement/camera tamper counts;
-- disconnect/reconnect counts;
-- recordings;
-- storage state;
-- critical events/errors.
+### NOTIFY-004 No developer relay
+Slack delivery goes directly from the user's deployment to the user's configured Slack endpoint/API.
 
-### NOTIFY-004 Threaded evidence
-Relevant thumbnails/event entries may be posted as thread replies under the daily summary where configured.
+## 12. Human remote-access requirements
 
-### NOTIFY-005 No developer relay
-Slack delivery shall go directly from the user's deployment to the user's configured Slack endpoint/API.
+### AUTH-001 Private reachability only
+Public Internet port exposure is not the default. Human remote access should use Tailscale or an equivalent private network.
 
-## 11. Presence requirements
+### AUTH-002 Tailnet membership is not authorization
+Being a Tailnet member does not grant ServerSentinel access.
 
-### PRES-001 Manual presence
-The dashboard shall provide explicit manual presence control.
+### AUTH-003 Network-level concealment for uninvited ordinary members
+The deployment shall use restrictive Tailscale access policy/Grants so ordinary Tailnet members who are not authorized for ServerSentinel receive no network grant to the ServerSentinel main node. Where supported by Tailscale peer-map behavior, they should not normally discover the node through peer visibility/status.
 
-### PRES-002 Presence states
-Inferred owner presence shall support uncertainty. Initial states:
-- `PRESENT`;
-- `PROBABLY_PRESENT`;
-- `ABSENT`;
-- `UNKNOWN`.
+This requirement does **not** claim concealment from Tailnet Owners/Admins, infrastructure administrators, or other principals that inherently manage the Tailnet/network.
 
-### PRES-003 Entrance-derived presence
-When a source has entrance-crossing + owner-verification profiles, owner entrance/exit observations may update inferred presence.
+### AUTH-004 Separate ServerSentinel allowlist
+Even if a user can reach the node, ServerSentinel checks an owner-managed allowlist/invitation before serving any dashboard/media data. Unauthorized users receive no camera names, counts, thumbnails, recordings, or deployment metadata.
 
-Uncertain/low-light/ambiguous observations shall not force `ABSENT` or `PRESENT`.
+### AUTH-005 Trusted Tailscale identity path
+When Tailscale Serve or an equivalent trusted proxy supplies user identity, the backend accepts those identity headers only from the trusted local proxy path. The dashboard/API should bind to loopback or another non-bypassable local boundary so arbitrary LAN clients cannot spoof proxy identity headers.
 
-### PRES-004 Suppression safety
-Only explicit `PRESENT` (including manual override) suppresses ordinary person/general-motion security automation by default. `PROBABLY_PRESENT` and `UNKNOWN` do not suppress security automation unless a future explicit policy changes this behavior.
+### AUTH-006 Granular invited-user permissions
+At minimum support independent permissions:
+- `live:view` — browser live view;
+- `recordings:view` — browser recording list/playback.
 
-Presence never disables:
-- confirmed server-movement detection;
-- confirmed camera-tamper detection;
-- critical-event evidence handling;
-- live view;
-- manual recording;
-- health status.
+Granting one does not imply the other.
 
-### PRES-005 Manual override precedence
-Manual override takes precedence over inferred presence and schedules until its expiry/cancellation.
+### AUTH-007 Browser-only non-owner playback
+Non-owner invited users do not receive an official recording download/export endpoint/button in the MVP. The product must state that browser playback cannot technically prevent screen recording or advanced client-side capture.
 
-### PRES-006 Schedule
-Weekly/day/time schedules may provide a lower-priority presence hint/automation but must not override an active manual override.
+### AUTH-008 Owner operations
+Only the owner (or a future explicitly defined privileged role) may add/revoke users, change permissions, register/revoke capture agents/cameras, enroll/delete owner biometrics, alter retention/security settings, or delete recordings.
 
-## 12. Setup, discovery, and pairing requirements
+### AUTH-009 Grant-management boundary
+Automatic mutation of Tailscale Grants from ServerSentinel is **not required** for MVP because it would introduce Tailscale administrative credentials. The owner may manage the Tailnet-level permission separately. ServerSentinel must clearly show that both Tailnet permission and application invitation are required.
 
-### SETUP-001 First-run wizard
-The Ubuntu web UI shall provide guided self-hosted setup.
+### AUTH-010 Immediate revocation
+Application permission revocation shall invalidate active authorization promptly. Tailnet-level access revocation remains a separate network-policy action unless a future approved integration automates it.
 
-### SETUP-002 Local UVC add flow
-Local UVC cameras shall be discovered locally and explicitly enabled/configured by the deployment owner. They do not use remote Camera Node pairing.
+### AUTH-011 Timeline permission unresolved
+Whether invited users with only `live:view` or `recordings:view` may access historical event/timeline metadata requires a separate explicit decision. Implementations shall not implicitly expose historical timeline data through live-view authorization.
 
-### SETUP-003 Remote Web Camera Node pairing
-Remote Web Camera Nodes shall use a short-lived owner-approved pairing/session bootstrap without a developer account.
+## 13. Dashboard requirements
 
-Initial pairing token target:
-- cryptographically random;
-- single use;
-- approximately 5-minute expiry;
-- never logged in plaintext.
+### UI-001 Responsive live grid
+Support phone/Mac/desktop browsers. One source uses a large tile, two use split layout, three/four use responsive grid where practical.
 
-QR and manual code/address flows may both be supported.
+### UI-002 Source health
+Show source name/type/role, camera/agent online state, negotiated capture/view profile, image-quality state, and any `manual_intervention_required` condition.
 
-### SETUP-004 Browser credential
-After successful pairing, the browser node shall receive/derive a revocable deployment-scoped credential using browser-appropriate secure storage/cryptographic APIs. Do not rely on a developer cloud identity.
+### UI-003 Access management
+Owner UI shall show invited identities, independent `live:view` / `recordings:view` permissions, active/revoked state, and the fact that Tailscale network permission is separately required.
 
-### SETUP-005 Source configuration
-After a source is added, setup shall allow:
-- name;
-- role label;
-- preview;
-- quality/profile;
-- audio state;
-- assigned detection profiles;
-- ROI/entrance-line calibration where applicable.
+## 14. Performance and overload requirements
 
-### SETUP-006 Owner enrollment
-Owner face enrollment is optional and separate from basic camera setup. Enrollment must explain local biometric processing and provide delete/re-enroll controls.
+### PERF-001 Four-source target
+Four active sources are a supported test target, not a guarantee that every camera can run maximum advertised quality simultaneously on every USB/network/host topology.
 
-### SETUP-007 Other users
-No configuration may require the original developer's personal IP, hostname, Tailnet, Slack, Wi-Fi, path, phone model, webcam model, or account.
+### PERF-002 Adaptive inference
+Inference cadence is independent from capture FPS and may reduce under load. Critical monitoring/health and evidence integrity take precedence over expensive analysis and viewer quality.
 
-## 13. Remote access and deployment-owner authorization
+### PERF-003 Truthful degradation
+Do not silently drop a source while reporting healthy monitoring. Surface overload, dropped frames, encoder pressure, and network/backpressure where material.
 
-### REMOTE-001 Tailscale recommended
-Tailscale is the recommended remote-access method for the dashboard. Equivalent private reachability may be used.
+## 15. Testing/repository requirements
 
-### REMOTE-002 No public exposure by default
-Documentation shall not recommend direct public Internet port exposure as the default.
+### TEST-001 Synthetic repository media only
+Repository and CI media fixtures shall be **synthetic/generated only**. Real-person, real-room, real-monitoring, or merely publicly licensed real-person media shall not be committed to the repository or attached to GitHub PRs/issues/actions artifacts.
 
-### REMOTE-003 Single-owner model
-MVP assumes one deployment owner.
+Public or privately licensed real-person benchmark datasets, if legally/ethically appropriate for local model evaluation, may be used only outside the repository under their terms and are not repository fixtures.
 
-### REMOTE-004 No developer identity
-No ServerSentinel developer-operated cloud account is required.
+### TEST-002 Real hardware stays local
+Real hardware/room/owner tests are documented in `MANUAL_TEST.md`; results may record measurements and PASS/FAIL without uploading real monitoring media or biometric templates.
 
-### REMOTE-005 Deployment-owner authorization
-Tailnet membership provides network reachability, not sufficient proof of deployment ownership.
+### TEST-003 Required source/agent tests
+Cover local UVC and remote-agent discovery, ambiguous identical-device reconnect, agent pairing/revocation, clock offset, LAN outage/reconnect, source health, 1–4 mixed topology, and capture-vs-inference/view profiles.
 
-Privileged operations including live media, playback/deletion, source add/remove/pair/revoke, biometric enrollment/deletion, presence/security settings, retention/storage, and Slack configuration require explicit deployment-owner authorization.
+## 16. Development/review requirements
 
-The exact self-hosted mechanism must be locked by ADR before implementation and must support recovery/revocation without a developer-operated account.
+### DEV-001 No direct main
+Non-trivial work uses Issue -> branch -> PR -> CI/review -> merge.
 
-## 14. Web dashboard requirements
+### DEV-002 Dual automated review
+Codex and Claude must both review the current PR diff. A review is valid only for the current **HEAD and base revision/diff context**. If either HEAD or relevant base changes, the review must be rerun before merge.
 
-The dashboard shall be responsive/mobile-first and expose at minimum:
-- server/service state;
-- camera-source list and capabilities;
-- 1–4 source live grid;
-- per-source configuration/detection profiles;
-- recording controls;
-- events/timeline;
-- thumbnails/playback;
-- star/delete;
-- storage/retention;
-- presence/inference/manual override;
-- optional owner enrollment management;
-- Slack settings;
-- reconnect/degraded/manual-intervention states;
-- audit/log view.
+### DEV-003 No secrets/private deployment data
+Never commit real credentials, private keys, owner biometrics, private deployment values, or real monitoring media.
 
-## 15. Availability and failure requirements
+## 17. Non-goals / deferred decisions
 
-The system shall handle gracefully:
-- one or more USB cameras disconnected/reordered;
-- Web Camera Node network interruption/reconnect;
-- browser suspension/termination;
-- backend restart;
-- storage pressure/full conditions;
-- Slack failure;
-- AI worker failure;
-- unsupported browser/camera capabilities;
-- expired/invalid pairing token;
-- denied camera/microphone permission;
-- low-light/insufficient image quality;
-- source count/profile exceeding available USB/network/compute capacity.
-
-Failures shall be explicit. Silent capture loss is not acceptable where health monitoring can detect it.
-
-If the Ubuntu deployment itself is fully offline, MVP does not require a developer-operated external uptime monitor.
-
-## 16. Performance requirements
-
-- Capture FPS and inference FPS are separate concepts.
-- The implementation must not run every detector on every frame unless benchmarks justify it.
-- Inference cadence shall be configurable/profile-driven per source.
-- Four active sources shall be included in benchmark/manual-test scenarios.
-- Resource pressure should degrade optional/high-cost analysis before losing source-health reporting or critical monitoring where practical.
-- CPU-only operation shall remain a supported baseline for core functionality even if GPU acceleration is available.
-
-## 17. Development and completion requirements
-
-Software-side completion before real hardware means, as applicable:
-- unit tests pass;
-- API integration tests pass;
-- web typecheck/lint/tests pass;
-- Camera Source mocks cover 1–4 source topologies;
-- local UVC abstraction can be tested with mocks/fixtures;
-- Web Camera Node protocol/state can be tested without a real phone;
-- core E2E passes with synthetic/generated media only;
-- storage/retry/idempotency tests pass;
-- owner-verification logic has synthetic/generated test assets and threshold tests;
-- documentation is aligned;
-- remaining physical/browser-specific behavior is listed in `MANUAL_TEST.md`.
-
-## 18. Explicit non-goals / future work
-
-Not MVP requirements:
-- native iOS/App Store client;
-- automatic phone torch/visible-light activation;
-- guaranteed background browser capture;
-- guaranteed browser-local durable critical evidence;
-- named facial identity database for non-owner people;
-- automatic culprit/guilt classification;
-- cross-camera biometric re-identification of anonymous people;
-- developer cloud/off-site evidence service;
-- RTSP/IP/Raspberry Pi source support (architecture should allow it later);
-- ESP32/environment-sensor integration;
-- complete CPU/GPU observability platform.
+Not required for MVP unless separately approved:
+- browser/iPhone used as a camera source;
+- native mobile app/App Store distribution;
+- audio surveillance;
+- cross-camera biometric re-identification;
+- named non-owner face database;
+- public Internet dashboard exposure;
+- automatic Tailscale admin-policy mutation;
+- guaranteed DRM/prevention of viewer screen capture;
+- guaranteed concealment from Tailnet/network administrators;
+- independent developer cloud/off-host evidence service;
+- exact agent-local recovery-buffer policy until its ADR/Issue is decided.

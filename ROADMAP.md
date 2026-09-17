@@ -1,110 +1,128 @@
 # Roadmap
 
-This roadmap is intentionally high-level. GitHub Issues are the execution source of truth. `docs/INITIAL_ISSUES.md` contains the current bootstrap execution sequence.
+This roadmap is intentionally high-level. GitHub Issues are the execution source of truth. `docs/INITIAL_ISSUES.md` contains the current bootstrap sequence.
 
 ## Phase 0 — Bootstrap
 
-- [ ] public repository
-- [ ] Apache-2.0 license
+- [ ] public repository / Apache-2.0
 - [ ] specifications committed
 - [ ] issue/PR templates
-- [ ] CI skeleton
-- [ ] secret scan
+- [ ] CI skeleton / secret scan
 - [ ] dependency/model license policy
 - [ ] hardened review-gate follow-up (Issue #4)
 
-## Phase 1 — Server and web foundation
+## Phase 1 — Main server and web foundation
 
 - [ ] FastAPI service
 - [ ] SQLite migrations
-- [ ] settings/config
-- [ ] recording storage abstraction
+- [ ] settings/config/storage abstraction
 - [ ] health endpoints
-- [ ] React dashboard shell
-- [ ] Web Camera Node route/shell
-- [ ] Docker Compose
+- [ ] React responsive dashboard shell
+- [ ] Docker Compose where appropriate
 - [ ] deployment-owner authorization ADR/bootstrap
+- [ ] trusted Tailscale/private-proxy identity boundary
 
-## Phase 2 — Camera Source platform
+## Phase 2 — Camera Source + Capture Node platform
 
 - [ ] generic Camera Source registry
-- [ ] configurable active-source limit (default 4)
-- [ ] capabilities/health/detection-profile model
+- [ ] `local_uvc` / `remote_agent`
+- [ ] active-source limit default 4
+- [ ] capabilities/health/profile model
 - [ ] local UVC discovery/ingest
-- [ ] stable UVC device identity/reconnect
-- [ ] secure Web Camera Node pairing
-- [ ] browser `getUserMedia()` capture
-- [ ] audio default OFF
-- [ ] browser lifecycle/reconnect state
-- [ ] no automatic torch/light behavior
+- [ ] stable/ambiguous UVC identity handling
+- [ ] `media-capture-agent` native service
+- [ ] video-only capture
+- [ ] one-time pairing + mTLS/revocation
+- [ ] separate LAN ingest listener
+- [ ] node health vs camera health
+- [ ] clock offset monitoring
 
 ## Phase 3 — Media
 
-- [ ] live transport PoC + ADR
-- [ ] secure-origin/TLS setup decision
-- [ ] multi-source live grid
-- [ ] durable remote recording chunks
-- [ ] local UVC recording path
-- [ ] checksums/retry/idempotency
-- [ ] server pre/post ring buffers
+- [ ] agent->main transport PoC + ADR
+- [ ] capture/record/inference/view profile separation
+- [ ] high-resolution room-overview benchmark
+- [ ] passthrough/hardware/software encode paths
+- [ ] main-host compressed pre/post ring buffer
 - [ ] generic source-ID recording manifest
 - [ ] manual recording
+- [ ] main->browser live transport PoC + ADR
+- [ ] phone/Mac 1–4 source live grid
+- [ ] demand-driven viewer transcoding/packaging
 
-## Phase 4 — Physical-security detection
+## Phase 4 — Human private access
+
+- [ ] restrictive Tailscale Grant guidance/validation
+- [ ] application invitation/allowlist
+- [ ] independent `live:view` / `recordings:view`
+- [ ] browser-only non-owner playback
+- [ ] prompt revocation
+- [ ] no deployment metadata leakage to unauthorized identity
+- [ ] decide historical timeline permission model
+
+## Phase 5 — Physical-security detection
 
 - [ ] general motion
 - [ ] permissively licensed person-detector evaluation
+- [ ] detector-specific image-quality gating
+- [ ] no false `no person` when quality is insufficient
 - [ ] per-source inference cadence
-- [ ] server ROI calibration
-- [ ] server movement
+- [ ] server ROI calibration/movement
 - [ ] camera tamper/occlusion/source-health correlation
-- [ ] low-light/image-quality gating
 
-## Phase 5 — Entrance and presence intelligence
+## Phase 6 — Entrance / owner / presence intelligence
 
 - [ ] owner-only face-verification model/license evaluation
 - [ ] explicit owner enrollment/delete flow
 - [ ] anonymous same-camera tracking
-- [ ] entrance line/direction calibration
-- [ ] anonymous entry/exit observations
-- [ ] owner entry/exit observations
+- [ ] entrance/zone calibration where geometry supports it
+- [ ] anonymous/owner entry-exit observations
 - [ ] `PRESENT / PROBABLY_PRESENT / ABSENT / UNKNOWN`
 - [ ] manual presence override/schedule
 - [ ] no non-owner named face database
-- [ ] no cross-camera biometric re-identification in MVP
+- [ ] no cross-camera biometric re-identification
 
-## Phase 6 — Timeline and user experience
+## Phase 7 — Timeline, recordings, storage, notifications
 
-- [ ] unified security timeline
-- [ ] relevant observation window around critical events
-- [ ] neutral observation wording/no culprit inference
-- [ ] events/thumbnails/playback
-- [ ] star/delete
+- [ ] unified factual timeline
+- [ ] neutral wording/no culprit inference
+- [ ] recording browser/playback
+- [ ] star/delete owner actions
 - [ ] storage/retention UX
-- [ ] camera-source configuration UX
-- [ ] Slack summary/threading
+- [ ] `STORAGE_PRESSURE` / `STORAGE_HARD_STOP`
+- [ ] Slack optional summary/threading
 
-## Phase 7 — Hardening
+## Phase 8 — Hardening / real environment
 
-- [ ] chaos/network tests
-- [ ] UVC disconnect/reorder/substitution tests
-- [ ] browser suspend/reconnect tests
+- [ ] UVC disconnect/reorder/substitution ambiguity tests
+- [ ] capture-agent LAN interruption/revocation tests
+- [ ] clock-skew tests
 - [ ] 1–4 source stress tests
+- [ ] phone/Mac private live-view tests
+- [ ] Tailscale visibility + app-permission isolation tests
 - [ ] storage-full tests
-- [ ] security review
-- [ ] privacy/biometric review
-- [ ] dependency/model/weight license review
-- [ ] low-light tests with no automatic illumination
+- [ ] low-light detector-gating tests
+- [ ] security/privacy/biometric/license review
 - [ ] 24-hour mixed-source run
+
+## Explicit pending decisions
+
+- [ ] exact agent->main transport;
+- [ ] exact main->browser live transport/target latency;
+- [ ] room-overview capture/record/inference/view defaults after benchmark;
+- [ ] agent outage-recovery buffer duration/storage medium or no buffer;
+- [ ] timeline permission: included with `recordings:view` vs separate `timeline:view`;
+- [ ] Tailscale Grant management remains manual vs future narrowly scoped integration.
 
 ## Future — not MVP
 
-Potential future work requires separate Issues/ADRs:
+- browser/iPhone used as camera source;
 - RTSP/IP camera source;
-- Raspberry Pi/edge Camera Node;
-- strong independent/off-host evidence storage;
+- Raspberry Pi/other edge node packaging;
+- independent/off-host evidence storage;
 - native mobile app if later justified;
 - cross-camera re-identification (privacy review required);
+- audio surveillance;
 - environment sensors;
 - NAS/off-host storage targets;
 - broader server observability.

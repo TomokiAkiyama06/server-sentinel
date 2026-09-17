@@ -2,212 +2,290 @@
 
 ## Security philosophy
 
-ServerSentinel handles camera/audio streams, biometric owner verification, private network endpoints, physical-security events, and persistent recordings.
+ServerSentinel handles private video streams, optional owner biometric verification, private-network identities, physical-security events, and persistent recordings.
 
 Safe defaults:
+
 - local/self-hosted;
 - no developer cloud;
 - no public Internet exposure by default;
 - least privilege;
 - explicit deployment-owner authorization;
-- explicit Web Camera Node pairing;
-- explicit local camera activation;
+- explicit capture-node pairing;
+- restrictive human-viewer authorization;
+- video-only MVP;
 - no secrets or real monitoring media in source control.
 
 ## Threat model
 
 Primary threats:
 
-1. Unauthorized remote dashboard/media access.
-2. Unauthorized Web Camera Node pairing or source registration.
-3. Device/source substitution (a different USB camera silently taking an old source identity).
-4. Theft/tampering of the monitored server or cameras.
-5. Secret leakage through logs/Git/diagnostics.
-6. Malicious media upload/path traversal/resource exhaustion.
-7. Recording filesystem exhaustion.
-8. Browser Camera Node suspension being mistaken for healthy monitoring.
-9. Biometric owner-template disclosure or misuse.
-10. False-positive/false-negative vision results creating false confidence.
-11. Dependency/model/supply-chain compromise.
-12. Slack/Tailscale credential disclosure.
+1. Unauthorized dashboard/live/recording access.
+2. Tailnet member treated as automatically authorized.
+3. Uninvited Tailnet member discovering/reaching the ServerSentinel node unnecessarily.
+4. Capture-node impersonation or credential theft.
+5. Different USB camera silently taking an old source identity.
+6. Theft/tampering of the monitored server/cameras.
+7. Secret leakage through logs/Git/diagnostics.
+8. Malicious media upload/path traversal/resource exhaustion.
+9. Recording filesystem exhaustion.
+10. Network/capture-node failure being mistaken for healthy monitoring.
+11. Biometric owner-template disclosure/misuse.
+12. Vision false positive/negative creating false confidence.
+13. Dependency/model/supply-chain compromise.
 
 Out of scope as guaranteed prevention:
-- physical destruction/removal of the Ubuntu recorder/storage;
-- guaranteed browser capture after screen lock/browser termination/device shutdown;
-- compromise of the deployment owner's admin device/Tailnet/browser profile;
+
+- physical destruction/removal of the main recorder/storage;
+- compromise of the owner's trusted admin/browser endpoint;
+- concealment from Tailnet Owners/Admins or infrastructure/network administrators;
+- DRM-style prevention of screen recording by an authorized viewer;
 - nation-state endpoint compromise;
 - proving guilt/culpability from camera correlation.
 
 ## Development-repository trust boundary
 
-The product threat model is separate from GitHub development security.
-
 Until Issue #4 establishes hardened repository-level enforcement:
+
 - same-repository write access is a trusted-maintainer capability;
 - external/untrusted contributors use fork PRs;
-- Codex + Claude current-HEAD review is a mandatory operational merge policy enforced by the repository owner/merge agent;
+- Codex + Claude review of the current **HEAD and current base/diff context** is a mandatory operational merge policy;
 - ordinary `GITHUB_TOKEN` statuses/check names are not treated as unforgeable against a malicious same-repository writer;
-- the merge actor verifies both reviews cover the current PR HEAD;
-- before additional write collaborators are granted access, Issue #4 must establish stronger Ruleset/required-workflow/dedicated-issuer enforcement.
+- any material HEAD or base change invalidates the prior review context;
+- real monitoring media, biometric templates, secrets, and private deployment values never appear in PRs.
 
-Claude review receives PR diff/repository context. Contributors must never put user recordings, real-person media, biometric templates, secrets, or private deployment data in PR content.
+## Network boundaries
 
-## Network defaults
+### Human dashboard path
 
-- Do not recommend router port forwarding as normal setup.
-- Dashboard remote reachability should use Tailscale or equivalent private networking.
-- Camera/server traffic should remain local/private where practical.
-- Web Camera Node browser capture requires a secure context; normal setup must provide a legitimate HTTPS/private-origin path rather than telling users to bypass TLS warnings.
-- Bind services to the smallest necessary interfaces.
-- Document firewall requirements instead of disabling firewalls.
+Human browser traffic should use:
 
-## Deployment-owner authorization
+```text
+invited browser
+ -> Tailscale/private network
+ -> trusted proxy / Tailscale Serve
+ -> loopback-only ServerSentinel dashboard/API
+```
 
-Tailscale/Tailnet membership provides reachability; it is **not** sufficient deployment-owner authorization.
+Do not expose the same human backend listener directly to the research-room LAN when proxy-supplied Tailscale identity headers are used. Otherwise a LAN client could attempt to spoof those headers.
 
-Privileged operations require owner authorization, including:
-- live media access;
-- playback/deletion;
-- camera-source add/remove/enable/disable;
-- Web Camera Node pair/revoke;
-- owner biometric enroll/delete;
-- presence/security settings;
-- retention/storage settings;
-- Slack configuration.
+### Capture-agent path
 
-The exact self-hosted authorization mechanism must be locked by ADR before implementation, support recovery/revocation, and require no developer-operated identity service.
+`media-capture-agent` uses a **separate** LAN-facing ingest endpoint:
 
-Do not trust arbitrary forwarded identity headers. Proxy-derived identity is accepted only from an explicitly trusted/verifiable proxy path.
+```text
+capture node
+ -> private LAN
+ -> mTLS-authenticated ingest listener
+```
 
-## Local UVC camera security
+The ingest listener:
 
-Local discovery is not equivalent to owner approval.
+- accepts only the capture-agent protocol;
+- never serves dashboard/settings/recording-browser routes;
+- requires revocable cryptographic node identity;
+- is narrowly bound/firewalled;
+- may additionally restrict known capture-node addresses when practical;
+- never treats source IP as sufficient authentication;
+- rate-limits/bounds media input and queues.
 
-- only owner-authorized devices become active sources;
-- prefer stable hardware identity over `/dev/videoN` ordering;
-- after disconnect/reconnect, do not silently attach a different physical camera to an existing source merely because it inherited the same numeric device path;
-- container/device access should be narrowly scoped;
-- do not require privileged containers solely for webcam access.
+The capture machine does not need to join Tailscale merely to forward video over the same private LAN.
 
-## Web Camera Node pairing
+## Human authorization
 
-Pairing tokens:
+### Two-gate rule
+
+Tailnet membership is **not** ServerSentinel authorization.
+
+A user must have both:
+
+1. a Tailscale/private-network permission path to the main node; and
+2. an active ServerSentinel principal/invitation with the required permission.
+
+### Tailscale visibility objective
+
+Configure restrictive Tailscale Grants/access policy so ordinary Tailnet members who are not intended ServerSentinel users receive no grant to the main node. Where Tailscale peer-map trimming applies, those users should not normally discover the node through peer/status visibility.
+
+Do not claim this hides the machine from Tailnet Owners/Admins or infrastructure administrators.
+
+MVP does not require ServerSentinel to hold Tailscale administrative credentials or automatically mutate Grants. Manual Tailnet-level membership/policy management is acceptable and preferred over introducing a powerful admin token without need.
+
+### Application allowlist
+
+Even when a network connection reaches the trusted human proxy/backend, ServerSentinel serves no deployment metadata until the external identity is matched to an active application principal.
+
+Unauthorized identities must not receive:
+
+- camera names/counts;
+- thumbnails;
+- live streams;
+- recording metadata/playback;
+- event/timeline details;
+- storage/server configuration.
+
+### Granular permissions
+
+Initial invited-user permissions:
+
+```text
+live:view
+recordings:view
+```
+
+They are independent.
+
+Only the owner may manage invitations/permissions, cameras/capture nodes, owner biometric enrollment, destructive recording actions, retention/security settings, and other privileged configuration unless a future role model explicitly expands this.
+
+### Recording playback
+
+Non-owner invited users with `recordings:view` receive browser playback only in MVP. No official non-owner download/export endpoint/button is provided.
+
+Playback segments/manifests remain authorization-protected; copying a URL does not make it public.
+
+This is not DRM. An authorized viewer may still screen-record or use advanced client tools, and the product must not claim otherwise.
+
+### Timeline
+
+Historical timeline access is not implied by `live:view`. Whether `recordings:view` includes timeline/history or a separate `timeline:view` permission is required is a pending product decision.
+
+### Revocation
+
+Application permission revocation invalidates active application access promptly. Tailnet network access must also be revoked separately when applicable unless a future approved integration automates both layers.
+
+## Trusted proxy identity
+
+Do not trust arbitrary forwarded identity headers.
+
+If Tailscale Serve/equivalent provides authenticated identity headers, the backend accepts them only on a non-bypassable local trusted-proxy path. Requests from LAN/other interfaces cannot directly set such headers and gain identity.
+
+## Capture-node pairing
+
+Pairing credentials:
+
 - cryptographically random;
-- single-use;
 - short-lived;
-- owner-approved;
+- single-use;
+- explicitly owner-approved;
 - redacted from logs.
 
-Long-term browser-node identity:
-- unique/revocable per node;
-- deployment-scoped;
-- should prefer browser-origin-bound/non-exportable key material through Web Crypto/IndexedDB where practical;
-- must not be hard-coded;
-- must not rely on a developer account.
+After pairing:
 
-Do not store long-lived privileged bearer credentials in plain browser `localStorage` when a safer browser-supported approach is practical.
+- each capture node has a unique revocable deployment-scoped credential/keypair;
+- mTLS is the default long-lived design target;
+- a capture-node credential authorizes only capture-node protocol actions, never dashboard/admin actions;
+- certificate/key material is stored with restrictive filesystem permissions;
+- revocation is auditable.
 
-## Browser lifecycle
+## `media-capture-agent` privilege boundary
 
-A Web Camera Node can stop because of OS/browser behavior. Health state must fail visibly rather than implying continuous monitoring.
+Normal operation runs as a dedicated non-root account and has only:
 
-Track, where possible:
-- heartbeat;
-- media track ended/muted;
-- connection state;
-- page visibility/suspension state;
-- reconnect attempts.
+- required UVC/video device access;
+- agent config/credential access;
+- bounded temp/buffer access if later enabled;
+- outbound/agent network capability.
 
-Wake Lock is best-effort, not a security boundary.
+It has no reason to require the Docker socket or broad filesystem/root access.
+
+The service name `media-capture-agent` is intentionally functional and non-deceptive. It may run without visible desktop UI/tray, but must not impersonate unrelated OS/vendor software.
+
+## Local UVC/source substitution security
+
+Discovery does not equal approval.
+
+- prefer stable hardware identity over `/dev/videoN`;
+- never pretend vendor/product/capability metadata is unique when identical non-serial devices cannot be distinguished;
+- after ambiguous reconnect, fail to `manual_intervention_required` rather than selecting a candidate;
+- explicit owner re-approval is required before healthy monitoring resumes;
+- device metadata is untrusted for filenames/logging/display.
+
+## Clock/timeline integrity
+
+Capture-node and main-host clock offset is monitored. Large offset becomes a degraded state. Do not silently present misordered timestamps as trustworthy security chronology.
 
 ## Owner biometric security
 
-Owner-only face verification processes sensitive biometric data.
+Owner-only verification requirements:
 
-Requirements:
-- raw owner template/embedding is never logged;
-- general settings/list APIs do not return raw biometric material;
+- raw owner template/embedding never logged;
+- normal settings/list APIs do not return raw biometric material;
 - diagnostics exclude it by default;
 - enrollment/replacement/deletion require owner authorization and are audited;
-- storage/access is restricted to the verification/config path;
-- non-owner persistent named biometric templates are prohibited in MVP;
-- low-quality observations return unknown rather than a forced identity conclusion.
+- non-owner persistent named biometric templates are prohibited;
+- low-quality observation returns `unknown`, not a forced identity conclusion.
 
-Model output is probabilistic and must not be presented as proof of identity or culpability.
+Model output is probabilistic and is not proof of identity or culpability.
+
+## Video-only MVP
+
+Do not open microphone/audio streams by default. `media-capture-agent` MVP is video-only. No event decision depends on audio.
 
 ## Secrets
 
-Repository must never contain:
-- `.env` with real values;
+Repository must never contain real:
+
+- `.env` secrets;
 - Slack webhook/token;
-- Tailscale auth key;
+- Tailscale auth/admin key;
 - private keys/certificates/credentials;
-- real deployment IPs/hostnames/SSID/Tailnet values;
-- raw owner biometric template;
-- real monitoring footage or person images.
+- private deployment IP/hostname/SSID/Tailnet values;
+- owner biometric template;
+- real monitoring footage or person images/audio.
 
 Run secret scanning in CI.
 
 ## Media ingestion
 
-For remote uploads/streams enforce:
-- authenticated node/source;
-- expected session/source ID;
-- size/rate limits;
-- allowed format/container/codec policy;
-- safe generated filenames;
-- checksum/integrity metadata for durable chunks;
-- no client-controlled arbitrary output path;
-- bounded queues/backpressure.
+For remote-agent media enforce:
 
-For local UVC, treat device metadata as untrusted input for filenames/logging/display.
+- authenticated node/source/session;
+- size/rate limits;
+- bounded queues/backpressure;
+- allowed codec/container policy;
+- generated safe filenames;
+- integrity/gap metadata where applicable;
+- no client-controlled arbitrary output path;
+- explicit degraded/offline state on known loss.
 
 ## Web/API
 
 - typed validation;
-- deployment-owner authorization for privileged actions;
-- CSRF protection/considerations for cookie/browser sessions;
+- permission checks server-side for every media/API route;
+- CSRF/session protections as applicable;
 - safe CORS;
 - no wildcard credential policy;
-- rate limiting for pairing/auth-sensitive endpoints;
+- rate limiting on pairing/auth-sensitive endpoints;
 - strict path validation;
 - no shell interpolation from request values;
-- security headers appropriate to camera/dashboard routes;
-- camera-node pages must not expose privileged dashboard actions merely because the node is paired.
+- appropriate security headers;
+- media URLs never become public bearer links with uncontrolled lifetime.
 
 ## Filesystem/storage
 
-Recording root is configured by the owner, but per-request arbitrary absolute paths are forbidden.
-
-Resolve/validate all writes/deletes against configured roots.
+Recording root is configured by the owner; per-request arbitrary absolute paths are forbidden.
 
 Preserve a hard filesystem safety reserve and enter explicit pressure/hard-stop states before unsafe writes.
 
-## Docker
-
-Avoid privileged containers unless explicitly justified/approved.
-
-Mount only required paths/devices. Do not mount the Docker socket into application containers.
-
 ## Vision/timeline interpretation
 
-ServerSentinel separates observations from conclusions.
+Allowed observations include:
 
-Allowed examples:
 - `Person observed at entrance 17:43`;
 - `Server movement detected 17:55`;
 - `Camera went offline 17:56`.
 
-Do not automatically transform temporal correlation into `suspect`, `attacker`, `thief`, or causal attribution.
+Do not convert temporal correlation into `suspect`, `attacker`, `thief`, guilt, or causal attribution.
+
+Each detector must fail unknown when input quality is insufficient. A person detector that did not run reliably must never produce a trustworthy `no person` conclusion.
+
+## Repository media policy
+
+Repository/CI media fixtures are synthetic/generated only. Real-person or real-environment media is not committed or attached to GitHub, even if publicly licensed or consented. External real-person datasets may be used only locally under their terms and are not repository fixtures.
 
 ## Dependency security
 
-See `docs/THIRD_PARTY_POLICY.md`.
-
-Computer-vision source code and model/weight licenses are reviewed separately. Vulnerability findings must be triaged rather than blindly upgrading security-sensitive dependencies.
+See `docs/THIRD_PARTY_POLICY.md`. Computer-vision code and model/weight licenses are reviewed separately.
 
 ## Reporting a vulnerability
 
-Before a public release contact process is established, use a private contact method defined by the repository owner rather than opening a public Issue containing exploit details.
-
-A public security contact address/process should be added before broad adoption.
+Before a public security contact process is established, use a private contact method defined by the repository owner rather than a public exploit-detail Issue.

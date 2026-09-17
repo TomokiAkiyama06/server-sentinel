@@ -4,49 +4,83 @@ Planned stack:
 - React
 - TypeScript
 
-The web project serves two user-facing roles:
+The web project is the **human dashboard/viewer**. Browser/iPhone camera capture is not required in the current MVP.
 
-1. **Owner Dashboard**
-2. **Remote Web Camera Node**
+## Human Dashboard
 
-## Owner Dashboard
-
-Primary design target: responsive/mobile-first.
+Primary design target: responsive/mobile-first, usable from phone, Mac, and desktop browsers.
 
 Core views:
 - overview/status;
 - Camera Sources;
+- Capture Nodes;
 - 1–4 source live grid;
 - events/timeline;
 - recordings/playback;
-- presence/inference/manual override;
+- presence/manual override;
 - owner verification settings;
+- access/invitations;
 - storage/retention;
 - Slack;
 - audit;
 - setup/security.
 
-Remote dashboard reachability is expected through Tailscale or an equivalent private path in MVP, plus the separate deployment-owner authorization boundary.
+## Private remote access
 
-## Web Camera Node
+Human remote reachability is expected through Tailscale or an equivalent private path.
 
-The Camera Node is browser-based in MVP and must work without native iOS/App Store distribution.
+Access requires **both**:
 
-Responsibilities:
-- secure-context `getUserMedia()` capture;
-- selected camera only (simultaneous phone front/rear is not required);
-- microphone separate and default OFF;
-- pairing/session bootstrap;
-- visible monitoring/connection state;
-- heartbeat/reconnect;
-- browser lifecycle state where detectable;
-- optional Screen Wake Lock best effort;
-- negotiated capture settings.
+1. network-level permission to the ServerSentinel node; and
+2. an active ServerSentinel application principal/invitation.
 
-It must not:
-- auto-enable phone torch/flash/screen light;
-- claim guaranteed background capture;
-- claim browser local storage is guaranteed durable critical evidence;
-- expose privileged owner/admin controls merely because the node is paired.
+Tailnet membership alone grants nothing.
 
-Camera/low-light insufficiency is represented as degraded/unknown, not solved by automatic visible illumination.
+The preferred Tailscale path places the human backend behind Tailscale Serve/equivalent trusted proxy with the application listener bound to loopback/non-bypassable local scope. Proxy-provided identity headers are trusted only on that path.
+
+Ordinary uninvited Tailnet members should receive no Tailscale Grant to the ServerSentinel node. Do not promise concealment from Tailnet Owners/Admins or infrastructure administrators.
+
+## Invited-user permissions
+
+Minimum independent permissions:
+
+```text
+live:view
+recordings:view
+```
+
+- `live:view` grants current live streams only;
+- `recordings:view` grants recording list and browser playback;
+- neither implies owner/admin capabilities;
+- non-owner download/export is not provided in MVP;
+- historical timeline access is a separate unresolved permission decision and must not leak through `live:view`.
+
+## Live view
+
+Responsive layout:
+
+```text
+1 source -> one large tile
+2 sources -> split/two-up
+3–4 sources -> responsive grid
+```
+
+Each tile shows source name/type/role, camera health, capture-node health where applicable, negotiated viewer quality, and image-quality/degraded state.
+
+Viewer media always comes through the main ServerSentinel host. Browsers do not connect directly to `media-capture-agent`.
+
+Viewer-only transcoding/packaging should be demand-driven and release resources when subscriber count returns to zero.
+
+## Recordings
+
+Authorized playback routes remain server-side permission checked. A copied playback URL must not become public access.
+
+No DRM guarantee is implied: browser playback cannot technically prevent screen recording or advanced client-side capture.
+
+## Video-only MVP
+
+The web UI does not expose monitoring-audio controls in MVP because capture/recording is video-only.
+
+## Quality honesty
+
+If a detector cannot operate reliably because of darkness, blur, low target resolution, or other insufficient input, the UI shows `unknown`/unavailable instead of a forced positive/negative result. In particular, skipped/failed person inference must not be presented as `no person`.

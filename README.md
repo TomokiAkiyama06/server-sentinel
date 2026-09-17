@@ -1,14 +1,14 @@
 # ServerSentinel
 
-ServerSentinel is a free, self-hosted physical-security monitoring system for valuable servers and workstations. It combines multiple camera sources, local recording, computer vision, event correlation, and a web dashboard without requiring a developer-operated cloud.
+ServerSentinel is a free, self-hosted physical-security monitoring system for valuable servers and workstations. It combines heterogeneous camera sources, local recording, computer vision, event correlation, and a private web dashboard without a developer-operated cloud.
 
 ## Core principles
 
-1. **No developer-operated cloud**
-2. **No telemetry, ads, or developer-side user-data collection**
-3. **Self-hosted storage and AI analysis**
-4. **Camera-source agnostic architecture**
-5. **Agent-friendly development with strict security/review gates**
+1. **No developer-operated cloud, telemetry, ads, or analytics**
+2. **Self-hosted recording and AI analysis**
+3. **Camera-source agnostic design**
+4. **Private-by-default remote access**
+5. **Least-privilege capture agents and strict review gates**
 
 ## Current project status
 
@@ -16,118 +16,161 @@ The repository is in the specification/bootstrap stage. Runtime implementation h
 
 ## Camera-source model
 
-The MVP supports **1 to 4 active video sources** per deployment. Four is an MVP operational limit, not a topology assumption that should be hard-coded throughout the implementation.
+The MVP supports **1 to 4 active video sources**. Four is a configurable MVP limit, not a fixed schema assumption.
 
-Supported MVP source types:
+MVP source types:
 
-- **Local UVC / USB webcam** connected directly to the Ubuntu host.
-- **Remote Web Camera Node** opened in a modern browser on a phone, tablet, laptop, or other camera-capable device.
+- **`local_uvc`** — UVC/V4L2-compatible USB camera connected directly to the main Ubuntu ServerSentinel host.
+- **`remote_agent`** — UVC/V4L2-compatible camera connected to another owner-authorized Linux machine running `media-capture-agent`, with video forwarded over a private LAN to the main host.
 
-Camera type and camera role are separate. A deployment may use only one webcam, several webcams, only a Web Camera Node, or a mixture.
+A browser/iPhone camera source is not required for the MVP. A future `remote_web` source may be reconsidered later without changing the common event/storage model.
 
 Example deployment:
 
 ```text
-USB Webcam A  ── Server side/overview ──┐
-USB Webcam B  ── Server rear/cables  ───┼── Ubuntu ServerSentinel
-                                         │     ├─ FastAPI
-Phone browser ─ Entrance Web Camera ─────┘     ├─ Recording/storage
-                                               ├─ Detection workers
-                                               ├─ Event timeline
-                                               ├─ SQLite
-                                               └─ React web UI
-                                                        │
-                                                        └─ Tailscale (recommended remote reachability)
+USB Webcam A ───────────────────────────────┐
+USB Webcam B ───────────────────────────────┤
+                                            │
+Yamaha CS-800                               │
+    │ USB                                   │
+    v                                       │
+Research-room Ubuntu                        │
+media-capture-agent                         │
+    │ authenticated private-LAN stream      │
+    └───────────────────────────────────────┤
+                                            v
+                                  Main ServerSentinel
+                                  ├─ recording/storage
+                                  ├─ detection workers
+                                  ├─ event timeline
+                                  ├─ SQLite
+                                  └─ React web dashboard
+                                             │
+                                      Tailscale/private access
+                                             │
+                                      invited phone / Mac
 ```
 
-The example above is not required. A single webcam is a valid deployment.
+Camera type and semantic role are separate. The room-overview camera, server-side camera, rear/cable camera, or any custom role may use either source type.
+
+## `media-capture-agent`
+
+`media-capture-agent` is a lightweight Linux capture service for cameras that are physically closer to another Linux machine than to the main ServerSentinel host.
+
+Initial rules:
+
+- runs as a background systemd service with no tray/window requirement;
+- uses a truthful functional process/service name: `media-capture-agent`;
+- normally runs as a dedicated non-root service account;
+- captures video only in the MVP; microphone/audio capture is not required;
+- initiates the connection toward the main host; the main host does not need SSH/admin access to the capture machine;
+- pairs using a short-lived owner-approved code and then uses a revocable cryptographic node identity;
+- long-lived agent-to-main transport must be mutually authenticated and encrypted, with mTLS as the default design target;
+- the capture machine does **not** need to join the owner's Tailnet when it can reach the main host on the same private LAN;
+- camera unplug/replug is reported as source health state; the agent process itself remains alive;
+- a reconnect is automatic only when the physical camera can be matched unambiguously; ambiguous device identity requires owner intervention rather than silently binding a different camera.
+
+Development may run the agent from a repository clone. A later stable release should provide a standalone release artifact/installer so production operation does not depend on a development checkout.
+
+## Video-only MVP
+
+Audio is not required for the MVP. Camera microphones, including microphones integrated into conference cameras, are not captured by default and no monitoring feature depends on audio.
 
 ## Detection model
 
-Detection features are assigned per camera source rather than being inferred from hardware type. Initial profiles include:
+Detection features are assigned per Camera Source. Initial profiles include:
 
 - general motion;
 - person detection;
 - server ROI / movement detection;
 - camera tamper / occlusion;
-- entrance crossing;
-- owner-only face verification;
-- low-light / image-quality gating.
+- room/entrance crossing where configured;
+- owner-only 1:1 face verification;
+- detector-specific image-quality / low-light gating.
 
-ServerSentinel may verify the explicitly enrolled deployment owner, but it does **not** maintain a named face database for everyone observed. Other people remain anonymous observations/tracks such as `Person #A` and must not be labelled as a culprit by the system.
+Insufficient image quality never becomes a reliable negative observation. If a person detector cannot operate reliably because the image is too dark/blurred, the result is `unknown`/unavailable rather than `no person`.
 
-## Presence and timeline
+ServerSentinel may verify one explicitly enrolled deployment owner, but it does **not** maintain a named face database for other observed people. Non-owner people remain anonymous observations/tracks. Timeline correlation must not label a person as a culprit, thief, attacker, or cause.
 
-An entrance camera may infer owner presence from owner verification plus entry/exit direction. Presence inference is uncertainty-aware and manual override remains available.
+## Live viewing from phone and Mac
 
-The dashboard correlates observations into a factual timeline, for example:
+Invited users can view live video from a normal browser on a phone or Mac through the main ServerSentinel host. Viewer devices never connect directly to `media-capture-agent`.
 
 ```text
-17:20 Owner exited
-17:43 Anonymous person entered
-17:55 Server movement detected
-17:56 Rear camera offline
-17:57 Server became unreachable
-18:03 Anonymous person exited
+Phone / Mac
+    │ Tailscale/private network
+    v
+Main ServerSentinel
+    │
+    └─ live stream already received from local/remote Camera Sources
 ```
 
-The system reports observations and timing; it does not make guilt/culprit determinations.
+The dashboard adapts to 1–4 sources. Viewer streaming should be demand-driven: when nobody is watching, ServerSentinel should not perform unnecessary viewer-only transcoding.
 
-## Web Camera Node
+## Private access and invitations
 
-The mobile Camera Node is web-based in the MVP. No Apple Developer Program or App Store distribution is required.
+**Tailnet membership is not ServerSentinel authorization.** Access requires both:
 
-- camera access uses browser `getUserMedia()` in a secure context;
-- microphone is optional and **OFF by default**;
-- PWA/home-screen installation may be offered where supported but is not required;
-- monitoring is expected to remain foreground/active;
-- background capture after browser suspension, screen lock, process termination, or device shutdown is **not guaranteed**;
-- automatic torch/light control is **not part of the MVP**.
+1. network-level permission to reach the ServerSentinel node; and
+2. an active ServerSentinel invitation/allowlist entry.
 
-If an image is too dark for reliable analysis, ServerSentinel reports a degraded/unknown state instead of automatically turning on a phone light or forcing a face/person conclusion.
+Ordinary Tailnet members who are not authorized for ServerSentinel should receive no Tailscale grant to the ServerSentinel node. The deployment should use restrictive Tailscale policy/netmap visibility so those users cannot normally discover or connect to the node through Tailnet peer visibility. This is not a promise to hide the machine from Tailnet Owners/Admins or other infrastructure administrators.
 
-## Primary priorities
+The dashboard itself should bind only to a trusted local proxy path (for example loopback behind Tailscale Serve). LAN camera ingestion uses a **separate** narrowly exposed endpoint and must not expose dashboard routes.
 
-1. Remote multi-camera live viewing.
-2. Evidence preservation for theft/tampering while the self-hosted recorder is available.
-3. Server movement/camera tamper detection.
-4. Entrance/person/presence timeline correlation.
-5. Unified ServerSentinel service/camera/storage status.
+Invited-user permissions are granular:
 
-ServerSentinel does not guarantee that browser camera footage survives theft/destruction/power loss of the Ubuntu recording host. Strong independent off-host evidence storage is a separate future architecture decision.
+- `live:view` — view current live video in the browser;
+- `recordings:view` — browse and play past recordings in the browser.
 
-## Default operating assumptions
+These permissions are independent. Non-owner invited users do not receive an official recording-download/export function in the MVP. Browser-only playback cannot technically prevent screen recording or advanced client-side capture, so the product must not claim DRM-style prevention.
 
-- Ubuntu is the primary recorder and analysis host.
-- Default recording retention: **20 days**.
-- Default audit-log retention: **90 days**.
-- Manual recording maximum: **20 minutes**.
-- Automatic event recording target: **30 seconds before + 120 seconds after**, extendable while activity continues, maximum **20 minutes**.
-- Audio exists but is **OFF by default**.
-- Remote dashboard access should use Tailscale or an equivalent private reachability layer; public Internet port exposure is not the default.
+## Recording and storage
+
+Ubuntu remains the primary durable evidence store.
+
+Defaults:
+
+- recording retention: **20 days**;
+- audit retention: **90 days**;
+- automatic event target: **30 s pre + 120 s post**, extendable while activity continues, maximum **20 minutes**;
+- manual recording maximum: **20 minutes**;
+- starred recordings are protected from automatic deletion;
+- recording allocation and a hard filesystem safety reserve are separate;
+- explicit `STORAGE_PRESSURE` and `STORAGE_HARD_STOP` states prevent unsafe writes.
+
+Compressed media should be buffered/recorded where practical rather than retaining large decoded frame histories in RAM.
+
+## Performance model
+
+Capture, inference, recording, and viewer profiles are separate.
+
+A high-resolution room-overview source may be captured/recorded at a higher resolution while person/ROI inference samples only a few frames per second and remote viewers receive an adaptive browser-compatible live profile. Exact resolution, FPS, bitrate, and encode path are benchmark-derived rather than hard-coded.
+
+When overloaded, ServerSentinel first keeps health state truthful and preserves critical monitoring/evidence, then reduces expensive inference cadence and viewer quality before silently dropping sources.
 
 ## Planned stack
 
 - Backend: Python / FastAPI
-- Web dashboard + Web Camera Node: React / TypeScript
-- Local camera ingest: Linux UVC/V4L2-compatible path
+- Dashboard: React / TypeScript
+- Local/agent capture: Linux UVC/V4L2
+- Remote capture service: `media-capture-agent` + systemd
 - Metadata: SQLite
-- Deployment: Docker Compose
-- Remote access: Tailscale recommended
+- Main deployment: Docker Compose where appropriate
+- Private remote access: Tailscale recommended
 - Notifications: Slack optional
-- Vision: pluggable permissively licensed detectors/models; source-code and model-weight licenses are reviewed separately
+- Vision: pluggable permissively licensed detectors/models; source-code and model/weight licenses reviewed separately
 
 ## Core documents
 
 - [REQUIREMENTS.md](REQUIREMENTS.md) — product requirements
 - [SPECIFICATION.md](SPECIFICATION.md) — technical contracts
 - [AGENTS.md](AGENTS.md) — mandatory rules for coding agents
-- [MANUAL_TEST.md](MANUAL_TEST.md) — real-hardware/browser test plan
+- [MANUAL_TEST.md](MANUAL_TEST.md) — real-hardware/network/browser test plan
 - [SECURITY.md](SECURITY.md) — security model
 - [PRIVACY.md](PRIVACY.md) — privacy/biometric model
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — architecture
 - [docs/SETUP.md](docs/SETUP.md) — intended setup UX
-- [docs/THIRD_PARTY_POLICY.md](docs/THIRD_PARTY_POLICY.md) — dependency/model licensing
 
 ## License
 
@@ -137,10 +180,11 @@ Apache License 2.0. See [LICENSE](LICENSE).
 
 - developer-hosted account/video service;
 - advertising, analytics, telemetry, subscriptions;
-- native iOS/App Store application;
-- automatic phone torch/visible-light activation;
+- native iOS/App Store camera application;
+- phone-camera monitoring requirement;
+- audio surveillance;
 - named identification database for non-owner people;
 - public Internet exposure by default;
-- ESP32/environment sensor integration;
-- full CPU/GPU observability suite;
-- guaranteed recording after the Ubuntu host/storage is physically removed or destroyed.
+- cross-camera biometric re-identification;
+- guaranteed concealment from Tailnet/infrastructure administrators;
+- guaranteed recording after the main recording host/storage is physically removed or destroyed.

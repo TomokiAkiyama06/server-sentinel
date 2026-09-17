@@ -4,63 +4,66 @@ ServerSentinel の開発・レビューでは、まず `AGENTS.md` を最上位�
 
 ## 言語
 
-GitHub上でリポジトリ所有者が確認する以下の内容は、原則として日本語で記載してください。
-
-- Issueタイトル・本文
-- PRタイトル・本文
-- PRレビューコメント
-- レビュー指摘への回答
-- マージ時の要約
-
-コード、識別子、API名、ライブラリ名、コマンドなどは英語のままで構いません。
+GitHub上でリポジトリ所有者が確認する Issue / PR / レビュー回答 / マージ要約は原則日本語で記載してください。コード、識別子、API名、ライブラリ名、コマンドは英語のままで構いません。
 
 ## 現在の製品前提
 
-レビュー時に旧iOS-first仕様を前提にしないでください。
+旧iOS-first / browser-camera-first仕様を前提にしないでください。
 
-MVPの基本構成は次です。
+MVPの基本構成:
 
-- Ubuntu ServerSentinel backend
+- Main Ubuntu ServerSentinel backend
 - React Web UI
-- 1〜4個のCamera Source
-- `local_uvc` USB Webcam
-- `remote_web` browser-based Web Camera Node
-- iPhoneはWeb Camera Nodeとして利用可能だが、native iOS/App StoreアプリはMVP要件ではない
-- Camera Sourceの種類と役割/Detection Profileは分離
+- 1〜4 Camera Sources
+- `local_uvc` USB/UVC camera
+- `remote_agent` Linux `media-capture-agent`
+- capture agentはprivate LANでmainへ接続できればTailscale不要
+- phone / Mac / desktopは主にhuman viewer
+- browser/iPhone camera sourceはMVP必須ではなくdeferred
+- `media-capture-agent`はvideo-only、非root常駐、capture credentialはadmin権限を持たない
+- Tailnet membershipだけではServerSentinelへアクセス不可
+- human accessはTailscale/private network permission + ServerSentinel invitationの二重条件
+- non-owner permissionは少なくとも `live:view` / `recordings:view` を独立管理
+- non-owner recording accessはbrowser playbackのみ、official download/exportなし
+- timeline権限は未決定なので暗黙に公開しない
 - owner-only face verificationは任意
-- non-ownerのnamed face databaseは禁止
-- motion/low-lightによる自動torch/light点灯は行わない
+- non-owner named face DB / cross-camera biometric re-identificationは禁止
+- audio surveillanceはMVP外
 
-## PRレビュー
+## PRレビュー重点
 
-レビューでは少なくとも以下を確認してください。
+少なくとも以下を確認してください。
 
 - 要件・仕様・受入条件との整合性
 - バグ、境界条件、エラー処理
-- セキュリティとSecret管理
-- プライバシー/biometric不変条件
-- データ破壊や容量枯渇時の安全性
-- 再接続、再試行、冪等性、競合状態
-- 1〜4 Camera Source構成で固定2台前提が混入していないか
-- UVCの`/dev/videoN`だけをstable identityとしていないか
-- Web Camera Nodeのsecure context / permission / browser lifecycle
-- browser background captureやlocal storageを過剰保証していないか
-- audioがsourceごとにdefault OFFか
-- automatic torch/lightが再導入されていないか
-- low-light時にowner match/non-matchを強制していないか
-- owner-only verificationがnon-owner identity DBへ拡張されていないか
-- timelineが人物をculprit/attackerと断定していないか
-- テスト不足と実機確認の切り分け
-- 依存関係、AIモデル、weightsのライセンス
-- Ubuntu / Web / Camera Source間の契約不整合
-- 不要な複雑化や保守性低下
+- セキュリティ/Secret管理
+- privacy/biometric不変条件
+- データ破壊/容量枯渇
+- retry/idempotency/backpressure/競合
+- 1〜4 sourceで固定2台前提がないか
+- UVC identityが`/dev/videoN`だけになっていないか
+- identical non-serial cameraの曖昧reconnectを自動bindしていないか
+- `media-capture-agent`が不要なroot/GUI/Tailscale/admin権限を要求していないか
+- capture ingest listenerとhuman dashboard listenerが分離されているか
+- agent credentialからhuman/admin APIへ昇格できないか
+- trusted Tailscale identity header pathをLANからbypassできないか
+- Tailnet member全員へnode visibility/connectivityを与えていないか
+- `live:view` / `recordings:view`分離がserver-sideで強制されるか
+- non-owner download/exportが再導入されていないか
+- low-light/poor-quality時にperson detector failureを`no person`へ変換していないか
+- owner verificationがnon-owner identity DBへ拡張されていないか
+- timelineがculprit/attackerと断定していないか
+- repository fixtureにreal-person/publicly-licensed real-person mediaが入っていないか
+- model/weights/dependency license
+- main / agent / Web間契約
+- 実機確認とmock確認の切り分け
 
-指摘は `重大`、`重要`、`提案` に分類してください。
+指摘は `重大` / `重要` / `提案` に分類してください。
 
-インタラクティブにClaude Codeへレビューを依頼する場合は、レビュー時にコードを変更せず、レビューコメントのみ投稿してください。修正を依頼された場合のみ、`AGENTS.md` のIssue/branch/PRルールに従って変更してください。
+## 自動レビュー
 
-**例外:** `.github/workflows/claude-review.yml` と `.github/workflows/claude-review-fork.yml` による自動PRレビューでは、workflow自身のより厳しい制約を優先します。自動レビューのClaude jobはread-onlyで動作し、GitHubへ直接コメントせず、コード・設定・スクリプトを変更または実行せず、指定されたstructured outputだけを返します。
+`.github/workflows/claude-review.yml` / `claude-review-fork.yml` の制約を優先します。自動Claude jobはread-onlyで、GitHubへ直接書き込まず、コード/設定/スクリプトを実行せず、固定されたHEAD/base差分だけをレビューします。
 
 ## マージ
 
-Claude単独のレビューでマージ可否を決めないでください。ServerSentinelでは Codex と Claude の両方のcurrent-HEADレビュー完了、必須CI成功、ブロッキング指摘解消がマージ条件です。
+Claude単独でマージ可否を決めないでください。Codex と Claude の両方が current HEAD **かつ current base/diff context** をレビューし、必須CI成功、blocking finding解消後にのみマージします。

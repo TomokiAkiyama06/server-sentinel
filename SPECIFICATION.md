@@ -2,87 +2,50 @@
 
 ## 1. Architecture overview
 
-ServerSentinel consists of three logical runtime areas:
+ServerSentinel consists of four logical runtime areas:
 
-1. **Ubuntu ServerSentinel Host** — authoritative configuration, recording, analysis, event correlation, retention, notifications.
-2. **Camera Sources** — local UVC devices and remote browser-based Web Camera Nodes.
-3. **Web UI** — dashboard, setup, live view, and the Web Camera Node capture page.
-
-Optional integrations:
-- Tailscale or equivalent private remote reachability;
-- Slack.
+1. **Main Ubuntu ServerSentinel Host** — authoritative configuration, recording, analysis, event correlation, retention, authorization, notifications.
+2. **Local Camera Sources** — UVC/V4L2 cameras attached directly to the main host.
+3. **Remote Capture Nodes** — owner-authorized Linux hosts running `media-capture-agent`, each exposing one or more locally attached UVC cameras to the main host over a private LAN.
+4. **Human Web Clients** — invited phone/Mac/desktop browsers accessing the main host through Tailscale/private networking.
 
 ```text
-Local UVC cameras                       Remote Web Camera Nodes
-┌───────────────┐                       ┌─────────────────────────┐
-│ USB Webcam A  │                       │ iPhone / Android / PC   │
-│ USB Webcam B  │                       │ Browser + getUserMedia  │
-└───────┬───────┘                       └────────────┬────────────┘
-        │ V4L2/UVC                                    │ secure session
-        └──────────────────────┬──────────────────────┘
-                               v
-                  ┌───────────────────────────────┐
-                  │ Ubuntu ServerSentinel        │
-                  │ API / source registry        │
-                  │ recorder / ring buffers      │
-                  │ detection workers            │
-                  │ event/timeline correlator    │
-                  │ SQLite / file storage        │
-                  │ Slack integration            │
-                  └───────────────┬───────────────┘
-                                  │
-                                  v
-                  ┌───────────────────────────────┐
-                  │ React Web UI                 │
-                  │ dashboard + camera-node UI  │
-                  └───────────────────────────────┘
+Local UVC cameras                         Remote room-overview camera
+┌───────────────┐                         ┌──────────────────────────┐
+│ Webcam A/B    │                         │ Camera (e.g. CS-800)     │
+└───────┬───────┘                         └────────────┬─────────────┘
+        │ V4L2/UVC                                     │ USB/UVC
+        │                                               v
+        │                                  ┌──────────────────────────┐
+        │                                  │ Linux capture machine    │
+        │                                  │ media-capture-agent      │
+        │                                  └────────────┬─────────────┘
+        │                                   private LAN │ authenticated
+        └───────────────────────────┬───────────────────┘
+                                    v
+                       ┌─────────────────────────────┐
+                       │ Main ServerSentinel        │
+                       │ source registry            │
+                       │ ingest / recorder          │
+                       │ detection workers          │
+                       │ event/presence correlator  │
+                       │ SQLite / file storage      │
+                       │ authorization / Slack      │
+                       └──────────────┬──────────────┘
+                                      │ loopback/trusted proxy
+                                      v
+                       ┌─────────────────────────────┐
+                       │ Tailscale Serve/private UI │
+                       └──────────────┬──────────────┘
+                                      v
+                            invited phone / Mac
 ```
 
-A deployment may contain 1–4 active video sources in any supported composition. No algorithm, schema, or filesystem layout may assume an iPhone `front`/`rear` pair.
+A deployment may contain 1–4 active video sources in any supported composition. No schema, algorithm, UI, or filesystem layout may assume fixed `front/rear` cameras or an iPhone.
 
-## 2. Repository layout
+A browser/iPhone camera source is deferred from the MVP. Human browsers are viewers, not capture nodes, in the current MVP architecture.
 
-```text
-server-sentinel/
-├── README.md
-├── REQUIREMENTS.md
-├── SPECIFICATION.md
-├── AGENTS.md
-├── CLAUDE.md
-├── MANUAL_TEST.md
-├── SECURITY.md
-├── PRIVACY.md
-├── CONTRIBUTING.md
-├── ROADMAP.md
-├── LICENSE
-├── NOTICE
-├── .gitignore
-├── .env.example
-├── server/
-│   └── README.md
-├── web/
-│   └── README.md
-├── infra/
-│   └── README.md
-├── tests/
-│   └── fixtures/
-│       └── README.md
-├── docs/
-│   ├── ARCHITECTURE.md
-│   ├── SETUP.md
-│   ├── CLAUDE_REVIEW_SETUP.md
-│   ├── THIRD_PARTY_POLICY.md
-│   ├── INITIAL_ISSUES.md
-│   ├── ADR/
-│   │   ├── README.md
-│   │   └── 0001-project-foundations.md
-│   └── proposals/
-│       └── README.md
-└── .github/
-    ├── workflows/
-    ├── pull_request_template.md
-    └── ISSUE_TEMPLATE/
-```
+## 2. Repository/runtime layout
 
 Expected implementation expansion:
 
@@ -93,19 +56,29 @@ server/app/
 ├── cameras/
 │   ├── registry/
 │   ├── uvc/
-│   └── remote_web/
+│   └── remote_agent/
 ├── detection/
 ├── events/
 ├── media/
 ├── notifications/
 └── storage/
 
+agent/
+├── capture/
+├── pairing/
+├── transport/
+└── service/
+
 web/src/
 ├── dashboard/
-├── camera-node/
+├── access/
+├── recordings/
+├── timeline/
 ├── setup/
 └── shared/
 ```
+
+The main application may use Docker Compose where appropriate. `media-capture-agent` is intended to run natively as a systemd service so UVC/udev/hotplug handling does not require a privileged container.
 
 ## 3. Camera Source domain model
 
@@ -115,10 +88,16 @@ MVP enum:
 
 ```text
 local_uvc
-remote_web
+remote_agent
 ```
 
-Future types must fit the same logical source/event model, e.g. `rtsp`, `pi_node`.
+Deferred/future candidates:
+
+```text
+remote_web
+rtsp
+pi_node
+```
 
 ### 3.2 Source record
 
@@ -127,7 +106,7 @@ Logical schema:
 ```text
 camera_source
 - id: UUID
-- node_id: nullable UUID
+- capture_node_id: nullable UUID
 - source_type
 - name
 - role_label
@@ -135,32 +114,15 @@ camera_source
 - desired_capture_profile
 - negotiated_capture_profile
 - health_state
+- image_quality_state
 - last_seen_at
 - created_at
 - updated_at
 ```
 
-`role_label` is descriptive metadata, not a replacement for explicit detection-profile configuration.
+`capture_node_id = null` for main-host-local sources. `role_label` is descriptive metadata, not a replacement for explicit profile configuration.
 
-### 3.3 Capabilities
-
-Capabilities are data, not assumptions derived from device name.
-
-Examples:
-
-```text
-video
-microphone
-camera_switch
-resolution_controls
-frame_rate_controls
-browser_wake_lock
-local_direct_capture
-```
-
-No MVP detector requires IMU or torch capabilities.
-
-### 3.4 Detection profile bindings
+### 3.3 Detection profile bindings
 
 A source may have zero or more profiles:
 
@@ -174,293 +136,294 @@ owner_verification
 image_quality
 ```
 
-A profile contains its own config, version, thresholds, and enabled state.
+Each profile contains config/version/thresholds/enabled state. Source type does not implicitly determine which profiles run.
 
-### 3.5 Active-source limit
+### 3.4 Active-source limit
 
 Initial `max_active_video_sources = 4`.
 
-This is a configurable product limit. Database/API collection types must not encode four fixed columns or four fixed source names.
+Activation that exceeds the configured limit returns an explicit validation error rather than silently replacing another source.
 
-If enabling a source would exceed the configured limit, reject the activation with an explicit validation error rather than silently replacing another source.
-
-## 4. Local UVC / USB ingest
+## 4. Physical UVC identity and reconnect
 
 ### 4.1 Discovery
 
-On Linux, enumerate V4L2/UVC-compatible devices. Prefer stable hardware identity where available:
+On Linux enumerate V4L2/UVC-compatible devices. Persist a physical-device identity record from the strongest available stable evidence, for example:
+
 - `/dev/v4l/by-id/` or equivalent stable symlink;
-- USB vendor/product/serial metadata;
-- negotiated video capabilities.
+- USB serial number;
+- udev properties;
+- USB physical/topology path where appropriate;
+- vendor/product IDs;
+- negotiated capabilities/descriptors.
 
-Do not persist `/dev/video0` alone as durable identity because enumeration order can change after reboot/replug.
+`/dev/videoN` alone is never durable identity.
 
-### 4.2 Activation
+### 4.2 Identity strength
 
-Discovery does not automatically activate recording. The deployment owner explicitly selects the device, names it, chooses capture settings, and assigns detection profiles.
+Identity matching has an explicit confidence/strength result. A serial/by-id-backed match may be strong. Vendor/product/capabilities alone are insufficient to distinguish multiple otherwise identical non-serial devices.
 
-### 4.3 Container boundary
+Do not invent a synthetic fingerprint and treat it as unique when the underlying hardware exposes no unique data.
 
-Do not require privileged Docker solely to access webcams. Mount/pass only explicitly configured video devices or use a narrowly scoped host capture design documented by ADR.
+### 4.3 Ambiguous reconnect
 
-### 4.4 Disconnect/reconnect
+If a previously approved source disappears:
 
-A disappearing UVC device transitions to `offline` and emits a source-health event. Reappearance is matched by stable identity where possible and does not silently bind a different physical camera to the old source.
+```text
+source -> offline
+```
 
-## 5. Remote Web Camera Node
+When devices reappear:
 
-### 5.1 Technology
+- if the prior physical camera can be matched unambiguously, reconnect automatically;
+- if several candidates are indistinguishable, do **not** bind one automatically;
+- transition to `manual_intervention_required` and show candidates to the owner for explicit re-approval;
+- audit the decision and never report healthy monitoring against an unverified substitute.
 
-MVP implementation target:
-- React/TypeScript UI shared with the web application where practical;
-- browser `navigator.mediaDevices.getUserMedia()`;
-- WebRTC evaluated first for low-latency media;
-- Web Crypto / browser-appropriate credential storage for paired identity;
-- Screen Wake Lock API as optional best-effort support where available.
+This rule applies on both the main host and remote capture nodes.
 
-No native iOS/Android package is required.
+## 5. `media-capture-agent`
 
-### 5.2 Secure context
+### 5.1 Purpose
 
-Camera/microphone capture requires a browser secure context except browser-defined localhost exceptions. Production/setup UX must provide a valid secure-origin path; it must not instruct the user to bypass browser TLS/security warnings as the normal solution.
+`media-capture-agent` captures video from UVC/V4L2 devices attached to another Linux machine and forwards it to the main ServerSentinel host.
 
-The exact local HTTPS/Tailscale/reverse-proxy certificate approach shall be documented by setup/transport ADR work.
+The service/process/systemd unit uses the functional name `media-capture-agent` and does not masquerade as unrelated OS/vendor software.
 
-### 5.3 Camera selection
+### 5.2 Privilege model
 
-A browser node may expose one selected video track as one Camera Source. Device camera switching may be offered where the browser exposes multiple cameras, but the MVP does not require simultaneous front/rear capture from one phone.
+Normal service execution:
 
-### 5.4 Audio
+```text
+user: dedicated non-root account (e.g. mediacapture)
+permissions: only required camera devices, config/credential path, bounded temp/buffer path, outbound network
+GUI/tray: none required
+```
 
-Microphone capture is separate from video permission/state and defaults to OFF.
+Installation may require `sudo` to install the binary, create the account/unit, and configure narrow device permissions.
 
-### 5.5 No automatic illumination
+### 5.3 Audio
 
-Do not call browser constraints or device APIs to automatically enable torch/flash/screen light on motion or low light. Low light is handled through quality gating and explicit degraded state.
+MVP agent capture is video-only. Do not open microphone/audio devices. No event/detection logic depends on audio.
 
-### 5.6 Foreground/lifecycle model
-
-The web node is expected to remain active and foreground while used as a camera source.
-
-The implementation must surface/recover from:
-- visibility/background suspension;
-- track ended/muted;
-- permission revocation;
-- browser reload;
-- network interruption;
-- device sleep/lock where detectable.
-
-No claim of uninterrupted background recording is allowed.
-
-### 5.7 Browser-local buffer
-
-Any MediaRecorder/IndexedDB/browser-side buffer is best-effort and non-authoritative in MVP. It may improve reconnect behavior, but MUST NOT be described as guaranteed independent critical-evidence storage.
-
-## 6. Pairing and node trust
-
-### 6.1 Local UVC
-
-Local UVC sources are host-local devices selected by an owner-authorized dashboard session. They do not use remote pairing tokens.
-
-### 6.2 Web Camera Node pairing
+### 5.4 Pairing
 
 Preferred flow:
 
 ```text
-Owner dashboard -> Add Web Camera
-        |
-        +-- one-time QR / short token (~5 min)
-        |
-Camera browser opens secure camera-node page
-        |
-server validates token + current owner approval
-        |
-revocable per-node identity/session established
+Owner dashboard -> Add Capture Node
+       |
+       +-- short-lived one-time pairing code
+       |
+Capture machine:
+media-capture-agent pair --server <LAN endpoint> --code <code>
+       |
+       +-- agent generates node keypair
+       +-- main host validates current owner approval
+       +-- revocable node credential/certificate established
 ```
 
-Pairing token:
-- cryptographically random;
-- one-time;
-- short-lived;
-- never logged plaintext.
+Pairing credentials are cryptographically random, single-use, short-lived, and never logged plaintext.
 
-### 6.3 Browser credential
+### 5.5 Long-lived trust
 
-Prefer a browser-origin-bound, revocable credential. Where practical use Web Crypto-generated non-exportable key material persisted through IndexedDB rather than a long-lived bearer token in `localStorage`.
+After pairing, use mutually authenticated encryption. mTLS with a deployment-local CA/issuer is the default target unless an ADR selects an equivalent mechanism.
 
-Exact authentication protocol must be covered by the deployment-owner authorization/pairing ADR before implementation.
+Node identity is independent from source identity: one agent may later expose multiple cameras without gaining human/admin dashboard permissions.
 
-## 7. Media architecture
+### 5.6 Network direction
 
-### 7.1 Separation of concerns
+The agent initiates the long-lived connection toward the main host. The main host does not need inbound SSH/admin access to the capture machine.
 
-Live video and durable recording are separate reliability problems.
+The capture machine does not need Tailscale when it shares a private LAN with the main host.
 
-- **Live**: optimize latency and recovery.
-- **Recording**: optimize durability, ordering, retry, integrity, source attribution.
+### 5.7 Main-host ingest listener
 
-### 7.2 Local source path
+Capture ingest is a dedicated LAN-facing service/route set, distinct from the human dashboard listener.
 
-Local UVC capture may feed both live-view encoder and recorder directly on the Ubuntu host.
+It accepts only agent protocol traffic and must not expose dashboard/settings/recording-browser endpoints.
 
-### 7.3 Remote source path
+Security layers:
 
-The transport PoC shall compare realistic browser-compatible options, with WebRTC evaluated first.
+1. mTLS/revocable agent credential — authoritative identity;
+2. narrow bind/interface/firewall exposure;
+3. optional source-address restriction when stable addressing is available;
+4. rate/size/backpressure limits.
 
-Measure:
-- LAN/Tailscale latency;
-- reconnect behavior;
-- browser compatibility;
-- CPU/GPU cost;
-- bitrate;
-- four-source behavior;
-- recording extraction/chunking options;
-- dependency/license burden.
+A LAN IP address alone never authenticates an agent.
 
-### 7.4 Recording segments
+### 5.8 Health model
 
-Logical chunk metadata:
+Separate node and camera health:
 
 ```text
-chunk_id
-source_id
-session_id
+capture_node.health = online/degraded/offline/revoked
+camera_source.health = online/degraded/offline/manual_intervention_required
+```
+
+Example: USB camera intentionally unplugged for another use:
+
+```text
+agent heartbeat: online
+camera source: offline
+camera_offline event: emitted
+```
+
+Reconnect is automatic only after unambiguous physical-device identity validation.
+
+### 5.9 Clock synchronization
+
+Node heartbeat carries monotonic/UTC timing information sufficient to estimate clock offset. Main and capture machines should use NTP/chrony or equivalent.
+
+Excessive offset causes a visible degraded state/event because timeline ordering and media timestamps may be unreliable.
+
+### 5.10 Agent local buffering
+
+A short agent-side outage-recovery buffer is **not yet fixed**. If later enabled, an ADR/Issue must define duration, RAM/tmpfs vs disk, encryption/privacy, deletion, retry/idempotency, and whether it is best-effort or durable. The current specification makes no independent-evidence guarantee for agent-local storage.
+
+## 6. Media architecture
+
+### 6.1 Separation of concerns
+
+Treat these as separate profiles:
+
+- **capture profile** — what the camera/agent obtains;
+- **recording profile** — what is persisted;
+- **inference profile** — resolution/FPS sampled by detectors;
+- **viewer profile** — what a browser receives.
+
+A room-overview source may use high-resolution capture/recording while inference uses downscaled 2–5 fps frames and viewers use adaptive 720p/1080p-class output.
+
+### 6.2 Encode path
+
+Preferred order:
+
+1. passthrough/stream-copy compatible compressed video when safe/useful;
+2. hardware encode/decode where available;
+3. bounded software encode fallback.
+
+Do not require a specific GPU vendor for correctness. Hardware acceleration is optimization.
+
+### 6.3 Room-overview benchmark
+
+For wide room coverage, real-hardware tests should compare at minimum:
+
+- highest useful camera resolution at ~10–15 fps;
+- 1080p/15 fps;
+- resulting person/entrance detection accuracy;
+- main/agent CPU, GPU, VRAM, LAN throughput, dropped frames;
+- browser live latency/quality.
+
+Final defaults are measured, not guessed.
+
+### 6.4 Agent-to-main transport
+
+Transport choice remains ADR/PoC work. Candidate technologies may include WebRTC, SRT, QUIC, or authenticated HTTP/streaming approaches.
+
+Required behavior regardless of protocol:
+
+- authenticated encrypted node session;
+- bounded memory/queues;
+- backpressure;
+- reconnect;
+- source/session identity;
+- timestamp continuity/gap reporting;
+- no arbitrary filesystem paths;
+- no silent loss while reporting healthy.
+
+### 6.5 Main-to-browser live transport
+
+Phone/Mac/desktop users view live video **through the main host**, never directly from `media-capture-agent`.
+
+Use a browser-compatible low-latency transport selected by PoC/ADR. If an already encoded source can be safely relayed in a browser-compatible form, avoid unnecessary transcoding. Otherwise transcode/packetize on demand.
+
+Viewer-only processing should scale down or stop when subscriber count is zero.
+
+### 6.6 Durable recording
+
+The main host is authoritative durable storage. Recording metadata includes:
+
+```text
 recording_id
+source_id
+capture_node_id (nullable)
 event_id (optional)
-sequence_number
 started_at
 ended_at
 codec/container
 byte_length
-checksum
-retry_count
+checksum/integrity metadata
+quality/gap metadata
 ```
 
-Remote uploads must be idempotent.
+### 6.7 Main-host event ring buffer
 
-### 7.5 Server ring buffers
+Maintain recent **compressed** media where practical for pre-event evidence. Default target 30 s pre / 120 s post, max event 20 min.
 
-Maintain recent per-source media on the server for pre-event capture. Memory/disk implementation is chosen by benchmark/ADR. The buffer must have explicit bounds.
+Do not keep a long decoded-RGB frame history merely to implement pre-roll when compressed media can satisfy it.
 
-### 7.6 Capture vs inference FPS
+## 7. Detection pipeline
 
-Do not couple inference rate to capture FPS. Each detector/profile can sample a source at a lower cadence.
+### 7.1 General motion
 
-Example benchmark starting points only:
-- capture: 15 fps;
-- person detector: 2–5 fps;
-- server ROI/movement: 2–5 fps;
-- owner verification: event/person-triggered rather than every frame.
+Use lightweight temporal/background/flow methods as appropriate.
 
-Final values are benchmark-derived.
+### 7.2 Person detection
 
-## 8. Detection pipeline
+Use a pluggable backend. Requirements: project-compatible license, CPU fallback, optional GPU acceleration, model/version metadata, code and weights license review separately.
 
-### 8.1 General motion
+YOLOX is an initial evaluation candidate only.
 
-Use lightweight temporal difference/flow/background methods as appropriate.
+### 7.3 Server movement
 
-### 8.2 Person detection
+Per source/profile calibration stores server ROI/polygon, reference descriptors, background context, thresholds, and calibration version/time.
 
-Use a pluggable backend.
+Runtime may combine global transform compensation, edges/contours, ROI similarity, temporal persistence, and person/occlusion masks.
 
-Requirements:
-- permissive project-compatible license;
-- CPU fallback;
-- optional GPU acceleration;
-- model/version in metadata;
-- source and pretrained weight licenses verified separately.
+### 7.4 Camera tamper
 
-YOLOX is the initial person-detector evaluation candidate because its source implementation is Apache-2.0. This does not pre-approve every weight artifact.
+Candidate signals include global optical transform, persistent occlusion/near-black view, abrupt focus/exposure/scene-pose change, and disconnect closely following scene movement.
 
-### 8.3 Server movement
+### 7.5 Detector-specific image-quality gate
 
-Per source/profile calibration stores:
-- server ROI/polygon;
-- reference frame/descriptors;
-- background context;
-- thresholds;
-- calibration version/time.
+Quality is not only for face verification. Every detector defines prerequisites required to make a trustworthy positive or negative conclusion.
 
-Runtime may combine:
-- feature points;
-- global transform/homography compensation;
-- edges/contours;
-- ROI similarity;
-- temporal persistence;
-- person/occlusion mask.
+Possible quality signals:
 
-### 8.4 Camera tamper
-
-Candidate signals:
-- global optical transform;
-- persistent occlusion/near-black lens cover;
-- abrupt focus/exposure change;
-- source disconnect closely following scene movement;
-- impossible/large scene pose shift.
-
-UVC/Web Camera Node implementations do not depend on IMU.
-
-### 8.5 Image-quality / low-light gate
-
-Before identity-sensitive inference, derive quality indicators such as:
-- luminance distribution;
+- luminance/underexposure;
 - blur/sharpness;
-- visible face size;
-- detector confidence;
-- excessive saturation/underexposure.
+- saturation;
+- source resolution/crop size;
+- target/face/person pixel size;
+- obstruction;
+- detector confidence/health.
 
-A profile returns `sufficient`, `degraded`, or `insufficient` plus metrics/reason. `insufficient` prevents owner match/non-match from being treated as reliable.
+A profile returns `sufficient`, `degraded`, or `insufficient` plus metrics/reasons.
 
-No motion-triggered torch operation exists in MVP.
+If the person detector's prerequisites are insufficient, the result is `unknown`/unavailable. It is **not** converted to `no person`. The same fail-unknown principle applies to owner verification and dependent presence/entrance conclusions.
 
-### 8.6 Owner-only face verification
+### 7.6 Owner-only face verification
 
-This is 1:1 verification against one explicitly enrolled deployment owner, not general named face identification.
-
-Logical flow:
+This is 1:1 verification against one explicitly enrolled deployment owner.
 
 ```text
 person/face candidate
-      -> quality gate
-      -> owner embedding comparison
-      -> match / no-match / unknown
+   -> detector-specific quality gate
+   -> owner embedding comparison
+   -> match / no-match / unknown
 ```
 
-Requirements:
-- owner enrollment requires owner-authorized UI action;
-- template/model metadata stored locally;
-- threshold chosen through synthetic/public benchmark + real-device manual validation;
-- result contains confidence/distance + quality state;
-- low-quality result becomes `unknown`;
-- enrollment can be deleted/replaced;
-- model implementation/weights need license review.
+Owner template/model metadata stays local; enrollment/delete/re-enroll require owner authorization; raw template is not logged/general-exported. No named templates for other people.
 
-Do not create persistent named templates for other people.
+### 7.7 Anonymous tracking and entrance
 
-### 8.7 Anonymous tracking
+Non-owner observations may use ephemeral anonymous track IDs. Same-camera temporal tracking is allowed. Cross-camera biometric re-identification is not MVP.
 
-Use ephemeral identifiers for non-owner observations, e.g. `anon_track_<uuid>`.
+Entrance/zone profile may emit anonymous/owner entry-exit observations only when direction/quality conditions are met.
 
-The initial tracking scope should be limited enough to avoid silently becoming a biometric re-identification system. Same-camera temporal tracking is allowed. Cross-camera re-identification is not an MVP requirement and requires a new privacy/architecture decision.
+## 8. Presence and timeline
 
-### 8.8 Entrance crossing
-
-Entrance profile config:
-- line or polygon;
-- `inside` and `outside` side/direction;
-- debounce/persistence threshold;
-- optional owner-verification requirement.
-
-Emitted observations may include:
-- `anonymous_person_entered`;
-- `anonymous_person_exited`;
-- `owner_entered`;
-- `owner_exited`.
-
-## 9. Presence engine
-
-Logical states:
+Presence states:
 
 ```text
 PRESENT
@@ -469,273 +432,211 @@ ABSENT
 UNKNOWN
 ```
 
-Inputs may include:
-- owner entrance/exit observations;
-- recency/consistency;
-- manual owner override;
-- configured schedule hints.
-
 Precedence:
-1. explicit manual override;
-2. high-confidence entrance-derived state;
-3. schedule/hints;
-4. otherwise unknown.
 
-Only `PRESENT` suppresses ordinary occupancy automation by default. `PROBABLY_PRESENT`/`UNKNOWN` are displayed but do not silently disarm ordinary security automation.
+1. explicit owner manual override;
+2. high-confidence owner entrance/exit observations;
+3. configured hints/schedules;
+4. otherwise uncertain/unknown.
 
-Critical server movement/camera tamper remains armed in every presence state.
+Only `PRESENT` suppresses ordinary occupancy automation by default. Server movement/camera tamper remain armed in every state.
 
-## 10. Event and timeline model
+Timeline correlation lists observations and relevant temporal context; it does not assert guilt/culpability/causality.
 
-Suggested event/observation types:
+## 9. Storage/admission
 
-```text
-motion_detected
-person_detected
-anonymous_person_entered
-anonymous_person_exited
-owner_match
-owner_entered
-owner_exited
-image_quality_degraded
-image_quality_recovered
-server_movement
-camera_tamper
-camera_offline
-camera_online
-web_camera_suspended
-web_camera_reconnected
-server_started
-server_stopped
-recording_started
-recording_stopped
-manual_recording_started
-manual_recording_stopped
-storage_warning
-storage_pressure_entered
-storage_pressure_cleared
-storage_hard_stop_entered
-storage_hard_stop_cleared
-presence_changed
-slack_error
-pairing_created
-pairing_revoked
-settings_changed
-```
+ServerSentinel distinguishes recording allocation from hard filesystem safety reserve.
 
-Each event:
-- UUID;
-- type;
-- severity;
-- started_at / ended_at;
-- source_id / node_id where applicable;
-- confidence/quality where applicable;
-- recording references;
-- thumbnail references;
-- metadata JSON;
-- acknowledged/starred state where applicable.
+Admission loop:
 
-### 10.1 Correlation
-
-Critical-event view may query a configurable time window around the event and show relevant entry/exit/person/camera/server observations.
-
-Correlation output MUST be phrased as observations, e.g. `Observed in relevant window`, not `suspect`/`culprit`.
-
-## 11. Recording layout
-
-Example:
-
-```text
-<recording_root>/
-├── recordings/
-│   └── 2026/09/17/<event_uuid>/
-│       ├── source_<uuid-a>.mp4
-│       ├── source_<uuid-b>.mp4
-│       ├── thumbnail_<uuid-a>.jpg
-│       └── manifest.json
-├── manual/
-├── temp/
-└── diagnostics/
-```
-
-No `rear.mp4` / `front.mp4` contract.
-
-Manifest records source IDs, source names at capture time, codecs, time ranges, checksums, gaps, and event links.
-
-Filesystem paths must never contain secrets or raw user-provided traversal components.
-
-## 12. SQLite logical model
-
-Initial logical tables:
-
-- `nodes`;
-- `camera_sources`;
-- `camera_capabilities`;
-- `camera_profiles`;
-- `pairings`;
-- `owner_biometric_profile` (0 or 1 active logical owner profile in MVP);
-- `person_tracks` / `person_observations`;
-- `events`;
-- `event_links`;
-- `recordings`;
-- `recording_files`;
-- `settings`;
-- `schedules`;
-- `presence_state_history`;
-- `audit_logs`;
-- `notification_deliveries`;
-- `schema_migrations`.
-
-Important constraints:
-- externally referenced objects use UUIDs where practical;
-- timestamps stored UTC; UI renders local time;
-- settings/biometric enrollment/deletion audited;
-- audit logs immutable through normal API except retention worker;
-- cascade/destructive behavior explicit;
-- non-owner named identity schema is intentionally absent.
-
-## 13. Retention and storage admission
-
-ServerSentinel distinguishes configured recording allocation from hard filesystem safety reserve.
-
-At scheduled intervals and before a new recording admission:
-
-1. calculate recording use, starred use, filesystem free space, configured maximum, bounded critical allowance, hard reserve;
+1. calculate recording use, starred use, filesystem free space, configured max, bounded critical allowance, hard reserve;
 2. delete expired unstarred recordings;
-3. if allocation/free-space admission remains unsafe, reclaim oldest eligible unstarred recordings even if they have not expired;
-4. if normal admission is still unsafe, enter `STORAGE_PRESSURE` and suppress new non-critical/manual disk recordings;
-5. confirmed critical server-movement/camera-tamper evidence may use only a bounded critical allowance that does not cross the hard reserve;
-6. before any write that would cross the hard reserve, enter `STORAGE_HARD_STOP` and refuse the write;
-7. starred recordings are never auto-deleted but also never justify intentional filesystem exhaustion;
+3. reclaim oldest eligible unstarred recordings if allocation/free-space still unsafe;
+4. enter `STORAGE_PRESSURE` and reject/suppress ordinary/manual disk recordings when necessary;
+5. confirmed critical evidence may use only a bounded allowance that does not cross hard reserve;
+6. enter `STORAGE_HARD_STOP` before any unsafe write;
+7. starred recordings are not auto-deleted;
 8. emit audit/UI state events;
-9. recover with hysteresis after free space is safely above recovery thresholds.
+9. recover with hysteresis.
 
-Exact thresholds are benchmark/config decisions, not hard-coded personal disk values.
+Defaults: recording retention 20 days; audit retention 90 days.
 
-## 14. Dashboard UI
+## 10. Human access architecture
+
+### 10.1 Two independent gates
+
+A human must pass both:
+
+```text
+Gate A: Tailscale/private-network permission
+Gate B: ServerSentinel invitation/permission
+```
+
+Tailnet membership by itself grants nothing.
+
+### 10.2 Tailscale visibility objective
+
+Use restrictive Tailscale Grants/access policy so ordinary Tailnet members not authorized for ServerSentinel have no grant to the main node. Where Tailscale's peer-map trimming applies, those users should not normally see the ServerSentinel node in ordinary peer/status visibility.
+
+Do not claim concealment from Tailnet Owners/Admins or infrastructure administrators.
+
+Automatic mutation of Tailscale policy is not required in MVP; avoiding long-lived Tailscale admin credentials inside ServerSentinel is preferred. The owner may perform Tailnet permission management separately from the in-app invitation.
+
+### 10.3 Trusted proxy boundary
+
+Human UI/API should listen on loopback (or another non-bypassable trusted local boundary) behind Tailscale Serve/equivalent.
+
+If proxy-supplied identity headers are used, accept them only from that trusted path. LAN clients must not be able to reach the same backend listener and spoof identity headers.
+
+### 10.4 In-app principals
+
+Logical model:
+
+```text
+access_principal
+- id
+- external_identity (e.g. verified Tailscale login identity)
+- display_name
+- status: invited/active/revoked
+- created_at
+- revoked_at
+
+principal_permission
+- principal_id
+- permission
+```
+
+Initial non-owner permissions:
+
+```text
+live:view
+recordings:view
+```
+
+They are independent.
+
+### 10.5 Route authorization
+
+Examples:
+
+```text
+GET /api/live/<source>                  -> live:view
+GET /api/recordings                     -> recordings:view
+GET /api/recordings/<id>/playback       -> recordings:view
+POST/DELETE camera/agent/settings       -> owner
+POST access invitations/permissions     -> owner
+POST biometric enroll/delete            -> owner
+DELETE recording                         -> owner
+```
+
+Unauthorized users get no deployment metadata, camera names/counts, thumbnails, event details, or recordings.
+
+### 10.6 Browser-only recording access
+
+No official non-owner recording download/export route/button in MVP. Playback manifests/segments remain authorization-protected and short-lived/session-bound as practical; a copied URL does not become public.
+
+This is not DRM. A user who can view video may still screen-record or use advanced client tooling, and the UI/docs must not claim otherwise.
+
+### 10.7 Timeline authorization pending
+
+Historical timeline/event-metadata permission is not implicitly granted by `live:view`. Whether `recordings:view` also includes historical timeline or a separate `timeline:view` permission is an unresolved product decision and must be decided before implementation of invited-user timeline access.
+
+### 10.8 Revocation
+
+ServerSentinel permission revocation invalidates application access promptly. Tailnet-level network permission is a separate revocation action unless a future approved Tailscale-admin integration automates it.
+
+## 11. Dashboard UI
 
 Primary views:
+
 - Overview/status;
 - Camera Sources;
+- Capture Nodes;
 - Live Grid;
 - Events/Timeline;
 - Recordings;
 - Presence;
-- Owner Verification settings;
+- Owner Verification;
+- Access;
 - Storage;
 - Slack;
 - Audit;
 - Setup/security.
 
-### 14.1 Live grid
+Live layout:
+- 1 source: single large view;
+- 2 sources: split/two-up;
+- 3–4: responsive grid.
 
-Layout adapts to source count:
-- 1 source: single view;
-- 2 sources: two-up responsive layout;
-- 3–4 sources: responsive 2×2-style grid where screen size permits.
+Camera/source cards show source name/type/role, capture node where applicable, source health, node health, negotiated capture/view quality, detector quality, and manual-intervention state.
 
-Do not render empty hard-coded camera slots as a product assumption.
+## 12. Security boundaries
 
-### 14.2 Camera source card
+### 12.1 Capture node != human user
 
-Display:
-- source name/type/role;
-- online/degraded/offline state;
-- negotiated resolution/FPS;
-- audio state;
-- active detection profiles;
-- low-light/image-quality state;
-- reconnect/manual-intervention state.
+A paired `media-capture-agent` may send camera/health data only. Its credential never grants dashboard/admin access.
 
-## 15. Security boundaries
+### 12.2 Media validation
 
-### 15.1 Deployment owner
+Validate authenticated node, expected source/session, rate/size bounds, allowed codecs/containers, generated safe filenames, integrity metadata, and bounded queues. No client-controlled arbitrary output paths.
 
-Tailscale membership is reachability only. Privileged dashboard/API actions require separate deployment-owner authorization selected by ADR.
+### 12.3 Biometrics
 
-### 15.2 Media uploads
+Owner template is sensitive secret-adjacent data, excluded from logs/general APIs/diagnostics and limited to the verification/config path. Non-owner persistent biometric templates are prohibited.
 
-Validate:
-- authenticated node;
-- expected source/session;
-- size/rate limits;
-- allowed media/container;
-- generated safe filenames;
-- checksum/integrity;
-- no arbitrary output paths.
+## 13. Performance/overload policy
 
-### 15.3 Biometric data
+Four active sources are a test target, not a promise of maximum camera modes on all hardware.
 
-Owner biometric template:
-- treated as sensitive secret-adjacent data;
-- excluded from logs/diagnostics by default;
-- not returned from general settings APIs;
-- deletion audited;
-- access limited to required verification worker/config path.
+Resource priority:
 
-Non-owner persistent biometric templates are prohibited by requirement.
+1. keep node/source health truthful;
+2. preserve critical server movement/tamper processing/evidence where safe;
+3. preserve recording integrity/backpressure;
+4. reduce expensive inference cadence;
+5. reduce viewer bitrate/FPS/resolution;
+6. report degraded state;
+7. never silently drop a source while claiming healthy.
 
-## 16. Failure/health behavior
+Measure USB controller bandwidth, agent/main CPU/GPU/VRAM, encode/decode capacity, LAN throughput, disk write rate, viewer latency, and dropped frames.
 
-Explicit states should distinguish:
-- UVC device disconnected;
-- remote browser node offline;
-- browser capture track ended;
-- low-light/quality degradation;
-- detector worker degraded;
-- storage pressure/hard stop;
-- server-side source overload;
-- owner verification unavailable;
-- manual intervention required.
+## 14. Testing and fixtures
 
-A failed owner verifier does not disable unrelated server movement/tamper monitoring.
+Repository/CI media fixtures are **synthetic/generated only**.
 
-## 17. Performance and overload policy
-
-Four active sources are a supported test target, not a promise that every camera can run its maximum advertised mode simultaneously on every host/USB topology.
-
-Resource policy:
-1. keep source health/heartbeat visible;
-2. preserve critical server movement/tamper processing where configured;
-3. reduce expensive analysis cadence;
-4. reduce live preview bitrate/FPS/resolution where necessary;
-5. report degraded state;
-6. do not silently drop a source while claiming healthy monitoring.
-
-USB controller bandwidth, CPU, GPU, encoder capacity, and network bandwidth must be measured.
-
-## 18. Testing and fixtures
-
-Repository media fixtures must be synthetic/generated only. Real monitoring footage, real-person media, and real-environment footage are not committed or attached to PRs even with consent.
+Real-person/real-room/real-monitoring footage—including publicly licensed real-person benchmark media—is not committed or attached to GitHub PRs/issues/actions artifacts. External real-person datasets may be used only for local evaluation under their terms and are not repository fixtures.
 
 Required test families include:
+
 - source registry 1–4 cameras;
-- UVC stable-device mapping/reconnect;
-- remote Web Camera Node pairing/reconnect;
-- media chunk retry/idempotency;
-- multi-source event linkage;
-- low-light gating;
-- owner-verification match/no-match/unknown using synthetic/generated/publicly licensed fixtures where appropriate;
-- anonymous tracking without named identities;
-- entrance crossing/presence state;
-- server ROI movement/occlusion;
-- camera tamper;
-- retention/storage pressure;
-- owner authorization;
-- migrations;
+- UVC stable mapping/reconnect;
+- two indistinguishable non-serial UVC devices and forced manual re-approval;
+- capture-agent pairing/revocation/mTLS;
+- camera-unplug while agent remains online;
+- clock skew/health degradation;
+- LAN interruption/reconnect/backpressure;
+- multi-source recording/event linkage;
+- detector-specific low-light gating, including person detector `unknown` rather than false negative;
+- owner match/no-match/unknown with synthetic/generated assets;
+- anonymous tracking/entrance;
+- presence/timeline;
+- storage pressure/hard stop;
+- access permissions and Tailscale-proxy trust boundary;
+- phone/Mac live-view authorization;
 - mock E2E.
 
-Real browser/hardware validation lives in `MANUAL_TEST.md`.
+Real hardware/network/browser validation lives in `MANUAL_TEST.md`.
 
-## 19. Deliberately deferred decisions
+## 15. Deliberately unresolved decisions
 
-Require ADR/Issue before implementation where material:
-- exact low-latency media transport;
-- local HTTPS/certificate setup UX for Web Camera Node;
-- final codecs/bitrates;
-- final owner face-verification model/weights/license;
-- exact owner-verification threshold/calibration method;
-- cross-camera re-identification (not MVP);
-- strong independent/off-host evidence storage;
-- RTSP/IP/Raspberry Pi source support;
-- any future native mobile application.
+Require explicit owner decision/ADR/Issue before implementation where material:
+
+- exact `media-capture-agent` -> main media transport and reconnection protocol;
+- exact main -> browser live transport and target latency;
+- exact capture/record/inference/view resolution/FPS/bitrate defaults after measurement;
+- whether an agent keeps a short outage-recovery buffer, and RAM/tmpfs vs disk/duration;
+- whether `recordings:view` includes historical timeline or a separate `timeline:view` permission is added;
+- whether Tailscale Grant management remains manual or later receives a narrowly scoped admin integration;
+- final owner face-verification model/weights/license/threshold;
+- any future browser/iPhone camera source;
+- independent off-host evidence storage.

@@ -6,28 +6,31 @@ Planned stack:
 - SQLite
 - recording/media workers
 - detection workers
-- Docker Compose
+- Docker Compose where appropriate
 
 Responsibilities:
-- deployment-owner authorization;
-- Camera Source registry/capabilities/health;
+- deployment-owner authorization and invited-user permissions;
+- trusted Tailscale/private-proxy identity handling;
+- Camera Source / Capture Node registry and health;
 - local UVC/V4L2 discovery and ingest;
-- Web Camera Node pairing/session/media ingest;
-- live-media routing;
-- durable recording/ring buffers;
+- `media-capture-agent` pairing/revocation and LAN media ingest;
+- live-media routing to authorized phone/Mac/desktop browsers;
+- durable recording / compressed pre-event buffers;
 - person/motion/server-movement/camera-tamper analysis;
-- low-light/image-quality gating;
+- detector-specific image-quality gating;
 - optional owner-only face verification;
-- entrance crossing/anonymous tracking;
-- presence inference;
-- unified event timeline/correlation;
+- entrance/anonymous tracking and presence inference;
+- unified factual event timeline;
 - retention/storage safety;
 - Slack notifications;
-- audit;
-- dashboard API.
+- audit.
 
-Heavy CV inference belongs here by default.
+Heavy CV inference belongs on the main host by default. Capture agents remain lightweight unless a future approved architecture introduces edge inference.
 
-The backend must support 1–4 active sources without fixed front/rear columns. UVC device identity must not rely solely on `/dev/videoN` ordering. Browser Camera Nodes are remote, revocable source identities and do not inherit owner/admin authorization.
+The backend supports 1–4 active sources without fixed front/rear columns. MVP source types are `local_uvc` and `remote_agent`.
 
-The server is primary durable evidence storage in MVP. Browser-local storage is best-effort only and must not be represented as guaranteed independent evidence preservation.
+A capture-node credential is not a human/admin credential. LAN capture ingest is separated from the human dashboard listener. Human access requires both private-network permission and ServerSentinel application authorization.
+
+UVC identity never relies solely on `/dev/videoN`. Ambiguous reconnect of indistinguishable physical devices fails to `manual_intervention_required`.
+
+ServerSentinel is video-only in MVP. The main Ubuntu host is authoritative durable evidence storage. Agent-local outage buffering is a separate pending design decision and is not currently an independent evidence guarantee.

@@ -6,125 +6,153 @@ Status: Accepted
 
 ServerSentinel protects valuable self-hosted servers/workstations through camera monitoring, recording, computer vision, and event correlation.
 
-The initial concept used one dedicated native iOS Camera Node with front/rear MultiCam, CoreMotion, torch control, local emergency evidence, and Public App Store distribution. During requirements refinement, the product goal became clearer: camera hardware should be freely composable, inexpensive USB webcams should be first-class, and a phone should be usable as an entrance camera without requiring Apple Developer/App Store distribution.
+The architecture evolved through requirements refinement:
 
-The architecture also gained an optional owner-only face-verification/presence feature. That creates additional privacy/security obligations and must not become a general named face database.
+1. initial native iOS Camera Node concept;
+2. browser-based phone camera concept;
+3. final MVP direction: first-class UVC cameras, including cameras physically connected to another Linux machine and forwarded over the same private LAN by a lightweight capture agent.
+
+The deployment also needs private phone/Mac viewing for explicitly invited people without exposing ServerSentinel to every member of the Tailnet.
 
 ## Decision
 
 Project foundations:
+
 - project name: ServerSentinel;
 - public GitHub repository;
 - Apache-2.0;
 - free, no ads/payment;
 - no telemetry/analytics;
 - no developer-operated user-data cloud;
-- self-hosted Ubuntu host;
+- main self-hosted Ubuntu host;
 - FastAPI backend;
-- React/TypeScript web UI;
+- React/TypeScript human dashboard;
 - SQLite metadata;
-- Docker Compose;
-- Tailscale recommended for remote dashboard reachability;
-- deployment-owner authorization remains separate from Tailnet membership;
+- Docker Compose where appropriate on the main host;
 - Slack optional;
-- heavy computer-vision inference runs on Ubuntu by default;
-- dependencies/model code/weights require license review;
-- audio supported where useful but OFF by default.
+- heavy CV inference runs on the main host by default;
+- model code/weights licenses reviewed separately;
+- MVP monitoring is video-only.
 
 Camera architecture:
+
 - common Camera Source abstraction;
-- MVP source types: local UVC/V4L2 and remote browser-based Web Camera Node;
-- MVP supports 1–4 active video sources in arbitrary supported composition;
-- camera type, user-visible role, and detection profiles are separate concepts;
-- iPhone/Android/PC may act as a Web Camera Node through a secure browser context;
-- no native iOS application, Apple Developer Program, or App Store distribution is required by MVP;
-- simultaneous phone front/rear capture is not required;
-- automatic motion/low-light torch or visible-light activation is not part of MVP;
-- browser background capture and browser-local storage are not treated as guaranteed durable evidence.
+- MVP source types: `local_uvc` and `remote_agent`;
+- `remote_agent` uses a Linux service named `media-capture-agent`;
+- 1–4 active sources in arbitrary supported composition;
+- source type, role, and Detection Profiles are separate;
+- capture agent normally runs non-root, without GUI/tray, and initiates its connection to the main host;
+- capture-node pairing uses short-lived owner approval followed by revocable mutually authenticated encryption, with mTLS as the default target;
+- capture machine does not need to join Tailscale when private-LAN reachability exists;
+- browser/iPhone camera capture is not an MVP requirement and is deferred;
+- ambiguous UVC reconnect does not silently substitute a different camera.
+
+Human-access architecture:
+
+- Tailscale/private network is recommended for human remote reachability;
+- Tailnet membership is not ServerSentinel authorization;
+- ordinary uninvited Tailnet members should receive no Tailscale Grant to the ServerSentinel node;
+- human backend is reached through a trusted Tailscale Serve/equivalent proxy path and remains non-bypassable from ordinary LAN clients;
+- ServerSentinel additionally maintains its own owner-managed invitation/allowlist;
+- minimum non-owner permissions are independent `live:view` and `recordings:view`;
+- non-owner recording access is browser playback only; no official download/export function in MVP;
+- concealment from Tailnet Owners/Admins or infrastructure administrators is not promised.
 
 Detection/privacy architecture:
+
 - general motion/person detection;
 - per-source server ROI/movement and camera-tamper profiles;
-- low-light/image-quality gating;
-- optional entrance crossing;
-- optional **owner-only 1:1 face verification**;
+- detector-specific image-quality gating;
+- insufficient person quality becomes `unknown`/unavailable, never trustworthy `no person`;
+- optional entrance/zone logic;
+- optional owner-only 1:1 face verification;
 - non-owner people remain anonymous observations/tracks;
-- named non-owner face database and cross-camera biometric re-identification are not MVP features;
+- named non-owner face database and cross-camera biometric re-identification are not MVP;
 - event timeline correlates observations but does not determine guilt/culpability.
 
 ## Alternatives considered
 
 ### Native iOS-first Camera Node
 
-Advantages:
-- AVFoundation/CoreMotion access;
-- stronger control of capture lifecycle;
-- possible native local evidence store;
-- richer device-specific telemetry.
+Rejected for MVP because it forces signing/App Store/device-specific lifecycle complexity and is unnecessary when UVC cameras are available.
 
-Rejected for MVP because:
-- forces Apple signing/developer/App Store work;
-- over-specializes the product around one device class;
-- duplicates capabilities cheaply available from UVC webcams;
-- increases thermal/mobile lifecycle complexity;
-- the revised phone role (e.g. entrance camera) can be served by a browser for MVP.
+### Browser phone as the primary remote camera
 
-A native mobile node may be reconsidered later if strong independent local/off-host evidence becomes a product requirement.
+Deferred from MVP because a permanently running Linux capture machine with UVC camera provides a cleaner always-on path, avoids browser lifecycle constraints, and can forward video over the existing private LAN.
+
+A browser camera source may be reconsidered later as another Camera Source type.
+
+### Put the capture machine in the owner's Tailnet
+
+Not required for the current deployment because the capture machine and main host share a private LAN. Keeping capture transport on LAN avoids extending Tailnet membership to the capture machine solely for media forwarding.
+
+### Main host connects inbound/SSH to capture machine
+
+Rejected as the default. `media-capture-agent` initiates its own authenticated outbound connection, so the main host does not need administrator access to the capture machine.
+
+### Tailnet membership as application authorization
+
+Rejected. Network reachability and ServerSentinel authorization are separate gates. Restrictive Tailnet policy also reduces unnecessary node visibility to ordinary uninvited members.
 
 ### Fixed two-webcam layout
 
-Rejected because users may reasonably deploy one, two, three, or four cameras and may mix USB/browser sources. Fixed `server_side/server_rear` columns would create unnecessary topology lock-in.
-
-### Automatic phone torch in low light
-
-Rejected because visible illumination may be undesirable and browser/device support is inconsistent. Low-light insufficiency is represented explicitly and may be solved by placement/ambient/IR-capable hardware instead.
+Rejected because deployments may use one to four sources and mix local/remote-agent cameras.
 
 ### General face identification
 
-Rejected for MVP because owner presence only needs 1:1 owner verification and a named multi-person biometric database creates significantly larger privacy/security scope.
+Rejected because owner presence only needs optional 1:1 owner verification and general named biometric identity would materially expand privacy/security scope.
 
 ## Consequences
 
 Advantages:
-- cheap one-webcam deployments are valid;
-- multi-camera deployments scale to four active sources;
-- USB webcams and phone browsers share one logical event/storage system;
+
+- local and physically remote UVC cameras share one logical event/storage model;
+- room-overview camera can be located near another Ubuntu machine without long USB cabling to main host;
+- no phone battery/browser lifecycle dependency;
 - no Apple Developer/App Store dependency;
-- Android/laptop cameras can participate;
-- source roles/detectors can evolve independently of hardware;
-- privacy scope of biometric processing stays narrow.
+- capture machines need no Tailnet membership when LAN is available;
+- invited phone/Mac viewers remain simple browsers;
+- access is narrower than whole-Tailnet visibility;
+- biometric scope remains narrow.
 
 Costs/limitations:
-- browser Camera Node reliability is subject to browser/OS foreground rules;
-- HTTPS/secure-origin setup must be solved cleanly;
-- browser-local evidence cannot be promised as durable;
-- independent evidence after physical loss of Ubuntu remains future work;
-- UVC stable-device mapping and USB bandwidth require careful handling;
-- owner verification needs model/license/threshold/privacy validation;
-- four maximum-quality streams are not guaranteed on every USB/compute topology and require adaptive profiles.
+
+- a new Linux capture-agent component must be packaged, paired, updated, and monitored;
+- agent-to-main transport requires its own ADR/benchmark;
+- LAN ingest and human dashboard must have distinct security boundaries;
+- Tailscale Grant management is separate from in-app invitation unless a future admin integration is approved;
+- UVC identity can be inherently ambiguous on identical devices without unique serials, requiring manual re-approval;
+- high-resolution room-overview capture needs encode/network/resource benchmarks;
+- independent evidence after physical loss of the main recorder remains future work.
 
 ## Validation
 
-Before calling the architecture production-ready:
-- test 1–4 active sources;
-- test multiple UVC devices/reordering/reconnect;
-- test Web Camera Node on iPhone Safari and at least one other browser/device where available;
-- verify secure-origin onboarding;
-- benchmark media/AI load;
-- test low-light degraded behavior with no auto-light;
-- test owner verification/entrance presence manually without publishing real-person media;
-- test unified timeline and neutral observation language;
-- verify storage pressure/failure behavior.
+Before production-ready status:
 
-## Follow-up ADRs
+- test 1–4 active local/remote-agent sources;
+- test multiple UVC devices/reordering/reconnect/ambiguous substitution;
+- test agent pairing/revocation/mTLS and LAN interruption;
+- test agent-online/camera-offline separation;
+- test clock offset handling;
+- benchmark room-overview high-resolution capture and inference/view profiles;
+- test phone/Mac live viewing;
+- test Tailscale network permission + application invitation isolation;
+- test `live:view` / `recordings:view` separation;
+- test detector-specific low-light/quality failure semantics;
+- test storage pressure/failure behavior;
+- test owner verification/timeline without publishing real-person media.
 
-Create ADRs before implementation where needed for:
-- deployment-owner authorization;
-- browser secure-origin/local HTTPS setup;
-- live media transport;
-- codec/recording profile;
-- final person detector/model/weights;
-- final owner face-verification model/weights/threshold method;
+## Follow-up ADRs / decisions
+
+Required before relevant implementation:
+
+- exact `media-capture-agent` -> main media transport;
+- exact main -> browser live transport and latency target;
+- exact room-overview capture/record/inference/view profiles after benchmark;
+- agent-local outage-recovery buffer policy;
+- historical timeline permission model;
+- final owner face-verification model/weights/threshold;
 - server-movement algorithm;
-- strong independent/off-host evidence storage if later required;
-- any future native mobile client.
+- any future automatic Tailscale administrative integration;
+- any future browser/native mobile camera source;
+- strong independent/off-host evidence storage if later required.
