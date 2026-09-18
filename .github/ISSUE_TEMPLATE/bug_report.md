@@ -12,7 +12,7 @@ Ubuntuバージョン:
 ブラウザ/OS:
 Camera Source構成:
 - `local_uvc`:
-- `remote_web`:
+- `remote_agent`:
 
 ## 期待する動作
 
@@ -32,7 +32,7 @@ Secret、private network情報、owner biometric template、実監視メディ�
 
 - [ ] 不要
 - [ ] USB/UVC Webcam
-- [ ] Web Camera Node（iPhone / Android / PC等）
+- [ ] Remote Linux `media-capture-agent` / room-overview Camera
 - [ ] Ubuntuサーバー
 - [ ] 複数Camera Source構成
 - [ ] その他:
