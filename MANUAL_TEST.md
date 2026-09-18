@@ -154,7 +154,7 @@ Per configured server source:
 - [ ] trivial vibration does not flood critical alerts;
 - [ ] known loss is never shown as healthy.
 
-## G. Network interruption / backpressure
+## G. Network interruption / backpressure and agent evidence protection
 
 Remote-agent scenarios:
 
@@ -165,6 +165,28 @@ Remote-agent scenarios:
 - [ ] capture-node restart;
 - [ ] bandwidth throttling/backpressure test in a controlled environment.
 
+Ring-buffer configuration:
+
+- [ ] owner can select **duration mode** and UI shows projected/actual disk usage;
+- [ ] owner can select **capacity mode** and UI shows estimated effective duration;
+- [ ] non-owner cannot change buffer mode/value;
+- [ ] current bytes, protected-incident bytes, filesystem free space, and safety reserve are visible;
+- [ ] unsafe values produce warning and are rejected before violating safety reserve;
+- [ ] configuration that cannot support the 10-minute pre-loss target is rejected when determinable;
+- [ ] runtime loss of effective pre-loss coverage becomes degraded/warning rather than silently healthy.
+
+Unexpected Main Server communication loss:
+
+- [ ] agent pins the 10 minutes immediately before loss when available;
+- [ ] agent continues local recording for 10 minutes after loss;
+- [ ] resulting protected incident targets 20 minutes total;
+- [ ] reconnect does not erase the protected incident;
+- [ ] segment gaps/shortened protection are reported truthfully;
+- [ ] protected incident has a 30-day agent-side expiry;
+- [ ] expiry cleanup removes it automatically after 30 days (use test clock/accelerated retention harness rather than waiting 30 real days where available);
+- [ ] ordinary ring-buffer pressure does not delete an unexpired protected incident;
+- [ ] disk pressure produces explicit warning/hard-stop behavior before unsafe writes.
+
 Record:
 
 - state transition;
@@ -172,10 +194,10 @@ Record:
 - recording gaps;
 - duplicate/missing media;
 - queue/memory growth;
+- agent buffer bytes;
+- protected incident bytes/expiry;
 - audit event;
 - manual-intervention requirement if automatic recovery is unsafe.
-
-Agent-local outage buffer behavior remains pending until that feature is explicitly designed; do not claim gap recovery that has not been implemented.
 
 ## H. Clock synchronization
 
@@ -211,42 +233,44 @@ Demand-driven processing:
 
 ## J. Tailscale / invitation visibility and authorization
 
-Use test identities/accounts appropriate for the deployment.
+Use test identities/accounts appropriate for the deployment. The MVP does **not** require changing existing Tailscale ACLs/Grants.
 
 ### Uninvited ordinary Tailnet member
 
-- [ ] no Tailscale Grant to the ServerSentinel node;
-- [ ] cannot establish dashboard connection;
-- [ ] where Tailscale peer-map trimming applies, ServerSentinel node is not normally visible in ordinary peer/status view;
-- [ ] no camera names/counts/metadata leak through errors or alternate endpoints.
-
-Do **not** claim invisibility from Tailnet Owners/Admins or infrastructure administrators.
+- [ ] if existing Tailnet policy makes the Main Server node visible/reachable, document that fact rather than claiming node invisibility;
+- [ ] ServerSentinel invitation is still required before application data is served;
+- [ ] unauthorized response is generic/non-branding where practical;
+- [ ] no ServerSentinel product/version, API schema, health detail, camera names/counts, thumbnails, recording data, timeline data, or deployment metadata leaks through errors/alternate endpoints;
+- [ ] LAN path cannot spoof trusted Tailscale identity headers.
 
 ### Invited user with `live:view` only
 
 - [ ] can view current live streams;
+- [ ] can view only current source health needed for live viewing;
 - [ ] cannot list/play recordings;
-- [ ] cannot access privileged settings;
-- [ ] historical timeline is not exposed implicitly while timeline permission policy remains undecided.
+- [ ] cannot access historical timeline/events;
+- [ ] cannot access privileged settings.
 
 ### Invited user with `recordings:view` only
 
-- [ ] can list/play recordings in browser if network/application authorization passes;
+- [ ] can list/play recordings in browser when application authorization passes;
+- [ ] can access historical timeline/events;
 - [ ] does not gain live view unless separately granted;
 - [ ] no official recording download/export control is present;
 - [ ] playback URL copied to an unauthorized identity does not work.
 
 ### User with both
 
-- [ ] live and browser playback both work;
+- [ ] live, browser playback, and historical timeline all work;
 - [ ] cannot manage cameras/users/settings unless owner.
 
 ### Revocation
 
 - [ ] app permission revoke blocks subsequent requests promptly;
-- [ ] Tailnet Grant removal blocks network path independently;
-- [ ] app invitation without Tailnet permission is insufficient;
-- [ ] Tailnet permission without app invitation is insufficient.
+- [ ] Tailnet membership alone remains insufficient for ServerSentinel application data;
+- [ ] no Tailscale policy mutation is performed by ServerSentinel.
+
+Do **not** claim invisibility from Tailnet Owners/Admins or infrastructure administrators, or node invisibility when existing Tailnet policy exposes the node.
 
 ## K. Manual/event recording
 
