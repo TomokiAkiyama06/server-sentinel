@@ -142,9 +142,18 @@ The main host and capture agent shall monitor clock synchronization/offset suffi
 Development may run the agent from a Git clone. Stable releases should provide a standalone versioned artifact/installer (for example GitHub Releases) and systemd unit so production operation does not depend on a mutable development checkout.
 
 ### AGENT-012 Configurable disk recovery ring buffer
-`media-capture-agent` shall maintain a bounded ring buffer of **compressed video on disk**, not decoded frame history. The deployment owner controls the normal ring-buffer duration through ServerSentinel settings, subject to implementation-defined safety limits and available disk space.
+`media-capture-agent` shall maintain a bounded ring buffer of **compressed video on disk**, not decoded frame history.
 
-Changing this setting is an owner-only operation. The UI shall show the estimated/actual disk footprint and must reject unsafe values rather than allowing unbounded growth.
+The deployment owner selects one of two configuration modes in ServerSentinel:
+
+- **duration mode** — configure the target rolling-buffer time; the UI shows the projected maximum/expected disk footprint from the negotiated/configured bitrate;
+- **capacity mode** — configure the maximum ring-buffer disk capacity; the UI shows the estimated effective buffer duration.
+
+The UI shall always show current ring-buffer usage, configured limit, agent-filesystem free space, protected-incident usage, and safety reserve. It shall warn before a selected value approaches an unsafe disk state and reject values that would violate the filesystem safety reserve.
+
+Because autonomous incident protection requires 10 minutes of pre-loss evidence, the configured ring buffer must be capable of retaining the target **10-minute pre-loss window** under the bounded/negotiated media profile. If the system cannot guarantee that target because of bitrate/capacity conditions, it shall surface a degraded/warning state rather than silently claiming full protection.
+
+Changing ring-buffer mode/value is an owner-only operation.
 
 ### AGENT-013 Main-host-loss temporary protection
 When the agent loses its authenticated connection/heartbeat to the main ServerSentinel host unexpectedly, it shall automatically protect a local incident window covering:
@@ -159,7 +168,11 @@ This behavior is intended to preserve room-overview evidence when the main serve
 When the main host confirms a critical server-movement/camera-tamper event and communication remains available, it may explicitly instruct paired agents to preserve the relevant local ring-buffer interval as incident evidence. Agent-side preserved evidence is an exception for critical resilience, not a general duplicate of all main-host recordings.
 
 ### AGENT-015 Protected-evidence lifecycle
-Protected agent evidence must have explicit retention/deletion policy, capacity bounds, status reporting, and owner-authorized deletion/export behavior. Running out of agent disk space must be surfaced and must not silently overwrite a currently protected critical incident.
+A protected agent incident is retained on the capture agent for **30 days from completion**, then automatically deleted from the agent. Owner-authorized manual deletion may remove it earlier.
+
+Protected incidents are excluded from ordinary ring-buffer overwrite before their 30-day expiry. If protected incidents and the active ring buffer create disk pressure, the agent shall reclaim only eligible non-protected ring-buffer data first, warn the owner, and refuse unsafe writes before crossing the filesystem safety reserve rather than silently deleting unexpired protected evidence.
+
+Protected evidence retention, deletion, current bytes, and expiry time shall be visible to the owner.
 
 ## 7. Capture, encode, and streaming requirements
 
@@ -324,10 +337,15 @@ Granting one does not imply the other. `live:view` alone shall not expose histor
 Non-owner invited users do not receive an official recording download/export endpoint/button in the MVP. The product must state that browser playback cannot technically prevent screen recording or advanced client-side capture.
 
 ### AUTH-008 Owner operations
-Only the owner (or a future explicitly defined privileged role) may add/revoke users, change permissions, register/revoke capture agents/cameras, configure agent recovery-buffer duration, enroll/delete owner biometrics, alter retention/security settings, or delete recordings.
+Only the owner (or a future explicitly defined privileged role) may add/revoke users, change permissions, register/revoke capture agents/cameras, configure agent ring-buffer mode/value, enroll/delete owner biometrics, alter retention/security settings, or delete recordings.
 
 ### AUTH-009 Immediate application revocation
 Application permission revocation shall invalidate active ServerSentinel authorization promptly. Tailnet membership/policy remains separately administered outside ServerSentinel.
+
+### AUTH-010 Application fingerprint minimization for uninvited users
+When an ordinary Tailnet user is not invited in ServerSentinel, the application shall minimize disclosure that ServerSentinel is running. Unauthorized responses should be generic/non-branding (for example not-found style), and shall not expose ServerSentinel product/version strings, camera/source counts, API schemas, health details, thumbnails, recordings, timeline data, or other deployment metadata.
+
+This is application-level non-disclosure only. With unchanged Tailscale policy, the existence/reachability of the underlying Tailscale node or listening service cannot be guaranteed hidden.
 
 ## 13. Dashboard requirements
 
@@ -341,7 +359,14 @@ Show source name/type/role, camera/agent online state, negotiated capture/view p
 Owner UI shall show invited identities, independent `live:view` / `recordings:view` permissions, active/revoked state, and clearly state that Tailnet membership by itself does not grant application access.
 
 ### UI-004 Agent evidence/buffer settings
-Owner UI shall expose the agent disk ring-buffer duration, current disk usage/limit, protected-incident status, and any storage pressure/error affecting agent-side protection.
+Owner UI shall expose:
+- ring-buffer configuration mode: **duration** or **disk capacity**;
+- configured value and estimated equivalent value in the other unit;
+- projected maximum/expected ring-buffer disk footprint;
+- current ring-buffer bytes;
+- protected-incident bytes and expiry dates;
+- agent filesystem free space and safety reserve;
+- clear warning/degraded/error states when the requested 10-minute pre-loss window or disk safety cannot be maintained.
 
 ## 14. Performance and overload requirements
 
