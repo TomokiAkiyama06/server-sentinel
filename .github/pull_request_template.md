@@ -45,8 +45,8 @@ Closes #
 ## Camera Source影響
 
 - [ ] 固定front/rearや固定2台構成を前提にしていない
-- [ ] `local_uvc` / `remote_web` のどちらかを不必要に特別扱いしていない、または理由を記載した
-- [ ] browser lifecycle / secure contextへの影響を確認した、または非該当
+- [ ] `local_uvc` / `remote_agent` のどちらかを不必要に特別扱いしていない、または理由を記載した
+- [ ] remote-agent pairing/ingest/reconnect/bufferへの影響を確認した、または非該当
 - [ ] automatic torch/lightを導入していない
 
 ## スクリーンショット
