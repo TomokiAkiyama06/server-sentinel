@@ -52,13 +52,13 @@ This roadmap is intentionally high-level. GitHub Issues are the execution source
 
 ## Phase 4 — Human private access
 
-- [ ] restrictive Tailscale Grant guidance/validation
+- [ ] unchanged-Tailnet-policy compatible application authorization
 - [ ] application invitation/allowlist
 - [ ] independent `live:view` / `recordings:view`
 - [ ] browser-only non-owner playback
 - [ ] prompt revocation
-- [ ] no deployment metadata leakage to unauthorized identity
-- [ ] decide historical timeline permission model
+- [ ] generic/non-branding denial and no deployment metadata leakage to unauthorized identity
+- [ ] `recordings:view` includes historical timeline/events
 
 ## Phase 5 — Physical-security detection
 
@@ -110,13 +110,10 @@ This roadmap is intentionally high-level. GitHub Issues are the execution source
 - [ ] exact agent->main transport;
 - [ ] exact main->browser live transport/target latency;
 - [ ] room-overview capture/record/inference/view defaults after benchmark;
-- [ ] agent outage-recovery buffer duration/storage medium or no buffer;
-- [ ] timeline permission: included with `recordings:view` vs separate `timeline:view`;
-- [ ] Tailscale Grant management remains manual vs future narrowly scoped integration.
+- [ ] agent filesystem safety-reserve/warning thresholds after capture-host measurement;
 
 ## Future — not MVP
 
-- browser/iPhone used as camera source;
 - RTSP/IP camera source;
 - Raspberry Pi/other edge node packaging;
 - independent/off-host evidence storage;
