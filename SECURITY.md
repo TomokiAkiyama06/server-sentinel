@@ -102,13 +102,13 @@ A user must have both:
 1. a Tailscale/private-network permission path to the main node; and
 2. an active ServerSentinel principal/invitation with the required permission.
 
-### Tailscale visibility objective
+### Tailscale policy boundary
 
-Configure restrictive Tailscale Grants/access policy so ordinary Tailnet members who are not intended ServerSentinel users receive no grant to the main node. Where Tailscale peer-map trimming applies, those users should not normally discover the node through peer/status visibility.
+ServerSentinel does **not** require changing Tailscale ACLs/Grants and does not store Tailscale administrative credentials. Existing Tailnet policy may remain unchanged.
 
-Do not claim this hides the machine from Tailnet Owners/Admins or infrastructure administrators.
+Therefore ServerSentinel does not claim that the underlying Main Server Tailscale node is hidden from ordinary Tailnet members. Node/peer visibility is controlled by Tailscale policy outside the application.
 
-MVP does not require ServerSentinel to hold Tailscale administrative credentials or automatically mutate Grants. Manual Tailnet-level membership/policy management is acceptable and preferred over introducing a powerful admin token without need.
+Application authorization remains mandatory even when the network path is reachable. For an uninvited identity, use a generic/non-branding denial and avoid exposing ServerSentinel product/version strings, API schema, health details, camera/source counts, thumbnails, recordings, or timeline data.
 
 ### Application allowlist
 
@@ -146,11 +146,11 @@ This is not DRM. An authorized viewer may still screen-record or use advanced cl
 
 ### Timeline
 
-Historical timeline access is not implied by `live:view`. Whether `recordings:view` includes timeline/history or a separate `timeline:view` permission is required is a pending product decision.
+Historical timeline/event access is included with `recordings:view`. A principal with only `live:view` receives current live/source state only and cannot access historical timeline/event data.
 
 ### Revocation
 
-Application permission revocation invalidates active application access promptly. Tailnet network access must also be revoked separately when applicable unless a future approved integration automates both layers.
+Application permission revocation invalidates active application access promptly. ServerSentinel does not mutate Tailnet ACL/Grant policy as part of revocation.
 
 ## Trusted proxy identity
 
