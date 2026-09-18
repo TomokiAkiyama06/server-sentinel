@@ -279,16 +279,27 @@ Excessive offset causes a visible degraded state/event because timeline ordering
 
 ### 5.10 Configurable disk ring buffer
 
-Each capture node may maintain a rolling buffer of **compressed video segments on disk**. The deployment owner configures the duration in the ServerSentinel UI/API; it is not a compile-time constant.
+Each capture node maintains a rolling buffer of **compressed video segments on disk**. Configuration is owner-only and has two mutually exclusive modes:
 
-Implementation requirements:
+```text
+buffer_limit_mode = duration | capacity
+```
 
-- bounded by both configured time and a hard byte/disk-safety limit;
-- use compressed segments, not long decoded frame histories;
-- expose estimated and actual footprint;
-- reject unsafe configuration values;
-- normal old segments are deleted/overwritten FIFO;
-- protected incident segments are excluded from ordinary ring-buffer overwrite until their own retention/deletion policy permits removal.
+**Duration mode**
+- owner selects target rolling-buffer duration;
+- UI derives/displays projected maximum and expected disk footprint from the configured/negotiated bounded media bitrate;
+- runtime still obeys filesystem safety reserve.
+
+**Capacity mode**
+- owner selects maximum bytes/GiB usable by the rolling buffer;
+- UI derives/displays estimated effective duration from the configured/negotiated bitrate;
+- FIFO overwrite keeps ordinary ring-buffer data within the selected capacity.
+
+In both modes the UI displays selected mode/value, estimated equivalent duration/capacity, current ring-buffer bytes, protected-incident bytes, filesystem free space, and safety reserve.
+
+The autonomous incident design requires a **10-minute pre-loss target**. A configuration that cannot support that target under the configured/negotiated bounded media profile shall be rejected when determinable in advance. If runtime conditions later make the effective retained window shorter than 10 minutes, the agent reports degraded protection and an explicit warning; it never silently claims a complete 10-minute pre-loss buffer.
+
+Normal unprotected segments are FIFO. Protected incident segments are not part of ordinary ring-buffer eviction.
 
 ### 5.11 Unexpected main-host communication loss
 
@@ -318,17 +329,35 @@ If Main Server confirms `server_movement` or `camera_tamper` while the agent con
 
 The remote capture node is therefore a secondary evidence location for critical incidents, not a continuous mirror of all recordings.
 
-### 5.13 Agent storage pressure
+### 5.13 Protected incident retention
 
-Agent-side disk safety must be explicit. Track ring-buffer bytes, protected-incident bytes, available filesystem capacity, and safety reserve.
+Completed protected incidents remain on the capture agent for **30 days from incident completion** and are then automatically deleted from the agent.
+
+The owner may explicitly delete a protected incident earlier. Reconnection to the Main Server, successful Main Server recording, or ordinary ring-buffer pressure does not by itself delete an unexpired protected incident.
+
+Each protected incident records at minimum:
+
+```text
+incident_id
+trigger_reason
+started_at
+ended_at
+expires_at = ended_at + 30 days
+byte_length
+segment_gap/integrity state
+```
+
+### 5.14 Agent storage pressure
+
+Agent-side disk safety is explicit. Track ordinary ring-buffer bytes, protected-incident bytes, selected ring-buffer limit, available filesystem capacity, and safety reserve.
 
 If space becomes unsafe:
 
-- do not silently report successful protection;
-- reclaim only eligible non-protected ring-buffer segments first;
-- surface `agent_storage_pressure`/equivalent state;
-- preserve already protected critical evidence where possible;
-- if continued recording becomes impossible, record a gap/error truthfully.
+- reclaim eligible non-protected ring-buffer segments first;
+- do not auto-delete a protected incident before its 30-day expiry merely to satisfy ordinary buffer demand;
+- surface `agent_storage_pressure`/equivalent state and an owner-visible warning;
+- stop/refuse unsafe writes before crossing the filesystem safety reserve;
+- if the full 10-minute pre-loss target or 10-minute post-loss continuation cannot be maintained, report the exact degraded/gap state rather than claiming complete protection.
 
 ## 6. Media architecture
 
@@ -596,7 +625,7 @@ POST biometric enroll/delete            -> owner
 DELETE recording                         -> owner
 ```
 
-Unauthorized users get no ServerSentinel deployment metadata, camera names/counts, thumbnails, event details, or recordings.
+Unauthorized users get no ServerSentinel deployment metadata, camera names/counts, thumbnails, event details, or recordings. For an uninvited identity, prefer a generic/non-branding denial such as a not-found-style response and do not expose product/version headers, API schema, health details, or other ServerSentinel fingerprints. This does not claim that the underlying Tailscale node/service is network-invisible when Tailnet policy is unchanged.
 
 ### 10.6 Browser-only recording access
 
@@ -635,10 +664,12 @@ Camera/source cards show source name/type/role, capture node where applicable, s
 
 Capture-node settings additionally show:
 
-- disk ring-buffer duration;
-- estimated/actual buffer usage;
+- ring-buffer mode: duration or disk capacity;
+- configured value plus estimated equivalent duration/capacity;
+- projected maximum/expected and current buffer usage;
+- protected-incident usage and 30-day expiry timestamps;
 - agent filesystem free/safety state;
-- protected incidents;
+- whether the 10-minute pre-loss target is currently satisfied;
 - Main Server connection/heartbeat state.
 
 ## 12. Security boundaries
@@ -710,6 +741,5 @@ Require explicit owner decision/ADR/Issue before implementation where material:
 - exact `media-capture-agent` -> Main Server media transport/reconnection protocol after real LAN testing;
 - exact Main Server -> browser live transport after PoC, with stability prioritized over minimum latency;
 - exact capture/record/inference/view resolution/FPS/bitrate defaults after camera/model measurement;
-- hard min/max allowed owner-configurable agent ring-buffer duration and byte safety limits;
-- protected-agent-incident retention duration after the automatic 20-minute capture is complete;
+- exact filesystem safety-reserve thresholds/warning thresholds for the agent buffer UI after measuring the target capture host;
 - final owner face-verification model/weights/license/threshold after hardware is available.
