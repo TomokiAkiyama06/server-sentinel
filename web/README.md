@@ -38,7 +38,7 @@ Tailnet membership alone grants nothing.
 
 The preferred Tailscale path places the human backend behind Tailscale Serve/equivalent trusted proxy with the application listener bound to loopback/non-bypassable local scope. Proxy-provided identity headers are trusted only on that path.
 
-Ordinary uninvited Tailnet members should receive no Tailscale Grant to the ServerSentinel node. Do not promise concealment from Tailnet Owners/Admins or infrastructure administrators.
+ServerSentinel does not require changing Tailscale ACLs/Grants. With existing Tailnet policy unchanged, the Main Server node/service may remain visible or reachable, but every application request is still checked against the ServerSentinel invitation/permission list. Uninvited identities receive generic/non-branding denial and no ServerSentinel deployment/media metadata.
 
 ## Invited-user permissions
 
@@ -50,10 +50,10 @@ recordings:view
 ```
 
 - `live:view` grants current live streams only;
-- `recordings:view` grants recording list and browser playback;
+- `recordings:view` grants recording list/browser playback and historical timeline/events;
 - neither implies owner/admin capabilities;
 - non-owner download/export is not provided in MVP;
-- historical timeline access is a separate unresolved permission decision and must not leak through `live:view`.
+- historical timeline/event access is included with `recordings:view` and must not leak through `live:view`.
 
 ## Live view
 
