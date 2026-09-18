@@ -59,17 +59,15 @@ They are independent.
 
 Non-owner recording access is browser playback only in MVP. ServerSentinel does not offer them a download/export button or route, but this is not DRM: a person who can view video may still screen-record or use advanced client tooling.
 
-Historical timeline access is not implicitly exposed through `live:view`; its exact invited-user permission model remains a separate decision.
+Historical timeline/event access is not exposed through `live:view`; it is included with `recordings:view`.
 
 ## Tailscale/private remote access
 
 Tailnet membership is not authorization.
 
-The deployment should use restrictive Tailscale access policy so ordinary Tailnet members who are not intended ServerSentinel users receive no grant to the ServerSentinel node and, where Tailscale peer-map trimming applies, do not normally discover it through ordinary peer visibility.
+ServerSentinel does not require changing existing Tailscale ACLs/Grants and does not store a Tailscale administrative credential. With unchanged Tailnet policy, the underlying Main Server node may remain visible/reachable to other Tailnet members.
 
-This is not a guarantee of concealment from Tailnet Owners/Admins or infrastructure administrators.
-
-Even a network-reachable identity must still pass the ServerSentinel application allowlist/permission check before receiving camera names, media, recordings, or other deployment metadata.
+Even a network-reachable identity must still pass the ServerSentinel application allowlist/permission check before receiving camera names, media, recordings, timeline data, or other deployment metadata. Uninvited identities should receive generic/non-branding responses so the application discloses as little as practical without claiming network-level invisibility.
 
 ## Owner-only face verification
 
@@ -118,7 +116,9 @@ Non-owner face crops/templates are not stored as a separate persistent identity 
 
 ## Capture-agent local storage
 
-The policy for a short outage-recovery buffer on `media-capture-agent` is not yet decided. Until an explicit ADR/Issue defines duration, RAM/tmpfs vs disk, encryption/deletion, and retry semantics, the agent must not be described as a second durable evidence store.
+`media-capture-agent` keeps a bounded **compressed-video disk ring buffer**. The owner configures it by either target duration or maximum disk capacity; the UI shows the estimated equivalent value, current use, free space, and safety state.
+
+If Main Server communication is unexpectedly lost, the agent protects the preceding 10 minutes and continues local capture for 10 minutes, targeting a 20-minute incident window. Protected incidents are retained on the agent for **30 days** and then automatically deleted. This storage is incident-focused secondary evidence, not continuous replication of all Main Server recordings.
 
 ## Slack
 
