@@ -150,7 +150,5 @@ Required before relevant implementation:
 - exact main -> browser live transport and latency target;
 - exact room-overview capture/record/inference/view profiles after benchmark;
 - agent filesystem safety-reserve/warning thresholds;
--
 - final owner face-verification model/weights/threshold;
 - server-movement algorithm;
-- strong independent/off-host evidence storage if later required.
