@@ -1,7 +1,7 @@
 # ADR 0002: Remote Capture Buffer / Viewer Access Decisions
 
 Status: Accepted
-Date: 2026-09-17
+Date: 2026-09-18
 
 ## Context
 
@@ -21,7 +21,12 @@ No fixed sub-second latency promise is made before the transport PoC. The target
 
 The agent keeps compressed media in a bounded disk-backed ring buffer. It MUST NOT retain a long history of decoded RGB frames for this purpose.
 
-The retention duration is owner-configurable from ServerSentinel. The implementation MUST apply a hard capacity limit as well as the configured time limit so an unexpected bitrate cannot exhaust the capture machine filesystem.
+The owner chooses one of two ring-buffer configuration modes from ServerSentinel:
+
+- **duration mode** — set the target retained time and show projected/actual disk use;
+- **capacity mode** — set the maximum ring-buffer disk capacity and show estimated effective duration.
+
+Both modes remain subject to filesystem safety reserve. The UI shows current use, configured limit, free space, protected-incident usage, and warnings. Configuration must support the 10-minute pre-loss target when determinable; otherwise it is rejected or clearly reported as degraded.
 
 The buffer is recovery/incident storage, not the authoritative long-term recording store. Main ServerSentinel remains authoritative for ordinary durable recordings.
 
@@ -36,7 +41,7 @@ For a sudden loss of main-host communication, the capture agent also performs au
 
 This produces a default 20-minute evidence window around the connectivity-loss boundary. The pre-loss portion is taken from the existing ring buffer. The post-loss portion continues locally even though the main host is unreachable.
 
-A temporary preserved incident MUST be protected from normal ring overwrite until the outcome is resolved by policy. Retention, maximum pinned-storage allowance, cleanup after benign outages, and repeated-outage behavior must be bounded so the capture machine cannot be filled indefinitely.
+A protected incident MUST be excluded from ordinary ring overwrite and is retained on the capture agent for **30 days from completion**, then automatically deleted. Owner-authorized manual deletion may remove it earlier. If disk pressure occurs before expiry, reclaim ordinary ring-buffer data first and surface explicit storage pressure rather than silently deleting unexpired protected evidence.
 
 ### 4. Human-access authorization does not require changing Tailscale Grants
 
@@ -51,7 +56,7 @@ At minimum, invited-user permissions remain independent:
 
 Non-owner recording access is browser playback only in the official MVP UI/API; no official download/export route is provided. This is not DRM and does not claim to prevent screen recording or advanced client-side capture.
 
-Because Tailscale policy is not required to be narrowed, ServerSentinel MUST NOT promise that uninvited Tailnet members cannot discover the underlying Tailscale machine or detect that a network service exists. It MUST, however, fail closed at the application boundary and disclose no ServerSentinel deployment metadata, camera names/counts, thumbnails, live media, recordings, or timeline data to an uninvited identity.
+Because Tailscale policy is not required to be narrowed, ServerSentinel MUST NOT promise that uninvited Tailnet members cannot discover the underlying Tailscale machine or detect that a network service exists. It MUST, however, fail closed at the application boundary and use generic/non-branding denial where practical, disclosing no ServerSentinel product/version, API schema, deployment metadata, camera names/counts, thumbnails, live media, recordings, or timeline data to an uninvited identity.
 
 Deployments that require network-level peer concealment may optionally tighten Tailscale Grants/ACLs outside ServerSentinel; that is an optional hardening step, not an MVP prerequisite.
 
@@ -61,7 +66,7 @@ A separate `timeline:view` permission is not introduced for MVP. Historical time
 
 ### 6. Browser/iPhone camera source removed from current product scope
 
-The current MVP does not include `remote_web` / iPhone-as-camera functionality. Phone/Mac/desktop browsers are human viewing clients. Reintroducing a browser camera source requires a future Issue/ADR and is not an implementation obligation of the current architecture.
+Browser/iPhone camera capture is outside the current ServerSentinel product scope. Phone/Mac/desktop browsers are human viewing clients. Any future reintroduction would be a new explicit product decision/ADR, not a deferred MVP obligation.
 
 ### 7. Off-host evidence is incident-focused, not full replication
 
