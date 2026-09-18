@@ -19,13 +19,14 @@ MVPの基本構成:
 - `remote_agent` Linux `media-capture-agent`
 - capture agentはprivate LANでmainへ接続できればTailscale不要
 - phone / Mac / desktopは主にhuman viewer
-- browser/iPhone camera sourceはMVP必須ではなくdeferred
+- browser/iPhone camera captureは現在のproduct scope外。phone/Mac/desktopはviewer
 - `media-capture-agent`はvideo-only、非root常駐、capture credentialはadmin権限を持たない
+- agentは圧縮disk ring bufferを持ち、Ownerが時間/容量モードを選択。通信断時は10分pre-loss + 10分post-lossを保護し、incidentは30日後agentから自動削除
 - Tailnet membershipだけではServerSentinelへアクセス不可
 - human accessはTailscale/private network permission + ServerSentinel invitationの二重条件
 - non-owner permissionは少なくとも `live:view` / `recordings:view` を独立管理
 - non-owner recording accessはbrowser playbackのみ、official download/exportなし
-- timeline権限は未決定なので暗黙に公開しない
+- historical timeline/eventは`recordings:view`に含め、`live:view`だけには公開しない
 - owner-only face verificationは任意
 - non-owner named face DB / cross-camera biometric re-identificationは禁止
 - audio surveillanceはMVP外
@@ -47,7 +48,7 @@ MVPの基本構成:
 - capture ingest listenerとhuman dashboard listenerが分離されているか
 - agent credentialからhuman/admin APIへ昇格できないか
 - trusted Tailscale identity header pathをLANからbypassできないか
-- Tailnet member全員へnode visibility/connectivityを与えていないか
+- ServerSentinelがTailscale ACL/Grants変更やadmin credentialを要求していないか、未招待identityへアプリ情報を漏らしていないか
 - `live:view` / `recordings:view`分離がserver-sideで強制されるか
 - non-owner download/exportが再導入されていないか
 - low-light/poor-quality時にperson detector failureを`no person`へ変換していないか
