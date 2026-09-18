@@ -34,11 +34,11 @@ Do not reintroduce the superseded iOS-first design without an explicit owner/ADR
 
 MVP assumptions:
 - 1–4 active Camera Sources;
-- source types `local_uvc` and `remote_web`;
+- source types `local_uvc` and `remote_agent`;
 - no fixed front/rear camera pair;
-- Web Camera Node runs in a browser and requires a secure context;
+- remote Linux Camera Source runs through `media-capture-agent`; phone/Mac/desktop browsers are viewer clients;
 - no native App Store client required;
-- audio default OFF per source;
+- audio capture is outside the MVP; `media-capture-agent` does not open microphones;
 - no automatic motion/low-light torch/light activation;
 - optional owner-only face verification;
 - no named non-owner face database;
