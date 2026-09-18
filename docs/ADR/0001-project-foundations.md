@@ -44,19 +44,19 @@ Camera architecture:
 - capture agent normally runs non-root, without GUI/tray, and initiates its connection to the main host;
 - capture-node pairing uses short-lived owner approval followed by revocable mutually authenticated encryption, with mTLS as the default target;
 - capture machine does not need to join Tailscale when private-LAN reachability exists;
-- browser/iPhone camera capture is not an MVP requirement and is deferred;
+- browser/iPhone camera capture is outside the current product scope; phone/Mac/desktop browsers are viewers;
 - ambiguous UVC reconnect does not silently substitute a different camera.
 
 Human-access architecture:
 
 - Tailscale/private network is recommended for human remote reachability;
 - Tailnet membership is not ServerSentinel authorization;
-- ordinary uninvited Tailnet members should receive no Tailscale Grant to the ServerSentinel node;
+- ServerSentinel does not require changing existing Tailscale ACLs/Grants and stores no Tailscale admin credential;
 - human backend is reached through a trusted Tailscale Serve/equivalent proxy path and remains non-bypassable from ordinary LAN clients;
 - ServerSentinel additionally maintains its own owner-managed invitation/allowlist;
 - minimum non-owner permissions are independent `live:view` and `recordings:view`;
 - non-owner recording access is browser playback only; no official download/export function in MVP;
-- concealment from Tailnet Owners/Admins or infrastructure administrators is not promised.
+- with unchanged Tailnet policy, node-level concealment from other Tailnet members is not promised; uninvited users still receive no ServerSentinel application data.
 
 Detection/privacy architecture:
 
@@ -78,7 +78,7 @@ Rejected for MVP because it forces signing/App Store/device-specific lifecycle c
 
 ### Browser phone as the primary remote camera
 
-Deferred from MVP because a permanently running Linux capture machine with UVC camera provides a cleaner always-on path, avoids browser lifecycle constraints, and can forward video over the existing private LAN.
+Rejected from the current product scope because a permanently running Linux capture machine with UVC camera provides a cleaner always-on path, avoids browser lifecycle constraints, and can forward video over the existing private LAN.
 
 A browser camera source may be reconsidered later as another Camera Source type.
 
@@ -120,7 +120,7 @@ Costs/limitations:
 - a new Linux capture-agent component must be packaged, paired, updated, and monitored;
 - agent-to-main transport requires its own ADR/benchmark;
 - LAN ingest and human dashboard must have distinct security boundaries;
-- Tailscale Grant management is separate from in-app invitation unless a future admin integration is approved;
+- Tailscale ACL/Grant management remains outside ServerSentinel; in-app invitation/permissions are authoritative for application data;
 - UVC identity can be inherently ambiguous on identical devices without unique serials, requiring manual re-approval;
 - high-resolution room-overview capture needs encode/network/resource benchmarks;
 - independent evidence after physical loss of the main recorder remains future work.
@@ -149,10 +149,8 @@ Required before relevant implementation:
 - exact `media-capture-agent` -> main media transport;
 - exact main -> browser live transport and latency target;
 - exact room-overview capture/record/inference/view profiles after benchmark;
-- agent-local outage-recovery buffer policy;
-- historical timeline permission model;
+- agent filesystem safety-reserve/warning thresholds;
+-
 - final owner face-verification model/weights/threshold;
 - server-movement algorithm;
-- any future automatic Tailscale administrative integration;
-- any future browser/native mobile camera source;
 - strong independent/off-host evidence storage if later required.
