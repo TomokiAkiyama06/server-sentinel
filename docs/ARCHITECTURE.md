@@ -47,7 +47,7 @@ MVP source types:
 - `local_uvc` — camera attached to the main host;
 - `remote_agent` — camera attached to an approved Linux capture node.
 
-A future `remote_web` browser camera may be added later. The current MVP does not require an iPhone as a camera source.
+Browser/iPhone camera capture is outside the current product scope. Phone/Mac/desktop browsers are viewer clients.
 
 The deployment supports 1–4 active sources. Camera count/type/role are configuration, never topology constants.
 
@@ -80,6 +80,8 @@ The remote Linux agent:
 - does not need Tailscale merely to forward a camera over the same LAN.
 
 The main host exposes a narrow LAN ingest boundary for agents, distinct from the human dashboard listener.
+
+The agent also keeps a bounded compressed-video disk ring buffer. The Owner chooses either duration mode or capacity mode. Unexpected Main Server communication loss protects 10 minutes before + 10 minutes after the loss boundary; protected incidents remain on the agent for 30 days and then auto-delete.
 
 ## Human-access boundary
 
