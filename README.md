@@ -23,7 +23,7 @@ MVP source types:
 - **`local_uvc`** — UVC/V4L2-compatible USB camera connected directly to the main Ubuntu ServerSentinel host.
 - **`remote_agent`** — UVC/V4L2-compatible camera connected to another owner-authorized Linux machine running `media-capture-agent`, with video forwarded over a private LAN to the main host.
 
-A browser/iPhone camera source is not required for the MVP. A future `remote_web` source may be reconsidered later without changing the common event/storage model.
+Browser/iPhone capture is outside the current ServerSentinel product scope. Phone/Mac/desktop browsers are viewer clients; adding browser-camera capture again would require a new explicit product decision/ADR.
 
 Example deployment:
 
@@ -114,20 +114,22 @@ The dashboard adapts to 1–4 sources. Viewer streaming should be demand-driven:
 1. network-level permission to reach the ServerSentinel node; and
 2. an active ServerSentinel invitation/allowlist entry.
 
-Ordinary Tailnet members who are not authorized for ServerSentinel should receive no Tailscale grant to the ServerSentinel node. The deployment should use restrictive Tailscale policy/netmap visibility so those users cannot normally discover or connect to the node through Tailnet peer visibility. This is not a promise to hide the machine from Tailnet Owners/Admins or other infrastructure administrators.
+ServerSentinel does not require changing existing Tailscale ACLs/Grants and does not store Tailscale administrative credentials. Tailnet membership alone still grants no ServerSentinel application data: every human request must pass the ServerSentinel invitation/permission check. With unchanged Tailnet policy, the underlying Main Server node may remain visible/reachable to other Tailnet members, so node-level concealment is not guaranteed. Uninvited users receive generic/non-branding denial and no ServerSentinel deployment metadata.
 
 The dashboard itself should bind only to a trusted local proxy path (for example loopback behind Tailscale Serve). LAN camera ingestion uses a **separate** narrowly exposed endpoint and must not expose dashboard routes.
 
 Invited-user permissions are granular:
 
 - `live:view` — view current live video in the browser;
-- `recordings:view` — browse and play past recordings in the browser.
+- `recordings:view` — browse/play past recordings and view historical timeline/events in the browser.
 
 These permissions are independent. Non-owner invited users do not receive an official recording-download/export function in the MVP. Browser-only playback cannot technically prevent screen recording or advanced client-side capture, so the product must not claim DRM-style prevention.
 
 ## Recording and storage
 
 Ubuntu remains the primary durable evidence store.
+
+Agent-side storage is limited to the bounded compressed disk ring buffer and protected critical incidents. Agent-side protected critical incidents are retained for **30 days** and then automatically deleted.
 
 Defaults:
 
