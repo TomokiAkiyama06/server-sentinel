@@ -100,7 +100,7 @@ Rules:
 - do not auto-bind an ambiguous identical non-serial UVC candidate after reconnect;
 - ambiguous reconnect => `manual_intervention_required` until explicit owner re-approval;
 - audio is not captured in MVP;
-- browser/iPhone camera source is deferred, not required.
+- browser/iPhone camera capture is outside the current product scope; phone/Mac/desktop browsers are viewers.
 
 ## 8. `media-capture-agent` invariants
 
@@ -116,7 +116,7 @@ Rules:
 - agent health and camera health are separate;
 - capture ingest listener is separate from human dashboard listener;
 - main host does not SSH/admin into the capture machine merely to receive video;
-- agent-side outage recovery buffer is undecided until explicit ADR/Issue.
+- agent keeps a compressed-video disk ring buffer; owner selects duration or capacity mode; unexpected Main Server loss protects T-10/T+10 minutes; protected incidents expire from the agent after 30 days.
 
 ## 9. Human-access invariants
 
@@ -136,7 +136,7 @@ They are independent.
 
 Non-owner recording access is browser playback only in MVP; do not add a download/export route/button unless the owner explicitly changes the requirement. Do not claim browser playback prevents screen recording/client capture.
 
-Historical timeline permission is unresolved; do not expose timeline/history merely because a user has `live:view`.
+Historical timeline/event access is included with `recordings:view`; never expose it to `live:view` alone.
 
 If trusted proxy/Tailscale identity headers are used, backend access to that listener must be non-bypassable from ordinary LAN clients.
 
@@ -215,8 +215,9 @@ As applicable cover:
 - clock skew;
 - LAN interruption/backpressure;
 - phone/Mac live viewing;
-- Tailscale + app two-gate authorization;
-- `live:view` vs `recordings:view` isolation;
+- Tailscale/private reachability + ServerSentinel application authorization;
+- `live:view` vs `recordings:view` isolation, including historical timeline only with `recordings:view`;
+- duration/capacity ring-buffer modes, T-10/T+10 protection, 30-day expiry, and agent disk pressure;
 - detector-specific quality gate including person false-negative prevention;
 - owner verification/anonymous tracking/presence;
 - storage pressure;
@@ -248,7 +249,7 @@ Stop and request explicit owner decision before:
 - enrolling/naming non-owner faces;
 - cross-camera biometric re-identification;
 - automatic culprit/guilt inference;
-- introducing browser/iPhone camera capture as a new MVP requirement;
+- introducing browser/iPhone camera capture without a new explicit product decision/ADR;
 - adding a non-owner recording download/export function;
-- deciding historical timeline permissions without owner approval;
-- claiming agent-local buffering is durable independent evidence before it is designed.
+- changing the established `recordings:view` -> historical timeline permission mapping without owner approval;
+- weakening the 10-minute pre/10-minute post agent protection or 30-day agent expiry without owner approval.
