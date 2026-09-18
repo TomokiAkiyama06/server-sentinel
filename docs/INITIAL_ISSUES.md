@@ -167,6 +167,29 @@ Acceptance:
 - authenticated encrypted node session preserved;
 - no silent healthy state during known media loss.
 
+## Plan 9A — Agent disk ring buffer + autonomous incident evidence
+
+Scope:
+- compressed-video disk ring buffer on `media-capture-agent`;
+- owner-selectable **duration mode** or **capacity mode**;
+- UI estimates equivalent capacity/duration and shows current usage/free space/safety reserve;
+- 10-minute pre-loss target validation;
+- automatic Main Server communication-loss protection: 10 minutes before + 10 minutes after;
+- critical-event preserve command while Main Server is reachable;
+- protected incidents retained on Agent for 30 days, then auto-deleted;
+- agent storage-pressure/hard-stop behavior.
+
+Acceptance:
+- only owner can change mode/value;
+- unsafe settings rejected before filesystem safety reserve is crossed;
+- capacity mode remains within selected byte limit;
+- duration mode reports projected/actual disk footprint;
+- full 20-minute incident is preserved when resources/stream continuity allow;
+- shortened/gapped protection is reported truthfully;
+- reconnect does not erase protected incident;
+- protected incident expires automatically at 30 days;
+- unexpired protected incident is not silently overwritten by ordinary ring-buffer pressure.
+
 ## Plan 10 — Capture/record/inference/view profile separation
 
 Scope:
@@ -278,29 +301,28 @@ Acceptance:
 - synthetic scenario can show entry -> movement -> camera offline;
 - UI never labels a person culprit/attacker from temporal correlation.
 
-## Plan 17 — Tailscale/private access visibility + granular permissions
+## Plan 17 — Tailscale/private access + granular permissions
 
 Scope:
-- restrictive Tailnet policy guidance/validation;
-- no Grant for ordinary uninvited users;
+- do not require ServerSentinel to modify Tailscale ACLs/Grants;
 - trusted proxy identity;
 - app principal allowlist;
+- generic/non-branding denial for uninvited users;
 - independent `live:view` and `recordings:view`;
+- `recordings:view` includes historical timeline/events;
 - owner access-management UI;
-- prompt revocation;
+- prompt application revocation;
 - non-owner browser-only recording playback.
 
 Acceptance:
-- Tailnet permission without app invitation denied;
-- app invitation without Tailnet permission unreachable;
-- uninvited identity receives no camera/count/thumbnail metadata;
-- `live:view` cannot list/play recordings;
-- `recordings:view` does not imply live;
+- Tailnet membership without app invitation receives no ServerSentinel application data;
+- existing Tailnet policy may remain unchanged;
+- docs do not promise Main Server node invisibility when Tailnet policy exposes it;
+- uninvited identity receives no product/version/API schema/camera/count/thumbnail/timeline metadata;
+- `live:view` cannot list/play recordings or historical timeline;
+- `recordings:view` includes browser playback and historical timeline but does not imply live;
 - no official non-owner recording download/export route/button;
-- docs do not promise concealment from Tailnet Owners/Admins.
-
-Pending within this plan:
-- decide whether historical timeline is included with `recordings:view` or receives separate `timeline:view`.
+- ServerSentinel stores no Tailscale admin credential and performs no automatic policy mutation.
 
 ## Plan 18 — Main-to-browser live transport
 
@@ -380,9 +402,8 @@ Acceptance:
 
 Do not silently decide these during implementation:
 
-1. exact `media-capture-agent` -> main media protocol;
-2. exact main -> browser live protocol and target latency;
-3. exact room-overview capture/record/inference/view profiles after benchmark;
-4. whether agent keeps an outage-recovery buffer, plus duration and RAM/tmpfs vs disk;
-5. whether historical timeline uses `recordings:view` or separate `timeline:view`;
-6. whether Tailscale Grant management remains manual or gains a future narrowly scoped admin integration.
+1. exact `media-capture-agent` -> Main Server media protocol/reconnection behavior after real LAN testing;
+2. exact Main Server -> browser live protocol after PoC, with stability prioritized over minimum latency;
+3. exact room-overview capture/record/inference/view profiles after the real camera/model benchmark;
+4. exact agent filesystem safety-reserve and warning thresholds after measuring the capture host;
+5. final owner face-verification model/weights/license/threshold after the target hardware is available.
