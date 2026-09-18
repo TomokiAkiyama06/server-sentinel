@@ -223,11 +223,11 @@ Recommended boundary:
 
 - dashboard/backend listener used by humans binds only to loopback or another trusted non-bypassable local proxy path;
 - Tailscale Serve/equivalent exposes it privately;
-- restrictive Tailscale Grants/access policy allows only intended ServerSentinel viewers;
-- ordinary uninvited Tailnet members receive no Grant to the ServerSentinel main node;
-- ServerSentinel still checks its own invitation/permission list.
+- existing Tailscale ACLs/Grants may remain unchanged; ServerSentinel does not require or automate policy changes;
+- ServerSentinel still checks its own invitation/permission list for every human request;
+- uninvited identities receive generic/non-branding denial and no ServerSentinel deployment/media metadata.
 
-Do not promise invisibility from Tailnet Owners/Admins or infrastructure administrators.
+With unchanged Tailnet policy, do not promise that the Main Server Tailscale node or listening service is invisible to other Tailnet members, Tailnet Owners/Admins, or infrastructure administrators.
 
 ## LAN capture-ingest setup
 
