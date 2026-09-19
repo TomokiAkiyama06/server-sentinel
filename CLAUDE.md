@@ -21,7 +21,7 @@ MVPの基本構成:
 - phone / Mac / desktopは主にhuman viewer
 - browser/iPhone camera captureは現在のproduct scope外。phone/Mac/desktopはviewer
 - `media-capture-agent`はvideo-only、非root常駐、capture credentialはadmin権限を持たない
-- agentは圧縮disk ring bufferを持ち、Ownerが時間/容量モードを選択。通信断時は10分pre-loss + 10分post-lossを保護し、incidentは30日後agentから自動削除
+- agentは圧縮disk ring bufferを持ち、Ownerが時間/容量モードを選択。通信断時は10分pre-loss + 10分post-lossを保護し、incidentは60日後をdefaultとしてagentから自動削除
 - Tailnet membershipだけではServerSentinelへアクセス不可
 - human accessはTailscale/private network permission + ServerSentinel invitationの二重条件
 - non-owner permissionは少なくとも `live:view` / `recordings:view` を独立管理
