@@ -354,10 +354,23 @@ Agent-side disk safety is explicit. Track ordinary ring-buffer bytes, protected-
 If space becomes unsafe:
 
 - reclaim eligible non-protected ring-buffer segments first;
-- do not auto-delete a protected incident before its 30-day expiry merely to satisfy ordinary buffer demand;
+- do not auto-delete a protected incident before its 60-day default expiry merely to satisfy ordinary buffer demand;
 - surface `agent_storage_pressure`/equivalent state and an owner-visible warning;
 - stop/refuse unsafe writes before crossing the filesystem safety reserve;
 - if the full 10-minute pre-loss target or 10-minute post-loss continuation cannot be maintained, report the exact degraded/gap state rather than claiming complete protection.
+
+### 5.13 Media-root mount safety
+
+The Agent media root is a configurable path that may live on a dedicated mounted filesystem rather than the root filesystem.
+
+At install/startup/runtime admission, the Agent shall verify:
+- the configured media root exists or can be created only by the intended installer/owner workflow;
+- it resolves to the expected filesystem/mount identity when an expected device/mount is configured;
+- sufficient free space and safety reserve remain;
+- it is writable by the dedicated Agent service account;
+- loss/unmount/substitution of the expected media filesystem does **not** silently redirect ring-buffer or incident writes into a directory on the root filesystem.
+
+If the expected media filesystem is unavailable or resolves unexpectedly, Agent recording/buffering becomes explicit degraded/failed state and unsafe writes are refused until the Owner resolves or re-approves the target.
 
 ## 6. Media architecture
 
@@ -754,7 +767,7 @@ Capture-node settings additionally show:
 - ring-buffer mode: duration or disk capacity;
 - configured value plus estimated equivalent duration/capacity;
 - projected maximum/expected and current buffer usage;
-- protected-incident usage and 30-day expiry timestamps;
+- protected-incident usage and 60-day default expiry timestamps;
 - agent filesystem free/safety state;
 - whether the 10-minute pre-loss target is currently satisfied;
 - Main Server connection/heartbeat state.
