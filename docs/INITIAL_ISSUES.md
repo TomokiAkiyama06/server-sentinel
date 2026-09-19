@@ -190,6 +190,7 @@ Labels: `remote-agent`, `backend`, `security`
 
 Scope:
 - owner-generated short-lived one-time pairing code;
+- non-echoing pairing-code input, never secret-bearing argv/environment/URL; protected input channel for any later installer automation;
 - node keypair/credential issuance;
 - mTLS or equivalent mutually authenticated transport;
 - revocation;
@@ -198,6 +199,7 @@ Scope:
 
 Acceptance:
 - expired/reused pairing rejected;
+- pairing code absent from process argv, shell history, environment, URLs, and logs;
 - unpaired LAN host cannot submit media;
 - revoked node cannot reconnect;
 - capture-node credential cannot call human/admin endpoints;

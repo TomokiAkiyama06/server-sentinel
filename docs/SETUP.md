@@ -136,8 +136,10 @@ Target command/UX shape:
 
 ```bash
 sudo ./scripts/install-agent.sh
-sudo media-capture-agent pair --server <private-lan-host> --code <one-time-code>
+sudo media-capture-agent pair --server <private-lan-host>
 ```
+
+Enter the one-time code only at the non-echoing prompt. Do not put it in command arguments, environment variables, URLs, or shell command text: these may appear in process listings, shell history, or sudo/audit logs. Installer automation must use a protected input channel rather than a literal command-line secret.
 
 After pairing:
 
@@ -169,7 +171,7 @@ Owner-only configuration offers one of two modes:
 [ Capacity limit ]  -> choose maximum ring-buffer disk bytes
 ```
 
-The UI shows estimated reciprocal capacity/duration, actual usage, protected-incident usage, free space, and safety reserve. Settings that cannot safely preserve the required 10-minute pre-loss target are rejected or explicitly degraded.
+The UI shows estimated reciprocal capacity/duration, actual usage, protected-incident usage, free space, and safety reserve. Settings determinably unable to preserve the required 10-minute pre-loss target under the bounded/negotiated media profile are rejected. Runtime uncertainty or later deterioration that shortens the window is explicitly degraded and reports actual coverage.
 
 On unexpected Main Server communication loss, the Agent protects 10 minutes before + 10 minutes after the loss boundary. Completed protected incidents are retained locally for **60 days by default** and are not overwritten by the ordinary ring buffer before expiry.
 

@@ -26,7 +26,7 @@ The owner chooses one of two ring-buffer configuration modes from ServerSentinel
 - **duration mode** — set the target retained time and show projected/actual disk use;
 - **capacity mode** — set the maximum ring-buffer disk capacity and show estimated effective duration.
 
-Both modes remain subject to filesystem safety reserve. The UI shows current use, configured limit, free space, protected-incident usage, and warnings. Configuration must support the 10-minute pre-loss target when determinable; otherwise it is rejected or clearly reported as degraded.
+Both modes remain subject to filesystem safety reserve. The UI shows current use, configured limit, free space, protected-incident usage, and warnings. Reject configurations determinably unable to preserve the 10-minute pre-loss target under the bounded/negotiated media profile. If runtime uncertainty or later deterioration shortens the effective window, report degraded protection and actual coverage rather than claiming a complete window.
 
 The buffer is recovery/incident storage, not the authoritative long-term recording store. Main ServerSentinel remains authoritative for ordinary durable recordings.
 

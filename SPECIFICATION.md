@@ -234,14 +234,15 @@ Owner dashboard -> Add Capture Node
        +-- short-lived one-time pairing code
        |
 Capture machine:
-media-capture-agent pair --server <LAN endpoint> --code <code>
+media-capture-agent pair --server <LAN endpoint>
+       +-- read pairing code through a non-echoing interactive prompt
        |
        +-- agent generates node keypair
        +-- main host validates current owner approval
        +-- revocable node credential/certificate established
 ```
 
-Pairing credentials are cryptographically random, single-use, short-lived, and never logged plaintext.
+Pairing credentials are cryptographically random, single-use, short-lived, and never logged plaintext. The CLI reads the code through a non-echoing interactive prompt; it does not accept the secret in command-line arguments, environment variables, or URLs. If a later installer needs non-interactive input, use a protected file descriptor/stdin channel without embedding the secret in shell command text, and preserve the same no-log boundary.
 
 ### 5.5 Long-lived trust
 
