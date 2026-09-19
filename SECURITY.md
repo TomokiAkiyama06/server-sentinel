@@ -32,7 +32,9 @@ Primary threats:
 10. Network/capture-node failure being mistaken for healthy monitoring.
 11. Biometric owner-template disclosure/misuse.
 12. Vision false positive/negative creating false confidence.
-13. Dependency/model/supply-chain compromise.
+13. Main-host CPU/RAM/GPU/NVMe/HDD changes or disappearance going unnoticed.
+14. Recorder/storage pipeline silently failing while monitoring still appears healthy.
+15. Dependency/model/supply-chain compromise.
 
 Out of scope as guaranteed prevention:
 
@@ -182,7 +184,7 @@ Normal operation runs as a dedicated non-root account and has only:
 
 - required UVC/video device access;
 - agent config/credential access;
-- bounded temp/buffer access if later enabled;
+- bounded temp/buffer access for the configured compressed-video ring buffer and protected incidents;
 - outbound/agent network capability.
 
 It has no reason to require the Docker socket or broad filesystem/root access.
@@ -265,6 +267,27 @@ For remote-agent media enforce:
 Recording root is configured by the owner; per-request arbitrary absolute paths are forbidden.
 
 Preserve a hard filesystem safety reserve and enter explicit pressure/hard-stop states before unsafe writes.
+
+The Agent's normal ring buffer is bounded by Owner-selected duration or capacity mode. Protected communication-loss/critical incidents are separate from normal overwrite and are retained for 60 days by default, subject to the agent filesystem safety boundary.
+
+## Main-host hardware integrity and recorder self-check
+
+The Owner approves a baseline for CPU, RAM, NVMe/M.2, HDD/recording drives, and GPU using the strongest identifiers exposed by the platform.
+
+Security rules:
+
+- compare inventory at ServerSentinel startup and at least daily;
+- never silently update the approved baseline;
+- deliberate replacements require explicit Owner approval and audit;
+- do not claim same-model physical replacement detection when no stable unique identifier is exposed;
+- missing/changed approved hardware produces an immediate Owner alert;
+- raw hardware serials/UUIDs stay deployment-local and are redacted from ordinary/public diagnostics.
+
+At least daily, run a bounded recording-health self-test that checks source freshness, recorder/encoder state, expected recording filesystem identity, free-space/safety admission, and a temporary write + fsync + reopen/read/decode path. Where available, surface SMART/NVMe critical health indicators.
+
+If the intended recording filesystem is missing or substituted, do not silently write to an unintended fallback filesystem while reporting healthy. A self-test failure or material recording-device mismatch is an immediate Owner-alert condition.
+
+Hardware inventory/SMART collection must use least privilege. If a privileged helper is needed for a narrow probe, do not grant the whole application broad root access.
 
 ## Vision/timeline interpretation
 
