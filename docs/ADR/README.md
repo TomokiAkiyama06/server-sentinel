@@ -12,7 +12,8 @@ Use ADRs for decisions that materially affect:
 
 ## Current ADRs
 
-- `0001-project-foundations.md` — Accepted. Defines the current heterogeneous Camera Source + browser Camera Node foundation and replaces the earlier iOS-first bootstrap concept within this pre-1.0 specification work.
+- `0001-project-foundations.md` — Accepted. Defines the current heterogeneous Camera Source foundation around `local_uvc` + `remote_agent` and rejects the earlier iOS/browser-camera-first bootstrap concept.
+- `0002-remote-agent-buffer-and-viewer-access.md` — Accepted. Defines the remote Agent disk ring buffer, protected incident behavior, live-view stability priority, and invited-viewer access model.
 
 ## Template
 
