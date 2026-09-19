@@ -14,9 +14,8 @@ labels: hardware-required,manual-test-required
 - [ ] Ubuntuサーバー
 - [ ] USB/UVC Webcam 1台
 - [ ] USB/UVC Webcam 複数台
-- [ ] Web Camera Node用スマートフォン/タブレット/PC
-- [ ] iPhone / Safari
-- [ ] Android / Chrome等
+- [ ] Remote Linux `media-capture-agent`
+- [ ] Phone/Mac browser viewer
 - [ ] 物理設置環境
 - [ ] 入口/通過テスト環境
 - [ ] 低照度テスト環境
