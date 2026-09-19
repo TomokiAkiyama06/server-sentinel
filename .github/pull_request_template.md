@@ -25,7 +25,7 @@ Closes #
 - [ ] 不要
 - [ ] `hardware-required`
 - [ ] `webcam-required`
-- [ ] `browser-camera-required`
+- [ ] `remote-agent-required`
 - [ ] `server-required`
 - [ ] `manual-test-required`
 
