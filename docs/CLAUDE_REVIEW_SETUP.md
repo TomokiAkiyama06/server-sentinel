@@ -67,16 +67,36 @@ fork PRへrepository secretを直接渡しません。maintainerがdefault branc
 - untrusted fork codeをSecret付きで実行しない;
 - `pull_request_target` でfork headをcheckout/executeしない.
 
-## 7. Structured output
+## 7. Structured outputと公開境界
+
+Claudeの出力schemaには自由記述欄を設けません。`review_markdown`、ファイル名、パス、URL、コード/差分の引用は受け付けません。
 
 ```json
 {
-  "highest_severity": "none | proposal | important | critical",
-  "review_markdown": "日本語のレビュー本文"
+  "highest_severity": "important",
+  "findings": [
+    {"severity": "important", "category": "authorization", "diff_line": 42}
+  ]
 }
 ```
 
-`critical` / `important` はworkflow failureです。
+- `highest_severity`: `none` / `proposal` / `important` / `critical`;
+- `findings`: 最大20件、重大・重要を優先;
+- findingの`severity`: `proposal` / `important` / `critical`;
+- `category`: `requirements` / `correctness` / `security` / `authorization` / `secrets` / `privacy` / `data_loss` / `storage` / `concurrency` / `tests` / `licensing` / `camera_source` / `protocol` / `maintenance`;
+- `diff_line`: 固定diffの範囲内にある1始まり整数行番号。
+
+指摘なしは`highest_severity=none`かつ`findings=[]`です。最高重要度は全findingと一致させます。余分なfield、未知enum、不正な行番号、JSON key/同一finding重複、不整合、Action失敗は検証をfailさせます。`critical` / `important`もworkflow failureです。
+
+`display_report: false` / `show_full_output: false`を明示し、Actionの自由文report・全文ログを公開しません。raw responseをstepの環境変数へ渡すとActionsが検証前に表示するため、検証stepは固定Actionのrunner-local execution JSONから最終成功resultの`structured_output`を直接読みます。raw executionはsummary/artifactへ出力しません。JSONが不正な場合もpayload/parse errorをログへ転記せず、定型エラーだけを返します。
+
+公開Job Summaryは検証済みの固定分類ラベル、重要度、行番号、固定HEAD/baseだけから生成します。Secret形式のregex検出やentropy推定には依存しません。場所と分類を基に同じ固定差分を確認し、重大・重要の解消を検証してください。
+
+行番号を再現するには、Summaryの40桁HEAD/baseを次のplaceholderに入れて実行します。
+
+```bash
+git -c core.quotePath=true diff --no-ext-diff --no-textconv --no-color --no-renames --diff-algorithm=myers --no-indent-heuristic --src-prefix=a/ --dst-prefix=b/ --unified=3 --inter-hunk-context=0 <base>...<head> | nl -ba
+```
 
 ## 8. Action固定
 
@@ -85,7 +105,7 @@ Secretへアクセスするthird-party Actionはfull commit SHAへ固定しま�
 - `anthropics/claude-code-action`: `9cdae7f0d995e3ba7c33f226087fdf82a59cd520`
 - `actions/checkout`: `d23441a48e516b6c34aea4fa41551a30e30af803`
 
-更新時は上流release/tagとの対応と権限影響を確認します。
+更新時は上流release/tagとの対応、権限影響、出力/ログの契約を確認します。現在の固定Actionは[execution JSONをrunner tempへ保存](https://github.com/anthropics/claude-code-action/blob/9cdae7f0d995e3ba7c33f226087fdf82a59cd520/base-action/src/execution-file.ts)し、[SDK resultにstructured_outputを保持](https://github.com/anthropics/claude-code-action/blob/9cdae7f0d995e3ba7c33f226087fdf82a59cd520/base-action/src/run-claude-sdk.ts)します。この契約が変わる場合はvalidatorも更新し、raw responseが公開されないことを再検証します。
 
 ## 9. 暫定マージ強制モデル
 
