@@ -116,7 +116,7 @@ Rules:
 - agent health and camera health are separate;
 - capture ingest listener is separate from human dashboard listener;
 - main host does not SSH/admin into the capture machine merely to receive video;
-- agent keeps a compressed-video disk ring buffer; owner selects duration or capacity mode; unexpected Main Server loss protects T-10/T+10 minutes; protected incidents expire from the agent after 30 days.
+- agent keeps a compressed-video disk ring buffer; owner selects duration or capacity mode; unexpected Main Server loss protects T-10/T+10 minutes; protected incidents expire from the agent after 60 days by default.
 
 ## 9. Human-access invariants
 
@@ -217,7 +217,7 @@ As applicable cover:
 - phone/Mac live viewing;
 - Tailscale/private reachability + ServerSentinel application authorization;
 - `live:view` vs `recordings:view` isolation, including historical timeline only with `recordings:view`;
-- duration/capacity ring-buffer modes, T-10/T+10 protection, 30-day expiry, and agent disk pressure;
+- duration/capacity ring-buffer modes, T-10/T+10 protection, 60-day default expiry, and agent disk pressure;
 - detector-specific quality gate including person false-negative prevention;
 - owner verification/anonymous tracking/presence;
 - storage pressure;
@@ -252,4 +252,4 @@ Stop and request explicit owner decision before:
 - introducing browser/iPhone camera capture without a new explicit product decision/ADR;
 - adding a non-owner recording download/export function;
 - changing the established `recordings:view` -> historical timeline permission mapping without owner approval;
-- weakening the 10-minute pre/10-minute post agent protection or 30-day agent expiry without owner approval.
+- weakening the 10-minute pre/10-minute post agent protection or 60-day default agent expiry without owner approval.
