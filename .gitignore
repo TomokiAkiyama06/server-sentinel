@@ -63,6 +63,20 @@ tests/fixtures/**/*.mp3
 !tests/fixtures/synthetic/**/*.heic
 !tests/fixtures/synthetic/**/*.heif
 
+# Agent runtime / deployment-local security data
+buffer/
+incidents/
+runtime/
+credentials/
+local-state/
+hardware-inventory*.json
+hardware_inventory*.json
+device-inventory*.json
+device_inventory*.json
+*.crt
+*.csr
+*.pfx
+
 # Logs / local diagnostics
 *.log
 logs/
