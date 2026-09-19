@@ -105,14 +105,18 @@ Scope:
 - video-only operation;
 - node heartbeat + camera health separation;
 - development-from-clone workflow;
-- later release-artifact installer path.
+- later release-artifact installer path;
+- configurable Agent media root on a dedicated data filesystem where available;
+- installer/startup validation of expected media-root mount identity, ownership, writability, free space, and safety reserve;
+- fail-safe behavior that refuses to spill buffer/incidents onto the root filesystem if the intended media mount disappears.
 
 Acceptance:
 - agent runs without GUI/tray;
 - microphone is not opened;
 - camera unplug leaves agent online/source offline;
 - service does not impersonate unrelated software;
-- no unnecessary root runtime.
+- no unnecessary root runtime;
+- expected media-root mount loss/substitution is explicit degraded/failed state rather than silent fallback.
 
 ## Plan 7 — Capture-node pairing + mTLS trust
 
