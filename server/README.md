@@ -33,4 +33,4 @@ A capture-node credential is not a human/admin credential. LAN capture ingest is
 
 UVC identity never relies solely on `/dev/videoN`. Ambiguous reconnect of indistinguishable physical devices fails to `manual_intervention_required`.
 
-ServerSentinel is video-only in MVP. The main Ubuntu host is authoritative durable evidence storage. Agent-local outage buffering is a separate pending design decision and is not currently an independent evidence guarantee.
+ServerSentinel is video-only in MVP. The main Ubuntu host is authoritative durable evidence storage for normal operation. A paired `media-capture-agent` keeps a bounded compressed-video disk ring buffer and preserves critical/unexpected-disconnect incident windows as secondary evidence; the default protected-incident retention on the agent is 60 days.
