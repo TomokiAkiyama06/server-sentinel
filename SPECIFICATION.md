@@ -331,7 +331,7 @@ The remote capture node is therefore a secondary evidence location for critical 
 
 ### 5.13 Protected incident retention
 
-Completed protected incidents remain on the capture agent for **30 days from incident completion** and are then automatically deleted from the agent.
+Completed protected incidents remain on the capture agent for **60 days from incident completion by default** and are then automatically deleted from the agent.
 
 The owner may explicitly delete a protected incident earlier. Reconnection to the Main Server, successful Main Server recording, or ordinary ring-buffer pressure does not by itself delete an unexpired protected incident.
 
@@ -342,7 +342,7 @@ incident_id
 trigger_reason
 started_at
 ended_at
-expires_at = ended_at + 30 days
+expires_at = ended_at + 60 days
 byte_length
 segment_gap/integrity state
 ```
@@ -548,7 +548,94 @@ Defaults: recording retention 20 days; audit retention 90 days.
 
 Agent disk-buffer safety is tracked separately from Main Server storage because the two filesystems may be different machines.
 
-## 10. Human access architecture
+## 10. Host hardware integrity and recording self-check
+
+### 10.1 Hardware baseline
+
+During setup, the Owner approves a baseline inventory for the main ServerSentinel host. Collect the strongest local identifiers available without pretending that unavailable identifiers exist.
+
+Representative Linux data sources may include sysfs/udev, SMBIOS/DMI, `lsblk`/block-device metadata, NVMe identify/health data, SMART data, and NVIDIA GPU UUID/serial/PCI metadata where applicable.
+
+Baseline categories:
+
+```text
+CPU
+- model/signature/topology where available
+
+Memory
+- slot
+- capacity
+- part number
+- serial where available
+
+NVMe / M.2 / HDD
+- model
+- serial / WWN-style stable identity where available
+- capacity
+- expected mount/filesystem role
+
+GPU
+- model
+- GPU UUID/serial where available
+- PCI identity where useful
+```
+
+The UI/API must represent missing unique identifiers honestly. If the platform exposes no stable per-device identifier for a same-model replacement, ServerSentinel must not claim it can prove that the physical component is unchanged.
+
+### 10.2 Inventory cadence and states
+
+Run inventory comparison:
+- at ServerSentinel startup; and
+- at least once every 24 hours while running.
+
+Per component/result, support at least:
+
+```text
+OK
+CHANGED
+MISSING
+NEW_DEVICE
+UNVERIFIABLE
+```
+
+Hardware drift never mutates the approved baseline automatically. The Owner must explicitly approve a new baseline/change. That approval is audited.
+
+### 10.3 Recording-health self-test
+
+At least once per day, run an end-to-end recording-health check. It should verify as much of the actual recording path as practical:
+
+1. enabled Camera Sources have fresh frames or an explicit truthful offline/degraded state;
+2. recorder/encoder pipeline is alive;
+3. configured recording root resolves to the expected filesystem/device rather than an accidental fallback mount;
+4. free-space and safety-reserve admission is valid;
+5. write a short bounded temporary media segment through the recording path;
+6. flush/fsync it;
+7. reopen it and validate container/duration/size and decode/readability as appropriate;
+8. delete the temporary successful self-test artifact;
+9. read available SMART/NVMe health indicators without making unsupported lifetime predictions.
+
+A self-test failure must not be hidden behind a generic healthy state.
+
+### 10.4 Alerting
+
+The following are immediate Owner-alert conditions rather than waiting only for the scheduled daily summary:
+
+- approved CPU/RAM/NVMe/HDD/GPU baseline component becomes `CHANGED` or `MISSING`;
+- recording storage resolves to an unexpected device/mount;
+- recording-health write/reopen/decode test fails;
+- storage health reports a material critical warning that threatens recording availability.
+
+`NEW_DEVICE` and `UNVERIFIABLE` are at least warnings; escalate when they materially prevent assurance of the configured recording path.
+
+Notification delivery follows configured local/UI/Slack channels. Slack remains optional; disabling Slack does not suppress the dashboard/audit fault state.
+
+### 10.5 Privacy and privilege
+
+Detailed hardware identifiers are deployment-local security metadata. Do not send raw serials/UUIDs through telemetry or developer infrastructure. General diagnostics should redact/hash them unless the Owner explicitly exports detailed diagnostics.
+
+Hardware/SMART probing must use the least privilege practical. Do not run the whole ServerSentinel stack as root merely to obtain inventory/health data; use narrow host permissions/helper boundaries if privileged probes are required.
+
+## 11. Human access architecture
 
 ### 10.1 Tailscale reachability vs application authorization
 
@@ -637,7 +724,7 @@ This is not DRM. A user who can view video may still screen-record or use advanc
 
 ServerSentinel permission revocation invalidates application access promptly. Tailnet membership/policy remains a separate Tailscale administrative concern.
 
-## 11. Dashboard UI
+## 12. Dashboard UI
 
 Primary views:
 
@@ -672,21 +759,21 @@ Capture-node settings additionally show:
 - whether the 10-minute pre-loss target is currently satisfied;
 - Main Server connection/heartbeat state.
 
-## 12. Security boundaries
+## 13. Security boundaries
 
-### 12.1 Capture node != human user
+### 13.1 Capture node != human user
 
 A paired `media-capture-agent` may send camera/health data and receive narrowly scoped media-preservation/control requests only. Its credential never grants dashboard/admin access.
 
-### 12.2 Media validation
+### 13.2 Media validation
 
 Validate authenticated node, expected source/session, rate/size bounds, allowed codecs/containers, generated safe filenames, integrity metadata, and bounded queues. No client-controlled arbitrary output paths.
 
-### 12.3 Biometrics
+### 13.3 Biometrics
 
 Owner template is sensitive secret-adjacent data, excluded from logs/general APIs/diagnostics and limited to the verification/config path. Non-owner persistent biometric templates are prohibited.
 
-## 13. Performance/overload policy
+## 14. Performance/overload policy
 
 Four active sources are a test target, not a promise of maximum camera modes on all hardware.
 
@@ -702,7 +789,7 @@ Resource priority:
 
 Measure USB controller bandwidth, agent/main CPU/GPU/VRAM, encode/decode capacity, LAN throughput, disk write rate, ring-buffer footprint, viewer latency, reconnect behavior, and dropped frames.
 
-## 14. Testing and fixtures
+## 15. Testing and fixtures
 
 Repository/CI media fixtures are **synthetic/generated only**.
 
@@ -734,7 +821,7 @@ Required test families include:
 
 Real hardware/network/browser validation lives in `MANUAL_TEST.md`.
 
-## 15. Deliberately unresolved decisions
+## 16. Deliberately unresolved decisions
 
 Require explicit owner decision/ADR/Issue before implementation where material:
 
