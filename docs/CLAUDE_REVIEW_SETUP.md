@@ -111,13 +111,16 @@ Secretへアクセスするthird-party Actionはfull commit SHAへ固定しま�
 
 Issue #4完了まではmerge actorが以下を明示確認します。
 
-- Codex `Reviewed commit` がcurrent HEADと一致;
+- 両レビューの依頼時に取得した40桁のHEAD/base SHAを、レビュー依頼コメントとPRのレビュー記録へ明記;
+- Codexにその固定HEAD/base差分を指定して依頼し、完了時とマージ直前に`Reviewed commit`がcurrent HEAD、依頼時に固定したbase SHAがcurrent baseと一致することを照合;
 - Claude runがcurrent HEAD **かつcurrent base** の固定差分を対象に成功;
 - Codex/Claudeの重大/重要が解消;
 - 必須CI成功;
 - blocking review threadなし.
 
-HEADまたはbaseが変わったら旧レビューはstaleです。
+Codexの`Reviewed commit`だけではbaseを検証できません。依頼時の固定baseの記録と、レビュー完了時・マージ直前のcurrent base照合を必須にします。baseの来歴が確認できないレビューを最終レビューとして採用しません。Issue #4による機械的な強制が完成するまでは、merge actorがこの照合を明示的に行います。
+
+HEADまたはbaseのどちらかが変わったら旧レビューはstaleです。HEADが同じでbaseだけ進んだ場合も、最新の固定HEAD/baseでCodexとClaudeの両方を再実行します。
 
 ## 10. Issue #4後の強化
 

@@ -22,9 +22,10 @@ Read:
 - Create a focused branch.
 - Add tests.
 - Open a PR.
-- Wait for CI and both Codex + Claude review of the current PR HEAD.
+- Record the current 40-character PR HEAD and base SHAs in the review request and PR review record. Request both Codex + Claude to review that fixed HEAD/base diff, and wait for CI.
+- At review completion and immediately before merge, compare both reviewed SHAs with the current PR HEAD/base. For Codex, verify `Reviewed commit` plus the base recorded in its pinned review request; HEAD alone is insufficient.
 - Resolve blocking review findings before merge.
-- If PR HEAD changes materially after review, request both reviews again.
+- If either HEAD or base changes after the review request, request both reviews again on the latest fixed HEAD/base diff, including a base-only change. A review without verifiable base provenance is not a final approval.
 
 Until Issue #4 establishes hardened repository-level review enforcement, same-repository write access is reserved for trusted maintainers. External/untrusted contributors should submit from a fork.
 
