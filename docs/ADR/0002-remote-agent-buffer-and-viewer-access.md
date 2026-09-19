@@ -41,7 +41,7 @@ For a sudden loss of main-host communication, the capture agent also performs au
 
 This produces a default 20-minute evidence window around the connectivity-loss boundary. The pre-loss portion is taken from the existing ring buffer. The post-loss portion continues locally even though the main host is unreachable.
 
-A protected incident MUST be excluded from ordinary ring overwrite and is retained on the capture agent for **30 days from completion**, then automatically deleted. Owner-authorized manual deletion may remove it earlier. If disk pressure occurs before expiry, reclaim ordinary ring-buffer data first and surface explicit storage pressure rather than silently deleting unexpired protected evidence.
+A protected incident MUST be excluded from ordinary ring overwrite and is retained on the capture agent for **60 days from completion by default**, then automatically deleted. Owner-authorized manual deletion may remove it earlier. If disk pressure occurs before expiry, reclaim ordinary ring-buffer data first and surface explicit storage pressure rather than silently deleting unexpired protected evidence.
 
 ### 4. Human-access authorization does not require changing Tailscale Grants
 
