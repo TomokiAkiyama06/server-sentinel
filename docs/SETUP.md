@@ -152,6 +152,14 @@ Audio: not captured
 
 Normal operation has no desktop window/tray requirement.
 
+### Agent media-root selection
+
+Prefer an existing dedicated data filesystem with sufficient free capacity for Agent video rather than assuming the root filesystem. The exact path is deployment-specific and must not be hard-coded into the public project.
+
+The setup/installer records the Owner-approved media root and, where practical, the expected filesystem/mount identity. At startup it verifies the mount is present, writable by the dedicated Agent account, has adequate free space/safety reserve, and has not silently fallen back to a directory on the root filesystem.
+
+Do not automatically format disks, edit `fstab`, or create new mounts without an explicit Owner/admin action outside the normal installer.
+
 ### Agent recovery-buffer setup
 
 Owner-only configuration offers one of two modes:
