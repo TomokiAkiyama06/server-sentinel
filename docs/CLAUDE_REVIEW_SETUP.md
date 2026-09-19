@@ -61,6 +61,7 @@ fork PRへrepository secretを直接渡しません。maintainerがdefault branc
 
 - default branchを信頼済みworkspaceとしてcheckout;
 - `headRefOid` / `baseRefOid` を固定;
+- checkout済みworkspaceのHEADが固定base SHAと一致することを検証し、不一致なら停止して再実行（base objectの存在だけでは不十分）;
 - GitHubのPR head refから固定head OIDだけを取得;
 - live `gh pr diff` ではなく固定OID間のgit diffを生成;
 - review完了時もHEAD/base両方を再確認;

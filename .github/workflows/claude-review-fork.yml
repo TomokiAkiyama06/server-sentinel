@@ -73,6 +73,12 @@ jobs:
             echo "固定したbase commitをtrusted default branch履歴から解決できません。" >&2
             exit 1
           }
+          # Default branch may advance after checkout but before baseRefOid is pinned.
+          # An existing commit object alone does not prove the workspace uses that base.
+          [ "$(git rev-parse HEAD)" = "$base_before" ] || {
+            echo "checkout済みbaseが固定baseと一致しません。最新baseで再実行してください。" >&2
+            exit 1
+          }
           git fetch --no-tags --no-recurse-submodules origin "refs/pull/$PR_NUMBER/head"
           fetched_head="$(git rev-parse FETCH_HEAD)"
           [ "$fetched_head" = "$head_before" ] || {
