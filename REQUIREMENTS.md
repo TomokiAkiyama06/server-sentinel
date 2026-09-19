@@ -168,9 +168,9 @@ This behavior is intended to preserve room-overview evidence when the main serve
 When the main host confirms a critical server-movement/camera-tamper event and communication remains available, it may explicitly instruct paired agents to preserve the relevant local ring-buffer interval as incident evidence. Agent-side preserved evidence is an exception for critical resilience, not a general duplicate of all main-host recordings.
 
 ### AGENT-015 Protected-evidence lifecycle
-A protected agent incident is retained on the capture agent for **30 days from completion**, then automatically deleted from the agent. Owner-authorized manual deletion may remove it earlier.
+A protected agent incident is retained on the capture agent for **60 days from completion by default**, then automatically deleted from the agent. Owner-authorized manual deletion may remove it earlier.
 
-Protected incidents are excluded from ordinary ring-buffer overwrite before their 30-day expiry. If protected incidents and the active ring buffer create disk pressure, the agent shall reclaim only eligible non-protected ring-buffer data first, warn the owner, and refuse unsafe writes before crossing the filesystem safety reserve rather than silently deleting unexpired protected evidence.
+Protected incidents are excluded from ordinary ring-buffer overwrite before their 60-day expiry. If protected incidents and the active ring buffer create disk pressure, the agent shall reclaim only eligible non-protected ring-buffer data first, warn the owner, and refuse unsafe writes before crossing the filesystem safety reserve rather than silently deleting unexpired protected evidence.
 
 Protected evidence retention, deletion, current bytes, and expiry time shall be visible to the owner.
 
@@ -293,7 +293,51 @@ Starred recordings are excluded from automatic deletion but count toward disk us
 ### STORE-006 Filesystem safety reserve
 Preserve a hard filesystem safety reserve independent of normal recording allocation. Reclaim eligible unstarred recordings first, then suppress ordinary/manual recording under `STORAGE_PRESSURE`; bounded critical evidence may use only a safe allowance; refuse writes before crossing the hard reserve under `STORAGE_HARD_STOP`; recover with hysteresis.
 
-## 11. Notifications
+## 11. Host hardware integrity and recording-health requirements
+
+### INTEGRITY-001 Owner-approved hardware baseline
+The main ServerSentinel host shall maintain a deployment-local, owner-approved hardware baseline for the components relevant to monitoring/evidence integrity.
+
+The baseline shall cover, where the operating system/hardware exposes usable identifiers:
+- CPU model/topology/signature information;
+- installed memory modules/slots, capacity, part number, and serial where available;
+- NVMe/M.2 devices, including stable model/serial/WWN-style identity and capacity where available;
+- HDD/other recording drives, including stable model/serial/WWN-style identity and capacity where available;
+- GPU identity, including model and stable GPU UUID/serial/PCI identity where available.
+
+The product shall not claim that replacement with an otherwise indistinguishable component can always be detected when the platform exposes no unique identifier.
+
+### INTEGRITY-002 Startup and daily inventory check
+Hardware inventory comparison shall run:
+- once during ServerSentinel startup; and
+- at least once per day while the service remains running.
+
+Results shall distinguish at minimum `OK`, `CHANGED`, `MISSING`, `NEW_DEVICE`, and `UNVERIFIABLE` where applicable.
+
+### INTEGRITY-003 No silent baseline rewrite
+Detected hardware drift shall never silently replace the approved baseline. Only the Owner may approve a new baseline or accept a deliberate hardware change, and that action shall be audited.
+
+### INTEGRITY-004 Recording-health self-test
+At least once per day, ServerSentinel shall run a recording-health self-test sufficient to detect common silent recording failures, including where applicable:
+- recent frame/capture freshness for enabled sources;
+- recorder/encoder pipeline state;
+- expected recording filesystem/mount/device identity;
+- writable/free-space state and filesystem safety reserve;
+- a bounded temporary write + flush/fsync + reopen/parse/decode verification on the recording path;
+- storage-device health indicators available through SMART/NVMe telemetry.
+
+Temporary self-test media shall be bounded, deployment-local, deleted after successful validation, and never uploaded as telemetry.
+
+### INTEGRITY-005 Recording-path fail-safe
+If the intended recording filesystem is missing/unmounted or resolves to an unexpected device, ServerSentinel shall not silently fall back to an unintended filesystem while reporting healthy recording. It shall expose a degraded/failed state and follow storage admission safeguards.
+
+### INTEGRITY-006 Immediate alerting
+A baseline component becoming missing/changed, an unexpected storage device substitution, or a recording-health self-test failure is an immediate owner notification condition rather than waiting only for the daily summary. `UNVERIFIABLE`/probe failures shall at least generate a visible warning, and shall escalate when they prevent assurance of recording/storage integrity.
+
+### INTEGRITY-007 Local-only inventory data
+Raw hardware serials/UUIDs and detailed inventory are deployment-local operational/security metadata. They shall not be sent to the developer, telemetry, public diagnostics, GitHub issues/PRs, or normal exported logs without an explicit owner-controlled diagnostic export.
+
+## 12. Notifications
 
 ### NOTIFY-001 Slack optional
 Slack is optional and disabled until configured.
@@ -307,7 +351,7 @@ Default daily summary: 23:00 local time, configurable. Include monitored duratio
 ### NOTIFY-004 No developer relay
 Slack delivery goes directly from the user's deployment to the user's configured Slack endpoint/API.
 
-## 12. Human remote-access requirements
+## 13. Human remote-access requirements
 
 ### AUTH-001 Private reachability only
 Public Internet port exposure is not the default. Human remote access should use Tailscale or an equivalent private network.
@@ -347,7 +391,7 @@ When an ordinary Tailnet user is not invited in ServerSentinel, the application 
 
 This is application-level non-disclosure only. With unchanged Tailscale policy, the existence/reachability of the underlying Tailscale node or listening service cannot be guaranteed hidden.
 
-## 13. Dashboard requirements
+## 14. Dashboard requirements
 
 ### UI-001 Responsive live grid
 Support phone/Mac/desktop browsers. One source uses a large tile, two use split layout, three/four use responsive grid where practical.
@@ -368,7 +412,7 @@ Owner UI shall expose:
 - agent filesystem free space and safety reserve;
 - clear warning/degraded/error states when the requested 10-minute pre-loss window or disk safety cannot be maintained.
 
-## 14. Performance and overload requirements
+## 15. Performance and overload requirements
 
 ### PERF-001 Four-source target
 Four active sources are a supported test target, not a guarantee that every camera can run maximum advertised quality simultaneously on every USB/network/host topology.
@@ -379,7 +423,7 @@ Inference cadence is independent from capture FPS and may reduce under load. Cri
 ### PERF-003 Truthful degradation
 Do not silently drop a source while reporting healthy monitoring. Surface overload, dropped frames, encoder pressure, and network/backpressure where material.
 
-## 15. Testing/repository requirements
+## 16. Testing/repository requirements
 
 ### TEST-001 Synthetic repository media only
 Repository and CI media fixtures shall be **synthetic/generated only**. Real-person, real-room, real-monitoring, or merely publicly licensed real-person media shall not be committed to the repository or attached to GitHub PRs/issues/actions artifacts.
@@ -392,7 +436,7 @@ Real hardware/room/owner tests are documented in `MANUAL_TEST.md`; results may r
 ### TEST-003 Required source/agent tests
 Cover local UVC and remote-agent discovery, ambiguous identical-device reconnect, agent pairing/revocation, clock offset, LAN outage/reconnect, source health, 1–4 mixed topology, capture-vs-inference/view profiles, bounded disk ring-buffer behavior, 10-minute pre-loss pinning, 10-minute post-loss continuation, and protected-evidence capacity handling.
 
-## 16. Development/review requirements
+## 17. Development/review requirements
 
 ### DEV-001 No direct main
 Non-trivial work uses Issue -> branch -> PR -> CI/review -> merge.
@@ -403,7 +447,7 @@ Codex and Claude must both review the current PR diff. A review is valid only fo
 ### DEV-003 No secrets/private deployment data
 Never commit real credentials, private keys, owner biometrics, private deployment values, or real monitoring media.
 
-## 17. Non-goals / deferred decisions
+## 18. Non-goals / deferred decisions
 
 Not required for MVP unless separately approved:
 - browser/iPhone used as a camera source;
