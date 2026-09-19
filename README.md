@@ -129,7 +129,7 @@ These permissions are independent. Non-owner invited users do not receive an off
 
 Ubuntu remains the primary durable evidence store.
 
-Agent-side storage is limited to the bounded compressed disk ring buffer and protected critical incidents. Agent-side protected critical incidents are retained for **30 days** and then automatically deleted.
+Agent-side storage is limited to the bounded compressed disk ring buffer and protected critical incidents. Agent-side protected critical incidents are retained for **60 days by default** and then automatically deleted.
 
 Defaults:
 
@@ -142,6 +142,16 @@ Defaults:
 - explicit `STORAGE_PRESSURE` and `STORAGE_HARD_STOP` states prevent unsafe writes.
 
 Compressed media should be buffered/recorded where practical rather than retaining large decoded frame histories in RAM.
+
+## Recorder self-check and hardware integrity
+
+ServerSentinel does not only monitor cameras; it also checks that the main recording machine still matches the Owner-approved hardware baseline and that the recording path actually works.
+
+The baseline covers CPU, RAM, NVMe/M.2, HDD/recording drives, and GPU using the strongest identifiers the host exposes. Comparison runs at ServerSentinel startup and at least once per day. A detected `CHANGED`, `MISSING`, `NEW_DEVICE`, or `UNVERIFIABLE` state is shown explicitly; deliberate hardware changes require Owner approval and never rewrite the baseline silently.
+
+At least once per day, the recorder performs a bounded recording-health self-test covering source freshness, encoder/recorder state, expected recording filesystem identity, free-space/safety reserve, and a temporary write + fsync + reopen/read/decode validation. Available SMART/NVMe health signals are also surfaced.
+
+Missing/changed approved hardware or a failed recording-health self-test triggers an immediate Owner alert instead of waiting only for the daily summary. Raw hardware serials/UUIDs remain deployment-local and are not sent to developer telemetry or public diagnostics.
 
 ## Performance model
 
