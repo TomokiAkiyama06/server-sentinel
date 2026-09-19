@@ -359,7 +359,7 @@ If space becomes unsafe:
 - stop/refuse unsafe writes before crossing the filesystem safety reserve;
 - if the full 10-minute pre-loss target or 10-minute post-loss continuation cannot be maintained, report the exact degraded/gap state rather than claiming complete protection.
 
-### 5.13 Media-root mount safety
+### 5.15 Media-root mount safety
 
 The Agent media root is a configurable path that may live on a dedicated mounted filesystem rather than the root filesystem.
 
@@ -563,7 +563,7 @@ Agent disk-buffer safety is tracked separately from Main Server storage because 
 
 ## 10. Host hardware integrity and recording self-check
 
-### 10.1 Hardware baseline
+### 11.1 Hardware baseline
 
 During setup, the Owner approves a baseline inventory for the main ServerSentinel host. Collect the strongest local identifiers available without pretending that unavailable identifiers exist.
 
@@ -595,7 +595,7 @@ GPU
 
 The UI/API must represent missing unique identifiers honestly. If the platform exposes no stable per-device identifier for a same-model replacement, ServerSentinel must not claim it can prove that the physical component is unchanged.
 
-### 10.2 Inventory cadence and states
+### 11.2 Inventory cadence and states
 
 Run inventory comparison:
 - at ServerSentinel startup; and
@@ -613,7 +613,7 @@ UNVERIFIABLE
 
 Hardware drift never mutates the approved baseline automatically. The Owner must explicitly approve a new baseline/change. That approval is audited.
 
-### 10.3 Recording-health self-test
+### 11.3 Recording-health self-test
 
 At least once per day, run an end-to-end recording-health check. It should verify as much of the actual recording path as practical:
 
@@ -629,7 +629,7 @@ At least once per day, run an end-to-end recording-health check. It should verif
 
 A self-test failure must not be hidden behind a generic healthy state.
 
-### 10.4 Alerting
+### 11.4 Alerting
 
 The following are immediate Owner-alert conditions rather than waiting only for the scheduled daily summary:
 
@@ -642,7 +642,7 @@ The following are immediate Owner-alert conditions rather than waiting only for 
 
 Notification delivery follows configured local/UI/Slack channels. Slack remains optional; disabling Slack does not suppress the dashboard/audit fault state.
 
-### 10.5 Privacy and privilege
+### 11.5 Privacy and privilege
 
 Detailed hardware identifiers are deployment-local security metadata. Do not send raw serials/UUIDs through telemetry or developer infrastructure. General diagnostics should redact/hash them unless the Owner explicitly exports detailed diagnostics.
 
@@ -727,13 +727,13 @@ DELETE recording                         -> owner
 
 Unauthorized users get no ServerSentinel deployment metadata, camera names/counts, thumbnails, event details, or recordings. For an uninvited identity, prefer a generic/non-branding denial such as a not-found-style response and do not expose product/version headers, API schema, health details, or other ServerSentinel fingerprints. This does not claim that the underlying Tailscale node/service is network-invisible when Tailnet policy is unchanged.
 
-### 10.6 Browser-only recording access
+### 11.6 Browser-only recording access
 
 No official non-owner recording download/export route/button in MVP. Playback manifests/segments remain authorization-protected and short-lived/session-bound as practical; a copied URL does not become public.
 
 This is not DRM. A user who can view video may still screen-record or use advanced client tooling, and the UI/docs must not claim otherwise.
 
-### 10.7 Revocation
+### 11.7 Revocation
 
 ServerSentinel permission revocation invalidates application access promptly. Tailnet membership/policy remains a separate Tailscale administrative concern.
 
