@@ -176,7 +176,7 @@ Scope:
 - 10-minute pre-loss target validation;
 - automatic Main Server communication-loss protection: 10 minutes before + 10 minutes after;
 - critical-event preserve command while Main Server is reachable;
-- protected incidents retained on Agent for 30 days, then auto-deleted;
+- protected incidents retained on Agent for 60 days by default, then auto-deleted;
 - agent storage-pressure/hard-stop behavior.
 
 Acceptance:
@@ -187,7 +187,7 @@ Acceptance:
 - full 20-minute incident is preserved when resources/stream continuity allow;
 - shortened/gapped protection is reported truthfully;
 - reconnect does not erase protected incident;
-- protected incident expires automatically at 30 days;
+- protected incident expires automatically at 60 days;
 - unexpired protected incident is not silently overwritten by ordinary ring-buffer pressure.
 
 ## Plan 10 — Capture/record/inference/view profile separation
@@ -359,6 +359,32 @@ Acceptance:
 - Slack credentials never logged;
 - ordinary person/motion does not spam main channel by default.
 
+## Plan 19A — Main-host hardware integrity + recording-health self-test
+
+Scope:
+- Owner-approved hardware baseline for CPU / RAM / NVMe(M.2) / HDD / GPU;
+- strongest available stable local identifiers with explicit `UNVERIFIABLE` handling;
+- startup inventory comparison;
+- at-least-daily inventory comparison;
+- no silent baseline rewrite;
+- Owner-only approval of deliberate hardware changes;
+- daily recorder self-test covering source freshness, recorder/encoder, expected recording filesystem identity, free space/safety reserve, bounded temporary write + fsync + reopen/decode;
+- SMART/NVMe health collection where available;
+- immediate Owner notification for missing/changed baseline hardware and recording-health failures;
+- local-only/redacted handling of raw serials/UUIDs.
+
+Acceptance:
+- baseline drift reports `CHANGED`/`MISSING`/`NEW_DEVICE`/`UNVERIFIABLE` as appropriate;
+- startup and daily checks both execute;
+- baseline never updates automatically;
+- same-model hardware with no exposed unique identifier is not falsely claimed as distinguishable;
+- unexpected/unmounted recording filesystem does not silently fall back while reporting healthy;
+- test segment write/fsync/reopen/readability failure is detected;
+- successful temporary self-test media is deleted locally;
+- immediate alert does not wait only for daily summary;
+- Slack alert works when configured, while dashboard/audit remains authoritative when Slack is disabled;
+- raw hardware identifiers and real monitoring media are absent from repo/CI/public diagnostics.
+
 ## Plan 20 — Full mock E2E + failure scenarios
 
 Scope:
@@ -371,7 +397,10 @@ Scope:
 - storage pressure/full;
 - backend restart;
 - access permission isolation;
-- timeline correlation.
+- timeline correlation;
+- hardware baseline drift/missing-device scenarios;
+- recording-filesystem substitution/unmount;
+- recording-health self-test failure and immediate alerting.
 
 Acceptance:
 - mock E2E passes without real hardware;
@@ -391,7 +420,9 @@ Minimum intended environments:
 - Mac browser live view;
 - restrictive Tailnet/app authorization test identities;
 - low-light/degraded behavior;
-- long-duration run.
+- long-duration run;
+- startup + daily hardware-integrity verification;
+- daily recording-health self-test.
 
 Acceptance:
 - results recorded without publishing real monitoring media/private infrastructure values;
