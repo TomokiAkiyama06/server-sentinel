@@ -182,8 +182,8 @@ Unexpected Main Server communication loss:
 - [ ] resulting protected incident targets 20 minutes total;
 - [ ] reconnect does not erase the protected incident;
 - [ ] segment gaps/shortened protection are reported truthfully;
-- [ ] protected incident has a 30-day agent-side expiry;
-- [ ] expiry cleanup removes it automatically after 30 days (use test clock/accelerated retention harness rather than waiting 30 real days where available);
+- [ ] protected incident has a 60-day agent-side expiry;
+- [ ] expiry cleanup removes it automatically after 60 days (use test clock/accelerated retention harness rather than waiting 60 real days where available);
 - [ ] ordinary ring-buffer pressure does not delete an unexpired protected incident;
 - [ ] disk pressure produces explicit warning/hard-stop behavior before unsafe writes.
 
@@ -393,3 +393,55 @@ Record:
 - false health states.
 
 Include a four-active-source run where hardware permits. Final defaults come from these measurements.
+
+
+## S. Main-host hardware integrity / recording-health self-test
+
+### Hardware baseline and startup/daily comparison
+
+Establish an Owner-approved baseline, then validate both startup and scheduled daily checks.
+
+- [ ] CPU model/topology/signature data is captured where available;
+- [ ] RAM slot/capacity/part/serial data is captured where available;
+- [ ] NVMe/M.2 device model/serial/WWN-style identity/capacity is captured where available;
+- [ ] HDD/recording-drive model/serial/WWN-style identity/capacity is captured where available;
+- [ ] GPU model/GPU UUID/serial/PCI identity is captured where available;
+- [ ] ServerSentinel startup triggers an integrity comparison;
+- [ ] a running service performs the comparison at least once every 24 hours;
+- [ ] results distinguish `OK`, `CHANGED`, `MISSING`, `NEW_DEVICE`, and `UNVERIFIABLE`;
+- [ ] a missing/changed approved component does not silently update the baseline;
+- [ ] only the Owner can approve a replacement/new baseline;
+- [ ] Owner approval is audited;
+- [ ] same-model replacement with no exposed stable unique identifier is reported as an identification limitation rather than falsely guaranteed;
+- [ ] raw hardware serials/UUIDs are not included in normal telemetry/public diagnostics/GitHub artifacts.
+
+Use controlled inventory mocks for destructive/expensive substitution cases where physical replacement is impractical. Real hardware swaps are optional and must not damage production equipment.
+
+### Recording-health daily self-test
+
+- [ ] enabled sources have fresh frames or an explicit truthful offline/degraded state;
+- [ ] recorder/encoder state is checked;
+- [ ] configured recording root resolves to the expected filesystem/device;
+- [ ] an intentionally unmounted recording filesystem does **not** silently fall back to another filesystem while reporting healthy;
+- [ ] current free space and safety reserve are checked;
+- [ ] a bounded temporary media segment is written through the recording path;
+- [ ] the segment is flushed/fsynced;
+- [ ] the segment is reopened and container/duration/size/decode readability is validated as appropriate;
+- [ ] successful temporary test media is deleted locally after validation;
+- [ ] available SMART/NVMe health data is read and surfaced without unsupported lifetime prediction;
+- [ ] a failed write/reopen/decode test creates a recording-health failure state;
+- [ ] the self-test runs at least once every 24 hours.
+
+### Immediate owner alerting
+
+For each condition below, verify the system does not wait only for the 23:00 daily summary:
+
+- [ ] approved CPU/RAM/NVMe/HDD/GPU becomes `CHANGED` or `MISSING`;
+- [ ] expected recording device/mount is substituted or missing;
+- [ ] recording-health write/reopen/decode fails;
+- [ ] storage health reports a material critical warning;
+- [ ] `NEW_DEVICE`/`UNVERIFIABLE` creates at least a visible warning and escalates when recording integrity cannot be assured;
+- [ ] Slack receives the immediate alert when Slack is configured;
+- [ ] when Slack is disabled, dashboard/audit fault state remains visible.
+
+Do not upload hardware serials, local mount identifiers, real temporary test media, or private infrastructure details to GitHub.
