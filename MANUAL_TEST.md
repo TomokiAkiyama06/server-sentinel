@@ -55,7 +55,13 @@ Installation/service:
 - [ ] normal process runs as a dedicated non-root account;
 - [ ] no GUI/tray is required;
 - [ ] service name/process is `media-capture-agent` and does not impersonate unrelated software;
-- [ ] microphone/audio device is not opened.
+- [ ] microphone/audio device is not opened;
+- [ ] media root is deployment-configured outside the checkout;
+- [ ] installer/startup and runtime admission verify expected mount/filesystem/device, dedicated-account writability, free space, and safety reserve;
+- [ ] using a disposable test volume, expected media-mount loss or substitution produces a visible degraded/failed state and refuses unsafe writes;
+- [ ] that failure never creates or uses a fallback media directory on the root filesystem.
+
+Use a disposable volume or controlled mount-identity mocks for failure checks; do not unmount or alter production storage for this test.
 
 Pairing/security:
 

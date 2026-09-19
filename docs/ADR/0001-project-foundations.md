@@ -80,7 +80,7 @@ Rejected for MVP because it forces signing/App Store/device-specific lifecycle c
 
 Rejected from the current product scope because a permanently running Linux capture machine with UVC camera provides a cleaner always-on path, avoids browser lifecycle constraints, and can forward video over the existing private LAN.
 
-A browser camera source may be reconsidered later as another Camera Source type.
+Browser/iPhone camera capture is outside the current product scope. Any reintroduction requires a new explicit Owner decision/ADR, as clarified by ADR 0002.
 
 ### Put the capture machine in the owner's Tailnet
 
@@ -92,7 +92,7 @@ Rejected as the default. `media-capture-agent` initiates its own authenticated o
 
 ### Tailnet membership as application authorization
 
-Rejected. Network reachability and ServerSentinel authorization are separate gates. Restrictive Tailnet policy also reduces unnecessary node visibility to ordinary uninvited members.
+Rejected. Network reachability and ServerSentinel authorization are separate gates. Existing Tailnet policy may remain unchanged; optional restrictive policy is configured separately by the Owner outside ServerSentinel.
 
 ### Fixed two-webcam layout
 
@@ -123,7 +123,7 @@ Costs/limitations:
 - Tailscale ACL/Grant management remains outside ServerSentinel; in-app invitation/permissions are authoritative for application data;
 - UVC identity can be inherently ambiguous on identical devices without unique serials, requiring manual re-approval;
 - high-resolution room-overview capture needs encode/network/resource benchmarks;
-- independent evidence after physical loss of the main recorder remains future work.
+- ADR 0002 defines the Agent ring buffer and protected incidents as current secondary evidence after Main Server loss; general-purpose recording replication remains outside MVP.
 
 ## Validation
 

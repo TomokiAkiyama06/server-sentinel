@@ -156,7 +156,7 @@ Normal operation has no desktop window/tray requirement.
 
 Prefer an existing dedicated data filesystem with sufficient free capacity for Agent video rather than assuming the root filesystem. The exact path is deployment-specific and must not be hard-coded into the public project.
 
-The setup/installer records the Owner-approved media root and, where practical, the expected filesystem/mount identity. At startup it verifies the mount is present, writable by the dedicated Agent account, has adequate free space/safety reserve, and has not silently fallen back to a directory on the root filesystem.
+The setup/installer records the Owner-approved media root outside the source tree and the expected filesystem/mount identity where available. Installer/startup and runtime write admission verify that the expected mount/device is present, writable by the dedicated Agent account, and has adequate free space/safety reserve. Missing or substituted mounts refuse unsafe writes and report a degraded/failed state; they never silently create or use a fallback media directory on the root filesystem.
 
 Do not automatically format disks, edit `fstab`, or create new mounts without an explicit Owner/admin action outside the normal installer.
 
@@ -244,13 +244,13 @@ Status: Active
 Minimum permissions:
 
 - `live:view` — current live streams;
-- `recordings:view` — recording list/browser playback.
+- `recordings:view` — recording list/browser playback and historical timeline/events.
 
-Permissions are independent.
+Permissions are independent. `live:view` alone cannot access historical timeline/events.
 
 Non-owner users receive no official recording download/export control in MVP. The UI must not promise that browser playback prevents screen recording/client-side capture.
 
-The screen must clearly state that Tailscale-level network permission is managed separately unless a future approved integration automates it.
+The screen must clearly state that Tailscale-level network permission is managed separately outside ServerSentinel. ServerSentinel does not modify ACLs/Grants or store Tailscale administrative credentials.
 
 ## Tailscale/private-network setup
 

@@ -30,6 +30,9 @@ MVPの基本構成:
 - owner-only face verificationは任意
 - non-owner named face DB / cross-camera biometric re-identificationは禁止
 - audio surveillanceはMVP外
+- Agent media rootはdeployment設定で受け取り、想定mountの消失・置換時はroot filesystemへのsilent fallbackを拒否
+- Main ServerのHardware Integrityはstartup + daily。baseline変更はOwner承認が必要
+- Recording Healthはdaily self-test。hardware change / self-test failureは即時Owner通知
 
 ## PRレビュー重点
 
@@ -56,6 +59,8 @@ MVPの基本構成:
 - timelineがculprit/attackerと断定していないか
 - repository fixtureにreal-person/publicly-licensed real-person mediaが入っていないか
 - model/weights/dependency license
+- Main Serverのstartup/daily hardware checkとdaily recording self-test、異常時の即時Owner通知が守られているか
+- Agent media rootのmount/書込権限/free space/safety reserve確認とsilent fallback拒否が守られているか
 - main / agent / Web間契約
 - 実機確認とmock確認の切り分け
 

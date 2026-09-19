@@ -53,7 +53,7 @@ Invited human viewers may receive only the permissions explicitly assigned by th
 
 Initial permissions:
 - `live:view` — current live video;
-- `recordings:view` — recording list/browser playback.
+- `recordings:view` — recording list/browser playback and historical timeline/events.
 
 They are independent.
 
@@ -119,6 +119,10 @@ Non-owner face crops/templates are not stored as a separate persistent identity 
 `media-capture-agent` keeps a bounded **compressed-video disk ring buffer**. The owner configures it by either target duration or maximum disk capacity; the UI shows the estimated equivalent value, current use, free space, and safety state.
 
 If Main Server communication is unexpectedly lost, the agent protects the preceding 10 minutes and continues local capture for 10 minutes, targeting a 20-minute incident window. Protected incidents are retained on the agent for **60 days by default** and then automatically deleted. This storage is incident-focused secondary evidence, not continuous replication of all Main Server recordings.
+
+## Hardware inventory and recorder diagnostics
+
+The Main Server keeps its Owner-approved hardware baseline and detailed hardware identifiers deployment-local. Raw serials/UUIDs are excluded from ordinary exported logs, public diagnostics, and GitHub artifacts. Any detailed diagnostic export requires an explicit Owner action. Bounded recording-health self-test media stays local and is deleted after successful validation.
 
 ## Slack
 

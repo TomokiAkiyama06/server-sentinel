@@ -22,7 +22,7 @@ Primary threats:
 
 1. Unauthorized dashboard/live/recording access.
 2. Tailnet member treated as automatically authorized.
-3. Uninvited Tailnet member discovering/reaching the ServerSentinel node unnecessarily.
+3. Uninvited Tailnet member obtaining application information through a reachable Main Server node.
 4. Capture-node impersonation or credential theft.
 5. Different USB camera silently taking an old source identity.
 6. Theft/tampering of the monitored server/cameras.
@@ -268,7 +268,9 @@ Recording root is configured by the owner; per-request arbitrary absolute paths 
 
 Preserve a hard filesystem safety reserve and enter explicit pressure/hard-stop states before unsafe writes.
 
-The Agent's normal ring buffer is bounded by Owner-selected duration or capacity mode. Protected communication-loss/critical incidents are separate from normal overwrite and are retained for 60 days by default, subject to the agent filesystem safety boundary.
+The Agent's normal ring buffer is bounded by Owner-selected duration or capacity mode. Protected communication-loss/critical incidents are separate from normal overwrite and expire 60 days after completion by default. Storage pressure reclaims eligible ordinary ring data first and refuses unsafe writes; it does not silently delete unexpired protected incidents.
+
+The Agent media root is deployment-configured outside the repository. Installer/startup and runtime admission check the expected mount/filesystem/device, dedicated-account writability, free space, and safety reserve. Missing or substituted media mounts produce a visible degraded/failed state and refused unsafe writes, never silent creation of a fallback media directory on the root filesystem.
 
 ## Main-host hardware integrity and recorder self-check
 

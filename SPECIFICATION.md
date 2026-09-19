@@ -47,7 +47,7 @@ Browser/iPhone camera capture is outside the current MVP. Human browsers are vie
 
 ## 2. Repository/runtime layout
 
-Expected implementation expansion:
+Implementation directory skeleton (runtime behavior remains unimplemented):
 
 ```text
 server/app/
@@ -59,7 +59,9 @@ server/app/
 │   └── remote_agent/
 ├── detection/
 ├── events/
+├── integrity/
 ├── media/
+│   └── health/
 ├── notifications/
 └── storage/
 
@@ -67,8 +69,9 @@ agent/
 ├── capture/
 ├── pairing/
 ├── transport/
-├── buffer/
-└── service/
+├── service/
+├── storage/
+└── health/
 
 web/src/
 ├── dashboard/
@@ -77,7 +80,22 @@ web/src/
 ├── timeline/
 ├── setup/
 └── shared/
+
+tests/
+├── unit/
+├── integration/
+├── e2e/
+└── fixtures/
+    └── synthetic/
+
+infra/
+├── systemd/
+└── docker/
+
+scripts/
 ```
+
+`server/app/integrity/` owns Main Server hardware baseline checks; `server/app/media/health/` owns its recording-health self-test. Human authorization and trusted-proxy identity belong in `server/app/auth/`. Agent ring-buffer/protected-incident code belongs in `agent/storage/`; `agent/health/` tracks node/camera health. Runtime media, credentials, inventories, and databases live outside the source tree. Only synthetic/generated fixtures may be versioned under `tests/fixtures/synthetic/`.
 
 The main application may use Docker Compose where appropriate. `media-capture-agent` is intended to run natively as a systemd service so UVC/udev/hotplug handling does not require a privileged container.
 
@@ -361,7 +379,7 @@ If space becomes unsafe:
 
 ### 5.15 Media-root mount safety
 
-The Agent media root is a configurable path that may live on a dedicated mounted filesystem rather than the root filesystem.
+The Agent media root is a deployment-configured path outside the source tree that may live on a dedicated mounted filesystem. Public code/configuration must not embed an actual deployment path.
 
 At install/startup/runtime admission, the Agent shall verify:
 - the configured media root exists or can be created only by the intended installer/owner workflow;
@@ -563,7 +581,7 @@ Agent disk-buffer safety is tracked separately from Main Server storage because 
 
 ## 10. Host hardware integrity and recording self-check
 
-### 11.1 Hardware baseline
+### 10.1 Hardware baseline
 
 During setup, the Owner approves a baseline inventory for the main ServerSentinel host. Collect the strongest local identifiers available without pretending that unavailable identifiers exist.
 
@@ -595,7 +613,7 @@ GPU
 
 The UI/API must represent missing unique identifiers honestly. If the platform exposes no stable per-device identifier for a same-model replacement, ServerSentinel must not claim it can prove that the physical component is unchanged.
 
-### 11.2 Inventory cadence and states
+### 10.2 Inventory cadence and states
 
 Run inventory comparison:
 - at ServerSentinel startup; and
@@ -613,7 +631,7 @@ UNVERIFIABLE
 
 Hardware drift never mutates the approved baseline automatically. The Owner must explicitly approve a new baseline/change. That approval is audited.
 
-### 11.3 Recording-health self-test
+### 10.3 Recording-health self-test
 
 At least once per day, run an end-to-end recording-health check. It should verify as much of the actual recording path as practical:
 
@@ -629,7 +647,7 @@ At least once per day, run an end-to-end recording-health check. It should verif
 
 A self-test failure must not be hidden behind a generic healthy state.
 
-### 11.4 Alerting
+### 10.4 Alerting
 
 The following are immediate Owner-alert conditions rather than waiting only for the scheduled daily summary:
 
@@ -642,7 +660,7 @@ The following are immediate Owner-alert conditions rather than waiting only for 
 
 Notification delivery follows configured local/UI/Slack channels. Slack remains optional; disabling Slack does not suppress the dashboard/audit fault state.
 
-### 11.5 Privacy and privilege
+### 10.5 Privacy and privilege
 
 Detailed hardware identifiers are deployment-local security metadata. Do not send raw serials/UUIDs through telemetry or developer infrastructure. General diagnostics should redact/hash them unless the Owner explicitly exports detailed diagnostics.
 
@@ -650,7 +668,7 @@ Hardware/SMART probing must use the least privilege practical. Do not run the wh
 
 ## 11. Human access architecture
 
-### 10.1 Tailscale reachability vs application authorization
+### 11.1 Tailscale reachability vs application authorization
 
 Tailscale provides private transport/reachability. ServerSentinel authorization is independent:
 
@@ -668,7 +686,7 @@ application access
 
 Tailnet membership by itself grants no ServerSentinel application data.
 
-### 10.2 Tailnet policy is not managed by ServerSentinel
+### 11.2 Tailnet policy is not managed by ServerSentinel
 
 The MVP does **not** require changing Tailscale ACLs/Grants and does not store Tailscale administrative credentials. The owner's existing Tailnet policy may remain unchanged.
 
@@ -676,13 +694,13 @@ Important limitation: when Tailnet policy is left unchanged, ServerSentinel cann
 
 If network-level node concealment is later required, it is an external deployment choice (for example restrictive Tailnet policy or a separate/private Tailnet architecture), not an in-app permission feature.
 
-### 10.3 Trusted proxy boundary
+### 11.3 Trusted proxy boundary
 
 Human UI/API should listen on loopback (or another non-bypassable trusted local boundary) behind Tailscale Serve/equivalent.
 
 If proxy-supplied identity headers are used, accept them only from that path. LAN clients must not be able to reach the same backend listener and spoof identity headers.
 
-### 10.4 In-app principals
+### 11.4 In-app principals
 
 Logical model:
 
@@ -709,7 +727,7 @@ recordings:view
 
 They are independent.
 
-### 10.5 Route authorization
+### 11.5 Route authorization
 
 Examples:
 
@@ -820,7 +838,8 @@ Required test families include:
 - configurable bounded disk ring buffer;
 - Main Server heartbeat loss pins previous 10 min and records next 10 min;
 - reconnect does not silently delete protected incident;
-- agent storage-pressure behavior;
+- agent storage-pressure behavior and 60-day protected-incident expiry;
+- configured Agent media-root mount loss/substitution refuses fallback writes;
 - critical preserve command while connection remains available;
 - multi-source recording/event linkage;
 - detector-specific low-light gating, including person detector `unknown` rather than false negative;
@@ -828,6 +847,8 @@ Required test families include:
 - anonymous tracking/entrance;
 - presence/timeline;
 - storage pressure/hard stop;
+- Main Server startup/daily hardware comparison and Owner-only baseline approval;
+- daily recording-health self-test, mount fail-safe, and immediate failure notification;
 - invited-user `live:view` / `recordings:view` boundaries;
 - phone/Mac live-view authorization;
 - mock E2E.

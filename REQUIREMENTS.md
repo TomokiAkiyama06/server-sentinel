@@ -174,6 +174,9 @@ Protected incidents are excluded from ordinary ring-buffer overwrite before thei
 
 Protected evidence retention, deletion, current bytes, and expiry time shall be visible to the owner.
 
+### AGENT-016 Configurable media root and mount fail-safe
+The Agent media root shall be deployment-configured outside the repository; no personal mount/path is hard-coded. Installer/startup and runtime write admission shall verify the approved filesystem/mount/device identity, dedicated-account writability, free space, and safety reserve. If the expected mount is absent or substituted, the Agent shall report a degraded/failed state and refuse unsafe writes. It shall not silently create or use a fallback media directory on the root filesystem.
+
 ## 7. Capture, encode, and streaming requirements
 
 ### MEDIA-001 Capture/record/inference/view separation
@@ -343,7 +346,7 @@ Raw hardware serials/UUIDs and detailed inventory are deployment-local operation
 Slack is optional and disabled until configured.
 
 ### NOTIFY-002 Sparse immediate alerts
-Immediate alerts default to confirmed server movement/camera tamper. Ordinary person/motion/entry and ordinary camera unplug events are summarized unless the owner configures otherwise.
+Immediate alerts cover confirmed server movement/camera tamper and hardware-integrity/recording-health failures defined by INTEGRITY-006. Ordinary person/motion/entry and ordinary camera unplug events are summarized unless the owner configures otherwise. Slack remains optional; disabling Slack does not suppress immediate local/UI fault reporting.
 
 ### NOTIFY-003 Daily summary
 Default daily summary: 23:00 local time, configurable. Include monitored duration, source/agent health, degraded/offline counts, person/motion/entry counts, critical events, recordings, storage, and errors.

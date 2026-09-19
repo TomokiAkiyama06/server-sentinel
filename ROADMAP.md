@@ -36,10 +36,14 @@ This roadmap is intentionally high-level. GitHub Issues are the execution source
 - [ ] separate LAN ingest listener
 - [ ] node health vs camera health
 - [ ] clock offset monitoring
+- [ ] deployment-configured Agent media root with expected-mount validation and no silent fallback
 
 ## Phase 3 — Media
 
 - [ ] agent->main transport PoC + ADR
+- [ ] Agent compressed disk ring buffer with Owner-selected duration/capacity modes
+- [ ] autonomous T-10/T+10 incident protection, critical preserve command, and 60-day default expiry
+- [ ] Agent storage pressure/hard stop without deleting unexpired protected evidence
 - [ ] capture/record/inference/view profile separation
 - [ ] high-resolution room-overview benchmark
 - [ ] passthrough/hardware/software encode paths
@@ -91,6 +95,9 @@ This roadmap is intentionally high-level. GitHub Issues are the execution source
 - [ ] storage/retention UX
 - [ ] `STORAGE_PRESSURE` / `STORAGE_HARD_STOP`
 - [ ] Slack optional summary/threading
+- [ ] Main Server Owner-approved hardware baseline and startup/daily comparison
+- [ ] daily recording-health self-test, expected-filesystem validation, and bounded write/read/decode verification
+- [ ] immediate Owner alerts for changed/missing hardware and recording-health failures
 
 ## Phase 8 — Hardening / real environment
 
@@ -99,8 +106,9 @@ This roadmap is intentionally high-level. GitHub Issues are the execution source
 - [ ] clock-skew tests
 - [ ] 1–4 source stress tests
 - [ ] phone/Mac private live-view tests
-- [ ] Tailscale visibility + app-permission isolation tests
-- [ ] storage-full tests
+- [ ] unchanged-Tailnet-policy reachability + application-permission isolation tests
+- [ ] storage-full and Agent/Main media-mount loss/substitution tests
+- [ ] startup/daily hardware-integrity and daily recording-health failure/notification tests
 - [ ] low-light detector-gating tests
 - [ ] security/privacy/biometric/license review
 - [ ] 24-hour mixed-source run
@@ -116,7 +124,7 @@ This roadmap is intentionally high-level. GitHub Issues are the execution source
 
 - RTSP/IP camera source;
 - Raspberry Pi/other edge node packaging;
-- independent/off-host evidence storage;
+- general-purpose replication of all Main Server recordings to another host;
 - native mobile app if later justified;
 - cross-camera re-identification (privacy review required);
 - audio surveillance;

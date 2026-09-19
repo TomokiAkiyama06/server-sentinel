@@ -81,7 +81,9 @@ The remote Linux agent:
 
 The main host exposes a narrow LAN ingest boundary for agents, distinct from the human dashboard listener.
 
-The agent also keeps a bounded compressed-video disk ring buffer. The Owner chooses either duration mode or capacity mode. Unexpected Main Server communication loss protects 10 minutes before + 10 minutes after the loss boundary; protected incidents remain on the agent for 60 days by default and then auto-delete.
+The agent also keeps a bounded compressed-video disk ring buffer. The Owner chooses either duration mode or capacity mode. Unexpected Main Server communication loss protects 10 minutes before + 10 minutes after the loss boundary; protected incidents remain on the agent for 60 days from completion by default and then auto-delete.
+
+Ring-buffer and incident storage code belongs in `agent/storage/`; its runtime media root is deployment-configured outside the source tree. Installer/startup and runtime admission verify expected mount/filesystem identity, writability, free space, and safety reserve. Mount loss/substitution refuses unsafe writes rather than silently falling back to the root filesystem.
 
 ## Human-access boundary
 
@@ -106,7 +108,7 @@ invited browser
 
 ServerSentinel does not require or automatically mutate Tailscale ACLs/Grants, and it does not retain a Tailscale administrative credential. The existing Tailnet policy may therefore continue to make the Main Server node visible/reachable to ordinary Tailnet members. Node-level concealment is not guaranteed unless the deployment owner separately configures Tailscale policy.
 
-The application independently checks an owner-managed allowlist and granular permissions such as `live:view` and `recordings:view`. An uninvited Tailnet identity receives no ServerSentinel camera/media/timeline/deployment data even when the underlying Tailscale node is reachable.
+The application independently checks an owner-managed allowlist and independent `live:view` and `recordings:view` permissions. Historical timeline/events belong to `recordings:view` and are unavailable to `live:view` alone. An uninvited Tailnet identity receives no ServerSentinel camera/media/timeline/deployment data even when the underlying Tailscale node is reachable.
 
 ## Media architecture
 
@@ -222,4 +224,4 @@ Default operation has:
 
 ## Extensibility
 
-Potential future additions include RTSP/IP cameras, browser camera nodes, Raspberry Pi/edge nodes, off-host evidence storage, host metrics, environment sensors, and NAS targets. They are not MVP requirements.
+Potential future additions include RTSP/IP cameras, Raspberry Pi/edge nodes, general-purpose off-host recording replication, host metrics, environment sensors, and NAS targets. They are not MVP requirements. Browser/iPhone camera capture is outside the current product scope; any reintroduction requires a new explicit Owner decision/ADR.

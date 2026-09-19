@@ -1,29 +1,150 @@
-# Environment / secrets
+# Environment / secrets (including synthetic fixture paths)
 .env
 .env.*
 !.env.example
+.envrc
+.secrets/
+secrets/
+credentials/
+keys/
+private-keys/
+private_keys/
+certs/
+certificates/
+.credentials
+credentials*.json
+credentials*.yaml
+credentials*.yml
+credentials*.toml
+.netrc
+.ssh/
+id_rsa*
+id_dsa*
+id_ecdsa*
+id_ed25519*
 *.pem
 *.key
+*.p8
 *.p12
+*.pfx
 *.mobileprovision
 *.cer
+*.der
+*.crt
+*.csr
 *.provisionprofile
 
-# Recordings / user data
-recordings/
-data/
-diagnostics/
+# Deployment media/data belongs outside the checkout. Root-scoped paths preserve
+# source modules such as web/src/recordings/ and server/app/media/.
+/recordings/
+/data/
+/diagnostics/
+/media/
+/captures/
+/snapshots/
+/uploads/
+
+# Agent runtime / deployment-local security data
+buffer/
+incidents/
+runtime/
+local-state/
+real-media/
+real-footage/
+camera-footage/
+
+# Local inventory/identifier exports. Source modules remain trackable.
+hardware[-_]inventory*.json
+hardware[-_]inventory*.yaml
+hardware[-_]inventory*.yml
+hardware[-_]inventory*.csv
+hardware[-_]inventory*.txt
+device[-_]inventory*.json
+device[-_]inventory*.yaml
+device[-_]inventory*.yml
+device[-_]inventory*.csv
+device[-_]inventory*.txt
+hardware[-_]serials*.json
+hardware[-_]serials*.yaml
+hardware[-_]serials*.yml
+hardware[-_]serials*.csv
+hardware[-_]serials*.txt
+hardware[-_]uuids*.json
+hardware[-_]uuids*.yaml
+hardware[-_]uuids*.yml
+hardware[-_]uuids*.csv
+hardware[-_]uuids*.txt
+
+hardware[-_]baseline*.json
+hardware[-_]baseline*.yaml
+hardware[-_]baseline*.yml
+hardware[-_]baseline*.csv
+hardware[-_]baseline*.txt
+device[-_]baseline*.json
+device[-_]baseline*.yaml
+device[-_]baseline*.yml
+device[-_]baseline*.csv
+device[-_]baseline*.txt
+device[-_]serials*.json
+device[-_]serials*.yaml
+device[-_]serials*.yml
+device[-_]serials*.csv
+device[-_]serials*.txt
+device[-_]uuids*.json
+device[-_]uuids*.yaml
+device[-_]uuids*.yml
+device[-_]uuids*.csv
+device[-_]uuids*.txt
+
+# Conventional root-local raw identifier exports
+/serials.json
+/serials.yaml
+/serials.yml
+/serials.csv
+/serials.txt
+/uuids.json
+/uuids.yaml
+/uuids.yml
+/uuids.csv
+/uuids.txt
+
+# Database runtime files, including SQLite journal/WAL/SHM sidecars
 *.sqlite
 *.sqlite3
 *.db
+*.sqlite-*
+*.sqlite3-*
+*.db-*
+
+# Monitoring video/audio and camera-original formats
 *.mp4
 *.mov
+*.m4v
+*.mkv
+*.avi
+*.webm
+*.m2ts
+*.h264
+*.h265
+*.hevc
+*.mjpeg
+*.mjpg
+*.yuv
 *.m4a
+*.aac
+*.wav
+*.mp3
+*.flac
+*.ogg
+*.opus
 *.heic
+*.heif
+*.dng
 
-# Test fixture media: real-person / real-environment media must not be committed.
-# Common image/video/audio formats are ignored anywhere under tests/fixtures/,
-# then explicitly re-enabled only for synthetic/generated fixtures.
+# Images in ordinary fixture paths are excluded; UI assets elsewhere remain
+# trackable. Ignore patterns cannot classify real-person/real-room content.
+# Review/CI must enforce synthetic provenance; never place real media or raw
+# deployment identifiers in source/fixture paths, even under an allowed name.
 tests/fixtures/**/*.jpg
 tests/fixtures/**/*.jpeg
 tests/fixtures/**/*.png
@@ -32,16 +153,9 @@ tests/fixtures/**/*.gif
 tests/fixtures/**/*.bmp
 tests/fixtures/**/*.tif
 tests/fixtures/**/*.tiff
-tests/fixtures/**/*.heif
-tests/fixtures/**/*.webm
-tests/fixtures/**/*.m4v
-tests/fixtures/**/*.mkv
-tests/fixtures/**/*.avi
-tests/fixtures/**/*.aac
-tests/fixtures/**/*.wav
-tests/fixtures/**/*.mp3
 
-# Synthetic/generated test media is allowed only in the dedicated fixture subtree.
+# Only generated media and inventory exports may be committed in this subtree.
+# These targeted exceptions never allow .env, credentials, keys, or certificates.
 !tests/fixtures/synthetic/**/*.jpg
 !tests/fixtures/synthetic/**/*.jpeg
 !tests/fixtures/synthetic/**/*.png
@@ -56,26 +170,64 @@ tests/fixtures/**/*.mp3
 !tests/fixtures/synthetic/**/*.mkv
 !tests/fixtures/synthetic/**/*.avi
 !tests/fixtures/synthetic/**/*.webm
+!tests/fixtures/synthetic/**/*.m2ts
+!tests/fixtures/synthetic/**/*.h264
+!tests/fixtures/synthetic/**/*.h265
+!tests/fixtures/synthetic/**/*.hevc
+!tests/fixtures/synthetic/**/*.mjpeg
+!tests/fixtures/synthetic/**/*.mjpg
+!tests/fixtures/synthetic/**/*.yuv
 !tests/fixtures/synthetic/**/*.m4a
 !tests/fixtures/synthetic/**/*.aac
 !tests/fixtures/synthetic/**/*.wav
 !tests/fixtures/synthetic/**/*.mp3
+!tests/fixtures/synthetic/**/*.flac
+!tests/fixtures/synthetic/**/*.ogg
+!tests/fixtures/synthetic/**/*.opus
 !tests/fixtures/synthetic/**/*.heic
 !tests/fixtures/synthetic/**/*.heif
+!tests/fixtures/synthetic/**/*.dng
+!tests/fixtures/synthetic/**/hardware[-_]inventory*.json
+!tests/fixtures/synthetic/**/hardware[-_]inventory*.yaml
+!tests/fixtures/synthetic/**/hardware[-_]inventory*.yml
+!tests/fixtures/synthetic/**/hardware[-_]inventory*.csv
+!tests/fixtures/synthetic/**/hardware[-_]inventory*.txt
+!tests/fixtures/synthetic/**/device[-_]inventory*.json
+!tests/fixtures/synthetic/**/device[-_]inventory*.yaml
+!tests/fixtures/synthetic/**/device[-_]inventory*.yml
+!tests/fixtures/synthetic/**/device[-_]inventory*.csv
+!tests/fixtures/synthetic/**/device[-_]inventory*.txt
+!tests/fixtures/synthetic/**/hardware[-_]serials*.json
+!tests/fixtures/synthetic/**/hardware[-_]serials*.yaml
+!tests/fixtures/synthetic/**/hardware[-_]serials*.yml
+!tests/fixtures/synthetic/**/hardware[-_]serials*.csv
+!tests/fixtures/synthetic/**/hardware[-_]serials*.txt
+!tests/fixtures/synthetic/**/hardware[-_]uuids*.json
+!tests/fixtures/synthetic/**/hardware[-_]uuids*.yaml
+!tests/fixtures/synthetic/**/hardware[-_]uuids*.yml
+!tests/fixtures/synthetic/**/hardware[-_]uuids*.csv
+!tests/fixtures/synthetic/**/hardware[-_]uuids*.txt
 
-# Agent runtime / deployment-local security data
-buffer/
-incidents/
-runtime/
-credentials/
-local-state/
-hardware-inventory*.json
-hardware_inventory*.json
-device-inventory*.json
-device_inventory*.json
-*.crt
-*.csr
-*.pfx
+!tests/fixtures/synthetic/**/hardware[-_]baseline*.json
+!tests/fixtures/synthetic/**/hardware[-_]baseline*.yaml
+!tests/fixtures/synthetic/**/hardware[-_]baseline*.yml
+!tests/fixtures/synthetic/**/hardware[-_]baseline*.csv
+!tests/fixtures/synthetic/**/hardware[-_]baseline*.txt
+!tests/fixtures/synthetic/**/device[-_]baseline*.json
+!tests/fixtures/synthetic/**/device[-_]baseline*.yaml
+!tests/fixtures/synthetic/**/device[-_]baseline*.yml
+!tests/fixtures/synthetic/**/device[-_]baseline*.csv
+!tests/fixtures/synthetic/**/device[-_]baseline*.txt
+!tests/fixtures/synthetic/**/device[-_]serials*.json
+!tests/fixtures/synthetic/**/device[-_]serials*.yaml
+!tests/fixtures/synthetic/**/device[-_]serials*.yml
+!tests/fixtures/synthetic/**/device[-_]serials*.csv
+!tests/fixtures/synthetic/**/device[-_]serials*.txt
+!tests/fixtures/synthetic/**/device[-_]uuids*.json
+!tests/fixtures/synthetic/**/device[-_]uuids*.yaml
+!tests/fixtures/synthetic/**/device[-_]uuids*.yml
+!tests/fixtures/synthetic/**/device[-_]uuids*.csv
+!tests/fixtures/synthetic/**/device[-_]uuids*.txt
 
 # Logs / local diagnostics
 *.log

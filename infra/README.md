@@ -1,13 +1,5 @@
 # Infrastructure
 
-Planned contents:
-- Docker Compose
-- container build files
-- install/update scripts
-- local service configuration
-- optional Tailscale setup guidance
-- CI helper scripts
+Owns deployment packaging: `systemd/` for native service definitions and `docker/` for appropriate Main Server container/Compose assets. Shared installer/update/check tooling belongs in `scripts/`.
 
-Do not place real deployment secrets here.
-
-ServerSentinel does not require a developer-operated production backend.
+Keep configuration paths and deployment values configurable. Do not commit secrets/private deployment data, expose human services publicly by default, change Tailscale ACLs/Grants, or bypass media-mount and least-privilege safeguards.

@@ -65,7 +65,7 @@ Default invariants:
 - no automatic culprit/guilt inference;
 - no public Internet dashboard exposure by default;
 - Tailnet membership alone never authorizes ServerSentinel;
-- uninvited ordinary Tailnet members should receive no ServerSentinel-node Grant where the deployment uses Tailscale access policy;
+- ServerSentinel does not modify Tailscale ACLs/Grants or store Tailscale administrative credentials; existing Tailnet policy may remain unchanged;
 - do not promise concealment from Tailnet Owners/Admins or infrastructure administrators.
 
 ## 6. Secret/sensitive-data handling
@@ -172,7 +172,10 @@ Manual override has precedence. Only explicit/high-confidence `PRESENT` suppress
 - starred recordings never auto-delete;
 - preserve hard filesystem safety reserve;
 - explicit `STORAGE_PRESSURE` / `STORAGE_HARD_STOP`;
-- no silent healthy state during known loss/overload.
+- no silent healthy state during known loss/overload;
+- Agent media root is deployment-configured outside the repository; expected mount loss/substitution refuses unsafe writes and never silently creates a root-filesystem fallback;
+- Main Server compares an Owner-approved hardware baseline at startup and at least daily;
+- Main Server performs a recording-health self-test at least daily; changed/missing approved hardware or recording-health failures trigger immediate Owner notification.
 
 ## 13. Dependency/model licenses
 

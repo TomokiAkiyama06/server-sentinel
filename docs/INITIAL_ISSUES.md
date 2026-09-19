@@ -1,8 +1,22 @@
 # Initial Implementation Issues / Plan
 
-This file is the implementation sequence for the bootstrap PR. Individual plans may become separate GitHub Issues.
+This file is the implementation plan and GitHub Issue index. Plan IDs are stable document identifiers, not GitHub Issue numbers. Each plan below links to its registered Issue, direct prerequisites, labels, and physical acceptance requirements; implementation remains open until its Acceptance Criteria are verified.
+
+Dependencies describe completion order, not a requirement to delay independent mock/contract work. Human-facing routes must remain unavailable until the authorization prerequisite and Plan 17 enforcement are complete. Hardware flags describe the acceptance of each Issue; mockable portions may proceed first, and Plan 21 records final deployment acceptance.
+
+Existing Issues are separate: [#1](https://github.com/TomokiAkiyama06/server-sentinel/issues/1) tracks specification/bootstrap, [#3](https://github.com/TomokiAkiyama06/server-sentinel/issues/3) tracks Claude authentication setup (already closed), and [#4](https://github.com/TomokiAkiyama06/server-sentinel/issues/4) tracks hardened review enforcement. Plan 1 adds CI lint/test and secret/fixture guards rather than duplicating #4.
+
+Label meanings: `server-required` means a Main Server or Capture Node is needed; `hardware-required` means physical camera/GPU/storage/probe validation; `manual-test-required` means manual host/browser/network acceptance. The per-plan Main Server / Capture Node / UVC fields identify the actual environment.
 
 ## Plan 1 — CI / repository guardrails
+
+GitHub Issue: [#5](https://github.com/TomokiAkiyama06/server-sentinel/issues/5)
+
+Depends on: None
+
+Labels: `ci`, `security`
+
+実機要件: Main Server: 不要; Capture Node: 不要; UVC Camera: 不要; Manual test: 不要
 
 Scope:
 - Python/TypeScript lint/test skeleton;
@@ -16,6 +30,14 @@ Acceptance:
 - repository media fixtures are synthetic/generated only.
 
 ## Plan 2 — Backend foundation
+
+GitHub Issue: [#7](https://github.com/TomokiAkiyama06/server-sentinel/issues/7)
+
+Depends on: [#5](https://github.com/TomokiAkiyama06/server-sentinel/issues/5) (Plan 1)
+
+Labels: `backend`
+
+実機要件: Main Server: 不要; Capture Node: 不要; UVC Camera: 不要; Manual test: 不要
 
 Scope:
 - FastAPI application skeleton;
@@ -31,6 +53,14 @@ Acceptance:
 
 ## Plan 3 — React dashboard foundation
 
+GitHub Issue: [#8](https://github.com/TomokiAkiyama06/server-sentinel/issues/8)
+
+Depends on: [#5](https://github.com/TomokiAkiyama06/server-sentinel/issues/5) (Plan 1)
+
+Labels: `frontend`
+
+実機要件: Main Server: 不要; Capture Node: 不要; UVC Camera: 不要; Manual test: 不要
+
 Scope:
 - Japanese-default localization-ready UI;
 - responsive layout;
@@ -42,6 +72,14 @@ Acceptance:
 - no fixed camera slot assumptions.
 
 ## Plan 4 — Camera Source registry
+
+GitHub Issue: [#9](https://github.com/TomokiAkiyama06/server-sentinel/issues/9)
+
+Depends on: [#7](https://github.com/TomokiAkiyama06/server-sentinel/issues/7) (Plan 2)
+
+Labels: `camera-source`, `backend`
+
+実機要件: Main Server: 不要; Capture Node: 不要; UVC Camera: 不要; Manual test: 不要
 
 Scope:
 - collection-based source schema;
@@ -59,6 +97,14 @@ Acceptance:
 
 ## Blocking prerequisite — Owner authorization / trusted Tailscale identity ADR
 
+GitHub Issue: [#6](https://github.com/TomokiAkiyama06/server-sentinel/issues/6)
+
+Depends on: None
+
+Labels: `documentation`, `security`
+
+実機要件: Main Server: 不要; Capture Node: 不要; UVC Camera: 不要; Manual test: 不要
+
 Scope:
 - trusted local owner bootstrap;
 - human dashboard path through Tailscale Serve/equivalent trusted proxy;
@@ -66,7 +112,7 @@ Scope:
 - application principal/allowlist;
 - session/revocation/recovery;
 - exact handling of verified external identity headers;
-- clarify manual Tailnet Grant management in MVP.
+- keep Tailnet policy separately Owner-managed outside ServerSentinel; existing ACLs/Grants may remain unchanged, and ServerSentinel performs no policy mutation or admin-credential storage.
 
 Acceptance:
 - Tailnet membership alone is insufficient;
@@ -76,6 +122,14 @@ Acceptance:
 - no developer-operated identity/cloud.
 
 ## Plan 5 — Local UVC discovery and stable identity
+
+GitHub Issue: [#11](https://github.com/TomokiAkiyama06/server-sentinel/issues/11)
+
+Depends on: [#9](https://github.com/TomokiAkiyama06/server-sentinel/issues/9) (Plan 4), [#6](https://github.com/TomokiAkiyama06/server-sentinel/issues/6) (Auth prerequisite)
+
+Labels: `camera-source`, `backend`, `server-required`, `hardware-required`, `manual-test-required`
+
+実機要件: Main Server: 必要; Capture Node: 不要; UVC Camera: 必要; Manual test: 必要
 
 Scope:
 - Linux UVC/V4L2 discovery;
@@ -95,7 +149,13 @@ Acceptance:
 
 ## Plan 6 — `media-capture-agent` foundation
 
-Labels: `camera-source`, `remote-agent`, `backend`, `security`, `server-required`, `manual-test-required`
+GitHub Issue: [#12](https://github.com/TomokiAkiyama06/server-sentinel/issues/12)
+
+Depends on: [#11](https://github.com/TomokiAkiyama06/server-sentinel/issues/11) (Plan 5)
+
+Labels: `camera-source`, `remote-agent`, `backend`, `security`, `server-required`, `hardware-required`, `manual-test-required`
+
+実機要件: Main Server: 不要; Capture Node: 必要; UVC Camera: 必要; Manual test: 必要
 
 Scope:
 - Linux native agent executable/service;
@@ -120,6 +180,14 @@ Acceptance:
 
 ## Plan 7 — Capture-node pairing + mTLS trust
 
+GitHub Issue: [#13](https://github.com/TomokiAkiyama06/server-sentinel/issues/13)
+
+Depends on: [#12](https://github.com/TomokiAkiyama06/server-sentinel/issues/12) (Plan 6), [#6](https://github.com/TomokiAkiyama06/server-sentinel/issues/6) (Auth prerequisite)
+
+Labels: `remote-agent`, `backend`, `security`
+
+実機要件: Main Server: 不要; Capture Node: 不要; UVC Camera: 不要; Manual test: 不要
+
 Scope:
 - owner-generated short-lived one-time pairing code;
 - node keypair/credential issuance;
@@ -137,6 +205,14 @@ Acceptance:
 
 ## Plan 8 — LAN ingest boundary
 
+GitHub Issue: [#14](https://github.com/TomokiAkiyama06/server-sentinel/issues/14)
+
+Depends on: [#13](https://github.com/TomokiAkiyama06/server-sentinel/issues/13) (Plan 7)
+
+Labels: `remote-agent`, `backend`, `security`, `server-required`, `manual-test-required`
+
+実機要件: Main Server: 必要; Capture Node: 必要; UVC Camera: 不要; Manual test: 必要
+
 Scope:
 - dedicated LAN-facing agent ingest listener;
 - no dashboard routes on ingest listener;
@@ -152,6 +228,14 @@ Acceptance:
 - private LAN operation does not require agent Tailscale membership.
 
 ## Plan 9 — Agent/main transport PoC + ADR
+
+GitHub Issue: [#15](https://github.com/TomokiAkiyama06/server-sentinel/issues/15)
+
+Depends on: [#14](https://github.com/TomokiAkiyama06/server-sentinel/issues/14) (Plan 8)
+
+Labels: `remote-agent`, `camera-source`, `backend`, `documentation`, `server-required`, `hardware-required`, `manual-test-required`
+
+実機要件: Main Server: 必要; Capture Node: 必要; UVC Camera: 必要; Manual test: 必要
 
 Compare realistic options (e.g. WebRTC/SRT/QUIC/authenticated HTTP streaming) against requirements.
 
@@ -172,6 +256,14 @@ Acceptance:
 - no silent healthy state during known media loss.
 
 ## Plan 9A — Agent disk ring buffer + autonomous incident evidence
+
+GitHub Issue: [#16](https://github.com/TomokiAkiyama06/server-sentinel/issues/16)
+
+Depends on: [#15](https://github.com/TomokiAkiyama06/server-sentinel/issues/15) (Plan 9), [#8](https://github.com/TomokiAkiyama06/server-sentinel/issues/8) (Plan 3), [#10](https://github.com/TomokiAkiyama06/server-sentinel/issues/10) (Plan 17)
+
+Labels: `remote-agent`, `storage`, `backend`, `frontend`, `security`, `server-required`, `hardware-required`, `manual-test-required`
+
+実機要件: Main Server: 必要; Capture Node: 必要; UVC Camera: 必要; Manual test: 必要
 
 Scope:
 - compressed-video disk ring buffer on `media-capture-agent`;
@@ -196,6 +288,14 @@ Acceptance:
 
 ## Plan 10 — Capture/record/inference/view profile separation
 
+GitHub Issue: [#17](https://github.com/TomokiAkiyama06/server-sentinel/issues/17)
+
+Depends on: [#15](https://github.com/TomokiAkiyama06/server-sentinel/issues/15) (Plan 9), [#9](https://github.com/TomokiAkiyama06/server-sentinel/issues/9) (Plan 4)
+
+Labels: `camera-source`, `backend`, `server-required`, `hardware-required`, `manual-test-required`
+
+実機要件: Main Server: 必要; Capture Node: 必要; UVC Camera: 必要; Manual test: 必要
+
 Scope:
 - independent profiles;
 - high-resolution room-overview capture option;
@@ -211,6 +311,14 @@ Acceptance:
 - measured resource use recorded.
 
 ## Plan 11 — Durable recording + main-host compressed pre-roll
+
+GitHub Issue: [#18](https://github.com/TomokiAkiyama06/server-sentinel/issues/18)
+
+Depends on: [#17](https://github.com/TomokiAkiyama06/server-sentinel/issues/17) (Plan 10), [#10](https://github.com/TomokiAkiyama06/server-sentinel/issues/10) (Plan 17)
+
+Labels: `backend`, `storage`, `camera-source`
+
+実機要件: Main Server: 不要; Capture Node: 不要; UVC Camera: 不要; Manual test: 不要
 
 Scope:
 - source-ID recording model;
@@ -228,6 +336,14 @@ Acceptance:
 
 ## Plan 12 — Person/motion detector evaluation
 
+GitHub Issue: [#20](https://github.com/TomokiAkiyama06/server-sentinel/issues/20)
+
+Depends on: [#17](https://github.com/TomokiAkiyama06/server-sentinel/issues/17) (Plan 10), [#18](https://github.com/TomokiAkiyama06/server-sentinel/issues/18) (Plan 11)
+
+Labels: `ai`, `backend`, `server-required`, `manual-test-required`, `hardware-required`
+
+実機要件: Main Server: 必要; Capture Node: 不要; UVC Camera: 不要; Manual test: 必要
+
 Scope:
 - motion baseline;
 - YOLOX-first person-detector evaluation;
@@ -242,6 +358,14 @@ Acceptance:
 - capture/inference FPS independent.
 
 ## Plan 13 — Detector-specific image-quality / low-light gating
+
+GitHub Issue: [#22](https://github.com/TomokiAkiyama06/server-sentinel/issues/22)
+
+Depends on: [#20](https://github.com/TomokiAkiyama06/server-sentinel/issues/20) (Plan 12)
+
+Labels: `ai`, `backend`
+
+実機要件: Main Server: 不要; Capture Node: 不要; UVC Camera: 不要; Manual test: 不要
 
 Scope:
 - luminance/blur/saturation/resolution/target-size quality signals;
@@ -258,6 +382,14 @@ Acceptance:
 
 ## Plan 14 — Server ROI movement + camera tamper
 
+GitHub Issue: [#24](https://github.com/TomokiAkiyama06/server-sentinel/issues/24)
+
+Depends on: [#18](https://github.com/TomokiAkiyama06/server-sentinel/issues/18) (Plan 11), [#22](https://github.com/TomokiAkiyama06/server-sentinel/issues/22) (Plan 13)
+
+Labels: `ai`, `backend`, `camera-source`
+
+実機要件: Main Server: 不要; Capture Node: 不要; UVC Camera: 不要; Manual test: 不要
+
 Scope:
 - ROI/polygon/reference capture;
 - global transform compensation;
@@ -272,6 +404,14 @@ Acceptance:
 - local and remote-agent sources supported.
 
 ## Plan 15 — Owner-only verification / anonymous tracking / entrance
+
+GitHub Issue: [#25](https://github.com/TomokiAkiyama06/server-sentinel/issues/25)
+
+Depends on: [#22](https://github.com/TomokiAkiyama06/server-sentinel/issues/22) (Plan 13), [#10](https://github.com/TomokiAkiyama06/server-sentinel/issues/10) (Plan 17)
+
+Labels: `ai`, `backend`, `security`, `server-required`, `manual-test-required`, `hardware-required`
+
+実機要件: Main Server: 必要; Capture Node: 不要; UVC Camera: 不要; Manual test: 必要
 
 Scope:
 - permissively licensed face model evaluation;
@@ -291,6 +431,14 @@ Acceptance:
 
 ## Plan 16 — Presence + unified factual timeline
 
+GitHub Issue: [#26](https://github.com/TomokiAkiyama06/server-sentinel/issues/26)
+
+Depends on: [#24](https://github.com/TomokiAkiyama06/server-sentinel/issues/24) (Plan 14), [#25](https://github.com/TomokiAkiyama06/server-sentinel/issues/25) (Plan 15), [#10](https://github.com/TomokiAkiyama06/server-sentinel/issues/10) (Plan 17)
+
+Labels: `backend`, `frontend`, `security`
+
+実機要件: Main Server: 不要; Capture Node: 不要; UVC Camera: 不要; Manual test: 不要
+
 Scope:
 - `PRESENT/PROBABLY_PRESENT/ABSENT/UNKNOWN`;
 - manual override precedence;
@@ -306,6 +454,14 @@ Acceptance:
 - UI never labels a person culprit/attacker from temporal correlation.
 
 ## Plan 17 — Tailscale/private access + granular permissions
+
+GitHub Issue: [#10](https://github.com/TomokiAkiyama06/server-sentinel/issues/10)
+
+Depends on: [#6](https://github.com/TomokiAkiyama06/server-sentinel/issues/6) (Auth prerequisite), [#7](https://github.com/TomokiAkiyama06/server-sentinel/issues/7) (Plan 2), [#8](https://github.com/TomokiAkiyama06/server-sentinel/issues/8) (Plan 3)
+
+Labels: `backend`, `frontend`, `security`, `server-required`, `manual-test-required`
+
+実機要件: Main Server: 必要; Capture Node: 不要; UVC Camera: 不要; Manual test: 必要
 
 Scope:
 - do not require ServerSentinel to modify Tailscale ACLs/Grants;
@@ -330,6 +486,14 @@ Acceptance:
 
 ## Plan 18 — Main-to-browser live transport
 
+GitHub Issue: [#19](https://github.com/TomokiAkiyama06/server-sentinel/issues/19)
+
+Depends on: [#10](https://github.com/TomokiAkiyama06/server-sentinel/issues/10) (Plan 17), [#17](https://github.com/TomokiAkiyama06/server-sentinel/issues/17) (Plan 10), [#8](https://github.com/TomokiAkiyama06/server-sentinel/issues/8) (Plan 3)
+
+Labels: `frontend`, `backend`, `security`, `server-required`, `manual-test-required`
+
+実機要件: Main Server: 必要; Capture Node: 不要; UVC Camera: 不要; Manual test: 必要
+
 Scope:
 - browser-compatible low-latency transport PoC/ADR;
 - phone + Mac browser support;
@@ -347,6 +511,14 @@ Acceptance:
 
 ## Plan 19 — Storage UX / retention / Slack
 
+GitHub Issue: [#21](https://github.com/TomokiAkiyama06/server-sentinel/issues/21)
+
+Depends on: [#18](https://github.com/TomokiAkiyama06/server-sentinel/issues/18) (Plan 11), [#10](https://github.com/TomokiAkiyama06/server-sentinel/issues/10) (Plan 17), [#8](https://github.com/TomokiAkiyama06/server-sentinel/issues/8) (Plan 3)
+
+Labels: `backend`, `frontend`, `storage`, `security`
+
+実機要件: Main Server: 不要; Capture Node: 不要; UVC Camera: 不要; Manual test: 不要
+
 Scope:
 - event/recording browser;
 - star/unstar/delete owner actions;
@@ -361,9 +533,22 @@ Acceptance:
 - external filesystem consumption triggers admission logic;
 - hard reserve not intentionally crossed;
 - Slack credentials never logged;
-- ordinary person/motion does not spam main channel by default.
+- ordinary person/motion does not spam main channel by default;
+- expired unstarred recordings are deleted first, then oldest eligible unstarred recordings are reclaimed as needed;
+- pressure rejects/suppresses ordinary/manual recording admission;
+- only confirmed critical evidence can use the bounded critical allowance, without crossing hard reserve;
+- unsafe writes enter `STORAGE_HARD_STOP`, with audit/UI state transitions;
+- recovery uses hysteresis rather than oscillating at the threshold.
 
 ## Plan 19A — Main-host hardware integrity + recording-health self-test
+
+GitHub Issue: [#23](https://github.com/TomokiAkiyama06/server-sentinel/issues/23)
+
+Depends on: [#21](https://github.com/TomokiAkiyama06/server-sentinel/issues/21) (Plan 19), [#18](https://github.com/TomokiAkiyama06/server-sentinel/issues/18) (Plan 11), [#10](https://github.com/TomokiAkiyama06/server-sentinel/issues/10) (Plan 17)
+
+Labels: `backend`, `storage`, `security`, `server-required`, `hardware-required`, `manual-test-required`
+
+実機要件: Main Server: 必要; Capture Node: 不要; UVC Camera: 不要; Manual test: 必要
 
 Scope:
 - Owner-approved hardware baseline for CPU / RAM / NVMe(M.2) / HDD / GPU;
@@ -391,6 +576,14 @@ Acceptance:
 
 ## Plan 20 — Full mock E2E + failure scenarios
 
+GitHub Issue: [#27](https://github.com/TomokiAkiyama06/server-sentinel/issues/27)
+
+Depends on: [#16](https://github.com/TomokiAkiyama06/server-sentinel/issues/16) (Plan 9A), [#26](https://github.com/TomokiAkiyama06/server-sentinel/issues/26) (Plan 16), [#19](https://github.com/TomokiAkiyama06/server-sentinel/issues/19) (Plan 18), [#23](https://github.com/TomokiAkiyama06/server-sentinel/issues/23) (Plan 19A)
+
+Labels: `backend`, `frontend`, `ci`
+
+実機要件: Main Server: 不要; Capture Node: 不要; UVC Camera: 不要; Manual test: 不要
+
 Scope:
 - 1–4 mixed local/remote-agent mock sources;
 - agent reconnect/revocation;
@@ -413,6 +606,14 @@ Acceptance:
 
 ## Plan 21 — Real hardware/network/browser acceptance
 
+GitHub Issue: [#28](https://github.com/TomokiAkiyama06/server-sentinel/issues/28)
+
+Depends on: [#27](https://github.com/TomokiAkiyama06/server-sentinel/issues/27) (Plan 20)
+
+Labels: `camera-source`, `remote-agent`, `server-required`, `hardware-required`, `manual-test-required`, `documentation`
+
+実機要件: Main Server: 必要; Capture Node: 必要; UVC Camera: 必要; Manual test: 必要
+
 Scope is defined by `MANUAL_TEST.md`.
 
 Minimum intended environments:
@@ -422,7 +623,7 @@ Minimum intended environments:
 - 1–4 mixed-source stress run;
 - phone browser live view;
 - Mac browser live view;
-- restrictive Tailnet/app authorization test identities;
+- unchanged Tailnet policy with uninvited/live-only/recordings-only/both/revoked application test identities;
 - low-light/degraded behavior;
 - long-duration run;
 - startup + daily hardware-integrity verification;

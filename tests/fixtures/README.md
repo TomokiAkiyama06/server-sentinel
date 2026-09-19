@@ -1,17 +1,5 @@
 # Test Fixtures
 
-Only synthetic or generated media may be committed. Do not commit real monitoring footage, real person images/video, or recordings captured from an actual deployment, even with consent.
+Owns generated domain/protocol fixtures and the `synthetic/` media-fixture boundary for tests.
 
-Media fixtures that need to be version-controlled belong under `tests/fixtures/synthetic/`; `.gitignore` keeps ordinary media files blocked elsewhere in the repository.
-
-Planned fixture classes:
-- empty scene;
-- person enters;
-- ordinary motion;
-- server occlusion;
-- server displacement;
-- camera movement;
-- low light;
-- stream interruption.
-
-Do not commit real research-lab/security footage.
+Only synthetic/generated media may be committed, and version-controlled media belongs under `synthetic/`. Do not commit real-person, real-room, or monitoring media, even with consent or a public license; real hardware serials/UUIDs, credentials, and private deployment values are also prohibited. External benchmark datasets stay outside the repository and GitHub artifacts.
