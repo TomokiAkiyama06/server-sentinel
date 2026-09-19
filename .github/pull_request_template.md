@@ -1,0 +1,66 @@
+## 関連 Issue
+
+Closes #
+
+## 変更内容
+
+-
+
+## 変更理由
+
+-
+
+## テスト
+
+- [ ] Unit
+- [ ] Integration / API
+- [ ] Web checks
+- [ ] Camera Source mock (1〜4 source)
+- [ ] Mock E2E
+- [ ] Docker / build
+- [ ] その他:
+
+## 実機・ブラウザ確認
+
+- [ ] 不要
+- [ ] `hardware-required`
+- [ ] `webcam-required`
+- [ ] `browser-camera-required`
+- [ ] `server-required`
+- [ ] `manual-test-required`
+
+実機確認の詳細:
+
+## セキュリティ / プライバシー / Biometric影響
+
+- [ ] 新たにユーザー環境外へ送信されるデータはない
+- [ ] 新しい Secret / pairing credential の取り扱いはない、または安全に管理している
+- [ ] owner biometric template/verificationへの影響を確認した、または非該当
+- [ ] non-owner named identity / cross-camera biometric re-identificationを追加していない
+- [ ] 追加依存関係・モデル・weights のsource/licenseを確認した
+- [ ] 必要な仕様・セキュリティ・プライバシー文書を更新した
+
+補足:
+
+## Camera Source影響
+
+- [ ] 固定front/rearや固定2台構成を前提にしていない
+- [ ] `local_uvc` / `remote_agent` のどちらかを不必要に特別扱いしていない、または理由を記載した
+- [ ] remote-agent pairing/ingest/reconnect/bufferへの影響を確認した、または非該当
+- [ ] automatic torch/lightを導入していない
+
+## スクリーンショット
+
+UI変更で添付が必要な場合は、synthetic/generated/demo素材のみを使用する。実人物・実環境の監視映像、実機カメラpreview、実運用環境が写る画像・動画・音声は、本人同意の有無にかかわらずPRへ添付せずローカルに保持する。owner face template/embeddingも添付しない。
+
+## 自動レビュー
+
+マージ前に以下を必須とする。
+
+- [ ] Codex レビュー完了（current HEAD）
+- [ ] Claude レビュー完了（current HEAD）
+- [ ] 両レビューの重大・重要な指摘を解消
+- [ ] 必須CI成功
+- [ ] 未解決のブロッキングレビューがない
+
+PRタイトル・本文、およびエージェントが投稿するレビュー対応コメントは原則日本語で記載する。技術用語、識別子、コード、固有名詞は英語のままでよい。
