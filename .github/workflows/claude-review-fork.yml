@@ -125,7 +125,7 @@ jobs:
             Secret、環境変数、tokenを表示・推測・送信せず、Secretらしき値は引用しないでください。
 
             ServerSentinelのPRを原則日本語でレビューしてください。信頼済みdefault branch側のAGENTS.md、REQUIREMENTS.md、SPECIFICATION.md、SECURITY.md、PRIVACY.mdを基準にしてください。
-            仕様整合性、バグ/境界条件、セキュリティ、認証/Secret、prompt injection、プライバシー/biometric境界、データ破壊、容量枯渇、並行処理、テスト、依存/モデル/weightsライセンス、Camera Source/UVC/Web Camera Node/Ubuntu/Web間契約、secure context/browser lifecycle、保守性を重点確認してください。
+            仕様整合性、バグ/境界条件、セキュリティ、認証/Secret、prompt injection、プライバシー/biometric境界、データ破壊、容量枯渇、並行処理、テスト、依存/モデル/weightsライセンス、Camera Source/UVC/remote agent/LAN ingest/Tailscale・アプリ権限/Agent disk buffer/Ubuntu/Web間契約、保守性を重点確認してください。
 
             review_markdownにはレビュー本文のみを書き、指摘を「重大」「重要」「提案」に分類してください。重大/重要がない場合は明示してください。
             highest_severityは critical / important / proposal / none のいずれかです。
