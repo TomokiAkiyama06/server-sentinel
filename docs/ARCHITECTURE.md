@@ -81,7 +81,7 @@ The remote Linux agent:
 
 The main host exposes a narrow LAN ingest boundary for agents, distinct from the human dashboard listener.
 
-The agent also keeps a bounded compressed-video disk ring buffer. The Owner chooses either duration mode or capacity mode. Unexpected Main Server communication loss protects 10 minutes before + 10 minutes after the loss boundary; protected incidents remain on the agent for 30 days and then auto-delete.
+The agent also keeps a bounded compressed-video disk ring buffer. The Owner chooses either duration mode or capacity mode. Unexpected Main Server communication loss protects 10 minutes before + 10 minutes after the loss boundary; protected incidents remain on the agent for 60 days by default and then auto-delete.
 
 ## Human-access boundary
 
@@ -104,9 +104,9 @@ invited browser
     -> loopback-only ServerSentinel dashboard/API
 ```
 
-Ordinary uninvited Tailnet members should receive no Grant to the main ServerSentinel node and therefore no normal peer visibility/connectivity where Tailscale policy trimming applies. ServerSentinel does not claim to hide the machine from Tailnet Owners/Admins or infrastructure administrators.
+ServerSentinel does not require or automatically mutate Tailscale ACLs/Grants, and it does not retain a Tailscale administrative credential. The existing Tailnet policy may therefore continue to make the Main Server node visible/reachable to ordinary Tailnet members. Node-level concealment is not guaranteed unless the deployment owner separately configures Tailscale policy.
 
-The application independently checks an allowlist and granular permissions such as `live:view` and `recordings:view`.
+The application independently checks an owner-managed allowlist and granular permissions such as `live:view` and `recordings:view`. An uninvited Tailnet identity receives no ServerSentinel camera/media/timeline/deployment data even when the underlying Tailscale node is reachable.
 
 ## Media architecture
 
@@ -180,7 +180,34 @@ When resources are constrained:
 5. reduce live-view quality;
 6. surface explicit degraded state.
 
-Ubuntu main storage is authoritative. Agent-side recovery buffering is a separate pending decision and is not currently a durable-evidence guarantee.
+Ubuntu main storage is authoritative for normal recording. A remote `media-capture-agent` keeps a bounded compressed-video disk ring buffer and, on unexpected Main Server communication loss, protects the 10 minutes before + 10 minutes after loss as secondary incident evidence. Protected incidents remain on the agent for 60 days by default. This is resilience evidence, not a full mirror of all recordings.
+
+## Main-host integrity architecture
+
+ServerSentinel also monitors whether the recorder itself still matches the Owner-approved hardware baseline and can actually write usable recordings.
+
+```text
+Owner-approved baseline
+  ├─ CPU
+  ├─ RAM modules
+  ├─ NVMe / M.2
+  ├─ HDD / recording devices
+  └─ GPU
+        │
+        ├─ compare at startup
+        └─ compare at least daily
+              │
+              ├─ OK
+              ├─ CHANGED / MISSING
+              ├─ NEW_DEVICE
+              └─ UNVERIFIABLE
+```
+
+Baseline drift never self-approves. The Owner explicitly approves deliberate replacements.
+
+A separate daily recording-health self-test validates source freshness, recorder/encoder state, the expected recording filesystem/device, free-space admission, and a bounded write + fsync + reopen/read/decode path. Available SMART/NVMe health indicators are also surfaced. Missing/changed baseline hardware and recording-health failures generate immediate Owner alerts rather than waiting only for the daily summary.
+
+Raw hardware serials/UUIDs remain deployment-local and are redacted from normal public diagnostics.
 
 ## Privacy architecture
 
