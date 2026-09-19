@@ -39,13 +39,27 @@ Bootstrap the deployment owner from a trusted local context. Configure recovery/
 - configure recording allocation;
 - explain hard filesystem safety reserve and pressure/hard-stop states.
 
-### Step 4 — Locale/time
+### Step 4 — Hardware baseline / recorder self-check
+
+Show the Owner the detected main-host inventory and require explicit approval of the initial baseline:
+
+- CPU;
+- RAM modules/slots;
+- NVMe/M.2;
+- HDD/recording drives;
+- GPU.
+
+Use the strongest available stable identifiers and clearly mark fields that are unavailable/unverifiable. Explain that ServerSentinel checks the baseline at startup and at least once per day, never silently rewrites it, and immediately alerts on material missing/changed hardware.
+
+Also run/preview the recording-health self-test: expected recording filesystem, source freshness, recorder/encoder state, free-space/safety reserve, bounded temporary write + fsync + reopen/read/decode validation, and available SMART/NVMe health.
+
+### Step 5 — Locale/time
 
 - timezone;
 - daily summary default 23:00;
 - verify main-host time synchronization.
 
-### Step 5 — Add Camera Sources
+### Step 6 — Add Camera Sources
 
 The product can complete setup with one source and supports up to four active sources.
 
@@ -56,7 +70,7 @@ The product can complete setup with one source and supports up to four active so
 
 No fixed front/rear slots.
 
-### Step 6 — Detection profiles
+### Step 7 — Detection profiles
 
 For each source:
 - name;
@@ -68,15 +82,15 @@ For each source:
 
 Audio controls are omitted in the MVP because monitoring is video-only.
 
-### Step 7 — Owner verification (optional)
+### Step 8 — Owner verification (optional)
 
 Explain biometric processing, enroll only the deployment owner, validate quality, store template locally, and provide delete/re-enroll controls.
 
-### Step 8 — Slack (optional)
+### Step 9 — Slack (optional)
 
 Disabled by default; skip allowed; provide a safe test message.
 
-### Step 9 — Human remote access
+### Step 10 — Human remote access
 
 Explain that two separate approvals are required:
 
@@ -137,6 +151,19 @@ Audio: not captured
 ```
 
 Normal operation has no desktop window/tray requirement.
+
+### Agent recovery-buffer setup
+
+Owner-only configuration offers one of two modes:
+
+```text
+[ Duration limit ]  -> choose rolling-buffer time
+[ Capacity limit ]  -> choose maximum ring-buffer disk bytes
+```
+
+The UI shows estimated reciprocal capacity/duration, actual usage, protected-incident usage, free space, and safety reserve. Settings that cannot safely preserve the required 10-minute pre-loss target are rejected or explicitly degraded.
+
+On unexpected Main Server communication loss, the Agent protects 10 minutes before + 10 minutes after the loss boundary. Completed protected incidents are retained locally for **60 days by default** and are not overwritten by the ordinary ring buffer before expiry.
 
 ### USB unplug behavior
 
@@ -273,5 +300,9 @@ Prefer explicit Japanese states:
 - `処理負荷のため解析頻度を下げています`
 - `ストレージ残量が少なくなっています`
 - `新しい録画を保存できません`
+- `承認済みハードウェア構成から変更を検出しました`
+- `録画先ストレージが見つからないか別デバイスです`
+- `録画自己診断に失敗しました`
+- `ハードウェア識別情報を確認できません`
 
 Avoid silent degradation.
