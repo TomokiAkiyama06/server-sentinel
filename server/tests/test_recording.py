@@ -59,6 +59,11 @@ class RecordingTests(unittest.TestCase):
         self.db = sqlite3.connect(self.base / "metadata.sqlite", isolation_level=None)
         self.addCleanup(self.db.close)
         migrate(self.db, APPLICATION_MIGRATIONS)
+        self.assertEqual(
+            self.db.execute("SELECT version, name FROM schema_migrations ORDER BY version").fetchall(),
+            [(1, "foundation"), (2, "camera_registry"), (3, "uvc_identity"),
+             (4, "durable_recording")],
+        )
         self.policy = Reservation()
         self.validator = SyntheticValidator()
         self.limits = Limits(pre_roll_bytes=4096, max_segment_bytes=512,
