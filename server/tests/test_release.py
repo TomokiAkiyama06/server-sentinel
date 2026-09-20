@@ -578,6 +578,21 @@ class DeploymentConfigurationTests(unittest.TestCase):
                     stdout.getvalue(), "ServerSentinel deployment validation passed\n"
                 )
 
+            source_module = root / "releases/server/app/deployment.py"
+            source_module.parent.mkdir(parents=True)
+            source_module.write_text("synthetic")
+            with patch("app.deployment.__file__", str(source_module)), patch(
+                    "app.deployment.os.path.ismount", return_value=True), patch(
+                    "app.deployment._operating_system_root_device",
+                    return_value=device + 1), patch(
+                        "sys.stdout", new_callable=io.StringIO) as stdout:
+                self.assertEqual(
+                    deployment_main(["--config", str(external), "--check"]), 0
+                )
+            self.assertEqual(
+                stdout.getvalue(), "ServerSentinel deployment validation passed\n"
+            )
+
     def test_configuration_is_private_bounded_and_owned(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

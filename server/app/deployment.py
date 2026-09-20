@@ -5,12 +5,14 @@ import argparse
 import json
 import os
 from pathlib import Path
+import re
 import stat
 
 from app.settings import ConfigurationError, Settings
 
 
 MAX_CONFIGURATION_BYTES = 16 * 1024
+RELEASE_VERSION = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+(?:-[a-z0-9.]+)?")
 
 
 def _operating_system_root_device() -> int:
@@ -22,7 +24,9 @@ def _runtime_roots() -> tuple[Path, Path | None]:
         code_root = Path(__file__).resolve(strict=True).parents[1]
     except (OSError, RuntimeError, IndexError):
         raise ConfigurationError("deployment code location is unavailable") from None
-    install_root = code_root.parent.parent if code_root.parent.name == "releases" else None
+    install_root = None
+    if code_root.parent.name == "releases" and RELEASE_VERSION.fullmatch(code_root.name):
+        install_root = code_root.parent.parent
     return code_root, install_root
 
 
