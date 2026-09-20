@@ -247,6 +247,8 @@ Repository must never contain real:
 
 Run secret scanning in CI.
 
+The `CI` workflow checks tracked files for known secret formats and sensitive paths before lint/tests, and checks deterministic synthetic fixture provenance. Findings never include matched values. This is a bounded scanner, not proof that unknown credentials or private values are absent; it does not scan Git history. CI runs PR code on GitHub-hosted runners without deployment secrets, persisted checkout credentials, or artifact uploads. See `docs/CI.md` for component onboarding and test limitations. Issue #4 continues to track enforcement of review provenance.
+
 ## Media ingestion
 
 For remote-agent media enforce:

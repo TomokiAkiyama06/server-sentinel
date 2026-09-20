@@ -1,0 +1,78 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  repository:
+    name: Repository guards and tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+      - name: Scan tracked files and synthetic provenance
+        run: python scripts/ci/repository_guard.py
+      - name: Install hash-pinned CI tools
+        env:
+          PIP_DISABLE_PIP_VERSION_CHECK: '1'
+        run: python -m pip install --require-hashes --only-binary=:all: -r .ci/requirements.txt
+      - name: Python lint
+        run: |
+          python -m pyflakes scripts tests
+          python -m pycodestyle --select=E4,E7,E9 scripts tests
+      - name: Synthetic guard and component regression tests
+        run: python -m unittest discover -s tests/unit -p 'test_*.py' -v
+      - name: Whitespace validation
+        run: git diff --check HEAD^ HEAD
+
+  components:
+    name: Conditional component checks
+    needs: repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - name: Run configured lint, tests, Docker, Compose and isolated smoke checks
+        run: python scripts/ci/component_checks.py
+      - name: Scan available component build output
+        run: python scripts/ci/repository_guard.py
+
+  ci:
+    name: CI
+    if: ${{ always() }}
+    needs: [repository, components]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - name: Require all checks to succeed
+        env:
+          REPOSITORY_RESULT: ${{ needs.repository.result }}
+          COMPONENT_RESULT: ${{ needs.components.result }}
+        run: |
+          test "$REPOSITORY_RESULT" = success
+          test "$COMPONENT_RESULT" = success

@@ -2,4 +2,5 @@ ServerSentinel
 
 This product includes software developed by ServerSentinel contributors.
 
-Third-party notices will be maintained separately as implementation dependencies are selected.
+Development/CI tooling is listed in THIRD_PARTY_NOTICES.md. Runtime dependencies
+and model artifacts require separate review before introduction.

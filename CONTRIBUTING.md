@@ -14,6 +14,7 @@ Read:
 6. `CLAUDE.md`
 7. `docs/THIRD_PARTY_POLICY.md`
 8. `docs/CLAUDE_REVIEW_SETUP.md`
+9. `docs/CI.md`
 
 ## Workflow
 
@@ -21,6 +22,7 @@ Read:
 - Do not work directly on `main`.
 - Create a focused branch.
 - Add tests.
+- Run the checks in `docs/CI.md`; new runtime components must provide locked dependencies, lint/test commands, and synthetic smoke scenarios.
 - Open a PR.
 - Record the current 40-character PR HEAD and base SHAs in the review request and PR review record. Request both Codex + Claude to review that fixed HEAD/base diff, and wait for CI.
 - At review completion and immediately before merge, compare both reviewed SHAs with the current PR HEAD/base. For Codex, verify `Reviewed commit` plus the base recorded in its pinned review request; HEAD alone is insufficient.

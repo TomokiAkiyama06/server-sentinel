@@ -1,0 +1,9 @@
+{
+  "schema": 1,
+  "fixtures": [
+    {
+      "path": "tests/fixtures/synthetic/checkerboard.ppm",
+      "recipe": "checkerboard-8x8-v1"
+    }
+  ]
+}
