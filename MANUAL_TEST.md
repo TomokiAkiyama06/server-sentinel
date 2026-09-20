@@ -712,3 +712,67 @@ synthetic test branches/PRs; no production data or unrelated rule deletion.
 - Before any person model is loaded, verify exact implementation/runtime/weights licenses, immutable versions, local artifact SHA-256 and the complete dependency notices. Confirm no runtime downloads, alternative-model fallback, reporting or unapproved outbound attempts on normal and failure paths.
 - Benchmark the accepted person backend on CPU; GPU is optional and separately measured. External benchmark media stays local under its terms and is never committed or attached to GitHub/CI. No real-model accuracy or target-host performance was verified by synthetic unit tests.
 - Stop/delay inference, inject quality loss, stale frames and a wedged plugin in the isolated worker: result must become unknown, loss/throttling remain visible, and capture/recording/health/storage-safety work must continue. Verify the production watchdog/resource limits separately; the primitive cannot forcibly interrupt a native call.
+
+## ADR-0003 follow-up: proposed human-access boundary
+
+These checks belong to #10/#19/#27/#28 after Owner approval and runtime
+integration, matching the follow-up recorded in ADR-0003. They are not completed
+by the Issue #6 synthetic policy model.
+
+- Verify the reserved hostname serves ServerSentinel alone on every scheme and
+  port: enumerate the Serve/reverse-proxy mappings for that name, request
+  unrelated paths and other ports, and confirm nothing else answers. Then add a
+  second mapping on the same origin, and separately on another HTTPS port of the
+  same hostname, and confirm startup refuses to serve instead of continuing,
+  including when the configuration cannot be read.
+- Confirm the port case really is a cookie leak before relying on the check:
+  with a session established, request the second port and observe that the
+  browser attaches the `__Host-` session cookie there, which is why the whole
+  hostname rather than one origin is reserved.
+- Bind an unrelated HTTPS listener directly to the node's Tailscale address from
+  a separate local process, creating no proxy mapping. Verify the startup and
+  daily listener enumeration detects it, closes human access and notifies the
+  Owner, and record explicitly that a bind occurring between two checks is not
+  detected until the next one. Then verify the recorded deployment isolation
+  (dedicated network identity, or single-purpose node) actually prevents that
+  bind, since the application cannot.
+- Verify Owner bootstrap provisions the first credential locally: the command
+  creates the Owner and a single-use short-lived enrollment authorization, human
+  access stays closed until it is redeemed once from the reserved origin with a
+  matching identity and user verification, and a second redemption, an expired
+  authorization, or a browser connection carrying only the shared login is
+  refused with the generic response. Confirm the value appears only on the local
+  console and never in logs, audit records, URLs, referrers or diagnostics on
+  either the local or the manually transferred remote path.
+- Issue an enrollment authorization, run recovery for the same Owner identity
+  before redeeming it, and confirm the pending authorization is refused
+  afterwards and that only a newly issued one completes recovery. Step the clock
+  backwards past its issue time and confirm redemption is refused rather than
+  effectively extending the short lifetime.
+- Confirm a verified shared-account login with an active invitation but no
+  credential-backed session is refused like an uninvited one, that user
+  verification is required at every authentication, that revoking one credential
+  ends only its own sessions, and that an Owner operation with a stale
+  verification performs nothing. Step the host clock backwards after a step-up
+  and restore a session record holding a future verification time: both must
+  require the step-up again instead of counting as fresh.
+- From ordinary LAN and Tailnet clients, attempt direct IPv4/IPv6 upstream access
+  and forged identity/forwarded headers, including Docker-published ports. Verify
+  no bypass to human routes, assets, health, schema, or SPA/error fallbacks.
+- On the installed Serve version, verify spoofed headers are replaced, tagged
+  devices have no human identity, and shared-but-uninvited users receive the same
+  generic denial. Reject malformed/duplicate/unsupported-encoding identities.
+- Verify first-visitor ownership is impossible; local administrator confirmation
+  creates exactly one Owner, and a concurrent attempt cannot add a second Owner.
+- Check phone/Mac/desktop same-origin session establishment, cookie attributes,
+  CSRF rejection, logout, expiry, restart/clock discontinuity, copied cookie/URL
+  rejection, and independent live/recordings/history permissions.
+- While each supported live/playback transport is actively delivering, revoke
+  access from another session. New requests fail after commit; measure delivery
+  cancellation across workers and blocked writes against the Owner-approved bound.
+  Distinguish server delivery from bytes already buffered in the browser.
+- Interrupt local recovery before/after durable commit, restore an authorization
+  backup, and simulate unavailable state. Verify fail-closed admission and no
+  restored sessions, media deletion, or network-policy mutation.
+- Keep real identities, network details, credentials, and media deployment-local.
+  Record sanitized outcomes only. No real execution is claimed by the ADR PR.
