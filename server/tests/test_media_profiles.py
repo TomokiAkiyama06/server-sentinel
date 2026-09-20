@@ -1,5 +1,6 @@
 """Synthetic packets exercise profile independence, bounds and resource release."""
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from fractions import Fraction
 import hashlib
@@ -9,8 +10,10 @@ from uuid import UUID
 from app.media.profiles import (
     AdapterUnavailable, CaptureProfile, CompressedPacket, EncodeMode,
     InferenceProfile, InferenceSampler, QueueLimits, RecordingProfile,
-    SourcePipeline, SourceProfiles, VideoFormat, ViewerProfile, plan_encoding,
+    SourcePipeline, SourceProfileAdmissions, SourceProfileCapabilities,
+    SourceProfiles, VideoFormat, ViewerProfile, plan_encoding,
 )
+from app.cameras.registry.models import SourceType
 
 
 SOURCE = UUID(int=1)
@@ -91,9 +94,11 @@ class SyntheticFactory:
 
 
 def pipeline(*, source=SOURCE, recording=None, viewer=None,
-             recording_limits=QueueLimits(8, 1024), viewer_limits=QueueLimits(8, 1024)):
-    return SourcePipeline(source, STREAM, source_profiles(), recording_limits,
-                          viewer_limits, recording, viewer)
+             recording_limits=QueueLimits(8, 1024), viewer_limits=QueueLimits(8, 1024),
+             profiles=None, admission=None):
+    profiles = profiles or source_profiles()
+    return SourcePipeline(source, STREAM, profiles, recording_limits,
+                          viewer_limits, recording, viewer, admission)
 
 
 class PlannerTests(unittest.TestCase):
@@ -166,7 +171,216 @@ class SamplingTests(unittest.TestCase):
                          "first_frame")
 
 
+class AdmissionTests(unittest.TestCase):
+    def capabilities(self, source=SOURCE, source_type=SourceType.LOCAL_UVC,
+                     profiles=None):
+        profiles = profiles or source_profiles()
+        return SourceProfileCapabilities(
+            source, source_type, (profiles,),
+        )
+
+    def test_profiles_are_admitted_from_that_sources_exact_allowlist(self):
+        admissions = SourceProfileAdmissions(4)
+        supported = source_profiles()
+        admitted = admissions.admit(self.capabilities(), supported)
+        self.assertTrue(admitted.admitted)
+        self.assertIsNotNone(admitted.lease)
+        self.assertEqual(admissions.admitted(SOURCE), supported)
+
+        # The alternative is synthetic and deliberately not a product default.
+        alternative = replace(
+            supported,
+            inference=inference_profile(fps=Fraction(2)),
+            viewer=ViewerProfile(video_format(width=1280, height=720,
+                                               fps=Fraction(15))),
+        )
+        rejected = admissions.admit(self.capabilities(), alternative)
+        self.assertFalse(rejected.admitted)
+        self.assertEqual(rejected.reasons, ("profile_set_unsupported",))
+        self.assertEqual(admissions.admitted(SOURCE), supported)
+
+    def test_source_allowlists_cannot_be_reused_or_change_source_type(self):
+        admissions = SourceProfileAdmissions(2)
+        profiles = source_profiles()
+        first = admissions.admit(self.capabilities(), profiles)
+        self.assertTrue(first.admitted)
+        changed = admissions.admit(
+            self.capabilities(source_type=SourceType.REMOTE_AGENT), profiles,
+        )
+        self.assertFalse(changed.admitted)
+        self.assertIn("source_type_changed", changed.reasons)
+
+        other = UUID(int=44)
+        other_decision = admissions.admit(self.capabilities(other), profiles)
+        self.assertTrue(other_decision.admitted)
+        third = admissions.admit(self.capabilities(UUID(int=45)), profiles)
+        self.assertEqual(third.reasons, ("active_source_limit",))
+        self.assertTrue(admissions.release(other_decision.lease))
+        replacement = admissions.admit(self.capabilities(UUID(int=45)), profiles)
+        self.assertTrue(replacement.admitted)
+        self.assertTrue(admissions.release(first.lease))
+        changed = admissions.admit(
+            self.capabilities(source_type=SourceType.REMOTE_AGENT), profiles,
+        )
+        self.assertEqual(changed.reasons, ("source_type_changed",))
+
+    def test_capabilities_require_verified_video_without_hardware_defaults(self):
+        profiles = source_profiles()
+        unverified = replace(
+            profiles,
+            capture=CaptureProfile(video_format(verified=False), Fraction(2)),
+        )
+        with self.assertRaises(ValueError):
+            self.capabilities(profiles=unverified)
+        with self.assertRaises(ValueError):
+            SourceProfileAdmissions(0)
+
+    def test_concurrent_source_admission_does_not_overbook(self):
+        admissions = SourceProfileAdmissions(4)
+        profiles = source_profiles()
+        sources = [UUID(int=value) for value in range(100, 108)]
+        with ThreadPoolExecutor(max_workers=len(sources)) as executor:
+            decisions = tuple(executor.map(
+                lambda source: admissions.admit(self.capabilities(source), profiles),
+                sources,
+            ))
+        self.assertEqual(sum(decision.admitted for decision in decisions), 4)
+        self.assertEqual(admissions.active_sources, 4)
+        self.assertTrue(all(decision.admitted
+                            or decision.reasons == ("active_source_limit",)
+                            for decision in decisions))
+
+    def test_stale_release_cannot_remove_replacement_generation(self):
+        admissions = SourceProfileAdmissions(1)
+        profiles = source_profiles()
+        first = admissions.admit(self.capabilities(), profiles)
+        replacement = admissions.admit(self.capabilities(), profiles)
+        self.assertFalse(admissions.release(first.lease))
+        self.assertEqual(admissions.active_sources, 1)
+        blocked = admissions.admit(self.capabilities(UUID(int=200)), profiles)
+        self.assertEqual(blocked.reasons, ("active_source_limit",))
+        self.assertTrue(admissions.release(replacement.lease))
+
+    def test_released_or_superseded_lease_cannot_run_a_pipeline(self):
+        admissions = SourceProfileAdmissions(1)
+        profiles = source_profiles()
+        first = admissions.admit(self.capabilities(), profiles)
+        old_pipeline = pipeline(recording=SyntheticFactory(), profiles=profiles,
+                                admission=first.lease)
+        blocked = admissions.admit(self.capabilities(), profiles)
+        self.assertEqual(blocked.reasons, ("pipeline_active",))
+        self.assertTrue(old_pipeline.status.state in {"degraded", "healthy"})
+        old_pipeline.close()
+        replacement = admissions.admit(self.capabilities(), profiles)
+        with self.assertRaises(RuntimeError):
+            old_pipeline.replace_inference_profile(inference_profile(fps=Fraction(2)))
+        with self.assertRaises(ValueError):
+            pipeline(recording=SyntheticFactory(), profiles=profiles,
+                     admission=first.lease)
+
+        self.assertTrue(admissions.release(replacement.lease))
+        with self.assertRaises(ValueError):
+            pipeline(recording=SyntheticFactory(), profiles=profiles,
+                     admission=replacement.lease)
+
+    def test_admission_bound_pipeline_rejects_unlisted_adaptation(self):
+        base = source_profiles()
+        allowed_viewer = ViewerProfile(video_format(width=1280, height=720,
+                                                     fps=Fraction(15)))
+        allowed = replace(base, viewer=allowed_viewer)
+        capabilities = SourceProfileCapabilities(
+            SOURCE, SourceType.LOCAL_UVC, (base, allowed),
+        )
+        admissions = SourceProfileAdmissions(1)
+        decision = admissions.admit(capabilities, base)
+        self.assertFalse(hasattr(decision.lease, "release_pipeline"))
+        self.assertFalse(hasattr(decision.lease, "transition"))
+        value = pipeline(recording=SyntheticFactory(), viewer=SyntheticFactory(),
+                         profiles=base, admission=decision.lease)
+        self.addCleanup(value.close)
+        value.replace_viewer_profile(allowed_viewer)
+        self.assertEqual(value.profiles, allowed)
+        self.assertEqual(admissions.admitted(SOURCE), allowed)
+        with self.assertRaises(ValueError):
+            pipeline(recording=SyntheticFactory(), profiles=base,
+                     admission=decision.lease)
+        with self.assertRaises(ValueError):
+            pipeline(recording=SyntheticFactory(), profiles=allowed,
+                     admission=decision.lease)
+        unsupported = ViewerProfile(video_format(width=640, height=360,
+                                                  fps=Fraction(5)))
+        value.add_viewer(SUBSCRIBER)
+        with self.assertRaises(ValueError):
+            value.replace_viewer_profile(unsupported)
+        self.assertEqual(value.profiles, allowed)
+        self.assertEqual(admissions.admitted(SOURCE), allowed)
+        self.assertIsNotNone(value.viewer_status)
+        self.assertTrue(value.viewer_status.active)
+        self.assertEqual(value.subscriber_count, 1)
+        with self.assertRaises(ValueError):
+            value.replace_inference_profile(inference_profile(fps=Fraction(2)))
+        self.assertEqual(value.profiles, allowed)
+        self.assertEqual(admissions.admitted(SOURCE), allowed)
+
+    def test_failed_pipeline_cleanup_retains_exclusive_lease_claim(self):
+        profiles = source_profiles()
+        admissions = SourceProfileAdmissions(1)
+        decision = admissions.admit(self.capabilities(), profiles)
+        factory = SyntheticFactory()
+        value = pipeline(recording=factory, profiles=profiles, admission=decision.lease)
+        factory.adapters[0].fail_close = True
+        value.close()
+        self.assertFalse(admissions.release(decision.lease))
+        with self.assertRaises(ValueError):
+            pipeline(recording=SyntheticFactory(), profiles=profiles,
+                     admission=decision.lease)
+
+        factory.adapters[0].fail_close = False
+        value.close()
+        replacement = pipeline(recording=SyntheticFactory(), profiles=profiles,
+                               admission=decision.lease)
+        value.close()  # The stale claim cannot release the replacement claim.
+        self.assertNotEqual(replacement.status.state, "unavailable")
+        self.assertTrue(replacement.offer(packet(0, keyframe=True)).recording_queued)
+        replacement.close()
+
+
 class PipelineTests(unittest.TestCase):
+    def test_source_status_reports_demand_paths_and_known_capture_loss(self):
+        recording, viewer = SyntheticFactory(), SyntheticFactory()
+        value = pipeline(recording=recording, viewer=viewer)
+        self.addCleanup(value.close)
+        self.assertEqual(value.status.state, "degraded")
+        self.assertIsNone(value.status.viewer)
+        value.offer(packet(0, keyframe=True))
+        value.pump(1)
+        self.assertEqual(value.status.state, "healthy")
+
+        value.add_viewer(SUBSCRIBER)
+        self.assertEqual(value.status.state, "degraded")
+        self.assertIn("viewer_awaiting_keyframe", value.status.reasons)
+        value.offer(packet(2, keyframe=True))
+        value.pump(1)
+        status = value.status
+        self.assertEqual(status.state, "degraded")
+        self.assertEqual(status.capture_discontinuities, 1)
+        self.assertIn("sequence_gap", status.reasons)
+        value.remove_viewer(SUBSCRIBER)
+        self.assertIsNone(value.status.viewer)
+
+    def test_unavailable_recording_or_capture_renegotiation_is_not_healthy(self):
+        value = pipeline(recording=None)
+        self.assertEqual(value.status.state, "unavailable")
+        self.assertIn("recording_unavailable", value.status.reasons)
+
+        value = pipeline(recording=SyntheticFactory())
+        self.addCleanup(value.close)
+        value.offer(packet(0, keyframe=True))
+        value.pump(1)
+        value.offer(packet(1, time_base=Fraction(1, 90_000)))
+        self.assertEqual(value.status.state, "unavailable")
+        self.assertIn("capture_renegotiation_required", value.status.reasons)
+
     def test_viewer_demand_lifetime_and_adaptation_leave_recording_unchanged(self):
         recording, viewer = SyntheticFactory(), SyntheticFactory()
         value = pipeline(recording=recording, viewer=viewer)
@@ -375,6 +589,43 @@ class PipelineTests(unittest.TestCase):
         value.add_viewer(SUBSCRIBER)
         self.assertTrue(factory.adapters[0].closed)
         self.assertEqual(len(factory.adapters), 2)
+
+    def test_failed_idle_viewer_cleanup_remains_source_degradation(self):
+        factory = SyntheticFactory()
+        value = pipeline(recording=SyntheticFactory(), viewer=factory)
+        self.addCleanup(value.close)
+        value.offer(packet(0, keyframe=True))
+        value.pump(1)
+        value.add_viewer(SUBSCRIBER)
+        factory.adapters[0].fail_close = True
+        value.remove_viewer(SUBSCRIBER)
+
+        status = value.status
+        self.assertEqual(status.state, "degraded")
+        self.assertIsNotNone(status.viewer)
+        self.assertTrue(status.viewer.failed)
+        self.assertIn("viewer_adapter_close_failed", status.reasons)
+
+    def test_failed_viewer_cleanup_cannot_publish_a_replacement_profile(self):
+        base = source_profiles()
+        replacement = replace(base, viewer=ViewerProfile(video_format(width=1280)))
+        admissions = SourceProfileAdmissions(1)
+        decision = admissions.admit(SourceProfileCapabilities(
+            SOURCE, SourceType.LOCAL_UVC, (base, replacement),
+        ), base)
+        factory = SyntheticFactory()
+        value = pipeline(profiles=base, recording=SyntheticFactory(), viewer=factory,
+                         admission=decision.lease)
+        self.addCleanup(value.close)
+        value.add_viewer(SUBSCRIBER)
+        factory.adapters[0].fail_close = True
+
+        with self.assertRaises(RuntimeError):
+            value.replace_viewer_profile(replacement.viewer)
+
+        self.assertEqual(value.profiles, base)
+        self.assertEqual(admissions.admitted(SOURCE), base)
+        self.assertEqual(factory.adapters[0].plan.target, base.viewer.format)
 
     def test_time_base_change_and_closed_pipeline_cannot_continue_silently(self):
         value = pipeline(recording=SyntheticFactory())
