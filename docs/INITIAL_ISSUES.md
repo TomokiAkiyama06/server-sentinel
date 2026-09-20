@@ -739,6 +739,12 @@ Depends on: [#18](https://github.com/TomokiAkiyama06/server-sentinel/issues/18),
 
 Labels: `backend`, `frontend`, `security`, `storage`
 
+Implementation status: internal reserved storage admission, real recorder
+retention/Owner action facade, audit retention, optional direct Slack and durable
+daily scheduling have synthetic filesystem/SQLite/transport coverage. No human
+route or playback integration is mounted; #10 authorization and the Owner's UI
+design work remain pending. This partial implementation does not close #21.
+
 実機要件: Main Server: 不要; Capture Node: 不要; UVC Camera: 不要; Manual test: 不要
 
 Scope:
