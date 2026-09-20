@@ -1,0 +1,340 @@
+import dataclasses
+import io
+import hashlib
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import unittest
+from unittest.mock import patch
+from uuid import uuid4
+
+from build_artifact import build
+from install import render_unit
+from media_capture_agent.cli import main
+from media_capture_agent.config import ConfigurationError, Settings
+from media_capture_agent.health import ClockExchange, assess_clock
+from media_capture_agent.runtime import Agent
+from media_capture_agent.storage import MediaStore, Mount, StorageRefused, parse_mounts
+from tests.support import MockSession, SyntheticCapture, configuration, settings
+
+
+class DeploymentCase(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory(prefix="agent-synthetic-")
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.settings = settings(self.root)
+
+    def store(self, **kwargs):
+        store = MediaStore(self.settings, **kwargs)
+        self.addCleanup(store.close)
+        return store
+
+
+class StorageTests(DeploymentCase):
+    def test_bounded_private_write_never_replaces_existing(self):
+        store = self.store()
+        identity = uuid4()
+        name = store.write_segment(identity, b"synthetic video bytes")
+        path = self.settings.media_root / name
+        self.assertEqual(path.read_bytes(), b"synthetic video bytes")
+        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+        with self.assertRaises(StorageRefused):
+            store.write_segment(identity, b"different data")
+        self.assertEqual(path.read_bytes(), b"synthetic video bytes")
+        for data in (b"", b"x" * (self.settings.max_segment_bytes + 1)):
+            with self.assertRaises(StorageRefused):
+                store.write_segment(uuid4(), data)
+        with self.assertRaises(StorageRefused):
+            store.write_segment("../escape", b"x")
+
+    def test_missing_or_substituted_mount_blocks_startup(self):
+        for mounts in ([], [Mount(dataclasses.replace(self.settings.expected_mount,
+                                                     source="synthetic-other-device"), 1, False)]):
+            with self.subTest(mounts=bool(mounts)), self.assertRaises(StorageRefused):
+                self.store(mounts=lambda: mounts)
+        self.assertEqual(list(self.settings.media_root.iterdir()), [])
+
+    def test_runtime_remount_same_device_is_refused(self):
+        current = [Mount(self.settings.expected_mount, 1, False)]
+        store = self.store(mounts=lambda: current, mount_id=lambda _: current[0].mount_id)
+        current[0] = dataclasses.replace(current[0], mount_id=2)
+        with self.assertRaisesRegex(StorageRefused, "mount_replaced"):
+            store.write_segment(uuid4(), b"synthetic")
+        self.assertEqual(list(self.settings.media_root.iterdir()), [])
+
+    def test_disappearance_creates_no_fallback(self):
+        store = self.store()
+        self.settings.media_root.rmdir()
+        with self.assertRaises(StorageRefused):
+            store.write_segment(uuid4(), b"synthetic")
+        self.assertFalse(self.settings.media_root.exists())
+
+    def test_directory_replacement_cannot_redirect_pinned_descriptor(self):
+        store = self.store()
+        old = self.root / "old-mounted-media"
+        self.settings.media_root.rename(old)
+        self.settings.media_root.mkdir(mode=0o700)
+        with self.assertRaisesRegex(StorageRefused, "media_root_replaced"):
+            store.write_segment(uuid4(), b"synthetic")
+        self.assertEqual(list(old.iterdir()), [])
+        self.assertEqual(list(self.settings.media_root.iterdir()), [])
+
+    def test_replacement_between_admission_and_open_stays_on_original_descriptor(self):
+        store = self.store()
+        original_open = os.open
+        old = self.root / "old-mounted-media"
+
+        def replace_at_open(path, flags, *args, **kwargs):
+            if str(path).endswith(".segment"):
+                self.settings.media_root.rename(old)
+                self.settings.media_root.mkdir(mode=0o700)
+            return original_open(path, flags, *args, **kwargs)
+
+        with patch("media_capture_agent.storage.os.open", side_effect=replace_at_open):
+            with self.assertRaisesRegex(StorageRefused, "media_root_replaced"):
+                store.write_segment(uuid4(), b"synthetic")
+        self.assertEqual(list(old.iterdir()), [])
+        self.assertEqual(list(self.settings.media_root.iterdir()), [])
+
+    def test_symlink_ancestors_and_media_root_refused(self):
+        original = self.settings.media_root
+        moved = self.root / "original"
+        original.rename(moved)
+        original.symlink_to(moved, target_is_directory=True)
+        with self.assertRaises(StorageRefused):
+            self.store()
+        original.unlink()
+        moved.rename(original)
+        alias = self.root / "alias"
+        alias.symlink_to(self.root, target_is_directory=True)
+        self.settings = dataclasses.replace(self.settings, media_root=alias / "media")
+        with self.assertRaises(StorageRefused):
+            self.store()
+
+    def test_readonly_or_shared_writable_root_rejected(self):
+        for mode in (0o500, 0o777):
+            self.settings.media_root.chmod(mode)
+            try:
+                with self.assertRaises(StorageRefused):
+                    self.store()
+            finally:
+                self.settings.media_root.chmod(0o700)
+
+    def test_reserve_uses_available_blocks_and_rounding(self):
+        value = os.statvfs(self.settings.media_root)
+        fake = type("Space", (), {"f_bavail": 1, "f_frsize": 4096, "f_flag": value.f_flag})()
+        store = self.store(space=lambda _: fake)
+        with self.assertRaisesRegex(StorageRefused, "STORAGE_HARD_STOP"):
+            store.write_segment(uuid4(), b"synthetic")
+        self.assertEqual(list(self.settings.media_root.iterdir()), [])
+
+    def test_failed_allocation_never_uses_sparse_fallback(self):
+        store = self.store()
+        with patch("media_capture_agent.storage.os.posix_fallocate", side_effect=OSError):
+            with self.assertRaises(StorageRefused):
+                store.write_segment(uuid4(), b"synthetic")
+        self.assertEqual(list(self.settings.media_root.iterdir()), [])
+
+    def test_failed_sync_removes_only_owned_partial(self):
+        store = self.store()
+        existing = store.write_segment(uuid4(), b"earlier synthetic")
+        with patch("media_capture_agent.storage.os.fsync", side_effect=OSError):
+            with self.assertRaises(StorageRefused):
+                store.write_segment(uuid4(), b"synthetic")
+        self.assertEqual([entry.name for entry in self.settings.media_root.iterdir()], [existing])
+
+    def test_inventory_verification_and_cleanup_at_hard_stop(self):
+        store = self.store()
+        identity, data = uuid4(), b"synthetic complete segment"
+        store.write_segment(identity, data)
+        digest = hashlib.sha256(data).hexdigest()
+        self.assertEqual(store.list_segments(), {identity: len(data)})
+        self.assertGreaterEqual(store.segment_allocations()[identity], len(data))
+        self.assertGreater(store.allocation_unit, 0)
+        self.assertTrue(store.verify_segment(identity, len(data), digest))
+        self.assertFalse(store.verify_segment(identity, len(data), "0" * 64))
+        self.assertFalse(store.verify_segment(identity, len(data) - 1, digest))
+        self.assertFalse(store.verify_segment(uuid4(), len(data), digest))
+        fake = type("Space", (), {"f_bavail": 0, "f_frsize": 4096, "f_flag": 0})()
+        store.space = lambda _: fake
+        with self.assertRaisesRegex(StorageRefused, "STORAGE_HARD_STOP"):
+            store.check()
+        self.assertEqual(store.check(require_reserve=False), 0)
+        self.assertTrue(store.verify_segment(identity, len(data), digest))
+        self.assertTrue(store.delete_segment(identity))
+        self.assertFalse(store.delete_segment(identity))
+        self.assertEqual(store.list_segments(), {})
+
+    def test_recovery_rejects_fullsize_but_partial_zeroed_content(self):
+        store = self.store()
+        identity, data = uuid4(), b"synthetic expected content"
+        path = self.settings.media_root / (str(identity) + ".segment")
+        descriptor = os.open(path, os.O_CREAT | os.O_WRONLY | os.O_EXCL, 0o600)
+        try:
+            os.posix_fallocate(descriptor, 0, len(data))
+            os.write(descriptor, data[:5])
+        finally:
+            os.close(descriptor)
+        self.assertEqual(store.list_segments()[identity], len(data))
+        self.assertFalse(store.verify_segment(identity, len(data), hashlib.sha256(data).hexdigest()))
+
+    def test_inventory_rejects_symlinks_without_reading_or_deleting_target(self):
+        store = self.store()
+        target = self.root / "unrelated"
+        target.write_bytes(b"keep")
+        identity = uuid4()
+        (self.settings.media_root / (str(identity) + ".segment")).symlink_to(target)
+        for operation in (store.list_segments, store.segment_allocations,
+                          lambda: store.delete_segment(identity),
+                          lambda: store.verify_segment(identity, 4, "0" * 64)):
+            with self.assertRaises(StorageRefused):
+                operation()
+        self.assertEqual(target.read_bytes(), b"keep")
+
+    def test_stacked_bind_mount_identity_change_is_detected(self):
+        store = self.store()
+        pinned = store.mount_id(store._fd)
+        store.mount_id = lambda fd: pinned if fd == store._fd else pinned + 1
+        with self.assertRaisesRegex(StorageRefused, "mount_replaced"):
+            store.check()
+
+    def test_mount_parser_escapes_and_readonly_superblock(self):
+        mount = parse_mounts("31 20 8:1 / /synthetic\\040mount rw - ext4 /dev/synthetic ro\n")[0]
+        self.assertEqual(mount.identity.mount_point, Path("/synthetic mount"))
+        self.assertTrue(mount.readonly)
+        with self.assertRaises(StorageRefused):
+            parse_mounts("malformed")
+
+
+class HealthTests(DeploymentCase):
+    def test_clock_offset_uncertainty_wall_step(self):
+        healthy = ClockExchange(100, 50, 100.1, 100.1, 100.2, 50.2)
+        self.assertEqual(assess_clock(healthy, self.settings).state, "online")
+        for exchange, reason in (
+            (None, "clock_unavailable"),
+            (dataclasses.replace(healthy, remote_receive_utc=110.1,
+                                 remote_send_utc=110.1), "clock_offset"),
+            (dataclasses.replace(healthy, local_receive_utc=104,
+                                 local_receive_monotonic=54), "clock_uncertain"),
+            (dataclasses.replace(healthy, local_receive_utc=120), "clock_step"),
+            (dataclasses.replace(healthy, local_receive_monotonic=49), "clock_invalid"),
+            (dataclasses.replace(healthy, remote_send_utc=float("nan")), "clock_invalid"),
+        ):
+            with self.subTest(reason=reason):
+                self.assertEqual(assess_clock(exchange, self.settings).reason, reason)
+
+    def test_unplug_keeps_node_online(self):
+        capture, session = SyntheticCapture(), MockSession()
+        agent = Agent(self.settings, self.store(), capture=capture, session=session)
+        self.addCleanup(agent.close)
+        healthy = agent.tick()
+        capture.online = False
+        unplugged = agent.tick()
+        self.assertEqual(healthy["node_state"], "online")
+        self.assertEqual(unplugged["node_state"], "online")
+        self.assertEqual(unplugged["sources"][0]["state"], "offline")
+        self.assertEqual(len(session.heartbeats), 2)
+        self.assertEqual(unplugged["sequence"], 2)
+
+    def test_clock_main_mount_failures_report_degradation(self):
+        capture, session = SyntheticCapture(), MockSession()
+        agent = Agent(self.settings, self.store(), capture=capture, session=session)
+        self.addCleanup(agent.close)
+        session.offset = 20
+        self.assertIn("clock_offset", agent.tick()["node_reasons"])
+        session.fail = True
+        self.assertIn("main_unavailable", agent.tick()["node_reasons"])
+        self.settings.media_root.rmdir()
+        heartbeat = agent.tick()
+        self.assertEqual(heartbeat["storage"]["state"], "failed")
+        self.assertEqual(heartbeat["node_state"], "degraded")
+        self.assertFalse(self.settings.media_root.exists())
+
+    def test_unpaired_service_closed_and_close_releases_resources(self):
+        agent = Agent(self.settings, self.store())
+        heartbeat = agent.tick()
+        self.assertIn("pairing_required", heartbeat["node_reasons"])
+        self.assertIn("capture_unconfigured", heartbeat["node_reasons"])
+        self.assertEqual(heartbeat["node_state"], "degraded")
+        agent.close()
+        self.assertIsNone(agent.store._fd)
+
+    def test_root_or_other_account_cannot_run_service(self):
+        for uid in (0, os.geteuid() + 1):
+            with patch("media_capture_agent.runtime.os.geteuid", return_value=uid):
+                with self.assertRaisesRegex(StorageRefused, "nonroot"):
+                    Agent(self.settings, self.store())
+
+
+class ConfigurationTests(unittest.TestCase):
+    def test_no_audio_or_resource_defaults_or_code_tree_data(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            value = configuration(root)
+            for key, bad in (("audio", True), ("service_uid", 0),
+                             ("clock_offset_limit_seconds", float("nan")),
+                             ("safety_reserve_bytes", 0), ("media_root", str(root / "code/media"))):
+                with self.subTest(key=key), self.assertRaises(ConfigurationError):
+                    Settings.parse(dict(value, **{key: bad}), code_root=root / "code")
+
+    def test_config_owner_only_and_redacted_errors(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = root / "config.json"
+            config.write_text(json.dumps(configuration(root)))
+            config.chmod(0o600)
+            self.assertEqual(Settings.load(config, code_root=root / "code").service_uid,
+                             os.geteuid())
+            config.chmod(0o644)
+            with self.assertRaises(ConfigurationError):
+                Settings.load(config, code_root=root / "code")
+            error = io.StringIO()
+            with patch("sys.stderr", error):
+                self.assertEqual(main(["--config", str(config), "--check"]), 1)
+            self.assertNotIn(str(root), error.getvalue())
+
+
+class DistributionTests(DeploymentCase):
+    def test_versioned_artifact_runs_outside_checkout(self):
+        version = self.root / "installation" / "0.1.0"
+        version.mkdir(parents=True)
+        artifact = version / "media-capture-agent"
+        digest = build(artifact)
+        self.assertEqual(len(digest), 64)
+        result = subprocess.run([sys.executable, str(artifact), "--help"], capture_output=True,
+                                text=True, check=True, cwd="/")
+        self.assertIn("media-capture-agent", result.stdout)
+        config = self.root / "deployment.json"
+        values = dataclasses.asdict(self.settings)
+        values["node_id"] = str(values["node_id"])
+        values["runtime_root"] = str(values["runtime_root"])
+        values["media_root"] = str(values["media_root"])
+        values["expected_mount"]["mount_point"] = str(values["expected_mount"]["mount_point"])
+        config.write_text(json.dumps(values))
+        config.chmod(0o600)
+        checked = subprocess.run([sys.executable, str(artifact), "--config", str(config), "--check"],
+                                 capture_output=True, text=True, check=True, cwd="/")
+        self.assertIn("validation passed", checked.stdout)
+        import zipfile
+        with zipfile.ZipFile(artifact) as archive:
+            self.assertIn("LICENSE", archive.namelist())
+            self.assertFalse(any("test" in name or name.endswith(".pyc")
+                                 for name in archive.namelist()))
+
+    def test_unit_dedicated_account_and_video_only_devices(self):
+        unit = render_unit(Path("/opt/example/0.1.0/media-capture-agent"),
+                           Path("/etc/example/config.json"), self.settings, "synthetic", 123,
+                           ["/dev/video0"])
+        self.assertIn("User=synthetic", unit)
+        self.assertIn("Group=123", unit)
+        self.assertIn("DevicePolicy=closed", unit)
+        self.assertIn('DeviceAllow="/dev/video0" rw', unit)
+        self.assertIn("--check", unit)
+        self.assertNotIn("/dev/snd", unit)
+        with self.assertRaises(ValueError):
+            render_unit(Path("/opt/example/agent"), Path("/etc/example/config.json"),
+                        self.settings, "synthetic", 123, ["/dev/snd/pcmC0D0c"])

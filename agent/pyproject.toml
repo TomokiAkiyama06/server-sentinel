@@ -1,0 +1,7 @@
+[project]
+name = "media-capture-agent"
+version = "0.1.0"
+description = "Native video-only ServerSentinel capture-node foundation"
+requires-python = ">=3.12"
+dependencies = []
+license = "Apache-2.0"

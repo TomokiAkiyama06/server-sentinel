@@ -220,6 +220,14 @@ GUI/tray: none required
 
 Installation may require `sudo` to install the binary, create the account/unit, and configure narrow device permissions.
 
+The Issue #12 native foundation uses Python 3.12+ standard-library modules under
+`agent/media_capture_agent/`, with an executable zipapp release artifact and an
+explicit systemd installer. Runtime/config/media directories are outside source
+and installation trees. Until approved capture and authenticated transport adapters
+are integrated, the production CLI remains visibly unconfigured and never starts
+unauthenticated network communication. This foundation does not complete physical
+Capture Node acceptance.
+
 ### 5.3 Audio
 
 MVP agent capture is video-only. Do not open microphone/audio devices. No event/detection logic depends on audio.
