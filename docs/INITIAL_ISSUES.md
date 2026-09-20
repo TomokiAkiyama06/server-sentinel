@@ -49,7 +49,7 @@ Other audited Issues (outside the 24 Plans):
 
 #1 closed when PR #2 merged after current HEAD/base Codex + Claude reviews and CI passed. #3 is already closed; its authentication setup does not substitute for future reviews. #4 requires trusted review provenance for both HEAD and base/diff context, including base-only changes and issuer-spoofing rejection.
 
-#4's [deployment proposal](REVIEW_GATE_SETUP.md) records the current personal-repository capability assessment and provides offline policy validation plus a disabled ruleset generator. Dedicated App registration/installation, trusted collector/publisher implementation, actual repository enforcement and test-PR acceptance remain pending; #4 stays OPEN.
+#4's [deployment proposal](REVIEW_GATE_SETUP.md) records the current personal-repository capability assessment and provides offline policy validation plus a disabled ruleset generator. The independent required-CI baseline ruleset is active; dedicated App registration/installation, trusted collector/publisher implementation, review-provenance enforcement and test-PR acceptance remain pending. #4 stays OPEN.
 
 ## Dependency graph
 

@@ -5,7 +5,14 @@ the `CI` GitHub Actions workflow. It runs for every pull request, pushes to
 `main`, and manual dispatch. The final check is named **CI**; both repository
 and component jobs must succeed. A failed, cancelled, or skipped prerequisite
 cannot produce a successful final check. Review provenance enforcement remains
-in Issue #4; the workflow does not change repository protection settings.
+in Issue #4; the workflow itself does not change repository protection settings.
+
+The Owner-authorized [baseline ruleset](https://github.com/TomokiAkiyama06/server-sentinel/rules/23728669)
+requires PRs, resolved review threads and the `CI` check from the GitHub Actions
+App on an up-to-date branch before merging to `main`. It blocks force pushes and
+deletion and has no bypass actors. That shared issuer does not distinguish a
+malicious same-repository workflow from trusted CI; same-repository writers
+remain trusted until #4's dedicated review gate is deployed and accepted.
 
 Issue #4's offline review-receipt policy tests run in the repository test job.
 The [deployment proposal](REVIEW_GATE_SETUP.md) and disabled ruleset generator

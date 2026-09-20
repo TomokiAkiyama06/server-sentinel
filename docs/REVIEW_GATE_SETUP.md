@@ -15,14 +15,19 @@ Read-only GitHub inspection for this proposal found:
 |---|---|
 | Repository ownership / visibility | Personal account (`User`) / public |
 | Current operator permission | `admin: true` |
-| Repository rulesets | Empty list |
+| Repository rulesets | Active baseline rule `23728669`: PR-only, strict required `CI` from GitHub Actions, thread resolution, no force push/deletion or bypass |
 | `main` branch protection | `404 Branch not protected` |
 | Existing CI check issuer | Shared GitHub Actions App, ID `15368` |
 | `GET /user/installations` | `403`: the current token cannot enumerate App installations; this does not establish that no App is installed |
 
 These are an inspection snapshot, not a permanent assertion. The Issue's older
 statement that the connected operator lacks repository administration rights is
-superseded by this inspection. No settings were changed.
+superseded by this inspection. The [CI baseline rule](https://github.com/TomokiAkiyama06/server-sentinel/rules/23728669)
+was applied separately under the Owner's CI instruction and re-read through the
+API. It protects `main` without bypass actors, but its shared GitHub Actions
+issuer does not implement #4's dedicated review provenance. Classic branch
+protection remains unset because the baseline uses a ruleset. This preparation
+does not change settings.
 
 GitHub documents Required workflows at the **organization or enterprise** level.
 The current personal repository cannot use that route in place. Moving ownership
@@ -174,8 +179,8 @@ it without bypass actors. Re-read the applied settings through the GitHub API.
 Existing rules remain in place; maintain the separately required `CI` check.
 The Owner/admin remains trusted because administrators can edit protections.
 
-The snapshot above has no required `CI` rule yet. During deployment, establish
-that independent requirement too; this candidate only encodes #4's review gate.
+The independent `CI` baseline rule is already active. Preserve it when adding the
+review gate; this candidate only encodes #4's additional review requirements.
 [GitHub: ruleset API](https://docs.github.com/en/rest/repos/rules#create-a-repository-ruleset).
 
 ## Acceptance and recovery
