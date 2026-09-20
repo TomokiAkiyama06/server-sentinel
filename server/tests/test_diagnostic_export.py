@@ -15,6 +15,7 @@ from fastapi import FastAPI, HTTPException, Request
 
 from app.api.diagnostics import router
 from app.diagnostics import (
+    export_failure_code,
     DiagnosticCategory,
     DiagnosticDocument,
     DiagnosticExportAction,
@@ -1036,7 +1037,36 @@ class DiagnosticExportTests(unittest.IsolatedAsyncioTestCase):
                 denied = await self.post_export(application, ("clip_a",))
                 self.assertEqual(denied[0]["status"], 503)
                 self.assertIn(reason.encode(), self.response_body(denied))
+
+        # Internal reservation/binding faults are not deployment storage
+        # conditions, so the route must not publish their internal codes.
+        for reason in ("STORAGE_INVALID_RESERVATION", "STORAGE_POLICY_UNAVAILABLE",
+                       "STORAGE_BINDING_UNAVAILABLE"):
+            with self.subTest(reason=reason):
+                self.policy.denial = RecordingError(reason)
+                internal = await self.post_export(application, ("clip_a",))
+                body = self.response_body(internal)
+                self.assertEqual(internal[0]["status"], 503)
+                self.assertIn(b"DIAGNOSTIC_EXPORT_UNAVAILABLE", body)
+                self.assertNotIn(reason.encode(), body)
         self.assertEqual(list(self.output.iterdir()), [])
+
+    def test_only_owner_actionable_storage_states_leave_the_export_boundary(self):
+        """Regression: internal reservation/binding codes stay inside."""
+        for reason in ("STORAGE_PRESSURE", "STORAGE_HARD_STOP"):
+            with self.subTest(reason=reason):
+                self.assertEqual(
+                    reason, export_failure_code(DiagnosticExportError(reason)))
+        for reason in ("STORAGE_INVALID_RESERVATION", "STORAGE_POLICY_UNAVAILABLE",
+                       "STORAGE_BINDING_UNAVAILABLE",
+                       "diagnostic storage state is uncertain",
+                       "diagnostic output directory is not admitted",
+                       "diagnostic storage worker is unavailable",
+                       "/private/deployment/mount SYNTHETIC_PRIVATE_VALUE"):
+            with self.subTest(reason=reason):
+                self.assertEqual(
+                    "DIAGNOSTIC_EXPORT_UNAVAILABLE",
+                    export_failure_code(DiagnosticExportError(reason)))
 
     async def test_prepared_route_denies_an_invited_non_owner_before_the_endpoint(self):
         """Regression: system access alone must not reach a selected-media lookup."""

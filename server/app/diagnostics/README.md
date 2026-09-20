@@ -104,9 +104,11 @@ directory. Production keeps the human surface closed until Issue #10 lands; when
 mounted, the route requires the existing human access boundary, the Owner-only
 route boundary, and the service's exact Owner confirmation. It reports fixed
 statuses only: a rejected selection never echoes the submitted identifiers, and a
-failure reports one reviewed fixed code. Explicit deployment conditions such as
-`STORAGE_PRESSURE` and `STORAGE_HARD_STOP` keep their code so the Owner is not
-shown a silent generic error; anything else becomes
+failure reports one reviewed fixed code. Only the two deployment storage
+conditions an Owner acts on, `STORAGE_PRESSURE` and `STORAGE_HARD_STOP`, keep
+their code so the Owner is not shown a silent generic error. Internal
+reservation and policy-binding faults describe composition state rather than a
+deployment condition, so they and every other failure become
 `DIAGNOSTIC_EXPORT_UNAVAILABLE`.
 
 The manifest reports included categories, counts, exclusion reasons and the

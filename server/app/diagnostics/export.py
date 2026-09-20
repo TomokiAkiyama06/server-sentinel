@@ -28,13 +28,20 @@ _SAFE_NAME = re.compile(r"^[a-z][a-z0-9_.-]{0,63}$")
 _MEDIA_CHUNK_BYTES = 64 * 1024
 _MAX_MEDIA_ITEM_BYTES = 512 * 1024 * 1024
 _MAX_DIAGNOSTIC_BUNDLE_BYTES = 1024 * 1024 * 1024
-# Fixed value-free codes a composed storage policy may report.
+# Fixed value-free codes a composed storage policy may report internally.
 _STORAGE_DENIAL_REASONS = frozenset({
     "STORAGE_PRESSURE",
     "STORAGE_HARD_STOP",
     "STORAGE_INVALID_RESERVATION",
     "STORAGE_POLICY_UNAVAILABLE",
     "STORAGE_BINDING_UNAVAILABLE",
+})
+# The subset a caller outside this package may see. The remaining codes above
+# describe internal reservation/binding faults rather than a deployment storage
+# condition, so they are collapsed instead of being published.
+_REPORTABLE_STORAGE_STATES = frozenset({
+    "STORAGE_PRESSURE",
+    "STORAGE_HARD_STOP",
 })
 
 
@@ -49,12 +56,13 @@ class _DiagnosticCleanupUncertain(RuntimeError):
 def export_failure_code(failure: DiagnosticExportError) -> str:
     """Return a fixed reviewed code for an export failure, never a local value.
 
-    Storage pressure and hard stop are explicit deployment conditions, so the
-    reviewed reason code is preserved for a caller instead of being collapsed
-    into an opaque failure. Anything else becomes one generic code.
+    Storage pressure and hard stop are explicit deployment conditions an Owner
+    acts on, so those two codes are preserved for a caller. Every other failure,
+    including an internal reservation or policy-binding fault, becomes one
+    generic code rather than publishing the deployment's internal wiring state.
     """
     reason = str(failure)
-    if reason in _STORAGE_DENIAL_REASONS:
+    if reason in _REPORTABLE_STORAGE_STATES:
         return reason
     return "DIAGNOSTIC_EXPORT_UNAVAILABLE"
 
