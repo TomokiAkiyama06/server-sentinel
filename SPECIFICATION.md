@@ -591,9 +591,26 @@ Per source/profile calibration stores server ROI/polygon, reference descriptors,
 
 Runtime may combine global transform compensation, edges/contours, ROI similarity, temporal persistence, and person/occlusion masks.
 
+The Issue #24 internal foundation in `server/app/detection/spatial/` accepts a
+per-source normalized polygon and version, an in-memory reference frame, and
+explicit bounded thresholds. The caller binds quality, occlusion and optional
+global translation evidence to the exact source/stream/sequence. Missing or
+insufficient evidence, discontinuity, geometry mismatch and inadequate
+reference coverage yield `unknown`; an ROI candidate needs consecutive frames
+before it is reported. The foundation neither estimates a transform nor
+persists reference media/calibration, publishes events, captures video, or
+identifies people. Production calibration, source-health correlation, durable
+configuration, evidence preservation, notifications and physical acceptance
+remain separate integration work.
+
 ### 7.4 Camera tamper
 
 Candidate signals include global optical transform, persistent occlusion/near-black view, abrupt focus/exposure/scene-pose change, and disconnect closely following scene movement.
+
+The same Issue #24 foundation has a local camera-tamper analyzer for persistent
+whole-frame change or trusted lens-occlusion evidence. It reports only a
+calibration-bound observation after explicit temporal confirmation; it does not
+infer a camera disconnect or a human cause from pixels alone.
 
 ### 7.5 Detector-specific image-quality gate
 
