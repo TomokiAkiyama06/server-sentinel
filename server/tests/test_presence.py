@@ -199,6 +199,26 @@ class PresenceTests(unittest.TestCase):
         self.service.dispatch_pending()
         self.assertEqual(self.status()["pending_critical_actions"], 0)
 
+    def test_recovered_action_dispatches_its_unavailable_backlog_fairly(self):
+        unavailable = self.make_service(evidence=None, notifications=None)
+        for index in range(3):
+            unavailable.record(observation(Kind.CAMERA_TAMPER, identifier=UUID(int=index + 1)))
+        unavailable.dispatch_pending()
+        recovered = self.make_service(evidence=None)
+        recovered.dispatch_pending(limit=2)
+        self.assertEqual([item.identifier for item in self.notifications], [UUID(int=1), UUID(int=2)])
+        recovered.dispatch_pending()
+        self.assertEqual([item.identifier for item in self.notifications], [UUID(int=1), UUID(int=2), UUID(int=3)])
+
+    def test_disabled_critical_action_stays_visible_as_degraded(self):
+        event = self.service.record(observation(Kind.SERVER_MOVEMENT))
+        self.service.complete_action(event.identifier, "notification", ActionResult.DISABLED)
+        self.service.dispatch_pending()
+        status = self.status()
+        self.assertEqual(status["pending_critical_actions"], 0)
+        self.assertEqual(status["critical_notifications"], "unavailable")
+        self.assertTrue(status["critical_paths_degraded"])
+
     def test_critical_paths_reported_from_configuration_and_known_health(self):
         closed = PresenceService(self.database)
         status = closed.snapshot(now=NOW, clock_trusted=True)
@@ -308,6 +328,20 @@ class PresenceTests(unittest.TestCase):
         self.assertTrue(result["ordering_degraded"])
         self.assertEqual(result["ordering_basis"], "received_at")
         self.assertEqual(result["items"][-1]["id"], str(skewed.identifier))
+
+    def test_source_high_water_never_restores_trust_for_late_intermediate_event(self):
+        high = self.service.record(observation(at=NOW + timedelta(hours=10), received=NOW),
+                                   presence_valid_until=NOW + timedelta(hours=12))
+        low = self.service.record(observation(Kind.OWNER_EXIT, at=NOW + timedelta(hours=5),
+                                  received=NOW + timedelta(seconds=1)),
+                                  presence_valid_until=NOW + timedelta(hours=12))
+        middle = self.service.record(observation(at=NOW + timedelta(hours=7),
+                                     received=NOW + timedelta(seconds=2)),
+                                     presence_valid_until=NOW + timedelta(hours=12))
+        self.assertTrue(high.clock_trusted)
+        self.assertFalse(low.clock_trusted)
+        self.assertFalse(middle.clock_trusted)
+        self.assertEqual(self.status(now=NOW + timedelta(seconds=2))["state"], "UNKNOWN")
 
     def test_uncertain_clock_keeps_override_visible_without_suppression_or_expiry(self):
         self.service.override("owner", PresenceState.PRESENT, now=NOW, expires_at=NOW + timedelta(hours=1), clock_trusted=True)

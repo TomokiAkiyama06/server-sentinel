@@ -146,12 +146,18 @@ class PresenceService:
                 return stored
             trusted = self._clock(db, observation.received_at, observation.clock_trusted)
             if observation.source_id:
-                previous = db.execute("SELECT payload FROM presence_observations WHERE source=? ORDER BY sequence DESC LIMIT 1",
-                                      (str(observation.source_id),)).fetchone()
-                if previous and observation.occurred_at < Observation.from_payload(json.loads(previous[0])).occurred_at:
+                source = str(observation.source_id)
+                high_water = db.execute("SELECT latest_occurred FROM presence_source_clock WHERE source=?",
+                                        (source,)).fetchone()
+                if high_water and timestamp(observation.occurred_at) < high_water["latest_occurred"]:
                     trusted = False
             if not trusted:
                 observation = observation.uncertain()
+            elif observation.source_id:
+                db.execute("INSERT INTO presence_source_clock(source,latest_occurred) VALUES (?,?) "
+                           "ON CONFLICT(source) DO UPDATE SET latest_occurred="
+                           "MAX(latest_occurred,excluded.latest_occurred)",
+                           (str(observation.source_id), timestamp(observation.occurred_at)))
             payload = json.dumps(observation.payload(), sort_keys=True, separators=(",", ":"))
             db.execute("INSERT INTO presence_observations(id,kind,source,received,payload) VALUES (?,?,?,?,?)",
                        (str(observation.identifier), observation.kind.value,
@@ -196,13 +202,21 @@ class PresenceService:
         # repeatedly attempted work cannot starve newly queued critical
         # evidence and notification jobs: never attempted rows lead, pending
         # precedes unavailable, and equal work is dispatched in receipt order.
+        available = tuple(action for action, port in
+                          (("evidence", self.evidence), ("notification", self.notifications))
+                          if port is not None)
+        eligibility = "job.state='pending'"
+        arguments = []
+        if available:
+            eligibility += " OR (job.state='unavailable' AND job.action IN (" + ",".join("?" * len(available)) + "))"
+            arguments.extend(available)
         with closing(self.database.connect()) as db:
             pending = db.execute(
                 "SELECT job.observation,job.action FROM presence_deliveries job "
                 "JOIN presence_observations item ON item.id=job.observation "
-                "WHERE job.state IN ('pending','unavailable') "
+                "WHERE " + eligibility + " "
                 "ORDER BY job.attempts, job.state='unavailable', item.sequence, job.action "
-                "LIMIT ?", (limit,)).fetchall()
+                "LIMIT ?", (*arguments, limit)).fetchall()
         for row in pending:
             with self._transaction() as db:
                 job = db.execute("SELECT * FROM presence_deliveries WHERE observation=? AND action=?",
@@ -291,7 +305,7 @@ class PresenceService:
             return UNAVAILABLE
         return ARMED
 
-    def _critical_paths(self):
+    def _critical_paths(self, disabled):
         """Report configured/known critical-path availability, never a fixed armed.
 
         ``armed`` means the path is configured and is not disarmed by any
@@ -301,8 +315,8 @@ class PresenceService:
         paths = {
             "critical_detection": self._detection_path(),
             "critical_persistence": self._persistence_path(),
-            "critical_evidence": ARMED if self.evidence is not None else UNAVAILABLE,
-            "critical_notifications": ARMED if self.notifications is not None else UNAVAILABLE,
+            "critical_evidence": ARMED if self.evidence is not None and "evidence" not in disabled else UNAVAILABLE,
+            "critical_notifications": ARMED if self.notifications is not None and "notification" not in disabled else UNAVAILABLE,
         }
         return {**paths, "critical_paths_degraded": any(value != ARMED for value in paths.values())}
 
@@ -321,10 +335,12 @@ class PresenceService:
             state, basis, expires = self._effective(db, now, trusted)
             failed = db.execute("SELECT count(*) FROM presence_deliveries "
                                 "WHERE state NOT IN ('delivered','disabled')").fetchone()[0]
+            disabled = {row[0] for row in db.execute("SELECT DISTINCT action FROM presence_deliveries "
+                                                      "WHERE state='disabled'")}
         return {"state": state.value, "basis": basis, "override_expires_at": expires,
                 "clock_degraded": not trusted,
                 "suppress_ordinary": state == PresenceState.PRESENT and trusted,
-                **self._critical_paths(),
+                **self._critical_paths(disabled),
                 "override_expiry_pending": not retired,
                 "pending_critical_actions": failed}
 

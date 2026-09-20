@@ -26,6 +26,9 @@ precedence over observation and schedule hints. Only a trusted, confirmed,
 quality-sufficient Owner entry can project `PRESENT`; untrusted timing and
 insufficient quality remain `UNKNOWN`. Critical movement/tamper observations
 always queue evidence and configured notification work regardless of presence.
+An unavailable action is not retried until that action's port recovers, so its
+backlog cannot starve the other critical action. A durable `disabled` result
+keeps the affected path visibly unavailable.
 
 The status snapshot does not create a presence write, so a refused or exhausted
 storage volume cannot hide presence state or unfinished critical work. It probes
@@ -42,5 +45,7 @@ Timeline ordering uses main-host receipt order, with the durable sequence only
 as a tie-break, as the single key for the SQL page, the cursor and the
 response, so concatenated pages stay complete and in the advertised order. It
 explicitly reports degraded timing if clock trust or source ordering is
-unavailable. It reports observations and their temporal context only; it never
+unavailable. Each source retains a trusted occurrence-time high-water mark, so
+an out-of-order event cannot later regain trust merely because it is newer than
+another untrusted delayed event. It reports observations and their temporal context only; it never
 infers cause, guilt, or identity.
