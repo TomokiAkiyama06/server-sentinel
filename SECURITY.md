@@ -207,6 +207,8 @@ Consequences to keep in mind while reviewing code:
 - the server verifies the transient WebAuthn data a registration or assertion carries — its own challenge, client data, authenticator data, the signature, the signature counter, the user-verification flag, and the relying-party id and origin — and persists only the credential id, its public key and owner-visible metadata; the rest is discarded once verified. A review that sees those fields skipped, or accepted from an unexpected origin, is looking at a broken check, not at data minimization;
 - no fingerprint or face template reaches ServerSentinel: it never leaves the authenticator. Credential records are not an identity or biometric database;
 - relying-party checks only hold if the dashboard owns its browser origin, with no other application sharing it (ADR-0003);
+- the pending challenge lives server-side for one bounded, single-use ceremony and is then dropped; a signature-counter regression is surfaced as a possible cloned authenticator, not accepted quietly;
+- ceremony material and enrollment codes stay out of logs, diagnostics and exports, and a failed verification is recorded as a typed outcome without the payload;
 - revocation is credential-scoped, not device-scoped. A synced passkey is one credential across several of its owner's devices, so revoking it applies everywhere it synced; a deployment that needs device-scoped control registers device-bound authenticators and refuses backup-eligible credentials.
 
 Residual limits are documented, not claimed away: a credential its holder deliberately lends, and a session left unlocked on an unattended machine, are outside what the application can observe.
@@ -296,6 +298,7 @@ Repository must never contain real:
 - Slack webhook/token;
 - Tailscale auth/admin key;
 - private keys/certificates/credentials;
+- human enrollment codes and WebAuthn ceremony material (challenges, client/authenticator data, signatures);
 - private deployment IP/hostname/SSID/Tailnet values;
 - owner biometric template;
 - real monitoring footage or person images/audio.

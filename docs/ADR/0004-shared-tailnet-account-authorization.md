@@ -39,6 +39,8 @@ ServerSentinel issues and verifies its own per-person credential:
 
 **WebAuthn/passkey is the selected mechanism.** Replacing it requires a superseding Owner-approved ADR.
 
+Revocation is credential-scoped, not device-scoped. A synced passkey is a single credential that can exist on several of its owner's devices, so revoking it applies everywhere it synced and losing one device does not by itself isolate a credential. The product describes revocation and labels accordingly; a deployment that needs device-scoped control registers device-bound authenticators and refuses backup-eligible credentials, which is a deployment setting rather than a default promise.
+
 ### 3. The credential must be bound to a person, not to a workstation
 
 A passkey alone does not separate people who share a machine. Therefore:
@@ -79,8 +81,6 @@ No viewer fingerprint or face template reaches the server; it never leaves the a
 
 Relying-party verification assumes ServerSentinel owns its browser origin. ADR-0003 reserves a dedicated origin for the dashboard with no other application sharing it, and this ADR depends on that: a co-hosted application on the same origin would put the credential within its reach.
 
-Revocation is credential-scoped, not device-scoped. A synced passkey is a single credential that can exist on several of its owner's devices, so revoking it applies everywhere it synced and losing one device does not by itself isolate a credential. The product describes revocation and labels accordingly; a deployment that needs device-scoped control registers device-bound authenticators and refuses backup-eligible credentials, which is a deployment setting rather than a default promise.
-
 ## Alternatives
 
 - **Keep Tailscale login as the principal.** Rejected: in this deployment it authorizes every holder of the shared account, including uninvited people.
@@ -95,6 +95,8 @@ Revocation is credential-scoped, not device-scoped. A synced passkey is a single
 - The data model gains `principal_credential` and enrollment/revocation flows, and the owner access UI gains per-credential listing and revocation.
 - Shared lab machines need a per-person OS account or portable authenticators; this is a deployment/setup obligation recorded in `docs/SETUP.md` and `MANUAL_TEST.md`.
 - ServerSentinel cannot detect a credential its holder deliberately lends, a session left unlocked on an unattended machine, or an authenticator registered into a shared profile against this ADR. These limits are documented, not claimed away.
+- This ADR depends on the dedicated dashboard origin reserved by ADR-0003: relying-party verification only means something while no other application shares that origin.
+- Revocation is credential-scoped, so neither the UI nor the documentation may offer "revoke this device"; a deployment that needs device-scoped control must register device-bound authenticators.
 - Node-level concealment remains outside the application: with unchanged Tailnet policy the Main Server node and its listening service may stay visible and reachable to everyone holding the shared account, which is the expected state rather than an incident.
 
 ## Validation

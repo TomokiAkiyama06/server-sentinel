@@ -186,7 +186,7 @@ independent of Slack delivery; production durable event integration is pending.
 
 Diagnostics remain local unless explicitly exported/shared.
 
-Exports redact/exclude credentials, pairing secrets, private keys, and sensitive headers. Owner biometric templates/embeddings are always excluded, including when the Owner explicitly initiates an export. Raw monitoring media is excluded unless the Owner explicitly selects it for export; that media exception does not authorize template/embedding export or external biometric processing/storage.
+Exports redact/exclude credentials, pairing secrets, human enrollment codes, WebAuthn ceremony material, private keys, and sensitive headers. Owner biometric templates/embeddings are always excluded, including when the Owner explicitly initiates an export. Raw monitoring media is excluded unless the Owner explicitly selects it for export; that media exception does not authorize template/embedding export or external biometric processing/storage.
 
 ## Public repository safety
 

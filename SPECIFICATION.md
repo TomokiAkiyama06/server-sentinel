@@ -919,9 +919,18 @@ server only as the authenticator's user-verification flag. The WebAuthn protocol
 data needed to check a registration or assertion — the server-issued challenge,
 client data, authenticator data, the attestation or assertion signature, the
 signature counter and the user-verification flag — is received and verified,
-including the relying-party id and origin. That data is transient: only the
-fields of `principal_credential` and `principal_session` persist, and the rest is
-discarded once verified.
+including the relying-party id and origin. That data is transient: the pending
+challenge is held server-side only for the bounded lifetime of one ceremony, is
+single-use and is dropped when the ceremony ends or expires; of the rest, only
+the fields of `principal_credential` and `principal_session` persist and
+everything else is discarded once verified. The signature counter is compared,
+and a regression is surfaced as a possible cloned authenticator rather than
+silently accepted.
+
+None of this material belongs in logs, diagnostics or exports: challenges,
+client and authenticator data, signatures, and enrollment codes are excluded
+alongside the other sensitive values of §13, and a failed verification is logged
+as a typed outcome without the payload that failed.
 
 What never reaches ServerSentinel is biometric material. No fingerprint or face
 template leaves the authenticator, so none is received, persisted or exportable
@@ -1104,7 +1113,11 @@ Validate authenticated node, expected source/session, rate/size bounds, allowed 
 
 Owner template is sensitive secret-adjacent data, excluded from logs/general APIs/diagnostics and limited to the verification/config path. Non-owner persistent biometric templates are prohibited.
 
-A viewer's WebAuthn user verification is not ServerSentinel biometric processing: the fingerprint/face check happens on the viewer's own device and only public credential material reaches the server (§11.4). It creates no template, no enrollment and no identity database here.
+A viewer's WebAuthn user verification is not ServerSentinel biometric processing: the fingerprint/face check happens on the viewer's own device, and what reaches the server is the ceremony's verification data plus the public credential material that persists (§11.4). It creates no template, no biometric enrollment and no identity database here.
+
+### 13.4 Human credential material
+
+Enrollment codes and WebAuthn ceremony material — challenges, client and authenticator data, attestation and assertion signatures — are sensitive secret-adjacent data. They are excluded from logs, general APIs, diagnostics and exports, are held only for the bounded lifetime of the ceremony they belong to, and a failed verification is recorded as a typed outcome without the payload.
 
 ## 14. Performance/overload policy
 
