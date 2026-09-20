@@ -26,7 +26,8 @@ def run_ring(scenario):
             with DiskRing(config, store, ledger_maximum_bytes=128 * 1024, authority=SyntheticAuthority()) as ring:
                 profile = SegmentProfile(SOURCE, 800, 400, 60 * SECOND, 100)
                 now = 3600 * SECOND
-                ring.configure(RingConfig("duration", 600), (profile,), now_us=now)
+                ring.configure(RingConfig("duration", 600), (profile,), now_us=now,
+                               clock_trusted=True)
                 payload = zlib.compress(b"generated-smoke-pattern" * 8)
                 for start in range(now - PRE, now, 60 * SECOND):
                     ring.append(SOURCE, start, start + 60 * SECOND, payload,

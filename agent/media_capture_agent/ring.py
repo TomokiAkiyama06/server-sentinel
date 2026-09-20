@@ -132,6 +132,12 @@ class DiskRing:
                 if row["end"] <= now - PRE and row["state"] != "writing"
                 and not self._protected(row["id"])]
 
+    def _selected_reclaimable(self, now, config):
+        rows = self._reclaimable(now)
+        if config.mode == "duration":
+            return [row for row in rows if row["end"] <= now - config.value * SECOND]
+        return rows
+
     def _estimate(self, profiles, duration, *, expected=False):
         result = sum(profile.bytes_for(duration, self.store.allocation_unit, expected=expected)
                      for profile in profiles.values())
@@ -155,9 +161,11 @@ class DiskRing:
             "safety_reserve": self.settings.safety_reserve_bytes, "ledger_headroom": self.ledger_headroom,
         }
 
-    def configure(self, config, profiles, *, now_us):
+    def configure(self, config, profiles, *, now_us, clock_trusted):
         self.authority.require_owner("configure_ring")
         integer(now_us)
+        if type(clock_trusted) is not bool:
+            raise RingRefused("clock_trust_required")
         if not isinstance(config, RingConfig) or not isinstance(profiles, tuple):
             raise RingRefused("invalid_configuration")
         if not 1 <= len(profiles) <= 4 or any(not isinstance(item, SegmentProfile) for item in profiles):
@@ -168,6 +176,10 @@ class DiskRing:
         if any(item.segment_bytes() > self.settings.max_segment_bytes for item in profiles):
             raise RingRefused("profile_exceeds_segment_write_limit")
         with self._operation():
+            # Configuration must respect a previously observed clock, but it is
+            # not itself a capture-time observation. Recording it here would
+            # make already buffered pre-roll look like a rollback.
+            clock_trusted = self._clock(now_us, clock_trusted, record=False)
             if self.db.execute("SELECT 1 FROM incidents WHERE state='active' LIMIT 1").fetchone():
                 raise RingRefused("protection_configuration_busy")
             pre = self._estimate(mapping, PRE)
@@ -183,7 +195,7 @@ class DiskRing:
             self._selected_target_fits(config, mapping)
             # Credit only blocks that were actually returned by deletion. A
             # hardlink/open reader can keep blocks allocated after unlink.
-            for row in self._reclaimable(now_us):
+            for row in self._selected_reclaimable(now_us, config) if clock_trusted else ():
                 if self.store.check(require_reserve=False) >= budget["required_additional"] + budget["safety_reserve"]:
                     break
                 self._remove_segment(row["id"])
@@ -196,8 +208,8 @@ class DiskRing:
                 self.db.execute("INSERT OR REPLACE INTO settings VALUES ('configuration', ?)",
                                 (json.dumps(value, separators=(",", ":")),))
             self.config, self.profiles = config, mapping
-            self._trim(now_us)
-            return self._status(now_us, clock_trusted=True)
+            self._trim(now_us, trusted=clock_trusted)
+            return self._status(now_us, clock_trusted=clock_trusted)
 
     def _selected_target_fits(self, config, profiles):
         selected = (self._estimate(profiles, config.value * SECOND)
@@ -226,7 +238,7 @@ class DiskRing:
         allocations = self.store.segment_allocations()
         ordinary = sum(allocations.get(UUID(row["id"]), 0) for row in self._rows()
                        if not self._protected(row["id"]))
-        for row in self._reclaimable(now):
+        for row in self._selected_reclaimable(now, self.config):
             outside = row["end"] <= now - self.config.value * SECOND
             if self.config.mode == "duration" and not outside:
                 continue
@@ -236,7 +248,7 @@ class DiskRing:
             ordinary -= allocations.get(UUID(row["id"]), 0)
 
     def _free_for_write(self, length, now, *, trusted):
-        for row in self._reclaimable(now) if trusted else ():
+        for row in self._selected_reclaimable(now, self.config) if trusted else ():
             try:
                 self.store.check(length + self.ledger_headroom)
                 return

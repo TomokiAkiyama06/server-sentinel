@@ -57,7 +57,8 @@ class RingTests(unittest.TestCase):
         self.profile = SegmentProfile(SOURCE, 800, 400, 60 * SECOND, 100)
 
     def configure(self, mode="duration", value=600, profiles=None):
-        return self.ring.configure(RingConfig(mode, value), profiles or (self.profile,), now_us=T0)
+        return self.ring.configure(RingConfig(mode, value), profiles or (self.profile,), now_us=T0,
+                                   clock_trusted=True)
 
     def append(self, start, *, source=SOURCE, trusted=True):
         return self.ring.append(source, start, start + 60 * SECOND, PAYLOAD,
@@ -219,6 +220,18 @@ class RingTests(unittest.TestCase):
         self.assertLessEqual(status["projected_expected_bytes"], status["projected_maximum_bytes"])
         self.assertEqual(len(self.store.list_segments()), 10)
 
+    def test_write_pressure_never_shortens_selected_duration(self):
+        self.configure(value=1200)
+        for start in range(T0 - 1200 * SECOND, T0, 60 * SECOND):
+            self.append(start)
+        selected = UUID(self.ring._rows()[1]["id"])
+        self.quota.other = self.quota.capacity - self.quota.used()
+        with self.assertRaisesRegex(RingRefused, "segment_storage_refused"):
+            self.append(T0)
+        self.assertIn(selected, self.store.list_segments())
+        status = self.ring.status(now_us=T0, clock_trusted=True)
+        self.assertIn(status["state"], {"STORAGE_PRESSURE", "STORAGE_HARD_STOP"})
+
     def test_existing_protected_incident_can_exhaust_next_incident_admission(self):
         self.warm()
         self.loss()
@@ -226,7 +239,8 @@ class RingTests(unittest.TestCase):
         self.quota.capacity = self.quota.used() + self.profile.bytes_for(PRE, self.store.allocation_unit)
         self.quota.other = 0
         with self.assertRaisesRegex(RingRefused, "insufficient_simultaneous_pre_post_budget"):
-            self.ring.configure(RingConfig("duration", 600), (self.profile,), now_us=T0 + POST + PRE)
+            self.ring.configure(RingConfig("duration", 600), (self.profile,), now_us=T0 + POST + PRE,
+                                clock_trusted=True)
 
     def test_profile_cadence_and_bitrate_violation_refused_before_file_write(self):
         self.configure()
@@ -313,6 +327,16 @@ class RingTests(unittest.TestCase):
         result = self.ring.incident(identifier, now_us=T0 + POST)
         self.assertEqual(result["state"], "partial")
         self.assertTrue(result["clock_uncertain"])
+
+    def test_clock_uncertain_reconfiguration_never_trims_by_timestamp(self):
+        self.configure(value=1200)
+        for start in range(T0 - 1200 * SECOND, T0, 60 * SECOND):
+            self.append(start)
+        before = set(self.store.list_segments())
+        status = self.ring.configure(RingConfig("duration", 600), (self.profile,),
+                                     now_us=T0 - SECOND, clock_trusted=True)
+        self.assertEqual(status["reason"], "clock_uncertain")
+        self.assertEqual(set(self.store.list_segments()), before)
 
     def test_interrupted_deletion_resumes_and_preserves_shared_incident(self):
         self.warm()
