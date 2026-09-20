@@ -62,6 +62,10 @@ class VideoFormat:
 @dataclass(frozen=True)
 class CaptureProfile:
     format: VideoFormat
+    maximum_timestamp_gap: Fraction
+
+    def __post_init__(self) -> None:
+        positive_fraction(self.maximum_timestamp_gap, "maximum_timestamp_gap")
 
 
 @dataclass(frozen=True)

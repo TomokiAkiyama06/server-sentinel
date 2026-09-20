@@ -452,7 +452,9 @@ explicit immutable profiles, conservative exact-descriptor copy eligibility,
 bounded per-path compressed queues, and demand-driven viewer adapter lifetimes.
 Inference sampling applies to presentation-ordered decoded frames, never to
 compressed reference packets before decoding. Packet gaps reset dependency state
-and require a keyframe; known loss remains visible after recovery. Missing codec
+and require a keyframe; the capture profile also sets an explicit maximum forward
+timestamp gap, independent of inference cadence. Known loss remains visible after
+recovery. Missing codec
 adapters report unavailable. Real codec/transport integration and measured
 deployment defaults are still required; see that directory's integration contract.
 

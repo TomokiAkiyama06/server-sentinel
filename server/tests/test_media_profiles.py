@@ -37,7 +37,7 @@ def inference_profile(**changes):
 
 def source_profiles():
     format_ = video_format()
-    return SourceProfiles(CaptureProfile(format_), RecordingProfile(format_),
+    return SourceProfiles(CaptureProfile(format_, Fraction(2)), RecordingProfile(format_),
                           inference_profile(), ViewerProfile(format_))
 
 
@@ -351,6 +351,27 @@ class PipelineTests(unittest.TestCase):
         self.assertTrue(value.offer(packet(1)).recording_queued)
         self.assertTrue(value.recording_status.healthy)
         self.assertEqual(factory.adapters[0].resets, 0)
+
+    def test_consecutive_sequence_forward_timestamp_gap_is_visible_on_both_paths(self):
+        recording, viewer = SyntheticFactory(), SyntheticFactory()
+        value = pipeline(recording=recording, viewer=viewer)
+        value.add_viewer(SUBSCRIBER)
+        value.offer(packet(0, keyframe=True))
+        value.pump(1)
+        result = value.offer(packet(1, pts=300, dts=300))
+        self.assertEqual(result.reason, "decode_timestamp_gap")
+        self.assertFalse(result.recording_queued)
+        self.assertFalse(result.viewer_queued)
+        for status in (value.recording_status, value.viewer_status):
+            self.assertFalse(status.healthy)
+            self.assertEqual(status.discontinuities, 1)
+            self.assertTrue(status.awaiting_keyframe)
+        result = value.offer(packet(2, keyframe=True, pts=301, dts=301))
+        self.assertTrue(result.recording_queued)
+        self.assertTrue(result.viewer_queued)
+        self.assertEqual(value.pump(1), (1, 1))
+        self.assertFalse(value.recording_status.healthy)
+        self.assertFalse(value.viewer_status.healthy)
 
     def test_video_only_invariant_applies_to_every_output_profile(self):
         invalid_format = video_format(video_only=False)

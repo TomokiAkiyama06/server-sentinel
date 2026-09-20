@@ -38,7 +38,8 @@ separate supervision before runtime integration.
 
 Packets from other sources/generations and duplicate/stale sequences are rejected
 without touching the active stream. A time-base mismatch requires a new stream
-generation. Sequence gaps, backwards DTS, overflow and oversized packets reset
+generation. Sequence gaps, backwards DTS, forward DTS gaps exceeding the explicit
+capture profile tolerance, overflow and oversized packets reset
 the affected adapter and require a keyframe. PTS reordering alone is allowed for
 compressed interframes. Loss and discontinuity counters remain visible after
 recovery; healthy is never reported for that generation after a known gap.

@@ -301,6 +301,10 @@ class SourcePipeline:
             reason = "sequence_gap"
         elif self._dts is not None and packet.dts < self._dts:
             reason = "decode_timestamp_reset"
+        elif (self._dts is not None
+              and (packet.dts - self._dts) * packet.time_base
+              > self._profiles.capture.maximum_timestamp_gap):
+            reason = "decode_timestamp_gap"
         if reason != "accepted":
             self._discontinuity(reason)
         self._sequence = packet.sequence
