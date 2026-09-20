@@ -165,8 +165,16 @@ try {
     });
     for (const recordings of [0, 3]) {
       await scenario(viewport, { recordings }, async page => {
+        assert.equal(await page.evaluate('window.syntheticRecordingLoads'), 0);
         await page.click('録画');
         await page.wait(`document.querySelectorAll('[data-recording-id]').length === ${recordings}`);
+        assert.equal(await page.evaluate('window.syntheticRecordingLoads'), 1);
+        // Re-opening replaces the snapshot instead of retaining coverage state
+        // that was current only at the beginning of the session.
+        await page.click('概要');
+        await page.click('録画');
+        for (let attempt = 0; attempt < 20 && await page.evaluate('window.syntheticRecordingLoads') < 2; attempt++) await delay(10);
+        assert.equal(await page.evaluate('window.syntheticRecordingLoads'), 2);
         assert.equal(await page.evaluate('document.documentElement.scrollWidth <= window.innerWidth'), true, 'recording list fits viewport');
         assert.equal(await page.evaluate("document.querySelectorAll('#main a[href], #main a[download], video, source, iframe').length"), 0);
         if (!recordings) return;

@@ -83,7 +83,9 @@ export function App({ services = deniedServices }: { services?: DashboardService
   // the check and no client state can widen it.
   useEffect(() => {
     const loader = services.loadRecordings;
-    if (!loader || access.state !== 'allowed' || !canVisit(access, 'recordings')) return;
+    // Recording coverage can change from active to gapped or interrupted after
+    // sign-in. Re-opening the list must obtain the current server snapshot.
+    if (!loader || access.state !== 'allowed' || !canVisit(access, 'recordings') || view !== 'recordings') return;
     const controller = new AbortController();
     setRecordings({ state: 'loading' });
     void (async () => {
@@ -95,7 +97,7 @@ export function App({ services = deniedServices }: { services?: DashboardService
       }
     })();
     return () => controller.abort();
-  }, [services, access, refresh]);
+  }, [services, access, refresh, view]);
 
   useEffect(() => {
     const loader = services.loadStorage;

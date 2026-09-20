@@ -46,6 +46,10 @@ delete control because `delete_recording()` always refuses one. Starring stays
 available for an active recording because the store permits it. Starred
 recordings are shown as never auto-deleted instead of a day count.
 
+Opening Recordings obtains a new server snapshot, so an active recording that
+later completes, is interrupted, or acquires known coverage loss is not kept as
+an earlier session-wide state.
+
 Playback is in-browser only: there is no download, export, media link or
 embedded media element for any role, and the screen states plainly that
 in-browser playback does not prevent screen recording or client-side copying.

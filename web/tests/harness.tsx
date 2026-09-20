@@ -18,6 +18,8 @@ function session(value: unknown): Session {
 }
 let recordings: RecordingSummary[] = [];
 let loaded = false;
+let recordingLoads = 0;
+Object.defineProperty(window, 'syntheticRecordingLoads', { get: () => recordingLoads });
 // Synthetic latency so tests can observe in-flight mutation handling.
 let syntheticMutations = 0;
 const settle = () => new Promise<void>(resolve => setTimeout(resolve, 150));
@@ -38,6 +40,7 @@ const services = {
     return value as CameraSourceSummary[];
   }, signal),
   loadRecordings: async (signal: AbortSignal) => {
+    recordingLoads += 1;
     if (!loaded) {
       recordings = await api.read('/api/mock/recordings', value => {
         if (!Array.isArray(value)) throw new Error();
