@@ -70,7 +70,13 @@ state, active cadence, intentional samples, drops and processed counts. A later
 successful inference remains `degraded` after known loss until the control
 plane explicitly acknowledges recovery; throttling remains visible until
 `restore_cadence()` is called. Neither operation erases an unavailable result.
-Observations expire to `unknown` when a feed stops. Plugin exceptions are
+`invalidate(source_id, reason=...)` is the explicit control-plane operation for
+a detector stop, failure or unusable quality that arrives without a frame: it
+drops the pending frame and replaces the published observation with `unknown`
+immediately, instead of waiting for `maximum_observation_age_ns`. It publishes
+no conclusion, rejects `evaluated`/`warmup` reasons, and ignores an unregistered
+source, which exposes no snapshot at all. Observations also expire to `unknown`
+when a feed stops. Plugin exceptions are
 reduced to a fixed reason; exception messages are not logged or returned.
 
 An evaluation budget is checked **after** a plugin returns. This primitive
