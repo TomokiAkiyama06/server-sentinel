@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import type { DashboardServices, Observation, ObservationKind, ObservationValue, TimelinePage } from '../domain';
 import type { TimelineCursor } from '../domain';
 import type { Messages } from '../i18n';
@@ -62,6 +62,10 @@ function attribution(item: Observation, t: Messages): string {
 function Row({ item, t }: { item: Observation; t: Messages }) {
   const group = kindGroup[item.kind];
   const value = displayValue(item);
+  // The core confirms only a quality-sufficient positive with a confidence;
+  // the UI repeats those prerequisites instead of trusting the flag alone.
+  const confirmed = item.confirmed && item.quality === 'sufficient'
+    && item.value === 'observed' && item.confidence !== null;
   // Receipt time is the ordering key; the occurrence time stays on the row.
   return <li className={`timeline-row timeline-${group}`} data-observation-kind={item.kind}>
     <time className="timeline-time" dateTime={item.received_at}
@@ -73,7 +77,7 @@ function Row({ item, t }: { item: Observation; t: Messages }) {
         {item.presence_state ? ` (${t[`state_${item.presence_state}`]})` : ''}
         {group === 'critical' && <span className="badge badge-critical">{t.criticalBadge}</span>}
         {/* A quality-gated result is never labelled confirmed. */}
-        {item.confirmed && value === item.value && <span className="badge">{t.confirmedLabel}</span>}
+        {confirmed && <span className="badge">{t.confirmedLabel}</span>}
       </p>
       <p className="timeline-meta">
         <span>{attribution(item, t)}</span>
@@ -142,6 +146,8 @@ function extend(previous: TimelinePage, next: TimelinePage): TimelinePage {
 export function TimelineScreen({ services, t }: { services: DashboardServices; t: Messages }) {
   const [data, setData] = useState<State>({ state: 'pending' });
   const [filter, setFilter] = useState<TimelineFilter>('all');
+  // One page request at a time, independent of render timing.
+  const inFlight = useRef(false);
 
   useEffect(() => {
     // Bound to the service so class-based providers keep their receiver.
@@ -171,6 +177,8 @@ export function TimelineScreen({ services, t }: { services: DashboardServices; t
   const cursor: TimelineCursor | null = data.page.next_cursor;
   const load = services.loadTimeline?.bind(services);
   const more = load && cursor && !data.complete ? () => {
+    if (inFlight.current) return;
+    inFlight.current = true;
     setData({ ...data, more: true, moreFailed: false });
     const controller = new AbortController();
     void (async () => {
@@ -183,7 +191,7 @@ export function TimelineScreen({ services, t }: { services: DashboardServices; t
       } catch {
         // Keep the history already loaded and leave the retry path in place.
         setData({ ...data, more: false, moreFailed: true });
-      }
+      } finally { inFlight.current = false; }
     })();
   } : undefined;
   return <TimelineBody page={data.page} filter={filter} t={t} onFilter={setFilter}

@@ -49,7 +49,7 @@ const olderTimelineFixture = {
 const presenceFixture = {
   snapshot: {
     state: 'PRESENT', basis: 'manual_override', override_expires_at: '2026-09-21T18:30:00.000000+00:00',
-    clock_degraded: false, suppress_ordinary: true, critical_detection: 'armed',
+    clock_degraded: false, observation_clock_degraded: true, suppress_ordinary: true, critical_detection: 'armed',
     critical_persistence: 'armed', critical_evidence: 'armed', critical_notifications: 'armed',
     critical_paths_degraded: false, override_expiry_pending: false, pending_critical_actions: 0,
   },
@@ -194,6 +194,8 @@ try {
       assert.match(presenceText, /手動上書きが有効です。/);
       assert.match(presenceText, /PRESENT かつ時刻が信頼できるため、通常の occupancy automation を抑制しています。/);
       assert.match(presenceText, /すべての presence state で継続します。/);
+      assert.match(presenceText, /観測の受信時刻に skew または不連続が報告されています。/);
+      assert.doesNotMatch(presenceText, /現在の状態の根拠となる記録の時刻信頼性/);
       assert.match(presenceText, /手動上書きを設定/);
       assert.equal(await page.evaluate('document.documentElement.scrollWidth <= window.innerWidth'), true, 'timeline and presence fit viewport');
       // Provider methods are invoked on their service; a lost receiver fails here.

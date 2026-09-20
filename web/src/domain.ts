@@ -94,7 +94,10 @@ export interface PresenceSnapshot {
   state: PresenceState;
   basis: PresenceBasis;
   override_expires_at: string | null;
+  /** Timing trust of the marker behind `basis`: Owner control or observation. */
   clock_degraded: boolean;
+  /** Timing trust of observation receipt, independent of `clock_degraded`. */
+  observation_clock_degraded: boolean;
   suppress_ordinary: boolean;
   critical_detection: CriticalPath;
   critical_persistence: CriticalPath;

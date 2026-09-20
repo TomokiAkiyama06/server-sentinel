@@ -38,6 +38,8 @@ export function PresenceBody({ report, t, onCancel, failed, cancelling, onRefres
       {onRefresh && <button type="button" disabled={cancelling}
         onClick={onRefresh}>{t.presenceRefresh}</button>}
       {snapshot.clock_degraded && <p className="timeline-degraded" role="status">{t.clockDegradedNotice}</p>}
+      {snapshot.observation_clock_degraded
+        && <p className="timeline-degraded" role="status">{t.observationClockDegraded}</p>}
     </section>
     <section className="presence-override" aria-label={t.overrideCancel}>
       <h2>{t.basis_manual_override}</h2>

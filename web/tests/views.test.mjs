@@ -43,7 +43,7 @@ const page = (items, overrides = {}) => ({
 const paths = ['critical_detection', 'critical_persistence', 'critical_evidence', 'critical_notifications'];
 const snapshot = (overrides = {}) => ({
   state: 'UNKNOWN', basis: 'unknown', override_expires_at: null, clock_degraded: false,
-  suppress_ordinary: false, critical_detection: 'armed', critical_persistence: 'armed',
+  observation_clock_degraded: false, suppress_ordinary: false, critical_detection: 'armed', critical_persistence: 'armed',
   critical_evidence: 'armed', critical_notifications: 'armed', critical_paths_degraded: false,
   override_expiry_pending: false, pending_critical_actions: 0, ...overrides,
 });
@@ -264,8 +264,15 @@ test('a quality-gated result is never labelled confirmed', () => {
   }
   const gatedNegative = observation('person', { confirmed: true, value: 'not_observed', quality: 'insufficient' });
   assert.doesNotMatch(timeline(page([gatedNegative])), /確認済み/);
-  // Status events are not quality gated, so their confirmation still stands.
-  assert.match(timeline(page([observation('recording', { value: 'failed', quality: 'unknown', confirmed: true })])), /確認済み/);
+  // The core confirms only a quality-sufficient positive carrying a confidence.
+  for (const overrides of [{ value: 'unknown' }, { value: 'not_observed' }, { quality: 'unknown' }, { confidence: null }]) {
+    const item = observation('camera_tamper', { confirmed: true, ...overrides });
+    assert.doesNotMatch(timeline(page([item])), /確認済み/, JSON.stringify(overrides));
+  }
+  assert.match(timeline(page([observation('camera_tamper', { confirmed: true })])), /確認済み/);
+  // A status event is not quality gated, but confirmation still needs its prerequisites.
+  assert.match(timeline(page([observation('recording', { confirmed: true })])), /確認済み/);
+  assert.doesNotMatch(timeline(page([observation('recording', { value: 'failed', quality: 'unknown', confirmed: true })])), /確認済み/);
 });
 
 test('critical observations are visually distinguished without asserting a culprit', () => {
@@ -430,9 +437,28 @@ test('only a future override expiry schedules a refresh', () => {
   assert.equal(refreshDelay('2026-09-22T09:00:00.000000+00:00', now), 3600000);
 });
 
+test('basis timing and observation timing are reported as separate facts', () => {
+  const basisOnly = presence({ snapshot: snapshot({ clock_degraded: true }), audit: [] });
+  assert.match(basisOnly, /現在の状態の根拠となる記録の時刻信頼性が低下しています。/);
+  assert.doesNotMatch(basisOnly, /観測の受信時刻に skew/);
+  const observationOnly = presence({ snapshot: snapshot({ observation_clock_degraded: true }), audit: [] });
+  assert.match(observationOnly, /観測の受信時刻に skew または不連続が報告されています。/);
+  assert.doesNotMatch(observationOnly, /現在の状態の根拠となる記録の時刻信頼性/);
+  const both = presence({ snapshot: snapshot({ clock_degraded: true, observation_clock_degraded: true }), audit: [] });
+  assert.match(both, /現在の状態の根拠となる記録の時刻信頼性/);
+  assert.match(both, /観測の受信時刻に skew/);
+  const neither = presence({ snapshot: snapshot(), audit: [] });
+  assert.doesNotMatch(neither, /時刻信頼性が低下|観測の受信時刻に skew/);
+  // A skewed observation clock never blocks an accepted Owner override.
+  const override = presence({ snapshot: snapshot({ state: 'PRESENT', basis: 'manual_override',
+    suppress_ordinary: true, observation_clock_degraded: true }), audit: [] });
+  assert.doesNotMatch(override, /一致していません/);
+  assert.match(override, /PRESENT かつ時刻が信頼できるため、通常の occupancy automation を抑制しています。/);
+});
+
 test('degraded clock and pending critical work stay visible on presence', () => {
   const markup = presence({ snapshot: snapshot({ clock_degraded: true, pending_critical_actions: 2 }), audit: [] });
-  assert.match(markup, /時刻の信頼性が低下しています。状態の根拠と手動上書きを確認してください。/);
+  assert.match(markup, /現在の状態の根拠となる記録の時刻信頼性が低下しています。/);
   assert.match(markup, /未完了の critical 対応: 2/);
   assert.doesNotMatch(presence({ snapshot: snapshot(), audit: [] }), /未完了の critical 対応/);
 });
@@ -445,7 +471,7 @@ test('degraded timing preserves a manual override state without claiming it beca
   }), audit: [] });
   assert.match(markup, /presence-PRESENT/);
   assert.match(markup, /手動上書きが有効です。/);
-  assert.match(markup, /時刻の信頼性が低下しています。状態の根拠と手動上書きを確認してください。/);
+  assert.match(markup, /現在の状態の根拠となる記録の時刻信頼性が低下しています。/);
   assert.match(markup, /PRESENT ですが時刻の信頼性が低下しているため、通常の occupancy automation は抑制しません。/);
   assert.doesNotMatch(markup, /一致していません/);
   assert.doesNotMatch(markup, /状態は不明側に倒して表示します。/);
