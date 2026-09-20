@@ -53,7 +53,9 @@ Integration sequence:
 2. Assess quality for the particular detector with its current execution state
    and frame-bound context. A stopped/failed/skipped/unavailable detector yields
    unknown even if another detector can continue.
-3. Pass `decision.quality` to that detector's `InferenceScheduler.offer`.
+3. Construct the gate with `results=` the detector's `InferenceScheduler` (any
+   `ResultSink`), so the gate can revoke that source's published conclusion
+   without a frame. Pass `decision.quality` to `InferenceScheduler.offer`.
    The scheduler immediately invalidates preceding conclusions on bad quality,
    and enforces queue/evaluation/result age through `SourcePolicy`.
 4. For dependent owner/entrance/presence adapters, propagate the scheduler's
@@ -61,10 +63,21 @@ Integration sequence:
    `gate.guard_result()` requires the gate's latest decision, the exact result
    frame identity, completed execution and an actual `Detection`. It also
    preserves any unknown detector result. An old assessment cannot authorize a
-   late completion after a newer assessment has invalidated it.
+   late completion after a newer assessment has invalidated it, and an
+   unavailable execution drops that assessment, so replaying the same decision
+   with a later `SUCCEEDED` cannot resurrect an incomplete batch.
 5. Call `gate.invalidate(execution=...)` when a worker stops or fails without a
-   new frame. On restart, quality recovery starts again. Result freshness still
-   belongs to the scheduler; a gate does not replace its monotonic age policy.
+   new frame. It returns the unknown `Detection` to publish. On restart, quality
+   recovery starts again. Result freshness still belongs to the scheduler; a
+   gate does not replace its monotonic age policy.
+
+Immediate effect covers the conclusion already published, not only the next
+one. A stop, failure, incomplete batch, unusable frame or pending recovery
+calls `ResultSink.invalidate(source_id, reason=...)`, which replaces the
+source's `present`/`absent` with `unknown` at once. Without that, a detector
+that stops after reporting `absent` would keep a trustworthy negative readable
+until `maximum_observation_age_ns` expired. The gate only ever revokes a
+result; publishing a conclusion stays with the scheduler.
 
 A stricter owner-verification profile must not disable an unrelated critical
 camera-tamper profile. Each profile lists its own prerequisites; for example a
@@ -75,7 +88,9 @@ change recording/live state or suppress critical monitoring.
 `server/tests/test_detector_quality.py` generates geometric synthetic shapes,
 darkness, severe box blur, clipped pixels and obstruction masks in memory. It
 checks both positive/negative results, source/profile independence, hysteresis,
-execution failure/stop, late-result rejection, and scheduler unknown propagation.
+execution failure/stop, late-result rejection, immediate invalidation of an
+already published conclusion on stop/failure/recovery/incomplete batch, and
+scheduler unknown propagation.
 The calibration in tests is only for those synthetic fixtures. Real lighting,
 physical camera/profile thresholds, and their acceptance remain `MANUAL_TEST.md`
 section L and the hardware hardening Issues.

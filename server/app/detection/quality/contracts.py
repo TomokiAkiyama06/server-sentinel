@@ -3,9 +3,10 @@
 from dataclasses import dataclass
 from enum import Enum
 import math
+from typing import Protocol
 from uuid import UUID
 
-from app.detection.foundation import GrayFrame, Quality
+from app.detection.foundation import GrayFrame, Quality, Reason
 
 
 class Metric(str, Enum):
@@ -27,6 +28,34 @@ class Execution(str, Enum):
     STOPPED = "stopped"
     FAILED = "failed"
     UNAVAILABLE = "unavailable"
+
+
+UNAVAILABLE_REASONS = {
+    Execution.SKIPPED: Reason.NOT_STARTED,
+    Execution.STOPPED: Reason.NOT_STARTED,
+    Execution.UNAVAILABLE: Reason.NOT_STARTED,
+    Execution.FAILED: Reason.FAILURE,
+}
+
+
+def unavailable_reason(execution: Execution) -> Reason:
+    """Fail-unknown result reason for an execution state that cannot conclude."""
+    if not isinstance(execution, Execution) or execution in (Execution.READY, Execution.SUCCEEDED):
+        raise ValueError("execution state is not unavailable")
+    return UNAVAILABLE_REASONS[execution]
+
+
+class ResultSink(Protocol):
+    """Publisher of a source's detection result, invalidated without a frame.
+
+    `InferenceScheduler` satisfies this. A quality gate never publishes a
+    conclusion; it only revokes one that can no longer be trusted, so that a
+    stop, failure or unusable frame cannot leave an earlier `absent` readable
+    until the scheduler's observation age expires.
+    """
+
+    def invalidate(self, source_id: UUID, *, reason: Reason):
+        ...
 
 
 class QualityReason(str, Enum):

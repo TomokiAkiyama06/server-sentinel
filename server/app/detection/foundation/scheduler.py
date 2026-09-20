@@ -198,6 +198,25 @@ class InferenceScheduler:
             state.pending = None
             self._unknown(state, Reason.NOT_STARTED)
 
+    def invalidate(self, source_id: UUID, *, reason: Reason) -> SourceSnapshot | None:
+        """Replace a published conclusion with unknown without a new frame.
+
+        Detector stop/failure and unusable quality must take effect at once;
+        waiting for maximum_observation_age_ns would keep publishing a result
+        that is no longer trustworthy. An unregistered source publishes no
+        snapshot at all, so it has no conclusion left to invalidate.
+        """
+        if (not isinstance(source_id, UUID) or not isinstance(reason, Reason)
+                or reason in (Reason.EVALUATED, Reason.WARMUP)):
+            raise ValueError("invalidation requires an unavailable reason")
+        with self._lock:
+            state = self._sources.get(source_id)
+            if state is None:
+                return None
+            state.pending = None
+            self._unknown(state, reason)
+            return self._snapshot(source_id, state)
+
     def snapshot(self, source_id: UUID) -> SourceSnapshot:
         with self._lock:
             now = self._now()
