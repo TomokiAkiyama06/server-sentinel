@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import subprocess
 import shutil
+import stat
 import sys
 import tempfile
 import unittest
@@ -19,7 +20,8 @@ from media_capture_agent.cli import main
 from media_capture_agent.config import ConfigurationError, Settings, MAX_CONFIGURATION_BYTES
 from media_capture_agent.health import ClockExchange, assess_clock
 from media_capture_agent.runtime import Agent
-from media_capture_agent.storage import MediaStore, Mount, StorageRefused, parse_mounts
+from media_capture_agent.storage import (MediaStore, Mount, StorageRefused, parse_mounts,
+                                         stable_device_matches)
 from tests.support import MockSession, SyntheticCapture, configuration, settings
 
 
@@ -31,6 +33,7 @@ class DeploymentCase(unittest.TestCase):
         self.settings = settings(self.root)
 
     def store(self, **kwargs):
+        kwargs.setdefault("stable_device", lambda _expected: True)
         store = MediaStore(self.settings, **kwargs)
         self.addCleanup(store.close)
         return store
@@ -60,8 +63,28 @@ class StorageTests(DeploymentCase):
                 self.store(mounts=lambda: mounts)
         self.assertEqual(list(self.settings.media_root.iterdir()), [])
 
+    def test_unverified_stable_device_blocks_startup(self):
+        with self.assertRaisesRegex(StorageRefused, "stable_device_mismatch"):
+            self.store(stable_device=lambda _expected: False)
+
+    def test_stable_device_uuid_must_resolve_to_approved_block_device(self):
+        expected = self.settings.expected_mount
+        matching = type("Device", (), {
+            "st_mode": stat.S_IFBLK,
+            "st_rdev": os.makedev(expected.major, expected.minor),
+        })()
+        with patch("media_capture_agent.storage.os.stat", return_value=matching):
+            self.assertTrue(stable_device_matches(expected))
+        replaced = type("Device", (), {
+            "st_mode": stat.S_IFBLK,
+            "st_rdev": os.makedev(expected.major, expected.minor + 1),
+        })()
+        with patch("media_capture_agent.storage.os.stat", return_value=replaced):
+            self.assertFalse(stable_device_matches(expected))
+
     def test_runtime_remount_same_device_is_refused(self):
-        current = [Mount(self.settings.expected_mount, 1, False)]
+        current = [Mount(dataclasses.replace(self.settings.expected_mount,
+                                             filesystem_uuid=None), 1, False)]
         store = self.store(mounts=lambda: current, mount_id=lambda _: current[0].mount_id)
         current[0] = dataclasses.replace(current[0], mount_id=2)
         with self.assertRaisesRegex(StorageRefused, "mount_replaced"):
@@ -207,9 +230,10 @@ class StorageTests(DeploymentCase):
     def test_systemd_narrow_writable_bind_preserves_approved_backing_identity(self):
         expected = self.settings.expected_mount
         relative = self.settings.media_root.relative_to(expected.mount_point)
-        namespace = dataclasses.replace(expected, mount_point=self.settings.media_root,
+        parent = dataclasses.replace(expected, filesystem_uuid=None)
+        namespace = dataclasses.replace(parent, mount_point=self.settings.media_root,
                                         filesystem_root=expected.filesystem_root / relative)
-        mounts = [Mount(expected, 10, True), Mount(namespace, 11, False)]
+        mounts = [Mount(parent, 10, True), Mount(namespace, 11, False)]
         store = self.store(mounts=lambda: mounts, mount_id=lambda _: 11)
         identity = uuid4()
         store.write_segment(identity, b"synthetic namespace capture")
@@ -452,7 +476,13 @@ raise SystemExit(1)
 
 
 class DistributionTests(DeploymentCase):
-    def test_versioned_artifact_runs_outside_checkout(self):
+    def test_ci_container_context_is_allow_listed(self):
+        rules = (Path(__file__).parents[1] / ".dockerignore").read_text(encoding="utf-8")
+        self.assertIn("\n*\n", "\n" + rules)
+        for path in ("!media_capture_agent/**", "!tests/**", "**/__pycache__/", "**/*.pyc"):
+            self.assertIn(path, rules)
+
+    def test_versioned_artifact_accepts_only_config_outside_installation(self):
         version = self.root / "installation" / "0.1.0"
         version.mkdir(parents=True)
         artifact = version / "media-capture-agent"
@@ -470,9 +500,22 @@ class DistributionTests(DeploymentCase):
         values["expected_mount"]["filesystem_root"] = str(values["expected_mount"]["filesystem_root"])
         config.write_text(json.dumps(values))
         config.chmod(0o600)
-        checked = subprocess.run([sys.executable, str(artifact), "--config", str(config), "--check"],
-                                 capture_output=True, text=True, check=True, cwd="/")
-        self.assertIn("validation passed", checked.stdout)
+        for parent in (version, version.parent):
+            internal = parent / "deployment.json"
+            internal.write_text(config.read_text())
+            internal.chmod(0o600)
+            rejected = subprocess.run([sys.executable, str(artifact), "--config", str(internal),
+                                       "--check"], capture_output=True, text=True, cwd="/", timeout=5)
+            self.assertEqual(rejected.returncode, 1)
+            self.assertNotIn("validation passed", rejected.stdout)
+        for key in ("runtime_root", "media_root"):
+            internal = version.parent / key
+            internal.mkdir(mode=0o700)
+            config.write_text(json.dumps(dict(values, **{key: str(internal)})))
+            rejected = subprocess.run([sys.executable, str(artifact), "--config", str(config),
+                                       "--check"], capture_output=True, text=True, cwd="/", timeout=5)
+            self.assertEqual(rejected.returncode, 1)
+            self.assertNotIn("validation passed", rejected.stdout)
         import zipfile
         with zipfile.ZipFile(artifact) as archive:
             self.assertIn("LICENSE", archive.namelist())
@@ -522,7 +565,7 @@ raise SystemExit(1)
         config.chmod(0o600)
         artifact = self.root / "bounded-artifact"
         artifact.write_bytes(b"synthetic-artifact-not-executed")
-        args = argparse.Namespace(artifact=artifact, config=config, version="0.1.0",
+        args = argparse.Namespace(artifact=artifact, config=Path(os.path.relpath(config)), version="0.1.0",
                                   destination=destination, video_device=[],
                                   unit=self.root / "media-capture-agent.service",
                                   sha256=hashlib.sha256(artifact.read_bytes()).hexdigest())
@@ -539,6 +582,8 @@ raise SystemExit(1)
             os.umask(previous)
         self.assertEqual((destination / "0.1.0").stat().st_mode & 0o777, 0o755)
         self.assertEqual((destination / "0.1.0/media-capture-agent").stat().st_mode & 0o777, 0o555)
+        self.assertEqual(preflight.call_args.args[0][2], str(config.absolute()))
+        self.assertIn(str(config.absolute()), args.unit.read_text(encoding="utf-8"))
 
     def test_checkout_named_agent_accepts_external_sibling_data(self):
         component = self.root / "agent" / "agent"
@@ -554,10 +599,8 @@ raise SystemExit(1)
             value["expected_mount"][key] = str(value["expected_mount"][key])
         config.write_text(json.dumps(value))
         config.chmod(0o600)
-        result = subprocess.run([sys.executable, "-m", "media_capture_agent.cli",
-                                 "--config", str(config), "--check"], cwd=component,
-                                capture_output=True, text=True, timeout=5, check=True)
-        self.assertIn("validation passed", result.stdout)
+        loaded = Settings.load(config, code_root=component)
+        self.assertEqual(loaded.node_id, self.settings.node_id)
 
     def test_unit_dedicated_account_and_video_only_devices(self):
         unit = render_unit(Path("/opt/example/0.1.0/media-capture-agent"),

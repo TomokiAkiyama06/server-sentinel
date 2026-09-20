@@ -217,6 +217,28 @@ When devices reappear:
 
 This rule applies on both the main host and remote capture nodes.
 
+### 4.4 Local adapter implementation boundary
+
+The local adapter stores private approval evidence and a durable ambiguity latch
+in the application database. A live approved weak binding does not constitute
+proof for a subsequent reconnect or process restart. Discovery alone is never
+`online`; successful frame capture is required. The initial implementation uses
+bounded single-planar V4L2 MMAP on Linux x86_64/aarch64, reports the actual
+negotiated dimensions/FPS/FourCC, and requires an explicit capture profile.
+Unsupported multi-planar capture or codec/bitrate controls fail explicitly.
+Source workers, Owner management and the preview frame sink are internal
+interfaces; physical capture is not auto-started by the backend launcher and no
+unauthenticated preview route is added. See `server/app/cameras/uvc/README.md`.
+
+Identity reconciliation starts only after an active-session marker is durable.
+An unclean session, including a failed ambiguity-latch write, requires Owner
+reapproval at restart; it cannot fall back to an older clean approval record.
+Clean shutdown releases this marker after closing capture while retaining any
+manual-approval latch. A missing capture profile does not hide that latch.
+Known duplicated serials remain unsuitable for automatic reconnect even after the current physical
+candidate is explicitly approved. This confidence is stored separately from raw
+device evidence. A different unique serial may establish a new strong identity.
+
 ## 5. `media-capture-agent`
 
 ### 5.1 Purpose
@@ -477,6 +499,17 @@ For wide room coverage, real-hardware tests should compare at minimum:
 - ring-buffer disk throughput/capacity at candidate capture profiles.
 
 Final defaults are measured, not guessed.
+
+The transport-independent implementation in `server/app/media/profiles/` uses
+explicit immutable profiles, conservative exact-descriptor copy eligibility,
+bounded per-path compressed queues, and demand-driven viewer adapter lifetimes.
+Inference sampling applies to presentation-ordered decoded frames, never to
+compressed reference packets before decoding. Packet gaps reset dependency state
+and require a keyframe; the capture profile also sets an explicit maximum forward
+timestamp gap, independent of inference cadence. Known loss remains visible after
+recovery. Missing codec
+adapters report unavailable. Real codec/transport integration and measured
+deployment defaults are still required; see that directory's integration contract.
 
 ### 6.4 Agent-to-main transport
 

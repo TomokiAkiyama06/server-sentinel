@@ -37,6 +37,41 @@ Tester:
 
 ## A. Local UVC / USB camera
 
+Issue #11 implementation status (2026-09-20): synthetic discovery, driver-ioctl,
+identity, restart-persistence and registry integration tests passed. No physical
+camera was opened and no actual preview, audio-device trace or arm64 execution
+was verified. All hardware checkboxes below remain unverified.
+
+After the Owner-authorized management and worker/preview wiring are available,
+run the following on the intended Main Ubuntu host under its dedicated account:
+
+1. Record model, supported profile, device permission and stable evidence in a
+   private local test record; publish only pass/fail and non-sensitive counts.
+2. Enable one source with an explicit profile and select its current physical
+   candidate. Verify negotiated dimensions/FPS/FourCC and first-frame transition
+   from degraded to online. Repeat with up to four sources.
+3. Observe the service's opened descriptors locally while the camera's integrated
+   microphone is present; only the selected video device may be opened, never
+   ALSA/OSS microphone devices. Do not publish trace paths or captured media.
+4. Unplug one camera. Verify its offline audit event, continuing service process,
+   and uninterrupted second source. Reconnect a unique serial camera with changed
+   video-node numbering and verify the same source UUID returns online only after
+   a new frame. Disable it and verify its video descriptor is closed.
+5. Reorder identical non-serial devices, including the case where only one is
+   reattached. Verify manual intervention; restart the backend and verify the
+   latch still holds. Explicitly reapprove the current candidate and confirm video
+   resumes. Duplicate-serial evidence must also require manual intervention.
+6. Check unsupported profile/permission, driver timeout and corrupted-frame paths
+   are visibly unavailable, never healthy; restore the supported configuration.
+7. Using a disposable database, inject a failed ambiguity-latch write and stop the
+   worker without clean shutdown. Restart with one formerly duplicated serial
+   device remaining: it must require Owner reapproval. Repeat with no capture
+   profile; the manual-intervention state must remain visible. A normal clean
+   shutdown/restart of an unambiguous serial device may reconnect automatically.
+
+Results: **NOT RUN — hardware, authorized management and viewer integration
+remain pending. Issue #11 is not closed by synthetic tests.**
+
 For each tested camera:
 
 - [ ] exact manufacturer/model and advertised UVC resolution/FPS/pixel-format/codec capabilities are recorded locally;
@@ -145,6 +180,15 @@ Compare at minimum where camera capabilities allow:
 - [ ] person/entrance detection quality.
 
 Choose defaults from measurements, not assumptions.
+
+The synthetic profile core tests do not satisfy the following integration checks:
+
+- [ ] run the selected real decoder on all compressed reference packets; verify independent inference cadence and actual resized image dimensions, including B-frame reordering and stream restart;
+- [ ] compare durable recording codec/profile/quality before, during, and after changing viewer quality; record any discontinuities explicitly;
+- [ ] count viewer-only codec processes, handles and memory before the first subscriber, with subscribers, and after the last leaves; confirm cleanup and bounded failure recovery;
+- [ ] apply recording and viewer queue pressure separately; verify bounded memory, visible loss, and keyframe recovery without claiming continuous evidence;
+- [ ] verify copy eligibility against actual codec configuration, container, timestamps and color metadata; unsupported copy/transcode paths remain unavailable;
+- [ ] record only sanitized aggregate resource measurements; no deployment identifiers, room imagery, media payloads, or exact private network values enter GitHub.
 
 ## D. Source registry / mixed topology
 
@@ -521,6 +565,11 @@ The synthetic CI tests do not complete these checks. On an isolated Capture Node
 - [ ] Confirm `--check` succeeds both outside and inside the generated systemd
   mount namespace when the media root is a subdirectory of an approved mount.
   A bind of another backing directory on the same device must be rejected.
+- [ ] Record the Owner-approved filesystem UUID only in the private deployment
+  configuration. On a disposable volume, replace the filesystem while reusing
+  the mount path and device name, restart the Agent, and verify `--check` and
+  new writes refuse the replacement rather than treating it as the approved
+  storage.
 - [ ] Start/stop through systemd after #11/#13/#14 integration; verify no GUI/tray,
   no microphone opens, no audio setting and no inbound listener/SSH dependency.
 - [ ] Unplug an approved UVC camera: source becomes offline while node heartbeat

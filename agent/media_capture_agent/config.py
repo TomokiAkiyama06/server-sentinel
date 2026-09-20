@@ -5,6 +5,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import stat
 from uuid import UUID
 
@@ -34,11 +35,13 @@ class ExpectedMount:
     major: int
     minor: int
     filesystem_root: Path
+    filesystem_uuid: str | None = None
 
     @classmethod
     def parse(cls, value):
         if not isinstance(value, dict) or set(value) != {
-            "mount_point", "filesystem", "source", "major", "minor", "filesystem_root"
+            "mount_point", "filesystem", "source", "major", "minor", "filesystem_root",
+            "filesystem_uuid"
         }:
             raise ConfigurationError("expected mount identity is required")
         for key in ("filesystem", "source"):
@@ -46,12 +49,16 @@ class ExpectedMount:
                 char in value[key] for char in "\0\r\n"
             ):
                 raise ConfigurationError("invalid mount identity")
+        filesystem_uuid = value["filesystem_uuid"]
+        if (not isinstance(filesystem_uuid, str)
+                or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{0,127}", filesystem_uuid)):
+            raise ConfigurationError("invalid stable filesystem identity")
         for key in ("major", "minor"):
             if type(value[key]) is not int or value[key] < 0:
                 raise ConfigurationError("invalid device identity")
         return cls(absolute_path(value["mount_point"]), value["filesystem"],
                    value["source"], value["major"], value["minor"],
-                   absolute_path(value["filesystem_root"]))
+                   absolute_path(value["filesystem_root"]), filesystem_uuid)
 
 
 @dataclass(frozen=True)

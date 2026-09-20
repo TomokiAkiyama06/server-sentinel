@@ -6,6 +6,7 @@ from pathlib import Path
 import signal
 import sys
 import threading
+import zipimport
 
 from .config import ConfigurationError, Settings
 from .runtime import Agent
@@ -22,10 +23,12 @@ def main(argv=None):
     stopped = threading.Event()
     previous = {}
     try:
-        # For checkout execution exclude the complete repository; for a zipapp
-        # exclude the versioned installation directory containing the executable.
+        # A release lives at destination/version/media-capture-agent. Exclude
+        # the whole destination, including siblings of this release directory.
+        # Checkout execution instead excludes the complete repository.
         location = Path(__file__).absolute()
-        code_root = location.parents[2]
+        code_root = (Path(__loader__.archive).resolve().parents[1]
+                     if isinstance(__loader__, zipimport.zipimporter) else location.parents[2])
         settings = Settings.load(args.config, code_root=code_root)
         store = MediaStore(settings)
         agent = Agent(settings, store)
