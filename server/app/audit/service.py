@@ -27,10 +27,20 @@ class OwnerAuthorizationError(PermissionError):
 
 class OwnerAuthorizer(Protocol):
     def require_owner(self, actor_context: object) -> None:
-        """Return only for the current deployment Owner; otherwise raise."""
+        """Return only for the current deployment Owner; otherwise raise.
+
+        This subsystem defines no authentication of its own. An implementation
+        must come from the Issue #6 human-access boundary and satisfy its
+        contract, including verified identity, current grants rechecked for
+        this operation, and the Owner-operation verification freshness window
+        proposed in ADR-0003. Network reachability, a Tailnet membership or a
+        capture-node credential never satisfies it.
+        """
 
 
 class DenyAllOwners:
+    """The default until a deployment supplies that boundary: deny everything."""
+
     def require_owner(self, actor_context: object) -> None:
         raise OwnerAuthorizationError()
 
