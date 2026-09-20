@@ -113,6 +113,29 @@ UNSUPPORTED_MANIFESTS = {
 }
 
 
+# Container build commands are allowlisted: an unrecognized installer, option
+# or subcommand fails closed instead of being skipped as "some other flag".
+PIP_BINARY = re.compile(r"pip[0-9.]*")
+PIP_REQUIREMENT_FLAGS = {"--requirement", "--constraint"}
+ALLOWED_PIP_FLAGS = {
+    "--disable-pip-version-check", "--no-build-isolation", "--no-cache-dir",
+    "--no-compile", "--no-deps", "--no-input", "--no-warn-script-location",
+    "--prefer-binary", "--quiet", "--require-hashes", "--upgrade", "-q", "-U",
+}
+ALLOWED_PIP_VALUE_FLAGS = {
+    "--only-binary", "--progress-bar", "--retries", "--root-user-action",
+    "--timeout",
+}
+# npm resolves installs from the lock only for the `ci` family; every other
+# command, including its documented `install` aliases, is rejected.
+REVIEWED_NPM_COMMANDS = {
+    "ci", "clean-install", "ic", "install-clean", "isntall-clean",
+    "run", "run-script", "start", "test",
+}
+REJECTED_PACKAGE_MANAGERS = {"bun", "npx", "pnpm", "yarn"}
+SOURCE_SCAN_SUFFIXES = {".py", ".pyi"}
+
+
 class GateError(ValueError):
     pass
 
@@ -461,48 +484,118 @@ def container_file(path: Path, relative: str, scope: str):
                     continue
                 images.append(image_use(source, relative, scope, relative))
         elif instruction == "RUN":
-            requirements.extend(run_requirements(arguments, relative))
+            requirements.extend(run_commands(arguments, relative))
     if not images:
         raise GateError(f"no reviewed base image in {relative}")
     return images, requirements
 
 
-def run_requirements(arguments, relative):
-    """Reject unpinned installs and report requirement files a build installs."""
-    text = " ".join(arguments)
-    if re.search(r"\bnpm\s+(?:install|i|add|update)\b", text):
-        raise GateError(f"container build must install npm packages with npm ci in {relative}")
+def shell_tokens(command):
+    """Split one shell command, ignoring JSON-exec quoting and separators."""
+    return [token.strip("[]\",'") for token in command.split() if token.strip("[]\",'")]
+
+
+def requirement_targets(target, relative):
+    """Repository paths a Dockerfile requirement option can refer to."""
+    if (not target or "://" in target or "\\" in target
+            or PurePosixPath(target).is_absolute()):
+        raise GateError(f"pip install uses an unreviewed source in {relative}")
+    parent = PurePosixPath(relative).parent
+    candidates = []
+    for option in (target, PurePosixPath(target).name):
+        resolved = posixpath.normpath(str(parent / option))
+        if resolved.startswith(("..", "/")):
+            raise GateError(f"pip install uses an unreviewed source in {relative}")
+        candidates.append(relative_path(resolved, field="pip requirement file"))
+    return tuple(dict.fromkeys(candidates))
+
+
+def pip_command(words, index, relative):
+    """Audit one pip invocation and report the requirement files it installs."""
+    subcommand = None
     requirements = []
-    for command in re.split(r"&&|\|\||;", text):
-        words = command.split()
-        if not any(word in {"pip", "pip3"} or word.endswith("/pip") for word in words):
-            continue
-        if "install" not in words:
-            continue
-        if "--require-hashes" not in words:
-            raise GateError(f"pip install must use --require-hashes in {relative}")
-        index = words.index("install") + 1
-        while index < len(words):
-            word = words[index]
-            if word in {"-r", "--requirement", "-c", "--constraint"}:
-                if index + 1 >= len(words):
-                    raise GateError(f"pip install requirement file is missing in {relative}")
-                target = words[index + 1]
-                if "://" in target or PurePosixPath(target).is_absolute():
-                    raise GateError(f"pip install uses an unreviewed source in {relative}")
-                resolved = posixpath.normpath(
-                    str(PurePosixPath(relative).parent / PurePosixPath(target).name))
-                requirements.append(relative_path(resolved, field="pip requirement file"))
-                index += 2
+    while index < len(words):
+        word = words[index]
+        index += 1
+        target = None
+        if word.startswith("--"):
+            name, separator, value = word.partition("=")
+            if name in PIP_REQUIREMENT_FLAGS:
+                target = value if separator else None
+            elif separator and name in ALLOWED_PIP_VALUE_FLAGS:
                 continue
-            if word.startswith("-"):
-                index += 1
+            elif not separator and name in ALLOWED_PIP_FLAGS:
                 continue
+            else:
+                raise GateError(f"unreviewed pip install option in {relative}")
+        elif word.startswith("-") and word != "-":
+            if word[:2] in {"-r", "-c"}:
+                target = word[2:] or None
+            elif word in ALLOWED_PIP_FLAGS:
+                continue
+            else:
+                raise GateError(f"unreviewed pip install option in {relative}")
+        elif subcommand is None and word == "install":
+            subcommand = word
+            continue
+        else:
             raise GateError(f"pip install must use a reviewed requirement file in {relative}")
+        if target is None:
+            if index >= len(words):
+                raise GateError(f"pip install requirement file is missing in {relative}")
+            target = words[index]
+            index += 1
+        requirements.append(requirement_targets(target, relative))
+    if subcommand is None:
+        raise GateError(f"unclassified pip command in {relative}")
+    if "--require-hashes" not in words:
+        raise GateError(f"pip install must use --require-hashes in {relative}")
+    if not requirements:
+        raise GateError(f"pip install must use a reviewed requirement file in {relative}")
     return requirements
 
 
-def model_files(root: Path):
+def npm_command(words, index, relative):
+    """Accept only lock-driven npm commands, whatever alias or option order."""
+    while index < len(words):
+        word = words[index]
+        index += 1
+        if word.startswith("-"):
+            raise GateError(f"unreviewed npm option before the command in {relative}")
+        if word not in REVIEWED_NPM_COMMANDS:
+            raise GateError(f"unclassified npm command in {relative}")
+        return
+    raise GateError(f"unclassified npm command in {relative}")
+
+
+def run_commands(arguments, relative):
+    """Reject unpinned installs and report requirement files a build installs."""
+    requirements = []
+    for command in re.split(r"&&|;|\|+", " ".join(arguments)):
+        words = shell_tokens(command)
+        for index, word in enumerate(words):
+            name = PurePosixPath(word).name
+            if name in REJECTED_PACKAGE_MANAGERS:
+                raise GateError(f"unreviewed package manager in {relative}")
+            if name == "npm":
+                npm_command(words, index + 1, relative)
+                break
+            if PIP_BINARY.fullmatch(name):
+                requirements.extend(pip_command(words, index + 1, relative))
+                break
+    return requirements
+
+
+def exempt_source_file(relative, suffix, exemptions):
+    """Reviewed source packages that merely share a reserved directory name."""
+    path = PurePosixPath(relative)
+    return (suffix in SOURCE_SCAN_SUFFIXES
+            and any(exemption in path.parents for exemption in exemptions))
+
+
+def model_files(root: Path, exemptions=()):
+    exempted = {PurePosixPath(value) for value in exemptions}
+    used = set()
     found = set()
     for path in scan_paths(root):
         relative = path.relative_to(root).as_posix()
@@ -518,8 +611,21 @@ def model_files(root: Path):
             continue
         if not classified and not reviewable and opaque_bytes(path):
             classified = True
+        if (classified and suffix not in MODEL_SUFFIXES
+                and exempt_source_file(relative, suffix, exempted)
+                and not opaque_bytes(path)):
+            # A reviewed, text-only source package never silently covers an
+            # opaque or model-suffixed file stored next to it.
+            used.add(str(PurePosixPath(relative).parent))
+            continue
         if classified:
             found.add(relative)
+    stale = {str(value) for value in exempted} - {
+        parent for value in used
+        for parent in [value] + [str(item) for item in PurePosixPath(value).parents]
+    }
+    if stale:
+        raise GateError("stale model scan exemption")
     return sorted(found)
 
 
@@ -584,6 +690,28 @@ def declared_pin(value, ecosystem, upstream):
     return Pin(kind, digests), ""
 
 
+def model_scan_exemptions(root: Path, data):
+    """Reviewed source directories that only share a reserved model name."""
+    records = data["model_scan_exemptions"]
+    if not isinstance(records, list):
+        raise GateError("invalid model scan exemption inventory")
+    paths = []
+    for record in records:
+        if not isinstance(record, dict) or set(record) != {"path", "reason", "evidence"}:
+            raise GateError("invalid model scan exemption record")
+        value = relative_path(record["path"], field="model scan exemption path")
+        if not (root / value).is_dir():
+            raise GateError("model scan exemption must name a committed directory")
+        if not set(PurePosixPath(value).parts) & MODEL_DIRECTORIES:
+            raise GateError("model scan exemption does not cover a reserved directory")
+        if value in paths:
+            raise GateError("duplicate model scan exemption")
+        nonempty_string(record["reason"], "model scan exemption reason")
+        evidence(root, record["evidence"], "model scan exemption evidence")
+        paths.append(value)
+    return tuple(paths)
+
+
 def container_images(root: Path, data, discovered_images):
     """Check every reviewed base image record against its Dockerfile uses."""
     records = data["container_images"]
@@ -638,7 +766,8 @@ def container_images(root: Path, data, discovered_images):
 
 def audit(root: Path, inventory_path=INVENTORY):
     data = load_json(root / inventory_path)
-    required_root = {"schema", "inputs", "scope_reviews", "components", "container_images"}
+    required_root = {"schema", "inputs", "scope_reviews", "components",
+                     "container_images", "model_scan_exemptions"}
     if not isinstance(data, dict) or set(data) != required_root or data["schema"] != SCHEMA:
         raise GateError("invalid component inventory schema")
 
@@ -700,9 +829,11 @@ def audit(root: Path, inventory_path=INVENTORY):
         raise GateError("npm-shrinkwrap.json and package-lock.json are ambiguous")
     if tracked_inputs != input_paths:
         raise GateError("dependency input set differs from reviewed inventory")
-    for target in sorted(build_requirements):
-        if input_ecosystems.get(target) != "python-requirements":
-            raise GateError(f"container build installs an unreviewed requirement file: {target}")
+    for candidates in sorted(build_requirements):
+        if not any(input_ecosystems.get(target) == "python-requirements"
+                   for target in candidates):
+            raise GateError(
+                f"container build installs an unreviewed requirement file: {candidates[0]}")
     for source, targets in include_graph.items():
         for target in targets:
             if target not in input_paths or input_ecosystems[target] != "python-requirements":
@@ -837,7 +968,7 @@ def audit(root: Path, inventory_path=INVENTORY):
             raise GateError("project pin references an unreviewed lock input")
         if (ecosystem, lock, scope, name, version) not in locked_index:
             raise GateError("project dependency lacks matching reviewed lock entry")
-    if set(model_files(root)) != artifacts:
+    if set(model_files(root, model_scan_exemptions(root, data))) != artifacts:
         raise GateError("model artifact set differs from reviewed component records")
     images = container_images(root, data, discovered_images)
     coverage = {

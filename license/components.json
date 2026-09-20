@@ -79,6 +79,16 @@
       ]
     }
   ],
+  "model_scan_exemptions": [
+    {
+      "path": "tests/models",
+      "reason": "Executable design-model Python package for repository contract tests; it shares the reserved models/ name but holds no ML artifact, and every opaque or model-suffixed file below it stays in the weight scan.",
+      "evidence": [
+        "tests/models/__init__.py",
+        "license/README.md"
+      ]
+    }
+  ],
   "components": [
     {
       "id": "pypi:annotated-doc@0.0.5",

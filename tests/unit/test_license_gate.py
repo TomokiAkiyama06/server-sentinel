@@ -36,6 +36,7 @@ class GateFixture(unittest.TestCase):
         ]
         self.components = [self.component()]
         self.images = []
+        self.exemptions = []
         self.approvals = []
         self.save()
 
@@ -170,6 +171,7 @@ class GateFixture(unittest.TestCase):
             "schema": 2,
             "inputs": self.inputs,
             "scope_reviews": self.reviews,
+            "model_scan_exemptions": self.exemptions,
             "components": self.components,
             "container_images": self.images,
         }))
@@ -751,6 +753,68 @@ version = {attr = "package.__version__"}
         with self.assertRaisesRegex(license_gate.GateError, "model artifact set differs"):
             license_gate.audit(self.root)
 
+    def test_reviewed_model_scan_exemption_covers_only_text_source_files(self):
+        """A source package may share the reserved name; artifacts still fail."""
+        self.write("tests/models/__init__.py", "\"\"\"synthetic design models.\"\"\"\n")
+        self.write("tests/models/contract.py", "VALUE = 1\n")
+        with self.assertRaisesRegex(license_gate.GateError, "model artifact set differs"):
+            license_gate.audit(self.root)
+
+        self.exemptions = [{
+            "path": "tests/models",
+            "reason": "synthetic design model package, no ML artifact",
+            "evidence": ["docs/evidence.md"],
+        }]
+        self.save()
+        self.assertEqual(license_gate.audit(self.root), (1, 1, 0, 0))
+
+        for path, content in (("tests/models/person.onnx", b"synthetic weight bytes"),
+                              ("tests/models/person.py", b"\x80\x04\x95opaque\x00"),
+                              ("tests/models/person.bin", "text but a model suffix\n")):
+            with self.subTest(path=path):
+                self.write(path, content)
+                self.assertIn(path, license_gate.model_files(
+                    self.root, ["tests/models"]))
+                with self.assertRaisesRegex(license_gate.GateError, "model artifact set differs"):
+                    license_gate.audit(self.root)
+                (self.root / path).unlink()
+
+    def test_model_scan_exemption_must_be_reviewed_and_used(self):
+        self.exemptions = [{
+            "path": "tests/models",
+            "reason": "synthetic design model package, no ML artifact",
+            "evidence": ["docs/evidence.md"],
+        }]
+        self.save()
+        with self.assertRaisesRegex(license_gate.GateError, "committed directory"):
+            license_gate.audit(self.root)
+
+        self.write("tests/models/__init__.py", "VALUE = 1\n")
+        self.save()
+        self.assertEqual(license_gate.audit(self.root), (1, 1, 0, 0))
+
+        self.write("docs/notes/__init__.py", "VALUE = 1\n")
+        self.exemptions[0]["path"] = "docs/notes"
+        self.save()
+        with self.assertRaisesRegex(license_gate.GateError, "reserved directory"):
+            license_gate.audit(self.root)
+
+        self.exemptions[0].update(path="tests/models", evidence=[])
+        self.save()
+        with self.assertRaisesRegex(license_gate.GateError, "exemption evidence"):
+            license_gate.audit(self.root)
+
+    def test_stale_model_scan_exemption_is_rejected(self):
+        self.write("tests/models/person.onnx", b"synthetic weight bytes")
+        self.exemptions = [{
+            "path": "tests/models",
+            "reason": "synthetic design model package, no ML artifact",
+            "evidence": ["docs/evidence.md"],
+        }]
+        self.save()
+        with self.assertRaisesRegex(license_gate.GateError, "stale model scan exemption"):
+            license_gate.audit(self.root)
+
     def test_npm_sri_requires_canonical_base64_and_algorithm_digest_length(self):
         for invalid in (
             "sha512-synthetic",
@@ -856,12 +920,95 @@ class ContainerImageGateTests(GateFixture):
         with self.assertRaisesRegex(license_gate.GateError, "input set differs"):
             license_gate.audit(self.root)
 
-    def test_container_build_must_use_npm_ci(self):
+    def test_container_build_must_use_a_lock_driven_npm_command(self):
+        """npm install aliases and option-first forms must not slip through."""
         self.add_container(
             "FROM demo/base:1.0@" + IMAGE_DIGEST + "\n"
-            "RUN npm install --ignore-scripts\n")
-        with self.assertRaisesRegex(license_gate.GateError, "npm ci"):
-            license_gate.audit(self.root)
+            "RUN npm ci --ignore-scripts\n"
+            "RUN npm run build\n")
+        self.assertEqual(license_gate.audit(self.root), (1, 1, 0, 1))
+
+        rejected = {
+            "RUN npm install --ignore-scripts\n": "unclassified npm command",
+            "RUN npm i unreviewed-package\n": "unclassified npm command",
+            "RUN npm in unreviewed-package\n": "unclassified npm command",
+            "RUN npm ins unreviewed-package\n": "unclassified npm command",
+            "RUN npm insta unreviewed-package\n": "unclassified npm command",
+            "RUN npm isntall unreviewed-package\n": "unclassified npm command",
+            "RUN npm add unreviewed-package\n": "unclassified npm command",
+            "RUN npm update\n": "unclassified npm command",
+            "RUN npm exec unreviewed-package\n": "unclassified npm command",
+            "RUN /usr/local/bin/npm install unreviewed-package\n": "unclassified npm command",
+            "RUN npm --prefix /tmp install unreviewed-package\n":
+                "unreviewed npm option before the command",
+            "RUN npx unreviewed-package\n": "unreviewed package manager",
+            "RUN pnpm install\n": "unreviewed package manager",
+            "RUN yarn add unreviewed-package\n": "unreviewed package manager",
+            'RUN ["npm", "install", "unreviewed-package"]\n': "unclassified npm command",
+        }
+        for command, message in rejected.items():
+            with self.subTest(command=command.strip()):
+                self.write("Dockerfile.ci",
+                           "FROM demo/base:1.0@" + IMAGE_DIGEST + "\n" + command)
+                with self.assertRaisesRegex(license_gate.GateError, message):
+                    license_gate.audit(self.root)
+
+    def test_container_build_parses_attached_pip_requirement_options(self):
+        """`-rvendor.lock` and `--requirement=vendor.lock` install real files."""
+        self.write("requirements.lock", "demo==1.2.3 --hash=" + DIGEST + "\n")
+        self.write("vendor.lock", "unreviewed==9.9.9 --hash=sha256:" + "e" * 64 + "\n")
+        self.add_container(
+            "FROM demo/base:1.0@" + IMAGE_DIGEST + "\n"
+            "RUN python -m pip install --require-hashes -rrequirements.lock\n")
+        self.assertEqual(license_gate.audit(self.root), (1, 1, 0, 1))
+
+        self.write("Dockerfile.ci",
+                   "FROM demo/base:1.0@" + IMAGE_DIGEST + "\n"
+                   "RUN python -m pip install --require-hashes --requirement=requirements.lock\n")
+        self.assertEqual(license_gate.audit(self.root), (1, 1, 0, 1))
+
+        for command in ("RUN python -m pip install --require-hashes -rvendor.lock\n",
+                        "RUN python -m pip install --require-hashes --requirement=vendor.lock\n",
+                        "RUN python -m pip install --require-hashes -cvendor.lock "
+                        "-r requirements.lock\n",
+                        "RUN python -m pip install --require-hashes "
+                        "--constraint=vendor.lock -r requirements.lock\n"):
+            with self.subTest(command=command.strip()):
+                self.write("Dockerfile.ci",
+                           "FROM demo/base:1.0@" + IMAGE_DIGEST + "\n" + command)
+                with self.assertRaisesRegex(
+                        license_gate.GateError, "installs an unreviewed requirement file"):
+                    license_gate.audit(self.root)
+
+    def test_container_build_rejects_unreviewed_pip_options_and_commands(self):
+        self.write("requirements.lock", "demo==1.2.3 --hash=" + DIGEST + "\n")
+        self.add_container()
+        rejected = {
+            "RUN python -m pip install --require-hashes --index-url=https://example.test/simple "
+            "-r requirements.lock\n": "unreviewed pip install option",
+            "RUN python -m pip install --require-hashes -e .\n":
+                "unreviewed pip install option",
+            "RUN python -m pip install --require-hashes -qr requirements.lock\n":
+                "unreviewed pip install option",
+            "RUN python -m pip download --require-hashes -r requirements.lock\n":
+                "reviewed requirement file",
+            "RUN python -m pip install -r requirements.lock\n": "--require-hashes",
+            "RUN python -m pip install --require-hashes\n": "reviewed requirement file",
+            'RUN ["python", "-m", "pip", "install", "unreviewed-package"]\n':
+                "reviewed requirement file",
+            "RUN python -m pip install --require-hashes -r /etc/requirements.lock\n":
+                "unreviewed source",
+            "RUN python -m pip install --require-hashes "
+            "-r https://example.test/requirements.lock\n": "unreviewed source",
+            "RUN python -m pip install --require-hashes -r ../requirements.lock\n":
+                "unreviewed source",
+        }
+        for command, message in rejected.items():
+            with self.subTest(command=command.strip()):
+                self.write("Dockerfile.ci",
+                           "FROM demo/base:1.0@" + IMAGE_DIGEST + "\n" + command)
+                with self.assertRaisesRegex(license_gate.GateError, message):
+                    license_gate.audit(self.root)
 
 
 class ResolvedPinTests(GateFixture):

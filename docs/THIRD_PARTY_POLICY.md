@@ -141,9 +141,12 @@ digest, and each reviewed image keeps its license summary, license and transitiv
 evidence, notices and redistribution obligations. Only the reviewed CI-only,
 non-republished use is accepted; declaring an image as redistributed, using a
 floating tag or variable, adding an unregistered image, or substituting a digest
-blocks until the Owner records a new decision. Container builds must install
-Python packages from a reviewed requirements input with `--require-hashes` and
-must use `npm ci`.
+blocks until the Owner records a new decision. Container build commands are
+allowlisted rather than pattern-matched: pip must run `install` with
+`--require-hashes`, reviewed options only, and requirement or constraint files
+that resolve to reviewed inputs in every option form, while npm must use a
+`ci`-family command, so `npm install` with any documented alias, an option before
+the command, and `npx`/`pnpm`/`yarn` fail closed.
 
 Blocked-by-default licenses require an exact record in
 [`license/owner-approvals.json`](../license/owner-approvals.json), including the
@@ -173,6 +176,9 @@ require independent weight evidence and checksum review. Common serialized model
 formats such as `.pkl`, `.joblib`, `.npz`, `.gguf` and `.safetensors` are
 detected anywhere in the repository, and any other opaque non-text file outside
 the reviewed media and Web asset formats is treated as a model artifact until it
-has its own record, so renaming a model does not bypass weight review. Recognized Web/static
+has its own record, so renaming a model does not bypass weight review. A reviewed
+`model_scan_exemptions` record covers a source package that only shares a
+reserved directory name, and it never covers an opaque or model-suffixed file
+stored below that path. Recognized Web/static
 asset suffixes, including `.wasm`, are not classified as model artifacts merely
 because they are in a build output directory.

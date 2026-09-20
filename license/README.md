@@ -27,7 +27,11 @@ or `model-artifacts/` directory is treated as a model artifact regardless of its
 extension; common serialized model suffixes elsewhere, including `.pkl`,
 `.joblib`, `.npz`, `.gguf` and `.safetensors`, are also detected, and any other
 opaque non-text file outside the reviewed media and Web asset formats is treated
-as a model artifact until it has its own record. Reviewed-empty
+as a model artifact until it has its own record. `model_scan_exemptions` records
+the reviewed source packages that only share a reserved directory name, such as
+`tests/models`; the exemption covers text-only Python sources, an opaque or
+model-suffixed file below the path still needs weight review, and an exemption
+that matches nothing fails as stale. Reviewed-empty
 records document scopes that currently have no third-party component.
 Every committed model weight must be stored below one of those reserved
 directories; a `model_weight` record pointing elsewhere is rejected.
@@ -42,9 +46,13 @@ license summary, license and transitive evidence, notices and redistribution
 obligations, and the Dockerfiles that use it. Only the reviewed CI-only,
 non-republished distribution is accepted; any other distribution intent, a
 floating tag, a variable reference, an unregistered image or a later digest
-substitution fails the gate and needs a new Owner decision. Container builds must
-install Python packages from a reviewed requirements input with
-`--require-hashes`, and must use `npm ci` rather than `npm install`.
+substitution fails the gate and needs a new Owner decision. Container build
+commands are allowlisted rather than pattern-matched. A pip invocation must be
+`install`, carry `--require-hashes`, use only reviewed options, and name reviewed
+requirement or constraint files, including the attached `-rfile` and
+`--requirement=file` forms. npm must use a `ci`-family command, so `npm install`
+and every documented alias, an option placed before the command, and
+`npx`/`pnpm`/`yarn` fail closed.
 
 Only licenses in the gate's explicit permissive SPDX allowlist pass directly.
 AGPL, GPL, SSPL, BSL/source-available, proprietary, Elastic, Commons Clause,

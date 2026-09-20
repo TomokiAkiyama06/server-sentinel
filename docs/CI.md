@@ -134,9 +134,13 @@ Every tracked `Dockerfile*` is a reviewed `container-image` inventory input. Eac
 `sha256` digest recorded with its license, notice and redistribution evidence in
 `license/components.json`. Floating tags, variable references, unregistered
 images and later digest substitutions fail closed, and a base image declared as
-redistributed instead of CI-only requires a new Owner decision. Container builds
-must install Python packages from a reviewed requirements input with
-`--require-hashes` and must use `npm ci`.
+redistributed instead of CI-only requires a new Owner decision. Container build
+commands are allowlisted rather than pattern-matched: a pip invocation must be
+`install` with `--require-hashes` and only reviewed options, and every
+`-r`/`-c`/`--requirement`/`--constraint` value, including the attached
+`-rfile` and `--requirement=file` forms, must resolve to a reviewed requirements
+input. npm must use a `ci`-family command, so every documented `install` alias,
+an option placed before the command, and `npx`/`pnpm`/`yarn` fail closed.
 
 Committed model artifacts require a distinct `model_weight` record whose pin
 evidence binds the exact path and SHA256 digest. All files in a reserved model
@@ -144,7 +148,10 @@ artifact directory are checked regardless of extension; common serialized model
 suffixes, including `.pkl`, `.joblib`, `.npz` and `.safetensors`, are checked in
 other directories, and any other opaque non-text file outside the reviewed media
 and Web asset formats is treated as a model artifact until it has its own
-record. Model weight inventory locations outside the reserved
+record. A source package that only shares a reserved directory name needs a
+reviewed `model_scan_exemptions` record, which covers text-only Python sources;
+an opaque or model-suffixed file below it still requires weight review, and an
+exemption that matches nothing fails as stale. Model weight inventory locations outside the reserved
 directories are rejected. Detection-only `assets/ml/` and `assets/ai/` paths are
 also scanned in full so an opaque archive cannot bypass suffix detection. Model
 implementation packages require `model_code` records.
