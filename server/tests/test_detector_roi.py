@@ -74,13 +74,14 @@ def repetitive(shift=0):
                  for y in range(HEIGHT) for x in range(WIDTH))
 
 
-def calibration(source_type=SourceType.LOCAL_UVC, *, version=1, rules=None, reference=None):
+def calibration(source_type=SourceType.LOCAL_UVC, *, version=1, rules=None, reference=None,
+                shape=POLYGON):
     return Calibration(UUID(int=400 + version), SOURCE, source_type, PROFILE, version, NOW,
-                       POLYGON, frame(0, reference), rules or policy())
+                       shape, frame(0, reference), rules or policy())
 
 
-def detector(source_type=SourceType.LOCAL_UVC, *, rules=None, reference=None):
-    return SceneDetector(calibration(source_type, rules=rules, reference=reference))
+def detector(source_type=SourceType.LOCAL_UVC, *, rules=None, reference=None, shape=POLYGON):
+    return SceneDetector(calibration(source_type, rules=rules, reference=reference, shape=shape))
 
 
 def inspect_scene(instance, sample, monotonic_ns, *, movement=Quality.SUFFICIENT,
@@ -258,15 +259,24 @@ class SceneDetectorTests(unittest.TestCase):
         self.assertFalse(buffered.critical)
 
     def test_comparison_budget_covers_the_unmatched_scene_path(self):
-        generous = detector(rules=policy(roi_search_pixels=0, maximum_comparisons=100_000))
+        small = ((4, 4), (5, 4), (4, 5))
+        rules = dict(roi_search_pixels=1, maximum_comparisons=100_000)
+        generous = detector(rules=policy(**rules), shape=small)
         roi_work = len(generous.roi_points) * len(generous.roi_candidates)
         background = len(generous.background)
         self.assertLess(roi_work, background)
-        registered_only = len(generous.background) * len(generous.global_candidates) + roi_work + WIDTH * HEIGHT
+        registered_only = background * len(generous.global_candidates) + roi_work + WIDTH * HEIGHT
         with self.assertRaises(ValueError):
-            detector(rules=policy(roi_search_pixels=0, maximum_comparisons=registered_only))
-        detector(rules=policy(roi_search_pixels=0,
-                              maximum_comparisons=registered_only - roi_work + background))
+            detector(rules=policy(**dict(rules, maximum_comparisons=registered_only)), shape=small)
+        detector(rules=policy(**dict(rules, maximum_comparisons=registered_only - roi_work + background)),
+                 shape=small)
+
+    def test_search_window_must_reach_its_own_displacement_thresholds(self):
+        with self.assertRaises(ValueError):
+            policy(roi_search_pixels=1, movement_pixels=2)
+        with self.assertRaises(ValueError):
+            policy(global_search_pixels=1, camera_shift_pixels=2)
+        policy(roi_search_pixels=2, movement_pixels=2, global_search_pixels=2, camera_shift_pixels=2)
 
     def test_confirmation_after_an_interruption_reports_new_critical_evidence(self):
         moved = transformed(pixels(), (1, 0), region=(4, 4, 8, 7))

@@ -591,6 +591,10 @@ an Owner-supplied transient frame whose digest and geometry must match the
 record. The core does not supply production thresholds, start capture, expose an
 API, retain decoded media, make a presence decision, or issue a notification.
 
+A calibration policy whose bounded search window cannot reach its own movement
+or camera-shift threshold is refused: such a configuration cannot express the
+displacement it asks to detect and would report a matching geometry instead.
+
 It first estimates a bounded global translation/quarter-turn transform from
 background support, then compares the ROI relative to that transform. A
 confirmed ROI movement requires the policy's multiple samples and elapsed time.

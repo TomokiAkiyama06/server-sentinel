@@ -60,6 +60,14 @@ class Policy:
         for name in ("global_search_pixels", "roi_search_pixels"):
             if type(getattr(self, name)) is not int or not 0 <= getattr(self, name) <= 32:
                 raise ValueError("invalid bounded transform search")
+        # A search window that cannot reach its own displacement threshold makes
+        # that displacement unobservable: the best candidate stays at or near
+        # the identity transform, which reports a matching geometry instead of
+        # the movement or camera shift the policy asked to detect.
+        if self.roi_search_pixels < self.movement_pixels:
+            raise ValueError("ROI search must reach the configured movement threshold")
+        if self.global_search_pixels < self.camera_shift_pixels:
+            raise ValueError("global search must reach the configured camera-shift threshold")
         for angles in (self.global_quarter_turns, self.roi_quarter_turns):
             if (type(angles) is not tuple or not angles or len(set(angles)) != len(angles)
                     or 0 not in angles or any(type(v) is not int or v not in (0, 1, 2, 3) for v in angles)):

@@ -7,7 +7,10 @@ decision.
 
 A calibration contains an Owner-selected polygon, reference frame digest,
 source type, profile ID, explicit search/quality thresholds, version, and
-timestamp. `CalibrationArchive` is a small append-only SQLite port: the Main
+timestamp. A policy is refused when a bounded search window cannot reach its
+own displacement threshold, because such a configuration cannot express the
+movement or camera shift it asks for and would report a matching geometry
+instead. `CalibrationArchive` is a small append-only SQLite port: the Main
 runtime must supply its already-open private database after application
 migration (`roi_calibration_history`) has run. The table holds provenance
 only — identities, polygon, policy, reference geometry and the reference
