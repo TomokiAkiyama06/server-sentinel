@@ -323,6 +323,13 @@ class RecordingStore:
                 (str(segment.source_id), str(segment.stream_id), segment.sequence, segment.end_ms,
                  str(segment.capture_node_id) if segment.capture_node_id else None),
             )
+            if prior and (str(segment.stream_id) != prior["stream_id"]
+                          or segment.sequence != prior["sequence"] + 1):
+                self.db.execute(
+                    "INSERT OR IGNORE INTO recording_source_discontinuities VALUES (?,?,?,?)",
+                    (str(segment.source_id), prior["end_ms"], segment.start_ms,
+                     "stream_discontinuity"),
+                )
             for recording in active:
                 self.db.execute("INSERT INTO recording_links VALUES (?,?)",
                                 (recording["id"], segment_id))
@@ -355,6 +362,12 @@ class RecordingStore:
                 self.db.execute("UPDATE recording_segments SET spool=0 WHERE id=?", (row["id"],))
                 total -= row["byte_length"]
                 remaining -= 1
+            self.db.execute(
+                "DELETE FROM recording_source_discontinuities WHERE end_ms <= "
+                "(SELECT MAX(s.end_ms) FROM recording_segments s "
+                "WHERE s.source_id=recording_source_discontinuities.source_id)-?",
+                (self.limits.pre_roll_ms,),
+            )
         unused = self.db.execute(
             "SELECT id FROM recording_segments WHERE spool=0 AND state='ready' "
             "AND NOT EXISTS (SELECT 1 FROM recording_links WHERE segment_id=recording_segments.id)"
@@ -443,6 +456,12 @@ class RecordingStore:
                     self.db.execute(
                         "INSERT INTO recording_links SELECT ?,id FROM recording_segments "
                         "WHERE source_id=? AND state='ready' AND spool=1 AND start_ms<? AND end_ms>?",
+                        (str(recording_id), str(source_id), end_ms, start_ms),
+                    )
+                    self.db.execute(
+                        "INSERT INTO recording_discontinuities SELECT ?,start_ms,end_ms,reason "
+                        "FROM recording_source_discontinuities WHERE source_id=? "
+                        "AND start_ms<? AND end_ms>?",
                         (str(recording_id), str(source_id), end_ms, start_ms),
                     )
             return identities

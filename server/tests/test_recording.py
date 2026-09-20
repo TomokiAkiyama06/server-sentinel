@@ -407,6 +407,15 @@ class RecordingTests(unittest.TestCase):
             (str(next_recording),),
         ).fetchone()[0])
 
+    def test_pre_roll_start_preserves_prior_stream_discontinuity(self):
+        self.store.append(self.segment(10_000, 20_000, 0))
+        self.store.append(self.segment(40_000, 50_000, 2))
+        recording = self.store.start_manual(self.source, 30_000, duration_ms=20_000)
+        result = self.store.finish(recording)
+        self.assertEqual("gapped", result["status"])
+        self.assertEqual([{"start_ms": 30_000, "end_ms": 40_000,
+                           "reason": "stream_discontinuity"}], result["discontinuities"])
+
     def test_cursor_survives_eviction_and_rejects_replays(self):
         self.store.close()
         self.limits = replace(self.limits, pre_roll_bytes=1)
