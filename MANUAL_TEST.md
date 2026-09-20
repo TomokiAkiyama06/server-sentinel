@@ -15,7 +15,7 @@ Camera source(s) / model(s):
 USB topology:
 LAN topology/speed:
 Tailscale/private-access path:
-Phone/Mac/browser used for viewing:
+Phone/Mac/desktop browser used for viewing:
 Recording volume:
 Tester:
 ```
@@ -24,6 +24,7 @@ Tester:
 
 For each tested camera:
 
+- [ ] exact manufacturer/model and advertised UVC resolution/FPS/pixel-format/codec capabilities are recorded locally;
 - [ ] device is discovered;
 - [ ] stable identity evidence is shown where available;
 - [ ] owner can enable/disable source;
@@ -57,6 +58,7 @@ Installation/service:
 - [ ] service name/process is `media-capture-agent` and does not impersonate unrelated software;
 - [ ] microphone/audio device is not opened;
 - [ ] media root is deployment-configured outside the checkout;
+- [ ] ring-buffer and incident writes use the approved dedicated media filesystem when configured;
 - [ ] installer/startup and runtime admission verify expected mount/filesystem/device, dedicated-account writability, free space, and safety reserve;
 - [ ] using a disposable test volume, expected media-mount loss or substitution produces a visible degraded/failed state and refuses unsafe writes;
 - [ ] that failure never creates or uses a fallback media directory on the root filesystem.
@@ -93,6 +95,8 @@ Health:
 - [ ] main-host restart/reconnect is reported truthfully;
 - [ ] heartbeat does not falsely imply that video frames are arriving.
 
+Apply the exact-model, UVC-capability, stable-identity, and reconnect checks in section A to capture-node cameras as well as Main Server cameras.
+
 ## C. Room-overview camera placement
 
 For the intended wide room view:
@@ -103,6 +107,8 @@ For the intended wide room view:
 - [ ] normal people/movement do not permanently occlude important regions;
 - [ ] mount is stable;
 - [ ] lighting variation is measured;
+- [ ] person-detection feasibility is measured at the actual room-wide placement and entrance;
+- [ ] optional owner-verification feasibility is measured at that placement, with insufficient face size/quality reported as unavailable rather than assumed reliable;
 - [ ] camera placement complies with institutional/local rules.
 
 Do not upload room geometry or imagery to GitHub.
@@ -111,8 +117,9 @@ Do not upload room geometry or imagery to GitHub.
 
 Compare at minimum where camera capabilities allow:
 
-- [ ] highest useful resolution at approximately 10–15 fps;
+- [ ] 4K candidate and highest useful resolution at approximately 10–15 fps; record unsupported modes explicitly when the camera lacks them;
 - [ ] 1080p/15 fps;
+- [ ] actual resolution, FPS, codec, and bitrate are recorded for each candidate;
 - [ ] camera-native compressed format vs re-encode path;
 - [ ] hardware-accelerated encode path where available;
 - [ ] LAN throughput;
@@ -195,6 +202,14 @@ Unexpected Main Server communication loss:
 - [ ] ordinary ring-buffer pressure does not delete an unexpired protected incident;
 - [ ] disk pressure produces explicit warning/hard-stop behavior before unsafe writes.
 
+Critical preservation and lifecycle:
+
+- [ ] an authenticated Main Server critical preserve request pins the requested available interval and reports partial coverage/gaps accurately;
+- [ ] the Owner can inspect protected-incident bytes, coverage, and expiry timestamps;
+- [ ] an explicit Owner manual delete can remove a protected incident before expiry and an unauthorized identity cannot delete it;
+- [ ] eligible ordinary ring-buffer data is reclaimed before unexpired protected evidence, and safety reserve still blocks unsafe writes;
+- [ ] configured dedicated-media mount loss/substitution refuses ring-buffer/incident writes with no root-filesystem fallback, including during post-loss capture.
+
 Record:
 
 - state transition;
@@ -215,12 +230,15 @@ Record:
 - [ ] timeline does not silently present unreliable remote timestamps as exact;
 - [ ] recovery clears degraded state appropriately.
 
-## I. Live view from phone and Mac
+## I. Live view from phone, Mac, and desktop
 
 Local/private path:
 
 - [ ] phone browser can open live dashboard when authorized;
 - [ ] Mac browser can open live dashboard when authorized;
+- [ ] desktop browser can open live dashboard when authorized;
+- [ ] browser viewers obtain media only from the Main Server and never connect directly to `media-capture-agent`;
+- [ ] a live URL copied to an unauthorized identity cannot retrieve or play media;
 - [ ] 1-source layout usable;
 - [ ] 2-source layout usable;
 - [ ] 3–4 source grid usable where applicable;
@@ -228,6 +246,7 @@ Local/private path:
 - [ ] selected camera expands cleanly;
 - [ ] live start time measured;
 - [ ] latency measured;
+- [ ] near-real-time quality is evaluated with stability/reconnect prioritized over absolute minimum latency;
 - [ ] reconnect works;
 - [ ] adaptive quality works;
 - [ ] one bad source does not hide health of others.
@@ -401,7 +420,7 @@ Record:
 - service crashes;
 - false health states.
 
-Include a four-active-source run where hardware permits. Final defaults come from these measurements.
+Record separate performance results for 1, 2, 3, and 4 active sources, including a long-duration mixed-source run. If required hardware is unavailable, mark the affected acceptance cases unperformed rather than PASS. Final defaults come from these measurements.
 
 
 ## S. Main-host hardware integrity / recording-health self-test
@@ -422,7 +441,7 @@ Establish an Owner-approved baseline, then validate both startup and scheduled d
 - [ ] only the Owner can approve a replacement/new baseline;
 - [ ] Owner approval is audited;
 - [ ] same-model replacement with no exposed stable unique identifier is reported as an identification limitation rather than falsely guaranteed;
-- [ ] raw hardware serials/UUIDs are not included in normal telemetry/public diagnostics/GitHub artifacts.
+- [ ] serials/UUIDs are redacted or hashed in normal operational logs and general diagnostics; raw identifiers remain absent from telemetry/public diagnostics/GitHub artifacts.
 
 Use controlled inventory mocks for destructive/expensive substitution cases where physical replacement is impractical. Real hardware swaps are optional and must not damage production equipment.
 
@@ -431,13 +450,13 @@ Use controlled inventory mocks for destructive/expensive substitution cases wher
 - [ ] enabled sources have fresh frames or an explicit truthful offline/degraded state;
 - [ ] recorder/encoder state is checked;
 - [ ] configured recording root resolves to the expected filesystem/device;
-- [ ] an intentionally unmounted recording filesystem does **not** silently fall back to another filesystem while reporting healthy;
-- [ ] current free space and safety reserve are checked;
+- [ ] on a disposable test volume, missing/unmounted or substituted recording filesystems refuse recording and self-test media writes; no fallback directory is created or used on the root filesystem or another unintended filesystem, even while reporting degradation;
+- [ ] writability, current free space, and safety reserve are checked;
 - [ ] a bounded temporary media segment is written through the recording path;
 - [ ] the segment is flushed/fsynced;
 - [ ] the segment is reopened and container/duration/size/decode readability is validated as appropriate;
 - [ ] self-test-owned temporary/partial media is deleted locally after success, write/read/decode failure, and cancellation;
-- [ ] an interrupted test leaves only bounded self-test artifacts, which are reconciled/cleaned at next startup before new self-test media is written;
+- [ ] process interruption and reboot leave only bounded self-test artifacts, which are reconciled/cleaned at next startup before new self-test media is written;
 - [ ] cleanup verifies the expected filesystem and self-test ownership and never deletes ordinary recordings or protected incidents;
 - [ ] simulated missing/read-only storage or cleanup failure reports failure and blocks further self-test media writes until safe cleanup succeeds;
 - [ ] leftover bytes count against storage admission/safety reserve, with no root-filesystem fallback or retained/uploaded diagnostic media;
@@ -452,7 +471,7 @@ For each condition below, verify the system does not wait only for the 23:00 dai
 - [ ] approved CPU/RAM/NVMe/HDD/GPU becomes `CHANGED` or `MISSING`;
 - [ ] expected recording device/mount is substituted or missing;
 - [ ] recording-health write/reopen/decode fails;
-- [ ] storage health reports a material critical warning;
+- [ ] available SMART/NVMe health reports a material critical warning;
 - [ ] `NEW_DEVICE`/`UNVERIFIABLE` creates at least a visible warning and escalates when recording integrity cannot be assured;
 - [ ] Slack receives the immediate alert when Slack is configured;
 - [ ] when Slack is disabled, dashboard/audit fault state remains visible.

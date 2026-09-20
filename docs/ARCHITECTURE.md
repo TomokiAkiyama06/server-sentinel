@@ -106,7 +106,7 @@ invited browser
     -> loopback-only ServerSentinel dashboard/API
 ```
 
-ServerSentinel does not require or automatically mutate Tailscale ACLs/Grants, and it does not retain a Tailscale administrative credential. The existing Tailnet policy may therefore continue to make the Main Server node visible/reachable to ordinary Tailnet members. Node-level concealment is not guaranteed unless the deployment owner separately configures Tailscale policy.
+ServerSentinel does not modify Tailscale ACLs/Grants or retain a Tailscale administrative credential; policy administration remains outside the application. The existing Tailnet policy may therefore continue to make the Main Server node visible/reachable to ordinary Tailnet members. Node-level concealment is not guaranteed unless the deployment owner separately configures Tailscale policy.
 
 The application independently checks an owner-managed allowlist and independent `live:view` and `recordings:view` permissions. Historical timeline/events belong to `recordings:view` and are unavailable to `live:view` alone. An uninvited Tailnet identity receives no ServerSentinel camera/media/timeline/deployment data even when the underlying Tailscale node is reachable.
 

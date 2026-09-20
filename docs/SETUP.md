@@ -267,7 +267,7 @@ Recommended boundary:
 
 - dashboard/backend listener used by humans binds only to loopback or another trusted non-bypassable local proxy path;
 - Tailscale Serve/equivalent exposes it privately;
-- existing Tailscale ACLs/Grants may remain unchanged; ServerSentinel does not require or automate policy changes;
+- existing Tailscale ACLs/Grants may remain unchanged; ServerSentinel does not modify the policy;
 - ServerSentinel still checks its own invitation/permission list for every human request;
 - uninvited identities receive generic/non-branding denial and no ServerSentinel deployment/media metadata.
 

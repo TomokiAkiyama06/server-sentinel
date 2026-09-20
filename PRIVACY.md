@@ -65,7 +65,7 @@ Historical timeline/event access is not exposed through `live:view`; it is inclu
 
 Tailnet membership is not authorization.
 
-ServerSentinel does not require changing existing Tailscale ACLs/Grants and does not store a Tailscale administrative credential. With unchanged Tailnet policy, the underlying Main Server node may remain visible/reachable to other Tailnet members.
+ServerSentinel does not modify Tailscale ACLs/Grants or store a Tailscale administrative credential; policy administration remains outside the application. With unchanged Tailnet policy, the underlying Main Server node may remain visible/reachable to other Tailnet members.
 
 Even a network-reachable identity must still pass the ServerSentinel application allowlist/permission check before receiving camera names, media, recordings, timeline data, or other deployment metadata. Uninvited identities should receive generic/non-branding responses so the application discloses as little as practical without claiming network-level invisibility.
 
@@ -122,7 +122,7 @@ If Main Server communication is unexpectedly lost, the agent protects the preced
 
 ## Hardware inventory and recorder diagnostics
 
-The Main Server keeps its Owner-approved hardware baseline and detailed hardware identifiers deployment-local. Raw serials/UUIDs are excluded from ordinary exported logs, public diagnostics, and GitHub artifacts. Any detailed diagnostic export requires an explicit Owner action. Bounded recording-health self-test media stays local and is never uploaded. Delete self-test-owned temporary/partial media after success, failure, or cancellation, and clean interrupted-test leftovers at the next startup before creating new self-test media. Cleanup verifies the expected filesystem and self-test ownership; it never deletes ordinary recordings or protected incidents. If cleanup is unsafe or fails, report failure and block further self-test media writes until safe cleanup succeeds. Leftovers count against storage admission and the safety reserve; they are not retained diagnostic media.
+The Main Server keeps its Owner-approved hardware baseline and detailed hardware identifiers deployment-local. Normal operational logs and general diagnostics redact or hash serials/UUIDs; raw identifiers are excluded from public diagnostics and GitHub artifacts. Any detailed diagnostic export requires an explicit Owner action and does not authorize automatic upload. Bounded recording-health self-test media stays local and is never uploaded. Delete self-test-owned temporary/partial media after success, failure, or cancellation, and clean interrupted-test leftovers at the next startup before creating new self-test media. Cleanup verifies the expected filesystem and self-test ownership; it never deletes ordinary recordings or protected incidents. If cleanup is unsafe or fails, report failure and block further self-test media writes until safe cleanup succeeds. Leftovers count against storage admission and the safety reserve; they are not retained diagnostic media.
 
 ## Slack
 

@@ -199,6 +199,8 @@ Agent-to-main and main-to-browser low-latency transports must be selected throug
 
 Correct authentication, reconnection, bounded buffering/backpressure, and truthful degradation are more important than committing prematurely to WebRTC/SRT/QUIC/another protocol.
 
+For the Agent-to-Main PoC, compare stability, reconnect, accurate gap reporting, bounded buffering/backpressure, authenticated encryption, resource usage, and latency in that order. Authenticated encryption is mandatory for any selected transport; the evaluation order does not make it optional. The exact transport remains undecided until the PoC/ADR.
+
 ### MEDIA-007 Durable recording
 Durable recording is main-host authoritative during normal operation. Remote source handling must preserve source identity, timestamps, bounded queues/backpressure, and integrity. Agent-side protected incident evidence defined above is a deliberate resilience exception.
 
@@ -332,13 +334,13 @@ At least once per day, ServerSentinel shall run a recording-health self-test suf
 Temporary self-test media shall be bounded, deployment-local, and never uploaded as telemetry. Self-test-owned temporary/partial media shall be cleaned up on success, failure, or cancellation, and interrupted-test leftovers shall be recovered for cleanup at the next startup before another test segment is written. Cleanup shall target only identified self-test artifacts on the expected filesystem, never ordinary recordings or protected incidents. If cleanup cannot complete, report a recording-health failure, include remaining artifacts in storage admission/safety-reserve accounting, and block further self-test media writes until safe cleanup succeeds; do not silently accumulate daily leftovers or use a fallback mount.
 
 ### INTEGRITY-005 Recording-path fail-safe
-If the intended recording filesystem is missing/unmounted or resolves to an unexpected device, ServerSentinel shall not silently fall back to an unintended filesystem while reporting healthy recording. It shall expose a degraded/failed state and follow storage admission safeguards.
+If the intended recording filesystem is missing/unmounted or resolves to an unexpected device, ServerSentinel shall refuse recording and self-test media writes to that target and expose a degraded/failed state. It shall not create or use a fallback recording directory on the root filesystem or another unintended filesystem, even while reporting degradation.
 
 ### INTEGRITY-006 Immediate alerting
 A baseline component becoming missing/changed, an unexpected storage device substitution, or a recording-health self-test failure is an immediate owner notification condition rather than waiting only for the daily summary. `UNVERIFIABLE`/probe failures shall at least generate a visible warning, and shall escalate when they prevent assurance of recording/storage integrity.
 
 ### INTEGRITY-007 Local-only inventory data
-Raw hardware serials/UUIDs and detailed inventory are deployment-local operational/security metadata. They shall not be sent to the developer, telemetry, public diagnostics, GitHub issues/PRs, or normal exported logs without an explicit owner-controlled diagnostic export.
+Raw hardware serials/UUIDs and detailed inventory are deployment-local operational/security metadata. Normal operational logs and general diagnostics shall redact or hash these identifiers. Raw identifiers shall not be sent to the developer, telemetry, public diagnostics, or GitHub issues/PRs. Any detailed diagnostic export requires an explicit owner-controlled action and does not authorize automatic upload.
 
 ## 12. Notifications
 
@@ -363,7 +365,7 @@ Public Internet port exposure is not the default. Human remote access should use
 Being a Tailnet member does not grant ServerSentinel application access.
 
 ### AUTH-003 No mandatory Tailnet policy modification
-The MVP shall **not require ServerSentinel to modify or manage Tailscale ACLs/Grants** and shall not require storing Tailscale administrative credentials. Existing Tailnet policy may remain unchanged.
+ServerSentinel shall **not modify or manage Tailscale ACLs/Grants** and shall not store Tailscale administrative credentials. Existing Tailnet policy may remain unchanged; any policy administration is performed by the Owner outside ServerSentinel.
 
 Because of this choice, ServerSentinel does **not** guarantee that an uninvited Tailnet member cannot discover that the main Tailscale node exists. Hiding the node itself requires an external Tailscale policy/architecture choice outside the application authorization layer.
 
@@ -459,7 +461,7 @@ Not required for MVP unless separately approved:
 - cross-camera biometric re-identification;
 - named non-owner face database;
 - public Internet dashboard exposure;
-- automatic Tailscale admin-policy mutation;
+- ServerSentinel-managed Tailscale admin-policy mutation;
 - guaranteed network-level concealment from ordinary Tailnet members when Tailnet policy is left unchanged;
 - guaranteed DRM/prevention of viewer screen capture;
 - guaranteed concealment from Tailnet/network administrators;

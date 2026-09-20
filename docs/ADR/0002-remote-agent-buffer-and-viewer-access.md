@@ -45,7 +45,7 @@ A protected incident MUST be excluded from ordinary ring overwrite and is retain
 
 ### 4. Human-access authorization does not require changing Tailscale Grants
 
-ServerSentinel MVP MUST NOT require automatic or routine mutation of the owner's Tailscale Grants/ACL policy.
+ServerSentinel MVP MUST NOT modify the owner's Tailscale Grants/ACL policy or store Tailscale administrative credentials. Policy administration remains outside the application and existing policy may remain unchanged.
 
 Tailscale provides private-network reachability. ServerSentinel performs its own owner-managed invitation/allowlist and application authorization before returning dashboard or media information.
 

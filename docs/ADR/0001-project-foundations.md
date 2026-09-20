@@ -51,7 +51,7 @@ Human-access architecture:
 
 - Tailscale/private network is recommended for human remote reachability;
 - Tailnet membership is not ServerSentinel authorization;
-- ServerSentinel does not require changing existing Tailscale ACLs/Grants and stores no Tailscale admin credential;
+- ServerSentinel does not modify Tailscale ACLs/Grants and stores no Tailscale admin credential; policy administration remains outside the application;
 - human backend is reached through a trusted Tailscale Serve/equivalent proxy path and remains non-bypassable from ordinary LAN clients;
 - ServerSentinel additionally maintains its own owner-managed invitation/allowlist;
 - minimum non-owner permissions are independent `live:view` and `recordings:view`;

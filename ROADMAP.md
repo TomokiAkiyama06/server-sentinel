@@ -2,14 +2,18 @@
 
 This roadmap is intentionally high-level. GitHub Issues are the execution source of truth. `docs/INITIAL_ISSUES.md` contains the current bootstrap sequence.
 
+Phases group capabilities rather than imposing a strict completion order. The dependency graph in `docs/INITIAL_ISSUES.md` governs acceptance: the authorization ADR precedes Backend endpoint contracts, Plan 17 enforcement precedes human-facing media/UI acceptance, negotiated profiles precede Agent buffer configuration acceptance, and Agent preservation plus notification contracts precede Presence integration. Mock/contract work can proceed independently.
+
 ## Phase 0 — Bootstrap
 
 - [ ] public repository / Apache-2.0
 - [ ] specifications committed
 - [ ] issue/PR templates
-- [ ] CI skeleton / secret scan
+- [ ] CI/secret-scan plan mapped to Issue #5 (implementation remains open)
 - [ ] dependency/model license policy
-- [ ] hardened review-gate follow-up (Issue #4)
+- [ ] hardened review-gate follow-up mapped to Issue #4 (enforcement implementation remains open)
+
+Issue #1 closes with PR #2 after documentation/bootstrap acceptance and current HEAD/base reviews plus CI pass. Open runtime Issues #5–#28 and the separately tracked #4 do not mean the specification bootstrap is incomplete.
 
 ## Phase 1 — Main server and web foundation
 
@@ -51,7 +55,7 @@ This roadmap is intentionally high-level. GitHub Issues are the execution source
 - [ ] generic source-ID recording manifest
 - [ ] manual recording
 - [ ] main->browser live transport PoC + ADR
-- [ ] phone/Mac 1–4 source live grid
+- [ ] phone/Mac/desktop 1–4 source live grid, with stability/reconnect prioritized over minimum latency
 - [ ] demand-driven viewer transcoding/packaging
 
 ## Phase 4 — Human private access
@@ -105,7 +109,7 @@ This roadmap is intentionally high-level. GitHub Issues are the execution source
 - [ ] capture-agent LAN interruption/revocation tests
 - [ ] clock-skew tests
 - [ ] 1–4 source stress tests
-- [ ] phone/Mac private live-view tests
+- [ ] phone/Mac/desktop private live-view tests, including copied-URL authorization
 - [ ] unchanged-Tailnet-policy reachability + application-permission isolation tests
 - [ ] storage-full and Agent/Main media-mount loss/substitution tests
 - [ ] startup/daily hardware-integrity and daily recording-health failure/notification tests

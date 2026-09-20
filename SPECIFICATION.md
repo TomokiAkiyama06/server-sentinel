@@ -647,12 +647,14 @@ At least once per day, run an end-to-end recording-health check. It should verif
 1. enabled Camera Sources have fresh frames or an explicit truthful offline/degraded state;
 2. recorder/encoder pipeline is alive;
 3. configured recording root resolves to the expected filesystem/device rather than an accidental fallback mount;
-4. free-space and safety-reserve admission is valid;
+4. the expected target is writable and free-space/safety-reserve admission is valid;
 5. write a short bounded temporary media segment through the recording path;
 6. flush/fsync it;
 7. reopen it and validate container/duration/size and decode/readability as appropriate;
 8. clean up self-test-owned temporary/partial media whether validation succeeds, fails, or is cancelled;
 9. read available SMART/NVMe health indicators without making unsupported lifetime predictions.
+
+Missing/unmounted or substituted recording filesystems refuse recording and self-test media writes to that target. Do not create or use a replacement directory on the root filesystem or another unintended filesystem; reporting degradation does not permit fallback writes.
 
 Run cleanup through the failure/cancellation path as well as the successful path. On startup, recover identified artifacts from interrupted tests and clean them before admitting another self-test segment. Cleanup verifies the expected filesystem and targets only self-test-owned artifacts; it never deletes ordinary recordings/protected incidents or creates a fallback on an unexpected mount. If cleanup fails (for example, a missing or read-only mount), record a recording-health failure, account for the leftovers in storage admission/safety-reserve checks, and block new self-test media writes until safe cleanup succeeds. Continue reporting the failed/blocked state rather than accumulating a new partial segment each day.
 
@@ -673,7 +675,7 @@ Notification delivery follows configured local/UI/Slack channels. Slack remains 
 
 ### 10.5 Privacy and privilege
 
-Detailed hardware identifiers are deployment-local security metadata. Do not send raw serials/UUIDs through telemetry or developer infrastructure. General diagnostics should redact/hash them unless the Owner explicitly exports detailed diagnostics.
+Detailed hardware identifiers are deployment-local security metadata. Do not send raw serials/UUIDs through telemetry or developer infrastructure. Normal operational logs and general diagnostics must redact/hash them. A detailed diagnostic export requires an explicit Owner action and does not authorize automatic upload.
 
 Hardware/SMART probing must use the least privilege practical. Do not run the whole ServerSentinel stack as root merely to obtain inventory/health data; use narrow host permissions/helper boundaries if privileged probes are required.
 
@@ -699,7 +701,7 @@ Tailnet membership by itself grants no ServerSentinel application data.
 
 ### 11.2 Tailnet policy is not managed by ServerSentinel
 
-The MVP does **not** require changing Tailscale ACLs/Grants and does not store Tailscale administrative credentials. The owner's existing Tailnet policy may remain unchanged.
+ServerSentinel does **not** modify Tailscale ACLs/Grants or store Tailscale administrative credentials; policy administration remains outside the application. The owner's existing Tailnet policy may remain unchanged.
 
 Important limitation: when Tailnet policy is left unchanged, ServerSentinel cannot promise network-level concealment of the **main Tailscale node itself** from other Tailnet members. Application authorization can prevent them from seeing ServerSentinel camera/media/deployment data, but Tailscale peer/device visibility is controlled by Tailscale policy, not by the ServerSentinel application.
 
