@@ -377,6 +377,14 @@ Runtime uncertainty or later growth of protected/other filesystem usage may redu
 
 Normal unprotected segments are FIFO. Protected incident segments are not part of ordinary ring-buffer eviction.
 
+The implemented core is `agent/media_capture_agent/ring.py`, with a private
+transactional SQLite ledger and #12's descriptor-pinned media store. Admission
+uses physical allocated bytes, unique shared references, explicit per-source
+bitrate/cadence/overhead bounds, and verified free space after any eligible
+reclamation. Its DTOs expose intervals/gaps, completion/expiry, pressure and
+deletion state. The concrete contract and incomplete production/UI integration
+are documented in [`agent/docs/RING_BUFFER.md`](agent/docs/RING_BUFFER.md).
+
 ### 5.11 Unexpected main-host communication loss
 
 If the agent unexpectedly loses the authenticated connection/heartbeat to the main host, it automatically creates a temporary protected incident window:
@@ -447,6 +455,21 @@ At install/startup/runtime admission, the Agent shall verify:
 - loss/unmount/substitution of the expected media filesystem does **not** silently redirect ring-buffer or incident writes into a directory on the root filesystem.
 
 If the expected media filesystem is unavailable or resolves unexpectedly, Agent recording/buffering becomes explicit degraded/failed state and unsafe writes are refused until the Owner resolves or re-approves the target.
+
+The Issue #16 ring core requires an explicit SQLite ledger size bound in addition
+to media-profile/reserve inputs. It guards runtime-filesystem metadata growth
+before schema creation, hot-journal recovery and transactions, and reserves
+conservative completion headroom in shared-filesystem media admission. The cap
+must also cover cadence-derived segment/index/protection rows for the selected
+ring and the next complete pre/post incident, including existing retained
+metadata. Failed reconfiguration retains the active ring's selected coverage;
+only trusted clock observations advance the durable rollback watermark.
+Untrusted capture discontinuities are refused without advancing per-source trusted
+chronology. Capacity changes must fit incompatible legacy pre-roll throughout
+profile rollover, not merely fit the filesystem or one immediate new segment. Unexpected
+authentication loss is an effective Main loss even while the raw socket remains
+connected; known protected-evidence damage stays degraded outside current pre-roll.
+See `agent/docs/RING_BUFFER.md` for the implemented budget and integration limits.
 
 ## 6. Media architecture
 

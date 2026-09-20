@@ -24,6 +24,14 @@ Safe defaults:
 
 ## Threat model
 
+The Agent ring core's configuration/early deletion and critical-preserve controls
+use separate default-deny injected authorization boundaries; no human/control
+listener is added. Its private SQLite ledger journals protection/deletion before
+media mutation, and the approved media store validates mount identity for writes,
+inventory and cleanup. Missing/uncertain media remains a visible gap; storage
+pressure cannot remove unexpired protected incidents. Production authority and
+transport integration remain pending. See `agent/docs/RING_BUFFER.md`.
+
 The internal compressed-recording store accepts no caller-controlled filenames or
 public requests. It requires a private, deployment-approved existing media root,
 an admission reservation and a trusted video-only codec validator. It rejects

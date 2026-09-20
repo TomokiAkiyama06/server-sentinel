@@ -52,7 +52,7 @@ no browser preview or physical device result is claimed.
 ## Phase 3 — Media
 
 - [ ] agent->main transport PoC + ADR
-- [ ] Agent compressed disk ring buffer with Owner-selected duration/capacity modes
+- [ ] Agent compressed disk ring buffer: tested disk/ledger core and duration/capacity DTOs implemented; Owner UI, capture/transport integration and hardware acceptance pending (#16)
 - [ ] autonomous T-10/T+10 incident protection, critical preserve command, and 60-day default expiry
 - [ ] Agent storage pressure/hard stop without deleting unexpired protected evidence
 - [ ] capture/record/inference/view profile separation

@@ -479,6 +479,14 @@ Acceptance:
 
 ## Plan 9A — Agent disk ring buffer + autonomous incident evidence
 
+Delivery note: the stdlib ring core now performs real immutable segment/SQLite
+writes, shared incident protection, bounded 20-minute admission, coverage/gap
+reporting and 60-day expiry with synthetic fault tests. It exposes default-deny
+control boundaries and UI DTOs; production capture/transport/profile integration,
+Owner authorization/dashboard wiring and physical acceptance remain open. See
+[`agent/docs/RING_BUFFER.md`](../agent/docs/RING_BUFFER.md). This is not Issue
+completion and does not resolve any pending transport or reserve-value decision.
+
 GitHub Issue: [#16](https://github.com/TomokiAkiyama06/server-sentinel/issues/16)
 
 Depends on: [#15](https://github.com/TomokiAkiyama06/server-sentinel/issues/15), [#17](https://github.com/TomokiAkiyama06/server-sentinel/issues/17), [#8](https://github.com/TomokiAkiyama06/server-sentinel/issues/8), [#10](https://github.com/TomokiAkiyama06/server-sentinel/issues/10)
