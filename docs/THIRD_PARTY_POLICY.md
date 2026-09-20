@@ -124,6 +124,9 @@ their absence is explicit rather than assumed.
 Committed model weights must live under `models/`, `weights/`, `checkpoints/`,
 or `model-artifacts/` at any repository depth. Inventory records outside those
 reserved directories are invalid, including opaque archives.
+Runtime-style `assets/ml/` and `assets/ai/` paths are detection-only model-like
+locations. Every file under them is checked, including opaque archives and
+extensionless files, but approved weights must move to a reserved directory.
 
 Blocked-by-default licenses require an exact record in
 [`license/owner-approvals.json`](../license/owner-approvals.json), including the

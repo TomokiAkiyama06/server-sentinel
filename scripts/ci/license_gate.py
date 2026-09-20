@@ -23,6 +23,7 @@ INVENTORY = "license/components.json"
 APPROVALS = "license/owner-approvals.json"
 PINS = "license/pins.json"
 MODEL_DIRECTORIES = {"models", "weights", "checkpoints", "model-artifacts"}
+MODEL_ASSET_PATHS = {("assets", "ml"), ("assets", "ai")}
 MODEL_SUFFIXES = {
     ".bin", ".ckpt", ".engine", ".h5", ".mlmodel", ".onnx", ".pb", ".pt",
     ".pth", ".safetensors", ".tflite", ".weights",
@@ -129,6 +130,14 @@ def reserved_model_path(value):
     return bool(set(PurePosixPath(value).parts[:-1]) & MODEL_DIRECTORIES)
 
 
+def model_like_path(value):
+    parts = PurePosixPath(value).parts[:-1]
+    return reserved_model_path(value) or any(
+        parts[index:index + 2] in MODEL_ASSET_PATHS
+        for index in range(max(0, len(parts) - 1))
+    )
+
+
 def python_lock(path: Path, relative: str, scope: str):
     text = path.read_text(encoding="utf-8")
     logical = text.replace("\\\n", " ").splitlines()
@@ -218,7 +227,7 @@ def model_files(root: Path):
         relative = path.relative_to(root)
         if set(relative.parts) & excluded:
             continue
-        in_model_directory = bool(set(relative.parts[:-1]) & MODEL_DIRECTORIES)
+        in_model_directory = model_like_path(relative.as_posix())
         has_model_suffix = path.suffix.lower() in MODEL_SUFFIXES
         if path.is_symlink() and (in_model_directory or has_model_suffix):
             raise GateError("model artifacts must be regular files")

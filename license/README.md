@@ -18,6 +18,9 @@ extension; common model suffixes elsewhere are also detected. Reviewed-empty
 records document scopes that currently have no third-party component.
 Every committed model weight must be stored below one of those reserved
 directories; a `model_weight` record pointing elsewhere is rejected.
+Files below an `assets/ml/` or `assets/ai/` path are also detected as model-like
+regardless of extension, but these paths are detection-only: move a reviewed
+weight into a reserved model directory before registering it.
 
 AGPL, GPL, SSPL, BSL/source-available, unknown, and unclear licenses require an
 exact entry in `owner-approvals.json`. An approval is valid only for the recorded

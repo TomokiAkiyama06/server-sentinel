@@ -128,7 +128,9 @@ Committed model artifacts require a distinct `model_weight` record with the
 exact path and SHA256. All files in a reserved model artifact directory are
 checked regardless of extension; common model suffixes are also checked in
 other directories. Model weight inventory locations outside the reserved
-directories are rejected. Model implementation packages require `model_code` records.
+directories are rejected. Detection-only `assets/ml/` and `assets/ai/` paths are
+also scanned in full so an opaque archive cannot bypass suffix detection. Model
+implementation packages require `model_code` records.
 Restricted or unclear licenses remain
 blocked unless `license/owner-approvals.json` contains an exact, decision-backed
 Owner approval for that component version and license.

@@ -3,11 +3,13 @@
 import hashlib
 import base64
 import json
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 
 from scripts.ci import license_gate
+from scripts.ci import repository_guard
 
 
 class LicenseGateTests(unittest.TestCase):
@@ -320,6 +322,23 @@ class LicenseGateTests(unittest.TestCase):
         self.reviews = [self.review("transport"), self.review("model_code")]
         self.save()
         with self.assertRaisesRegex(license_gate.GateError, "reserved model artifact directory"):
+            license_gate.audit(self.root)
+
+    def test_ci_rejects_unregistered_opaque_artifact_in_model_like_asset_path(self):
+        path = "assets/ml/opaque-weight.zip"
+        self.write(path, b"synthetic opaque model archive without ZIP magic")
+        ordinary = "assets/downloads/ordinary-archive.zip"
+        self.write(ordinary, b"synthetic unrelated archive bytes")
+        subprocess.run(["git", "-C", str(self.root), "init", "--quiet"], check=True)
+        subprocess.run(["git", "-C", str(self.root), "add", "."], check=True)
+
+        # The general repository guard does not ban arbitrary non-runtime ZIP
+        # bytes. The following license gate in the CI sequence must fail based
+        # on the narrowly model-like assets/ml path.
+        self.assertEqual(repository_guard.audit(self.root), [])
+        self.assertIn(path, license_gate.model_files(self.root))
+        self.assertNotIn(ordinary, license_gate.model_files(self.root))
+        with self.assertRaisesRegex(license_gate.GateError, "model artifact set differs"):
             license_gate.audit(self.root)
 
     def test_npm_sri_requires_canonical_base64_and_algorithm_digest_length(self):
