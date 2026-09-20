@@ -101,9 +101,11 @@ acceptance.
 
 - [ ] owner-only face-verification model/license evaluation
 - [ ] explicit owner enrollment/delete flow
-- [ ] anonymous same-camera tracking
+- [x] internal Owner-only template enrollment/delete/re-enroll with generation/audit and default-deny authorization (#25; human flow/model pending)
+- [x] anonymous same-camera tracking primitive (generated geometry; real detector/worker/room integration pending)
 - [ ] entrance/zone calibration where geometry supports it
 - [ ] anonymous/owner entry-exit observations
+- [x] internal candidate-bound quality/verification receipts and finite directed-line observations (#25; production adapter and #26 integration pending)
 - [ ] `PRESENT / PROBABLY_PRESENT / ABSENT / UNKNOWN`
 - [ ] manual presence override/schedule
 - [ ] no non-owner enrollment or persistent face-crop/template/embedding/profile library, whether named or anonymous
