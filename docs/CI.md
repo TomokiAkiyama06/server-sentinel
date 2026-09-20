@@ -7,6 +7,11 @@ and component jobs must succeed. A failed, cancelled, or skipped prerequisite
 cannot produce a successful final check. Review provenance enforcement remains
 in Issue #4; the workflow does not change repository protection settings.
 
+Issue #4's offline review-receipt policy tests run in the repository test job.
+The [deployment proposal](REVIEW_GATE_SETUP.md) and disabled ruleset generator
+are preparatory tooling; their successful tests do not establish a deployed
+trusted issuer or required Codex/Claude enforcement.
+
 ## Current coverage
 
 The repository currently contains CI tooling and application README skeletons.
