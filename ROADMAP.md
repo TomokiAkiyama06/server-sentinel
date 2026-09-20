@@ -141,6 +141,11 @@ UI remain pending; these phase boxes represent integrated acceptance.
 
 ## Explicit pending decisions
 
+Issue #23 has an independent comparison/approval/outbox core and recording-health
+worker adapter with disposable-file cleanup/recovery tests. Authorization,
+actual codec/source wiring, notifications and physical acceptance remain open;
+see the integrity and media/health module READMEs.
+
 - [ ] exact agent->main transport;
 - [ ] exact main->browser live transport/target latency;
 - [ ] room-overview capture/record/inference/view defaults after benchmark;

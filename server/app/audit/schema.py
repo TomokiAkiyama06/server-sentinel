@@ -19,8 +19,9 @@ AUDIT_STATEMENTS = (
 
 
 def audit_migration(version: int) -> Migration:
-    """Place the audit DDL at a caller-assigned slot, like other modules."""
+    """Place the audit DDL at a caller-assigned slot, like other modules.
+
+    The application aggregator owns the ordering; this module never pins a
+    version so an append-only catalog can grow without renumbering.
+    """
     return Migration(version, "security_admin_audit", AUDIT_STATEMENTS)
-
-
-AUDIT_MIGRATION = audit_migration(5)

@@ -104,6 +104,19 @@ class RecordingStore:
             os.close(self._fd)
             self._fd = -1
 
+    def self_test_probe(self, pipeline_status, sample, storage_health, *,
+                        max_bytes: int, max_duration_ms: int):
+        """Create an owned-artifact adapter on this same serialized worker.
+
+        Requires recording_health_migration plus a bounded actual-pipeline
+        sample provider and the mandatory codec validator. No fallback codec,
+        fake frame freshness, HTTP route, or independent root writer is added.
+        """
+        from app.media.health.artifacts import RecorderSelfTestProbe
+        self._check()
+        return RecorderSelfTestProbe(self, pipeline_status, sample, storage_health,
+                                     max_bytes=max_bytes, max_duration_ms=max_duration_ms)
+
     def __enter__(self):
         return self
 
