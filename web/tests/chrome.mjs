@@ -41,7 +41,10 @@ export async function launchChrome() {
   const command = (method, params = {}, sessionId) => new Promise((resolve, reject) => {
     if (stopped) { reject(stopped); return; }
     const commandId = ++id;
-    const timeout = setTimeout(() => { pending.delete(commandId); reject(new Error(`Chrome command timeout: ${method}`)); }, 10000);
+    // Chrome can take longer to answer its first CDP command on a freshly
+    // provisioned CI runner. Subsequent commands retain the short failure bound.
+    const timeoutMilliseconds = commandId === 1 ? 30000 : 10000;
+    const timeout = setTimeout(() => { pending.delete(commandId); reject(new Error(`Chrome command timeout: ${method}`)); }, timeoutMilliseconds);
     pending.set(commandId, {
       resolve(value) { clearTimeout(timeout); resolve(value); },
       reject(error) { clearTimeout(timeout); reject(error); },
