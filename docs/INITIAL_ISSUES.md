@@ -617,15 +617,19 @@ core with immutable source/profile calibration, append-only private calibration
 history that stores provenance and the reference digest but never decoded media,
 global transform compensation, relative ROI comparison, explicit
 occlusion/quality fail-unknown handling, temporal confirmation, persistent
-dark/unmatched-scene tamper, and trusted source-loss correlation. It has no
-capture, HTTP, notification, presence, or identity integration. The generated
-fixtures in `server/tests/test_detector_roi.py` verify local and remote-agent
+dark/unmatched-scene tamper, and trusted source-loss correlation. A refused or
+incompatible sample ends temporal confirmation and advances the observed frame
+progression, and a registration that is acceptable but ambiguous stays
+`unknown` instead of confirming tamper or its absence. It has no capture,
+HTTP, notification, presence, or identity integration. The generated fixtures
+in `server/tests/test_detector_roi.py` verify local and remote-agent
 calibration types, controlled ROI displacement, camera-global shift separation,
-temporary occlusion, persistent unmatched scenes, ambiguous registration,
-quality isolation, source loss, media-free migration/history, and bounded
-failed-delivery retry. Physical-camera calibration and integration into
-capture/source health, recording preservation, notification, and Plan 16 remain
-separate acceptance work.
+temporary occlusion, persistent unmatched scenes, ambiguous and low-margin
+registration, refused foreign-source samples, frame-progression watermarks, the
+unmatched-path comparison budget, quality isolation, source loss, media-free
+migration/history, and bounded failed-delivery retry. Physical-camera
+calibration and integration into capture/source health, recording preservation,
+notification, and Plan 16 remain separate acceptance work.
 
 ## Plan 15 — Owner-only verification / anonymous tracking / entrance
 
