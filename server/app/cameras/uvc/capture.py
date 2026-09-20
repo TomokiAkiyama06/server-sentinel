@@ -90,7 +90,9 @@ def negotiate(fd, desired, ioctl=fcntl.ioctl):
     struct.pack_into("=I", parameters, 0, 1)
     ioctl(fd, G_PARM, parameters, True)
     if struct.unpack_from("=I", parameters, 4)[0] & 0x1000:
-        interval = Fraction(1 / desired.fps).limit_denominator(1_000_000)
+        interval = (Fraction(1, 1) / Fraction(str(desired.fps))).limit_denominator(1_000_000)
+        if not 0 < interval.numerator <= 0xFFFFFFFF or not 0 < interval.denominator <= 0xFFFFFFFF:
+            raise CaptureError("video frame interval exceeds V4L2 bounds")
         struct.pack_into("=II", parameters, 12, interval.numerator, interval.denominator)
         ioctl(fd, S_PARM, parameters, True)
     numerator, denominator = struct.unpack_from("=II", parameters, 12)

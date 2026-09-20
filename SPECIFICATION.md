@@ -230,6 +230,12 @@ Source workers, Owner management and the preview frame sink are internal
 interfaces; physical capture is not auto-started by the backend launcher and no
 unauthenticated preview route is added. See `server/app/cameras/uvc/README.md`.
 
+Identity reconciliation starts only after an active-session marker is durable.
+An unclean session, including a failed ambiguity-latch write, requires Owner
+reapproval at restart; it cannot fall back to an older clean approval record.
+Clean shutdown releases this marker after closing capture while retaining any
+manual-approval latch. A missing capture profile does not hide that latch.
+
 ## 5. `media-capture-agent`
 
 ### 5.1 Purpose

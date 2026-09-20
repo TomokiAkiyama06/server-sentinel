@@ -40,8 +40,11 @@ class LocalUvcAdapter:
         self.capture_factory = capture_factory
         self.clock = clock or (lambda: datetime.now(timezone.utc))
         self.sessions = {}
+        self.closed = False
 
     def _source(self, source_id):
+        if self.closed:
+            raise ValueError("UVC adapter is closed")
         source = self.registry.get_source(source_id)
         if source.source_type != SourceType.LOCAL_UVC:
             raise ValueError("source is not local UVC")
@@ -123,6 +126,18 @@ class LocalUvcAdapter:
             raise
 
     def close(self):
+        if self.closed:
+            return
+        self.closed = True
+        failures = []
         for session in self.sessions.values():
-            session.close()
-            session.controller.disconnected()
+            try:
+                session.close()
+                session.controller.disconnected()
+                session.controller.shutdown()
+            except BaseException as error:
+                # Close every source even when one database/health sink fails.
+                # A failed release keeps the already durable recovery marker.
+                failures.append(error)
+        if failures:
+            raise failures[0]

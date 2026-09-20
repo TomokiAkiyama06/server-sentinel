@@ -3,6 +3,7 @@ from pathlib import Path
 import sqlite3
 import tempfile
 import unittest
+from unittest.mock import patch
 from uuid import UUID
 
 from app.cameras.uvc.identity import CameraState, DeviceEvidence, ReconnectController
@@ -41,6 +42,8 @@ class PersistenceTests(unittest.TestCase):
         self.assertIsNone(restarted.reconcile([self.camera]))
         self.assertEqual(restarted.state, CameraState.MANUAL)
         restarted.approve(self.camera, [self.camera])
+        restarted.capture_closed()
+        restarted.shutdown()
         second_restart = self.controller()
         self.assertEqual(second_restart.reconcile([self.camera]), self.camera)
         self.assertEqual(second_restart.state, CameraState.DEGRADED)
@@ -67,6 +70,56 @@ class PersistenceTests(unittest.TestCase):
         self.assertTrue(control.requires_approval)
         with self.assertRaises(ValueError):
             control.capture_ready(self.camera)
+
+    def test_failed_ambiguity_write_is_fail_closed_after_restart(self):
+        control = self.controller()
+        with patch.object(self.store, "save", side_effect=ApprovalStorageError("synthetic write failure")):
+            with self.assertRaises(ApprovalStorageError):
+                control.reconcile([self.camera, replace(self.camera, device_path="/dev/video1")])
+        # The failed write left the old approval value, but the pre-armed session
+        # marker is durable and prevents trusting that stale value after restart.
+        persisted = self.store.load(self.source_id)
+        self.assertFalse(persisted.requires_approval)
+        self.assertIsNotNone(persisted.session_token)
+        restarted = self.controller()
+        self.assertIsNone(restarted.reconcile([self.camera]))
+        self.assertEqual(restarted.state, CameraState.MANUAL)
+        restarted.approve(self.camera, [self.camera])
+        restarted.capture_ready(self.camera)
+        self.assertEqual(restarted.state, CameraState.ONLINE)
+
+    def test_old_controller_cannot_clear_new_session_recovery_state(self):
+        old = self.controller()
+        current = self.controller()
+        token = self.store.load(self.source_id).session_token
+        with self.assertRaises(ApprovalStorageError):
+            old.shutdown()
+        self.assertEqual(self.store.load(self.source_id).session_token, token)
+        self.assertTrue(current.requires_approval)
+        self.assertIsNone(current.reconcile([self.camera]))
+
+    def test_clean_shutdown_allows_unique_serial_reconnect(self):
+        control = self.controller()
+        control.reconcile([self.camera])
+        control.capture_ready(self.camera)
+        control.capture_closed()
+        control.shutdown()
+        self.assertIsNone(self.store.load(self.source_id).session_token)
+        with self.assertRaises(ValueError):
+            control.reconcile([self.camera])
+        restarted = self.controller()
+        self.assertEqual(restarted.reconcile([self.camera]), self.camera)
+
+    def test_session_cannot_start_if_recovery_marker_cannot_be_written(self):
+        connection = self.database.connect()
+        connection.execute(
+            "CREATE TRIGGER synthetic_write_failure BEFORE INSERT ON uvc_approvals "
+            "BEGIN SELECT RAISE(ABORT, 'synthetic failure'); END"
+        )
+        connection.close()
+        with self.assertRaises(ApprovalStorageError):
+            self.controller()
+        self.assertIsNone(self.store.load(self.source_id))
 
 
 if __name__ == "__main__":

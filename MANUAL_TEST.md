@@ -54,6 +54,11 @@ run the following on the intended Main Ubuntu host under its dedicated account:
    resumes. Duplicate-serial evidence must also require manual intervention.
 6. Check unsupported profile/permission, driver timeout and corrupted-frame paths
    are visibly unavailable, never healthy; restore the supported configuration.
+7. Using a disposable database, inject a failed ambiguity-latch write and stop the
+   worker without clean shutdown. Restart with one formerly duplicated serial
+   device remaining: it must require Owner reapproval. Repeat with no capture
+   profile; the manual-intervention state must remain visible. A normal clean
+   shutdown/restart of an unambiguous serial device may reconnect automatically.
 
 Results: **NOT RUN — hardware, authorized management and viewer integration
 remain pending. Issue #11 is not closed by synthetic tests.**

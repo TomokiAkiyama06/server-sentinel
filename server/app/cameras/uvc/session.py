@@ -45,6 +45,10 @@ class CaptureSession:
         """Deliver at most one frame, returning False on offline/manual/failure."""
         if self.profile is None:
             self.close()
+            if self.controller.requires_approval:
+                # A missing profile must not hide a durable Owner action. This
+                # needs no physical discovery and the transition is deduplicated.
+                self.controller.reconcile(())
             return False
         try:
             scan = self.discovery.scan()

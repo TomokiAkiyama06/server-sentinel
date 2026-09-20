@@ -174,6 +174,13 @@ class CaptureTests(unittest.TestCase):
         with self.assertRaisesRegex(CaptureError, "timed out"):
             capture.read_frame()
 
+    def test_tiny_positive_rate_fails_safely_before_fraction_overflow(self):
+        self.capture.desired = VideoProfile(1280, 720, 1e-300, "MJPG")
+        with self.assertRaisesRegex(CaptureError, "frame interval exceeds"):
+            self.capture.open()
+        self.assertNotIn(S_PARM, self.calls)
+        self.assertEqual(self.closed, [8])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -26,6 +26,14 @@ also latches manual intervention. `ApprovalStore` persists approved evidence and
 the ambiguity latch in the private application SQLite database (migration 3);
 storage failure blocks approval rather than falling back to an empty state.
 
+Before any reconciliation, a durable active-session marker is written. If the
+process dies or a later latch write fails, the next session requires Owner
+approval instead of trusting the earlier approval value. A clean shutdown closes
+capture before releasing this marker, preserving any existing ambiguity latch.
+Session-token checks prevent an old controller's shutdown from clearing a newer
+session. This means an unclean restart conservatively requires reapproval even
+for serial-backed devices. A clean restart can reconnect a unique serial device.
+
 `MmapCapture` implements single-planar streaming on Linux LP64 x86_64/aarch64.
 It opens only a selected `/dev/videoN` with no symlink following, checks the
 character-device number and rescans identity after open, then uses V4L2

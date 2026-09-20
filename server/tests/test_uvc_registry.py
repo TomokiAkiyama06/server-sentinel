@@ -109,6 +109,22 @@ class UvcRegistryTests(unittest.TestCase):
         self.assertEqual(self.registry.get_source(self.source.id).health_state,
                          HealthState.MANUAL_INTERVENTION_REQUIRED)
 
+    def test_restart_without_profile_keeps_durable_manual_state_without_churn(self):
+        self.adapter.approve_source(self.source.id, self.camera)
+        self.discovery.devices.append(replace(self.camera, device_path="/dev/video2"))
+        self.assertFalse(self.adapter.poll_source(self.source.id))
+        self.assertTrue(self.adapter.store.load(self.source.id).requires_approval)
+        self.registry.update_source(self.source.id, desired_capture_profile=None)
+        self.adapter.close()
+        restarted = self.make_adapter()
+        self.addCleanup(restarted.close)
+        self.assertFalse(restarted.poll_source(self.source.id))
+        self.assertEqual(self.registry.get_source(self.source.id).health_state,
+                         HealthState.MANUAL_INTERVENTION_REQUIRED)
+        event_count = len(self.events)
+        self.assertFalse(restarted.poll_source(self.source.id))
+        self.assertEqual(len(self.events), event_count)
+
 
 if __name__ == "__main__":
     unittest.main()

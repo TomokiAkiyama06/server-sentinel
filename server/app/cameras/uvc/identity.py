@@ -111,7 +111,8 @@ class ReconnectController:
             raise ValueError("enabled must be boolean")
         self.source_id = source_id
         self.store = store
-        saved = store.load(source_id) if store is not None else None
+        saved = store.start_session(source_id, approved) if store is not None else None
+        self._session_token = saved.session_token if saved else None
         self.approved = saved.approved if saved else approved
         self.emit = emit
         self.enabled = enabled
@@ -119,12 +120,12 @@ class ReconnectController:
         self.bound = None
         self.requires_approval = saved.requires_approval if saved else False
         self._reason = "not_started"
-        if saved is None:
-            self._persist()
+        self._finished = False
 
     def _persist(self):
         if self.store is not None:
-            self.store.save(self.source_id, self.approved, self.requires_approval)
+            self.store.save(self.source_id, self.approved, self.requires_approval,
+                            session_token=self._session_token)
 
     def _transition(self, state, reason):
         changed = (self.state, self._reason) != (state, reason)
@@ -137,6 +138,8 @@ class ReconnectController:
         self._transition(CameraState.OFFLINE, "device_disconnected")
 
     def reconcile(self, devices):
+        if self._finished:
+            raise ValueError("capture controller is closed")
         if not self.enabled:
             self.bound = None
             self._transition(CameraState.OFFLINE, "disabled")
@@ -163,10 +166,10 @@ class ReconnectController:
     def approve(self, candidate, current_devices):
         # Exact current candidate selection is required. A remembered device
         # path cannot approve a candidate that vanished during the ceremony.
-        if not self.enabled or tuple(current_devices).count(candidate) != 1:
+        if self._finished or not self.enabled or tuple(current_devices).count(candidate) != 1:
             raise ValueError("candidate is unavailable or ambiguous")
         if self.store is not None:
-            self.store.save(self.source_id, candidate, False)
+            self.store.save(self.source_id, candidate, False, session_token=self._session_token)
         self.approved = self.bound = candidate
         self.requires_approval = False
         self._transition(CameraState.DEGRADED, "owner_approved_pending_capture")
@@ -187,8 +190,18 @@ class ReconnectController:
         if self.state in (CameraState.DEGRADED, CameraState.ONLINE):
             self._transition(CameraState.OFFLINE, "video_capture_closed")
 
+    def shutdown(self):
+        """Release recovery marker only after capture is closed and state durable."""
+        if self.bound is not None:
+            raise ValueError("capture binding must close before shutdown")
+        if self.store is not None and self._session_token is not None:
+            self.store.save(self.source_id, self.approved, self.requires_approval,
+                            session_token=self._session_token, release=True)
+            self._session_token = None
+        self._finished = True
+
     def set_enabled(self, enabled):
-        if type(enabled) is not bool:
+        if self._finished or type(enabled) is not bool:
             raise ValueError("enabled must be boolean")
         self.enabled = enabled
         self.bound = None
