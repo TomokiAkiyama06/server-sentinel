@@ -89,6 +89,10 @@ sudo /tmp/server-sentinel-installer-1.1.0.pyz \
   --unit /etc/systemd/system/server-sentinel.service rollback
 ```
 
+`--unit` accepts exactly `/etc/systemd/system/server-sentinel.service`. Using one
+canonical administrator unit prevents another systemd search path from selecting
+a different definition when the installer restarts the logical service.
+
 Each release gets its own virtual environment under `releases/<version>`.
 Dependencies install offline from the artifact with hashes and binary-only
 enforcement. Root-only environment construction accepts only an absolute,

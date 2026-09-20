@@ -25,6 +25,7 @@ MAX_ARTIFACT_BYTES = 256 * 1024 * 1024
 MAX_UNIT_BYTES = 64 * 1024
 LOCK_WAIT_SECONDS = 600
 LOCK_POLL_SECONDS = 0.05
+SYSTEMD_UNIT = Path("/etc/systemd/system/server-sentinel.service")
 VERSION = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+(?:-[a-z0-9.]+)?")
 
 
@@ -366,8 +367,8 @@ def execute(args, *, runner=subprocess.run) -> None:
     if (not args.destination.is_absolute() or not args.config.is_absolute()
             or not args.unit.is_absolute()):
         raise ValueError("absolute installation paths required")
-    if args.unit.name != "server-sentinel.service":
-        raise ValueError("service must retain its functional name")
+    if args.unit != SYSTEMD_UNIT:
+        raise ValueError("service unit must use the supported system path")
     _protected_parent(args.destination.parent)
     _protected_parent(args.unit.parent)
     with _release_lock(args.unit):

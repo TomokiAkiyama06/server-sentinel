@@ -109,7 +109,7 @@ class ReleaseLifecycleTests(unittest.TestCase):
             # volume that a real installation requires.
             root_device = self.runtime.stat().st_dev + 1
         with patch("install.os.geteuid", return_value=0), patch(
-                "install._protected_parent"), patch(
+                "install.SYSTEMD_UNIT", self.unit), patch("install._protected_parent"), patch(
                 "install._trusted_python", side_effect=lambda path: path.resolve()), patch(
                 "install._installed_unit", side_effect=lambda path: path.read_text()), patch(
                 "app.deployment.os.path.ismount", return_value=mount), patch(
@@ -215,6 +215,7 @@ class ReleaseLifecycleTests(unittest.TestCase):
         first = threading.Thread(target=invoke, args=(first_arguments,))
         second = threading.Thread(target=invoke, args=(second_arguments,))
         with patch("install.os.geteuid", return_value=0), patch(
+                "install.SYSTEMD_UNIT", self.unit), patch(
                 "install._protected_parent"), patch("install._execute_locked",
                                                     side_effect=operation):
             first.start()
@@ -235,6 +236,16 @@ class ReleaseLifecycleTests(unittest.TestCase):
             (str(first_arguments.destination), str(first_arguments.destination)),
             (str(second_arguments.destination), str(second_arguments.destination)),
         ])
+
+    def test_alternate_systemd_unit_path_is_rejected_before_mutation(self):
+        arguments = self.arguments("rollback")
+        arguments.unit = self.root / "alternate" / "server-sentinel.service"
+        arguments.unit.parent.mkdir()
+        with patch("install.os.geteuid", return_value=0), self.assertRaisesRegex(
+                ValueError, "supported system path"):
+            execute(arguments, runner=self.runner)
+        self.assertFalse(self.installation.exists())
+        self.assertEqual(list(arguments.unit.parent.iterdir()), [])
 
     def test_release_lock_rejects_unsafe_files_and_does_not_reenter(self):
         lock = self.root / ".server-sentinel.service.release.lock"
