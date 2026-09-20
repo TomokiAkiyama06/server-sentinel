@@ -57,6 +57,11 @@ class Finding:
     state: State
     reason: str
 
+    def __post_init__(self):
+        if (not isinstance(self.kind, Kind) or not isinstance(self.state, State)
+                or not isinstance(self.reason, str) or not 1 <= len(self.reason) <= 128):
+            raise ValueError("INVALID_INTEGRITY_FINDING")
+
     @property
     def immediate(self) -> bool:
         return self.state in (State.CHANGED, State.MISSING) or (
@@ -76,6 +81,8 @@ def compare(approved: Inventory | None, current: Inventory) -> tuple[Finding, ..
     used = set()
     identity_counts = Counter((item.kind, item.identity) for item in current.components if item.identity)
     baseline_counts = Counter((item.kind, item.identity) for item in approved.components if item.identity)
+    fields = Counter((item.kind, key, value) for item in current.components for key, value in item.identity)
+    approved_fields = Counter((item.kind, key, value) for item in approved.components for key, value in item.identity)
     for old in approved.components:
         if old.kind in current.unavailable:
             findings.append(Finding(old.kind, State.UNVERIFIABLE, "PROBE_UNAVAILABLE"))
@@ -84,6 +91,15 @@ def compare(approved: Inventory | None, current: Inventory) -> tuple[Finding, ..
                       if index not in used and item.kind == old.kind]
         match = next(((index, item) for index, item in candidates
                       if old.identity and item.identity == old.identity), None)
+        if match is None:
+            # A retained unique serial/WWID still identifies a device when an
+            # optional field disappears and the kernel renumbers its location.
+            partial = [(index, item) for index, item in candidates
+                       if any(fields[(old.kind, key, value)] == 1
+                              and approved_fields[(old.kind, key, value)] == 1
+                              for key, value in set(old.identity) & set(item.identity))]
+            if len(partial) == 1:
+                match = partial[0]
         if match is None:
             match = next(((index, item) for index, item in candidates
                           if item.location == old.location), None)

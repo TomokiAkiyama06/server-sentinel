@@ -10,7 +10,7 @@ import json
 import sqlite3
 import threading
 
-from app.integrity.model import Component, Inventory, Kind, State, compare
+from app.integrity.model import Component, Finding, Inventory, Kind, State, compare
 from app.integrity.probes import CommandRunner, LinuxProbe, ProbeUnavailable
 from app.integrity.service import IntegrityService
 from app.integrity.store import IntegrityStore, integrity_migration
@@ -60,6 +60,17 @@ class CompareTests(TestCase):
         old = Component(Kind.STORAGE, "disk0", (), (("serial", "synthetic-a"), ("wwid", "synthetic-w")))
         new = Component(Kind.STORAGE, "disk0", (), (("serial", "synthetic-a"),))
         self.assertEqual(compare(Inventory((old,)), Inventory((new,)))[0].state, State.UNVERIFIABLE)
+
+    def test_unique_partial_identity_survives_renumbering_and_location_reuse(self):
+        old = Component(Kind.STORAGE, "disk0", (), (("serial", "synthetic-a"), ("wwid", "synthetic-w")))
+        new = Component(Kind.STORAGE, "disk9", (), (("serial", "synthetic-a"),))
+        findings = compare(Inventory((old,)), Inventory((disk("synthetic-other"), new)))
+        self.assertEqual([item.state for item in findings], [State.UNVERIFIABLE, State.NEW_DEVICE])
+
+    def test_retained_unique_identifier_still_reports_changed_other_identity(self):
+        old = Component(Kind.STORAGE, "disk0", (), (("serial", "synthetic-a"), ("wwid", "synthetic-w")))
+        new = Component(Kind.STORAGE, "disk9", (), (("serial", "synthetic-a"), ("wwid", "synthetic-replaced")))
+        self.assertEqual([item.state for item in compare(Inventory((old,)), Inventory((new,)))], [State.CHANGED])
 
     def test_duplicate_unique_identity_not_ok(self):
         findings = compare(Inventory((disk(),)), Inventory((disk(), disk(slot="disk1"))))
@@ -200,12 +211,37 @@ class StoreTests(TestCase):
         self.assertEqual(self.db.execute("SELECT COUNT(*) FROM integrity_outbox").fetchone()[0], 1)
         self.assertEqual(self.db.execute("SELECT delivery_blocked FROM integrity_status").fetchone()[0], 1)
         identifiers = []
-        store.deliver(lambda identifier, *args: identifiers.append(identifier))
+        for _ in range(5):
+            store.deliver(lambda identifier, *args: identifiers.append(identifier))
         self.assertEqual(self.db.execute("SELECT COUNT(*) FROM integrity_outbox").fetchone()[0], 0)
         store.record(findings, NOW)
         store.deliver(lambda identifier, *args: identifiers.append(identifier))
         self.assertGreater(identifiers[1], identifiers[0])
         self.assertFalse(self.db.in_transaction)
+
+    def test_saturated_transient_faults_survive_healthy_observation_and_restart(self):
+        store = IntegrityStore(self.db, reservation=self.reservation, max_pending_events=1)
+        store.record((Finding(Kind.CPU, State.NEW_DEVICE, "UNAPPROVED_COMPONENT"),), NOW)
+        for kind in Kind:
+            for state in (State.CHANGED, State.MISSING, State.NEW_DEVICE, State.UNVERIFIABLE):
+                for _ in range(2):
+                    with self.assertRaisesRegex(RuntimeError, "INTEGRITY_OUTBOX_FULL"):
+                        store.record((Finding(kind, state, "TRANSIENT_SYNTHETIC_WARNING"),), NOW + timedelta(seconds=1))
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM integrity_overflow").fetchone()[0], 16)
+        store.record((Finding(Kind.STORAGE, State.OK, "IDENTITY_AND_PROPERTIES_MATCH"),), NOW + timedelta(seconds=2))
+        self.assertEqual(self.db.execute("SELECT delivery_blocked FROM integrity_status").fetchone()[0], 1)
+        store = IntegrityStore(self.db, reservation=self.reservation, max_pending_events=1)
+        seen = []
+        for _ in range(17):
+            store.deliver(lambda *args: seen.append(args))
+        self.assertEqual(len(seen), 17)
+        self.assertEqual(len({event[0] for event in seen}), 17)
+        categories = {(finding["kind"], finding["state"]) for event in seen[1:] for finding in event[3]}
+        self.assertEqual(len(categories), 16)
+        self.assertTrue(all(event[1] == NOW + timedelta(seconds=1) for event in seen[1:]))
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM integrity_overflow").fetchone()[0], 0)
+        self.assertEqual(self.db.execute("SELECT delivery_blocked FROM integrity_status").fetchone()[0], 0)
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM integrity_outbox").fetchone()[0], 0)
 
 
 class FakeRunner:

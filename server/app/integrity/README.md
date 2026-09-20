@@ -55,10 +55,15 @@ The #21 bridge maps immediate faults to `HARDWARE_INTEGRITY_FAILURE`, retaining
 local/UI state independently of optional Slack. Pending sink events retry each
 tick; delivery is at least once, so consumers deduplicate by monotonically
 increasing event ID. Acknowledged outbox rows are removed after durable sink
-acceptance. Pending rows have an explicit capacity limit; saturation retains
-local status with `delivery_blocked` and raises `INTEGRITY_OUTBOX_FULL`, never
-silently growing or dropping a fault. Retry drains pending events before another
-observation. The durable #21 sink owns fault history and its retention; approval
+acceptance. Pending rows have an explicit capacity limit. Saturation also has
+sixteen bounded durable overflow slots (four hardware kinds by four non-OK
+states), coalescing repeated observations of the same category/state and
+retaining their first observation time. It sets `delivery_blocked` and raises
+`INTEGRITY_OUTBOX_FULL`. A later healthy status cannot erase these warnings.
+Reserved acknowledgement transactions promote overflow into the normal outbox
+with the fixed `COALESCED_PENDING_WARNING` reason and fresh monotonic event IDs;
+the sink must continue draining on subsequent ticks. Retry drains pending events
+before another observation. The durable #21 sink owns fault history and its retention; approval
 audit retention also needs that integration before deployment.
 
 Tests only read generated procfs/sysfs fixtures in temporary directories and

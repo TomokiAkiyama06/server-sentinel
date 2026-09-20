@@ -10,7 +10,7 @@ import sqlite3
 import threading
 
 from app.storage.migrations import Migration
-from .model import Component, Finding, Inventory, Kind
+from .model import Component, Finding, Inventory, Kind, State
 
 
 def integrity_migration(version: int) -> Migration:
@@ -24,6 +24,9 @@ def integrity_migration(version: int) -> Migration:
         "at TEXT NOT NULL, findings TEXT NOT NULL, delivery_blocked INTEGER NOT NULL DEFAULT 0)",
         "CREATE TABLE integrity_outbox (id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL, "
         "immediate INTEGER NOT NULL, findings TEXT NOT NULL, delivered INTEGER NOT NULL DEFAULT 0)",
+        "CREATE TABLE integrity_overflow (kind TEXT NOT NULL CHECK(kind IN ('CPU','MEMORY','STORAGE','GPU')), "
+        "state TEXT NOT NULL CHECK(state IN ('CHANGED','MISSING','NEW_DEVICE','UNVERIFIABLE')), "
+        "at TEXT NOT NULL, PRIMARY KEY(kind,state))",
     ))
 
 
@@ -117,14 +120,35 @@ class IntegrityStore:
         with self._transaction():
             pending = self.db.execute("SELECT COUNT(*) FROM integrity_outbox WHERE delivered=0").fetchone()[0]
             blocked = warning and pending >= self._max_pending
+            if blocked:
+                # Sixteen fixed category/state slots coalesce repeated faults
+                # durably even if healthy status later replaces the observation.
+                self.db.executemany("INSERT INTO integrity_overflow(kind,state,at) VALUES(?,?,?) "
+                                    "ON CONFLICT(kind,state) DO NOTHING",
+                                    ((item.kind, item.state, when) for item in findings if item.state != State.OK))
+            overflow = bool(self.db.execute("SELECT 1 FROM integrity_overflow LIMIT 1").fetchone())
             self.db.execute("INSERT INTO integrity_status VALUES(1,?,?,?) "
                             "ON CONFLICT(singleton) DO UPDATE SET at=excluded.at,findings=excluded.findings,"
-                            "delivery_blocked=excluded.delivery_blocked", (when, payload, int(blocked)))
+                            "delivery_blocked=excluded.delivery_blocked", (when, payload, int(overflow)))
             if warning and not blocked:
                 self.db.execute("INSERT INTO integrity_outbox(at,immediate,findings) VALUES(?,?,?)",
                                 (when, int(any(item.immediate for item in findings)), payload))
         if blocked:
             raise RuntimeError("INTEGRITY_OUTBOX_FULL")
+
+    def _promote_overflow(self):
+        """Run inside the reserved acknowledgement transaction, without loss."""
+        pending = self.db.execute("SELECT COUNT(*) FROM integrity_outbox WHERE delivered=0").fetchone()[0]
+        rows = self.db.execute("SELECT kind,state,at FROM integrity_overflow ORDER BY at,kind,state LIMIT ?",
+                               (max(0, self._max_pending - pending),)).fetchall()
+        for row in rows:
+            finding = Finding(Kind(row["kind"]), State(row["state"]), "COALESCED_PENDING_WARNING")
+            payload = json.dumps([asdict(finding)], separators=(",", ":"))
+            self.db.execute("INSERT INTO integrity_outbox(at,immediate,findings) VALUES(?,?,?)",
+                            (row["at"], int(finding.immediate), payload))
+            self.db.execute("DELETE FROM integrity_overflow WHERE kind=? AND state=?", (finding.kind, finding.state))
+        remaining = bool(self.db.execute("SELECT 1 FROM integrity_overflow LIMIT 1").fetchone())
+        self.db.execute("UPDATE integrity_status SET delivery_blocked=? WHERE singleton=1", (int(remaining),))
 
     def deliver(self, sink) -> bool:
         """At-least-once fixed-data events. Slack failure cannot erase local faults.
@@ -143,4 +167,5 @@ class IntegrityStore:
             # durable #21 sink. Keep only pending transport rows in this outbox.
             with self._transaction():
                 self.db.execute("DELETE FROM integrity_outbox WHERE id=?", (row["id"],))
+                self._promote_overflow()
         return True
