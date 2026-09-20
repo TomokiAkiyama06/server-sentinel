@@ -1,6 +1,6 @@
 """Durable precedence, neutral history, and presence-independent critical work."""
 
-from contextlib import closing, contextmanager
+from contextlib import ExitStack, closing, contextmanager
 from datetime import timedelta
 import json
 from uuid import UUID
@@ -19,15 +19,34 @@ UNKNOWN = "unknown"
 
 class PresenceService:
     def __init__(self, database, *, access=None, evidence=None, notifications=None,
-                 write_guard=None, detection=None):
+                 reservation=None, detection=None):
         self.database = database
         self.access = access or DenyAccess()
         self.evidence = evidence
         self.notifications = notifications
-        self.write_guard = write_guard
+        # Storage admission port supplied by #21, such as
+        # `MainStoragePolicy.control`: a callable returning a reservation
+        # context manager. Presence holds it for the whole write, so the hard
+        # filesystem reserve is honoured and the reservation is released again.
+        self.reservation = reservation
         # Injected by the reviewed #24 detector supervisor. Absent means unknown
         # detection health here; this module never claims a detector is running.
         self.detection = detection
+
+    def _admission(self):
+        """Obtain one storage reservation context for a single durable write.
+
+        The port must return a context manager. A bare admit call would leak a
+        reservation that is never released, so the next presence write would be
+        refused, and calling a reservation factory without entering it would
+        write with no admission at all.
+        """
+        if self.reservation is None:
+            raise RuntimeError("storage admission required")
+        held = self.reservation()
+        if not (hasattr(held, "__enter__") and hasattr(held, "__exit__")):
+            raise RuntimeError("storage admission reservation required")
+        return held
 
     @contextmanager
     def _transaction(self, *, required=True):
@@ -35,20 +54,18 @@ class PresenceService:
 
         Only read-only status reporting uses the optional form, so a refused or
         exhausted volume degrades visibly instead of hiding presence state.
+        The reservation stays entered until after the SQLite commit and the
+        connection close, and is released even when the write fails.
         """
-        if self.write_guard is None:
-            if not required:
+        with ExitStack() as reserved:
+            try:
+                reserved.enter_context(self._admission())
+            except Exception:
+                if required:
+                    raise
                 yield None
                 return
-            raise RuntimeError("storage admission required")
-        try:
-            self.write_guard()
-        except Exception:
-            if required:
-                raise
-            yield None
-            return
-        with closing(self.database.connect()) as db:
+            db = reserved.enter_context(closing(self.database.connect()))
             db.execute("PRAGMA synchronous=FULL")
             db.execute("BEGIN IMMEDIATE")
             try:
@@ -146,6 +163,14 @@ class PresenceService:
                 if stored.payload() != observation.payload() and stored.payload() != observation.uncertain().payload():
                     raise ValueError("observation identity conflict")
                 return stored
+            completed = db.execute("SELECT 1 FROM presence_completed_events WHERE id=?",
+                                   (str(observation.identifier),)).fetchone()
+            if completed:
+                # The timeline payload passed its retention horizon after this
+                # event's critical actions completed. Recording the identity
+                # again would preserve evidence and notify a second time, so a
+                # delayed replay stays a duplicate and its payload stays expired.
+                return observation
             trusted = self._clock(db, observation.received_at, observation.clock_trusted)
             if observation.source_id:
                 source = str(observation.source_id)
@@ -307,27 +332,33 @@ class PresenceService:
         return ARMED if reported else UNAVAILABLE
 
     def _persistence_path(self):
-        """Probe current storage admission without creating a presence write."""
-        if self.write_guard is None:
-            return UNAVAILABLE
+        """Probe current storage admission without creating a presence write.
+
+        The probed reservation is entered and released immediately, so the
+        status read neither holds nor leaks the deployment's write admission.
+        """
         try:
-            self.write_guard()
+            with self._admission():
+                pass
         except Exception:
             return UNAVAILABLE
         return ARMED
 
-    def _critical_paths(self, disabled):
+    def _critical_paths(self, unresolved):
         """Report configured/known critical-path availability, never a fixed armed.
 
         ``armed`` means the path is configured and is not disarmed by any
         presence state; it is not a liveness guarantee for an external worker.
+        A durable delivery outcome that did not complete the critical action,
+        including a failed or uncertain submission, keeps its path reported as
+        unavailable until that work is resolved.
         ``pending_critical_actions`` still reports unfinished critical work.
         """
         paths = {
             "critical_detection": self._detection_path(),
             "critical_persistence": self._persistence_path(),
-            "critical_evidence": ARMED if self.evidence is not None and "evidence" not in disabled else UNAVAILABLE,
-            "critical_notifications": ARMED if self.notifications is not None and "notification" not in disabled else UNAVAILABLE,
+            "critical_evidence": ARMED if self.evidence is not None and "evidence" not in unresolved else UNAVAILABLE,
+            "critical_notifications": ARMED if self.notifications is not None and "notification" not in unresolved else UNAVAILABLE,
         }
         return {**paths, "critical_paths_degraded": any(value != ARMED for value in paths.values())}
 
@@ -346,12 +377,16 @@ class PresenceService:
             state, basis, expires = self._effective(db, now, trusted)
             failed = db.execute("SELECT count(*) FROM presence_deliveries "
                                 "WHERE state NOT IN ('delivered','disabled')").fetchone()[0]
-            disabled = {row[0] for row in db.execute("SELECT DISTINCT action FROM presence_deliveries "
-                                                      "WHERE state IN ('disabled','unavailable')")}
+            # Every durable outcome that left critical work undone, including a
+            # failed or uncertain submission, degrades its path. Silence after a
+            # known delivery failure would report a healthy safety path.
+            unresolved = {row[0] for row in db.execute(
+                "SELECT DISTINCT action FROM presence_deliveries "
+                "WHERE state IN ('disabled','unavailable','failed','uncertain')")}
         return {"state": state.value, "basis": basis, "override_expires_at": expires,
                 "clock_degraded": not trusted,
                 "suppress_ordinary": state == PresenceState.PRESENT and trusted,
-                **self._critical_paths(disabled),
+                **self._critical_paths(unresolved),
                 "override_expiry_pending": not retired,
                 "pending_critical_actions": failed}
 
@@ -385,6 +420,11 @@ class PresenceService:
 
         Unfinished critical delivery is retained even after ordinary timeline
         expiry, so cleanup cannot discard evidence or notification work.
+        An event whose critical actions already completed keeps a compact
+        identity tombstone once its timeline payload expires, so a delayed
+        replay of the same identity cannot repeat those side effects. Only
+        events that carried critical delivery are tombstoned, because replaying
+        any other expired observation queues no action.
         """
         if type(limit) is not int or not 1 <= limit <= 1000:
             raise ValueError("invalid timeline retention limit")
@@ -395,6 +435,9 @@ class PresenceService:
                               "WHERE job.observation=item.id AND job.state NOT IN ('delivered','disabled')) "
                               "ORDER BY item.received,item.sequence LIMIT ?", (cutoff, limit)).fetchall()
             identifiers = [(row[0],) for row in rows]
+            db.executemany("INSERT OR IGNORE INTO presence_completed_events(id,expired_at) "
+                           "SELECT DISTINCT observation,? FROM presence_deliveries WHERE observation=?",
+                           [(timestamp(now), row[0]) for row in rows])
             db.executemany("DELETE FROM presence_deliveries WHERE observation=?", identifiers)
             db.executemany("DELETE FROM presence_observations WHERE id=?", identifiers)
         return len(rows)

@@ -25,4 +25,7 @@ def presence_migration(version: int) -> Migration:
         "action TEXT NOT NULL, state TEXT NOT NULL, attempts INTEGER NOT NULL, PRIMARY KEY(observation, action))",
         "CREATE TABLE presence_delivery_fairness (singleton INTEGER PRIMARY KEY CHECK(singleton=1), "
         "next_state TEXT NOT NULL CHECK(next_state IN ('pending','unavailable')))",
+        # Identity-only tombstones for completed critical events whose timeline
+        # payload expired; they carry no observation content.
+        "CREATE TABLE presence_completed_events (id TEXT PRIMARY KEY, expired_at TEXT NOT NULL)",
     ))

@@ -1,6 +1,6 @@
 """Real SQLite smoke through closed, synthetic-only permission/action ports."""
 
-from contextlib import closing
+from contextlib import closing, nullcontext
 from datetime import datetime, timedelta, timezone
 from uuid import UUID
 
@@ -39,7 +39,7 @@ def run_presence(root, scenario):
         return ActionResult.DELIVERED
 
     core = PresenceService(database, access=SyntheticAccess(), evidence=evidence,
-                           notifications=notify, write_guard=lambda: None,
+                           notifications=notify, reservation=nullcontext,
                            detection=lambda: True)
     now = datetime(2026, 1, 1, tzinfo=timezone.utc)
     core.override("synthetic-owner", PresenceState.PRESENT, now=now, clock_trusted=True)
@@ -52,8 +52,11 @@ def run_presence(root, scenario):
     status = core.snapshot(now=now, clock_trusted=True)
     assert status["pending_critical_actions"] == (scenario == "error")
     assert [status[key] for key in ("critical_detection", "critical_persistence",
-                                    "critical_evidence", "critical_notifications")] == ["armed"] * 4
-    assert not status["critical_paths_degraded"] and not status["override_expiry_pending"]
+                                    "critical_notifications")] == ["armed"] * 3
+    # The failed evidence submission stays a visibly degraded critical path.
+    assert status["critical_evidence"] == ("unavailable" if scenario == "error" else "armed")
+    assert status["critical_paths_degraded"] == (scenario == "error")
+    assert not status["override_expiry_pending"]
     window = dict(received_from=now - timedelta(seconds=1), received_to=now + timedelta(seconds=1))
     assert len(core.history("synthetic-recordings", **window)["items"]) == 2
     try:

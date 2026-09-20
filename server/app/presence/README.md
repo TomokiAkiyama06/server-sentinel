@@ -16,8 +16,11 @@ Its integration ports keep the dependent stack explicit:
 - Issue #25 supplies quality-gated, confirmed Owner entry/exit observations;
   this module never compares biometric data or selects a confidence threshold.
 - Issue #21 supplies storage admission, evidence preservation, and configured
-  notification workers. Side effects are durably queued and dispatched outside
-  the database write transaction.
+  notification workers. The admission port is a callable returning a
+  reservation context manager, such as `MainStoragePolicy.control`; presence
+  holds it through the SQLite commit and releases it afterwards, so a presence
+  write neither leaks a reservation nor writes without admission. Side effects
+  are durably queued and dispatched outside the database write transaction.
 - Issue #10 supplies Owner and `recordings:view` authorization before any
   future human route delegates here.
 
@@ -27,14 +30,17 @@ quality-sufficient Owner entry can project `PRESENT`; untrusted timing and
 insufficient quality remain `UNKNOWN`. Critical movement/tamper observations
 always queue evidence and configured notification work regardless of presence.
 An unavailable action is not retried until that action's port recovers, so its
-backlog cannot starve the other critical action. A durable `disabled` result
-keeps the affected path visibly unavailable.
+backlog cannot starve the other critical action. Any durable delivery outcome
+that left the critical action undone, including `disabled`, `unavailable`,
+`failed` and `uncertain`, keeps the affected path visibly unavailable until
+that work is resolved.
 
 The status snapshot does not create a presence write, so a refused or exhausted
-storage volume cannot hide presence state or unfinished critical work. It probes
-the injected storage-admission guard and reports each
-critical path as `armed`, `unavailable`, or `unknown` from configured ports,
-the storage admission it actually observed, and the injected detection health
+storage volume cannot hide presence state or unfinished critical work. It
+enters and immediately releases the injected storage reservation to probe
+current admission, and reports each critical path as `armed`, `unavailable`,
+or `unknown` from configured ports, the storage admission it actually
+observed, the durable delivery outcomes, and the injected detection health
 probe; no path is reported as healthy merely because nothing failed yet.
 `armed` means configured and never disarmed by a presence state, not a
 liveness guarantee for an external worker. An expired manual override stops
@@ -45,6 +51,11 @@ Owner-control audit records use the main 90-day audit retention period. The
 maintenance operation is bounded and deletes the oldest expired rows first.
 Timeline observations use the main 20-day recording-retention period; an
 unfinished critical delivery retains its observation until the work resolves.
+An event whose critical actions completed keeps an identity-only tombstone when
+its payload expires, so a delayed replay of the same identity stays a duplicate
+instead of preserving evidence and notifying a second time. Only events that
+carried critical delivery are tombstoned, because replaying any other expired
+observation queues no action.
 
 Timeline ordering uses main-host receipt order, with the durable sequence only
 as a tie-break, as the single key for the SQL page, the cursor and the

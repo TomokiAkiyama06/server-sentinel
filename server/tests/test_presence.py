@@ -1,7 +1,7 @@
 """Synthetic persisted presence/history with explicit mock permission/storage ports."""
 
 import asyncio
-from contextlib import closing
+from contextlib import closing, nullcontext
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -22,10 +22,19 @@ from app.presence.models import (InvalidObservation, Kind, Observation, Presence
 from app.presence.service import PresenceService
 from app.storage.database import Database
 from app.storage.migrations import migrate
+from app.storage.policy import FilesystemSpace, MainStoragePolicy, StorageLimits
+from app.storage.retention import RetentionPeriods
 from app.storage.schema import APPLICATION_MIGRATIONS
 
 CRITICAL_PATHS = ("critical_detection", "critical_persistence",
                   "critical_evidence", "critical_notifications")
+
+# Synthetic main-host storage limits; no deployment value is implied.
+STORAGE_LIMITS = StorageLimits(recording_limit_bytes=100_000, critical_allowance_bytes=10_000,
+                               hard_reserve_bytes=4_096, pressure_free_bytes=8_192,
+                               recovery_free_bytes=16_384, recovery_allocation_bytes=90_000,
+                               write_overhead_bytes=4_096, max_request_bytes=50_000,
+                               cleanup_batch_size=10)
 
 NOW = datetime(2026, 1, 1, tzinfo=timezone.utc)
 SOURCE, NODE, OWNER = UUID(int=1), UUID(int=2), UUID(int=3)
@@ -73,7 +82,7 @@ class PresenceTests(unittest.TestCase):
             self.notifications.append(item)
             return ActionResult.DELIVERED
         ports = dict(access=self.access, evidence=evidence, notifications=notifications,
-                     write_guard=lambda: None, detection=lambda: True)
+                     reservation=nullcontext, detection=lambda: True)
         ports.update(changes)
         return PresenceService(self.database, **ports)
 
@@ -263,7 +272,7 @@ class PresenceTests(unittest.TestCase):
         def full():
             raise RuntimeError("storage admission refused")
 
-        self.service.write_guard = full
+        self.service.reservation = full
         # No expiring override is needed for status to prove current storage
         # admission. A configured but refusing guard never looks armed.
         self.assertEqual(self.status()["critical_persistence"], "unavailable")
@@ -276,13 +285,90 @@ class PresenceTests(unittest.TestCase):
         self.assertTrue(status["critical_paths_degraded"])
         self.assertEqual(status["pending_critical_actions"], 2)
         self.assertEqual([row["action"] for row in self.service.audit("owner")], ["override_set"])
-        self.service.write_guard = lambda: None
+        self.service.reservation = nullcontext
         recovered = self.status(now=NOW + timedelta(hours=2))
         self.assertFalse(recovered["override_expiry_pending"])
         self.assertEqual(recovered["critical_persistence"], "armed")
         self.status(now=NOW + timedelta(hours=2))
         self.assertEqual([row["action"] for row in self.service.audit("owner")],
                          ["override_set", "override_expired"])
+
+    def test_storage_reservation_is_held_and_released_around_every_write(self):
+        policy = MainStoragePolicy(STORAGE_LIMITS, lambda: FilesystemSpace(50_000, 100_000),
+                                   lambda: 0, lambda transition: None)
+        service = self.make_service(reservation=policy.control)
+        held = []
+        with service._transaction() as db:
+            # The reservation is entered for the whole write, not merely built.
+            held.append(policy._reservation)
+            db.execute("INSERT INTO presence_audit(action,at) VALUES ('synthetic',?)", (timestamp(NOW),))
+        self.assertEqual(held, [True])
+        self.assertFalse(policy._reservation)
+        service.override("owner", PresenceState.ABSENT, now=NOW, clock_trusted=True)
+        # An admit-only port would hold this reservation forever and refuse
+        # every later presence write with STORAGE_INVALID_RESERVATION.
+        self.assertFalse(policy._reservation)
+        event = service.record(observation(Kind.SERVER_MOVEMENT))
+        self.assertFalse(policy._reservation)
+        service.dispatch_pending()
+        self.assertEqual(self.evidence[-1].identifier, event.identifier)
+        status = service.snapshot(now=NOW, clock_trusted=True)
+        self.assertEqual(status["critical_persistence"], "armed")
+        self.assertFalse(policy._reservation)
+        with self.assertRaises(KeyboardInterrupt):
+            with service._transaction() as db:
+                db.execute("INSERT INTO presence_audit(action,at) VALUES ('synthetic',?)", (timestamp(NOW),))
+                raise KeyboardInterrupt()
+        self.assertFalse(policy._reservation)
+        service.override("owner", PresenceState.PRESENT, now=NOW, clock_trusted=True)
+
+    def test_storage_admission_port_must_supply_a_reservation_context(self):
+        policy = MainStoragePolicy(STORAGE_LIMITS, lambda: FilesystemSpace(50_000, 100_000),
+                                   lambda: 0, lambda transition: None)
+        # An admit-only port reserves without ever releasing, so it is refused
+        # instead of silently leaking the deployment's metadata reserve.
+        for port in (lambda: None, policy.admit_control):
+            service = self.make_service(reservation=port)
+            with self.assertRaisesRegex(RuntimeError, "storage admission reservation required"):
+                service.record(observation())
+            self.assertEqual(service.snapshot(now=NOW, clock_trusted=True)["critical_persistence"],
+                             "unavailable")
+        self.assertEqual(self.history()["items"], [])
+
+    def test_failed_or_uncertain_delivery_keeps_its_path_degraded(self):
+        def failing(item, complete):
+            raise OSError("synthetic private failure")
+
+        service = self.make_service(evidence=failing)
+        service.record(observation(Kind.SERVER_MOVEMENT, identifier=UUID(int=11)))
+        service.dispatch_pending()
+        status = service.snapshot(now=NOW, clock_trusted=True)
+        # An uncertain evidence submission is known unfinished critical work.
+        self.assertEqual(status["critical_evidence"], "unavailable")
+        self.assertEqual(status["critical_notifications"], "armed")
+        self.assertTrue(status["critical_paths_degraded"])
+        second = service.record(observation(Kind.CAMERA_TAMPER, identifier=UUID(int=12)))
+        service.complete_action(second.identifier, "notification", ActionResult.FAILED)
+        status = service.snapshot(now=NOW, clock_trusted=True)
+        self.assertEqual(status["critical_notifications"], "unavailable")
+        self.assertTrue(status["critical_paths_degraded"])
+
+    def test_expired_critical_identity_is_not_replayed_into_new_side_effects(self):
+        event = self.service.record(observation(Kind.SERVER_MOVEMENT))
+        self.service.dispatch_pending()
+        self.assertEqual((len(self.evidence), len(self.notifications)), (1, 1))
+        later = NOW + timedelta(days=RetentionPeriods().recording_days + 1)
+        self.assertEqual(self.service.expire_history(now=later), 1)
+        self.assertEqual(self.history()["items"], [])
+        # A delayed source reconnect replays the same event identity.
+        replay = self.service.record(observation(Kind.SERVER_MOVEMENT, identifier=event.identifier,
+                                                 at=later, received=later))
+        self.service.dispatch_pending()
+        self.assertEqual(replay.identifier, event.identifier)
+        self.assertEqual((len(self.evidence), len(self.notifications)), (1, 1))
+        self.assertEqual(self.status(now=later)["pending_critical_actions"], 0)
+        window = dict(received_from=later - timedelta(hours=1), received_to=later + timedelta(hours=1))
+        self.assertEqual(self.history(**window)["items"], [])
 
     def test_application_startup_migration_creates_presence_storage(self):
         directory = tempfile.TemporaryDirectory()
@@ -296,7 +382,7 @@ class PresenceTests(unittest.TestCase):
 
         asyncio.run(start())
         service = PresenceService(Database(settings.database_path), access=self.access,
-                                  write_guard=lambda: None)
+                                  reservation=nullcontext)
         service.record(observation())
         window = dict(received_from=NOW - timedelta(days=1), received_to=NOW + timedelta(days=1))
         self.assertEqual(len(service.history("recordings", **window)["items"]), 1)
@@ -456,7 +542,7 @@ class PresenceTests(unittest.TestCase):
     def test_storage_guard_failure_prevents_mutation(self):
         def full():
             raise RuntimeError("storage admission refused")
-        self.service.write_guard = full
+        self.service.reservation = full
         with self.assertRaisesRegex(RuntimeError, "storage admission refused"):
             self.service.override("owner", PresenceState.PRESENT, now=NOW, clock_trusted=True)
         self.assertEqual(self.service.audit("owner"), [])
