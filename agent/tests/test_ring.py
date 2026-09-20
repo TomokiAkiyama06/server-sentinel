@@ -691,6 +691,59 @@ class RingTests(unittest.TestCase):
         self.assertEqual(self.configure("capacity", minimum)["state"], "healthy")
         self.append(T0)
 
+    def test_duration_expansion_refuses_incompatible_rollover_before_mutation(self):
+        high = SegmentProfile(SOURCE, 2000, 1000, 60 * SECOND, 100)
+        self.configure(profiles=(high,))
+        large = zlib.compress(random.Random(16).randbytes(12000))
+        for start in range(T0 - PRE, T0, 60 * SECOND):
+            self.ring.append(SOURCE, start, start + 60 * SECOND, large,
+                             now_us=start + 60 * SECOND, clock_trusted=True)
+        before = self.store.segment_allocations()
+        configuration = self.ring.db.execute("SELECT value FROM settings WHERE key='configuration'").fetchone()[0]
+        target = self.profile.bytes_for(3600 * SECOND, self.store.allocation_unit)
+        self.quota.capacity = target + self.settings.safety_reserve_bytes + self.ring.ledger_headroom
+        with self.assertRaisesRegex(RingRefused, "duration_transition_exceeds_filesystem"):
+            self.configure(value=3600)
+        self.assertEqual(self.store.segment_allocations(), before)
+        self.assertEqual(self.ring.profiles[SOURCE], high)
+        self.assertEqual(self.ring.db.execute("SELECT value FROM settings WHERE key='configuration'").fetchone()[0],
+                         configuration)
+
+    def test_duration_expansion_with_carryover_budget_completes_rollover_after_restart(self):
+        high = SegmentProfile(SOURCE, 2000, 1000, 60 * SECOND, 100)
+        self.configure(profiles=(high,))
+        large = zlib.compress(random.Random(16).randbytes(12000))
+        for start in range(T0 - PRE, T0, 60 * SECOND):
+            self.ring.append(SOURCE, start, start + 60 * SECOND, large,
+                             now_us=start + 60 * SECOND, clock_trusted=True)
+        carryover = self.quota.used()
+        target = self.profile.bytes_for(3600 * SECOND, self.store.allocation_unit)
+        self.quota.capacity = target + carryover + self.settings.safety_reserve_bytes + self.ring.ledger_headroom
+        self.configure(value=3600)
+        self.restart()
+        payload = zlib.compress(random.Random(17).randbytes(6000))
+        for start in range(T0, T0 + 3600 * SECOND, 60 * SECOND):
+            self.ring.append(SOURCE, start, start + 60 * SECOND, payload,
+                             now_us=start + 60 * SECOND, clock_trusted=True)
+        self.assertEqual(len(self.store.list_segments()), 60)
+        self.assertEqual(self.ring.status(now_us=T0 + 3600 * SECOND, clock_trusted=True)["state"], "healthy")
+
+    def test_duration_transition_credit_requires_compatible_retained_trusted_sources(self):
+        profiles = tuple(SegmentProfile(UUID(int=index + 100), 800, 400, 60 * SECOND, 100)
+                         for index in range(4))
+        self.warm(profiles=profiles)
+        before = self.store.segment_allocations()
+        for proposed, trusted in ((profiles[:3], True), (profiles, False)):
+            target = sum(item.bytes_for(3600 * SECOND, self.store.allocation_unit) for item in proposed)
+            self.quota.capacity = target + self.settings.safety_reserve_bytes + self.ring.ledger_headroom
+            with self.subTest(sources=len(proposed), trusted=trusted):
+                with self.assertRaisesRegex(RingRefused, "duration_transition_exceeds_filesystem"):
+                    self.ring.configure(RingConfig("duration", 3600), proposed, now_us=T0, clock_trusted=trusted)
+                self.assertEqual(self.store.segment_allocations(), before)
+        target = sum(item.bytes_for(3600 * SECOND, self.store.allocation_unit) for item in profiles)
+        self.quota.capacity = target + self.settings.safety_reserve_bytes + self.ring.ledger_headroom
+        self.assertEqual(self.configure(value=3600, profiles=profiles)["state"], "healthy")
+
     def test_capacity_transition_counts_four_sources_removed_source_and_untrusted_time(self):
         self.ring.close()
         self.quota.capacity = 4 * 1024 * 1024 * 1024

@@ -118,6 +118,14 @@ larger old segments may remain until several smaller new batches have arrived.
 Unknown time credits no timestamp reclamation. Rejection leaves configuration,
 profiles and currently owned media unchanged; existing over-limit capacity is
 reported as pressure, including on restart.
+Duration transitions likewise reserve the new full-duration envelope while
+incompatible legacy rows remain allocated. Only trusted, retained, same-source
+and same-cadence segments within the new allocation bound count toward that
+envelope. Removed sources, uncertain data and larger old segments stay additional
+carryover. This prevents a longer, lower-bitrate setting from fitting its final
+target but exhausting space while the older high-bitrate media still belongs to
+the new duration. The check runs before mutation and again after any permitted
+reclamation; expired blocks are not credited before actual deletion.
 
 Every media write retains `L` in addition to the hard reserve, and uses the store's exclusive
 allocation/write/fsync path. Runtime status recomputes full protection headroom;

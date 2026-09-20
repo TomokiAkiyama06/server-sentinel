@@ -330,6 +330,7 @@ class DiskRing:
                 raise RingRefused("insufficient_simultaneous_pre_post_budget")
             self._selected_target_fits(config, mapping)
             self._capacity_transition_fits(config, mapping, now_us, clock_trusted)
+            self._duration_transition_fits(config, mapping, now_us, clock_trusted)
             self._ledger_capacity(config, mapping, proposal=(now_us - PRE, now_us + POST))
             # Credit only blocks that were actually returned by deletion. A
             # hardlink/open reader can keep blocks allocated after unlink.
@@ -339,6 +340,7 @@ class DiskRing:
                 self._remove_segment(row["id"])
             self.store.check(budget["required_additional"])
             self._selected_target_fits(config, mapping)
+            self._duration_transition_fits(config, mapping, now_us, clock_trusted)
             value = {"config": asdict(config), "profiles": [
                 {**asdict(item), "source_id": str(item.source_id)} for item in profiles
             ]}
@@ -383,6 +385,27 @@ class DiskRing:
                          for profile in profiles.values())
         if max(transition, retained + next_batch) > config.value:
             raise RingRefused("capacity_transition_exceeds_limit")
+
+    def _duration_transition_fits(self, config, profiles, now, trusted):
+        if config.mode != "duration":
+            return
+        allocations = self.store.segment_allocations()
+        compatible = 0
+        for row in self._rows():
+            if (not trusted or self._protected(row["id"]) or row["state"] != "stored"
+                    or row["end"] <= now - config.value * SECOND
+                    or not self._trusted_profile_row(row, profiles)):
+                continue
+            allocated = allocations.get(UUID(row["id"]), 0)
+            profile = profiles[UUID(row["source"])]
+            if 512 <= allocated <= round_up(profile.segment_bytes(), self.store.allocation_unit):
+                compatible += allocated
+        # Only compatible retained bytes are already part of the new envelope.
+        # Other media occupies additional space throughout rollover; even
+        # currently expired blocks get no credit before actual reclamation.
+        target = self._estimate(profiles, config.value * SECOND)
+        if self.store.check(require_reserve=False) + compatible < target + self.settings.safety_reserve_bytes + self.ledger_headroom:
+            raise RingRefused("duration_transition_exceeds_filesystem")
 
     def _remove_segment(self, identifier):
         if self._protected(identifier):
