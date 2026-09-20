@@ -34,6 +34,13 @@ Deleted-incident tombstones expose deletion state to the future authorized UI;
 the core does not enable that UI or a playback/download route. Synthetic tests
 use generated compressed patterns, not real camera/room/person media.
 
+The internal recording store writes compressed media and source/event/integrity
+metadata only to deployment-local storage. It has no network client, telemetry,
+codec download or export endpoint. Tests generate compressed non-video bytes in
+temporary directories; these are storage fixtures and do not contain people,
+rooms or playable surveillance media. Real media adapters and authorized playback
+remain separate integration gates.
+
 The implemented backend foundation has no network client, reporting integration
 or media input. Its structured logs discard arbitrary strings, request metadata
 and exception contents, including values with unknown secret formats. Synthetic
