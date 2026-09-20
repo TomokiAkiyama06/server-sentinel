@@ -63,6 +63,7 @@ server/app/
 ├── media/
 │   └── health/
 ├── notifications/
+├── presence/
 └── storage/
 
 agent/
@@ -687,6 +688,8 @@ Timeline correlation lists observations and relevant temporal context; it does n
 
 For invited non-owner users, historical timeline/event metadata is included with `recordings:view`. `live:view` alone exposes only current live/source-health information needed for live viewing.
 
+The Issue #26 internal implementation keeps Owner-control time in a marker separate from source observation time, so one skewed receipt timestamp can neither lock out Owner control nor withhold the suppression an accepted override asks for. Critical movement/tamper work is durably queued, dispatched outside the write transaction, and never retried automatically; every critical path is reported as armed, unavailable or unknown from configured ports, observed storage admission and injected detection health, and any delivery that has not completed keeps its path degraded. Stranded critical work returns to the queue only through an audited Owner-approved resubmission. Timeline pages use main-host receipt order as their single key. The status projection performs no authorization check, and no human timeline, override or audit route may be registered until the Issue #10 boundary lands. See `server/app/presence/README.md` for the port, retention and status contracts.
+
 ## 9. Storage/admission
 
 ServerSentinel distinguishes recording allocation from hard filesystem safety reserve.
@@ -704,6 +707,8 @@ Admission loop:
 9. recover with hysteresis.
 
 Defaults: recording retention 20 days; audit retention 90 days.
+
+Documented exception: a timeline observation whose confirmed critical action (evidence preservation or Owner notification) has not completed is retained past the recording-retention period, including its identity and payload, so unresolved critical work is never discarded as if it had succeeded. It returns to ordinary retention as soon as that action completes or the Owner clears it; an already completed event keeps only an identity-sized tombstone plus a per-action degradation marker after expiry.
 
 Agent disk-buffer safety is tracked separately from Main Server storage because the two filesystems may be different machines.
 

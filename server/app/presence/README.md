@@ -70,7 +70,11 @@ never automatically.
 
 `snapshot()` performs no authorization check. Critical-path health is Owner
 information: a future route delegates to `owner_status()` and never exposes
-this payload to a `live:view` identity.
+this payload to a `live:view` identity. `complete_action()` is an internal
+worker callback with no authorization or audit of its own, and an unscoped
+call can return a degraded path to `armed`. It must never be registered as a
+route; Owner-facing recovery goes through the audited `requeue_action()` and
+`clear_expired_degradation()`, which require an Owner identity.
 
 The status snapshot does not create a presence write, so a refused or exhausted
 storage volume cannot hide presence state or unfinished critical work. It
@@ -101,7 +105,9 @@ Timeline ordering uses main-host receipt order, with the durable sequence only
 as a tie-break, as the single key for the SQL page, the cursor and the
 response, so concatenated pages stay complete and in the advertised order. It
 explicitly reports degraded timing if clock trust or source ordering is
-unavailable. Each source retains a trusted occurrence-time high-water mark, so
+unavailable. `ordering_degraded` describes the page it is returned with, so a
+caller that concatenates pages treats the window as degraded when any page
+reports it. Each source retains a trusted occurrence-time high-water mark, so
 an out-of-order event cannot later regain trust merely because it is newer than
 another untrusted delayed event. It reports observations and their temporal context only; it never
 infers cause, guilt, or identity.
