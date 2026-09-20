@@ -2,6 +2,7 @@
 
 from collections import Counter
 from collections.abc import Iterable
+from concurrent.futures import Future
 from dataclasses import dataclass, field as dataclass_field
 from enum import StrEnum
 import asyncio
@@ -14,7 +15,8 @@ import os
 from pathlib import Path
 import re
 import secrets
-from typing import BinaryIO, ContextManager, Protocol, TypeAlias
+import stat
+from typing import BinaryIO, Callable, ContextManager, Protocol, TypeAlias
 from zipfile import ZIP64_LIMIT, ZIP_STORED, ZipFile, ZipInfo
 
 from app.media.recording.model import StoragePolicy
@@ -265,10 +267,30 @@ class DiagnosticExportAction:
 
 
 class OwnerDiagnosticExportAuthorizer(Protocol):
+    async def require_owner_caller(self, action: DiagnosticExportAction) -> None:
+        """Deny a non-Owner caller before any diagnostic or selected-media lookup.
+
+        The generic human/system access boundary is not an Owner check. This runs
+        before collection so an invited non-Owner cannot reach a diagnostic
+        producer or probe selected-media IDs for existence or error timing.
+        """
+
     async def require_owner_export(
             self, action: DiagnosticExportAction,
             confirmation: "DiagnosticExportConfirmation") -> None:
         """Confirm the sanitized contents and deny unless the Owner approves."""
+
+
+class StorageWorker(Protocol):
+    def submit(self, call: Callable[[], object]) -> Future:
+        """Schedule one bounded call on the thread that owns the storage policy.
+
+        `MainStoragePolicy` admits, releases and serializes every filesystem
+        writer on the thread that constructed it. Admission, bundle I/O and
+        release therefore run as one submitted unit there, so the reservation is
+        never held across an unrelated owner-worker operation and the ASGI event
+        loop is never blocked by ZIP writing or fsync.
+        """
 
 
 @dataclass(frozen=True)
@@ -459,71 +481,72 @@ class _DiagnosticBundleWriter:
             _zip_size(sized_entries),
         )
 
-    def write(self, prepared: _PreparedBundle) -> DiagnosticExportResult:
+    def write(self, prepared: _PreparedBundle,
+              directory_fd: int) -> DiagnosticExportResult:
+        """Write, publish and fsync entirely through the verified directory fd.
 
+        Every create, rename, unlink and fsync is relative to the descriptor the
+        caller pinned and verified against the admitting filesystem, so a mount
+        substituted after admission cannot redirect the bundle or its cleanup.
+        """
         bundle_name = f"serversentinel-diagnostics-{secrets.token_hex(12)}.zip"
         temporary_name = f".{bundle_name}.part"
-        temporary_path = prepared.output_directory / temporary_name
-        bundle_path = prepared.output_directory / bundle_name
-        owned_path: Path | None = None
+        owned_name: str | None = None
         try:
-            descriptor = os.open(temporary_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            owned_path = temporary_path
-            with os.fdopen(descriptor, "w+b") as stream, ZipFile(
-                    stream, "w", compression=ZIP_STORED) as archive:
-                for name, value in prepared.static_entries:
-                    self._write_bytes(archive, name, value)
-                if prepared.selected_media and self._media_source is None:
-                    raise DiagnosticExportError(
-                        "selected diagnostic media is unavailable")
-                for index, (media_id, expected) in enumerate(
-                        prepared.selected_media, start=1):
-                    with self._media_source.open_selected(media_id) as supplied:
-                        if not isinstance(supplied, MediaAsset):
-                            raise TypeError
-                        asset = MediaAsset(supplied.reader, supplied.media_type)
-                        if asset.media_type != expected.media_type:
-                            raise ValueError
-                        self._write_stream(
-                            archive, f"media/{index:04d}.bin", asset.reader,
-                            expected.size_bytes)
-                        del asset
-                    del supplied
+            descriptor = os.open(
+                temporary_name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                0o600, dir_fd=directory_fd)
+            owned_name = temporary_name
+            with os.fdopen(descriptor, "w+b") as stream:
+                with ZipFile(stream, "w", compression=ZIP_STORED) as archive:
+                    for name, value in prepared.static_entries:
+                        self._write_bytes(archive, name, value)
+                    if prepared.selected_media and self._media_source is None:
+                        raise DiagnosticExportError(
+                            "selected diagnostic media is unavailable")
+                    for index, (media_id, expected) in enumerate(
+                            prepared.selected_media, start=1):
+                        with self._media_source.open_selected(media_id) as supplied:
+                            if not isinstance(supplied, MediaAsset):
+                                raise TypeError
+                            asset = MediaAsset(supplied.reader, supplied.media_type)
+                            if asset.media_type != expected.media_type:
+                                raise ValueError
+                            self._write_stream(
+                                archive, f"media/{index:04d}.bin", asset.reader,
+                                expected.size_bytes)
+                            del asset
+                        del supplied
+                # Flush after the central directory is written, so the fsync
+                # covers the complete archive rather than its entries alone.
                 stream.flush()
                 os.fsync(stream.fileno())
-            if temporary_path.stat().st_size != prepared.reserved_bytes:
+                written_bytes = os.fstat(stream.fileno()).st_size
+            if written_bytes != prepared.reserved_bytes:
                 raise OSError("unexpected diagnostic bundle size")
-            os.replace(temporary_path, bundle_path)
-            owned_path = bundle_path
-            directory_fd = os.open(
-                prepared.output_directory, os.O_RDONLY | os.O_DIRECTORY)
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
+            os.replace(temporary_name, bundle_name,
+                       src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+            owned_name = bundle_name
+            os.fsync(directory_fd)
         except Exception:
             cleanup_durable = True
-            if owned_path is not None:
+            if owned_name is not None:
                 try:
-                    owned_path.unlink()
+                    os.unlink(owned_name, dir_fd=directory_fd)
                 except FileNotFoundError:
                     pass
                 except OSError:
                     cleanup_durable = False
                 try:
-                    directory_fd = os.open(
-                        prepared.output_directory, os.O_RDONLY | os.O_DIRECTORY)
-                    try:
-                        os.fsync(directory_fd)
-                    finally:
-                        os.close(directory_fd)
+                    os.fsync(directory_fd)
                 except OSError:
                     cleanup_durable = False
             if not cleanup_durable:
                 raise _DiagnosticCleanupUncertain from None
             raise DiagnosticExportError("diagnostic bundle write failed") from None
         return DiagnosticExportResult(
-            bundle_path=bundle_path,
+            bundle_path=prepared.output_directory / bundle_name,
             included_categories=tuple(
                 item.category for item in prepared.confirmation.included_categories),
             included_media_count=len(prepared.selected_media),
@@ -568,28 +591,71 @@ class DiagnosticExportService:
 
     def __init__(self, authorizer: OwnerDiagnosticExportAuthorizer,
                  source: DiagnosticSource, storage_policy: StoragePolicy,
+                 storage_worker: StorageWorker, storage_root: Path,
                  media_source: MediaSource | None = None) -> None:
+        for gate in ("require_owner_caller", "require_owner_export"):
+            if not callable(getattr(authorizer, gate, None)):
+                raise TypeError("owner export authorization is incomplete")
+        if not callable(getattr(storage_worker, "submit", None)):
+            raise TypeError("storage worker must schedule owning-thread calls")
+        if not isinstance(storage_root, Path):
+            raise TypeError("storage_root must be a path")
         self._authorizer = authorizer
         self.__storage_policy = storage_policy
+        self.__storage_worker = storage_worker
+        self.__storage_root = storage_root
         self.__writer = _DiagnosticBundleWriter(source, media_source)
         self.__worker_slot = asyncio.Semaphore(1)
         self.__storage_uncertain = False
 
+    def __open_admitted_output(self, output_directory: Path) -> int:
+        """Pin the export directory and refuse a target the policy cannot admit.
+
+        The injected policy samples free space on the approved storage root, so a
+        bundle written to another filesystem would spend space that was never
+        reserved and could consume that volume's hard safety reserve. A missing or
+        substituted approved root fails closed instead of falling back.
+        """
+        descriptor = -1
+        try:
+            descriptor = os.open(
+                output_directory,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+            info = os.fstat(descriptor)
+            admitted = os.stat(self.__storage_root)
+            if (not stat.S_ISDIR(admitted.st_mode)
+                    or info.st_dev != admitted.st_dev
+                    or info.st_uid != os.geteuid() or info.st_mode & 0o077
+                    or not info.st_mode & stat.S_IWUSR
+                    or not info.st_mode & stat.S_IXUSR):
+                raise OSError("unadmitted diagnostic output directory")
+            return descriptor
+        except OSError:
+            if descriptor >= 0:
+                os.close(descriptor)
+            raise DiagnosticExportError(
+                "diagnostic output directory is not admitted") from None
+
     def __write_reserved(self, prepared: _PreparedBundle) -> DiagnosticExportResult:
+        """Verify, admit, write and release on the storage policy's owning thread."""
         admitted = False
         retain_reservation = False
+        directory_fd = -1
         try:
             if self.__storage_uncertain:
                 raise DiagnosticExportError("diagnostic storage state is uncertain")
+            directory_fd = self.__open_admitted_output(prepared.output_directory)
             self.__storage_policy.admit(prepared.reserved_bytes, critical=False)
             admitted = True
-            return self.__writer.write(prepared)
+            return self.__writer.write(prepared, directory_fd)
         except _DiagnosticCleanupUncertain:
             self.__storage_uncertain = True
             retain_reservation = True
             raise DiagnosticExportError(
                 "diagnostic storage state is uncertain") from None
         finally:
+            if directory_fd >= 0:
+                os.close(directory_fd)
             if admitted and not retain_reservation:
                 try:
                     self.__storage_policy.release()
@@ -598,35 +664,104 @@ class DiagnosticExportService:
                     raise DiagnosticExportError(
                         "diagnostic storage state is uncertain") from None
 
+    def __remove_published(self, result: DiagnosticExportResult) -> bool:
+        """Durably drop a bundle whose Owner request no longer receives its name."""
+        directory_fd = -1
+        try:
+            directory_fd = self.__open_admitted_output(result.bundle_path.parent)
+            try:
+                os.unlink(result.bundle_path.name, dir_fd=directory_fd)
+            except FileNotFoundError:
+                pass
+            os.fsync(directory_fd)
+            return True
+        except (OSError, DiagnosticExportError):
+            return False
+        finally:
+            if directory_fd >= 0:
+                os.close(directory_fd)
+
+    def __submit_storage(self, call):
+        try:
+            scheduled = self.__storage_worker.submit(call)
+        except Exception:
+            raise DiagnosticExportError(
+                "diagnostic storage worker is unavailable") from None
+        if not isinstance(scheduled, Future):
+            raise DiagnosticExportError(
+                "diagnostic storage worker is unavailable")
+        return asyncio.wrap_future(scheduled)
+
     @staticmethod
-    async def __run_worker(call):
+    async def __drain(worker) -> None:
+        """Settle an in-flight worker even while this caller is being cancelled."""
+        while not worker.done():
+            try:
+                await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                continue
+            except BaseException:
+                break
+        if worker.done() and not worker.cancelled():
+            try:
+                worker.exception()
+            except BaseException:
+                pass
+
+    @staticmethod
+    def __completed(worker):
+        if not worker.done() or worker.cancelled():
+            return None
+        try:
+            if worker.exception() is not None:
+                return None
+        except BaseException:
+            return None
+        return worker.result()
+
+    @classmethod
+    async def __run_worker(cls, call):
         worker = asyncio.create_task(asyncio.to_thread(call))
         try:
             return await asyncio.shield(worker)
         except asyncio.CancelledError:
-            while not worker.done():
-                try:
-                    await asyncio.shield(worker)
-                except asyncio.CancelledError:
-                    continue
-                except BaseException:
-                    break
-            if not worker.cancelled():
-                try:
-                    worker.exception()
-                except BaseException:
-                    pass
+            await cls.__drain(worker)
+            raise
+
+    async def __discard_published(self, published: DiagnosticExportResult) -> None:
+        try:
+            worker = self.__submit_storage(
+                partial(self.__remove_published, published))
+        except DiagnosticExportError:
+            self.__storage_uncertain = True
+            return
+        await self.__drain(worker)
+        if self.__completed(worker) is not True:
+            self.__storage_uncertain = True
+
+    async def __write_bundle(self, prepared: _PreparedBundle) -> DiagnosticExportResult:
+        worker = self.__submit_storage(partial(self.__write_reserved, prepared))
+        try:
+            return await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            await self.__drain(worker)
+            published = self.__completed(worker)
+            if published is not None:
+                # The cancelled caller never receives this bundle name, so the
+                # archive - including any Owner-selected raw media - must not
+                # survive on disk for a later reader.
+                await self.__discard_published(published)
             raise
 
     async def export(self, action: DiagnosticExportAction) -> DiagnosticExportResult:
+        await self._authorizer.require_owner_caller(action)
         async with self.__worker_slot:
             if self.__storage_uncertain:
                 raise DiagnosticExportError("diagnostic storage state is uncertain")
             prepared = await self.__run_worker(
                 partial(self.__writer.prepare, action))
             await self._authorizer.require_owner_export(action, prepared.confirmation)
-            return await self.__run_worker(
-                partial(self.__write_reserved, prepared))
+            return await self.__write_bundle(prepared)
 
 
 class DiagnosticExportEndpoint:

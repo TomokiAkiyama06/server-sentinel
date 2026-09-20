@@ -22,6 +22,7 @@ from .export import (
     SafeDiagnosticFieldName,
     SafeDiagnosticReasonCode,
     SafeDiagnosticState,
+    StorageWorker,
 )
 
 __all__ = [
@@ -46,4 +47,5 @@ __all__ = [
     "SafeDiagnosticFieldName",
     "SafeDiagnosticReasonCode",
     "SafeDiagnosticState",
+    "StorageWorker",
 ]

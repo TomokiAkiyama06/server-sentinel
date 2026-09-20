@@ -3,7 +3,7 @@
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field
 
-from app.auth.boundary import require_system_access
+from app.auth.boundary import require_owner_access, require_system_access
 from app.diagnostics import DiagnosticExportEndpoint
 
 
@@ -13,7 +13,10 @@ class DiagnosticExportRequest(BaseModel):
     selected_media_ids: list[str] = Field(default_factory=list, max_length=100)
 
 
-router = APIRouter(dependencies=[Depends(require_system_access)])
+# Owner authorization precedes the handler, so an invited non-Owner identity
+# never reaches diagnostic collection or a selected-media lookup.
+router = APIRouter(dependencies=[Depends(require_system_access),
+                                 Depends(require_owner_access)])
 
 
 @router.post("/diagnostics/export")

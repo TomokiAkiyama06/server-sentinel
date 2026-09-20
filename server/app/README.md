@@ -15,4 +15,7 @@ Do not mix human authorization with capture-node credentials or embed deployment
 
 The prepared diagnostic route remains unmounted while the human surface is
 closed. Future mounting must use the composed `DiagnosticExportEndpoint`; the
-internal bundle writer is not a route or application integration point.
+internal bundle writer is not a route or application integration point. That
+route depends on the system access boundary *and* an Owner-only boundary, so a
+generic invited identity never reaches diagnostic collection or a selected-media
+lookup; an authorizer that composes no Owner gate fails closed.

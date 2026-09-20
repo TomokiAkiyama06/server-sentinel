@@ -1,3 +1,4 @@
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 import asyncio
 from io import BytesIO
@@ -10,7 +11,7 @@ import unittest
 from unittest.mock import patch
 from zipfile import ZipFile
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 
 from app.api.diagnostics import router
 from app.diagnostics import (
@@ -26,6 +27,8 @@ from app.diagnostics import (
     MediaDescriptor,
     SafeDiagnosticState,
 )
+from app.media.recording.model import RecordingError
+from app.storage.policy import FilesystemSpace, MainStoragePolicy, StorageLimits
 from tests.asgi import request
 
 
@@ -49,6 +52,35 @@ class SyntheticDiagnostics:
                 )
             )),
         )
+
+
+class OwnerAuthorization:
+    """Owner boundary: a caller gate plus the exact-contents confirmation."""
+
+    def __init__(self):
+        self.caller_actions = []
+        self.confirmations = []
+
+    async def require_owner_caller(self, action):
+        self.caller_actions.append(action)
+
+    async def require_owner_export(self, action, confirmation):
+        self.confirmations.append((action, confirmation))
+
+
+class Permit(OwnerAuthorization):
+    pass
+
+
+class DenyContents(OwnerAuthorization):
+    async def require_owner_export(self, action, confirmation):
+        await super().require_owner_export(action, confirmation)
+        raise PermissionError("denied")
+
+
+class DenyCaller(OwnerAuthorization):
+    async def require_owner_caller(self, action):
+        raise PermissionError("not the deployment owner")
 
 
 class SelectedMedia:
@@ -95,13 +127,26 @@ class SelectedMedia:
 
 
 class StorageAdmission:
+    """Synthetic policy reproducing MainStoragePolicy's owning-thread affinity.
+
+    The real policy raises STORAGE_POLICY_UNAVAILABLE when admit()/release() run
+    off the thread that constructed it, so every test admits through the same
+    owning worker the service must use.
+    """
+
     def __init__(self):
+        self.owner = threading.get_ident()
         self.reservations = []
         self.active = False
         self.releases = 0
         self.denial = None
+        self.admit_threads = []
+        self.release_threads = []
 
     def admit(self, media_bytes, *, critical):
+        self.admit_threads.append(threading.get_ident())
+        if threading.get_ident() != self.owner:
+            raise AssertionError("STORAGE_POLICY_UNAVAILABLE")
         if self.denial:
             raise DiagnosticExportError(self.denial)
         if self.active or type(media_bytes) is not int or media_bytes <= 0 or critical:
@@ -110,6 +155,9 @@ class StorageAdmission:
         self.active = True
 
     def release(self):
+        self.release_threads.append(threading.get_ident())
+        if threading.get_ident() != self.owner:
+            raise AssertionError("STORAGE_POLICY_UNAVAILABLE")
         if not self.active:
             raise AssertionError("diagnostic reservation is not active")
         self.active = False
@@ -120,10 +168,20 @@ class DiagnosticExportTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
-        self.output = Path(self.temporary.name)
+        self.output = Path(self.temporary.name).resolve()
         self.source = SyntheticDiagnostics()
         self.media = SelectedMedia()
-        self.policy = StorageAdmission()
+        # One serialized worker owns the storage policy, exactly as the recording
+        # store's owning worker does in a composed deployment.
+        self.worker = ThreadPoolExecutor(max_workers=1)
+        self.addCleanup(self.worker.shutdown)
+        self.policy = self.worker.submit(StorageAdmission).result()
+
+    def make_service(self, authorizer, *, source=None, media=None, policy=None,
+                     storage_root=None):
+        return DiagnosticExportService(
+            authorizer, source or self.source, policy or self.policy,
+            self.worker, storage_root or self.output, media)
 
     def read_bundle(self, result):
         with ZipFile(result.bundle_path) as archive:
@@ -131,45 +189,34 @@ class DiagnosticExportTests(unittest.IsolatedAsyncioTestCase):
                     json.loads(archive.read("manifest.json")))
 
     async def test_denial_gets_safe_confirmation_but_writes_and_resolves_nothing(self):
-        confirmations = []
-
-        class Deny:
-            async def require_owner_export(inner_self, action, confirmation):
-                confirmations.append(confirmation)
-                raise PermissionError("denied")
-
-        service = DiagnosticExportService(
-            Deny(), self.source, self.policy, self.media)
+        authorizer = DenyContents()
+        service = self.make_service(authorizer, media=self.media)
         with self.assertRaises(PermissionError):
             await service.export(DiagnosticExportAction(self.output, ("clip_a",)))
+        confirmation = authorizer.confirmations[0][1]
         self.assertEqual(list(self.output.iterdir()), [])
         self.assertEqual(self.media.resolved, [])
         self.assertEqual(
             [(item.category, item.item_count)
-             for item in confirmations[0].included_categories],
+             for item in confirmation.included_categories],
             [("runtime", 2), ("raw_monitoring_media", 1)],
         )
-        self.assertEqual(confirmations[0].selected_media_ids, ("clip_a",))
-        self.assertFalse(hasattr(confirmations[0], "included_values"))
+        self.assertEqual(confirmation.selected_media_ids, ("clip_a",))
+        self.assertFalse(hasattr(confirmation, "included_values"))
 
     async def test_authorized_default_bundle_excludes_and_hashes_sensitive_values(self):
-        seen = []
-
-        class Permit:
-            async def require_owner_export(inner_self, action, confirmation):
-                seen.append((action, confirmation))
-
+        authorizer = Permit()
         action = DiagnosticExportAction(self.output)
-        result = await DiagnosticExportService(
-            Permit(), self.source, self.policy, self.media).export(action)
+        result = await self.make_service(authorizer, media=self.media).export(action)
         files, manifest = self.read_bundle(result)
         runtime = json.loads(files["diagnostics/runtime.json"])
 
-        self.assertEqual(seen[0][0], action)
+        self.assertEqual(authorizer.confirmations[0][0], action)
         self.assertEqual(
             [(item.category, item.item_count)
-             for item in seen[0][1].included_categories], [("runtime", 2)])
-        self.assertEqual(seen[0][1].selected_media_ids, ())
+             for item in authorizer.confirmations[0][1].included_categories],
+            [("runtime", 2)])
+        self.assertEqual(authorizer.confirmations[0][1].selected_media_ids, ())
         self.assertEqual(self.media.resolved, [])
         self.assertFalse(any(self.source.marker.encode() in value
                              for value in files.values()))
@@ -189,13 +236,8 @@ class DiagnosticExportTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.policy.active)
 
     async def test_only_individually_selected_raw_media_is_resolved_and_included(self):
-        class Permit:
-            async def require_owner_export(inner_self, action, confirmation):
-                return None
-
         action = DiagnosticExportAction(self.output, ("clip_b", "clip_a"))
-        result = await DiagnosticExportService(
-            Permit(), self.source, self.policy, self.media).export(action)
+        result = await self.make_service(Permit(), media=self.media).export(action)
         files, manifest = self.read_bundle(result)
 
         self.assertEqual(self.media.resolved, ["clip_b", "clip_a"])
@@ -213,15 +255,10 @@ class DiagnosticExportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(media_entry["item_count"], 2)
 
     async def test_pressure_and_hard_stop_deny_before_file_or_media_open(self):
-        class Permit:
-            async def require_owner_export(inner_self, action, confirmation):
-                return None
-
         for reason in ("STORAGE_PRESSURE", "STORAGE_HARD_STOP"):
             with self.subTest(reason=reason):
                 self.policy.denial = reason
-                service = DiagnosticExportService(
-                    Permit(), self.source, self.policy, self.media)
+                service = self.make_service(Permit(), media=self.media)
                 with self.assertRaisesRegex(DiagnosticExportError, reason):
                     await service.export(DiagnosticExportAction(
                         self.output, ("clip_a",)))
@@ -236,10 +273,16 @@ class DiagnosticExportTests(unittest.IsolatedAsyncioTestCase):
         fsync_threads = []
         original_writestr = ZipFile.writestr
         original_fsync = os.fsync
+        test_case = self
 
-        class Permit:
+        class LoopBoundOwner(OwnerAuthorization):
+            async def require_owner_caller(inner_self, action):
+                test_case.assertEqual(threading.get_ident(), event_loop_thread)
+                await super().require_owner_caller(action)
+
             async def require_owner_export(inner_self, action, confirmation):
-                self.assertEqual(threading.get_ident(), event_loop_thread)
+                test_case.assertEqual(threading.get_ident(), event_loop_thread)
+                await super().require_owner_export(action, confirmation)
 
         def observed_writestr(archive, *args, **kwargs):
             zip_threads.append(threading.get_ident())
@@ -251,21 +294,97 @@ class DiagnosticExportTests(unittest.IsolatedAsyncioTestCase):
 
         with patch("app.diagnostics.export.ZipFile.writestr", new=observed_writestr), \
                 patch("app.diagnostics.export.os.fsync", side_effect=observed_fsync):
-            await DiagnosticExportService(
-                Permit(), self.source, self.policy, self.media).export(
-                    DiagnosticExportAction(self.output, ("clip_a",)))
+            await self.make_service(LoopBoundOwner(), media=self.media).export(
+                DiagnosticExportAction(self.output, ("clip_a",)))
 
         worker_threads = self.media.worker_threads + zip_threads + fsync_threads
         self.assertTrue(worker_threads)
         self.assertTrue(all(item != event_loop_thread for item in worker_threads))
         self.assertEqual(self.media.max_active, 1)
 
+    async def test_admission_release_and_bundle_io_use_the_policy_owning_worker(self):
+        """Regression: admission off the owning worker is rejected by the policy."""
+        result = await self.make_service(Permit(), media=self.media).export(
+            DiagnosticExportAction(self.output, ("clip_a",)))
+
+        self.assertTrue(result.bundle_path.exists())
+        self.assertEqual(set(self.policy.admit_threads), {self.policy.owner})
+        self.assertEqual(set(self.policy.release_threads), {self.policy.owner})
+        self.assertNotIn(threading.get_ident(), self.policy.admit_threads)
+        # The reservation is held across the write, so the archive itself is
+        # produced on the same owning worker rather than a detached thread.
+        self.assertIn(self.policy.owner, self.media.worker_threads)
+
+    async def test_repository_main_storage_policy_admits_diagnostic_bundles(self):
+        """Regression: the composed MainStoragePolicy must not reject every export."""
+        limits = StorageLimits(
+            recording_limit_bytes=10_000_000, critical_allowance_bytes=1_000_000,
+            hard_reserve_bytes=1_000_000, pressure_free_bytes=2_000_000,
+            recovery_free_bytes=3_000_000, recovery_allocation_bytes=5_000_000,
+            write_overhead_bytes=100_000, max_request_bytes=5_000_000,
+            cleanup_batch_size=10)
+
+        class SyntheticInventory:
+            def usage_bytes(inner_self, *, starred_only=False, critical_only=False):
+                return 0
+
+        class SyntheticReclaimer:
+            def expired(inner_self, now_ms, limit):
+                return 0
+
+            def oldest(inner_self, limit):
+                return 0
+
+        def build_on_owning_worker():
+            policy = MainStoragePolicy(
+                limits, lambda: FilesystemSpace(50_000_000, 100_000_000),
+                lambda: 0, lambda transition: None)
+            policy.bind(SyntheticInventory(), SyntheticReclaimer())
+            return policy
+
+        policy = self.worker.submit(build_on_owning_worker).result()
+        with self.assertRaisesRegex(RecordingError, "STORAGE_POLICY_UNAVAILABLE"):
+            await asyncio.to_thread(policy.admit, 1, critical=False)
+
+        result = await self.make_service(
+            Permit(), media=self.media, policy=policy).export(
+                DiagnosticExportAction(self.output, ("clip_a",)))
+        self.assertTrue(result.bundle_path.exists())
+        self.assertEqual(
+            0, self.worker.submit(lambda: policy.status().reserved_bytes).result())
+
+    async def test_output_outside_the_admitted_filesystem_is_refused_before_admission(self):
+        service = self.make_service(
+            Permit(), media=self.media,
+            storage_root=self.output / "absent-storage-root")
+        with self.assertRaisesRegex(DiagnosticExportError, "not admitted"):
+            await service.export(DiagnosticExportAction(self.output, ("clip_a",)))
+        self.assertEqual(self.policy.reservations, [])
+        self.assertEqual(list(self.output.iterdir()), [])
+
+        real_stat = os.stat
+        admitted_root = real_stat(self.output)
+
+        class ForeignFilesystemRoot:
+            st_mode = admitted_root.st_mode
+            st_dev = admitted_root.st_dev + 1
+            st_uid = admitted_root.st_uid
+
+        def foreign_stat(path, *args, **kwargs):
+            if isinstance(path, (str, Path)) and Path(path) == self.output:
+                return ForeignFilesystemRoot()
+            return real_stat(path, *args, **kwargs)
+
+        service = self.make_service(Permit(), media=self.media)
+        with patch("app.diagnostics.export.os.stat", side_effect=foreign_stat):
+            with self.assertRaisesRegex(DiagnosticExportError, "not admitted"):
+                await service.export(DiagnosticExportAction(self.output, ("clip_a",)))
+        self.assertEqual(self.policy.reservations, [])
+        self.assertEqual(self.media.resolved, [])
+        self.assertEqual(list(self.output.iterdir()), [])
+
     async def test_directory_fsync_failure_removes_published_bundle_and_releases(self):
         calls = []
-
-        class Permit:
-            async def require_owner_export(inner_self, action, confirmation):
-                return None
 
         def fail_publication_fsync(descriptor):
             calls.append(descriptor)
@@ -277,9 +396,8 @@ class DiagnosticExportTests(unittest.IsolatedAsyncioTestCase):
                    side_effect=fail_publication_fsync):
             with self.assertRaisesRegex(
                     DiagnosticExportError, "diagnostic bundle write failed"):
-                await DiagnosticExportService(
-                    Permit(), self.source, self.policy).export(
-                        DiagnosticExportAction(self.output))
+                await self.make_service(Permit()).export(
+                    DiagnosticExportAction(self.output))
 
         self.assertGreaterEqual(len(calls), 3)
         self.assertEqual(list(self.output.iterdir()), [])
@@ -289,16 +407,12 @@ class DiagnosticExportTests(unittest.IsolatedAsyncioTestCase):
     async def test_cleanup_fsync_failure_retains_reservation_and_blocks_service(self):
         calls = []
 
-        class Permit:
-            async def require_owner_export(inner_self, action, confirmation):
-                return None
-
         def fail_publication_and_cleanup_fsync(descriptor):
             calls.append(descriptor)
             if len(calls) in {2, 3}:
                 raise OSError("synthetic directory fsync failure")
 
-        service = DiagnosticExportService(Permit(), self.source, self.policy)
+        service = self.make_service(Permit())
         with patch("app.diagnostics.export.os.fsync",
                    side_effect=fail_publication_and_cleanup_fsync):
             with self.assertRaisesRegex(
@@ -315,14 +429,8 @@ class DiagnosticExportTests(unittest.IsolatedAsyncioTestCase):
             await service.export(DiagnosticExportAction(self.output))
         self.assertEqual(len(self.policy.reservations), 1)
 
-    async def test_cancelled_write_drains_worker_before_next_export(self):
-        entered = threading.Event()
-        proceed = threading.Event()
-
-        class Permit:
-            async def require_owner_export(inner_self, action, confirmation):
-                return None
-
+    @staticmethod
+    def blocking_media_class(entered, proceed):
         class BlockingMedia(SelectedMedia):
             @contextmanager
             def open_selected(inner_self, media_id):
@@ -346,8 +454,40 @@ class DiagnosticExportTests(unittest.IsolatedAsyncioTestCase):
                     inner_self.active -= 1
                     inner_self.released.append(media_id)
 
-        media = BlockingMedia()
-        service = DiagnosticExportService(Permit(), self.source, self.policy, media)
+        return BlockingMedia
+
+    async def test_cancelled_export_durably_removes_its_published_bundle(self):
+        """Regression: a cancelled caller never leaves a readable archive behind."""
+        entered = threading.Event()
+        proceed = threading.Event()
+        media = self.blocking_media_class(entered, proceed)()
+        service = self.make_service(Permit(), media=media)
+
+        export = asyncio.create_task(service.export(
+            DiagnosticExportAction(self.output, ("clip_a",))))
+        while not entered.is_set():
+            await asyncio.sleep(0)
+        export.cancel()
+        proceed.set()
+        with self.assertRaises(asyncio.CancelledError):
+            await export
+
+        self.assertEqual(media.released, ["clip_a"])
+        self.assertEqual(list(self.output.iterdir()), [])
+        self.assertEqual(self.policy.reservations and self.policy.releases, 1)
+        self.assertFalse(self.policy.active)
+
+        later = await service.export(DiagnosticExportAction(self.output))
+        self.assertTrue(later.bundle_path.exists())
+        self.assertEqual([item.name for item in self.output.iterdir()],
+                         [later.bundle_path.name])
+
+    async def test_cancelled_write_drains_worker_before_next_export(self):
+        entered = threading.Event()
+        proceed = threading.Event()
+        media = self.blocking_media_class(entered, proceed)()
+        service = self.make_service(Permit(), media=media)
+
         first = asyncio.create_task(service.export(
             DiagnosticExportAction(self.output, ("clip_a",))))
         while not entered.is_set():
@@ -369,6 +509,9 @@ class DiagnosticExportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(media.released, ["clip_a", "clip_b"])
         self.assertEqual(self.policy.releases, 2)
         self.assertFalse(self.policy.active)
+        # Only the export whose caller received a bundle name survives.
+        self.assertEqual([item.name for item in self.output.iterdir()],
+                         [second_result.bundle_path.name])
 
     async def test_cancelled_prepare_drains_worker_and_repeated_cancel_keeps_slot(self):
         entered = threading.Event()
@@ -393,12 +536,8 @@ class DiagnosticExportTests(unittest.IsolatedAsyncioTestCase):
                 finally:
                     inner_self.active -= 1
 
-        class Permit:
-            async def require_owner_export(inner_self, action, confirmation):
-                return None
-
         source = BlockingDiagnostics()
-        service = DiagnosticExportService(Permit(), source, self.policy)
+        service = self.make_service(Permit(), source=source)
         first = asyncio.create_task(service.export(DiagnosticExportAction(self.output)))
         while not entered.is_set():
             await asyncio.sleep(0)
@@ -423,10 +562,6 @@ class DiagnosticExportTests(unittest.IsolatedAsyncioTestCase):
         media_size = 3 * 64 * 1024 + 17
         requests = []
 
-        class Permit:
-            async def require_owner_export(inner_self, action, confirmation):
-                return None
-
         class GeneratedMedia:
             def describe_selected(inner_self, media_id):
                 return MediaDescriptor(media_size)
@@ -446,9 +581,8 @@ class DiagnosticExportTests(unittest.IsolatedAsyncioTestCase):
 
                 yield MediaAsset(GeneratedReader())
 
-        result = await DiagnosticExportService(
-            Permit(), self.source, self.policy, GeneratedMedia()).export(
-                DiagnosticExportAction(self.output, ("clip_a",)))
+        result = await self.make_service(Permit(), media=GeneratedMedia()).export(
+            DiagnosticExportAction(self.output, ("clip_a",)))
         with ZipFile(result.bundle_path) as archive:
             with archive.open("media/0001.bin") as stored:
                 self.assertEqual(len(stored.read()), media_size)
@@ -456,38 +590,28 @@ class DiagnosticExportTests(unittest.IsolatedAsyncioTestCase):
         self.assertLessEqual(max(requests), 64 * 1024)
 
     async def test_media_stream_size_and_bundle_caps_fail_before_authorization(self):
-        authorized = []
-
-        class MustNotAuthorize:
-            async def require_owner_export(inner_self, action, confirmation):
-                authorized.append(confirmation)
-
         class OversizedMedia(SelectedMedia):
             def describe_selected(inner_self, media_id):
                 return MediaDescriptor(512 * 1024 * 1024 + 1)
 
+        authorizer = Permit()
         with self.assertRaises(DiagnosticExportError):
-            await DiagnosticExportService(
-                MustNotAuthorize(), self.source, self.policy, OversizedMedia()).export(
-                    DiagnosticExportAction(self.output, ("clip_a",)))
+            await self.make_service(authorizer, media=OversizedMedia()).export(
+                DiagnosticExportAction(self.output, ("clip_a",)))
 
         class ExcessiveAggregateMedia(SelectedMedia):
             def describe_selected(inner_self, media_id):
                 return MediaDescriptor(400 * 1024 * 1024)
 
         with self.assertRaisesRegex(DiagnosticExportError, "too large"):
-            await DiagnosticExportService(
-                MustNotAuthorize(), self.source, self.policy,
-                ExcessiveAggregateMedia()).export(DiagnosticExportAction(
-                    self.output, ("clip_a", "clip_b", "clip_c")))
-        self.assertEqual(authorized, [])
+            await self.make_service(
+                authorizer, media=ExcessiveAggregateMedia()).export(
+                    DiagnosticExportAction(
+                        self.output, ("clip_a", "clip_b", "clip_c")))
+        self.assertEqual(authorizer.confirmations, [])
         self.assertEqual(self.policy.reservations, [])
 
     async def test_media_size_change_removes_partial_bundle_and_releases_each_item(self):
-        class Permit:
-            async def require_owner_export(inner_self, action, confirmation):
-                return None
-
         class ChangedMedia(SelectedMedia):
             def describe_selected(inner_self, media_id):
                 described = super().describe_selected(media_id)
@@ -496,15 +620,51 @@ class DiagnosticExportTests(unittest.IsolatedAsyncioTestCase):
         media = ChangedMedia()
         with self.assertRaisesRegex(
                 DiagnosticExportError, "diagnostic bundle write failed"):
-            await DiagnosticExportService(
-                Permit(), self.source, self.policy, media).export(
-                    DiagnosticExportAction(self.output, ("clip_a",)))
+            await self.make_service(Permit(), media=media).export(
+                DiagnosticExportAction(self.output, ("clip_a",)))
 
         self.assertEqual(media.resolved, ["clip_a"])
         self.assertEqual(media.released, ["clip_a"])
         self.assertEqual(media.active, 0)
         self.assertEqual(list(self.output.iterdir()), [])
         self.assertEqual(self.policy.releases, 1)
+
+    async def test_non_owner_caller_is_refused_before_collection_or_media_lookup(self):
+        """Regression: a non-Owner cannot probe selected-media IDs for existence."""
+        collected = []
+
+        class WatchedSource(SyntheticDiagnostics):
+            def collect(inner_self):
+                collected.append(threading.get_ident())
+                return super().collect()
+
+        authorizer = DenyCaller()
+        service = self.make_service(
+            authorizer, source=WatchedSource(), media=self.media)
+        for selected in ((), ("clip_a",), ("unknown_clip",)):
+            with self.subTest(selected=selected), self.assertRaises(PermissionError):
+                await service.export(DiagnosticExportAction(self.output, selected))
+        self.assertEqual(collected, [])
+        self.assertEqual(self.media.worker_threads, [])
+        self.assertEqual(self.media.resolved, [])
+        self.assertEqual(authorizer.confirmations, [])
+        self.assertEqual(self.policy.reservations, [])
+        self.assertEqual(list(self.output.iterdir()), [])
+
+    def test_service_requires_a_complete_owner_boundary_and_storage_worker(self):
+        class ContentsOnly:
+            async def require_owner_export(inner_self, action, confirmation):
+                return None
+
+        for authorizer, worker, root in (
+                (ContentsOnly(), self.worker, self.output),
+                (object(), self.worker, self.output),
+                (Permit(), object(), self.output),
+                (Permit(), self.worker, str(self.output))):
+            with self.subTest(authorizer=type(authorizer).__name__), \
+                    self.assertRaises(TypeError):
+                DiagnosticExportService(
+                    authorizer, self.source, self.policy, worker, root)
 
     def test_invalid_or_duplicate_selection_is_rejected_before_authorization(self):
         for selected in (("clip_a", "clip_a"), ("../clip",), ("",),
@@ -545,42 +705,84 @@ class DiagnosticExportTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(TypeError):
             DiagnosticDocument("private-hostname", ())
 
-    async def test_prepared_route_uses_fixed_endpoint_and_both_authorizers(self):
-        observed = []
-
-        class SystemPermit:
-            async def require_system_access(inner_self, route_request: Request):
-                observed.append("system")
-
-        class OwnerPermit:
-            async def require_owner_export(inner_self, action, confirmation):
-                observed.append((action.output_directory, confirmation))
-
+    def prepared_route_application(self, human_authorizer, authorizer, media=None):
         application = FastAPI()
-        application.state.human_authorizer = SystemPermit()
+        application.state.human_authorizer = human_authorizer
         application.state.diagnostic_export_endpoint = DiagnosticExportEndpoint(
-            DiagnosticExportService(
-                OwnerPermit(), self.source, self.policy, self.media), self.output)
+            self.make_service(authorizer, media=media), self.output)
         application.include_router(router)
-        body = json.dumps({"selected_media_ids": []}).encode()
-        result = await request(
+        return application
+
+    @staticmethod
+    async def post_export(application, selected_media_ids=()):
+        body = json.dumps({"selected_media_ids": list(selected_media_ids)}).encode()
+        return await request(
             application, "/diagnostics/export", method="POST", body=body,
             headers=((b"content-type", b"application/json"),))
 
+    async def test_prepared_route_uses_fixed_endpoint_and_both_authorizers(self):
+        observed = []
+
+        class SystemAndOwnerPermit:
+            async def require_system_access(inner_self, route_request: Request):
+                observed.append("system")
+
+            async def require_owner_access(inner_self, route_request: Request):
+                observed.append("owner")
+
+        authorizer = Permit()
+        application = self.prepared_route_application(
+            SystemAndOwnerPermit(), authorizer, self.media)
+        result = await self.post_export(application)
+
         self.assertEqual(result[0]["status"], 200)
-        self.assertEqual(observed[0], "system")
-        self.assertEqual(observed[1][0], self.output)
+        self.assertEqual(observed, ["system", "owner"])
+        self.assertEqual(authorizer.confirmations[0][0].output_directory, self.output)
         self.assertEqual(
             [(item.category, item.item_count)
-             for item in observed[1][1].included_categories], [("runtime", 2)])
+             for item in authorizer.confirmations[0][1].included_categories],
+            [("runtime", 2)])
+
+    async def test_prepared_route_denies_an_invited_non_owner_before_the_endpoint(self):
+        """Regression: system access alone must not reach a selected-media lookup."""
+        observed = []
+
+        class InvitedNonOwner:
+            async def require_system_access(inner_self, route_request: Request):
+                observed.append("system")
+
+            async def require_owner_access(inner_self, route_request: Request):
+                raise HTTPException(status_code=404, detail="Not Found")
+
+        authorizer = Permit()
+        application = self.prepared_route_application(
+            InvitedNonOwner(), authorizer, self.media)
+        result = await self.post_export(application, ("clip_a", "clip_b"))
+
+        self.assertEqual(result[0]["status"], 404)
+        self.assertEqual(observed, ["system"])
+        self.assertEqual(authorizer.caller_actions, [])
+        self.assertEqual(authorizer.confirmations, [])
+        self.assertEqual(self.media.worker_threads, [])
+        self.assertEqual(self.policy.reservations, [])
+        self.assertEqual(list(self.output.iterdir()), [])
+
+    async def test_prepared_route_fails_closed_without_a_composed_owner_gate(self):
+        class SystemOnlyAuthorizer:
+            async def require_system_access(inner_self, route_request: Request):
+                return None
+
+        authorizer = Permit()
+        application = self.prepared_route_application(
+            SystemOnlyAuthorizer(), authorizer, self.media)
+        result = await self.post_export(application)
+
+        self.assertEqual(result[0]["status"], 404)
+        self.assertEqual(authorizer.caller_actions, [])
+        self.assertEqual(self.media.worker_threads, [])
+        self.assertEqual(list(self.output.iterdir()), [])
 
     async def test_writer_revalidates_duck_types_and_mutated_dtos_before_owner(self):
-        authorized = []
-
-        class MustNotAuthorize:
-            async def require_owner_export(inner_self, action, confirmation):
-                authorized.append(confirmation)
-
         class DuckField:
             name = "status"
             value = self.source.marker
@@ -612,13 +814,13 @@ class DiagnosticExportTests(unittest.IsolatedAsyncioTestCase):
             def collect(inner_self):
                 return (mutated_document,)
 
+        authorizer = Permit()
         for source in (DuckSource(), DuckFieldsSource(), MutatedSource()):
             with self.subTest(source=type(source).__name__), self.assertRaises(
                     DiagnosticExportError):
-                await DiagnosticExportService(
-                    MustNotAuthorize(), source, self.policy).export(
-                        DiagnosticExportAction(self.output))
-        self.assertEqual(authorized, [])
+                await self.make_service(authorizer, source=source).export(
+                    DiagnosticExportAction(self.output))
+        self.assertEqual(authorizer.confirmations, [])
         self.assertEqual(list(self.output.iterdir()), [])
 
     def test_public_package_has_no_unconditionally_writable_exporter(self):
