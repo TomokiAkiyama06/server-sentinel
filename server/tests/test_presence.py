@@ -184,6 +184,21 @@ class PresenceTests(unittest.TestCase):
         self.service.record(observation(Kind.SERVER_MOVEMENT))
         self.assertEqual(self.status()["pending_critical_actions"], 2)
 
+    def test_bounded_dispatch_never_starves_newly_queued_critical_work(self):
+        unconfigured = self.make_service(evidence=None, notifications=None)
+        for index in range(3):
+            unconfigured.record(observation(Kind.CAMERA_TAMPER, identifier=UUID(int=index + 1)))
+        unconfigured.dispatch_pending()
+        self.assertEqual(self.status()["pending_critical_actions"], 6)
+        fresh = self.service.record(observation(Kind.SERVER_MOVEMENT, identifier=UUID(int=2 ** 128 - 1)))
+        # A bounded batch reaches the newly queued work instead of repeating
+        # the stuck backlog that happens to sort first by identity.
+        self.service.dispatch_pending(limit=2)
+        self.assertEqual([item.identifier for item in self.evidence], [fresh.identifier])
+        self.assertEqual([item.identifier for item in self.notifications], [fresh.identifier])
+        self.service.dispatch_pending()
+        self.assertEqual(self.status()["pending_critical_actions"], 0)
+
     def test_critical_paths_reported_from_configuration_and_known_health(self):
         closed = PresenceService(self.database)
         status = closed.snapshot(now=NOW, clock_trusted=True)

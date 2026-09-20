@@ -191,9 +191,18 @@ class PresenceService:
         # release the SQLite lock, then invoke the port. A process crash in this
         # interval leaves submitting/queued visibly unresolved; it never causes
         # a blind retry of a potentially completed external side effect.
+        #
+        # The bounded batch is ordered, so a backlog of still unavailable or
+        # repeatedly attempted work cannot starve newly queued critical
+        # evidence and notification jobs: never attempted rows lead, pending
+        # precedes unavailable, and equal work is dispatched in receipt order.
         with closing(self.database.connect()) as db:
-            pending = db.execute("SELECT observation,action FROM presence_deliveries "
-                                 "WHERE state IN ('pending','unavailable') LIMIT ?", (limit,)).fetchall()
+            pending = db.execute(
+                "SELECT job.observation,job.action FROM presence_deliveries job "
+                "JOIN presence_observations item ON item.id=job.observation "
+                "WHERE job.state IN ('pending','unavailable') "
+                "ORDER BY job.attempts, job.state='unavailable', item.sequence, job.action "
+                "LIMIT ?", (limit,)).fetchall()
         for row in pending:
             with self._transaction() as db:
                 job = db.execute("SELECT * FROM presence_deliveries WHERE observation=? AND action=?",
