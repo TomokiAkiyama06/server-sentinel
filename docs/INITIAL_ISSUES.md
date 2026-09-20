@@ -274,6 +274,11 @@ Acceptance:
 
 ## Plan 5 — Local UVC discovery and stable identity
 
+Implementation progress: video-only V4L2 discovery/MMAP, conservative identity,
+durable ambiguity latch and registry/session integration are implemented and
+synthetically tested. Owner management, running worker/preview integration and
+real UVC acceptance remain pending; Issue #11 stays OPEN. See `MANUAL_TEST.md` A.
+
 GitHub Issue: [#11](https://github.com/TomokiAkiyama06/server-sentinel/issues/11)
 
 Depends on: [#9](https://github.com/TomokiAkiyama06/server-sentinel/issues/9), [#6](https://github.com/TomokiAkiyama06/server-sentinel/issues/6)
@@ -490,6 +495,12 @@ Acceptance:
 - viewer quality independent from durable recording quality;
 - no-viewer state avoids unnecessary viewer-only transcode;
 - measured resource use recorded.
+
+Implementation progress: `server/app/media/profiles/` contains the independent
+profile planner, decoded-frame cadence control and bounded compressed-packet
+adapter lifecycle, with synthetic tests for quality isolation and no-subscriber
+cleanup. Codec/transport adapters and measured Main Server / Capture Node / UVC
+resource use remain pending; this is not completion of Issue #17.
 
 ## Plan 11 — Durable recording + main-host compressed pre-roll
 
