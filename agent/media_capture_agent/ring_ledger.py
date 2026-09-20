@@ -81,6 +81,8 @@ class Ledger:
                                               isolation_level=None, check_same_thread=False)
             self.connection.row_factory = sqlite3.Row
             self.connection.execute("PRAGMA page_size = 4096")
+            if self.connection.execute("PRAGMA auto_vacuum").fetchone()[0] != 0 or (header and header[20] != 0):
+                raise RingRefused("unsupported_ledger_format")
             if self.connection.execute(f"PRAGMA max_page_count = {self.maximum_pages}").fetchone()[0] != self.maximum_pages:
                 raise RingRefused("ledger_size_limit")
             self.connection.execute("PRAGMA foreign_keys = ON")
@@ -113,6 +115,18 @@ class Ledger:
             raise RingRefused("ledger_readonly")
         if space.f_bavail * space.f_frsize < self.settings.safety_reserve_bytes + self.headroom:
             raise RingRefused("ledger_reserve_unavailable")
+
+    def require_rows(self, *, segments, incidents, protections):
+        # Bounded UUID/numeric records fit without overflow in schema v1.
+        # Each B-tree needs at most two pages per entry (leaf + interior).
+        # segments have three trees; incidents/protection each have two.
+        # 74 extra pages cover schema/settings roots and transient split work;
+        # this deliberately does not depend on average UUID insertion packing.
+        required = PAGE_BYTES * (74 + 6 * integer(segments) + 4 * integer(incidents)
+                                 + 4 * integer(protections))
+        if required > self.maximum_bytes:
+            raise RingRefused("insufficient_ledger_capacity")
+        return required
 
     def _check_sidecars(self):
         for name in ("ring.sqlite3-wal", "ring.sqlite3-shm", "ring.sqlite3-journal"):

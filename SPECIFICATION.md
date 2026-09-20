@@ -459,7 +459,11 @@ If the expected media filesystem is unavailable or resolves unexpectedly, Agent 
 The Issue #16 ring core requires an explicit SQLite ledger size bound in addition
 to media-profile/reserve inputs. It guards runtime-filesystem metadata growth
 before schema creation, hot-journal recovery and transactions, and reserves
-conservative completion headroom in shared-filesystem media admission. Unexpected
+conservative completion headroom in shared-filesystem media admission. The cap
+must also cover cadence-derived segment/index/protection rows for the selected
+ring and the next complete pre/post incident, including existing retained
+metadata. Failed reconfiguration retains the active ring's selected coverage;
+only trusted clock observations advance the durable rollback watermark. Unexpected
 authentication loss is an effective Main loss even while the raw socket remains
 connected; known protected-evidence damage stays degraded outside current pre-roll.
 See `agent/docs/RING_BUFFER.md` for the implemented budget and integration limits.

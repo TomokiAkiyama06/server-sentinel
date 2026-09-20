@@ -39,6 +39,7 @@ class DiskRing:
                 self.profiles = {UUID(item["source_id"]): SegmentProfile(
                     **{**item, "source_id": UUID(item["source_id"])}
                 ) for item in value["profiles"]}
+                self._ledger_capacity(self.config, self.profiles)
             self._recover()
         except BaseException:
             self.close()
@@ -75,7 +76,7 @@ class DiskRing:
         previous = int(row[0]) if row else 0
         if now < previous:
             trusted = False
-        elif record:
+        elif trusted and record:
             with self.ledger.transaction():
                 self.db.execute("INSERT OR REPLACE INTO settings VALUES ('latest_clock', ?)", (str(now),))
         return trusted
@@ -91,7 +92,7 @@ class DiskRing:
                 state = "missing"
                 if identifier in physical:
                     valid = self.store.verify_segment(identifier, row["length"], row["checksum"])
-                    state = "stored" if valid else "uncertain"
+                    state = "stored" if valid and allocated.get(identifier, 0) >= 512 else "uncertain"
                 self.db.execute("UPDATE segments SET state=?, allocated=? WHERE id=?",
                                 (state, allocated.get(identifier, 0), row["id"]))
                 if state != "stored":
@@ -111,7 +112,8 @@ class DiskRing:
         changes = []
         for row in self._rows():
             identifier = UUID(row["id"])
-            if row["state"] == "stored" and physical.get(identifier) != row["length"]:
+            if row["state"] == "stored" and (physical.get(identifier) != row["length"]
+                                               or allocations.get(identifier, 0) < 512):
                 state = "missing" if identifier not in physical else "uncertain"
                 changes.append((state, allocations.get(identifier, 0), row["id"]))
         if changes:
@@ -138,10 +140,60 @@ class DiskRing:
             return [row for row in rows if row["end"] <= now - config.value * SECOND]
         return rows
 
+    def _configuration_reclaimable(self, now, proposed):
+        candidates = self._selected_reclaimable(now, proposed)
+        if self.config is None:
+            return candidates
+        # A failed proposal leaves the current configuration authoritative.
+        # Only media already eligible for its FIFO may be removed pre-commit.
+        current = self._selected_reclaimable(now, self.config)
+        if self.config.mode == "capacity":
+            allocations = self.store.segment_allocations()
+            excess = sum(allocations.get(UUID(row["id"]), 0) for row in self._rows()
+                         if not self._protected(row["id"])) - self.config.value
+            eligible = []
+            for row in current:
+                if excess <= 0:
+                    break
+                eligible.append(row)
+                excess -= allocations.get(UUID(row["id"]), 0)
+            current = eligible
+        allowed = {row["id"] for row in current}
+        return [row for row in candidates if row["id"] in allowed]
+
     def _estimate(self, profiles, duration, *, expected=False):
         result = sum(profile.bytes_for(duration, self.store.allocation_unit, expected=expected)
                      for profile in profiles.values())
         return integer(result)
+
+    @staticmethod
+    def _segment_count(profiles, duration):
+        return sum((duration + item.segment_duration_us - 1) // item.segment_duration_us + 2
+                   for item in profiles.values())
+
+    def _ledger_capacity(self, config, profiles, *, proposal=None):
+        rows = self._rows()
+        protected = sum(self._protected(row["id"]) for row in rows)
+        selected = (self._segment_count(profiles, config.value * SECOND) if config.mode == "duration"
+                    else config.value // 512 + 1)
+        segments = protected + max(len(rows) - protected, selected)
+        incidents = self.db.execute("SELECT count(*) FROM incidents").fetchone()[0]
+        protections = self.db.execute("SELECT count(*) FROM protection").fetchone()[0]
+        for incident in self.db.execute("SELECT * FROM incidents WHERE state='active'").fetchall():
+            present = self.db.execute("SELECT count(*) FROM protection WHERE incident=?", (incident["id"],)).fetchone()[0]
+            future = max(0, self._segment_count(profiles, incident["end"] - incident["start"]) - present)
+            segments += future
+            protections += future
+        if proposal is not None:
+            start, end = proposal
+            matching = [row for row in rows if row["end"] > start and row["start"] < end
+                        and UUID(row["source"]) in profiles]
+            present = len(matching)
+            total = max(present, self._segment_count(profiles, end - start))
+            segments += total - present + sum(not self._protected(row["id"]) for row in matching)
+            protections += total
+            incidents += 1
+        return self.ledger.require_rows(segments=segments, incidents=incidents, protections=protections)
 
     def _budget(self, profiles, now):
         self._reconcile_presence()
@@ -189,13 +241,17 @@ class DiskRing:
                 integer(config.value * SECOND)
                 self._estimate(mapping, config.value * SECOND)
             budget = self._budget(mapping, now_us)
-            if (budget["filesystem_free"] + budget["reclaimable_allocated"]
+            reclaimable = self._configuration_reclaimable(now_us, config) if clock_trusted else ()
+            allocations = self.store.segment_allocations()
+            credit = sum(allocations.get(UUID(row["id"]), 0) for row in reclaimable)
+            if (budget["filesystem_free"] + credit
                     < budget["required_additional"] + budget["safety_reserve"]):
                 raise RingRefused("insufficient_simultaneous_pre_post_budget")
             self._selected_target_fits(config, mapping)
+            self._ledger_capacity(config, mapping, proposal=(now_us - PRE, now_us + POST))
             # Credit only blocks that were actually returned by deletion. A
             # hardlink/open reader can keep blocks allocated after unlink.
-            for row in self._selected_reclaimable(now_us, config) if clock_trusted else ():
+            for row in reclaimable:
                 if self.store.check(require_reserve=False) >= budget["required_additional"] + budget["safety_reserve"]:
                     break
                 self._remove_segment(row["id"])
@@ -273,6 +329,7 @@ class DiskRing:
                     or not isinstance(data, bytes) or not data or len(data) > profile.segment_bytes()):
                 self.state, self.reason = "degraded", "profile_bound_violation"
                 raise RingRefused("profile_bound_violation")
+            self._ledger_capacity(self.config, self.profiles)
             previous = self.db.execute("SELECT max(end) FROM segments WHERE source=?",
                                        (str(source_id),)).fetchone()[0]
             if previous is not None and start_us < previous:
@@ -316,6 +373,12 @@ class DiskRing:
                 self._free_for_write(len(data), now_us, trusted=clock_trusted)
                 self.store.write_segment(UUID(identifier), data)
                 allocated = self.store.segment_allocations()[UUID(identifier)]
+                # st_blocks uses 512-byte units; f_frsize is not a guaranteed
+                # minimum allocation on every filesystem. Zero-allocation
+                # media cannot uphold the finite capacity-mode row bound.
+                if allocated < 512:
+                    self.store.delete_segment(UUID(identifier))
+                    raise StorageRefused("unsupported_segment_allocation")
                 if self.config.mode == "capacity" and not incidents:
                     allocations = self.store.segment_allocations()
                     total = sum(allocations.get(UUID(row["id"]), 0) for row in self._rows()
@@ -365,6 +428,7 @@ class DiskRing:
         integer(now + RETENTION)
         if start >= end or self.config is None or type(trusted) is not bool:
             raise RingRefused("invalid_preservation_window")
+        self._ledger_capacity(self.config, self.profiles, proposal=(start, end))
         trusted = self._clock(now, trusted)
         identifier = str(uuid4())
         with self.ledger.transaction():
@@ -502,6 +566,14 @@ class DiskRing:
         self.ledger.check_space()
         budget = self._budget(self.profiles, now)
         clock_trusted = self._clock(now, clock_trusted, record=False)
+        ledger_pressure = False
+        try:
+            active = self.db.execute("SELECT 1 FROM incidents WHERE state='active' LIMIT 1").fetchone()
+            self._ledger_capacity(self.config, self.profiles, proposal=None if active else (now - PRE, now + POST))
+        except RingRefused as exc:
+            if str(exc) != "insufficient_ledger_capacity":
+                raise
+            ledger_pressure = True
         allocated = self.store.segment_allocations()
         rows = self._rows()
         known_ids = {UUID(row["id"]) for row in rows}
@@ -517,6 +589,8 @@ class DiskRing:
             coverage[str(source)] = {"intervals_us": intervals, "gaps_us": gaps}
         if budget["filesystem_free"] < budget["safety_reserve"]:
             self.state, self.reason = "STORAGE_HARD_STOP", "safety_reserve_unavailable"
+        elif ledger_pressure:
+            self.state, self.reason = "STORAGE_PRESSURE", "insufficient_ledger_capacity"
         elif budget["filesystem_free"] + budget["reclaimable_allocated"] < budget["required_additional"] + budget["safety_reserve"]:
             self.state, self.reason = "STORAGE_PRESSURE", "post_loss_headroom_reduced"
         elif not clock_trusted:

@@ -20,6 +20,7 @@ from tests.support import SOURCE, settings
 
 PAYLOAD = zlib.compress(b"generated-pattern-0001" * 8)
 T0 = 3600 * SECOND
+LEDGER_BYTES = 16 * 1024 * 1024
 
 
 class AllowControls:
@@ -31,7 +32,7 @@ class AllowControls:
 
 
 class Quota:
-    def __init__(self, root, capacity=4096 * 4000):
+    def __init__(self, root, capacity=2 * 1024 * 1024 * 1024):
         self.root, self.capacity, self.other = root, capacity, 0
 
     def used(self):
@@ -53,7 +54,7 @@ class RingTests(unittest.TestCase):
         self.store = MediaStore(self.settings, space=self.quota,
                                 stable_device=lambda _expected: True)
         self.addCleanup(self.store.close)
-        self.ring = DiskRing(self.settings, self.store, ledger_maximum_bytes=128 * 1024, authority=AllowControls())
+        self.ring = DiskRing(self.settings, self.store, ledger_maximum_bytes=LEDGER_BYTES, authority=AllowControls())
         self.addCleanup(lambda: self.ring.close())
         self.profile = SegmentProfile(SOURCE, 800, 400, 60 * SECOND, 100)
 
@@ -82,12 +83,13 @@ class RingTests(unittest.TestCase):
             self.append(start)
 
     def restart(self):
+        maximum = self.ring.ledger.maximum_bytes
         self.ring.close()
-        self.ring = DiskRing(self.settings, self.store, ledger_maximum_bytes=128 * 1024, authority=AllowControls())
+        self.ring = DiskRing(self.settings, self.store, ledger_maximum_bytes=maximum, authority=AllowControls())
 
     def test_owner_controls_and_preserve_commands_default_deny(self):
         self.ring.close()
-        self.ring = DiskRing(self.settings, self.store, ledger_maximum_bytes=128 * 1024)
+        self.ring = DiskRing(self.settings, self.store, ledger_maximum_bytes=LEDGER_BYTES)
         with self.assertRaisesRegex(RingRefused, "owner_authorization_required"):
             self.configure()
         with self.assertRaisesRegex(RingRefused, "authenticated_preserve_required"):
@@ -339,6 +341,27 @@ class RingTests(unittest.TestCase):
         self.assertEqual(status["reason"], "clock_uncertain")
         self.assertEqual(set(self.store.list_segments()), before)
 
+    def test_untrusted_forward_jump_does_not_poison_trusted_clock_after_restart(self):
+        self.warm()
+        incident = self.loss()
+        before = self.store.segment_allocations()
+        status = self.ring.tick(now_us=T0 + RETENTION, clock_trusted=False)
+        self.assertEqual(status["reason"], "clock_uncertain")
+        self.assertEqual(self.store.segment_allocations(), before)
+        self.assertEqual(int(self.ring.db.execute(
+            "SELECT value FROM settings WHERE key='latest_clock'"
+        ).fetchone()[0]), T0)
+        self.restart()
+        self.finish()
+        result = self.ring.incident(incident, now_us=T0 + POST)
+        # The uncertain interval stays visible, but trusted time can complete
+        # and eventually expire it without waiting for the rejected jump.
+        self.assertEqual(result["state"], "partial")
+        self.assertEqual(result["completed_at_us"], T0 + POST)
+        self.assertEqual(result["expires_at_us"], T0 + POST + RETENTION)
+        self.ring.tick(now_us=T0 + POST + RETENTION, clock_trusted=True)
+        self.assertEqual(self.ring.incident(incident, now_us=T0 + POST + RETENTION)["state"], "deleted")
+
     def test_interrupted_deletion_resumes_and_preserves_shared_incident(self):
         self.warm()
         first = self.loss()
@@ -358,6 +381,7 @@ class RingTests(unittest.TestCase):
         self.configure(value=1200)
         for start in range(T0 - 1200 * SECOND, T0, 60 * SECOND):
             self.append(start)
+        before = self.store.segment_allocations()
         budget = self.ring._budget(self.ring.profiles, T0)
         self.assertGreater(budget["reclaimable_allocated"], 0)
         self.quota.capacity = (self.quota.used() + budget["required_additional"]
@@ -374,7 +398,62 @@ class RingTests(unittest.TestCase):
             with self.assertRaises(RingRefused):
                 self.configure(value=600)
         self.assertEqual(self.ring.config.value, 1200)
+        self.assertEqual(self.store.segment_allocations(), before)
+        self.quota.capacity += budget["reclaimable_allocated"]
+        self.restart()
+        self.assertEqual(self.ring.config.value, 1200)
+        self.assertEqual(self.store.segment_allocations(), before)
+        self.assertEqual(self.ring.status(now_us=T0, clock_trusted=True)["state"], "healthy")
+
+    def test_successful_duration_reconfiguration_trims_only_after_commit(self):
+        self.configure(value=1200)
+        for start in range(T0 - 1200 * SECOND, T0, 60 * SECOND):
+            self.append(start)
+        original = self.store.delete_segment
+        def after_commit(identifier):
+            self.assertEqual(self.ring.config.value, 600)
+            return original(identifier)
+        with patch.object(self.store, "delete_segment", side_effect=after_commit):
+            self.configure(value=600)
         self.assertEqual(len(self.store.list_segments()), 10)
+
+    def test_reconfiguration_rechecks_blocks_only_from_expired_current_media(self):
+        self.configure(value=1200)
+        # Uncertain time retained older ordinary files that the next trusted
+        # observation may expire under the current, longer configuration.
+        for start in range(T0 - 1800 * SECOND, T0, 60 * SECOND):
+            self.append(start, trusted=False)
+        current = {UUID(row["id"]) for row in self.ring._rows() if row["end"] > T0 - 1200 * SECOND}
+        eligible = self.ring._configuration_reclaimable(T0, RingConfig("duration", 600))
+        allocations = self.store.segment_allocations()
+        credit = sum(allocations[UUID(row["id"])] for row in eligible)
+        budget = self.ring._budget(self.ring.profiles, T0)
+        self.quota.capacity = (self.quota.used() + budget["required_additional"]
+                               + budget["safety_reserve"] - credit)
+        original = self.store.delete_segment
+        def kept_open(identifier):
+            allocation = self.store.segment_allocations()[identifier]
+            original(identifier)
+            self.quota.other += allocation
+        with patch.object(self.store, "delete_segment", side_effect=kept_open):
+            with self.assertRaises(RingRefused):
+                self.configure(value=600)
+        self.assertEqual(self.ring.config.value, 1200)
+        self.assertEqual(set(self.store.list_segments()), current)
+
+    def test_failed_capacity_reconfiguration_retains_current_ordinary_limit(self):
+        minimum = self.profile.bytes_for(PRE, self.store.allocation_unit)
+        self.configure("capacity", 2 * minimum)
+        for start in range(T0 - 1800 * SECOND, T0, 60 * SECOND):
+            self.append(start)
+        before = self.store.segment_allocations()
+        budget = self.ring._budget(self.ring.profiles, T0)
+        self.quota.capacity = (self.quota.used() + budget["required_additional"]
+                               + budget["safety_reserve"] - self.store.allocation_unit)
+        with self.assertRaises(RingRefused):
+            self.configure("capacity", minimum)
+        self.assertEqual(self.ring.config.value, 2 * minimum)
+        self.assertEqual(self.store.segment_allocations(), before)
 
     def test_hard_stop_status_does_not_claim_free_space_when_mount_missing(self):
         self.configure()
@@ -420,7 +499,96 @@ class RingTests(unittest.TestCase):
         with self.assertRaisesRegex(RingRefused, "selected_target_exceeds_safe_filesystem"):
             self.configure("capacity", self.quota.capacity * 2)
         with self.assertRaisesRegex(RingRefused, "selected_target_exceeds_safe_filesystem"):
-            self.configure("duration", 86400 * 10)
+            self.configure("duration", 86400 * 1000)
+
+    def test_small_ledger_rejects_one_second_cadence_before_configuration(self):
+        self.ring.close()
+        self.ring = DiskRing(self.settings, self.store, ledger_maximum_bytes=128 * 1024, authority=AllowControls())
+        profile = SegmentProfile(SOURCE, 800, 400, SECOND, 100)
+        with self.assertRaisesRegex(RingRefused, "insufficient_ledger_capacity"):
+            self.configure(profiles=(profile,))
+        self.assertIsNone(self.ring.config)
+        self.assertEqual(self.ring.db.execute("SELECT count(*) FROM settings").fetchone()[0], 0)
+        self.assertEqual(self.ring._rows(), [])
+        self.assertEqual(self.store.list_segments(), {})
+
+    def test_capacity_admission_counts_512_byte_allocations_before_capture(self):
+        self.ring.close()
+        self.ring = DiskRing(self.settings, self.store, ledger_maximum_bytes=1792 * 1024,
+                             authority=AllowControls())
+        minimum = self.profile.bytes_for(PRE, self.store.allocation_unit)
+        with self.assertRaisesRegex(RingRefused, "insufficient_ledger_capacity"):
+            self.configure("capacity", minimum)
+        self.assertIsNone(self.ring.config)
+        self.assertEqual(self.store.list_segments(), {})
+
+    def test_sufficient_ledger_completes_one_second_pre_and_post_through_restart(self):
+        self.ring.close()
+        self.quota.capacity = 4 * 1024 * 1024 * 1024
+        self.ring = DiskRing(self.settings, self.store, ledger_maximum_bytes=64 * 1024 * 1024,
+                             authority=AllowControls())
+        profile = SegmentProfile(SOURCE, 800, 400, SECOND, 100)
+        self.configure(profiles=(profile,))
+        for start in range(T0 - PRE, T0, SECOND):
+            self.ring.append(SOURCE, start, start + SECOND, PAYLOAD, now_us=start + SECOND, clock_trusted=True)
+        incident = self.loss()
+        self.restart()
+        for start in range(T0, T0 + POST, SECOND):
+            self.ring.append(SOURCE, start, start + SECOND, PAYLOAD, now_us=start + SECOND, clock_trusted=True)
+        result = self.ring.incident(incident, now_us=T0 + POST)
+        self.assertEqual(result["state"], "complete")
+        self.assertFalse(result["has_gaps"])
+        self.assertEqual(len(self.ring._rows()), 1200)
+
+    def test_metadata_budget_counts_selected_horizon_and_every_source_cadence(self):
+        with self.assertRaisesRegex(RingRefused, "insufficient_ledger_capacity"):
+            self.configure("duration", 86400)
+        with self.assertRaisesRegex(RingRefused, "insufficient_ledger_capacity"):
+            self.configure("capacity", 20 * self.profile.bytes_for(PRE, self.store.allocation_unit))
+        profiles = tuple(SegmentProfile(UUID(int=100 + index), 800, 400,
+                                        SECOND if index == 3 else 60 * SECOND, 100)
+                         for index in range(4))
+        with self.assertRaisesRegex(RingRefused, "insufficient_ledger_capacity"):
+            self.configure(profiles=profiles)
+        self.assertIsNone(self.ring.config)
+
+    def test_ledger_reservation_rejects_overlapping_preserve_without_harming_active_post(self):
+        self.ring.close()
+        self.ring = DiskRing(self.settings, self.store, ledger_maximum_bytes=2 * 1024 * 1024,
+                             authority=AllowControls())
+        self.warm()
+        incident = self.loss()
+        before = self.store.segment_allocations()
+        with self.assertRaisesRegex(RingRefused, "insufficient_ledger_capacity"):
+            self.ring.preserve("camera_tamper", T0 - PRE, T0 + POST, now_us=T0, clock_trusted=True)
+        self.assertEqual(self.ring.db.execute("SELECT count(*) FROM incidents").fetchone()[0], 1)
+        self.assertEqual(self.store.segment_allocations(), before)
+        self.restart()
+        self.finish()
+        self.assertEqual(self.ring.incident(incident, now_us=T0 + POST)["state"], "complete")
+
+    def test_existing_tombstones_are_counted_without_reset_or_deletion(self):
+        with self.ring.ledger.transaction():
+            self.ring.db.executemany("INSERT INTO incidents VALUES (?, 'camera_tamper', ?, ?, ?, ?, 'deleted', 0, ?)",
+                                    ((str(UUID(int=index + 1)), T0 - PRE, T0, T0, T0 + RETENTION,
+                                      '["' + str(SOURCE) + '"]') for index in range(1200)))
+        with self.assertRaisesRegex(RingRefused, "insufficient_ledger_capacity"):
+            self.configure()
+        self.assertIsNone(self.ring.config)
+        self.assertEqual(self.ring.db.execute("SELECT count(*) FROM incidents").fetchone()[0], 1200)
+
+    def test_zero_allocation_cannot_enter_capacity_accounting_or_healthy_recovery(self):
+        self.configure()
+        allocation = self.store.segment_allocations
+        with patch.object(self.store, "segment_allocations", side_effect=lambda: dict.fromkeys(allocation(), 0)):
+            with self.assertRaisesRegex(RingRefused, "segment_storage_refused"):
+                self.append(T0)
+        self.assertEqual(self.store.list_segments(), {})
+        identifier = self.append(T0 + 60 * SECOND)
+        with patch.object(self.store, "segment_allocations", side_effect=lambda: dict.fromkeys(allocation(), 0)):
+            self.restart()
+            self.assertEqual(self.ring.db.execute("SELECT state FROM segments WHERE id=?", (str(identifier),)).fetchone()[0],
+                             "uncertain")
 
     def test_replaced_ledger_is_a_hard_stop_and_never_recreated(self):
         self.configure()
@@ -499,6 +667,8 @@ class RingTests(unittest.TestCase):
         self.assertEqual(self.ring.status(now_us=T0, clock_trusted=True)["reason"], "ledger_reserve_unavailable")
 
     def test_sqlite_growth_is_bounded_and_rolls_back_at_explicit_page_limit(self):
+        self.ring.close()
+        self.ring = DiskRing(self.settings, self.store, ledger_maximum_bytes=128 * 1024, authority=AllowControls())
         before = self.settings.runtime_root.joinpath("ring.sqlite3").stat().st_size
         with self.assertRaises(sqlite3.Error):
             with self.ring.ledger.transaction():

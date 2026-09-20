@@ -85,6 +85,11 @@ is rechecked before configuration is committed. An unlinked file whose blocks
 are still held by another process cannot provide fictional free space. Existing
 protected incidents and other processes' disk usage can therefore cause a new
 configuration to be rejected even when the ordinary limit alone appears valid.
+During reconfiguration, pre-commit reclaim credit includes only files already
+eligible for FIFO under the current setting as well as the proposed setting.
+Current duration coverage and the current capacity allocation remain owned until
+the new setting commits. A failed shrink therefore preserves the active ring;
+it may require free space to be restored before the shorter setting can apply.
 
 Every media write retains `L` in addition to the hard reserve, and uses the store's exclusive
 allocation/write/fsync path. Runtime status recomputes full protection headroom;
@@ -126,6 +131,33 @@ DB-cap exhaustion is an explicit failure; schema history and incidents are never
 reset to make capacity available. Interrupted transactions roll back even for
 `KeyboardInterrupt` / `SystemExit`.
 
+Configuration also checks that this page cap can hold the selected ordinary
+ring and a complete new T-10/T+10 incident at every configured segment cadence.
+Duration-mode row counts include boundary segments per source. Capacity-mode
+counts use the [512-byte `st_blocks` unit](https://man7.org/linux/man-pages/man3/stat.3type.html)
+as the minimum positive allocation, independently of the filesystem fragment
+size. New zero-allocation media is refused before admission; such existing media
+is uncertain at inventory/recovery. Maximum bitrate is never treated as a
+minimum payload. Existing protected segments, incident tombstones and every
+protection reference consume metadata capacity, including separate references
+when incidents share one media file. New preservation requests must fit before
+any incident is created; active incidents keep room for their remaining segment
+and reference rows across append and restart. Status exposes insufficient room
+for the next incident as `STORAGE_PRESSURE / insufficient_ledger_capacity`.
+
+The admission bound deliberately does not assume average SQLite page packing.
+Schema-v1 bounded UUID/numeric records and indexes need no overflow pages. The
+[SQLite B-tree format](https://www.sqlite.org/fileformat2.html#b_tree_pages)
+allows a conservative two pages per entry per tree, covering leaf and interior
+pages: six pages per segment (table and two indexes), four per incident and four
+per protection edge (table and primary-key index). Ten root pages and 64 pages
+of transient split headroom are added; 4096-byte pages, no reserved page bytes
+and no auto-vacuum pointer maps are required. This intentionally generous bound
+can reject a cap that happens to fit one insertion order. The Owner must size
+the explicit ledger cap and its filesystem reserve together. Continued incident
+growth can still exhaust a finite cap; expiry does not silently erase tombstones
+or promise unlimited incident storage.
+
 ## Durable recovery, time and deletion
 
 The runtime directory must already exist, be private to the service account and
@@ -154,10 +186,13 @@ completion. Clock-uncertain segments never count as trustworthy coverage.
 The integration supplies trustworthy **local capture time**, independently of
 whether Main is reachable; Main loss alone does not mean the local monotonic
 capture interval is unknown. Integer UTC microseconds describe intervals, and
-the persisted highest clock observation also detects backward movement across
+the persisted highest trusted clock observation also detects backward movement across
 restart. Explicit clock uncertainty or rollback degrades protection and suspends
 automatic expiry until time is trusted. The future timing adapter must compare
 wall/monotonic changes and assess forward jumps under the approved clock policy.
+Rejected forward jumps never advance that persisted watermark. Corrected trusted
+time can resume completion and expiry, including after restart, while affected
+incidents retain their explicit clock-uncertainty flag.
 
 Completion establishes `expires_at = completed_at + 60 days`. Trusted-clock ticks
 perform expiry; Owner-authorized early deletion does not need the clock to become
