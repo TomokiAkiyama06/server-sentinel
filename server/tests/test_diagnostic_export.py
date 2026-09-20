@@ -12,10 +12,12 @@ from app.diagnostics import (
     DiagnosticDocument,
     DiagnosticExportAction,
     DiagnosticExportEndpoint,
+    DiagnosticExportError,
     DiagnosticExportService,
     DiagnosticField,
     DiagnosticFieldKind,
     MediaAsset,
+    SafeDiagnosticState,
 )
 from tests.asgi import request
 
@@ -26,7 +28,7 @@ class SyntheticDiagnostics:
     def collect(self):
         return (
             DiagnosticDocument(DiagnosticCategory.RUNTIME, (
-                DiagnosticField("status", "degraded"),
+                DiagnosticField("status", SafeDiagnosticState.DEGRADED),
                 DiagnosticField("hardware_identifier.camera_serial", self.marker),
             )),
             DiagnosticDocument(DiagnosticCategory.SECURITY, tuple(
@@ -146,6 +148,19 @@ class DiagnosticExportTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(TypeError):
             DiagnosticField("status", {"authorization": self.source.marker})
 
+    def test_allowlisted_names_cannot_carry_secrets_or_private_deployment_values(self):
+        invalid = (
+            ("status", "SYNTHETIC_SECRET"),
+            ("component", "private-host-42"),
+            ("reason_code", "credential_leaked"),
+            ("version", "1.2.3-private-host-42"),
+            ("count", "123456"),
+            ("enabled", 1),
+        )
+        for name, value in invalid:
+            with self.subTest(name=name), self.assertRaises((TypeError, ValueError)):
+                DiagnosticField(name, value)
+
     def test_unrecognized_safe_names_fail_closed_instead_of_using_regex(self):
         for name in ("access_key", "client_cert", "pairing_code", "owner_vector",
                      "x_forwarded_user", "monitoring_payload"):
@@ -189,6 +204,53 @@ class DiagnosticExportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             [(item.category, item.item_count)
              for item in observed[1][1].included_categories], [("runtime", 2)])
+
+    async def test_writer_revalidates_duck_types_and_mutated_dtos_before_owner(self):
+        authorized = []
+
+        class MustNotAuthorize:
+            async def require_owner_export(inner_self, action, confirmation):
+                authorized.append(confirmation)
+
+        class DuckField:
+            name = "status"
+            value = self.source.marker
+            kind = DiagnosticFieldKind.SAFE
+
+        class DuckDocument:
+            category = DiagnosticCategory.RUNTIME
+            fields = (DuckField(),)
+
+        class DuckSource:
+            def collect(inner_self):
+                return (DuckDocument(),)
+
+        duck_fields_document = DiagnosticDocument(
+            DiagnosticCategory.RUNTIME,
+            (DiagnosticField("status", SafeDiagnosticState.OK),))
+        object.__setattr__(duck_fields_document, "fields", (DuckField(),))
+
+        class DuckFieldsSource:
+            def collect(inner_self):
+                return (duck_fields_document,)
+
+        mutated_field = DiagnosticField("status", SafeDiagnosticState.OK)
+        object.__setattr__(mutated_field, "value", self.source.marker)
+        mutated_document = DiagnosticDocument(
+            DiagnosticCategory.RUNTIME, (mutated_field,))
+
+        class MutatedSource:
+            def collect(inner_self):
+                return (mutated_document,)
+
+        for source in (DuckSource(), DuckFieldsSource(), MutatedSource()):
+            with self.subTest(source=type(source).__name__), self.assertRaises(
+                    DiagnosticExportError):
+                await DiagnosticExportService(
+                    MustNotAuthorize(), source).export(
+                        DiagnosticExportAction(self.output))
+        self.assertEqual(authorized, [])
+        self.assertEqual(list(self.output.iterdir()), [])
 
     def test_public_package_has_no_unconditionally_writable_exporter(self):
         import app.diagnostics as diagnostics

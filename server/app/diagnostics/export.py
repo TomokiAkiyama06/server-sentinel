@@ -57,7 +57,45 @@ class SafeDiagnosticFieldName(StrEnum):
     ENABLED = "enabled"
 
 
+class SafeDiagnosticState(StrEnum):
+    OK = "ok"
+    DEGRADED = "degraded"
+    FAILED = "failed"
+    UNAVAILABLE = "unavailable"
+    UNKNOWN = "unknown"
+    READY = "ready"
+    ONLINE = "online"
+    OFFLINE = "offline"
+    DISABLED = "disabled"
+
+
+class SafeDiagnosticComponent(StrEnum):
+    MAIN_SERVER = "main_server"
+    DATABASE = "database"
+    CAMERA_REGISTRY = "camera_registry"
+    UVC_CAPTURE = "uvc_capture"
+    MEDIA_PIPELINE = "media_pipeline"
+    RECORDER = "recorder"
+    STORAGE = "storage"
+    DIAGNOSTICS = "diagnostics"
+
+
+class SafeDiagnosticReasonCode(StrEnum):
+    NONE = "none"
+    NOT_CONFIGURED = "not_configured"
+    DEPENDENCY_UNAVAILABLE = "dependency_unavailable"
+    SOURCE_OFFLINE = "source_offline"
+    STORAGE_PRESSURE = "storage_pressure"
+    STORAGE_HARD_STOP = "storage_hard_stop"
+    MANUAL_INTERVENTION_REQUIRED = "manual_intervention_required"
+    SELF_TEST_FAILED = "self_test_failed"
+
+
 _SAFE_FIELD_NAMES = frozenset(item.value for item in SafeDiagnosticFieldName)
+_SAFE_VERSION = re.compile(
+    r"^(?:0|[1-9][0-9]{0,5})\.(?:0|[1-9][0-9]{0,5})\."
+    r"(?:0|[1-9][0-9]{0,5})$"
+)
 _CLASSIFIED_FIELD_NAMES = {
     "hardware_identifier.camera_serial": DiagnosticFieldKind.HARDWARE_IDENTIFIER,
     "hardware_identifier.device_serial": DiagnosticFieldKind.HARDWARE_IDENTIFIER,
@@ -84,6 +122,35 @@ _CLASSIFIED_FIELD_NAMES = {
 }
 
 
+def _validate_safe_value(name: str, value: object) -> None:
+    if name in {SafeDiagnosticFieldName.STATUS, SafeDiagnosticFieldName.STATE,
+                SafeDiagnosticFieldName.HEALTH}:
+        if not isinstance(value, SafeDiagnosticState):
+            raise TypeError("diagnostic state must use the reviewed enum")
+        return
+    if name == SafeDiagnosticFieldName.COMPONENT:
+        if not isinstance(value, SafeDiagnosticComponent):
+            raise TypeError("diagnostic component must use the reviewed enum")
+        return
+    if name == SafeDiagnosticFieldName.REASON_CODE:
+        if not isinstance(value, SafeDiagnosticReasonCode):
+            raise TypeError("diagnostic reason must use the reviewed enum")
+        return
+    if name == SafeDiagnosticFieldName.VERSION:
+        if type(value) is not str or not _SAFE_VERSION.fullmatch(value):
+            raise ValueError("diagnostic version is invalid")
+        return
+    if name == SafeDiagnosticFieldName.COUNT:
+        if type(value) is not int or not 0 <= value <= 1_000_000_000:
+            raise ValueError("diagnostic count is invalid")
+        return
+    if name == SafeDiagnosticFieldName.ENABLED:
+        if type(value) is not bool:
+            raise TypeError("diagnostic enabled value must be boolean")
+        return
+    raise ValueError("safe diagnostic field is unsupported")
+
+
 @dataclass(frozen=True)
 class DiagnosticField:
     name: str
@@ -95,6 +162,7 @@ class DiagnosticField:
             raise ValueError("diagnostic field name is invalid")
         if self.name in _SAFE_FIELD_NAMES:
             derived_kind = DiagnosticFieldKind.SAFE
+            _validate_safe_value(self.name, self.value)
         else:
             derived_kind = _CLASSIFIED_FIELD_NAMES.get(self.name)
             if derived_kind is None:
@@ -102,7 +170,10 @@ class DiagnosticField:
         object.__setattr__(self, "kind", derived_kind)
         if type(self.value) is float and not math.isfinite(self.value):
             raise ValueError("diagnostic field value is invalid")
-        if not (self.value is None or type(self.value) in {str, int, float, bool}):
+        if not (self.value is None or type(self.value) in {str, int, float, bool}
+                or isinstance(self.value, (SafeDiagnosticState,
+                                           SafeDiagnosticComponent,
+                                           SafeDiagnosticReasonCode))):
             raise TypeError("diagnostic fields must be scalar")
 
 
@@ -114,6 +185,9 @@ class DiagnosticDocument:
     def __post_init__(self) -> None:
         if not isinstance(self.category, DiagnosticCategory):
             raise TypeError("diagnostic category must be allowlisted")
+        if type(self.fields) is not tuple or not all(
+                isinstance(field, DiagnosticField) for field in self.fields):
+            raise TypeError("diagnostic fields must use validated records")
         if len({field.name for field in self.fields}) != len(self.fields):
             raise ValueError("diagnostic field names must be unique")
 
@@ -220,6 +294,29 @@ class _DiagnosticBundleWriter:
         self._source = source
         self._media_source = media_source
 
+    def _collect_validated(self) -> tuple[DiagnosticDocument, ...]:
+        try:
+            supplied = tuple(self._source.collect())
+            validated = []
+            for document in supplied:
+                if not isinstance(document, DiagnosticDocument):
+                    raise TypeError
+                rebuilt_fields = []
+                for supplied_field in document.fields:
+                    if not isinstance(supplied_field, DiagnosticField):
+                        raise TypeError
+                    rebuilt = DiagnosticField(
+                        supplied_field.name, supplied_field.value)
+                    if rebuilt.kind is not supplied_field.kind:
+                        raise ValueError
+                    rebuilt_fields.append(rebuilt)
+                validated.append(DiagnosticDocument(
+                    document.category, tuple(rebuilt_fields)))
+            return tuple(validated)
+        except Exception:
+            raise DiagnosticExportError(
+                "diagnostic source returned invalid data") from None
+
     def prepare(self, action: DiagnosticExportAction) -> _PreparedBundle:
         try:
             output = action.output_directory.resolve(strict=True)
@@ -228,7 +325,7 @@ class _DiagnosticBundleWriter:
                 "diagnostic output directory is unavailable") from None
         if not output.is_dir():
             raise DiagnosticExportError("diagnostic output directory is unavailable")
-        documents = tuple(self._source.collect())
+        documents = self._collect_validated()
         if len({item.category for item in documents}) != len(documents):
             raise DiagnosticExportError("diagnostic categories must be unique")
 

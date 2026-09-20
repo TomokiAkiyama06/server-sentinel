@@ -6,6 +6,7 @@ from .export import (
     DiagnosticExportAction,
     DiagnosticExportConfirmation,
     DiagnosticExportEndpoint,
+    DiagnosticExportError,
     DiagnosticExportResult,
     DiagnosticExportService,
     DiagnosticExclusion,
@@ -16,7 +17,10 @@ from .export import (
     MediaAsset,
     MediaSource,
     OwnerDiagnosticExportAuthorizer,
+    SafeDiagnosticComponent,
     SafeDiagnosticFieldName,
+    SafeDiagnosticReasonCode,
+    SafeDiagnosticState,
 )
 
 __all__ = [
@@ -25,6 +29,7 @@ __all__ = [
     "DiagnosticExportAction",
     "DiagnosticExportConfirmation",
     "DiagnosticExportEndpoint",
+    "DiagnosticExportError",
     "DiagnosticExportResult",
     "DiagnosticExportService",
     "DiagnosticExclusion",
@@ -35,5 +40,8 @@ __all__ = [
     "MediaAsset",
     "MediaSource",
     "OwnerDiagnosticExportAuthorizer",
+    "SafeDiagnosticComponent",
     "SafeDiagnosticFieldName",
+    "SafeDiagnosticReasonCode",
+    "SafeDiagnosticState",
 ]

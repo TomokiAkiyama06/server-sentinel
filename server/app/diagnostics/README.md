@@ -12,6 +12,11 @@ export primitive.
 Every diagnostic producer must use an allowlisted category, label scalar fields,
 and use a centrally reviewed `SafeDiagnosticFieldName` for included fields.
 Unknown names fail closed rather than relying on secret-name pattern matching.
+Allowlisted names are not free-form value channels: state/health, component and
+reason fields require reviewed enums; versions use a bounded numeric form;
+counts and enabled flags require bounded integer and strict boolean values.
+Private hostnames, identifiers or secrets therefore cannot be placed in a
+generic `status` or `component` string.
 Credentials, pairing
 secrets, private keys, sensitive headers, Owner biometric data, and embedded raw
 media are always excluded. Hardware serials/UUIDs receive a keyed per-bundle
