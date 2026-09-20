@@ -26,6 +26,25 @@ class DeviceEvidence:
     formats: tuple[str, ...] = ()
     device_number: int | None = field(default=None, repr=False)
 
+    def __post_init__(self):
+        for value in (self.device_path, self.vendor, self.product, self.interface):
+            if not isinstance(value, str) or not value or len(value) > 4096:
+                raise ValueError("invalid device evidence")
+        for value in (self.serial, self.topology):
+            if value is not None and (not isinstance(value, str) or not value or len(value) > 4096):
+                raise ValueError("invalid device evidence")
+        if not isinstance(self.by_id, tuple) or not isinstance(self.formats, tuple):
+            raise ValueError("invalid device evidence collection")
+        if len(self.by_id) > 256 or len(self.formats) > 256:
+            raise ValueError("device evidence exceeds bound")
+        if any(not isinstance(value, str) or not value or len(value) > 4096 for value in self.by_id):
+            raise ValueError("invalid device alias")
+        if any(not isinstance(value, str) or len(value) != 4
+               or any(ord(char) < 32 or ord(char) > 126 for char in value) for value in self.formats):
+            raise ValueError("invalid video format evidence")
+        if self.device_number is not None and (type(self.device_number) is not int or self.device_number < 0):
+            raise ValueError("invalid device number")
+
     @property
     def strong_key(self):
         # A by-id name can be synthesized from non-unique product metadata.

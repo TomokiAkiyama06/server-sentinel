@@ -217,6 +217,19 @@ When devices reappear:
 
 This rule applies on both the main host and remote capture nodes.
 
+### 4.4 Local adapter implementation boundary
+
+The local adapter stores private approval evidence and a durable ambiguity latch
+in the application database. A live approved weak binding does not constitute
+proof for a subsequent reconnect or process restart. Discovery alone is never
+`online`; successful frame capture is required. The initial implementation uses
+bounded single-planar V4L2 MMAP on Linux x86_64/aarch64, reports the actual
+negotiated dimensions/FPS/FourCC, and requires an explicit capture profile.
+Unsupported multi-planar capture or codec/bitrate controls fail explicitly.
+Source workers, Owner management and the preview frame sink are internal
+interfaces; physical capture is not auto-started by the backend launcher and no
+unauthenticated preview route is added. See `server/app/cameras/uvc/README.md`.
+
 ## 5. `media-capture-agent`
 
 ### 5.1 Purpose
