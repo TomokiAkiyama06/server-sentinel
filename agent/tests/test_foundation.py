@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import shutil
 import sys
 import tempfile
 import unittest
@@ -505,6 +506,25 @@ raise SystemExit(1)
             os.umask(previous)
         self.assertEqual((destination / "0.1.0").stat().st_mode & 0o777, 0o755)
         self.assertEqual((destination / "0.1.0/media-capture-agent").stat().st_mode & 0o777, 0o555)
+
+    def test_checkout_named_agent_accepts_external_sibling_data(self):
+        component = self.root / "agent" / "agent"
+        component.mkdir(parents=True)
+        shutil.copytree(Path(__file__).resolve().parents[1] / "media_capture_agent",
+                        component / "media_capture_agent",
+                        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+        config = self.root / "deployment.json"
+        value = dataclasses.asdict(self.settings)
+        for key in ("node_id", "runtime_root", "media_root"):
+            value[key] = str(value[key])
+        for key in ("mount_point", "filesystem_root"):
+            value["expected_mount"][key] = str(value["expected_mount"][key])
+        config.write_text(json.dumps(value))
+        config.chmod(0o600)
+        result = subprocess.run([sys.executable, "-m", "media_capture_agent.cli",
+                                 "--config", str(config), "--check"], cwd=component,
+                                capture_output=True, text=True, timeout=5, check=True)
+        self.assertIn("validation passed", result.stdout)
 
     def test_unit_dedicated_account_and_video_only_devices(self):
         unit = render_unit(Path("/opt/example/0.1.0/media-capture-agent"),

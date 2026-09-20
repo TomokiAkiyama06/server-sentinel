@@ -26,8 +26,6 @@ def main(argv=None):
         # exclude the versioned installation directory containing the executable.
         location = Path(__file__).absolute()
         code_root = location.parents[2]
-        if code_root.name == "agent":
-            code_root = code_root.parent
         settings = Settings.load(args.config, code_root=code_root)
         store = MediaStore(settings)
         agent = Agent(settings, store)
