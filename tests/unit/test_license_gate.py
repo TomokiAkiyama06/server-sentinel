@@ -236,6 +236,36 @@ class LicenseGateTests(unittest.TestCase):
         with self.assertRaisesRegex(license_gate.GateError, "reviewed parser"):
             license_gate.audit(self.root)
 
+    def test_unregistered_pip_requirement_manifest_fails_closed(self):
+        self.write("server/requirements-prod.in", "demo==1.2.3 --hash=sha256:" + "a" * 64 + "\n")
+        with self.assertRaisesRegex(license_gate.GateError, "input set differs"):
+            license_gate.audit(self.root)
+
+    def test_python_optional_and_build_dependencies_require_reviewed_parser(self):
+        self.write("pyproject.toml", """\
+[project]
+dependencies = []
+
+[project.optional-dependencies]
+detector = ["detector==1.2.3"]
+""")
+        self.inputs.append({
+            "path": "pyproject.toml", "ecosystem": "python-project", "scope": "backend",
+        })
+        self.save()
+        with self.assertRaisesRegex(license_gate.GateError, "unsupported project dependency section"):
+            license_gate.audit(self.root)
+
+        self.write("pyproject.toml", """\
+[project]
+dependencies = []
+
+[build-system]
+requires = ["build-backend==1.2.3"]
+""")
+        with self.assertRaisesRegex(license_gate.GateError, "unsupported project dependency section"):
+            license_gate.audit(self.root)
+
     def test_nested_requirement_dependency_is_recursively_audited(self):
         self.write("requirements.lock", "-r requirements-nested.lock\n")
         self.write("requirements-nested.lock", "nested==9.8.7 --hash=sha256:" + "c" * 64 + "\n")

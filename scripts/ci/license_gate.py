@@ -216,9 +216,18 @@ def python_project(path: Path, relative: str, scope: str):
         data = tomllib.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, tomllib.TOMLDecodeError) as error:
         raise GateError(f"cannot parse {relative}") from error
-    dependencies = data.get("project", {}).get("dependencies", [])
+    project = data.get("project", {})
+    if not isinstance(project, dict):
+        raise GateError(f"invalid project table in {relative}")
+    dependencies = project.get("dependencies", [])
     if not isinstance(dependencies, list):
         raise GateError(f"invalid project dependencies in {relative}")
+    optional_dependencies = project.get("optional-dependencies", {})
+    build_system = data.get("build-system", {})
+    if not isinstance(optional_dependencies, dict) or not isinstance(build_system, dict):
+        raise GateError(f"invalid unsupported dependency section in {relative}")
+    if optional_dependencies or build_system.get("requires", []):
+        raise GateError(f"unsupported project dependency section in {relative}")
     found = []
     for dependency in dependencies:
         match = PACKAGE.fullmatch(dependency) if isinstance(dependency, str) else None
@@ -360,7 +369,7 @@ def audit(root: Path, inventory_path=INVENTORY):
             discovered_pins.extend(pins)
 
     tracked_inputs = set()
-    for pattern in ("**/requirements*.lock", "**/requirements*.txt", "**/package-lock.json",
+    for pattern in ("**/requirements*", "**/package-lock.json",
                     "**/package.json", "**/pyproject.toml"):
         for path in root.glob(pattern):
             if path.is_file() and not set(path.relative_to(root).parts) & {"node_modules", ".venv"}:
