@@ -20,10 +20,14 @@ boundary.
 The service dispatches collection through a one-slot worker boundary so the ASGI
 event loop is not blocked. Before releasing that slot after caller cancellation,
 it shields and drains the active worker so no second export can overlap its files
-or storage reservation. A cancelled caller never receives a bundle name, so a
-bundle the drained worker had already published — including any Owner-selected
-raw media — is durably unlinked and directory-fsynced instead of accumulating on
-disk across repeated disconnects.
+or storage reservation. Whenever a caller will not receive a bundle name — after
+cancellation, or when releasing the reservation fails after publication — a bundle
+the worker had already published, including any Owner-selected raw media, is
+durably unlinked and directory-fsynced instead of accumulating on disk. The
+publication directory's device and inode are recorded with the result, so
+cancellation cleanup verifies it reopened the same directory; a renamed or
+replaced directory means the archive is unreachable, an absent file is not
+accepted as deletion, and the service blocks later exports instead.
 
 Admission, bundle I/O and release are submitted as one unit to the storage
 policy's owning worker. `MainStoragePolicy` admits, releases and serializes every
@@ -35,13 +39,16 @@ byte count through that policy; the policy owns filesystem allocation and
 metadata overhead, pressure/hard-stop state and the deployment hard reserve.
 
 Admission covers the approved storage filesystem, so the export directory is
-pinned first: it is opened without following symlinks, must be a private
-directory owned by the service account, and must report the same device as the
-approved storage root. A target on another filesystem, or a missing or
-substituted approved root, is refused before any reservation rather than spending
-another volume's hard reserve. Every create, rename, unlink and fsync then uses
-that single verified descriptor, so a mount swapped after admission cannot
-redirect the bundle or its cleanup.
+pinned first: it is opened without following symlinks and must be a private
+directory owned by the service account whose device matches the approved
+`RootIdentity` that composition also configured the storage policy with. Because
+an open descriptor's device cannot change and the approved identity is a fixed
+configured value, that check is atomic with admission — it is not a second
+pathname sample that a mount substituted and restored around `admit()` could
+race. A substituted approved root is refused by the policy itself, which hard
+stops rather than reserving space on a replacement filesystem. Every create,
+rename, unlink and fsync then uses that single verified descriptor, so a mount
+swapped after admission cannot redirect the bundle or its cleanup.
 
 Admission remains held through publication and directory fsync. Failure removes
 and directory-fsyncs the temporary file, or an already-renamed bundle when final

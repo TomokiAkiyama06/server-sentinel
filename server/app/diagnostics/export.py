@@ -20,6 +20,7 @@ from typing import BinaryIO, Callable, ContextManager, Protocol, TypeAlias
 from zipfile import ZIP64_LIMIT, ZIP_STORED, ZipFile, ZipInfo
 
 from app.media.recording.model import StoragePolicy
+from app.media.recording.store import RootIdentity
 
 
 JsonScalar: TypeAlias = str | int | float | bool | None
@@ -333,6 +334,15 @@ _EXCLUDED_KINDS = {
 
 
 @dataclass(frozen=True)
+class _PublishedBundle:
+    """One published archive plus the directory identity that received it."""
+
+    result: DiagnosticExportResult
+    directory_device: int
+    directory_inode: int
+
+
+@dataclass(frozen=True)
 class _PreparedBundle:
     output_directory: Path
     confirmation: DiagnosticExportConfirmation
@@ -591,30 +601,38 @@ class DiagnosticExportService:
 
     def __init__(self, authorizer: OwnerDiagnosticExportAuthorizer,
                  source: DiagnosticSource, storage_policy: StoragePolicy,
-                 storage_worker: StorageWorker, storage_root: Path,
+                 storage_worker: StorageWorker,
+                 storage_filesystem: RootIdentity,
                  media_source: MediaSource | None = None) -> None:
         for gate in ("require_owner_caller", "require_owner_export"):
             if not callable(getattr(authorizer, gate, None)):
                 raise TypeError("owner export authorization is incomplete")
         if not callable(getattr(storage_worker, "submit", None)):
             raise TypeError("storage worker must schedule owning-thread calls")
-        if not isinstance(storage_root, Path):
-            raise TypeError("storage_root must be a path")
+        if not isinstance(storage_filesystem, RootIdentity):
+            raise TypeError("storage_filesystem must be an approved RootIdentity")
+        if (type(storage_filesystem.device) is not int
+                or type(storage_filesystem.inode) is not int):
+            raise TypeError("approved storage identity must be numeric")
         self._authorizer = authorizer
         self.__storage_policy = storage_policy
         self.__storage_worker = storage_worker
-        self.__storage_root = storage_root
+        self.__storage_filesystem = storage_filesystem
         self.__writer = _DiagnosticBundleWriter(source, media_source)
         self.__worker_slot = asyncio.Semaphore(1)
         self.__storage_uncertain = False
 
     def __open_admitted_output(self, output_directory: Path) -> int:
-        """Pin the export directory and refuse a target the policy cannot admit.
+        """Pin the export directory to the filesystem the policy reserves on.
 
-        The injected policy samples free space on the approved storage root, so a
-        bundle written to another filesystem would spend space that was never
-        reserved and could consume that volume's hard safety reserve. A missing or
-        substituted approved root fails closed instead of falling back.
+        Composition supplies the same approved `RootIdentity` the storage policy
+        was configured with, and the check compares it against `fstat` of the
+        descriptor the writer will use. Both sides therefore bind to one fixed
+        device instead of a second pathname sample: an open descriptor's device
+        cannot change, so a mount substituted and restored around admission
+        cannot leave the writer on an unadmitted volume. A substituted approved
+        root is still refused by the policy itself, which hard stops rather than
+        reserving space on a replacement filesystem.
         """
         descriptor = -1
         try:
@@ -622,9 +640,7 @@ class DiagnosticExportService:
                 output_directory,
                 os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
             info = os.fstat(descriptor)
-            admitted = os.stat(self.__storage_root)
-            if (not stat.S_ISDIR(admitted.st_mode)
-                    or info.st_dev != admitted.st_dev
+            if (info.st_dev != self.__storage_filesystem.device
                     or info.st_uid != os.geteuid() or info.st_mode & 0o077
                     or not info.st_mode & stat.S_IWUSR
                     or not info.st_mode & stat.S_IXUSR):
@@ -636,45 +652,76 @@ class DiagnosticExportService:
             raise DiagnosticExportError(
                 "diagnostic output directory is not admitted") from None
 
-    def __write_reserved(self, prepared: _PreparedBundle) -> DiagnosticExportResult:
-        """Verify, admit, write and release on the storage policy's owning thread."""
-        admitted = False
-        retain_reservation = False
-        directory_fd = -1
+    def __release_reservation(self) -> None:
         try:
-            if self.__storage_uncertain:
-                raise DiagnosticExportError("diagnostic storage state is uncertain")
-            directory_fd = self.__open_admitted_output(prepared.output_directory)
-            self.__storage_policy.admit(prepared.reserved_bytes, critical=False)
-            admitted = True
-            return self.__writer.write(prepared, directory_fd)
-        except _DiagnosticCleanupUncertain:
+            self.__storage_policy.release()
+        except Exception:
             self.__storage_uncertain = True
-            retain_reservation = True
             raise DiagnosticExportError(
                 "diagnostic storage state is uncertain") from None
-        finally:
-            if directory_fd >= 0:
-                os.close(directory_fd)
-            if admitted and not retain_reservation:
-                try:
-                    self.__storage_policy.release()
-                except Exception:
-                    self.__storage_uncertain = True
-                    raise DiagnosticExportError(
-                        "diagnostic storage state is uncertain") from None
 
-    def __remove_published(self, result: DiagnosticExportResult) -> bool:
-        """Durably drop a bundle whose Owner request no longer receives its name."""
+    @staticmethod
+    def __unlink_published(directory_fd: int, name: str) -> bool:
+        try:
+            os.unlink(name, dir_fd=directory_fd)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            return False
+        try:
+            os.fsync(directory_fd)
+        except OSError:
+            return False
+        return True
+
+    def __write_reserved(self, prepared: _PreparedBundle) -> _PublishedBundle:
+        """Verify, admit, write and release on the storage policy's owning thread."""
+        if self.__storage_uncertain:
+            raise DiagnosticExportError("diagnostic storage state is uncertain")
+        directory_fd = self.__open_admitted_output(prepared.output_directory)
+        try:
+            directory = os.fstat(directory_fd)
+            self.__storage_policy.admit(prepared.reserved_bytes, critical=False)
+            try:
+                result = self.__writer.write(prepared, directory_fd)
+            except _DiagnosticCleanupUncertain:
+                # Leftover bytes are unaccounted for, so keep the reservation.
+                self.__storage_uncertain = True
+                raise DiagnosticExportError(
+                    "diagnostic storage state is uncertain") from None
+            except BaseException:
+                self.__release_reservation()
+                raise
+            try:
+                self.__release_reservation()
+            except BaseException:
+                # The caller receives no bundle name when this failure is
+                # reported, so the published archive - including any
+                # Owner-selected raw media - must not remain readable.
+                self.__unlink_published(directory_fd, result.bundle_path.name)
+                raise
+            return _PublishedBundle(result, directory.st_dev, directory.st_ino)
+        finally:
+            os.close(directory_fd)
+
+    def __remove_published(self, published: _PublishedBundle) -> bool:
+        """Durably drop a bundle whose Owner request no longer receives its name.
+
+        The publication directory is re-opened by pathname, so its identity is
+        verified against the descriptor that received the archive. A renamed or
+        replaced directory means the bundle is not reachable here, and an absent
+        file is then not evidence of deletion.
+        """
         directory_fd = -1
         try:
-            directory_fd = self.__open_admitted_output(result.bundle_path.parent)
-            try:
-                os.unlink(result.bundle_path.name, dir_fd=directory_fd)
-            except FileNotFoundError:
-                pass
-            os.fsync(directory_fd)
-            return True
+            directory_fd = self.__open_admitted_output(
+                published.result.bundle_path.parent)
+            directory = os.fstat(directory_fd)
+            if (directory.st_dev != published.directory_device
+                    or directory.st_ino != published.directory_inode):
+                return False
+            return self.__unlink_published(
+                directory_fd, published.result.bundle_path.name)
         except (OSError, DiagnosticExportError):
             return False
         finally:
@@ -728,7 +775,7 @@ class DiagnosticExportService:
             await cls.__drain(worker)
             raise
 
-    async def __discard_published(self, published: DiagnosticExportResult) -> None:
+    async def __discard_published(self, published: _PublishedBundle) -> None:
         try:
             worker = self.__submit_storage(
                 partial(self.__remove_published, published))
@@ -742,7 +789,7 @@ class DiagnosticExportService:
     async def __write_bundle(self, prepared: _PreparedBundle) -> DiagnosticExportResult:
         worker = self.__submit_storage(partial(self.__write_reserved, prepared))
         try:
-            return await asyncio.shield(worker)
+            published = await asyncio.shield(worker)
         except asyncio.CancelledError:
             await self.__drain(worker)
             published = self.__completed(worker)
@@ -752,6 +799,7 @@ class DiagnosticExportService:
                 # survive on disk for a later reader.
                 await self.__discard_published(published)
             raise
+        return published.result
 
     async def export(self, action: DiagnosticExportAction) -> DiagnosticExportResult:
         await self._authorizer.require_owner_caller(action)

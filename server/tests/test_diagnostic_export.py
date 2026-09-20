@@ -28,6 +28,7 @@ from app.diagnostics import (
     SafeDiagnosticState,
 )
 from app.media.recording.model import RecordingError
+from app.media.recording.store import RootIdentity
 from app.storage.policy import FilesystemSpace, MainStoragePolicy, StorageLimits
 from tests.asgi import request
 
@@ -140,6 +141,7 @@ class StorageAdmission:
         self.active = False
         self.releases = 0
         self.denial = None
+        self.release_failure = None
         self.admit_threads = []
         self.release_threads = []
 
@@ -160,6 +162,8 @@ class StorageAdmission:
             raise AssertionError("STORAGE_POLICY_UNAVAILABLE")
         if not self.active:
             raise AssertionError("diagnostic reservation is not active")
+        if self.release_failure:
+            raise RuntimeError(self.release_failure)
         self.active = False
         self.releases += 1
 
@@ -176,12 +180,15 @@ class DiagnosticExportTests(unittest.IsolatedAsyncioTestCase):
         self.worker = ThreadPoolExecutor(max_workers=1)
         self.addCleanup(self.worker.shutdown)
         self.policy = self.worker.submit(StorageAdmission).result()
+        # The approved storage filesystem identity the policy is configured with.
+        admitted = os.stat(self.output)
+        self.storage_filesystem = RootIdentity(admitted.st_dev, admitted.st_ino)
 
     def make_service(self, authorizer, *, source=None, media=None, policy=None,
-                     storage_root=None):
+                     storage_filesystem=None):
         return DiagnosticExportService(
             authorizer, source or self.source, policy or self.policy,
-            self.worker, storage_root or self.output, media)
+            self.worker, storage_filesystem or self.storage_filesystem, media)
 
     def read_bundle(self, result):
         with ZipFile(result.bundle_path) as archive:
@@ -354,34 +361,66 @@ class DiagnosticExportTests(unittest.IsolatedAsyncioTestCase):
             0, self.worker.submit(lambda: policy.status().reserved_bytes).result())
 
     async def test_output_outside_the_admitted_filesystem_is_refused_before_admission(self):
-        service = self.make_service(
-            Permit(), media=self.media,
-            storage_root=self.output / "absent-storage-root")
-        with self.assertRaisesRegex(DiagnosticExportError, "not admitted"):
-            await service.export(DiagnosticExportAction(self.output, ("clip_a",)))
-        self.assertEqual(self.policy.reservations, [])
-        self.assertEqual(list(self.output.iterdir()), [])
+        admitted = self.storage_filesystem
+        foreign = (RootIdentity(admitted.device + 1, admitted.inode),
+                   RootIdentity(admitted.device + 7, 0))
+        for identity in foreign:
+            with self.subTest(device=identity.device):
+                service = self.make_service(
+                    Permit(), media=self.media, storage_filesystem=identity)
+                with self.assertRaisesRegex(DiagnosticExportError, "not admitted"):
+                    await service.export(
+                        DiagnosticExportAction(self.output, ("clip_a",)))
 
-        real_stat = os.stat
-        admitted_root = real_stat(self.output)
-
-        class ForeignFilesystemRoot:
-            st_mode = admitted_root.st_mode
-            st_dev = admitted_root.st_dev + 1
-            st_uid = admitted_root.st_uid
-
-        def foreign_stat(path, *args, **kwargs):
-            if isinstance(path, (str, Path)) and Path(path) == self.output:
-                return ForeignFilesystemRoot()
-            return real_stat(path, *args, **kwargs)
-
-        service = self.make_service(Permit(), media=self.media)
-        with patch("app.diagnostics.export.os.stat", side_effect=foreign_stat):
+        os.chmod(self.output, 0o777)
+        try:
+            service = self.make_service(Permit(), media=self.media)
             with self.assertRaisesRegex(DiagnosticExportError, "not admitted"):
                 await service.export(DiagnosticExportAction(self.output, ("clip_a",)))
+        finally:
+            os.chmod(self.output, 0o700)
+
         self.assertEqual(self.policy.reservations, [])
         self.assertEqual(self.media.resolved, [])
         self.assertEqual(list(self.output.iterdir()), [])
+
+    async def test_admission_binds_the_pinned_descriptor_without_resampling_a_path(self):
+        """Regression: no pathname sample may race admission on the owning worker."""
+        real_stat = os.stat
+        sampled_on_owning_worker = []
+
+        def observed_stat(path, *args, **kwargs):
+            # Only deployment paths matter; stdlib traceback/linecache machinery
+            # also stats source files on whichever thread raises.
+            if (threading.get_ident() == self.policy.owner
+                    and str(path).startswith(str(self.output))):
+                sampled_on_owning_worker.append(str(path))
+            return real_stat(path, *args, **kwargs)
+
+        service = self.make_service(Permit(), media=self.media)
+        with patch("app.diagnostics.export.os.stat", side_effect=observed_stat):
+            result = await service.export(
+                DiagnosticExportAction(self.output, ("clip_a",)))
+
+        self.assertTrue(result.bundle_path.exists())
+        self.assertEqual(sampled_on_owning_worker, [])
+        self.assertEqual(set(self.policy.admit_threads), {self.policy.owner})
+
+    async def test_release_failure_after_publication_removes_the_bundle(self):
+        """Regression: a caller that receives no bundle name leaves no archive."""
+        self.policy.release_failure = "synthetic release failure"
+        service = self.make_service(Permit(), media=self.media)
+        with self.assertRaisesRegex(
+                DiagnosticExportError, "diagnostic storage state is uncertain"):
+            await service.export(DiagnosticExportAction(self.output, ("clip_a",)))
+
+        self.assertEqual(len(self.policy.reservations), 1)
+        self.assertEqual(self.policy.releases, 0)
+        self.assertEqual(list(self.output.iterdir()), [])
+        with self.assertRaisesRegex(
+                DiagnosticExportError, "diagnostic storage state is uncertain"):
+            await service.export(DiagnosticExportAction(self.output))
+        self.assertEqual(len(self.policy.reservations), 1)
 
     async def test_directory_fsync_failure_removes_published_bundle_and_releases(self):
         calls = []
@@ -482,6 +521,51 @@ class DiagnosticExportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([item.name for item in self.output.iterdir()],
                          [later.bundle_path.name])
 
+    async def test_cancellation_cleanup_refuses_a_replaced_publication_directory(self):
+        """Regression: an absent file in a different directory is not deletion."""
+        entered = threading.Event()
+        proceed = threading.Event()
+        target = self.output / "bundles"
+        target.mkdir(mode=0o700)
+        moved = self.output / "bundles-renamed"
+        media = self.blocking_media_class(entered, proceed)()
+
+        class RenamingWorker:
+            def __init__(inner_self, executor):
+                inner_self.executor = executor
+                inner_self.calls = 0
+
+            def submit(inner_self, call):
+                inner_self.calls += 1
+                if inner_self.calls == 2:
+                    # Rename the publication directory away and put another
+                    # valid private directory on the same device at its path,
+                    # just before cancellation cleanup reopens that pathname.
+                    target.rename(moved)
+                    target.mkdir(mode=0o700)
+                return inner_self.executor.submit(call)
+
+        worker = RenamingWorker(self.worker)
+        service = DiagnosticExportService(
+            Permit(), self.source, self.policy, worker,
+            self.storage_filesystem, media)
+        export = asyncio.create_task(service.export(
+            DiagnosticExportAction(target, ("clip_a",))))
+        while not entered.is_set():
+            await asyncio.sleep(0)
+        export.cancel()
+        proceed.set()
+        with self.assertRaises(asyncio.CancelledError):
+            await export
+
+        self.assertEqual(worker.calls, 2)
+        self.assertEqual(list(target.iterdir()), [])
+        self.assertEqual(
+            len([item for item in moved.iterdir() if item.suffix == ".zip"]), 1)
+        with self.assertRaisesRegex(
+                DiagnosticExportError, "diagnostic storage state is uncertain"):
+            await service.export(DiagnosticExportAction(target))
+
     async def test_cancelled_write_drains_worker_before_next_export(self):
         entered = threading.Event()
         proceed = threading.Event()
@@ -557,6 +641,54 @@ class DiagnosticExportTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(second_result.bundle_path.exists())
         self.assertEqual(source.calls, 2)
         self.assertEqual(source.max_active, 1)
+
+    async def test_owner_biometric_template_and_embedding_never_reach_a_bundle(self):
+        """Issue #25 enrolls an Owner template locally; export is never its exit."""
+        template = b"SYNTHETIC_OWNER_TEMPLATE_BYTES"
+        encoded = template.hex()
+
+        class OwnerVerificationDiagnostics:
+            def collect(inner_self):
+                return (
+                    DiagnosticDocument(DiagnosticCategory.SECURITY, (
+                        DiagnosticField("owner_biometric.template", encoded),
+                        DiagnosticField("owner_biometric.embedding", encoded),
+                        DiagnosticField("status", SafeDiagnosticState.OK),
+                    )),
+                )
+
+        source = OwnerVerificationDiagnostics()
+        result = await self.make_service(Permit(), source=source).export(
+            DiagnosticExportAction(self.output))
+        files, manifest = self.read_bundle(result)
+
+        self.assertNotIn(encoded.encode(), result.bundle_path.read_bytes())
+        self.assertNotIn(template, result.bundle_path.read_bytes())
+        self.assertEqual(json.loads(files["diagnostics/security.json"]),
+                         {"status": "ok"})
+        self.assertEqual(
+            [item for item in manifest["exclusions"]
+             if item["reason"] == "owner_biometric"],
+            [{"category": "security", "reason": "owner_biometric", "count": 2}])
+
+        # Owner-selected raw media is not an exception for biometric material.
+        selected = await self.make_service(
+            Permit(), source=source, media=self.media).export(
+                DiagnosticExportAction(self.output, ("clip_a",)))
+        self.assertNotIn(encoded.encode(), selected.bundle_path.read_bytes())
+        self.assertEqual(selected.included_media_count, 1)
+
+        # A producer cannot smuggle a template through another field name.
+        for name in ("status", "component", "version", "reason_code",
+                     "owner_template", "owner_biometric.vector",
+                     "hardware_identifier.owner_face"):
+            with self.subTest(name=name), self.assertRaises((TypeError, ValueError)):
+                DiagnosticField(name, encoded)
+        for value in (template, bytearray(template), memoryview(template),
+                      [encoded]):
+            with self.subTest(value=type(value).__name__), self.assertRaises(
+                    TypeError):
+                DiagnosticField("owner_biometric.template", value)
 
     async def test_media_stream_is_generated_and_copied_in_bounded_chunks(self):
         media_size = 3 * 64 * 1024 + 17
@@ -656,15 +788,19 @@ class DiagnosticExportTests(unittest.IsolatedAsyncioTestCase):
             async def require_owner_export(inner_self, action, confirmation):
                 return None
 
-        for authorizer, worker, root in (
-                (ContentsOnly(), self.worker, self.output),
-                (object(), self.worker, self.output),
-                (Permit(), object(), self.output),
-                (Permit(), self.worker, str(self.output))):
-            with self.subTest(authorizer=type(authorizer).__name__), \
-                    self.assertRaises(TypeError):
+        cases = (
+            ("incomplete-owner-boundary", ContentsOnly(), self.worker,
+             self.storage_filesystem),
+            ("no-owner-boundary", object(), self.worker, self.storage_filesystem),
+            ("no-storage-worker", Permit(), object(), self.storage_filesystem),
+            ("path-instead-of-identity", Permit(), self.worker, self.output),
+            ("non-numeric-identity", Permit(), self.worker,
+             RootIdentity("device", "inode")),
+        )
+        for label, authorizer, worker, filesystem in cases:
+            with self.subTest(case=label), self.assertRaises(TypeError):
                 DiagnosticExportService(
-                    authorizer, self.source, self.policy, worker, root)
+                    authorizer, self.source, self.policy, worker, filesystem)
 
     def test_invalid_or_duplicate_selection_is_rejected_before_authorization(self):
         for selected in (("clip_a", "clip_a"), ("../clip",), ("",),

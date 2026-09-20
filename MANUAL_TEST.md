@@ -613,7 +613,13 @@ Run this only on the intended Main Server using synthetic, non-production diagno
 - [ ] verify Owner biometric templates/embeddings are excluded even from an explicitly initiated export, and no selected export authorizes external biometric processing/storage;
 - [ ] verify raw hardware serials/UUIDs are absent or redacted/hashed, while the manifest reports only safe categories and exclusion reasons;
 - [ ] verify raw monitoring media is absent by default and can be included only after an additional explicit Owner selection; do not use real monitoring media for this check;
+- [ ] before authorization, the confirmation names the included categories and every individually selected raw-media item; selecting one synthetic item includes only that item and selecting none includes no media;
+- [ ] the manifest records no excluded value, media ID, path, or other private deployment identifier, and the bundle stays deployment-local until the Owner separately chooses how to share it;
+- [ ] an export directed at a directory outside the approved storage filesystem, or attempted while the approved mount is missing or substituted, is refused before any space is reserved and never falls back to the root filesystem;
+- [ ] cancelling the Owner request or disconnecting mid-export leaves no bundle, partial file, or held reservation behind; repeat the disconnect and confirm archives do not accumulate;
 - [ ] record only sanitized PASS/FAIL and aggregate results locally; do not retain the test bundle after the local verification policy permits deletion.
+
+Results: **NOT RUN — Owner authorization/UI integration and Main Server network observation remain pending. Synthetic tests do not complete this acceptance.**
 
 ## V. Deployed Main Server install / update / rollback lifecycle
 
@@ -704,30 +710,6 @@ explicitly. Do not alter production protection to make a negative test pass.
 Never use a real secret as a fixture or publish an App key/token, reviewer token,
 raw private API response, or monitoring data. Cleanup only the identified
 synthetic test branches/PRs; no production data or unrelated rule deletion.
-
-## V. Privacy-safe diagnostic export
-
-Run this only after the Owner authorization UI/API is integrated. Use a disposable
-deployment with synthetic values and synthetic media; do not attach the resulting
-bundle or private deployment data to GitHub.
-
-- [ ] without an explicit Owner export action, no bundle is created and local
-  network observation shows no automatic upload/share traffic;
-- [ ] the confirmation identifies included categories and any individually
-  selected raw-media items before authorization;
-- [ ] the default export includes no raw monitoring media;
-- [ ] selecting one synthetic media item includes only that item, and cancelling
-  or selecting none includes no media;
-- [ ] credentials, pairing secrets, private keys, sensitive headers and Owner
-  biometric templates/embeddings remain absent even after explicit export;
-- [ ] hardware serials/UUIDs are transformed and raw values remain absent;
-- [ ] the manifest reports included categories and exclusion reasons without
-  recording excluded values, media IDs, paths or private deployment identifiers;
-- [ ] the bundle remains deployment-local until the Owner separately chooses how
-  to share it, and export does not enable external biometric processing/storage.
-
-Results: **NOT RUN — Owner authorization/UI integration and Main Server network
-observation remain pending. Synthetic tests do not complete this acceptance.**
 
 ## Issue #20 — Target Main detector acceptance (pending)
 
