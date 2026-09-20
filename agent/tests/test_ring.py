@@ -440,6 +440,68 @@ class RingTests(unittest.TestCase):
         self.assertEqual(self.store.segment_allocations(), before)
         self.assertEqual(self.ring.db.execute("SELECT count(*) FROM incidents").fetchone()[0], 0)
 
+    def test_late_trusted_capture_reserves_reactivated_incident_before_mutation(self):
+        self.warm()
+        incident = self.loss()
+        self.ring.tick(now_us=T0 + POST, clock_trusted=True)
+        self.assertEqual(self.ring.incident(incident, now_us=T0 + POST)["state"], "partial")
+        self.ring.close()
+        # Existing ordinary target, ten protected rows/references and one
+        # incident fit, but reactivating its future reservation does not.
+        self.ring = DiskRing(self.settings, self.store, ledger_maximum_bytes=250 * 4096,
+                             authority=AllowControls())
+        before = self.store.segment_allocations()
+        with self.assertRaisesRegex(RingRefused, "insufficient_ledger_capacity"):
+            self.ring.append(SOURCE, T0, T0 + 60 * SECOND, PAYLOAD,
+                             now_us=T0 + POST, clock_trusted=True)
+        self.assertEqual(self.store.segment_allocations(), before)
+        self.assertEqual(self.ring.db.execute("SELECT state FROM incidents WHERE id=?",
+                                              (str(incident),)).fetchone()[0], "partial")
+
+    def test_late_trusted_capture_with_room_completes_partial_incident(self):
+        self.warm()
+        incident = self.loss()
+        self.ring.tick(now_us=T0 + POST, clock_trusted=True)
+        for start in range(T0, T0 + POST, 60 * SECOND):
+            self.ring.append(SOURCE, start, start + 60 * SECOND, PAYLOAD,
+                             now_us=T0 + POST, clock_trusted=True)
+        self.assertEqual(self.ring.incident(incident, now_us=T0 + POST)["state"], "complete")
+
+    def test_delayed_completion_and_late_media_keep_original_end_based_expiry(self):
+        self.warm()
+        incident = self.loss()
+        delayed = T0 + POST + 24 * 3600 * SECOND
+        self.restart()
+        self.ring.tick(now_us=delayed, clock_trusted=True)
+        initial = self.ring.incident(incident, now_us=delayed)
+        self.assertEqual(initial["completed_at_us"], T0 + POST)
+        self.assertEqual(initial["expires_at_us"], T0 + POST + RETENTION)
+        for start in range(T0, T0 + POST, 60 * SECOND):
+            self.ring.append(SOURCE, start, start + 60 * SECOND, PAYLOAD,
+                             now_us=delayed, clock_trusted=True)
+        final = self.ring.incident(incident, now_us=delayed)
+        self.assertEqual(final["state"], "complete")
+        self.assertEqual(final["expires_at_us"], initial["expires_at_us"])
+
+    def test_first_trusted_tick_after_retention_expires_delayed_active_incident(self):
+        self.warm()
+        incident = self.loss()
+        delayed = T0 + POST + RETENTION + 15 * 24 * 3600 * SECOND
+        self.restart()
+        self.ring.tick(now_us=delayed, clock_trusted=False)
+        self.assertEqual(len(self.store.list_segments()), 10)
+        self.assertEqual(self.ring.incident(incident, now_us=delayed)["state"], "active")
+        self.ring.tick(now_us=delayed, clock_trusted=True)
+        self.assertEqual(self.ring.incident(incident, now_us=delayed)["state"], "deleted")
+        self.assertEqual(self.store.list_segments(), {})
+
+    def test_preserve_refuses_end_based_expiry_overflow_before_creating_incident(self):
+        self.configure()
+        end = 2**63 - 1 - RETENTION + 1
+        with self.assertRaises(RingRefused):
+            self.ring.preserve("camera_tamper", end - PRE, end, now_us=T0, clock_trusted=True)
+        self.assertEqual(self.ring.db.execute("SELECT count(*) FROM incidents").fetchone()[0], 0)
+
     def test_interrupted_deletion_resumes_and_preserves_shared_incident(self):
         self.warm()
         first = self.loss()

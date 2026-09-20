@@ -260,6 +260,7 @@ Unexpected Main Server communication loss:
 - [ ] segment gaps/shortened protection are reported truthfully;
 - [ ] protected incident has a 60-day agent-side expiry;
 - [ ] expiry cleanup removes it automatically after 60 days (use test clock/accelerated retention harness rather than waiting 60 real days where available);
+- [ ] restart or trusted-clock recovery after that deadline expires the incident immediately; delayed finalization/late media never extends `ended_at + 60 days`;
 - [ ] ordinary ring-buffer pressure does not delete an unexpired protected incident;
 - [ ] disk pressure produces explicit warning/hard-stop behavior before unsafe writes.
 

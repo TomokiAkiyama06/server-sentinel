@@ -177,7 +177,8 @@ class DiskRing:
         return (row["clock_trusted"] and profile is not None
                 and row["end"] - row["start"] == profile.segment_duration_us)
 
-    def _ledger_capacity(self, config, profiles, *, proposal=None, additional_segments=0, additional_protections=0):
+    def _ledger_capacity(self, config, profiles, *, proposal=None, additional_segments=0, additional_protections=0,
+                         reactivating=()):
         rows = self._rows()
         protected = sum(self._protected(row["id"]) for row in rows)
         carryover = 0
@@ -192,7 +193,8 @@ class DiskRing:
         segments = protected + carryover + max(len(rows) - protected - carryover, selected) + additional_segments
         incidents = self.db.execute("SELECT count(*) FROM incidents").fetchone()[0]
         protections = self.db.execute("SELECT count(*) FROM protection").fetchone()[0] + additional_protections
-        for incident in self.db.execute("SELECT * FROM incidents WHERE state='active'").fetchall():
+        active = self.db.execute("SELECT * FROM incidents WHERE state='active'").fetchall()
+        for incident in active + list(reactivating):
             linked = self.db.execute("SELECT segments.* FROM segments JOIN protection ON segment=segments.id "
                                      "WHERE incident=?", (incident["id"],)).fetchall()
             present = sum(self._trusted_profile_row(row, profiles) for row in linked)
@@ -395,7 +397,8 @@ class DiskRing:
             # Untrusted chronology may later overlap corrected trusted capture;
             # it cannot spend that capture's reserved post-window metadata.
             self._ledger_capacity(self.config, self.profiles, additional_segments=int(not clock_trusted),
-                                  additional_protections=len(incidents) if not clock_trusted else 0)
+                                  additional_protections=len(incidents) if not clock_trusted else 0,
+                                  reactivating=tuple(row for row in incidents if row["state"] != "active"))
             self._trim(now_us, trusted=clock_trusted)
             # Ordinary capacity remains a physical allocation limit, separate
             # from protected bytes. Never evict required pre-loss coverage.
@@ -480,7 +483,7 @@ class DiskRing:
         integer(start)
         integer(end)
         integer(now)
-        integer(now + RETENTION)
+        integer(end + RETENTION)
         if start >= end or self.config is None or type(trusted) is not bool:
             raise RingRefused("invalid_preservation_window")
         self._ledger_capacity(self.config, self.profiles, proposal=(start, end))
@@ -507,7 +510,7 @@ class DiskRing:
             return self._status(now_us, clock_trusted=clock_trusted)
 
     def _tick(self, now, trusted):
-        integer(now + RETENTION)
+        integer(now)
         for row in self.db.execute("SELECT id FROM incidents WHERE state='deleting'").fetchall():
             self._delete_incident(row["id"], now=now, trusted=trusted)
         if not trusted:
@@ -519,7 +522,7 @@ class DiskRing:
             state = "partial" if details["has_gaps"] or row["clock_uncertain"] else "complete"
             with self.ledger.transaction():
                 self.db.execute("UPDATE incidents SET state=?, completed=?, expires=? WHERE id=?",
-                                (state, now, now + RETENTION, row["id"]))
+                                (state, row["end"], row["end"] + RETENTION, row["id"]))
         for row in self.db.execute("SELECT id FROM incidents WHERE "
                                    "state IN ('complete','partial') AND expires<=?", (now,)).fetchall():
             self._delete_incident(row["id"], now=now, trusted=True)

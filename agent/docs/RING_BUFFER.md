@@ -155,6 +155,8 @@ and restart. Untrusted timestamps never spend the reserved slots for corrected
 trusted capture; admitting such segments requires additional row/reference room
 before writing. Status exposes insufficient room
 for the next incident as `STORAGE_PRESSURE / insufficient_ledger_capacity`.
+Late media that reactivates a completed/partial incident must also fit that
+incident's segment/reference reservation before reactivation or media writes.
 
 The admission bound deliberately does not assume average SQLite page packing.
 Schema-v1 bounded UUID/numeric records and indexes need no overflow pages. The
@@ -191,8 +193,9 @@ full-content integrity scan of every historical segment on every tick.
 Per-source interval unions expose actual coverage and exact gaps. A completed
 incident whose media later disappears reports `partial`. Multiple sources
 finalizing their last segment separately cannot leave a stale partial/complete
-result; late finalization re-evaluates coverage and anchors expiry at the actual
-completion. Clock-uncertain segments never count as trustworthy coverage.
+result; late finalization re-evaluates coverage without extending the protected
+interval's completion or expiry. Clock-uncertain segments never count as
+trustworthy coverage.
 
 The integration supplies trustworthy **local capture time**, independently of
 whether Main is reachable; Main loss alone does not mean the local monotonic
@@ -210,8 +213,11 @@ appends are refused as `clock_uncertain` and active incidents stay visibly
 uncertain. Trusted capture ordering uses only trusted segment endpoints, so a
 legacy untrusted future endpoint cannot block corrected capture after restart.
 
-Completion establishes `expires_at = completed_at + 60 days`. Trusted-clock ticks
-perform expiry; Owner-authorized early deletion does not need the clock to become
+Completion uses the protected interval's end, establishing
+`completed_at = ended_at` and `expires_at = ended_at + 60 days`. A delayed trusted
+tick immediately expires an incident whose deadline has already passed; restart,
+clock recovery and late finalization do not start another 60-day period.
+Owner-authorized early deletion does not need the clock to become
 trusted. Deletion intent is durable before unlink, shared references keep media
 needed by other incidents, and an interrupted delete resumes at restart/tick.
 Media-root loss never creates a fallback directory. Deleted-incident tombstones
