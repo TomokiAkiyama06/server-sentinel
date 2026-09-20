@@ -29,7 +29,10 @@ critical work supplied through the trusted recorder port can use the allowance.
 `admit_external` reserves bytes for optional non-recording local artifacts such
 as an Owner-initiated diagnostic bundle. It never runs retention or reclamation,
 so such an artifact cannot evict monitoring evidence to make room; it refuses
-with the current state whenever the deployment is not `NORMAL`.
+with the current state whenever the deployment is not `NORMAL`. It classifies
+the real filesystem condition first and then evaluates the projected allocation
+without persisting it, so a refused artifact never latches pressure and never
+pushes the next admissible recording into recovery-mode reclamation.
 The allowance conservatively caps resident critical segment bytes plus the new
 reservation (including after restart), and also bounds total quota overflow.
 No evidence classifier is implemented here. Cleanup tries expired completed

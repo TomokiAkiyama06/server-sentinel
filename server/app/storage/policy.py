@@ -358,17 +358,24 @@ class MainStoragePolicy:
         # Check identity before reserving, including on a substituted mount.
         self.guard_metadata()
         space, used, _, _ = self._read()
+        # Classify the real filesystem condition first, with no projected
+        # allocation included. This keeps genuine pressure and hard stop
+        # visible while never latching a state the deployment is not in.
+        self._state_for(space, used)
+        if self.state != StorageState.NORMAL:
+            # A failed earlier cleanup also keeps this optional work out.
+            raise RecordingError(self.state.value)
+        # Evaluate the projected allocation without persisting it. Latching the
+        # projection would push the next otherwise-admissible recording into
+        # recovery-mode reclamation and delete recordings, even though the
+        # refused artifact wrote nothing. `hard_reserve_bytes` is below
+        # `pressure_free_bytes` by construction, so a projection that clears
+        # this predicate cannot approach the reserve either.
+        if not self._within(space, used, total, media_bytes):
+            raise RecordingError("STORAGE_PRESSURE")
         self._reservation = True
         self._reserved_media = media_bytes
         self._reserved_total = total
-        try:
-            self._state_for(space, used)
-            if self.state != StorageState.NORMAL:
-                # A failed earlier cleanup also keeps this optional work out.
-                raise RecordingError(self.state.value)
-        except BaseException:
-            self.release()
-            raise
 
     def release(self) -> None:
         if threading.get_ident() != self._owner or not self._reservation:

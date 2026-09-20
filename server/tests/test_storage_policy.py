@@ -108,6 +108,25 @@ class StoragePolicyTests(unittest.TestCase):
         self.assertTrue(self.inventory.deleted)
         self.policy.release()
 
+    def test_rejected_external_reservation_does_not_latch_pressure(self):
+        """A refused optional artifact must not make the next recording reclaim."""
+        self.inventory.add(400, 89 * DAY_MS)
+        self.inventory.add(400, 89 * DAY_MS)
+        self.inventory.free = 350
+
+        with self.assertRaisesRegex(RecordingError, "STORAGE_PRESSURE"):
+            self.policy.admit_external(100)
+        self.assertEqual(StorageState.NORMAL, self.policy.state)
+        self.assertEqual([], self.events)
+        self.assertEqual(0, self.policy.status().reserved_bytes)
+
+        # The next admissible recording still runs outside recovery-mode
+        # reclamation, so no recording is deleted for a bundle that never wrote.
+        self.policy.admit(10, critical=False)
+        self.assertEqual([], self.inventory.deleted)
+        self.policy.release()
+        self.assertEqual(StorageState.NORMAL, self.policy.state)
+
     def test_external_artifact_reservation_covers_overhead_and_releases(self):
         self.policy.admit_external(100)
         self.assertEqual(120, self.policy.status().reserved_bytes)
