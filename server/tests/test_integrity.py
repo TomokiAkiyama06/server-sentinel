@@ -111,6 +111,20 @@ class CompareTests(TestCase):
         findings = compare(Inventory((disk(),)), Inventory((disk(), disk(slot="disk1"))))
         self.assertEqual(findings[0].state, State.UNVERIFIABLE)
 
+    def test_duplicate_exact_identities_are_unknown_before_property_comparison(self):
+        baseline = Inventory((disk(),))
+        current = (disk(size="2000"), disk(slot="disk9"))
+        for ordered in (current, tuple(reversed(current))):
+            findings = compare(baseline, Inventory(ordered))
+            self.assertEqual([item.state for item in findings], [State.UNVERIFIABLE])
+            self.assertEqual(findings[0].reason, "AMBIGUOUS_IDENTITY")
+
+    def test_duplicate_baseline_identities_do_not_derive_drift_from_arbitrary_pairing(self):
+        baseline = Inventory((disk(), disk(slot="disk9", size="2000")))
+        for current in ((disk(size="3000"),), (disk(size="3000"), disk(slot="disk9", size="4000"))):
+            findings = compare(baseline, Inventory(current))
+            self.assertEqual([item.state for item in findings], [State.UNVERIFIABLE, State.UNVERIFIABLE])
+
     def test_unapproved_inventory_never_becomes_baseline(self):
         findings = compare(None, Inventory((disk(),)))
         self.assertEqual(len(findings), 4)

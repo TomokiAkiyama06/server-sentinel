@@ -99,8 +99,14 @@ def compare(approved: Inventory | None, current: Inventory) -> tuple[Finding, ..
             continue
         candidates = [(index, item) for index, item in enumerate(current.components)
                       if index not in used and item.kind == old.kind and (not linked[index] or old_index in linked[index])]
-        match = next(((index, item) for index, item in candidates
-                      if old.identity and item.identity == old.identity), None)
+        exact = [(index, item) for index, item in candidates if old.identity and item.identity == old.identity]
+        if len(exact) > 1 or (old.identity and baseline_counts[(old.kind, old.identity)] > 1):
+            # Ambiguous identity invalidates drift inference before comparing
+            # any one candidate's properties. Sysfs order is not evidence.
+            findings.append(Finding(old.kind, State.UNVERIFIABLE, "AMBIGUOUS_IDENTITY"))
+            uncertain.update(index for index, _ in exact)
+            continue
+        match = exact[0] if exact else None
         if match is None:
             # A retained unique serial/WWID still identifies a device when an
             # optional field disappears and the kernel renumbers its location.
