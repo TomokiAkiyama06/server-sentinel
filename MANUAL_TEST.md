@@ -591,30 +591,63 @@ Run this only on the intended Main Server using synthetic, non-production diagno
 - [ ] verify raw monitoring media is absent by default and can be included only after an additional explicit Owner selection; do not use real monitoring media for this check;
 - [ ] record only sanitized PASS/FAIL and aggregate results locally; do not retain the test bundle after the local verification policy permits deletion.
 
-## V. Main Server deployment and first-run setup
+## V. Deployed Main Server install / update / rollback lifecycle
 
-Run these checks on an intended Main Server or an isolated deployment-equivalent host. Do not publish release artifacts, configuration, mount/device identities, private listener addresses, user identities, diagnostics, or monitoring media.
+Issue #47 remains open. The synthetic CI tests do not complete these checks: they require an actual deployed Main Ubuntu Server installed from a versioned artifact or the documented Docker Compose path, kept separate from any development checkout. Use a disposable host and disposable storage; never run the destructive cases against a production deployment. Do not commit, attach, or paste release artifacts, private deployment paths, hostnames/IPs, listener addresses, configuration values, credentials, mount/device identities, hardware identifiers, audit contents, or recorded media into GitHub.
 
-- [ ] install the versioned Main Server artifact or documented Compose path without relying on a mutable development checkout; verify the process uses its intended non-root runtime identity and private listener/trusted-proxy boundary;
-- [ ] perform a version update and a safe rollback using the documented lifecycle; verify deployment-configured configuration, state, recordings, and audit logs remain outside the release checkout and are retained;
-- [ ] safely simulate missing runtime configuration or an expected runtime mount and verify an explicit failure/degraded result without creating a root-filesystem fallback;
-- [ ] as the deployment Owner, run the first-run wizard through Welcome, owner bootstrap, storage, baseline/self-check, locale/time, source/profile, optional verification/Slack, and private human-access steps;
-- [ ] interrupt and resume the wizard, skip optional steps, and confirm unavailable dependent features remain explicitly pending rather than appearing complete;
-- [ ] verify the UI distinguishes Tailnet/private-network reachability from ServerSentinel invitation/permission, and no settings, secrets, raw hardware identifiers, or biometric data are exposed in general display/logs;
-- [ ] record only sanitized PASS/FAIL results locally.
+- [ ] install the versioned artifact / documented Compose path on a clean Main Ubuntu host without relying on a mutable development checkout; the service runs under its intended dedicated non-root runtime identity;
+- [ ] configuration, state/database, recordings, and audit logs resolve to the documented deployment locations outside the release checkout, and remain readable/writable only by the intended runtime account;
+- [ ] the human listener stays private-by-default behind the intended trusted-proxy boundary after install; it is not exposed to the public Internet and the proxy cannot be bypassed from an ordinary LAN client;
+- [ ] record a pre-update inventory (version/commit, recording count and sizes, starred recordings, protected incidents, audit record count with oldest/newest timestamps, camera source registrations, Owner-approved hardware baseline) in local sanitized notes only;
+- [ ] update to a newer version through the documented lifecycle; the reported version changes and every item of the pre-update inventory survives except for intended, documented migrations;
+- [ ] roll back to the previous version through the documented lifecycle; the service starts and the same inventory is still intact — no recording, starred recording, protected incident, or audit record is deleted, truncated, or silently rewritten;
+- [ ] when rolled-back code cannot safely read forward-migrated state, startup refuses and reports the incompatibility truthfully instead of destructively downgrading or discarding data; follow and record the documented recovery path;
+- [ ] repeat update and rollback with an in-progress recording and with storage near the safety reserve; no partial media is left counted as healthy, and the reserve is still honored afterwards;
+- [ ] on a disposable volume, safely simulate a missing/unmounted or substituted runtime mount and restart: install, update, and rollback refuse unsafe writes, report an explicit failed/degraded result, and never create or use a silent root-filesystem fallback directory;
+- [ ] start with missing or unreadable deployment configuration: the service fails closed with an actionable error and does not invent defaults for storage roots, listener boundary, or secrets;
+- [ ] after update and after rollback, the startup hardware-integrity comparison and the recording-health self-test run again; a changed approved component still requires Owner approval and still produces the immediate Owner notification of section S;
+- [ ] record only sanitized PASS/FAIL results and version identifiers locally; keep deployment paths, host identity, configuration, audit contents, and media private.
 
-## W. Security/admin audit retention
+## W. First-run setup wizard / initial configuration
 
-Use a disposable Main Server database and synthetic logical target IDs. Do not enter real secrets, biometric material, hardware serials/UUIDs, private network values, or monitoring media for this test.
+Issue #48 remains open. The synthetic CI and browser integration tests do not complete these checks: they require a freshly installed deployed Main Server with no prior state, reached from a real browser over the intended private access path. Use a disposable deployment and synthetic test identities. Do not publish deployment URLs/hostnames, invitation values, secrets, raw hardware identifiers, biometric material, or monitoring media.
+
+- [ ] on a deployment with no existing state, the first-run wizard is reachable only through the intended private listener/trusted-proxy boundary; an unauthenticated or uninvited ordinary network client cannot read or complete wizard steps and learns nothing about the deployment beyond a generic denial;
+- [ ] Owner bootstrap creates exactly one Owner: with two browsers/tabs submitting the bootstrap step concurrently, and with a resubmitted/replayed bootstrap request, exactly one Owner exists afterwards and later attempts are refused rather than creating a second Owner or overwriting the first;
+- [ ] after Owner creation, re-opening the wizard does not re-run bootstrap, reset the deployment, or let an unauthenticated visitor claim ownership;
+- [ ] as the deployment Owner, run the wizard through Welcome, owner bootstrap, storage, hardware baseline / recorder self-check, locale/time, sources, profiles, optional verification/Slack, and private human-access steps;
+- [ ] interrupt the wizard at each step (close the browser, restart the service, reboot the host); it resumes at the same step, previously completed steps are preserved, and no step silently repeats Owner creation;
+- [ ] the storage step verifies the configured recording root's mount, write permission, free space, and safety reserve; on a disposable volume, a missing/unmounted or substituted filesystem is refused with a truthful error and no root-filesystem fallback is created;
+- [ ] the hardware-baseline / recorder self-check step records the Owner-approved baseline, reports unavailable identifiers as `UNVERIFIABLE` rather than as a guarantee, and audits the Owner approval;
+- [ ] the locale/time step records time configuration, and excessive clock offset/uncertainty stays visible instead of being presented as reliable event ordering;
+- [ ] the source and profile steps complete with zero sources and with 1–4 configured sources; no step assumes a fixed two-camera topology, and absent capture hardware yields a truthful pending/unavailable state rather than a false ready state;
+- [ ] skip the optional Owner face verification and Slack steps; skipping leaves them disabled, unavailable dependent features remain explicitly pending rather than appearing complete, and completing them never enrolls a non-owner identity or enables audio capture;
+- [ ] the private-access step presents network-level private/Tailscale reachability and ServerSentinel invitation/permission as two independent approvals; Tailnet membership alone never becomes an application invitation, and the wizard neither requests Tailscale administrative credentials nor offers to modify ACLs/Grants;
+- [ ] invitations created in the wizard grant `live:view` and `recordings:view` independently, and a `live:view`-only test identity still cannot reach recordings or the historical timeline after the wizard finishes;
+- [ ] wizard screens, summaries, generated diagnostics, and service logs expose no settings secrets, pairing values, raw hardware serials/UUIDs, or biometric data;
+- [ ] the wizard shell stays usable while unfinished areas remain pending, and completing it leaves the deployment in the documented post-setup state;
+- [ ] record only sanitized PASS/FAIL results locally; keep deployment identifiers, invitation values, and any captured frames private.
+
+## X. Security / admin audit log and 90-day retention
+
+Issue #50 remains open. The synthetic CI tests do not complete these checks: they require the deployment-local audit store of a running Main Server, real service restarts, and a clock advanced across the retention boundary. Use a disposable Main Server database, synthetic test actors, synthetic logical target IDs, and synthetic sentinel values; drive retention with an accelerated/test clock or back-dated synthetic audit rows, and never back-date or delete production audit data. Do not enter or publish real secrets, biometric material, hardware serials/UUIDs, private network values, audit contents, actor identities, or monitoring media.
 
 - [ ] approve a hardware baseline as the deployment Owner and verify one fixed-action success record with a logical target ID;
-- [ ] change a security/admin setting and revoke one test camera, source, or capture node; verify fixed action, target kind, logical ID, UTC time, and outcome;
-- [ ] attempt an Owner-only operation as an invited/non-owner principal and verify the mutation does not run while a denied audit outcome is retained;
-- [ ] induce a safe synthetic mutation failure and verify a failed audit outcome without submitted values or exception text;
-- [ ] run retention with a test clock just past 90 days and verify only expired audit rows are removed while boundary/newer rows, recordings, factual timeline events, and capture-agent protected incidents remain unchanged;
-- [ ] inspect deployed database permissions and confirm the audit database remains deployment-local with no upload/reporting path.
+- [ ] change a security/admin setting and revoke one test camera, source, or capture node; each record carries actor category, fixed action, target kind, logical target ID, UTC time, and outcome, and nothing more identifying than that;
+- [ ] invitation, permission grant/change/revocation, and authorization denials are recorded with their outcome; attempt an Owner-only operation as an invited non-owner principal and verify the mutation does not run while the denied audit outcome is retained;
+- [ ] induce a safe synthetic mutation failure and verify a failed audit outcome is recorded without submitted values or exception text;
+- [ ] using synthetic sentinel inputs, verify records contain no credentials, pairing secrets, private keys, sensitive headers, raw biometric templates/embeddings, raw hardware serials/UUIDs, or raw media;
+- [ ] inspect deployed database permissions and confirm the audit store stays deployment-local with no upload/reporting path; any inclusion in a diagnostic export follows the explicit-Owner-action and redaction rules of section U;
+- [ ] the audit log remains separate from the unified factual timeline; the timeline gains no admin/security detail through it, and audit entries state observed actions and outcomes without asserting culprit, guilt, or causality;
+- [ ] server-side authorization restricts audit reading to Owner-level access: a non-owner identity with `live:view`, `recordings:view`, or both cannot read, alter, or delete audit records, including through copied URLs, and a capture-node credential cannot reach the audit routes at all;
+- [ ] confirm the configured audit retention default is 90 days and is independent of the 20-day recording retention: changing one does not change the other;
+- [ ] run retention with a test clock just past 90 days: only expired audit rows are removed while boundary and newer rows remain; run cleanup twice and confirm the second run is idempotent;
+- [ ] immediately before and after cleanup, compare recording inventory, starred recordings, factual timeline events, protected incidents, capture-agent protected incidents, and their expiry times: cleanup applies only to expired audit rows and changes no recording or protected-incident lifecycle;
+- [ ] interrupt cleanup (stop the service mid-run, simulate a read-only or full audit volume): the store stays consistent, the failure is reported as a visible fault instead of a silent success, and the next run completes without losing unexpired rows;
+- [ ] audit writes survive service restart and are not lost by an unclean shutdown; a failure to write an audit record for a security-sensitive action is itself surfaced rather than silently dropped;
+- [ ] record only sanitized PASS/FAIL counts and timings locally; keep audit exports, actor identities, and deployment values private.
 
-## X. GitHub review-gate enforcement
+## Y. GitHub review-gate enforcement
 
 Issue #4 remains open. The offline tests do not complete these checks. Follow
 `docs/REVIEW_GATE_SETUP.md` after Owner App registration and trusted publisher
