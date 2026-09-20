@@ -167,6 +167,19 @@ class StoragePolicyTests(unittest.TestCase):
         self.assertEqual(StorageState.NORMAL, self.policy.status().state)
         self.assertEqual(2, len(self.events))
 
+    def test_pressure_cleanup_reclaims_through_recovery_thresholds(self):
+        oldest = self.inventory.add(300, 80 * DAY_MS)
+        next_oldest = self.inventory.add(200, 81 * DAY_MS)
+        retained = self.inventory.add(700, 82 * DAY_MS)
+        self.assertEqual(StorageState.PRESSURE, self.policy.status().state)
+
+        self.policy.admit(100, critical=False)
+
+        self.assertEqual([oldest["id"], next_oldest["id"]], self.inventory.deleted)
+        self.assertEqual([retained], self.inventory.rows)
+        self.assertEqual(StorageState.NORMAL, self.policy.status().state)
+        self.policy.release()
+
     def test_star_race_rechecks_before_delete_and_stops_admission(self):
         row = self.inventory.add(1000, DAY_MS)
         self.inventory.before_delete = lambda item: item.update(starred=True)
@@ -216,6 +229,14 @@ class ExpectedFilesystemTests(unittest.TestCase):
             metadata.touch(mode=0o600)
             checker = ExpectedFilesystem(root, RootIdentity(info.st_dev, info.st_ino), metadata)
             self.assertGreater(checker.snapshot().available_bytes, 0)
+            root.chmod(0o500)
+            with self.assertRaises(RecordingError):
+                checker.snapshot()
+            root.chmod(0o700)
+            metadata.chmod(0o400)
+            with self.assertRaises(RecordingError):
+                checker.snapshot()
+            metadata.chmod(0o600)
             metadata.chmod(0o644)
             with self.assertRaises(RecordingError):
                 checker.snapshot()

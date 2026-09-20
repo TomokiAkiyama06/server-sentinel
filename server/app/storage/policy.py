@@ -73,7 +73,8 @@ class ExpectedFilesystem:
                 descriptor = next_descriptor
             info = os.fstat(descriptor)
             if (info.st_dev != device or not stat.S_ISREG(info.st_mode)
-                    or info.st_uid != os.geteuid() or info.st_mode & 0o077):
+                    or info.st_uid != os.geteuid() or info.st_mode & 0o077
+                    or not info.st_mode & stat.S_IWUSR):
                 raise OSError()
         finally:
             if descriptor >= 0:
@@ -93,6 +94,7 @@ class ExpectedFilesystem:
             info = os.fstat(descriptor)
             if (RootIdentity(info.st_dev, info.st_ino) != self.expected
                     or info.st_uid != os.geteuid() or info.st_mode & 0o077
+                    or not info.st_mode & stat.S_IWUSR
                     or not stat.S_ISDIR(info.st_mode)):
                 raise OSError()
             self._check_metadata(info.st_dev)
@@ -288,10 +290,15 @@ class MainStoragePolicy:
         self.cleanup_failed = False
         try:
             self._reclaimer.expired(self._clock(), self.limits.cleanup_batch_size)
+            recovering = self.state == StorageState.PRESSURE
             for _ in range(self.limits.cleanup_batch_size):
                 space, used, _, _ = self._read()
-                if (space.available_bytes - total >= self.limits.pressure_free_bytes
-                        and used + media_bytes <= self.limits.recording_limit_bytes):
+                free_threshold = (self.limits.recovery_free_bytes if recovering
+                                  else self.limits.pressure_free_bytes)
+                allocation_threshold = (self.limits.recovery_allocation_bytes if recovering
+                                        else self.limits.recording_limit_bytes)
+                if (space.available_bytes - total >= free_threshold
+                        and used + media_bytes <= allocation_threshold):
                     break
                 if self._reclaimer.oldest(1) == 0:
                     break
