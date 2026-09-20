@@ -64,12 +64,14 @@ class Session:
 
 @dataclass(frozen=True)
 class Evidence:
-    identity: Identity | None
-    trusted_transport: bool = True
-    human_listener: bool = True
-    identity_valid: bool = True
-    origin: OriginEvidence = OriginEvidence.MATCHING
-    csrf_valid: bool = True
+    # Absent evidence is failed evidence: every field defaults to the value
+    # that denies, so a caller states what it actually verified.
+    identity: Identity | None = None
+    trusted_transport: bool = False
+    human_listener: bool = False
+    identity_valid: bool = False
+    origin: OriginEvidence = OriginEvidence.FOREIGN
+    csrf_valid: bool = False
 
 
 @dataclass(frozen=True)
@@ -139,6 +141,45 @@ def permits(policy, evidence, principal, session, capability, now,
     permission = (Capability.RECORDINGS.value if capability is Capability.TIMELINE
                   else capability.value)
     return permission in principal.permissions
+
+
+@dataclass(frozen=True)
+class Enrollment:
+    """One locally authorized, single-use credential registration."""
+
+    identity: Identity
+    secret: str
+    expires: int
+    used: bool = False
+
+
+def bootstrap(identity, local_admin_confirmed, now, secret, lifetime=15 * 60):
+    """Model the local administrative bootstrap of the single Owner.
+
+    It creates the Owner principal with no credential yet and authorizes exactly
+    one enrollment. The command's authority, uniqueness transaction, and console
+    handling are outside the model; only the resulting policy state is here.
+    """
+    if not local_admin_confirmed:
+        raise PermissionError("local administration required")
+    return (Principal(identity, owner=True),
+            Enrollment(identity, secret, now + lifetime))
+
+
+def redeem(enrollment, principal, identity, secret, credential, now):
+    """Model the single-use redemption that registers the first credential.
+
+    A verified identity alone never enrolls: under a shared Tailscale login the
+    presented secret is what the holder of the local console has. Every refusal
+    is the one generic denial.
+    """
+    if (enrollment.used or now >= enrollment.expires
+            or secret != enrollment.secret
+            or identity != enrollment.identity
+            or identity != principal.identity):
+        raise PermissionError("generic denial")
+    return (enroll_credential(principal, credential),
+            replace(enrollment, used=True))
 
 
 def change_grants(principal, permissions, active=True):

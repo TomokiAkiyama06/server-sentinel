@@ -21,9 +21,9 @@ implementation/review of the full boundary.
 
 | Decision | Recommended choice | Alternative and consequence |
 |---|---|---|
-| Initial Owner and recovery | A privileged local administrative command on the Main Server creates/rebinds the single Owner. No remote first-visitor setup or remote account recovery. | A local browser ceremony needs a separate short-lived bootstrap credential and another attack surface. |
+| Initial Owner and recovery | A privileged local administrative command on the Main Server creates/rebinds the single Owner and locally authorizes its one credential enrollment. No remote first-visitor setup or remote account recovery. | Per-person credentials leave no alternative: enrolling on first connection would let any holder of the shared login claim Owner, and requiring a credential first makes the first login impossible. The single-use local authorization is the residual attack surface, and it is bounded, principal-bound, and non-reusable. |
 | Human identity and trust | Tailscale Serve over private HTTPS, forwarding to a loopback-only human backend on a host whose local processes are trusted. Match a deployment-scoped exact login identity to the application allowlist as a supplementary check, never as the authoritative authenticator. | An equivalent isolated authentication proxy can supply a stable issuer/subject, but needs its own reviewed adapter and deployment validation before support. |
-| Hostname reservation | A hostname dedicated to ServerSentinel on every scheme and port, serving only the human listener. Deployment and startup verification refuse any other application answering for that name. | Sharing the name by path keeps one browser origin, and sharing it by port still keeps one cookie scope because cookies are not port-scoped, so a compromised neighbor receives or replays the Owner's session; supporting either would need a different session and credential design. |
+| Hostname reservation | A hostname dedicated to ServerSentinel on every scheme and port, held by a dedicated network identity or a single-purpose node that the Owner records. Startup and daily checks enumerate actual listeners and proxy routes for the name and close access on any other answer. | Sharing the name by path keeps one browser origin, and sharing it by port still keeps one cookie scope because cookies are not port-scoped, so a neighbor receives or replays the Owner's session. Configuration enumeration alone cannot see a direct bind, so without the deployment isolation the checks only bound the exposure window. |
 | Sessions and revocation | Server-side opaque sessions bound to verified identity and to the per-person credential that established them; 30-minute idle and 12-hour absolute lifetimes, and a 5-minute user-verification freshness window for Owner operations. Recheck current grants on every request and cancel active delivery on revocation, with a maximum five-second watchdog. | Different lifetimes, a different freshness window, or a stricter stream-revocation bound change usability/resource tradeoffs and must be recorded before implementation. |
 
 No option permits Tailnet membership alone, automatic Tailscale policy changes,
@@ -39,6 +39,14 @@ a shared bearer password, or a permission of the normal application service
 account. An existing administrator-controlled local/SSH terminal may run it;
 ServerSentinel does not configure SSH or grant remote administration.
 
+Owner bootstrap must provision the Owner's first per-person credential, because
+the session contract below admits no one without a credential assertion. Leaving
+enrollment to the first browser connection would let any holder of the shared
+Tailscale login claim the Owner credential, since that login names the account
+and not the person; requiring an existing credential would make the first login
+impossible. The local boundary resolves both, and the steps are symmetric with
+recovery.
+
 1. Verify administrative authority, the expected deployment/state directory, and
    the trusted proxy configuration. Refuse symlink/path substitution and unsafe
    state-file ownership or permissions.
@@ -49,23 +57,38 @@ ServerSentinel does not configure SSH or grant remote administration.
 3. Within one transaction, create the deployment-scoped Owner principal only if
    none exists. Record an audit event without raw identity headers or credentials.
    Concurrent bootstrap attempts cannot create a second Owner.
-4. On the first browser connection, require the verified identity to exactly match
-   this binding. The local setup command does not create a remotely reusable
-   bootstrap token or bypass the private-network gate.
+4. In the same local step, authorize exactly one credential enrollment for that
+   Owner principal: a single-use, short-lived authorization bound to the
+   principal, shown only on the local administrative console, never transmitted,
+   logged, or stored in reusable form. Access stays closed until it is redeemed.
+5. The Owner redeems it once from a browser on the reserved origin and registers
+   an authenticator with user verification, which is the invitation-redemption
+   path of the shared-account ADR rather than a new route. Redemption requires
+   both the local authorization and a verified identity matching the binding, is
+   rate-limited, returns no application data, and grants no access by itself.
+   Where the Main Server has a usable local browser, the same ceremony runs over
+   the loopback boundary and the authorization never leaves the host.
+6. An expired, unredeemed, or already-redeemed authorization leaves human access
+   closed; only the local administrator can issue another. The first browser
+   connection therefore cannot enroll on verified identity alone. The
+   authorization is not a bearer credential for application data, is not
+   remotely reusable, and bypasses neither the private-network gate nor any
+   later credential assertion.
 
 Recovery requires the same administrative local boundary and explicit
 confirmation of the replacement identity. Stop admission of human requests,
 increment a deployment authorization generation, invalidate all human sessions,
 cancel active delivery, revoke the old Owner binding together with every
 credential enrolled under it, and bind exactly one new Owner atomically. The
-replacement Owner enrolls a credential through the same local boundary before
-any session exists, so recovery never leaves a usable credential behind.
-Persist the audit outcome before reopening admission; crash or storage failure
-leaves access closed. Media and non-owner invitations are preserved, but prior
-sessions must be re-established. Recovery does not erase recordings, alter
-biometric enrollment, change capture-node credentials, or operate Tailscale
-administration. Restoring an authorization database backup must also advance
-the generation and invalidate all restored sessions before serving.
+replacement Owner enrolls a credential through the same locally authorized,
+single-use enrollment as bootstrap step 4 before any session exists, so
+recovery never leaves a usable credential behind. Persist the audit outcome
+before reopening admission; crash or storage failure leaves access closed.
+Media and non-owner invitations are preserved, but prior sessions must be
+re-established. Recovery does not erase recordings, alter biometric enrollment,
+change capture-node credentials, or operate Tailscale administration. Restoring
+an authorization database backup must also advance the generation and
+invalidate all restored sessions before serving.
 
 ## Proposed proxy and identity boundary
 
@@ -78,7 +101,8 @@ Human browser
   -> permitted handler
 
 Capture agent -> separate authenticated ingest listener -> agent protocol only
-Local administrator -> protected local administrative command -> bootstrap/recovery
+Local administrator -> protected local administrative command
+  -> Owner bootstrap/recovery + one single-use credential enrollment
 ```
 
 The approved binding uses an explicit loopback address; wildcard or LAN listeners
@@ -183,16 +207,44 @@ therefore takes its own hostname. Another port, path prefix, subdirectory, or
 shared `__Host-` cookie scope does not separate it, and neither does a reverse
 proxy that merges both behind one name.
 
-Reserving the hostname is verified, not assumed. Deployment enumerates the
-Serve/reverse-proxy configuration for the whole name — every scheme and port,
-not only the configured origin — and records that its single route target is
-this human listener. Startup reads that same configuration and refuses to serve
-when any other mapping, alias, wildcard, port, or fallback also answers for the
-name, when the expected single mapping is absent, or when the configuration
-cannot be read; it fails closed instead of guessing. Any proxy configuration
-change repeats the check, and a deployment that cannot demonstrate the
-reservation keeps human access closed. The check is a deployment-boundary
-condition and precedes identity, session, and permission evaluation.
+Reserving the hostname is a property of the host, not of a configuration file,
+and the checks below detect violations rather than prevent them. Enumerating
+Serve/reverse-proxy routes is not sufficient on its own: any local process may
+bind another HTTPS port on the node's Tailscale address without appearing in
+that configuration, and it may do so after the check, which no configuration
+change would re-trigger. Because cookies are not port-scoped, such a listener
+receives the session cookie exactly as a configured neighbor would. Saying that
+startup refuses any other application on the name would therefore be a claim
+this design cannot keep.
+
+The reservation is consequently a deployment obligation, recorded and
+acknowledged by the Owner, met by one of two isolations: ServerSentinel holds
+its own network identity — a dedicated host, VM, or network namespace with its
+own Tailscale address, so no other process can bind the reserved name — or the
+node is administered as single-purpose, where only this deployment and its
+proxy may bind that address and the restriction is enforced outside the
+application by OS/service policy. This is the same trust assumption already
+stated for the loopback boundary: processes in that host/network namespace are
+trusted, and an untrusted shared host is unsupported.
+
+Within that obligation the application verifies what it can observe. At
+startup, and again on the existing daily schedule rather than only on
+configuration change, it enumerates the actual sockets bound to the reserved
+address together with the Serve/reverse-proxy routes for the whole name — every
+scheme and port, not only the configured origin — and refuses to serve when any
+listener or route other than this human listener and its proxy answers for the
+name, when the expected single mapping is absent, when the deployment record
+does not state which isolation is in force, or when the enumeration cannot be
+performed. It fails closed instead of guessing, and a violation found on a
+later check closes human access and notifies the Owner like any other integrity
+finding.
+
+The residual limitation is stated rather than designed away: a process that
+binds the reserved address between two checks can receive cookies until the
+next check, and the application cannot prevent a local process from binding at
+all. Detection bounds the exposure window; only the deployment isolation
+removes it. The reservation check precedes identity, session, and permission
+evaluation.
 
 The session is an additional application state boundary. Every human request
 still needs the same verified proxy identity and current invitation/grant; a
@@ -281,10 +333,10 @@ capture credentials are never accepted by the human boundary.
 
 | Threat or transition | Design evidence |
 |---|---|
-| First visitor claims Owner; replay/concurrent bootstrap | Local-only explicit bootstrap, uniqueness transaction, no bootstrap HTTP route |
+| First visitor claims Owner; shared-login holder enrolls the Owner credential; replay/concurrent bootstrap | Local-only explicit bootstrap, single-use local enrollment authorization, uniqueness transaction, no bootstrap HTTP route |
 | LAN/forwarded-header spoof; ingest-to-human bypass | Actual peer and listener separation; deployment reachability tests required |
 | Missing/duplicate/tagged/shared-but-uninvited identity | Strict adapter, no identity fallback, application allowlist |
-| Co-hosted application on the same origin, or on another port of the same hostname, reads or replays the session cookie | Hostname reserved across every scheme and port; deployment and startup verification of a single route target |
+| Co-hosted application on the same origin, or on another port of the same hostname, reads or replays the session cookie | Hostname held by a dedicated network identity or single-purpose node; startup and daily listener/route enumeration close access on any other answer, with the between-check window stated |
 | Shared Tailscale account holder without an invitation or per-person credential | Supplementary proxy identity; credential-backed session required on every human route |
 | Copied cookie/URL; wrong issuer; identity reassignment | Session identity binding; documented upstream login-reuse limitation |
 | Permission change, expiry, logout, recovery, re-invitation | Current state and generation validation; delivery cancellation |
@@ -298,13 +350,15 @@ transitions; it is neither production authentication code nor evidence that
 sockets, proxy headers, cryptographic cookies, CSRF, database transactions,
 clock handling, or real stream cancellation have been implemented. The model
 receives evidence as explicit inputs and tests policy composition, rather than
-pretending to verify those inputs. Origin exclusivity, the origin evidence of a
-request, and the credential that established a session enter the same way: the
-model checks that a deployment without a verified exclusive origin stays closed
-and that a session whose credential was revoked stops authorizing, but it
-cannot inspect proxy configuration or verify an authenticator. Session
-timeout/watchdog numbers remain proposals even though tests can exercise
-boundary values.
+pretending to verify those inputs. The hostname reservation, the origin
+evidence of a request, and the credential that established a session enter the
+same way, and every evidence field defaults to the value that denies. The model
+checks that a deployment without a verified reservation stays closed, that a
+bootstrapped Owner authorizes nothing until the single-use local enrollment is
+redeemed once, and that a session whose credential was revoked stops
+authorizing. It cannot enumerate listeners, inspect proxy configuration, or
+verify an authenticator. Session timeout/watchdog numbers remain proposals even
+though tests can exercise boundary values.
 
 ## Alternatives and consequences
 
@@ -315,8 +369,11 @@ boundary values.
 - Password/SSO account administration hosted by the project conflicts with the
   no-developer-cloud model. An independent deployment-local identity provider
   would add setup/recovery scope and needs its own Owner decision.
-- A local browser bootstrap can be designed safely but needs a secret ceremony;
-  the local command keeps privileged bootstrap outside the human HTTP listener.
+- A remote first-visitor bootstrap is rejected: under a shared Tailscale login
+it grants Owner to whoever connects first. The local command keeps the
+privileged decision outside the human HTTP listener and reduces the remote
+ceremony to redeeming one short-lived, single-use, principal-bound enrollment
+authorization.
 - Trusted-host loopback is simpler but does not protect against malicious local
   processes, a compromised proxy, host administrators, or upstream account reuse.
   The proposed design states these trust assumptions explicitly.

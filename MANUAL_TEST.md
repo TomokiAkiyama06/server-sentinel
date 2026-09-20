@@ -650,6 +650,19 @@ They are not completed by the Issue #6 synthetic policy model.
   with a session established, request the second port and observe that the
   browser attaches the `__Host-` session cookie there, which is why the whole
   hostname rather than one origin is reserved.
+- Bind an unrelated HTTPS listener directly to the node's Tailscale address from
+  a separate local process, creating no proxy mapping. Verify the startup and
+  daily listener enumeration detects it, closes human access and notifies the
+  Owner, and record explicitly that a bind occurring between two checks is not
+  detected until the next one. Then verify the recorded deployment isolation
+  (dedicated network identity, or single-purpose node) actually prevents that
+  bind, since the application cannot.
+- Verify Owner bootstrap provisions the first credential locally: the command
+  creates the Owner and a single-use short-lived enrollment authorization, human
+  access stays closed until it is redeemed once from the reserved origin with a
+  matching identity and user verification, and a second redemption, an expired
+  authorization, or a browser connection carrying only the shared login is
+  refused with the generic response.
 - Confirm a verified shared-account login with an active invitation but no
   credential-backed session is refused like an uninvited one, that user
   verification is required at every authentication, that revoking one credential

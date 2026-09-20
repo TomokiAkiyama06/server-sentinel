@@ -6,8 +6,8 @@ import unittest
 
 from tests.models.human_access import (
     Capability, Evidence, Identity, OriginEvidence, Policy, Principal,
-    change_grants, enroll_credential, fresh_session, permits, recover,
-    revoke_credential,
+    bootstrap, change_grants, enroll_credential, fresh_session, permits,
+    recover, redeem, revoke_credential,
 )
 
 
@@ -19,7 +19,10 @@ class HumanAccessContractTests(unittest.TestCase):
                                    credentials=frozenset({"credential-1"}))
         self.policy = Policy(approved_and_implemented=True,
                              reserved_hostname=True)
-        self.evidence = Evidence(self.identity)
+        # Every gate is stated explicitly; the dataclass defaults all deny.
+        self.evidence = Evidence(self.identity, trusted_transport=True,
+                                 human_listener=True, identity_valid=True,
+                                 origin=OriginEvidence.MATCHING, csrf_valid=True)
         self.session = fresh_session(self.principal, self.policy, 100)
 
     def allowed(self, capability=Capability.LIVE, **changes):
@@ -114,7 +117,8 @@ class HumanAccessContractTests(unittest.TestCase):
             Identity(self.identity.issuer, self.identity.login + " "),
         ):
             with self.subTest(identity=identity):
-                self.assertFalse(self.allowed(evidence=Evidence(identity)))
+                self.assertFalse(self.allowed(
+                    evidence=replace(self.evidence, identity=identity)))
                 self.assertFalse(self.allowed(session=replace(self.session, identity=identity)))
 
     def test_permission_matrix_and_history_mapping_exhaustively(self):
@@ -212,6 +216,50 @@ class HumanAccessContractTests(unittest.TestCase):
                 self.assertFalse(self.allowed(Capability.OWNER, principal=owner,
                                               session=session, mutation=True))
 
+    def test_evidence_defaults_deny(self):
+        # An unstated gate must never read as verified.
+        self.assertFalse(self.allowed(evidence=Evidence(self.identity)))
+
+    def test_bootstrap_provisions_the_owner_credential_locally(self):
+        with self.assertRaises(PermissionError):
+            bootstrap(self.identity, local_admin_confirmed=False, now=100,
+                      secret="enrollment-secret")
+        owner, enrollment = bootstrap(self.identity, local_admin_confirmed=True,
+                                      now=100, secret="enrollment-secret")
+        # The Owner exists but holds no credential, so nothing authorizes yet.
+        self.assertEqual(owner.credentials, frozenset())
+        for capability in Capability:
+            with self.subTest(capability=capability):
+                self.assertFalse(self.allowed(capability, principal=owner))
+        enrolled, spent = redeem(enrollment, owner, self.identity,
+                                 "enrollment-secret", "credential-owner", now=100)
+        self.assertEqual(enrolled.credentials, frozenset({"credential-owner"}))
+        self.assertTrue(self.allowed(
+            Capability.OWNER, principal=enrolled,
+            session=fresh_session(enrolled, self.policy, 100)))
+        # One use only: a second redemption is refused like any other.
+        with self.assertRaises(PermissionError):
+            redeem(spent, enrolled, self.identity, "enrollment-secret",
+                   "credential-second", now=100)
+
+    def test_shared_login_alone_cannot_redeem_the_bootstrap_enrollment(self):
+        owner, enrollment = bootstrap(self.identity, local_admin_confirmed=True,
+                                      now=100, secret="enrollment-secret")
+        other = Identity(self.identity.issuer, "roommate@example.invalid")
+        refusals = (
+            # Same shared Tailscale login, no local authorization.
+            (owner, self.identity, "guessed-secret", 100),
+            # Another login of the same shared account.
+            (owner, other, "enrollment-secret", 100),
+            # Expired authorization.
+            (owner, self.identity, "enrollment-secret", 100 + 15 * 60),
+        )
+        for principal, identity, secret, now in refusals:
+            with self.subTest(identity=identity, secret=secret, now=now):
+                with self.assertRaises(PermissionError):
+                    redeem(enrollment, principal, identity, secret,
+                           "credential-owner", now)
+
     def test_recovery_requires_local_admin_evidence_and_invalidates_every_session(self):
         owner = replace(self.principal, owner=True)
         replacement = Identity("synthetic-issuer", "new-owner@example.invalid")
@@ -221,10 +269,12 @@ class HumanAccessContractTests(unittest.TestCase):
         self.assertEqual(new_owner.credentials, frozenset())
         self.assertFalse(self.allowed(policy=policy))
         self.assertFalse(self.allowed(policy=policy, principal=new_owner,
-                                      evidence=Evidence(replacement)))
+                                      evidence=replace(self.evidence,
+                                                       identity=replacement)))
         enrolled = enroll_credential(new_owner, "credential-owner-2")
         self.assertTrue(self.allowed(Capability.OWNER, policy=policy, principal=enrolled,
-                                     evidence=Evidence(replacement),
+                                     evidence=replace(self.evidence,
+                                                      identity=replacement),
                                      session=fresh_session(enrolled, policy, 100)))
 
     def test_long_lived_delivery_rechecks_current_permission_for_each_emission(self):

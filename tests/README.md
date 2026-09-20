@@ -11,7 +11,10 @@ Use mocks, virtual sources, dependency injection, and synthetic/generated data. 
 `models/human_access.py` and `unit/test_human_access_contract.py` exercise the
 proposed ADR-0003 policy conjunction and state transitions using invented
 identities and a synthetic clock. The hostname reservation, per-request origin
-evidence, and the credential behind a session are explicit inputs there. They do
+evidence, and the credential behind a session are explicit inputs there, and
+every evidence field defaults to the value that denies. The bootstrap model
+covers only the resulting state: an Owner with no credential plus one
+single-use enrollment authorization, never the local command's authority. They do
 not open listeners, generate real credentials, verify proxy configuration,
 establish transport trust, implement authentication, or verify browser/network
 behavior. Approved runtime handlers still need independent

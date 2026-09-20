@@ -200,10 +200,16 @@ real Tailscale installation, LAN bypass resistance, or active stream cancellatio
 
 That proposal also requires a hostname reserved for the human listener on every
 scheme and port. No other application, static tree, alias, port, or catch-all
-answers for that name: one sharing a path would run in the same browser origin,
-and one on another HTTPS port would still receive the host-only session cookie,
-because cookies are not port-scoped. Deployment and startup verify the single
-route target for the whole name and otherwise fail closed.
+may answer for that name: one sharing a path would run in the same browser
+origin, and one on another HTTPS port would still receive the host-only session
+cookie, because cookies are not port-scoped. The reservation is a deployment
+obligation — a dedicated network identity for ServerSentinel, or a
+single-purpose node enforced outside the application — because a local process
+can bind another port on that address without appearing in any proxy
+configuration. Startup and daily checks enumerate actual listeners and proxy
+routes for the whole name and close human access on any other answer, which
+bounds rather than removes that exposure; the application cannot prevent a
+local process from binding.
 
 ## Capture-node pairing
 

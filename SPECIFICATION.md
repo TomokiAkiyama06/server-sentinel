@@ -904,7 +904,14 @@ proxy, session, cryptographic, or browser behavior.
 The proposal also reserves a whole hostname: that name serves ServerSentinel
 alone on every scheme and port. Path-based co-hosting shares one browser origin,
 and another port of the same name still shares the cookie scope because cookies
-are not port-scoped, so neither is supported. A verified trusted-proxy identity stays a supplementary check
+are not port-scoped, so neither is supported. Holding the name is a deployment
+obligation (a dedicated network identity, or a single-purpose node enforced
+outside the application), because a directly bound listener never appears in
+proxy configuration; the application's startup and daily listener/route checks
+close access when another answer is found, which bounds the exposure window
+instead of preventing the bind. Owner bootstrap also provisions the Owner's
+first per-person credential through the local administrative boundary, since no
+session exists without one. A verified trusted-proxy identity stays a supplementary check
 there; the authoritative per-person application credential is decided separately
 for Issue #6.
 
