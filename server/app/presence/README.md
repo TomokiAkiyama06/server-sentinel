@@ -90,10 +90,11 @@ reports that retirement as still pending.
 
 Owner-control audit records use the main 90-day audit retention period. The
 maintenance operation is bounded and deletes the oldest expired rows first.
-Timeline observations use the main 20-day recording-retention period; an
-unfinished critical delivery retains its observation until the work resolves,
-bounded by the main audit-retention period so a permanently unresolved action
-cannot keep observations on disk without limit.
+Timeline observations use the main 20-day recording-retention period. Only a
+confirmed movement/tamper event with unfinished critical delivery keeps its own
+observation past that period, until the work resolves and at most until the
+main audit-retention period, so a permanently unresolved action cannot keep
+observations on disk without limit. No other observation is held back.
 An event whose critical actions completed keeps an identity-only tombstone when
 its payload expires, so a delayed replay of the same identity stays a duplicate
 instead of preserving evidence and notifying a second time. Only events that

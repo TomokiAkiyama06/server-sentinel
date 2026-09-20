@@ -147,6 +147,8 @@ Defaults:
 
 Starred recordings may outlive normal recording retention.
 
+Timeline metadata for a confirmed server-movement or camera-tamper event whose evidence preservation or owner notification has not completed also outlives the recording default, until that action completes or the owner clears it and at most until the audit-log retention period. This never extends the retention of recorded video, thumbnails, or ordinary person/motion observations, and after that bound only the event identity and a count that the action never completed remain, with no observation content.
+
 Non-owner face crops, templates/embeddings, and facial profiles must not be stored as separate persistent libraries. People may still appear in ordinary configured video recordings subject to recording authorization and retention; this does not permit building a persistent facial identity library from those recordings.
 
 ## Capture-agent local storage

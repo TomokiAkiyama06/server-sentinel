@@ -289,7 +289,7 @@ No recording path is hard-coded to a personal disk/mount.
 ### STORE-003 Retention
 Default recording retention: **20 days**. Default audit-log retention: **90 days**.
 
-Documented exception: timeline data for a confirmed critical event whose evidence preservation or owner notification has not completed is retained beyond the recording-retention default until that action completes or the owner clears it, and at most until the audit-retention period. After that bound only a compact record that the action never completed remains, so unresolved work stays visible without growing on disk without limit. Nothing else outlives the configured retention.
+Documented exception: when a confirmed server-movement or camera-tamper event's evidence preservation or owner notification has not completed, that event's own timeline metadata is retained beyond the recording-retention default until the action completes or the owner clears it, and at most until the audit-retention period. It covers only those critical events: recorded video, thumbnails, and ordinary person/motion observations keep the configured retention. After that bound only the event identity and a count that the action never completed remain, with no observation content, and the owner sees the affected critical path as unavailable until it is resolved.
 
 ### STORE-004 Capacity ceiling
 The owner configures maximum recording allocation. Cleanup reacts to retention, configured allocation, and actual filesystem safety pressure.
