@@ -792,6 +792,19 @@ ServerSentinel permission revocation invalidates application access promptly. Ta
 
 ## 12. Dashboard UI
 
+The #8 foundation is a Japanese-default React/TypeScript shell with an English
+catalog and six initial placeholders. Its production entry denies access and
+makes no API calls; synthetic session/source providers exist only in tests.
+The injectable GET client permits only same-origin `/api/` paths, disables
+redirects/caching, and returns fixed local failure codes. This foundation
+establishes no session endpoint or authentication method.
+
+Until #10 supplies human-access integration, generated assets and loopback-only
+preview are development/test artifacts. Production integration must protect the
+full HTML/JS/CSS/icon/map/worker/config namespace through the human listener,
+independent of UI visibility. Never mount these assets on the capture listener
+or an unauthenticated static host. See `web/README.md`.
+
 Primary views:
 
 - Overview/status;

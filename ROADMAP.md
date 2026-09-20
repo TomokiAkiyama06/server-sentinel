@@ -13,7 +13,7 @@ Phases group capabilities rather than imposing a strict completion order. The de
 - [ ] dependency/model license policy
 - [ ] hardened review gate #4: capability assessment, offline policy tests and disabled ruleset generator prepared; Owner App setup, trusted publisher/collector and GitHub enforcement acceptance remain open (see `docs/REVIEW_GATE_SETUP.md`)
 
-Issue #1 closed when PR #2 merged after documentation/bootstrap acceptance and current HEAD/base reviews plus CI passed. CI foundation #5 is implemented. The #7 closed backend foundation now has synthetic coverage; its authorization prerequisite remains separate. Runtime/ADR Issues #6–#28 and the separately tracked #4 retain their own acceptance gates.
+Issue #1 closed when PR #2 merged after documentation/bootstrap acceptance and current HEAD/base reviews plus CI passed. CI foundation #5 is implemented. The backend and dashboard foundations have synthetic coverage; their authorization prerequisites remain separate. Runtime/ADR progress for Issues #6–#28 and the separately tracked #4 is tracked below and in GitHub.
 
 ## Phase 1 — Main server and web foundation
 
@@ -21,7 +21,7 @@ Issue #1 closed when PR #2 merged after documentation/bootstrap acceptance and c
 - [x] SQLite migration foundation
 - [x] validated deployment settings and database abstraction
 - [ ] health endpoints
-- [ ] React responsive dashboard shell
+- [x] React responsive dashboard shell (#8; synthetic/mock foundation, production access integration remains #10)
 - [ ] Docker Compose where appropriate
 - [ ] deployment-owner authorization ADR/bootstrap
 - [ ] trusted Tailscale/private-proxy identity boundary

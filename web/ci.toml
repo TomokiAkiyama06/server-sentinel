@@ -1,0 +1,6 @@
+version = 1
+
+[smoke]
+dockerfile = "Dockerfile.ci"
+normal = ["node", "tests/smoke.mjs", "normal"]
+error = ["node", "tests/smoke.mjs", "error"]
