@@ -62,7 +62,9 @@ holds the current ring against FIFO and reconfiguration. The first trusted
 capture/maintenance observation creates an uncertain incident covering the held
 ring and POST after that observation before releasing the hold. Status-only
 reads do not release it; without enough ledger/disk budget, the hold remains and
-the refusal is explicit. Such protection never claims exact loss-time coverage.
+the refusal is explicit. The hold is released in the same durable transition
+that creates its incident, so an interrupted release cannot leave a durable
+incident beside a marker that would admit a duplicate loss on recovery. Such protection never claims exact loss-time coverage.
 Critical `server_movement`/`camera_tamper` preservation uses an explicit interval.
 Profile changes are refused while post-loss protection is active so a new profile
 cannot invalidate an in-progress capacity estimate.

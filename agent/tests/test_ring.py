@@ -47,6 +47,21 @@ class Quota:
         return os.statvfs_result(values)
 
 
+class InterruptedHoldRelease:
+    """Connection proxy that interrupts only the pending-loss clearance."""
+
+    def __init__(self, connection):
+        self.connection = connection
+
+    def execute(self, statement, *arguments):
+        if statement.startswith("DELETE FROM settings WHERE key='pending_loss'"):
+            raise sqlite3.OperationalError("generated interruption")
+        return self.connection.execute(statement, *arguments)
+
+    def __getattr__(self, name):
+        return getattr(self.connection, name)
+
+
 class RingTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -960,6 +975,28 @@ class RingTests(unittest.TestCase):
         self.assertEqual(result["coverage"][str(SOURCE)]["intervals_us"], [(T0, T0 + POST)])
         self.assertTrue(result["has_gaps"])
         self.assertNotEqual(self.ring.status(now_us=T0 + POST, clock_trusted=True)["state"], "healthy")
+
+    def test_pending_hold_release_and_incident_creation_are_one_transition(self):
+        self.configure()
+        self.ring.observe_connection(authenticated=True, connected=True, unexpected=False,
+                                     now_us=T0, clock_trusted=False)
+        self.ring.observe_connection(authenticated=True, connected=False, unexpected=True,
+                                     now_us=T0, clock_trusted=False)
+        self.assertTrue(self.ring._pending_loss())
+        with patch.object(self.ring, "db", InterruptedHoldRelease(self.ring.db)):
+            with self.assertRaises(RingRefused):
+                self.append(T0)
+        self.restart()
+        # An interrupted release leaves neither a durable incident nor a
+        # cleared hold, so recovery cannot admit a duplicate loss incident
+        # instead of the existing one's required post-loss capture.
+        self.assertTrue(self.ring._pending_loss())
+        self.assertEqual(self.ring.db.execute("SELECT count(*) FROM incidents").fetchone()[0], 0)
+        self.assertEqual(self.ring._reclaimable(T0 + RETENTION), [])
+        identifier = self.append(T0)
+        self.assertFalse(self.ring._pending_loss())
+        self.assertEqual(self.ring.db.execute("SELECT count(*) FROM incidents").fetchone()[0], 1)
+        self.assertTrue(self.ring._protected(str(identifier)))
 
     def test_existing_tombstones_are_counted_without_reset_or_deletion(self):
         with self.ring.ledger.transaction():

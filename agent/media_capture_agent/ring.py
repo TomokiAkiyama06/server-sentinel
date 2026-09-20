@@ -83,9 +83,12 @@ class DiskRing:
                 # No reliable anchor existed at loss. Keep the held ring and
                 # cover through POST after the first recovered trusted time.
                 start = min([max(0, now - PRE)] + [item["start"] for item in self._rows()])
-                self._preserve("main_connection_lost", start, now + POST, now, False)
-                with self.ledger.transaction():
-                    self.db.execute("DELETE FROM settings WHERE key='pending_loss'")
+                # The hold is released in the same durable transition that
+                # creates its incident. A separate commit could leave the
+                # incident durable with the marker set, and recovery would then
+                # keep admitting a duplicate loss instead of its T+10 capture.
+                self._preserve("main_connection_lost", start, now + POST, now, False,
+                               clearing_pending=True)
         return trusted
 
     def _pending_loss(self):
@@ -571,7 +574,7 @@ class DiskRing:
         with self._operation():
             return self._preserve(reason, start_us, end_us, now_us, clock_trusted)
 
-    def _preserve(self, reason, start, end, now, trusted):
+    def _preserve(self, reason, start, end, now, trusted, *, clearing_pending=False):
         integer(start)
         integer(end)
         integer(now)
@@ -592,6 +595,8 @@ class DiskRing:
             for row in self._rows():
                 if row["end"] > start and row["start"] < end and UUID(row["source"]) in self.profiles:
                     self.db.execute("INSERT INTO protection VALUES (?,?)", (identifier, row["id"]))
+            if clearing_pending:
+                self.db.execute("DELETE FROM settings WHERE key='pending_loss'")
         self._tick(now, trusted)
         return UUID(identifier)
 
