@@ -79,16 +79,26 @@ def compare(approved: Inventory | None, current: Inventory) -> tuple[Finding, ..
         return tuple(Finding(kind, State.UNVERIFIABLE, "BASELINE_REQUIRED") for kind in Kind)
     findings = []
     used = set()
+    uncertain = set()
     identity_counts = Counter((item.kind, item.identity) for item in current.components if item.identity)
     baseline_counts = Counter((item.kind, item.identity) for item in approved.components if item.identity)
     fields = Counter((item.kind, key, value) for item in current.components for key, value in item.identity)
     approved_fields = Counter((item.kind, key, value) for item in approved.components for key, value in item.identity)
-    for old in approved.components:
+    # Reserve identity-linked observations before weaker/location matching;
+    # an earlier anonymous baseline entry must not consume a later known disk.
+    linked = {}
+    for index, item in enumerate(current.components):
+        linked[index] = {old_index for old_index, old in enumerate(approved.components)
+                         if old.kind == item.kind and old.identity and (
+                             old.identity == item.identity or any(fields[(old.kind, key, value)] == 1
+                                                                  and approved_fields[(old.kind, key, value)] == 1
+                                                                  for key, value in set(old.identity) & set(item.identity)))}
+    for old_index, old in enumerate(approved.components):
         if old.kind in current.unavailable:
             findings.append(Finding(old.kind, State.UNVERIFIABLE, "PROBE_UNAVAILABLE"))
             continue
         candidates = [(index, item) for index, item in enumerate(current.components)
-                      if index not in used and item.kind == old.kind]
+                      if index not in used and item.kind == old.kind and (not linked[index] or old_index in linked[index])]
         match = next(((index, item) for index, item in candidates
                       if old.identity and item.identity == old.identity), None)
         if match is None:
@@ -100,9 +110,24 @@ def compare(approved: Inventory | None, current: Inventory) -> tuple[Finding, ..
                               for key, value in set(old.identity) & set(item.identity))]
             if len(partial) == 1:
                 match = partial[0]
+            elif len(partial) > 1:
+                findings.append(Finding(old.kind, State.UNVERIFIABLE, "AMBIGUOUS_IDENTITY"))
+                uncertain.update(index for index, _ in partial)
+                continue
         if match is None:
-            match = next(((index, item) for index, item in candidates
-                          if (not old.identity or not item.identity) and item.properties == old.properties), None)
+            # Missing values cannot contradict an approved device. A unique
+            # identity-less candidate with unreadable capacity/model still
+            # prevents a reused old location from proving substitution.
+            old_properties = dict(old.properties)
+            weak = [(index, item) for index, item in candidates
+                    if (not old.identity or not item.identity)
+                    and all(old_properties[key] == value for key, value in item.properties if key in old_properties)]
+            if len(weak) == 1:
+                match = weak[0]
+            elif len(weak) > 1:
+                findings.append(Finding(old.kind, State.UNVERIFIABLE, "AMBIGUOUS_IDENTITY"))
+                uncertain.update(index for index, _ in weak)
+                continue
         if match is None:
             match = next(((index, item) for index, item in candidates
                           if item.location == old.location), None)
@@ -129,6 +154,6 @@ def compare(approved: Inventory | None, current: Inventory) -> tuple[Finding, ..
     for kind in (current.unavailable | approved.unavailable) - covered:
         findings.append(Finding(kind, State.UNVERIFIABLE, "PROBE_UNAVAILABLE"))
     for index, item in enumerate(current.components):
-        if index not in used and item.kind not in current.unavailable:
+        if index not in used and index not in uncertain and item.kind not in current.unavailable:
             findings.append(Finding(item.kind, State.NEW_DEVICE, "UNAPPROVED_COMPONENT"))
     return tuple(findings)

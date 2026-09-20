@@ -76,6 +76,37 @@ class CompareTests(TestCase):
         findings = compare(Inventory((disk(),)), Inventory((disk("synthetic-replacement"), disk("", slot="disk9"))))
         self.assertEqual([item.state for item in findings], [State.UNVERIFIABLE, State.NEW_DEVICE])
 
+    def test_incomplete_moved_disk_is_unknown_before_reused_location(self):
+        for properties in ((), (("model", "Synthetic Disk"),)):
+            incomplete = Component(Kind.STORAGE, "disk9", properties, (), False)
+            findings = compare(Inventory((disk(),)), Inventory((disk("synthetic-replacement"), incomplete)))
+            self.assertEqual([item.state for item in findings], [State.UNVERIFIABLE, State.NEW_DEVICE])
+
+    def test_multiple_incomplete_candidates_are_unknown_without_arbitrary_binding(self):
+        current = Inventory((disk("synthetic-replacement"),
+                             Component(Kind.STORAGE, "disk8", (), (), False),
+                             Component(Kind.STORAGE, "disk9", (), (), False)))
+        findings = compare(Inventory((disk(),)), current)
+        self.assertEqual([item.state for item in findings], [State.UNVERIFIABLE, State.NEW_DEVICE])
+        self.assertEqual(findings[0].reason, "AMBIGUOUS_IDENTITY")
+
+    def test_conflicting_capacity_is_not_matched_as_incomplete_moved_disk(self):
+        changed = Component(Kind.STORAGE, "disk9", (("capacity_bytes", "2000"),), (), False)
+        findings = compare(Inventory((disk(),)), Inventory((disk("synthetic-replacement"), changed)))
+        self.assertEqual([item.state for item in findings], [State.CHANGED, State.NEW_DEVICE])
+
+    def test_weak_or_location_match_cannot_consume_another_approved_disk(self):
+        current = Inventory((disk("synthetic-b", slot="disk0"), disk("", slot="disk9")))
+        for first in (disk(""), disk("synthetic-a")):
+            findings = compare(Inventory((first, disk("synthetic-b", slot="disk1"))), current)
+            self.assertEqual([item.state for item in findings], [State.UNVERIFIABLE, State.OK])
+
+    def test_conflicting_unique_links_are_ambiguous_not_missing(self):
+        old = Component(Kind.STORAGE, "disk0", (), (("serial", "synthetic-a"), ("wwid", "synthetic-w")))
+        current = Inventory((Component(Kind.STORAGE, "disk8", (), (("serial", "synthetic-a"),)),
+                             Component(Kind.STORAGE, "disk9", (), (("wwid", "synthetic-w"),))))
+        self.assertEqual([item.state for item in compare(Inventory((old,)), current)], [State.UNVERIFIABLE])
+
     def test_duplicate_unique_identity_not_ok(self):
         findings = compare(Inventory((disk(),)), Inventory((disk(), disk(slot="disk1"))))
         self.assertEqual(findings[0].state, State.UNVERIFIABLE)
