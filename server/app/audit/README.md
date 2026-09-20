@@ -64,8 +64,11 @@ Every audit write — success, failure, denial and retention cleanup — is admi
 through an injected storage reservation, so audit rows, their rollback journal
 and this subsystem's transaction metadata can never spend the hard filesystem
 reserve. `create_app(storage_reservation=...)` receives the deployment's Main
-Server storage admission; when a deployment has not bound its storage policy
-yet, no reservation is held and the remaining guarantees are unchanged. Owner
+Server storage admission, which this subsystem consumes rather than defines: it
+never invents a numeric filesystem reserve of its own. Until the Main Server
+binds its storage policy, `application.state.audit_storage_admitted` is false,
+so the unadmitted state is explicit rather than assumed, and the remaining
+guarantees are unchanged. Owner
 operations that already own an admitted reservation, such as the recording
 store's starred/delete transactions, pass it as `reservation=` so the shared
 transaction stays admitted until it commits or rolls back. A refused admission

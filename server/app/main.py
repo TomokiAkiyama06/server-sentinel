@@ -98,6 +98,9 @@ def create_app(settings: Settings, *, database: Database | None = None,
     application.state.database = store
     application.state.human_authorizer = human_authorizer or DenyAll()
     application.state.audit_store = audit_store
+    # Whether audit writes are admitted is explicit deployment state, not an
+    # assumption: it is false until the Main Server storage policy is bound.
+    application.state.audit_storage_admitted = storage_reservation is not None
     application.state.audit_retention = audit_retention
     application.state.owner_administration = owner_administration
     # Do not include api.system.router before approved permission enforcement.

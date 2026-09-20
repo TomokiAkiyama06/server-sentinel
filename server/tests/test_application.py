@@ -127,6 +127,9 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
 
         application = create_app(self.settings, storage_reservation=reservation,
                                  audit_cleanup_interval_seconds=0.01)
+        self.assertTrue(application.state.audit_storage_admitted)
+        # An application without a bound storage policy says so explicitly.
+        self.assertFalse(self.application.state.audit_storage_admitted)
         with closing(application.state.database.connect()) as connection:
             migrate(connection, APPLICATION_MIGRATIONS)
         old = datetime(2020, 1, 1, tzinfo=timezone.utc)

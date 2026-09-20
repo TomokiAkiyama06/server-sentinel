@@ -102,7 +102,8 @@ class OwnerAuditService:
 
     def execute_transactional(self, actor_context: object, *, action: AuditAction,
                               target_kind: TargetKind, target_logical_id: UUID,
-                              operation: Callable[[sqlite3.Connection], Result],
+                              operation: Callable[..., Result],
+                              prepare: Callable[[], object] | None = None,
                               connection: sqlite3.Connection | None = None,
                               reservation: Callable[[], ContextManager] | None = None) -> Result:
         """Commit the mutation and success audit in one SQLite transaction.
@@ -112,15 +113,22 @@ class OwnerAuditService:
         On mutation/audit failure the shared transaction rolls back, then a
         separate bounded failure record is attempted. An audit append failure
         can therefore never leave only the sensitive mutation committed.
+
+        ``prepare`` runs after authorization and before the transaction opens,
+        for validation that must not hold a database write lock, such as
+        blocking device discovery. It is not run for a denied actor, its result
+        is passed to ``operation``, and its failure is audited like any other.
         """
         validate_action_target(action, target_kind, target_logical_id)
         if reservation is not None and not callable(reservation):
             raise AuditValidationError("invalid audit storage reservation")
+        if prepare is not None and not callable(prepare):
+            raise AuditValidationError("invalid audit operation preparation")
         self._authorize(actor_context, action, target_kind, target_logical_id,
                         connection=connection, reservation=reservation)
 
         def run(active):
-            result = operation(active)
+            result = operation(active) if prepare is None else operation(active, prepared)
             self.store.append_on(
                 active, actor_category=ActorCategory.OWNER, action=action,
                 target_kind=target_kind, target_logical_id=target_logical_id,
@@ -129,6 +137,9 @@ class OwnerAuditService:
             return result
 
         try:
+            # Preparation stays outside the transaction so slow validation
+            # cannot hold the database write lock against other writers.
+            prepared = prepare() if prepare is not None else None
             boundary = reservation() if reservation is not None else nullcontext()
             with boundary:
                 if connection is None:

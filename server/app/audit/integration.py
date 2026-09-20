@@ -85,12 +85,18 @@ class OwnerAdministration:
         )
 
     def approve_uvc(self, actor_context, adapter, source_id, candidate):
-        """Approve through the adapter; its transaction-aware hook is required."""
+        """Approve through the adapter; its transaction-aware hook is required.
+
+        Device discovery and candidate validation run after authorization and
+        before the audited transaction, so no denied actor triggers a scan and
+        no hardware I/O holds the database write lock.
+        """
         approved = self.service.execute_transactional(
             actor_context, action=AuditAction.APPROVE_CAMERA,
             target_kind=TargetKind.CAMERA, target_logical_id=source_id,
-            operation=lambda connection: adapter.approve_source_on(
-                connection, source_id, candidate,
+            prepare=lambda: adapter.prepare_approval(source_id, candidate),
+            operation=lambda connection, prepared: adapter.approve_source_on(
+                connection, prepared,
             ),
         )
         adapter.accept_committed_approval(source_id, approved)

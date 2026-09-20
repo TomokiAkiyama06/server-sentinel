@@ -1,4 +1,4 @@
-from contextlib import closing
+from contextlib import closing, contextmanager
 from dataclasses import replace
 from pathlib import Path
 import tempfile
@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 from app.audit import (
     AuditAction, AuditOutcome, AuditStorageError, AuditStore, OwnerAuditService,
+    OwnerAuthorizationError,
 )
 from app.audit.integration import OwnerAdministration
 from app.cameras.registry import CameraRegistry, CaptureProfile, SourceHealthState, SourceType
@@ -223,7 +224,9 @@ class UvcRegistryTests(unittest.TestCase):
         self.adapter._approved_handoffs[self.source.id] = weak
         with closing(self.database.connect()) as connection:
             connection.execute("BEGIN IMMEDIATE")
-            self.adapter.approve_source_on(connection, self.source.id, replacement)
+            self.adapter.approve_source_on(
+                connection, self.adapter.prepare_approval(self.source.id, replacement),
+            )
             connection.commit()
         # The stale handoff never binds a device the Owner did not select; the
         # superseded approval falls back to conservative manual intervention.
@@ -234,6 +237,50 @@ class UvcRegistryTests(unittest.TestCase):
             SourceHealthState.MANUAL_INTERVENTION_REQUIRED,
             self.registry.get_source(self.source.id).health_state,
         )
+
+    def test_device_scan_never_runs_inside_the_audited_transaction(self):
+        class PermitOwner:
+            def require_owner(self, actor_context):
+                if actor_context != "synthetic-owner":
+                    raise PermissionError("denied")
+
+        audit = AuditStore(self.database)
+        admin = OwnerAdministration(
+            OwnerAuditService(audit, PermitOwner()), self.registry,
+        )
+        scans = []
+        original_scan = self.discovery.scan
+
+        def counted_scan():
+            scans.append(True)
+            return original_scan()
+
+        self.discovery.scan = counted_scan
+        original_transaction = audit.transaction
+        inside = []
+
+        @contextmanager
+        def watched(*args, **kwargs):
+            before = len(scans)
+            with original_transaction(*args, **kwargs) as connection:
+                yield connection
+            inside.append(len(scans) - before)
+
+        with patch.object(audit, "transaction", side_effect=watched):
+            admin.approve_uvc(
+                "synthetic-owner", self.adapter, self.source.id, self.camera,
+            )
+        # Blocking USB/UVC discovery must not hold the database write lock.
+        self.assertTrue(scans)
+        self.assertEqual([0], inside)
+
+        # A denied actor never reaches device discovery either.
+        scans.clear()
+        with self.assertRaises(OwnerAuthorizationError):
+            admin.approve_uvc("not-owner", self.adapter, self.source.id, self.camera)
+        self.assertEqual([], scans)
+        with self.assertRaises(ValueError):
+            self.adapter.approve_source_on(object(), self.camera)
 
     def make_adapter(self):
         return LocalUvcAdapter(self.registry, emit_audit=self.events.append,

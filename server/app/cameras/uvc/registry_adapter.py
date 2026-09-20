@@ -1,6 +1,8 @@
 """Internal registry integration; authorization belongs to the calling Owner boundary."""
 
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from uuid import UUID
 
 from app.cameras.registry import CaptureProfile, SourceHealthState, SourceType
 from .capture import MmapCapture, VideoProfile
@@ -19,6 +21,15 @@ def capture_profile(profile):
     if profile.codec is not None or profile.bitrate_bps is not None:
         raise ValueError("UVC codec and bitrate controls are not supported")
     return VideoProfile(profile.width, profile.height, profile.fps, profile.pixel_format)
+
+
+@dataclass(frozen=True)
+class PreparedApproval:
+    """One Owner selection already validated against a current device scan."""
+
+    source_id: UUID
+    candidate: DeviceEvidence = field(repr=False)
+    serial_ambiguous: bool
 
 
 class LocalUvcAdapter:
@@ -106,12 +117,11 @@ class LocalUvcAdapter:
                               profile=capture_profile(source.desired_capture_profile))
         session.controller.approve(candidate, scan.devices)
 
-    def approve_source_on(self, connection, source_id, candidate):
-        """Atomically persist an idle Owner selection with its audit record.
+    def prepare_approval(self, source_id, candidate):
+        """Validate an Owner selection against the current devices.
 
-        A live session must be stopped by its supervisor before reapproval. This
-        avoids an in-memory/physical-camera transition escaping SQLite rollback.
-        The next poll starts a fresh recovery-fenced session from this approval.
+        Device discovery runs here, before the audited transaction opens, so a
+        slow or blocking USB/UVC scan never holds the database write lock.
         """
         source = self._source(source_id)
         scan = self.discovery.scan()
@@ -123,20 +133,38 @@ class LocalUvcAdapter:
             candidate.strong_key is not None and device.strong_key == candidate.strong_key
             for device in scan.devices
         )
+        return PreparedApproval(source.id, candidate,
+                                candidate.strong_key is not None and peers > 1)
+
+    def approve_source_on(self, connection, prepared):
+        """Atomically persist a prepared idle Owner selection with its audit.
+
+        A live session must be stopped by its supervisor before reapproval. This
+        avoids an in-memory/physical-camera transition escaping SQLite rollback.
+        The next poll starts a fresh recovery-fenced session from this approval.
+        No device discovery runs here, so the transaction holds no hardware I/O.
+        """
+        if not isinstance(prepared, PreparedApproval):
+            raise ValueError("owner approval was not prepared")
+        source = self._source(prepared.source_id)
+        session = self.sessions.get(prepared.source_id)
+        if (session is not None and not session.stopped) or not source.enabled:
+            raise ValueError("candidate is unavailable or approval session is active")
         self.registry.update_source_on(connection, source.id, capabilities={
-            **source.capabilities, "uvc_formats": list(candidate.formats), "video_only": True,
+            **source.capabilities, "uvc_formats": list(prepared.candidate.formats),
+            "video_only": True,
         })
         self.store.approve_on(
-            connection, source.id, candidate,
-            serial_ambiguous=candidate.strong_key is not None and peers > 1,
+            connection, source.id, prepared.candidate,
+            serial_ambiguous=prepared.serial_ambiguous,
         )
         if session is not None:
             # Runtime supervisor serializes this source. Discarding a stopped
             # cache is safe even if the transaction later rolls back: the next
             # poll reconstructs the prior durable approval and recovery latch.
             session.supersede_stopped_session()
-            del self.sessions[source_id]
-        return candidate
+            del self.sessions[prepared.source_id]
+        return prepared.candidate
 
     def accept_committed_approval(self, source_id, candidate):
         """Hand one exact live selection to the next session after commit."""
