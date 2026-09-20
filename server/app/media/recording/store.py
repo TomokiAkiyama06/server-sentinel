@@ -389,6 +389,8 @@ class RecordingStore:
                             (str(source_id),))
             self.db.execute("UPDATE recording_segments SET spool=0 WHERE source_id=?",
                             (str(source_id),))
+            self.db.execute("DELETE FROM recording_source_discontinuities WHERE source_id=?",
+                            (str(source_id),))
         try:
             self._trim()
         except BaseException:

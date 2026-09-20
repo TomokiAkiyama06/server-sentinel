@@ -416,6 +416,15 @@ class RecordingTests(unittest.TestCase):
         self.assertEqual([{"start_ms": 30_000, "end_ms": 40_000,
                            "reason": "stream_discontinuity"}], result["discontinuities"])
 
+    def test_release_source_drops_bounded_source_discontinuities(self):
+        self.store.append(self.segment(10_000, 20_000, 0))
+        self.store.append(self.segment(40_000, 50_000, 2))
+        self.assertEqual(1, self.db.execute(
+            "SELECT COUNT(*) FROM recording_source_discontinuities").fetchone()[0])
+        self.store.release_source(self.source)
+        self.assertEqual(0, self.db.execute(
+            "SELECT COUNT(*) FROM recording_source_discontinuities").fetchone()[0])
+
     def test_cursor_survives_eviction_and_rejects_replays(self):
         self.store.close()
         self.limits = replace(self.limits, pre_roll_bytes=1)
