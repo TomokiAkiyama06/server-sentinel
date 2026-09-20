@@ -6,6 +6,7 @@ thread, retention policy or implicit directory creation is provided here.
 
 from contextlib import contextmanager
 from dataclasses import dataclass
+from functools import wraps
 from pathlib import Path
 from uuid import UUID, uuid4
 import fcntl
@@ -19,6 +20,15 @@ from .model import Limits, RecordingError, Segment, SegmentValidator, StoragePol
 
 
 MAX_RECORDING_MS = 1_200_000
+
+
+def _control_operation(method):
+    @wraps(method)
+    def guarded(self, *args, **kwargs):
+        self._check()
+        with self._control_reservation():
+            return method(self, *args, **kwargs)
+    return guarded
 
 
 @dataclass(frozen=True)
@@ -57,6 +67,7 @@ class RecordingStore:
         self._owner = threading.get_ident()
         self._fd = -1
         self._failed = False
+        self._reservation_active = False
         # The installed image uses /app/app/... without a checkout marker;
         # a fixed checkout parent count would accidentally identify '/' there.
         code_root = Path(__file__).resolve().parents[2]
@@ -122,16 +133,37 @@ class RecordingStore:
                 os.close(descriptor)
 
     @contextmanager
+    def _control_reservation(self):
+        owns_reservation = not self._reservation_active
+        if owns_reservation:
+            self.policy.admit_control()
+            self._reservation_active = True
+        try:
+            yield
+        finally:
+            if owns_reservation:
+                self._release_reservation()
+
+    def _release_reservation(self):
+        self._reservation_active = False
+        try:
+            self.policy.release()
+        except BaseException:
+            self._failed = True
+            raise
+
+    @contextmanager
     def _transaction(self):
         if self.db.in_transaction:
             raise RecordingError("RECORDING_DATABASE_BUSY")
-        try:
-            self.db.execute("BEGIN IMMEDIATE")
-            yield
-            self.db.commit()
-        except BaseException:
-            self.db.rollback()
-            raise
+        with self._control_reservation():
+            try:
+                self.db.execute("BEGIN IMMEDIATE")
+                yield
+                self.db.commit()
+            except BaseException:
+                self.db.rollback()
+                raise
 
     @staticmethod
     def _name(segment_id: str, extension: str) -> str:
@@ -145,6 +177,7 @@ class RecordingStore:
         except FileNotFoundError:
             pass
 
+    @_control_operation
     def _recover(self) -> None:
         # A journal row is committed before any media file exists. Only those
         # identified artifacts may be removed after interrupted publication.
@@ -233,6 +266,7 @@ class RecordingStore:
                 raise RecordingError("RECORDING_SEGMENT_LIMIT")
         critical = any(row["critical"] for row in active)
         self.policy.admit(len(segment.data), critical=critical)
+        self._reservation_active = True
         segment_id = str(uuid4())
         try:
             with self._transaction():
@@ -260,7 +294,7 @@ class RecordingStore:
             self._failed = True
             raise
         finally:
-            self.policy.release()
+            self._release_reservation()
 
     def _publish(self, segment_id, segment, active, prior):
         with self._transaction():
@@ -285,6 +319,7 @@ class RecordingStore:
                                     (recording["id"], prior["end_ms"], segment.start_ms,
                                      "stream_discontinuity"))
 
+    @_control_operation
     def _trim(self) -> None:
         """Evict only unreferenced media; linked evidence survives spool eviction."""
         self._verify_root()
@@ -317,6 +352,7 @@ class RecordingStore:
             with self._transaction():
                 self.db.execute("DELETE FROM recording_segments WHERE id=?", (row["id"],))
 
+    @_control_operation
     def release_source(self, source_id: UUID) -> None:
         """Explicitly release a disabled source's spool, preserving recording links."""
         self._check()
@@ -357,6 +393,7 @@ class RecordingStore:
         # Even metadata-only starts need storage admission. The common policy
         # accounts for journal overhead and can suppress ordinary/manual work.
         self.policy.admit(0, critical=critical)
+        self._reservation_active = True
         try:
             with self._transaction():
                 if event_id and self.db.execute(
@@ -390,7 +427,7 @@ class RecordingStore:
                     )
             return identities
         finally:
-            self.policy.release()
+            self._release_reservation()
 
     def advance(self, now_ms: int) -> None:
         """The owning worker's bounded timer closes deadlines even with no input."""
@@ -403,6 +440,7 @@ class RecordingStore:
         for row in rows:
             self.finish(UUID(row["id"]))
 
+    @_control_operation
     def finish(self, recording_id: UUID, *, stop_ms: int | None = None) -> dict:
         self._check()
         row = self._recording(recording_id)
@@ -529,13 +567,21 @@ class RecordingStore:
         result["byte_length"] = sum(item["byte_length"] for item in result["segments"])
         if result["status"] == "complete" and (result["gaps"] or result["discontinuities"]):
             result["status"] = "gapped"
-        with self._transaction():
-            for item in result["segments"]:
-                self.db.execute("UPDATE recording_segments SET integrity=? WHERE id=?",
-                                (item["integrity"], item["id"]))
-            if result["status"] != row["status"]:
-                self.db.execute("UPDATE recordings SET status=? WHERE id=?",
-                                (result["status"], str(recording_id)))
+        result["integrity_persisted"] = True
+        try:
+            with self._transaction():
+                for item in result["segments"]:
+                    self.db.execute("UPDATE recording_segments SET integrity=? WHERE id=?",
+                                    (item["integrity"], item["id"]))
+                if result["status"] != row["status"]:
+                    self.db.execute("UPDATE recordings SET status=? WHERE id=?",
+                                    (result["status"], str(recording_id)))
+        except RecordingError as exc:
+            if str(exc) not in {"STORAGE_HARD_STOP", "STORAGE_PRESSURE"}:
+                raise
+            # Read-only playback/integrity reporting remains useful on a full
+            # disk. The denied update is explicit and never crosses the reserve.
+            result["integrity_persisted"] = False
         return result
 
     def event_manifest(self, event_id: UUID) -> dict:
@@ -550,6 +596,7 @@ class RecordingStore:
         return {"event_id": str(event_id),
                 "recordings": [self.manifest(UUID(row["id"])) for row in rows]}
 
+    @_control_operation
     def set_starred(self, recording_id: UUID, starred: bool) -> None:
         """Domain operation; an Owner-authorized caller is mandatory upstream."""
         self._check()
@@ -610,6 +657,7 @@ class RecordingStore:
         ).fetchall()
         return tuple(dict(row) for row in rows)
 
+    @_control_operation
     def delete_recording(self, recording_id: UUID, *, owner_requested: bool = False) -> int:
         """Delete one eligible recording; return actual unique media bytes reclaimed.
 

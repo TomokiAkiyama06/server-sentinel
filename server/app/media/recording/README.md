@@ -19,13 +19,22 @@ policy, audited codec validator/muxer and authorization prerequisites are wired.
   without symlinks and holds a directory descriptor and exclusive writer lock.
   Every filesystem operation rechecks that the visible path still names the
   approved directory. Unmount/substitution blocks writes; no fallback is created.
-- Supply `StoragePolicy.admit(media_bytes, critical=...)` / `release()`. Admission
+- Supply `StoragePolicy.admit(media_bytes, critical=...)`, `admit_control()` and
+  `release()`. Admission
   is a reservation held through publication, fsync and spool cleanup. It must
   coordinate concurrent filesystem users, include SQLite/journal/container
   overhead and existing interrupted artifacts, enforce the configured hard
   reserve and reject ordinary/manual work during `STORAGE_PRESSURE`. Critical
   evidence receives only the allowance supplied by that policy and never bypasses
   `STORAGE_HARD_STOP`. This module invents no numeric reserve or retention rule.
+  The control reservation is mandatory for every SQLite mutation and for cleanup
+  through directory fsync, including constructor recovery before the inventory is
+  bound. It must validate the expected filesystem and overhead without invoking
+  retention recursively. Existing media/control reservations are reused inside
+  nested transactions. Configured overhead must cover the largest operation at
+  the configured spool/active/link row limits and actual database/index size,
+  including journal/WAL/page and directory metadata growth; it is not merely a
+  per-file header estimate. This must be validated before enabling the deployment.
 - Supply a `SegmentValidator`. This is a mandatory trusted codec boundary, not
   a boolean supplied by a network peer. The adapter validates video-only content,
   allowed formats/configuration, bounded decode dimensions and independent
@@ -117,8 +126,13 @@ pending row for accounting/retry. Active recordings become `interrupted`; ready
 segments survive and missing requested coverage remains visible. There is no
 silent resumption of an old recording after restart. Manifests re-open bounded
 regular files without following symlinks, reject extra hard links, compare hashes
-and persist observed integrity degradation. They return metadata only, never
+  and persist observed integrity degradation. They return metadata only, never
 filesystem paths or file contents.
+
+When hard-stop admission rejects an integrity metadata update, manifest reads
+still report freshly verified bytes/gaps without writing SQLite and explicitly
+return `integrity_persisted=false`. This does not turn a denied write into success;
+the storage service retains its hard-stop state.
 
 The owning service must treat the metadata database and media directory as one
 deployment binding, use durable SQLite settings and supply its private database

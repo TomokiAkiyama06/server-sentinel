@@ -59,6 +59,15 @@ class Segment:
 
 
 class StoragePolicy(Protocol):
+    def admit_control(self) -> None:
+        """Reserve bounded metadata/cleanup overhead without invoking reclamation.
+
+        This must work before the recorder is bound to the storage inventory,
+        because startup recovery also writes SQLite and directory metadata.
+        Ordinary recording pressure may permit control work, but the configured
+        hard filesystem reserve is never spent. Hold until release().
+        """
+
     def admit(self, media_bytes: int, *, critical: bool) -> None:
         """Reserve bytes atomically, including metadata/temporary overhead.
 

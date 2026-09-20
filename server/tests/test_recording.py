@@ -30,6 +30,9 @@ class Reservation:
         self.reserved = False
         self.calls = []
 
+    def admit_control(self):
+        self.admit(0, critical=False)
+
     def admit(self, media_bytes, *, critical):
         self.calls.append((media_bytes, critical))
         if self.denial:
@@ -66,6 +69,7 @@ class RecordingTests(unittest.TestCase):
         self.source = uuid4()
         self.stream = uuid4()
         self.store = self.open_store()
+        self.policy.calls.clear()
         self.addCleanup(lambda: self.store.close())
 
     def open_store(self, **kwargs):
@@ -486,6 +490,62 @@ class RecordingTests(unittest.TestCase):
                 self.store.append(self.segment(40_000, 50_000, 1))
         self.assertEqual(size * 2, self.store.usage_bytes(critical_only=True))
         self.assertEqual(size * 2, self.store.usage_bytes())
+
+    def test_hard_stop_blocks_metadata_before_any_sql_write_and_keeps_reads(self):
+        self.store.append(self.segment())
+        completed = self.store.start_manual(self.source, 30_000, duration_ms=10_000)
+        self.store.finish(completed)
+        active = self.store.start_manual(self.source, 40_000, duration_ms=10_000)
+        statements = []
+        self.db.set_trace_callback(statements.append)
+        self.policy.denial = "STORAGE_HARD_STOP"
+        for mutation in (lambda: self.store.set_starred(completed, True),
+                         lambda: self.store.finish(active),
+                         lambda: self.store.delete_recording(completed),
+                         lambda: self.store.release_source(self.source)):
+            with self.assertRaisesRegex(RecordingError, "STORAGE_HARD_STOP"):
+                mutation()
+        result = self.store.manifest(completed)
+        self.assertEqual("verified", result["segments"][0]["integrity"])
+        self.assertFalse(result["integrity_persisted"])
+        writes = [sql for sql in statements if sql.split()[0] in
+                  {"BEGIN", "COMMIT", "UPDATE", "INSERT", "DELETE"}]
+        self.assertEqual([], writes)
+        self.db.set_trace_callback(None)
+
+    def test_startup_recovery_requires_control_admission_before_mutation(self):
+        self.store.start_manual(self.source, 30_000)
+        self.store.close()
+        self.policy.denial = "STORAGE_HARD_STOP"
+        statements = []
+        self.db.set_trace_callback(statements.append)
+        with self.assertRaisesRegex(RecordingError, "STORAGE_HARD_STOP"):
+            self.open_store()
+        self.assertEqual([], [sql for sql in statements if sql.split()[0] in
+                              {"BEGIN", "COMMIT", "UPDATE", "INSERT", "DELETE"}])
+        self.assertEqual("active", self.db.execute("SELECT status FROM recordings").fetchone()[0])
+        self.db.set_trace_callback(None)
+        self.policy.denial = None
+        self.store = self.open_store()
+        self.assertEqual("interrupted", self.db.execute("SELECT status FROM recordings").fetchone()[0])
+
+    def test_control_reservation_survives_cleanup_fsync_and_nested_transactions(self):
+        self.store.append(self.segment())
+        recording = self.store.start_manual(self.source, 30_000, duration_ms=10_000)
+        self.store.finish(recording)
+        self.store.release_source(self.source)
+        original_fsync = os.fsync
+        observed = []
+
+        def reserved_fsync(descriptor):
+            observed.append(self.policy.reserved)
+            self.assertTrue(self.policy.reserved)
+            return original_fsync(descriptor)
+
+        with patch("app.media.recording.store.os.fsync", side_effect=reserved_fsync):
+            self.store.delete_recording(recording)
+        self.assertTrue(observed)
+        self.assertFalse(self.policy.reserved)
 
 
 if __name__ == "__main__":
