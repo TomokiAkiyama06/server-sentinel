@@ -355,6 +355,9 @@ class RecordingTests(unittest.TestCase):
         self.assertEqual("gapped", result["status"])
         self.assertEqual([], result["gaps"])
         self.assertEqual("stream_discontinuity", result["discontinuities"][0]["reason"])
+        self.assertEqual((40_000, 40_000),
+                         (result["discontinuities"][0]["start_ms"],
+                          result["discontinuities"][0]["end_ms"]))
         next_recording = self.store.start_manual(self.source, 50_000, duration_ms=10_000)
         self.store.append(self.segment(50_000, 60_000, 0, stream_id=uuid4()))
         # The new recording begins at this independently decodable generation;
@@ -400,6 +403,15 @@ class RecordingTests(unittest.TestCase):
         self.store.release_source(self.source)
         self.store.append(self.segment(source_id=uuid4()))
         self.assertEqual("complete", self.store.finish(recording)["status"])
+
+    def test_late_stop_clips_discontinuity_crossing_both_window_boundaries(self):
+        self.store.append(self.segment(10_000, 20_000))
+        recording = self.store.start_manual(self.source, 30_000, duration_ms=70_000)
+        self.store.append(self.segment(90_000, 100_000, 2))
+        result = self.store.finish(recording, stop_ms=50_000)
+        self.assertEqual([], result["segments"])
+        self.assertEqual([{"start_ms": 30_000, "end_ms": 50_000,
+                           "reason": "stream_discontinuity"}], result["discontinuities"])
 
     def test_row_and_active_recording_limits(self):
         self.store.close()

@@ -556,11 +556,7 @@ class RecordingStore:
             "WHERE recording_id=? AND start_ms<? AND end_ms>? ORDER BY start_ms",
             (str(recording_id), end, row["start_ms"]),
         ).fetchall()
-        result["discontinuities"] = [
-            {"start_ms": max(row["start_ms"], item["start_ms"]),
-             "end_ms": min(end, item["end_ms"]), "reason": item["reason"]}
-            for item in discontinuities
-        ]
+        result["discontinuities"] = [dict(item) for item in discontinuities]
         for previous, current in zip(segments, segments[1:]):
             if (previous["stream_id"] != current["stream_id"]
                     or current["sequence"] != previous["sequence"] + 1):
@@ -568,6 +564,17 @@ class RecordingStore:
                           "reason": "stream_discontinuity"}
                 if marker not in result["discontinuities"]:
                     result["discontinuities"].append(marker)
+        bounded = []
+        seen = set()
+        for marker in result["discontinuities"]:
+            if marker["start_ms"] >= end or marker["end_ms"] <= row["start_ms"]:
+                continue
+            key = (max(row["start_ms"], marker["start_ms"]),
+                   min(end, marker["end_ms"]), marker["reason"])
+            if key not in seen:
+                bounded.append({"start_ms": key[0], "end_ms": key[1], "reason": key[2]})
+                seen.add(key)
+        result["discontinuities"] = bounded
         result["byte_length"] = sum(item["byte_length"] for item in result["segments"])
         if result["status"] == "complete" and (result["gaps"] or result["discontinuities"]):
             result["status"] = "gapped"
