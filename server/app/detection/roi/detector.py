@@ -72,8 +72,12 @@ class SceneDetector:
             raise ValueError("calibration lacks distinctive ROI or background texture")
         self.global_candidates = candidates(self.policy.global_search_pixels, self.policy.global_quarter_turns)
         self.roi_candidates = candidates(self.policy.roi_search_pixels, self.policy.roi_quarter_turns)
+        # Budget the costlier of the two per-sample paths. A registered scene
+        # pays for ROI matching; an unmatched one skips it and pays for the
+        # background scene-difference instead, so neither may exceed the bound.
         comparisons = (len(self.background) * len(self.global_candidates)
-                       + len(self.roi_points) * len(self.roi_candidates) + len(reference.pixels))
+                       + max(len(self.roi_points) * len(self.roi_candidates), len(self.background))
+                       + len(reference.pixels))
         if comparisons > self.policy.maximum_comparisons:
             raise ValueError("calibration exceeds comparison budget")
         self.reference_digest = calibration.reference_sha256
@@ -147,20 +151,25 @@ class SceneDetector:
             self._interrupt()
             raise
         c = self.calibration
-        if (frame.channels != 1 or (frame.width, frame.height) != (c.reference.width, c.reference.height)):
-            self._interrupt()
-            return self._observation(frame, monotonic_ns, observed_at, movement_reason="reference_shape_mismatch",
-                                     tamper_reason="reference_shape_mismatch")
         if (monotonic_ns <= self.last_ns or self.stream_id == frame.stream_id and frame.sequence <= self.last_sequence):
             self._interrupt()
             return self._observation(frame, monotonic_ns, observed_at, movement_reason="clock_or_sequence_regression",
                                      tamper_reason="clock_or_sequence_regression")
         restarted = self.stream_id is not None and self.stream_id != frame.stream_id
         gap = self.last_ns >= 0 and monotonic_ns - self.last_ns > self.policy.maximum_gap_ns
+        # Record the observed progression before any fail-unknown return. The
+        # source has already advanced past this sample, so a later buffered
+        # frame from the superseded geometry or stream must not pass the
+        # regression check and re-enter temporal confirmation.
         self.stream_id, self.last_sequence, self.last_ns = frame.stream_id, frame.sequence, monotonic_ns
         if restarted or gap:
-            self._interrupt()
             self.last_scene_shift_ns, self.last_scene_shift_confidence = None, None
+        if (frame.channels != 1 or (frame.width, frame.height) != (c.reference.width, c.reference.height)):
+            self._interrupt()
+            return self._observation(frame, monotonic_ns, observed_at, movement_reason="reference_shape_mismatch",
+                                     tamper_reason="reference_shape_mismatch")
+        if restarted or gap:
+            self._interrupt()
             return self._observation(frame, monotonic_ns, observed_at, movement_reason="stream_or_sampling_discontinuity",
                                      tamper_reason="stream_or_sampling_discontinuity")
         if movement_quality is not Quality.SUFFICIENT and tamper_quality is not Quality.SUFFICIENT:

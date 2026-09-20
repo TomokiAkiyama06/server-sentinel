@@ -244,6 +244,30 @@ class SceneDetectorTests(unittest.TestCase):
         self.assertEqual("awaiting_confirmation", after.movement_reason)
         self.assertFalse(after.critical)
 
+    def test_incompatible_geometry_advances_the_observed_frame_progression(self):
+        moved = transformed(pixels(), (1, 0), region=(4, 4, 8, 7))
+        instance = detector()
+        inspect_scene(instance, frame(0), 0)
+        inspect_scene(instance, frame(1, moved), 10)
+        wider = GrayFrame(SOURCE, STREAM, 2, WIDTH + 1, HEIGHT, bytes((WIDTH + 1) * HEIGHT))
+        mismatch = inspect_scene(instance, wider, 20)
+        self.assertEqual("reference_shape_mismatch", mismatch.movement_reason)
+        buffered = inspect_scene(instance, frame(2, moved), 30)
+        self.assertEqual("clock_or_sequence_regression", buffered.movement_reason)
+        self.assertEqual(Observation.UNKNOWN, buffered.movement)
+        self.assertFalse(buffered.critical)
+
+    def test_comparison_budget_covers_the_unmatched_scene_path(self):
+        generous = detector(rules=policy(roi_search_pixels=0, maximum_comparisons=100_000))
+        roi_work = len(generous.roi_points) * len(generous.roi_candidates)
+        background = len(generous.background)
+        self.assertLess(roi_work, background)
+        registered_only = len(generous.background) * len(generous.global_candidates) + roi_work + WIDTH * HEIGHT
+        with self.assertRaises(ValueError):
+            detector(rules=policy(roi_search_pixels=0, maximum_comparisons=registered_only))
+        detector(rules=policy(roi_search_pixels=0,
+                              maximum_comparisons=registered_only - roi_work + background))
+
     def test_confirmation_after_an_interruption_reports_new_critical_evidence(self):
         moved = transformed(pixels(), (1, 0), region=(4, 4, 8, 7))
         instance = detector()

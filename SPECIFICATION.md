@@ -598,7 +598,9 @@ An explicit ROI-occlusion signal, insufficient movement quality, sampling gap,
 stream restart, regression, incompatible frame, or inadequate calibration
 returns `unknown` and resets confirmation; none is converted into a trustworthy
 no-movement result. A refused sample, such as a frame from another source, ends
-the episode as well, so no later confirmation spans it. Because such an
+the episode as well, so no later confirmation spans it, and the observed stream,
+sequence and clock advance before any such result so that a buffered frame from
+a superseded geometry cannot re-enter confirmation. Because such an
 interruption ends the episode, a condition
 confirmed again afterwards is emitted again instead of being suppressed as a
 duplicate, so no confirmed critical observation is silently lost. Person

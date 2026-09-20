@@ -30,7 +30,12 @@ duration of corroborating samples. An explicit ROI-occlusion signal, sampling
 gap, stream restart, regression, mismatched frame, or insufficient movement
 quality resets confirmation and yields `unknown`, never `no movement`. A
 sample the detector refuses outright, such as a frame belonging to another
-source, ends the episode too, so no later confirmation spans it.
+source, ends the episode too, so no later confirmation spans it. Every accepted
+sample records the observed stream, sequence and clock before any such
+`unknown` result, so a buffered frame from a superseded geometry or stream
+cannot pass the regression check afterwards. The calibration comparison budget
+covers the costlier of the registered and unmatched paths, because the latter
+trades ROI matching for a background scene-difference.
 Ending an episode that way also clears its emitted latch: a condition that is
 confirmed again after the interruption is new evidence and is reported again
 rather than dropped as a duplicate. Person presence is deliberately not an
@@ -57,6 +62,7 @@ must remain armed in every presence state.
 local and remote-agent calibration, relative movement, global camera motion,
 temporary ROI occlusion, dark-scene tamper, persistent unmatched scenes,
 ambiguous and low-margin registration, refused foreign-source samples,
+frame-progression watermarks, the unmatched-path comparison budget,
 source-loss correlation, quality isolation, media-free calibration history,
 and failed critical delivery. Hardware,
 lighting, camera pose, and source-health integration are not verified here.
