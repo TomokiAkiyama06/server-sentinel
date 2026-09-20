@@ -54,9 +54,30 @@ class FilesystemSpace:
 class ExpectedFilesystem:
     """Pin an existing private directory; never create a fallback or follow links."""
 
-    def __init__(self, root: Path, expected: RootIdentity):
+    def __init__(self, root: Path, expected: RootIdentity, metadata: Path):
         self.root = root
         self.expected = expected
+        self.metadata = metadata
+
+    def _check_metadata(self, device: int) -> None:
+        descriptor = -1
+        try:
+            if not self.metadata.is_absolute() or '..' in self.metadata.parts:
+                raise OSError()
+            flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
+            descriptor = os.open('/', flags | os.O_DIRECTORY)
+            for index, part in enumerate(self.metadata.parts[1:]):
+                directory = index < len(self.metadata.parts) - 2
+                next_descriptor = os.open(part, flags | (os.O_DIRECTORY if directory else 0), dir_fd=descriptor)
+                os.close(descriptor)
+                descriptor = next_descriptor
+            info = os.fstat(descriptor)
+            if (info.st_dev != device or not stat.S_ISREG(info.st_mode)
+                    or info.st_uid != os.geteuid() or info.st_mode & 0o077):
+                raise OSError()
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
 
     def snapshot(self) -> FilesystemSpace:
         descriptor = -1
@@ -74,6 +95,7 @@ class ExpectedFilesystem:
                     or info.st_uid != os.geteuid() or info.st_mode & 0o077
                     or not stat.S_ISDIR(info.st_mode)):
                 raise OSError()
+            self._check_metadata(info.st_dev)
             space = os.fstatvfs(descriptor)
             if space.f_flag & os.ST_RDONLY:
                 raise OSError()
@@ -88,7 +110,8 @@ class ExpectedFilesystem:
 
 class Inventory(Protocol):
     def usage_bytes(self, *, starred_only: bool = False,
-                    critical_only: bool = False) -> int: ...
+                    critical_only: bool = False) -> int:
+        ...
 
 
 class Reclaimer(Protocol):

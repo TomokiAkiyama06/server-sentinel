@@ -114,6 +114,8 @@ class StorageAudit:
     def __init__(self, connection: sqlite3.Connection,
                  periods: RetentionPeriods = RetentionPeriods(),
                  reservation=deny_reservation):
+        if connection.isolation_level is not None:
+            raise RecordingError("STORAGE_AUDIT_UNAVAILABLE")
         self.db, self.periods = connection, periods
         self._reservation = reservation
 

@@ -150,6 +150,13 @@ The Main Server keeps its Owner-approved hardware baseline and detailed hardware
 
 If the owner enables Slack, configured event information/thumbnails may be sent directly from the deployment to the owner's Slack workspace. The ServerSentinel developer does not relay the message.
 
+The initial internal adapter sends only fixed critical categories or aggregate
+daily counts/duration/storage state, never thumbnails, source names, hardware
+identifiers or arbitrary event text. It is disabled without deployment
+configuration. Person/motion/entry and ordinary camera-offline observations do not
+generate immediate Slack messages by default. Local fault reporting remains
+independent of Slack delivery; production durable event integration is pending.
+
 ## Diagnostics
 
 Diagnostics remain local unless explicitly exported/shared.

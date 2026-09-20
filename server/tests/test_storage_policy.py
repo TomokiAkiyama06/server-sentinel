@@ -196,8 +196,20 @@ class ExpectedFilesystemTests(unittest.TestCase):
             root = Path(temp) / "media"
             root.mkdir(mode=0o700)
             info = root.stat()
-            checker = ExpectedFilesystem(root, RootIdentity(info.st_dev, info.st_ino))
+            metadata = Path(temp) / 'metadata.sqlite'
+            metadata.touch(mode=0o600)
+            checker = ExpectedFilesystem(root, RootIdentity(info.st_dev, info.st_ino), metadata)
             self.assertGreater(checker.snapshot().available_bytes, 0)
+            metadata.chmod(0o644)
+            with self.assertRaises(RecordingError):
+                checker.snapshot()
+            metadata.chmod(0o600)
+            metadata.rename(Path(temp) / 'saved.sqlite')
+            metadata.symlink_to(Path(temp) / 'saved.sqlite')
+            with self.assertRaises(RecordingError):
+                checker.snapshot()
+            metadata.unlink()
+            (Path(temp) / 'saved.sqlite').rename(metadata)
             root.rename(Path(temp) / "saved")
             with self.assertRaisesRegex(RecordingError, "STORAGE_HARD_STOP"):
                 checker.snapshot()

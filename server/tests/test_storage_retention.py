@@ -30,6 +30,7 @@ class RealRetentionTests(unittest.TestCase):
         info = self.root.stat()
         identity = RootIdentity(info.st_dev, info.st_ino)
         self.db = sqlite3.connect(base / "metadata.sqlite", isolation_level=None)
+        (base / "metadata.sqlite").chmod(0o600)
         self.addCleanup(self.db.close)
         migrate(self.db, BUILTIN_MIGRATIONS + (recording_migration(2), storage_audit_migration(3)))
         self.now = 5 * DAY_MS
@@ -40,7 +41,7 @@ class RealRetentionTests(unittest.TestCase):
                           recovery_free_bytes=16_384, recovery_allocation_bytes=90_000,
                           write_overhead_bytes=4096, max_request_bytes=1024,
                           cleanup_batch_size=10),
-            ExpectedFilesystem(self.root, identity).snapshot, lambda: self.now, self.audit.append,
+            ExpectedFilesystem(self.root, identity, base / "metadata.sqlite").snapshot, lambda: self.now, self.audit.append,
         )
         self.store = RecordingStore(
             self.db, self.root, identity,

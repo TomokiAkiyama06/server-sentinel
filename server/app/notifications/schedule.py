@@ -29,7 +29,8 @@ class DailySummaryScheduler:
     def __init__(self, connection: sqlite3.Connection, zone: ZoneInfo,
                  service: NotificationService, reservation, *, hour: int = 23,
                  minute: int = 0):
-        if (not isinstance(zone, ZoneInfo) or type(hour) is not int or not 0 <= hour <= 23
+        if (connection.isolation_level is not None or not isinstance(zone, ZoneInfo)
+                or type(hour) is not int or not 0 <= hour <= 23
                 or type(minute) is not int or not 0 <= minute <= 59):
             raise ValueError("invalid daily schedule")
         self.db, self.zone, self.service = connection, zone, service

@@ -30,6 +30,7 @@ from app.main import create_app  # noqa: E402
 from app.settings import Settings  # noqa: E402
 from tests.asgi import request  # noqa: E402
 from tests.recording_smoke import run_recording_smoke  # noqa: E402
+from tests.storage_smoke import run_storage_smoke  # noqa: E402
 
 
 async def run(scenario):
@@ -37,6 +38,7 @@ async def run(scenario):
     configure_logging(stream=output)
     with tempfile.TemporaryDirectory(prefix="synthetic-server-") as temporary:
         run_recording_smoke(Path(temporary), scenario)
+        run_storage_smoke(Path(temporary), scenario)
         settings = Settings(Path(temporary))
         if scenario == "error":
             settings.database_path.write_bytes(b"SYNTHETIC_PRIVATE_VALUE")

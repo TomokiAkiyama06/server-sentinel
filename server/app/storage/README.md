@@ -8,9 +8,10 @@ the recorder, then `bind(store, RetentionService(store))`. Constructor recovery
 uses physical-only `admit_control` before binding; media admission fails closed
 until binding. All recorder metadata/media writes hold a reservation until
 commit/fsync. The same `policy.control` context protects `StorageAudit` and the
-daily scheduler, including transitions triggered during admission. The metadata
-database must reside on the checked filesystem; deployment integration must
-verify this before opening/migrating it. Provisioning migrations need their own
+daily scheduler, including transitions triggered during admission.
+`ExpectedFilesystem(root, identity, metadata_path)` also verifies a private regular
+metadata file on the same filesystem without following symlinks. Deployment
+integration must reserve space before opening/migrating it. Provisioning migrations need their own
 reserved initialization phase; these services never open a production volume.
 
 Thresholds, quota, maximum request size, critical allowance, cleanup batch and
