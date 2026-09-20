@@ -34,7 +34,8 @@ Closes #
 - [ ] 新たにユーザー環境外へ送信されるデータはない
 - [ ] 新しい Secret / pairing credential の取り扱いはない、または安全に管理している
 - [ ] owner biometric template/verificationへの影響を確認した、または非該当
-- [ ] non-owner named identity / cross-camera biometric re-identificationを追加していない
+- [ ] non-owner enrollment / named identity / cross-camera biometric re-identificationを追加していない
+- [ ] non-owner face crop/template/embedding/profileの永続libraryを、氏名の有無を問わず作成・保存していない（権限・保持期間に従う通常録画とは区別）
 - [ ] 追加依存関係・モデル・weights のsource/licenseを確認した
 - [ ] 必要な仕様・セキュリティ・プライバシー文書を更新した
 

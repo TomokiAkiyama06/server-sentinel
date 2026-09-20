@@ -323,7 +323,8 @@ Use only the deployment owner's own enrollment during manual testing. Never uplo
 - [ ] low-light/blur/partial occlusion tested;
 - [ ] result includes quality/confidence;
 - [ ] ambiguous input becomes `unknown`;
-- [ ] no named non-owner enrollment feature exists.
+- [ ] no non-owner enrollment feature exists;
+- [ ] verification and anonymous tracking do not create or retain persistent non-owner face-crop/template/embedding/profile libraries, whether named or anonymous; ordinary authorized recordings remain subject to recording retention and must not be used to build such libraries.
 
 ## O. Entrance / anonymous tracking / presence
 

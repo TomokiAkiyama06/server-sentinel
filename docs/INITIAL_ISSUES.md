@@ -133,6 +133,7 @@ Labels: `camera-source`, `backend`, `server-required`, `hardware-required`, `man
 
 Scope:
 - Linux UVC/V4L2 discovery;
+- video-only local capture with no audio-enabling option;
 - `/dev/v4l/by-id`, serial/udev/topology/capability identity evidence;
 - owner enable/disable;
 - preview/capture negotiation;
@@ -140,6 +141,7 @@ Scope:
 - ambiguous identical-device handling.
 
 Acceptance:
+- local capture never opens microphone/audio devices or captures, stores, or forwards monitoring audio, including integrated camera microphones;
 - `/dev/videoN` alone not durable identity;
 - disconnect -> offline;
 - unique reconnect may auto-return online;
@@ -424,13 +426,14 @@ Scope:
 - owner-only 1:1 enrollment/delete/re-enroll;
 - anonymous same-camera track IDs;
 - entrance/zone crossing;
-- no named non-owner database;
+- no non-owner enrollment/naming or separate persistent face-crop/template/embedding/profile library, whether named or anonymous; ordinary authorized recordings remain distinct;
 - no cross-camera biometric re-identification.
 
 Acceptance:
 - raw owner embedding absent from logs/general APIs;
 - low-quality result -> unknown;
 - non-owner enrollment API does not exist;
+- automatic/background paths also never persist non-owner face crops, templates, embeddings, or identity profiles as a separate library, including under anonymous track IDs; synthetic/mock validation checks that no such files/database records survive a session;
 - repository fixtures synthetic/generated only;
 - any external real-person benchmark stays local and is not committed/attached.
 
@@ -450,11 +453,12 @@ Scope:
 - owner entry/exit observations;
 - source/node health events;
 - relevant observation windows;
-- neutral timeline language.
+- neutral timeline language;
+- historical timeline/events require `recordings:view` and are not exposed by `live:view` alone.
 
 Acceptance:
 - only `PRESENT` suppresses ordinary occupancy automation by default;
-- critical server movement/camera tamper always armed;
+- critical server movement/camera tamper detection, evidence preservation, and configured critical notifications continue in every state, including `PRESENT` and manual presence overrides; synthetic tests verify all three outcomes;
 - synthetic scenario can show entry -> movement -> camera offline;
 - UI never labels a person culprit/attacker from temporal correlation.
 

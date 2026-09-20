@@ -83,7 +83,7 @@ This roadmap is intentionally high-level. GitHub Issues are the execution source
 - [ ] anonymous/owner entry-exit observations
 - [ ] `PRESENT / PROBABLY_PRESENT / ABSENT / UNKNOWN`
 - [ ] manual presence override/schedule
-- [ ] no non-owner named face database
+- [ ] no non-owner enrollment or persistent face-crop/template/embedding/profile library, whether named or anonymous
 - [ ] no cross-camera biometric re-identification
 
 ## Phase 7 — Timeline, recordings, storage, notifications
