@@ -1,208 +1,141 @@
 # ServerSentinel
 
-ServerSentinel is a free, self-hosted physical-security monitoring system for valuable servers and workstations. It combines heterogeneous camera sources, local recording, computer vision, event correlation, and a private web dashboard without a developer-operated cloud.
+ServerSentinel は、価値の高いサーバーやワークステーションの物理的な状態を見守る、無料・セルフホスト型の監視システムです。異なる場所のウェブカメラ、ローカル録画、画像解析、イベントの時系列表示、プライベートな Web ダッシュボードを組み合わせます。開発者が運用するクラウドや映像サービスは使いません。
 
-## Core principles
+## 基本方針
 
-1. **No developer-operated cloud, telemetry, ads, or analytics**
-2. **Self-hosted recording and AI analysis**
-3. **Camera-source agnostic design**
-4. **Private-by-default remote access**
-5. **Least-privilege capture agents and strict review gates**
+1. 開発者運用のクラウド、テレメトリー、広告、分析を使わない
+2. 録画と AI 解析は利用者の環境だけで実行する
+3. カメラの接続場所や役割を固定しない
+4. リモート閲覧はプライベートアクセスを前提にする
+5. Capture Agent は最小権限で動かし、変更は厳格にレビューする
 
-## Current project status
+## 現在の状態
 
-CI, the closed [Main Server foundation](server/docs/FOUNDATION.md), and the
-[React dashboard shell](web/README.md) have synthetic validation. The dashboard
-provides Japanese/English placeholders. Human backend routes and production UI
-access remain denied pending authorization integration. Internal recording
-storage primitives are in progress; camera capture, live playback and full-system
-hardware/network acceptance are not established by these foundations. See
-[ROADMAP.md](ROADMAP.md) and GitHub Issues for component progress.
+CI、Main Server の基盤、React ダッシュボードのシェルには合成データによる検証があります。人向けのバックエンド API と本番 UI の認可は、アクセス制御の統合が完了するまで拒否されたままです。録画・検出・カメラ接続には内部基盤がありますが、実機カメラ、ライブ再生、ネットワークを含む総合受入はまだ完了していません。進行状況は [ROADMAP.md](ROADMAP.md) と GitHub Issue を参照してください。
 
-## Camera-source model
+## カメラ構成
 
-The MVP supports **1 to 4 active video sources**. Four is a configurable MVP limit, not a fixed schema assumption.
+MVP では **1〜4 台の有効な映像ソース**を扱います。4 台は MVP の既定上限であり、固定台数・固定役割のスキーマではありません。
 
-MVP source types:
+対応する映像ソースは次の 2 種類です。
 
-- **`local_uvc`** — UVC/V4L2-compatible USB camera connected directly to the main Ubuntu ServerSentinel host.
-- **`remote_agent`** — UVC/V4L2-compatible camera connected to another owner-authorized Linux machine running `media-capture-agent`, with video forwarded over a private LAN to the main host.
-
-Browser/iPhone capture is outside the current ServerSentinel product scope. Phone/Mac/desktop browsers are viewer clients; adding browser-camera capture again would require a new explicit product decision/ADR.
-
-Example deployment:
+- **`local_uvc`** — Main ServerSentinel を動かす Ubuntu ホストへ直接つないだ、UVC/V4L2 対応ウェブカメラ
+- **`remote_agent`** — 所有者が承認した別の Linux マシン上の `media-capture-agent` へつないだ、UVC/V4L2 対応ウェブカメラ
 
 ```text
-USB Webcam A ───────────────────────────────┐
-USB Webcam B ───────────────────────────────┤
+USB ウェブカメラ A ───────────────────────┐
+USB ウェブカメラ B ───────────────────────┤
+                                           │
+遠隔 Linux マシン上のウェブカメラ           │
+    │ UVC/USB                              │
+    v                                      │
+media-capture-agent                        │
+    │ 認証済みのプライベート LAN 映像        │
+    └──────────────────────────────────────┤
+                                           v
+                                 Main ServerSentinel
+                                 ├─ 録画・ストレージ
+                                 ├─ 検出ワーカー
+                                 ├─ イベント時系列
+                                 ├─ SQLite
+                                 └─ React ダッシュボード
                                             │
-Yamaha CS-800                               │
-    │ USB                                   │
-    v                                       │
-Research-room Ubuntu                        │
-media-capture-agent                         │
-    │ authenticated private-LAN stream      │
-    └───────────────────────────────────────┤
-                                            v
-                                  Main ServerSentinel
-                                  ├─ recording/storage
-                                  ├─ detection workers
-                                  ├─ event timeline
-                                  ├─ SQLite
-                                  └─ React web dashboard
-                                             │
-                                      Tailscale/private access
-                                             │
-                                      invited phone / Mac
+                                     Tailscale / 私設ネットワーク
+                                            │
+                                   招待済みの phone / Mac / desktop
 ```
 
-Camera type and semantic role are separate. The room-overview camera, server-side camera, rear/cable camera, or any custom role may use either source type.
+カメラの種類と意味上の役割は別です。部屋全体、サーバー正面、背面・配線、入口などの役割は、どちらのソース種別にも設定できます。ブラウザや iPhone をカメラとして使うことは現在の対象外です。phone、Mac、desktop のブラウザは閲覧クライアントです。
 
 ## `media-capture-agent`
 
-`media-capture-agent` is a lightweight Linux capture service for cameras that are physically closer to another Linux machine than to the main ServerSentinel host.
+`media-capture-agent` は、Main Server から離れた場所のウェブカメラを接続するための軽量な Linux キャプチャサービスです。
 
-Initial rules:
+- systemd のバックグラウンドサービスとして動き、トレイやデスクトップ UI を必要としない
+- 専用の非 root アカウントで動く
+- MVP では映像のみを扱い、マイクを開かず音声を取得・保存・転送しない
+- Agent から Main Server に接続し、Main Server はキャプチャマシンへ SSH や管理アクセスを行わない
+- 所有者の一回限りの承認後、失効可能な暗号学的ノード ID を使う
+- 同じプライベート LAN で Main Server に到達できるなら、Agent マシンは Tailnet 参加を必要としない
+- カメラの再接続は物理デバイスを一意に照合できる場合だけ自動化し、曖昧な再接続は所有者の再承認を待つ
 
-- runs as a background systemd service with no tray/window requirement;
-- uses a truthful functional process/service name: `media-capture-agent`;
-- normally runs as a dedicated non-root service account;
-- captures video only in the MVP; microphone/audio devices are not opened and audio is not captured, stored, or forwarded;
-- initiates the connection toward the main host; the main host does not need SSH/admin access to the capture machine;
-- pairs using a short-lived owner-approved code and then uses a revocable cryptographic node identity;
-- long-lived agent-to-main transport must be mutually authenticated and encrypted, with mTLS as the default design target;
-- the capture machine does **not** need to join the owner's Tailnet when it can reach the main host on the same private LAN;
-- camera unplug/replug is reported as source health state; the agent process itself remains alive;
-- a reconnect is automatic only when the physical camera can be matched unambiguously; ambiguous device identity requires owner intervention rather than silently binding a different camera.
+## 検出とプライバシー
 
-Development may run the agent from a repository clone. A later stable release should provide a standalone release artifact/installer so production operation does not depend on a development checkout.
+カメラごとに、一般的な動き、人検出、サーバー ROI の移動、カメラの遮蔽・改変、入口通過、所有者のみの 1:1 照合、画質・低照度ゲートを設定できます。
 
-## Video-only MVP
+画像品質が不足する場合、人がいないという信頼できる結論にはしません。暗すぎる、ぼけているなどで人検出が十分に動かない結果は `unknown` / 利用不可です。
 
-The MVP is video-only. Neither local capture nor media-capture-agent opens microphone/audio devices, including microphones integrated into conference cameras, or captures, stores, or forwards monitoring audio. Recordings and browser playback contain no monitoring audio, there is no audio-enabling option, and no monitoring feature depends on audio.
+ServerSentinel が照合できるのは、明示的に登録した一人の所有者だけです。その他の人について氏名付きの顔データベースを作らず、カメラ間の生体再同定も行いません。時系列表示から、人物を犯人・攻撃者・原因と断定することもありません。
 
-## Detection model
+## プライベートなライブ閲覧
 
-Detection features are assigned per Camera Source. Initial profiles include:
+招待された利用者は、phone、Mac、desktop の通常のブラウザから Main ServerSentinel 経由でライブ映像を閲覧できます。閲覧端末が `media-capture-agent` へ直接つながることはありません。ダッシュボードは 1〜4 ソースに対応し、閲覧者がいない間は閲覧専用の変換処理を止めるか縮小します。
 
-- general motion;
-- person detection;
-- server ROI / movement detection;
-- camera tamper / occlusion;
-- room/entrance crossing where configured;
-- owner-only 1:1 face verification;
-- detector-specific image-quality / low-light gating.
+アクセスには次の 2 つが必要です。
 
-Insufficient image quality never becomes a reliable negative observation. If a person detector cannot operate reliably because the image is too dark/blurred, the result is `unknown`/unavailable rather than `no person`.
+1. Main Server に到達できるネットワーク上の許可
+2. ServerSentinel の招待・権限
 
-ServerSentinel may verify one explicitly enrolled deployment owner, but it does **not** maintain a named face database for other observed people. Non-owner people remain anonymous observations/tracks. Timeline correlation must not label a person as a culprit, thief, attacker, or cause.
+Tailnet のメンバーであるだけでは、ServerSentinel のデータへアクセスできません。アプリケーションは Tailscale ACL/Grant を変更せず、Tailscale の管理資格情報も保存しません。
 
-## Live viewing from phone and Mac
+利用者の権限は独立しています。
 
-Invited users can view live video from a normal browser on a phone or Mac through the main ServerSentinel host. Viewer devices never connect directly to `media-capture-agent`.
+- `live:view` — ブラウザで現在のライブ映像を閲覧
+- `recordings:view` — 過去の録画と履歴タイムラインをブラウザで閲覧
 
-```text
-Phone / Mac
-    │ Tailscale/private network
-    v
-Main ServerSentinel
-    │
-    └─ live stream already received from local/remote Camera Sources
-```
+MVP では、所有者以外に公式の録画ダウンロード・エクスポート機能を提供しません。ブラウザ再生は画面録画などを技術的に防ぐものではありません。
 
-The dashboard adapts to 1–4 sources. Viewer streaming should be demand-driven: when nobody is watching, ServerSentinel should not perform unnecessary viewer-only transcoding.
+## 録画とストレージ
 
-## Private access and invitations
+Ubuntu の Main Server が耐久性のある証拠保管先です。Agent 側には、圧縮された短時間のリングバッファと保護済みの重大インシデントだけを保持します。
 
-**Tailnet membership is not ServerSentinel authorization.** Access requires both:
+- 録画保持: 既定 20 日
+- 監査ログ保持: 既定 90 日
+- Agent の保護済み重大インシデント: 完了から既定 60 日
+- 自動イベント録画: 既定で前 30 秒 + 後 120 秒、最大 20 分
+- 手動録画: 最大 20 分
+- スター付き録画は自動削除しない
+- `STORAGE_PRESSURE` / `STORAGE_HARD_STOP` により安全でない書込みを明示的に止める
 
-1. network-level permission to reach the ServerSentinel node; and
-2. an active ServerSentinel invitation/allowlist entry.
+Main Server は、所有者が承認したハードウェア構成との比較と、録画パスの書込み・同期・再オープン・読込み検査を少なくとも毎日実行する設計です。承認済みハードウェアの変更・欠落や録画健全性の失敗は、日次サマリーを待たず所有者に通知します。シリアル番号や UUID は利用者の環境内に留め、公開診断や開発者テレメトリーに送りません。
 
-ServerSentinel does not modify Tailscale ACLs/Grants or store Tailscale administrative credentials; policy administration remains outside the application. Tailnet membership alone still grants no ServerSentinel application data: every human request must pass the ServerSentinel invitation/permission check. With unchanged Tailnet policy, the underlying Main Server node may remain visible/reachable to other Tailnet members, so node-level concealment is not guaranteed. Uninvited users receive generic/non-branding denial and no ServerSentinel deployment metadata.
-
-The dashboard itself should bind only to a trusted local proxy path (for example loopback behind Tailscale Serve). LAN camera ingestion uses a **separate** narrowly exposed endpoint and must not expose dashboard routes.
-
-Invited-user permissions are granular:
-
-- `live:view` — view current live video in the browser;
-- `recordings:view` — browse/play past recordings and view historical timeline/events in the browser.
-
-These permissions are independent. Non-owner invited users do not receive an official recording-download/export function in the MVP. Browser-only playback cannot technically prevent screen recording or advanced client-side capture, so the product must not claim DRM-style prevention.
-
-## Recording and storage
-
-Ubuntu remains the primary durable evidence store.
-
-Agent-side storage is limited to the bounded compressed disk ring buffer and protected critical incidents. Agent-side protected critical incidents are retained for **60 days by default** and then automatically deleted.
-
-Defaults:
-
-- recording retention: **20 days**;
-- audit retention: **90 days**;
-- automatic event target: **30 s pre + 120 s post**, extendable while activity continues, maximum **20 minutes**;
-- manual recording maximum: **20 minutes**;
-- starred recordings are protected from automatic deletion;
-- recording allocation and a hard filesystem safety reserve are separate;
-- explicit `STORAGE_PRESSURE` and `STORAGE_HARD_STOP` states prevent unsafe writes.
-
-Compressed media should be buffered/recorded where practical rather than retaining large decoded frame histories in RAM.
-
-## Recorder self-check and hardware integrity
-
-ServerSentinel does not only monitor cameras; it also checks that the main recording machine still matches the Owner-approved hardware baseline and that the recording path actually works.
-
-The baseline covers CPU, RAM, NVMe/M.2, HDD/recording drives, and GPU using the strongest identifiers the host exposes. Comparison runs at ServerSentinel startup and at least once per day. A detected `CHANGED`, `MISSING`, `NEW_DEVICE`, or `UNVERIFIABLE` state is shown explicitly; deliberate hardware changes require Owner approval and never rewrite the baseline silently.
-
-At least once per day, the recorder performs a bounded recording-health self-test covering source freshness, encoder/recorder state, expected recording filesystem identity, free-space/safety reserve, and a temporary write + fsync + reopen/read/decode validation. Available SMART/NVMe health signals are also surfaced.
-
-Missing/changed approved hardware or a failed recording-health self-test triggers an immediate Owner alert instead of waiting only for the daily summary. Raw hardware serials/UUIDs remain deployment-local and are not sent to developer telemetry or public diagnostics.
-
-## Performance model
-
-Capture, inference, recording, and viewer profiles are separate.
-
-A high-resolution room-overview source may be captured/recorded at a higher resolution while person/ROI inference samples only a few frames per second and remote viewers receive an adaptive browser-compatible live profile. Exact resolution, FPS, bitrate, and encode path are benchmark-derived rather than hard-coded.
-
-When overloaded, ServerSentinel first keeps health state truthful and preserves critical monitoring/evidence, then reduces expensive inference cadence and viewer quality before silently dropping sources.
-
-## Planned stack
+## 想定技術
 
 - Backend: Python / FastAPI
 - Dashboard: React / TypeScript
-- Local/agent capture: Linux UVC/V4L2
-- Remote capture service: `media-capture-agent` + systemd
-- Metadata: SQLite
-- Main deployment: Docker Compose where appropriate
-- Private remote access: Tailscale recommended
-- Notifications: Slack optional
-- Vision: pluggable permissively licensed detectors/models; source-code and model/weight licenses reviewed separately
+- ローカル・Agent キャプチャ: Linux UVC/V4L2
+- リモートキャプチャ: `media-capture-agent` + systemd
+- メタデータ: SQLite
+- Main 配置: Docker Compose（必要な場合）
+- プライベートアクセス: Tailscale を推奨
+- 通知: Slack は任意
+- Vision: 許容ライセンスを個別に確認した交換可能な detector / model
 
-## Core documents
+## 主要ドキュメント
 
-- [REQUIREMENTS.md](REQUIREMENTS.md) — product requirements
-- [SPECIFICATION.md](SPECIFICATION.md) — technical contracts
-- [AGENTS.md](AGENTS.md) — mandatory rules for coding agents
-- [MANUAL_TEST.md](MANUAL_TEST.md) — real-hardware/network/browser test plan
-- [SECURITY.md](SECURITY.md) — security model
-- [PRIVACY.md](PRIVACY.md) — privacy/biometric model
-- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — architecture
-- [docs/SETUP.md](docs/SETUP.md) — intended setup UX
+- [REQUIREMENTS.md](REQUIREMENTS.md) — プロダクト要件
+- [SPECIFICATION.md](SPECIFICATION.md) — 技術契約
+- [AGENTS.md](AGENTS.md) — コーディングエージェントの必須ルール
+- [MANUAL_TEST.md](MANUAL_TEST.md) — 実機・ネットワーク・ブラウザ検証計画
+- [SECURITY.md](SECURITY.md) — セキュリティモデル
+- [PRIVACY.md](PRIVACY.md) — プライバシー・生体情報モデル
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — アーキテクチャ
+- [docs/SETUP.md](docs/SETUP.md) — 想定セットアップ体験
 
-## License
+## ライセンス
 
-Apache License 2.0. See [LICENSE](LICENSE).
+Apache License 2.0。詳細は [LICENSE](LICENSE) を参照してください。
 
-## Non-goals for the initial release
+## 初期リリースで扱わないもの
 
-- developer-hosted account/video service;
-- advertising, analytics, telemetry, subscriptions;
-- native iOS/App Store camera application;
-- phone-camera monitoring requirement;
-- audio surveillance;
-- named identification database for non-owner people;
-- public Internet exposure by default;
-- cross-camera biometric re-identification;
-- guaranteed concealment from Tailnet/infrastructure administrators;
-- guaranteed recording after the main recording host/storage is physically removed or destroyed.
+- 開発者運用のアカウント・映像サービス
+- 広告、分析、テレメトリー、課金
+- ネイティブ iOS / App Store のカメラアプリ
+- phone カメラを監視カメラとして使う要件
+- 音声監視
+- 所有者以外の氏名付き識別データベース
+- 既定の公衆インターネット公開
+- カメラ間の生体再同定
+- Tailnet 管理者やインフラ管理者からの秘匿の保証
+- Main Server やストレージが物理的に失われた後の録画保証

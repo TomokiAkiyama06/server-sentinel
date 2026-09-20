@@ -12,7 +12,7 @@ ServerSentinel consists of four logical runtime areas:
 ```text
 Local UVC cameras                         Remote room-overview camera
 ┌───────────────┐                         ┌──────────────────────────┐
-│ Webcam A/B    │                         │ Camera (e.g. CS-800)     │
+│ ウェブカメラ A/B │                       │ UVC ウェブカメラ          │
 └───────┬───────┘                         └────────────┬─────────────┘
         │ V4L2/UVC                                     │ USB/UVC
         │                                               v
