@@ -9,6 +9,7 @@ from pathlib import Path
 import pwd
 import re
 import subprocess
+import stat
 
 from media_capture_agent.config import ConfigurationError, Settings
 from media_capture_agent.storage import StorageRefused, open_directory
@@ -86,10 +87,10 @@ def install(args):
     artifact = args.artifact.read_bytes()
     if hashlib.sha256(artifact).hexdigest() != args.sha256:
         raise ValueError("artifact digest mismatch")
-    fd = os.open(args.config, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    fd = os.open(args.config, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
     with os.fdopen(fd, encoding="utf-8") as stream:
         info = os.fstat(stream.fileno())
-        if info.st_mode & 0o077 or info.st_size > 65536:
+        if not stat.S_ISREG(info.st_mode) or info.st_mode & 0o077 or info.st_size > 65536:
             raise ValueError("protected configuration required")
         settings = Settings.parse(json.load(stream), code_root=args.destination)
     code_root = Path(__file__).resolve().parents[1]
