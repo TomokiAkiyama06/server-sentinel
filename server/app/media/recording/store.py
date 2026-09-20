@@ -476,7 +476,7 @@ class RecordingStore:
                 )
                 self.db.execute(
                     "DELETE FROM recording_discontinuities WHERE recording_id=? "
-                    "AND (start_ms>=? OR end_ms<?)",
+                    "AND (start_ms>=? OR end_ms<=?)",
                     (str(recording_id), end_ms, row["start_ms"]),
                 )
             try:
@@ -566,7 +566,7 @@ class RecordingStore:
             result[bucket].append({"start_ms": cursor, "end_ms": end, "reason": reason})
         discontinuities = self.db.execute(
             "SELECT start_ms,end_ms,reason FROM recording_discontinuities "
-            "WHERE recording_id=? AND start_ms<? AND end_ms>=? ORDER BY start_ms",
+            "WHERE recording_id=? AND start_ms<? AND end_ms>? ORDER BY start_ms",
             (str(recording_id), end, row["start_ms"]),
         ).fetchall()
         result["discontinuities"] = [dict(item) for item in discontinuities]

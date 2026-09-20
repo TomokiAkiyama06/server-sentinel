@@ -357,7 +357,15 @@ class RecordingTests(unittest.TestCase):
         self.assertEqual("stream_discontinuity", result["discontinuities"][0]["reason"])
         next_recording = self.store.start_manual(self.source, 50_000, duration_ms=10_000)
         self.store.append(self.segment(50_000, 60_000, 0, stream_id=uuid4()))
-        self.assertEqual("gapped", self.store.finish(next_recording)["status"])
+        # The new recording begins at this independently decodable generation;
+        # the previous generation ends outside its half-open clip interval.
+        next_result = self.store.finish(next_recording)
+        self.assertEqual("complete", next_result["status"])
+        self.assertEqual([], next_result["discontinuities"])
+        self.assertEqual(0, self.db.execute(
+            "SELECT COUNT(*) FROM recording_discontinuities WHERE recording_id=?",
+            (str(next_recording),),
+        ).fetchone()[0])
 
     def test_cursor_survives_eviction_and_rejects_replays(self):
         self.store.close()
