@@ -13,3 +13,5 @@ Where the screen shows the Tailscale login/device last observed for a person, sh
 Invitations hand out a short-lived single-use enrollment code; the redemption screen registers one credential and shows nothing about cameras, recordings or the deployment.
 
 Owner-only actions follow the server's step-up contract: on a step-up-required response, prompt for a fresh assertion and retry the original request; on cancellation or failure, report the generic failure and leave the action unperformed. Do not decide freshness in the client or retry silently.
+
+The server issues the step-up challenge for the current session's own credential, so pass it through unchanged and expect a refusal when a different passkey answers. Do not offer an account picker or fall back to another credential there; a refusal means this session cannot be refreshed, not that the person should try a different key.

@@ -392,6 +392,8 @@ Only the owner (or a future explicitly defined privileged role) may add/revoke u
 
 These operations shall additionally require a user verification newer than a bounded freshness window, so an older or unattended session cannot perform them on its own. A step-up that fails, is cancelled, or is declined shall leave the operation unperformed, change no state, and disclose nothing beyond the generic failure.
 
+The step-up shall be bound to the session: the challenge is issued for that session and accepts only the still-active credential the session was created with. An assertion from any other credential, including a valid credential belonging to a different person at the same workstation, shall be refused and shall not refresh the session's verification time. Otherwise a non-owner could use their own passkey to revive a stale owner session and run a privileged operation.
+
 ### AUTH-009 Immediate application revocation
 Application permission revocation shall invalidate active ServerSentinel authorization promptly. Tailnet membership/policy remains separately administered outside ServerSentinel.
 

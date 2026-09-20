@@ -69,6 +69,8 @@ Both the invitation code and the bootstrap authorization are bearer authorizatio
 
 The AUTH-008 owner operations require a user verification newer than a bounded freshness window, so a long-lived or unattended owner session cannot revoke users, change retention/security settings or delete recordings by itself. A failed, cancelled or declined step-up leaves the operation unperformed, changes no state and returns only the generic failure. The exact freshness window is settled with ADR-0003.
 
+The step-up is bound to the session's own credential, which matters here precisely because people share workstations: the challenge allows only the credential the session was created with, and an assertion from anyone else's passkey is refused and does not refresh the session. Without that binding, an invited non-owner who finds a stale owner session could verify with their own credential and run a privileged operation.
+
 ### 6. Device approval is not person identification
 
 Device-scoped approval may be offered as an additional restriction, but the product MUST NOT describe approving a device as identifying a person.

@@ -1045,10 +1045,23 @@ to know when to prompt:
 ```text
 owner route, session fresh      -> the operation runs
 owner route, session stale      -> distinct step_up_required response, no other data
-step-up assertion succeeds      -> last_user_verification_at updates; client retries
+step-up challenge               -> issued for the session, allowing only
+                                   principal_session.credential_id
+assertion by that credential    -> last_user_verification_at updates; client retries
+assertion by any other credential-> refused; freshness unchanged
 retry                           -> permission and freshness re-checked server-side
 step-up cancelled/failed        -> generic failure; nothing executed, nothing changed
 ```
+
+The step-up is bound to the session, not merely to the deployment. The challenge
+is issued for that `principal_session`, its allowed credential list contains only
+`principal_session.credential_id`, and the assertion is accepted only when it
+comes from that still-active credential of that same principal. An assertion
+from any other registered credential — including a valid one belonging to
+someone else who is standing at the same workstation — is refused and leaves
+`last_user_verification_at` untouched, so a second person cannot refresh a stale
+owner session with their own passkey. If the session's credential has been
+revoked, the session is invalid and no step-up can revive it.
 
 The `step_up_required` signal is returned only to an already authenticated
 session that holds the required permission. Anything unauthenticated, uninvited

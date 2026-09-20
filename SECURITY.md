@@ -252,6 +252,8 @@ Three request classes necessarily run before a credential exists, and the set is
 
 Owner-only operations additionally require a user verification newer than a bounded freshness window, so a stale or unattended owner session cannot revoke users, change retention/security settings or delete recordings; a failed or cancelled step-up performs nothing and reveals nothing.
 
+The step-up is bound to the session's own credential: the challenge allows only `principal_session.credential_id`, and an assertion from any other registered credential is refused without touching the session's verification time. A route that accepts any valid passkey here lets whoever is standing at a shared workstation refresh someone else's stale owner session with their own credential, which is the attack this binding exists to stop.
+
 ## Capture-node pairing
 
 Pairing credentials:

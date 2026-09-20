@@ -349,7 +349,8 @@ The research-room Tailnet is shared, so run these with two people (or two browse
 - [ ] record the configured entropy of enrollment codes and bootstrap authorizations and confirm it meets the stated minimum; guessing attempts against a wrong code are rate-limited and give the same generic response;
 - [ ] a first-time invitee redeems an enrollment code and registers a credential without already holding one, and the same code cannot be redeemed twice;
 - [ ] an absent, unknown, expired or already-redeemed code returns the same generic response as an uninvited person, and the enrollment step returns no camera, recording or timeline data;
-- [ ] an owner operation (revoke a user, change a retention/security setting, delete a recording) asks for a fresh user verification even inside an existing owner session, and cancelling it leaves everything unchanged.
+- [ ] an owner operation (revoke a user, change a retention/security setting, delete a recording) asks for a fresh user verification even inside an existing owner session, and cancelling it leaves everything unchanged;
+- [ ] with a stale owner session open on a shared machine, a second invited person's own passkey cannot satisfy the step-up: the assertion is refused, the operation does not run, and the owner session's freshness is unchanged.
 
 Record the residual limits instead of testing them away: a credential its holder deliberately lends, and a session left unlocked on an unattended machine, are outside what the application can detect.
 
