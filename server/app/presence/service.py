@@ -303,12 +303,12 @@ class PresenceService:
                           (("evidence", self.evidence), ("notification", self.notifications))
                           if port is not None)
         with self._transaction() as db:
-            # A submission claimed by an earlier cycle cannot still be in
-            # flight once this serialized worker starts a new one. Its outcome
-            # is unknown, so it becomes uncertain: visibly unresolved, never
-            # blindly retried, and recoverable only through an Owner-approved
-            # requeue that accepts the duplicate-side-effect risk.
-            db.execute("UPDATE presence_deliveries SET state='uncertain' WHERE state='submitting'")
+            # A claimed submission is never reclaimed here. Its outcome is
+            # unknown, and a concurrent or re-entrant dispatcher may still be
+            # inside that port call, so rewriting the row would either duplicate
+            # an external side effect or discard a completion that is about to
+            # land. It stays visibly unresolved in the status snapshot and
+            # returns to the queue only through an Owner-approved requeue.
             next_row = db.execute("SELECT next_state FROM presence_delivery_fairness WHERE singleton=1").fetchone()
             fresh = db.execute(
                 "SELECT job.observation,job.action FROM presence_deliveries job "

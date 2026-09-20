@@ -44,9 +44,9 @@ completed its critical action keeps the affected path visibly unavailable:
 `disabled`, `unavailable`, `failed` and `uncertain` outcomes, and also a
 submission whose completion is unconfirmed (`submitting`, `queued`), which an
 interrupted worker or a lost completion callback would otherwise strand while
-the path still claimed to be armed. A submission claimed by an earlier dispatch
-cycle becomes `uncertain` when the next cycle starts, because it cannot still
-be in flight and its outcome is unknown.
+the path still claimed to be armed. A claimed submission is never reclaimed by
+a later cycle, because a concurrent or re-entrant dispatcher may still be inside
+that port call; it stays visibly unresolved instead.
 
 Automatic dispatch never retries an outcome it could not confirm, so stranded
 work is recovered only through `requeue_action()`, an audited Owner decision
