@@ -30,7 +30,7 @@ class DiskRing:
         self.connected = False
         self.state, self.reason = "degraded", "not_configured"
         try:
-            self.ledger_headroom = (self.ledger.headroom if os.stat(settings.media_root, follow_symlinks=False).st_dev
+            self.ledger_headroom = (self.ledger.headroom if self.store.filesystem_device
                                     == os.fstat(self.ledger.fd).st_dev else 0)
             row = self.db.execute("SELECT value FROM settings WHERE key='configuration'").fetchone()
             if row:
@@ -218,7 +218,7 @@ class DiskRing:
             incidents += 1
         return self.ledger.require_rows(segments=segments, incidents=incidents, protections=protections)
 
-    def _budget(self, profiles, now):
+    def _budget(self, profiles, now, *, clock_trusted):
         self._reconcile_presence()
         free = self.store.check(require_reserve=False)
         allocations = self.store.segment_allocations()
@@ -226,8 +226,8 @@ class DiskRing:
         pre = sum(allocations.get(UUID(row["id"]), 0) for row in self._rows()
                   if row["state"] == "stored" and row["clock_trusted"] and row["source"] in source_ids
                   and row["end"] > now - PRE and row["start"] < now)
-        reclaimable = sum(allocations.get(UUID(row["id"]), 0)
-                          for row in self._reclaimable(now))
+        eligible = self._selected_reclaimable(now, self.config) if clock_trusted and self.config else ()
+        reclaimable = sum(allocations.get(UUID(row["id"]), 0) for row in eligible)
         post = self._estimate(profiles, POST)
         additional = max(post, self._estimate(profiles, PRE + POST) - pre) + self.ledger_headroom
         return {
@@ -263,7 +263,7 @@ class DiskRing:
             if config.mode == "duration":
                 integer(config.value * SECOND)
                 self._estimate(mapping, config.value * SECOND)
-            budget = self._budget(mapping, now_us)
+            budget = self._budget(mapping, now_us, clock_trusted=clock_trusted)
             reclaimable = self._configuration_reclaimable(now_us, config) if clock_trusted else ()
             allocations = self.store.segment_allocations()
             credit = sum(allocations.get(UUID(row["id"]), 0) for row in reclaimable)
@@ -622,8 +622,8 @@ class DiskRing:
         if self.config is None:
             return {"state": "degraded", "reason": "not_configured"}
         self.ledger.check_space()
-        budget = self._budget(self.profiles, now)
         clock_trusted = self._clock(now, clock_trusted, record=False)
+        budget = self._budget(self.profiles, now, clock_trusted=clock_trusted)
         ledger_pressure = False
         try:
             active = self.db.execute("SELECT 1 FROM incidents WHERE state='active' LIMIT 1").fetchone()

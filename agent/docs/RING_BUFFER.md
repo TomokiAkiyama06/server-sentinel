@@ -67,11 +67,18 @@ For a candidate configuration:
 - `P` is the unique allocated size of usable segments intersecting the required
   pre-loss interval. A segment shared by multiple incidents is counted once.
 - `R` contains only closed ordinary segments wholly outside that interval.
-  Protected, writing, unknown/orphan and required pre-loss files provide no
-  reclaim credit.
+  Runtime credit additionally requires current selected-FIFO eligibility and
+  trusted time. Future aging during POST provides no advance credit, avoiding
+  assumptions about when released bytes become available. Protected, writing,
+  unknown/orphan and required pre-loss files provide no reclaim credit.
 - `B20` and `Bpost` are bounded aggregate estimates for 20 and 10 minutes.
 - `L` is the conservative ledger completion headroom when runtime/media share a filesystem; otherwise it is zero on the media filesystem.
 - Admission requires `free + R - reserve >= max(Bpost, B20 - P) + L`.
+
+The shared-filesystem decision compares the verified pinned directory devices,
+so a transient pathname substitution cannot cache a zero ledger reservation.
+The runtime headroom estimate is conservative: later FIFO expiry becomes credit
+at a subsequent trusted status check, and can clear an earlier pressure warning.
 
 The pre-loss setting must itself hold at least ten minutes: duration is at least
 600 seconds, and capacity is at least the bounded ten-minute estimate. The

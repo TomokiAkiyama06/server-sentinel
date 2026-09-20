@@ -7,6 +7,7 @@ import random
 import sqlite3
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 from uuid import UUID, uuid4
@@ -275,6 +276,32 @@ class RingTests(unittest.TestCase):
             self.ring.configure(RingConfig("duration", 600), (self.profile,), now_us=T0 + POST + PRE,
                                 clock_trusted=True)
 
+    def test_post_budget_does_not_credit_media_retained_by_longer_duration(self):
+        self.configure(value=1800)
+        payload = zlib.compress(random.Random(16).randbytes(6000))
+        for start in range(T0 - 1200 * SECOND, T0, 60 * SECOND):
+            self.ring.append(SOURCE, start, start + 60 * SECOND, payload,
+                             now_us=start + 60 * SECOND, clock_trusted=True)
+        self.quota.capacity = (self.quota.used() + self.ring.ledger_headroom
+                               + self.settings.safety_reserve_bytes + 2 * 8192)
+        result = self.ring.status(now_us=T0, clock_trusted=True)
+        self.assertFalse(result["pre_loss_coverage"][str(SOURCE)]["gaps_us"])
+        self.assertEqual(result["state"], "STORAGE_PRESSURE")
+        self.assertEqual(result["reason"], "post_loss_headroom_reduced")
+        self.assertEqual(result["reclaimable_allocated"], 0)
+
+    def test_post_budget_credits_only_current_fifo_with_trusted_time(self):
+        self.configure(value=1200)
+        with patch.object(self.ring, "_trim"):
+            for start in range(T0 - 1800 * SECOND, T0, 60 * SECOND):
+                self.append(start)
+        expected = sum(self.store.segment_allocations()[UUID(row["id"])]
+                       for row in self.ring._rows() if row["end"] <= T0 - 1200 * SECOND)
+        self.assertGreater(expected, 0)
+        self.assertEqual(self.ring.status(now_us=T0, clock_trusted=True)["reclaimable_allocated"], expected)
+        self.assertEqual(self.ring.status(now_us=T0, clock_trusted=False)["reclaimable_allocated"], 0)
+        self.assertEqual(self.ring.status(now_us=T0 - SECOND, clock_trusted=True)["reclaimable_allocated"], 0)
+
     def test_profile_cadence_and_bitrate_violation_refused_before_file_write(self):
         self.configure()
         with self.assertRaisesRegex(RingRefused, "profile_bound_violation"):
@@ -339,7 +366,7 @@ class RingTests(unittest.TestCase):
         self.store.write_segment(orphan, PAYLOAD)
         self.restart()
         self.assertIn(orphan, self.store.list_segments())
-        self.assertEqual(self.ring._budget(self.ring.profiles, T0)["reclaimable_allocated"], 0)
+        self.assertEqual(self.ring._budget(self.ring.profiles, T0, clock_trusted=True)["reclaimable_allocated"], 0)
 
     def test_pending_corrupt_file_never_recovers_as_complete_after_fallocate(self):
         self.configure()
@@ -545,29 +572,21 @@ class RingTests(unittest.TestCase):
         self.assertFalse(result["has_gaps"])
         self.assertGreater(result["allocated_bytes"], 0)
 
-    def test_reclaimed_blocks_must_actually_become_free_before_config_acceptance(self):
+    def test_failed_duration_reconfiguration_does_not_credit_current_coverage(self):
         self.configure(value=1200)
         for start in range(T0 - 1200 * SECOND, T0, 60 * SECOND):
             self.append(start)
         before = self.store.segment_allocations()
-        budget = self.ring._budget(self.ring.profiles, T0)
-        self.assertGreater(budget["reclaimable_allocated"], 0)
+        budget = self.ring._budget(self.ring.profiles, T0, clock_trusted=True)
+        self.assertEqual(budget["reclaimable_allocated"], 0)
+        shortage = self.store.allocation_unit
         self.quota.capacity = (self.quota.used() + budget["required_additional"]
-                               + budget["safety_reserve"] - budget["reclaimable_allocated"])
-        original = self.store.delete_segment
-
-        def kept_open(identifier):
-            allocation = self.store.segment_allocations()[identifier]
-            result = original(identifier)
-            self.quota.other += allocation  # Models blocks retained by an open reader.
-            return result
-
-        with patch.object(self.store, "delete_segment", side_effect=kept_open):
-            with self.assertRaises(RingRefused):
-                self.configure(value=600)
+                               + budget["safety_reserve"] - shortage)
+        with self.assertRaises(RingRefused):
+            self.configure(value=600)
         self.assertEqual(self.ring.config.value, 1200)
         self.assertEqual(self.store.segment_allocations(), before)
-        self.quota.capacity += budget["reclaimable_allocated"]
+        self.quota.capacity += shortage
         self.restart()
         self.assertEqual(self.ring.config.value, 1200)
         self.assertEqual(self.store.segment_allocations(), before)
@@ -596,7 +615,7 @@ class RingTests(unittest.TestCase):
         eligible = self.ring._configuration_reclaimable(T0, RingConfig("duration", 600))
         allocations = self.store.segment_allocations()
         credit = sum(allocations[UUID(row["id"])] for row in eligible)
-        budget = self.ring._budget(self.ring.profiles, T0)
+        budget = self.ring._budget(self.ring.profiles, T0, clock_trusted=True)
         self.quota.capacity = (self.quota.used() + budget["required_additional"]
                                + budget["safety_reserve"] - credit)
         original = self.store.delete_segment
@@ -616,7 +635,7 @@ class RingTests(unittest.TestCase):
         for start in range(T0 - 1800 * SECOND, T0, 60 * SECOND):
             self.append(start)
         before = self.store.segment_allocations()
-        budget = self.ring._budget(self.ring.profiles, T0)
+        budget = self.ring._budget(self.ring.profiles, T0, clock_trusted=True)
         self.quota.capacity = (self.quota.used() + budget["required_additional"]
                                + budget["safety_reserve"] - self.store.allocation_unit)
         with self.assertRaises(RingRefused):
@@ -964,6 +983,27 @@ class RingTests(unittest.TestCase):
         self.assertIsNone(self.ring.db.execute("SELECT value FROM settings WHERE key='oversize'").fetchone())
         self.assertLessEqual(self.settings.runtime_root.joinpath("ring.sqlite3").stat().st_size, 128 * 1024)
         self.assertGreater(before, 0)
+
+    def test_transient_pathname_device_cannot_drop_pinned_filesystem_reservation(self):
+        self.ring.close()
+        original_stat = os.stat
+        def transient_device(path, *args, **kwargs):
+            result = original_stat(path, *args, **kwargs)
+            if path == self.settings.media_root:
+                # A pathname can briefly resolve to another filesystem and
+                # recover before later mount checks; the pinned fd cannot.
+                return SimpleNamespace(st_dev=result.st_dev + 1)
+            return result
+        with patch("media_capture_agent.ring.os.stat", side_effect=transient_device):
+            self.ring = DiskRing(self.settings, self.store, ledger_maximum_bytes=LEDGER_BYTES,
+                                 authority=AllowControls(), ledger_space=self.quota)
+        self.assertEqual(self.ring.ledger_headroom, self.ring.ledger.headroom)
+        self.configure()
+        self.quota.capacity = self.settings.safety_reserve_bytes + self.ring.ledger.headroom
+        with self.assertRaises(RingRefused):
+            self.append(T0)
+        self.assertEqual(self.store.list_segments(), {})
+        self.assertFalse(any(row["state"] == "writing" for row in self.ring._rows()))
 
     def test_media_write_retains_shared_filesystem_ledger_headroom(self):
         self.warm()
