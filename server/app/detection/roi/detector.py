@@ -6,7 +6,8 @@ from uuid import uuid4
 from app.cameras.registry.models import timestamp
 from app.detection.foundation import GrayFrame, Observation, Quality
 from .contracts import Calibration, CriticalKind, CriticalObservation, SceneObservation
-from .geometry import candidates, contains, match, validate_polygon, variance
+from .geometry import (candidates, contains, dissimilarity, match,
+                       validate_polygon, variance)
 
 
 @dataclass
@@ -180,17 +181,29 @@ class SceneDetector:
         if tamper_quality is Quality.SUFFICIENT:
             dark = sum(value <= self.policy.dark_pixel_ceiling for value in frame.pixels) / len(frame.pixels)
             global_shift = global_good and (global_match.transform.dx ** 2 + global_match.transform.dy ** 2 >= self.policy.camera_shift_pixels ** 2
-                                           or global_match.transform.rotated > 0)
-            changed = global_shift or dark >= self.policy.camera_dark_fraction or not global_good
-            tamper_reason = "global_scene_shift" if global_shift else "scene_obscured_or_changed" if changed else "background_matches"
-            tamper_confidence = 1 - global_match.error if global_good else dark if dark >= self.policy.camera_dark_fraction else None
+                                            or global_match.transform.rotated > 0)
+            obscured = dark >= self.policy.camera_dark_fraction
+            # A covered or redirected camera often cannot register at all. Such a
+            # scene is a persistence candidate when it also differs measurably;
+            # an ambiguous registration of an otherwise unchanged scene stays
+            # indeterminate and is never confirmed or called untampered.
+            difference = 0.0 if global_good else dissimilarity(c.reference, frame, self.background)
+            unmatched = not global_good and difference > self.policy.maximum_match_error
+            indeterminate = not (global_good or obscured or unmatched)
+            changed = global_shift or obscured or unmatched
             if global_shift:
+                tamper_reason, tamper_confidence = "global_scene_shift", 1 - global_match.error
                 self.last_scene_shift_ns, self.last_scene_shift_confidence = monotonic_ns, tamper_confidence
-            # Unmatched textured scenes are unknown, not automatically confirmed
-            # tamper: unsupported transforms/exposure may prevent registration.
-            if changed and tamper_confidence is None:
+            elif obscured:
+                tamper_reason, tamper_confidence = "scene_obscured_or_changed", dark
+            elif unmatched:
+                tamper_reason, tamper_confidence = "scene_unmatched_persistently", difference
+            elif indeterminate:
+                tamper_reason, tamper_confidence = "global_alignment_unavailable", None
+            else:
+                tamper_reason, tamper_confidence = "background_matches", 1 - global_match.error
+            if indeterminate:
                 self.tamper.interrupt()
-                tamper_reason = "global_alignment_unavailable"
             else:
                 confirmed, emit = self.tamper.observe(changed, monotonic_ns, self.policy)
                 tamper = Observation.PRESENT if confirmed else Observation.UNKNOWN if changed else Observation.ABSENT

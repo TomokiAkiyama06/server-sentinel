@@ -65,6 +65,21 @@ def variance(reference, points):
     return sum((value - mean) ** 2 for value in values) / len(values)
 
 
+def dissimilarity(reference: GrayFrame, current: GrayFrame, points):
+    """Mean absolute untransformed difference in [0, 1] over support points.
+
+    This is a scene-change measurement, not a probability and not an identity:
+    it never describes who or what is in the frame. It stays available when
+    bounded rigid registration fails, so a persistently unmatched scene can be
+    measured instead of being discarded every sample.
+    """
+    if not points:
+        return 0.0
+    total = sum(abs(reference.pixels[y * reference.width + x]
+                    - current.pixels[y * current.width + x]) for x, y in points)
+    return total / (255 * len(points))
+
+
 @dataclass(frozen=True)
 class Match:
     transform: Transform

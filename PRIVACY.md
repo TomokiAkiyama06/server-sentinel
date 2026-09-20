@@ -161,4 +161,14 @@ The deployment owner is responsible for camera placement and compliance with app
 
 Any feature that sends monitoring/biometric data to infrastructure operated by the ServerSentinel developer is a fundamental privacy-model change and requires explicit owner approval plus updated requirements/security/privacy documentation before implementation.
 
+The Issue #24 ROI/tamper core keeps its calibration history as metadata only:
+identities, Owner polygon, policy, reference geometry, version, timestamp and
+the reference SHA-256. No reference frame, crop or other decoded monitoring
+media is written to that history, so it cannot become a persistent still-image
+store outside recording authorization and retention. Restoring a calibration
+re-binds an Owner-supplied transient frame that must match the stored digest
+and geometry. Its scene-change measurements are bounded scalars and never
+person identities, and a detector that cannot register a scene reliably reports
+`unknown` rather than a trustworthy "no tamper".
+
 The Issue #20 detector foundation keeps only bounded transient grayscale samples and a previous motion sample per source. It performs no model download, persistence or network I/O; unavailable person inference remains `unknown`. Model/runtime adoption and their separate privacy/license acceptance are documented in `server/docs/DETECTOR_MODEL_AUDIT.md`; synthetic primitive tests are not acceptance of an external model.

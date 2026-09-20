@@ -1,5 +1,6 @@
 """Generated grayscale scenes for calibrated ROI movement and camera tamper."""
 
+import base64
 from dataclasses import replace
 from datetime import datetime, timezone
 import inspect
@@ -10,8 +11,8 @@ from uuid import UUID
 from app.cameras.registry.models import SourceType
 from app.detection.foundation import GrayFrame, Observation, Quality
 from app.detection.roi import (
-    Calibration, CalibrationArchive, CriticalDelivery, CriticalKind,
-    OwnerCalibrationOperations, Policy, SceneDetector,
+    Calibration, CalibrationArchive, CalibrationRecord, CriticalDelivery,
+    CriticalKind, OwnerCalibrationOperations, Policy, SceneDetector,
 )
 from app.storage.migrations import migrate
 from app.storage.schema import APPLICATION_MIGRATIONS
@@ -62,13 +63,18 @@ def policy(**changes):
     return Policy(**values)
 
 
-def calibration(source_type=SourceType.LOCAL_UVC, *, version=1):
+def covered():
+    """Generated bright, textured non-dark scene that does not register."""
+    return bytes((x * 3 + y * 5) % 37 + 210 for y in range(HEIGHT) for x in range(WIDTH))
+
+
+def calibration(source_type=SourceType.LOCAL_UVC, *, version=1, rules=None):
     return Calibration(UUID(int=400 + version), SOURCE, source_type, PROFILE, version, NOW,
-                       POLYGON, frame(0), policy())
+                       POLYGON, frame(0), rules or policy())
 
 
-def detector(source_type=SourceType.LOCAL_UVC):
-    return SceneDetector(calibration(source_type))
+def detector(source_type=SourceType.LOCAL_UVC, *, rules=None):
+    return SceneDetector(calibration(source_type, rules=rules))
 
 
 def inspect_scene(instance, sample, monotonic_ns, *, movement=Quality.SUFFICIENT,
@@ -128,6 +134,31 @@ class SceneDetectorTests(unittest.TestCase):
         self.assertEqual(Observation.PRESENT, confirmed.tamper)
         self.assertEqual("scene_obscured_or_changed", confirmed.tamper_reason)
         self.assertEqual((CriticalKind.CAMERA_TAMPER,), tuple(item.kind for item in confirmed.critical))
+
+    def test_persistent_unmatched_scene_confirms_camera_tamper(self):
+        instance = detector()
+        obstruction = covered()
+        inspect_scene(instance, frame(0), 0)
+        first = inspect_scene(instance, frame(1, obstruction), 10)
+        confirmed = inspect_scene(instance, frame(2, obstruction), 20)
+        self.assertEqual(Observation.UNKNOWN, first.tamper)
+        self.assertFalse(first.critical)
+        self.assertEqual(Observation.PRESENT, confirmed.tamper)
+        self.assertEqual("scene_unmatched_persistently", confirmed.tamper_reason)
+        self.assertEqual((CriticalKind.CAMERA_TAMPER,), tuple(item.kind for item in confirmed.critical))
+        self.assertEqual(Observation.UNKNOWN, confirmed.movement)
+        self.assertEqual("global_alignment_unavailable", confirmed.movement_reason)
+
+    def test_ambiguous_registration_is_never_tamper_or_trustworthy_no_tamper(self):
+        instance = detector(rules=policy(minimum_match_margin=.9))
+        inspect_scene(instance, frame(0), 0)
+        samples = [inspect_scene(instance, frame(index), index * 10) for index in range(1, 5)]
+        for sample in samples:
+            self.assertEqual(Observation.UNKNOWN, sample.tamper)
+            self.assertEqual("global_alignment_unavailable", sample.tamper_reason)
+            self.assertIsNone(sample.tamper_confidence)
+            self.assertEqual(Observation.UNKNOWN, sample.movement)
+            self.assertFalse(sample.critical)
 
     def test_source_loss_is_critical_only_when_trusted_and_correlated(self):
         shifted = transformed(pixels(), (1, 0))
@@ -199,13 +230,53 @@ class CalibrationAndDeliveryTests(unittest.TestCase):
         with self.assertRaises(PermissionError):
             owner.save(first)
         owner = OwnerCalibrationOperations(archive, owner_authorized=lambda: True)
-        owner.save(first)
+        record = owner.save(first)
         second = replace(first, version=2)
         owner.save(second)
-        self.assertEqual(second, archive.load(SOURCE, PROFILE))
-        self.assertEqual(first, archive.load(SOURCE, PROFILE, 1))
+        self.assertEqual(2, archive.load(SOURCE, PROFILE).version)
+        self.assertEqual(record, archive.load(SOURCE, PROFILE, 1))
+        self.assertEqual(first, record.rehydrate(first.reference))
         with self.assertRaises(ValueError):
             owner.save(replace(second, identifier=UUID(int=499), version=3))
+
+    def test_calibration_history_never_persists_decoded_reference_media(self):
+        connection = sqlite3.connect(":memory:", isolation_level=None)
+        migrate(connection, APPLICATION_MIGRATIONS)
+        archive = CalibrationArchive(connection)
+        stored = calibration()
+        OwnerCalibrationOperations(archive, owner_authorized=lambda: True).save(stored)
+        columns = connection.execute("PRAGMA table_info(roi_calibration_history)").fetchall()
+        self.assertEqual(["source_id", "profile_id", "version", "identifier", "metadata"],
+                         [column[1] for column in columns])
+        self.assertNotIn("BLOB", [column[2].upper() for column in columns])
+        media = stored.reference.pixels
+        for (table,) in connection.execute("SELECT name FROM sqlite_master WHERE type='table'"):
+            for row in connection.execute(f'SELECT * FROM "{table}"'):
+                for value in row:
+                    self.assertNotIsInstance(value, (bytes, bytearray))
+                    text = str(value)
+                    self.assertNotIn(media.hex(), text)
+                    self.assertNotIn(base64.b64encode(media).decode(), text)
+                    self.assertNotIn(media.decode("latin-1"), text)
+        record = archive.load(SOURCE, PROFILE)
+        self.assertIsInstance(record, CalibrationRecord)
+        self.assertEqual(stored.reference_sha256, record.reference_sha256)
+        self.assertFalse([name for name, value in vars(record).items()
+                          if isinstance(value, (bytes, bytearray, GrayFrame))])
+        self.assertEqual(stored, record.rehydrate(stored.reference))
+        for rejected in (frame(0, covered()), frame(1), frame(0, source=UUID(int=399))):
+            with self.assertRaises(ValueError):
+                record.rehydrate(rejected)
+
+    def test_archive_refuses_history_table_carrying_a_media_column(self):
+        connection = sqlite3.connect(":memory:", isolation_level=None)
+        connection.execute(
+            "CREATE TABLE roi_calibration_history ("
+            "source_id TEXT, profile_id TEXT, version INTEGER, identifier TEXT, "
+            "metadata TEXT, reference BLOB)"
+        )
+        with self.assertRaises(RuntimeError):
+            CalibrationArchive(connection)
 
     def test_critical_delivery_requires_confirmed_events_and_never_discards_failure(self):
         instance = detector()

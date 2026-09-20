@@ -530,10 +530,15 @@ Candidate signals include global optical transform, persistent occlusion/near-bl
 
 The internal `server/app/detection/roi/` core operates only on transient,
 bounded grayscale frames for one immutable source/profile calibration. It stores
-source type, profile, polygon, reference digest, policy, version, and timestamp
-in a private append-only calibration history after application migration 3. It
-does not supply production thresholds, start capture, expose an API, retain
-decoded media, make a presence decision, or issue a notification.
+source type, profile, polygon, reference digest, reference geometry, policy,
+version, and timestamp in a private append-only calibration history after
+application migration 3. That history is metadata only: no frame pixels, crop,
+thumbnail or other decoded monitoring media is persisted, so it cannot become
+still-image storage outside recording authorization and retention. A stored
+record therefore cannot reproduce a reference image; resuming detection re-binds
+an Owner-supplied transient frame whose digest and geometry must match the
+record. The core does not supply production thresholds, start capture, expose an
+API, retain decoded media, make a presence decision, or issue a notification.
 
 It first estimates a bounded global translation/quarter-turn transform from
 background support, then compares the ROI relative to that transform. A
@@ -544,7 +549,12 @@ returns `unknown` and resets confirmation; none is converted into a trustworthy
 no-movement result. Person presence is not an input to this conclusion.
 
 Camera tamper has an independent quality input and confirmation state. The core
-can report a persistent near-dark/changed scene or global scene shift. Trusted
+can report a persistent near-dark scene, a global scene shift, or a scene that
+stops registering while differing measurably from the calibrated background,
+which covers a covered or redirected camera. That difference is a bounded
+scene-change scalar and never an identity or a culprit attribution. A merely
+ambiguous registration of an otherwise unchanged scene remains `unknown` and
+confirms neither tamper nor its absence. Trusted
 source loss becomes critical only when it occurs within the configured interval
 after a recorded global scene shift; uncorrelated or untrusted loss stays
 `unknown`. A later runtime must durably handle a confirmed critical observation
