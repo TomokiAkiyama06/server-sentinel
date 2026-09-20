@@ -7,7 +7,6 @@ import random
 import sqlite3
 from pathlib import Path
 import tempfile
-from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 from uuid import UUID, uuid4
@@ -987,12 +986,17 @@ class RingTests(unittest.TestCase):
     def test_transient_pathname_device_cannot_drop_pinned_filesystem_reservation(self):
         self.ring.close()
         original_stat = os.stat
+
         def transient_device(path, *args, **kwargs):
             result = original_stat(path, *args, **kwargs)
             if path == self.settings.media_root:
                 # A pathname can briefly resolve to another filesystem and
                 # recover before later mount checks; the pinned fd cannot.
-                return SimpleNamespace(st_dev=result.st_dev + 1)
+                # Only the reported device changes: every other caller of this
+                # path, including the test filesystem quota, keeps working.
+                values = list(result)
+                values[2] = result.st_dev + 1
+                return os.stat_result(values)
             return result
         with patch("media_capture_agent.ring.os.stat", side_effect=transient_device):
             self.ring = DiskRing(self.settings, self.store, ledger_maximum_bytes=LEDGER_BYTES,
