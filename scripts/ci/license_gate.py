@@ -15,6 +15,7 @@ the earlier review even when the exact version string is unchanged.
 import argparse
 import base64
 import binascii
+import codecs
 import datetime
 import hashlib
 import json
@@ -157,6 +158,16 @@ REVIEWED_NPM_COMMANDS = {
     "ci", "clean-install", "ic", "install-clean", "isntall-clean",
     "run", "run-script", "start", "test",
 }
+NPM_SCRIPT_COMMANDS = {"run", "run-script", "start", "test"}
+ALLOWED_NPM_FLAGS = {
+    "--foreground-scripts", "--ignore-scripts", "--no-audit", "--no-fund",
+    "--no-progress", "--quiet", "--silent", "-q",
+}
+ALLOWED_NPM_VALUE_FLAGS = {"--loglevel", "--omit", "--progress"}
+# Docker's default shell resolves quoting, escaping and expansion before the
+# command runs, so a token that is not a plain literal is never classified.
+SHELL_LITERAL = re.compile(r"[A-Za-z0-9._:/=@,+-]+")
+MAX_TEXT_SCAN_BYTES = 16 * 1024 * 1024
 REJECTED_PACKAGE_MANAGERS = {"bun", "npx", "pnpm", "yarn"}
 SOURCE_SCAN_SUFFIXES = {".py", ".pyi"}
 
@@ -317,21 +328,30 @@ def reviewed_media(path: Path, suffix):
 
 
 def opaque_bytes(path: Path):
-    """Report whether a file is opaque rather than reviewable UTF-8 text."""
+    """Report whether a file is opaque rather than reviewable UTF-8 text.
+
+    The whole file is decoded, so trailing artifact bytes after a readable
+    prefix are still opaque. A file larger than the bounded scan is opaque by
+    definition rather than trusted unread.
+    """
+    decoder = codecs.getincrementaldecoder("utf-8")()
+    scanned = 0
     try:
         with path.open("rb") as handle:
-            chunk = handle.read(65536)
+            while True:
+                chunk = handle.read(65536)
+                if not chunk:
+                    break
+                scanned += len(chunk)
+                if scanned > MAX_TEXT_SCAN_BYTES or b"\x00" in chunk:
+                    return True
+                decoder.decode(chunk)
+            decoder.decode(b"", True)
     except OSError as error:
         raise GateError(f"cannot inspect {path.name}") from error
-    if b"\x00" in chunk:
+    except UnicodeDecodeError:
         return True
-    for trim in range(4):
-        try:
-            chunk[:len(chunk) - trim].decode("utf-8")
-        except UnicodeDecodeError:
-            continue
-        return False
-    return True
+    return False
 
 
 def scan_paths(root: Path):
@@ -596,16 +616,29 @@ def pip_command(words, index, relative):
 
 
 def npm_command(words, index, relative):
-    """Accept only lock-driven npm commands, whatever alias or option order."""
+    """Accept only lock-driven npm commands with reviewed options."""
+    command = None
     while index < len(words):
         word = words[index]
         index += 1
+        if command is None:
+            if word.startswith("-"):
+                raise GateError(f"unreviewed npm option before the command in {relative}")
+            if word not in REVIEWED_NPM_COMMANDS:
+                raise GateError(f"unclassified npm command in {relative}")
+            command = word
+            continue
         if word.startswith("-"):
-            raise GateError(f"unreviewed npm option before the command in {relative}")
-        if word not in REVIEWED_NPM_COMMANDS:
-            raise GateError(f"unclassified npm command in {relative}")
-        return
-    raise GateError(f"unclassified npm command in {relative}")
+            name, separator, _ = word.partition("=")
+            if separator and name in ALLOWED_NPM_VALUE_FLAGS:
+                continue
+            if not separator and word in ALLOWED_NPM_FLAGS:
+                continue
+            raise GateError(f"unreviewed npm option in {relative}")
+        if command not in NPM_SCRIPT_COMMANDS:
+            raise GateError(f"unreviewed npm argument in {relative}")
+    if command is None:
+        raise GateError(f"unclassified npm command in {relative}")
 
 
 def run_commands(arguments, relative):
@@ -613,6 +646,9 @@ def run_commands(arguments, relative):
     requirements = []
     for command in re.split(r"&&|;|\|+", " ".join(arguments)):
         words = shell_tokens(command)
+        for word in words:
+            if not SHELL_LITERAL.fullmatch(word):
+                raise GateError(f"unreviewed shell syntax in {relative}")
         for index, word in enumerate(words):
             name = PurePosixPath(word).name
             if name in REJECTED_PACKAGE_MANAGERS:

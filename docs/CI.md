@@ -140,8 +140,10 @@ commands are allowlisted rather than pattern-matched: a pip invocation must be
 `install` with `--require-hashes` and only reviewed options, and every
 `-r`/`-c`/`--requirement`/`--constraint` value, including the attached
 `-rfile` and `--requirement=file` forms, must resolve to a reviewed requirements
-input. npm must use a `ci`-family command, so every documented `install` alias,
-an option placed before the command, and `npx`/`pnpm`/`yarn` fail closed.
+input. npm must use a `ci`-family command with reviewed options only, so
+every documented `install` alias, a path-changing option such as `--prefix`, a
+positional argument, and `npx`/`pnpm`/`yarn` fail closed. Build tokens must be
+plain literals; shell escaping, expansion and globbing are rejected.
 
 Committed model artifacts require a distinct `model_weight` record whose pin
 evidence binds the exact path and SHA256 digest. All files in a reserved model

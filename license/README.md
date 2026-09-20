@@ -27,7 +27,9 @@ or `model-artifacts/` directory is treated as a model artifact regardless of its
 extension; common serialized model suffixes elsewhere, including `.pkl`,
 `.joblib`, `.npz`, `.gguf` and `.safetensors`, are also detected, and any other
 opaque non-text file outside the reviewed media and Web asset formats is treated
-as a model artifact until it has its own record. `model_scan_exemptions` records
+as a model artifact until it has its own record. The whole file is decoded, so a
+readable prefix followed by artifact bytes is still opaque, and a file larger
+than the bounded text scan is opaque rather than trusted unread. `model_scan_exemptions` records
 the reviewed source packages that only share a reserved directory name, such as
 `tests/models`; the exemption covers text-only Python sources, an opaque or
 model-suffixed file below the path still needs weight review, and an exemption
@@ -52,9 +54,12 @@ substitution fails the gate and needs a new Owner decision. Container build
 commands are allowlisted rather than pattern-matched. A pip invocation must be
 `install`, carry `--require-hashes`, use only reviewed options, and name reviewed
 requirement or constraint files, including the attached `-rfile` and
-`--requirement=file` forms. npm must use a `ci`-family command, so `npm install`
-and every documented alias, an option placed before the command, and
-`npx`/`pnpm`/`yarn` fail closed.
+`--requirement=file` forms. npm must use a `ci`-family command with reviewed options only, so `npm install`
+and every documented alias, a path-changing option such as `--prefix` before or
+after the command, a positional argument, and `npx`/`pnpm`/`yarn` fail closed.
+Every RUN token must be a plain literal: escaping, quoting-based obfuscation,
+variable expansion and globbing are rejected instead of being read as an
+unrelated word.
 
 Only licenses in the gate's explicit permissive SPDX allowlist pass directly.
 AGPL, GPL, SSPL, BSL/source-available, proprietary, Elastic, Commons Clause,

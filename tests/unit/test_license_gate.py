@@ -656,6 +656,19 @@ version = {attr = "package.__version__"}
         with self.assertRaisesRegex(license_gate.GateError, "model artifact set differs"):
             license_gate.audit(self.root)
 
+    def test_text_prefix_does_not_hide_a_trailing_artifact(self):
+        """The whole file is decoded, not only its first scan chunk."""
+        path = self.root / "server/app/detector/person.dat"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"synthetic readable prefix\n" * 4096
+                         + b"\x80\x04\x95synthetic weight bytes")
+        self.assertGreater(path.stat().st_size, 65536)
+        self.assertTrue(license_gate.opaque_bytes(path))
+        self.assertIn("server/app/detector/person.dat",
+                      license_gate.model_files(self.root))
+        with self.assertRaisesRegex(license_gate.GateError, "model artifact set differs"):
+            license_gate.audit(self.root)
+
     def test_tracked_build_and_dist_model_artifacts_are_not_excluded(self):
         paths = {"build/opaque-model.zip", "dist/opaque-weight.binpack"}
         for path in paths:
@@ -965,6 +978,54 @@ class ContainerImageGateTests(GateFixture):
                 self.write("Dockerfile.ci",
                            "FROM demo/base:1.0@" + IMAGE_DIGEST + "\n" + command)
                 with self.assertRaisesRegex(license_gate.GateError, message):
+                    license_gate.audit(self.root)
+
+    def test_container_build_rejects_path_changing_npm_options(self):
+        """`npm ci --prefix /tmp` would install an undiscovered dependency tree."""
+        self.add_container(
+            "FROM demo/base:1.0@" + IMAGE_DIGEST + "\n"
+            "RUN npm ci --ignore-scripts --no-audit --no-fund --omit=dev\n"
+            "RUN npm run build\n")
+        self.assertEqual(license_gate.audit(self.root), (1, 1, 0, 1))
+
+        rejected = {
+            "RUN npm ci --prefix /tmp\n": "unreviewed npm option",
+            "RUN npm ci -C /tmp\n": "unreviewed npm option",
+            "RUN npm ci --registry=https://example.test\n": "unreviewed npm option",
+            "RUN npm ci --global\n": "unreviewed npm option",
+            "RUN npm ci --userconfig=/tmp/npmrc\n": "unreviewed npm option",
+            "RUN npm ci unreviewed-package\n": "unreviewed npm argument",
+        }
+        for command, message in rejected.items():
+            with self.subTest(command=command.strip()):
+                self.write("Dockerfile.ci",
+                           "FROM demo/base:1.0@" + IMAGE_DIGEST + "\n" + command)
+                with self.assertRaisesRegex(license_gate.GateError, message):
+                    license_gate.audit(self.root)
+
+    def test_container_build_rejects_shell_expanded_installer_names(self):
+        """The default shell resolves escaping and expansion before the command."""
+        self.write("requirements.lock", "demo==1.2.3 --hash=" + DIGEST + "\n")
+        self.add_container()
+        for command in ("RUN pi\\p install unreviewed-package\n",
+                        "RUN p${EMPTY}ip install unreviewed-package\n",
+                        "RUN $PIP install unreviewed-package\n",
+                        "RUN python -m pip install --require-hashes -r req*.lock\n",
+                        "RUN python -m pip install --require-hashes -r $LOCK\n"):
+            with self.subTest(command=command.strip()):
+                self.write("Dockerfile.ci",
+                           "FROM demo/base:1.0@" + IMAGE_DIGEST + "\n" + command)
+                with self.assertRaisesRegex(license_gate.GateError, "unreviewed shell syntax"):
+                    license_gate.audit(self.root)
+
+        # Quoting does not hide the installer: the command is still classified.
+        for command in ("RUN 'pip' install unreviewed-package\n",
+                        "RUN eval \"pip install unreviewed-package\"\n"):
+            with self.subTest(command=command.strip()):
+                self.write("Dockerfile.ci",
+                           "FROM demo/base:1.0@" + IMAGE_DIGEST + "\n" + command)
+                with self.assertRaisesRegex(
+                        license_gate.GateError, "reviewed requirement file"):
                     license_gate.audit(self.root)
 
     def test_container_build_parses_attached_pip_requirement_options(self):
