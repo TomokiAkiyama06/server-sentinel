@@ -230,7 +230,8 @@ class PresenceService:
                             str(observation.identifier)))
             if observation.kind in CRITICAL and observation.confirmed:
                 for action in ("evidence", "notification"):
-                    db.execute("INSERT INTO presence_deliveries VALUES (?,?,'pending',0)",
+                    db.execute("INSERT INTO presence_deliveries(observation,action,state,attempts) "
+                               "VALUES (?,?,'pending',0)",
                                (str(observation.identifier), action))
         return observation
 
@@ -263,8 +264,11 @@ class PresenceService:
                              (str(identifier), action)).fetchone()
             if job is None or job["state"] in {"delivered", "pending"}:
                 raise ValueError("no unresolved critical action")
-            db.execute("UPDATE presence_deliveries SET state='pending' WHERE observation=? AND action=?",
-                       (str(identifier), action))
+            # The retained attempt count would otherwise sort this recovered
+            # action behind every fresh zero-attempt job, so an explicit Owner
+            # recovery leads the queue instead of being starved by new work.
+            db.execute("UPDATE presence_deliveries SET state='pending',requeued=1 "
+                       "WHERE observation=? AND action=?", (str(identifier), action))
             db.execute("INSERT INTO presence_audit(action,actor,at,state) "
                        "VALUES ('critical_action_requeued',?,?,NULL)", (actor, timestamp(now)))
         return action
@@ -313,7 +317,8 @@ class PresenceService:
             fresh = db.execute(
                 "SELECT job.observation,job.action FROM presence_deliveries job "
                 "JOIN presence_observations item ON item.id=job.observation "
-                "WHERE job.state='pending' ORDER BY job.attempts,item.sequence,job.action LIMIT ?", (limit,)).fetchall()
+                "WHERE job.state='pending' "
+                "ORDER BY job.requeued DESC,job.attempts,item.sequence,job.action LIMIT ?", (limit,)).fetchall()
             recovered = []
             if available:
                 recovered = db.execute(
@@ -374,15 +379,20 @@ class PresenceService:
         if override and not (override["expires"] and control_trusted
                              and override["expires"] <= timestamp(now)):
             return PresenceState(override["state"]), "manual_override", override["expires"]
-        if trusted:
-            for slot in ("owner_observation", "hint"):
-                item = db.execute("SELECT * FROM presence_inputs WHERE slot=? AND observed<=? AND valid_until>?",
-                                  (slot, timestamp(now), timestamp(now))).fetchone()
-                # Only a high-confidence owner observation outranks a configured
-                # hint. An unusable one holds no projection, so it invalidates
-                # the earlier inference without masking a still valid hint.
-                if item and PresenceState(item["state"]) != PresenceState.UNKNOWN:
-                    return PresenceState(item["state"]), slot, None
+        # Inference from observations needs observation-clock trust, while an
+        # Owner-configured hint is control input and follows the control marker.
+        # Otherwise one skewed source timestamp would also discard the Owner's
+        # own configuration.
+        for slot, usable in (("owner_observation", trusted), ("hint", control_trusted)):
+            if not usable:
+                continue
+            item = db.execute("SELECT * FROM presence_inputs WHERE slot=? AND observed<=? AND valid_until>?",
+                              (slot, timestamp(now), timestamp(now))).fetchone()
+            # Only a high-confidence owner observation outranks a configured
+            # hint. An unusable one holds no projection, so it invalidates
+            # the earlier inference without masking a still valid hint.
+            if item and PresenceState(item["state"]) != PresenceState.UNKNOWN:
+                return PresenceState(item["state"]), slot, None
         return PresenceState.UNKNOWN, "unknown", None
 
     def _retire_override(self, now):
@@ -480,9 +490,16 @@ class PresenceService:
             # the critical action never completed.
             unresolved |= {row[0] for row in db.execute(
                 "SELECT action FROM presence_expired_unresolved")}
-        timing = trusted and control_trusted
+        # The reported state is only as trustworthy as the marker behind its
+        # basis: Owner control for an override or hint, observation receipt for
+        # an inferred owner observation. A skewed source timestamp must not
+        # withhold the suppression an accepted Owner override asks for, and the
+        # separate observation flag keeps that skew visible.
+        timing = {"manual_override": control_trusted, "hint": control_trusted,
+                  "owner_observation": trusted}.get(basis, trusted and control_trusted)
         return {"state": state.value, "basis": basis, "override_expires_at": expires,
                 "clock_degraded": not timing,
+                "observation_clock_degraded": not trusted,
                 "suppress_ordinary": state == PresenceState.PRESENT and timing,
                 **self._critical_paths(unresolved),
                 "override_expiry_pending": not retired,

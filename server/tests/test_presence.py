@@ -707,15 +707,47 @@ class PresenceTests(unittest.TestCase):
         # Owner control keeps its own monotonic marker, so a single source
         # timestamp cannot refuse every later override, cancellation and hint.
         result = self.service.override("owner", PresenceState.PRESENT, now=NOW, clock_trusted=True)
-        self.assertEqual(result["state"], "PRESENT")
-        self.assertTrue(result["clock_degraded"])
-        self.assertFalse(result["suppress_ordinary"])
+        self.assertEqual((result["state"], result["basis"]), ("PRESENT", "manual_override"))
+        # The accepted override keeps its documented precedence: a source
+        # timestamp neither withholds its suppression nor hides its own skew.
+        self.assertTrue(result["suppress_ordinary"])
+        self.assertFalse(result["clock_degraded"])
+        self.assertTrue(result["observation_clock_degraded"])
         self.service.cancel_override("owner", now=NOW, clock_trusted=True)
         self.service.set_hint("owner", PresenceState.ABSENT, now=NOW,
                               valid_until=NOW + timedelta(hours=1), clock_trusted=True)
         self.assertEqual([row["action"] for row in self.service.audit("owner")],
                          ["override_set", "override_cancelled", "hint_set"])
-        self.assertEqual(self.status()["state"], "UNKNOWN")
+        # The Owner-configured hint also survives the skewed observation clock.
+        status = self.status()
+        self.assertEqual((status["state"], status["basis"]), ("ABSENT", "hint"))
+        self.assertFalse(status["suppress_ordinary"])
+        self.assertTrue(status["observation_clock_degraded"])
+        # Observation-derived inference still needs observation-clock trust.
+        self.service.record(observation(identifier=UUID(int=41)),
+                            presence_valid_until=NOW + timedelta(hours=1))
+        self.assertEqual(self.status()["basis"], "hint")
+
+    def test_owner_requeued_action_leads_fresh_zero_attempt_work(self):
+        def failing(item, complete):
+            raise OSError("synthetic private failure")
+
+        def healthy(item, complete):
+            self.evidence.append(item)
+            return ActionResult.DELIVERED
+
+        self.service.evidence = failing
+        stranded = self.service.record(observation(Kind.SERVER_MOVEMENT, identifier=UUID(int=51)))
+        self.service.dispatch_pending()
+        self.assertEqual(self.evidence, [])
+        self.service.evidence = healthy
+        for index in range(3):
+            self.service.record(observation(Kind.CAMERA_TAMPER, identifier=UUID(int=60 + index)))
+        self.service.requeue_action("owner", stranded.identifier, "evidence", now=NOW, clock_trusted=True)
+        # The recovered action retains its attempt count, so ordering by
+        # attempts alone would let fresh work starve an Owner decision.
+        self.service.dispatch_pending(limit=1)
+        self.assertEqual([item.identifier for item in self.evidence], [stranded.identifier])
 
 
     def test_mock_api_permissions_and_production_route_stays_closed(self):

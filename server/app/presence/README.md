@@ -27,8 +27,13 @@ Its integration ports keep the dependent stack explicit:
 Owner control time is tracked in a marker separate from observation receipt
 time. Receipt times arrive from capture sources, so a shared marker would let a
 single far-future observation refuse every later Owner override, cancellation
-and hint with no way back. Override expiry follows the control marker for the
-same reason, while the reported `clock_degraded` covers both markers.
+and hint with no way back. Everything the Owner configures follows the control
+marker: the mutations themselves, override expiry, the override projection and
+configured hints. Observation-clock trust is reserved for inference from
+observations, so a skewed source timestamp can no longer withhold the
+suppression an accepted `PRESENT` override asks for. `clock_degraded` reports
+the marker behind the state actually returned, and `observation_clock_degraded`
+keeps source-time skew visible alongside it.
 
 Manual overrides require an injected, audited Owner identity and take
 precedence over observation and schedule hints. Only a trusted, confirmed,
@@ -50,7 +55,10 @@ that port call; it stays visibly unresolved instead.
 
 Automatic dispatch never retries an outcome it could not confirm, so stranded
 work is recovered only through `requeue_action()`, an audited Owner decision
-that accepts the risk of a duplicate preservation or notification. An expired
+that accepts the risk of a duplicate preservation or notification. A requeued
+job keeps its attempt count for diagnostics but is dispatched ahead of fresh
+zero-attempt work, so a continuous stream of new events cannot starve the
+action an Owner explicitly recovered. An expired
 degradation marker is cleared the same way, through `clear_expired_degradation()`,
 never automatically.
 

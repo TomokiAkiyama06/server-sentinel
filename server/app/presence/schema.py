@@ -25,8 +25,11 @@ def presence_migration(version: int) -> Migration:
         "CREATE TABLE presence_control_clock (singleton INTEGER PRIMARY KEY CHECK(singleton=1), "
         "latest TEXT NOT NULL)",
         "CREATE TABLE presence_source_clock (source TEXT PRIMARY KEY, latest_occurred TEXT NOT NULL)",
+        # `requeued` marks work an Owner explicitly recovered, so its retained
+        # attempt count cannot push it behind an endless stream of fresh jobs.
         "CREATE TABLE presence_deliveries (observation TEXT REFERENCES presence_observations(id), "
-        "action TEXT NOT NULL, state TEXT NOT NULL, attempts INTEGER NOT NULL, PRIMARY KEY(observation, action))",
+        "action TEXT NOT NULL, state TEXT NOT NULL, attempts INTEGER NOT NULL, "
+        "requeued INTEGER NOT NULL DEFAULT 0 CHECK(requeued IN (0,1)), PRIMARY KEY(observation, action))",
         "CREATE TABLE presence_delivery_fairness (singleton INTEGER PRIMARY KEY CHECK(singleton=1), "
         "next_state TEXT NOT NULL CHECK(next_state IN ('pending','unavailable')))",
         # Identity-only tombstones for completed critical events whose timeline
