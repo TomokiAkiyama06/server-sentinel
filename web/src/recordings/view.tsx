@@ -9,7 +9,7 @@ export interface RecordingActions {
   remove(recording: RecordingSummary): void;
 }
 
-const filters = ['all', 'event', 'continuous', 'critical', 'starred'] as const;
+const filters = ['all', 'event', 'manual', 'critical', 'starred'] as const;
 type Filter = typeof filters[number];
 
 function matches(recording: RecordingSummary, filter: Filter): boolean {
@@ -59,6 +59,7 @@ export function RecordingsView({ t, recordings, owner = false, actions, busy = [
         <th scope="col">{t.columnTime}</th>
         <th scope="col">{t.columnCamera}</th>
         <th scope="col">{t.columnKind}</th>
+        <th scope="col">{t.columnStatus}</th>
         <th scope="col">{t.columnDuration}</th>
         <th scope="col">{t.columnSize}</th>
         <th scope="col">{t.columnRetention}</th>
@@ -70,6 +71,8 @@ export function RecordingsView({ t, recordings, owner = false, actions, busy = [
         <td className="numeric">{timestamp(recording.start_ms)}</td>
         <td>{recording.source_name}</td>
         <td><span className={`kind kind-${recording.kind}`}>{t[`kind_${recording.kind}`]}</span></td>
+        <td><span className={`recording-status recording-status-${recording.status}`}>{t[`status_${recording.status}`]}</span>
+          {(recording.status === 'gapped' || recording.status === 'interrupted') && <p className="coverage-warning">{t.coverageIncomplete}</p>}</td>
         <td className="numeric">{duration(recording.duration_ms)}</td>
         <td className="numeric">{bytes(recording.size_bytes)}</td>
         <td>{recording.starred || recording.retention_days_left === null
@@ -80,12 +83,12 @@ export function RecordingsView({ t, recordings, owner = false, actions, busy = [
         {manageable && <td className="row-actions">
           <button type="button" disabled={waiting.has(recording.id)} onClick={() => manageable.star(recording)}>
             {recording.starred ? t.starOff : t.starOn}</button>
-          {confirming === recording.id ? <>
+          {recording.status !== 'active' && (confirming === recording.id ? <>
             <button type="button" className="danger" disabled={waiting.has(recording.id)}
               onClick={() => { setConfirming(null); manageable.remove(recording); }}>{t.confirmDelete}</button>
             <button type="button" disabled={waiting.has(recording.id)} onClick={() => setConfirming(null)}>{t.cancel}</button>
           </> : <button type="button" disabled={waiting.has(recording.id)}
-            onClick={() => setConfirming(recording.id)}>{t.deleteRecording}</button>}
+            onClick={() => setConfirming(recording.id)}>{t.deleteRecording}</button>)}
         </td>}
       </tr>)}</tbody>
     </table></div>}

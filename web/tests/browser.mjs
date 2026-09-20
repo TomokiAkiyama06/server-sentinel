@@ -28,7 +28,8 @@ const fixture = count => Array.from({ length: count }, (_, index) => ({
 const recordingFixture = count => Array.from({ length: count }, (_, index) => ({
   id: `synthetic-recording-${index}`, source_id: `synthetic-source-${index % 2}`,
   source_name: `生成カメラ ${(index % 2) + 1}`,
-  kind: ['event', 'critical', 'continuous'][index % 3],
+  kind: ['event', 'critical', 'manual'][index % 3],
+  status: ['complete', 'gapped', 'active'][index % 3],
   start_ms: 1_700_000_000_000 + index * 600_000, duration_ms: 150_000 + index * 1_000,
   size_bytes: 536_870_912 * (index + 1), starred: index % 3 === 1,
   retention_days_left: index % 3 === 1 ? null : 20 - index,
@@ -165,11 +166,17 @@ try {
         assert.equal(await page.evaluate("document.querySelectorAll('#main a[href], #main a[download], video, source, iframe').length"), 0);
         if (!recordings) return;
         assert.equal(await page.evaluate("document.querySelectorAll('.row-actions').length"), recordings);
-        // Every recording kind can be isolated, continuous included.
-        for (const [label, expected] of [['イベント', 1], ['連続', 1], ['critical 証拠', 1], ['★ 付き', 1], ['すべて', 3]]) {
+        // Every store-backed recording kind can be isolated, manual included.
+        for (const [label, expected] of [['イベント', 1], ['手動録画', 1], ['critical 証拠', 1], ['★ 付き', 1], ['すべて', 3]]) {
           await page.evaluate(`Array.from(document.querySelectorAll('.filter')).find(el => el.textContent === ${JSON.stringify(label)}).click()`);
           await page.wait(`document.querySelectorAll('[data-recording-id]').length === ${expected}`);
         }
+        // Active recordings are visibly in progress and never offer the store's
+        // invalid delete operation; known gaps stay visible to the owner.
+        assert.match(await page.evaluate("document.querySelector('[data-recording-id=\"synthetic-recording-2\"]').innerText"), /録画中/);
+        assert.doesNotMatch(await page.evaluate("document.querySelector('[data-recording-id=\"synthetic-recording-2\"]').innerText"), /削除/);
+        assert.match(await page.evaluate("document.querySelector('[data-recording-id=\"synthetic-recording-1\"]').innerText"), /欠落あり/);
+        assert.match(await page.evaluate('document.body.innerText'), /この録画には既知の映像欠落があります/);
         // Owner deletion requires an explicit second confirmation in the same row.
         await page.evaluate("Array.from(document.querySelectorAll('[data-recording-id] button')).find(el => el.textContent === '削除').click()");
         await page.wait("Array.from(document.querySelectorAll('button')).some(el => el.textContent === '削除を確定')");

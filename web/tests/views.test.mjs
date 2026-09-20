@@ -15,13 +15,13 @@ const { StorageView } = await import('../build/storage-view.mjs');
 
 const recordings = [
   { id: 'synthetic-recording-1', source_id: 'synthetic-source-1', source_name: '生成カメラ 1',
-    kind: 'event', start_ms: 1_700_000_000_000, duration_ms: 150_000,
+    kind: 'event', status: 'complete', start_ms: 1_700_000_000_000, duration_ms: 150_000,
     size_bytes: 536_870_912, starred: false, retention_days_left: 12 },
   { id: 'synthetic-recording-2', source_id: 'synthetic-source-2', source_name: '生成カメラ 2',
-    kind: 'critical', start_ms: 1_700_003_600_000, duration_ms: 900_000,
+    kind: 'critical', status: 'gapped', start_ms: 1_700_003_600_000, duration_ms: 900_000,
     size_bytes: 3_221_225_472, starred: true, retention_days_left: null },
   { id: 'synthetic-recording-3', source_id: 'synthetic-source-1', source_name: '生成カメラ 1',
-    kind: 'continuous', start_ms: 1_700_007_200_000, duration_ms: 1_200_000,
+    kind: 'manual', status: 'active', start_ms: 1_700_007_200_000, duration_ms: 1_200_000,
     size_bytes: 104_857_600, starred: false, retention_days_left: 3 },
 ];
 const storage = {
@@ -32,8 +32,8 @@ const storage = {
   slack_configured: false, daily_summary_local_time: '23:00',
 };
 const actions = { star() { assert.fail('render must not mutate'); }, remove() { assert.fail('render must not mutate'); } };
-const recordingsMarkup = (owner, extra = {}) =>
-  renderToStaticMarkup(createElement(RecordingsView, { t: messages.ja, recordings, owner, ...extra }));
+const recordingsMarkup = (owner, { recordings: items = recordings, ...extra } = {}) =>
+  renderToStaticMarkup(createElement(RecordingsView, { t: messages.ja, recordings: items, owner, ...extra }));
 const storageMarkup = (locale = 'ja', value = storage) =>
   renderToStaticMarkup(createElement(StorageView, { t: messages[locale], storage: value }));
 
@@ -106,15 +106,32 @@ test('starred recordings are shown as never auto-deleted and keep their day coun
   assert.match(markup, /3 日/);
 });
 
-test('recording filters keep every kind selectable', () => {
+test('recording filters keep every store-backed kind selectable', () => {
   const markup = recordingsMarkup(false);
-  // Every kind in the catalog must be isolatable, continuous included.
+  // Every kind in the catalog must be isolatable, manual included.
   const kinds = Object.keys(messages.ja).filter(key => key.startsWith('kind_')).map(key => messages.ja[key]);
   assert.equal(kinds.length, new Set(recordings.map(recording => recording.kind)).size);
   for (const label of [messages.ja.filterAll, ...kinds, messages.ja.filterStarred]) {
     assert.match(markup, new RegExp(`aria-pressed="(true|false)"[^>]*>${label}<`));
   }
   assert.match(markup, /role="group"/);
+});
+
+test('recording coverage state is projected and active rows never offer deletion', () => {
+  const markup = recordingsMarkup(true, { actions, recordings: [
+    ...recordings,
+    { ...recordings[1], id: 'synthetic-recording-4', status: 'interrupted' },
+  ] });
+  for (const status of ['active', 'complete', 'gapped', 'interrupted']) {
+    assert.ok(markup.includes(messages.ja[`status_${status}`]));
+  }
+  assert.ok(markup.includes(messages.ja.coverageIncomplete));
+  const active = markup.split('<tr').find(row => row.includes('data-recording-id="synthetic-recording-3"'));
+  assert.ok(active);
+  assert.doesNotMatch(active, new RegExp(`>${messages.ja.deleteRecording}<`));
+  const gapped = markup.split('<tr').find(row => row.includes('data-recording-id="synthetic-recording-2"'));
+  assert.ok(gapped);
+  assert.match(gapped, new RegExp(`>${messages.ja.coverageIncomplete}<`));
 });
 
 test('storage shows all three states with the current one marked', () => {

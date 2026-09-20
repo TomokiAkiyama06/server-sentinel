@@ -36,7 +36,7 @@ the backend or ingest listener.
 ## Recording browser and storage/notification screens for #21
 
 `src/recordings/view.tsx` lists authorized recordings with time, camera, type
-(event / continuous / critical evidence), length, size and remaining Main
+(event / manual / critical evidence), recording coverage state, length, size and remaining Main
 retention. Starred recordings are shown as never auto-deleted instead of a day
 count. Playback is in-browser only: there is no download, export, media link or
 embedded media element for any role, and the screen states plainly that

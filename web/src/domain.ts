@@ -14,12 +14,16 @@ export interface CameraSourceSummary {
   health: CameraHealth;
 }
 
-export type RecordingKind = 'event' | 'continuous' | 'critical';
+/** `manual` has no event_id in RecordingStore; ordinary/critical event rows do. */
+export type RecordingKind = 'event' | 'manual' | 'critical';
+export type RecordingStatus = 'active' | 'complete' | 'gapped' | 'interrupted';
 export interface RecordingSummary {
   id: string;
   source_id: string;
   source_name: string;
   kind: RecordingKind;
+  /** Store coverage state; `gapped` and `interrupted` are never presented as complete. */
+  status: RecordingStatus;
   start_ms: number;
   duration_ms: number;
   size_bytes: number;
