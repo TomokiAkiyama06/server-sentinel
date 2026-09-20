@@ -126,6 +126,21 @@ class UvcRegistryTests(unittest.TestCase):
         self.assertFalse(restarted.poll_source(self.source.id))
         self.assertEqual(len(self.events), event_count)
 
+    def test_failed_first_approval_never_promotes_candidate_even_after_clean_restart(self):
+        with patch.object(self.adapter.store, "save", side_effect=ApprovalStorageError("synthetic failure")):
+            with self.assertRaises(ApprovalStorageError):
+                self.adapter.approve_source(self.source.id, self.camera)
+        self.assertTrue(self.adapter.store.load(self.source.id).requires_approval)
+        self.assertFalse(self.adapter.poll_source(self.source.id))
+        self.assertEqual(self.frames, [])
+        self.adapter.close()
+        restarted = self.make_adapter()
+        self.addCleanup(restarted.close)
+        self.assertFalse(restarted.poll_source(self.source.id))
+        self.assertEqual(self.frames, [])
+        restarted.approve_source(self.source.id, self.camera)
+        self.assertTrue(restarted.poll_source(self.source.id))
+
 
 if __name__ == "__main__":
     unittest.main()

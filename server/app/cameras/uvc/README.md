@@ -25,6 +25,8 @@ restart requires approval again when identity is weak. Duplicate serial evidence
 also latches manual intervention. `ApprovalStore` persists approved evidence and
 the ambiguity latch in the private application SQLite database (migration 3);
 storage failure blocks approval rather than falling back to an empty state.
+The first selected candidate is persisted as approval-required; only a
+successful explicit approval write can promote it to an approved binding.
 
 Before any reconciliation, a durable active-session marker is written. If the
 process dies or a later latch write fails, the next session requires Owner

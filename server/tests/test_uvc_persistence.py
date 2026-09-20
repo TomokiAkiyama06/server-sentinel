@@ -33,7 +33,12 @@ class PersistenceTests(unittest.TestCase):
         self.store = ApprovalStore(self.database)
 
     def controller(self):
-        return ReconnectController(self.source_id, self.camera, lambda event: None, store=self.store)
+        new_source = self.store.load(self.source_id) is None
+        control = ReconnectController(self.source_id, self.camera, lambda event: None, store=self.store)
+        if new_source:
+            control.approve(self.camera, [self.camera])
+            control.capture_closed()
+        return control
 
     def test_ambiguity_remains_latched_after_process_restart(self):
         control = self.controller()

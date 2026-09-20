@@ -84,7 +84,9 @@ class ApprovalStore:
             ).fetchone()
             prior = self._state(row)
             approved = initial_approved if prior is None else prior.approved
-            required = False if prior is None else prior.requires_approval or prior.session_token is not None
+            # Initial evidence is merely an Owner selection candidate. Only a
+            # successful approve() write may clear its approval-required flag.
+            required = True if prior is None else prior.requires_approval or prior.session_token is not None
             ambiguous = False if prior is None else prior.serial_ambiguous
             token = str(uuid4())
             connection.execute(
