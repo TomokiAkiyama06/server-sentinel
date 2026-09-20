@@ -266,7 +266,9 @@ Non-owner users receive no official recording download/export control in MVP. Th
 
 The screen must clearly state that Tailscale-level network permission is managed separately outside ServerSentinel. ServerSentinel does not modify ACLs/Grants or store Tailscale administrative credentials.
 
-The screen also lists each person's registered credentials with their owner-visible label and last-used time, and allows revoking one credential or the whole principal. Revoking one credential (for example a lost device) leaves the person's other credentials working; revoking the principal ends all of them and their sessions promptly.
+The screen also lists each person's registered credentials with their owner-visible label and last-used time, and allows revoking one credential or the whole principal. Revoking one credential leaves the person's other credentials working; revoking the principal ends all of them and their sessions promptly.
+
+Revocation is credential-scoped. A synced passkey is one credential that may live on several of that person's devices, so revoking it applies everywhere it synced, and the label is a hint rather than proof of a device. A deployment that needs device-scoped control registers device-bound authenticators and refuses backup-eligible credentials.
 
 ## Tailscale/private-network setup
 

@@ -271,14 +271,15 @@ The authorization decision is recorded in ADR 0004 (shared Tailnet account, per-
 
 Acceptance:
 - Tailnet membership alone is insufficient;
-- verified Tailscale/trusted-proxy identity alone is insufficient; no human route authorizes on an identity header alone;
+- verified Tailscale/trusted-proxy identity alone is insufficient; no human route authorizes on an identity header alone, and no route requires one where the deployment supplies none;
 - every human route verifies the requesting principal's own credential before returning application data, except the enumerated AUTH-012 pre-credential routes, which return no application data themselves;
 - initial owner bootstrap and first-credential enrollment are reachable without an existing credential, so a fresh deployment and a first-time invitee are not deadlocked;
 - AUTH-008 owner operations require a fresh user verification, and a cancelled or failed step-up changes nothing;
 - uninvited identity receives no deployment metadata, and an uninvited and a revoked person receive the same generic response;
 - owner can revoke app access, at both the single-credential and the whole-principal level;
 - backend rejects spoofed identity headers from untrusted LAN paths;
-- no viewer biometric template reaches the server; only public credential material is stored;
+- no viewer biometric template reaches the server; transient WebAuthn verification data is checked and discarded, and only public credential material plus owner-visible metadata is persisted;
+- revocation is credential-scoped: a synced passkey is revoked everywhere it synced, and nothing promises per-device revocation;
 - no developer-operated identity/cloud.
 
 ## Plan 5 — Local UVC discovery and stable identity
@@ -711,7 +712,8 @@ Acceptance:
 - Tailnet membership without app invitation receives no ServerSentinel application data;
 - existing Tailnet policy may remain unchanged;
 - docs do not promise Main Server node invisibility when Tailnet policy exposes it;
-- every human/media request requires verified Tailscale/trusted-proxy identity plus an active invitation, that principal's own verified credential, and the required permission; a request carrying only a verified identity header is refused;
+- every human/media request requires an active principal, that principal's own verified credential, and the required permission; a request carrying only a verified identity header is refused;
+- where the deployment configures a trusted proxy identity, it is additionally verified on the trusted local path and recorded, per AUTH-005; where the private-network path supplies no identity header, the absence alone does not deny access and does not weaken the credential check;
 - the only exceptions are the enumerated pre-credential routes of AUTH-012: local owner bootstrap (a privileged local action, not a remote route), invitation redemption gated by a valid unexpired single-use enrollment code, and the authentication route. A fresh deployment reaches its first owner and an invitee redeems a first credential without a deadlock, and neither path returns camera, recording, timeline or deployment data;
 - an absent, unknown, expired or already-redeemed enrollment code receives the same generic response as an uninvited person, redemption succeeds at most once, attempts are rate-limited, and logs carry no raw code;
 - AUTH-008 owner operations require a user verification newer than the configured freshness window; a credential-bearing but stale session is refused, and a failed or cancelled step-up performs no state change and returns only the generic failure;

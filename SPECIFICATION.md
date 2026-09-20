@@ -863,7 +863,7 @@ principal_credential
 - public_key (public material only; never a biometric template)
 - user_verification: required (asserted at registration, verified again at
   every authentication)
-- label (owner-visible device label)
+- label (owner-visible hint, not proof of a device)
 - created_at
 - last_used_at
 - revoked_at
@@ -914,11 +914,24 @@ server-enforced, an explicit sign-out is available for shared machines, and
 owner-only routes require a fresh user-verification step rather than an older
 session.
 
-User verification runs on the viewer's own device. The server receives the
-credential id and public key only; no fingerprint or face template reaches
-ServerSentinel. `principal_credential` is an access-control record, unrelated to
-the optional owner face verification of §7.6 and never a non-owner identity
-or biometric database (see `PRIVACY.md`).
+User verification runs on the viewer's own device, and its result reaches the
+server only as the authenticator's user-verification flag. The WebAuthn protocol
+data needed to check a registration or assertion — the server-issued challenge,
+client data, authenticator data, the attestation or assertion signature, the
+signature counter and the user-verification flag — is received and verified,
+including the relying-party id and origin. That data is transient: only the
+fields of `principal_credential` and `principal_session` persist, and the rest is
+discarded once verified.
+
+What never reaches ServerSentinel is biometric material. No fingerprint or face
+template leaves the authenticator, so none is received, persisted or exportable
+here. `principal_credential` is an access-control record, unrelated to the
+optional owner face verification of §7.6 and never a non-owner identity or
+biometric database (see `PRIVACY.md`).
+
+Relying-party verification depends on ServerSentinel owning its browser origin:
+the dashboard is served from an origin reserved for it, with no other
+application sharing it, as ADR-0003 requires.
 
 Initial non-owner permissions:
 
@@ -998,7 +1011,9 @@ This is not DRM. A user who can view video may still screen-record or use advanc
 
 ServerSentinel permission revocation invalidates application access promptly. Tailnet membership/policy remains a separate Tailscale administrative concern.
 
-Revoking a single `principal_credential` (for example a lost or shared device) invalidates that credential only; revoking the `access_principal` invalidates all of its credentials and active sessions.
+Revocation is credential-scoped, not device-scoped. Revoking a single `principal_credential` invalidates that credential and the sessions bound to it; revoking the `access_principal` invalidates all of its credentials and active sessions.
+
+A synced passkey is one credential that can exist on several of its owner's devices, so revoking it disables it everywhere it synced, and losing one device does not by itself isolate a credential to revoke. The UI and documentation therefore describe revocation as credential-scoped and treat the label as a hint. A deployment that needs device-scoped control configures device-bound authenticators and refuses backup-eligible credentials at registration; that choice is a deployment setting, not a promise the product makes by default.
 
 ### 11.8 Shared Tailnet account
 

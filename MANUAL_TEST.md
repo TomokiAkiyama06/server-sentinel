@@ -327,7 +327,8 @@ The research-room Tailnet is shared, so run these with two people (or two browse
 - [ ] a session ends after its idle/absolute lifetime, and the explicit sign-out control works on a shared machine;
 - [ ] the refusal is the generic response: no product/version string, camera names/counts, recording or timeline data, or deployment metadata, and the credential prompt itself carries none of them;
 - [ ] a revoked person receives the same response as an uninvited person;
-- [ ] revoking one credential (one device) leaves the principal's other credentials working, and revoking the principal blocks all of them promptly;
+- [ ] revoking one credential leaves the principal's other credentials working, and revoking the principal blocks all of them promptly;
+- [ ] if a synced passkey is in use, confirm that revoking it takes effect on every device it synced to, and record that revocation is credential-scoped rather than per-device; if the deployment requires device-scoped control, confirm that registration refuses backup-eligible credentials;
 - [ ] no human route grants access on the proxy identity header alone;
 - [ ] record that reachability is expected for every holder of the shared account and is not treated as a finding.
 

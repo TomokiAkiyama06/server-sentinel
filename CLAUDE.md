@@ -55,6 +55,8 @@ MVPの基本構成:
 - trusted Tailscale identity header pathをLANからbypassできないか
 - Tailscale login / proxy identity headerだけでhuman routeを認可していないか、per-person credential検証がserver-sideであるか
 - device承認や network到達性を「人物の特定」「uninvitedを排除する障壁」として説明していないか
+- credential失効を per-device revocation のように説明していないか（synced passkey は 1 credential が複数 device に存在しうる）
+- WebAuthn の transientな検証データ（challenge / client data / signature / UV flag / RP id・origin）の検証を「最小化」を理由に省いていないか
 - ServerSentinelがTailscale ACL/Grants変更やadmin credentialを要求していないか、未招待identityへアプリ情報を漏らしていないか
 - `live:view` / `recordings:view`分離がserver-sideで強制されるか
 - non-owner download/exportが再導入されていないか

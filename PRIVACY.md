@@ -90,12 +90,14 @@ The target deployment shares one Tailscale account across the research room, so 
 For each credential the main host stores:
 - the credential id and its public key;
 - the principal it belongs to;
-- an owner-visible device label;
+- an owner-visible label, which is a hint chosen at registration and not proof of a device;
 - created/last-used/revoked timestamps.
 
-Authenticator user verification (device PIN, device unlock, fingerprint or face unlock) runs on the viewer's own device. ServerSentinel never receives or stores a viewer's fingerprint or face template. These records are an access-control list, not an identity or biometric database, and they are unrelated to the optional owner face verification described below. Revoking a credential or its principal permanently disables the corresponding record.
+Authenticator user verification (device PIN, device unlock, fingerprint or face unlock) runs on the viewer's own device; the server learns only that it succeeded. Signing in also sends the short-lived data needed to check the sign-in itself, which is verified and then discarded rather than stored. ServerSentinel never receives or stores a viewer's fingerprint or face template. These records are an access-control list, not an identity or biometric database, and they are unrelated to the optional owner face verification described below. Revoking a credential or its principal permanently disables the corresponding record.
 
 Invitations carry a short-lived, single-use enrollment code that is delivered out of band and is never written to logs. Redeeming it registers one credential and returns no camera, recording, timeline or deployment information.
+
+Revoking a credential applies to that credential wherever it exists: a synced passkey can live on several of its owner's devices, so revocation is credential-scoped rather than per-device.
 
 Approving a device is not the same as identifying a person. The application cannot detect a credential whose holder lends it out, or a session left unlocked on an unattended shared machine; the deployment owner manages those risks outside the application.
 

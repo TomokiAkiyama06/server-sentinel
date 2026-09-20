@@ -73,7 +73,13 @@ Before authentication succeeds, responses follow `REQUIREMENTS.md` AUTH-010: gen
 
 ### 9. Credential data is not biometric data
 
-Authenticator user verification runs on the viewer's own device. ServerSentinel receives and stores only public credential material (credential id and public key) plus owner-visible metadata: label, created/last-used/revoked timestamps. No viewer fingerprint or face template reaches the server. `principal_credential` is an access-control record; it is unrelated to the optional owner face verification and never becomes a non-owner identity or biometric database.
+Authenticator user verification runs on the viewer's own device and reaches the server as the authenticator's user-verification flag. ServerSentinel verifies the transient data a WebAuthn registration or assertion carries — its own challenge, client data, authenticator data, the attestation or assertion signature, the signature counter, the user-verification flag, and the relying-party id and origin — and persists only public credential material (credential id and public key) plus owner-visible metadata: label, created/last-used/revoked timestamps. The rest is discarded once verified.
+
+No viewer fingerprint or face template reaches the server; it never leaves the authenticator. `principal_credential` is an access-control record; it is unrelated to the optional owner face verification and never becomes a non-owner identity or biometric database.
+
+Relying-party verification assumes ServerSentinel owns its browser origin. ADR-0003 reserves a dedicated origin for the dashboard with no other application sharing it, and this ADR depends on that: a co-hosted application on the same origin would put the credential within its reach.
+
+Revocation is credential-scoped, not device-scoped. A synced passkey is a single credential that can exist on several of its owner's devices, so revoking it applies everywhere it synced and losing one device does not by itself isolate a credential. The product describes revocation and labels accordingly; a deployment that needs device-scoped control registers device-bound authenticators and refuses backup-eligible credentials, which is a deployment setting rather than a default promise.
 
 ## Alternatives
 
