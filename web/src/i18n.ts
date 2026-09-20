@@ -68,7 +68,7 @@ export const messages = {
     criticalNotArmed: 'critical 対応の一部が継続中であると確認できていません。下記の内訳を確認してください。',
     armedDetection: '検知', armedEvidence: '証拠保護', armedNotification: 'critical 通知',
     armedYes: '継続中', armedNo: '未確認', pendingCritical: '未完了の critical 対応',
-    clockDegradedNotice: '時刻の信頼性が低下しているため、状態は不明側に倒して表示します。',
+    clockDegradedNotice: '時刻の信頼性が低下しています。状態の根拠と手動上書きを確認してください。',
     transitions: '本日の推移', transitionsEmpty: '本日の推移はありません。',
   },
   en: {
@@ -139,7 +139,7 @@ export const messages = {
     criticalNotArmed: 'Part of the critical work is not confirmed as armed. Check the breakdown below.',
     armedDetection: 'Detection', armedEvidence: 'Evidence preservation', armedNotification: 'Critical notification',
     armedYes: 'Armed', armedNo: 'Not confirmed', pendingCritical: 'Pending critical actions',
-    clockDegradedNotice: 'Clock confidence is degraded, so the state is shown conservatively as uncertain.',
+    clockDegradedNotice: 'Clock confidence is degraded. Check the state basis and manual override.',
     transitions: 'Transitions today', transitionsEmpty: 'There are no transitions today.',
   },
 } as const;

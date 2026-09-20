@@ -53,10 +53,13 @@ function attribution(item: Observation, t: Messages): string {
   return `${where} · ${t.detector}: ${t[`kind_${item.kind}`]}`;
 }
 
-function Row({ item, t }: { item: Observation; t: Messages }) {
+function Row({ item, t, orderingBasis }: {
+  item: Observation; t: Messages; orderingBasis: TimelinePage['ordering_basis'];
+}) {
   const group = kindGroup[item.kind];
+  const displayedAt = orderingBasis === 'received_at' ? item.received_at : item.occurred_at;
   return <li className={`timeline-row timeline-${group}`} data-observation-kind={item.kind}>
-    <time className="timeline-time" dateTime={item.occurred_at}>{stamp(item.occurred_at)}</time>
+    <time className="timeline-time" dateTime={displayedAt}>{stamp(displayedAt)}</time>
     <span className={`timeline-dot timeline-dot-${group}`} aria-hidden="true" />
     <div className="timeline-detail">
       <p className="timeline-body">
@@ -96,7 +99,8 @@ export function TimelineBody({ page, filter, t, onFilter }: {
     {spans(items).map(span => <section key={span.items[0].id}
       className={span.degraded ? 'timeline-span timeline-span-degraded' : 'timeline-span'}>
       {span.degraded && <p className="timeline-degraded" role="status">{t.timelineDegraded}</p>}
-      <ol className="timeline-list">{span.items.map(item => <Row key={item.id} item={item} t={t} />)}</ol>
+      <ol className="timeline-list">{span.items.map(item => <Row key={item.id} item={item} t={t}
+        orderingBasis={page.ordering_basis} />)}</ol>
     </section>)}
   </section>;
 }

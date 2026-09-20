@@ -105,12 +105,17 @@ test('low-quality person and owner observations are not presented as factual res
 });
 
 test('ordering statement follows ordering_basis and the warning follows ordering_degraded', () => {
-  const item = observation('motion');
+  const item = observation('motion', {
+    occurred_at: '2026-09-21T09:00:00.000000+00:00', received_at: '2026-09-21T09:04:00.000000+00:00',
+  });
   const received = timeline(page([item], { ordering_basis: 'received_at', ordering_degraded: false }));
   assert.match(received, /受信順で表示しています。/);
+  assert.match(received, /<time[^>]*datetime="2026-09-21T09:04:00.000000\+00:00"[^>]*>2026-09-21 09:04:00<\/time>/);
+  assert.doesNotMatch(received, /<time[^>]*>2026-09-21 09:00:00<\/time>/);
   assert.doesNotMatch(received, /観測時刻順で表示しています。|時刻ずれまたは不連続が報告されています。/);
   const occurred = timeline(page([item], { ordering_basis: 'occurred_at', ordering_degraded: true }));
   assert.match(occurred, /観測時刻順で表示しています。/);
+  assert.match(occurred, /<time[^>]*datetime="2026-09-21T09:00:00.000000\+00:00"[^>]*>2026-09-21 09:00:00<\/time>/);
   assert.match(occurred, /時刻ずれまたは不連続が報告されています。/);
   assert.doesNotMatch(occurred, /受信順で表示しています。/);
   assert.doesNotMatch(timeline(page([item])), /時刻ずれまたは不連続が報告されています。/);
@@ -212,4 +217,14 @@ test('degraded clock and pending critical work stay visible on presence', () => 
   assert.match(markup, /時刻の信頼性が低下しているため/);
   assert.match(markup, /未完了の critical 対応: 2/);
   assert.doesNotMatch(presence({ snapshot: snapshot(), transitions: [] }), /未完了の critical 対応/);
+});
+
+test('degraded timing preserves a manual override state without claiming it became unknown', () => {
+  const markup = presence({ snapshot: snapshot({
+    state: 'PRESENT', basis: 'manual_override', suppress_ordinary: true, clock_degraded: true,
+  }), transitions: [] });
+  assert.match(markup, /presence-PRESENT/);
+  assert.match(markup, /手動上書きが有効です。/);
+  assert.match(markup, /時刻の信頼性が低下しています。状態の根拠と手動上書きを確認してください。/);
+  assert.doesNotMatch(markup, /状態は不明側に倒して表示します。/);
 });
