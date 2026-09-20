@@ -444,6 +444,21 @@ Anonymous person exits
 
 Use a disposable/test volume.
 
+Issue #21 unit/container scenarios cover temporary synthetic files, reserved
+constructor recovery, starvation/cleanup/star races, audit failure, retention,
+mock Slack and DST/rollback scheduling. They do not establish deployed volume,
+real codec, configured Slack, browser playback or human authorization acceptance.
+Keep the following deployment checks open; do not use production data for fills.
+
+- [ ] metadata database and media use the expected filesystem, and configured
+      journal/temp overhead safely covers recovery, cleanup and migrations;
+- [ ] configured Slack receives one safe immediate critical alert and one daily
+      aggregate; a failed/unconfigured channel leaves local/UI faults visible;
+- [ ] slow/unavailable Slack does not block recording; full queues, pending
+      shutdown/crash delivery and failed completion persistence remain visible;
+- [ ] after deployment restart/DST change, summary sends at the configured local
+      time without duplicate dispatch, and uncertain `pending` delivery is visible.
+
 - [ ] retention deletes expired unstarred data;
 - [ ] allocation/free-space pressure reclaims oldest eligible unstarred data;
 - [ ] unrelated filesystem consumption affects admission;
