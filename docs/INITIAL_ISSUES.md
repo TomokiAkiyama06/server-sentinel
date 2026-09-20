@@ -152,6 +152,9 @@ Acceptance:
 - failing secret/fixture guard blocks CI;
 - repository media fixtures are synthetic/generated only.
 - lint/test failures block CI for existing Python/TypeScript components, and existing Docker/Compose configurations are validated.
+- audit Main/Agent/Web dependency and SDK inventories, lockfiles, and generated bundles/packages for analytics, advertising/tracking SDKs, telemetry, and developer-operated crash upload, including opt-in configuration paths;
+- CI negative fixtures for a forbidden SDK/dependency or reporting configuration fail the guard; controlled startup/smoke tests inspect outbound requests for prohibited reporting without using real deployment data;
+- PRIV-003 is an unconditional MVP gate: adding those facilities requires a new explicit Owner decision and ADR before changing requirements/acceptance; an opt-in toggle is not authorization.
 
 ## Plan 2 — Backend foundation
 
@@ -182,7 +185,7 @@ GitHub Issue: [#8](https://github.com/TomokiAkiyama06/server-sentinel/issues/8)
 
 Depends on: [#5](https://github.com/TomokiAkiyama06/server-sentinel/issues/5)
 
-Labels: `frontend`
+Labels: `frontend`, `security`
 
 実機要件: Main Server: 不要; Capture Node: 不要; UVC Camera: 不要; Manual test: 不要
 
@@ -195,6 +198,8 @@ Scope:
 Acceptance:
 - phone/Mac/desktop responsive smoke tests;
 - no fixed camera slot assumptions.
+- dashboard dependencies/bundles and ordinary/error/opt-in-config smoke paths contain no analytics, ads/tracking SDKs, telemetry, or developer crash upload; browser request interception detects any such outbound reporting;
+- keep local error handling free of third-party reporting; changes to this prohibition require explicit Owner decision and ADR under PRIV-003, never an implicit optional setting.
 
 ## Plan 4 — Camera Source registry
 
@@ -788,6 +793,7 @@ Acceptance:
 - test startup/daily hardware drift, Owner-only audited baseline approval, every recording self-test stage, cleanup after success/failure/cancellation/reboot, and cleanup failure without artifact accumulation;
 - critical detection/preservation/configured alerts continue in every presence state; Dashboard/Audit faults remain with Slack disabled or delivery failure;
 - zero-viewer processing stops and 1–4 source reconnect/quality degradation uses browser automation/synthetic media without claiming physical acceptance.
+- controlled Main/Agent/Web runtime and browser/network mocks verify no prohibited analytics/telemetry/ads/tracking/developer-crash reporting in normal/error/opt-in-config paths; explicitly configured product integrations are tested separately and never excuse unrelated reporting.
 
 ## Plan 21 — Real hardware/network/browser acceptance
 
@@ -828,6 +834,8 @@ Acceptance:
 - exercise actual bounded recording write/flush/fsync/reopen/container/duration/size/read/decode self-test, failure injection, interruption/reboot cleanup, cleanup failure, and immediate SMART/NVMe/recording-fault reporting;
 - record individual 1-, 2-, 3-, and 4-source performance and a long-duration run (including the 24-hour stability checklist); never substitute simulated results for unperformed physical tests;
 - publish only sanitized results: no real-person/real-room media, hardware serial/UUID, private IP/hostname/Tailnet values, credentials, or biometric material on GitHub.
+- inspect deployed Main/Agent/Web dependencies and controlled runtime/browser outbound traffic for PRIV-003 compliance, including error/configuration paths; keep any trace deployment-local and publish only sanitized pass/fail results;
+- in PRESENT/PROBABLY_PRESENT/ABSENT/UNKNOWN and manual presence overrides, verify critical movement/tamper detection, safe evidence preservation, and configured critical notifications through the actual deployment paths; detector-armed status alone is insufficient.
 
 ## Explicitly pending product decisions
 

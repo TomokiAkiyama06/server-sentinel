@@ -358,10 +358,15 @@ Where room geometry supports entrance logic:
 - [ ] reversal/loiter near line does not spam events;
 - [ ] unknown people receive no real names;
 - [ ] no cross-camera biometric re-identification claim;
+
+Presence safety applies even when entrance inference is unavailable:
+
 - [ ] manual presence override wins;
 - [ ] ambiguous/low-quality owner observation does not force presence;
 - [ ] only `PRESENT` suppresses ordinary occupancy automation by default;
-- [ ] server movement/camera tamper remain armed.
+- [ ] repeat controlled server-movement and camera-tamper scenarios in each of `PRESENT`, `PROBABLY_PRESENT`, `ABSENT`, and `UNKNOWN`, including Owner manual overrides;
+- [ ] in every case, verify the actual critical detection event, preserved recording/Agent incident evidence where configured, and configured immediate critical notifications; an armed indicator alone does not satisfy acceptance;
+- [ ] `PRESENT` and manual overrides do not suppress any of those three outcomes; configured Slack receives the immediate notification, and dashboard/audit faults remain when Slack is disabled or delivery fails.
 
 ## P. Unified security timeline
 
@@ -479,3 +484,11 @@ For each condition below, verify the system does not wait only for the 23:00 dai
 - [ ] when Slack is disabled, dashboard/audit fault state remains visible.
 
 Do not upload hardware serials, local mount identifiers, real temporary test media, or private infrastructure details to GitHub.
+
+
+## T. No telemetry / developer reporting
+
+- [ ] inspect Main/Agent/Web dependency inventories, installed packages, and dashboard bundles for analytics, advertising/tracking SDKs, telemetry, and developer-operated crash upload; the prohibition includes opt-in features;
+- [ ] inspect controlled startup, ordinary operation, error handling, and configuration paths using browser request inspection/local network observation; no prohibited reporting occurs;
+- [ ] explicitly configured product integrations are checked separately and never excuse unrelated reporting; no telemetry feature is introduced without a new explicit Owner decision and ADR changing PRIV-003;
+- [ ] traces and deployment identifiers remain local; publish only sanitized pass/fail results, never raw monitoring data, secrets, or private network logs.
