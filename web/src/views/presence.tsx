@@ -13,9 +13,11 @@ function Path({ label, state, t }: { label: string; state: CriticalPath; t: Mess
   </div>;
 }
 
-export function PresenceBody({ report, t, onCancel, failed, cancelling, onRefresh, fetchedAt }: {
+export function PresenceBody({ report, t, onCancel, failed, cancelling, onRefresh, fetchedAt,
+  refreshFailed }: {
   report: PresenceReport; t: Messages; onCancel?: (() => void) | undefined; failed?: boolean | undefined;
   cancelling?: boolean | undefined; onRefresh?: (() => void) | undefined; fetchedAt?: string | undefined;
+  refreshFailed?: boolean | undefined;
 }) {
   const snapshot: PresenceSnapshot = report.snapshot;
   const override = snapshot.basis === 'manual_override';
@@ -32,6 +34,7 @@ export function PresenceBody({ report, t, onCancel, failed, cancelling, onRefres
       <p className="presence-value">{t[`state_${snapshot.state}`]}</p>
       <p className="muted">{t.presenceBasis}: {t[`basis_${snapshot.basis}`]}</p>
       {fetchedAt && <p className="muted">{t.presenceFetchedAt}: {stamp(fetchedAt)}</p>}
+      {refreshFailed && <p role="alert">{t.presenceRefreshFailed}</p>}
       {onRefresh && <button type="button" disabled={cancelling}
         onClick={onRefresh}>{t.presenceRefresh}</button>}
       {snapshot.clock_degraded && <p className="timeline-degraded" role="status">{t.clockDegradedNotice}</p>}
@@ -88,7 +91,8 @@ export function PresenceBody({ report, t, onCancel, failed, cancelling, onRefres
   </section>;
 }
 
-type State = { state: 'pending' } | { state: 'loading' } | { state: 'failed' } | { state: 'ready'; report: PresenceReport };
+type State = { state: 'pending' } | { state: 'loading' } | { state: 'failed' }
+  | { state: 'ready'; report: PresenceReport; refreshFailed: boolean };
 
 const HOUR = 3600000;
 
@@ -118,16 +122,21 @@ export function PresenceScreen({ services, t }: { services: DashboardServices; t
     if (!load) return;
     const controller = new AbortController();
     const current = ticket.current += 1;
-    setData({ state: 'loading' });
+    // A refresh keeps the last known status on screen while it runs.
+    setData(previous => previous.state === 'ready'
+      ? { ...previous, refreshFailed: false } : { state: 'loading' });
     void (async () => {
       try {
         const report = await load(controller.signal);
         if (!controller.signal.aborted && current === ticket.current) {
-          setData({ state: 'ready', report });
+          setData({ state: 'ready', report, refreshFailed: false });
           setFetchedAt(new Date().toISOString());
         }
       } catch {
-        if (!controller.signal.aborted && current === ticket.current) setData({ state: 'failed' });
+        if (!controller.signal.aborted && current === ticket.current) {
+          setData(previous => previous.state === 'ready'
+            ? { ...previous, refreshFailed: true } : { state: 'failed' });
+        }
       }
     })();
     return () => controller.abort();
@@ -138,7 +147,13 @@ export function PresenceScreen({ services, t }: { services: DashboardServices; t
     // A known expiry must not leave an expired override on screen as active.
     const delay = refreshDelay(expiry, Date.now());
     if (delay === null) return;
-    const timer = setTimeout(() => setAttempt(value => value + 1), delay);
+    let timer: ReturnType<typeof setTimeout>;
+    const fire = () => {
+      // An audited control result always wins over an automatic re-read.
+      if (inFlight.current) { timer = setTimeout(fire, 1000); return; }
+      setAttempt(value => value + 1);
+    };
+    timer = setTimeout(fire, delay);
     return () => clearTimeout(timer);
   }, [expiry]);
 
@@ -159,7 +174,7 @@ export function PresenceScreen({ services, t }: { services: DashboardServices; t
       try {
         const report = await cancel(controller.signal);
         if (current === ticket.current) {
-          setData({ state: 'ready', report });
+          setData({ state: 'ready', report, refreshFailed: false });
           setFetchedAt(new Date().toISOString());
         }
       } catch { setFailed(true); } finally {
@@ -170,5 +185,5 @@ export function PresenceScreen({ services, t }: { services: DashboardServices; t
   } : undefined;
   return <PresenceBody report={data.report} t={t} onCancel={request} failed={failed}
     cancelling={cancelling} onRefresh={() => setAttempt(value => value + 1)}
-    fetchedAt={fetchedAt ?? undefined} />;
+    fetchedAt={fetchedAt ?? undefined} refreshFailed={data.refreshFailed} />;
 }

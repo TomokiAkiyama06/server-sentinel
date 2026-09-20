@@ -404,6 +404,13 @@ test('presence offers a refresh path and serializes override cancellation', () =
   assert.match(pending, /<button[^>]*disabled[^>]*>取り消しています<\/button>/);
   assert.match(pending, /<button[^>]*disabled[^>]*>最新の状態を取得<\/button>/);
   assert.doesNotMatch(pending, />手動上書きを取り消す</);
+  // A failed refresh keeps the last known status and the retry control.
+  const stale = presence(active, 'ja', { onRefresh: () => undefined, refreshFailed: true,
+    fetchedAt: '2026-09-21T09:30:00.000000+00:00' });
+  assert.match(stale, /<p role="alert">最新の状態を取得できませんでした。/);
+  assert.match(stale, /<button[^>]*>最新の状態を取得<\/button>/);
+  assert.match(stale, /取得時刻: 2026-09-21 09:30:00/);
+  assert.match(stale, /手動上書きが有効です。/);
   // Without providers neither affordance appears as usable.
   const plain = presence(active, 'ja');
   assert.doesNotMatch(plain, /最新の状態を取得/);
