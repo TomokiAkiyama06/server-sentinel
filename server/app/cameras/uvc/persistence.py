@@ -66,6 +66,23 @@ class ApprovalStore:
             if connection is not None:
                 connection.close()
 
+    @staticmethod
+    def approve_on(connection, source_id, approved, *, serial_ambiguous):
+        """Persist Owner selection inside a caller-owned audit transaction."""
+        if not connection.in_transaction:
+            raise ApprovalStorageError("UVC approval transaction is unavailable")
+        try:
+            evidence = json.dumps(asdict(approved), allow_nan=False, separators=(",", ":"))
+            connection.execute(
+                "INSERT INTO uvc_approvals VALUES (?, ?, 0, NULL, ?) "
+                "ON CONFLICT(source_id) DO UPDATE SET evidence=excluded.evidence, "
+                "requires_approval=0, session_token=NULL, "
+                "serial_ambiguous=excluded.serial_ambiguous",
+                (str(source_id), evidence, int(serial_ambiguous)),
+            )
+        except (sqlite3.Error, ValueError, TypeError):
+            raise ApprovalStorageError("UVC approval state could not be saved") from None
+
     def start_session(self, source_id, initial_approved):
         """Arm recovery before any discovery/reconciliation decision is trusted.
 

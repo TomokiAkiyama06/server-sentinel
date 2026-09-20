@@ -1,16 +1,24 @@
+import asyncio
 from contextlib import closing
+from datetime import datetime, timezone
 from pathlib import Path
 import tempfile
 import unittest
+from uuid import uuid4
 
 from fastapi import FastAPI, Request
 
 from app.api.system import router
 from app.auth.boundary import DenyAll
+from app.audit import (
+    ActorCategory, AuditAction, AuditOutcome, AuditStore, OwnerAuthorizationError,
+    TargetKind,
+)
 from app.cameras.registry import CameraRegistry, SourceType
 from app.main import create_app
 from app.settings import Settings
 from app.storage.schema import APPLICATION_MIGRATIONS
+from app.storage.migrations import migrate
 from tests.asgi import request
 
 
@@ -32,6 +40,49 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
             source = registry.create_source(source_type=SourceType.LOCAL_UVC, name="Synthetic", enabled=True)
             self.assertEqual(source, registry.get_source(source.id))
         self.assertFalse(self.application.state.ready)
+
+    async def test_lifespan_runs_audit_retention_cleanup(self):
+        with closing(self.application.state.database.connect()) as connection:
+            migrate(connection, APPLICATION_MIGRATIONS)
+        old = datetime(2020, 1, 1, tzinfo=timezone.utc)
+        audit = AuditStore(self.application.state.database, clock=lambda: old)
+        audit.append(
+            actor_category=ActorCategory.SYSTEM,
+            action=AuditAction.CHANGE_ADMIN_SETTING,
+            target_kind=TargetKind.ADMIN_SETTINGS,
+            target_logical_id=uuid4(), outcome=AuditOutcome.SUCCEEDED,
+        )
+        self.assertEqual(1, len(audit.list_records()))
+        async with self.application.router.lifespan_context(self.application):
+            self.assertEqual((), self.application.state.audit_store.list_records())
+
+    async def test_runtime_periodically_cleans_expired_audit_records(self):
+        application = create_app(self.settings, audit_cleanup_interval_seconds=0.01)
+        async with application.router.lifespan_context(application):
+            old = datetime(2020, 1, 1, tzinfo=timezone.utc)
+            AuditStore(application.state.database, clock=lambda: old).append(
+                actor_category=ActorCategory.SYSTEM,
+                action=AuditAction.CHANGE_ADMIN_SETTING,
+                target_kind=TargetKind.ADMIN_SETTINGS,
+                target_logical_id=uuid4(), outcome=AuditOutcome.SUCCEEDED,
+            )
+            await asyncio.sleep(0.03)
+            self.assertEqual((), application.state.audit_store.list_records())
+
+    async def test_runtime_owner_admin_defaults_to_denial_with_audit(self):
+        async with self.application.router.lifespan_context(self.application):
+            with self.assertRaises(OwnerAuthorizationError):
+                self.application.state.owner_administration.create_capture_node(
+                    {"synthetic": "untrusted"}, "Denied node",
+                )
+            self.assertEqual(
+                AuditOutcome.DENIED,
+                self.application.state.audit_store.list_records()[0].outcome,
+            )
+            with closing(self.application.state.database.connect()) as connection:
+                self.assertEqual(0, connection.execute(
+                    "SELECT count(*) FROM capture_nodes"
+                ).fetchone()[0])
 
     async def test_invalid_database_fails_startup_without_leaking_exception_values(self):
         self.settings.database_path.write_text("SYNTHETIC_PRIVATE_VALUE")

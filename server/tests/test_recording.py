@@ -11,7 +11,13 @@ import threading
 import unittest
 import zlib
 
+from app.audit import (
+    AuditAction, AuditOutcome, AuditStorageError, AuditStore, OwnerAuditService,
+)
+from app.audit.integration import OwnerAdministration
+from app.cameras.registry import CameraRegistry
 from app.media.recording import Limits, RecordingError, RecordingStore, RootIdentity, Segment
+from app.storage.database import Database
 from app.storage.migrations import migrate
 from app.storage.schema import APPLICATION_MIGRATIONS
 
@@ -520,6 +526,33 @@ class RecordingTests(unittest.TestCase):
         self.assertEqual(size, self.store.delete_recording(first, owner_requested=True))
         self.assertEqual(0, self.store.usage_bytes())
         self.assertEqual([], list(self.root.iterdir()))
+
+    def test_owner_recording_change_and_audit_share_transaction(self):
+        class PermitOwner:
+            def require_owner(self, actor_context):
+                return None
+
+        self.store.append(self.segment())
+        recording = self.store.start_manual(self.source, 30_000, duration_ms=10_000)
+        self.store.finish(recording)
+        database = Database(self.base / "metadata.sqlite")
+        audit = AuditStore(database)
+        admin = OwnerAdministration(
+            OwnerAuditService(audit, PermitOwner()), CameraRegistry(database),
+        )
+        admin.set_recording_starred("synthetic-owner", self.store, recording, True)
+        self.assertTrue(self.store.manifest(recording)["starred"])
+        record = audit.list_records()[0]
+        self.assertEqual(AuditAction.UPDATE_RECORDING, record.action)
+        self.assertEqual(AuditOutcome.SUCCEEDED, record.outcome)
+
+        with patch.object(audit, "append_on",
+                          side_effect=AuditStorageError("synthetic unavailable")):
+            with self.assertRaises(AuditStorageError):
+                admin.set_recording_starred(
+                    "synthetic-owner", self.store, recording, False,
+                )
+        self.assertTrue(self.store.manifest(recording)["starred"])
 
     def test_active_recording_cannot_be_deleted_even_by_owner(self):
         recording = self.store.start_manual(self.source, 30_000)

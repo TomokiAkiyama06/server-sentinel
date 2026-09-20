@@ -45,7 +45,7 @@ class AuditStore:
         self.retention = retention
 
     @contextmanager
-    def _transaction(self, *, write=False):
+    def transaction(self, *, write=False):
         connection = None
         try:
             connection = self.database.connect()
@@ -64,21 +64,37 @@ class AuditStore:
             if connection is not None:
                 connection.close()
 
-    def append(self, *, actor_category: ActorCategory, action: AuditAction,
-               target_kind: TargetKind, target_logical_id: UUID,
-               outcome: AuditOutcome) -> AuditRecord:
+    def append_on(self, connection: sqlite3.Connection, *,
+                  actor_category: ActorCategory, action: AuditAction,
+                  target_kind: TargetKind, target_logical_id: UUID,
+                  outcome: AuditOutcome) -> AuditRecord:
+        """Append on a caller-owned transaction for atomic domain mutations."""
+        if not isinstance(connection, sqlite3.Connection) or not connection.in_transaction:
+            raise AuditStorageError("audit transaction is unavailable")
         record = AuditRecord(
             uuid4(), actor_category, action, target_kind, target_logical_id,
             utc_timestamp(self._clock()), outcome,
         )
-        with self._transaction(write=True) as connection:
+        try:
             connection.execute(
                 "INSERT INTO security_admin_audit_records VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (str(record.id), record.actor_category.value, record.action.value,
                  record.target_kind.value, str(record.target_logical_id),
                  _microseconds(record.occurred_at), record.outcome.value),
             )
+        except sqlite3.Error:
+            raise AuditStorageError("audit storage operation failed") from None
         return record
+
+    def append(self, *, actor_category: ActorCategory, action: AuditAction,
+               target_kind: TargetKind, target_logical_id: UUID,
+               outcome: AuditOutcome) -> AuditRecord:
+        with self.transaction(write=True) as connection:
+            return self.append_on(
+                connection, actor_category=actor_category, action=action,
+                target_kind=target_kind, target_logical_id=target_logical_id,
+                outcome=outcome,
+            )
 
     @staticmethod
     def _record(row) -> AuditRecord:
@@ -94,7 +110,7 @@ class AuditStore:
         if type(limit) is not int or not 1 <= limit <= MAX_PAGE_SIZE:
             raise AuditValidationError("invalid audit page size")
         cutoff = _microseconds(before) if before is not None else None
-        with self._transaction() as connection:
+        with self.transaction() as connection:
             if cutoff is None:
                 rows = connection.execute(
                     "SELECT * FROM security_admin_audit_records "
@@ -111,7 +127,7 @@ class AuditStore:
         """Delete only audit rows strictly older than this store's retention."""
         reference = utc_timestamp(self._clock() if now is None else now)
         cutoff = _microseconds(reference - self.retention)
-        with self._transaction(write=True) as connection:
+        with self.transaction(write=True) as connection:
             cursor = connection.execute(
                 "DELETE FROM security_admin_audit_records WHERE occurred_at_us < ?", (cutoff,),
             )

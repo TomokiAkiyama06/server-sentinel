@@ -1,12 +1,17 @@
 """Application construction and lifespan. No listener starts during import."""
 
-from contextlib import asynccontextmanager, closing
+import asyncio
+from contextlib import asynccontextmanager, closing, suppress
 import logging
 
 from fastapi import FastAPI
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from app.auth.boundary import DenyAll, HumanAuthorizer
+from app.audit import AuditStore, DenyAllOwners, OwnerAuditService, OwnerAuthorizer
+from app.audit.integration import OwnerAdministration
+from app.audit.runtime import AuditRetentionRuntime
+from app.cameras.registry import CameraRegistry
 from app.logging import Event
 from app.settings import Settings
 from app.storage.database import Database
@@ -40,8 +45,16 @@ class ClosedHumanSurface:
 
 
 def create_app(settings: Settings, *, database: Database | None = None,
-               human_authorizer: HumanAuthorizer | None = None) -> FastAPI:
+               human_authorizer: HumanAuthorizer | None = None,
+               owner_authorizer: OwnerAuthorizer | None = None,
+               audit_cleanup_interval_seconds: float = 24 * 60 * 60) -> FastAPI:
     store = database or Database(settings.database_path)
+    audit_store = AuditStore(store)
+    audit_service = OwnerAuditService(audit_store, owner_authorizer or DenyAllOwners())
+    owner_administration = OwnerAdministration(audit_service, CameraRegistry(store))
+    audit_retention = AuditRetentionRuntime(
+        audit_store, interval_seconds=audit_cleanup_interval_seconds,
+    )
 
     @asynccontextmanager
     async def lifespan(application: FastAPI):
@@ -49,15 +62,20 @@ def create_app(settings: Settings, *, database: Database | None = None,
         try:
             with closing(store.connect()) as connection:
                 migrate(connection, APPLICATION_MIGRATIONS)
+            audit_retention.startup_cleanup()
         except Exception:
             logging.getLogger(__name__).error(Event.STARTUP_FAILED)
             # Lifespan failures must not pass SQLite/config values to servers.
             raise RuntimeError("application startup failed") from None
         application.state.ready = True
+        cleanup_task = asyncio.create_task(audit_retention.run())
         logging.getLogger(__name__).info(Event.STARTED)
         try:
             yield
         finally:
+            cleanup_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await cleanup_task
             application.state.ready = False
             logging.getLogger(__name__).info(Event.STOPPED)
 
@@ -68,6 +86,9 @@ def create_app(settings: Settings, *, database: Database | None = None,
     application.state.ready = False
     application.state.database = store
     application.state.human_authorizer = human_authorizer or DenyAll()
+    application.state.audit_store = audit_store
+    application.state.audit_retention = audit_retention
+    application.state.owner_administration = owner_administration
     # Do not include api.system.router before approved permission enforcement.
     application.add_middleware(ClosedHumanSurface)
     return application

@@ -119,26 +119,37 @@ class CameraRegistry:
     def set_active_limit(self, limit: int) -> None:
         positive_integer(limit, "active source limit")
         with self._transaction(write=True) as connection:
-            active = connection.execute(
-                "SELECT COUNT(*) FROM camera_sources WHERE enabled = 1"
-            ).fetchone()[0]
-            if active > limit:
-                raise ActiveSourceLimitError("active sources exceed requested limit")
-            connection.execute(
-                "UPDATE camera_registry_settings SET max_active_video_sources = ? WHERE id = 1",
-                (limit,),
-            )
+            self.set_active_limit_on(connection, limit)
+
+    def set_active_limit_on(self, connection, limit: int) -> None:
+        """Transactional integration hook; callers own authorization/commit."""
+        positive_integer(limit, "active source limit")
+        active = connection.execute(
+            "SELECT COUNT(*) FROM camera_sources WHERE enabled = 1"
+        ).fetchone()[0]
+        if active > limit:
+            raise ActiveSourceLimitError("active sources exceed requested limit")
+        connection.execute(
+            "UPDATE camera_registry_settings SET max_active_video_sources = ? WHERE id = 1",
+            (limit,),
+        )
 
     def create_capture_node(self, name: str) -> CaptureNode:
         """Record an independent node identity; this does not pair or authorize it."""
         text_value(name, "node name")
-        node_id, now = str(uuid4()), _time(self._clock())
         with self._transaction(write=True) as connection:
-            connection.execute(
-                "INSERT INTO capture_nodes VALUES (?, ?, 'offline', NULL, ?, ?)",
-                (node_id, name, now, now),
-            )
-            return self._node(connection, node_id)
+            return self.create_capture_node_on(connection, uuid4(), name)
+
+    def create_capture_node_on(self, connection, node_id: UUID, name: str) -> CaptureNode:
+        """Transactional integration hook using an application logical ID."""
+        identity = _identity(node_id)
+        text_value(name, "node name")
+        now = _time(self._clock())
+        connection.execute(
+            "INSERT INTO capture_nodes VALUES (?, ?, 'offline', NULL, ?, ?)",
+            (identity, name, now, now),
+        )
+        return self._node(connection, identity)
 
     @staticmethod
     def _node(connection, node_id: str) -> CaptureNode:
@@ -158,20 +169,27 @@ class CameraRegistry:
 
     def update_capture_node(self, node_id: UUID, *, name=_UNSET,
                             health_state=_UNSET, last_seen_at=_UNSET) -> CaptureNode:
-        identity = _identity(node_id)
         with self._transaction(write=True) as connection:
-            old = self._node(connection, identity)
-            name = old.name if name is _UNSET else text_value(name, "node name")
-            health = old.health_state if health_state is _UNSET else health_state
-            if not isinstance(health, NodeHealthState):
-                raise ValidationError("invalid node health")
-            seen = old.last_seen_at if last_seen_at is _UNSET else last_seen_at
-            connection.execute(
-                "UPDATE capture_nodes SET name = ?, health_state = ?, last_seen_at = ?, "
-                "updated_at = ? WHERE id = ?",
-                (name, health.value, _time(seen), _time(self._clock()), identity),
+            return self.update_capture_node_on(
+                connection, node_id, name=name, health_state=health_state,
+                last_seen_at=last_seen_at,
             )
-            return self._node(connection, identity)
+
+    def update_capture_node_on(self, connection, node_id: UUID, *, name=_UNSET,
+                               health_state=_UNSET, last_seen_at=_UNSET) -> CaptureNode:
+        identity = _identity(node_id)
+        old = self._node(connection, identity)
+        name = old.name if name is _UNSET else text_value(name, "node name")
+        health = old.health_state if health_state is _UNSET else health_state
+        if not isinstance(health, NodeHealthState):
+            raise ValidationError("invalid node health")
+        seen = old.last_seen_at if last_seen_at is _UNSET else last_seen_at
+        connection.execute(
+            "UPDATE capture_nodes SET name = ?, health_state = ?, last_seen_at = ?, "
+            "updated_at = ? WHERE id = ?",
+            (name, health.value, _time(seen), _time(self._clock()), identity),
+        )
+        return self._node(connection, identity)
 
     @staticmethod
     def _admit(connection, limit: int):
@@ -205,6 +223,21 @@ class CameraRegistry:
                       enabled: bool = False, capabilities: dict | None = None,
                       desired_capture_profile: CaptureProfile | None = None,
                       detection_bindings: tuple[DetectionBinding, ...] = ()) -> CameraSource:
+        with self._transaction(write=True) as connection:
+            return self.create_source_on(
+                connection, uuid4(), source_type=source_type, name=name,
+                capture_node_id=capture_node_id, role_label=role_label, enabled=enabled,
+                capabilities=capabilities, desired_capture_profile=desired_capture_profile,
+                detection_bindings=detection_bindings,
+            )
+
+    def create_source_on(self, connection, source_id: UUID, *, source_type: SourceType,
+                         name: str, capture_node_id: UUID | None = None,
+                         role_label: str | None = None, enabled: bool = False,
+                         capabilities: dict | None = None,
+                         desired_capture_profile: CaptureProfile | None = None,
+                         detection_bindings: tuple[DetectionBinding, ...] = ()) -> CameraSource:
+        identity = _identity(source_id)
         if not isinstance(source_type, SourceType):
             raise ValidationError("invalid source type")
         if ((source_type is SourceType.LOCAL_UVC and capture_node_id is not None)
@@ -215,20 +248,19 @@ class CameraRegistry:
             name, role_label, enabled, {} if capabilities is None else capabilities,
             desired_capture_profile, detection_bindings,
         )
-        identity, now = str(uuid4()), _time(self._clock())
-        with self._transaction(write=True) as connection:
-            if node_id is not None:
-                self._node(connection, node_id)
-            if enabled:
-                self._admit(connection, self._limit(connection))
-            connection.execute(
-                "INSERT INTO camera_sources VALUES "
-                "(?, ?, ?, ?, ?, ?, ?, ?, NULL, 'offline', 'unknown', NULL, ?, ?)",
-                (identity, node_id, source_type.value, name, role_label, int(enabled),
-                 caps, desired, now, now),
-            )
-            self._write_bindings(connection, identity, bindings)
-            return self._source(connection, identity)
+        now = _time(self._clock())
+        if node_id is not None:
+            self._node(connection, node_id)
+        if enabled:
+            self._admit(connection, self._limit(connection))
+        connection.execute(
+            "INSERT INTO camera_sources VALUES "
+            "(?, ?, ?, ?, ?, ?, ?, ?, NULL, 'offline', 'unknown', NULL, ?, ?)",
+            (identity, node_id, source_type.value, name, role_label, int(enabled),
+             caps, desired, now, now),
+        )
+        self._write_bindings(connection, identity, bindings)
+        return self._source(connection, identity)
 
     @staticmethod
     def _source(connection, identity) -> CameraSource:
@@ -267,26 +299,36 @@ class CameraRegistry:
                       enabled=_UNSET, capabilities=_UNSET, desired_capture_profile=_UNSET,
                       detection_bindings=_UNSET) -> CameraSource:
         """Update metadata/configuration without changing source or node identities."""
-        identity = _identity(source_id)
         with self._transaction(write=True) as connection:
-            old = self._source(connection, identity)
-            name = old.name if name is _UNSET else name
-            role = old.role_label if role_label is _UNSET else role_label
-            active = old.enabled if enabled is _UNSET else enabled
-            caps = old.capabilities if capabilities is _UNSET else capabilities
-            desired = (old.desired_capture_profile if desired_capture_profile is _UNSET
-                       else desired_capture_profile)
-            bindings = old.detection_bindings if detection_bindings is _UNSET else detection_bindings
-            caps, desired, bindings = self._config(name, role, active, caps, desired, bindings)
-            if active and not old.enabled:
-                self._admit(connection, self._limit(connection))
-            connection.execute(
-                "UPDATE camera_sources SET name = ?, role_label = ?, enabled = ?, capabilities = ?, "
-                "desired_capture_profile = ?, updated_at = ? WHERE id = ?",
-                (name, role, int(active), caps, desired, _time(self._clock()), identity),
+            return self.update_source_on(
+                connection, source_id, name=name, role_label=role_label, enabled=enabled,
+                capabilities=capabilities, desired_capture_profile=desired_capture_profile,
+                detection_bindings=detection_bindings,
             )
-            self._write_bindings(connection, identity, bindings)
-            return self._source(connection, identity)
+
+    def update_source_on(self, connection, source_id: UUID, *, name=_UNSET,
+                         role_label=_UNSET, enabled=_UNSET, capabilities=_UNSET,
+                         desired_capture_profile=_UNSET,
+                         detection_bindings=_UNSET) -> CameraSource:
+        identity = _identity(source_id)
+        old = self._source(connection, identity)
+        name = old.name if name is _UNSET else name
+        role = old.role_label if role_label is _UNSET else role_label
+        active = old.enabled if enabled is _UNSET else enabled
+        caps = old.capabilities if capabilities is _UNSET else capabilities
+        desired = (old.desired_capture_profile if desired_capture_profile is _UNSET
+                   else desired_capture_profile)
+        bindings = old.detection_bindings if detection_bindings is _UNSET else detection_bindings
+        caps, desired, bindings = self._config(name, role, active, caps, desired, bindings)
+        if active and not old.enabled:
+            self._admit(connection, self._limit(connection))
+        connection.execute(
+            "UPDATE camera_sources SET name = ?, role_label = ?, enabled = ?, capabilities = ?, "
+            "desired_capture_profile = ?, updated_at = ? WHERE id = ?",
+            (name, role, int(active), caps, desired, _time(self._clock()), identity),
+        )
+        self._write_bindings(connection, identity, bindings)
+        return self._source(connection, identity)
 
     def update_source_health(self, source_id: UUID, *, health_state: SourceHealthState,
                              negotiated_capture_profile=_UNSET, image_quality_state=_UNSET,

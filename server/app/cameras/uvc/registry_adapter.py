@@ -104,6 +104,30 @@ class LocalUvcAdapter:
                               profile=capture_profile(source.desired_capture_profile))
         session.controller.approve(candidate, scan.devices)
 
+    def approve_source_on(self, connection, source_id, candidate):
+        """Atomically persist an idle Owner selection with its audit record.
+
+        A live session must be stopped by its supervisor before reapproval. This
+        avoids an in-memory/physical-camera transition escaping SQLite rollback.
+        The next poll starts a fresh recovery-fenced session from this approval.
+        """
+        source = self._source(source_id)
+        scan = self.discovery.scan()
+        if (source_id in self.sessions or not source.enabled or scan.failures
+                or scan.devices.count(candidate) != 1):
+            raise ValueError("candidate is unavailable or approval session is active")
+        peers = sum(
+            candidate.strong_key is not None and device.strong_key == candidate.strong_key
+            for device in scan.devices
+        )
+        self.registry.update_source_on(connection, source.id, capabilities={
+            **source.capabilities, "uvc_formats": list(candidate.formats), "video_only": True,
+        })
+        self.store.approve_on(
+            connection, source.id, candidate,
+            serial_ambiguous=candidate.strong_key is not None and peers > 1,
+        )
+
     def poll_source(self, source_id, *, timeout=1.0):
         source = self._source(source_id)
         session = self.sessions.get(source_id)

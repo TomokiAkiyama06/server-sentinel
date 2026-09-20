@@ -12,14 +12,16 @@ evidence field. Raw credentials, biometric material, serials/UUIDs from
 hardware, monitoring media, network values, and submitted setting values must
 not be passed as logical IDs.
 
-`OwnerAuditService.execute()` is the integration boundary for privileged
-mutations. Its injected authorizer must fail closed unless the current
-deployment Owner is established. The actor context is used only by that
-authorizer and is never stored or represented. A denied operation is not run;
-successful and failed operations are recorded without their result or exception
-details. Integrations that need atomic mutation plus audit must use a shared
-transactional adapter rather than treating an audit success as authorization.
+`OwnerAdministration` is the runtime-facing integration boundary for privileged
+registry, UVC approval, and recording-state mutations. Its injected authorizer
+must fail closed unless the current deployment Owner is established. The actor
+context is used only by that authorizer and is never stored or represented. A
+denied operation is not run; successful and failed operations are recorded
+without their result or exception details. `execute_transactional()` places the
+domain mutation and successful audit append in the same SQLite transaction, so
+an audit write failure rolls the mutation back. Plain `PermissionError` denial
+from an injected authorizer is safely classified without inspecting its detail.
 
 `AuditStore.cleanup_expired()` defaults to 90 days and deletes only rows from
-the audit table that are strictly older than the cutoff. Scheduling belongs to
-the future Main Server runtime supervisor.
+the audit table that are strictly older than the cutoff. The Main Server runs it
+at startup and every 24 hours through `AuditRetentionRuntime`.

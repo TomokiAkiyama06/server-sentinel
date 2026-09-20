@@ -45,6 +45,7 @@ class AuditAction(StrEnum):
     DELETE_OWNER_BIOMETRIC = "delete_owner_biometric"
     CREATE_CAMERA = "create_camera"
     UPDATE_CAMERA = "update_camera"
+    APPROVE_CAMERA = "approve_camera"
     REVOKE_CAMERA = "revoke_camera"
     CREATE_SOURCE = "create_source"
     UPDATE_SOURCE = "update_source"
@@ -55,6 +56,7 @@ class AuditAction(StrEnum):
     CHANGE_PRINCIPAL_PERMISSIONS = "change_principal_permissions"
     REVOKE_PRINCIPAL = "revoke_principal"
     DELETE_RECORDING = "delete_recording"
+    UPDATE_RECORDING = "update_recording"
 
 
 ACTION_TARGETS = {
@@ -66,6 +68,7 @@ ACTION_TARGETS = {
     AuditAction.DELETE_OWNER_BIOMETRIC: TargetKind.OWNER_BIOMETRIC,
     AuditAction.CREATE_CAMERA: TargetKind.CAMERA,
     AuditAction.UPDATE_CAMERA: TargetKind.CAMERA,
+    AuditAction.APPROVE_CAMERA: TargetKind.CAMERA,
     AuditAction.REVOKE_CAMERA: TargetKind.CAMERA,
     AuditAction.CREATE_SOURCE: TargetKind.SOURCE,
     AuditAction.UPDATE_SOURCE: TargetKind.SOURCE,
@@ -76,6 +79,7 @@ ACTION_TARGETS = {
     AuditAction.CHANGE_PRINCIPAL_PERMISSIONS: TargetKind.PRINCIPAL,
     AuditAction.REVOKE_PRINCIPAL: TargetKind.PRINCIPAL,
     AuditAction.DELETE_RECORDING: TargetKind.RECORDING,
+    AuditAction.UPDATE_RECORDING: TargetKind.RECORDING,
 }
 
 

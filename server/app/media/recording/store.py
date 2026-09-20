@@ -672,6 +672,20 @@ class RecordingStore:
             self.db.execute("UPDATE recordings SET starred=? WHERE id=?",
                             (int(starred), str(recording_id)))
 
+    def set_starred_on(self, connection, recording_id: UUID, starred: bool) -> None:
+        """Transactional Owner integration; connection must be this writer's."""
+        self._check()
+        if connection is not self.db or not connection.in_transaction:
+            raise RecordingError("RECORDING_DATABASE_BUSY")
+        self._recording(recording_id)
+        if type(starred) is not bool:
+            raise ValueError("invalid starred state")
+        with self._control_reservation():
+            connection.execute(
+                "UPDATE recordings SET starred=? WHERE id=?",
+                (int(starred), str(recording_id)),
+            )
+
     def usage_bytes(self, *, starred_only: bool = False, critical_only: bool = False) -> int:
         """Unique journaled bytes, conservatively including pending writes.
 

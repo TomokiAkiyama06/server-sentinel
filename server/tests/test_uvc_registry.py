@@ -4,6 +4,10 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+from app.audit import (
+    AuditAction, AuditOutcome, AuditStorageError, AuditStore, OwnerAuditService,
+)
+from app.audit.integration import OwnerAdministration
 from app.cameras.registry import CameraRegistry, CaptureProfile, SourceHealthState, SourceType
 from app.cameras.uvc.identity import DeviceEvidence
 from app.cameras.uvc.persistence import ApprovalStorageError
@@ -19,6 +23,7 @@ class UvcRegistryTests(unittest.TestCase):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         database = Database(Path(temporary.name) / "synthetic.sqlite")
+        self.database = database
         connection = database.connect()
         migrate(connection, APPLICATION_MIGRATIONS)
         connection.close()
@@ -32,6 +37,46 @@ class UvcRegistryTests(unittest.TestCase):
         self.events, self.frames = [], []
         self.adapter = self.make_adapter()
         self.addCleanup(self.adapter.close)
+
+    def test_owner_admin_uvc_approval_is_atomically_audited(self):
+        class PermitOwner:
+            def require_owner(self, actor_context):
+                if actor_context != "synthetic-owner":
+                    raise PermissionError("denied")
+
+        audit = AuditStore(self.database)
+        admin = OwnerAdministration(
+            OwnerAuditService(audit, PermitOwner()), self.registry,
+        )
+        admin.approve_uvc(
+            "synthetic-owner", self.adapter, self.source.id, self.camera,
+        )
+        approval = self.adapter.store.load(self.source.id)
+        self.assertFalse(approval.requires_approval)
+        self.assertEqual(self.camera, approval.approved)
+        record = audit.list_records()[0]
+        self.assertEqual(AuditAction.APPROVE_CAMERA, record.action)
+        self.assertEqual(AuditOutcome.SUCCEEDED, record.outcome)
+        self.assertTrue(self.adapter.poll_source(self.source.id))
+
+    def test_uvc_approval_rolls_back_when_audit_append_fails(self):
+        class PermitOwner:
+            def require_owner(self, actor_context):
+                return None
+
+        audit = AuditStore(self.database)
+        admin = OwnerAdministration(
+            OwnerAuditService(audit, PermitOwner()), self.registry,
+        )
+        before = self.registry.get_source(self.source.id)
+        with patch.object(audit, "append_on",
+                          side_effect=AuditStorageError("synthetic unavailable")):
+            with self.assertRaises(AuditStorageError):
+                admin.approve_uvc(
+                    "synthetic-owner", self.adapter, self.source.id, self.camera,
+                )
+        self.assertIsNone(self.adapter.store.load(self.source.id))
+        self.assertEqual(before, self.registry.get_source(self.source.id))
 
     def make_adapter(self):
         return LocalUvcAdapter(self.registry, emit_audit=self.events.append,
