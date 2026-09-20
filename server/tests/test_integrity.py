@@ -125,6 +125,20 @@ class CompareTests(TestCase):
             self.assertEqual(findings[1].reason, "SURPLUS_AMBIGUOUS_COMPONENT")
             self.assertNotIn("synthetic-a", repr(findings))
 
+    def test_incompatible_baseline_does_not_absorb_a_surplus_observation(self):
+        """A MISSING approved disk explains no observation of its own category."""
+        first = Component(Kind.STORAGE, "old-a", (("capacity_bytes", "1000"),),
+                          (("serial", "synthetic-a"), ("wwid", "synthetic-w")))
+        second = Component(Kind.STORAGE, "old-b", (("capacity_bytes", "2000"),),
+                           (("serial", "synthetic-b"),))
+        current = (Component(Kind.STORAGE, "new-a", (("capacity_bytes", "1000"),), (("serial", "synthetic-a"),)),
+                   Component(Kind.STORAGE, "new-b", (("capacity_bytes", "1000"),), (("wwid", "synthetic-w"),)))
+        for old_order in permutations((first, second)):
+            for new_order in permutations(current):
+                findings = compare(Inventory(old_order), Inventory(new_order))
+                self.assertEqual(sorted(item.state for item in findings),
+                                 sorted([State.UNVERIFIABLE, State.MISSING, State.NEW_DEVICE]))
+
     def test_surplus_new_device_is_not_claimed_while_the_baseline_can_explain_it(self):
         """Two approved disks explain two ambiguous observations; report no growth."""
         first = Component(Kind.STORAGE, "disk0", (), (("serial", "synthetic-a"), ("wwid", "synthetic-w")))

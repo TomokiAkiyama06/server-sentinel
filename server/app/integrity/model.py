@@ -78,6 +78,48 @@ def _conflicts(before, after):
     return any(before[key] != after[key] for key in before.keys() & after.keys())
 
 
+def _explained(claims: dict[int, set[int]]) -> set[int]:
+    """Largest set of shared observations the approved components can cover.
+
+    Hopcroft-Karp over the compatibility graph itself. Counting approved
+    components per category instead would let one that no observation fits
+    absorb another component's surplus observation and hide added hardware.
+    """
+    left, right = {}, {}
+
+    def augment(index, depth):
+        for candidate in claims[index]:
+            owner = right.get(candidate)
+            if owner is None or (depth.get(owner) == depth[index] + 1 and augment(owner, depth)):
+                left[index], right[candidate] = candidate, index
+                return True
+        # Exhausted inside this layered phase; never retried at this length.
+        depth[index] = -1
+        return False
+
+    while True:
+        # Layer from the still unexplained components and stop at the shortest
+        # augmenting length, which bounds both the phases and the recursion.
+        depth = {index: 0 for index in claims if index not in left}
+        frontier, reached = list(depth), False
+        while frontier and not reached:
+            following = []
+            for index in frontier:
+                for candidate in claims[index]:
+                    owner = right.get(candidate)
+                    if owner is None:
+                        reached = True
+                    elif owner not in depth:
+                        depth[owner] = depth[index] + 1
+                        following.append(owner)
+            frontier = following
+        if not reached:
+            return set(right)
+        for index in list(depth):
+            if index not in left:
+                augment(index, depth)
+
+
 def compare(approved: Inventory | None, current: Inventory) -> tuple[Finding, ...]:
     """Match complete identities, unique partial identities, then weak graphs.
 
@@ -92,6 +134,8 @@ def compare(approved: Inventory | None, current: Inventory) -> tuple[Finding, ..
     results = [None] * len(old_items)
     used = set()
     uncertain = set()
+    # Which shared observations each approved component could still account for.
+    claims = {}
     identity_counts = Counter((item.kind, item.identity) for item in new_items if item.identity)
     baseline_counts = Counter((item.kind, item.identity) for item in old_items if item.identity)
     fields = Counter((item.kind, key, value) for item in new_items for key, value in item.identity)
@@ -125,6 +169,7 @@ def compare(approved: Inventory | None, current: Inventory) -> tuple[Finding, ..
         if len(exact) > 1 or (old.identity and baseline_counts[(old.kind, old.identity)] > 1):
             ambiguous(index)
             uncertain.update(exact)
+            claims[index] = set(exact)
         elif exact:
             matched(index, next(iter(exact)))
             used.update(exact)
@@ -152,6 +197,7 @@ def compare(approved: Inventory | None, current: Inventory) -> tuple[Finding, ..
             # Ambiguity claims no exclusive ownership. These observations may
             # also cover identity-less baselines in the following weak graph.
             uncertain.update(candidates)
+            claims[index] = set(candidates)
 
     # Resolve every compatible weak link together. Missing values are not
     # contradictions, including partial non-unique serial/WWID observations.
@@ -170,6 +216,7 @@ def compare(approved: Inventory | None, current: Inventory) -> tuple[Finding, ..
     for index, candidates in weak.items():
         if not candidates:
             continue
+        claims[index] = set(candidates)
         if len(candidates) == 1 and weak_reverse[next(iter(candidates))] == 1:
             matched(index, next(iter(candidates)))
         else:
@@ -187,16 +234,20 @@ def compare(approved: Inventory | None, current: Inventory) -> tuple[Finding, ..
             results[index] = Finding(old.kind, State.MISSING, "APPROVED_COMPONENT_ABSENT")
         elif location in weak_used or location in uncertain:
             ambiguous(index)
+            # A same-slot successor could still be this component, CHANGED.
+            claims[index] = {location}
         else:
             matched(index, location)
             used.add(location)
     # An ambiguous observation never proves WHICH approved component it is, but
-    # one approved component still explains at most one current component. Count
-    # the surplus per category so added hardware stays visible to the Owner
-    # instead of disappearing behind UNVERIFIABLE (SPECIFICATION 10.1-10.2).
+    # one approved component still explains at most one current component, and
+    # only a compatible one. Report the observations no compatible assignment
+    # can cover so added hardware stays visible (SPECIFICATION 10.1-10.2).
     shared = (weak_used | uncertain) - used
-    explaining = Counter(item.kind for item in old_items) - Counter(new_items[item].kind for item in used)
-    surplus = Counter(new_items[item].kind for item in shared) - explaining
+    linked = {index: candidates & shared for index, candidates in claims.items()}
+    explained = _explained({index: candidates for index, candidates in linked.items() if candidates})
+    surplus = (Counter(new_items[item].kind for item in shared)
+               - Counter(new_items[item].kind for item in explained))
     covered = {item.kind for item in old_items}
     for kind in (current.unavailable | approved.unavailable) - covered:
         results.append(Finding(kind, State.UNVERIFIABLE, "PROBE_UNAVAILABLE"))
