@@ -45,8 +45,12 @@ backlog never grows one rollback journal beyond the configured write overhead.
 Each committed batch is durable on its own: an interrupted run leaves a
 consistent store, the next run resumes, and repeating a completed run deletes
 nothing more. The Main Server runs it at startup and every 24 hours through
-`AuditRetentionRuntime`. Scheduled failures set bounded degraded health and are
-retried at the next interval; exception details are not retained. Audit
+`AuditRetentionRuntime`. A failed run sets bounded degraded health and is
+retried on a shorter interval, so a transient fault cannot delay expired-row
+deletion by a whole day; exception details are not retained. A degraded startup
+run is reported as `audit_retention_degraded` and does not stop the Main Server
+from monitoring, because a storage or database fault in retention must not take
+physical-security monitoring offline. Audit
 browsing uses `AuditCursor`, whose timestamp plus record UUID matches the stable
 descending database order so equal-timestamp records remain reachable across
 pages.

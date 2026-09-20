@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 from uuid import uuid4
 
 from fastapi import FastAPI, Request
@@ -141,6 +142,51 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
             # Startup retention cleanup runs inside the storage reservation.
             self.assertGreater(len(acquired), seeded)
             self.assertEqual((), application.state.audit_store.list_records())
+
+    async def test_degraded_audit_retention_does_not_block_monitoring_startup(self):
+        application = create_app(self.settings, audit_cleanup_interval_seconds=1000)
+        with closing(application.state.database.connect()) as connection:
+            migrate(connection, APPLICATION_MIGRATIONS)
+        with patch.object(application.state.audit_store, "cleanup_expired",
+                          side_effect=AuditStorageError("synthetic unavailable")):
+            async with application.router.lifespan_context(application):
+                # A refused retention run is visible as degraded health, not as
+                # an offline physical-security monitor.
+                self.assertTrue(application.state.ready)
+                self.assertEqual(AuditRetentionHealth.DEGRADED,
+                                 application.state.audit_retention.health)
+                self.assertEqual(1, application.state.audit_retention.total_failures)
+
+    async def test_degraded_startup_cleanup_is_retried_on_the_short_interval(self):
+        class FailingOnceStore:
+            def __init__(self):
+                self.calls = 0
+
+            def cleanup_expired(self):
+                self.calls += 1
+                if self.calls == 1:
+                    raise AuditStorageError("synthetic startup failure")
+                return 0
+
+        store = FailingOnceStore()
+        runtime = AuditRetentionRuntime(store, interval_seconds=1000,
+                                        retry_seconds=0.001)
+        with self.assertRaises(AuditStorageError):
+            runtime.startup_cleanup()
+        self.assertEqual(AuditRetentionHealth.DEGRADED, runtime.health)
+        task = asyncio.create_task(runtime.run())
+        try:
+            for _ in range(200):
+                if store.calls >= 2:
+                    break
+                await asyncio.sleep(0.001)
+            # Retention is not delayed by a whole interval after a failure.
+            self.assertGreaterEqual(store.calls, 2)
+            self.assertEqual(AuditRetentionHealth.HEALTHY, runtime.health)
+        finally:
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
 
     async def test_invalid_database_fails_startup_without_leaking_exception_values(self):
         self.settings.database_path.write_text("SYNTHETIC_PRIVATE_VALUE")

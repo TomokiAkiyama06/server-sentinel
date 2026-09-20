@@ -67,11 +67,17 @@ def create_app(settings: Settings, *, database: Database | None = None,
         try:
             with closing(store.connect()) as connection:
                 migrate(connection, APPLICATION_MIGRATIONS)
-            audit_retention.startup_cleanup()
         except Exception:
             logging.getLogger(__name__).error(Event.STARTUP_FAILED)
             # Lifespan failures must not pass SQLite/config values to servers.
             raise RuntimeError("application startup failed") from None
+        try:
+            audit_retention.startup_cleanup()
+        except Exception:
+            # A refused storage admission or transient database fault must not
+            # take physical-security monitoring offline. The bounded degraded
+            # retention state stays visible and the scheduled run retries it.
+            logging.getLogger(__name__).error(Event.AUDIT_RETENTION_DEGRADED)
         application.state.ready = True
         cleanup_task = asyncio.create_task(audit_retention.run())
         logging.getLogger(__name__).info(Event.STARTED)
