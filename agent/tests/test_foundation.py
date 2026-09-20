@@ -452,6 +452,12 @@ raise SystemExit(1)
 
 
 class DistributionTests(DeploymentCase):
+    def test_ci_container_context_is_allow_listed(self):
+        rules = (Path(__file__).parents[1] / ".dockerignore").read_text(encoding="utf-8")
+        self.assertIn("\n*\n", "\n" + rules)
+        for path in ("!media_capture_agent/**", "!tests/**"):
+            self.assertIn(path, rules)
+
     def test_versioned_artifact_accepts_only_config_outside_installation(self):
         version = self.root / "installation" / "0.1.0"
         version.mkdir(parents=True)

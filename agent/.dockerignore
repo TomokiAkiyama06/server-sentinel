@@ -1,4 +1,8 @@
-__pycache__
-*.pyc
-.venv
-.venv-ci
+# The CI image exercises only the in-tree synthetic runtime. Keep the build
+# context allow-listed so a deployment configuration, credentials, or an
+# unreviewed future directory cannot be copied by Dockerfile.ci's broad COPY.
+*
+!media_capture_agent/
+!media_capture_agent/**
+!tests/
+!tests/**
