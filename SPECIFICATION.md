@@ -115,8 +115,13 @@ dedicated non-root account, then atomically switches `current`/`previous` releas
 pointers. Failed service activation restores the prior pointer and attempts to
 restart it. Configuration, state, recordings, and audit data remain outside both
 the checkout and install tree. The systemd launcher keeps the human listener on
-loopback and grants write access only to the configured runtime root. Exact
-commands and limitations are in `server/docs/DEPLOYMENT.md`.
+loopback and grants write access only to the configured runtime root. A
+`Type=notify` unit does not complete activation until database migration,
+application lifespan startup, and listener creation succeed. Runtime
+subdirectories are resolved and must remain contained on the approved runtime
+filesystem. Root-only environment construction uses an isolated, root-controlled
+Python interpreter from a fixed working directory and sanitized environment.
+Exact commands and limitations are in `server/docs/DEPLOYMENT.md`.
 
 No Docker Compose path is currently implemented or advertised. A future Compose
 path must provide the same versioned update/rollback, external runtime mount,

@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import pwd
 import subprocess
+import sys
 import tarfile
 import tempfile
 import unittest
@@ -15,7 +16,7 @@ from app.deployment import Deployment
 from app.settings import ConfigurationError
 from build_artifact import _required_wheels, build
 from build_installer import build as build_installer
-from install import execute
+from install import _trusted_python, execute
 
 
 class Runner:
@@ -26,8 +27,8 @@ class Runner:
 
     def __call__(self, arguments, **options):
         self.calls.append((arguments, options))
-        if arguments[1:3] == ["-m", "venv"]:
-            python = Path(arguments[3]) / "bin/python"
+        if arguments[1:4] == ["-I", "-m", "venv"]:
+            python = Path(arguments[4]) / "bin/python"
             python.parent.mkdir(parents=True)
             python.write_text("synthetic")
         if arguments[:2] == ["systemctl", "restart"] and self.fail_version:
@@ -88,13 +89,15 @@ class ReleaseLifecycleTests(unittest.TestCase):
                       unit=self.unit, version=version)
         if command in {"install", "update"}:
             artifact, digest = self.artifact(version)
-            values.update(artifact=artifact, sha256=digest, python=Path("/usr/bin/python3"))
+            values.update(artifact=artifact, sha256=digest, python=Path(sys.executable))
         return argparse.Namespace(**values)
 
     def perform(self, arguments):
         account = pwd.getpwuid(self.uid)
         with patch("install.os.geteuid", return_value=0), patch(
-                "install._protected_parent"), patch("install.pwd.getpwuid", return_value=account):
+                "install._protected_parent"), patch(
+                "install._trusted_python", side_effect=lambda path: path.resolve()), patch(
+                "install.pwd.getpwuid", return_value=account):
             execute(arguments, runner=self.runner)
 
     def test_install_update_and_rollback_preserve_external_runtime_data(self):
@@ -112,6 +115,9 @@ class ReleaseLifecycleTests(unittest.TestCase):
         self.assertIn("User=" + pwd.getpwuid(self.uid).pw_name, unit)
         self.assertIn('WorkingDirectory="' + str(self.installation / "current") + '"', unit)
         self.assertIn("ProtectSystem=strict", unit)
+        self.assertIn("Type=notify", unit)
+        self.assertIn("NotifyAccess=main", unit)
+        self.assertNotIn("Type=simple", unit)
         self.assertNotIn("0.0.0.0", unit)
 
         self.perform(self.arguments("update", "1.1.0"))
@@ -182,6 +188,17 @@ class ReleaseLifecycleTests(unittest.TestCase):
         with self.assertRaises(ConfigurationError):
             self.perform(self.arguments("install", "1.0.1"))
 
+    def test_runtime_subdirectory_symlink_cannot_escape_approved_root(self):
+        state = self.runtime / "state"
+        state.rmdir()
+        outside = self.root / "external-state"
+        outside.mkdir(mode=0o700)
+        state.symlink_to(outside, target_is_directory=True)
+        with self.assertRaisesRegex(ConfigurationError, "escapes"):
+            self.perform(self.arguments("install", "1.0.0"))
+        self.assertEqual(list(outside.iterdir()), [])
+        self.assertFalse((self.installation / "releases").exists())
+
     def test_artifact_is_versioned_allow_list_without_tests_or_private_config(self):
         artifact, digest = self.artifact("1.2.3")
         self.assertEqual(hashlib.sha256(artifact.read_bytes()).hexdigest(), digest)
@@ -217,6 +234,42 @@ class ReleaseLifecycleTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.perform(self.arguments("rollback", "9.9.9"))
         self.assertEqual(os.readlink(self.installation / "current"), "releases/1.0.0")
+
+    def test_rollback_version_rejects_path_traversal_before_switch(self):
+        self.perform(self.arguments("install", "1.0.0"))
+        calls = len(self.runner.calls)
+        for version in ("../1.0.0", "1.0.0/..", "/tmp/release", ".", "1.0"):
+            with self.subTest(version=version), self.assertRaisesRegex(ValueError, "version"):
+                self.perform(self.arguments("rollback", version))
+            self.assertEqual(os.readlink(self.installation / "current"), "releases/1.0.0")
+            self.assertEqual(len(self.runner.calls), calls)
+
+    def test_root_python_helpers_are_isolated_from_invocation_directory(self):
+        shadow = self.root / "venv.py"
+        shadow.write_text("raise RuntimeError('must not execute')")
+        previous = Path.cwd()
+        try:
+            os.chdir(self.root)
+            self.perform(self.arguments("install", "1.0.0"))
+        finally:
+            os.chdir(previous)
+        root_helpers = [entry for entry in self.runner.calls
+                        if "venv" in entry[0] or "pip" in entry[0]]
+        self.assertEqual(len(root_helpers), 2)
+        for arguments, options in root_helpers:
+            self.assertIn("-I", arguments)
+            self.assertEqual(options["cwd"], "/")
+            self.assertEqual(options["env"]["PATH"], "/usr/bin:/bin")
+            self.assertNotIn("PYTHONPATH", options["env"])
+            self.assertNotIn("PYTHONHOME", options["env"])
+
+    def test_python_interpreter_must_be_absolute_and_root_controlled(self):
+        candidate = self.root / "python"
+        candidate.write_text("synthetic")
+        candidate.chmod(0o755)
+        for path in (Path("python3"), candidate):
+            with self.subTest(path=path), self.assertRaises(ValueError):
+                _trusted_python(path)
 
 
 class DeploymentConfigurationTests(unittest.TestCase):

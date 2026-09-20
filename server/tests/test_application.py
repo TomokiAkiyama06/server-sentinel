@@ -26,10 +26,13 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
         async with self.application.router.lifespan_context(self.application):
             self.assertTrue(self.application.state.ready)
             with closing(self.application.state.database.connect()) as connection:
-                self.assertEqual(connection.execute("SELECT count(*) FROM schema_migrations").fetchone()[0],
-                                 len(APPLICATION_MIGRATIONS))
+                count = connection.execute(
+                    "SELECT count(*) FROM schema_migrations"
+                ).fetchone()[0]
+                self.assertEqual(count, len(APPLICATION_MIGRATIONS))
             registry = CameraRegistry(self.application.state.database)
-            source = registry.create_source(source_type=SourceType.LOCAL_UVC, name="Synthetic", enabled=True)
+            source = registry.create_source(source_type=SourceType.LOCAL_UVC, name="Synthetic",
+                                            enabled=True)
             self.assertEqual(source, registry.get_source(source.id))
         self.assertFalse(self.application.state.ready)
 

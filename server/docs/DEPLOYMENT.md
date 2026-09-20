@@ -91,7 +91,10 @@ sudo /tmp/server-sentinel-installer-1.1.0.pyz \
 
 Each release gets its own virtual environment under `releases/<version>`.
 Dependencies install offline from the artifact with hashes and binary-only
-enforcement. Preflight runs as the dedicated account. `current` and `previous`
+enforcement. Root-only environment construction accepts only an absolute,
+root-controlled interpreter and runs Python isolated from the invoking directory
+and inherited `PYTHON*` environment. Preflight runs as the dedicated account.
+`current` and `previous`
 are atomically replaced relative symlinks; a failed update restart restores and
 restarts the prior release. Rollback defaults to `previous`, or accepts an
 already installed `--version`. Releases and runtime data are never deleted by
@@ -101,7 +104,10 @@ running before the attempt.
 
 The generated systemd unit runs without capabilities as the dedicated account,
 gives write access only to the runtime root, checks mount/config before every
-start, and invokes the loopback-enforcing launcher. Enabling the unit at boot
+start, and invokes the loopback-enforcing launcher. It uses `Type=notify`; the
+launcher sends readiness only after ASGI lifespan/database migration and Uvicorn
+listener startup both succeed. `systemctl restart` therefore remains pending or
+fails rather than accepting a merely spawned process. Enabling the unit at boot
 remains an explicit administrator action. Install the Ubuntu package providing
 `venv` for the selected Python before the first release operation; the installer
 fails closed if it cannot create the per-release environment.

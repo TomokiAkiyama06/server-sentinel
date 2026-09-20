@@ -97,7 +97,9 @@ After=local-fs.target network.target
 RequiresMountsFor={_quote(deployment.runtime_root)}
 
 [Service]
-Type=simple
+Type=notify
+NotifyAccess=main
+TimeoutStartSec=60
 User={account.pw_name}
 Group={account.pw_gid}
 WorkingDirectory={_quote(current)}
@@ -160,6 +162,21 @@ def _protected_parent(path: Path) -> None:
             raise ValueError("installation ancestors must be root-controlled")
 
 
+def _trusted_python(path: Path) -> Path:
+    if not path.is_absolute():
+        raise ValueError("Python interpreter must be absolute")
+    try:
+        resolved = path.resolve(strict=True)
+        info = resolved.stat()
+    except (OSError, RuntimeError):
+        raise ValueError("Python interpreter is unavailable") from None
+    _protected_parent(resolved.parent)
+    if (not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022
+            or not info.st_mode & 0o111):
+        raise ValueError("Python interpreter is not root-controlled")
+    return resolved
+
+
 def _switch(root: Path, target: str, runner) -> None:
     old_current = _link_target(root, "current")
     old_previous = _link_target(root, "previous")
@@ -195,13 +212,16 @@ def _stage(args, deployment: Deployment, account: pwd.struct_passwd, runner) -> 
     staging.mkdir(mode=0o755)
     try:
         _extract(content, staging, args.version)
-        runner([str(args.python), "-m", "venv", str(staging / "venv")],
-               check=True, timeout=120)
+        root_environment = {
+            "PATH": "/usr/bin:/bin", "PYTHONNOUSERSITE": "1", "PYTHONSAFEPATH": "1",
+        }
+        runner([str(args.python), "-I", "-m", "venv", str(staging / "venv")],
+               check=True, timeout=120, cwd="/", env=root_environment)
         runner([
-            str(staging / "venv/bin/python"), "-m", "pip", "install", "--no-index",
+            str(staging / "venv/bin/python"), "-I", "-m", "pip", "install", "--no-index",
             "--require-hashes", "--only-binary=:all:", "--no-deps", "--no-cache-dir",
             "--find-links", str(staging / "wheels"), "-r", str(staging / "requirements.lock"),
-        ], check=True, timeout=300)
+        ], check=True, timeout=300, cwd="/", env=root_environment)
         runner([
             str(staging / "venv/bin/python"), "-m", "app.deployment", "--config",
             str(args.config), "--check",
@@ -234,6 +254,7 @@ def execute(args, *, runner=subprocess.run) -> None:
         raise ValueError("dedicated non-root account required")
     unit_content = render_unit(args.destination, args.config, deployment, account)
     if args.command in {"install", "update"}:
+        args.python = _trusted_python(args.python)
         if args.command == "install":
             if _link_target(args.destination, "current") is not None or args.unit.exists():
                 raise ValueError("deployment already installed")
@@ -260,6 +281,8 @@ def execute(args, *, runner=subprocess.run) -> None:
         else:
             _switch(args.destination, target, runner)
     else:
+        if args.version is not None and not VERSION.fullmatch(args.version):
+            raise ValueError("invalid rollback version")
         if (args.unit.is_symlink() or not args.unit.is_file()
                 or args.unit.read_text(encoding="utf-8") != unit_content):
             raise ValueError("installed service configuration differs")

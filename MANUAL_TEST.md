@@ -597,12 +597,20 @@ runtime path, filesystem/device identity, account details, and logs private.
 - [ ] Make the candidate service fail its post-switch start. Verify `current`
   returns to the prior version and that version is active without modifying the
   runtime markers.
+- [ ] Make database migration and listener bind fail separately. Verify systemd
+  never reports the candidate ready and the installer restores the prior release.
+- [ ] Place a synthetic `venv.py` and hostile `PYTHONPATH` in the administrator's
+  invocation directory/environment. Verify release environment construction uses
+  the reviewed standard-library `venv` and offline artifact wheels only.
 - [ ] Stop/unmount the disposable runtime filesystem while leaving its mount
   directory present. Install and service preflight must fail without creating
   `state`, `recordings`, `audit`, a root-filesystem fallback, or new media.
 - [ ] Replace the disposable filesystem at the same path and verify the pinned
   major/minor identity rejects it until an explicit Owner-approved private
   configuration change.
+- [ ] Replace `state`, `recordings`, and `audit` individually with symlinks to
+  paths outside the runtime root and to another filesystem; each preflight must
+  fail without writing through the link.
 - [ ] Verify an older release that cannot read a newer migration fails rollback
   and the installer restores the release that was active before the attempt.
 - [ ] Reboot after explicitly enabling the unit and repeat the account, mount,

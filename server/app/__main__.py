@@ -9,12 +9,13 @@ from app.settings import ConfigurationError, Settings
 
 def run(settings: Settings) -> int:
     configure_logging(settings.log_level)
-    import uvicorn
-    uvicorn.run(
+    from app.systemd import build_server
+    server = build_server(
         create_app(settings), host=settings.human_host, port=settings.human_port,
         server_header=False, date_header=False, access_log=False, log_config=None,
         proxy_headers=False, forwarded_allow_ips="", ws="none",
     )
+    server.run()
     return 0
 
 

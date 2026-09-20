@@ -54,18 +54,12 @@ class Deployment:
     runtime_root: Path
     service_uid: int
     settings: Settings
+    recordings_directory: Path
+    audit_directory: Path
 
     @property
     def state_directory(self) -> Path:
-        return self.runtime_root / "state"
-
-    @property
-    def recordings_directory(self) -> Path:
-        return self.runtime_root / "recordings"
-
-    @property
-    def audit_directory(self) -> Path:
-        return self.runtime_root / "audit"
+        return self.settings.data_directory
 
     @classmethod
     def load(cls, path: Path, *, code_root: Path | None = None,
@@ -110,12 +104,18 @@ class Deployment:
             _private_directory(runtime_root / name, uid, roots)
             for name in ("state", "recordings", "audit")
         )
+        for directory in directories:
+            directory_device = directory.stat().st_dev
+            if (not directory.is_relative_to(runtime_root)
+                    or directory_device != root_info.st_dev
+                    or [os.major(directory_device), os.minor(directory_device)] != device):
+                raise ConfigurationError("runtime subdirectory escapes the approved filesystem")
         settings = Settings(
             directories[0], human_host=value["human_host"],
             human_port=value["human_port"], log_level=value["log_level"],
             source_root=code_root,
         )
-        return cls(runtime_root, uid, settings)
+        return cls(runtime_root, uid, settings, directories[1], directories[2])
 
 
 def main(arguments: list[str] | None = None) -> int:
