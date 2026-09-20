@@ -634,16 +634,20 @@ class ProbeCleanupTests(TestCase):
     def test_unkillable_probe_does_not_block_the_worker(self):
         self.run_probe(lambda pid, number: self.killed.append((pid, number)))
         self.assertEqual(self.killed, [(_StuckChild.pid, signal.SIGKILL)])
-        # Every reap is bounded, so a wedged disk cannot stall startup/daily.
-        self.assertTrue(self.child.waits)
+        # The status wait and the cleanup reap, both bounded, so a wedged disk
+        # cannot stall the startup/daily check.
+        self.assertEqual(len(self.child.waits), 2)
         self.assertTrue(all(timeout is not None for timeout in self.child.waits))
         self.assertTrue(self.child.closed)
 
-    def test_failed_signal_still_closes_the_probe_pipe(self):
+    def test_failed_signal_still_reaps_and_closes_the_probe_pipe(self):
+        """A child exiting between poll() and the signal must not stay a zombie."""
         def refuse(pid, number):
             self.killed.append((pid, number))
             raise ProcessLookupError("synthetic-probe")
 
         self.run_probe(refuse)
         self.assertEqual(self.killed, [(_StuckChild.pid, signal.SIGKILL)])
+        self.assertEqual(len(self.child.waits), 2)
+        self.assertTrue(all(timeout is not None for timeout in self.child.waits))
         self.assertTrue(self.child.closed)

@@ -68,7 +68,13 @@ class CommandRunner:
             if process is not None:
                 try:
                     if process.poll() is None:
-                        os.killpg(process.pid, signal.SIGKILL)
+                        try:
+                            os.killpg(process.pid, signal.SIGKILL)
+                        except OSError:
+                            # The child may have exited between poll() and the
+                            # signal. Reap it anyway; a skipped wait() leaves a
+                            # zombie until an unrelated spawn or backend exit.
+                            pass
                         process.wait(timeout=5)
                 except (OSError, subprocess.SubprocessError):
                     pass
