@@ -244,6 +244,8 @@ Acceptance:
 - source health, node health, image-quality state, desired/negotiated capture profile, last-seen, and versioned/enabled/threshold detection bindings follow SPECIFICATION section 3;
 - over-limit activation returns an explicit validation error without replacing/disabling existing sources; human management routes remain unavailable before Plan 17.
 
+Implementation: `server/app/cameras/registry/` provides the internal SQLite registry and migration. `server/tests/test_registry.py` covers mixed 1–4 sources, concurrent admission and limit changes, atomic fifth-source rejection, migration/restart persistence, independent node/source health, and profiles/bindings. HTTP management remains unavailable before #10. Issue acceptance still requires its dependency #7 and the PR's current-HEAD/base review and CI gates.
+
 ## Blocking prerequisite — Owner authorization / trusted Tailscale identity ADR
 
 GitHub Issue: [#6](https://github.com/TomokiAkiyama06/server-sentinel/issues/6)
@@ -272,6 +274,11 @@ Acceptance:
 
 ## Plan 5 — Local UVC discovery and stable identity
 
+Implementation progress: video-only V4L2 discovery/MMAP, conservative identity,
+durable ambiguity latch and registry/session integration are implemented and
+synthetically tested. Owner management, running worker/preview integration and
+real UVC acceptance remain pending; Issue #11 stays OPEN. See `MANUAL_TEST.md` A.
+
 GitHub Issue: [#11](https://github.com/TomokiAkiyama06/server-sentinel/issues/11)
 
 Depends on: [#9](https://github.com/TomokiAkiyama06/server-sentinel/issues/9), [#6](https://github.com/TomokiAkiyama06/server-sentinel/issues/6)
@@ -299,6 +306,12 @@ Acceptance:
 - real webcam verification in `MANUAL_TEST.md`.
 
 ## Plan 6 — `media-capture-agent` foundation
+
+Delivery note: the #12 native foundation now includes explicit protected config,
+non-root lifecycle, separate source/node/clock health, descriptor-pinned mount and
+reserve admission, versioned executable artifact and systemd installer. Synthetic
+CI covers failure paths. Capture/paired transport integration and physical
+acceptance remain pending; Issue #12 stays OPEN.
 
 GitHub Issue: [#12](https://github.com/TomokiAkiyama06/server-sentinel/issues/12)
 
@@ -483,6 +496,12 @@ Acceptance:
 - no-viewer state avoids unnecessary viewer-only transcode;
 - measured resource use recorded.
 
+Implementation progress: `server/app/media/profiles/` contains the independent
+profile planner, decoded-frame cadence control and bounded compressed-packet
+adapter lifecycle, with synthetic tests for quality isolation and no-subscriber
+cleanup. Codec/transport adapters and measured Main Server / Capture Node / UVC
+resource use remain pending; this is not completion of Issue #17.
+
 ## Plan 11 — Durable recording + main-host compressed pre-roll
 
 GitHub Issue: [#18](https://github.com/TomokiAkiyama06/server-sentinel/issues/18)
@@ -492,9 +511,10 @@ Depends on: [#17](https://github.com/TomokiAkiyama06/server-sentinel/issues/17),
 Labels: `backend`, `camera-source`, `storage`
 
 Implementation status: internal storage primitives and synthetic filesystem/SQLite
-coverage are prepared in `server/app/media/recording/`. Final migration/worker
-integration, audited codec muxing/validation, common storage admission and the
-`#17` / `#10` prerequisites remain open; no human media route is enabled here.
+coverage are prepared in `server/app/media/recording/`. Application migration v4
+is integrated; worker integration, audited codec muxing/validation, common
+storage admission and the `#17` / `#10` prerequisites remain open; no human media
+route is enabled here.
 
 実機要件: Main Server: 不要; Capture Node: 不要; UVC Camera: 不要; Manual test: 不要
 

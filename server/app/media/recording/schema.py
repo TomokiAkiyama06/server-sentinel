@@ -28,6 +28,9 @@ RECORDING_STATEMENTS = (
     "PRIMARY KEY(recording_id,segment_id))",
     "CREATE TABLE recording_discontinuities (recording_id TEXT NOT NULL REFERENCES recordings(id), "
     "start_ms INTEGER NOT NULL, end_ms INTEGER NOT NULL, reason TEXT NOT NULL)",
+    "CREATE TABLE recording_source_discontinuities ("
+    "source_id TEXT NOT NULL, start_ms INTEGER NOT NULL, end_ms INTEGER NOT NULL, "
+    "reason TEXT NOT NULL, PRIMARY KEY(source_id,start_ms,end_ms,reason))",
 )
 
 

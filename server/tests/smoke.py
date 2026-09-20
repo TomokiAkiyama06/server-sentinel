@@ -25,12 +25,16 @@ import io  # noqa: E402
 from pathlib import Path  # noqa: E402
 import tempfile  # noqa: E402
 
+from app.cameras.registry import ActiveSourceLimitError, CameraRegistry, CaptureProfile, SourceType  # noqa: E402
+from app.cameras.uvc.identity import DeviceEvidence  # noqa: E402
+from app.cameras.uvc.registry_adapter import LocalUvcAdapter  # noqa: E402
 from app.logging import configure_logging  # noqa: E402
 from app.main import create_app  # noqa: E402
 from app.settings import Settings  # noqa: E402
 from tests.asgi import request  # noqa: E402
 from tests.recording_smoke import run_recording_smoke  # noqa: E402
 from tests.storage_smoke import run_storage_smoke  # noqa: E402
+from tests.test_uvc_session import Discovery, SyntheticCapture  # noqa: E402
 
 
 async def run(scenario):
@@ -46,7 +50,31 @@ async def run(scenario):
         if scenario == "normal":
             async with application.router.lifespan_context(application):
                 assert application.state.ready
-                for path in ("/health", "/version", "/openapi.json", "/api/live/synthetic"):
+                registry = CameraRegistry(application.state.database)
+                for _ in range(4):
+                    registry.create_source(source_type=SourceType.LOCAL_UVC, name="Synthetic", enabled=True)
+                try:
+                    registry.create_source(source_type=SourceType.LOCAL_UVC, name="Synthetic", enabled=True)
+                    raise AssertionError("registry exceeded active-source limit")
+                except ActiveSourceLimitError:
+                    pass
+                assert len(registry.list_sources()) == 4
+                source = registry.list_sources()[0]
+                registry.update_source(source.id, desired_capture_profile=CaptureProfile(640, 480, 10, "MJPG"))
+                candidate = DeviceEvidence("/dev/video0", "synthetic", "model", "serial")
+                discovery = Discovery([candidate])
+                events, frames = [], []
+                adapter = LocalUvcAdapter(registry, emit_audit=events.append,
+                                          on_frame=lambda identity, frame: frames.append(frame),
+                                          discovery=discovery, capture_factory=SyntheticCapture)
+                adapter.approve_source(source.id, candidate)
+                assert adapter.poll_source(source.id)
+                assert len(frames) == 1
+                discovery.devices = []
+                assert not adapter.poll_source(source.id)
+                assert events[-1].reason == "device_disconnected"
+                adapter.close()
+                for path in ("/health", "/version", "/openapi.json", "/api/live/synthetic", "/api/sources"):
                     messages = await request(application, path)
                     assert messages[0]["status"] == 404
                     assert messages[1]["body"] == b'{"detail":"Not Found"}'
