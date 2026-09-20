@@ -10,10 +10,10 @@ Phases group capabilities rather than imposing a strict completion order. The de
 - [ ] specifications committed
 - [ ] issue/PR templates
 - [x] CI/repository guards, synthetic regression tests, and conditional component checks (#5; see `docs/CI.md`)
-- [ ] dependency/model license policy
+- [ ] dependency/model license compliance gate (#51)
 - [ ] hardened review gate #4: capability assessment, offline policy tests and disabled ruleset generator prepared; Owner App setup, trusted publisher/collector and GitHub enforcement acceptance remain open (see `docs/REVIEW_GATE_SETUP.md`)
 
-Issue #1 closed when PR #2 merged after documentation/bootstrap acceptance and current HEAD/base reviews plus CI passed. CI foundation #5 is implemented. The backend and dashboard foundations have synthetic coverage; their authorization prerequisites remain separate. Runtime/ADR progress for Issues #6–#28 and the separately tracked #4 is tracked below and in GitHub.
+Issue #1 closed when PR #2 merged after documentation/bootstrap acceptance and current HEAD/base reviews plus CI passed. CI foundation #5 is implemented. The backend and dashboard foundations have synthetic coverage; their authorization prerequisites remain separate. Runtime/ADR progress for Issues #6–#28, #47–#51, and the separately tracked #4 is tracked below and in GitHub.
 
 ## Phase 1 — Main server and web foundation
 
@@ -23,6 +23,8 @@ Issue #1 closed when PR #2 merged after documentation/bootstrap acceptance and c
 - [ ] health endpoints
 - [x] React responsive dashboard shell (#8; synthetic/mock foundation, production access integration remains #10)
 - [ ] Docker Compose where appropriate
+- [ ] versioned Main Server install / update / rollback lifecycle (#47)
+- [ ] first-run setup wizard and resumable initial configuration flow (#48)
 - [ ] deployment-owner authorization ADR/bootstrap
 - [ ] trusted Tailscale/private-proxy identity boundary
 
@@ -123,6 +125,8 @@ UI remain pending; these phase boxes represent integrated acceptance.
 - [ ] Main Server Owner-approved hardware baseline and startup/daily comparison
 - [ ] daily recording-health self-test, expected-filesystem validation, and bounded write/read/decode verification
 - [ ] immediate Owner alerts for changed/missing hardware and recording-health failures
+- [ ] privacy-safe Owner-initiated diagnostic export / support bundle (#49)
+- [ ] security / admin audit log with 90-day retention (#50)
 
 ## Phase 8 — Hardening / real environment
 
