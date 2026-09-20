@@ -97,6 +97,16 @@ scripts/
 
 `server/app/integrity/` owns Main Server hardware baseline checks; `server/app/media/health/` owns its recording-health self-test. Human authorization and trusted-proxy identity belong in `server/app/auth/`. Agent ring-buffer/protected-incident code belongs in `agent/storage/`; `agent/health/` tracks node/camera health. Runtime media, credentials, inventories, and databases live outside the source tree. Only synthetic/generated fixtures may be versioned under `tests/fixtures/synthetic/`.
 
+The implemented #7 foundation uses explicit typed environment settings, an
+existing deployment-local data directory, and transactional checksummed SQLite
+migrations. Its human listener is loopback-only and all HTTP paths return a
+generic denial; prepared health/version handlers are unmounted and schema/docs
+routes are disabled until #6/#10 acceptance. No identity-header trust is
+implemented by that shell. Its structured log formatter discards free-form
+values and admits only reviewed event names and bounded numeric metadata.
+The concrete settings, persistence and validation contract is documented in
+[`server/docs/FOUNDATION.md`](server/docs/FOUNDATION.md).
+
 The main application may use Docker Compose where appropriate. `media-capture-agent` is intended to run natively as a systemd service so UVC/udev/hotplug handling does not require a privileged container.
 
 ## 3. Camera Source domain model

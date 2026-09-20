@@ -1,0 +1,461 @@
+[
+  {
+    "name": "annotated-doc",
+    "version": "0.0.5",
+    "license": "MIT",
+    "requires_python": ">=3.9",
+    "requires_dist": [],
+    "project_urls": [
+      "Homepage, https://github.com/fastapi/annotated-doc",
+      "Documentation, https://github.com/fastapi/annotated-doc",
+      "Repository, https://github.com/fastapi/annotated-doc",
+      "Issues, https://github.com/fastapi/annotated-doc/issues",
+      "Changelog, https://github.com/fastapi/annotated-doc/release-notes.md"
+    ],
+    "wheel": "annotated_doc-0.0.5-py3-none-any.whl",
+    "sha256": "117bac03a25ede5df5440e855b32d556049ca169ead221505badf432fed4b101",
+    "license_files": [
+      "annotated_doc-0.0.5.dist-info/licenses/LICENSE"
+    ],
+    "download_url": "https://files.pythonhosted.org/packages/3e/30/e900b21425a860e195f32e37657aa1f7c7f2b1bfb26f03ca209b90933c06/annotated_doc-0.0.5-py3-none-any.whl",
+    "release_metadata_url": "https://pypi.org/pypi/annotated-doc/0.0.5/json",
+    "license_sha256": {
+      "annotated_doc-0.0.5.dist-info/licenses/LICENSE": "fff170779a6acbf65abdb405c087f1cee1786691e4a96a4034517e4a504a0cdf"
+    }
+  },
+  {
+    "name": "annotated-types",
+    "version": "0.8.0",
+    "license": "MIT",
+    "requires_python": ">=3.10",
+    "requires_dist": [],
+    "project_urls": [
+      "Homepage, https://github.com/annotated-types/annotated-types",
+      "Source, https://github.com/annotated-types/annotated-types",
+      "Changelog, https://github.com/annotated-types/annotated-types/releases"
+    ],
+    "wheel": "annotated_types-0.8.0-py3-none-any.whl",
+    "sha256": "f072f4d804ea359e4eaf198b1af7a8b0943881a87f31bb764f8bf219bb9419e0",
+    "license_files": [
+      "annotated_types-0.8.0.dist-info/licenses/LICENSE"
+    ],
+    "download_url": "https://files.pythonhosted.org/packages/99/91/8acff4f5e50511b911bbccb72b8628a49c68ce14148cd9f6431094859a90/annotated_types-0.8.0-py3-none-any.whl",
+    "release_metadata_url": "https://pypi.org/pypi/annotated-types/0.8.0/json",
+    "license_sha256": {
+      "annotated_types-0.8.0.dist-info/licenses/LICENSE": "fe1049884b1a0d9342901e88e07f32925d24b3121d9972b6a6805fb9824b095d"
+    }
+  },
+  {
+    "name": "anyio",
+    "version": "4.15.1",
+    "license": "MIT",
+    "requires_python": ">=3.10",
+    "requires_dist": [
+      "exceptiongroup>=1.0.2; python_version < \"3.11\"",
+      "idna>=2.8",
+      "typing_extensions>=4.16.0; python_version < \"3.15\"",
+      "trio>=0.32.0; extra == \"trio\""
+    ],
+    "project_urls": [
+      "Documentation, https://anyio.readthedocs.io/en/latest/",
+      "Changelog, https://anyio.readthedocs.io/en/stable/versionhistory.html",
+      "Source code, https://github.com/agronholm/anyio",
+      "Issue tracker, https://github.com/agronholm/anyio/issues"
+    ],
+    "wheel": "anyio-4.15.1-py3-none-any.whl",
+    "sha256": "6152fdbbf9a77fdec97731721bebf7c4c44f7c29b424b0065826173efc7ed101",
+    "license_files": [
+      "anyio-4.15.1.dist-info/licenses/LICENSE"
+    ],
+    "download_url": "https://files.pythonhosted.org/packages/12/b8/4bd346e22b28902df4d651910f5242c28d84e4a5c2435ca5c3f797ed7e2e/anyio-4.15.1-py3-none-any.whl",
+    "release_metadata_url": "https://pypi.org/pypi/anyio/4.15.1/json",
+    "license_sha256": {
+      "anyio-4.15.1.dist-info/licenses/LICENSE": "5361ac9dc58f2ef5fd2e9b09c68297c17f04950909bbc8023bdb82eacf22c2b0"
+    }
+  },
+  {
+    "name": "click",
+    "version": "8.5.0",
+    "license": "BSD-3-Clause",
+    "requires_python": ">=3.10",
+    "requires_dist": [],
+    "project_urls": [
+      "Changes, https://click.palletsprojects.com/page/changes/",
+      "Chat, https://discord.gg/pallets",
+      "Documentation, https://click.palletsprojects.com/",
+      "Donate, https://palletsprojects.com/donate",
+      "Source, https://github.com/pallets/click/"
+    ],
+    "wheel": "click-8.5.0-py3-none-any.whl",
+    "sha256": "255bc9599cf7748b4b1a446ccc735421bd08a2ae529a8b88597d3de5664ee360",
+    "license_files": [
+      "click-8.5.0.dist-info/licenses/LICENSE.txt"
+    ],
+    "download_url": "https://files.pythonhosted.org/packages/58/50/6c0d534c5f134586a8e1ba4e330569e32f057e33372ae556463212fb4cd3/click-8.5.0-py3-none-any.whl",
+    "release_metadata_url": "https://pypi.org/pypi/click/8.5.0/json",
+    "license_sha256": {
+      "click-8.5.0.dist-info/licenses/LICENSE.txt": "9a8ad106a394e853bfe21f42f4e72d592819a22805d991b5f3275029292b658d"
+    }
+  },
+  {
+    "name": "fastapi",
+    "version": "0.141.1",
+    "license": "MIT",
+    "requires_python": ">=3.10",
+    "requires_dist": [
+      "starlette>=0.46.0",
+      "pydantic>=2.9.0",
+      "typing-extensions>=4.8.0",
+      "typing-inspection>=0.4.2",
+      "annotated-doc>=0.0.2",
+      "fastapi-cli[standard]>=0.0.32; extra == \"standard\"",
+      "fastar>=0.9.0; extra == \"standard\"",
+      "httpx<1.0.0,>=0.23.0; extra == \"standard\"",
+      "jinja2>=3.1.5; extra == \"standard\"",
+      "python-multipart>=0.0.18; extra == \"standard\"",
+      "email-validator>=2.0.0; extra == \"standard\"",
+      "uvicorn[standard]>=0.12.0; extra == \"standard\"",
+      "pydantic-settings>=2.0.0; extra == \"standard\"",
+      "pydantic-extra-types>=2.0.0; extra == \"standard\"",
+      "fastapi-cli[standard-no-fastapi-cloud-cli]>=0.0.32; extra == \"standard-no-fastapi-cloud-cli\"",
+      "httpx<1.0.0,>=0.23.0; extra == \"standard-no-fastapi-cloud-cli\"",
+      "jinja2>=3.1.5; extra == \"standard-no-fastapi-cloud-cli\"",
+      "python-multipart>=0.0.18; extra == \"standard-no-fastapi-cloud-cli\"",
+      "email-validator>=2.0.0; extra == \"standard-no-fastapi-cloud-cli\"",
+      "uvicorn[standard]>=0.12.0; extra == \"standard-no-fastapi-cloud-cli\"",
+      "pydantic-settings>=2.0.0; extra == \"standard-no-fastapi-cloud-cli\"",
+      "pydantic-extra-types>=2.0.0; extra == \"standard-no-fastapi-cloud-cli\"",
+      "fastapi-cli[standard]>=0.0.32; extra == \"all\"",
+      "httpx<1.0.0,>=0.23.0; extra == \"all\"",
+      "jinja2>=3.1.5; extra == \"all\"",
+      "python-multipart>=0.0.18; extra == \"all\"",
+      "itsdangerous>=1.1.0; extra == \"all\"",
+      "pyyaml>=5.3.1; extra == \"all\"",
+      "email-validator>=2.0.0; extra == \"all\"",
+      "uvicorn[standard]>=0.12.0; extra == \"all\"",
+      "pydantic-settings>=2.0.0; extra == \"all\"",
+      "pydantic-extra-types>=2.0.0; extra == \"all\""
+    ],
+    "project_urls": [
+      "Homepage, https://github.com/fastapi/fastapi",
+      "Documentation, https://fastapi.tiangolo.com/",
+      "Repository, https://github.com/fastapi/fastapi",
+      "Issues, https://github.com/fastapi/fastapi/issues",
+      "Changelog, https://fastapi.tiangolo.com/release-notes/"
+    ],
+    "wheel": "fastapi-0.141.1-py3-none-any.whl",
+    "sha256": "bfb91aa2d334c61cb35ba9a116fc123b3d3df31640b801cf57a7a78ec3f603b3",
+    "license_files": [
+      "fastapi-0.141.1.dist-info/licenses/LICENSE"
+    ],
+    "download_url": "https://files.pythonhosted.org/packages/cb/03/10388a42375ee7e4ac9b94eb2c5c569c8b5795e377e701c9ac3ad63de890/fastapi-0.141.1-py3-none-any.whl",
+    "release_metadata_url": "https://pypi.org/pypi/fastapi/0.141.1/json",
+    "license_sha256": {
+      "fastapi-0.141.1.dist-info/licenses/LICENSE": "4ec89ffc81485b97fec584b2d4a961032eeffe834453894fd9c1274906cc744e"
+    }
+  },
+  {
+    "name": "h11",
+    "version": "0.16.0",
+    "license": "MIT",
+    "requires_python": ">=3.8",
+    "requires_dist": [],
+    "project_urls": [],
+    "wheel": "h11-0.16.0-py3-none-any.whl",
+    "sha256": "63cf8bbe7522de3bf65932fda1d9c2772064ffb3dae62d55932da54b31cb6c86",
+    "license_files": [
+      "h11-0.16.0.dist-info/licenses/LICENSE.txt"
+    ],
+    "download_url": "https://files.pythonhosted.org/packages/04/4b/29cac41a4d98d144bf5f6d33995617b185d14b22401f75ca86f384e87ff1/h11-0.16.0-py3-none-any.whl",
+    "release_metadata_url": "https://pypi.org/pypi/h11/0.16.0/json",
+    "license_sha256": {
+      "h11-0.16.0.dist-info/licenses/LICENSE.txt": "37db5bb85926db28a427a25867f10b1232003aea1be69ccb851138adb8e6f361"
+    }
+  },
+  {
+    "name": "idna",
+    "version": "3.20",
+    "license": "BSD-3-Clause",
+    "requires_python": ">=3.9",
+    "requires_dist": [
+      "ruff >= 0.16.0 ; extra == \"all\"",
+      "mypy >= 1.11.2 ; extra == \"all\"",
+      "ty >= 0.0.37 ; extra == \"all\"",
+      "pytest >= 8.3.2 ; extra == \"all\"",
+      "hypothesis >= 6.141.1 ; extra == \"all\"",
+      "coverage >= 7.10.0 ; extra == \"all\""
+    ],
+    "project_urls": [
+      "Changelog, https://github.com/kjd/idna/blob/master/HISTORY.md",
+      "Issue tracker, https://github.com/kjd/idna/issues",
+      "Source, https://github.com/kjd/idna"
+    ],
+    "wheel": "idna-3.20-py3-none-any.whl",
+    "sha256": "ab7ae7122974553370f0bdb919e1a960b2cd1bc1ef0276416d896db81c14582c",
+    "license_files": [
+      "idna-3.20.dist-info/licenses/LICENSE.md"
+    ],
+    "download_url": "https://files.pythonhosted.org/packages/58/a2/bb081bab032533a855d44de1d56f8e8426114ff1ba5d1f07a438a0a654f8/idna-3.20-py3-none-any.whl",
+    "release_metadata_url": "https://pypi.org/pypi/idna/3.20/json",
+    "license_sha256": {
+      "idna-3.20.dist-info/licenses/LICENSE.md": "1a9a4f0e3d479a27240ddd59a9137a66ab4a0f9dfdc8ca6188cc0bfd85187f04"
+    }
+  },
+  {
+    "name": "pycodestyle",
+    "version": "2.14.0",
+    "license": "MIT",
+    "requires_python": ">=3.9",
+    "requires_dist": [],
+    "project_urls": [
+      "Changes, https://pycodestyle.pycqa.org/en/latest/developer.html#changes"
+    ],
+    "wheel": "pycodestyle-2.14.0-py2.py3-none-any.whl",
+    "sha256": "dd6bf7cb4ee77f8e016f9c8e74a35ddd9f67e1d5fd4184d86c3b98e07099f42d",
+    "license_files": [
+      "pycodestyle-2.14.0.dist-info/LICENSE"
+    ],
+    "download_url": "https://files.pythonhosted.org/packages/d7/27/a58ddaf8c588a3ef080db9d0b7e0b97215cee3a45df74f3a94dbbf5c893a/pycodestyle-2.14.0-py2.py3-none-any.whl",
+    "release_metadata_url": "https://pypi.org/pypi/pycodestyle/2.14.0/json",
+    "license_sha256": {
+      "pycodestyle-2.14.0.dist-info/LICENSE": "f772295e81af3478d34e88e52d076200230ec7dd6a39e123bc5cb35aa66abdae"
+    }
+  },
+  {
+    "name": "pydantic",
+    "version": "2.13.5",
+    "license": "MIT",
+    "requires_python": ">=3.9",
+    "requires_dist": [
+      "annotated-types>=0.6.0",
+      "pydantic-core==2.46.5",
+      "typing-extensions>=4.14.1",
+      "typing-inspection>=0.4.2",
+      "email-validator>=2.0.0; extra == 'email'",
+      "tzdata; (python_version >= '3.9' and platform_system == 'Windows') and extra == 'timezone'"
+    ],
+    "project_urls": [
+      "Homepage, https://github.com/pydantic/pydantic",
+      "Documentation, https://docs.pydantic.dev",
+      "Funding, https://github.com/sponsors/samuelcolvin",
+      "Source, https://github.com/pydantic/pydantic",
+      "Changelog, https://docs.pydantic.dev/latest/changelog/"
+    ],
+    "wheel": "pydantic-2.13.5-py3-none-any.whl",
+    "sha256": "346a034f080da3755d8e9cb5e00e8b07de1d39e4f6e2c87d8ab7cafa0b269a73",
+    "license_files": [
+      "pydantic-2.13.5.dist-info/licenses/LICENSE"
+    ],
+    "download_url": "https://files.pythonhosted.org/packages/eb/47/c95ffc2009878c7aac0c5e08528022dcb885933252a88b5f170058014464/pydantic-2.13.5-py3-none-any.whl",
+    "release_metadata_url": "https://pypi.org/pypi/pydantic/2.13.5/json",
+    "license_sha256": {
+      "pydantic-2.13.5.dist-info/licenses/LICENSE": "a9e186f3ca16b5eef84318e7a701721351a00cb7b8ae3a4394b67b49e3529ef3"
+    }
+  },
+  {
+    "name": "pydantic-core",
+    "version": "2.46.5",
+    "license": "MIT",
+    "requires_python": ">=3.9",
+    "requires_dist": [
+      "typing-extensions>=4.14.1"
+    ],
+    "project_urls": [
+      "Funding, https://github.com/sponsors/samuelcolvin",
+      "Homepage, https://github.com/pydantic",
+      "Source, https://github.com/pydantic/pydantic/tree/main/pydantic-core"
+    ],
+    "wheel": "pydantic_core-2.46.5-cp312-cp312-manylinux_2_17_aarch64.manylinux2014_aarch64.whl",
+    "sha256": "4fdc8b93a41521988916eeaa271173fcca7fa0803d62f87675aac8dcec1c8e29",
+    "license_files": [
+      "pydantic_core-2.46.5.dist-info/licenses/LICENSE"
+    ],
+    "download_url": "https://files.pythonhosted.org/packages/09/f0/2a8ce3849e299d44e2d2c196b6082643a3235565a735cb51db7a6261f614/pydantic_core-2.46.5-cp312-cp312-manylinux_2_17_aarch64.manylinux2014_aarch64.whl",
+    "release_metadata_url": "https://pypi.org/pypi/pydantic-core/2.46.5/json",
+    "license_sha256": {
+      "pydantic_core-2.46.5.dist-info/licenses/LICENSE": "2afdd30d54b4d62b6f488a6bcc1546e84ec5061f13f4209c03d012348783795a"
+    }
+  },
+  {
+    "name": "pydantic-core",
+    "version": "2.46.5",
+    "license": "MIT",
+    "requires_python": ">=3.9",
+    "requires_dist": [
+      "typing-extensions>=4.14.1"
+    ],
+    "project_urls": [
+      "Funding, https://github.com/sponsors/samuelcolvin",
+      "Homepage, https://github.com/pydantic",
+      "Source, https://github.com/pydantic/pydantic/tree/main/pydantic-core"
+    ],
+    "wheel": "pydantic_core-2.46.5-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+    "sha256": "0fc5be0abd4a407e200d844b404e33639a554e7bd0d448e7b9ae181be4789ac2",
+    "license_files": [
+      "pydantic_core-2.46.5.dist-info/licenses/LICENSE"
+    ],
+    "download_url": "https://files.pythonhosted.org/packages/c0/a4/eb9409ec0736e50aa70a412f16c204ed149516846912f7e6724d4c73ee53/pydantic_core-2.46.5-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+    "release_metadata_url": "https://pypi.org/pypi/pydantic-core/2.46.5/json",
+    "license_sha256": {
+      "pydantic_core-2.46.5.dist-info/licenses/LICENSE": "2afdd30d54b4d62b6f488a6bcc1546e84ec5061f13f4209c03d012348783795a"
+    }
+  },
+  {
+    "name": "pydantic-core",
+    "version": "2.46.5",
+    "license": "MIT",
+    "requires_python": ">=3.9",
+    "requires_dist": [
+      "typing-extensions>=4.14.1"
+    ],
+    "project_urls": [
+      "Funding, https://github.com/sponsors/samuelcolvin",
+      "Homepage, https://github.com/pydantic",
+      "Source, https://github.com/pydantic/pydantic/tree/main/pydantic-core"
+    ],
+    "wheel": "pydantic_core-2.46.5-cp314-cp314-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+    "sha256": "54d510bac3ee52247af28ed4bb18a1e799f040ac60fd2bf5ccd4c92f1fbe786f",
+    "license_files": [
+      "pydantic_core-2.46.5.dist-info/licenses/LICENSE"
+    ],
+    "download_url": "https://files.pythonhosted.org/packages/2c/9b/59634b7ac631c63b2a37760eb6943af3e29573d6b59a4abc5e7f019d4cee/pydantic_core-2.46.5-cp314-cp314-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+    "release_metadata_url": "https://pypi.org/pypi/pydantic-core/2.46.5/json",
+    "license_sha256": {
+      "pydantic_core-2.46.5.dist-info/licenses/LICENSE": "2afdd30d54b4d62b6f488a6bcc1546e84ec5061f13f4209c03d012348783795a"
+    }
+  },
+  {
+    "name": "pyflakes",
+    "version": "3.4.0",
+    "license": "MIT",
+    "requires_python": ">=3.9",
+    "requires_dist": [],
+    "project_urls": [],
+    "wheel": "pyflakes-3.4.0-py2.py3-none-any.whl",
+    "sha256": "f742a7dbd0d9cb9ea41e9a24a918996e8170c799fa528688d40dd582c8265f4f",
+    "license_files": [
+      "pyflakes-3.4.0.dist-info/LICENSE"
+    ],
+    "download_url": "https://files.pythonhosted.org/packages/c2/2f/81d580a0fb83baeb066698975cb14a618bdbed7720678566f1b046a95fe8/pyflakes-3.4.0-py2.py3-none-any.whl",
+    "release_metadata_url": "https://pypi.org/pypi/pyflakes/3.4.0/json",
+    "license_sha256": {
+      "pyflakes-3.4.0.dist-info/LICENSE": "22c47569cc0aae531b372361366818af01c6fc2e314770584a7866c92b3a0463"
+    }
+  },
+  {
+    "name": "starlette",
+    "version": "1.6.0",
+    "license": "BSD-3-Clause",
+    "requires_python": ">=3.10",
+    "requires_dist": [
+      "anyio<5,>=3.6.2",
+      "typing-extensions>=4.10.0; python_version < '3.13'",
+      "httpx2>=2.0.0; extra == 'full'",
+      "httpx<0.29.0,>=0.27.0; extra == 'full'",
+      "itsdangerous; extra == 'full'",
+      "jinja2; extra == 'full'",
+      "python-multipart>=0.0.18; extra == 'full'",
+      "pyyaml; extra == 'full'"
+    ],
+    "project_urls": [
+      "Homepage, https://github.com/Kludex/starlette",
+      "Documentation, https://starlette.dev/",
+      "Changelog, https://starlette.dev/release-notes/",
+      "Funding, https://github.com/sponsors/Kludex",
+      "Source, https://github.com/Kludex/starlette"
+    ],
+    "wheel": "starlette-1.6.0-py3-none-any.whl",
+    "sha256": "a86dd39d14bb45f85a3d18525215a9ef0cfd1f192ac793220e72598c90335f0c",
+    "license_files": [
+      "starlette-1.6.0.dist-info/licenses/LICENSE.md"
+    ],
+    "download_url": "https://files.pythonhosted.org/packages/c8/cb/6a6a47d5b464bd08695d254f3da6e7986cc70c9fa5d778eda57538edfe56/starlette-1.6.0-py3-none-any.whl",
+    "release_metadata_url": "https://pypi.org/pypi/starlette/1.6.0/json",
+    "license_sha256": {
+      "starlette-1.6.0.dist-info/licenses/LICENSE.md": "dcb95677a02240243187e964f941847d19b17821cf99e5afae684fab328c19bf"
+    }
+  },
+  {
+    "name": "typing-extensions",
+    "version": "4.16.0",
+    "license": "PSF-2.0",
+    "requires_python": ">=3.9",
+    "requires_dist": [],
+    "project_urls": [
+      "Bug Tracker, https://github.com/python/typing_extensions/issues",
+      "Changes, https://github.com/python/typing_extensions/blob/main/CHANGELOG.md",
+      "Documentation, https://typing-extensions.readthedocs.io/",
+      "Home, https://github.com/python/typing_extensions",
+      "Q & A, https://github.com/python/typing/discussions",
+      "Repository, https://github.com/python/typing_extensions"
+    ],
+    "wheel": "typing_extensions-4.16.0-py3-none-any.whl",
+    "sha256": "481caa481374e813c1b176ada14e97f1f67a4539ce9cfeb3f350d78d6370c2e8",
+    "license_files": [
+      "typing_extensions-4.16.0.dist-info/licenses/LICENSE"
+    ],
+    "download_url": "https://files.pythonhosted.org/packages/49/d3/b8441a820a491ddfc024b0b0cf0393375b75ea13866d9c66727e54c2fc80/typing_extensions-4.16.0-py3-none-any.whl",
+    "release_metadata_url": "https://pypi.org/pypi/typing-extensions/4.16.0/json",
+    "license_sha256": {
+      "typing_extensions-4.16.0.dist-info/licenses/LICENSE": "3b2f81fe21d181c499c59a256c8e1968455d6689d269aa85373bfb6af41da3bf"
+    }
+  },
+  {
+    "name": "typing-inspection",
+    "version": "0.4.4",
+    "license": "MIT",
+    "requires_python": ">=3.10",
+    "requires_dist": [
+      "typing-extensions>=4.15.0"
+    ],
+    "project_urls": [
+      "Homepage, https://github.com/pydantic/typing-inspection",
+      "Documentation, https://pydantic.github.io/typing-inspection/dev/",
+      "Source, https://github.com/pydantic/typing-inspection",
+      "Changelog, https://github.com/pydantic/typing-inspection/blob/main/HISTORY.md"
+    ],
+    "wheel": "typing_inspection-0.4.4-py3-none-any.whl",
+    "sha256": "65b8397ba37ccbce054456aaccddfc91e6e3083c92824df348d96ca832f3f147",
+    "license_files": [
+      "typing_inspection-0.4.4.dist-info/licenses/LICENSE"
+    ],
+    "download_url": "https://files.pythonhosted.org/packages/67/81/4add07e5172b7ac40d8ed5ff580409a7801a4fe26d529bdd915401dabfbe/typing_inspection-0.4.4-py3-none-any.whl",
+    "release_metadata_url": "https://pypi.org/pypi/typing-inspection/0.4.4/json",
+    "license_sha256": {
+      "typing_inspection-0.4.4.dist-info/licenses/LICENSE": "804b59b25f2c31bd278f9202a19ae49a3945aa2664387e2d0a128c7cacc61ec3"
+    }
+  },
+  {
+    "name": "uvicorn",
+    "version": "0.53.0",
+    "license": "BSD-3-Clause",
+    "requires_python": ">=3.10",
+    "requires_dist": [
+      "click>=7.0",
+      "h11>=0.8",
+      "typing-extensions>=4.0; python_version < '3.11'",
+      "httptools>=0.8.0; extra == 'standard'",
+      "python-dotenv>=0.13; extra == 'standard'",
+      "pyyaml>=5.1; extra == 'standard'",
+      "uvloop>=0.15.1; (sys_platform != 'win32' and (sys_platform != 'cygwin' and platform_python_implementation != 'PyPy')) and extra == 'standard'",
+      "watchfiles>=0.20; extra == 'standard'",
+      "websockets>=13.0; extra == 'standard'"
+    ],
+    "project_urls": [
+      "Changelog, https://uvicorn.dev/release-notes",
+      "Funding, https://github.com/sponsors/Kludex",
+      "Homepage, https://uvicorn.dev/",
+      "Source, https://github.com/Kludex/uvicorn"
+    ],
+    "wheel": "uvicorn-0.53.0-py3-none-any.whl",
+    "sha256": "e8dca71ec86dce5f04e333f0d56cdedf942446e6643b9cea1af0d6d3a02cb03e",
+    "license_files": [
+      "uvicorn-0.53.0.dist-info/licenses/LICENSE.md"
+    ],
+    "download_url": "https://files.pythonhosted.org/packages/76/18/0eea75741ee812e9f598b687619ce2454f6c3a1c5cd21ea990ec6bd26f45/uvicorn-0.53.0-py3-none-any.whl",
+    "release_metadata_url": "https://pypi.org/pypi/uvicorn/0.53.0/json",
+    "license_sha256": {
+      "uvicorn-0.53.0.dist-info/licenses/LICENSE.md": "efe1acf3e62fb99c288b0ec73e5a773b7268ef4320fe757ea994214e4b63c371"
+    }
+  }
+]

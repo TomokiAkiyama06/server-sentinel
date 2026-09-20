@@ -22,6 +22,10 @@ trusted issuer or required Codex/Claude enforcement.
 
 ## Current coverage
 
+The Main Server foundation has configured lint, synthetic tests and isolated
+normal/error ASGI smoke. Its smoke additionally observes Python outbound and
+process-spawn attempts; see `server/docs/FOUNDATION.md` for the precise limits.
+
 The `web/` React foundation is implemented and activates locked dependency
 installation, TypeScript/JavaScript checks, Node tests, production bundling,
 Docker validation and isolated normal/error preview smoke. The additional
