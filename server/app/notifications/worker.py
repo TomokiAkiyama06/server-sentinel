@@ -1,18 +1,29 @@
 """One bounded daemon delivery worker; no SQLite or local event callbacks here."""
 
-from queue import Empty, Queue
+from queue import Empty, Full, Queue
 import threading
 
 from app.notifications.slack import DeliveryResult
 
 
 class DeliveryWorker:
+    """Hands completions to the owning thread without losing one or a wake-up.
+
+    The delivery thread publishes a completion and raises `ready` under the same
+    lock the owner uses to drain, and the owner lowers `ready` only after it has
+    observed the completion queue empty under that lock. A completion can
+    therefore never be acknowledged by a flag that was already lowered. The
+    thread also survives a transiently full completion queue: dropping a
+    completion, or letting the thread exit, would strand the event as pending
+    forever and silently lose a critical alert's outcome.
+    """
+
     def __init__(self, transport, capacity: int):
         self._transport = transport
         self._work = Queue(maxsize=capacity)
         self._results = Queue(maxsize=capacity)
-        self._result_lock = threading.Lock()
         self._stop = threading.Event()
+        self._handoff = threading.Lock()
         self.ready = threading.Event()
         self._thread = None
 
@@ -38,19 +49,34 @@ class DeliveryWorker:
                     result = DeliveryResult.FAILED
             except Exception:
                 result = DeliveryResult.FAILED
-            with self._result_lock:
-                self._results.put_nowait((identifier, result))
+            self._complete(identifier, result)
+
+    def _complete(self, identifier, result) -> None:
+        # A finished delivery is always offered, including after close, so the
+        # owner can persist its real outcome instead of a stranded pending row.
+        while True:
+            with self._handoff:
+                try:
+                    self._results.put_nowait((identifier, result))
+                    published = True
+                except Full:
+                    published = False
+                # Raised while the queue may hold completions, including while
+                # this one still waits for the owner to make room for it.
                 self.ready.set()
+            if published or self._stop.is_set():
+                return
+            self._stop.wait(0.01)
 
     def results(self):
-        with self._result_lock:
-            results = []
-            while True:
+        while True:
+            with self._handoff:
                 try:
-                    results.append(self._results.get_nowait())
+                    completion = self._results.get_nowait()
                 except Empty:
                     self.ready.clear()
-                    return tuple(results)
+                    return
+            yield completion
 
     def close(self) -> None:
         # Never join a possibly stuck DNS/transport call on the recorder thread.

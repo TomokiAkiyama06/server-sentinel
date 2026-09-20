@@ -30,6 +30,10 @@ The allowance conservatively caps resident critical segment bytes plus the new
 reservation (including after restart), and also bounds total quota overflow.
 No evidence classifier is implemented here. Cleanup tries expired completed
 unstarred recordings first, then oldest eligible recordings in bounded batches.
+Cleanup and state classification share one threshold predicate, so a request
+never stops reclaiming exactly where admission still rejects it. While pressured
+or hard stopped, bounded cleanup targets the recovery thresholds; stopping at the
+entry boundary would latch the state and reject later recordings indefinitely.
 The recorder rechecks stars/active status before deleting its own generated
 segments and preserves shared/spool links. Star changes and admission serialize
 on the same owning worker. Agent protected incident lifecycles are untouched.
