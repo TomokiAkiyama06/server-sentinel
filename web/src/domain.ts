@@ -108,7 +108,12 @@ export interface PresenceSnapshot {
   pending_critical_actions: number;
 }
 
-/** Audited Owner control history; it carries no biometric or viewer identity. */
+/** Audited Owner control history; it carries no biometric or viewer identity.
+ *
+ * The core also records the acting Owner identity. It is deliberately left out
+ * of this projection: the screen is Owner-only and the actor adds no fact the
+ * Owner needs here, so the identifier is not carried into the browser.
+ */
 export interface PresenceAuditEntry {
   sequence: number;
   action: PresenceAuditAction;

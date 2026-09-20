@@ -42,7 +42,7 @@ const timelineFixture = {
   ordering_basis: 'received_at', ordering_degraded: true, causality: 'not_inferred',
   next_cursor: { received_at: '2026-09-21T09:00:01.000000+00:00', sequence: 1 },
 };
-const olderTimelineFixture = {
+const newerTimelineFixture = {
   items: [observation('storage', { value: 'degraded', quality: 'unknown', confidence: null, source_id: null, sequence: 2 })],
   ordering_basis: 'received_at', ordering_degraded: false, causality: 'not_inferred', next_cursor: null,
 };
@@ -102,7 +102,7 @@ async function scenario(viewport, { production = false, status = 200, session = 
       await fulfill(JSON.stringify(sourceStatus === 200 ? fixture(count) : { detail: 'synthetic private error' }), 'application/json', sourceStatus); return;
     }
     if (!production && url.pathname === '/api/mock/timeline') {
-      await fulfill(JSON.stringify(url.searchParams.has('after') ? olderTimelineFixture : timelineFixture),
+      await fulfill(JSON.stringify(url.searchParams.has('after') ? newerTimelineFixture : timelineFixture),
         'application/json'); return;
     }
     if (!production && url.pathname === '/api/mock/presence') {
@@ -181,7 +181,7 @@ try {
       await page.evaluate("Array.from(document.querySelectorAll('.timeline-filter button')).find(el => el.textContent === 'critical').click()");
       await page.wait("document.querySelectorAll('[data-observation-kind]').length === 1");
       assert.equal(await page.evaluate("document.querySelector('[data-observation-kind]').dataset.observationKind"), 'server_movement');
-      // A non-null cursor offers older history; the next page ends the window.
+      // A non-null cursor offers newer history; the next page ends the window.
       await page.evaluate("Array.from(document.querySelectorAll('.timeline-filter button')).find(el => el.textContent === 'すべて').click()");
       await page.wait("document.querySelectorAll('[data-observation-kind]').length === 4");
       await page.evaluate("document.querySelector('.timeline-screen > button').click()");

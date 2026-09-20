@@ -148,6 +148,9 @@ export function TimelineScreen({ services, t }: { services: DashboardServices; t
   const [filter, setFilter] = useState<TimelineFilter>('all');
   // One page request at a time, independent of render timing.
   const inFlight = useRef(false);
+  const paging = useRef<AbortController | null>(null);
+  // An in-flight page request does not outlive the screen.
+  useEffect(() => () => paging.current?.abort(), []);
 
   useEffect(() => {
     // Bound to the service so class-based providers keep their receiver.
@@ -181,17 +184,22 @@ export function TimelineScreen({ services, t }: { services: DashboardServices; t
     inFlight.current = true;
     setData({ ...data, more: true, moreFailed: false });
     const controller = new AbortController();
+    paging.current = controller;
     void (async () => {
       try {
         const next = await load(controller.signal, cursor);
+        if (controller.signal.aborted) return;
         setData({
           state: 'ready', page: extend(data.page, next), more: false, moreFailed: false,
           complete: !cursorAdvanced(cursor, next.next_cursor),
         });
       } catch {
         // Keep the history already loaded and leave the retry path in place.
-        setData({ ...data, more: false, moreFailed: true });
-      } finally { inFlight.current = false; }
+        if (!controller.signal.aborted) setData({ ...data, more: false, moreFailed: true });
+      } finally {
+        inFlight.current = false;
+        if (paging.current === controller) paging.current = null;
+      }
     })();
   } : undefined;
   return <TimelineBody page={data.page} filter={filter} t={t} onFilter={setFilter}

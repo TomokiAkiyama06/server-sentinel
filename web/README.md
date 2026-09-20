@@ -37,54 +37,62 @@ the backend or ingest listener.
 
 `src/views/timeline.tsx` lists one observation per row with its time, kind dot,
 neutral text, source attribution and confidence/quality. Only a detector result
-is attributed to a detector; status and control events report their kind. Unreliable or
-unavailable results stay `unknown`: a quality-gated negative is never shown as
-"no person", and a low-quality detector observation (person, motion, owner and
-anonymous entry/exit, server movement, camera tamper) is never shown as a
-factual detection, including the detector contract's `degraded` quality. Status
-and configuration events, whose reported state is not image-quality gated, keep
-their value with the quality shown beside it, and the value labels cover every
-source/node health transition, including `manual_intervention_required` and
-`revoked`. The `critical` badge names the detector category, not a confirmed
-event, and a result is labelled confirmed only when it also meets the core's
-confirmation prerequisites: sufficient quality, an observed value and a
-reported confidence. Rows follow the
-Main Server receipt order the core reports and each row also shows its own
-observation time, and a `next_cursor` offers the older part of the window
-through a load-more control so a limited response cannot hide older events; a
-failed page keeps the history already loaded and reports the failure beside the
-retry. The ordering statement follows `ordering_basis` while
-`ordering_degraded` adds the warning. Clock skew or timestamp discontinuity is
-reported per span and by that ordering notice;
-the UI does not present that order as established causality, cause or
+is attributed to a detector; status and control events report their kind.
+
+Unreliable or unavailable results stay `unknown`: a quality-gated negative is
+never shown as "no person", and a low-quality detector observation (person,
+motion, owner and anonymous entry/exit, server movement, camera tamper) is never
+shown as a factual detection, including the detector contract's `degraded`
+quality. Status and configuration events, whose reported state is not
+image-quality gated, keep their value with the quality shown beside it, and the
+value labels cover every source/node health transition, including
+`manual_intervention_required` and `revoked`. The `critical` badge names the
+detector category, not a confirmed event, and a result is labelled confirmed
+only when it also meets the core's confirmation prerequisites: sufficient
+quality, an observed value and a reported confidence.
+
+Rows follow the Main Server receipt order the core reports, and each row also
+shows its own observation time. The core pages forward in that order, so
+`next_cursor` leads to *newer* observations; the load-more control is labelled
+accordingly, a failed page keeps the history already loaded and reports the
+failure beside the retry, and paging ends only when the cursor stops advancing.
+Clock skew or timestamp discontinuity is reported per span and by the ordering
+notice; the UI does not present that order as established causality, cause or
 culpability. A kind filter selects all, people/motion, critical, device and
-recording, or configuration entries. `src/views/presence.tsx` shows the current
-state, its basis, manual-override expiry and cancel affordance, the fact that
-only `PRESENT` suppresses ordinary occupancy automation, and today's
-audited Owner control history, and reports the timing trust of the record
-behind the current basis separately from the timing trust of observation
-receipt. Suppression is judged against the state *and*
-clock trust, because the core suppresses ordinary automation only for a trusted
-`PRESENT`; a report that disagrees raises a degraded alert with the reported
-suppression instead of a contradictory statement. The four critical paths
-(detection, persistence, evidence, notification) are shown with their reported
-`armed` / `unavailable` / `unknown` state, a known failure is never merged with
-an unreported one, and the continuity statement appears only while every path is
-armed and `critical_paths_degraded` is false; aggregate degradation with every
-path armed gets its own wording rather than contradicting the breakdown; an evidence or notification path
-also reports `unavailable` while a submission is in flight or accepted but
-unconfirmed. An incomplete override expiry (`override_expiry_pending`) is
-reported so an expired override cannot look active. The snapshot is not left stale: the screen shows when it was fetched,
+recording, or configuration entries.
+
+`src/views/presence.tsx` shows the current state, its basis, manual-override
+expiry and cancel affordance, the fact that only `PRESENT` suppresses ordinary
+occupancy automation, and the audited Owner control history, which explains the
+Owner critical-recovery actions, including that an approved requeue accepts a
+possible duplicate preservation or notification. The timing trust of the record
+behind the current basis is reported separately from the timing trust of
+observation receipt.
+
+Suppression is judged against the state *and* clock trust, because the core
+suppresses ordinary automation only for a trusted `PRESENT`; a report that
+disagrees raises a degraded alert with the reported suppression instead of a
+contradictory statement. The four critical paths (detection, persistence,
+evidence, notification) are shown with their reported `armed` / `unavailable` /
+`unknown` state, a known failure is never merged with an unreported one, and
+the continuity statement appears only while every path is armed and
+`critical_paths_degraded` is false; aggregate degradation with every path armed
+gets its own wording rather than contradicting the breakdown. An evidence or
+notification path also reports `unavailable` while a submission is in flight or
+accepted but unconfirmed.
+
+An incomplete override expiry (`override_expiry_pending`) is reported so an
+expired override cannot look active, and an override the core still applies
+past its stated expiry under degraded timing says so rather than looking
+ordinary. The snapshot is not left stale: the screen shows when it was fetched,
 offers an explicit refresh, and re-reads itself once a known future override
 expiry passes (checked at most hourly and re-armed until that expiry is
-actually reached, never rescheduling an expiry that already passed); that automatic re-read defers while a control operation is in flight,
-and a read that a newer control result superseded is discarded. A failed
-refresh keeps the last known status, its fetch time and the retry control. Override cancellation is serialized, so a second click cannot start a
-duplicate audited control operation. The control history
-explains the Owner critical-recovery actions, including that an approved
-requeue accepts a possible duplicate preservation or notification. The critical-continuity statement is shown only while every
-reported `critical_*_armed` flag is true; otherwise the screen raises a degraded
-alert instead of reassuring the Owner.
+actually reached, never rescheduling an expiry that already passed). That
+automatic re-read defers while a control operation is in flight, a read that a
+newer control result superseded is discarded, and a failed refresh keeps the
+last known status, its fetch time and the retry control. Override cancellation
+is serialized, so a second click cannot start a duplicate audited control
+operation.
 
 `canVisit()` keeps the timeline with `recordings:view` and presence with the
 Owner. This remains UI projection only: the production entry still denies
@@ -94,10 +102,9 @@ The projections follow the presence/timeline core contract (Issue #26 core PR):
 receipt-ordered pages with a `next_cursor`, the presence snapshot's three-valued
 critical paths, and the audited Owner control history. Timeline and presence
 data are loaded through optional `DashboardServices` providers that only tests
-supply, using synthetic observations. Providers are
-invoked bound to their service, so a class-based implementation keeps its
-receiver; the browser harness is class-based to hold that contract. A
-quality-gated result is never labelled confirmed.
+supply, using synthetic observations. Providers are invoked bound to their
+service, so a class-based implementation keeps its receiver; the browser
+harness is class-based to hold that contract.
 
 ## Local build and tests
 

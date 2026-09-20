@@ -14,10 +14,10 @@ function Path({ label, state, t }: { label: string; state: CriticalPath; t: Mess
 }
 
 export function PresenceBody({ report, t, onCancel, failed, cancelling, onRefresh, fetchedAt,
-  refreshFailed }: {
+  refreshFailed, now = Date.now() }: {
   report: PresenceReport; t: Messages; onCancel?: (() => void) | undefined; failed?: boolean | undefined;
   cancelling?: boolean | undefined; onRefresh?: (() => void) | undefined; fetchedAt?: string | undefined;
-  refreshFailed?: boolean | undefined;
+  refreshFailed?: boolean | undefined; now?: number | undefined;
 }) {
   const snapshot: PresenceSnapshot = report.snapshot;
   const override = snapshot.basis === 'manual_override';
@@ -28,6 +28,9 @@ export function PresenceBody({ report, t, onCancel, failed, cancelling, onRefres
   const armed = allArmed && !snapshot.critical_paths_degraded;
   // The backend suppresses ordinary automation only for a trusted PRESENT.
   const expectedSuppression = snapshot.state === 'PRESENT' && !snapshot.clock_degraded;
+  // Untrusted control timing keeps an override applied past its stated expiry.
+  const expiredButApplied = override && snapshot.clock_degraded && !snapshot.override_expiry_pending
+    && snapshot.override_expires_at !== null && Date.parse(snapshot.override_expires_at) <= now;
   return <section className="presence-screen">
     <section className={`presence-state presence-${snapshot.state}`} aria-label={t.presenceCurrent}>
       <p className="eyebrow">{t.presenceCurrent}</p>
@@ -51,6 +54,7 @@ export function PresenceBody({ report, t, onCancel, failed, cancelling, onRefres
         onClick={() => onCancel?.()}>{cancelling ? t.overrideCancelling : t.overrideCancel}</button>}
       {override && !onCancel && <p className="muted">{t.foundation}</p>}
       {snapshot.override_expiry_pending && <p className="timeline-degraded" role="alert">{t.overrideExpiryPending}</p>}
+      {expiredButApplied && <p className="timeline-degraded" role="alert">{t.overrideExpiredApplied}</p>}
       {failed && <p role="alert">{t.overrideFailed}</p>}
     </section>
     <section className="presence-automation" aria-label={t.armedNotification}>

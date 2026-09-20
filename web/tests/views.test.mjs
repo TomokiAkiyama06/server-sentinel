@@ -147,28 +147,31 @@ test('rows are ordered by receipt and still carry their own observation time', (
   assert.equal(page([]).next_cursor, null);
 });
 
-test('older history stays reachable while a cursor is offered', () => {
+test('newer observations stay reachable while a cursor is offered', () => {
   const items = [observation('motion'), observation('person')];
+  // The core pages forward in receipt order, so the next page is newer.
   const offered = timeline(page(items), 'ja', 'all', { onMore: () => undefined, complete: false });
-  assert.match(offered, /<button[^>]*>古い観測をさらに読み込む<\/button>/);
+  assert.match(offered, /<button[^>]*>新しい観測をさらに読み込む<\/button>/);
+  assert.doesNotMatch(offered, /古い観測/);
+  assert.match(timeline(page(items), 'en', 'all', { onMore: () => undefined }), /Load newer observations/);
   assert.doesNotMatch(offered, /この期間の観測をすべて読み込みました。/);
   const loading = timeline(page(items), 'ja', 'all', { onMore: () => undefined, loadingMore: true });
   assert.match(loading, /<button[^>]*disabled[^>]*>読み込んでいます<\/button>/);
   // A failed page keeps the loaded history and the retry path.
   const failedMore = timeline(page(items), 'ja', 'all', { onMore: () => undefined, moreFailed: true });
-  assert.match(failedMore, /<p role="alert">古い観測を読み込めませんでした。/);
-  assert.match(failedMore, /<button[^>]*>古い観測をさらに読み込む<\/button>/);
+  assert.match(failedMore, /<p role="alert">新しい観測を読み込めませんでした。/);
+  assert.match(failedMore, /<button[^>]*>新しい観測をさらに読み込む<\/button>/);
   assert.equal((failedMore.match(/data-observation-kind=/g) || []).length, items.length);
   const exhausted = timeline(page(items, { next_cursor: null }), 'ja', 'all', { complete: true });
-  assert.doesNotMatch(exhausted, /古い観測をさらに読み込む/);
+  assert.doesNotMatch(exhausted, /さらに読み込む/);
   assert.match(exhausted, /この期間の観測をすべて読み込みました。/);
   // Without a provider there is no load-more affordance at all.
-  assert.doesNotMatch(timeline(page(items)), /古い観測をさらに読み込む/);
+  assert.doesNotMatch(timeline(page(items)), /さらに読み込む/);
 });
 
-test('paging continues while the cursor advances, including over an empty page', () => {
+test('paging continues forward while the cursor advances, including over an empty page', () => {
   const sent = { received_at: '2026-09-21T09:00:01.000000+00:00', sequence: 4 };
-  // An empty intermediate page that still moves the cursor keeps older history reachable.
+  // An empty intermediate page that still moves the cursor keeps newer history reachable.
   assert.equal(cursorAdvanced(sent, { received_at: '2026-09-21T09:30:00.000000+00:00', sequence: 9 }), true);
   assert.equal(cursorAdvanced(sent, { received_at: sent.received_at, sequence: 9 }), true);
   // The core echoes the cursor it was given when it has no rows: that ends paging.
@@ -391,6 +394,22 @@ test('a critical path that is not armed replaces the continuity statement with a
   const armed = presence({ snapshot: snapshot(), audit: [] });
   assert.match(armed, /すべての presence state で継続します。/);
   assert.equal((armed.match(/armed（継続中）/g) || []).length, 4);
+});
+
+test('an override applied past its stated expiry is reported, not shown as ordinary', () => {
+  const at = '2026-09-21T07:00:00.000000+00:00';
+  const now = Date.parse('2026-09-21T09:00:00.000Z');
+  // Untrusted control timing keeps the override applied; say so explicitly.
+  const applied = presence({ snapshot: snapshot({ basis: 'manual_override', clock_degraded: true,
+    override_expires_at: at }), audit: [] }, 'ja', { now });
+  assert.match(applied, /<p class="timeline-degraded" role="alert">表示している期限時刻は過ぎていますが、時刻の信頼性が低下しているため、上書きの適用が継続していると報告されています。/);
+  // Trusted timing, a future expiry, or a pending retirement do not claim this.
+  for (const overrides of [{ clock_degraded: false }, { override_expires_at: '2026-09-21T18:00:00.000000+00:00' },
+    { override_expiry_pending: true }]) {
+    const other = presence({ snapshot: snapshot({ basis: 'manual_override', clock_degraded: true,
+      override_expires_at: at, ...overrides }), audit: [] }, 'ja', { now });
+    assert.doesNotMatch(other, /上書きの適用が継続していると報告されています/, JSON.stringify(overrides));
+  }
 });
 
 test('an incomplete override expiry is reported instead of a silently active override', () => {
