@@ -589,6 +589,8 @@ Acceptance:
 - live/recording continues where frames remain.
 - occlusion, saturation, insufficient target size, detector failure, and both positive/negative quality prerequisites are tested; expose reasons/metrics, apply recovery hysteresis, and do not globally stop unrelated critical monitoring.
 
+
+Implementation: `server/app/detection/quality/` provides bounded local metrics, explicit per-detector prerequisites, frame-bound context, recovery hysteresis, and fail-unknown result guards. `server/tests/test_detector_quality.py` verifies synthetic darkness/blur/clipping/obstruction/small targets, positive/negative rejection, execution failure, scheduler propagation, and independent live/recording/critical profiles. Production thresholds and real-lighting acceptance remain separate; integration acceptance depends on #20 and the current PR review/CI gates.
 ## Plan 14 — Server ROI movement + camera tamper
 
 GitHub Issue: [#24](https://github.com/TomokiAkiyama06/server-sentinel/issues/24)
