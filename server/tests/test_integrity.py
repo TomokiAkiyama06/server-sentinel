@@ -178,9 +178,12 @@ class CompareTests(TestCase):
 
     def test_duplicate_baseline_identities_do_not_derive_drift_from_arbitrary_pairing(self):
         baseline = Inventory((disk(), disk(slot="disk9", size="2000")))
-        for current in ((disk(size="3000"),), (disk(size="3000"), disk(slot="disk9", size="4000"))):
+        # One observation cannot cover both approved duplicates; two can.
+        for current, extra in (((disk(size="3000"),), [State.MISSING]),
+                               ((disk(size="3000"), disk(slot="disk9", size="4000")), [])):
             findings = compare(baseline, Inventory(current))
-            self.assertEqual([item.state for item in findings], [State.UNVERIFIABLE, State.UNVERIFIABLE])
+            self.assertEqual([item.state for item in findings],
+                             [State.UNVERIFIABLE, State.UNVERIFIABLE] + extra)
 
     def test_duplicated_baseline_identity_is_missing_without_any_observation(self):
         """A successful probe returning nothing proves absence, duplicates or not."""
@@ -191,6 +194,31 @@ class CompareTests(TestCase):
         self.assertEqual([item.state for item in findings], [State.MISSING, State.MISSING])
         self.assertTrue(all(item.immediate for item in findings))
         self.assertTrue(all(item.reason == "APPROVED_COMPONENT_ABSENT" for item in findings))
+
+    def test_duplicate_identity_count_deficit_is_missing(self):
+        """Fewer observations than approved duplicates proves one of them absent."""
+        def module(slot, serial="synthetic-vendor-default"):
+            return Component(Kind.MEMORY, slot, (("capacity_bytes", "8"),), (("serial", serial),))
+        baseline = Inventory((module("slot0"), module("slot1")))
+        findings = compare(baseline, Inventory((module("slot9"),)))
+        self.assertEqual([item.state for item in findings],
+                         [State.UNVERIFIABLE, State.UNVERIFIABLE, State.MISSING])
+        self.assertEqual(findings[2].reason, "MISSING_AMBIGUOUS_COMPONENT")
+        self.assertTrue(findings[2].immediate)
+        self.assertNotIn(State.NEW_DEVICE, [item.state for item in findings])
+        self.assertNotIn("synthetic-vendor-default", repr(findings))
+
+    def test_duplicate_identity_deficit_and_surplus_are_reported_together(self):
+        """Three approved duplicates, one survivor and two unrelated arrivals."""
+        def module(slot, serial="synthetic-vendor-default"):
+            return Component(Kind.MEMORY, slot, (("capacity_bytes", "8"),), (("serial", serial),))
+        baseline = Inventory((module("slot0"), module("slot1"), module("slot2")))
+        current = (module("slot9"), Component(Kind.MEMORY, "slot8", (("capacity_bytes", "16"),),
+                                              (("serial", "synthetic-other"),)))
+        findings = compare(baseline, Inventory(current))
+        self.assertEqual([item.state for item in findings[:3]], [State.UNVERIFIABLE] * 3)
+        self.assertEqual(sorted(item.state for item in findings[3:]),
+                         sorted([State.NEW_DEVICE, State.MISSING, State.MISSING]))
 
     def test_duplicated_baseline_identity_stays_unknown_while_a_candidate_remains(self):
         """A duplicate still refuses arbitrary drift when an observation exists."""

@@ -262,8 +262,13 @@ def compare(approved: Inventory | None, current: Inventory) -> tuple[Finding, ..
                if index not in bound and old.kind not in current.unavailable) if candidates}
     shared = set().union(*linked.values()) if linked else set()
     explained = _explained(linked)
-    surplus = (Counter(new_items[item].kind for item in shared)
-               - Counter(new_items[item].kind for item in explained))
+    assigned = Counter(new_items[item].kind for item in explained)
+    surplus = Counter(new_items[item].kind for item in shared) - assigned
+    # The same assignment bounds the other direction: approved components the
+    # remaining observations cannot cover are absent even when no single slot
+    # can be accused, so the cardinality deficit still raises the immediate
+    # MISSING alert (SPECIFICATION 10.2/10.4, REQUIREMENTS INTEGRITY-002/006).
+    deficit = Counter(old_items[index].kind for index in linked) - assigned
     covered = {item.kind for item in old_items}
     for kind in (current.unavailable | approved.unavailable) - covered:
         results.append(Finding(kind, State.UNVERIFIABLE, "PROBE_UNAVAILABLE"))
@@ -272,4 +277,5 @@ def compare(approved: Inventory | None, current: Inventory) -> tuple[Finding, ..
             results.append(Finding(item.kind, State.NEW_DEVICE, "UNAPPROVED_COMPONENT"))
     for kind in Kind:
         results.extend([Finding(kind, State.NEW_DEVICE, "SURPLUS_AMBIGUOUS_COMPONENT")] * surplus[kind])
+        results.extend([Finding(kind, State.MISSING, "MISSING_AMBIGUOUS_COMPONENT")] * deficit[kind])
     return tuple(results)
