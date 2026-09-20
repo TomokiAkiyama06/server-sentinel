@@ -642,6 +642,20 @@ version = {attr = "package.__version__"}
         self.assertEqual(license_gate.model_files(self.root), [])
         self.assertEqual(license_gate.audit(self.root), (1, 1, 0, 0))
 
+    def test_media_suffix_without_its_format_is_not_a_reviewed_asset(self):
+        """A weight renamed to .png or .wasm stays an unreviewed artifact."""
+        self.write("web/src/icon.png", b"\x89PNG\r\n\x1a\n synthetic image bytes")
+        self.write("web/src/person.png", b"\x80\x04\x95synthetic weight bytes\x00")
+        self.write("web/dist/person.wasm", b"\x80\x04\x95synthetic weight bytes\x00")
+        self.write("web/src/glyph.woff2", b"wOF2 synthetic font bytes\x00")
+        found = license_gate.model_files(self.root)
+        self.assertNotIn("web/src/icon.png", found)
+        self.assertNotIn("web/src/glyph.woff2", found)
+        self.assertIn("web/src/person.png", found)
+        self.assertIn("web/dist/person.wasm", found)
+        with self.assertRaisesRegex(license_gate.GateError, "model artifact set differs"):
+            license_gate.audit(self.root)
+
     def test_tracked_build_and_dist_model_artifacts_are_not_excluded(self):
         paths = {"build/opaque-model.zip", "dist/opaque-weight.binpack"}
         for path in paths:

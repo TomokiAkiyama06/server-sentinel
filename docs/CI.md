@@ -45,8 +45,9 @@ The repository job always runs:
 - fail-closed dependency/model license inventory validation, including exact
   lock entries, separate model code/weight evidence, notices and Owner approvals;
 - immutable pin validation of lock digests, resolved artifacts, model weight
-  digests and container base image digests, plus a build-time comparison of the
-  pins pip and npm actually resolved against that reviewed evidence;
+  digests and container base image digests, followed by a build-time comparison
+  of the pins pip actually resolved against that reviewed evidence; the
+  dashboard browser job runs the same comparison for the packages npm installed;
 - Pyflakes and pycodestyle lint checks for Python tooling/tests;
 - synthetic positive/negative unit tests for the guards and component runner;
 - whitespace checks on the checked-out change.
@@ -151,7 +152,9 @@ and Web asset formats is treated as a model artifact until it has its own
 record. A source package that only shares a reserved directory name needs a
 reviewed `model_scan_exemptions` record, which covers text-only Python sources;
 an opaque or model-suffixed file below it still requires weight review, and an
-exemption that matches nothing fails as stale. Model weight inventory locations outside the reserved
+exemption that matches nothing fails as stale. A recognized media or Web asset
+suffix only exempts a file whose header actually matches that format, so a
+renamed weight remains an unreviewed opaque artifact. Model weight inventory locations outside the reserved
 directories are rejected. Detection-only `assets/ml/` and `assets/ai/` paths are
 also scanned in full so an opaque archive cannot bypass suffix detection. Model
 implementation packages require `model_code` records.

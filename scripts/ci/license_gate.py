@@ -40,12 +40,37 @@ RECOGNIZED_STATIC_OUTPUT_SUFFIXES = {
     ".js", ".json", ".license", ".map", ".md", ".mjs", ".otf", ".png",
     ".svg", ".ttf", ".txt", ".wasm", ".webp", ".woff", ".woff2", ".xml",
 }
-# Binary formats that are reviewed as media or Web runtime assets. Any other
-# opaque file is treated as a model artifact until it has its own record.
-RECOGNIZED_BINARY_SUFFIXES = {
-    ".avif", ".bmp", ".gif", ".ico", ".jpeg", ".jpg", ".mkv", ".mp3", ".mp4",
-    ".oga", ".ogg", ".otf", ".pbm", ".pgm", ".png", ".pnm", ".ppm", ".ttf",
-    ".wasm", ".wav", ".webm", ".webp", ".woff", ".woff2",
+# Binary formats reviewed as media or Web runtime assets. The suffix alone is
+# never enough: the header must match the declared format, so a renamed model
+# stays an unreviewed opaque artifact. Any other opaque file is treated as a
+# model artifact until it has its own record.
+BINARY_SIGNATURES = {
+    ".avif": (((4, b"ftyp"),),),
+    ".bmp": (((0, b"BM"),),),
+    ".gif": (((0, b"GIF87a"),), ((0, b"GIF89a"),)),
+    ".ico": (((0, b"\x00\x00\x01\x00"),),),
+    ".jpeg": (((0, b"\xff\xd8\xff"),),),
+    ".jpg": (((0, b"\xff\xd8\xff"),),),
+    ".mkv": (((0, b"\x1a\x45\xdf\xa3"),),),
+    ".mp3": (((0, b"ID3"),), ((0, b"\xff\xfb"),), ((0, b"\xff\xf3"),),
+             ((0, b"\xff\xf2"),)),
+    ".mp4": (((4, b"ftyp"),),),
+    ".oga": (((0, b"OggS"),),),
+    ".ogg": (((0, b"OggS"),),),
+    ".otf": (((0, b"OTTO"),),),
+    ".pbm": (((0, b"P1"),), ((0, b"P4"),)),
+    ".pgm": (((0, b"P2"),), ((0, b"P5"),)),
+    ".png": (((0, b"\x89PNG\r\n\x1a\n"),),),
+    ".pnm": (((0, b"P1"),), ((0, b"P2"),), ((0, b"P3"),), ((0, b"P4"),),
+             ((0, b"P5"),), ((0, b"P6"),)),
+    ".ppm": (((0, b"P3"),), ((0, b"P6"),)),
+    ".ttf": (((0, b"\x00\x01\x00\x00"),), ((0, b"true"),), ((0, b"ttcf"),)),
+    ".wasm": (((0, b"\x00asm"),),),
+    ".wav": (((0, b"RIFF"), (8, b"WAVE")),),
+    ".webm": (((0, b"\x1a\x45\xdf\xa3"),),),
+    ".webp": (((0, b"RIFF"), (8, b"WEBP")),),
+    ".woff": (((0, b"wOFF"),),),
+    ".woff2": (((0, b"wOF2"),),),
 }
 MODEL_SUFFIXES = {
     ".bin", ".caffemodel", ".ckpt", ".dlc", ".engine", ".ggml", ".gguf",
@@ -274,6 +299,21 @@ def opaque_build_output(value):
     path = PurePosixPath(value)
     return (bool(set(path.parts[:-1]) & BUILD_OUTPUT_DIRECTORIES)
             and path.suffix.lower() not in RECOGNIZED_STATIC_OUTPUT_SUFFIXES)
+
+
+def reviewed_media(path: Path, suffix):
+    """Report whether the file really is the media format its suffix claims."""
+    signatures = BINARY_SIGNATURES.get(suffix)
+    if signatures is None:
+        return False
+    try:
+        with path.open("rb") as handle:
+            header = handle.read(64)
+    except OSError as error:
+        raise GateError(f"cannot inspect {path.name}") from error
+    return any(all(header[offset:offset + len(magic)] == magic
+                   for offset, magic in alternative)
+               for alternative in signatures)
 
 
 def opaque_bytes(path: Path):
@@ -602,7 +642,7 @@ def model_files(root: Path, exemptions=()):
         suffix = path.suffix.lower()
         classified = (model_like_path(relative) or opaque_build_output(relative)
                       or suffix in MODEL_SUFFIXES)
-        reviewable = suffix in RECOGNIZED_BINARY_SUFFIXES
+        reviewable = path.is_file() and reviewed_media(path, suffix)
         if path.is_symlink():
             if classified or (not reviewable and path.is_file() and opaque_bytes(path)):
                 raise GateError("model artifacts must be regular files")

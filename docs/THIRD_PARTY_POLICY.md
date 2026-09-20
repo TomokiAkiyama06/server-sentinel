@@ -179,6 +179,7 @@ the reviewed media and Web asset formats is treated as a model artifact until it
 has its own record, so renaming a model does not bypass weight review. A reviewed
 `model_scan_exemptions` record covers a source package that only shares a
 reserved directory name, and it never covers an opaque or model-suffixed file
-stored below that path. Recognized Web/static
+stored below that path. A recognized media or Web asset suffix exempts a file
+only when its header matches that format. Recognized Web/static
 asset suffixes, including `.wasm`, are not classified as model artifacts merely
 because they are in a build output directory.

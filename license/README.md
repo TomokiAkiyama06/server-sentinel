@@ -31,7 +31,9 @@ as a model artifact until it has its own record. `model_scan_exemptions` records
 the reviewed source packages that only share a reserved directory name, such as
 `tests/models`; the exemption covers text-only Python sources, an opaque or
 model-suffixed file below the path still needs weight review, and an exemption
-that matches nothing fails as stale. Reviewed-empty
+that matches nothing fails as stale. A recognized media or Web asset suffix
+exempts a file only when its header matches that format, so renaming a weight to
+`.png` or `.wasm` does not make it a reviewed asset. Reviewed-empty
 records document scopes that currently have no third-party component.
 Every committed model weight must be stored below one of those reserved
 directories; a `model_weight` record pointing elsewhere is rejected.
