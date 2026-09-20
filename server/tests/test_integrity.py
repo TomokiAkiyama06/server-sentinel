@@ -7,10 +7,14 @@ from tempfile import TemporaryDirectory
 from unittest import TestCase
 from uuid import UUID
 import json
+import os
+import signal
 import sqlite3
+import subprocess
 import threading
 from itertools import permutations
 
+from app.integrity import probes
 from app.integrity.model import Component, Finding, Inventory, Kind, State, compare
 from app.integrity.probes import CommandRunner, LinuxProbe, ProbeUnavailable
 from app.integrity.service import IntegrityService
@@ -559,3 +563,87 @@ class LinuxProbeTests(TestCase):
     def test_arbitrary_commands_rejected_before_spawn(self):
         with self.assertRaises(ProbeUnavailable):
             CommandRunner().run(("sh", "-c", "anything"))
+
+
+class _Stream:
+    def __init__(self, descriptor, owner):
+        self._descriptor, self._owner = descriptor, owner
+
+    def fileno(self):
+        return self._descriptor
+
+    def close(self):
+        self._owner.closed = True
+
+
+class _StuckChild:
+    """Synthetic child that stays unreapable, like uninterruptible disk I/O."""
+
+    pid = 424242
+
+    def __init__(self, descriptor):
+        self.closed = False
+        self.waits = []
+        self.stdout = _Stream(descriptor, self)
+
+    def poll(self):
+        return None
+
+    def wait(self, timeout=None):
+        self.waits.append(timeout)
+        raise subprocess.TimeoutExpired("synthetic-probe", timeout)
+
+
+class _Spawn:
+    def __init__(self, child):
+        self._child = child
+
+    def Popen(self, *arguments, **options):
+        return self._child
+
+    def __getattr__(self, name):
+        return getattr(subprocess, name)
+
+
+class _Signals:
+    def __init__(self, killpg):
+        self.killpg = killpg
+
+    def __getattr__(self, name):
+        return getattr(os, name)
+
+
+class ProbeCleanupTests(TestCase):
+    """Synthetic child objects only; no real probe process is ever spawned."""
+
+    def setUp(self):
+        reader, writer = os.pipe()
+        os.close(writer)
+        self.addCleanup(os.close, reader)
+        self.child = _StuckChild(reader)
+        self.killed = []
+
+    def run_probe(self, killpg):
+        spawn, signals = probes.subprocess, probes.os
+        probes.subprocess, probes.os = _Spawn(self.child), _Signals(killpg)
+        self.addCleanup(setattr, probes, "subprocess", spawn)
+        self.addCleanup(setattr, probes, "os", signals)
+        with self.assertRaises(ProbeUnavailable):
+            CommandRunner().run(("dmidecode", "--type", "17"))
+
+    def test_unkillable_probe_does_not_block_the_worker(self):
+        self.run_probe(lambda pid, number: self.killed.append((pid, number)))
+        self.assertEqual(self.killed, [(_StuckChild.pid, signal.SIGKILL)])
+        # Every reap is bounded, so a wedged disk cannot stall startup/daily.
+        self.assertTrue(self.child.waits)
+        self.assertTrue(all(timeout is not None for timeout in self.child.waits))
+        self.assertTrue(self.child.closed)
+
+    def test_failed_signal_still_closes_the_probe_pipe(self):
+        def refuse(pid, number):
+            self.killed.append((pid, number))
+            raise ProcessLookupError("synthetic-probe")
+
+        self.run_probe(refuse)
+        self.assertEqual(self.killed, [(_StuckChild.pid, signal.SIGKILL)])
+        self.assertTrue(self.child.closed)

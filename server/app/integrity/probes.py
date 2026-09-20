@@ -60,11 +60,20 @@ class CommandRunner:
         except (OSError, subprocess.SubprocessError):
             raise ProbeUnavailable() from None
         finally:
+            # Cleanup must be total and bounded. A failed signal must not skip
+            # closing the pipe, and a command wedged in uninterruptible I/O on a
+            # failing disk must never block the integrity worker: an abandoned
+            # child is reaped by subprocess later instead of stalling the
+            # startup/daily check (SPECIFICATION 10.2, REQUIREMENTS INTEGRITY-002).
             if process is not None:
-                if process.poll() is None:
-                    os.killpg(process.pid, signal.SIGKILL)
-                process.wait()
-                process.stdout.close()
+                try:
+                    if process.poll() is None:
+                        os.killpg(process.pid, signal.SIGKILL)
+                        process.wait(timeout=5)
+                except (OSError, subprocess.SubprocessError):
+                    pass
+                finally:
+                    process.stdout.close()
 
 
 def _read(path: Path) -> str:
