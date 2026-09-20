@@ -126,18 +126,23 @@ Capture Nodes
   -> Add Capture Node
   -> generate short-lived one-time pairing code
   -> show main-host private-LAN address/port
+  -> provide public Main Server trust information through a trusted Owner channel
 ```
 
 ### Capture-machine side
 
 During development the repository may be cloned locally and the agent run from that checkout. Stable releases should install only the versioned `media-capture-agent` artifact.
 
+Before pairing, verify/configure the intended Main Server's public trust information through a trusted Owner-controlled local or out-of-band channel. The address alone is not trusted identity. The exact trust setup and encrypted bootstrap transport are selected by PoC/ADR before implementation; the command below assumes that trust setup is complete.
+
 Target command/UX shape:
 
 ```bash
 sudo ./scripts/install-agent.sh
-sudo media-capture-agent pair --server <private-lan-host>
+sudo media-capture-agent pair --server <verified-private-lan-host>
 ```
+
+Pairing authenticates the intended Main Server and establishes an encrypted channel before sending the code. Missing/mismatched trust or failed certificate verification stops enrollment without transmitting the code; there is no plaintext or unverified-certificate fallback.
 
 Enter the one-time code only at the non-echoing prompt. Do not put it in command arguments, environment variables, URLs, or shell command text: these may appear in process listings, shell history, or sudo/audit logs. Installer automation must use a protected input channel rather than a literal command-line secret.
 

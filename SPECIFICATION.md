@@ -232,10 +232,14 @@ Preferred flow:
 Owner dashboard -> Add Capture Node
        |
        +-- short-lived one-time pairing code
+       +-- public Main Server trust information via a trusted Owner channel
        |
 Capture machine:
-media-capture-agent pair --server <LAN endpoint>
+       +-- verify/configure intended Main Server trust through that channel
+media-capture-agent pair --server <verified-LAN-endpoint>
+       +-- authenticate Main Server and establish an encrypted channel
        +-- read pairing code through a non-echoing interactive prompt
+       +-- send code only over that authenticated encrypted channel
        |
        +-- agent generates node keypair
        +-- main host validates current owner approval
@@ -243,6 +247,10 @@ media-capture-agent pair --server <LAN endpoint>
 ```
 
 Pairing credentials are cryptographically random, single-use, short-lived, and never logged plaintext. The CLI reads the code through a non-echoing interactive prompt; it does not accept the secret in command-line arguments, environment variables, or URLs. If a later installer needs non-interactive input, use a protected file descriptor/stdin channel without embedding the secret in shell command text, and preserve the same no-log boundary.
+
+Before transmitting a pairing code, the Agent must authenticate the intended Main Server and establish confidentiality/integrity for the initial enrollment exchange. Private-LAN reachability or a short-lived code does not replace this server-authentication requirement. Public trust information must be obtained/verified through an Owner-controlled trusted local or out-of-band channel, independently of an unverified network endpoint. Missing/mismatched trust or certificate verification failure stops pairing without sending the code; plaintext or unverified-certificate fallback is forbidden.
+
+The concrete bootstrap trust mechanism and initial encrypted transport remain PoC/ADR decisions before pairing implementation. These requirements do not select a particular certificate/pinning protocol. Post-pairing mTLS does not retroactively protect an insecure initial code exchange.
 
 ### 5.5 Long-lived trust
 
@@ -528,7 +536,7 @@ person/face candidate
    -> match / no-match / unknown
 ```
 
-Owner template/model metadata stays local; enrollment/delete/re-enroll require owner authorization; raw template is not logged/general-exported. No named templates for other people.
+Owner template/model metadata stays local; enrollment/delete/re-enroll require owner authorization; raw template is not logged/general-exported. Persistent non-owner face-template/profile libraries are prohibited whether named or anonymous; ordinary authorized video recordings remain distinct from such a library.
 
 ### 7.7 Anonymous tracking and entrance
 

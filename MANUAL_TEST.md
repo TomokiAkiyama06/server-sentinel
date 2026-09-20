@@ -66,6 +66,8 @@ Use a disposable volume or controlled mount-identity mocks for failure checks; d
 Pairing/security:
 
 - [ ] owner creates a short-lived one-time pairing code;
+- [ ] initial pairing is encrypted and authenticates the intended Main Server using Owner-approved bootstrap trust before sending the code;
+- [ ] missing/mismatched Server trust and plaintext bootstrap attempts fail without exposing the code;
 - [ ] expired code is rejected;
 - [ ] reused code is rejected;
 - [ ] agent identity is unique/revocable;
@@ -304,7 +306,7 @@ Progressively degrade lighting/blur/visibility.
 
 ## M. Video-only behavior
 
-- [ ] camera microphone is not opened by local path unless a future approved feature changes requirements;
+- [ ] the local capture path does not open microphone/audio devices or capture monitoring audio; MVP has no audio-enabling option;
 - [ ] `media-capture-agent` does not request/open microphone devices;
 - [ ] browser live playback contains no audio track in MVP;
 - [ ] recordings contain no monitoring audio in MVP.

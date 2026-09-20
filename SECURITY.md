@@ -170,6 +170,16 @@ Pairing credentials:
 - explicitly owner-approved;
 - redacted from logs.
 
+Before sending the pairing code:
+
+- verify the intended Main Server using public trust information obtained/checked through an Owner-controlled trusted local or out-of-band channel;
+- establish an encrypted exchange with authenticated Main Server identity and integrity protection;
+- never treat private-LAN location or an unverified endpoint's own claimed identity as proof of trust;
+- fail closed on missing/mismatched trust or certificate validation failure, without sending the code;
+- do not offer plaintext or unverified-certificate fallback.
+
+The concrete bootstrap trust/transport method requires PoC/ADR selection before implementation. A short-lived code and post-pairing mTLS do not replace confidentiality and intended-server authentication during initial enrollment. Pairing secrets are entered through a non-echoing prompt or protected automation input, never command arguments, environment variables, URLs, or logs.
+
 After pairing:
 
 - each capture node has a unique revocable deployment-scoped credential/keypair;
@@ -213,14 +223,14 @@ Owner-only verification requirements:
 - normal settings/list APIs do not return raw biometric material;
 - diagnostics exclude it by default;
 - enrollment/replacement/deletion require owner authorization and are audited;
-- non-owner persistent named biometric templates are prohibited;
+- persistent non-owner face-template/profile libraries are prohibited, whether named or anonymous; ordinary authorized recordings may still contain people and are not a separate biometric identity library;
 - low-quality observation returns `unknown`, not a forced identity conclusion.
 
 Model output is probabilistic and is not proof of identity or culpability.
 
 ## Video-only MVP
 
-Do not open microphone/audio streams by default. `media-capture-agent` MVP is video-only. No event decision depends on audio.
+The MVP does not open microphones/audio streams or capture, store, or forward monitoring audio. This applies to local capture, `media-capture-agent`, recordings, and viewer delivery; no audio opt-in is offered in MVP. No event decision depends on audio.
 
 ## Secrets
 

@@ -62,7 +62,7 @@ Initial rules:
 - runs as a background systemd service with no tray/window requirement;
 - uses a truthful functional process/service name: `media-capture-agent`;
 - normally runs as a dedicated non-root service account;
-- captures video only in the MVP; microphone/audio capture is not required;
+- captures video only in the MVP; microphone/audio devices are not opened and audio is not captured, stored, or forwarded;
 - initiates the connection toward the main host; the main host does not need SSH/admin access to the capture machine;
 - pairs using a short-lived owner-approved code and then uses a revocable cryptographic node identity;
 - long-lived agent-to-main transport must be mutually authenticated and encrypted, with mTLS as the default design target;
@@ -74,7 +74,7 @@ Development may run the agent from a repository clone. A later stable release sh
 
 ## Video-only MVP
 
-Audio is not required for the MVP. Camera microphones, including microphones integrated into conference cameras, are not captured by default and no monitoring feature depends on audio.
+The MVP is video-only. Neither local capture nor media-capture-agent opens microphone/audio devices, including microphones integrated into conference cameras, or captures, stores, or forwards monitoring audio. Recordings and browser playback contain no monitoring audio, there is no audio-enabling option, and no monitoring feature depends on audio.
 
 ## Detection model
 

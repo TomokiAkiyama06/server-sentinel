@@ -41,13 +41,13 @@ Camera media shall flow only inside the user's deployment/private network path, 
 Owner face verification is optional and requires explicit enrollment. The owner template/embedding is sensitive biometric data, stays deployment-local by default, is deletable/re-enrollable, and is excluded from normal diagnostics.
 
 ### PRIV-007 Non-owner identity minimization
-The MVP shall not maintain a named biometric identity database for other observed people. Anonymous tracking identifiers may be used only for scoped event correlation.
+The MVP shall not enroll, name, or persist facial identity profiles or separate face-crop/template libraries for other observed people. Anonymous tracking identifiers may be used only for scoped event correlation; ordinary authorized recordings may contain people without creating a separate biometric library.
 
 ### PRIV-008 Deployment responsibility
 The deployment owner is responsible for applicable laws, institutional policies, notice requirements, and camera/biometric rules in the deployment environment.
 
 ### PRIV-009 Video-only MVP
-Audio capture/surveillance is not required for the MVP. Camera microphones shall not be used by default and no security decision may depend on audio.
+The MVP shall be video-only: neither local capture nor media-capture-agent shall open microphone/audio devices, capture monitoring audio, or store/forward audio tracks. Browser live playback and recordings shall contain no monitoring audio, and no security decision may depend on audio. The MVP shall not offer an audio-enabling option.
 
 ## 4. Distribution and licensing requirements
 
@@ -115,13 +115,13 @@ The Linux capture service shall use the truthful functional name `media-capture-
 The agent shall run without a desktop window/tray requirement and should run under a dedicated non-root service account during normal operation. Root/admin privileges are limited to installation and narrowly required device/service configuration.
 
 ### AGENT-003 Video-only capture
-The MVP agent captures video only. Microphones are not required and should not be opened.
+The MVP agent shall capture video only. It shall not open microphone/audio devices, capture monitoring audio, or store/forward audio tracks.
 
 ### AGENT-004 Outbound connection model
 The agent initiates its connection toward the main ServerSentinel host. The main host does not require SSH/admin access to the capture machine merely to receive video.
 
 ### AGENT-005 Pairing
-Initial agent enrollment uses an owner-approved, short-lived, single-use pairing credential/code. The agent generates or receives a unique revocable node identity. Long-lived media/control traffic shall use authenticated encryption, with mTLS as the default design target unless an ADR selects an equivalent design.
+Initial agent enrollment uses an owner-approved, short-lived, single-use pairing credential/code. Before transmitting that credential, the Agent shall authenticate the intended Main Server using trust established through an Owner-approved trusted channel and establish encrypted bootstrap communication that protects the credential and enrollment exchange. Plaintext bootstrap and bypassing Server identity verification are prohibited; failed or missing trust verification aborts pairing without sending the code. The exact bootstrap trust mechanism shall be specified by the pairing/transport ADR. The agent generates or receives a unique revocable node identity. Long-lived media/control traffic shall use authenticated encryption, with mTLS as the default design target unless an ADR selects an equivalent design.
 
 ### AGENT-006 No Tailnet requirement
 The capture agent shall be able to operate over the same private LAN without being enrolled in the owner's Tailnet.
@@ -151,7 +151,7 @@ The deployment owner selects one of two configuration modes in ServerSentinel:
 
 The UI shall always show current ring-buffer usage, configured limit, agent-filesystem free space, protected-incident usage, and safety reserve. It shall warn before a selected value approaches an unsafe disk state and reject values that would violate the filesystem safety reserve.
 
-Because autonomous incident protection requires 10 minutes of pre-loss evidence, the configured ring buffer must be capable of retaining the target **10-minute pre-loss window** under the bounded/negotiated media profile. If the system cannot guarantee that target because of bitrate/capacity conditions, it shall surface a degraded/warning state rather than silently claiming full protection.
+Because autonomous incident protection requires 10 minutes of pre-loss evidence, the configured ring buffer must be capable of retaining the target **10-minute pre-loss window** under the bounded/negotiated media profile. If the selected duration/capacity and bounded/negotiated media profile make a shorter-than-10-minute window determinable before applying the configuration, the system shall reject the setting. Runtime uncertainty or later loss of effective coverage shall instead surface a degraded/warning state with the actual retained interval and gaps; it shall never silently claim full protection.
 
 Changing ring-buffer mode/value is an owner-only operation.
 

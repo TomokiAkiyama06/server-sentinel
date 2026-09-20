@@ -191,6 +191,7 @@ Labels: `remote-agent`, `backend`, `security`
 Scope:
 - owner-generated short-lived one-time pairing code;
 - non-echoing pairing-code input, never secret-bearing argv/environment/URL; protected input channel for any later installer automation;
+- encrypted initial pairing exchange with intended Main Server identity authenticated before the code is sent; bootstrap trust established through an Owner-approved trusted channel, exact mechanism documented in the ADR;
 - node keypair/credential issuance;
 - mTLS or equivalent mutually authenticated transport;
 - revocation;
@@ -198,6 +199,7 @@ Scope:
 - capture-node protocol authorization separate from human API.
 
 Acceptance:
+- plaintext bootstrap and missing/mismatched/unverified Main Server trust are rejected before transmitting the pairing code; passive LAN observers cannot read the code or enrollment exchange;
 - expired/reused pairing rejected;
 - pairing code absent from process argv, shell history, environment, URLs, and logs;
 - unpaired LAN host cannot submit media;
@@ -280,6 +282,7 @@ Scope:
 Acceptance:
 - only owner can change mode/value;
 - unsafe settings rejected before filesystem safety reserve is crossed;
+- selected duration/capacity/profile configurations determinably unable to retain 10 minutes of pre-loss evidence are rejected before applying them; runtime uncertainty or later coverage loss reports degraded/warning with actual retained intervals and gaps;
 - capacity mode remains within selected byte limit;
 - duration mode reports projected/actual disk footprint;
 - full 20-minute incident is preserved when resources/stream continuity allow;

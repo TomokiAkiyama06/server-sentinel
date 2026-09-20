@@ -39,7 +39,7 @@ The project developer should not receive during normal operation:
 
 ## Video-only MVP
 
-The MVP is video-only for monitoring. Camera microphones are not required and `media-capture-agent` must not open audio devices by default.
+The MVP is video-only for monitoring. Neither the Main Server/local UVC path nor `media-capture-agent` may open microphone/audio devices or streams, capture monitoring audio, store audio tracks, or transfer audio. Audio cannot be enabled by configuration in the MVP.
 
 ## Camera sources
 
@@ -84,7 +84,7 @@ This is biometric processing. Therefore:
 
 ## Other observed people
 
-The MVP does **not** maintain a named facial identity database for non-owner people.
+The MVP must not enroll or name non-owner people or maintain persistent facial identity profiles for them, whether named or anonymous.
 
 Other people may receive anonymous/ephemeral track IDs for limited event correlation. Cross-camera biometric re-identification is outside MVP scope.
 
@@ -112,7 +112,7 @@ Defaults:
 
 Starred recordings may outlive normal recording retention.
 
-Non-owner face crops/templates are not stored as a separate persistent identity library by default. People may still appear in ordinary configured video recordings.
+Non-owner face crops, templates/embeddings, and facial profiles must not be stored as separate persistent libraries. People may still appear in ordinary configured video recordings subject to recording authorization and retention; this does not permit building a persistent facial identity library from those recordings.
 
 ## Capture-agent local storage
 
