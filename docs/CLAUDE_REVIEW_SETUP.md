@@ -91,7 +91,7 @@ Claudeの出力schemaには自由記述欄を設けません。`review_markdown`
 
 `display_report: false` / `show_full_output: false`を明示し、Actionの自由文report・全文ログを公開しません。raw responseをstepの環境変数へ渡すとActionsが検証前に表示するため、検証stepは固定Actionのrunner-local execution JSONから最終成功resultの`structured_output`を直接読みます。raw executionはsummary/artifactへ出力しません。JSONが不正な場合もpayload/parse errorをログへ転記せず、定型エラーだけを返します。
 
-公開Job Summaryは検証済みの固定分類ラベル、重要度、行番号、固定HEAD/baseだけから生成します。Secret形式のregex検出やentropy推定には依存しません。場所と分類を基に同じ固定差分を確認し、重大・重要の解消を検証してください。
+公開Job Summaryは検証済みの固定分類ラベル、重要度、行番号、固定HEAD/baseだけから生成します。同じ検証済みreportをjob logにも出し、REST/CLIから指摘位置を取得できるようにします。raw responseは出しません。Secret形式のregex検出やentropy推定には依存しません。場所と分類を基に同じ固定差分を確認し、重大・重要の解消を検証してください。
 
 行番号を再現するには、Summaryの40桁HEAD/baseを次のplaceholderに入れて実行します。
 
