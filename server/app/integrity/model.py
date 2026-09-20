@@ -82,7 +82,9 @@ def compare(approved: Inventory | None, current: Inventory) -> tuple[Finding, ..
     """Match complete identities, unique partial identities, then weak graphs.
 
     Every phase considers all remaining baselines before consuming observations.
-    Weak/shared observations never prove which approved device vanished.
+    Weak/shared observations never prove which approved device vanished, but
+    observations the approved inventory cannot account for are still reported
+    as NEW_DEVICE alongside the UNVERIFIABLE findings.
     """
     if approved is None:
         return tuple(Finding(kind, State.UNVERIFIABLE, "BASELINE_REQUIRED") for kind in Kind)
@@ -188,12 +190,19 @@ def compare(approved: Inventory | None, current: Inventory) -> tuple[Finding, ..
         else:
             matched(index, location)
             used.add(location)
-    used.update(weak_used)
-    used.update(uncertain)
+    # An ambiguous observation never proves WHICH approved component it is, but
+    # one approved component still explains at most one current component. Count
+    # the surplus per category so added hardware stays visible to the Owner
+    # instead of disappearing behind UNVERIFIABLE (SPECIFICATION 10.1-10.2).
+    shared = (weak_used | uncertain) - used
+    explaining = Counter(item.kind for item in old_items) - Counter(new_items[item].kind for item in used)
+    surplus = Counter(new_items[item].kind for item in shared) - explaining
     covered = {item.kind for item in old_items}
     for kind in (current.unavailable | approved.unavailable) - covered:
         results.append(Finding(kind, State.UNVERIFIABLE, "PROBE_UNAVAILABLE"))
     for candidate, item in enumerate(new_items):
-        if candidate not in used and item.kind not in current.unavailable:
+        if candidate not in used and candidate not in shared and item.kind not in current.unavailable:
             results.append(Finding(item.kind, State.NEW_DEVICE, "UNAPPROVED_COMPONENT"))
+    for kind in Kind:
+        results.extend([Finding(kind, State.NEW_DEVICE, "SURPLUS_AMBIGUOUS_COMPONENT")] * surplus[kind])
     return tuple(results)

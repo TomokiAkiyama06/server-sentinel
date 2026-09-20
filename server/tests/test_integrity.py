@@ -88,7 +88,8 @@ class CompareTests(TestCase):
                              Component(Kind.STORAGE, "disk8", (), (), False),
                              Component(Kind.STORAGE, "disk9", (), (), False)))
         findings = compare(Inventory((disk(),)), current)
-        self.assertEqual([item.state for item in findings], [State.UNVERIFIABLE, State.NEW_DEVICE])
+        self.assertEqual([item.state for item in findings],
+                         [State.UNVERIFIABLE, State.NEW_DEVICE, State.NEW_DEVICE])
         self.assertEqual(findings[0].reason, "AMBIGUOUS_IDENTITY")
 
     def test_conflicting_capacity_is_not_matched_as_incomplete_moved_disk(self):
@@ -106,18 +107,46 @@ class CompareTests(TestCase):
         old = Component(Kind.STORAGE, "disk0", (), (("serial", "synthetic-a"), ("wwid", "synthetic-w")))
         current = Inventory((Component(Kind.STORAGE, "disk8", (), (("serial", "synthetic-a"),)),
                              Component(Kind.STORAGE, "disk9", (), (("wwid", "synthetic-w"),))))
-        self.assertEqual([item.state for item in compare(Inventory((old,)), current)], [State.UNVERIFIABLE])
+        findings = compare(Inventory((old,)), current)
+        self.assertEqual([item.state for item in findings], [State.UNVERIFIABLE, State.NEW_DEVICE])
+        self.assertFalse(any(item.state == State.MISSING for item in findings))
+
+    def test_split_identifier_surplus_observation_is_reported_as_new_device(self):
+        """One approved disk cannot account for two observed disks (SPEC 10.1-10.2)."""
+        old = Component(Kind.STORAGE, "disk0", (("capacity_bytes", "1000"),),
+                        (("serial", "synthetic-a"), ("wwid", "synthetic-w")))
+        halves = (Component(Kind.STORAGE, "disk8", (("capacity_bytes", "1000"),), (("serial", "synthetic-a"),)),
+                  Component(Kind.STORAGE, "disk9", (("capacity_bytes", "1000"),), (("wwid", "synthetic-w"),)))
+        for ordered in (halves, tuple(reversed(halves))):
+            findings = compare(Inventory((old,)), Inventory(ordered))
+            self.assertEqual([item.state for item in findings], [State.UNVERIFIABLE, State.NEW_DEVICE])
+            self.assertEqual(findings[0].reason, "AMBIGUOUS_IDENTITY")
+            self.assertEqual(findings[1].kind, Kind.STORAGE)
+            self.assertEqual(findings[1].reason, "SURPLUS_AMBIGUOUS_COMPONENT")
+            self.assertNotIn("synthetic-a", repr(findings))
+
+    def test_surplus_new_device_is_not_claimed_while_the_baseline_can_explain_it(self):
+        """Two approved disks explain two ambiguous observations; report no growth."""
+        first = Component(Kind.STORAGE, "disk0", (), (("serial", "synthetic-a"), ("wwid", "synthetic-w")))
+        second = Component(Kind.STORAGE, "disk1", (), ())
+        current = (Component(Kind.STORAGE, "disk8", (), (("serial", "synthetic-a"),)),
+                   Component(Kind.STORAGE, "disk9", (), (("wwid", "synthetic-w"),)))
+        for old_order in permutations((first, second)):
+            for new_order in permutations(current):
+                findings = compare(Inventory(old_order), Inventory(new_order))
+                self.assertEqual([item.state for item in findings],
+                                 [State.UNVERIFIABLE, State.UNVERIFIABLE])
 
     def test_duplicate_unique_identity_not_ok(self):
         findings = compare(Inventory((disk(),)), Inventory((disk(), disk(slot="disk1"))))
-        self.assertEqual(findings[0].state, State.UNVERIFIABLE)
+        self.assertEqual([item.state for item in findings], [State.UNVERIFIABLE, State.NEW_DEVICE])
 
     def test_duplicate_exact_identities_are_unknown_before_property_comparison(self):
         baseline = Inventory((disk(),))
         current = (disk(size="2000"), disk(slot="disk9"))
         for ordered in (current, tuple(reversed(current))):
             findings = compare(baseline, Inventory(ordered))
-            self.assertEqual([item.state for item in findings], [State.UNVERIFIABLE])
+            self.assertEqual([item.state for item in findings], [State.UNVERIFIABLE, State.NEW_DEVICE])
             self.assertEqual(findings[0].reason, "AMBIGUOUS_IDENTITY")
 
     def test_duplicate_baseline_identities_do_not_derive_drift_from_arbitrary_pairing(self):
@@ -143,7 +172,7 @@ class CompareTests(TestCase):
         first = Component(Kind.STORAGE, "disk0", (), (("serial", "a"), ("wwid", "x")))
         second = Component(Kind.STORAGE, "disk1", (), (("wwid", "x"), ("serial", "a")))
         findings = compare(Inventory((first,)), Inventory((first, second)))
-        self.assertEqual([item.state for item in findings], [State.UNVERIFIABLE])
+        self.assertEqual([item.state for item in findings], [State.UNVERIFIABLE, State.NEW_DEVICE])
 
     def test_ambiguous_partial_candidates_remain_available_to_anonymous_baseline(self):
         first = Component(Kind.STORAGE, "old-a", (("model", "Synthetic"),),
