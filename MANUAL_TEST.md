@@ -520,3 +520,34 @@ The synthetic CI tests do not complete these checks. On an isolated Capture Node
 
 Publish only pass/fail summaries; keep configs, mount identity, host identifiers,
 credentials and captured media private.
+
+## U. GitHub review-gate enforcement
+
+Issue #4 remains open. The offline tests do not complete these checks. Follow
+`docs/REVIEW_GATE_SETUP.md` after Owner App registration and trusted publisher
+implementation. Use harmless synthetic documentation PRs against an isolated
+test branch and an equivalent strict rule before activating protection on `main`.
+The candidate generator targets `main` only; review any test-branch adaptation
+explicitly. Do not alter production protection to make a negative test pass.
+
+- [ ] record the App ID/slug/installation, immutable trusted publisher revision, applied rules, and both required check names with expected App sources;
+- [ ] missing either review blocks merge; pending, failed, cancelled, unavailable, skipped and neutral reviewer outcomes each produce a blocking/pending App check (never a skipped/neutral check conclusion, which GitHub accepts);
+- [ ] both trusted reviews of the exact current repository/PR/HEAD/base/merge-base/diff allow merge only after independent CI and thread gates pass;
+- [ ] push a new PR HEAD and confirm old reviews cannot permit merge;
+- [ ] advance the base without changing the PR HEAD and attempt merge immediately, including before the publisher handles the base update; strict protection blocks it;
+- [ ] repeat base advancement with a new base already in the PR HEAD's ancestry: checks only on the old test-merge SHA cannot satisfy the new merge context, and no same-name success exists on PR HEAD;
+- [ ] check targets are the current GitHub test-merge commit with the pinned base/head parents; missing/stale merge refs block publication;
+- [ ] incorporate the new base into the PR, rerun both reviewers, and confirm only the new current context becomes eligible;
+- [ ] a same-repository test workflow publishes the identical check names with its ordinary `GITHUB_TOKEN`; even a success from GitHub Actions cannot satisfy the dedicated-App requirement;
+- [ ] a same-name commit status and a check from a different synthetic test App cannot satisfy the requirement;
+- [ ] copied successful receipt JSON, a forged `Reviewed commit` comment, and a wrong PR/repository/base/diff receipt fail;
+- [ ] a newer pending/failed authoritative attempt cannot be hidden by an older successful check; out-of-order completion cannot re-enable stale evidence;
+- [ ] fork review completes through the trusted path; fork/same-repository PR code never receives reviewer credentials, the App key or publisher token;
+- [ ] a PR retarget, base change during either review, missing API page, provider/API error, malformed receipt and unavailable publisher each fail closed;
+- [ ] inspect the App's selected-repository grant and verify the publisher cannot alter source, workflows, branch protection, collaborators or repository administration;
+- [ ] demonstrate recovery from a stopped publisher without disabling protection, changing expected issuers or adding bypass actors;
+- [ ] record public test PR/run/check IDs, non-secret context digests, rule snapshots and observed GitHub merge refusals, then re-read the production rule after activation.
+
+Never use a real secret as a fixture or publish an App key/token, reviewer token,
+raw private API response, or monitoring data. Cleanup only the identified
+synthetic test branches/PRs; no production data or unrelated rule deletion.
