@@ -96,6 +96,40 @@ class LicenseGateTests(unittest.TestCase):
         with self.assertRaisesRegex(license_gate.GateError, "locked dependencies differ"):
             license_gate.audit(self.root)
 
+    def test_python_project_dependency_requires_matching_hashed_lock_entry(self):
+        self.write("pyproject.toml", '[project]\ndependencies = ["direct==9.8.7"]\n')
+        project_location = {
+            "path": "pyproject.toml", "ecosystem": "python-project", "scope": "backend",
+        }
+        self.inputs.append(project_location)
+        self.components.append(self.component(
+            id="pypi:direct@9.8.7",
+            name="direct",
+            version="9.8.7",
+            upstream="https://example.test/direct/9.8.7",
+            locations=[project_location],
+        ))
+        self.save()
+        with self.assertRaisesRegex(
+                license_gate.GateError, "python project dependency lacks matching reviewed lock entry"):
+            license_gate.audit(self.root)
+
+    def test_python_project_lock_correspondence_includes_scope(self):
+        self.write("pyproject.toml", '[project]\ndependencies = ["demo==1.2.3"]\n')
+        project_location = {
+            "path": "pyproject.toml", "ecosystem": "python-project", "scope": "frontend",
+        }
+        self.inputs.append(project_location)
+        self.components[0]["locations"].append(project_location)
+        self.save()
+        with self.assertRaisesRegex(
+                license_gate.GateError, "python project dependency lacks matching reviewed lock entry"):
+            license_gate.audit(self.root)
+
+        project_location["scope"] = "backend"
+        self.save()
+        self.assertEqual(license_gate.audit(self.root), (1, 2, 0))
+
     def test_missing_license_transitive_notice_and_upstream_evidence_fail(self):
         mutations = [
             {"license_evidence": []},

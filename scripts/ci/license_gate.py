@@ -397,6 +397,15 @@ def audit(root: Path, inventory_path=INVENTORY):
         visit(path)
     if sorted(discovered_pins) != sorted(reviewed_pins(root)):
         raise GateError("lock digests differ from reviewed pinning evidence")
+    locked_python = {
+        (component.scope, component.name, component.version)
+        for component in discovered
+        if component.ecosystem == "python-requirements"
+    }
+    for component in discovered:
+        if (component.ecosystem == "python-project"
+                and (component.scope, component.name, component.version) not in locked_python):
+            raise GateError("python project dependency lacks matching reviewed lock entry")
 
     reviews = data["scope_reviews"]
     if not isinstance(reviews, list):

@@ -33,6 +33,8 @@ The gate is offline. URLs are durable evidence references reviewed in the commit
 the gate does not claim to re-fetch or independently reinterpret legal terms.
 Python `-r`/`-c` includes must resolve inside the repository to another reviewed
 requirements input. Every included file is audited and include cycles fail.
+Every Python project dependency must match a reviewed, hash-pinned requirements
+entry by normalized name, exact version, and scope.
 Tracked `build/` and `dist/` trees are scanned for model artifacts like any other
 repository path. Recognized Web/static output suffixes, including `.wasm`,
 remain allowed, while

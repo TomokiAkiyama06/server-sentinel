@@ -136,7 +136,9 @@ or unused approval records.
 
 Requirements `-r` and `-c` includes are recursively covered: each target must be
 a separate reviewed repository input, paths may not escape or use a remote URL,
-and cycles fail. The permissive license set is explicit; unknown free-form,
+and cycles fail. Each Python project dependency must correspond by normalized
+name, exact version, and scope to a reviewed requirements lock entry whose
+hashes match `license/pins.json`. The permissive license set is explicit; unknown free-form,
 proprietary, Elastic, Commons Clause, source-available, and other unlisted terms
 need exact Owner approval rather than being accepted because they do not match a
 known copyleft name. Committed `build/` and `dist/` archives, extensionless
