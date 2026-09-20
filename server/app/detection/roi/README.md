@@ -40,7 +40,10 @@ duration of corroborating samples. An explicit ROI-occlusion signal, sampling
 gap, stream restart, regression, mismatched frame, or insufficient movement
 quality resets confirmation and yields `unknown`, never `no movement`. A
 sample the detector refuses outright, such as a frame belonging to another
-source, ends the episode too, so no later confirmation spans it. Every accepted
+source, ends the episode too, so no later confirmation spans it. A bounded
+history of replaced streams is kept, so a delayed frame from a stream this
+source already left is refused as stale imagery rather than becoming current
+again through an A-to-B-to-A transition. Every accepted
 sample records the observed stream, sequence and clock before any such
 `unknown` result, so a buffered frame from a superseded geometry or stream
 cannot pass the regression check afterwards. The calibration comparison budget
@@ -75,7 +78,8 @@ must remain armed in every presence state.
 `server/tests/test_detector_roi.py` generates all pixel inputs in memory for
 local and remote-agent calibration, relative movement, global camera motion,
 temporary ROI occlusion, dark-scene tamper, persistent unmatched scenes,
-ambiguous and low-margin registration, refused foreign-source samples,
+ambiguous and low-margin registration, refused foreign-source and
+retired-stream samples,
 frame-progression watermarks, the unmatched-path comparison budget,
 source-loss correlation, quality isolation, media-free calibration history,
 and failed critical delivery. Hardware,

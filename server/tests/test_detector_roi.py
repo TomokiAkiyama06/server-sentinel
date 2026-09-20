@@ -313,6 +313,28 @@ class SceneDetectorTests(unittest.TestCase):
             policy(global_search_pixels=1, camera_shift_pixels=2)
         policy(roi_search_pixels=2, movement_pixels=2, global_search_pixels=2, camera_shift_pixels=2)
 
+    def test_frames_from_a_retired_stream_never_confirm(self):
+        moved = transformed(pixels(), (1, 0), region=(4, 4, 8, 7))
+        replacement = UUID(int=305)
+        instance = detector()
+        inspect_scene(instance, frame(0), 0)
+        inspect_scene(instance, frame(1, moved), 10)
+        inspect_scene(instance, frame(0, moved, stream=replacement), 20)
+        inspect_scene(instance, frame(1, moved, stream=replacement), 30)
+        stale = [inspect_scene(instance, frame(2 + index, moved), 40 + index * 10)
+                 for index in range(3)]
+        for sample in stale:
+            self.assertEqual("retired_stream", sample.movement_reason)
+            self.assertEqual("retired_stream", sample.tamper_reason)
+            self.assertEqual(Observation.UNKNOWN, sample.movement)
+            self.assertEqual(Observation.UNKNOWN, sample.tamper)
+            self.assertEqual(STREAM, sample.stream_id)
+            self.assertFalse(sample.critical)
+        resumed = inspect_scene(instance, frame(2, moved, stream=replacement), 80)
+        self.assertEqual("awaiting_confirmation", resumed.movement_reason)
+        self.assertEqual(replacement, resumed.stream_id)
+        self.assertFalse(resumed.critical)
+
     def test_confirmation_after_an_interruption_reports_new_critical_evidence(self):
         moved = transformed(pixels(), (1, 0), region=(4, 4, 8, 7))
         instance = detector()

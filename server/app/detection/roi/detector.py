@@ -1,5 +1,6 @@
 """Calibrated global compensation and persistent, neutral critical observations."""
 
+from collections import deque
 from dataclasses import dataclass
 from uuid import uuid4
 
@@ -8,6 +9,10 @@ from app.detection.foundation import GrayFrame, Observation, Quality
 from .contracts import Calibration, CriticalKind, CriticalObservation, SceneObservation
 from .geometry import (candidates, contains, coverage, dissimilarity, match,
                        validate_polygon, variance)
+
+
+# Matches the inference scheduler's retired-stream admission history.
+RETIRED_STREAM_HISTORY = 4
 
 
 @dataclass
@@ -99,6 +104,10 @@ class SceneDetector:
             raise ValueError("no usable ROI transform reaches the movement threshold")
         self.reference_digest = calibration.reference_sha256
         self.stream_id = None
+        # Bounded history of streams this source has replaced, matching the
+        # inference scheduler's admission bound. Frames from one of them are
+        # stale imagery, never a new restart.
+        self.retired_streams = deque(maxlen=RETIRED_STREAM_HISTORY)
         self.last_sequence = -1
         self.last_ns = -1
         self.last_scene_shift_ns = None
@@ -138,14 +147,14 @@ class SceneDetector:
                                    observed_at, now, c.identifier, c.version, c.created_at,
                                    self.reference_digest, confidence, Quality.SUFFICIENT, reason)
 
-    def _observation(self, frame, now, observed_at, *, movement=Observation.UNKNOWN,
+    def _observation(self, frame, now, observed_at, *, stream=None, movement=Observation.UNKNOWN,
                      movement_quality=Quality.UNKNOWN, tamper=Observation.UNKNOWN,
                      tamper_quality=Quality.UNKNOWN, movement_reason="unavailable",
                      tamper_reason="unavailable", movement_confidence=None,
                      tamper_confidence=None, global_transform=None, relative_transform=None,
                      critical=()):
         c = self.calibration
-        return SceneObservation(c.source_id, self.stream_id or c.reference.stream_id,
+        return SceneObservation(c.source_id, stream or self.stream_id or c.reference.stream_id,
                                 frame.sequence if frame is not None else None,
                                 observed_at, now, c.identifier, c.version, c.created_at,
                                 self.reference_digest, movement, movement_quality,
@@ -189,7 +198,18 @@ class SceneDetector:
             return self._observation(frame, monotonic_ns, observed_at, movement_reason="clock_or_sequence_regression",
                                      tamper_reason="clock_or_sequence_regression")
         restarted = self.stream_id is not None and self.stream_id != frame.stream_id
+        if restarted and frame.stream_id in self.retired_streams:
+            # A stream this source already replaced. Treating it as another
+            # restart would make it current again and let delayed frames confirm
+            # from stale imagery, so it is refused as unknown instead.
+            self._interrupt()
+            self.last_ns = monotonic_ns
+            return self._observation(frame, monotonic_ns, observed_at, stream=frame.stream_id,
+                                     movement_reason="retired_stream",
+                                     tamper_reason="retired_stream")
         gap = self.last_ns >= 0 and monotonic_ns - self.last_ns > self.policy.maximum_gap_ns
+        if restarted:
+            self.retired_streams.append(self.stream_id)
         # Record the observed progression before any fail-unknown return. The
         # source has already advanced past this sample, so a later buffered
         # frame from the superseded geometry or stream must not pass the
