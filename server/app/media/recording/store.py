@@ -144,6 +144,11 @@ class RecordingStore:
             if owns_reservation:
                 self._release_reservation()
 
+    def control_reservation(self):
+        """Reserve storage for one caller-owned audited control transaction."""
+        self._check()
+        return self._control_reservation()
+
     def _release_reservation(self):
         self._reservation_active = False
         try:
@@ -776,6 +781,7 @@ class RecordingStore:
             )
         return before
 
+    @_control_operation
     def finish_prepared_delete(self, recording_id: UUID, before: int) -> int:
         """Complete media cleanup after the durable deletion journal commits."""
         self._check()

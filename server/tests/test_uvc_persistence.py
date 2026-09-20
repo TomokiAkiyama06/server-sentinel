@@ -141,7 +141,7 @@ class PersistenceTests(unittest.TestCase):
         restarted = self.controller()
         self.assertEqual(restarted.reconcile([new_camera]), new_camera)
 
-    def test_explicit_binding_is_consumed_by_exactly_one_session_start(self):
+    def test_durable_approval_never_restores_a_live_explicit_binding(self):
         connection = self.database.connect()
         connection.execute("BEGIN IMMEDIATE")
         weak = replace(self.camera, serial=None)
@@ -150,11 +150,12 @@ class PersistenceTests(unittest.TestCase):
         )
         connection.commit()
         connection.close()
-        self.assertTrue(self.store.load(self.source_id).explicit_binding)
+        self.assertFalse(self.store.load(self.source_id).explicit_binding)
         current = ReconnectController(
             self.source_id, weak, lambda event: None, store=self.store,
         )
-        self.assertEqual(weak, current.reconcile([weak]))
+        self.assertIsNone(current.reconcile([weak]))
+        self.assertEqual(CameraState.MANUAL, current.state)
         self.assertFalse(self.store.load(self.source_id).explicit_binding)
 
 

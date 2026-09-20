@@ -1,7 +1,8 @@
 """Owner-only execution boundary with atomic domain mutation plus audit."""
 
 import sqlite3
-from typing import Callable, Protocol, TypeVar
+from contextlib import nullcontext
+from typing import Callable, ContextManager, Protocol, TypeVar
 from uuid import UUID
 
 from .model import (
@@ -84,9 +85,12 @@ class OwnerAuditService:
     def execute_transactional(self, actor_context: object, *, action: AuditAction,
                               target_kind: TargetKind, target_logical_id: UUID,
                               operation: Callable[[sqlite3.Connection], Result],
-                              connection: sqlite3.Connection | None = None) -> Result:
+                              connection: sqlite3.Connection | None = None,
+                              reservation: Callable[[], ContextManager] | None = None) -> Result:
         """Commit the mutation and success audit in one SQLite transaction.
 
+        An optional reservation is acquired after authorization and remains
+        active until the shared transaction commits or rolls back.
         On mutation/audit failure the shared transaction rolls back, then a
         separate bounded failure record is attempted. An audit append failure
         can therefore never leave only the sensitive mutation committed.
@@ -105,20 +109,22 @@ class OwnerAuditService:
             return result
 
         try:
-            if connection is None:
-                with self.store.transaction(write=True) as active:
-                    return run(active)
-            if connection.in_transaction:
-                raise AuditStorageError("audit transaction is unavailable")
-            connection.execute("BEGIN IMMEDIATE")
-            try:
-                result = run(connection)
-                connection.execute("COMMIT")
-                return result
-            except BaseException:
+            boundary = reservation() if reservation is not None else nullcontext()
+            with boundary:
+                if connection is None:
+                    with self.store.transaction(write=True) as active:
+                        return run(active)
                 if connection.in_transaction:
-                    connection.execute("ROLLBACK")
-                raise
+                    raise AuditStorageError("audit transaction is unavailable")
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    result = run(connection)
+                    connection.execute("COMMIT")
+                    return result
+                except BaseException:
+                    if connection.in_transaction:
+                        connection.execute("ROLLBACK")
+                    raise
         except Exception:
             # A failed success-append may also prevent this best-effort failure
             # append. The mutation has already rolled back either way.

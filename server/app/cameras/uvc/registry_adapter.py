@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from app.cameras.registry import CaptureProfile, SourceHealthState, SourceType
 from .capture import MmapCapture, VideoProfile
 from .discovery import LinuxDiscovery
-from .identity import ReconnectController
+from .identity import DeviceEvidence, ReconnectController
 from .persistence import ApprovalStore
 from .session import CaptureSession
 
@@ -40,6 +40,7 @@ class LocalUvcAdapter:
         self.capture_factory = capture_factory
         self.clock = clock or (lambda: datetime.now(timezone.utc))
         self.sessions = {}
+        self._approved_handoffs = {}
         self.closed = False
 
     def _source(self, source_id):
@@ -58,11 +59,12 @@ class LocalUvcAdapter:
         )
         self.emit_audit(event)
 
-    def _session(self, source, approved):
+    def _session(self, source, approved, *, explicit_candidate=None):
         self.registry.update_source_health(source.id, health_state=SourceHealthState.OFFLINE,
                                            negotiated_capture_profile=None, image_quality_state="unknown")
         controller = ReconnectController(source.id, approved, self._event,
-                                         enabled=source.enabled, store=self.store)
+                                         enabled=source.enabled, store=self.store,
+                                         explicit_candidate=explicit_candidate)
 
         def profile_sink(negotiated):
             value = negotiated.profile
@@ -134,6 +136,16 @@ class LocalUvcAdapter:
             # poll reconstructs the prior durable approval and recovery latch.
             session.supersede_stopped_session()
             del self.sessions[source_id]
+        return candidate
+
+    def accept_committed_approval(self, source_id, candidate):
+        """Hand one exact live selection to the next session after commit."""
+        if not isinstance(candidate, DeviceEvidence):
+            raise ValueError("invalid committed approval")
+        # The transaction hook already validated this source and candidate.
+        # Keep this post-commit handoff free of storage operations so a
+        # transient read cannot turn a durable success into an apparent error.
+        self._approved_handoffs[source_id] = candidate
 
     def poll_source(self, source_id, *, timeout=1.0):
         source = self._source(source_id)
@@ -145,7 +157,8 @@ class LocalUvcAdapter:
                 self.registry.update_source_health(source_id, health_state=SourceHealthState.OFFLINE,
                                                    negotiated_capture_profile=None)
                 return False
-            session = self._session(source, approved.approved)
+            explicit = self._approved_handoffs.pop(source_id, None)
+            session = self._session(source, approved.approved, explicit_candidate=explicit)
         try:
             session.configure(enabled=source.enabled,
                               profile=capture_profile(source.desired_capture_profile))
@@ -160,6 +173,7 @@ class LocalUvcAdapter:
         if self.closed:
             return
         self.closed = True
+        self._approved_handoffs.clear()
         failures = []
         for session in self.sessions.values():
             try:

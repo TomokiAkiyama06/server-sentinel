@@ -76,6 +76,7 @@ class UvcRegistryTests(unittest.TestCase):
                     "synthetic-owner", self.adapter, self.source.id, self.camera,
                 )
         self.assertIsNone(self.adapter.store.load(self.source.id))
+        self.assertNotIn(self.source.id, self.adapter._approved_handoffs)
         self.assertEqual(before, self.registry.get_source(self.source.id))
 
     def test_audited_owner_reapproval_replaces_stopped_cached_session(self):
@@ -102,7 +103,8 @@ class UvcRegistryTests(unittest.TestCase):
         self.assertNotIn(self.source.id, self.adapter.sessions)
         approved = self.adapter.store.load(self.source.id)
         self.assertTrue(approved.serial_ambiguous)
-        self.assertTrue(approved.explicit_binding)
+        self.assertFalse(approved.explicit_binding)
+        self.assertEqual(self.camera, self.adapter._approved_handoffs[self.source.id])
         self.assertTrue(self.adapter.poll_source(self.source.id))
         self.assertFalse(self.adapter.store.load(self.source.id).explicit_binding)
         self.adapter.sessions[self.source.id].close()
@@ -131,10 +133,48 @@ class UvcRegistryTests(unittest.TestCase):
             OwnerAuditService(audit, PermitOwner()), self.registry,
         )
         admin.approve_uvc("owner", self.adapter, self.source.id, weak)
-        self.assertTrue(self.adapter.store.load(self.source.id).explicit_binding)
+        self.assertFalse(self.adapter.store.load(self.source.id).explicit_binding)
+        self.assertEqual(weak, self.adapter._approved_handoffs[self.source.id])
         self.assertTrue(self.adapter.poll_source(self.source.id))
         self.assertFalse(self.adapter.store.load(self.source.id).explicit_binding)
         self.adapter.sessions[self.source.id].close()
+        self.assertFalse(self.adapter.poll_source(self.source.id))
+        self.assertEqual(
+            SourceHealthState.MANUAL_INTERVENTION_REQUIRED,
+            self.registry.get_source(self.source.id).health_state,
+        )
+
+    def test_process_restart_cannot_consume_persisted_explicit_approval(self):
+        class PermitOwner:
+            def require_owner(self, actor_context):
+                return None
+
+        weak = replace(self.camera, serial=None, instance_token=(1, 2, 3))
+        self.discovery.devices = [weak]
+        admin = OwnerAdministration(
+            OwnerAuditService(AuditStore(self.database), PermitOwner()), self.registry,
+        )
+        admin.approve_uvc("owner", self.adapter, self.source.id, weak)
+        restarted = self.make_adapter()
+        self.addCleanup(restarted.close)
+        self.assertFalse(restarted.poll_source(self.source.id))
+        self.assertEqual(
+            SourceHealthState.MANUAL_INTERVENTION_REQUIRED,
+            self.registry.get_source(self.source.id).health_state,
+        )
+
+    def test_committed_handoff_still_requires_the_exact_live_candidate(self):
+        class PermitOwner:
+            def require_owner(self, actor_context):
+                return None
+
+        weak = replace(self.camera, serial=None, instance_token=(1, 2, 3))
+        self.discovery.devices = [weak]
+        admin = OwnerAdministration(
+            OwnerAuditService(AuditStore(self.database), PermitOwner()), self.registry,
+        )
+        admin.approve_uvc("owner", self.adapter, self.source.id, weak)
+        self.discovery.devices = [replace(weak, device_path="/dev/video2")]
         self.assertFalse(self.adapter.poll_source(self.source.id))
         self.assertEqual(
             SourceHealthState.MANUAL_INTERVENTION_REQUIRED,

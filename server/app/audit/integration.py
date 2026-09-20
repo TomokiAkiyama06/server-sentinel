@@ -82,13 +82,15 @@ class OwnerAdministration:
 
     def approve_uvc(self, actor_context, adapter, source_id, candidate):
         """Approve through the adapter; its transaction-aware hook is required."""
-        return self.service.execute_transactional(
+        approved = self.service.execute_transactional(
             actor_context, action=AuditAction.APPROVE_CAMERA,
             target_kind=TargetKind.CAMERA, target_logical_id=source_id,
             operation=lambda connection: adapter.approve_source_on(
                 connection, source_id, candidate,
             ),
         )
+        adapter.accept_committed_approval(source_id, approved)
+        return approved
 
     def approve_hardware_baseline(self, actor_context, baseline_id, approve_on):
         """Plan 23 contract: callback mutates its baseline on this transaction."""
@@ -107,6 +109,7 @@ class OwnerAdministration:
             actor_context, action=AuditAction.UPDATE_RECORDING,
             target_kind=TargetKind.RECORDING, target_logical_id=recording_id,
             connection=recording_store.db,
+            reservation=recording_store.control_reservation,
             operation=lambda connection: recording_store.set_starred_on(
                 connection, recording_id, starred,
             ),
@@ -118,6 +121,7 @@ class OwnerAdministration:
             actor_context, action=AuditAction.DELETE_RECORDING,
             target_kind=TargetKind.RECORDING, target_logical_id=recording_id,
             connection=recording_store.db,
+            reservation=recording_store.control_reservation,
             operation=lambda connection: recording_store.prepare_delete_on(
                 connection, recording_id, owner_requested=True,
             ),

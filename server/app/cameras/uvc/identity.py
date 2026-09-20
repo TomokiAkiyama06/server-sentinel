@@ -106,7 +106,8 @@ class ReconnectController:
     succeeds; discovery alone is never reported as healthy monitoring.
     """
 
-    def __init__(self, source_id, approved, emit, *, enabled=True, store=None):
+    def __init__(self, source_id, approved, emit, *, enabled=True, store=None,
+                 explicit_candidate=None):
         if not isinstance(source_id, UUID) or not isinstance(approved, DeviceEvidence):
             raise ValueError("invalid source identity")
         if type(enabled) is not bool:
@@ -117,11 +118,18 @@ class ReconnectController:
         self._session_token = saved.session_token if saved else None
         self.serial_ambiguous = saved.serial_ambiguous if saved else False
         self.approved = saved.approved if saved else approved
+        if (explicit_candidate is not None
+                and (not isinstance(explicit_candidate, DeviceEvidence)
+                     or explicit_candidate != self.approved)):
+            raise ValueError("explicit candidate does not match approval")
         self.emit = emit
         self.enabled = enabled
         self.state = CameraState.OFFLINE
-        self.bound = self.approved if saved is not None and saved.explicit_binding else None
-        self._explicit_binding = saved.explicit_binding if saved is not None else False
+        # Only a candidate handed off in memory after the audited approval
+        # commit represents the exact live selection. Durable evidence alone
+        # must go through reconnect matching after a process restart.
+        self.bound = explicit_candidate
+        self._explicit_binding = explicit_candidate is not None
         self.requires_approval = saved.requires_approval if saved else False
         self._reason = "not_started"
         self._finished = False

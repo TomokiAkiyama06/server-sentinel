@@ -92,10 +92,10 @@ class ApprovalStore:
             connection.execute(
                 "INSERT INTO uvc_approvals "
                 "(source_id,evidence,requires_approval,session_token,serial_ambiguous,explicit_binding) "
-                "VALUES (?, ?, 0, NULL, ?, 1) "
+                "VALUES (?, ?, 0, NULL, ?, 0) "
                 "ON CONFLICT(source_id) DO UPDATE SET evidence=excluded.evidence, "
                 "requires_approval=0, session_token=NULL, "
-                "serial_ambiguous=excluded.serial_ambiguous, explicit_binding=1",
+                "serial_ambiguous=excluded.serial_ambiguous, explicit_binding=0",
                 (str(source_id), evidence, int(serial_ambiguous or preserve_latch)),
             )
         except (sqlite3.Error, ValueError, TypeError):
@@ -124,7 +124,6 @@ class ApprovalStore:
             # successful approve() write may clear its approval-required flag.
             required = True if prior is None else prior.requires_approval or prior.session_token is not None
             ambiguous = False if prior is None else prior.serial_ambiguous
-            explicit = False if prior is None else prior.explicit_binding
             token = str(uuid4())
             connection.execute(
                 "INSERT INTO uvc_approvals "
@@ -136,7 +135,7 @@ class ApprovalStore:
                 (str(source_id), json.dumps(asdict(approved), allow_nan=False), int(required), token, int(ambiguous)),
             )
             connection.commit()
-            return ApprovalState(approved, required, token, ambiguous, explicit)
+            return ApprovalState(approved, required, token, ambiguous, False)
         except (sqlite3.Error, ValueError, TypeError, KeyError):
             if connection is not None:
                 connection.rollback()

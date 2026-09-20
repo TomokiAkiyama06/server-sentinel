@@ -542,7 +542,17 @@ class RecordingTests(unittest.TestCase):
         admin = OwnerAdministration(
             OwnerAuditService(audit, PermitOwner()), CameraRegistry(database),
         )
-        admin.set_recording_starred("synthetic-owner", self.store, recording, True)
+        original_append = audit.append_on
+
+        def append_while_reserved(*args, **kwargs):
+            self.assertTrue(self.policy.reserved)
+            return original_append(*args, **kwargs)
+
+        self.policy.calls.clear()
+        with patch.object(audit, "append_on", side_effect=append_while_reserved):
+            admin.set_recording_starred("synthetic-owner", self.store, recording, True)
+        self.assertEqual([(0, False)], self.policy.calls)
+        self.assertFalse(self.policy.reserved)
         self.assertTrue(self.store.manifest(recording)["starred"])
         record = audit.list_records()[0]
         self.assertEqual(AuditAction.UPDATE_RECORDING, record.action)
@@ -573,7 +583,17 @@ class RecordingTests(unittest.TestCase):
             OwnerAuditService(audit, PermitOwner()), CameraRegistry(database),
         )
 
-        admin.delete_recording("synthetic-owner", self.store, deleted)
+        original_append = audit.append_on
+
+        def append_while_reserved(*args, **kwargs):
+            self.assertTrue(self.policy.reserved)
+            return original_append(*args, **kwargs)
+
+        self.policy.calls.clear()
+        with patch.object(audit, "append_on", side_effect=append_while_reserved):
+            admin.delete_recording("synthetic-owner", self.store, deleted)
+        self.assertEqual([(0, False), (0, False)], self.policy.calls)
+        self.assertFalse(self.policy.reserved)
         with self.assertRaises(RecordingError):
             self.store.manifest(deleted)
         missing = uuid4()
@@ -593,8 +613,10 @@ class RecordingTests(unittest.TestCase):
         denied_admin = OwnerAdministration(
             OwnerAuditService(audit, GenericDeny()), CameraRegistry(database),
         )
+        self.policy.calls.clear()
         with self.assertRaises(OwnerAuthorizationError):
             denied_admin.delete_recording("not-owner", self.store, denied)
+        self.assertEqual([], self.policy.calls)
         self.assertEqual(str(denied), self.store.manifest(denied)["id"])
         outcomes = {
             record.target_logical_id: record.outcome
@@ -625,6 +647,7 @@ class RecordingTests(unittest.TestCase):
                 side_effect=RecordingError(private_detail)):
             with self.assertRaisesRegex(RecordingError, private_detail):
                 admin.delete_recording("synthetic-owner", self.store, recording)
+        self.assertFalse(self.policy.reserved)
 
         records = [record for record in audit.list_records()
                    if record.target_logical_id == recording]
