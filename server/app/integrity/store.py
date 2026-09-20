@@ -82,9 +82,12 @@ class IntegrityStore:
             try:
                 self.db.execute("BEGIN IMMEDIATE")
                 yield
-                self.db.commit()
+                # Python 3.12+ autocommit=True makes Connection.commit/rollback
+                # no-ops even for our explicit BEGIN. Close it using SQL.
+                self.db.execute("COMMIT")
             except BaseException:
-                self.db.rollback()
+                if self.db.in_transaction:
+                    self.db.execute("ROLLBACK")
                 raise
 
     def baseline(self) -> tuple[int, Inventory | None]:

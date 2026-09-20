@@ -278,6 +278,23 @@ class StoreTests(TestCase):
         thread.join()
         self.assertEqual(errors, ["INTEGRITY_WORKER_UNAVAILABLE"])
 
+    def test_python_autocommit_true_closes_reserved_success_and_failure_transactions(self):
+        self.db.autocommit = True
+        self.store.approval = Owner()
+        self.store.approve(Inventory((disk(),)), expected_revision=0, at=NOW)
+        self.store.record(compare(None, Inventory(())), NOW)
+        self.assertFalse(self.db.in_transaction)
+        self.db.execute("CREATE TRIGGER fail_outbox BEFORE INSERT ON integrity_outbox "
+                        "BEGIN SELECT RAISE(ABORT, 'synthetic-storage-failure'); END")
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.store.record(compare(None, Inventory(())), NOW)
+        self.assertFalse(self.db.in_transaction)
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM integrity_outbox").fetchone()[0], 1)
+        self.db.execute("DROP TRIGGER fail_outbox")
+        self.store.deliver(lambda *args: None)
+        self.assertFalse(self.db.in_transaction)
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM integrity_outbox").fetchone()[0], 0)
+
     def test_reservation_covers_approval_record_and_ack_transactions(self):
         writes = []
         def observe(statement):
