@@ -5,7 +5,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
 WORKDIR /app
-COPY requirements.lock requirements-ci.lock ./
+COPY requirements.lock requirements-ci.lock requirements-detector.lock ./
 RUN python -m pip install --no-cache-dir --require-hashes --only-binary=:all: -r requirements-ci.lock
 COPY app ./app
 COPY tests ./tests
