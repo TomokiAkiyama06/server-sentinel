@@ -542,6 +542,14 @@ class RecordingTests(unittest.TestCase):
         self.assertEqual((), self.store.list_recordings(limit=1))
         self.assertEqual([], list(self.root.iterdir()))
 
+    def test_release_source_cleanup_failure_blocks_later_mutation(self):
+        self.store.append(self.segment())
+        with patch("app.media.recording.store.os.unlink", side_effect=PermissionError):
+            with self.assertRaises(PermissionError):
+                self.store.release_source(self.source)
+        with self.assertRaisesRegex(RecordingError, "WRITER_UNAVAILABLE"):
+            self.store.start_manual(self.source, 30_000)
+
     def test_recovery_refuses_inconsistent_deletion_journal_with_evidence_links(self):
         segment = self.store.append(self.segment())
         recording = self.store.start_manual(self.source, 30_000, duration_ms=10_000)

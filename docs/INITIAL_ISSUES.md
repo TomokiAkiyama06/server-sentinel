@@ -511,9 +511,10 @@ Depends on: [#17](https://github.com/TomokiAkiyama06/server-sentinel/issues/17),
 Labels: `backend`, `camera-source`, `storage`
 
 Implementation status: internal storage primitives and synthetic filesystem/SQLite
-coverage are prepared in `server/app/media/recording/`. Final migration/worker
-integration, audited codec muxing/validation, common storage admission and the
-`#17` / `#10` prerequisites remain open; no human media route is enabled here.
+coverage are prepared in `server/app/media/recording/`. Application migration v4
+is integrated; worker integration, audited codec muxing/validation, common
+storage admission and the `#17` / `#10` prerequisites remain open; no human media
+route is enabled here.
 
 実機要件: Main Server: 不要; Capture Node: 不要; UVC Camera: 不要; Manual test: 不要
 

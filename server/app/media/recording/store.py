@@ -376,7 +376,14 @@ class RecordingStore:
                             (str(source_id),))
             self.db.execute("UPDATE recording_segments SET spool=0 WHERE source_id=?",
                             (str(source_id),))
-        self._trim()
+        try:
+            self._trim()
+        except BaseException:
+            # Cursor and spool state are already committed.  A failed cleanup
+            # leaves the writer unable to make a safe next mutation, so require
+            # an explicit close/reopen recovery boundary.
+            self._failed = True
+            raise
 
     def start_event(self, event_id: UUID, source_ids: tuple[UUID, ...], at_ms: int,
                     *, pre_ms: int = 30_000, post_ms: int = 120_000,

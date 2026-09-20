@@ -546,8 +546,8 @@ recording windows carry explicit clip intervals and integrity/gap/discontinuity
 state. Restart retains committed media, cleans only journal-owned pending files
 and marks active recordings interrupted. Runtime admission and codec validation
 are mandatory injected boundaries; no human routes are enabled by this module.
-See its README for the unresolved application migration/worker integration and
-the distinction between storage integrity and playable-media validation.
+See its README for the remaining worker integration and the distinction between
+storage integrity and playable-media validation.
 
 ### 6.7 Main-host event ring buffer
 
