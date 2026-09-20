@@ -640,16 +640,23 @@ synthetic test branches/PRs; no production data or unrelated rule deletion.
 These checks belong to #10/#19/#28 after Owner approval and runtime integration.
 They are not completed by the Issue #6 synthetic policy model.
 
-- Verify the reserved browser origin serves ServerSentinel alone: enumerate the
-  Serve/reverse-proxy mappings for that scheme/host/port, request unrelated paths
-  and a co-hosted name, and confirm nothing else answers. Then add a second
-  mapping, alias, or path route on the same origin and confirm startup refuses to
-  serve instead of continuing, including when the configuration cannot be read.
+- Verify the reserved hostname serves ServerSentinel alone on every scheme and
+  port: enumerate the Serve/reverse-proxy mappings for that name, request
+  unrelated paths and other ports, and confirm nothing else answers. Then add a
+  second mapping on the same origin, and separately on another HTTPS port of the
+  same hostname, and confirm startup refuses to serve instead of continuing,
+  including when the configuration cannot be read.
+- Confirm the port case really is a cookie leak before relying on the check:
+  with a session established, request the second port and observe that the
+  browser attaches the `__Host-` session cookie there, which is why the whole
+  hostname rather than one origin is reserved.
 - Confirm a verified shared-account login with an active invitation but no
   credential-backed session is refused like an uninvited one, that user
   verification is required at every authentication, that revoking one credential
   ends only its own sessions, and that an Owner operation with a stale
-  verification performs nothing.
+  verification performs nothing. Step the host clock backwards after a step-up
+  and restore a session record holding a future verification time: both must
+  require the step-up again instead of counting as fresh.
 - From ordinary LAN and Tailnet clients, attempt direct IPv4/IPv6 upstream access
   and forged identity/forwarded headers, including Docker-published ports. Verify
   no bypass to human routes, assets, health, schema, or SPA/error fallbacks.

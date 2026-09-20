@@ -23,7 +23,7 @@ implementation/review of the full boundary.
 |---|---|---|
 | Initial Owner and recovery | A privileged local administrative command on the Main Server creates/rebinds the single Owner. No remote first-visitor setup or remote account recovery. | A local browser ceremony needs a separate short-lived bootstrap credential and another attack surface. |
 | Human identity and trust | Tailscale Serve over private HTTPS, forwarding to a loopback-only human backend on a host whose local processes are trusted. Match a deployment-scoped exact login identity to the application allowlist as a supplementary check, never as the authoritative authenticator. | An equivalent isolated authentication proxy can supply a stable issuer/subject, but needs its own reviewed adapter and deployment validation before support. |
-| Browser origin reservation | A dedicated scheme/host/port serves ServerSentinel alone. Deployment and startup verification refuse an origin that also routes another application. | Sharing one HTTPS host by path keeps a single cookie scope and a single browser origin, so a compromised co-hosted application acts as the current user; supporting it would need a different session and credential design. |
+| Hostname reservation | A hostname dedicated to ServerSentinel on every scheme and port, serving only the human listener. Deployment and startup verification refuse any other application answering for that name. | Sharing the name by path keeps one browser origin, and sharing it by port still keeps one cookie scope because cookies are not port-scoped, so a compromised neighbor receives or replays the Owner's session; supporting either would need a different session and credential design. |
 | Sessions and revocation | Server-side opaque sessions bound to verified identity and to the per-person credential that established them; 30-minute idle and 12-hour absolute lifetimes, and a 5-minute user-verification freshness window for Owner operations. Recheck current grants on every request and cancel active delivery on revocation, with a maximum five-second watchdog. | Different lifetimes, a different freshness window, or a stricter stream-revocation bound change usability/resource tradeoffs and must be recorded before implementation. |
 
 No option permits Tailnet membership alone, automatic Tailscale policy changes,
@@ -155,32 +155,44 @@ URL/session parameter, localStorage token, client-selected session identifier,
 or self-contained permission-bearing JWT is accepted. Rotate the ID at
 establishment and privilege changes.
 
-ServerSentinel requires an exclusive browser origin. The configured
-`https://<host>[:<port>]` serves this deployment alone: no other application,
-static tree, alias, or catch-all forward is routed on that scheme/host/port,
-and path-based co-hosting is unsupported. The cookie attributes above cannot
-contain a co-hosted application. `Path=/` sends the session cookie to every
-path of that host, and script served from another path of it runs in this same
-browser origin, so one compromised neighbor can call session establishment and
-API paths as the currently proxy-verified user, present the exact reserved
-`Origin`, read any CSRF token handed to the frontend, and reach Owner
-operations. Nothing in
-the request distinguishes that script from the dashboard, so host-only cookies,
-`SameSite`, and same-origin checks cannot be the boundary; reserving the origin
-is. A second application takes its own host or port. A different path prefix,
-subdirectory, or shared `__Host-` cookie scope does not separate it, and
-neither does a reverse proxy that merges both behind one name.
+ServerSentinel requires an exclusive hostname, not merely an exclusive path.
+The reserved name serves this deployment alone on every scheme and port, and
+the configured `https://<host>[:<port>]` is the only thing routed under it: no
+other application, static tree, alias, additional port, or catch-all forward
+answers for that name, and path-based co-hosting is unsupported. Two distinct
+scopes make the hostname, rather than the origin, the unit of reservation.
 
-Reserving the origin is verified, not assumed. Deployment enumerates the
-Serve/reverse-proxy configuration for the configured origin and records that it
-has exactly one route target, this human listener. Startup reads that same
-configuration and refuses to serve when another mapping, alias, wildcard, or
-fallback also claims the scheme/host/port, when the expected single mapping is
-absent, or when the configuration cannot be read; it fails closed instead of
-guessing. Any proxy configuration change repeats the check, and a deployment
-that cannot demonstrate exclusivity keeps human access closed. The check is a
-deployment-boundary condition and precedes identity, session, and permission
-evaluation.
+The first is the browser origin. `Path=/` sends the session cookie to every
+path of that host, and script served from another path of it runs in this same
+origin, so one compromised neighbor can call session establishment and API
+paths as the currently proxy-verified user, present the exact reserved
+`Origin`, read any CSRF token handed to the frontend, and reach Owner
+operations. Nothing in the request distinguishes that script from the
+dashboard, so host-only cookies, `SameSite`, and same-origin checks cannot be
+the boundary.
+
+The second is the cookie scope, which is wider than the origin because cookies
+are not port-scoped. A host-only `__Host-` cookie is sent to every HTTPS port
+of the reserved name, so an application answering at
+`https://<host>:<other-port>` receives the Owner's opaque session ID even
+though it is a different origin. Under a shared Tailscale login it can replay
+that session through Serve as the same supplementary identity, arriving behind
+the per-person credential gate instead of passing through it, and neither
+`SameSite=Strict` nor the `__Host-` prefix prevents this. A second application
+therefore takes its own hostname. Another port, path prefix, subdirectory, or
+shared `__Host-` cookie scope does not separate it, and neither does a reverse
+proxy that merges both behind one name.
+
+Reserving the hostname is verified, not assumed. Deployment enumerates the
+Serve/reverse-proxy configuration for the whole name — every scheme and port,
+not only the configured origin — and records that its single route target is
+this human listener. Startup reads that same configuration and refuses to serve
+when any other mapping, alias, wildcard, port, or fallback also answers for the
+name, when the expected single mapping is absent, or when the configuration
+cannot be read; it fails closed instead of guessing. Any proxy configuration
+change repeats the check, and a deployment that cannot demonstrate the
+reservation keeps human access closed. The check is a deployment-boundary
+condition and precedes identity, session, and permission evaluation.
 
 The session is an additional application state boundary. Every human request
 still needs the same verified proxy identity and current invitation/grant; a
@@ -203,7 +215,10 @@ absent `Origin` is accepted only for non-mutating reads, because browsers omit
 it for same-origin navigations; establishment, state-changing requests, and
 handshakes require the exact value and deny an absent one. Owner operations
 under AUTH-008 additionally require a user verification newer than a proposed
-five-minute freshness window, evaluated server-side from the session record;
+five-minute freshness window, evaluated server-side from the session record.
+A verification time that is not between the session's establishment and now is
+unusable rather than fresh, so a backward clock step or restored future
+timestamp requires the step-up again;
 the response for an otherwise authorized but stale Owner session is defined
 with the shared-account ADR, and a failed or cancelled step-up performs
 nothing. Token material and raw identity/cookie headers never enter logs,
@@ -269,7 +284,7 @@ capture credentials are never accepted by the human boundary.
 | First visitor claims Owner; replay/concurrent bootstrap | Local-only explicit bootstrap, uniqueness transaction, no bootstrap HTTP route |
 | LAN/forwarded-header spoof; ingest-to-human bypass | Actual peer and listener separation; deployment reachability tests required |
 | Missing/duplicate/tagged/shared-but-uninvited identity | Strict adapter, no identity fallback, application allowlist |
-| Co-hosted application on the same origin reads the cookie scope or CSRF token | Reserved exclusive origin; deployment and startup verification of a single route target |
+| Co-hosted application on the same origin, or on another port of the same hostname, reads or replays the session cookie | Hostname reserved across every scheme and port; deployment and startup verification of a single route target |
 | Shared Tailscale account holder without an invitation or per-person credential | Supplementary proxy identity; credential-backed session required on every human route |
 | Copied cookie/URL; wrong issuer; identity reassignment | Session identity binding; documented upstream login-reuse limitation |
 | Permission change, expiry, logout, recovery, re-invitation | Current state and generation validation; delivery cancellation |

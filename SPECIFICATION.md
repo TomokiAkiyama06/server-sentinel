@@ -901,10 +901,10 @@ a development/mock artifact until integrated with this protected delivery path.
 The ADR's synthetic design model proves only policy composition, not deployed
 proxy, session, cryptographic, or browser behavior.
 
-The proposal also reserves an exclusive browser origin: the configured
-scheme/host/port serves ServerSentinel alone, and path-based co-hosting with
-another application is unsupported because it shares one cookie scope and one
-browser origin. A verified trusted-proxy identity stays a supplementary check
+The proposal also reserves a whole hostname: that name serves ServerSentinel
+alone on every scheme and port. Path-based co-hosting shares one browser origin,
+and another port of the same name still shares the cookie scope because cookies
+are not port-scoped, so neither is supported. A verified trusted-proxy identity stays a supplementary check
 there; the authoritative per-person application credential is decided separately
 for Issue #6.
 

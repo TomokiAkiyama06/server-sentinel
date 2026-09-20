@@ -80,9 +80,11 @@ class Policy:
     owner_step_up_limit: int = 5 * 60
     deployment_generation: int = 0
     state_available: bool = True
-    # Deployment/startup verification found a dedicated scheme/host/port with no
-    # other application routed on it. Unverified exclusivity keeps access closed.
-    exclusive_origin: bool = False
+    # Deployment/startup verification found a hostname reserved for this
+    # deployment on every scheme and port, serving only the human listener.
+    # Cookies are not port-scoped, so reserving one origin is not enough, and an
+    # unverified reservation keeps access closed.
+    reserved_hostname: bool = False
     # Production routes remain closed until approval AND implementation.
     approved_and_implemented: bool = False
 
@@ -91,7 +93,7 @@ def permits(policy, evidence, principal, session, capability, now,
             mutation=False, handshake=False):
     """Evaluate the conjunction of gates on already-verified synthetic evidence."""
     if not (policy.approved_and_implemented and policy.state_available
-            and policy.exclusive_origin
+            and policy.reserved_hostname
             and evidence.trusted_transport and evidence.human_listener
             and evidence.identity_valid):
         return False
@@ -119,11 +121,14 @@ def permits(policy, evidence, principal, session, capability, now,
         return False
     if mutation and not evidence.csrf_valid:
         return False
-    # AUTH-008 Owner operations need a recent user verification. Admit/deny is
-    # all this model returns; the stale-session response belongs to the
+    # AUTH-008 Owner operations need a recent user verification. A time outside
+    # (establishment, now] is a clock or restore anomaly, so it is unusable
+    # rather than fresh and the step-up is required again. Admit/deny is all
+    # this model returns; the stale-session response belongs to the
     # shared-Tailnet-account ADR and its main-to-Web contract.
-    if (mutation and capability is Capability.OWNER
-            and now - session.verified >= policy.owner_step_up_limit):
+    if mutation and capability is Capability.OWNER and not (
+            session.issued <= session.verified <= now
+            and now - session.verified < policy.owner_step_up_limit):
         return False
     if capability in (Capability.UNKNOWN, Capability.NONOWNER_EXPORT):
         return False

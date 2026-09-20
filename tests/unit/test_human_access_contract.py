@@ -17,7 +17,8 @@ class HumanAccessContractTests(unittest.TestCase):
         self.principal = Principal(self.identity,
                                    permissions=frozenset({"live:view"}),
                                    credentials=frozenset({"credential-1"}))
-        self.policy = Policy(approved_and_implemented=True, exclusive_origin=True)
+        self.policy = Policy(approved_and_implemented=True,
+                             reserved_hostname=True)
         self.evidence = Evidence(self.identity)
         self.session = fresh_session(self.principal, self.policy, 100)
 
@@ -36,10 +37,11 @@ class HumanAccessContractTests(unittest.TestCase):
                         capability, policy=Policy(),
                         principal=replace(self.principal, owner=owner)))
 
-    def test_a_shared_browser_origin_closes_every_route(self):
-        # Without a reserved scheme/host/port, a co-hosted application shares
-        # this cookie scope and origin, so no exact-Origin or CSRF check helps.
-        closed = replace(self.policy, exclusive_origin=False)
+    def test_a_shared_hostname_closes_every_route(self):
+        # Without the reserved hostname, a neighbor shares this browser origin
+        # by path or, because cookies are not port-scoped, this cookie scope on
+        # another port. No exact-Origin, `__Host-`, or CSRF check helps then.
+        closed = replace(self.policy, reserved_hostname=False)
         for capability in Capability:
             for owner in (False, True):
                 with self.subTest(capability=capability, owner=owner):
@@ -164,6 +166,10 @@ class HumanAccessContractTests(unittest.TestCase):
 
     def test_backward_clock_and_invalid_order_fail_closed(self):
         self.assertFalse(self.allowed(now=99))
+        self.assertFalse(self.allowed(session=replace(self.session, verified=99),
+                                      capability=Capability.OWNER,
+                                      principal=replace(self.principal, owner=True),
+                                      mutation=True))
         self.assertFalse(self.allowed(session=replace(self.session, last_use=99)))
         self.assertFalse(self.allowed(session=replace(self.session, last_use=101)))
 
@@ -184,15 +190,27 @@ class HumanAccessContractTests(unittest.TestCase):
 
     def test_owner_operations_need_a_fresh_user_verification(self):
         owner = replace(self.principal, owner=True)
-        stale = replace(self.session,
-                        verified=100 - self.policy.owner_step_up_limit)
-        fresh = replace(stale, verified=101 - self.policy.owner_step_up_limit)
+        now = 100 + self.policy.owner_step_up_limit
+        stale = replace(self.session, last_use=now)
+        fresh = replace(stale, verified=now - self.policy.owner_step_up_limit + 1)
         self.assertFalse(self.allowed(Capability.OWNER, principal=owner,
-                                      session=stale, mutation=True))
+                                      session=stale, now=now, mutation=True))
         self.assertTrue(self.allowed(Capability.OWNER, principal=owner,
-                                     session=fresh, mutation=True))
+                                     session=fresh, now=now, mutation=True))
         # Freshness gates the AUTH-008 operation, not ordinary viewing.
-        self.assertTrue(self.allowed(principal=owner, session=stale))
+        self.assertTrue(self.allowed(principal=owner, session=stale, now=now))
+
+    def test_unusable_verification_time_denies_owner_operations(self):
+        # A verification stamped after now, or before this session existed,
+        # means the clock stepped or state was restored: never treat the
+        # negative or impossible interval as fresh.
+        owner = replace(self.principal, owner=True)
+        for verified in (101, 100 + self.policy.owner_step_up_limit, 99,
+                         100 - self.policy.owner_step_up_limit):
+            with self.subTest(verified=verified):
+                session = replace(self.session, verified=verified)
+                self.assertFalse(self.allowed(Capability.OWNER, principal=owner,
+                                              session=session, mutation=True))
 
     def test_recovery_requires_local_admin_evidence_and_invalidates_every_session(self):
         owner = replace(self.principal, owner=True)

@@ -198,11 +198,12 @@ proposal alone. Human routes and dashboard assets remain closed until the design
 is accepted and implemented/tested under #10. Its model tests do not validate a
 real Tailscale installation, LAN bypass resistance, or active stream cancellation.
 
-That proposal also requires an exclusive browser origin for the human listener.
-No other application, static tree, alias, or catch-all is routed on the
-configured scheme/host/port, because a co-hosted application would share the
-session cookie scope and the browser origin and could act as the current user;
-deployment and startup verify the single route target and otherwise fail closed.
+That proposal also requires a hostname reserved for the human listener on every
+scheme and port. No other application, static tree, alias, port, or catch-all
+answers for that name: one sharing a path would run in the same browser origin,
+and one on another HTTPS port would still receive the host-only session cookie,
+because cookies are not port-scoped. Deployment and startup verify the single
+route target for the whole name and otherwise fail closed.
 
 ## Capture-node pairing
 
