@@ -36,7 +36,8 @@ the backend or ingest listener.
 ## Timeline and presence screens for #26
 
 `src/views/timeline.tsx` lists one observation per row with its time, kind dot,
-neutral text, source/detector attribution and confidence/quality. Unreliable or
+neutral text, source attribution and confidence/quality. Only a detector result
+is attributed to a detector; status and control events report their kind. Unreliable or
 unavailable results stay `unknown`: a quality-gated negative is never shown as
 "no person", and a low-quality detector observation (person, motion, owner and
 anonymous entry/exit, server movement, camera tamper) is never shown as a
@@ -67,7 +68,10 @@ armed and `critical_paths_degraded` is false; aggregate degradation with every
 path armed gets its own wording rather than contradicting the breakdown; an evidence or notification path
 also reports `unavailable` while a submission is in flight or accepted but
 unconfirmed. An incomplete override expiry (`override_expiry_pending`) is
-reported so an expired override cannot look active. The control history
+reported so an expired override cannot look active. The snapshot is not left stale: the screen shows when it was fetched,
+offers an explicit refresh, and re-reads itself once a known override expiry
+passes. Override cancellation is serialized, so a second click cannot start a
+duplicate audited control operation. The control history
 explains the Owner critical-recovery actions, including that an approved
 requeue accepts a possible duplicate preservation or notification. The critical-continuity statement is shown only while every
 reported `critical_*_armed` flag is true; otherwise the screen raises a degraded

@@ -53,7 +53,10 @@ function attribution(item: Observation, t: Messages): string {
   const where = item.source_id ? `${t.attributionCamera} ${item.source_id.slice(0, 8)}`
     : item.node_id ? `${t.attributionNode} ${item.node_id.slice(0, 8)}`
       : t.attributionServer;
-  return `${where} · ${t.detector}: ${t[`kind_${item.kind}`]}`;
+  // Only a detector result is attributed to a detector; status and control
+  // events report their kind instead.
+  const origin = detectorObservation(item.kind) ? t.detector : t.originLabel;
+  return `${where} · ${origin}: ${t[`kind_${item.kind}`]}`;
 }
 
 function Row({ item, t }: { item: Observation; t: Messages }) {

@@ -197,6 +197,9 @@ try {
       assert.match(presenceText, /手動上書きを設定/);
       assert.equal(await page.evaluate('document.documentElement.scrollWidth <= window.innerWidth'), true, 'timeline and presence fit viewport');
       // Provider methods are invoked on their service; a lost receiver fails here.
+      // The refresh control re-reads the snapshot without leaving the view.
+      await page.evaluate("document.querySelector('.presence-state button').click()");
+      await page.wait("Boolean(document.querySelector('.presence-value'))");
       await page.evaluate("document.querySelector('.presence-override button').click()");
       await page.wait("document.querySelector('.presence-value').textContent === '不明'");
       const cancelledText = await page.evaluate('document.body.innerText');

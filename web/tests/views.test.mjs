@@ -184,8 +184,14 @@ test('timeline rows always carry source attribution plus confidence and quality'
   ];
   const markup = timeline(page(rows));
   assert.match(markup, /カメラ 00000000 · 検知器: 人物の観測/);
-  assert.match(markup, /キャプチャノード 00000000 · 検知器: キャプチャノード状態の観測/);
-  assert.match(markup, /メインサーバー · 検知器: 設定の更新/);
+  // A status or control event is not attributed to a detector.
+  assert.match(markup, /キャプチャノード 00000000 · 種別: キャプチャノード状態の観測/);
+  assert.match(markup, /メインサーバー · 種別: 設定の更新/);
+  for (const kind of kinds) {
+    const row = timeline(page([observation(kind)]));
+    assert.equal(/· 検知器: /.test(row), detectorObservation(kind), kind);
+    assert.equal(/· 種別: /.test(row), !detectorObservation(kind), kind);
+  }
   assert.equal((markup.match(/確度:/g) || []).length, 3);
   assert.equal((markup.match(/品質:/g) || []).length, 3);
   assert.match(markup, /確度: 42%/);
@@ -368,6 +374,23 @@ test('an incomplete override expiry is reported instead of a silently active ove
     override_expires_at: '2026-09-21T07:00:00.000000+00:00' }), audit: [] });
   assert.match(markup, /<p class="timeline-degraded" role="alert">手動上書きの期限切れ処理が完了していません。/);
   assert.doesNotMatch(presence({ snapshot: snapshot({ basis: 'manual_override' }), audit: [] }), /期限切れ処理が完了していません/);
+});
+
+test('presence offers a refresh path and serializes override cancellation', () => {
+  const active = { snapshot: snapshot({ basis: 'manual_override' }), audit: [] };
+  const idle = presence(active, 'ja', { onCancel: () => undefined, onRefresh: () => undefined, fetchedAt: '2026-09-21T09:30:00.000000+00:00' });
+  assert.match(idle, /<button[^>]*>最新の状態を取得<\/button>/);
+  assert.match(idle, /取得時刻: 2026-09-21 09:30:00/);
+  assert.match(idle, /<button[^>]*>手動上書きを取り消す<\/button>/);
+  // While a cancellation is in flight the control cannot be triggered again.
+  const pending = presence(active, 'ja', { onCancel: () => undefined, cancelling: true });
+  assert.match(pending, /<button[^>]*disabled[^>]*>取り消しています<\/button>/);
+  assert.doesNotMatch(pending, />手動上書きを取り消す</);
+  // Without providers neither affordance appears as usable.
+  const plain = presence(active, 'ja');
+  assert.doesNotMatch(plain, /最新の状態を取得/);
+  assert.doesNotMatch(plain, /取得時刻/);
+  assert.match(plain, /<button[^>]*disabled/);
 });
 
 test('degraded clock and pending critical work stay visible on presence', () => {

@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import type { CriticalPath, DashboardServices, PresenceReport, PresenceSnapshot } from '../domain';
 import type { Messages } from '../i18n';
 
@@ -13,8 +13,9 @@ function Path({ label, state, t }: { label: string; state: CriticalPath; t: Mess
   </div>;
 }
 
-export function PresenceBody({ report, t, onCancel, failed }: {
+export function PresenceBody({ report, t, onCancel, failed, cancelling, onRefresh, fetchedAt }: {
   report: PresenceReport; t: Messages; onCancel?: (() => void) | undefined; failed?: boolean | undefined;
+  cancelling?: boolean | undefined; onRefresh?: (() => void) | undefined; fetchedAt?: string | undefined;
 }) {
   const snapshot: PresenceSnapshot = report.snapshot;
   const override = snapshot.basis === 'manual_override';
@@ -30,6 +31,8 @@ export function PresenceBody({ report, t, onCancel, failed }: {
       <p className="eyebrow">{t.presenceCurrent}</p>
       <p className="presence-value">{t[`state_${snapshot.state}`]}</p>
       <p className="muted">{t.presenceBasis}: {t[`basis_${snapshot.basis}`]}</p>
+      {fetchedAt && <p className="muted">{t.presenceFetchedAt}: {stamp(fetchedAt)}</p>}
+      {onRefresh && <button type="button" onClick={onRefresh}>{t.presenceRefresh}</button>}
       {snapshot.clock_degraded && <p className="timeline-degraded" role="status">{t.clockDegradedNotice}</p>}
     </section>
     <section className="presence-override" aria-label={t.overrideCancel}>
@@ -38,8 +41,8 @@ export function PresenceBody({ report, t, onCancel, failed }: {
       <p className="muted">{t.overridePrecedence}</p>
       {override && <p>{t.overrideExpires}: {snapshot.override_expires_at
         ? stamp(snapshot.override_expires_at) : t.overrideNoExpiry}</p>}
-      {override && <button type="button" className="primary" disabled={!onCancel}
-        onClick={() => onCancel?.()}>{t.overrideCancel}</button>}
+      {override && <button type="button" className="primary" disabled={!onCancel || cancelling}
+        onClick={() => onCancel?.()}>{cancelling ? t.overrideCancelling : t.overrideCancel}</button>}
       {override && !onCancel && <p className="muted">{t.foundation}</p>}
       {snapshot.override_expiry_pending && <p className="timeline-degraded" role="alert">{t.overrideExpiryPending}</p>}
       {failed && <p role="alert">{t.overrideFailed}</p>}
@@ -86,9 +89,16 @@ export function PresenceBody({ report, t, onCancel, failed }: {
 
 type State = { state: 'pending' } | { state: 'loading' } | { state: 'failed' } | { state: 'ready'; report: PresenceReport };
 
+const HOUR = 3600000;
+
 export function PresenceScreen({ services, t }: { services: DashboardServices; t: Messages }) {
   const [data, setData] = useState<State>({ state: 'pending' });
   const [failed, setFailed] = useState(false);
+  const [cancelling, setCancelling] = useState(false);
+  const [attempt, setAttempt] = useState(0);
+  const [fetchedAt, setFetchedAt] = useState<string | null>(null);
+  // One audited control operation at a time, independent of render timing.
+  const inFlight = useRef(false);
   // Bound to the service so class-based providers keep their receiver.
   const cancel = services.cancelPresenceOverride?.bind(services);
 
@@ -100,13 +110,27 @@ export function PresenceScreen({ services, t }: { services: DashboardServices; t
     void (async () => {
       try {
         const report = await load(controller.signal);
-        if (!controller.signal.aborted) setData({ state: 'ready', report });
+        if (!controller.signal.aborted) {
+          setData({ state: 'ready', report });
+          setFetchedAt(new Date().toISOString());
+        }
       } catch {
         if (!controller.signal.aborted) setData({ state: 'failed' });
       }
     })();
     return () => controller.abort();
-  }, [services]);
+  }, [services, attempt]);
+
+  const expiry = data.state === 'ready' ? data.report.snapshot.override_expires_at : null;
+  useEffect(() => {
+    // A known expiry must not leave an expired override on screen as active.
+    if (!expiry) return;
+    const remaining = Date.parse(expiry) - Date.now();
+    if (Number.isNaN(remaining)) return;
+    const timer = setTimeout(() => setAttempt(value => value + 1),
+      Math.min(Math.max(remaining + 1000, 1000), HOUR));
+    return () => clearTimeout(timer);
+  }, [expiry]);
 
   if (data.state === 'failed') return <p role="alert">{t.presenceUnavailable}</p>;
   if (data.state === 'loading') return <p role="status">{t.checking}</p>;
@@ -115,12 +139,23 @@ export function PresenceScreen({ services, t }: { services: DashboardServices; t
       <h2>{t.presence}</h2><p>{t.foundation}</p></section>;
   }
   const request = cancel ? () => {
-    const controller = new AbortController();
+    if (inFlight.current) return;
+    inFlight.current = true;
+    setCancelling(true);
     setFailed(false);
+    const controller = new AbortController();
     void (async () => {
-      try { setData({ state: 'ready', report: await cancel(controller.signal) }); }
-      catch { setFailed(true); }
+      try {
+        const report = await cancel(controller.signal);
+        setData({ state: 'ready', report });
+        setFetchedAt(new Date().toISOString());
+      } catch { setFailed(true); } finally {
+        inFlight.current = false;
+        setCancelling(false);
+      }
     })();
   } : undefined;
-  return <PresenceBody report={data.report} t={t} onCancel={request} failed={failed} />;
+  return <PresenceBody report={data.report} t={t} onCancel={request} failed={failed}
+    cancelling={cancelling} onRefresh={() => setAttempt(value => value + 1)}
+    fetchedAt={fetchedAt ?? undefined} />;
 }
