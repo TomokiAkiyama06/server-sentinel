@@ -13,7 +13,7 @@ SCHEMA = (
     "CREATE TABLE uvc_approvals (source_id TEXT PRIMARY KEY "
     "REFERENCES camera_sources(id), evidence TEXT NOT NULL, "
     "requires_approval INTEGER NOT NULL CHECK (requires_approval IN (0, 1)), "
-    "session_token TEXT)"
+    "session_token TEXT, serial_ambiguous INTEGER NOT NULL CHECK (serial_ambiguous IN (0, 1)))"
 )
 
 
@@ -26,6 +26,7 @@ class ApprovalState:
     approved: DeviceEvidence = field(repr=False)
     requires_approval: bool
     session_token: str | None = field(default=None, repr=False)
+    serial_ambiguous: bool = False
 
 
 class ApprovalStore:
@@ -47,14 +48,15 @@ class ApprovalStore:
         evidence["formats"] = tuple(evidence["formats"])
         if evidence.get("instance_token") is not None:
             evidence["instance_token"] = tuple(evidence["instance_token"])
-        return ApprovalState(DeviceEvidence(**evidence), bool(row[1]), row[2])
+        return ApprovalState(DeviceEvidence(**evidence), bool(row[1]), row[2], bool(row[3]))
 
     def load(self, source_id):
         connection = None
         try:
             connection = self.database.connect()
             row = connection.execute(
-                "SELECT evidence, requires_approval, session_token FROM uvc_approvals WHERE source_id = ?",
+                "SELECT evidence, requires_approval, session_token, serial_ambiguous "
+                "FROM uvc_approvals WHERE source_id = ?",
                 (str(source_id),),
             ).fetchone()
             return self._state(row)
@@ -76,21 +78,23 @@ class ApprovalStore:
             connection = self.database.connect()
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
-                "SELECT evidence, requires_approval, session_token FROM uvc_approvals WHERE source_id = ?",
+                "SELECT evidence, requires_approval, session_token, serial_ambiguous "
+                "FROM uvc_approvals WHERE source_id = ?",
                 (str(source_id),),
             ).fetchone()
             prior = self._state(row)
             approved = initial_approved if prior is None else prior.approved
             required = False if prior is None else prior.requires_approval or prior.session_token is not None
+            ambiguous = False if prior is None else prior.serial_ambiguous
             token = str(uuid4())
             connection.execute(
-                "INSERT INTO uvc_approvals VALUES (?, ?, ?, ?) ON CONFLICT(source_id) "
+                "INSERT INTO uvc_approvals VALUES (?, ?, ?, ?, ?) ON CONFLICT(source_id) "
                 "DO UPDATE SET evidence = excluded.evidence, requires_approval = excluded.requires_approval, "
-                "session_token = excluded.session_token",
-                (str(source_id), json.dumps(asdict(approved), allow_nan=False), int(required), token),
+                "session_token = excluded.session_token, serial_ambiguous = excluded.serial_ambiguous",
+                (str(source_id), json.dumps(asdict(approved), allow_nan=False), int(required), token, int(ambiguous)),
             )
             connection.commit()
-            return ApprovalState(approved, required, token)
+            return ApprovalState(approved, required, token, ambiguous)
         except (sqlite3.Error, ValueError, TypeError, KeyError):
             if connection is not None:
                 connection.rollback()
@@ -99,7 +103,7 @@ class ApprovalStore:
             if connection is not None:
                 connection.close()
 
-    def save(self, source_id, approved, requires_approval, *, session_token, release=False):
+    def save(self, source_id, approved, requires_approval, *, session_token, serial_ambiguous, release=False):
         if session_token is None:
             raise ApprovalStorageError("UVC approval session is not active")
         evidence = json.dumps(asdict(approved), allow_nan=False, separators=(",", ":"))
@@ -108,10 +112,10 @@ class ApprovalStore:
             connection = self.database.connect()
             connection.execute("BEGIN IMMEDIATE")
             changed = connection.execute(
-                "UPDATE uvc_approvals SET evidence = ?, requires_approval = ?, session_token = ? "
+                "UPDATE uvc_approvals SET evidence = ?, requires_approval = ?, session_token = ?, serial_ambiguous = ? "
                 "WHERE source_id = ? AND session_token = ?",
                 (evidence, int(requires_approval), None if release else session_token,
-                 str(source_id), session_token),
+                 int(serial_ambiguous), str(source_id), session_token),
             )
             if changed.rowcount != 1:
                 connection.rollback()

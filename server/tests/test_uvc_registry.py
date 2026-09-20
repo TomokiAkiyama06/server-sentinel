@@ -111,6 +111,7 @@ class UvcRegistryTests(unittest.TestCase):
 
     def test_restart_without_profile_keeps_durable_manual_state_without_churn(self):
         self.adapter.approve_source(self.source.id, self.camera)
+        self.adapter.sessions[self.source.id].close()
         self.discovery.devices.append(replace(self.camera, device_path="/dev/video2"))
         self.assertFalse(self.adapter.poll_source(self.source.id))
         self.assertTrue(self.adapter.store.load(self.source.id).requires_approval)

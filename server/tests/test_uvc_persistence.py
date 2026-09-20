@@ -45,8 +45,9 @@ class PersistenceTests(unittest.TestCase):
         restarted.capture_closed()
         restarted.shutdown()
         second_restart = self.controller()
-        self.assertEqual(second_restart.reconcile([self.camera]), self.camera)
-        self.assertEqual(second_restart.state, CameraState.DEGRADED)
+        self.assertIsNone(second_restart.reconcile([self.camera]))
+        self.assertEqual(second_restart.state, CameraState.MANUAL)
+        self.assertTrue(self.store.load(self.source_id).serial_ambiguous)
 
     def test_weak_approval_survives_live_poll_but_not_restart(self):
         weak = replace(self.camera, serial=None)
@@ -120,6 +121,17 @@ class PersistenceTests(unittest.TestCase):
         with self.assertRaises(ApprovalStorageError):
             self.controller()
         self.assertIsNone(self.store.load(self.source_id))
+
+    def test_owner_selection_of_a_different_unique_serial_can_establish_new_identity(self):
+        control = self.controller()
+        control.reconcile([self.camera, replace(self.camera, device_path="/dev/video1")])
+        new_camera = replace(self.camera, serial="new-synthetic-unique-serial")
+        control.approve(new_camera, [new_camera])
+        self.assertFalse(control.serial_ambiguous)
+        control.capture_closed()
+        control.shutdown()
+        restarted = self.controller()
+        self.assertEqual(restarted.reconcile([new_camera]), new_camera)
 
 
 if __name__ == "__main__":

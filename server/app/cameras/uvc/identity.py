@@ -71,16 +71,18 @@ class IdentityDecision:
     candidates: tuple[DeviceEvidence, ...] = field(default=(), repr=False)
 
 
-def match_reconnect(approved: DeviceEvidence, devices: tuple[DeviceEvidence, ...]):
+def match_reconnect(approved: DeviceEvidence, devices: tuple[DeviceEvidence, ...], *, serial_ambiguous=False):
     """Return a unique serial match, or explicitly refuse to choose a device."""
-    if approved.strong_key is not None:
+    if approved.strong_key is not None and not serial_ambiguous:
         matches = tuple(d for d in devices if d.strong_key == approved.strong_key)
         if len(matches) == 1:
             return IdentityDecision(CameraState.DEGRADED, "identity_matched", matches[0])
         if len(matches) > 1:
             return IdentityDecision(CameraState.MANUAL, "duplicate_identity", candidates=matches)
         return IdentityDecision(CameraState.OFFLINE, "approved_device_absent")
-    matches = tuple(d for d in devices if d.model_key == approved.model_key)
+    matches = tuple(d for d in devices if (
+        d.strong_key == approved.strong_key if approved.strong_key is not None else d.model_key == approved.model_key
+    ))
     if matches:
         # A reused USB port or /dev/videoN cannot prove that the old non-serial
         # camera returned, even if only one indistinguishable candidate remains.
@@ -113,11 +115,13 @@ class ReconnectController:
         self.store = store
         saved = store.start_session(source_id, approved) if store is not None else None
         self._session_token = saved.session_token if saved else None
+        self.serial_ambiguous = saved.serial_ambiguous if saved else False
         self.approved = saved.approved if saved else approved
         self.emit = emit
         self.enabled = enabled
         self.state = CameraState.OFFLINE
         self.bound = None
+        self._explicit_binding = False
         self.requires_approval = saved.requires_approval if saved else False
         self._reason = "not_started"
         self._finished = False
@@ -125,7 +129,7 @@ class ReconnectController:
     def _persist(self):
         if self.store is not None:
             self.store.save(self.source_id, self.approved, self.requires_approval,
-                            session_token=self._session_token)
+                            session_token=self._session_token, serial_ambiguous=self.serial_ambiguous)
 
     def _transition(self, state, reason):
         changed = (self.state, self._reason) != (state, reason)
@@ -153,12 +157,16 @@ class ReconnectController:
         # Losing that descriptor ends this allowance, including process restart.
         if self.bound is not None and devices.count(self.bound) == 1:
             peers = [d for d in devices if d.strong_key == self.bound.strong_key]
-            if self.bound.strong_key is None or len(peers) == 1:
+            if (self._explicit_binding or self.bound.strong_key is None
+                    or not self.serial_ambiguous and len(peers) == 1):
                 return self.bound
-        decision = match_reconnect(self.approved, devices)
+        decision = match_reconnect(self.approved, devices, serial_ambiguous=self.serial_ambiguous)
         self.bound = decision.device
+        self._explicit_binding = False
         if decision.state == CameraState.MANUAL:
             self.requires_approval = True
+            if decision.reason == "duplicate_identity":
+                self.serial_ambiguous = True
             self._persist()
         self._transition(decision.state, decision.reason)
         return self.bound
@@ -166,11 +174,20 @@ class ReconnectController:
     def approve(self, candidate, current_devices):
         # Exact current candidate selection is required. A remembered device
         # path cannot approve a candidate that vanished during the ceremony.
-        if self._finished or not self.enabled or tuple(current_devices).count(candidate) != 1:
+        current_devices = tuple(current_devices)
+        if (self._finished or not self.enabled or not isinstance(candidate, DeviceEvidence)
+                or current_devices.count(candidate) != 1):
             raise ValueError("candidate is unavailable or ambiguous")
+        ambiguous = (self.serial_ambiguous and candidate.strong_key == self.approved.strong_key
+                     or candidate.strong_key is not None and sum(
+                         device.strong_key == candidate.strong_key for device in current_devices
+                     ) > 1)
         if self.store is not None:
-            self.store.save(self.source_id, candidate, False, session_token=self._session_token)
+            self.store.save(self.source_id, candidate, False, session_token=self._session_token,
+                            serial_ambiguous=ambiguous)
         self.approved = self.bound = candidate
+        self._explicit_binding = True
+        self.serial_ambiguous = ambiguous
         self.requires_approval = False
         self._transition(CameraState.DEGRADED, "owner_approved_pending_capture")
 
@@ -196,7 +213,7 @@ class ReconnectController:
             raise ValueError("capture binding must close before shutdown")
         if self.store is not None and self._session_token is not None:
             self.store.save(self.source_id, self.approved, self.requires_approval,
-                            session_token=self._session_token, release=True)
+                            session_token=self._session_token, serial_ambiguous=self.serial_ambiguous, release=True)
             self._session_token = None
         self._finished = True
 

@@ -235,6 +235,9 @@ An unclean session, including a failed ambiguity-latch write, requires Owner
 reapproval at restart; it cannot fall back to an older clean approval record.
 Clean shutdown releases this marker after closing capture while retaining any
 manual-approval latch. A missing capture profile does not hide that latch.
+Known duplicated serials remain unsuitable for automatic reconnect even after the current physical
+candidate is explicitly approved. This confidence is stored separately from raw
+device evidence. A different unique serial may establish a new strong identity.
 
 ## 5. `media-capture-agent`
 

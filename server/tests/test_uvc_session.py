@@ -108,6 +108,17 @@ class SessionTests(unittest.TestCase):
         self.assertEqual(self.controller.state, CameraState.MANUAL)
         self.assertEqual(self.frames, [])
 
+    def test_owner_can_select_one_current_duplicate_until_descriptor_closes(self):
+        duplicate = replace(self.camera, device_path="/dev/video1", instance_token=(1, 3, 4))
+        self.discovery.devices.append(duplicate)
+        self.assertFalse(self.session.step())
+        self.controller.approve(duplicate, self.discovery.devices)
+        self.assertTrue(self.session.step())
+        self.assertEqual(self.controller.state, CameraState.ONLINE)
+        self.session.close()
+        self.assertFalse(self.session.step())
+        self.assertEqual(self.controller.state, CameraState.MANUAL)
+
 
 if __name__ == "__main__":
     unittest.main()

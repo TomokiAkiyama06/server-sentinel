@@ -32,7 +32,11 @@ approval instead of trusting the earlier approval value. A clean shutdown closes
 capture before releasing this marker, preserving any existing ambiguity latch.
 Session-token checks prevent an old controller's shutdown from clearing a newer
 session. This means an unclean restart conservatively requires reapproval even
-for serial-backed devices. A clean restart can reconnect a unique serial device.
+for serial-backed devices. Known duplicated serials are persisted as ambiguous.
+Owner selection permits that exact current binding; it does not make the same
+serial trustworthy for a later reconnect. A different uniquely observed serial
+can establish new approved identity. A clean session with no known serial ambiguity
+can still reconnect its unique serial device automatically.
 
 `MmapCapture` implements single-planar streaming on Linux LP64 x86_64/aarch64.
 It opens only a selected `/dev/videoN` with no symlink following, checks the
