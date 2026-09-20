@@ -311,6 +311,25 @@ try {
         ['synthetic-recording-0']);
       await page.evaluate("window.slowRecordingLoads(0); window.mutationPlan({})");
     });
+    // Retrying the same recording raises a newer failure. A reload that began
+    // before that retry failed must not claim to have answered for it.
+    await scenario(viewport, { recordings: 3 }, async page => {
+      await page.click('録画');
+      await page.wait("document.querySelectorAll('[data-recording-id]').length === 3");
+      await page.evaluate("window.mutationPlan({ 'synthetic-recording-0': { fail: true } })");
+      await page.evaluate("document.querySelector('[data-recording-id=\"synthetic-recording-0\"] .row-actions button').click()");
+      await page.wait("document.querySelectorAll('[data-write-failed=\"true\"]').length === 1");
+      // Retry the same row, then reload before that retry settles.
+      await page.evaluate("window.mutationPlan({ 'synthetic-recording-0': { fail: true, delay: 700 } }); window.slowRecordingLoads(1200)");
+      await page.evaluate("document.querySelector('[data-recording-id=\"synthetic-recording-0\"] .row-actions button').click()");
+      await page.evaluate("document.querySelector('.write-alert .primary').click()");
+      await page.wait("document.querySelectorAll('[data-recording-id]').length === 3");
+      // The retry failed after the reload began, so its marker survives.
+      assert.deepEqual(await page.evaluate("Array.from(document.querySelectorAll('[data-write-failed=\"true\"]')).map(el => el.dataset.recordingId)"),
+        ['synthetic-recording-0']);
+      assert.equal(await page.evaluate("document.querySelectorAll('.write-alert').length"), 1);
+      await page.evaluate("window.slowRecordingLoads(0); window.mutationPlan({})");
+    });
     // The reload control must not clear the markers before a reload succeeds.
     await scenario(viewport, { recordings: 3 }, async page => {
       await page.click('録画');

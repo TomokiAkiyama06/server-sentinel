@@ -65,8 +65,10 @@ the loaded list with a read-failure banner, because the server-side result of
 that write is unknown rather than the list being unavailable. Those unknown
 results are tracked per recording and the affected rows are marked. Only a
 recording-list reload that actually succeeds clears them, and it clears only the
-markers that existed when that reload began, so a write failing while the
-request was already in flight keeps its marker. Requesting a reload never
+failures raised before that reload began. Each failure carries a sequence
+number rather than just a recording id, so retrying an already-marked recording
+raises a newer failure that an in-flight reload cannot claim to have answered
+for. Requesting a reload never
 clears anything by itself: if the reload fails, the list-unavailable notice
 still reports the unknown results. A write that succeeds drops the list in the
 same commit as its reload request, so a deleted row cannot briefly stay
