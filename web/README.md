@@ -76,8 +76,8 @@ also reports `unavailable` while a submission is in flight or accepted but
 unconfirmed. An incomplete override expiry (`override_expiry_pending`) is
 reported so an expired override cannot look active. The snapshot is not left stale: the screen shows when it was fetched,
 offers an explicit refresh, and re-reads itself once a known future override
-expiry passes (at most hourly, and never rescheduling an expiry that already
-passed); that automatic re-read defers while a control operation is in flight,
+expiry passes (checked at most hourly and re-armed until that expiry is
+actually reached, never rescheduling an expiry that already passed); that automatic re-read defers while a control operation is in flight,
 and a read that a newer control result superseded is discarded. A failed
 refresh keeps the last known status, its fetch time and the retry control. Override cancellation is serialized, so a second click cannot start a
 duplicate audited control operation. The control history

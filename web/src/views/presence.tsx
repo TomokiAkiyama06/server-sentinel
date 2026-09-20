@@ -106,6 +106,29 @@ export function refreshDelay(expiry: string | null, now: number): number | null 
   return Math.min(remaining + 1000, HOUR);
 }
 
+/** Re-arms bounded checks until a distant expiry is actually reached.
+ *
+ * A clamped hourly check refreshes the snapshot and schedules the next one, so
+ * an override that outlives the clamp cannot keep reporting itself as active
+ * after it expired. An audited control operation in flight defers the check.
+ */
+export function scheduleExpiryRefresh(expiry: string | null, refresh: () => void,
+  busy: () => boolean, now: () => number = Date.now): () => void {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  function arm() {
+    const delay = refreshDelay(expiry, now());
+    timer = delay === null ? undefined : setTimeout(fire, delay);
+  }
+  function fire() {
+    // An audited control result always wins over an automatic re-read.
+    if (busy()) { timer = setTimeout(fire, 1000); return; }
+    refresh();
+    arm();
+  }
+  arm();
+  return () => { if (timer !== undefined) clearTimeout(timer); };
+}
+
 export function PresenceScreen({ services, t }: { services: DashboardServices; t: Messages }) {
   const [data, setData] = useState<State>({ state: 'pending' });
   const [failed, setFailed] = useState(false);
@@ -145,19 +168,9 @@ export function PresenceScreen({ services, t }: { services: DashboardServices; t
   }, [services, attempt]);
 
   const expiry = data.state === 'ready' ? data.report.snapshot.override_expires_at : null;
-  useEffect(() => {
-    // A known expiry must not leave an expired override on screen as active.
-    const delay = refreshDelay(expiry, Date.now());
-    if (delay === null) return;
-    let timer: ReturnType<typeof setTimeout>;
-    const fire = () => {
-      // An audited control result always wins over an automatic re-read.
-      if (inFlight.current) { timer = setTimeout(fire, 1000); return; }
-      setAttempt(value => value + 1);
-    };
-    timer = setTimeout(fire, delay);
-    return () => clearTimeout(timer);
-  }, [expiry]);
+  // A known expiry must not leave an expired override on screen as active.
+  useEffect(() => scheduleExpiryRefresh(expiry, () => setAttempt(value => value + 1),
+    () => inFlight.current), [expiry]);
 
   if (data.state === 'failed') return <p role="alert">{t.presenceUnavailable}</p>;
   if (data.state === 'loading') return <p role="status">{t.checking}</p>;

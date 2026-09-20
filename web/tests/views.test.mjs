@@ -1,4 +1,4 @@
-import test from 'node:test';
+import test, { mock } from 'node:test';
 import assert from 'node:assert/strict';
 import { createElement } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
@@ -11,7 +11,7 @@ await compile('src/views/presence.tsx', 'build/presence.mjs');
 const { canVisit, views } = await import('../build/domain.mjs');
 const { messages } = await import('../build/i18n.mjs');
 const { TimelineBody, cursorAdvanced, detectorObservation, displayValue, filters, kindGroup, matches, spans } = await import('../build/timeline.mjs');
-const { PresenceBody, refreshDelay } = await import('../build/presence.mjs');
+const { PresenceBody, refreshDelay, scheduleExpiryRefresh } = await import('../build/presence.mjs');
 
 // Synthetic only: no real person, deployment, camera or identity value appears here.
 const kinds = ['person', 'motion', 'owner_entry', 'owner_exit', 'anonymous_entry', 'anonymous_exit',
@@ -454,6 +454,48 @@ test('basis timing and observation timing are reported as separate facts', () =>
     suppress_ordinary: true, observation_clock_degraded: true }), audit: [] });
   assert.doesNotMatch(override, /一致していません/);
   assert.match(override, /PRESENT かつ時刻が信頼できるため、通常の occupancy automation を抑制しています。/);
+});
+
+test('a clamped expiry re-arms until the override actually expires', () => {
+  mock.timers.enable({ apis: ['setTimeout'] });
+  try {
+    let refreshes = 0;
+    let current = Date.parse('2026-09-21T09:00:00.000Z');
+    const tick = milliseconds => { current += milliseconds; mock.timers.tick(milliseconds); };
+    // An override three hours out is checked hourly, then once at its expiry.
+    const stop = scheduleExpiryRefresh('2026-09-21T12:00:30.000000+00:00',
+      () => { refreshes += 1; }, () => false, () => current);
+    for (const expected of [1, 2, 3]) {
+      tick(3600000);
+      assert.equal(refreshes, expected);
+    }
+    tick(31000);
+    assert.equal(refreshes, 4);
+    // Once the expiry has passed nothing is scheduled again.
+    tick(3600000 * 5);
+    assert.equal(refreshes, 4);
+    stop();
+  } finally { mock.timers.reset(); }
+});
+
+test('an expiry check defers while an audited control operation is in flight', () => {
+  mock.timers.enable({ apis: ['setTimeout'] });
+  try {
+    let refreshes = 0;
+    let busy = true;
+    let current = Date.parse('2026-09-21T09:00:00.000Z');
+    const tick = milliseconds => { current += milliseconds; mock.timers.tick(milliseconds); };
+    const stop = scheduleExpiryRefresh('2026-09-21T09:00:30.000000+00:00',
+      () => { refreshes += 1; }, () => busy, () => current);
+    tick(31000);
+    assert.equal(refreshes, 0);
+    tick(5000);
+    assert.equal(refreshes, 0);
+    busy = false;
+    tick(1000);
+    assert.equal(refreshes, 1);
+    stop();
+  } finally { mock.timers.reset(); }
 });
 
 test('degraded clock and pending critical work stay visible on presence', () => {
