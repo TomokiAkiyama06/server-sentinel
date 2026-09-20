@@ -3,11 +3,15 @@
 Status: Accepted
 Date: 2026-09-20
 
-Recorded for Issue #6 (Owner authorization / trusted Tailscale identity) and enforced by Issue #10 (human access enforcement). The shared research-room Tailscale account and the requirement for per-person application credentials are deployment constraints stated by the repository owner; this ADR takes effect when the owner merges the pull request that adds it. Issue #6 stays Open until its implementation and manual verification land, so this ADR records the decision only, not its enforcement.
+## What this status covers
 
-Relationship to ADR-0003 (*Owner authentication and the trusted human-access boundary*, also Issue #6): this ADR records the deployment constraint — one shared Tailscale account — and the resulting decision to authorize on a per-person ServerSentinel credential, while ADR-0003 works out the implementation boundary around it (owner bootstrap and recovery, the trusted-proxy path, and session/revocation mechanics). Where the two overlap, a verified Tailscale/trusted-proxy identity is supplementary under this ADR and never sufficient on its own.
+Accepted means the repository owner has settled the decisions below: the research room shares one Tailscale account, and application authorization rests on per-person ServerSentinel credentials.
 
-ADR-0003 arrives with a separate open pull request for Issue #6 and is therefore not in the repository yet; the number is reserved for it, which is why this record is 0004. ADR-0003 is `Proposed`, so the concrete parameters of that boundary — including session idle/absolute lifetimes and the exact identity-header handling — are settled there and in Issue #6, not here. Until it lands, treat the references to ADR-0003 below as pointing at that pending record.
+It does not open human access, and by itself it does not discharge the Issue #6 prerequisite. That prerequisite is met only when the companion record for owner authentication and the trusted human-access boundary is accepted as well. Human routes stay closed until Issue #10 implements and tests both, which is what `docs/INITIAL_ISSUES.md` and `server/docs/FOUNDATION.md` continue to say.
+
+That companion record is ADR-0003 (*Owner authentication and the trusted human-access boundary*, also Issue #6). It arrives with a separate open pull request, so the number is reserved for it and this record is 0004. It is `Proposed`, and the parameters of that boundary — session idle and absolute lifetimes, the owner step-up freshness window, and the exact identity-header handling — are settled there and in Issue #6 rather than here.
+
+The division of labour: this ADR records the deployment constraint (one shared Tailscale account) and the resulting decision to authorize on a per-person credential; ADR-0003 works out the boundary around it (owner bootstrap and recovery, the trusted-proxy path, session and revocation mechanics). Where they overlap, a verified Tailscale/trusted-proxy identity is supplementary under this ADR and never sufficient on its own.
 
 ## Context
 
@@ -57,7 +61,7 @@ Redemption is rate-limited, registers exactly one credential for the named princ
 
 ### 5. Owner operations need a fresh user verification
 
-The AUTH-008 owner operations require a user verification newer than a bounded freshness window, so a long-lived or unattended owner session cannot revoke users, change retention/security settings or delete recordings by itself. A failed, cancelled or declined step-up leaves the operation unperformed, changes no state and returns only the generic failure. The exact freshness window is a parameter of ADR-0003/Issue #6.
+The AUTH-008 owner operations require a user verification newer than a bounded freshness window, so a long-lived or unattended owner session cannot revoke users, change retention/security settings or delete recordings by itself. A failed, cancelled or declined step-up leaves the operation unperformed, changes no state and returns only the generic failure. The exact freshness window is settled with the Issue #6 boundary record.
 
 ### 6. Device approval is not person identification
 

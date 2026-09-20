@@ -3,10 +3,11 @@
 The runnable foundation contains configuration validation, SQLite migrations,
 structured logging and a FastAPI lifespan. It does not capture, record, infer,
 pair agents or authenticate people. Issue #6's Owner-approved authorization ADR
-and Issue #10's enforcement are prerequisites to opening human routes. The ADR is
-recorded as `docs/ADR/0004-shared-tailnet-account-authorization.md`; its per-person
-credential check is part of what Issue #10 must implement before any human route
-opens.
+and Issue #10's enforcement are prerequisites to opening human routes. Half of
+that ADR work is recorded in `docs/ADR/0004-shared-tailnet-account-authorization.md`
+(shared Tailscale account, per-person credentials); the owner-authentication and
+trusted-proxy boundary record is still pending, and human routes stay closed
+until both are accepted and Issue #10 implements them.
 
 ## Running locally
 
