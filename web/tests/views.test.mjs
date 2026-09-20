@@ -30,6 +30,8 @@ const storage = {
   recording_limit_bytes: 85_899_345_920, critical_allowance_bytes: 2_147_483_648,
   recording_retention_days: 20, audit_retention_days: 90, agent_incident_retention_days: 60,
   slack_configured: false, daily_summary_local_time: '23:00',
+  audit_delivery_failed: false, cleanup_failed: false,
+  notification_delivery_failed: false, notification_log_failed: false,
 };
 const actions = { star() { assert.fail('render must not mutate'); }, remove() { assert.fail('render must not mutate'); } };
 const recordingsMarkup = (owner, { recordings: items = recordings, ...extra } = {}) =>
@@ -207,4 +209,38 @@ test('a consumed hard reserve is never drawn as intact space', () => {
   // The configured target stays visible as a separate figure, not as space.
   assert.ok(markup.includes(messages.ja.reserveTarget));
   assert.match(markup, /aria-current="true"/);
+});
+
+test('a healthy backend shows no fault alert', () => {
+  const markup = storageMarkup();
+  assert.doesNotMatch(markup, /data-fault=/);
+  assert.doesNotMatch(markup, /fault-alert/);
+});
+
+test('sticky backend faults stay visible after the state recovers', () => {
+  // NORMAL capacity must not hide a lost transition audit or a stalled cleanup.
+  const markup = storageMarkup('ja', { ...storage, state: 'NORMAL', audit_delivery_failed: true, cleanup_failed: true });
+  assert.match(markup, /class="fault-alert" role="alert"/);
+  for (const name of ['audit_delivery_failed', 'cleanup_failed']) {
+    assert.match(markup, new RegExp(`data-fault="${name}"`));
+    assert.ok(markup.includes(messages.ja[`fault_${name}`]));
+  }
+  assert.ok(markup.includes(messages.ja.state_NORMAL));
+});
+
+test('a configured Slack that lost a notification is not reported as healthy', () => {
+  const markup = storageMarkup('ja', {
+    ...storage, slack_configured: true,
+    notification_delivery_failed: true, notification_log_failed: true,
+  });
+  assert.ok(markup.includes(messages.ja.slackEnabled));
+  for (const name of ['notification_delivery_failed', 'notification_log_failed']) {
+    assert.match(markup, new RegExp(`data-fault="${name}"`));
+    assert.ok(markup.includes(messages.ja[`fault_${name}`]));
+  }
+  // Still no credential, in either locale.
+  for (const locale of ['ja', 'en']) {
+    assert.doesNotMatch(storageMarkup(locale, { ...storage, notification_delivery_failed: true }),
+      /hooks\.slack\.com|xox[baprs]-|webhook/i);
+  }
 });

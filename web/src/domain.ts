@@ -49,6 +49,12 @@ export interface StorageSummary {
   agent_incident_retention_days: number;
   slack_configured: boolean;
   daily_summary_local_time: string;
+  /** Sticky backend faults. A recovered state never hides a lost audit record,
+   *  an unfinished cleanup, or a notification that was never delivered. */
+  audit_delivery_failed: boolean;
+  cleanup_failed: boolean;
+  notification_delivery_failed: boolean;
+  notification_log_failed: boolean;
 }
 
 export interface DashboardServices {

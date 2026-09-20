@@ -31,7 +31,23 @@ export function App({ services = deniedServices }: { services?: DashboardService
   const [busy, setBusy] = useState<readonly string[]>([]);
   const [writeFailed, setWriteFailed] = useState(false);
   const [mutations] = useState(() => new MutationQueue());
+  const [loadedFor, setLoadedFor] = useState({ services, attempt });
   const t = messages[locale];
+
+  // Replacing the provider or retrying must not paint the previous session's
+  // data for even one commit, so the reset happens during render rather than in
+  // a passive effect that runs after the browser already has the old rows.
+  if (loadedFor.services !== services || loadedFor.attempt !== attempt) {
+    setLoadedFor({ services, attempt });
+    setAccess({ state: 'loading' });
+    setSources({ state: 'pending' });
+    setRecordings({ state: 'pending' });
+    setStorage({ state: 'pending' });
+    setView('overview');
+    setBusy([]);
+    setWriteFailed(false);
+    mutations.abortAll();
+  }
 
   useEffect(() => { document.documentElement.lang = locale; }, [locale]);
   useEffect(() => {

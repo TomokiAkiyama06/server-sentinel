@@ -77,6 +77,17 @@ configured, with the 23:00 local daily summary, immediate critical/hardware/
 self-test alerts, and ordinary person/motion aggregated into the summary. No
 Slack credential is rendered.
 
+Backend faults stay visible instead of being smoothed over: a lost storage
+transition audit, an unfinished retention cleanup, an undelivered Slack
+notification and an unrecorded notification each raise their own owner-visible
+alert, even once capacity has recovered to `NORMAL` and even while Slack still
+reads as configured.
+
+Replacing the provider or retrying the session resets the cached session,
+sources, recordings, storage and pending writes during render rather than in a
+passive effect, so the previous session's rows are never committed to the screen
+under a new provider.
+
 `canVisit` keeps `storage` owner-only and `recordings` behind `recordings:view`;
 `live:view` alone reaches neither the recording list nor historical metadata.
 The production entry still uses `deniedServices`, which supplies no recording,

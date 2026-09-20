@@ -63,4 +63,12 @@ const services = {
   },
 };
 const root = document.getElementById('root');
-if (root) createRoot(root).render(<App services={services} />);
+if (root) {
+  const tree = createRoot(root);
+  tree.render(<App services={services} />);
+  // Test-only provider switch. The replacement never resolves a session, so any
+  // data still on screen afterwards came from the previous provider.
+  Object.defineProperty(window, 'switchProvider', {
+    value: () => tree.render(<App services={{ loadSession: () => new Promise<Session>(() => {}) }} />),
+  });
+}

@@ -18,6 +18,14 @@ export function StorageView({ t, storage }: { t: Catalog; storage: StorageSummar
     ['reserve', reserve],
   ] as const;
   const total = segments.reduce((sum, [, value]) => sum + value, 0);
+  const faults = ([
+    ['audit_delivery_failed', storage.audit_delivery_failed],
+    ['cleanup_failed', storage.cleanup_failed],
+  ] as const).filter(([, failed]) => failed);
+  const notificationFaults = ([
+    ['notification_delivery_failed', storage.notification_delivery_failed],
+    ['notification_log_failed', storage.notification_log_failed],
+  ] as const).filter(([, failed]) => failed);
   const retention = [
     ['main', t.retentionMainRecordings, storage.recording_retention_days, t.retentionMainNote],
     ['audit', t.retentionAudit, storage.audit_retention_days, t.retentionAuditNote],
@@ -32,6 +40,8 @@ export function StorageView({ t, storage }: { t: Catalog; storage: StorageSummar
     </div>
     <p>{t.currentState}: <strong>{t[`state_${storage.state}`]}</strong></p>
     <p className="muted">{t.hysteresis}</p>
+    {faults.length > 0 && <div className="fault-alert" role="alert">{faults.map(([name]) =>
+      <p key={name} data-fault={name}>{t[`fault_${name}`]}</p>)}</div>}
 
     <h2>{t.diskBreakdown}</h2>
     <dl className="breakdown">
@@ -62,6 +72,8 @@ export function StorageView({ t, storage }: { t: Catalog; storage: StorageSummar
     <h2>{t.slackTitle}</h2>
     <p><span className="badge">{storage.slack_configured ? t.slackEnabled : t.slackDisabled}</span></p>
     <p>{storage.slack_configured ? t.slackConfiguredNote : t.slackUnconfiguredNote}</p>
+    {notificationFaults.length > 0 && <div className="fault-alert" role="alert">{notificationFaults.map(([name]) =>
+      <p key={name} data-fault={name}>{t[`fault_${name}`]}</p>)}</div>}
     <ul className="notification-rules">
       <li>{t.slackDailyTime}: <span className="numeric">{storage.daily_summary_local_time}</span></li>
       <li>{t.slackImmediate}</li>

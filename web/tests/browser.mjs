@@ -34,16 +34,18 @@ const recordingFixture = count => Array.from({ length: count }, (_, index) => ({
   size_bytes: 536_870_912 * (index + 1), starred: index % 3 === 1,
   retention_days_left: index % 3 === 1 ? null : 20 - index,
 }));
-const storageFixture = (state, available_bytes = 21_474_836_480) => ({
+const storageFixture = (state, available_bytes = 21_474_836_480, faults = false) => ({
   state, recording_bytes: 64_424_509_440, starred_bytes: 10_737_418_240,
   available_bytes, hard_reserve_bytes: 5_368_709_120,
   recording_limit_bytes: 85_899_345_920, critical_allowance_bytes: 2_147_483_648,
   recording_retention_days: 20, audit_retention_days: 90, agent_incident_retention_days: 60,
   slack_configured: false, daily_summary_local_time: '23:00',
+  audit_delivery_failed: faults, cleanup_failed: faults,
+  notification_delivery_failed: faults, notification_log_failed: faults,
 });
 let cases = 0;
 
-async function scenario(viewport, { production = false, status = 200, session = owner, count = 1, optIn = false, sourceStatus = 200, positiveControl = false, recordings = 3, recordingStatus = 200, storageState = 'STORAGE_PRESSURE', storageAvailable, storageStatus = 200, mutationStatus = 200 } = {}, assertions) {
+async function scenario(viewport, { production = false, status = 200, session = owner, count = 1, optIn = false, sourceStatus = 200, positiveControl = false, recordings = 3, recordingStatus = 200, storageState = 'STORAGE_PRESSURE', storageAvailable, storageFaults = false, storageStatus = 200, mutationStatus = 200 } = {}, assertions) {
   const page = await pageFor(browser, viewport);
   // Chrome applies bypass when parsing a document's policy. Set it before
   // navigation, only for the dedicated interception positive control.
@@ -89,7 +91,7 @@ async function scenario(viewport, { production = false, status = 200, session = 
       await fulfill(JSON.stringify(mutationStatus === 200 ? { accepted: true } : { detail: 'synthetic private error' }), 'application/json', mutationStatus); return;
     }
     if (!production && url.pathname === '/api/mock/storage') {
-      await fulfill(JSON.stringify(storageStatus === 200 ? storageFixture(storageState, storageAvailable) : { detail: 'synthetic private error' }), 'application/json', storageStatus); return;
+      await fulfill(JSON.stringify(storageStatus === 200 ? storageFixture(storageState, storageAvailable, storageFaults) : { detail: 'synthetic private error' }), 'application/json', storageStatus); return;
     }
     unexpected.push('unexpected path');
     await page.command('Fetch.failRequest', { requestId, errorReason: 'BlockedByClient' });
@@ -201,6 +203,26 @@ try {
         assert.equal(await page.evaluate("document.querySelectorAll('.row-actions button:disabled').length"), 0);
       });
     }
+    // Replacing the provider must not leave the previous session's data on
+    // screen; the replacement never resolves, so anything shown is stale.
+    await scenario(viewport, { recordings: 3 }, async page => {
+      await page.click('録画');
+      await page.wait("document.querySelectorAll('[data-recording-id]').length === 3");
+      await page.evaluate('window.switchProvider()');
+      await page.wait("document.querySelectorAll('[data-recording-id]').length === 0");
+      await page.heading('アクセスを確認しています');
+      assert.doesNotMatch(await page.evaluate('document.body.innerText'), /生成カメラ/);
+      assert.equal(await page.evaluate("document.querySelectorAll('nav button:disabled').length"), 7);
+    });
+    // A recovered NORMAL state must still surface sticky backend faults.
+    await scenario(viewport, { storageState: 'NORMAL', storageFaults: true }, async page => {
+      await page.click('ストレージと通知');
+      await page.wait("document.querySelectorAll('[data-fault]').length === 4");
+      assert.equal(await page.evaluate("document.querySelectorAll('.fault-alert[role=alert]').length"), 2);
+      assert.match(await page.evaluate('document.body.innerText'), /監査記録に書き込めませんでした/);
+      assert.match(await page.evaluate('document.body.innerText'), /Slack へ通知を送信できませんでした/);
+      assert.equal(await page.evaluate('document.documentElement.scrollWidth <= window.innerWidth'), true, 'fault alerts fit viewport');
+    });
     // A rejected write reports itself without discarding the loaded list.
     await scenario(viewport, { recordings: 3, mutationStatus: 503 }, async page => {
       await page.click('録画');
@@ -228,6 +250,7 @@ try {
         assert.match(await page.evaluate('document.body.innerText'), /23:00/);
         // An intact reserve reports no shortfall.
         assert.equal(await page.evaluate("document.querySelectorAll('[data-reserve-shortfall]').length"), 0);
+        assert.equal(await page.evaluate("document.querySelectorAll('[data-fault]').length"), 0);
         assert.deepEqual(await page.evaluate("Array.from(document.querySelectorAll('meter')).map(el => el.value)"),
           [53_687_091_200, 10_737_418_240, 16_106_127_360, 5_368_709_120]);
       });
