@@ -410,11 +410,29 @@ class RecordingStore:
             if type(stop_ms) is not int or not row["start_ms"] < stop_ms <= row["target_end_ms"]:
                 raise ValueError("invalid stop time")
         if row["status"] == "active":
+            end_ms = stop_ms or row["target_end_ms"]
             with self._transaction():
                 self.db.execute(
                     "UPDATE recordings SET target_end_ms=?,ended_ms=?,status='complete' WHERE id=?",
-                    (stop_ms or row["target_end_ms"], stop_ms or row["target_end_ms"], str(recording_id)),
+                    (end_ms, end_ms, str(recording_id)),
                 )
+                # A queued stop can precede segments already appended. Retain
+                # boundary overlap but release evidence wholly outside the clip.
+                self.db.execute(
+                    "DELETE FROM recording_links WHERE recording_id=? AND segment_id IN "
+                    "(SELECT id FROM recording_segments WHERE start_ms>=? OR end_ms<=?)",
+                    (str(recording_id), end_ms, row["start_ms"]),
+                )
+                self.db.execute(
+                    "DELETE FROM recording_discontinuities WHERE recording_id=? "
+                    "AND (start_ms>=? OR end_ms<?)",
+                    (str(recording_id), end_ms, row["start_ms"]),
+                )
+            try:
+                self._trim()
+            except BaseException:
+                self._failed = True
+                raise
         result = self.manifest(recording_id)
         if result["status"] == "gapped" or (result["gaps"] and result["status"] == "complete"):
             with self._transaction():

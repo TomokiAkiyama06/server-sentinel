@@ -169,6 +169,23 @@ class RecordingTests(unittest.TestCase):
         self.assertEqual([(30_000, 40_000), (40_000, 45_000)],
                          [(item["clip_start_ms"], item["clip_end_ms"]) for item in result["segments"]])
 
+    def test_queued_stop_releases_post_stop_links_and_discontinuities(self):
+        recording = self.store.start_manual(self.source, 30_000, duration_ms=40_000)
+        self.store.append(self.segment())
+        boundary = self.store.append(self.segment(40_000, 50_000, 1))
+        after_stop = self.store.append(self.segment(50_000, 60_000, 0, stream_id=uuid4()))
+        result = self.store.finish(recording, stop_ms=45_000)
+        self.assertEqual("complete", result["status"])
+        self.assertEqual([], result["discontinuities"])
+        self.assertEqual(2, len(result["segments"]))
+        self.assertEqual(2, self.db.execute(
+            "SELECT COUNT(*) FROM recording_links WHERE recording_id=?", (str(recording),)
+        ).fetchone()[0])
+        self.store.release_source(self.source)
+        self.assertTrue((self.root / (boundary.hex + ".seg")).exists())
+        self.assertFalse((self.root / (after_stop.hex + ".seg")).exists())
+        self.assertEqual(result["byte_length"], self.store.usage_bytes())
+
     def test_corruption_and_missing_segment_never_report_complete(self):
         first = self.store.append(self.segment())
         recording = self.store.start_manual(self.source, 30_000, duration_ms=20_000)
