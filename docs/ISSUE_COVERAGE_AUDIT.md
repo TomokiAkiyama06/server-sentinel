@@ -55,6 +55,6 @@
 | Plan 25 | #50 | Security / admin audit log と90日 retention |
 | Plan 26 | #51 | Dependency / model license compliance gate |
 
-Plan 19 (#21) remains the Owner for recording storage, capacity and Slack. Its audit-retention reference alone did not own security/admin audit events, sensitive-data exclusions, or the retention subsystem, so Plan 25 was registered as a separate cross-cutting owner. Plan 12 (#12) is a Capture Node installer and Plan 5 (#5) validates Compose where relevant; neither owns the Main Server lifecycle. Plans 12, 20 and 25 contain focused license/privacy checks, but none owned a repository-wide release gate or generic diagnostic export.
+Plan 19 (#21) remains the Owner for recording storage, capacity and Slack. Its audit-retention reference alone did not own security/admin audit events, sensitive-data exclusions, or the retention subsystem, so Plan 25 was registered as a separate cross-cutting owner. Plan 12 (#12) is a Capture Node installer and Plan 5 (#5) validates Compose where relevant; neither owns the Main Server lifecycle. Plans 12, 20 and 25 contain focused license/privacy checks, but none owned a repository-wide release gate (including material transitive and redistribution obligations) or generic diagnostic export.
 
 The direct dependency graph in `docs/INITIAL_ISSUES.md` was updated with all five Issues. It has no self-dependency or cycle.

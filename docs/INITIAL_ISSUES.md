@@ -955,7 +955,8 @@ Scope:
 Acceptance:
 - Owner biometric template / embeddingは常に除外し、exportをexternal biometric processing / storageの例外にしない;
 - raw monitoring mediaはOwnerが個別に選択した場合だけ含め、default bundleは含めない;
-- synthetic testsでautomatic upload不在とexclude / redact pathを検証する。
+- synthetic testsでautomatic upload不在とexclude / redact pathを検証する;
+- `MANUAL_TEST.md` Uのdeployed export受入で、明示Owner action、default media exclusion、sensitive-value exclusion/redaction、automatic upload不在を、bundle内容をGitHubへ出さずに確認する。
 
 ## Plan 25 — Security / admin audit log と90日 retention
 
@@ -992,9 +993,9 @@ Scope:
 - source-codeとmodel / weightを別々に評価し、unreviewed componentのreleaseをblockする。
 
 Acceptance:
-- exact version、upstream、license evidence、component種別を記録する;
+- exact version、upstream、license evidence、component種別、material transitive obligations、required notices / redistribution obligationsを記録する;
 - AGPL/GPL/SSPL/source-available/unclearはOwnerの明示approval/documentationなしにblockする;
-- CI / release validationとsynthetic manifestsでallow、block、missing evidenceを検証する。
+- CI / release validationとsynthetic manifestsでallow、block、missing evidence、transitive-obligation / notice evidenceの欠落を検証する。
 
 ## Explicitly pending product decisions
 

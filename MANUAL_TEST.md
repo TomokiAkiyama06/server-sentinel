@@ -579,7 +579,19 @@ The synthetic CI tests do not complete these checks. On an isolated Capture Node
 Publish only pass/fail summaries; keep configs, mount identity, host identifiers,
 credentials and captured media private.
 
-## U. GitHub review-gate enforcement
+## U. Privacy-safe diagnostic export / support bundle
+
+Run this only on the intended Main Server using synthetic, non-production diagnostic inputs. Do not upload, commit, attach, or paste the generated bundle, its manifest, private deployment data, raw identifiers, monitoring media, credentials, or biometric material into GitHub.
+
+- [ ] an Owner initiates a diagnostic export from the deployed application; no background, scheduled, or error path creates or transfers a bundle without that explicit action;
+- [ ] before export, the bundle remains deployment-local; observe the controlled export operation locally and verify that it does not automatically upload/share to a developer or third-party endpoint;
+- [ ] use harmless synthetic sentinel inputs to verify credentials, pairing secrets, private keys, and sensitive headers are excluded;
+- [ ] verify Owner biometric templates/embeddings are excluded even from an explicitly initiated export, and no selected export authorizes external biometric processing/storage;
+- [ ] verify raw hardware serials/UUIDs are absent or redacted/hashed, while the manifest reports only safe categories and exclusion reasons;
+- [ ] verify raw monitoring media is absent by default and can be included only after an additional explicit Owner selection; do not use real monitoring media for this check;
+- [ ] record only sanitized PASS/FAIL and aggregate results locally; do not retain the test bundle after the local verification policy permits deletion.
+
+## V. GitHub review-gate enforcement
 
 Issue #4 remains open. The offline tests do not complete these checks. Follow
 `docs/REVIEW_GATE_SETUP.md` after Owner App registration and trusted publisher
