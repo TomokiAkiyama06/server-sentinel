@@ -22,8 +22,8 @@ from build_installer import build as build_installer
 from install import _extract, _protected_parent, _release_lock, _trusted_python, execute
 
 
-def _hold_release_lock(root, acquired, release):
-    with _release_lock(Path(root)):
+def _hold_release_lock(unit, acquired, release):
+    with _release_lock(Path(unit)):
         acquired.set()
         release.wait(5)
 
@@ -131,7 +131,7 @@ class ReleaseLifecycleTests(unittest.TestCase):
             self.perform(self.arguments("rollback"))
         self.assertEqual(
             release_lock.call_args_list,
-            [call(self.installation), call(self.installation), call(self.installation)],
+            [call(self.unit), call(self.unit), call(self.unit)],
         )
         self.assertEqual(os.readlink(self.installation / "current"), "releases/1.0.0")
         unit = self.unit.read_text()
@@ -149,16 +149,15 @@ class ReleaseLifecycleTests(unittest.TestCase):
         )
 
     def test_release_lock_excludes_an_overlapping_process(self):
-        self.installation.mkdir()
         context = multiprocessing.get_context("fork")
         acquired = context.Event()
         release = context.Event()
         process = context.Process(
             target=_hold_release_lock,
-            args=(str(self.installation), acquired, release),
+            args=(str(self.unit), acquired, release),
         )
         try:
-            with _release_lock(self.installation):
+            with _release_lock(self.unit):
                 process.start()
                 self.assertFalse(acquired.wait(0.2))
             self.assertTrue(acquired.wait(5))
@@ -171,15 +170,16 @@ class ReleaseLifecycleTests(unittest.TestCase):
                     process.join(5)
         self.assertEqual(process.exitcode, 0)
 
-    def test_execute_calls_are_serialized_for_the_whole_operation(self):
+    def test_same_unit_serializes_destinations_and_restart_state(self):
         first_entered = threading.Event()
         allow_first_to_finish = threading.Event()
         second_entered = threading.Event()
         errors = []
+        restart_states = []
         active = 0
         state_lock = threading.Lock()
 
-        def operation(_arguments, _runner):
+        def operation(arguments, _runner):
             nonlocal active
             with state_lock:
                 active += 1
@@ -187,65 +187,79 @@ class ReleaseLifecycleTests(unittest.TestCase):
                 first = not first_entered.is_set()
             if overlap:
                 errors.append(AssertionError("release operations overlapped"))
-            if first:
-                first_entered.set()
-                allow_first_to_finish.wait(5)
-            else:
-                second_entered.set()
-            with state_lock:
-                active -= 1
+            current = arguments.destination / "synthetic-current"
+            arguments.unit.write_text(str(arguments.destination))
+            current.write_text(str(arguments.destination))
+            try:
+                if first:
+                    first_entered.set()
+                    allow_first_to_finish.wait(5)
+                else:
+                    second_entered.set()
+                restart_states.append((arguments.unit.read_text(), current.read_text()))
+                _runner(["systemctl", "restart", "server-sentinel.service"], check=True)
+            finally:
+                with state_lock:
+                    active -= 1
 
-        arguments = self.arguments("rollback")
+        first_arguments = self.arguments("rollback")
+        second_arguments = self.arguments("rollback")
+        second_arguments.destination = self.root / "other-installation"
 
-        def invoke():
+        def invoke(arguments):
             try:
                 execute(arguments, runner=self.runner)
             except Exception as error:
                 errors.append(error)
 
+        first = threading.Thread(target=invoke, args=(first_arguments,))
+        second = threading.Thread(target=invoke, args=(second_arguments,))
         with patch("install.os.geteuid", return_value=0), patch(
                 "install._protected_parent"), patch("install._execute_locked",
                                                     side_effect=operation):
-            first = threading.Thread(target=invoke)
-            second = threading.Thread(target=invoke)
             first.start()
-            self.assertTrue(first_entered.wait(5))
-            second.start()
-            self.assertFalse(second_entered.wait(0.2))
-            allow_first_to_finish.set()
-            first.join(5)
-            second.join(5)
+            try:
+                self.assertTrue(first_entered.wait(5))
+                second.start()
+                self.assertFalse(second_entered.wait(0.2))
+            finally:
+                allow_first_to_finish.set()
+                first.join(5)
+                if second.ident is not None:
+                    second.join(5)
         self.assertFalse(first.is_alive())
         self.assertFalse(second.is_alive())
         self.assertEqual(errors, [])
         self.assertTrue(second_entered.is_set())
+        self.assertEqual(restart_states, [
+            (str(first_arguments.destination), str(first_arguments.destination)),
+            (str(second_arguments.destination), str(second_arguments.destination)),
+        ])
 
     def test_release_lock_rejects_unsafe_files_and_does_not_reenter(self):
-        self.installation.mkdir()
-        lock = self.installation / ".release.lock"
+        lock = self.root / ".server-sentinel.service.release.lock"
         target = self.root / "lock-target"
         target.write_text("")
         lock.symlink_to(target)
         with self.assertRaisesRegex(ValueError, "unavailable"):
-            with _release_lock(self.installation):
+            with _release_lock(self.unit):
                 self.fail("unsafe lock acquired")
         lock.unlink()
 
         lock.write_text("")
         lock.chmod(0o644)
         with self.assertRaisesRegex(ValueError, "invalid"):
-            with _release_lock(self.installation):
+            with _release_lock(self.unit):
                 self.fail("unsafe lock acquired")
         lock.chmod(0o600)
 
-        with _release_lock(self.installation):
+        with _release_lock(self.unit):
             with self.assertRaisesRegex(ValueError, "still running"):
-                with _release_lock(self.installation, timeout=0):
+                with _release_lock(self.unit, timeout=0):
                     self.fail("release lock reentered")
 
     def test_release_lock_checks_owner_and_releases_after_failure(self):
-        self.installation.mkdir()
-        lock = self.installation / ".release.lock"
+        lock = self.root / ".server-sentinel.service.release.lock"
         lock.write_text("")
         lock.chmod(0o600)
         actual = lock.stat()
@@ -256,13 +270,13 @@ class ReleaseLifecycleTests(unittest.TestCase):
         })()
         with patch("install.os.fstat", return_value=unsafe):
             with self.assertRaisesRegex(ValueError, "invalid"):
-                with _release_lock(self.installation):
+                with _release_lock(self.unit):
                     self.fail("wrong-owner lock acquired")
 
         with self.assertRaisesRegex(RuntimeError, "synthetic"):
-            with _release_lock(self.installation):
+            with _release_lock(self.unit):
                 raise RuntimeError("synthetic")
-        with _release_lock(self.installation, timeout=0):
+        with _release_lock(self.unit, timeout=0):
             pass
 
     def test_failed_update_restores_running_release_and_runtime_data(self):

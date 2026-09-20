@@ -195,12 +195,12 @@ def _trusted_python(path: Path) -> Path:
 
 
 @contextmanager
-def _release_lock(root: Path, *, timeout=LOCK_WAIT_SECONDS):
-    """Serialize release-pointer and service-unit transactions."""
-    path = root / ".release.lock"
+def _release_lock(unit: Path, *, timeout=LOCK_WAIT_SECONDS):
+    """Serialize every transaction that controls one service unit."""
+    path = unit.with_name("." + unit.name + ".release.lock")
     descriptor = None
     try:
-        root_info = root.stat()
+        parent_info = unit.parent.stat()
         flags = os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
         try:
             descriptor = os.open(path, flags | os.O_CREAT | os.O_EXCL, 0o600)
@@ -209,7 +209,7 @@ def _release_lock(root: Path, *, timeout=LOCK_WAIT_SECONDS):
             descriptor = os.open(path, flags)
         info = os.fstat(descriptor)
         if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
-                or info.st_uid != root_info.st_uid or info.st_mode & 0o077):
+                or info.st_uid != parent_info.st_uid or info.st_mode & 0o077):
             raise ValueError("release operation lock is invalid")
         deadline = time.monotonic() + timeout
         while True:
@@ -370,9 +370,9 @@ def execute(args, *, runner=subprocess.run) -> None:
         raise ValueError("service must retain its functional name")
     _protected_parent(args.destination.parent)
     _protected_parent(args.unit.parent)
-    args.destination.mkdir(mode=0o755, exist_ok=True)
-    _protected_parent(args.destination)
-    with _release_lock(args.destination):
+    with _release_lock(args.unit):
+        args.destination.mkdir(mode=0o755, exist_ok=True)
+        _protected_parent(args.destination)
         args.destination.chmod(0o755)
         _execute_locked(args, runner)
 
