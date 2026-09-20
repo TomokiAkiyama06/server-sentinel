@@ -2,7 +2,7 @@
 
 from datetime import datetime, timezone
 
-from app.cameras.registry import CaptureProfile, HealthState, SourceType
+from app.cameras.registry import CaptureProfile, SourceHealthState, SourceType
 from .capture import MmapCapture, VideoProfile
 from .discovery import LinuxDiscovery
 from .identity import ReconnectController
@@ -52,14 +52,14 @@ class LocalUvcAdapter:
 
     def _event(self, event):
         self.registry.update_source_health(
-            event.source_id, health_state=HealthState(event.state.value),
+            event.source_id, health_state=SourceHealthState(event.state.value),
             image_quality_state="unknown",
             **({"negotiated_capture_profile": None} if event.state != "online" else {}),
         )
         self.emit_audit(event)
 
     def _session(self, source, approved):
-        self.registry.update_source_health(source.id, health_state=HealthState.OFFLINE,
+        self.registry.update_source_health(source.id, health_state=SourceHealthState.OFFLINE,
                                            negotiated_capture_profile=None, image_quality_state="unknown")
         controller = ReconnectController(source.id, approved, self._event,
                                          enabled=source.enabled, store=self.store)
@@ -67,7 +67,7 @@ class LocalUvcAdapter:
         def profile_sink(negotiated):
             value = negotiated.profile
             self.registry.update_source_health(
-                source.id, health_state=HealthState(controller.state.value),
+                source.id, health_state=SourceHealthState(controller.state.value),
                 negotiated_capture_profile=CaptureProfile(
                     width=value.width, height=value.height, fps=value.fps,
                     pixel_format=value.pixel_format,
@@ -75,7 +75,7 @@ class LocalUvcAdapter:
             )
 
         def frame_sink(frame):
-            self.registry.update_source_health(source.id, health_state=HealthState(controller.state.value),
+            self.registry.update_source_health(source.id, health_state=SourceHealthState(controller.state.value),
                                                last_seen_at=self.clock())
             self.on_frame(source.id, frame)
 
@@ -111,7 +111,7 @@ class LocalUvcAdapter:
             approved = self.store.load(source_id)
             if approved is None:
                 # Registry entries never automatically acquire a physical device.
-                self.registry.update_source_health(source_id, health_state=HealthState.OFFLINE,
+                self.registry.update_source_health(source_id, health_state=SourceHealthState.OFFLINE,
                                                    negotiated_capture_profile=None)
                 return False
             session = self._session(source, approved.approved)

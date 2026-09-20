@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from app.cameras.registry import CameraRegistry, CaptureProfile, HealthState, SourceType
+from app.cameras.registry import CameraRegistry, CaptureProfile, SourceHealthState, SourceType
 from app.cameras.uvc.identity import DeviceEvidence
 from app.cameras.uvc.persistence import ApprovalStorageError
 from app.cameras.uvc.registry_adapter import LocalUvcAdapter
@@ -40,21 +40,21 @@ class UvcRegistryTests(unittest.TestCase):
 
     def test_source_does_not_acquire_camera_without_owner_selection(self):
         self.assertFalse(self.adapter.poll_source(self.source.id))
-        self.assertEqual(self.registry.get_source(self.source.id).health_state, HealthState.OFFLINE)
+        self.assertEqual(self.registry.get_source(self.source.id).health_state, SourceHealthState.OFFLINE)
         self.assertEqual(self.frames, [])
 
     def test_approval_negotiation_health_and_disable_are_persisted(self):
         self.adapter.approve_source(self.source.id, self.camera)
-        self.assertEqual(self.registry.get_source(self.source.id).health_state, HealthState.DEGRADED)
+        self.assertEqual(self.registry.get_source(self.source.id).health_state, SourceHealthState.DEGRADED)
         self.assertTrue(self.adapter.poll_source(self.source.id))
         source = self.registry.get_source(self.source.id)
-        self.assertEqual(source.health_state, HealthState.ONLINE)
+        self.assertEqual(source.health_state, SourceHealthState.ONLINE)
         self.assertEqual(source.negotiated_capture_profile.pixel_format, "MJPG")
         self.assertIsNotNone(source.last_seen_at)
         self.assertEqual(source.image_quality_state, "unknown")
         self.registry.update_source(source.id, enabled=False)
         self.assertFalse(self.adapter.poll_source(source.id))
-        self.assertEqual(self.registry.get_source(source.id).health_state, HealthState.OFFLINE)
+        self.assertEqual(self.registry.get_source(source.id).health_state, SourceHealthState.OFFLINE)
         self.assertIsNone(self.registry.get_source(source.id).negotiated_capture_profile)
 
     def test_unplug_and_restart_keep_uuid_and_ambiguity_latch(self):
@@ -71,7 +71,7 @@ class UvcRegistryTests(unittest.TestCase):
         self.addCleanup(restarted.close)
         self.assertFalse(restarted.poll_source(self.source.id))
         self.assertEqual(self.registry.get_source(self.source.id).health_state,
-                         HealthState.MANUAL_INTERVENTION_REQUIRED)
+                         SourceHealthState.MANUAL_INTERVENTION_REQUIRED)
         restarted.approve_source(self.source.id, self.camera)
         self.assertTrue(restarted.poll_source(self.source.id))
         self.assertEqual(self.registry.get_source(self.source.id).id, self.source.id)
@@ -90,7 +90,7 @@ class UvcRegistryTests(unittest.TestCase):
         self.discovery.devices = [other_camera]
         self.assertFalse(self.adapter.poll_source(self.source.id))
         self.assertTrue(self.adapter.poll_source(other.id))
-        self.assertEqual(self.registry.get_source(other.id).health_state, HealthState.ONLINE)
+        self.assertEqual(self.registry.get_source(other.id).health_state, SourceHealthState.ONLINE)
 
     def test_failed_weak_reapproval_does_not_reopen_closed_binding(self):
         weak = replace(self.camera, serial=None, instance_token=(1, 2, 3))
@@ -103,11 +103,11 @@ class UvcRegistryTests(unittest.TestCase):
                 self.adapter.approve_source(self.source.id, weak)
         self.assertTrue(closed_capture.closed)
         self.assertIsNone(self.adapter.sessions[self.source.id].controller.bound)
-        self.assertEqual(self.registry.get_source(self.source.id).health_state, HealthState.OFFLINE)
+        self.assertEqual(self.registry.get_source(self.source.id).health_state, SourceHealthState.OFFLINE)
         self.assertFalse(self.adapter.poll_source(self.source.id))
         self.assertEqual(len(self.frames), 1)
         self.assertEqual(self.registry.get_source(self.source.id).health_state,
-                         HealthState.MANUAL_INTERVENTION_REQUIRED)
+                         SourceHealthState.MANUAL_INTERVENTION_REQUIRED)
 
     def test_restart_without_profile_keeps_durable_manual_state_without_churn(self):
         self.adapter.approve_source(self.source.id, self.camera)
@@ -121,7 +121,7 @@ class UvcRegistryTests(unittest.TestCase):
         self.addCleanup(restarted.close)
         self.assertFalse(restarted.poll_source(self.source.id))
         self.assertEqual(self.registry.get_source(self.source.id).health_state,
-                         HealthState.MANUAL_INTERVENTION_REQUIRED)
+                         SourceHealthState.MANUAL_INTERVENTION_REQUIRED)
         event_count = len(self.events)
         self.assertFalse(restarted.poll_source(self.source.id))
         self.assertEqual(len(self.events), event_count)
