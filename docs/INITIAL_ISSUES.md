@@ -1007,6 +1007,7 @@ Scope:
 
 Acceptance:
 - recordsにはactor category、action、logical target ID、time、outcomeを持たせ、secret、raw biometric、raw serial/UUID、raw mediaを含めない;
+- security-sensitive mutationとそのdurable audit recordは一緒にcommitし、audit write failure時はmutationをfail/rollbackしてvisible faultにする;
 - cleanupはexpired auditだけに適用し、recording / protected incident lifecycleを変更しない;
 - synthetic testsでredaction、retention、Owner-only security action、failure outcomeを検証する;
 - `MANUAL_TEST.md` Xのdeployed audit受入で、Owner action、non-owner denial、記録項目とredaction、local-only database permission、default 90-day retentionのcleanupがexpired audit rowsだけに適用されrecording / protected incident lifecycleを変更しないことを、private dataを公開せずに確認する;
