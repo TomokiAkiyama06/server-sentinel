@@ -323,6 +323,8 @@ Acceptance:
 - `none` attestation registrations are accepted on the strength of the challenge, origin/relying-party id, authenticator data, credential public key and user-verification flag; a present-but-invalid attestation statement fails;
 - the signature-counter comparison runs whenever the stored or the received counter is non-zero, so a received 0 after a stored non-zero is refused as a regression and notified to the Owner;
 - revocation is credential-scoped: a synced passkey is revoked everywhere it synced, and nothing promises per-device revocation;
+- registration records the authenticator's backup-eligibility and backup-state flags, the owner UI shows them, and a deployment configured for device-bound credentials refuses a backup-eligible registration with an actionable message;
+- credential and principal records are kept while the person is invited rather than on a timer; deleting a principal removes its credentials, enrollments, sessions and last-observed login, and sign-in history ages out with the audit log;
 - no developer-operated identity/cloud.
 
 Design progress: [ADR-0003](ADR/0003-owner-authentication-and-trusted-proxy.md)

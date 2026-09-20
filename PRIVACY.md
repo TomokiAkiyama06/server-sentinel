@@ -160,12 +160,14 @@ The main Ubuntu deployment stores:
 - event/timeline metadata;
 - audit logs;
 - configuration;
-- invited-viewer credential and principal records (public key material, the last accepted signature counter, metadata, and at most the last observed Tailscale login/device);
+- invited-viewer credential and principal records (public key material, the last accepted signature counter, the authenticator's backup-eligibility flags, metadata, and at most the last observed Tailscale login/device), kept while the person is invited rather than on a timer;
 - optional owner biometric template.
 
 Defaults:
 - recordings: 20 days;
 - audit logs: 90 days.
+
+Credential and principal records are not time-expired: they last as long as the person is invited. Revoking a credential or a principal marks it revoked so the owner can see what was withdrawn and when; deleting the principal removes its credentials, enrollments, sessions and last-observed login together. Sign-in history stays in the audit log and ages out with it.
 
 Starred recordings may outlive normal recording retention.
 

@@ -45,7 +45,9 @@ ServerSentinel issues and verifies its own per-person credential:
 
 **WebAuthn/passkey is the selected mechanism.** Replacing it requires a superseding Owner-approved ADR.
 
-Revocation is credential-scoped, not device-scoped. A synced passkey is a single credential that can exist on several of its owner's devices, so revoking it applies everywhere it synced and losing one device does not by itself isolate a credential. The product describes revocation and labels accordingly; a deployment that needs device-scoped control registers device-bound authenticators and refuses backup-eligible credentials, which is a deployment setting rather than a default promise.
+Revocation is credential-scoped, not device-scoped. A synced passkey is a single credential that can exist on several of its owner's devices, so revoking it applies everywhere it synced and losing one device does not by itself isolate a credential. The product describes revocation and labels accordingly.
+
+Whether a credential syncs is read rather than assumed: registration records the authenticator's backup-eligibility and backup-state flags, the owner UI shows them, and a deployment that needs device-scoped control refuses a backup-eligible registration on that signal. That is a deployment setting rather than a default promise.
 
 ### 3. The credential must be bound to a person, not to a workstation
 

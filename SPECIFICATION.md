@@ -896,6 +896,9 @@ principal_credential
   every authentication)
 - sign_count (last accepted signature counter; 0 when the authenticator keeps
   none)
+- backup_eligible / backup_state (the authenticator's BE and BS flags as read
+  at registration; a backup-eligible credential can sync to the person's other
+  devices)
 - label (owner-visible hint, not proof of a device)
 - created_at
 - last_used_at
@@ -1117,7 +1120,15 @@ ServerSentinel permission revocation invalidates application access promptly. Ta
 
 Revocation is credential-scoped, not device-scoped. Revoking a single `principal_credential` invalidates that credential and the sessions bound to it; revoking the `access_principal` invalidates all of its credentials and active sessions.
 
-A synced passkey is one credential that can exist on several of its owner's devices, so revoking it disables it everywhere it synced, and losing one device does not by itself isolate a credential to revoke. The UI and documentation therefore describe revocation as credential-scoped and treat the label as a hint. A deployment that needs device-scoped control configures device-bound authenticators and refuses backup-eligible credentials at registration; that choice is a deployment setting, not a promise the product makes by default.
+A synced passkey is one credential that can exist on several of its owner's devices, so revoking it disables it everywhere it synced, and losing one device does not by itself isolate a credential to revoke. The UI and documentation therefore describe revocation as credential-scoped and treat the label as a hint.
+
+Registration reads the authenticator's backup-eligibility and backup-state flags
+and stores them as `principal_credential.backup_eligible` / `.backup_state`, so
+the owner UI can show whether a credential can sync instead of guessing. A
+deployment that needs device-scoped control refuses a backup-eligible
+registration on that signal and tells the person why, which is a deployment
+setting rather than a promise the product makes by default. The Web client
+surfaces that refusal as an actionable message, not as a generic failure.
 
 ### 11.8 Shared Tailnet account
 

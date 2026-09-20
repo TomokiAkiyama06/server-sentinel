@@ -338,7 +338,8 @@ The research-room Tailnet is shared, so run these with two people (or two browse
 - [ ] the refusal is the generic response: no product/version string, camera names/counts, recording or timeline data, or deployment metadata, and the credential prompt itself carries none of them;
 - [ ] a revoked person receives the same response as an uninvited person;
 - [ ] revoking one credential leaves the principal's other credentials working, and revoking the principal blocks all of them promptly;
-- [ ] if a synced passkey is in use, confirm that revoking it takes effect on every device it synced to, and record that revocation is credential-scoped rather than per-device; if the deployment requires device-scoped control, confirm that registration refuses backup-eligible credentials;
+- [ ] if a synced passkey is in use, confirm that revoking it takes effect on every device it synced to, and record that revocation is credential-scoped rather than per-device;
+- [ ] the owner screen shows each credential's backup-eligibility as read at registration; if the deployment requires device-bound credentials, registering a backup-eligible authenticator is refused with a message the person can act on;
 - [ ] no human route grants access on the proxy identity header alone;
 - [ ] a passkey that reports `none` attestation registers successfully, and a registration whose attestation statement is present but invalid is refused;
 - [ ] where the owner screen shows a last-observed Tailscale login/device, confirm it is owner-visible only, that it is cleared when the principal is revoked or deleted, and that a diagnostic export does not contain it;

@@ -399,7 +399,9 @@ Application permission revocation shall invalidate active ServerSentinel authori
 
 Revocation is available at two levels and is credential-scoped, not device-scoped: revoking one credential of a principal shall invalidate that credential and the sessions bound to it only, while revoking the principal shall invalidate all of its credentials and sessions.
 
-A synced passkey is a single credential that may exist on several of its owner's devices, so revoking it takes effect everywhere it synced, and the product shall not present credential revocation as per-device revocation. A deployment that requires device-scoped control shall configure device-bound authenticators and refuse backup-eligible credentials at registration.
+A synced passkey is a single credential that may exist on several of its owner's devices, so revoking it takes effect everywhere it synced, and the product shall not present credential revocation as per-device revocation.
+
+Whether a credential can sync is not a guess: registration reads the authenticator's backup-eligibility and backup-state flags and records them with the credential, and the owner UI shows the resulting state. A deployment that requires device-scoped control shall be able to refuse a backup-eligible registration on that signal, with a refusal the person can act on; a deployment that does not require it shall still record the flags rather than imply that every credential is device-bound.
 
 ### AUTH-010 Application fingerprint minimization for uninvited users
 When an ordinary Tailnet user is not invited in ServerSentinel, the application shall minimize disclosure that ServerSentinel is running. Unauthorized responses should be generic/non-branding (for example not-found style), and shall not expose ServerSentinel product/version strings, camera/source counts, API schemas, health details, thumbnails, recordings, timeline data, or other deployment metadata.
