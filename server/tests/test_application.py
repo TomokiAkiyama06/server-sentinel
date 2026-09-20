@@ -7,8 +7,10 @@ from fastapi import FastAPI, Request
 
 from app.api.system import router
 from app.auth.boundary import DenyAll
+from app.cameras.registry import CameraRegistry, SourceType
 from app.main import create_app
 from app.settings import Settings
+from app.storage.schema import APPLICATION_MIGRATIONS
 from tests.asgi import request
 
 
@@ -24,7 +26,11 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
         async with self.application.router.lifespan_context(self.application):
             self.assertTrue(self.application.state.ready)
             with closing(self.application.state.database.connect()) as connection:
-                self.assertEqual(connection.execute("SELECT count(*) FROM schema_migrations").fetchone()[0], 1)
+                self.assertEqual(connection.execute("SELECT count(*) FROM schema_migrations").fetchone()[0],
+                                 len(APPLICATION_MIGRATIONS))
+            registry = CameraRegistry(self.application.state.database)
+            source = registry.create_source(source_type=SourceType.LOCAL_UVC, name="Synthetic", enabled=True)
+            self.assertEqual(source, registry.get_source(source.id))
         self.assertFalse(self.application.state.ready)
 
     async def test_invalid_database_fails_startup_without_leaking_exception_values(self):
@@ -36,7 +42,8 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_all_human_paths_methods_and_forged_headers_get_same_generic_denial(self):
         expected = await request(self.application)
-        for path in ("/health", "/version", "/openapi.json", "/docs", "/redoc", "/api/live/1", "/missing/"):
+        for path in ("/health", "/version", "/openapi.json", "/docs", "/redoc", "/api/live/1",
+                     "/api/sources", "/api/capture-nodes", "/missing/"):
             for method in ("GET", "POST", "HEAD", "OPTIONS", "DELETE"):
                 with self.subTest(path=path, method=method):
                     actual = await request(self.application, path, method=method, headers=[

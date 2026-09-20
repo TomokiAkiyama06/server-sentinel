@@ -139,6 +139,7 @@ camera_source
 - name
 - role_label
 - enabled
+- capabilities
 - desired_capture_profile
 - negotiated_capture_profile
 - health_state
@@ -148,7 +149,13 @@ camera_source
 - updated_at
 ```
 
-`capture_node_id = null` for main-host-local sources. `role_label` is descriptive metadata, not a replacement for explicit profile configuration.
+`capture_node_id = null` for main-host-local sources. Remote sources reference a separate capture-node UUID; one node may contain multiple source UUIDs. `role_label` is descriptive metadata, not a replacement for explicit profile configuration. Configuration and health updates preserve source UUIDs.
+
+The in-process SQLite registry stores node health separately from source health. New source records start disabled, `offline`, with `unknown` image quality and no negotiated capture profile. Camera health supports `online`, `degraded`, `offline`, and `manual_intervention_required`; node liveness never implicitly changes camera health. Node health uses `online`, `degraded`, `offline`, and `revoked` as specified in section 5.8; the registry rejects node/source health types used interchangeably. Last-seen observations require timezone-aware timestamps and are normalized to UTC.
+
+Desired and negotiated video profiles are independent optional records with width, height, fps, pixel format, codec, and bitrate fields. Unset fields do not select hardware defaults. `image_quality_state` stores the adapter's descriptive state; detector-specific quality gating remains the detector's responsibility. The registry does not interpret `unknown` as evidence that no person is present.
+
+The implementation contract and bounded configuration validation are described in `server/app/cameras/registry/README.md`. Registry operations are internal only until the Owner authorization boundary in Issue #10 is implemented; no human management route is exposed by the registry.
 
 ### 3.3 Detection profile bindings
 
@@ -164,13 +171,13 @@ owner_verification
 image_quality
 ```
 
-Each profile contains config/version/thresholds/enabled state. Source type does not implicitly determine which profiles run.
+Each binding has its own UUID and contains a detector kind, JSON config, positive version, finite numeric thresholds, and enabled state. Multiple bindings may use the same detector kind, for example for distinct regions. Source type does not implicitly determine which profiles run.
 
 ### 3.4 Active-source limit
 
 Initial `max_active_video_sources = 4`.
 
-Activation that exceeds the configured limit returns an explicit validation error rather than silently replacing another source.
+Activation that exceeds the configured limit returns an explicit validation error rather than silently replacing another source. The limit is persisted with registry configuration; lowering it below the current enabled count is rejected. Enabled sources continue to reserve capacity while offline or awaiting manual intervention. Admission, metadata changes, and binding updates are one serialized SQLite transaction, so concurrent requests cannot overbook or partially apply a rejected activation.
 
 ## 4. Physical UVC identity and reconnect
 
