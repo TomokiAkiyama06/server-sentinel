@@ -1,0 +1,737 @@
+[
+  {
+    "Package": "adduser",
+    "Version": "3.134",
+    "Source": null,
+    "Architecture": "all",
+    "Homepage": null
+  },
+  {
+    "Package": "apt",
+    "Version": "2.6.1",
+    "Source": null,
+    "Architecture": "amd64",
+    "Homepage": null
+  },
+  {
+    "Package": "base-files",
+    "Version": "12.4+deb12u15",
+    "Source": null,
+    "Architecture": "amd64",
+    "Homepage": null
+  },
+  {
+    "Package": "base-passwd",
+    "Version": "3.6.1",
+    "Source": null,
+    "Architecture": "amd64",
+    "Homepage": null
+  },
+  {
+    "Package": "bash",
+    "Version": "5.2.15-2+b13",
+    "Source": "bash (5.2.15-2)",
+    "Architecture": "amd64",
+    "Homepage": "http://tiswww.case.edu/php/chet/bash/bashtop.html"
+  },
+  {
+    "Package": "bsdutils",
+    "Version": "1:2.38.1-5+deb12u3",
+    "Source": "util-linux (2.38.1-5+deb12u3)",
+    "Architecture": "amd64",
+    "Homepage": "https://www.kernel.org/pub/linux/utils/util-linux/"
+  },
+  {
+    "Package": "ca-certificates",
+    "Version": "20250419~deb12u1",
+    "Source": null,
+    "Architecture": "all",
+    "Homepage": null
+  },
+  {
+    "Package": "coreutils",
+    "Version": "9.1-1",
+    "Source": null,
+    "Architecture": "amd64",
+    "Homepage": "http://gnu.org/software/coreutils"
+  },
+  {
+    "Package": "dash",
+    "Version": "0.5.12-2",
+    "Source": null,
+    "Architecture": "amd64",
+    "Homepage": "http://gondor.apana.org.au/~herbert/dash/"
+  },
+  {
+    "Package": "debconf",
+    "Version": "1.5.82",
+    "Source": null,
+    "Architecture": "all",
+    "Homepage": null
+  },
+  {
+    "Package": "debian-archive-keyring",
+    "Version": "2023.3+deb12u2",
+    "Source": null,
+    "Architecture": "all",
+    "Homepage": null
+  },
+  {
+    "Package": "debianutils",
+    "Version": "5.7-0.5~deb12u1",
+    "Source": null,
+    "Architecture": "amd64",
+    "Homepage": null
+  },
+  {
+    "Package": "diffutils",
+    "Version": "1:3.8-4",
+    "Source": null,
+    "Architecture": "amd64",
+    "Homepage": "https://www.gnu.org/software/diffutils/"
+  },
+  {
+    "Package": "dpkg",
+    "Version": "1.21.23",
+    "Source": null,
+    "Architecture": "amd64",
+    "Homepage": "https://wiki.debian.org/Teams/Dpkg"
+  },
+  {
+    "Package": "e2fsprogs",
+    "Version": "1.47.0-2+b2",
+    "Source": "e2fsprogs (1.47.0-2)",
+    "Architecture": "amd64",
+    "Homepage": "http://e2fsprogs.sourceforge.net"
+  },
+  {
+    "Package": "findutils",
+    "Version": "4.9.0-4",
+    "Source": null,
+    "Architecture": "amd64",
+    "Homepage": "https://savannah.gnu.org/projects/findutils/"
+  },
+  {
+    "Package": "gcc-12-base",
+    "Version": "12.2.0-14+deb12u1",
+    "Source": "gcc-12",
+    "Architecture": "amd64",
+    "Homepage": "http://gcc.gnu.org/"
+  },
+  {
+    "Package": "gpgv",
+    "Version": "2.2.40-1.1+deb12u2",
+    "Source": "gnupg2",
+    "Architecture": "amd64",
+    "Homepage": "https://www.gnupg.org/"
+  },
+  {
+    "Package": "grep",
+    "Version": "3.8-5",
+    "Source": null,
+    "Architecture": "amd64",
+    "Homepage": "https://www.gnu.org/software/grep/"
+  },
+  {
+    "Package": "gzip",
+    "Version": "1.12-1",
+    "Source": null,
+    "Architecture": "amd64",
+    "Homepage": "https://www.gnu.org/software/gzip/"
+  },
+  {
+    "Package": "hostname",
+    "Version": "3.23+nmu1",
+    "Source": null,
+    "Architecture": "amd64",
+    "Homepage": null
+  },
+  {
+    "Package": "init-system-helpers",
+    "Version": "1.65.2+deb12u1",
+    "Source": null,
+    "Architecture": "all",
+    "Homepage": null
+  },
+  {
+    "Package": "libacl1",
+    "Version": "2.3.1-3",
+    "Source": "acl",
+    "Architecture": "amd64",
+    "Homepage": "https://savannah.nongnu.org/projects/acl/"
+  },
+  {
+    "Package": "libapt-pkg6.0",
+    "Version": "2.6.1",
+    "Source": "apt",
+    "Architecture": "amd64",
+    "Homepage": null
+  },
+  {
+    "Package": "libattr1",
+    "Version": "1:2.5.1-4",
+    "Source": "attr",
+    "Architecture": "amd64",
+    "Homepage": "https://savannah.nongnu.org/projects/attr/"
+  },
+  {
+    "Package": "libaudit-common",
+    "Version": "1:3.0.9-1",
+    "Source": "audit",
+    "Architecture": "all",
+    "Homepage": "https://people.redhat.com/sgrubb/audit/"
+  },
+  {
+    "Package": "libaudit1",
+    "Version": "1:3.0.9-1",
+    "Source": "audit",
+    "Architecture": "amd64",
+    "Homepage": "https://people.redhat.com/sgrubb/audit/"
+  },
+  {
+    "Package": "libblkid1",
+    "Version": "2.38.1-5+deb12u3",
+    "Source": "util-linux",
+    "Architecture": "amd64",
+    "Homepage": "https://www.kernel.org/pub/linux/utils/util-linux/"
+  },
+  {
+    "Package": "libbz2-1.0",
+    "Version": "1.0.8-5+b1",
+    "Source": "bzip2 (1.0.8-5)",
+    "Architecture": "amd64",
+    "Homepage": "https://sourceware.org/bzip2/"
+  },
+  {
+    "Package": "libc-bin",
+    "Version": "2.36-9+deb12u14",
+    "Source": "glibc",
+    "Architecture": "amd64",
+    "Homepage": "https://www.gnu.org/software/libc/libc.html"
+  },
+  {
+    "Package": "libc6",
+    "Version": "2.36-9+deb12u14",
+    "Source": "glibc",
+    "Architecture": "amd64",
+    "Homepage": "https://www.gnu.org/software/libc/libc.html"
+  },
+  {
+    "Package": "libcap-ng0",
+    "Version": "0.8.3-1+b3",
+    "Source": "libcap-ng (0.8.3-1)",
+    "Architecture": "amd64",
+    "Homepage": "https://people.redhat.com/sgrubb/libcap-ng"
+  },
+  {
+    "Package": "libcap2",
+    "Version": "1:2.66-4+deb12u3+b1",
+    "Source": "libcap2 (1:2.66-4+deb12u3)",
+    "Architecture": "amd64",
+    "Homepage": "https://sites.google.com/site/fullycapable/"
+  },
+  {
+    "Package": "libcom-err2",
+    "Version": "1.47.0-2+b2",
+    "Source": "e2fsprogs (1.47.0-2)",
+    "Architecture": "amd64",
+    "Homepage": "http://e2fsprogs.sourceforge.net"
+  },
+  {
+    "Package": "libcrypt1",
+    "Version": "1:4.4.33-2",
+    "Source": "libxcrypt",
+    "Architecture": "amd64",
+    "Homepage": null
+  },
+  {
+    "Package": "libdb5.3",
+    "Version": "5.3.28+dfsg2-1",
+    "Source": "db5.3",
+    "Architecture": "amd64",
+    "Homepage": "http://www.oracle.com/technetwork/database/database-technologies/berkeleydb/overview/index.html"
+  },
+  {
+    "Package": "libdebconfclient0",
+    "Version": "0.270",
+    "Source": "cdebconf",
+    "Architecture": "amd64",
+    "Homepage": null
+  },
+  {
+    "Package": "libext2fs2",
+    "Version": "1.47.0-2+b2",
+    "Source": "e2fsprogs (1.47.0-2)",
+    "Architecture": "amd64",
+    "Homepage": "http://e2fsprogs.sourceforge.net"
+  },
+  {
+    "Package": "libffi8",
+    "Version": "3.4.4-1",
+    "Source": "libffi",
+    "Architecture": "amd64",
+    "Homepage": "https://sourceware.org/libffi/"
+  },
+  {
+    "Package": "libgcc-s1",
+    "Version": "12.2.0-14+deb12u1",
+    "Source": "gcc-12",
+    "Architecture": "amd64",
+    "Homepage": "http://gcc.gnu.org/"
+  },
+  {
+    "Package": "libgcrypt20",
+    "Version": "1.10.1-3+deb12u1",
+    "Source": null,
+    "Architecture": "amd64",
+    "Homepage": "https://directory.fsf.org/project/libgcrypt/"
+  },
+  {
+    "Package": "libgdbm6",
+    "Version": "1.23-3",
+    "Source": "gdbm",
+    "Architecture": "amd64",
+    "Homepage": "https://gnu.org/software/gdbm"
+  },
+  {
+    "Package": "libgmp10",
+    "Version": "2:6.2.1+dfsg1-1.1",
+    "Source": "gmp",
+    "Architecture": "amd64",
+    "Homepage": "https://gmplib.org/"
+  },
+  {
+    "Package": "libgnutls30",
+    "Version": "3.7.9-2+deb12u7",
+    "Source": "gnutls28",
+    "Architecture": "amd64",
+    "Homepage": "https://www.gnutls.org/"
+  },
+  {
+    "Package": "libgpg-error0",
+    "Version": "1.46-1",
+    "Source": "libgpg-error",
+    "Architecture": "amd64",
+    "Homepage": "https://www.gnupg.org/related_software/libgpg-error/"
+  },
+  {
+    "Package": "libgssapi-krb5-2",
+    "Version": "1.20.1-2+deb12u5",
+    "Source": "krb5",
+    "Architecture": "amd64",
+    "Homepage": "https://web.mit.edu/kerberos/"
+  },
+  {
+    "Package": "libhogweed6",
+    "Version": "3.8.1-2",
+    "Source": "nettle",
+    "Architecture": "amd64",
+    "Homepage": "http://www.lysator.liu.se/~nisse/nettle/"
+  },
+  {
+    "Package": "libidn2-0",
+    "Version": "2.3.3-1+b1",
+    "Source": "libidn2 (2.3.3-1)",
+    "Architecture": "amd64",
+    "Homepage": "https://www.gnu.org/software/libidn/#libidn2"
+  },
+  {
+    "Package": "libk5crypto3",
+    "Version": "1.20.1-2+deb12u5",
+    "Source": "krb5",
+    "Architecture": "amd64",
+    "Homepage": "https://web.mit.edu/kerberos/"
+  },
+  {
+    "Package": "libkeyutils1",
+    "Version": "1.6.3-2",
+    "Source": "keyutils",
+    "Architecture": "amd64",
+    "Homepage": "https://git.kernel.org/pub/scm/linux/kernel/git/dhowells/keyutils.git"
+  },
+  {
+    "Package": "libkrb5-3",
+    "Version": "1.20.1-2+deb12u5",
+    "Source": "krb5",
+    "Architecture": "amd64",
+    "Homepage": "https://web.mit.edu/kerberos/"
+  },
+  {
+    "Package": "libkrb5support0",
+    "Version": "1.20.1-2+deb12u5",
+    "Source": "krb5",
+    "Architecture": "amd64",
+    "Homepage": "https://web.mit.edu/kerberos/"
+  },
+  {
+    "Package": "liblz4-1",
+    "Version": "1.9.4-1",
+    "Source": "lz4",
+    "Architecture": "amd64",
+    "Homepage": "https://github.com/lz4/lz4"
+  },
+  {
+    "Package": "liblzma5",
+    "Version": "5.4.1-1+deb12u2",
+    "Source": "xz-utils",
+    "Architecture": "amd64",
+    "Homepage": "https://tukaani.org/xz/"
+  },
+  {
+    "Package": "libmd0",
+    "Version": "1.0.4-2",
+    "Source": "libmd",
+    "Architecture": "amd64",
+    "Homepage": "https://www.hadrons.org/software/libmd/"
+  },
+  {
+    "Package": "libmount1",
+    "Version": "2.38.1-5+deb12u3",
+    "Source": "util-linux",
+    "Architecture": "amd64",
+    "Homepage": "https://www.kernel.org/pub/linux/utils/util-linux/"
+  },
+  {
+    "Package": "libncursesw6",
+    "Version": "6.4-4",
+    "Source": "ncurses",
+    "Architecture": "amd64",
+    "Homepage": "https://invisible-island.net/ncurses/"
+  },
+  {
+    "Package": "libnettle8",
+    "Version": "3.8.1-2",
+    "Source": "nettle",
+    "Architecture": "amd64",
+    "Homepage": "http://www.lysator.liu.se/~nisse/nettle/"
+  },
+  {
+    "Package": "libnsl2",
+    "Version": "1.3.0-2",
+    "Source": "libnsl",
+    "Architecture": "amd64",
+    "Homepage": "https://github.com/thkukuk/libnsl"
+  },
+  {
+    "Package": "libp11-kit0",
+    "Version": "0.24.1-2",
+    "Source": "p11-kit",
+    "Architecture": "amd64",
+    "Homepage": "https://p11-glue.github.io/p11-glue/p11-kit.html"
+  },
+  {
+    "Package": "libpam-modules",
+    "Version": "1.5.2-6+deb12u2",
+    "Source": "pam",
+    "Architecture": "amd64",
+    "Homepage": "http://www.linux-pam.org/"
+  },
+  {
+    "Package": "libpam-modules-bin",
+    "Version": "1.5.2-6+deb12u2",
+    "Source": "pam",
+    "Architecture": "amd64",
+    "Homepage": "http://www.linux-pam.org/"
+  },
+  {
+    "Package": "libpam-runtime",
+    "Version": "1.5.2-6+deb12u2",
+    "Source": "pam",
+    "Architecture": "all",
+    "Homepage": "http://www.linux-pam.org/"
+  },
+  {
+    "Package": "libpam0g",
+    "Version": "1.5.2-6+deb12u2",
+    "Source": "pam",
+    "Architecture": "amd64",
+    "Homepage": "http://www.linux-pam.org/"
+  },
+  {
+    "Package": "libpcre2-8-0",
+    "Version": "10.42-1+deb12u1",
+    "Source": "pcre2",
+    "Architecture": "amd64",
+    "Homepage": "https://pcre.org/"
+  },
+  {
+    "Package": "libreadline8",
+    "Version": "8.2-1.3",
+    "Source": "readline",
+    "Architecture": "amd64",
+    "Homepage": null
+  },
+  {
+    "Package": "libseccomp2",
+    "Version": "2.5.4-1+deb12u1",
+    "Source": "libseccomp",
+    "Architecture": "amd64",
+    "Homepage": "https://github.com/seccomp/libseccomp"
+  },
+  {
+    "Package": "libselinux1",
+    "Version": "3.4-1+b6",
+    "Source": "libselinux (3.4-1)",
+    "Architecture": "amd64",
+    "Homepage": "https://selinuxproject.org"
+  },
+  {
+    "Package": "libsemanage-common",
+    "Version": "3.4-1",
+    "Source": "libsemanage",
+    "Architecture": "all",
+    "Homepage": "https://selinuxproject.org"
+  },
+  {
+    "Package": "libsemanage2",
+    "Version": "3.4-1+b5",
+    "Source": "libsemanage (3.4-1)",
+    "Architecture": "amd64",
+    "Homepage": "https://selinuxproject.org"
+  },
+  {
+    "Package": "libsepol2",
+    "Version": "3.4-2.1",
+    "Source": "libsepol",
+    "Architecture": "amd64",
+    "Homepage": "https://selinuxproject.org"
+  },
+  {
+    "Package": "libsmartcols1",
+    "Version": "2.38.1-5+deb12u3",
+    "Source": "util-linux",
+    "Architecture": "amd64",
+    "Homepage": "https://www.kernel.org/pub/linux/utils/util-linux/"
+  },
+  {
+    "Package": "libsqlite3-0",
+    "Version": "3.40.1-2+deb12u2",
+    "Source": "sqlite3",
+    "Architecture": "amd64",
+    "Homepage": "https://www.sqlite.org/"
+  },
+  {
+    "Package": "libss2",
+    "Version": "1.47.0-2+b2",
+    "Source": "e2fsprogs (1.47.0-2)",
+    "Architecture": "amd64",
+    "Homepage": "http://e2fsprogs.sourceforge.net"
+  },
+  {
+    "Package": "libssl3",
+    "Version": "3.0.20-1~deb12u2",
+    "Source": "openssl",
+    "Architecture": "amd64",
+    "Homepage": "https://www.openssl.org/"
+  },
+  {
+    "Package": "libstdc++6",
+    "Version": "12.2.0-14+deb12u1",
+    "Source": "gcc-12",
+    "Architecture": "amd64",
+    "Homepage": "http://gcc.gnu.org/"
+  },
+  {
+    "Package": "libsystemd0",
+    "Version": "252.39-1~deb12u2",
+    "Source": "systemd",
+    "Architecture": "amd64",
+    "Homepage": "https://www.freedesktop.org/wiki/Software/systemd"
+  },
+  {
+    "Package": "libtasn1-6",
+    "Version": "4.19.0-2+deb12u1",
+    "Source": null,
+    "Architecture": "amd64",
+    "Homepage": "https://www.gnu.org/software/libtasn1/"
+  },
+  {
+    "Package": "libtinfo6",
+    "Version": "6.4-4",
+    "Source": "ncurses",
+    "Architecture": "amd64",
+    "Homepage": "https://invisible-island.net/ncurses/"
+  },
+  {
+    "Package": "libtirpc-common",
+    "Version": "1.3.3+ds-1",
+    "Source": "libtirpc",
+    "Architecture": "all",
+    "Homepage": "http://sourceforge.net/projects/libtirpc"
+  },
+  {
+    "Package": "libtirpc3",
+    "Version": "1.3.3+ds-1",
+    "Source": "libtirpc",
+    "Architecture": "amd64",
+    "Homepage": "http://sourceforge.net/projects/libtirpc"
+  },
+  {
+    "Package": "libudev1",
+    "Version": "252.39-1~deb12u2",
+    "Source": "systemd",
+    "Architecture": "amd64",
+    "Homepage": "https://www.freedesktop.org/wiki/Software/systemd"
+  },
+  {
+    "Package": "libunistring2",
+    "Version": "1.0-2",
+    "Source": "libunistring",
+    "Architecture": "amd64",
+    "Homepage": "https://www.gnu.org/software/libunistring/"
+  },
+  {
+    "Package": "libuuid1",
+    "Version": "2.38.1-5+deb12u3",
+    "Source": "util-linux",
+    "Architecture": "amd64",
+    "Homepage": "https://www.kernel.org/pub/linux/utils/util-linux/"
+  },
+  {
+    "Package": "libxxhash0",
+    "Version": "0.8.1-1",
+    "Source": "xxhash",
+    "Architecture": "amd64",
+    "Homepage": "https://cyan4973.github.io/xxHash"
+  },
+  {
+    "Package": "libzstd1",
+    "Version": "1.5.4+dfsg2-5",
+    "Source": "libzstd",
+    "Architecture": "amd64",
+    "Homepage": "https://github.com/facebook/zstd"
+  },
+  {
+    "Package": "login",
+    "Version": "1:4.13+dfsg1-1+deb12u2",
+    "Source": "shadow",
+    "Architecture": "amd64",
+    "Homepage": "https://github.com/shadow-maint/shadow"
+  },
+  {
+    "Package": "logsave",
+    "Version": "1.47.0-2+b2",
+    "Source": "e2fsprogs (1.47.0-2)",
+    "Architecture": "amd64",
+    "Homepage": "http://e2fsprogs.sourceforge.net"
+  },
+  {
+    "Package": "mawk",
+    "Version": "1.3.4.20200120-3.1",
+    "Source": null,
+    "Architecture": "amd64",
+    "Homepage": "https://invisible-island.net/mawk/"
+  },
+  {
+    "Package": "mount",
+    "Version": "2.38.1-5+deb12u3",
+    "Source": "util-linux",
+    "Architecture": "amd64",
+    "Homepage": "https://www.kernel.org/pub/linux/utils/util-linux/"
+  },
+  {
+    "Package": "ncurses-base",
+    "Version": "6.4-4",
+    "Source": "ncurses",
+    "Architecture": "all",
+    "Homepage": "https://invisible-island.net/ncurses/"
+  },
+  {
+    "Package": "ncurses-bin",
+    "Version": "6.4-4",
+    "Source": "ncurses",
+    "Architecture": "amd64",
+    "Homepage": "https://invisible-island.net/ncurses/"
+  },
+  {
+    "Package": "netbase",
+    "Version": "6.4",
+    "Source": null,
+    "Architecture": "all",
+    "Homepage": null
+  },
+  {
+    "Package": "openssl",
+    "Version": "3.0.20-1~deb12u2",
+    "Source": null,
+    "Architecture": "amd64",
+    "Homepage": "https://www.openssl.org/"
+  },
+  {
+    "Package": "passwd",
+    "Version": "1:4.13+dfsg1-1+deb12u2",
+    "Source": "shadow",
+    "Architecture": "amd64",
+    "Homepage": "https://github.com/shadow-maint/shadow"
+  },
+  {
+    "Package": "perl-base",
+    "Version": "5.36.0-7+deb12u3",
+    "Source": "perl",
+    "Architecture": "amd64",
+    "Homepage": "http://dev.perl.org/perl5/"
+  },
+  {
+    "Package": "readline-common",
+    "Version": "8.2-1.3",
+    "Source": "readline",
+    "Architecture": "all",
+    "Homepage": null
+  },
+  {
+    "Package": "sed",
+    "Version": "4.9-1+deb12u1",
+    "Source": null,
+    "Architecture": "amd64",
+    "Homepage": "https://www.gnu.org/software/sed/"
+  },
+  {
+    "Package": "sysvinit-utils",
+    "Version": "3.06-4",
+    "Source": "sysvinit",
+    "Architecture": "amd64",
+    "Homepage": "https://github.com/slicer69/sysvinit"
+  },
+  {
+    "Package": "tar",
+    "Version": "1.34+dfsg-1.2+deb12u1",
+    "Source": null,
+    "Architecture": "amd64",
+    "Homepage": "https://www.gnu.org/software/tar/"
+  },
+  {
+    "Package": "tzdata",
+    "Version": "2026b-0+deb12u1",
+    "Source": null,
+    "Architecture": "all",
+    "Homepage": "https://www.iana.org/time-zones"
+  },
+  {
+    "Package": "usr-is-merged",
+    "Version": "37~deb12u1",
+    "Source": "usrmerge",
+    "Architecture": "all",
+    "Homepage": "https://wiki.debian.org/UsrMerge"
+  },
+  {
+    "Package": "util-linux",
+    "Version": "2.38.1-5+deb12u3",
+    "Source": null,
+    "Architecture": "amd64",
+    "Homepage": "https://www.kernel.org/pub/linux/utils/util-linux/"
+  },
+  {
+    "Package": "util-linux-extra",
+    "Version": "2.38.1-5+deb12u3",
+    "Source": "util-linux",
+    "Architecture": "amd64",
+    "Homepage": "https://www.kernel.org/pub/linux/utils/util-linux/"
+  },
+  {
+    "Package": "zlib1g",
+    "Version": "1:1.2.13.dfsg-1",
+    "Source": "zlib",
+    "Architecture": "amd64",
+    "Homepage": "http://zlib.net/"
+  }
+]

@@ -13,13 +13,13 @@ Phases group capabilities rather than imposing a strict completion order. The de
 - [ ] dependency/model license policy
 - [ ] hardened review-gate follow-up mapped to Issue #4 (enforcement implementation remains open)
 
-Issue #1 closed when PR #2 merged after documentation/bootstrap acceptance and current HEAD/base reviews plus CI passed. CI foundation #5 is implemented without starting runtime components. Runtime/ADR Issues #6–#28 and the separately tracked #4 remain independent follow-up work.
+Issue #1 closed when PR #2 merged after documentation/bootstrap acceptance and current HEAD/base reviews plus CI passed. CI foundation #5 is implemented. The #7 closed backend foundation now has synthetic coverage; its authorization prerequisite remains separate. Runtime/ADR Issues #6–#28 and the separately tracked #4 retain their own acceptance gates.
 
 ## Phase 1 — Main server and web foundation
 
-- [ ] FastAPI service
-- [ ] SQLite migrations
-- [ ] settings/config/storage abstraction
+- [x] closed FastAPI foundation (human routes await #6/#10)
+- [x] SQLite migration foundation
+- [x] validated deployment settings and database abstraction
 - [ ] health endpoints
 - [ ] React responsive dashboard shell
 - [ ] Docker Compose where appropriate

@@ -162,6 +162,12 @@ Acceptance:
 
 GitHub Issue: [#7](https://github.com/TomokiAkiyama06/server-sentinel/issues/7)
 
+Implementation: `server/app/` and `server/tests/` provide the closed FastAPI
+foundation, validated deployment settings, transactional SQLite migration and
+value-free structured logging. See [`server/docs/FOUNDATION.md`](../server/docs/FOUNDATION.md).
+Human routes remain unavailable; final acceptance retains the #6 dependency and
+does not treat this foundation as #10 permission enforcement.
+
 Depends on: [#5](https://github.com/TomokiAkiyama06/server-sentinel/issues/5), [#6](https://github.com/TomokiAkiyama06/server-sentinel/issues/6)
 
 Labels: `backend`, `security`

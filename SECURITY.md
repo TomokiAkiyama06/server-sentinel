@@ -18,6 +18,15 @@ Safe defaults:
 
 ## Threat model
 
+The current backend foundation denies every human HTTP/WebSocket route,
+including system health, version, schema and framework documentation. Its
+documented launcher accepts only loopback bind settings, disables proxy-header
+parsing and access logs, and removes the server product header. The authorization
+adapter remains deny-all until the #6/#10 gates are met. Newly created SQLite
+files use mode `0600`; deployment operators must keep their parent data directory
+private. This foundation does not yet implement trusted proxy/session handling
+or Agent media-root mount enforcement. Details: `server/docs/FOUNDATION.md`.
+
 Primary threats:
 
 1. Unauthorized dashboard/live/recording access.

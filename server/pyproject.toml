@@ -1,0 +1,11 @@
+[project]
+name = "server-sentinel"
+version = "0.1.0"
+requires-python = ">=3.12,<3.15"
+description = "Deployment-local Main Server foundation"
+license = "Apache-2.0"
+dependencies = ["fastapi==0.141.1", "uvicorn==0.53.0"]
+
+[tool.server-sentinel]
+# Install reviewed wheels via requirements-ci.lock; no editable build is needed.
+tested-ci-platform = "Linux x86_64 / CPython 3.12"

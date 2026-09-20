@@ -9,10 +9,11 @@ in Issue #4; the workflow does not change repository protection settings.
 
 ## Current coverage
 
-The repository currently contains CI tooling and application README skeletons.
-There is no runnable Main Server, capture agent, or web application. Consequently
-component checks explicitly report **not implemented**. This is not a runtime,
-hardware, browser, or network acceptance result.
+The Main Server foundation has configured lint, synthetic tests and isolated
+normal/error ASGI smoke. Its smoke additionally observes Python outbound and
+process-spawn attempts; see `server/docs/FOUNDATION.md` for the precise limits.
+README-only components still report **not implemented**. These checks do not
+constitute camera, browser, trusted-proxy or physical-network acceptance.
 
 The repository job always runs:
 
