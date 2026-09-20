@@ -1,7 +1,11 @@
+from contextlib import contextmanager
 import json
+import os
 from pathlib import Path
 import tempfile
+import threading
 import unittest
+from unittest.mock import patch
 from zipfile import ZipFile
 
 from fastapi import FastAPI, Request
@@ -17,6 +21,7 @@ from app.diagnostics import (
     DiagnosticField,
     DiagnosticFieldKind,
     MediaAsset,
+    MediaDescriptor,
     SafeDiagnosticState,
 )
 from tests.asgi import request
@@ -47,10 +52,58 @@ class SyntheticDiagnostics:
 class SelectedMedia:
     def __init__(self):
         self.resolved = []
+        self.released = []
+        self.active = 0
+        self.max_active = 0
+        self.worker_threads = []
 
-    def resolve_selected(self, media_id):
+    @staticmethod
+    def content(media_id):
+        values = {
+            "clip_a": b"SYNTHETIC_MEDIA_ALPHA",
+            "clip_b": b"SYNTHETIC_MEDIA_BRAVO",
+        }
+        return values[media_id]
+
+    def describe_selected(self, media_id):
+        self.worker_threads.append(threading.get_ident())
+        return MediaDescriptor(len(self.content(media_id)))
+
+    @contextmanager
+    def open_selected(self, media_id):
+        self.worker_threads.append(threading.get_ident())
+        self.active += 1
+        self.max_active = max(self.max_active, self.active)
+        if self.active != 1:
+            raise AssertionError("selected media retained across writes")
         self.resolved.append(media_id)
-        return MediaAsset(("SYNTHETIC_MEDIA_" + media_id).encode())
+        try:
+            yield MediaAsset(self.content(media_id))
+        finally:
+            self.active -= 1
+            self.released.append(media_id)
+
+
+class StorageAdmission:
+    def __init__(self):
+        self.reservations = []
+        self.active = False
+        self.releases = 0
+        self.denial = None
+
+    def admit(self, media_bytes, *, critical):
+        if self.denial:
+            raise DiagnosticExportError(self.denial)
+        if self.active or type(media_bytes) is not int or media_bytes <= 0 or critical:
+            raise AssertionError("invalid diagnostic storage admission")
+        self.reservations.append(media_bytes)
+        self.active = True
+
+    def release(self):
+        if not self.active:
+            raise AssertionError("diagnostic reservation is not active")
+        self.active = False
+        self.releases += 1
 
 
 class DiagnosticExportTests(unittest.IsolatedAsyncioTestCase):
@@ -60,6 +113,7 @@ class DiagnosticExportTests(unittest.IsolatedAsyncioTestCase):
         self.output = Path(self.temporary.name)
         self.source = SyntheticDiagnostics()
         self.media = SelectedMedia()
+        self.policy = StorageAdmission()
 
     def read_bundle(self, result):
         with ZipFile(result.bundle_path) as archive:
@@ -74,7 +128,8 @@ class DiagnosticExportTests(unittest.IsolatedAsyncioTestCase):
                 confirmations.append(confirmation)
                 raise PermissionError("denied")
 
-        service = DiagnosticExportService(Deny(), self.source, self.media)
+        service = DiagnosticExportService(
+            Deny(), self.source, self.policy, self.media)
         with self.assertRaises(PermissionError):
             await service.export(DiagnosticExportAction(self.output, ("clip_a",)))
         self.assertEqual(list(self.output.iterdir()), [])
@@ -96,7 +151,7 @@ class DiagnosticExportTests(unittest.IsolatedAsyncioTestCase):
 
         action = DiagnosticExportAction(self.output)
         result = await DiagnosticExportService(
-            Permit(), self.source, self.media).export(action)
+            Permit(), self.source, self.policy, self.media).export(action)
         files, manifest = self.read_bundle(result)
         runtime = json.loads(files["diagnostics/runtime.json"])
 
@@ -119,6 +174,9 @@ class DiagnosticExportTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("identifier_salt", manifest)
         self.assertNotIn("security", result.included_categories)
         self.assertEqual(result.bundle_path.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(self.policy.reservations, [result.bundle_path.stat().st_size])
+        self.assertEqual(self.policy.releases, 1)
+        self.assertFalse(self.policy.active)
 
     async def test_only_individually_selected_raw_media_is_resolved_and_included(self):
         class Permit:
@@ -127,10 +185,13 @@ class DiagnosticExportTests(unittest.IsolatedAsyncioTestCase):
 
         action = DiagnosticExportAction(self.output, ("clip_b", "clip_a"))
         result = await DiagnosticExportService(
-            Permit(), self.source, self.media).export(action)
+            Permit(), self.source, self.policy, self.media).export(action)
         files, manifest = self.read_bundle(result)
 
         self.assertEqual(self.media.resolved, ["clip_b", "clip_a"])
+        self.assertEqual(self.media.released, ["clip_b", "clip_a"])
+        self.assertEqual(self.media.max_active, 1)
+        self.assertEqual(self.media.active, 0)
         self.assertEqual(result.included_media_count, 2)
         self.assertEqual(len([name for name in files if name.startswith("media/")]), 2)
         self.assertFalse(any(media_id.encode() in result.bundle_path.read_bytes()
@@ -139,8 +200,106 @@ class DiagnosticExportTests(unittest.IsolatedAsyncioTestCase):
                            if item["category"] == "raw_monitoring_media")
         self.assertEqual(media_entry["item_count"], 2)
 
+    async def test_pressure_and_hard_stop_deny_before_file_or_media_open(self):
+        class Permit:
+            async def require_owner_export(inner_self, action, confirmation):
+                return None
+
+        for reason in ("STORAGE_PRESSURE", "STORAGE_HARD_STOP"):
+            with self.subTest(reason=reason):
+                self.policy.denial = reason
+                service = DiagnosticExportService(
+                    Permit(), self.source, self.policy, self.media)
+                with self.assertRaisesRegex(DiagnosticExportError, reason):
+                    await service.export(DiagnosticExportAction(
+                        self.output, ("clip_a",)))
+                self.assertEqual(list(self.output.iterdir()), [])
+                self.assertEqual(self.media.resolved, [])
+                self.assertEqual(self.policy.releases, 0)
+                self.policy.denial = None
+
+    async def test_media_zip_and_fsync_run_in_bounded_worker(self):
+        event_loop_thread = threading.get_ident()
+        zip_threads = []
+        fsync_threads = []
+        original_writestr = ZipFile.writestr
+        original_fsync = os.fsync
+
+        class Permit:
+            async def require_owner_export(inner_self, action, confirmation):
+                self.assertEqual(threading.get_ident(), event_loop_thread)
+
+        def observed_writestr(archive, *args, **kwargs):
+            zip_threads.append(threading.get_ident())
+            return original_writestr(archive, *args, **kwargs)
+
+        def observed_fsync(descriptor):
+            fsync_threads.append(threading.get_ident())
+            return original_fsync(descriptor)
+
+        with patch("app.diagnostics.export.ZipFile.writestr", new=observed_writestr), \
+                patch("app.diagnostics.export.os.fsync", side_effect=observed_fsync):
+            await DiagnosticExportService(
+                Permit(), self.source, self.policy, self.media).export(
+                    DiagnosticExportAction(self.output, ("clip_a",)))
+
+        worker_threads = self.media.worker_threads + zip_threads + fsync_threads
+        self.assertTrue(worker_threads)
+        self.assertTrue(all(item != event_loop_thread for item in worker_threads))
+        self.assertEqual(self.media.max_active, 1)
+
+    async def test_directory_fsync_failure_removes_published_bundle_and_releases(self):
+        calls = []
+
+        class Permit:
+            async def require_owner_export(inner_self, action, confirmation):
+                return None
+
+        def fail_publication_fsync(descriptor):
+            calls.append(descriptor)
+            self.assertTrue(self.policy.active)
+            if len(calls) == 2:
+                raise OSError("synthetic directory fsync failure")
+
+        with patch("app.diagnostics.export.os.fsync",
+                   side_effect=fail_publication_fsync):
+            with self.assertRaisesRegex(
+                    DiagnosticExportError, "diagnostic bundle write failed"):
+                await DiagnosticExportService(
+                    Permit(), self.source, self.policy).export(
+                        DiagnosticExportAction(self.output))
+
+        self.assertGreaterEqual(len(calls), 3)
+        self.assertEqual(list(self.output.iterdir()), [])
+        self.assertEqual(self.policy.releases, 1)
+        self.assertFalse(self.policy.active)
+
+    async def test_media_size_change_removes_partial_bundle_and_releases_each_item(self):
+        class Permit:
+            async def require_owner_export(inner_self, action, confirmation):
+                return None
+
+        class ChangedMedia(SelectedMedia):
+            def describe_selected(inner_self, media_id):
+                described = super().describe_selected(media_id)
+                return MediaDescriptor(described.size_bytes + 1, described.media_type)
+
+        media = ChangedMedia()
+        with self.assertRaisesRegex(
+                DiagnosticExportError, "diagnostic bundle write failed"):
+            await DiagnosticExportService(
+                Permit(), self.source, self.policy, media).export(
+                    DiagnosticExportAction(self.output, ("clip_a",)))
+
+        self.assertEqual(media.resolved, ["clip_a"])
+        self.assertEqual(media.released, ["clip_a"])
+        self.assertEqual(media.active, 0)
+        self.assertEqual(list(self.output.iterdir()), [])
+        self.assertEqual(self.policy.releases, 1)
+
     def test_invalid_or_duplicate_selection_is_rejected_before_authorization(self):
-        for selected in (("clip_a", "clip_a"), ("../clip",), ("",)):
+        for selected in (("clip_a", "clip_a"), ("../clip",), ("",),
+                         tuple(f"clip_{index}" for index in range(101))):
             with self.subTest(selected=selected), self.assertRaises(ValueError):
                 DiagnosticExportAction(self.output, selected)
 
@@ -191,7 +350,8 @@ class DiagnosticExportTests(unittest.IsolatedAsyncioTestCase):
         application = FastAPI()
         application.state.human_authorizer = SystemPermit()
         application.state.diagnostic_export_endpoint = DiagnosticExportEndpoint(
-            DiagnosticExportService(OwnerPermit(), self.source, self.media), self.output)
+            DiagnosticExportService(
+                OwnerPermit(), self.source, self.policy, self.media), self.output)
         application.include_router(router)
         body = json.dumps({"selected_media_ids": []}).encode()
         result = await request(
@@ -247,7 +407,7 @@ class DiagnosticExportTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(source=type(source).__name__), self.assertRaises(
                     DiagnosticExportError):
                 await DiagnosticExportService(
-                    MustNotAuthorize(), source).export(
+                    MustNotAuthorize(), source, self.policy).export(
                         DiagnosticExportAction(self.output))
         self.assertEqual(authorized, [])
         self.assertEqual(list(self.output.iterdir()), [])

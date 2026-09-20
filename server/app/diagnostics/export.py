@@ -4,6 +4,8 @@ from collections import Counter
 from collections.abc import Iterable
 from dataclasses import dataclass, field as dataclass_field
 from enum import StrEnum
+import asyncio
+from functools import partial
 import hashlib
 import hmac
 import json
@@ -12,8 +14,10 @@ import os
 from pathlib import Path
 import re
 import secrets
-from typing import Protocol, TypeAlias
-from zipfile import ZIP_DEFLATED, ZipFile, ZipInfo
+from typing import ContextManager, Protocol, TypeAlias
+from zipfile import ZIP64_LIMIT, ZIP_STORED, ZipFile, ZipInfo
+
+from app.media.recording.model import StoragePolicy
 
 
 JsonScalar: TypeAlias = str | int | float | bool | None
@@ -207,14 +211,30 @@ class MediaAsset:
             raise ValueError("media type is invalid")
 
 
+@dataclass(frozen=True)
+class MediaDescriptor:
+    size_bytes: int
+    media_type: str = "application/octet-stream"
+
+    def __post_init__(self) -> None:
+        if type(self.size_bytes) is not int or self.size_bytes <= 0:
+            raise ValueError("media size is invalid")
+        if not isinstance(self.media_type, str) or not _SAFE_NAME.fullmatch(
+                self.media_type.replace("/", ".")):
+            raise ValueError("media type is invalid")
+
+
 class DiagnosticSource(Protocol):
     def collect(self) -> Iterable[DiagnosticDocument]:
         """Return typed deployment-local diagnostic fields."""
 
 
 class MediaSource(Protocol):
-    def resolve_selected(self, media_id: str) -> MediaAsset:
-        """Resolve exactly one Owner-selected media ID; never enumerate media."""
+    def describe_selected(self, media_id: str) -> MediaDescriptor:
+        """Return bounded size/type metadata for one selected item."""
+
+    def open_selected(self, media_id: str) -> ContextManager[MediaAsset]:
+        """Open exactly one selected item and release it when the context exits."""
 
 
 @dataclass(frozen=True)
@@ -227,6 +247,8 @@ class DiagnosticExportAction:
     def __post_init__(self) -> None:
         if not isinstance(self.output_directory, Path):
             raise TypeError("output_directory must be a path")
+        if len(self.selected_media_ids) > 100:
+            raise ValueError("too many selected media IDs")
         if len(set(self.selected_media_ids)) != len(self.selected_media_ids):
             raise ValueError("selected media IDs must be unique")
         if any(not isinstance(item, str) or not _SAFE_NAME.fullmatch(item)
@@ -283,8 +305,25 @@ _EXCLUDED_KINDS = {
 @dataclass(frozen=True)
 class _PreparedBundle:
     output_directory: Path
-    included: dict[str, dict[str, JsonScalar]]
     confirmation: DiagnosticExportConfirmation
+    static_entries: tuple[tuple[str, bytes], ...]
+    selected_media: tuple[tuple[str, MediaDescriptor], ...]
+    reserved_bytes: int
+
+
+def _zip_size(entries: Iterable[tuple[str, int]]) -> int:
+    """Exact ZIP_STORED size for ASCII names and default ZipInfo metadata."""
+    total = 22  # end of central directory
+    count = 0
+    for name, content_size in entries:
+        if not 0 <= content_size < ZIP64_LIMIT:
+            raise DiagnosticExportError("diagnostic bundle is too large")
+        name_size = len(name.encode("ascii"))
+        total += content_size + 76 + 2 * name_size
+        count += 1
+    if count > 65535 or total >= ZIP64_LIMIT:
+        raise DiagnosticExportError("diagnostic bundle is too large")
+    return total
 
 
 class _DiagnosticBundleWriter:
@@ -366,48 +405,86 @@ class _DiagnosticBundleWriter:
             exclusions=tuple(exclusion_summary),
             selected_media_ids=action.selected_media_ids,
         )
-        return _PreparedBundle(output, included, confirmation)
-
-    def write(self, action: DiagnosticExportAction,
-              prepared: _PreparedBundle) -> DiagnosticExportResult:
-        media: list[MediaAsset] = []
+        selected_media: list[tuple[str, MediaDescriptor]] = []
         if action.selected_media_ids:
             if self._media_source is None:
                 raise DiagnosticExportError("selected diagnostic media is unavailable")
-            media = [self._media_source.resolve_selected(media_id)
-                     for media_id in action.selected_media_ids]
+            try:
+                for media_id in action.selected_media_ids:
+                    supplied = self._media_source.describe_selected(media_id)
+                    if not isinstance(supplied, MediaDescriptor):
+                        raise TypeError
+                    selected_media.append((media_id, MediaDescriptor(
+                        supplied.size_bytes, supplied.media_type)))
+            except Exception:
+                raise DiagnosticExportError(
+                    "selected diagnostic media is unavailable") from None
+
+        static_entries = [
+            (f"diagnostics/{category}.json", self._json_bytes(values))
+            for category, values in sorted(included.items())
+        ]
+        exclusion_manifest = [
+            ({"category": item.category, "reason": item.reason,
+              **({"count": item.count} if item.count is not None else {})})
+            for item in confirmation.exclusions
+        ]
+        manifest = {
+            "format": 1,
+            "transfer": "none_local_bundle_only",
+            "included_categories": [
+                {"category": item.category, "item_count": item.item_count}
+                for item in confirmation.included_categories
+            ],
+            "exclusions": exclusion_manifest,
+            "identifier_transform": "ephemeral_keyed_sha256",
+        }
+        static_entries.append(("manifest.json", self._json_bytes(manifest)))
+        sized_entries = [(name, len(value)) for name, value in static_entries]
+        sized_entries.extend(
+            (f"media/{index:04d}.bin", descriptor.size_bytes)
+            for index, (_, descriptor) in enumerate(selected_media, start=1)
+        )
+        return _PreparedBundle(
+            output, confirmation, tuple(static_entries), tuple(selected_media),
+            _zip_size(sized_entries),
+        )
+
+    def write(self, prepared: _PreparedBundle) -> DiagnosticExportResult:
 
         bundle_name = f"serversentinel-diagnostics-{secrets.token_hex(12)}.zip"
         temporary_name = f".{bundle_name}.part"
         temporary_path = prepared.output_directory / temporary_name
         bundle_path = prepared.output_directory / bundle_name
+        published = False
         try:
             descriptor = os.open(temporary_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             with os.fdopen(descriptor, "w+b") as stream, ZipFile(
-                    stream, "w", compression=ZIP_DEFLATED) as archive:
-                for category, values in sorted(prepared.included.items()):
-                    self._write_json(archive, f"diagnostics/{category}.json", values)
-                for index, asset in enumerate(media, start=1):
-                    self._write_bytes(archive, f"media/{index:04d}.bin", asset.content)
-                exclusion_manifest = [
-                    ({"category": item.category, "reason": item.reason,
-                      **({"count": item.count} if item.count is not None else {})})
-                    for item in prepared.confirmation.exclusions
-                ]
-                manifest = {
-                    "format": 1,
-                    "transfer": "none_local_bundle_only",
-                    "included_categories": [
-                        {"category": item.category, "item_count": item.item_count}
-                        for item in prepared.confirmation.included_categories
-                    ],
-                    "exclusions": exclusion_manifest,
-                    "identifier_transform": "ephemeral_keyed_sha256",
-                }
-                self._write_json(archive, "manifest.json", manifest)
+                    stream, "w", compression=ZIP_STORED) as archive:
+                for name, value in prepared.static_entries:
+                    self._write_bytes(archive, name, value)
+                if prepared.selected_media and self._media_source is None:
+                    raise DiagnosticExportError(
+                        "selected diagnostic media is unavailable")
+                for index, (media_id, expected) in enumerate(
+                        prepared.selected_media, start=1):
+                    with self._media_source.open_selected(media_id) as supplied:
+                        if not isinstance(supplied, MediaAsset):
+                            raise TypeError
+                        asset = MediaAsset(supplied.content, supplied.media_type)
+                        if (len(asset.content) != expected.size_bytes
+                                or asset.media_type != expected.media_type):
+                            raise ValueError
+                        self._write_bytes(
+                            archive, f"media/{index:04d}.bin", asset.content)
+                        del asset
+                    del supplied
                 stream.flush()
                 os.fsync(stream.fileno())
+            if temporary_path.stat().st_size != prepared.reserved_bytes:
+                raise OSError("unexpected diagnostic bundle size")
             os.replace(temporary_path, bundle_path)
+            published = True
             directory_fd = os.open(
                 prepared.output_directory, os.O_RDONLY | os.O_DIRECTORY)
             try:
@@ -416,32 +493,39 @@ class _DiagnosticBundleWriter:
                 os.close(directory_fd)
         except Exception:
             try:
-                temporary_path.unlink()
+                (bundle_path if published else temporary_path).unlink()
             except FileNotFoundError:
                 pass
             except OSError:
                 pass
-            raise
+            if published:
+                try:
+                    directory_fd = os.open(
+                        prepared.output_directory, os.O_RDONLY | os.O_DIRECTORY)
+                    try:
+                        os.fsync(directory_fd)
+                    finally:
+                        os.close(directory_fd)
+                except OSError:
+                    pass
+            raise DiagnosticExportError("diagnostic bundle write failed") from None
         return DiagnosticExportResult(
             bundle_path=bundle_path,
             included_categories=tuple(
                 item.category for item in prepared.confirmation.included_categories),
-            included_media_count=len(media),
+            included_media_count=len(prepared.selected_media),
         )
 
     @staticmethod
-    def _write_json(archive: ZipFile, name: str, value: object) -> None:
-        _DiagnosticBundleWriter._write_bytes(
-            archive, name,
-            json.dumps(value, separators=(",", ":"), sort_keys=True,
-                       ensure_ascii=True).encode("ascii"),
-        )
+    def _json_bytes(value: object) -> bytes:
+        return json.dumps(value, separators=(",", ":"), sort_keys=True,
+                          ensure_ascii=True).encode("ascii")
 
     @staticmethod
     def _write_bytes(archive: ZipFile, name: str, value: bytes) -> None:
         info = ZipInfo(name)
         info.external_attr = 0o600 << 16
-        info.compress_type = ZIP_DEFLATED
+        info.compress_type = ZIP_STORED
         archive.writestr(info, value)
 
 
@@ -449,15 +533,29 @@ class DiagnosticExportService:
     """The sole public bundle creation path, with pre-write confirmation."""
 
     def __init__(self, authorizer: OwnerDiagnosticExportAuthorizer,
-                 source: DiagnosticSource,
+                 source: DiagnosticSource, storage_policy: StoragePolicy,
                  media_source: MediaSource | None = None) -> None:
         self._authorizer = authorizer
+        self.__storage_policy = storage_policy
         self.__writer = _DiagnosticBundleWriter(source, media_source)
+        self.__worker_slot = asyncio.Semaphore(1)
+
+    def __write_reserved(self, prepared: _PreparedBundle) -> DiagnosticExportResult:
+        admitted = False
+        try:
+            self.__storage_policy.admit(prepared.reserved_bytes, critical=False)
+            admitted = True
+            return self.__writer.write(prepared)
+        finally:
+            if admitted:
+                self.__storage_policy.release()
 
     async def export(self, action: DiagnosticExportAction) -> DiagnosticExportResult:
-        prepared = self.__writer.prepare(action)
-        await self._authorizer.require_owner_export(action, prepared.confirmation)
-        return self.__writer.write(action, prepared)
+        async with self.__worker_slot:
+            prepared = await asyncio.to_thread(self.__writer.prepare, action)
+            await self._authorizer.require_owner_export(action, prepared.confirmation)
+            return await asyncio.to_thread(
+                partial(self.__write_reserved, prepared))
 
 
 class DiagnosticExportEndpoint:
