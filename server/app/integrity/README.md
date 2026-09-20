@@ -27,7 +27,11 @@ and [SMBIOS type-17 interface](https://manpages.debian.org/bookworm/dmidecode/dm
 No Python dependency, downloaded model or redistributed utility is added. Record
 host tool versions/availability and driver-specific limits deployment-locally.
 
-`IntegrityStore` receives a deployment-local SQLite connection. Assign
+`IntegrityStore` requires an autocommit deployment-local SQLite connection,
+an explicit metadata-reservation context factory and a pending-event limit.
+All access stays on the creating worker. Every approval, status/outbox and
+acknowledgement transaction holds the metadata reservation through commit; a
+hard-reserve denial propagates. Assign
 `integrity_migration(version)` the next unused contiguous application schema
 slot. The database and journals belong in the private runtime directory, outside
 checkout and media export paths. Raw baseline observations are local only and
@@ -49,8 +53,13 @@ categories/states/reasons only. `CHANGED`, `MISSING` and storage-assurance-block
 `UNVERIFIABLE` are immediate; other unknown/new devices are visible warnings.
 The #21 bridge maps immediate faults to `HARDWARE_INTEGRITY_FAILURE`, retaining
 local/UI state independently of optional Slack. Pending sink events retry each
-tick; delivery is at least once, so consumers can deduplicate by event ID. Status,
-approval audit and outbox need #21 retention integration before deployment.
+tick; delivery is at least once, so consumers deduplicate by monotonically
+increasing event ID. Acknowledged outbox rows are removed after durable sink
+acceptance. Pending rows have an explicit capacity limit; saturation retains
+local status with `delivery_blocked` and raises `INTEGRITY_OUTBOX_FULL`, never
+silently growing or dropping a fault. Retry drains pending events before another
+observation. The durable #21 sink owns fault history and its retention; approval
+audit retention also needs that integration before deployment.
 
 Tests only read generated procfs/sysfs fixtures in temporary directories and
 inject command output. They never inspect the test runner's real inventory.

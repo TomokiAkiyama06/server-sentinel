@@ -1,12 +1,14 @@
 """Synthetic inventory only. No commands read the test runner's host inventory."""
 
 from datetime import datetime, timedelta, timezone
+from contextlib import contextmanager
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import TestCase
 from uuid import UUID
 import json
 import sqlite3
+import threading
 
 from app.integrity.model import Component, Inventory, Kind, State, compare
 from app.integrity.probes import CommandRunner, LinuxProbe, ProbeUnavailable
@@ -80,7 +82,20 @@ class StoreTests(TestCase):
         self.db = sqlite3.connect(":memory:", isolation_level=None)
         migrate(self.db, (integrity_migration(1),))
         self.addCleanup(self.db.close)
-        self.store = IntegrityStore(self.db)
+        self.reserved = False
+        self.denied = False
+        self.store = IntegrityStore(self.db, reservation=self.reservation, max_pending_events=8)
+
+    @contextmanager
+    def reservation(self):
+        if self.denied:
+            raise RuntimeError("STORAGE_HARD_STOP")
+        self.assertFalse(self.reserved)
+        self.reserved = True
+        try:
+            yield
+        finally:
+            self.reserved = False
 
     def test_approval_denies_by_default(self):
         with self.assertRaises(PermissionError):
@@ -143,6 +158,55 @@ class StoreTests(TestCase):
         self.assertEqual(len(findings), 4)
         self.assertNotIn("synthetic-secret", str(findings))
 
+    def test_autocommit_required_and_worker_confined(self):
+        db = sqlite3.connect(":memory:")
+        self.addCleanup(db.close)
+        with self.assertRaisesRegex(ValueError, "AUTOCOMMIT"):
+            IntegrityStore(db, reservation=self.reservation, max_pending_events=8)
+        errors = []
+        def wrong_worker():
+            try:
+                self.store.deliver(lambda *args: None)
+            except RuntimeError as exc:
+                errors.append(str(exc))
+        thread = threading.Thread(target=wrong_worker)
+        thread.start()
+        thread.join()
+        self.assertEqual(errors, ["INTEGRITY_WORKER_UNAVAILABLE"])
+
+    def test_reservation_covers_approval_record_and_ack_transactions(self):
+        writes = []
+        def observe(statement):
+            if statement.startswith(("BEGIN", "INSERT", "UPDATE", "DELETE", "COMMIT")):
+                writes.append(self.reserved)
+        self.db.set_trace_callback(observe)
+        self.store.approval = Owner()
+        self.store.approve(Inventory((disk(),)), expected_revision=0, at=NOW)
+        self.store.record(compare(self.store.baseline()[1], Inventory(())), NOW)
+        self.store.deliver(lambda *args: self.assertFalse(self.reserved))
+        self.assertTrue(writes)
+        self.assertTrue(all(writes))
+        self.denied = True
+        with self.assertRaisesRegex(RuntimeError, "STORAGE_HARD_STOP"):
+            self.store.record(compare(None, Inventory(())), NOW)
+        self.assertFalse(self.db.in_transaction)
+
+    def test_pending_outbox_bounded_and_acked_ids_never_reused(self):
+        store = IntegrityStore(self.db, reservation=self.reservation, max_pending_events=1)
+        findings = compare(None, Inventory(()))
+        store.record(findings, NOW)
+        with self.assertRaisesRegex(RuntimeError, "INTEGRITY_OUTBOX_FULL"):
+            store.record(findings, NOW)
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM integrity_outbox").fetchone()[0], 1)
+        self.assertEqual(self.db.execute("SELECT delivery_blocked FROM integrity_status").fetchone()[0], 1)
+        identifiers = []
+        store.deliver(lambda identifier, *args: identifiers.append(identifier))
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM integrity_outbox").fetchone()[0], 0)
+        store.record(findings, NOW)
+        store.deliver(lambda identifier, *args: identifiers.append(identifier))
+        self.assertGreater(identifiers[1], identifiers[0])
+        self.assertFalse(self.db.in_transaction)
+
 
 class FakeRunner:
     def __init__(self, outputs=None):
@@ -187,6 +251,8 @@ class LinuxProbeTests(TestCase):
         gpu = next(item for item in inventory.components if item.kind == Kind.GPU)
         self.assertEqual(dict(gpu.identity)["uuid"], "GPU-synthetic")
         self.assertNotIn("synthetic-serial", repr(inventory))
+        self.probe.runner = FakeRunner({"nvidia-smi": b"00010000:01:00.0, GPU-other-domain, [N/A]\n"})
+        self.assertEqual(self.probe._gpu()[0].identity, ())
 
     def test_unavailable_hardware_is_unknown(self):
         self.assertEqual(self.probe.collect().unavailable, frozenset(Kind))
@@ -194,10 +260,21 @@ class LinuxProbeTests(TestCase):
     def test_zero_capacity_enumerated_device_is_not_confirmed_missing(self):
         self.put("sys/class/block/disk0/size", "0")
         current = self.probe.collect()
-        self.assertIn(Kind.STORAGE, current.unavailable)
+        self.assertNotIn(Kind.STORAGE, current.unavailable)
         findings = compare(Inventory((disk(),)), current)
         storage = [item for item in findings if item.kind == Kind.STORAGE]
         self.assertEqual([item.state for item in storage], [State.UNVERIFIABLE])
+
+    def test_unrelated_empty_drive_preserves_verified_recording_disk(self):
+        self.put("sys/class/block/disk0/size", "2048")
+        self.put("sys/class/block/disk0/device/serial", "synthetic-disk-a")
+        self.put("sys/class/block/sr0/size", "0")
+        baseline = Inventory((Component(Kind.STORAGE, "disk0", (("capacity_bytes", "1048576"),),
+                                        (("serial", "synthetic-disk-a"),)),))
+        findings = compare(baseline, self.probe.collect())
+        storage = [item for item in findings if item.kind == Kind.STORAGE]
+        self.assertEqual([item.state for item in storage], [State.OK, State.NEW_DEVICE])
+        self.assertFalse(any(item.immediate for item in storage))
 
     def test_memory_placeholder_serial_is_not_identity(self):
         self.probe.runner = FakeRunner({"dmidecode": b"Handle 0x0001\nMemory Device\n Size: 8 GB\n Locator: DIMM 0\n Serial Number: Not Specified\n"})

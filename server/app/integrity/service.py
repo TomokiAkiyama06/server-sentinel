@@ -35,6 +35,9 @@ class IntegrityService:
         started = self.monotonic()
         if not math.isfinite(started):
             raise ValueError("INVALID_MONOTONIC_CLOCK")
+        # Drain pending accepted events before admitting another observation;
+        # a previously full outbox must not prevent its own recovery.
+        self.store.deliver(self.sink)
         try:
             current = self.probe.collect()
             if not isinstance(current, Inventory):

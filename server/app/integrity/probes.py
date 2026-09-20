@@ -96,6 +96,14 @@ def _pairs(values: dict[str, str]) -> tuple[tuple[str, str], ...]:
     return tuple(sorted((key, value) for key, value in values.items() if value))
 
 
+def _pci_slot(value: str) -> str:
+    match = re.fullmatch(r"([0-9a-fA-F]{4,8}):([0-9a-fA-F]{2}):([0-9a-fA-F]{2})\.([0-7])", value)
+    if match is None:
+        raise ProbeUnavailable()
+    domain, bus, device, function = match.groups()
+    return f"{int(domain, 16):04x}:{bus.lower()}:{device.lower()}.{function}"
+
+
 @dataclass
 class LinuxProbe:
     root: Path = field(default=Path("/"), repr=False)
@@ -159,16 +167,17 @@ class LinuxProbe:
         for device in sorted((self.root / "sys/class/block").iterdir()):
             if (device / "partition").exists() or device.name.startswith(("loop", "ram", "zram")):
                 continue
-            sectors = int(_read(device / "size"))
-            if sectors <= 0:
-                # Still enumerated: unavailable capacity is not proof that an
-                # approved device disappeared (e.g. initialization/fault).
-                raise ProbeUnavailable()
-            properties = _pairs({"capacity_bytes": str(sectors * 512),
+            try:
+                sectors = int(_read(device / "size"))
+            except (ProbeUnavailable, ValueError):
+                sectors = 0
+            # Preserve other disks when e.g. an empty optical drive reports 0.
+            # This location is observed but its capacity cannot be verified.
+            properties = _pairs({"capacity_bytes": str(sectors * 512) if sectors > 0 else "",
                                  "model": _optional(device / "device/model")})
             identifiers = _pairs({"serial": _identity(_optional(device / "device/serial")),
                                   "wwid": _identity(_optional(device / "wwid"))})
-            components.append(Component(Kind.STORAGE, device.name, properties, identifiers))
+            components.append(Component(Kind.STORAGE, device.name, properties, identifiers, complete=sectors > 0))
         return tuple(components)
 
     def _gpu(self):
@@ -180,15 +189,18 @@ class LinuxProbe:
                 if len(row) != 3:
                     raise ProbeUnavailable()
                 slot, uuid, serial = (value.strip() for value in row)
-                gpu_ids[slot.lower()[-12:]] = _pairs({"uuid": _identity(uuid), "serial": _identity(serial)})
+                normalized = _pci_slot(slot)
+                if normalized in gpu_ids:
+                    raise ProbeUnavailable()
+                gpu_ids[normalized] = _pairs({"uuid": _identity(uuid), "serial": _identity(serial)})
         except (ProbeUnavailable, UnicodeError):
-            pass
+            gpu_ids = {}
         for device in sorted((self.root / "sys/bus/pci/devices").iterdir()):
             class_id = int(_read(device / "class"), 16)
             if class_id >> 16 != 3:
                 continue
             properties = _pairs({key: _read(device / key) for key in ("vendor", "device", "subsystem_vendor", "subsystem_device")})
-            components.append(Component(Kind.GPU, device.name, properties, gpu_ids.get(device.name.lower(), ())))
+            components.append(Component(Kind.GPU, device.name, properties, gpu_ids.get(_pci_slot(device.name), ())))
         return tuple(components)
 
     def storage_health(self, devices: tuple[str, ...]) -> tuple[str, ...]:

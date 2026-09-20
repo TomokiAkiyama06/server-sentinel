@@ -26,9 +26,10 @@ class Component:
     location: str = field(repr=False)
     properties: tuple[tuple[str, str], ...] = field(repr=False)
     identity: tuple[tuple[str, str], ...] = field(default=(), repr=False)
+    complete: bool = True
 
     def __post_init__(self):
-        if not self.location or len(self.location) > 256:
+        if not self.location or len(self.location) > 256 or type(self.complete) is not bool:
             raise ValueError("INVALID_COMPONENT")
         for pairs in (self.properties, self.identity):
             if len(pairs) > 32 or len({key for key, _ in pairs}) != len(pairs):
@@ -100,7 +101,7 @@ def compare(approved: Inventory | None, current: Inventory) -> tuple[Finding, ..
         changed = changed or any(old_identity[key] != new_identity[key] for key in old_identity.keys() & new_identity.keys())
         if changed:
             findings.append(Finding(old.kind, State.CHANGED, "APPROVED_COMPONENT_CHANGED"))
-        elif old.properties != item.properties or old.identity != item.identity:
+        elif not old.complete or not item.complete or old.properties != item.properties or old.identity != item.identity:
             findings.append(Finding(old.kind, State.UNVERIFIABLE, "IDENTIFIERS_OR_PROPERTIES_INCOMPLETE"))
         elif not old.identity or not item.identity:
             findings.append(Finding(old.kind, State.UNVERIFIABLE, "UNIQUE_ID_UNAVAILABLE"))
