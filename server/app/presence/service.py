@@ -19,7 +19,7 @@ UNKNOWN = "unknown"
 
 class PresenceService:
     def __init__(self, database, *, access=None, evidence=None, notifications=None,
-                 reservation=None, detection=None):
+                 reservation=None, detection=None, storage_status=None):
         self.database = database
         self.access = access or DenyAccess()
         self.evidence = evidence
@@ -29,6 +29,10 @@ class PresenceService:
         # context manager. Presence holds it for the whole write, so the hard
         # filesystem reserve is honoured and the reservation is released again.
         self.reservation = reservation
+        # Optional read-only storage health probe from #21, such as a bounded
+        # wrapper over MainStoragePolicy.status(). Status reads use it instead
+        # of taking a write reservation of their own.
+        self.storage_status = storage_status
         # Injected by the reviewed #24 detector supervisor. Absent means unknown
         # detection health here; this module never claims a detector is running.
         self.detection = detection
@@ -450,20 +454,35 @@ class PresenceService:
             return UNKNOWN
         return ARMED if reported else UNAVAILABLE
 
-    def _persistence_path(self):
-        """Probe current storage admission without creating a presence write.
+    def _persistence_path(self, denied):
+        """Report storage admission without reserving write capacity for a read.
 
-        The probed reservation is entered and released immediately, so the
-        status read neither holds nor leaks the deployment's write admission.
+        Entering a reservation here would make every status read take the
+        deployment's bounded control allowance, contend with the writer that
+        owns it and, on a full volume, drive a state transition from a read
+        path. The status therefore never enters a reservation. It checks that
+        the port still yields one, uses the injected read-only storage health
+        probe when one is supplied, uses the admission a write in this snapshot
+        actually observed, and otherwise reports only that the port is
+        configured, which is not a liveness claim.
         """
+        if denied:
+            return UNAVAILABLE
         try:
-            with self._admission():
-                pass
+            self._admission()
         except Exception:
             return UNAVAILABLE
-        return ARMED
+        if self.storage_status is None:
+            return ARMED
+        try:
+            reported = self.storage_status()
+        except Exception:
+            return UNKNOWN
+        if type(reported) is not bool:
+            return UNKNOWN
+        return ARMED if reported else UNAVAILABLE
 
-    def _critical_paths(self, unresolved):
+    def _critical_paths(self, unresolved, denied):
         """Report configured/known critical-path availability, never a fixed armed.
 
         ``armed`` means the path is configured and is not disarmed by any
@@ -475,7 +494,7 @@ class PresenceService:
         """
         paths = {
             "critical_detection": self._detection_path(),
-            "critical_persistence": self._persistence_path(),
+            "critical_persistence": self._persistence_path(denied),
             "critical_evidence": ARMED if self.evidence is not None and "evidence" not in unresolved else UNAVAILABLE,
             "critical_notifications": ARMED if self.notifications is not None and "notification" not in unresolved else UNAVAILABLE,
         }
@@ -496,7 +515,7 @@ class PresenceService:
                        and override["expires"] <= timestamp(now))
         # An expired override stops applying even when the durable retirement
         # write is refused; the pending flag keeps that difference visible.
-        retired, _admitted = self._retire_override(now) if expired else (True, None)
+        retired, admitted = self._retire_override(now) if expired else (True, True)
         with closing(self.database.connect()) as db:
             trusted = self._clock_trust(db, now, clock_trusted)
             control_trusted = self._control_trust(db, now, clock_trusted)
@@ -526,7 +545,7 @@ class PresenceService:
                 "clock_degraded": not timing,
                 "observation_clock_degraded": not trusted,
                 "suppress_ordinary": state == PresenceState.PRESENT and timing,
-                **self._critical_paths(unresolved),
+                **self._critical_paths(unresolved, not admitted),
                 "override_expiry_pending": not retired,
                 "pending_critical_actions": failed}
 

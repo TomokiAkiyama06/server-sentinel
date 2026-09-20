@@ -1,7 +1,7 @@
 """Synthetic persisted presence/history with explicit mock permission/storage ports."""
 
 import asyncio
-from contextlib import closing, nullcontext
+from contextlib import closing, contextmanager, nullcontext
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -321,6 +321,39 @@ class PresenceTests(unittest.TestCase):
                 raise KeyboardInterrupt()
         self.assertFalse(policy._reservation)
         service.override("owner", PresenceState.PRESENT, now=NOW, clock_trusted=True)
+
+    def test_status_read_never_takes_a_write_reservation(self):
+        policy = MainStoragePolicy(STORAGE_LIMITS, lambda: FilesystemSpace(50_000, 100_000),
+                                   lambda: 0, lambda transition: None)
+        entered = []
+
+        @contextmanager
+        def reservation():
+            with policy.control():
+                entered.append(policy._reservation)
+                yield
+
+        service = self.make_service(reservation=reservation)
+        service.record(observation(Kind.SERVER_MOVEMENT, identifier=UUID(int=101)))
+        self.assertEqual(entered, [True])
+        status = service.snapshot(now=NOW, clock_trusted=True)
+        # A status read must not spend the deployment's bounded write admission
+        # or contend with the writer that owns it.
+        self.assertEqual(entered, [True])
+        self.assertFalse(policy._reservation)
+        self.assertEqual(status["critical_persistence"], "armed")
+        refusing = self.make_service(reservation=reservation, storage_status=lambda: False)
+        self.assertEqual(refusing.snapshot(now=NOW, clock_trusted=True)["critical_persistence"],
+                         "unavailable")
+
+        def broken():
+            raise OSError("synthetic private storage probe failure")
+
+        for probe in (broken, lambda: "healthy"):
+            unclear = self.make_service(reservation=reservation, storage_status=probe)
+            self.assertEqual(unclear.snapshot(now=NOW, clock_trusted=True)["critical_persistence"],
+                             "unknown")
+        self.assertEqual(entered, [True])
 
     def test_storage_admission_port_must_supply_a_reservation_context(self):
         policy = MainStoragePolicy(STORAGE_LIMITS, lambda: FilesystemSpace(50_000, 100_000),

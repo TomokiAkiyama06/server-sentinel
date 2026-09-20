@@ -77,12 +77,16 @@ route; Owner-facing recovery goes through the audited `requeue_action()` and
 `clear_expired_degradation()`, which require an Owner identity.
 
 The status snapshot does not create a presence write, so a refused or exhausted
-storage volume cannot hide presence state or unfinished critical work. It
-enters and immediately releases the injected storage reservation to probe
-current admission, and reports each critical path as `armed`, `unavailable`,
-or `unknown` from configured ports, the storage admission it actually
-observed, the durable delivery outcomes, and the injected detection health
-probe; no path is reported as healthy merely because nothing failed yet.
+storage volume cannot hide presence state or unfinished critical work. It never
+enters a storage reservation either: spending the deployment's bounded control
+allowance on a read would contend with the writer that owns it and could drive
+a storage state transition from a read path. It instead checks that the
+admission port still yields a reservation, uses the optional read-only
+`storage_status` probe, and uses the admission a write in the same snapshot
+actually observed. Each critical path is reported as `armed`, `unavailable`,
+or `unknown` from configured ports, that storage information, the durable
+delivery outcomes, and the injected detection health probe; no path is
+reported as healthy merely because nothing failed yet.
 `armed` means configured and never disarmed by a presence state, not a
 liveness guarantee for an external worker. An expired manual override stops
 applying even when its durable retirement write is refused, and the snapshot
