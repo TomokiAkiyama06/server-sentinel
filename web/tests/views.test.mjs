@@ -110,12 +110,12 @@ test('ordering statement follows ordering_basis and the warning follows ordering
   });
   const received = timeline(page([item], { ordering_basis: 'received_at', ordering_degraded: false }));
   assert.match(received, /受信順で表示しています。/);
-  assert.match(received, /<time[^>]*datetime="2026-09-21T09:04:00.000000\+00:00"[^>]*>2026-09-21 09:04:00<\/time>/);
+  assert.match(received, /<time[^>]*dateTime="2026-09-21T09:04:00.000000\+00:00"[^>]*>2026-09-21 09:04:00<\/time>/);
   assert.doesNotMatch(received, /<time[^>]*>2026-09-21 09:00:00<\/time>/);
   assert.doesNotMatch(received, /観測時刻順で表示しています。|時刻ずれまたは不連続が報告されています。/);
   const occurred = timeline(page([item], { ordering_basis: 'occurred_at', ordering_degraded: true }));
   assert.match(occurred, /観測時刻順で表示しています。/);
-  assert.match(occurred, /<time[^>]*datetime="2026-09-21T09:00:00.000000\+00:00"[^>]*>2026-09-21 09:00:00<\/time>/);
+  assert.match(occurred, /<time[^>]*dateTime="2026-09-21T09:00:00.000000\+00:00"[^>]*>2026-09-21 09:00:00<\/time>/);
   assert.match(occurred, /時刻ずれまたは不連続が報告されています。/);
   assert.doesNotMatch(occurred, /受信順で表示しています。/);
   assert.doesNotMatch(timeline(page([item])), /時刻ずれまたは不連続が報告されています。/);
@@ -214,7 +214,7 @@ test('an unarmed critical protection replaces the continuity statement with an a
 
 test('degraded clock and pending critical work stay visible on presence', () => {
   const markup = presence({ snapshot: snapshot({ clock_degraded: true, pending_critical_actions: 2 }), transitions: [] });
-  assert.match(markup, /時刻の信頼性が低下しているため/);
+  assert.match(markup, /時刻の信頼性が低下しています。状態の根拠と手動上書きを確認してください。/);
   assert.match(markup, /未完了の critical 対応: 2/);
   assert.doesNotMatch(presence({ snapshot: snapshot(), transitions: [] }), /未完了の critical 対応/);
 });
