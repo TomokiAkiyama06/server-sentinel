@@ -58,6 +58,11 @@ Issue #1 closed when PR #2 merged after documentation/bootstrap acceptance and c
 - [ ] phone/Mac/desktop 1–4 source live grid, with stability/reconnect prioritized over minimum latency
 - [ ] demand-driven viewer transcoding/packaging
 
+Issue #18 now has bounded compressed storage primitives, source/event manifests
+and synthetic crash/integrity coverage. Its runtime worker, final migration slot,
+codec adapter, shared storage guard and authorization integration remain open;
+these primitives do not establish playable-video or hardware acceptance.
+
 ## Phase 4 — Human private access
 
 - [ ] unchanged-Tailnet-policy compatible application authorization
