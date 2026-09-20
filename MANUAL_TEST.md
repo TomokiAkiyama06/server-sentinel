@@ -202,6 +202,9 @@ Validate:
 - [ ] mixed `local_uvc` + `remote_agent` works;
 - [ ] source rename/role change works;
 - [ ] detection profiles remain independent of source type;
+- [ ] each local/remote source's admitted capture/recording/inference/viewer set
+  comes from that source's inspected capabilities; a profile supported only by
+  another camera/node is rejected without replacing the active configuration;
 - [ ] removing one source does not corrupt recordings/events for others.
 
 ## E. Server ROI / movement
