@@ -2,7 +2,7 @@
 import { createRoot } from 'react-dom/client';
 import { App } from '../src/App';
 import { createApiClient } from '../src/api';
-import { type CameraSourceSummary, type Session } from '../src/domain';
+import { type CameraSourceSummary, type PresenceReport, type Session, type TimelinePage } from '../src/domain';
 import '../src/style.css';
 
 const api = createApiClient(window.location.origin);
@@ -21,6 +21,14 @@ const services = {
   loadSources: (signal: AbortSignal) => api.read('/api/mock/sources', value => {
     if (!Array.isArray(value)) throw new Error();
     return value as CameraSourceSummary[];
+  }, signal),
+  loadTimeline: (signal: AbortSignal) => api.read('/api/mock/timeline', value => {
+    if (typeof value !== 'object' || value === null || !Array.isArray((value as TimelinePage).items)) throw new Error();
+    return value as TimelinePage;
+  }, signal),
+  loadPresence: (signal: AbortSignal) => api.read('/api/mock/presence', value => {
+    if (typeof value !== 'object' || value === null || !('snapshot' in value)) throw new Error();
+    return value as PresenceReport;
   }, signal),
 };
 const root = document.getElementById('root');

@@ -33,6 +33,26 @@ worker/config files must be served through the protected human listener after
 the preview server as a deployment dashboard. This change mounts no assets on
 the backend or ingest listener.
 
+## Timeline and presence screens for #26
+
+`src/views/timeline.tsx` lists one observation per row with its time, kind dot,
+neutral text, source/detector attribution and confidence/quality. Unreliable or
+unavailable results stay `unknown` and are never shown as "no person". Clock
+skew or timestamp discontinuity is reported per span and by an ordering notice;
+the UI does not present that order as established causality, cause or
+culpability. A kind filter selects all, people/motion, critical, device and
+recording, or configuration entries. `src/views/presence.tsx` shows the current
+state, its basis, manual-override expiry and cancel affordance, the fact that
+only `PRESENT` suppresses ordinary occupancy automation, that critical work
+continues in every state, and today's transitions.
+
+`canVisit()` keeps the timeline with `recordings:view` and presence with the
+Owner. This remains UI projection only: the production entry still denies
+access, these screens make no request without an injected provider, and #10
+must supply server-side authorization before any human route is published.
+Timeline and presence data are loaded through optional `DashboardServices`
+providers that only tests supply, using synthetic observations.
+
 ## Local build and tests
 
 Use Node 24 and the committed lockfile:
@@ -53,9 +73,12 @@ no browser is downloaded. Tests execute the built production bundle and a
 separate synthetic harness.
 
 Node tests cover API failure/redirect/path restrictions, independent permissions,
-localization keys, the denied default, and production bundle isolation.
+localization keys, the denied default, production bundle isolation, and the
+timeline/presence screens rendered from synthetic observations (permission
+separation, kind filtering, `unknown` handling, degraded timing spans, manual
+override precedence and always-armed critical work).
 Chrome CDP tests cover phone/Mac-sized/desktop viewports, zero through four
-synthetic sources, all six screens, locale switching, session permission
+synthetic sources, all eight screens, locale switching, session permission
 combinations, and normal/error paths with hostile opt-in configuration.
 Every page request is intercepted and fulfilled locally or rejected. CSP
 violations and WebSocket attempts fail tests. A dedicated external `.invalid`

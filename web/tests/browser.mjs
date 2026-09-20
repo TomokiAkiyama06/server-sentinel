@@ -25,6 +25,30 @@ const fixture = count => Array.from({ length: count }, (_, index) => ({
   source_type: index % 2 ? 'remote_agent' : 'local_uvc', role: index % 2 ? 'custom role' : null,
   enabled: true, health: ['online', 'offline', 'degraded', 'manual_intervention_required'][index % 4],
 }));
+const observation = (kind, overrides = {}) => ({
+  id: `generated-observation-${kind}`, kind, value: 'observed',
+  occurred_at: '2026-09-21T09:00:00.000000+00:00', received_at: '2026-09-21T09:00:01.000000+00:00',
+  source_id: '00000000-0000-4000-8000-00000000abcd', node_id: null, confidence: 0.8,
+  quality: 'sufficient', clock_trusted: true, uncertainty_us: 0, confirmed: false,
+  presence_state: null, sequence: 1, ...overrides,
+});
+const timelineFixture = {
+  items: [
+    observation('owner_entry', { confirmed: true }),
+    observation('server_movement', { confirmed: true, clock_trusted: false }),
+    observation('camera_health', { value: 'offline', quality: 'unknown', confidence: null, clock_trusted: false }),
+    observation('person', { value: 'not_observed', quality: 'insufficient', confidence: null }),
+  ],
+  ordering_basis: 'received_at', ordering_degraded: true, causality: 'not_inferred', next_sequence: 4,
+};
+const presenceFixture = {
+  snapshot: {
+    state: 'PRESENT', basis: 'manual_override', override_expires_at: '2026-09-21T18:30:00.000000+00:00',
+    clock_degraded: false, suppress_ordinary: true, critical_detection_armed: true,
+    critical_evidence_armed: true, critical_notifications_armed: true, pending_critical_actions: 0,
+  },
+  transitions: [{ at: '2026-09-21T08:00:00.000000+00:00', state: 'UNKNOWN', basis: 'unknown' }],
+};
 let cases = 0;
 
 async function scenario(viewport, { production = false, status = 200, session = owner, count = 1, optIn = false, sourceStatus = 200, positiveControl = false } = {}, assertions) {
@@ -66,6 +90,12 @@ async function scenario(viewport, { production = false, status = 200, session = 
     if (!production && url.pathname === '/api/mock/sources') {
       await fulfill(JSON.stringify(sourceStatus === 200 ? fixture(count) : { detail: 'synthetic private error' }), 'application/json', sourceStatus); return;
     }
+    if (!production && url.pathname === '/api/mock/timeline') {
+      await fulfill(JSON.stringify(timelineFixture), 'application/json'); return;
+    }
+    if (!production && url.pathname === '/api/mock/presence') {
+      await fulfill(JSON.stringify(presenceFixture), 'application/json'); return;
+    }
     unexpected.push('unexpected path');
     await page.command('Fetch.failRequest', { requestId, errorReason: 'BlockedByClient' });
   }
@@ -102,7 +132,7 @@ try {
       await scenario(viewport, { production: true, optIn }, async (page, requests) => {
         await page.heading('アクセスの確認が必要です');
         assert.equal(await page.evaluate('document.documentElement.lang'), 'ja');
-        assert.equal(await page.evaluate("document.querySelectorAll('nav button:disabled').length"), 6);
+        assert.equal(await page.evaluate("document.querySelectorAll('nav button:disabled').length"), 8);
         assert.equal(requests.some(path => path.startsWith('/api/')), false);
       });
       await scenario(viewport, { status: 500, optIn }, async page => {
@@ -125,6 +155,25 @@ try {
         assert.equal(await page.evaluate('document.documentElement.lang'), 'en');
       });
     }
+    await scenario(viewport, {}, async page => {
+      await page.click('タイムライン');
+      await page.wait("document.querySelectorAll('[data-observation-kind]').length === 4");
+      assert.equal(await page.evaluate("document.querySelectorAll('.timeline-span-degraded').length"), 1);
+      const timelineText = await page.evaluate('document.body.innerText');
+      assert.match(timelineText, /受信順で表示しています/);
+      assert.match(timelineText, /判定できません/);
+      assert.doesNotMatch(timelineText, /観測されず/);
+      await page.evaluate("Array.from(document.querySelectorAll('.timeline-filter button')).find(el => el.textContent === 'critical').click()");
+      await page.wait("document.querySelectorAll('[data-observation-kind]').length === 1");
+      assert.equal(await page.evaluate("document.querySelector('[data-observation-kind]').dataset.observationKind"), 'server_movement');
+      await page.click('プレゼンス');
+      await page.wait("Boolean(document.querySelector('.presence-value'))");
+      const presenceText = await page.evaluate('document.body.innerText');
+      assert.match(presenceText, /手動上書きが有効です。/);
+      assert.match(presenceText, /PRESENT のため通常の occupancy automation を抑制しています。/);
+      assert.match(presenceText, /すべての状態で継続します。/);
+      assert.equal(await page.evaluate('document.documentElement.scrollWidth <= window.innerWidth'), true, 'timeline and presence fit viewport');
+    });
     await scenario(viewport, { sourceStatus: 503 }, async page => {
       await page.click('カメラソース');
       await page.wait("Boolean(document.querySelector('[role=alert]'))");
@@ -135,8 +184,12 @@ try {
         await page.heading('概要');
         assert.equal(await page.enabled('ライブ'), permissions.includes('live:view'));
         assert.equal(await page.enabled('録画'), permissions.includes('recordings:view'));
+        // Historical timeline follows recordings:view; presence stays owner-only.
+        assert.equal(await page.enabled('タイムライン'), permissions.includes('recordings:view'));
+        assert.equal(await page.enabled('プレゼンス'), false);
         assert.equal(await page.enabled('アクセス'), false);
         assert.equal(requests.includes('/api/mock/sources'), false);
+        assert.equal(requests.some(path => path.includes('timeline') || path.includes('presence')), false);
       });
     }
     process.stdout.write(`${name}: responsive synthetic UI and request interception passed\n`);

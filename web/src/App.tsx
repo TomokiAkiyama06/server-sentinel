@@ -1,6 +1,8 @@
 import { Component, useEffect, useState, type ReactNode } from 'react';
 import { canVisit, deniedServices, views, type CameraSourceSummary, type DashboardServices, type Session, type View } from './domain';
 import { messages, type Locale } from './i18n';
+import { PresenceScreen } from './views/presence';
+import { TimelineScreen } from './views/timeline';
 
 type Access = { state: 'loading' | 'failed' } | Session;
 type Sources = { state: 'loading' | 'failed' | 'pending' } | { state: 'ready'; items: readonly CameraSourceSummary[] };
@@ -76,7 +78,9 @@ export function App({ services = deniedServices }: { services?: DashboardService
           {access.state === 'failed' && <section className="notice" role="alert"><h1>{t.failedTitle}</h1><p>{t.failed}</p><button className="primary" onClick={() => setAttempt(value => value + 1)}>{t.retry}</button></section>}
           {access.state === 'allowed' && <>
             <div className="page-heading"><div><span className="eyebrow">{t[access.role]}</span><h1>{t[selected]}</h1><p>{t[hint]}</p></div><span className="badge">{t.pending}</span></div>
-            {selected === 'sources' && access.role === 'owner' && sources.state === 'ready' ? <>
+            {selected === 'timeline' && canVisit(session, 'timeline') ? <TimelineScreen services={services} t={t} />
+              : selected === 'presence' && access.role === 'owner' ? <PresenceScreen services={services} t={t} />
+                : selected === 'sources' && access.role === 'owner' && sources.state === 'ready' ? <>
               <p className="source-count">{t.sourceCount}: {sources.items.length}</p>
               <div className="source-grid">{sources.items.map(source => <article className="source-card" key={source.id} data-source-id={source.id}>
                 <div className="source-icon" aria-hidden="true">▣</div><h2>{source.name}</h2><p>{t[source.source_type]}</p>
