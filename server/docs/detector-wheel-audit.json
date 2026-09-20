@@ -1,0 +1,133 @@
+[
+  {
+    "name": "onnxruntime",
+    "version": "1.28.0",
+    "license": "MIT; bundled terms retained in ThirdPartyNotices, including Eigen MPL-2.0",
+    "requires_python": ">=3.11",
+    "requires_dist": [
+      "flatbuffers",
+      "numpy>=1.21.6",
+      "packaging",
+      "protobuf>=4.25.8",
+      "sympy; extra == \"symbolic\"",
+      "ml_dtypes; extra == \"quantization\""
+    ],
+    "project_urls": [],
+    "wheel": "onnxruntime-1.28.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
+    "sha256": "0a83bdb70d143cede762b677789bf2a7acca54b3fb82565601d5c30695aa933c",
+    "download_url": "https://files.pythonhosted.org/packages/95/df/5486ab03e9be288d5268867054c8b04bebcf95bfd12e801c05cc67703dab/onnxruntime-1.28.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
+    "release_metadata_url": "https://pypi.org/pypi/onnxruntime/1.28.0/json",
+    "license_files": [
+      "onnxruntime/LICENSE",
+      "onnxruntime/ThirdPartyNotices.txt"
+    ],
+    "license_sha256": {
+      "onnxruntime/LICENSE": "2f07c72751aed99790b8a4869cf2311df85a860b22ded05fa22803587a48922c",
+      "onnxruntime/ThirdPartyNotices.txt": "0e07b95f3a8d6230037707c5c4a2b554d12c4cb67369669ac255635528ffcee2"
+    },
+    "implementation_revision": "45de2a8b06d62989b3ab55ba7dc58a27ca83f9fc",
+    "review_document": "RTDETR_RUNTIME_AUDIT.md"
+  },
+  {
+    "name": "numpy",
+    "version": "2.3.5",
+    "license": "BSD-3-Clause; bundled BSD/MIT/Zlib, GPL-3.0-or-later WITH GCC-exception-3.1, LGPL-2.1-or-later",
+    "requires_python": ">=3.11",
+    "requires_dist": [],
+    "project_urls": [
+      "homepage, https://numpy.org",
+      "documentation, https://numpy.org/doc/",
+      "source, https://github.com/numpy/numpy",
+      "download, https://pypi.org/project/numpy/#files",
+      "tracker, https://github.com/numpy/numpy/issues",
+      "release notes, https://numpy.org/doc/stable/release"
+    ],
+    "wheel": "numpy-2.3.5-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
+    "sha256": "0d8163f43acde9a73c2a33605353a4f1bc4798745a8b1d73183b28e5b435ae28",
+    "download_url": "https://files.pythonhosted.org/packages/b6/23/2a1b231b8ff672b4c450dac27164a8b2ca7d9b7144f9c02d2396518352eb/numpy-2.3.5-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
+    "release_metadata_url": "https://pypi.org/pypi/numpy/2.3.5/json",
+    "license_files": [
+      "numpy/_core/include/numpy/random/LICENSE.txt",
+      "numpy/ma/LICENSE",
+      "numpy/random/LICENSE.md",
+      "numpy-2.3.5.dist-info/LICENSE.txt"
+    ],
+    "license_sha256": {
+      "numpy/_core/include/numpy/random/LICENSE.txt": "fbc539f47d0cf83bc61378080fb873d5c14630126cacbfe754035c3926daa5ec",
+      "numpy/ma/LICENSE": "05f3b88351988ecfad10abe92c0c50e5875c6452d5009a0084cc291551ffcca6",
+      "numpy/random/LICENSE.md": "103166b62b80443afb9eb3488e052ea06be0cff566b908f199e561fde49af19f",
+      "numpy-2.3.5.dist-info/LICENSE.txt": "2046a3130e50b11c01659b3a0d963e6ae0b7436ff8e89cbcfd9e87bc6112d595"
+    },
+    "review_document": "RTDETR_RUNTIME_AUDIT.md"
+  },
+  {
+    "name": "flatbuffers",
+    "version": "25.12.19",
+    "license": "Apache-2.0 (upstream notice; wheel omits LICENSE)",
+    "requires_python": null,
+    "requires_dist": [],
+    "project_urls": [
+      "Documentation, https://google.github.io/flatbuffers/",
+      "Source, https://github.com/google/flatbuffers"
+    ],
+    "wheel": "flatbuffers-25.12.19-py2.py3-none-any.whl",
+    "sha256": "7634f50c427838bb021c2d66a3d1168e9d199b0607e6329399f04846d42e20b4",
+    "download_url": "https://files.pythonhosted.org/packages/e8/2d/d2a548598be01649e2d46231d151a6c56d10b964d94043a335ae56ea2d92/flatbuffers-25.12.19-py2.py3-none-any.whl",
+    "release_metadata_url": "https://pypi.org/pypi/flatbuffers/25.12.19/json",
+    "license_files": [
+      "upstream/v25.12.19/LICENSE"
+    ],
+    "license_sha256": {
+      "upstream/v25.12.19/LICENSE": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+    },
+    "upstream_license_sources": {
+      "upstream/v25.12.19/LICENSE": "https://github.com/google/flatbuffers/blob/v25.12.19/LICENSE"
+    },
+    "review_document": "RTDETR_RUNTIME_AUDIT.md"
+  },
+  {
+    "name": "packaging",
+    "version": "25.0",
+    "license": "Apache-2.0 OR BSD-2-Clause",
+    "requires_python": ">=3.8",
+    "requires_dist": [],
+    "project_urls": [
+      "Documentation, https://packaging.pypa.io/",
+      "Source, https://github.com/pypa/packaging"
+    ],
+    "wheel": "packaging-25.0-py3-none-any.whl",
+    "sha256": "29572ef2b1f17581046b3a2227d5c611fb25ec70ca1ba8554b24b0e69331a484",
+    "download_url": "https://files.pythonhosted.org/packages/20/12/38679034af332785aac8774540895e234f4d07f7545804097de4b666afd8/packaging-25.0-py3-none-any.whl",
+    "release_metadata_url": "https://pypi.org/pypi/packaging/25.0/json",
+    "license_files": [
+      "packaging-25.0.dist-info/licenses/LICENSE",
+      "packaging-25.0.dist-info/licenses/LICENSE.APACHE",
+      "packaging-25.0.dist-info/licenses/LICENSE.BSD"
+    ],
+    "license_sha256": {
+      "packaging-25.0.dist-info/licenses/LICENSE": "cad1ef5bd340d73e074ba614d26f7deaca5c7940c3d8c34852e65c4909686c48",
+      "packaging-25.0.dist-info/licenses/LICENSE.APACHE": "0d542e0c8804e39aa7f37eb00da5a762149dc682d7829451287e11b938e94594",
+      "packaging-25.0.dist-info/licenses/LICENSE.BSD": "b70e7e9b742f1cc6f948b34c16aa39ffece94196364bc88ff0d2180f0028fac5"
+    },
+    "review_document": "RTDETR_RUNTIME_AUDIT.md"
+  },
+  {
+    "name": "protobuf",
+    "version": "6.33.5",
+    "license": "3-Clause BSD License",
+    "requires_python": ">=3.9",
+    "requires_dist": [],
+    "project_urls": [],
+    "wheel": "protobuf-6.33.5-cp39-abi3-manylinux2014_x86_64.whl",
+    "sha256": "cbf16ba3350fb7b889fca858fb215967792dc125b35c7976ca4818bee3521cf0",
+    "download_url": "https://files.pythonhosted.org/packages/9b/53/a9443aa3ca9ba8724fdfa02dd1887c1bcd8e89556b715cfbacca6b63dbec/protobuf-6.33.5-cp39-abi3-manylinux2014_x86_64.whl",
+    "release_metadata_url": "https://pypi.org/pypi/protobuf/6.33.5/json",
+    "license_files": [
+      "protobuf-6.33.5.dist-info/LICENSE"
+    ],
+    "license_sha256": {
+      "protobuf-6.33.5.dist-info/LICENSE": "6e5e117324afd944dcf67f36cf329843bc1a92229a8cd9bb573d7a83130fea7d"
+    },
+    "review_document": "RTDETR_RUNTIME_AUDIT.md"
+  }
+]
