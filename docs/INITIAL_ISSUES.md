@@ -508,7 +508,10 @@ Acceptance:
 Implementation progress: `server/app/media/profiles/` contains the independent
 profile planner, decoded-frame cadence control and bounded compressed-packet
 adapter lifecycle, with synthetic tests for quality isolation and no-subscriber
-cleanup. Codec/transport adapters and measured Main Server / Capture Node / UVC
+cleanup. It also contains atomic per-source exact-allowlist admission and a
+source-level truthful status that keeps capture loss/renegotiation, mandatory
+recording failure, and demanded viewer degradation visible without guessing
+hardware defaults. Codec/transport adapters and measured Main Server / Capture Node / UVC
 resource use remain pending; this is not completion of Issue #17.
 
 ## Plan 11 — Durable recording + main-host compressed pre-roll
@@ -593,6 +596,8 @@ Acceptance:
 - live/recording continues where frames remain.
 - occlusion, saturation, insufficient target size, detector failure, and both positive/negative quality prerequisites are tested; expose reasons/metrics, apply recovery hysteresis, and do not globally stop unrelated critical monitoring.
 
+
+Implementation: `server/app/detection/quality/` provides bounded local metrics, explicit per-detector prerequisites, frame-bound context, recovery hysteresis, and fail-unknown result guards. `server/tests/test_detector_quality.py` verifies synthetic darkness/blur/clipping/obstruction/small targets, positive/negative rejection, execution failure, scheduler propagation, and independent live/recording/critical profiles. Production thresholds and real-lighting acceptance remain separate; integration acceptance depends on #20 and the current PR review/CI gates.
 ## Plan 14 — Server ROI movement + camera tamper
 
 GitHub Issue: [#24](https://github.com/TomokiAkiyama06/server-sentinel/issues/24)

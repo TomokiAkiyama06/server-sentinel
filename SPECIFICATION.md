@@ -487,11 +487,27 @@ Final defaults are measured, not guessed.
 The transport-independent implementation in `server/app/media/profiles/` uses
 explicit immutable profiles, conservative exact-descriptor copy eligibility,
 bounded per-path compressed queues, and demand-driven viewer adapter lifetimes.
+Before pipeline construction, scheduler-side admission can bind the complete
+profile set to an exact allowlist discovered for that source and an explicit
+active-source limit. Admission is atomic, does not infer profiles from source
+type/role, and supplies no benchmark-derived defaults. The persisted Camera
+Source registry remains authoritative for configuration. Successful admission
+returns a generation-bound lease: profile adaptation must remain within its
+complete-set allowlist and atomically updates the manager's selected profile set.
+Pipeline construction atomically claims the lease only for that current selected
+set and retains an opaque pipeline-specific ownership claim; a lease holder cannot
+release or transition that claim, and the same lease cannot own two pipelines.
+Stale generation teardown cannot release a later pipeline or the current source
+reservation, and a released or superseded lease cannot construct or continue a
+pipeline.
 Inference sampling applies to presentation-ordered decoded frames, never to
 compressed reference packets before decoding. Packet gaps reset dependency state
 and require a keyframe; the capture profile also sets an explicit maximum forward
 timestamp gap, independent of inference cadence. Known loss remains visible after
-recovery. Missing codec
+recovery. Source status combines capture continuity and mandatory recording with
+viewer health only while viewers are subscribed; capture renegotiation or missing
+recording capability is unavailable, and known loss/backpressure is degraded
+rather than silently healthy. Missing codec
 adapters report unavailable. Real codec/transport integration and measured
 deployment defaults are still required; see that directory's integration contract.
 
@@ -596,6 +612,10 @@ Possible quality signals:
 A profile returns `sufficient`, `degraded`, or `insufficient` plus metrics/reasons.
 
 If the person detector's prerequisites are insufficient, the result is `unknown`/unavailable. It is **not** converted to `no person`. The same fail-unknown principle applies to owner verification and dependent presence/entrance conclusions.
+
+The internal implementation in `server/app/detection/quality/` uses explicit per-source/detector policy ranges and an explicit pixel budget; it provides no production thresholds. It measures bounded grayscale/RGB luminance, neighboring-pixel sharpness, clipping and resolution, and accepts frame-attributed calibrated target-size/obstruction/confidence context. Missing required context never defaults to adequate target size or zero obstruction. All configured prerequisites apply to both positive and negative conclusions.
+
+Quality failure is immediate. Recovery requires the configured number of consecutive good frames (at least two); stream/sequence/geometry discontinuities and unavailable execution reset recovery. Reason codes, numeric metrics, profile version and source/stream/sequence are available for authorized UI integration. Detector stop/failure invalidates the last assessment without a new frame and, through the registered result sink, immediately replaces the source's published `present`/`absent` with `unknown`; an unusable frame, a pending recovery and an incomplete inference batch do the same. A stopped or failed detector never leaves a trustworthy conclusion readable until its observation age expires. The result guard rejects obsolete assessments and mismatched frame identities; the inference scheduler remains responsible for observation age. Live/recording delivery and unrelated critical detector profiles remain independent. Real-camera calibration is not established by synthetic quality tests.
 
 ### 7.6 Owner-only face verification
 
