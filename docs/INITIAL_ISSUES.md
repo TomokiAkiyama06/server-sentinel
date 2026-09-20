@@ -589,6 +589,19 @@ Acceptance:
 - record calibration/reference version/time and source/confidence/quality; insufficient input/source loss is not trustworthy no-movement;
 - critical detection events remain available in all presence states for Plan 16 integration.
 
+Implementation: `server/app/detection/roi/` provides a bounded local grayscale
+core with immutable source/profile calibration, append-only private calibration
+history, global transform compensation, relative ROI comparison, explicit
+occlusion/quality fail-unknown handling, temporal confirmation, persistent
+dark/changed-scene tamper, and trusted source-loss correlation. It has no
+capture, HTTP, notification, presence, or identity integration. The generated
+fixtures in `server/tests/test_detector_roi.py` verify local and remote-agent
+calibration types, controlled ROI displacement, camera-global shift separation,
+temporary occlusion, quality isolation, source loss, migration/history, and
+bounded failed-delivery retry. Physical-camera calibration and integration into
+capture/source health, recording preservation, notification, and Plan 16 remain
+separate acceptance work.
+
 ## Plan 15 — Owner-only verification / anonymous tracking / entrance
 
 GitHub Issue: [#25](https://github.com/TomokiAkiyama06/server-sentinel/issues/25)
