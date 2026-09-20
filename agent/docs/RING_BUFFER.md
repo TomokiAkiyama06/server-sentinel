@@ -90,6 +90,13 @@ eligible for FIFO under the current setting as well as the proposed setting.
 Current duration coverage and the current capacity allocation remain owned until
 the new setting commits. A failed shrink therefore preserves the active ring;
 it may require free space to be restored before the shorter setting can apply.
+Capacity transitions must also fit the new pre-window envelope plus incompatible
+legacy carryover (changed source/cadence/allocation bound or uncertain data),
+and room for the next full source batch. A one-batch-only check is insufficient:
+larger old segments may remain until several smaller new batches have arrived.
+Unknown time credits no timestamp reclamation. Rejection leaves configuration,
+profiles and currently owned media unchanged; existing over-limit capacity is
+reported as pressure, including on restart.
 
 Every media write retains `L` in addition to the hard reserve, and uses the store's exclusive
 allocation/write/fsync path. Runtime status recomputes full protection headroom;
@@ -140,9 +147,13 @@ size. New zero-allocation media is refused before admission; such existing media
 is uncertain at inventory/recovery. Maximum bitrate is never treated as a
 minimum payload. Existing protected segments, incident tombstones and every
 protection reference consume metadata capacity, including separate references
-when incidents share one media file. New preservation requests must fit before
-any incident is created; active incidents keep room for their remaining segment
-and reference rows across append and restart. Status exposes insufficient room
+when incidents share one media file. Missing, untrusted or incompatible ordinary
+rows consume additional capacity; they cannot replace future selected-ring rows.
+New preservation requests must fit before any incident is created; active
+incidents keep room for their remaining segment and reference rows across append
+and restart. Untrusted timestamps never spend the reserved slots for corrected
+trusted capture; admitting such segments requires additional row/reference room
+before writing. Status exposes insufficient room
 for the next incident as `STORAGE_PRESSURE / insufficient_ledger_capacity`.
 
 The admission bound deliberately does not assume average SQLite page packing.
@@ -193,6 +204,11 @@ wall/monotonic changes and assess forward jumps under the approved clock policy.
 Rejected forward jumps never advance that persisted watermark. Corrected trusted
 time can resume completion and expiry, including after restart, while affected
 incidents retain their explicit clock-uncertainty flag.
+An untrusted segment may only continue an existing contiguous per-source
+chronology. It cannot establish an initial timeline or jump over a gap; those
+appends are refused as `clock_uncertain` and active incidents stay visibly
+uncertain. Trusted capture ordering uses only trusted segment endpoints, so a
+legacy untrusted future endpoint cannot block corrected capture after restart.
 
 Completion establishes `expires_at = completed_at + 60 days`. Trusted-clock ticks
 perform expiry; Owner-authorized early deletion does not need the clock to become

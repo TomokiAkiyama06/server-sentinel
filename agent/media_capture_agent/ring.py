@@ -15,7 +15,7 @@ from uuid import UUID, uuid4
 
 from .ring_ledger import Ledger
 from .ring_models import (DenyControls, POST, PRE, RETENTION, SECOND, RingConfig,
-                          RingRefused, SegmentProfile, integer, intervals_and_gaps)
+                          RingRefused, SegmentProfile, integer, intervals_and_gaps, round_up)
 from .storage import StorageRefused
 
 
@@ -171,16 +171,31 @@ class DiskRing:
         return sum((duration + item.segment_duration_us - 1) // item.segment_duration_us + 2
                    for item in profiles.values())
 
-    def _ledger_capacity(self, config, profiles, *, proposal=None):
+    @staticmethod
+    def _trusted_profile_row(row, profiles):
+        profile = profiles.get(UUID(row["source"]))
+        return (row["clock_trusted"] and profile is not None
+                and row["end"] - row["start"] == profile.segment_duration_us)
+
+    def _ledger_capacity(self, config, profiles, *, proposal=None, additional_segments=0, additional_protections=0):
         rows = self._rows()
         protected = sum(self._protected(row["id"]) for row in rows)
+        carryover = 0
+        for row in rows:
+            if self._protected(row["id"]):
+                continue
+            if (row["state"] != "stored" or row["allocated"] < 512
+                    or not self._trusted_profile_row(row, profiles)):
+                carryover += 1
         selected = (self._segment_count(profiles, config.value * SECOND) if config.mode == "duration"
                     else config.value // 512 + 1)
-        segments = protected + max(len(rows) - protected, selected)
+        segments = protected + carryover + max(len(rows) - protected - carryover, selected) + additional_segments
         incidents = self.db.execute("SELECT count(*) FROM incidents").fetchone()[0]
-        protections = self.db.execute("SELECT count(*) FROM protection").fetchone()[0]
+        protections = self.db.execute("SELECT count(*) FROM protection").fetchone()[0] + additional_protections
         for incident in self.db.execute("SELECT * FROM incidents WHERE state='active'").fetchall():
-            present = self.db.execute("SELECT count(*) FROM protection WHERE incident=?", (incident["id"],)).fetchone()[0]
+            linked = self.db.execute("SELECT segments.* FROM segments JOIN protection ON segment=segments.id "
+                                     "WHERE incident=?", (incident["id"],)).fetchall()
+            present = sum(self._trusted_profile_row(row, profiles) for row in linked)
             future = max(0, self._segment_count(profiles, incident["end"] - incident["start"]) - present)
             segments += future
             protections += future
@@ -188,10 +203,16 @@ class DiskRing:
             start, end = proposal
             matching = [row for row in rows if row["end"] > start and row["start"] < end
                         and UUID(row["source"]) in profiles]
-            present = len(matching)
-            total = max(present, self._segment_count(profiles, end - start))
-            segments += total - present + sum(not self._protected(row["id"]) for row in matching)
-            protections += total
+            present = sum(self._trusted_profile_row(row, profiles) for row in matching)
+            future = max(0, self._segment_count(profiles, end - start) - present)
+            # Ordinary carryover already occupies a separate row reservation.
+            # Only compatible ordinary rows newly leaving the projected ring
+            # need an additional reservation when they become protected.
+            projected = sum(not self._protected(row["id"]) and row["state"] == "stored"
+                            and row["allocated"] >= 512 and self._trusted_profile_row(row, profiles)
+                            for row in matching)
+            segments += future + projected
+            protections += len(matching) + future
             incidents += 1
         return self.ledger.require_rows(segments=segments, incidents=incidents, protections=protections)
 
@@ -248,6 +269,7 @@ class DiskRing:
                     < budget["required_additional"] + budget["safety_reserve"]):
                 raise RingRefused("insufficient_simultaneous_pre_post_budget")
             self._selected_target_fits(config, mapping)
+            self._capacity_transition_fits(config, mapping, now_us, clock_trusted)
             self._ledger_capacity(config, mapping, proposal=(now_us - PRE, now_us + POST))
             # Credit only blocks that were actually returned by deletion. A
             # hardlink/open reader can keep blocks allocated after unlink.
@@ -277,6 +299,30 @@ class DiskRing:
         # target. They are not credited as immediately reclaimable pre-data.
         if self.store.check(require_reserve=False) + ordinary < selected + self.settings.safety_reserve_bytes + self.ledger_headroom:
             raise RingRefused("selected_target_exceeds_safe_filesystem")
+
+    def _capacity_transition_fits(self, config, profiles, now, trusted):
+        if config.mode != "capacity":
+            return
+        allocations = self.store.segment_allocations()
+        retained = carryover = 0
+        for row in self._rows():
+            if self._protected(row["id"]) or (trusted and row["end"] <= now - PRE):
+                continue
+            allocated = allocations.get(UUID(row["id"]), 0)
+            retained += allocated
+            profile = profiles.get(UUID(row["source"]))
+            if (not trusted or not row["clock_trusted"] or row["state"] != "stored" or profile is None
+                    or row["end"] - row["start"] != profile.segment_duration_us
+                    or allocated > round_up(profile.segment_bytes(), self.store.allocation_unit)):
+                carryover += allocated
+        # Compatible legacy intervals fit within the new bounded PRE envelope.
+        # Incompatible media remains additional carryover throughout rollover;
+        # checking only one next segment misses failures several batches later.
+        transition = self._estimate(profiles, PRE) + carryover
+        next_batch = sum(round_up(profile.segment_bytes(), self.store.allocation_unit)
+                         for profile in profiles.values())
+        if max(transition, retained + next_batch) > config.value:
+            raise RingRefused("capacity_transition_exceeds_limit")
 
     def _remove_segment(self, identifier):
         if self._protected(identifier):
@@ -329,9 +375,14 @@ class DiskRing:
                     or not isinstance(data, bytes) or not data or len(data) > profile.segment_bytes()):
                 self.state, self.reason = "degraded", "profile_bound_violation"
                 raise RingRefused("profile_bound_violation")
-            self._ledger_capacity(self.config, self.profiles)
-            previous = self.db.execute("SELECT max(end) FROM segments WHERE source=?",
-                                       (str(source_id),)).fetchone()[0]
+            query = "SELECT max(end) FROM segments WHERE source=?"
+            if clock_trusted:
+                query += " AND clock_trusted=1"
+            previous = self.db.execute(query, (str(source_id),)).fetchone()[0]
+            if not clock_trusted and (previous is None or start_us != previous):
+                self._tick(now_us, False)
+                self.state, self.reason = "degraded", "clock_uncertain"
+                raise RingRefused("clock_uncertain")
             if previous is not None and start_us < previous:
                 self.state, self.reason = "degraded", "non_monotonic_segment"
                 raise RingRefused("non_monotonic_segment")
@@ -341,6 +392,10 @@ class DiskRing:
                 "AND start<? AND end>? AND (expires IS NULL OR expires>?)", (end_us, start_us, now_us)
             ).fetchall()
             incidents = [row for row in incidents if str(source_id) in json.loads(row["sources"])]
+            # Untrusted chronology may later overlap corrected trusted capture;
+            # it cannot spend that capture's reserved post-window metadata.
+            self._ledger_capacity(self.config, self.profiles, additional_segments=int(not clock_trusted),
+                                  additional_protections=len(incidents) if not clock_trusted else 0)
             self._trim(now_us, trusted=clock_trusted)
             # Ordinary capacity remains a physical allocation limit, separate
             # from protected bytes. Never evict required pre-loss coverage.
@@ -589,6 +644,8 @@ class DiskRing:
             coverage[str(source)] = {"intervals_us": intervals, "gaps_us": gaps}
         if budget["filesystem_free"] < budget["safety_reserve"]:
             self.state, self.reason = "STORAGE_HARD_STOP", "safety_reserve_unavailable"
+        elif self.config.mode == "capacity" and ordinary > self.config.value:
+            self.state, self.reason = "STORAGE_PRESSURE", "ordinary_capacity_exhausted"
         elif ledger_pressure:
             self.state, self.reason = "STORAGE_PRESSURE", "insufficient_ledger_capacity"
         elif budget["filesystem_free"] + budget["reclaimable_allocated"] < budget["required_additional"] + budget["safety_reserve"]:

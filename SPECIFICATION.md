@@ -463,7 +463,10 @@ conservative completion headroom in shared-filesystem media admission. The cap
 must also cover cadence-derived segment/index/protection rows for the selected
 ring and the next complete pre/post incident, including existing retained
 metadata. Failed reconfiguration retains the active ring's selected coverage;
-only trusted clock observations advance the durable rollback watermark. Unexpected
+only trusted clock observations advance the durable rollback watermark.
+Untrusted capture discontinuities are refused without advancing per-source trusted
+chronology. Capacity changes must fit incompatible legacy pre-roll throughout
+profile rollover, not merely fit the filesystem or one immediate new segment. Unexpected
 authentication loss is an effective Main loss even while the raw socket remains
 connected; known protected-evidence damage stays degraded outside current pre-roll.
 See `agent/docs/RING_BUFFER.md` for the implemented budget and integration limits.
