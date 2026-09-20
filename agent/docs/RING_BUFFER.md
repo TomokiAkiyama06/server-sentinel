@@ -196,6 +196,10 @@ finalizing their last segment separately cannot leave a stale partial/complete
 result; late finalization re-evaluates coverage without extending the protected
 interval's completion or expiry. Clock-uncertain segments never count as
 trustworthy coverage.
+An unexpired partial incident keeps overall status degraded even when every
+existing file is intact and current pre-roll has recovered. Historical absent
+intervals and clock uncertainty cannot disappear from health merely because
+they have no missing-file row; expiry or authorized deletion ends that warning.
 
 The integration supplies trustworthy **local capture time**, independently of
 whether Main is reachable; Main loss alone does not mean the local monotonic
@@ -230,7 +234,10 @@ from this media-expiry core and must follow the application's retention contract
 `status()` provides selected mode/value/unit, projected maximum/expected bytes,
 estimated capacity-mode duration, physical ordinary/protected/orphan usage,
 filesystem free, reserve, required future bytes, pressure state and per-source
-pre-loss intervals/gaps. `incident()` includes trigger, target interval,
+pre-loss intervals/gaps. Duration estimates use each profile's allocated segment
+size and cadence; capacity bytes are never treated as elapsed seconds. Search
+probes above capacity do not overflow the persisted numeric range.
+`incident()` includes trigger, target interval,
 completion, expiry, logical/allocated bytes, integrity/time gaps and deletion
 state. Known damaged protected evidence keeps overall status degraded even after
 its interval leaves the current pre-loss window. On unavailable storage, free space is `None` and the state is a hard stop;

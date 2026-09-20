@@ -214,6 +214,34 @@ class RingTests(unittest.TestCase):
             self.assertLessEqual(status["ordinary_allocated_bytes"], limit)
         self.assertGreater(status["estimated_duration_us"], 0)
 
+    def test_capacity_estimate_handles_sub_byte_per_second_allocation_model(self):
+        def small_blocks(descriptor):
+            values = list(self.quota(descriptor))
+            values[4] *= values[1] // 512
+            values[1] = 512
+            return os.statvfs_result(values)
+        self.store.space = small_blocks
+        profile = SegmentProfile(SOURCE, 1, 1, 600 * SECOND, 0)
+        result = self.configure("capacity", 10240, profiles=(profile,))
+        self.assertEqual(result["estimated_duration_us"], 10800 * SECOND)
+        self.assertEqual(result["projected_maximum_bytes"], 10240)
+        self.assertGreater(profile.bytes_for(result["estimated_duration_us"] + 1, 512), 10240)
+
+    def test_capacity_estimate_never_overflows_on_infeasible_search_probe(self):
+        self.ring.close()
+        # Only injected space counters are large; SQLite/media files stay tiny.
+        self.quota.capacity = 1 << 50
+        self.ring = DiskRing(self.settings, self.store, ledger_maximum_bytes=8 * 1024**4,
+                             authority=AllowControls(), ledger_space=self.quota)
+        profile = SegmentProfile(SOURCE, 1_000_000_000, 1_000_000_000, 100, 0)
+        capacity = 128 * 1024**3
+        result = self.configure("capacity", capacity, profiles=(profile,))
+        self.assertEqual(result["estimated_duration_us"], (capacity // 16384 - 2) * 100)
+        self.assertLessEqual(result["projected_maximum_bytes"], capacity)
+        self.assertEqual(self.ring.status(now_us=T0, clock_trusted=True)["estimated_duration_us"],
+                         result["estimated_duration_us"])
+        self.assertLess(self.settings.runtime_root.joinpath("ring.sqlite3").stat().st_size, 1024 * 1024)
+
     def test_duration_fifo_and_projected_equivalent_are_reported(self):
         self.configure()
         for index in range(30):
@@ -856,6 +884,37 @@ class RingTests(unittest.TestCase):
         self.assertEqual(status["reason"], "protected_evidence_integrity_gap")
         self.restart()
         self.assertEqual(self.ring.status(now_us=now, clock_trusted=True)["state"], "degraded")
+
+    def test_historical_partial_without_missing_rows_never_becomes_healthy(self):
+        self.configure()
+        incident = self.loss()
+        self.finish()
+        self.assertEqual(self.ring.incident(incident, now_us=T0 + POST)["state"], "partial")
+        for start in range(T0 + POST, T0 + POST + PRE, 60 * SECOND):
+            self.append(start)
+        now = T0 + POST + PRE
+        self.restart()
+        result = self.ring.status(now_us=now, clock_trusted=True)
+        self.assertFalse(result["pre_loss_coverage"][str(SOURCE)]["gaps_us"])
+        self.assertTrue(all(row["state"] == "stored" for row in self.ring._rows()))
+        self.assertEqual(result["state"], "degraded")
+        self.assertEqual(result["reason"], "protected_incident_partial")
+        self.ring.delete_incident(incident, now_us=now, clock_trusted=True)
+        self.assertEqual(self.ring.status(now_us=now, clock_trusted=True)["state"], "healthy")
+
+    def test_historical_clock_uncertain_partial_remains_visible_after_recovery(self):
+        self.warm()
+        incident = self.loss()
+        self.ring.tick(now_us=T0, clock_trusted=False)
+        self.finish()
+        for start in range(T0 + POST, T0 + POST + PRE, 60 * SECOND):
+            self.append(start)
+        now = T0 + POST + PRE
+        self.restart()
+        self.assertFalse(self.ring.incident(incident, now_us=now)["has_gaps"])
+        result = self.ring.status(now_us=now, clock_trusted=True)
+        self.assertEqual(result["state"], "degraded")
+        self.assertEqual(result["reason"], "protected_incident_partial")
 
     def test_ledger_transaction_rolls_back_process_interruptions(self):
         for exception in (KeyboardInterrupt, SystemExit):

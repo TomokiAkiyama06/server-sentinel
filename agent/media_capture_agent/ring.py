@@ -14,7 +14,7 @@ import threading
 from uuid import UUID, uuid4
 
 from .ring_ledger import Ledger
-from .ring_models import (DenyControls, POST, PRE, RETENTION, SECOND, RingConfig,
+from .ring_models import (DenyControls, MAX_INTEGER, POST, PRE, RETENTION, SECOND, RingConfig,
                           RingRefused, SegmentProfile, integer, intervals_and_gaps, round_up)
 from .storage import StorageRefused
 
@@ -657,6 +657,8 @@ class DiskRing:
             self.state, self.reason = "degraded", "clock_uncertain"
         elif any(row["state"] != "stored" and self._protected(row["id"]) for row in rows):
             self.state, self.reason = "degraded", "protected_evidence_integrity_gap"
+        elif self.db.execute("SELECT 1 FROM incidents WHERE state='partial' AND expires>? LIMIT 1", (now,)).fetchone():
+            self.state, self.reason = "degraded", "protected_incident_partial"
         elif orphan_bytes:
             self.state, self.reason = "degraded", "orphan_media_present"
         elif any(item["gaps_us"] for item in coverage.values()):
@@ -672,10 +674,18 @@ class DiskRing:
         estimated_duration = None
         if self.config.mode == "capacity":
             # Binary search under the exact same aggregate block/overhead model.
-            left, right = 0, self.config.value * SECOND
+            # Capacity bytes are not seconds. Each individual profile bounds
+            # the duration; the combined estimate may overflow signed storage
+            # integers only for an infeasible probe, which is simply too large.
+            left = 0
+            right = min(MAX_INTEGER, *(max(0, self.config.value // round_up(
+                profile.segment_bytes(), self.store.allocation_unit) - 2) * profile.segment_duration_us
+                for profile in self.profiles.values()))
             while left < right:
                 middle = (left + right + 1) // 2
-                if self._estimate(self.profiles, middle) <= self.config.value:
+                candidate = sum(profile.bytes_for(middle, self.store.allocation_unit)
+                                for profile in self.profiles.values())
+                if candidate <= self.config.value:
                     left = middle
                 else:
                     right = middle - 1
