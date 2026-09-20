@@ -29,7 +29,7 @@ The project shall not require a ServerSentinel-operated cloud service.
 The developer shall not receive or retain users' video, biometric templates, private network information, event metadata, recordings, audit logs, or deployment configuration as part of normal operation.
 
 ### PRIV-003 No telemetry/analytics
-The official project shall not include analytics, advertising SDKs, telemetry, developer-operated crash upload, or tracking SDKs by default.
+The official MVP shall not include analytics, advertising SDKs, telemetry, developer-operated crash upload, or tracking SDKs, including as opt-in features. Introducing any of these requires an explicit Owner decision and ADR before changing the product scope.
 
 ### PRIV-004 Explicit diagnostic export
 Diagnostics may leave the user's environment only after an explicit export/share action initiated by the deployment owner.
