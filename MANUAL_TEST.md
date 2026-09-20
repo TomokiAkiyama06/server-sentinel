@@ -438,6 +438,13 @@ Record separate performance results for 1, 2, 3, and 4 active sources, including
 
 ## S. Main-host hardware integrity / recording-health self-test
 
+Current Issue #23 automation uses generated inventory and synthetic compressed
+bytes only. Before physical acceptance, wire the approved Owner authorizer,
+local schema/runtime configuration, actual source/encoder/codec callbacks and
+#21 durable notification bridge. Verify optional read-only tools under the
+dedicated non-root account; unavailable fields must stay unknown. Do not publish
+collected identifiers or self-test bytes.
+
 ### Hardware baseline and startup/daily comparison
 
 Establish an Owner-approved baseline, then validate both startup and scheduled daily checks.
