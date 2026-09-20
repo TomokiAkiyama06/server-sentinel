@@ -549,6 +549,23 @@ class RingTests(unittest.TestCase):
         self.assertEqual(self.ring.incident(incident, now_us=delayed)["state"], "deleted")
         self.assertEqual(self.store.list_segments(), {})
 
+    def test_untrusted_forward_time_cannot_unprotect_overlapping_late_segment(self):
+        self.warm()
+        incident = self.loss()
+        self.ring.tick(now_us=T0 + POST, clock_trusted=True)
+        identifier = self.ring.append(SOURCE, T0, T0 + 60 * SECOND, PAYLOAD,
+                                      now_us=T0 + POST + RETENTION + SECOND, clock_trusted=False)
+        self.assertIsNotNone(self.ring.db.execute("SELECT 1 FROM protection WHERE incident=? AND segment=?",
+                                                 (str(incident), str(identifier))).fetchone())
+        self.restart()
+        corrected = T0 + POST + 24 * 3600 * SECOND
+        self.ring.tick(now_us=corrected, clock_trusted=True)
+        self.assertIn(identifier, self.store.list_segments())
+        result = self.ring.incident(incident, now_us=corrected)
+        self.assertEqual(result["state"], "partial")
+        self.assertTrue(result["clock_uncertain"])
+        self.assertEqual(result["expires_at_us"], T0 + POST + RETENTION)
+
     def test_preserve_refuses_end_based_expiry_overflow_before_creating_incident(self):
         self.configure()
         end = 2**63 - 1 - RETENTION + 1
@@ -813,7 +830,7 @@ class RingTests(unittest.TestCase):
 
     def test_ledger_reservation_rejects_overlapping_preserve_without_harming_active_post(self):
         self.ring.close()
-        self.ring = DiskRing(self.settings, self.store, ledger_maximum_bytes=2 * 1024 * 1024,
+        self.ring = DiskRing(self.settings, self.store, ledger_maximum_bytes=450 * 4096,
                              authority=AllowControls())
         self.warm()
         incident = self.loss()
@@ -825,6 +842,48 @@ class RingTests(unittest.TestCase):
         self.restart()
         self.finish()
         self.assertEqual(self.ring.incident(incident, now_us=T0 + POST)["state"], "complete")
+
+    def test_overlapping_incidents_share_future_rows_but_keep_separate_edges_after_restart(self):
+        self.ring.close()
+        self.ring = DiskRing(self.settings, self.store, ledger_maximum_bytes=512 * 4096,
+                             authority=AllowControls())
+        self.warm()
+        first = self.loss()
+        second = self.ring.preserve("camera_tamper", T0 - PRE, T0 + POST, now_us=T0, clock_trusted=True)
+        self.restart()
+        self.finish()
+        for incident in (first, second):
+            self.assertEqual(self.ring.incident(incident, now_us=T0 + POST)["state"], "complete")
+        self.assertEqual(len(self.ring._rows()), 20)
+        self.assertEqual(self.ring.db.execute("SELECT count(*) FROM protection").fetchone()[0], 40)
+
+    def test_partially_overlapping_incidents_reserve_union_through_both_ends(self):
+        self.ring.close()
+        self.ring = DiskRing(self.settings, self.store, ledger_maximum_bytes=512 * 4096,
+                             authority=AllowControls())
+        self.warm()
+        first = self.loss()
+        second = self.ring.preserve("camera_tamper", T0 - 300 * SECOND, T0 + 900 * SECOND,
+                                    now_us=T0, clock_trusted=True)
+        self.restart()
+        for start in range(T0, T0 + 900 * SECOND, 60 * SECOND):
+            self.append(start)
+        for incident in (first, second):
+            self.assertEqual(self.ring.incident(incident, now_us=T0 + 900 * SECOND)["state"], "complete")
+        self.assertEqual(len(self.ring._rows()), 25)
+        self.assertEqual(self.ring.db.execute("SELECT count(*) FROM protection").fetchone()[0], 40)
+
+    def test_future_row_union_preserves_disjoint_windows_sources_and_untrusted_reservations(self):
+        other = UUID(int=200)
+        profiles = {SOURCE: self.profile, other: SegmentProfile(other, 800, 400, 30 * SECOND, 100)}
+        windows = [(T0, T0 + 60 * SECOND, {str(SOURCE), str(other)}),
+                   (T0, T0 + 60 * SECOND, {str(SOURCE)}),
+                   (T0 + 120 * SECOND, T0 + 180 * SECOND, {str(SOURCE)})]
+        row = {"id": str(uuid4()), "source": str(SOURCE), "start": T0,
+               "end": T0 + 60 * SECOND, "clock_trusted": 1}
+        untrusted = {**row, "id": str(uuid4()), "clock_trusted": 0}
+        incompatible = {**row, "id": str(uuid4()), "end": T0 + 30 * SECOND}
+        self.assertEqual(self.ring._future_segment_rows(profiles, windows, [row, row, untrusted, incompatible]), 9)
 
     def test_existing_tombstones_are_counted_without_reset_or_deletion(self):
         with self.ring.ledger.transaction():

@@ -177,6 +177,25 @@ class DiskRing:
         return (row["clock_trusted"] and profile is not None
                 and row["end"] - row["start"] == profile.segment_duration_us)
 
+    def _future_segment_rows(self, profiles, windows, existing):
+        future = 0
+        for source, profile in profiles.items():
+            merged = []
+            for start, end, sources in sorted(windows, key=lambda item: item[:2]):
+                if str(source) not in sources:
+                    continue
+                if merged and start <= merged[-1][1]:
+                    merged[-1] = (merged[-1][0], max(end, merged[-1][1]))
+                else:
+                    merged.append((start, end))
+            target = sum((end - start + profile.segment_duration_us - 1) // profile.segment_duration_us + 2
+                         for start, end in merged)
+            present = {row["id"] for row in existing if row["source"] == str(source)
+                       and self._trusted_profile_row(row, profiles)
+                       and any(row["end"] > start and row["start"] < end for start, end in merged)}
+            future += max(0, target - len(present))
+        return future
+
     def _ledger_capacity(self, config, profiles, *, proposal=None, additional_segments=0, additional_protections=0,
                          reactivating=()):
         rows = self._rows()
@@ -194,28 +213,34 @@ class DiskRing:
         incidents = self.db.execute("SELECT count(*) FROM incidents").fetchone()[0]
         protections = self.db.execute("SELECT count(*) FROM protection").fetchone()[0] + additional_protections
         active = self.db.execute("SELECT * FROM incidents WHERE state='active'").fetchall()
+        windows, existing = [], {}
         for incident in active + list(reactivating):
             linked = self.db.execute("SELECT segments.* FROM segments JOIN protection ON segment=segments.id "
                                      "WHERE incident=?", (incident["id"],)).fetchall()
-            present = sum(self._trusted_profile_row(row, profiles) for row in linked)
-            future = max(0, self._segment_count(profiles, incident["end"] - incident["start"]) - present)
-            segments += future
-            protections += future
+            window = (incident["start"], incident["end"], set(json.loads(incident["sources"])))
+            windows.append(window)
+            existing.update((row["id"], row) for row in linked)
+            protections += self._future_segment_rows(profiles, [window], linked)
         if proposal is not None:
             start, end = proposal
             matching = [row for row in rows if row["end"] > start and row["start"] < end
                         and UUID(row["source"]) in profiles]
-            present = sum(self._trusted_profile_row(row, profiles) for row in matching)
-            future = max(0, self._segment_count(profiles, end - start) - present)
+            window = (start, end, {str(source) for source in profiles})
+            windows.append(window)
+            existing.update((row["id"], row) for row in matching)
+            future = self._future_segment_rows(profiles, [window], matching)
             # Ordinary carryover already occupies a separate row reservation.
             # Only compatible ordinary rows newly leaving the projected ring
             # need an additional reservation when they become protected.
             projected = sum(not self._protected(row["id"]) and row["state"] == "stored"
                             and row["allocated"] >= 512 and self._trusted_profile_row(row, profiles)
                             for row in matching)
-            segments += future + projected
+            segments += projected
             protections += len(matching) + future
             incidents += 1
+        # One captured row can serve every overlapping incident, while each
+        # incident still reserves its own protection edge for that row.
+        segments += self._future_segment_rows(profiles, windows, existing.values())
         return self.ledger.require_rows(segments=segments, incidents=incidents, protections=protections)
 
     def _budget(self, profiles, now, *, clock_trusted):
@@ -391,7 +416,8 @@ class DiskRing:
             identifier = str(uuid4())
             incidents = self.db.execute(
                 "SELECT * FROM incidents WHERE state IN ('active','complete','partial') "
-                "AND start<? AND end>? AND (expires IS NULL OR expires>?)", (end_us, start_us, now_us)
+                "AND start<? AND end>? AND (?=0 OR expires IS NULL OR expires>?)",
+                (end_us, start_us, int(clock_trusted), now_us)
             ).fetchall()
             incidents = [row for row in incidents if str(source_id) in json.loads(row["sources"])]
             # Untrusted chronology may later overlap corrected trusted capture;

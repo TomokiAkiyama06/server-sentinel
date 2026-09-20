@@ -49,6 +49,9 @@ its command resource/rate bounds; the core does not establish remote trust itsel
 Loss at T0 protects the requested interval `[T0-600s, T0+600s]`. Existing segment
 references are pinned in one durable transaction, and subsequent local appends
 whose intervals overlap the incident are protected without a Main connection.
+An untrusted wall-clock observation cannot apply an expiry cutoff to a late
+overlapping append; retained incidents keep their protection until trusted time
+can establish expiry.
 Critical `server_movement`/`camera_tamper` preservation uses an explicit interval.
 Profile changes are refused while post-loss protection is active so a new profile
 cannot invalidate an in-progress capacity estimate.
@@ -158,7 +161,10 @@ when incidents share one media file. Missing, untrusted or incompatible ordinary
 rows consume additional capacity; they cannot replace future selected-ring rows.
 New preservation requests must fit before any incident is created; active
 incidents keep room for their remaining segment and reference rows across append
-and restart. Untrusted timestamps never spend the reserved slots for corrected
+and restart. Overlapping requested windows share future segment-row reservations
+per source, including distinct trusted coverage and boundary allowance for each
+connected interval. Each incident still reserves its own protection references.
+Untrusted timestamps never spend the reserved slots for corrected
 trusted capture; admitting such segments requires additional row/reference room
 before writing. Status exposes insufficient room
 for the next incident as `STORAGE_PRESSURE / insufficient_ledger_capacity`.
