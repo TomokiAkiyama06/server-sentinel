@@ -355,6 +355,16 @@ class RecordingTests(unittest.TestCase):
         self.db.execute("PRAGMA synchronous=FULL")
         self.store = self.open_store()
 
+    def test_explicit_transactions_close_with_python_sqlite_autocommit(self):
+        if not hasattr(self.db, "autocommit"):
+            self.skipTest("Python sqlite3 has no autocommit mode")
+        original = self.db.autocommit
+        self.addCleanup(setattr, self.db, "autocommit", original)
+        self.db.autocommit = True
+        self.store.append(self.segment())
+        self.assertFalse(self.db.in_transaction)
+        self.assertFalse(self.policy.reserved)
+
     def test_denied_reserve_or_pressure_does_not_write_or_delete(self):
         existing = self.store.append(self.segment())
         for reason in ("STORAGE_PRESSURE", "STORAGE_HARD_STOP"):

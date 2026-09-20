@@ -160,9 +160,13 @@ class RecordingStore:
             try:
                 self.db.execute("BEGIN IMMEDIATE")
                 yield
-                self.db.commit()
+                # Connection.commit() is a documented no-op when Python
+                # sqlite3 runs with autocommit=True, even after explicit BEGIN.
+                # Use SQL so the durable transaction closes in either mode.
+                self.db.execute("COMMIT")
             except BaseException:
-                self.db.rollback()
+                if self.db.in_transaction:
+                    self.db.execute("ROLLBACK")
                 raise
 
     @staticmethod
