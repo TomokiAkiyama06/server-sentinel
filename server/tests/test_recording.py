@@ -188,6 +188,18 @@ class RecordingTests(unittest.TestCase):
         self.assertEqual([(30_000, 40_000), (40_000, 45_000)],
                          [(item["clip_start_ms"], item["clip_end_ms"]) for item in result["segments"]])
 
+    def test_manual_stop_keeps_open_boundary_segment_linkable(self):
+        recording = self.store.start_manual(self.source, 30_000, duration_ms=20_000)
+        self.store.append(self.segment(30_000, 40_000))
+        pending = self.store.finish(recording, stop_ms=45_000)
+        self.assertEqual("active", pending["status"])
+        boundary = self.store.append(self.segment(40_000, 50_000, 1))
+        self.store.advance(45_000 + self.limits.max_segment_ms)
+        result = self.store.manifest(recording)
+        self.assertEqual("complete", result["status"])
+        self.assertEqual([str(boundary)], [item["id"] for item in result["segments"]
+                                            if item["clip_end_ms"] == 45_000])
+
     def test_queued_stop_releases_post_stop_links_and_discontinuities(self):
         recording = self.store.start_manual(self.source, 30_000, duration_ms=40_000)
         self.store.append(self.segment())

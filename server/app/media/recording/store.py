@@ -450,28 +450,40 @@ class RecordingStore:
                 raise ValueError("invalid stop time")
         if row["status"] == "active":
             end_ms = stop_ms or row["target_end_ms"]
+            cursor = self.db.execute(
+                "SELECT end_ms FROM recording_source_cursors WHERE source_id=?", (row["source_id"],)
+            ).fetchone()
+            # A manual stop inside a still-open muxed segment remains active
+            # through the same bounded close grace used by advance().  This
+            # keeps the eventual overlapping segment linkable instead of
+            # turning available bytes into a permanent manifest gap.
+            close_now = stop_ms is None or (cursor is not None and cursor["end_ms"] >= end_ms)
             with self._transaction():
                 self.db.execute(
-                    "UPDATE recordings SET target_end_ms=?,ended_ms=?,status='complete' WHERE id=?",
-                    (end_ms, end_ms, str(recording_id)),
+                    "UPDATE recordings SET target_end_ms=?,ended_ms=?,status=? WHERE id=?",
+                    (end_ms, end_ms if close_now else None,
+                     "complete" if close_now else "active", str(recording_id)),
                 )
-                # A queued stop can precede segments already appended. Retain
-                # boundary overlap but release evidence wholly outside the clip.
-                self.db.execute(
-                    "DELETE FROM recording_links WHERE recording_id=? AND segment_id IN "
-                    "(SELECT id FROM recording_segments WHERE start_ms>=? OR end_ms<=?)",
-                    (str(recording_id), end_ms, row["start_ms"]),
-                )
-                self.db.execute(
-                    "DELETE FROM recording_discontinuities WHERE recording_id=? "
-                    "AND (start_ms>=? OR end_ms<=?)",
-                    (str(recording_id), end_ms, row["start_ms"]),
-                )
-            try:
-                self._trim()
-            except BaseException:
-                self._failed = True
-                raise
+                if close_now:
+                    # A queued stop can precede segments already appended.
+                    # Retain boundary overlap but release data wholly outside
+                    # the requested clip.
+                    self.db.execute(
+                        "DELETE FROM recording_links WHERE recording_id=? AND segment_id IN "
+                        "(SELECT id FROM recording_segments WHERE start_ms>=? OR end_ms<=?)",
+                        (str(recording_id), end_ms, row["start_ms"]),
+                    )
+                    self.db.execute(
+                        "DELETE FROM recording_discontinuities WHERE recording_id=? "
+                        "AND (start_ms>=? OR end_ms<=?)",
+                        (str(recording_id), end_ms, row["start_ms"]),
+                    )
+            if close_now:
+                try:
+                    self._trim()
+                except BaseException:
+                    self._failed = True
+                    raise
         result = self.manifest(recording_id)
         if result["status"] == "gapped" or (result["gaps"] and result["status"] == "complete"):
             with self._transaction():
