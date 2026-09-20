@@ -12,8 +12,8 @@ import unittest
 import zlib
 
 from app.media.recording import Limits, RecordingError, RecordingStore, RootIdentity, Segment
-from app.media.recording.schema import recording_migration
-from app.storage.migrations import BUILTIN_MIGRATIONS, migrate
+from app.storage.migrations import migrate
+from app.storage.schema import APPLICATION_MIGRATIONS
 
 
 class SyntheticValidator:
@@ -58,9 +58,12 @@ class RecordingTests(unittest.TestCase):
         self.identity = RootIdentity(info.st_dev, info.st_ino)
         self.db = sqlite3.connect(self.base / "metadata.sqlite", isolation_level=None)
         self.addCleanup(self.db.close)
-        # Isolated domain DB assigns slot 2. The application aggregator assigns
-        # a contiguous final slot after prior feature migrations merge.
-        migrate(self.db, BUILTIN_MIGRATIONS + (recording_migration(2),))
+        migrate(self.db, APPLICATION_MIGRATIONS)
+        self.assertEqual(
+            self.db.execute("SELECT version, name FROM schema_migrations ORDER BY version").fetchall(),
+            [(1, "foundation"), (2, "camera_registry"), (3, "uvc_identity"),
+             (4, "durable_recording")],
+        )
         self.policy = Reservation()
         self.validator = SyntheticValidator()
         self.limits = Limits(pre_roll_bytes=4096, max_segment_bytes=512,
@@ -99,7 +102,7 @@ class RecordingTests(unittest.TestCase):
             for source in (self.source, remote_source):
                 self.store.append(self.segment(start, start + 10_000, index, source_id=source,
                                               capture_node_id=node if source == remote_source else None))
-        self.store.advance(180_000)
+        self.store.advance(180_000 + self.limits.max_segment_ms)
         manifest = self.store.event_manifest(event)
         self.assertEqual(2, len(manifest["recordings"]))
         self.assertEqual({str(value) for value in recordings},
@@ -146,10 +149,22 @@ class RecordingTests(unittest.TestCase):
         active = self.store.manifest(recording)
         self.assertEqual([], active["gaps"])
         self.assertEqual("awaiting_media", active["pending"][0]["reason"])
-        self.store.advance(40_000)
+        self.store.advance(40_000 + self.limits.max_segment_ms)
         result = self.store.manifest(recording)
         self.assertEqual("gapped", result["status"])
         self.assertEqual("unavailable", result["gaps"][0]["reason"])
+
+    def test_timer_keeps_boundary_segment_linkable_until_bounded_close(self):
+        recording = self.store.start_manual(self.source, 30_000, duration_ms=15_000)
+        self.store.append(self.segment(30_000, 40_000))
+        self.store.advance(45_000)
+        self.assertEqual("active", self.store.manifest(recording)["status"])
+        boundary = self.store.append(self.segment(40_000, 50_000, 1))
+        self.store.advance(45_000 + self.limits.max_segment_ms)
+        result = self.store.manifest(recording)
+        self.assertEqual("complete", result["status"])
+        self.assertEqual([str(boundary)], [item["id"] for item in result["segments"]
+                                            if item["clip_end_ms"] == 45_000])
 
     def test_manual_and_event_limits_and_invalid_identifiers(self):
         recording = self.store.start_manual(self.source, 30_000)
@@ -172,6 +187,18 @@ class RecordingTests(unittest.TestCase):
         self.assertEqual("complete", result["status"])
         self.assertEqual([(30_000, 40_000), (40_000, 45_000)],
                          [(item["clip_start_ms"], item["clip_end_ms"]) for item in result["segments"]])
+
+    def test_manual_stop_keeps_open_boundary_segment_linkable(self):
+        recording = self.store.start_manual(self.source, 30_000, duration_ms=20_000)
+        self.store.append(self.segment(30_000, 40_000))
+        pending = self.store.finish(recording, stop_ms=45_000)
+        self.assertEqual("active", pending["status"])
+        boundary = self.store.append(self.segment(40_000, 50_000, 1))
+        self.store.advance(45_000 + self.limits.max_segment_ms)
+        result = self.store.manifest(recording)
+        self.assertEqual("complete", result["status"])
+        self.assertEqual([str(boundary)], [item["id"] for item in result["segments"]
+                                            if item["clip_end_ms"] == 45_000])
 
     def test_queued_stop_releases_post_stop_links_and_discontinuities(self):
         recording = self.store.start_manual(self.source, 30_000, duration_ms=40_000)
@@ -328,6 +355,16 @@ class RecordingTests(unittest.TestCase):
         self.db.execute("PRAGMA synchronous=FULL")
         self.store = self.open_store()
 
+    def test_explicit_transactions_close_with_python_sqlite_autocommit(self):
+        if not hasattr(self.db, "autocommit"):
+            self.skipTest("Python sqlite3 has no autocommit mode")
+        original = self.db.autocommit
+        self.addCleanup(setattr, self.db, "autocommit", original)
+        self.db.autocommit = True
+        self.store.append(self.segment())
+        self.assertFalse(self.db.in_transaction)
+        self.assertFalse(self.policy.reserved)
+
     def test_denied_reserve_or_pressure_does_not_write_or_delete(self):
         existing = self.store.append(self.segment())
         for reason in ("STORAGE_PRESSURE", "STORAGE_HARD_STOP"):
@@ -369,6 +406,24 @@ class RecordingTests(unittest.TestCase):
             "SELECT COUNT(*) FROM recording_discontinuities WHERE recording_id=?",
             (str(next_recording),),
         ).fetchone()[0])
+
+    def test_pre_roll_start_preserves_prior_stream_discontinuity(self):
+        self.store.append(self.segment(10_000, 20_000, 0))
+        self.store.append(self.segment(40_000, 50_000, 2))
+        recording = self.store.start_manual(self.source, 30_000, duration_ms=20_000)
+        result = self.store.finish(recording)
+        self.assertEqual("gapped", result["status"])
+        self.assertEqual([{"start_ms": 30_000, "end_ms": 40_000,
+                           "reason": "stream_discontinuity"}], result["discontinuities"])
+
+    def test_release_source_drops_bounded_source_discontinuities(self):
+        self.store.append(self.segment(10_000, 20_000, 0))
+        self.store.append(self.segment(40_000, 50_000, 2))
+        self.assertEqual(1, self.db.execute(
+            "SELECT COUNT(*) FROM recording_source_discontinuities").fetchone()[0])
+        self.store.release_source(self.source)
+        self.assertEqual(0, self.db.execute(
+            "SELECT COUNT(*) FROM recording_source_discontinuities").fetchone()[0])
 
     def test_cursor_survives_eviction_and_rejects_replays(self):
         self.store.close()
@@ -504,6 +559,25 @@ class RecordingTests(unittest.TestCase):
         self.assertEqual(0, self.store.usage_bytes())
         self.assertEqual((), self.store.list_recordings(limit=1))
         self.assertEqual([], list(self.root.iterdir()))
+
+    def test_release_source_cleanup_failure_blocks_later_mutation(self):
+        self.store.append(self.segment())
+        with patch("app.media.recording.store.os.unlink", side_effect=PermissionError):
+            with self.assertRaises(PermissionError):
+                self.store.release_source(self.source)
+        with self.assertRaisesRegex(RecordingError, "WRITER_UNAVAILABLE"):
+            self.store.start_manual(self.source, 30_000)
+
+    def test_recovery_refuses_inconsistent_deletion_journal_with_evidence_links(self):
+        segment = self.store.append(self.segment())
+        recording = self.store.start_manual(self.source, 30_000, duration_ms=10_000)
+        self.store.finish(recording)
+        self.db.execute("UPDATE recordings SET status='deleting' WHERE id=?", (str(recording),))
+        self.store.close()
+        with self.assertRaisesRegex(RecordingError, "RECORDING_RECOVERY_REQUIRED"):
+            self.open_store()
+        self.assertTrue((self.root / (segment.hex + ".seg")).exists())
+        self.assertEqual(1, self.db.execute("SELECT COUNT(*) FROM recording_links").fetchone()[0])
 
     def test_critical_usage_counts_shared_and_interrupted_pending_bytes_once(self):
         self.store.append(self.segment())

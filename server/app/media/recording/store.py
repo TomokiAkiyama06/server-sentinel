@@ -173,9 +173,13 @@ class RecordingStore:
             try:
                 self.db.execute("BEGIN IMMEDIATE")
                 yield
-                self.db.commit()
+                # Connection.commit() is a documented no-op when Python
+                # sqlite3 runs with autocommit=True, even after explicit BEGIN.
+                # Use SQL so the durable transaction closes in either mode.
+                self.db.execute("COMMIT")
             except BaseException:
-                self.db.rollback()
+                if self.db.in_transaction:
+                    self.db.execute("ROLLBACK")
                 raise
 
     @staticmethod
@@ -210,6 +214,15 @@ class RecordingStore:
                 "start_ms)) WHERE status='active'"
             )
         self._trim()
+        # A normal delete transaction removes links before its cleanup can be
+        # interrupted. Do not turn an inconsistent deletion journal into media
+        # loss during startup: preserve the linked evidence and leave the
+        # worker unavailable for an explicit recovery decision.
+        if self.db.execute(
+                "SELECT 1 FROM recordings r JOIN recording_links l ON l.recording_id=r.id "
+                "WHERE r.status='deleting' LIMIT 1"
+        ).fetchone():
+            raise RecordingError("RECORDING_RECOVERY_REQUIRED")
         with self._transaction():
             self.db.execute("DELETE FROM recordings WHERE status='deleting'")
 
@@ -323,6 +336,13 @@ class RecordingStore:
                 (str(segment.source_id), str(segment.stream_id), segment.sequence, segment.end_ms,
                  str(segment.capture_node_id) if segment.capture_node_id else None),
             )
+            if prior and (str(segment.stream_id) != prior["stream_id"]
+                          or segment.sequence != prior["sequence"] + 1):
+                self.db.execute(
+                    "INSERT OR IGNORE INTO recording_source_discontinuities VALUES (?,?,?,?)",
+                    (str(segment.source_id), prior["end_ms"], segment.start_ms,
+                     "stream_discontinuity"),
+                )
             for recording in active:
                 self.db.execute("INSERT INTO recording_links VALUES (?,?)",
                                 (recording["id"], segment_id))
@@ -355,6 +375,12 @@ class RecordingStore:
                 self.db.execute("UPDATE recording_segments SET spool=0 WHERE id=?", (row["id"],))
                 total -= row["byte_length"]
                 remaining -= 1
+            self.db.execute(
+                "DELETE FROM recording_source_discontinuities WHERE end_ms <= "
+                "(SELECT MAX(s.end_ms) FROM recording_segments s "
+                "WHERE s.source_id=recording_source_discontinuities.source_id)-?",
+                (self.limits.pre_roll_ms,),
+            )
         unused = self.db.execute(
             "SELECT id FROM recording_segments WHERE spool=0 AND state='ready' "
             "AND NOT EXISTS (SELECT 1 FROM recording_links WHERE segment_id=recording_segments.id)"
@@ -376,7 +402,16 @@ class RecordingStore:
                             (str(source_id),))
             self.db.execute("UPDATE recording_segments SET spool=0 WHERE source_id=?",
                             (str(source_id),))
-        self._trim()
+            self.db.execute("DELETE FROM recording_source_discontinuities WHERE source_id=?",
+                            (str(source_id),))
+        try:
+            self._trim()
+        except BaseException:
+            # Cursor and spool state are already committed.  A failed cleanup
+            # leaves the writer unable to make a safe next mutation, so require
+            # an explicit close/reopen recovery boundary.
+            self._failed = True
+            raise
 
     def start_event(self, event_id: UUID, source_ids: tuple[UUID, ...], at_ms: int,
                     *, pre_ms: int = 30_000, post_ms: int = 120_000,
@@ -438,17 +473,24 @@ class RecordingStore:
                         "WHERE source_id=? AND state='ready' AND spool=1 AND start_ms<? AND end_ms>?",
                         (str(recording_id), str(source_id), end_ms, start_ms),
                     )
+                    self.db.execute(
+                        "INSERT INTO recording_discontinuities SELECT ?,start_ms,end_ms,reason "
+                        "FROM recording_source_discontinuities WHERE source_id=? "
+                        "AND start_ms<? AND end_ms>?",
+                        (str(recording_id), str(source_id), end_ms, start_ms),
+                    )
             return identities
         finally:
             self._release_reservation()
 
     def advance(self, now_ms: int) -> None:
-        """The owning worker's bounded timer closes deadlines even with no input."""
+        """The owning worker closes deadlines after the bounded segment-close grace."""
         self._check()
         if type(now_ms) is not int or now_ms < 0:
             raise ValueError("invalid clock")
         rows = self.db.execute(
-            "SELECT id FROM recordings WHERE status='active' AND target_end_ms<=?", (now_ms,)
+            "SELECT id FROM recordings WHERE status='active' "
+            "AND target_end_ms + ? <=?", (self.limits.max_segment_ms, now_ms)
         ).fetchall()
         for row in rows:
             self.finish(UUID(row["id"]))
@@ -462,28 +504,40 @@ class RecordingStore:
                 raise ValueError("invalid stop time")
         if row["status"] == "active":
             end_ms = stop_ms or row["target_end_ms"]
+            cursor = self.db.execute(
+                "SELECT end_ms FROM recording_source_cursors WHERE source_id=?", (row["source_id"],)
+            ).fetchone()
+            # A manual stop inside a still-open muxed segment remains active
+            # through the same bounded close grace used by advance().  This
+            # keeps the eventual overlapping segment linkable instead of
+            # turning available bytes into a permanent manifest gap.
+            close_now = stop_ms is None or (cursor is not None and cursor["end_ms"] >= end_ms)
             with self._transaction():
                 self.db.execute(
-                    "UPDATE recordings SET target_end_ms=?,ended_ms=?,status='complete' WHERE id=?",
-                    (end_ms, end_ms, str(recording_id)),
+                    "UPDATE recordings SET target_end_ms=?,ended_ms=?,status=? WHERE id=?",
+                    (end_ms, end_ms if close_now else None,
+                     "complete" if close_now else "active", str(recording_id)),
                 )
-                # A queued stop can precede segments already appended. Retain
-                # boundary overlap but release evidence wholly outside the clip.
-                self.db.execute(
-                    "DELETE FROM recording_links WHERE recording_id=? AND segment_id IN "
-                    "(SELECT id FROM recording_segments WHERE start_ms>=? OR end_ms<=?)",
-                    (str(recording_id), end_ms, row["start_ms"]),
-                )
-                self.db.execute(
-                    "DELETE FROM recording_discontinuities WHERE recording_id=? "
-                    "AND (start_ms>=? OR end_ms<=?)",
-                    (str(recording_id), end_ms, row["start_ms"]),
-                )
-            try:
-                self._trim()
-            except BaseException:
-                self._failed = True
-                raise
+                if close_now:
+                    # A queued stop can precede segments already appended.
+                    # Retain boundary overlap but release data wholly outside
+                    # the requested clip.
+                    self.db.execute(
+                        "DELETE FROM recording_links WHERE recording_id=? AND segment_id IN "
+                        "(SELECT id FROM recording_segments WHERE start_ms>=? OR end_ms<=?)",
+                        (str(recording_id), end_ms, row["start_ms"]),
+                    )
+                    self.db.execute(
+                        "DELETE FROM recording_discontinuities WHERE recording_id=? "
+                        "AND (start_ms>=? OR end_ms<=?)",
+                        (str(recording_id), end_ms, row["start_ms"]),
+                    )
+            if close_now:
+                try:
+                    self._trim()
+                except BaseException:
+                    self._failed = True
+                    raise
         result = self.manifest(recording_id)
         if result["status"] == "gapped" or (result["gaps"] and result["status"] == "complete"):
             with self._transaction():

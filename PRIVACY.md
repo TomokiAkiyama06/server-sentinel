@@ -144,6 +144,12 @@ If Main Server communication is unexpectedly lost, the agent protects the preced
 
 ## Hardware inventory and recorder diagnostics
 
+Local UVC approval evidence, including raw camera serials and USB topology, stays
+in the deployment's private application database. Normal UVC health/audit
+callbacks expose only logical source IDs, state and fixed reason codes. Captured
+video bytes are excluded from object representations and no frame is written to
+disk or uploaded by the UVC adapter itself. Downstream media policies still apply.
+
 The implementation's local fault status/outbox contains component categories,
 comparison states and fixed reasons, excluding serials, UUIDs, paths and media.
 Raw approved observations remain in the deployment-local baseline and omit

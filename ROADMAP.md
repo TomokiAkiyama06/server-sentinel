@@ -34,7 +34,12 @@ Issue #1 closed when PR #2 merged after documentation/bootstrap acceptance and c
 - [x] capabilities/health/profile model
 - [ ] local UVC discovery/ingest
 - [ ] stable/ambiguous UVC identity handling
-- [ ] `media-capture-agent` native service
+
+Issue #11 now has a V4L2 discovery/MMAP adapter, durable approval latch and
+registry integration with synthetic tests. The UVC items remain unchecked until
+Owner management/worker integration and real-webcam acceptance are complete;
+no browser preview or physical device result is claimed.
+- [ ] `media-capture-agent` native service — #12 foundation implemented; capture/paired transport integration and physical acceptance pending
 - [ ] video-only capture
 - [ ] one-time pairing + mTLS/revocation
 - [ ] separate LAN ingest listener
@@ -58,10 +63,11 @@ Issue #1 closed when PR #2 merged after documentation/bootstrap acceptance and c
 - [ ] phone/Mac/desktop 1–4 source live grid, with stability/reconnect prioritized over minimum latency
 - [ ] demand-driven viewer transcoding/packaging
 
-Issue #18 now has bounded compressed storage primitives, source/event manifests
-and synthetic crash/integrity coverage. Its runtime worker, final migration slot,
-codec adapter, shared storage guard and authorization integration remain open;
-these primitives do not establish playable-video or hardware acceptance.
+Issue #18 now has bounded compressed storage primitives, source/event manifests,
+application migration v4 integration, and synthetic crash/integrity coverage. Its
+runtime worker, codec adapter, shared storage guard and authorization integration
+remain open; these primitives do not establish playable-video or hardware
+acceptance.
 
 ## Phase 4 — Human private access
 

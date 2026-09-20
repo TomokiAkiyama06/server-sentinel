@@ -4,9 +4,9 @@ from uuid import uuid4
 import zlib
 
 from app.media.recording import Limits, RecordingError, RecordingStore, RootIdentity, Segment
-from app.media.recording.schema import recording_migration
 from app.storage.database import Database
-from app.storage.migrations import BUILTIN_MIGRATIONS, migrate
+from app.storage.migrations import migrate
+from app.storage.schema import APPLICATION_MIGRATIONS
 from tests.test_recording import Reservation, SyntheticValidator
 
 
@@ -17,7 +17,7 @@ def run_recording_smoke(base, scenario):
     connection = Database(base / "recording-metadata.sqlite").connect()
     policy = Reservation()
     try:
-        migrate(connection, BUILTIN_MIGRATIONS + (recording_migration(2),))
+        migrate(connection, APPLICATION_MIGRATIONS)
         limits = Limits(pre_roll_bytes=4096, max_segment_bytes=512,
                         max_segment_ms=30_000, max_active_recordings=4,
                         max_spool_segments=16, max_segments_per_recording=100)

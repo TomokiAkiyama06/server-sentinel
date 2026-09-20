@@ -1,0 +1,179 @@
+#!/usr/bin/env python3
+"""Explicit local installer; never create accounts, change mounts, or start units."""
+
+import argparse
+import hashlib
+import os
+from pathlib import Path
+import pwd
+import re
+import subprocess
+import stat
+
+from media_capture_agent.config import ConfigurationError, Settings, read_protected_configuration
+from media_capture_agent.storage import StorageRefused, open_directory
+
+
+MAX_ARTIFACT_BYTES = 16 * 1024 * 1024
+
+
+def read_artifact(path):
+    """Never block on a special file or read an unbounded root-owned input."""
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
+    with os.fdopen(fd, "rb") as stream:
+        before = os.fstat(stream.fileno())
+        if not stat.S_ISREG(before.st_mode) or not 0 < before.st_size <= MAX_ARTIFACT_BYTES:
+            raise ValueError("artifact must be a bounded regular file")
+        data = stream.read(MAX_ARTIFACT_BYTES + 1)
+        after = os.fstat(stream.fileno())
+        if (len(data) != before.st_size or (before.st_size, before.st_mtime_ns, before.st_ctime_ns)
+                != (after.st_size, after.st_mtime_ns, after.st_ctime_ns)):
+            raise ValueError("artifact changed during verification")
+        return data
+
+
+def quote(value):
+    value = str(value)
+    if any(ord(char) < 32 for char in value) or "$" in value:
+        raise ValueError("invalid unit argument")
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%") + '"'
+
+
+def render_unit(executable, config, settings, account, group, devices=()):
+    if not re.fullmatch(r"[a-z_][a-z0-9_-]*[$]?", account):
+        raise ValueError("invalid dedicated account")
+    if type(group) is not int or group < 0:
+        raise ValueError("invalid dedicated group")
+    for device in devices:
+        if not re.fullmatch(r"/dev/video[0-9]+", device):
+            raise ValueError("only explicit video device nodes are supported")
+    device_rules = "\n".join("DeviceAllow=" + quote(device) + " rw" for device in devices)
+    return f"""[Unit]
+Description=ServerSentinel media-capture-agent
+After=local-fs.target network.target
+RequiresMountsFor={quote(settings.media_root)} {quote(settings.runtime_root)}
+
+[Service]
+Type=simple
+User={account}
+Group={group}
+ExecStartPre={quote(executable)} --config {quote(config)} --check
+ExecStart={quote(executable)} --config {quote(config)}
+Restart=on-failure
+UMask=0077
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths={quote(settings.media_root)} {quote(settings.runtime_root)}
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+DevicePolicy=closed
+{device_rules}
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+Environment=PYTHONDONTWRITEBYTECODE=1
+
+[Install]
+WantedBy=multi-user.target
+"""
+
+
+def protected_parent(path):
+    for parent in (path, *path.parents):
+        fd = open_directory(parent)
+        try:
+            info = os.fstat(fd)
+            if info.st_uid != 0 or info.st_mode & 0o022:
+                raise ValueError("installation ancestors must be root-controlled")
+        finally:
+            os.close(fd)
+
+
+def install(args):
+    if os.geteuid() != 0:
+        raise ValueError("installation requires explicit administrator execution")
+    if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(?:-[a-z0-9.]+)?", args.version):
+        raise ValueError("invalid release version")
+    if not re.fullmatch(r"[0-9a-f]{64}", args.sha256):
+        raise ValueError("verified artifact digest required")
+    artifact = read_artifact(args.artifact)
+    if hashlib.sha256(artifact).hexdigest() != args.sha256:
+        raise ValueError("artifact digest mismatch")
+    # Bind a relative deployment path to the administrator's invocation
+    # directory before the preflight changes cwd and before writing the unit.
+    # Do not resolve it: read_protected_configuration must retain its final
+    # symlink refusal when it opens the configuration.
+    config = Path(os.path.abspath(args.config))
+    code_root = Path(__file__).resolve().parents[1]
+    value, config_owner = read_protected_configuration(
+        config, forbidden_roots=(args.destination, code_root)
+    )
+    settings = Settings.parse(value, code_root=args.destination)
+    if any(root.is_relative_to(code_root) for root in (settings.runtime_root, settings.media_root)):
+        raise ValueError("runtime data must be outside the checkout")
+    if config_owner != settings.service_uid:
+        raise ValueError("configuration must belong to dedicated account")
+    account = pwd.getpwuid(settings.service_uid)
+    if pwd.getpwnam(account.pw_name).pw_uid == 0:
+        raise ValueError("dedicated non-root account required")
+    if not args.destination.is_absolute() or not args.unit.is_absolute():
+        raise ValueError("absolute installation paths required")
+    if args.unit.name != "media-capture-agent.service":
+        raise ValueError("service must retain its functional name")
+    protected_parent(args.destination)
+    protected_parent(args.unit.parent)
+    version_root = args.destination / args.version
+    version_root.mkdir(mode=0o755)
+    version_root.chmod(0o755)
+    executable = version_root / "media-capture-agent"
+    unit_created = False
+    try:
+        with executable.open("xb") as stream:
+            stream.write(artifact)
+        executable.chmod(0o555)
+        # Verify ownership/writability/mount/reserve under the actual service UID,
+        # not administrator capabilities. No network, capture or media writes.
+        subprocess.run([str(executable), "--config", str(config), "--check"],
+                       check=True, timeout=30, user=account.pw_uid, group=account.pw_gid,
+                       extra_groups=[], env={"PATH": "/usr/bin:/bin",
+                                             "PYTHONDONTWRITEBYTECODE": "1"},
+                       cwd="/", stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        content = render_unit(executable, config, settings, account.pw_name,
+                              account.pw_gid, args.video_device)
+        with args.unit.open("x", encoding="utf-8") as stream:
+            unit_created = True
+            stream.write(content)
+        args.unit.chmod(0o644)
+    except Exception:
+        if unit_created:
+            args.unit.unlink()
+        executable.unlink(missing_ok=True)
+        version_root.rmdir()
+        raise
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--artifact", type=Path, required=True)
+    parser.add_argument("--sha256", required=True)
+    parser.add_argument("--version", required=True)
+    parser.add_argument("--destination", type=Path, required=True)
+    parser.add_argument("--config", type=Path, required=True)
+    parser.add_argument("--unit", type=Path, required=True)
+    parser.add_argument("--video-device", action="append", default=[])
+    args = parser.parse_args()
+    try:
+        install(args)
+    except (OSError, ValueError, ConfigurationError, StorageRefused,
+            KeyError, subprocess.SubprocessError):
+        parser.exit(1, "media-capture-agent installation validation failed\n")
+    print("media-capture-agent installed; inspect and enable the unit explicitly")
+
+
+if __name__ == "__main__":
+    main()
