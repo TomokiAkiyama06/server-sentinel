@@ -23,6 +23,26 @@ class AuditStorageError(RuntimeError):
     """Audit persistence failed without disclosing database paths or values."""
 
 
+class UnboundStorageAdmission:
+    """Refuse audit writes until the deployment binds a storage admission.
+
+    This subsystem consumes the Main Server storage policy's hard filesystem
+    reserve; it never defines a numeric reserve of its own. Until a deployment
+    binds that policy, a write whose safety cannot be verified is refused
+    rather than allowed to cross an unknown reserve, mirroring the default-deny
+    Owner authorizer. Reading audit history stays available.
+    """
+
+    def __call__(self) -> "UnboundStorageAdmission":
+        return self
+
+    def __enter__(self) -> None:
+        raise AuditStorageError("audit storage admission is not configured")
+
+    def __exit__(self, *details) -> bool:
+        return False
+
+
 @dataclass(frozen=True)
 class AuditCursor:
     occurred_at: datetime

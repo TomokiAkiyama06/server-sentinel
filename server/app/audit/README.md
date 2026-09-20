@@ -66,9 +66,11 @@ and this subsystem's transaction metadata can never spend the hard filesystem
 reserve. `create_app(storage_reservation=...)` receives the deployment's Main
 Server storage admission, which this subsystem consumes rather than defines: it
 never invents a numeric filesystem reserve of its own. Until the Main Server
-binds its storage policy, `application.state.audit_storage_admitted` is false,
-so the unadmitted state is explicit rather than assumed, and the remaining
-guarantees are unchanged. Owner
+binds that policy, `create_app()` installs `UnboundStorageAdmission`, which
+refuses audit writes instead of admitting them against a reserve this process
+cannot verify — the same default-deny posture as `DenyAllOwners`. That state is
+explicit in `application.state.audit_storage_admitted`, retention health is
+degraded rather than silently healthy, and Owner-only reading stays available. Owner
 operations that already own an admitted reservation, such as the recording
 store's starred/delete transactions, pass it as `reservation=` so the shared
 transaction stays admitted until it commits or rolls back. A refused admission

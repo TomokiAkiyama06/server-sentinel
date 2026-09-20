@@ -25,12 +25,19 @@ from app.storage.migrations import migrate
 from tests.asgi import request
 
 
+@contextmanager
+def synthetic_admission():
+    """Stands in for a bound Main Server storage admission reservation."""
+    yield
+
+
 class ApplicationTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         self.settings = Settings(Path(self.temporary.name))
-        self.application = create_app(self.settings)
+        self.application = create_app(self.settings,
+                                      storage_reservation=synthetic_admission)
 
     async def test_lifespan_migrates_and_clears_readiness_at_shutdown(self):
         self.assertFalse(self.application.state.ready)
@@ -48,7 +55,8 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
         with closing(self.application.state.database.connect()) as connection:
             migrate(connection, APPLICATION_MIGRATIONS)
         old = datetime(2020, 1, 1, tzinfo=timezone.utc)
-        audit = AuditStore(self.application.state.database, clock=lambda: old)
+        audit = AuditStore(self.application.state.database, clock=lambda: old,
+                           reservation=synthetic_admission)
         audit.append(
             actor_category=ActorCategory.SYSTEM,
             action=AuditAction.CHANGE_ADMIN_SETTING,
@@ -60,10 +68,12 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual((), self.application.state.audit_store.list_records())
 
     async def test_runtime_periodically_cleans_expired_audit_records(self):
-        application = create_app(self.settings, audit_cleanup_interval_seconds=0.01)
+        application = create_app(self.settings, audit_cleanup_interval_seconds=0.01,
+                                 storage_reservation=synthetic_admission)
         async with application.router.lifespan_context(application):
             old = datetime(2020, 1, 1, tzinfo=timezone.utc)
-            AuditStore(application.state.database, clock=lambda: old).append(
+            AuditStore(application.state.database, clock=lambda: old,
+                       reservation=synthetic_admission).append(
                 actor_category=ActorCategory.SYSTEM,
                 action=AuditAction.CHANGE_ADMIN_SETTING,
                 target_kind=TargetKind.ADMIN_SETTINGS,
@@ -128,8 +138,7 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
         application = create_app(self.settings, storage_reservation=reservation,
                                  audit_cleanup_interval_seconds=0.01)
         self.assertTrue(application.state.audit_storage_admitted)
-        # An application without a bound storage policy says so explicitly.
-        self.assertFalse(self.application.state.audit_storage_admitted)
+
         with closing(application.state.database.connect()) as connection:
             migrate(connection, APPLICATION_MIGRATIONS)
         old = datetime(2020, 1, 1, tzinfo=timezone.utc)
@@ -147,7 +156,8 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual((), application.state.audit_store.list_records())
 
     async def test_degraded_audit_retention_does_not_block_monitoring_startup(self):
-        application = create_app(self.settings, audit_cleanup_interval_seconds=1000)
+        application = create_app(self.settings, audit_cleanup_interval_seconds=1000,
+                                 storage_reservation=synthetic_admission)
         with closing(application.state.database.connect()) as connection:
             migrate(connection, APPLICATION_MIGRATIONS)
         with patch.object(application.state.audit_store, "cleanup_expired",
@@ -190,6 +200,34 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
             task.cancel()
             with self.assertRaises(asyncio.CancelledError):
                 await task
+
+    async def test_unbound_storage_admission_refuses_audit_writes(self):
+        application = create_app(self.settings, audit_cleanup_interval_seconds=1000)
+        # Without a bound Main Server storage policy the deployment cannot
+        # verify the hard filesystem reserve, so audit writes fail closed
+        # instead of being admitted against an unknown reserve.
+        self.assertFalse(application.state.audit_storage_admitted)
+        async with application.router.lifespan_context(application):
+            self.assertTrue(application.state.ready)
+            self.assertEqual(AuditRetentionHealth.DEGRADED,
+                             application.state.audit_retention.health)
+            with self.assertRaises(AuditStorageError):
+                application.state.audit_store.append(
+                    actor_category=ActorCategory.SYSTEM,
+                    action=AuditAction.CHANGE_ADMIN_SETTING,
+                    target_kind=TargetKind.ADMIN_SETTINGS,
+                    target_logical_id=uuid4(), outcome=AuditOutcome.SUCCEEDED,
+                )
+            with self.assertRaises(AuditStorageError):
+                application.state.owner_administration.create_capture_node(
+                    {"synthetic": "untrusted"}, "Refused node",
+                )
+            # Nothing was written, and reading audit history still works.
+            self.assertEqual((), application.state.audit_store.list_records())
+            with closing(application.state.database.connect()) as connection:
+                self.assertEqual(0, connection.execute(
+                    "SELECT count(*) FROM capture_nodes"
+                ).fetchone()[0])
 
     async def test_invalid_database_fails_startup_without_leaking_exception_values(self):
         self.settings.database_path.write_text("SYNTHETIC_PRIVATE_VALUE")

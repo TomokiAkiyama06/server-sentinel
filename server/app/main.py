@@ -9,7 +9,10 @@ from fastapi import FastAPI
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from app.auth.boundary import DenyAll, HumanAuthorizer
-from app.audit import AuditStore, DenyAllOwners, OwnerAuditService, OwnerAuthorizer
+from app.audit import (
+    AuditStore, DenyAllOwners, OwnerAuditService, OwnerAuthorizer,
+    UnboundStorageAdmission,
+)
 from app.audit.integration import OwnerAdministration
 from app.audit.runtime import AuditRetentionRuntime
 from app.cameras.registry import CameraRegistry
@@ -53,8 +56,10 @@ def create_app(settings: Settings, *, database: Database | None = None,
     store = database or Database(settings.database_path)
     # The deployment injects the Main Server storage admission reservation once
     # its storage policy is bound, so audit writes and retention cleanup cannot
-    # spend the hard filesystem reserve.
-    audit_store = AuditStore(store, reservation=storage_reservation)
+    # spend the hard filesystem reserve. Until then writes are refused rather
+    # than admitted against a reserve this process cannot verify.
+    audit_store = AuditStore(store, reservation=storage_reservation
+                             or UnboundStorageAdmission())
     audit_service = OwnerAuditService(audit_store, owner_authorizer or DenyAllOwners())
     owner_administration = OwnerAdministration(audit_service, CameraRegistry(store))
     audit_retention = AuditRetentionRuntime(
