@@ -604,6 +604,41 @@ class RecordingTests(unittest.TestCase):
         self.assertEqual(AuditOutcome.FAILED, outcomes[missing])
         self.assertEqual(AuditOutcome.DENIED, outcomes[denied])
 
+    def test_owner_delete_cleanup_failure_gets_distinct_failed_audit(self):
+        class PermitOwner:
+            def require_owner(self, actor_context):
+                return None
+
+        self.store.append(self.segment())
+        recording = self.store.start_manual(self.source, 30_000, duration_ms=10_000)
+        self.store.finish(recording)
+        self.store.release_source(self.source)
+        database = Database(self.base / "metadata.sqlite")
+        audit = AuditStore(database)
+        admin = OwnerAdministration(
+            OwnerAuditService(audit, PermitOwner()), CameraRegistry(database),
+        )
+        private_detail = "synthetic-private-cleanup-detail"
+        with patch.object(
+                self.store, "_trim",
+                side_effect=RecordingError(private_detail)):
+            with self.assertRaisesRegex(RecordingError, private_detail):
+                admin.delete_recording("synthetic-owner", self.store, recording)
+
+        records = [record for record in audit.list_records()
+                   if record.target_logical_id == recording]
+        self.assertEqual(
+            {(AuditAction.DELETE_RECORDING, AuditOutcome.SUCCEEDED),
+             (AuditAction.DELETE_RECORDING_CLEANUP, AuditOutcome.FAILED)},
+            {(record.action, record.outcome) for record in records},
+        )
+        with sqlite3.connect(self.base / "metadata.sqlite") as connection:
+            self.assertEqual("deleting", connection.execute(
+                "SELECT status FROM recordings WHERE id=?", (str(recording),)
+            ).fetchone()[0])
+        self.assertNotIn(private_detail.encode(),
+                         (self.base / "metadata.sqlite").read_bytes())
+
     def test_active_recording_cannot_be_deleted_even_by_owner(self):
         recording = self.store.start_manual(self.source, 30_000)
         for owner in (False, True):

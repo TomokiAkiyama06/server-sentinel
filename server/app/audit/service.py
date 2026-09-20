@@ -131,3 +131,14 @@ class OwnerAuditService:
             except Exception:
                 pass
             raise
+
+    def record_owner_post_commit_failure(self, *, action: AuditAction,
+                                         target_kind: TargetKind,
+                                         target_logical_id: UUID):
+        """Record a bounded failure after an authorized durable journal commit."""
+        validate_action_target(action, target_kind, target_logical_id)
+        return self.store.append(
+            actor_category=ActorCategory.OWNER, action=action,
+            target_kind=target_kind, target_logical_id=target_logical_id,
+            outcome=AuditOutcome.FAILED,
+        )

@@ -33,7 +33,10 @@ Owner recording deletion commits its `deleting` journal transition and
 `delete_recording` audit together. Media cleanup then follows the recording
 store's existing recoverable deletion lifecycle. A cleanup interruption leaves
 the durable deletion journal for startup recovery rather than restoring a
-recording whose links may already have been reclaimed.
+recording whose links may already have been reclaimed. It also appends a fixed
+`delete_recording_cleanup` failure outcome for the same logical recording ID;
+the earlier immutable success continues to mean that the Owner-authorized
+deletion journal committed, not that physical cleanup completed.
 
 `AuditStore.cleanup_expired()` defaults to 90 days and deletes only rows from
 the audit table that are strictly older than the cutoff. The Main Server runs it

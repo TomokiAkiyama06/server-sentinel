@@ -56,6 +56,7 @@ class AuditAction(StrEnum):
     CHANGE_PRINCIPAL_PERMISSIONS = "change_principal_permissions"
     REVOKE_PRINCIPAL = "revoke_principal"
     DELETE_RECORDING = "delete_recording"
+    DELETE_RECORDING_CLEANUP = "delete_recording_cleanup"
     UPDATE_RECORDING = "update_recording"
 
 
@@ -79,6 +80,7 @@ ACTION_TARGETS = {
     AuditAction.CHANGE_PRINCIPAL_PERMISSIONS: TargetKind.PRINCIPAL,
     AuditAction.REVOKE_PRINCIPAL: TargetKind.PRINCIPAL,
     AuditAction.DELETE_RECORDING: TargetKind.RECORDING,
+    AuditAction.DELETE_RECORDING_CLEANUP: TargetKind.RECORDING,
     AuditAction.UPDATE_RECORDING: TargetKind.RECORDING,
 }
 

@@ -122,4 +122,15 @@ class OwnerAdministration:
                 connection, recording_id, owner_requested=True,
             ),
         )
-        return recording_store.finish_prepared_delete(recording_id, before)
+        try:
+            return recording_store.finish_prepared_delete(recording_id, before)
+        except Exception:
+            # The deletion journal and its success audit are already durable.
+            # Preserve that history and append the distinct cleanup failure;
+            # never rewrite an existing security audit record.
+            self.service.record_owner_post_commit_failure(
+                action=AuditAction.DELETE_RECORDING_CLEANUP,
+                target_kind=TargetKind.RECORDING,
+                target_logical_id=recording_id,
+            )
+            raise
