@@ -125,6 +125,19 @@ class CompareTests(TestCase):
             self.assertEqual(findings[1].reason, "SURPLUS_AMBIGUOUS_COMPONENT")
             self.assertNotIn("synthetic-a", repr(findings))
 
+    def test_ambiguous_baseline_keeps_its_other_compatible_links(self):
+        """An identity-ambiguous component can still be the only fit for a third disk."""
+        first = Component(Kind.STORAGE, "old-a", (), (("serial", "synthetic-a"),))
+        second = Component(Kind.STORAGE, "old-b", (("model", "synthetic-one"),), ())
+        third = Component(Kind.STORAGE, "old-c", (("model", "synthetic-two"),), ())
+        current = (Component(Kind.STORAGE, "new-a", (("model", "synthetic-one"),), (("serial", "synthetic-a"),)),
+                   Component(Kind.STORAGE, "new-b", (("model", "synthetic-two"),), (("serial", "synthetic-a"),)),
+                   Component(Kind.STORAGE, "new-c", (("model", "synthetic-three"),), ()))
+        for old_order in permutations((first, second, third)):
+            for new_order in permutations(current):
+                findings = compare(Inventory(old_order), Inventory(new_order))
+                self.assertEqual([item.state for item in findings], [State.UNVERIFIABLE] * 3)
+
     def test_incompatible_baseline_does_not_absorb_a_surplus_observation(self):
         """A MISSING approved disk explains no observation of its own category."""
         first = Component(Kind.STORAGE, "old-a", (("capacity_bytes", "1000"),),

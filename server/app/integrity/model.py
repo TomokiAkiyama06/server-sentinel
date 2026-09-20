@@ -134,8 +134,10 @@ def compare(approved: Inventory | None, current: Inventory) -> tuple[Finding, ..
     results = [None] * len(old_items)
     used = set()
     uncertain = set()
-    # Which shared observations each approved component could still account for.
-    claims = {}
+    # Approved components exclusively bound to one observation, and the extra
+    # identity links a still unbound component keeps for the surplus graph.
+    bound = set()
+    identified = {}
     identity_counts = Counter((item.kind, item.identity) for item in new_items if item.identity)
     baseline_counts = Counter((item.kind, item.identity) for item in old_items if item.identity)
     fields = Counter((item.kind, key, value) for item in new_items for key, value in item.identity)
@@ -169,10 +171,11 @@ def compare(approved: Inventory | None, current: Inventory) -> tuple[Finding, ..
         if len(exact) > 1 or (old.identity and baseline_counts[(old.kind, old.identity)] > 1):
             ambiguous(index)
             uncertain.update(exact)
-            claims[index] = set(exact)
+            identified[index] = set(exact)
         elif exact:
             matched(index, next(iter(exact)))
             used.update(exact)
+            bound.add(index)
 
     # A unique serial/WWID can survive loss of another field. The entire
     # bipartite graph must be one-to-one before drawing a property conclusion.
@@ -192,12 +195,13 @@ def compare(approved: Inventory | None, current: Inventory) -> tuple[Finding, ..
         if len(candidates) == 1 and partial_reverse[next(iter(candidates))] == 1:
             matched(index, next(iter(candidates)))
             used.update(candidates)
+            bound.add(index)
         else:
             ambiguous(index)
             # Ambiguity claims no exclusive ownership. These observations may
             # also cover identity-less baselines in the following weak graph.
             uncertain.update(candidates)
-            claims[index] = set(candidates)
+            identified[index] = set(candidates)
 
     # Resolve every compatible weak link together. Missing values are not
     # contradictions, including partial non-unique serial/WWID observations.
@@ -216,7 +220,6 @@ def compare(approved: Inventory | None, current: Inventory) -> tuple[Finding, ..
     for index, candidates in weak.items():
         if not candidates:
             continue
-        claims[index] = set(candidates)
         if len(candidates) == 1 and weak_reverse[next(iter(candidates))] == 1:
             matched(index, next(iter(candidates)))
         else:
@@ -234,18 +237,29 @@ def compare(approved: Inventory | None, current: Inventory) -> tuple[Finding, ..
             results[index] = Finding(old.kind, State.MISSING, "APPROVED_COMPONENT_ABSENT")
         elif location in weak_used or location in uncertain:
             ambiguous(index)
-            # A same-slot successor could still be this component, CHANGED.
-            claims[index] = {location}
         else:
             matched(index, location)
             used.add(location)
+            bound.add(index)
     # An ambiguous observation never proves WHICH approved component it is, but
     # one approved component still explains at most one current component, and
-    # only a compatible one. Report the observations no compatible assignment
-    # can cover so added hardware stays visible (SPECIFICATION 10.1-10.2).
-    shared = (weak_used | uncertain) - used
-    linked = {index: candidates & shared for index, candidates in claims.items()}
-    explained = _explained({index: candidates for index, candidates in linked.items() if candidates})
+    # only one it could actually be. Rebuild every link an unbound component
+    # keeps, whatever phase left it unbound: the same identity, a unique shared
+    # identifier, a compatible observation, or its own slot as a CHANGED
+    # successor. Report only what no assignment covers (SPECIFICATION 10.1-10.2).
+    def links(index):
+        old = old_items[index]
+        return {candidate for candidate, item in enumerate(new_items)
+                if candidate not in used and item.kind == old.kind
+                and (candidate in identified.get(index, ()) or item.location == old.location
+                     or not (_conflicts(old.properties, item.properties)
+                             or _conflicts(old.identity, item.identity)))}
+
+    linked = {index: candidates for index, candidates in
+              ((index, links(index)) for index, old in enumerate(old_items)
+               if index not in bound and old.kind not in current.unavailable) if candidates}
+    shared = set().union(*linked.values()) if linked else set()
+    explained = _explained(linked)
     surplus = (Counter(new_items[item].kind for item in shared)
                - Counter(new_items[item].kind for item in explained))
     covered = {item.kind for item in old_items}
