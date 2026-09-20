@@ -84,22 +84,14 @@ def _explained(claims: dict[int, set[int]]) -> set[int]:
     Hopcroft-Karp over the compatibility graph itself. Counting approved
     components per category instead would let one that no observation fits
     absorb another component's surplus observation and hide added hardware.
+    Both the layering and the augmenting walk are iterative: an alternating
+    path as long as the accepted inventory must not exhaust the interpreter
+    stack and abort the startup/daily check.
     """
     left, right = {}, {}
-
-    def augment(index, depth):
-        for candidate in claims[index]:
-            owner = right.get(candidate)
-            if owner is None or (depth.get(owner) == depth[index] + 1 and augment(owner, depth)):
-                left[index], right[candidate] = candidate, index
-                return True
-        # Exhausted inside this layered phase; never retried at this length.
-        depth[index] = -1
-        return False
-
     while True:
-        # Layer from the still unexplained components and stop at the shortest
-        # augmenting length, which bounds both the phases and the recursion.
+        # Layer from the still unexplained components, stopping at the shortest
+        # augmenting length so each walk only follows consecutive layers.
         depth = {index: 0 for index in claims if index not in left}
         frontier, reached = list(depth), False
         while frontier and not reached:
@@ -115,9 +107,26 @@ def _explained(claims: dict[int, set[int]]) -> set[int]:
             frontier = following
         if not reached:
             return set(right)
-        for index in list(depth):
-            if index not in left:
-                augment(index, depth)
+        for start in list(depth):
+            if start in left:
+                continue
+            # Explicit stack of (component, untried observations, entry edge).
+            walk = [(start, iter(claims[start]), None)]
+            while walk:
+                index, remaining, _ = walk[-1]
+                candidate = next(remaining, None)
+                if candidate is None:
+                    # Exhausted inside this phase; never retried at this length.
+                    depth[index] = -1
+                    walk.pop()
+                elif (owner := right.get(candidate)) is None:
+                    # Free observation: flip every hop back along the walk.
+                    for hop, _, entered in reversed(walk):
+                        left[hop], right[candidate] = candidate, hop
+                        candidate = entered
+                    walk.clear()
+                elif depth.get(owner) == depth[index] + 1:
+                    walk.append((owner, iter(claims[owner]), candidate))
 
 
 def compare(approved: Inventory | None, current: Inventory) -> tuple[Finding, ...]:

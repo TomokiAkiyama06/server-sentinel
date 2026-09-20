@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 import math
 import time
 
-from .model import Inventory, Kind, compare
+from .model import Finding, Inventory, Kind, State, compare
 from .store import IntegrityOutboxFull, IntegrityStore
 
 
@@ -44,8 +44,14 @@ class IntegrityService:
                 raise ValueError("INVALID_INVENTORY")
         except Exception:
             current = Inventory((), frozenset(Kind))
-        _, baseline = self.store.baseline()
-        findings = compare(baseline, current)
+        try:
+            _, baseline = self.store.baseline()
+            findings = compare(baseline, current)
+        except Exception:
+            # Loading or comparing the baseline must never end the check in
+            # silence; report the categories as unknown so the Owner still
+            # sees a warning (SPECIFICATION 10.2/10.4, INTEGRITY-002/006).
+            findings = tuple(Finding(kind, State.UNVERIFIABLE, "COMPARISON_UNAVAILABLE") for kind in Kind)
         try:
             self.store.record(findings, self.utcnow())
         except IntegrityOutboxFull:

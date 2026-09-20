@@ -11,11 +11,12 @@ import os
 import signal
 import sqlite3
 import subprocess
+import sys
 import threading
 from itertools import permutations
 
 from app.integrity import probes
-from app.integrity.model import Component, Finding, Inventory, Kind, State, compare
+from app.integrity.model import Component, Finding, Inventory, Kind, State, _explained, compare
 from app.integrity.probes import CommandRunner, LinuxProbe, ProbeUnavailable
 from app.integrity.service import IntegrityService
 from app.integrity.store import IntegrityStore, integrity_migration
@@ -23,6 +24,13 @@ from app.storage.migrations import migrate
 
 
 NOW = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+
+def _stack_depth():
+    depth, frame = 0, sys._getframe()
+    while frame is not None:
+        depth, frame = depth + 1, frame.f_back
+    return depth
 
 
 def disk(serial="synthetic-disk-a", *, slot="disk0", size="1000"):
@@ -272,6 +280,45 @@ class CompareTests(TestCase):
             self.assertEqual([item.state for item in compare(Inventory(old_order), Inventory(current))],
                              [State.UNVERIFIABLE, State.UNVERIFIABLE])
 
+    def test_long_alternating_path_does_not_exhaust_the_stack(self):
+        """An accepted inventory must never abort the check with RecursionError."""
+        # One long alternating path: the greedy first phase fills it, leaving a
+        # single augmenting walk as long as the whole accepted inventory.
+        size = 1023
+        claims = {0: {0, size}}
+        claims.update({index: {index - 1, index} for index in range(1, size)})
+        claims[size] = {size - 1}
+        self.assertEqual(len(_explained(claims)), size + 1)
+
+    def test_inventory_limit_comparison_stays_iterative(self):
+        """A real inventory forming that path must still complete the check."""
+        # Each observation keeps one approved serial and the next approved WWID,
+        # so the partial-identity links form the same long alternating path. The
+        # distinct capacities leave location/compatibility links out of it.
+        size = 511
+        old = [Component(Kind.STORAGE, f"old{index}", (("capacity_bytes", str(index)),),
+                         (("serial", f"synthetic-s{index}"), ("wwid", f"synthetic-w{index}")))
+               for index in range(size)]
+        old[0] = Component(Kind.STORAGE, "old0", (("capacity_bytes", "0"),),
+                           (("serial", "synthetic-s0"), ("wwid", "synthetic-w0"),
+                            ("uuid", "synthetic-spare")))
+        old.append(Component(Kind.STORAGE, f"old{size}", (("capacity_bytes", str(size)),),
+                             (("serial", "synthetic-extra"), ("wwid", f"synthetic-w{size}"))))
+        new = [Component(Kind.STORAGE, f"new{index}", (("capacity_bytes", str(9000 + index)),),
+                         (("serial", f"synthetic-s{index}"), ("wwid", f"synthetic-w{index + 1}")))
+               for index in range(size)]
+        new.append(Component(Kind.STORAGE, f"new{size}", (("capacity_bytes", str(9000 + size)),),
+                             (("uuid", "synthetic-spare"),)))
+        limit = sys.getrecursionlimit()
+        self.addCleanup(sys.setrecursionlimit, limit)
+        sys.setrecursionlimit(_stack_depth() + 40)
+        try:
+            findings = compare(Inventory(tuple(old)), Inventory(tuple(new)))
+        finally:
+            sys.setrecursionlimit(limit)
+        # Every approved component can be assigned, so nothing is missing or new.
+        self.assertEqual([item.state for item in findings], [State.UNVERIFIABLE] * (size + 1))
+
     def test_unapproved_inventory_never_becomes_baseline(self):
         findings = compare(None, Inventory((disk(),)))
         self.assertEqual(len(findings), 4)
@@ -364,6 +411,31 @@ class StoreTests(TestCase):
         findings = IntegrityService(self.store, Probe(), lambda *args: None).startup()
         self.assertEqual(len(findings), 4)
         self.assertNotIn("synthetic-secret", str(findings))
+
+    def test_comparison_failure_is_reported_not_skipped(self):
+        class Probe:
+            def collect(self):
+                return Inventory((disk(),))
+
+        class Broken:
+            def __getattr__(self, name):
+                return getattr(self.store, name)
+
+            def baseline(self):
+                raise RuntimeError("synthetic-secret-serial")
+
+        broken = Broken()
+        broken.store = self.store
+        delivered = []
+        service = IntegrityService(broken, Probe(), lambda *args: delivered.append(args),
+                                   utcnow=lambda: NOW)
+        findings = service.startup()
+        self.assertEqual(len(findings), 4)
+        self.assertTrue(all(item.state == State.UNVERIFIABLE for item in findings))
+        self.assertTrue(all(item.reason == "COMPARISON_UNAVAILABLE" for item in findings))
+        self.assertNotIn("synthetic-secret", str(findings))
+        # The warning still reaches the durable outbox and the sink.
+        self.assertEqual(len(delivered), 1)
 
     def test_full_outbox_preserves_daily_probe_cadence_and_retries_delivery(self):
         store = IntegrityStore(self.db, reservation=self.reservation, max_pending_events=1)
