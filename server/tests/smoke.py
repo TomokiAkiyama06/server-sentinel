@@ -25,7 +25,10 @@ import io  # noqa: E402
 from pathlib import Path  # noqa: E402
 import tempfile  # noqa: E402
 
-from app.cameras.registry import ActiveSourceLimitError, CameraRegistry, CaptureProfile, SourceType  # noqa: E402
+from app.cameras.registry import (  # noqa: E402
+    ActiveSourceLimitError, CameraRegistry, CaptureProfile, NodeHealthState,
+    SourceHealthState, SourceType,
+)
 from app.cameras.uvc.identity import DeviceEvidence  # noqa: E402
 from app.cameras.uvc.registry_adapter import LocalUvcAdapter  # noqa: E402
 from app.logging import configure_logging  # noqa: E402
@@ -53,15 +56,39 @@ async def run(scenario):
             async with application.router.lifespan_context(application):
                 assert application.state.ready
                 registry = CameraRegistry(application.state.database)
-                for _ in range(4):
-                    registry.create_source(source_type=SourceType.LOCAL_UVC, name="Synthetic", enabled=True)
+                # This is a composition test for the generic source registry,
+                # not a remote-agent protocol test.  Keep the mix explicit so
+                # the four-source invariant never becomes a local-UVC-only
+                # assumption while agent transport remains independently tested.
+                local_sources = [
+                    registry.create_source(
+                        source_type=SourceType.LOCAL_UVC, name=f"Synthetic local {index}", enabled=True,
+                    )
+                    for index in range(2)
+                ]
+                nodes = [registry.create_capture_node(f"Synthetic node {index}") for index in range(2)]
+                remote_sources = [
+                    registry.create_source(
+                        source_type=SourceType.REMOTE_AGENT, capture_node_id=node.id,
+                        name=f"Synthetic remote {index}", enabled=True,
+                    )
+                    for index, node in enumerate(nodes)
+                ]
                 try:
                     registry.create_source(source_type=SourceType.LOCAL_UVC, name="Synthetic", enabled=True)
                     raise AssertionError("registry exceeded active-source limit")
                 except ActiveSourceLimitError:
                     pass
-                assert len(registry.list_sources()) == 4
-                source = registry.list_sources()[0]
+                sources = registry.list_sources()
+                assert len(sources) == 4
+                assert {source.source_type for source in sources} == {
+                    SourceType.LOCAL_UVC, SourceType.REMOTE_AGENT,
+                }
+                registry.update_capture_node(nodes[0].id, health_state=NodeHealthState.ONLINE)
+                assert registry.get_capture_node(nodes[0].id).health_state is NodeHealthState.ONLINE
+                # Agent reachability never promotes its camera source by itself.
+                assert registry.get_source(remote_sources[0].id).health_state is SourceHealthState.OFFLINE
+                source = local_sources[0]
                 registry.update_source(source.id, desired_capture_profile=CaptureProfile(640, 480, 10, "MJPG"))
                 candidate = DeviceEvidence("/dev/video0", "synthetic", "model", "serial")
                 discovery = Discovery([candidate])
@@ -75,6 +102,17 @@ async def run(scenario):
                 discovery.devices = []
                 assert not adapter.poll_source(source.id)
                 assert events[-1].reason == "device_disconnected"
+                assert registry.get_source(source.id).health_state is SourceHealthState.OFFLINE
+                # A local capture loss never turns an unrelated remote source
+                # into a healthy camera, and an ambiguous UVC return latches
+                # manual intervention until a future Owner reapproval.
+                assert registry.get_source(remote_sources[1].id).health_state is SourceHealthState.OFFLINE
+                discovery.devices = [candidate, DeviceEvidence(
+                    "/dev/video1", "synthetic", "model", "serial",
+                )]
+                assert not adapter.poll_source(source.id)
+                assert (registry.get_source(source.id).health_state
+                        is SourceHealthState.MANUAL_INTERVENTION_REQUIRED)
                 adapter.close()
                 for path in ("/health", "/version", "/openapi.json", "/api/live/synthetic", "/api/sources"):
                     messages = await request(application, path)
