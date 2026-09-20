@@ -10,14 +10,14 @@ Label meanings: `server-required` means a Main Server or Capture Node is needed;
 
 ## GitHub Issue index
 
-Audited 2026-09-20 against the current specification. CI foundation #5 is implemented and closes on merge of its CI delivery PR; the other 23 implementation/ADR Issues remain OPEN. This is not runtime completion. Status below records the delivery state of this revision; labels, physical requirements, dependencies, and acceptance summaries follow in each Plan.
+Audited 2026-09-21 against the current specification and all Open/Closed GitHub Issues. Plans 22–26 close the identified ownership gaps; their Issues are OPEN. This is not runtime completion. Status below records the GitHub delivery state at this revision; labels, physical requirements, dependencies, and acceptance summaries follow in each Plan.
 
 | Plan | GitHub Issue | Title | Status |
 |---|---|---|---|
-| Plan 1 | [#5](https://github.com/TomokiAkiyama06/server-sentinel/issues/5) | Plan 1: CIとRepositoryガードの整備 | CLOSED on CI PR merge |
+| Plan 1 | [#5](https://github.com/TomokiAkiyama06/server-sentinel/issues/5) | Plan 1: CIとRepositoryガードの整備 | CLOSED |
 | Blocking prerequisite | [#6](https://github.com/TomokiAkiyama06/server-sentinel/issues/6) | Blocking prerequisite: Owner認可とtrusted Tailscale identityのADR策定 | OPEN |
 | Plan 2 | [#7](https://github.com/TomokiAkiyama06/server-sentinel/issues/7) | Plan 2: Backend基盤の構築 | OPEN |
-| Plan 3 | [#8](https://github.com/TomokiAkiyama06/server-sentinel/issues/8) | Plan 3: React Dashboard基盤の構築 | OPEN |
+| Plan 3 | [#8](https://github.com/TomokiAkiyama06/server-sentinel/issues/8) | Plan 3: React Dashboard基盤の構築 | CLOSED |
 | Plan 4 | [#9](https://github.com/TomokiAkiyama06/server-sentinel/issues/9) | Plan 4: Camera Source Registryの実装 | OPEN |
 | Plan 5 | [#11](https://github.com/TomokiAkiyama06/server-sentinel/issues/11) | Plan 5: Local UVC検出と安定したCamera identityの実装 | OPEN |
 | Plan 6 | [#12](https://github.com/TomokiAkiyama06/server-sentinel/issues/12) | Plan 6: media-capture-agent基盤の構築 | OPEN |
@@ -26,7 +26,7 @@ Audited 2026-09-20 against the current specification. CI foundation #5 is implem
 | Plan 9 | [#15](https://github.com/TomokiAkiyama06/server-sentinel/issues/15) | Plan 9: Agent–Main transportのPoCとADR策定 | OPEN |
 | Plan 9A | [#16](https://github.com/TomokiAkiyama06/server-sentinel/issues/16) | Plan 9A: Agent disk ring bufferと自律的incident証拠保護の実装 | OPEN |
 | Plan 10 | [#17](https://github.com/TomokiAkiyama06/server-sentinel/issues/17) | Plan 10: Capture・Recording・Inference・Viewer profile の分離 | OPEN |
-| Plan 11 | [#18](https://github.com/TomokiAkiyama06/server-sentinel/issues/18) | Plan 11: 永続録画と Main Server の圧縮 pre-roll | OPEN |
+| Plan 11 | [#18](https://github.com/TomokiAkiyama06/server-sentinel/issues/18) | Plan 11: 永続録画と Main Server の圧縮 pre-roll | CLOSED |
 | Plan 12 | [#20](https://github.com/TomokiAkiyama06/server-sentinel/issues/20) | Plan 12: 人物・動体 detector の評価と交換可能な推論基盤 | OPEN |
 | Plan 13 | [#22](https://github.com/TomokiAkiyama06/server-sentinel/issues/22) | Plan 13: detector ごとの画質・低照度 gate と fail-unknown | OPEN |
 | Plan 14 | [#24](https://github.com/TomokiAkiyama06/server-sentinel/issues/24) | Plan 14: Server ROI の移動検知と camera tamper | OPEN |
@@ -38,8 +38,13 @@ Audited 2026-09-20 against the current specification. CI foundation #5 is implem
 | Plan 19A | [#23](https://github.com/TomokiAkiyama06/server-sentinel/issues/23) | Plan 19A: Main Server の Hardware Integrity と日次 Recording Health | OPEN |
 | Plan 20 | [#27](https://github.com/TomokiAkiyama06/server-sentinel/issues/27) | Plan 20: 実機不要の統合 mock E2E と障害シナリオ | OPEN |
 | Plan 21 | [#28](https://github.com/TomokiAkiyama06/server-sentinel/issues/28) | Plan 21: 実 hardware・network・browser の総合受入 | OPEN |
+| Plan 22 | [#47](https://github.com/TomokiAkiyama06/server-sentinel/issues/47) | Plan 22: Main Server deployment / install / release lifecycle | OPEN |
+| Plan 23 | [#48](https://github.com/TomokiAkiyama06/server-sentinel/issues/48) | Plan 23: First-run setup wizard と初期設定フロー | OPEN |
+| Plan 24 | [#49](https://github.com/TomokiAkiyama06/server-sentinel/issues/49) | Plan 24: Privacy-safe diagnostic export / support bundle | OPEN |
+| Plan 25 | [#50](https://github.com/TomokiAkiyama06/server-sentinel/issues/50) | Plan 25: Security / admin audit log と90日 retention | OPEN |
+| Plan 26 | [#51](https://github.com/TomokiAkiyama06/server-sentinel/issues/51) | Plan 26: Dependency / model license compliance gate | OPEN |
 
-Other audited Issues (outside the 24 Plans):
+Other audited Issues (outside the 29 Plans):
 
 | Issue | Title | Status | Labels | Main / Capture / UVC / Manual | Depends on |
 |---|---|---|---|---|---|
@@ -81,6 +86,11 @@ flowchart TD
   i23["#23 Plan 19A"]
   i27["#27 Plan 20"]
   i28["#28 Plan 21"]
+  i47["#47 Plan 22"]
+  i48["#48 Plan 23"]
+  i49["#49 Plan 24"]
+  i50["#50 Plan 25"]
+  i51["#51 Plan 26"]
   i5 --> i7
   i6 --> i7
   i5 --> i8
@@ -129,9 +139,19 @@ flowchart TD
   i19 --> i27
   i23 --> i27
   i27 --> i28
+  i7 --> i47
+  i10 --> i47
+  i7 --> i48
+  i8 --> i48
+  i10 --> i48
+  i7 --> i49
+  i10 --> i49
+  i7 --> i50
+  i10 --> i50
+  i5 --> i51
 ```
 
-Issue #7 now explicitly depends on #6 (authorization design before health/version endpoint contracts), #16 on #17 (bounded media profiles for buffer estimates/admission), and #26 on #16 / #21 (critical preservation and configured notification integration). These do not prevent independent mock/contract work.
+Issue #7 explicitly depends on #6 (authorization design before health/version endpoint contracts), #16 on #17 (bounded media profiles for buffer estimates/admission), and #26 on #16 / #21 (critical preservation and configured notification integration). Plans 22–25 depend only on their required foundation and authorization work; Plan 26 depends on the CI guard. These do not prevent independent mock/contract work.
 
 ## Plan 1 — CI / repository guardrails
 
@@ -878,6 +898,103 @@ Acceptance:
 - publish only sanitized results: no real-person/real-room media, hardware serial/UUID, private IP/hostname/Tailnet values, credentials, or biometric material on GitHub.
 - inspect deployed Main/Agent/Web dependencies and controlled runtime/browser outbound traffic for PRIV-003 compliance, including error/configuration paths; keep any trace deployment-local and publish only sanitized pass/fail results;
 - in PRESENT/PROBABLY_PRESENT/ABSENT/UNKNOWN and manual presence overrides, verify critical movement/tamper detection, safe evidence preservation, and configured critical notifications through the actual deployment paths; detector-armed status alone is insufficient.
+
+## Plan 22 — Main Server deployment / install / release lifecycle
+
+GitHub Issue: [#47](https://github.com/TomokiAkiyama06/server-sentinel/issues/47)
+
+Depends on: [#7](https://github.com/TomokiAkiyama06/server-sentinel/issues/7), [#10](https://github.com/TomokiAkiyama06/server-sentinel/issues/10)
+
+Labels: `backend`, `security`, `storage`, `documentation`, `server-required`, `manual-test-required`
+
+実機要件: Main Server: 必要; Capture Node: 不要; UVC Camera: 不要; Manual test: 必要
+
+Scope:
+- versioned artifact / documented Docker Compose pathによるstable Main Server install、update、rollbackを、development checkoutから分離する;
+- configuration、state、recordings、audit logsをmutable checkout外に保持する;
+- dedicated non-root runtimeとprivate-by-default trusted-proxy listenerを確立する。
+
+Acceptance:
+- stable install / update / rollback後にもruntime dataを保持し、暗黙のroot-filesystem fallbackを作らない;
+- disposable environmentでinstall、update、rollback、missing runtime mount/configurationを検証する;
+- documented Main Ubuntu / Compose pathとrelease lifecycleを一致させ、実Main Server受入はprivate deployment dataを公開せずに行う。
+
+## Plan 23 — First-run setup wizard と初期設定フロー
+
+GitHub Issue: [#48](https://github.com/TomokiAkiyama06/server-sentinel/issues/48)
+
+Depends on: [#7](https://github.com/TomokiAkiyama06/server-sentinel/issues/7), [#8](https://github.com/TomokiAkiyama06/server-sentinel/issues/8), [#10](https://github.com/TomokiAkiyama06/server-sentinel/issues/10)
+
+Labels: `backend`, `frontend`, `security`, `storage`, `server-required`, `manual-test-required`
+
+実機要件: Main Server: 必要; Capture Node: 不要; UVC Camera: 不要; Manual test: 必要
+
+Scope:
+- Welcome、owner、storage、hardware baseline / recorder self-check、locale/time、sources、profiles、optional biometric / Slack、private human accessを順序付ける;
+- 未完の領域は安全なpending / unavailableとして表示し、wizard shellを全機能の完了までblockしない。
+
+Acceptance:
+- owner bootstrap、storage、integrity、source、profile、optional integration、private accessの各stepを再開可能な状態として実装する;
+- Tailnet membershipとapplication invitationを別の承認として明示し、秘密値・raw identifier・biometricを一般表示/diagnosticsへ出さない;
+- unit / browser integration testを実施し、実機完走はPlan 21と個別Planで受入する。
+
+## Plan 24 — Privacy-safe diagnostic export / support bundle
+
+GitHub Issue: [#49](https://github.com/TomokiAkiyama06/server-sentinel/issues/49)
+
+Depends on: [#7](https://github.com/TomokiAkiyama06/server-sentinel/issues/7), [#10](https://github.com/TomokiAkiyama06/server-sentinel/issues/10)
+
+Labels: `backend`, `security`, `documentation`, `server-required`, `manual-test-required`
+
+実機要件: Main Server: 必要; Capture Node: 不要; UVC Camera: 不要; Manual test: 必要
+
+Scope:
+- deployment-local diagnosticsからOwnerが明示操作するexport / support bundleを実装する;
+- automatic uploadを行わず、credentials、pairing secrets、private keys、sensitive headers、biometric、raw hardware identifierを安全に除外する。
+
+Acceptance:
+- Owner biometric template / embeddingは常に除外し、exportをexternal biometric processing / storageの例外にしない;
+- raw monitoring mediaはOwnerが個別に選択した場合だけ含め、default bundleは含めない;
+- synthetic testsでautomatic upload不在とexclude / redact pathを検証する。
+
+## Plan 25 — Security / admin audit log と90日 retention
+
+GitHub Issue: [#50](https://github.com/TomokiAkiyama06/server-sentinel/issues/50)
+
+Depends on: [#7](https://github.com/TomokiAkiyama06/server-sentinel/issues/7), [#10](https://github.com/TomokiAkiyama06/server-sentinel/issues/10)
+
+Labels: `backend`, `security`, `storage`, `server-required`, `manual-test-required`
+
+実機要件: Main Server: 必要; Capture Node: 不要; UVC Camera: 不要; Manual test: 必要
+
+Scope:
+- unified factual timelineとは分離した、deployment-local security / admin audit logを実装する;
+- owner baseline approval、security-sensitive owner action、camera/source/nodeおよびsecurity/admin設定変更を記録する;
+- default 90-day retentionとcleanupを担う。
+
+Acceptance:
+- recordsにはactor category、action、logical target ID、time、outcomeを持たせ、secret、raw biometric、raw serial/UUID、raw mediaを含めない;
+- cleanupはexpired auditだけに適用し、recording / protected incident lifecycleを変更しない;
+- synthetic testsでredaction、retention、Owner-only security action、failure outcomeを検証する。
+
+## Plan 26 — Dependency / model license compliance gate
+
+GitHub Issue: [#51](https://github.com/TomokiAkiyama06/server-sentinel/issues/51)
+
+Depends on: [#5](https://github.com/TomokiAkiyama06/server-sentinel/issues/5)
+
+Labels: `ci`, `security`, `documentation`
+
+実機要件: Main Server: 不要; Capture Node: 不要; UVC Camera: 不要; Manual test: 不要
+
+Scope:
+- source、frontend、backend、transport、AI model code、model weightsのlicense evidenceを継続的に追跡する;
+- source-codeとmodel / weightを別々に評価し、unreviewed componentのreleaseをblockする。
+
+Acceptance:
+- exact version、upstream、license evidence、component種別を記録する;
+- AGPL/GPL/SSPL/source-available/unclearはOwnerの明示approval/documentationなしにblockする;
+- CI / release validationとsynthetic manifestsでallow、block、missing evidenceを検証する。
 
 ## Explicitly pending product decisions
 
