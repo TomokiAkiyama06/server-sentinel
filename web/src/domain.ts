@@ -119,6 +119,8 @@ export interface PresenceAuditEntry {
   action: PresenceAuditAction;
   at: string;
   state: PresenceState | null;
+  /** What a recovery action applied to: `<action>:<observation>` or `<action>`. */
+  target: string | null;
 }
 
 export interface PresenceReport {

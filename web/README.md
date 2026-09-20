@@ -68,7 +68,9 @@ recording, or configuration entries.
 expiry and cancel affordance, the fact that only `PRESENT` suppresses ordinary
 occupancy automation, and the audited Owner control history, which explains the
 Owner critical-recovery actions, including that an approved requeue accepts a
-possible duplicate preservation or notification. The timing trust of the record
+possible duplicate preservation or notification. A recovery entry also names
+the critical path it applied to and, for a requeue, the observation identifier
+the core recorded. The timing trust of the record
 behind the current basis is reported separately from the timing trust of
 observation receipt.
 

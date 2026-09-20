@@ -6,6 +6,17 @@ function stamp(value: string): string {
   return value.slice(0, 19).replace('T', ' ');
 }
 
+/** Names what an Owner recovery action applied to, without inventing detail. */
+function describeTarget(value: string | null, t: Messages): string | null {
+  if (!value) return null;
+  const [action, identifier] = value.split(':');
+  const path = action === 'evidence' ? t.armedEvidence
+    : action === 'notification' ? t.armedNotification : action;
+  return identifier
+    ? `${t.targetLabel}: ${path} / ${t.targetObservation} ${identifier.slice(0, 8)}`
+    : `${t.targetLabel}: ${path}`;
+}
+
 /** Reports the three path states separately: unknown is not a known failure. */
 function Path({ label, state, t }: { label: string; state: CriticalPath; t: Messages }) {
   return <div className={`presence-armed presence-path-${state}`}>
@@ -87,6 +98,8 @@ export function PresenceBody({ report, t, onCancel, failed, cancelling, onRefres
             <div className="timeline-detail">
               <p className="timeline-body">{t[`action_${entry.action}`]}</p>
               {entry.state && <p className="timeline-meta"><span>{t[`state_${entry.state}`]}</span></p>}
+              {describeTarget(entry.target, t)
+                && <p className="timeline-meta"><span>{describeTarget(entry.target, t)}</span></p>}
               {entry.action === 'critical_action_requeued'
                 && <p className="timeline-meta"><span>{t.note_critical_action_requeued}</span></p>}
               {entry.action === 'critical_degradation_cleared'

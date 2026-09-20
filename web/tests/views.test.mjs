@@ -304,7 +304,7 @@ test('presence shows state, basis and the owner control history', () => {
   for (const state of states) {
     const markup = presence({
       snapshot: { ...reported(state), basis: 'owner_observation' },
-      audit: [{ sequence: 1, action: 'override_cancelled', at: '2026-09-21T08:00:00.000000+00:00', state }],
+      audit: [{ sequence: 1, action: 'override_cancelled', at: '2026-09-21T08:00:00.000000+00:00', state, target: null }],
     });
     assert.match(markup, new RegExp(`presence-${state}`));
     assert.match(markup, /根拠: 管理者の入退室観測/);
@@ -317,16 +317,16 @@ test('presence shows state, basis and the owner control history', () => {
     assert.equal(/PRESENT 以外のため通常の occupancy automation は抑制しません。/.test(markup), state !== 'PRESENT');
   }
   for (const action of actions) {
-    const markup = presence({ snapshot: snapshot(), audit: [{ sequence: 2, action, at: '2026-09-21T08:00:00.000000+00:00', state: null }] });
+    const markup = presence({ snapshot: snapshot(), audit: [{ sequence: 2, action, at: '2026-09-21T08:00:00.000000+00:00', state: null, target: null }] });
     assert.match(markup, new RegExp(`data-control-action="${action}"`));
   }
   assert.match(presence({ snapshot: snapshot(), audit: [] }), /記録された管理者の操作はありません。/);
 });
 
 test('owner critical recovery actions explain what happened in the control history', () => {
-  const entry = (action, locale) => presence({
+  const entry = (action, locale, target = null) => presence({
     snapshot: snapshot(),
-    audit: [{ sequence: 3, action, at: '2026-09-21T08:15:00.000000+00:00', state: null }],
+    audit: [{ sequence: 3, action, at: '2026-09-21T08:15:00.000000+00:00', state: null, target }],
   }, locale);
   const requeued = entry('critical_action_requeued', 'ja');
   assert.match(requeued, /未完了の critical 対応を再投入（管理者承認）/);
@@ -339,6 +339,26 @@ test('owner critical recovery actions explain what happened in the control histo
   assert.match(entry('critical_degradation_cleared', 'en'), /handled outside ServerSentinel/);
   // Ordinary override actions carry no critical-recovery note.
   assert.doesNotMatch(entry('override_set', 'ja'), /再投入しました。|劣化表示を解除しました。/);
+});
+
+test('a recovery action names what the owner approved', () => {
+  const entry = (action, target, locale = 'ja') => presence({
+    snapshot: snapshot(),
+    audit: [{ sequence: 4, action, at: '2026-09-21T08:20:00.000000+00:00', state: null, target }],
+  }, locale);
+  // Requeue targets one critical action of one observation.
+  const requeued = entry('critical_action_requeued', 'evidence:00000000-0000-4000-8000-00000000abcd');
+  assert.match(requeued, /対象: 証拠保護 \/ 観測 00000000/);
+  const notified = entry('critical_action_requeued', 'notification:00000000-0000-4000-8000-0000000012ef');
+  assert.match(notified, /対象: critical 通知 \/ 観測 00000000/);
+  // Clearing an expired marker names the path only; no observation remains.
+  const cleared = entry('critical_degradation_cleared', 'notification');
+  assert.match(cleared, /対象: critical 通知/);
+  assert.doesNotMatch(cleared, /観測 /);
+  assert.match(entry('critical_action_requeued', 'evidence:00000000-0000-4000-8000-00000000abcd', 'en'),
+    /Target: Evidence preservation \/ Observation 00000000/);
+  // Owner control actions carry no target.
+  assert.doesNotMatch(entry('override_set', null), /対象:/);
 });
 
 test('manual override reports precedence, expiry and a cancel affordance', () => {

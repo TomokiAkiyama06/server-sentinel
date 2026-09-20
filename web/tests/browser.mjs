@@ -54,12 +54,16 @@ const presenceFixture = {
     critical_persistence: 'armed', critical_evidence: 'armed', critical_notifications: 'armed',
     critical_paths_degraded: false, override_expiry_pending: false, pending_critical_actions: 0,
   },
-  audit: [{ sequence: 1, action: 'override_set', at: '2026-09-21T08:00:00.000000+00:00', state: 'PRESENT' }],
+  audit: [
+    { sequence: 1, action: 'override_set', at: '2026-09-21T08:00:00.000000+00:00', state: 'PRESENT', target: null },
+    { sequence: 2, action: 'critical_action_requeued', at: '2026-09-21T08:10:00.000000+00:00', state: null,
+      target: 'evidence:00000000-0000-4000-8000-00000000abcd' },
+  ],
 };
 const cancelledPresenceFixture = {
   snapshot: { ...presenceFixture.snapshot, state: 'UNKNOWN', basis: 'unknown', override_expires_at: null, suppress_ordinary: false },
   audit: [...presenceFixture.audit,
-    { sequence: 2, action: 'override_cancelled', at: '2026-09-21T08:30:00.000000+00:00', state: 'PRESENT' }],
+    { sequence: 3, action: 'override_cancelled', at: '2026-09-21T08:30:00.000000+00:00', state: 'PRESENT', target: null }],
 };
 let cases = 0;
 
@@ -202,6 +206,7 @@ try {
       assert.match(presenceText, /観測の受信時刻に skew または不連続が報告されています。/);
       assert.doesNotMatch(presenceText, /現在の状態の根拠となる記録の時刻信頼性/);
       assert.match(presenceText, /手動上書きを設定/);
+      assert.match(presenceText, /対象: 証拠保護 \/ 観測 00000000/);
       assert.equal(await page.evaluate('document.documentElement.scrollWidth <= window.innerWidth'), true, 'timeline and presence fit viewport');
       // Provider methods are invoked on their service; a lost receiver fails here.
       // The refresh control re-reads the snapshot without leaving the view.
