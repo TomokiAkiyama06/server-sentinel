@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
 import unittest
 from unittest.mock import call, patch
 import zipfile
@@ -169,6 +170,100 @@ class ReleaseLifecycleTests(unittest.TestCase):
                     process.terminate()
                     process.join(5)
         self.assertEqual(process.exitcode, 0)
+
+    def test_execute_calls_are_serialized_for_the_whole_operation(self):
+        first_entered = threading.Event()
+        allow_first_to_finish = threading.Event()
+        second_entered = threading.Event()
+        errors = []
+        active = 0
+        state_lock = threading.Lock()
+
+        def operation(_arguments, _runner):
+            nonlocal active
+            with state_lock:
+                active += 1
+                overlap = active > 1
+                first = not first_entered.is_set()
+            if overlap:
+                errors.append(AssertionError("release operations overlapped"))
+            if first:
+                first_entered.set()
+                allow_first_to_finish.wait(5)
+            else:
+                second_entered.set()
+            with state_lock:
+                active -= 1
+
+        arguments = self.arguments("rollback")
+
+        def invoke():
+            try:
+                execute(arguments, runner=self.runner)
+            except Exception as error:
+                errors.append(error)
+
+        with patch("install.os.geteuid", return_value=0), patch(
+                "install._protected_parent"), patch("install._execute_locked",
+                                                    side_effect=operation):
+            first = threading.Thread(target=invoke)
+            second = threading.Thread(target=invoke)
+            first.start()
+            self.assertTrue(first_entered.wait(5))
+            second.start()
+            self.assertFalse(second_entered.wait(0.2))
+            allow_first_to_finish.set()
+            first.join(5)
+            second.join(5)
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertEqual(errors, [])
+        self.assertTrue(second_entered.is_set())
+
+    def test_release_lock_rejects_unsafe_files_and_does_not_reenter(self):
+        self.installation.mkdir()
+        lock = self.installation / ".release.lock"
+        target = self.root / "lock-target"
+        target.write_text("")
+        lock.symlink_to(target)
+        with self.assertRaisesRegex(ValueError, "unavailable"):
+            with _release_lock(self.installation):
+                self.fail("unsafe lock acquired")
+        lock.unlink()
+
+        lock.write_text("")
+        lock.chmod(0o644)
+        with self.assertRaisesRegex(ValueError, "invalid"):
+            with _release_lock(self.installation):
+                self.fail("unsafe lock acquired")
+        lock.chmod(0o600)
+
+        with _release_lock(self.installation):
+            with self.assertRaisesRegex(ValueError, "still running"):
+                with _release_lock(self.installation, timeout=0):
+                    self.fail("release lock reentered")
+
+    def test_release_lock_checks_owner_and_releases_after_failure(self):
+        self.installation.mkdir()
+        lock = self.installation / ".release.lock"
+        lock.write_text("")
+        lock.chmod(0o600)
+        actual = lock.stat()
+        unsafe = type("UnsafeLock", (), {
+            "st_mode": actual.st_mode,
+            "st_nlink": actual.st_nlink,
+            "st_uid": actual.st_uid + 1,
+        })()
+        with patch("install.os.fstat", return_value=unsafe):
+            with self.assertRaisesRegex(ValueError, "invalid"):
+                with _release_lock(self.installation):
+                    self.fail("wrong-owner lock acquired")
+
+        with self.assertRaisesRegex(RuntimeError, "synthetic"):
+            with _release_lock(self.installation):
+                raise RuntimeError("synthetic")
+        with _release_lock(self.installation, timeout=0):
+            pass
 
     def test_failed_update_restores_running_release_and_runtime_data(self):
         marker = self.runtime / "state/preserved.synthetic"
