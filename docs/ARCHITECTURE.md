@@ -93,9 +93,12 @@ Human remote access has two gates:
 Tailscale/private-network permission
              AND
 ServerSentinel owner invitation/permission
+    proved by a verified per-person ServerSentinel credential
 ```
 
 Tailnet membership alone grants nothing.
+
+The target deployment shares one Tailscale account across the research room, so the Tailscale login identifies the account rather than the person. Both gates remain required, but only the application gate distinguishes individuals: every human route verifies the per-person credential (WebAuthn/passkey, ADR 0003) and the requested permission server-side. Approving a device does not identify a person.
 
 The recommended human path is:
 

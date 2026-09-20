@@ -763,6 +763,8 @@ Tailnet membership by itself grants no ServerSentinel application data.
 
 In this deployment the Tailnet account is shared by the research room, so "verified Tailscale/trusted-proxy identity" identifies the account the request arrived under, not the person. The ServerSentinel credential below is what identifies the person; see §11.8.
 
+The two gates are unchanged: a network-level permission path and an application authorization. Inside the application gate the owner invitation names the principal and the per-person credential proves who is presenting it.
+
 ### 11.2 Tailnet policy is not managed by ServerSentinel
 
 ServerSentinel does **not** modify Tailscale ACLs/Grants or store Tailscale administrative credentials; policy administration remains outside the application. The owner's existing Tailnet policy may remain unchanged.
@@ -794,7 +796,10 @@ access_principal
 principal_credential
 - id
 - principal_id
-- kind (default design target: WebAuthn/passkey)
+- kind (WebAuthn/passkey, per ADR-0003)
+- credential_id
+- public_key (public material only; never a biometric template)
+- user_verification: required
 - label (owner-visible device label)
 - created_at
 - last_used_at
@@ -808,6 +813,20 @@ principal_permission
 A principal is created by an owner invitation that carries a short-lived,
 single-use enrollment code; the invited person redeems it once to register a
 credential. Credentials are revocable individually and with the principal.
+
+Registration and every authentication require authenticator user verification,
+and the authenticator must be one the invited person controls. A platform
+authenticator kept inside a shared OS account or behind a shared device unlock
+is a shared credential and does not satisfy §11.8; such a machine needs a
+per-person OS account or a portable authenticator the person carries. A session
+is bound to the credential that created it and ends on a bounded idle lifetime
+and a bounded absolute lifetime, with an explicit sign-out available.
+
+User verification runs on the viewer's own device. The server receives the
+credential id and public key only; no fingerprint or face template reaches
+ServerSentinel. `principal_credential` is an access-control record, unrelated to
+the optional owner face verification of §7.6 and never a non-owner identity
+or biometric database (see `PRIVACY.md`).
 
 Initial non-owner permissions:
 
@@ -867,7 +886,13 @@ Therefore:
   authentication prompt carries no product/version string, camera information,
   or deployment metadata;
 - reachability guarantees nothing here: everyone with the shared account can
-  reach the listener, which is the expected state, not an incident.
+  reach the listener, which is the expected state, not an incident;
+- a credential is person-bound only under the §11.4 user-verification and
+  authenticator-custody rules. Without them a passkey stored in a shared profile
+  authorizes whoever uses that profile;
+- ServerSentinel cannot observe a deliberately lent credential or a session left
+  unlocked on an unattended machine. Documentation states this limit instead of
+  claiming the application separates people who share a workstation.
 
 ## 12. Dashboard UI
 
@@ -930,6 +955,8 @@ Validate authenticated node, expected source/session, rate/size bounds, allowed 
 ### 13.3 Biometrics
 
 Owner template is sensitive secret-adjacent data, excluded from logs/general APIs/diagnostics and limited to the verification/config path. Non-owner persistent biometric templates are prohibited.
+
+A viewer's WebAuthn user verification is not ServerSentinel biometric processing: the fingerprint/face check happens on the viewer's own device and only public credential material reaches the server (§11.4). It creates no template, no enrollment and no identity database here.
 
 ## 14. Performance/overload policy
 

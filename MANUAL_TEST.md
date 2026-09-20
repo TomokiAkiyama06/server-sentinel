@@ -318,13 +318,17 @@ Use test identities/accounts appropriate for the deployment. ServerSentinel does
 
 The research-room Tailnet is shared, so run these with two people (or two browser profiles) using the **same** Tailscale login.
 
-- [ ] an invited person with a registered ServerSentinel credential passes authentication;
-- [ ] an uninvited person on the same Tailscale login and the same device is refused;
+- [ ] an invited person with a registered ServerSentinel credential passes authentication, and the authenticator asks for user verification each time;
+- [ ] each credential is registered on an authenticator the invited person controls; confirm no credential is left in a shared OS profile or behind a shared device unlock;
+- [ ] with the invited person signed out, an uninvited person on the same Tailscale login and the same device is refused;
+- [ ] a session ends after its idle/absolute lifetime, and the explicit sign-out control works on a shared machine;
 - [ ] the refusal is the generic response: no product/version string, camera names/counts, recording or timeline data, or deployment metadata, and the credential prompt itself carries none of them;
 - [ ] a revoked person receives the same response as an uninvited person;
 - [ ] revoking one credential (one device) leaves the principal's other credentials working, and revoking the principal blocks all of them promptly;
 - [ ] no human route grants access on the proxy identity header alone;
 - [ ] record that reachability is expected for every holder of the shared account and is not treated as a finding.
+
+Record the residual limits instead of testing them away: a credential its holder deliberately lends, and a session left unlocked on an unattended machine, are outside what the application can detect.
 
 ### Uninvited ordinary Tailnet member
 

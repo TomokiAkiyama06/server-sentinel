@@ -393,6 +393,8 @@ Only the owner (or a future explicitly defined privileged role) may add/revoke u
 ### AUTH-009 Immediate application revocation
 Application permission revocation shall invalidate active ServerSentinel authorization promptly. Tailnet membership/policy remains separately administered outside ServerSentinel.
 
+Revocation is available at two levels: revoking one credential of a principal (for example a lost device) shall invalidate that credential and the sessions bound to it only, while revoking the principal shall invalidate all of its credentials and sessions.
+
 ### AUTH-010 Application fingerprint minimization for uninvited users
 When an ordinary Tailnet user is not invited in ServerSentinel, the application shall minimize disclosure that ServerSentinel is running. Unauthorized responses should be generic/non-branding (for example not-found style), and shall not expose ServerSentinel product/version strings, camera/source counts, API schemas, health details, thumbnails, recordings, timeline data, or other deployment metadata.
 
@@ -404,12 +406,19 @@ The target deployment shares a single Tailscale account across the research room
 Consequences for this product:
 
 - Tailscale login identity shall **not** be the authoritative application principal, because it cannot distinguish invited people from uninvited people in this deployment;
-- ServerSentinel shall issue and verify its own per-person credential, created from an owner invitation and individually revocable. WebAuthn/passkey is the default design target unless an ADR selects an equivalent mechanism;
+- ServerSentinel shall issue and verify its own per-person credential, created from an owner invitation and individually revocable. WebAuthn/passkey is the selected mechanism recorded in ADR-0003; replacing it requires a superseding owner-approved ADR;
+- the credential shall be bound to a person rather than to a workstation. Registration and every authentication shall require authenticator user verification (local PIN, device unlock, or on-device biometric), and the authenticator shall be one the invited person controls. Where a lab machine's OS account or device unlock is shared, a platform authenticator stored in that shared account is a shared credential and does not satisfy this requirement; such a deployment shall use a per-person OS account or a portable authenticator the invited person carries;
+- a session shall be bound to the credential that created it, shall end after a bounded idle lifetime and a bounded absolute lifetime, and the UI shall offer an explicit sign-out for shared machines;
+- authenticator user verification runs on the viewer's own device. ServerSentinel shall receive and store only public credential material (credential id and public key) plus owner-visible metadata, never a fingerprint or face template. Credential records are an access-control list; they are unrelated to the optional owner face verification of DET-008 and shall not become a non-owner identity or biometric database;
 - verified Tailscale login/device information may be used only as a supplementary signal (for example logging or an additional restriction), never as the only check;
 - device-scoped approval may be offered in addition, but the product shall not claim that approving a device identifies a person; a shared or borrowed device is used by whoever holds it;
 - network reachability is not a boundary in this deployment: anyone holding the shared account can reach the node, so every human route depends on the application credential;
 - an authenticated session shall remain bound to one principal, and revoking a principal or one of its credentials shall take effect promptly per AUTH-009;
 - before authentication succeeds the application responds per AUTH-010, and an uninvited person and a revoked person receive the same response.
+
+Both gates of AUTH-001/AUTH-004 remain mandatory and unchanged. What the shared account changes is that the network gate no longer distinguishes individuals, so it shall not be presented as the barrier that keeps an uninvited person out.
+
+Limits that shall be documented rather than claimed away: ServerSentinel cannot detect a credential whose holder deliberately lends it, a session left unlocked on an unattended machine, or an authenticator that the deployment registered inside a shared profile against this requirement. The product shall not claim that the application separates two people who share a workstation and a device unlock.
 
 ## 14. Dashboard requirements
 

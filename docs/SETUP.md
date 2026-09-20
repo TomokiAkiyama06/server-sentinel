@@ -97,9 +97,11 @@ Disabled by default; skip allowed; provide a safe test message.
 Explain that two separate approvals are required:
 
 1. Tailscale/private-network permission to the main node;
-2. ServerSentinel invitation/permissions.
+2. a ServerSentinel invitation, redeemed once to register that person's own credential, plus the permissions the owner grants.
 
 Public port forwarding is not the normal setup.
+
+Where the room shares one Tailscale account, the Tailscale login does not identify the person; the ServerSentinel credential does. Register each credential on an authenticator the invited person controls and keep authenticator user verification required. On a machine whose OS account or device unlock is shared, use a per-person OS account or a portable authenticator instead of a passkey stored in the shared profile. See ADR 0003.
 
 ## Add local USB camera
 
@@ -215,6 +217,7 @@ Invited users access only the main ServerSentinel host.
 phone / Mac
     -> Tailscale/private network
     -> trusted proxy/Tailscale Serve
+    -> ServerSentinel credential verification
     -> ServerSentinel dashboard
 ```
 
@@ -260,6 +263,8 @@ Permissions are independent. `live:view` alone cannot access historical timeline
 Non-owner users receive no official recording download/export control in MVP. The UI must not promise that browser playback prevents screen recording/client-side capture.
 
 The screen must clearly state that Tailscale-level network permission is managed separately outside ServerSentinel. ServerSentinel does not modify ACLs/Grants or store Tailscale administrative credentials.
+
+The screen also lists each person's registered credentials with their owner-visible label and last-used time, and allows revoking one credential or the whole principal. Revoking one credential (for example a lost device) leaves the person's other credentials working; revoking the principal ends all of them and their sessions promptly.
 
 ## Tailscale/private-network setup
 

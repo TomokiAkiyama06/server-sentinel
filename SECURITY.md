@@ -124,7 +124,9 @@ Tailnet membership is **not** ServerSentinel authorization.
 A user must have both:
 
 1. a Tailscale/private-network permission path to the main node; and
-2. an active ServerSentinel principal/invitation with the required permission.
+2. an active ServerSentinel principal/invitation, proved by that principal's own verified credential, with the required permission.
+
+Both gates stay mandatory. In the shared-account deployment below the first gate no longer distinguishes individuals, which makes the second gate the only one that does.
 
 ### Tailscale policy boundary
 
@@ -191,7 +193,12 @@ Consequences to keep in mind while reviewing code:
 - a route that authorizes on the proxy identity header alone grants access to everyone holding the shared account;
 - network reachability is not a boundary in this deployment; assume an uninvited person can reach every listener the shared account can reach;
 - the unauthenticated response, including the credential prompt, stays generic: no product/version strings, camera names or counts, recording or timeline data, or deployment metadata, and the same response for uninvited and revoked people;
-- approving a device is not identifying a person; a shared lab machine is used by whoever sits at it.
+- approving a device is not identifying a person; a shared lab machine is used by whoever sits at it;
+- a credential is person-bound only when authenticator user verification is required at registration and at every authentication and the authenticator is not kept inside a shared OS account or behind a shared device unlock. A platform passkey sitting in a shared lab profile is a shared credential;
+- sessions are bound to the credential that created them and end on a bounded idle and absolute timeout; an explicit sign-out control is expected for shared machines;
+- the server stores only the credential id, its public key and owner-visible metadata. No fingerprint or face template reaches ServerSentinel, and credential records are not an identity or biometric database.
+
+Residual limits are documented, not claimed away: a credential its holder deliberately lends, and a session left unlocked on an unattended machine, are outside what the application can observe.
 
 ## Capture-node pairing
 

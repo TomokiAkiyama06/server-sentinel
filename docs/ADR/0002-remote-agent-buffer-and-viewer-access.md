@@ -49,6 +49,8 @@ ServerSentinel MVP MUST NOT modify the owner's Tailscale Grants/ACL policy or st
 
 Tailscale provides private-network reachability. ServerSentinel performs its own owner-managed invitation/allowlist and application authorization before returning dashboard or media information.
 
+ADR 0003 adds the deployment reality that the research-room Tailscale account is shared, so the Tailscale login identifies an account rather than a person and a per-person ServerSentinel credential is what authorizes a human request. The permission model below is unchanged.
+
 At minimum, invited-user permissions remain independent:
 
 - `live:view` — current live video and current source/health state;

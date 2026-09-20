@@ -261,15 +261,21 @@ Scope:
 - human dashboard path through Tailscale Serve/equivalent trusted proxy;
 - loopback/non-bypassable backend listener;
 - application principal/allowlist;
+- per-person ServerSentinel credential (`principal_credential`) with invitation enrollment, required authenticator user verification, and individual revocation;
 - session/revocation/recovery;
-- exact handling of verified external identity headers;
+- exact handling of verified external identity headers, which in the shared-Tailscale-account deployment are supplementary only;
 - keep Tailnet policy separately Owner-managed outside ServerSentinel; existing ACLs/Grants may remain unchanged, and ServerSentinel performs no policy mutation or admin-credential storage.
+
+The authorization decision is recorded in ADR 0003 (shared Tailnet account, per-person WebAuthn/passkey credentials). Implementation follows that ADR.
 
 Acceptance:
 - Tailnet membership alone is insufficient;
-- uninvited identity receives no deployment metadata;
-- owner can revoke app access;
+- verified Tailscale/trusted-proxy identity alone is insufficient; no human route authorizes on an identity header alone;
+- every human route verifies the requesting principal's own credential before returning application data;
+- uninvited identity receives no deployment metadata, and an uninvited and a revoked person receive the same generic response;
+- owner can revoke app access, at both the single-credential and the whole-principal level;
 - backend rejects spoofed identity headers from untrusted LAN paths;
+- no viewer biometric template reaches the server; only public credential material is stored;
 - no developer-operated identity/cloud.
 
 ## Plan 5 — Local UVC discovery and stable identity
@@ -673,20 +679,23 @@ Labels: `backend`, `frontend`, `hardware-required`, `manual-test-required`, `sec
 
 Scope:
 - ServerSentinel never modifies Tailscale ACLs/Grants or stores Tailscale admin credentials;
-- trusted proxy identity;
+- trusted proxy identity, treated as supplementary in the shared-Tailscale-account deployment;
 - app principal allowlist;
+- per-person credential verification on every human/media route, per ADR 0003;
 - generic/non-branding denial for uninvited users;
 - independent `live:view` and `recordings:view`;
 - `recordings:view` includes historical timeline/events;
-- owner access-management UI;
-- prompt application revocation;
+- owner access-management UI, including per-credential listing and revocation;
+- prompt application revocation at credential and principal level;
 - non-owner browser-only recording playback.
 
 Acceptance:
 - Tailnet membership without app invitation receives no ServerSentinel application data;
 - existing Tailnet policy may remain unchanged;
 - docs do not promise Main Server node invisibility when Tailnet policy exposes it;
-- every human/media request requires verified Tailscale/trusted-proxy identity plus an active invitation and the required permission;
+- every human/media request requires verified Tailscale/trusted-proxy identity plus an active invitation, that principal's own verified credential, and the required permission; a request carrying only a verified identity header is refused;
+- the shared Tailscale account is assumed: a second person on the same Tailscale login and the same device, without a credential of their own, receives the same generic response as any uninvited person;
+- revoking one credential invalidates that credential and its sessions only; revoking the principal invalidates all of them promptly;
 - uninvited identity receives no camera names/counts, thumbnails, live, recordings, timeline, storage state, product/version, API schema, or detailed health; use generic/non-branding denial where practical;
 - `live:view` cannot list/play recordings or historical timeline;
 - `recordings:view` includes browser playback and historical timeline but does not imply live;

@@ -76,9 +76,23 @@ Non-owner recording access is browser playback only in MVP. ServerSentinel does 
 
 Historical timeline/event access is not exposed through `live:view`; it is included with `recordings:view`.
 
+## Human viewer credentials
+
+The target deployment shares one Tailscale account across the research room, so a Tailscale login identifies the account rather than the person. ServerSentinel therefore issues each invited person its own credential from an owner invitation and verifies it on every human request; verified Tailscale login/device information is at most supplementary context.
+
+For each credential the main host stores:
+- the credential id and its public key;
+- the principal it belongs to;
+- an owner-visible device label;
+- created/last-used/revoked timestamps.
+
+Authenticator user verification (device PIN, device unlock, fingerprint or face unlock) runs on the viewer's own device. ServerSentinel never receives or stores a viewer's fingerprint or face template. These records are an access-control list, not an identity or biometric database, and they are unrelated to the optional owner face verification described below. Revoking a credential or its principal permanently disables the corresponding record.
+
+Approving a device is not the same as identifying a person. The application cannot detect a credential whose holder lends it out, or a session left unlocked on an unattended shared machine; the deployment owner manages those risks outside the application.
+
 ## Tailscale/private remote access
 
-Tailnet membership is not authorization.
+Tailnet membership is not authorization. Where one Tailscale account is shared by several people, the Tailscale login does not identify the person either, and the ServerSentinel credential above is what does.
 
 ServerSentinel does not modify Tailscale ACLs/Grants or store a Tailscale administrative credential; policy administration remains outside the application. With unchanged Tailnet policy, the underlying Main Server node may remain visible/reachable to other Tailnet members.
 
@@ -119,6 +133,7 @@ The main Ubuntu deployment stores:
 - event/timeline metadata;
 - audit logs;
 - configuration;
+- invited-viewer credential records (public key material and metadata only);
 - optional owner biometric template.
 
 Defaults:

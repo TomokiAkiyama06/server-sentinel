@@ -24,7 +24,8 @@ MVPの基本構成:
 - agentは圧縮disk ring bufferを持ち、Ownerが時間/容量モードを選択。通信断時は10分pre-loss + 10分post-lossを保護し、incidentは60日後をdefaultとしてagentから自動削除
 - Tailnet membershipだけではServerSentinelへアクセス不可
 - human accessはTailscale/private network permission + ServerSentinel invitationの二重条件
-- 研究室のTailnetは費用のため単一アカウントを共有する。Tailscale loginは人を特定しないため、application認可はServerSentinelが発行する個人単位のcredential（既定はWebAuthn/passkey）に依存し、Tailscale identity/device情報は補助扱い
+- 研究室のTailnetは費用のため単一アカウントを共有する。Tailscale loginは人を特定しないため、application認可はServerSentinelが発行する個人単位のcredential（WebAuthn/passkey、ADR-0003）に依存し、Tailscale identity/device情報は補助扱い
+- credentialは登録時・認証毎のuser verification必須と本人管理のauthenticatorで人に紐づける。共有OS account内のplatform authenticatorは共有credential扱い。user verificationはviewer端末内で完結し、biometric templateはserverへ送らない
 - non-owner permissionは少なくとも `live:view` / `recordings:view` を独立管理
 - non-owner recording accessはbrowser playbackのみ、official download/exportなし
 - historical timeline/eventは`recordings:view`に含め、`live:view`だけには公開しない
@@ -52,6 +53,8 @@ MVPの基本構成:
 - capture ingest listenerとhuman dashboard listenerが分離されているか
 - agent credentialからhuman/admin APIへ昇格できないか
 - trusted Tailscale identity header pathをLANからbypassできないか
+- Tailscale login / proxy identity headerだけでhuman routeを認可していないか、per-person credential検証がserver-sideであるか
+- device承認や network到達性を「人物の特定」「uninvitedを排除する障壁」として説明していないか
 - ServerSentinelがTailscale ACL/Grants変更やadmin credentialを要求していないか、未招待identityへアプリ情報を漏らしていないか
 - `live:view` / `recordings:view`分離がserver-sideで強制されるか
 - non-owner download/exportが再導入されていないか
