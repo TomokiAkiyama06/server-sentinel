@@ -107,7 +107,22 @@ values and admits only reviewed event names and bounded numeric metadata.
 The concrete settings, persistence and validation contract is documented in
 [`server/docs/FOUNDATION.md`](server/docs/FOUNDATION.md).
 
-The main application may use Docker Compose where appropriate. `media-capture-agent` is intended to run natively as a systemd service so UVC/udev/hotplug handling does not require a privileged container.
+Stable Main Server releases use a checksummed versioned archive containing the
+reviewed application, lockfile, license material, and offline wheelhouse. The
+native installer stages immutable per-version environments, validates private
+deployment configuration and its existing pinned runtime filesystem as the
+dedicated non-root account, then atomically switches `current`/`previous` release
+pointers. Failed service activation restores the prior pointer and attempts to
+restart it. Configuration, state, recordings, and audit data remain outside both
+the checkout and install tree. The systemd launcher keeps the human listener on
+loopback and grants write access only to the configured runtime root. Exact
+commands and limitations are in `server/docs/DEPLOYMENT.md`.
+
+No Docker Compose path is currently implemented or advertised. A future Compose
+path must provide the same versioned update/rollback, external runtime mount,
+dedicated identity, missing-mount refusal, and private-listener guarantees.
+`media-capture-agent` is intended to run natively as a systemd service so
+UVC/udev/hotplug handling does not require a privileged container.
 
 ## 3. Camera Source domain model
 

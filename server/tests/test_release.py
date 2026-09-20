@@ -1,0 +1,243 @@
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import pwd
+import subprocess
+import tarfile
+import tempfile
+import unittest
+from unittest.mock import patch
+import zipfile
+
+from app.deployment import Deployment
+from app.settings import ConfigurationError
+from build_artifact import _required_wheels, build
+from build_installer import build as build_installer
+from install import execute
+
+
+class Runner:
+    def __init__(self, root: Path):
+        self.root = root
+        self.calls = []
+        self.fail_version = None
+
+    def __call__(self, arguments, **options):
+        self.calls.append((arguments, options))
+        if arguments[1:3] == ["-m", "venv"]:
+            python = Path(arguments[3]) / "bin/python"
+            python.parent.mkdir(parents=True)
+            python.write_text("synthetic")
+        if arguments[:2] == ["systemctl", "restart"] and self.fail_version:
+            current = os.readlink(self.root / "current")
+            if current == "releases/" + self.fail_version:
+                raise OSError("synthetic service startup failure")
+        return object()
+
+
+class ReleaseLifecycleTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory(prefix="server-release-synthetic-")
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.installation = self.root / "installation"
+        self.unit = self.root / "server-sentinel.service"
+        self.runtime = self.root / "runtime"
+        self.uid = os.geteuid()
+        self.gid = os.getegid()
+        for path in (self.runtime, self.runtime / "state", self.runtime / "recordings",
+                     self.runtime / "audit"):
+            path.mkdir(mode=0o700)
+        self.config = self.root / "deployment.json"
+        device = self.runtime.stat().st_dev
+        self.config.write_text(json.dumps({
+            "runtime_root": str(self.runtime),
+            "runtime_mount_point": str(self.root),
+            "runtime_device": [os.major(device), os.minor(device)],
+            "service_uid": self.uid,
+            "human_host": "127.0.0.1",
+            "human_port": 8000,
+            "log_level": "INFO",
+        }))
+        self.config.chmod(0o600)
+        self.wheelhouse = self.root / "wheels"
+        self.wheelhouse.mkdir()
+        (self.root / "LICENSE").write_text("synthetic Apache-2.0 fixture")
+        (self.root / "NOTICE").write_text("synthetic notice fixture")
+        for line in (Path(__file__).parents[1] / "requirements.lock").read_text().splitlines():
+            if "==" in line and line.endswith(" \\"):
+                name, version = line[:-2].split("==")
+                name = name.replace("-", "_").replace(".", "_")
+                (self.wheelhouse / f"{name}-{version}-py3-none-any.whl").write_bytes(
+                    (name + version).encode()
+                )
+        self.runner = Runner(self.installation)
+
+    def artifact(self, version):
+        path = self.root / ("server-sentinel-" + version + ".tar.gz")
+        wheels = sorted(self.wheelhouse.glob("*.whl"))
+        with patch("build_artifact.REPOSITORY", self.root), patch(
+                "build_artifact._required_wheels", return_value=wheels):
+            digest = build(path, version, self.wheelhouse)
+        return path, digest
+
+    def arguments(self, command, version=None):
+        values = dict(command=command, destination=self.installation, config=self.config,
+                      unit=self.unit, version=version)
+        if command in {"install", "update"}:
+            artifact, digest = self.artifact(version)
+            values.update(artifact=artifact, sha256=digest, python=Path("/usr/bin/python3"))
+        return argparse.Namespace(**values)
+
+    def perform(self, arguments):
+        account = pwd.getpwuid(self.uid)
+        with patch("install.os.geteuid", return_value=0), patch(
+                "install._protected_parent"), patch("install.pwd.getpwuid", return_value=account):
+            execute(arguments, runner=self.runner)
+
+    def test_install_update_and_rollback_preserve_external_runtime_data(self):
+        markers = []
+        for directory in (self.runtime / "state", self.runtime / "recordings",
+                          self.runtime / "audit"):
+            marker = directory / "preserved.synthetic"
+            marker.write_text(directory.name)
+            markers.append(marker)
+
+        self.perform(self.arguments("install", "1.0.0"))
+        self.assertEqual(os.readlink(self.installation / "current"), "releases/1.0.0")
+        self.assertFalse((self.installation / "previous").exists())
+        unit = self.unit.read_text()
+        self.assertIn("User=" + pwd.getpwuid(self.uid).pw_name, unit)
+        self.assertIn('WorkingDirectory="' + str(self.installation / "current") + '"', unit)
+        self.assertIn("ProtectSystem=strict", unit)
+        self.assertNotIn("0.0.0.0", unit)
+
+        self.perform(self.arguments("update", "1.1.0"))
+        self.assertEqual(os.readlink(self.installation / "current"), "releases/1.1.0")
+        self.assertEqual(os.readlink(self.installation / "previous"), "releases/1.0.0")
+        self.perform(self.arguments("rollback"))
+        self.assertEqual(os.readlink(self.installation / "current"), "releases/1.0.0")
+        self.assertEqual(os.readlink(self.installation / "previous"), "releases/1.1.0")
+        self.assertEqual(
+            [marker.read_text() for marker in markers], ["state", "recordings", "audit"]
+        )
+
+    def test_failed_update_restores_running_release_and_runtime_data(self):
+        marker = self.runtime / "state/preserved.synthetic"
+        marker.write_text("unchanged")
+        self.perform(self.arguments("install", "1.0.0"))
+        self.runner.fail_version = "2.0.0"
+        with self.assertRaises(OSError):
+            self.perform(self.arguments("update", "2.0.0"))
+        self.assertEqual(os.readlink(self.installation / "current"), "releases/1.0.0")
+        self.assertFalse((self.installation / "previous").exists())
+        self.assertEqual(marker.read_text(), "unchanged")
+        restarts = [call for call, _ in self.runner.calls if call[:2] == ["systemctl", "restart"]]
+        self.assertGreaterEqual(len(restarts), 3)
+
+    def test_missing_runtime_tree_and_public_listener_fail_before_artifact_install(self):
+        (self.runtime / "recordings").rmdir()
+        with self.assertRaises(ConfigurationError):
+            self.perform(self.arguments("install", "1.0.0"))
+        self.assertFalse((self.runtime / "recordings").exists())
+        self.assertFalse((self.installation / "releases").exists())
+
+        (self.runtime / "recordings").mkdir(mode=0o700)
+        value = json.loads(self.config.read_text())
+        value["runtime_device"][1] += 1
+        self.config.write_text(json.dumps(value))
+        self.config.chmod(0o600)
+        with self.assertRaisesRegex(ConfigurationError, "filesystem identity"):
+            self.perform(self.arguments("install", "1.0.1"))
+
+        value = json.loads(self.config.read_text())
+        device = self.runtime.stat().st_dev
+        value["runtime_device"] = [os.major(device), os.minor(device)]
+        value["human_host"] = "0.0.0.0"
+        self.config.write_text(json.dumps(value))
+        self.config.chmod(0o600)
+        with self.assertRaises(ConfigurationError):
+            self.perform(self.arguments("install", "1.0.2"))
+        self.assertFalse((self.installation / "releases").exists())
+
+    def test_configuration_and_runtime_cannot_live_in_release_tree(self):
+        self.installation.mkdir()
+        internal = self.installation / "runtime"
+        for path in (internal, internal / "state", internal / "recordings", internal / "audit"):
+            path.mkdir(mode=0o700)
+        value = json.loads(self.config.read_text())
+        value["runtime_root"] = str(internal)
+        self.config.write_text(json.dumps(value))
+        self.config.chmod(0o600)
+        with self.assertRaises(ConfigurationError):
+            self.perform(self.arguments("install", "1.0.0"))
+
+        value["runtime_root"] = str(self.runtime)
+        internal_config = self.installation / "deployment.json"
+        internal_config.write_text(json.dumps(value))
+        internal_config.chmod(0o600)
+        self.config = internal_config
+        with self.assertRaises(ConfigurationError):
+            self.perform(self.arguments("install", "1.0.1"))
+
+    def test_artifact_is_versioned_allow_list_without_tests_or_private_config(self):
+        artifact, digest = self.artifact("1.2.3")
+        self.assertEqual(hashlib.sha256(artifact.read_bytes()).hexdigest(), digest)
+        with tarfile.open(artifact, "r:gz") as archive:
+            names = archive.getnames()
+        self.assertIn("manifest.json", names)
+        self.assertIn("app/deployment.py", names)
+        self.assertTrue(any(name.startswith("wheels/fastapi-") for name in names))
+        self.assertFalse(any("test" in name or name.endswith("deployment.json") for name in names))
+
+    def test_builder_rejects_wheel_not_approved_by_lock_hash(self):
+        with self.assertRaisesRegex(ValueError, "unreviewed"):
+            _required_wheels(self.wheelhouse)
+
+    def test_standalone_installer_does_not_require_checkout(self):
+        installer = self.root / "server-sentinel-installer.pyz"
+        with patch("build_installer.REPOSITORY", self.root):
+            digest = build_installer(installer)
+        self.assertEqual(hashlib.sha256(installer.read_bytes()).hexdigest(), digest)
+        result = subprocess.run(
+            ["python3", str(installer), "--help"], cwd="/", text=True,
+            capture_output=True, check=True,
+        )
+        self.assertIn("Install, update or roll back", result.stdout)
+        with zipfile.ZipFile(installer) as archive:
+            names = archive.namelist()
+        self.assertIn("install.py", names)
+        self.assertIn("app/deployment.py", names)
+        self.assertFalse(any("test" in name or name.endswith(".pyc") for name in names))
+
+    def test_explicit_rollback_target_must_already_be_installed(self):
+        self.perform(self.arguments("install", "1.0.0"))
+        with self.assertRaises(ValueError):
+            self.perform(self.arguments("rollback", "9.9.9"))
+        self.assertEqual(os.readlink(self.installation / "current"), "releases/1.0.0")
+
+
+class DeploymentConfigurationTests(unittest.TestCase):
+    def test_configuration_is_private_bounded_and_owned(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for path in (root / "runtime", root / "runtime/state",
+                         root / "runtime/recordings", root / "runtime/audit"):
+                path.mkdir(mode=0o700)
+            config = root / "deployment.json"
+            device = (root / "runtime").stat().st_dev
+            config.write_text(json.dumps({
+                "runtime_root": str(root / "runtime"), "service_uid": os.geteuid(),
+                "runtime_mount_point": str(root),
+                "runtime_device": [os.major(device), os.minor(device)],
+                "human_host": "127.0.0.1", "human_port": 8000, "log_level": "INFO",
+            }))
+            config.chmod(0o644)
+            with self.assertRaises(ConfigurationError):
+                Deployment.load(config, code_root=root / "code")
+
+
+if __name__ == "__main__":
+    unittest.main()

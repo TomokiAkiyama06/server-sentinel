@@ -7,13 +7,7 @@ from app.main import create_app
 from app.settings import ConfigurationError, Settings
 
 
-def main() -> int:
-    configure_logging()
-    try:
-        settings = Settings.from_env()
-    except ConfigurationError:
-        logging.getLogger(__name__).error(Event.STARTUP_FAILED)
-        return 1
+def run(settings: Settings) -> int:
     configure_logging(settings.log_level)
     import uvicorn
     uvicorn.run(
@@ -22,6 +16,16 @@ def main() -> int:
         proxy_headers=False, forwarded_allow_ips="", ws="none",
     )
     return 0
+
+
+def main() -> int:
+    configure_logging()
+    try:
+        settings = Settings.from_env()
+    except ConfigurationError:
+        logging.getLogger(__name__).error(Event.STARTUP_FAILED)
+        return 1
+    return run(settings)
 
 
 if __name__ == "__main__":

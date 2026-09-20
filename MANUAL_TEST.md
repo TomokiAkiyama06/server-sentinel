@@ -579,7 +579,40 @@ The synthetic CI tests do not complete these checks. On an isolated Capture Node
 Publish only pass/fail summaries; keep configs, mount identity, host identifiers,
 credentials and captured media private.
 
-## U. GitHub review-gate enforcement
+## U. Main Server release lifecycle
+
+Use a disposable Main Ubuntu host and synthetic files only. Keep the real
+runtime path, filesystem/device identity, account details, and logs private.
+
+- [ ] Build a tagged version archive and standalone installer with the reviewed
+  wheelhouse; verify both published SHA-256 values on the target before use.
+- [ ] Install as an administrator; verify the service runs as the configured
+  dedicated non-root account with no capabilities and writes only under the
+  Owner-approved runtime root.
+- [ ] Verify the human listener is loopback-only and is reachable remotely only
+  through the intended private trusted-proxy path. Do not add public forwarding.
+- [ ] Put synthetic markers in `state`, `recordings`, and `audit`; update to a
+  second version and roll back. Verify all markers and private configuration are
+  unchanged and both release directories remain separate from runtime data.
+- [ ] Make the candidate service fail its post-switch start. Verify `current`
+  returns to the prior version and that version is active without modifying the
+  runtime markers.
+- [ ] Stop/unmount the disposable runtime filesystem while leaving its mount
+  directory present. Install and service preflight must fail without creating
+  `state`, `recordings`, `audit`, a root-filesystem fallback, or new media.
+- [ ] Replace the disposable filesystem at the same path and verify the pinned
+  major/minor identity rejects it until an explicit Owner-approved private
+  configuration change.
+- [ ] Verify an older release that cannot read a newer migration fails rollback
+  and the installer restores the release that was active before the attempt.
+- [ ] Reboot after explicitly enabling the unit and repeat the account, mount,
+  loopback listener, and selected-version checks.
+
+Publish only sanitized PASS/FAIL results. Do not attach configuration, service
+UIDs, mount identifiers, private addresses, logs containing deployment data, or
+runtime contents.
+
+## V. GitHub review-gate enforcement
 
 Issue #4 remains open. The offline tests do not complete these checks. Follow
 `docs/REVIEW_GATE_SETUP.md` after Owner App registration and trusted publisher

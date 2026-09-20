@@ -23,6 +23,9 @@ Issue #1 closed when PR #2 merged after documentation/bootstrap acceptance and c
 - [ ] health endpoints
 - [x] React responsive dashboard shell (#8; synthetic/mock foundation, production access integration remains #10)
 - [ ] Docker Compose where appropriate
+- [ ] versioned Main Server release/install/update/rollback lifecycle — #47
+  artifact, native installer, external pinned runtime root and synthetic failure
+  coverage implemented; disposable Main Ubuntu acceptance remains pending
 - [ ] deployment-owner authorization ADR/bootstrap
 - [ ] trusted Tailscale/private-proxy identity boundary
 
