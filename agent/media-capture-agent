@@ -1,0 +1,5 @@
+#!/usr/bin/env python3
+"""Development entry point; production installs a versioned executable zipapp."""
+from media_capture_agent.cli import main
+
+raise SystemExit(main())

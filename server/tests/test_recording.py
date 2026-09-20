@@ -12,8 +12,8 @@ import unittest
 import zlib
 
 from app.media.recording import Limits, RecordingError, RecordingStore, RootIdentity, Segment
-from app.media.recording.schema import recording_migration
-from app.storage.migrations import BUILTIN_MIGRATIONS, migrate
+from app.storage.migrations import migrate
+from app.storage.schema import APPLICATION_MIGRATIONS
 
 
 class SyntheticValidator:
@@ -58,9 +58,7 @@ class RecordingTests(unittest.TestCase):
         self.identity = RootIdentity(info.st_dev, info.st_ino)
         self.db = sqlite3.connect(self.base / "metadata.sqlite", isolation_level=None)
         self.addCleanup(self.db.close)
-        # Isolated domain DB assigns slot 2. The application aggregator assigns
-        # a contiguous final slot after prior feature migrations merge.
-        migrate(self.db, BUILTIN_MIGRATIONS + (recording_migration(2),))
+        migrate(self.db, APPLICATION_MIGRATIONS)
         self.policy = Reservation()
         self.validator = SyntheticValidator()
         self.limits = Limits(pre_roll_bytes=4096, max_segment_bytes=512,
