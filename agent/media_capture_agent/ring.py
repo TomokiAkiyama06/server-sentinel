@@ -79,7 +79,17 @@ class DiskRing:
         elif trusted and record:
             with self.ledger.transaction():
                 self.db.execute("INSERT OR REPLACE INTO settings VALUES ('latest_clock', ?)", (str(now),))
+            if self.config is not None and self._pending_loss():
+                # No reliable anchor existed at loss. Keep the held ring and
+                # cover through POST after the first recovered trusted time.
+                start = min([max(0, now - PRE)] + [item["start"] for item in self._rows()])
+                self._preserve("main_connection_lost", start, now + POST, now, False)
+                with self.ledger.transaction():
+                    self.db.execute("DELETE FROM settings WHERE key='pending_loss'")
         return trusted
+
+    def _pending_loss(self):
+        return self.db.execute("SELECT 1 FROM settings WHERE key='pending_loss'").fetchone() is not None
 
     def _recover(self):
         physical = self.store.list_segments()
@@ -130,6 +140,8 @@ class DiskRing:
         return self.db.execute(query + " LIMIT 1", values).fetchone() is not None
 
     def _reclaimable(self, now):
+        if self._pending_loss():
+            return []
         return [row for row in self._rows()
                 if row["end"] <= now - PRE and row["state"] != "writing"
                 and not self._protected(row["id"])]
@@ -276,6 +288,8 @@ class DiskRing:
         if any(item.segment_bytes() > self.settings.max_segment_bytes for item in profiles):
             raise RingRefused("profile_exceeds_segment_write_limit")
         with self._operation():
+            if self._pending_loss():
+                raise RingRefused("protection_configuration_busy")
             # Configuration must respect a previously observed clock, but it is
             # not itself a capture-time observation. Recording it here would
             # make already buffered pre-roll look like a rollback.
@@ -493,8 +507,19 @@ class DiskRing:
             clock_trusted = self._clock(now_us, clock_trusted)
             incident = None
             if self.connected and not (authenticated and connected) and unexpected:
-                incident = self._preserve("main_connection_lost", now_us - PRE,
-                                          now_us + POST, now_us, clock_trusted)
+                if self.config is None:
+                    raise RingRefused("invalid_preservation_window")
+                anchor = now_us
+                if not clock_trusted:
+                    row = self.db.execute("SELECT value FROM settings WHERE key='latest_clock'").fetchone()
+                    anchor = int(row[0]) if row else None
+                if anchor is None:
+                    with self.ledger.transaction():
+                        self.db.execute("INSERT OR REPLACE INTO settings VALUES ('pending_loss', '1')")
+                    self.state, self.reason = "degraded", "loss_time_anchor_unavailable"
+                else:
+                    incident = self._preserve("main_connection_lost", max(0, anchor - PRE),
+                                              anchor + POST, now_us, clock_trusted)
             self.connected = authenticated and connected
             return incident
 
@@ -566,6 +591,8 @@ class DiskRing:
             self._trim(now_us, trusted=trusted)
 
     def _ordinary_owned(self, row, now, trusted):
+        if self._pending_loss():
+            return True
         # On recovery/uncertain time, retaining an ordinary reference is safer
         # than asserting a FIFO cutoff. The next trusted tick applies limits.
         if self.config is None:
@@ -679,7 +706,10 @@ class DiskRing:
             self.state, self.reason = "STORAGE_PRESSURE", "insufficient_ledger_capacity"
         elif budget["filesystem_free"] + budget["reclaimable_allocated"] < budget["required_additional"] + budget["safety_reserve"]:
             self.state, self.reason = "STORAGE_PRESSURE", "post_loss_headroom_reduced"
-        elif not clock_trusted:
+        elif self._pending_loss():
+            self.state, self.reason = "degraded", "loss_time_anchor_unavailable"
+        elif not clock_trusted or self.db.execute(
+                "SELECT 1 FROM incidents WHERE state='active' AND clock_uncertain=1 LIMIT 1").fetchone():
             self.state, self.reason = "degraded", "clock_uncertain"
         elif any(row["state"] != "stored" and self._protected(row["id"]) for row in rows):
             self.state, self.reason = "degraded", "protected_evidence_integrity_gap"

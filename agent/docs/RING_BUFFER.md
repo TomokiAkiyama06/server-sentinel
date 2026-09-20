@@ -52,6 +52,15 @@ whose intervals overlap the incident are protected without a Main connection.
 An untrusted wall-clock observation cannot apply an expiry cutoff to a late
 overlapping append; retained incidents keep their protection until trusted time
 can establish expiry.
+Loss observations with an untrusted or rolled-back clock use the last accepted
+trusted timestamp as their window anchor, never the jumped wall time. Timing
+uncertainty remains visible while the incident is active and after completion.
+If no trusted timestamp has ever been accepted, a durable pending-loss marker
+holds the current ring against FIFO and reconfiguration. The first trusted
+capture/maintenance observation creates an uncertain incident covering the held
+ring and POST after that observation before releasing the hold. Status-only
+reads do not release it; without enough ledger/disk budget, the hold remains and
+the refusal is explicit. Such protection never claims exact loss-time coverage.
 Critical `server_movement`/`camera_tamper` preservation uses an explicit interval.
 Profile changes are refused while post-loss protection is active so a new profile
 cannot invalidate an in-progress capacity estimate.

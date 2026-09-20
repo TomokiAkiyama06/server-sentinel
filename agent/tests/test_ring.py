@@ -993,6 +993,68 @@ class RingTests(unittest.TestCase):
         self.assertEqual(result["state"], "degraded")
         self.assertEqual(result["reason"], "protected_incident_partial")
 
+    def test_untrusted_loss_jump_protects_actual_pre_and_corrected_post(self):
+        self.warm()
+        before = set(self.store.list_segments())
+        self.ring.observe_connection(authenticated=True, connected=True, unexpected=False,
+                                     now_us=T0, clock_trusted=True)
+        incident = self.ring.observe_connection(authenticated=True, connected=False, unexpected=True,
+                                                now_us=T0 + RETENTION, clock_trusted=False)
+        self.assertTrue(all(self.ring._protected(str(identifier)) for identifier in before))
+        self.restart()
+        self.finish()
+        self.assertTrue(before <= set(self.store.list_segments()))
+        result = self.ring.incident(incident, now_us=T0 + POST)
+        self.assertEqual(result["started_at_us"], T0 - PRE)
+        self.assertEqual(result["target_end_us"], T0 + POST)
+        self.assertTrue(result["clock_uncertain"])
+        self.assertFalse(result["has_gaps"])
+        self.assertEqual(result["state"], "partial")
+
+    def test_rollback_loss_uses_last_trusted_anchor_for_all_sources(self):
+        profiles = tuple(SegmentProfile(UUID(int=index + 100), 800, 400, 60 * SECOND, 100)
+                         for index in range(4))
+        self.warm(profiles=profiles)
+        self.ring.observe_connection(authenticated=True, connected=True, unexpected=False,
+                                     now_us=T0, clock_trusted=True)
+        incident = self.ring.observe_connection(authenticated=True, connected=False, unexpected=True,
+                                                now_us=T0 - 1800 * SECOND, clock_trusted=True)
+        self.assertTrue(all(self.ring._protected(row["id"]) for row in self.ring._rows()))
+        for start in range(T0, T0 + POST, 60 * SECOND):
+            for profile in profiles:
+                self.append(start, source=profile.source_id)
+        result = self.ring.incident(incident, now_us=T0 + POST)
+        self.assertFalse(result["has_gaps"])
+        self.assertEqual(result["state"], "partial")
+
+    def test_active_uncertain_incident_stays_degraded_after_clock_recovers(self):
+        self.warm()
+        incident = self.ring.preserve("camera_tamper", T0 - PRE, T0 + POST, now_us=T0, clock_trusted=False)
+        self.restart()
+        result = self.ring.status(now_us=T0, clock_trusted=True)
+        self.assertEqual(self.ring.incident(incident, now_us=T0)["state"], "active")
+        self.assertEqual(result["state"], "degraded")
+        self.assertEqual(result["reason"], "clock_uncertain")
+
+    def test_loss_without_trusted_anchor_persists_hold_until_trusted_capture(self):
+        self.configure()
+        self.ring.observe_connection(authenticated=True, connected=True, unexpected=False,
+                                     now_us=T0 + RETENTION, clock_trusted=False)
+        self.assertIsNone(self.ring.observe_connection(authenticated=True, connected=False, unexpected=True,
+                                                       now_us=T0 + RETENTION, clock_trusted=False))
+        self.restart()
+        self.assertEqual(self.ring.status(now_us=T0, clock_trusted=True)["reason"], "loss_time_anchor_unavailable")
+        self.assertEqual(self.ring._reclaimable(T0 + RETENTION), [])
+        with self.assertRaisesRegex(RingRefused, "protection_configuration_busy"):
+            self.configure()
+        identifier = self.append(T0)
+        self.assertFalse(self.ring._pending_loss())
+        self.assertTrue(self.ring._protected(str(identifier)))
+        incident = self.ring.db.execute("SELECT * FROM incidents").fetchone()
+        self.assertEqual(incident["end"], T0 + 60 * SECOND + POST)
+        self.assertTrue(incident["clock_uncertain"])
+        self.assertEqual(self.ring.status(now_us=T0 + 60 * SECOND, clock_trusted=True)["state"], "degraded")
+
     def test_ledger_transaction_rolls_back_process_interruptions(self):
         for exception in (KeyboardInterrupt, SystemExit):
             with self.assertRaises(exception):
