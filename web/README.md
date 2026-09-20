@@ -91,7 +91,9 @@ under a new provider.
 `canVisit` keeps `storage` owner-only and `recordings` behind `recordings:view`;
 `live:view` alone reaches neither the recording list nor historical metadata.
 The production entry still uses `deniedServices`, which supplies no recording,
-storage or mutation provider. Server wiring for these screens is #42.
+storage or mutation provider. #21's server-side storage, retention and
+notification core landed with #42; the authorized human provider that would feed
+these screens is still #10's human-access work, so no deployment serves them yet.
 
 ## Local build and tests
 
