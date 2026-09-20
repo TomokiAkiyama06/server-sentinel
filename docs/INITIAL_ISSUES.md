@@ -10,11 +10,11 @@ Label meanings: `server-required` means a Main Server or Capture Node is needed;
 
 ## GitHub Issue index
 
-Audited 2026-09-20 against the current specification. All 24 implementation/ADR Issues remain OPEN; this is planned work, not runtime completion. Exact titles/status are below; labels, physical requirements, dependencies, and acceptance summaries follow in each Plan.
+Audited 2026-09-20 against the current specification. CI foundation #5 is implemented and closes on merge of its CI delivery PR; the other 23 implementation/ADR Issues remain OPEN. This is not runtime completion. Status below records the delivery state of this revision; labels, physical requirements, dependencies, and acceptance summaries follow in each Plan.
 
 | Plan | GitHub Issue | Title | Status |
 |---|---|---|---|
-| Plan 1 | [#5](https://github.com/TomokiAkiyama06/server-sentinel/issues/5) | Plan 1: CIとRepositoryガードの整備 | OPEN |
+| Plan 1 | [#5](https://github.com/TomokiAkiyama06/server-sentinel/issues/5) | Plan 1: CIとRepositoryガードの整備 | CLOSED on CI PR merge |
 | Blocking prerequisite | [#6](https://github.com/TomokiAkiyama06/server-sentinel/issues/6) | Blocking prerequisite: Owner認可とtrusted Tailscale identityのADR策定 | OPEN |
 | Plan 2 | [#7](https://github.com/TomokiAkiyama06/server-sentinel/issues/7) | Plan 2: Backend基盤の構築 | OPEN |
 | Plan 3 | [#8](https://github.com/TomokiAkiyama06/server-sentinel/issues/8) | Plan 3: React Dashboard基盤の構築 | OPEN |
@@ -43,11 +43,11 @@ Other audited Issues (outside the 24 Plans):
 
 | Issue | Title | Status | Labels | Main / Capture / UVC / Manual | Depends on |
 |---|---|---|---|---|---|
-| [#1](https://github.com/TomokiAkiyama06/server-sentinel/issues/1) | 初期仕様・マルチCamera Source設計・エージェント開発ルールを整備する | OPEN | `documentation` | 不要 / 不要 / 不要 / 不要 | None |
+| [#1](https://github.com/TomokiAkiyama06/server-sentinel/issues/1) | 初期仕様・マルチCamera Source設計・エージェント開発ルールを整備する | CLOSED | `documentation` | 不要 / 不要 / 不要 / 不要 | None |
 | [#3](https://github.com/TomokiAkiyama06/server-sentinel/issues/3) | Claude PRレビュー用のOAuth Secretを設定する | CLOSED | `ci`, `manual-test-required`, `security` | 不要 / 不要 / 不要 / 必要 | None |
 | [#4](https://github.com/TomokiAkiyama06/server-sentinel/issues/4) | Ruleset / 専用GitHub Appで自動レビューゲートを強制する | OPEN | `ci`, `documentation`, `manual-test-required`, `security` | 不要 / 不要 / 不要 / 必要 | None |
 
-#1 closes only when PR #2 merges after current HEAD/base Codex + Claude reviews and CI pass. #3 is already closed; its authentication setup does not substitute for future reviews. #4 requires trusted review provenance for both HEAD and base/diff context, including base-only changes and issuer-spoofing rejection.
+#1 closed when PR #2 merged after current HEAD/base Codex + Claude reviews and CI passed. #3 is already closed; its authentication setup does not substitute for future reviews. #4 requires trusted review provenance for both HEAD and base/diff context, including base-only changes and issuer-spoofing rejection.
 
 ## Dependency graph
 
@@ -134,6 +134,8 @@ Issue #7 now explicitly depends on #6 (authorization design before health/versio
 ## Plan 1 — CI / repository guardrails
 
 GitHub Issue: [#5](https://github.com/TomokiAkiyama06/server-sentinel/issues/5)
+
+Implementation: `.github/workflows/ci.yml`, `scripts/ci/`, and synthetic unit tests; usage and limits are in [`docs/CI.md`](CI.md). Missing runtime components are reported explicitly. Existing component source/manifests require configured lint/test, locked dependencies, and isolated synthetic normal/error smoke checks. No real hardware or runtime egress absence is claimed. The final `CI` check requires all configured jobs to succeed; this does not implement #4's review-provenance enforcement.
 
 Depends on: None
 

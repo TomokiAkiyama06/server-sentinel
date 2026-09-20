@@ -9,11 +9,11 @@ Phases group capabilities rather than imposing a strict completion order. The de
 - [ ] public repository / Apache-2.0
 - [ ] specifications committed
 - [ ] issue/PR templates
-- [ ] CI/secret-scan plan mapped to Issue #5 (implementation remains open)
+- [x] CI/repository guards, synthetic regression tests, and conditional component checks (#5; see `docs/CI.md`)
 - [ ] dependency/model license policy
 - [ ] hardened review-gate follow-up mapped to Issue #4 (enforcement implementation remains open)
 
-Issue #1 closes with PR #2 after documentation/bootstrap acceptance and current HEAD/base reviews plus CI pass. Open runtime Issues #5–#28 and the separately tracked #4 do not mean the specification bootstrap is incomplete.
+Issue #1 closed when PR #2 merged after documentation/bootstrap acceptance and current HEAD/base reviews plus CI passed. CI foundation #5 is implemented without starting runtime components. Runtime/ADR Issues #6–#28 and the separately tracked #4 remain independent follow-up work.
 
 ## Phase 1 — Main server and web foundation
 
