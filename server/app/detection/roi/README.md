@@ -11,8 +11,10 @@ timestamp. A policy is refused when a bounded search window cannot reach its
 own displacement threshold, because such a configuration cannot express the
 movement or camera shift it asks for and would report a matching geometry
 instead. A calibration is refused for the same reason when its own support
-leaves no threshold-reaching candidate above `minimum_coverage`, since the
-policy radius alone does not say which candidates survive the coverage gate.
+leaves no translating candidate at or beyond a threshold above
+`minimum_coverage`, since the policy radius alone does not say which
+candidates survive the coverage gate and a usable quarter turn does not
+register a pixel shift.
 A calibration whose reference already meets the obscured-scene threshold is
 refused too: every unchanged sample would look obscured and confirm a tamper
 that never happened. `CalibrationArchive` is a small append-only SQLite port: the Main
@@ -63,7 +65,10 @@ and at most once per tracked shift episode; source loss by itself stays
 before it is refused. The scene-difference measurement is a
 bounded scalar over background support points; it never describes who or what
 is in view. The core records neutral observation provenance and offers
-`CriticalDelivery` for bounded, explicit local handoff. A later runtime owns
+`CriticalDelivery` for bounded, explicit local handoff; its staging holds at
+least `MAXIMUM_BATCH` observations, because one confirmed sample can carry a
+server movement and a camera tamper together and a batch that never fits could
+not make progress by retrying. A later runtime owns
 durable events, recording preservation, and configured notifications, which
 must remain armed in every presence state.
 

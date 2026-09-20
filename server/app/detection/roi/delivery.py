@@ -3,7 +3,13 @@
 from dataclasses import dataclass
 from typing import Protocol
 
-from .contracts import CriticalObservation
+from .contracts import CriticalKind, CriticalObservation
+
+
+# A single confirmed sample can produce one observation per critical kind, so
+# staging smaller than that could never accept a whole batch: it would refuse
+# the batch before any recorder ran and could not progress by retrying it.
+MAXIMUM_BATCH = len(CriticalKind)
 
 
 class CriticalRecorder(Protocol):
@@ -28,14 +34,17 @@ class CriticalDelivery:
     """Finite local retry staging; capture and recording remain independent.
 
     A caller must drain/check capacity before running another detector tick.
+    Capacity is at least `MAXIMUM_BATCH`, so a batch from one sample is always
+    admissible when the staging is drained and backpressure only ever reflects
+    undelivered evidence rather than a size a caller can never satisfy.
     Refusing a new batch is explicit backpressure, never silent evidence loss.
     Process durability starts only when the injected recorder accepts the UUID;
     pending data must be preserved by the Main runtime during shutdown.
     """
 
     def __init__(self, *, capacity: int, recorder: CriticalRecorder | None = None):
-        if type(capacity) is not int or capacity < 1:
-            raise ValueError("positive critical staging capacity required")
+        if type(capacity) is not int or capacity < MAXIMUM_BATCH:
+            raise ValueError("critical staging must hold a full detector batch")
         self.capacity, self.recorder = capacity, recorder
         self._pending = {}
 

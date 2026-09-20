@@ -11,8 +11,9 @@ from uuid import UUID
 from app.cameras.registry.models import SourceType
 from app.detection.foundation import GrayFrame, Observation, Quality
 from app.detection.roi import (
-    Calibration, CalibrationArchive, CalibrationRecord, CriticalDelivery,
-    CriticalKind, OwnerCalibrationOperations, Policy, SceneDetector,
+    MAXIMUM_BATCH, Calibration, CalibrationArchive, CalibrationRecord,
+    CriticalDelivery, CriticalKind, OwnerCalibrationOperations, Policy,
+    SceneDetector,
 )
 from app.storage.migrations import migrate
 from app.storage.schema import APPLICATION_MIGRATIONS
@@ -228,6 +229,11 @@ class SceneDetectorTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             detector(rules=policy(minimum_coverage=1))
 
+    def test_a_usable_rotation_does_not_satisfy_a_translation_threshold(self):
+        rules = policy(minimum_coverage=1, global_quarter_turns=(0, 2))
+        with self.assertRaises(ValueError):
+            detector(rules=rules)
+
     def test_low_margin_match_stays_indeterminate_instead_of_confirming_tamper(self):
         rules = policy(camera_shift_pixels=2, minimum_coverage=.5)
         instance = detector(rules=rules, reference=repetitive())
@@ -402,6 +408,26 @@ class CalibrationAndDeliveryTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             CalibrationArchive(connection)
 
+    def test_delivery_staging_admits_a_whole_detector_batch(self):
+        shifted = transformed(pixels(), (1, 0))
+        both = transformed(shifted, (1, 0), region=(5, 4, 9, 8))
+        instance = detector()
+        inspect_scene(instance, frame(0), 0)
+        inspect_scene(instance, frame(1, both), 10)
+        batch = inspect_scene(instance, frame(2, both), 20).critical
+        self.assertEqual({CriticalKind.SERVER_MOVEMENT, CriticalKind.CAMERA_TAMPER},
+                         {item.kind for item in batch})
+        self.assertEqual(MAXIMUM_BATCH, len(batch))
+        with self.assertRaises(ValueError):
+            CriticalDelivery(capacity=MAXIMUM_BATCH - 1)
+        recorded = []
+        delivery = CriticalDelivery(capacity=MAXIMUM_BATCH, recorder=recorded.append)
+        state = delivery.submit(batch)
+        self.assertTrue(state.available)
+        self.assertEqual({item.identifier for item in batch}, set(state.accepted))
+        self.assertEqual({item.identifier for item in batch},
+                         {item.identifier for item in recorded})
+
     def test_critical_delivery_requires_confirmed_events_and_never_discards_failure(self):
         instance = detector()
         dark = bytes(WIDTH * HEIGHT)
@@ -415,7 +441,7 @@ class CalibrationAndDeliveryTests(unittest.TestCase):
             if len(calls) == 1:
                 raise RuntimeError("synthetic outage")
 
-        delivery = CriticalDelivery(capacity=1, recorder=failing_once)
+        delivery = CriticalDelivery(capacity=MAXIMUM_BATCH, recorder=failing_once)
         state = delivery.submit((event,))
         self.assertFalse(state.available)
         self.assertEqual((event.identifier,), state.pending)

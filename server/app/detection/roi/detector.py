@@ -111,9 +111,15 @@ class SceneDetector:
         self.tamper = _Confirmation()
 
     def _reachable(self, points, transforms, center, threshold, reference):
-        """Does a candidate at or beyond the threshold survive the coverage gate?"""
+        """Does a translating candidate at the threshold survive the coverage gate?
+
+        A usable rotation does not substitute for one. The threshold is a pixel
+        displacement, so if every translation of that size fails the coverage
+        gate, a real shift stays unregistered however many quarter turns are
+        configured.
+        """
         for transform in transforms:
-            if transform.rotated == 0 and transform.dx ** 2 + transform.dy ** 2 < threshold ** 2:
+            if transform.dx ** 2 + transform.dy ** 2 < threshold ** 2:
                 continue
             if coverage(points, transform, center, reference.width,
                         reference.height) >= self.policy.minimum_coverage:

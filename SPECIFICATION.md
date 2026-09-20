@@ -610,8 +610,9 @@ API, retain decoded media, make a presence decision, or issue a notification.
 A calibration policy whose bounded search window cannot reach its own movement
 or camera-shift threshold is refused: such a configuration cannot express the
 displacement it asks to detect and would report a matching geometry instead. A
-calibration is refused as well when its own support leaves no
-threshold-reaching candidate above the coverage minimum, or when its reference
+calibration is refused as well when its own support leaves no translating
+candidate at or beyond a threshold above the coverage minimum, since a quarter
+turn does not register a pixel shift, or when its reference
 already meets the obscured-scene threshold, since every unchanged sample would
 then confirm a tamper that never happened.
 
@@ -641,7 +642,10 @@ absence, because its untransformed difference is large even when the
 registered transform is small. Trusted source loss becomes critical
 only when it occurs within the configured interval after a recorded global
 scene shift, and at most once per tracked shift episode; uncorrelated or
-untrusted loss stays `unknown`. A later runtime must durably handle a confirmed critical observation
+untrusted loss stays `unknown`. One confirmed sample may carry both a server
+movement and a camera tamper, so local critical staging always admits a whole
+batch rather than refusing evidence a caller could never resubmit.
+A later runtime must durably handle a confirmed critical observation
 for evidence preservation and configured notifications in every presence state.
 Synthetic tests do not establish physical-camera, lighting, pose, or
 source-health behavior.
