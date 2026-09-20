@@ -119,7 +119,17 @@ export function TimelineBody({ page, filter, t, onFilter, onMore, loadingMore, c
 type State = { state: 'pending' } | { state: 'loading' } | { state: 'failed' }
   | { state: 'ready'; page: TimelinePage; complete: boolean; more: boolean; moreFailed: boolean };
 
-/** Pages concatenate in receipt order; a page without items ends the window. */
+/** The window ends when the core stops offering a cursor that moves forward.
+ *
+ * An empty page is not itself an end: the core echoes the cursor it was given
+ * when it returns no rows, so only a cursor that did not advance ends paging.
+ */
+export function cursorAdvanced(sent: TimelineCursor | null, next: TimelineCursor | null): boolean {
+  if (next === null) return false;
+  return sent === null || sent.received_at !== next.received_at || sent.sequence !== next.sequence;
+}
+
+/** Pages concatenate in receipt order. */
 function extend(previous: TimelinePage, next: TimelinePage): TimelinePage {
   const seen = new Set(previous.items.map(item => item.id));
   return {
@@ -168,7 +178,7 @@ export function TimelineScreen({ services, t }: { services: DashboardServices; t
         const next = await load(controller.signal, cursor);
         setData({
           state: 'ready', page: extend(data.page, next), more: false, moreFailed: false,
-          complete: next.items.length === 0 || next.next_cursor === null,
+          complete: !cursorAdvanced(cursor, next.next_cursor),
         });
       } catch {
         // Keep the history already loaded and leave the retry path in place.

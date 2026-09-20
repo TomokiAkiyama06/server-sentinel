@@ -10,7 +10,7 @@ await compile('src/views/timeline.tsx', 'build/timeline.mjs');
 await compile('src/views/presence.tsx', 'build/presence.mjs');
 const { canVisit, views } = await import('../build/domain.mjs');
 const { messages } = await import('../build/i18n.mjs');
-const { TimelineBody, detectorObservation, displayValue, filters, kindGroup, matches, spans } = await import('../build/timeline.mjs');
+const { TimelineBody, cursorAdvanced, detectorObservation, displayValue, filters, kindGroup, matches, spans } = await import('../build/timeline.mjs');
 const { PresenceBody, refreshDelay } = await import('../build/presence.mjs');
 
 // Synthetic only: no real person, deployment, camera or identity value appears here.
@@ -164,6 +164,18 @@ test('older history stays reachable while a cursor is offered', () => {
   assert.match(exhausted, /この期間の観測をすべて読み込みました。/);
   // Without a provider there is no load-more affordance at all.
   assert.doesNotMatch(timeline(page(items)), /古い観測をさらに読み込む/);
+});
+
+test('paging continues while the cursor advances, including over an empty page', () => {
+  const sent = { received_at: '2026-09-21T09:00:01.000000+00:00', sequence: 4 };
+  // An empty intermediate page that still moves the cursor keeps older history reachable.
+  assert.equal(cursorAdvanced(sent, { received_at: '2026-09-21T09:30:00.000000+00:00', sequence: 9 }), true);
+  assert.equal(cursorAdvanced(sent, { received_at: sent.received_at, sequence: 9 }), true);
+  // The core echoes the cursor it was given when it has no rows: that ends paging.
+  assert.equal(cursorAdvanced(sent, { ...sent }), false);
+  assert.equal(cursorAdvanced(sent, null), false);
+  assert.equal(cursorAdvanced(null, null), false);
+  assert.equal(cursorAdvanced(null, sent), true);
 });
 
 test('degraded timing is reported per span and never presented as ordering certainty', () => {
