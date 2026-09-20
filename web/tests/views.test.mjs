@@ -90,6 +90,32 @@ test('unreliable or unavailable results stay unknown instead of becoming a negat
   assert.equal(displayValue(observation('camera_health', { value: 'offline', quality: 'unknown' })), 'offline');
 });
 
+test('low-quality person and owner observations are not presented as factual results', () => {
+  for (const kind of ['person', 'owner_entry', 'owner_exit', 'anonymous_entry', 'anonymous_exit']) {
+    for (const quality of ['insufficient', 'unknown']) {
+      const item = observation(kind, { value: 'observed', quality, confidence: 0.3 });
+      assert.equal(displayValue(item), 'unknown');
+      assert.match(timeline(page([item])), /判定できません/);
+    }
+    assert.equal(displayValue(observation(kind, { value: 'observed', quality: 'sufficient' })), 'observed');
+  }
+  // Device and recording states keep their reported value; quality is shown beside it.
+  assert.equal(displayValue(observation('node_health', { value: 'offline', quality: 'unknown', source_id: null, node_id: '00000000-0000-4000-8000-0000000012ef' })), 'offline');
+  assert.equal(displayValue(observation('recording', { value: 'failed', quality: 'unknown' })), 'failed');
+});
+
+test('ordering statement follows ordering_basis and the warning follows ordering_degraded', () => {
+  const item = observation('motion');
+  const received = timeline(page([item], { ordering_basis: 'received_at', ordering_degraded: false }));
+  assert.match(received, /受信順で表示しています。/);
+  assert.doesNotMatch(received, /観測時刻順で表示しています。|時刻ずれまたは不連続が報告されています。/);
+  const occurred = timeline(page([item], { ordering_basis: 'occurred_at', ordering_degraded: true }));
+  assert.match(occurred, /観測時刻順で表示しています。/);
+  assert.match(occurred, /時刻ずれまたは不連続が報告されています。/);
+  assert.doesNotMatch(occurred, /受信順で表示しています。/);
+  assert.doesNotMatch(timeline(page([item])), /時刻ずれまたは不連続が報告されています。/);
+});
+
 test('degraded timing is reported per span and never presented as ordering certainty', () => {
   const trusted = [observation('motion'), observation('motion')];
   const skewed = observation('motion', { clock_trusted: false, received_at: '2026-09-21T09:05:00.000000+00:00' });
@@ -170,6 +196,15 @@ test('manual override reports precedence, expiry and a cancel affordance', () =>
   const open = presence({ snapshot: snapshot({ basis: 'manual_override' }), transitions: [] }, 'ja', { onCancel: () => undefined });
   assert.match(open, /期限なし（取り消すまで有効）/);
   assert.match(presence({ snapshot: snapshot(), transitions: [] }), /手動上書きはありません。/);
+});
+
+test('an unarmed critical protection replaces the continuity statement with an alert', () => {
+  for (const flag of ['critical_detection_armed', 'critical_evidence_armed', 'critical_notifications_armed']) {
+    const markup = presence({ snapshot: snapshot({ [flag]: false }), transitions: [] });
+    assert.doesNotMatch(markup, /すべての状態で継続します。/);
+    assert.match(markup, /<p class="timeline-degraded" role="alert">critical 対応の一部が継続中であると確認できていません。/);
+    assert.match(markup, /未確認/);
+  }
 });
 
 test('degraded clock and pending critical work stay visible on presence', () => {

@@ -17,6 +17,9 @@ export function PresenceBody({ report, t, onCancel, failed }: {
 }) {
   const snapshot: PresenceSnapshot = report.snapshot;
   const override = snapshot.basis === 'manual_override';
+  // Report the invariant only while every critical protection is actually armed.
+  const armed = snapshot.critical_detection_armed && snapshot.critical_evidence_armed
+    && snapshot.critical_notifications_armed;
   return <section className="presence-screen">
     <section className={`presence-state presence-${snapshot.state}`} aria-label={t.presenceCurrent}>
       <p className="eyebrow">{t.presenceCurrent}</p>
@@ -35,9 +38,10 @@ export function PresenceBody({ report, t, onCancel, failed }: {
       {override && !onCancel && <p className="muted">{t.foundation}</p>}
       {failed && <p role="alert">{t.overrideFailed}</p>}
     </section>
-    <section className="presence-automation" aria-label={t.criticalArmed}>
+    <section className="presence-automation" aria-label={t.armedNotification}>
       <p>{snapshot.suppress_ordinary ? t.suppressOn : t.suppressOff}</p>
-      <p>{t.criticalArmed}</p>
+      {armed ? <p>{t.criticalArmed}</p>
+        : <p className="timeline-degraded" role="alert">{t.criticalNotArmed}</p>}
       <dl className="presence-armed-list">
         <Armed label={t.armedDetection} armed={snapshot.critical_detection_armed} t={t} />
         <Armed label={t.armedEvidence} armed={snapshot.critical_evidence_armed} t={t} />

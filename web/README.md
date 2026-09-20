@@ -37,14 +37,19 @@ the backend or ingest listener.
 
 `src/views/timeline.tsx` lists one observation per row with its time, kind dot,
 neutral text, source/detector attribution and confidence/quality. Unreliable or
-unavailable results stay `unknown` and are never shown as "no person". Clock
-skew or timestamp discontinuity is reported per span and by an ordering notice;
+unavailable results stay `unknown`: a quality-gated negative is never shown as
+"no person", and a low-quality person/owner/anonymous observation is never shown
+as a factual detection. The ordering statement follows `ordering_basis` while
+`ordering_degraded` adds the warning. Clock skew or timestamp discontinuity is
+reported per span and by that ordering notice;
 the UI does not present that order as established causality, cause or
 culpability. A kind filter selects all, people/motion, critical, device and
 recording, or configuration entries. `src/views/presence.tsx` shows the current
 state, its basis, manual-override expiry and cancel affordance, the fact that
-only `PRESENT` suppresses ordinary occupancy automation, that critical work
-continues in every state, and today's transitions.
+only `PRESENT` suppresses ordinary occupancy automation, and today's
+transitions. The critical-continuity statement is shown only while every
+reported `critical_*_armed` flag is true; otherwise the screen raises a degraded
+alert instead of reassuring the Owner.
 
 `canVisit()` keeps the timeline with `recordings:view` and presence with the
 Owner. This remains UI projection only: the production entry still denies

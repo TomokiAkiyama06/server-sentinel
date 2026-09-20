@@ -18,9 +18,13 @@ export function matches(filter: TimelineFilter, kind: ObservationKind): boolean 
   return filter === 'all' || kindGroup[kind] === filter;
 }
 
-/** An unreliable or unavailable result stays unknown; it never becomes a negative. */
+const identityKinds: readonly ObservationKind[] = ['person', 'owner_entry', 'owner_exit',
+  'anonymous_entry', 'anonymous_exit'];
+
+/** Unreliable results stay unknown: never a negative, never a factual person result. */
 export function displayValue(item: Observation): ObservationValue {
-  return item.value === 'not_observed' && item.quality !== 'sufficient' ? 'unknown' : item.value;
+  if (item.quality === 'sufficient') return item.value;
+  return item.value === 'not_observed' || identityKinds.includes(item.kind) ? 'unknown' : item.value;
 }
 
 export function untrusted(item: Observation): boolean {
@@ -80,7 +84,8 @@ export function TimelineBody({ page, filter, t, onFilter }: {
     <p className="muted">{t.utcNote} {t.confidenceCaveat}</p>
     <p className={page.ordering_degraded ? 'timeline-notice timeline-notice-degraded' : 'timeline-notice'}
       role={page.ordering_degraded ? 'status' : undefined}>
-      {page.ordering_degraded ? t.orderingDegraded : t.orderingTrusted}
+      {page.ordering_basis === 'received_at' ? t.orderingReceived : t.orderingOccurred}
+      {page.ordering_degraded ? ` ${t.orderingDegraded}` : ''}
     </p>
     <div className="timeline-filter" role="group" aria-label={t.filter}>
       {filters.map(name => <button key={name} type="button" aria-pressed={filter === name}
