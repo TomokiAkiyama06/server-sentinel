@@ -129,7 +129,7 @@ inside one guarded transaction under a service-global lock, and each recovery
 step is attempted independently. Root-only environment construction uses an
 isolated, root-controlled Python interpreter from a fixed working directory and
 sanitized environment. The native lifecycle is the only implemented Main Server
-deployment path (ADR-0003, `REQUIREMENTS.md` DIST-005/DIST-006). Exact commands
+deployment path (ADR-0005, `REQUIREMENTS.md` DIST-005/DIST-006). Exact commands
 and limitations are in `server/docs/DEPLOYMENT.md`.
 
 No Docker Compose path is currently implemented or advertised. A future Compose

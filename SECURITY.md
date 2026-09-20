@@ -89,7 +89,7 @@ acceptance remain open in #4.
 ## Main Server release and installer trust boundary
 
 The stable Main Server deployment path is the native versioned release lifecycle
-in ADR-0003 and [`server/docs/DEPLOYMENT.md`](server/docs/DEPLOYMENT.md). No
+in ADR-0005 and [`server/docs/DEPLOYMENT.md`](server/docs/DEPLOYMENT.md). No
 Docker Compose path is implemented or advertised.
 
 Privilege assumptions:
