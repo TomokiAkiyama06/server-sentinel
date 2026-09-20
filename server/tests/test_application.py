@@ -28,6 +28,17 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
             with closing(self.application.state.database.connect()) as connection:
                 self.assertEqual(connection.execute("SELECT count(*) FROM schema_migrations").fetchone()[0],
                                  len(APPLICATION_MIGRATIONS))
+                # The health and integrity workers are constructed after
+                # application startup.  Their durable journals must already
+                # exist in the production migration catalog, not only in
+                # isolated feature tests.
+                tables = {row[0] for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )}
+                self.assertTrue({
+                    "recording_selftest", "integrity_baseline", "integrity_audit",
+                    "integrity_status", "integrity_outbox", "integrity_overflow",
+                } <= tables)
             registry = CameraRegistry(self.application.state.database)
             source = registry.create_source(source_type=SourceType.LOCAL_UVC, name="Synthetic", enabled=True)
             self.assertEqual(source, registry.get_source(source.id))

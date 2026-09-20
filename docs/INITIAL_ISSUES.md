@@ -860,6 +860,12 @@ Acceptance:
 
 ## Plan 19A — Main-host hardware integrity + recording-health self-test
 
+Implementation foundation: `server/app/integrity/` and `server/app/media/health/`
+provide synthetic-tested probes/comparison, denied-by-default baseline approval,
+local fault persistence, daily coordinators and recorder-owned temporary I/O.
+Issue #23 remains OPEN for authorization, production codec/notification wiring
+and Main-host acceptance; no actual inventory/media test is claimed.
+
 GitHub Issue: [#23](https://github.com/TomokiAkiyama06/server-sentinel/issues/23)
 
 Depends on: [#21](https://github.com/TomokiAkiyama06/server-sentinel/issues/21), [#18](https://github.com/TomokiAkiyama06/server-sentinel/issues/18), [#10](https://github.com/TomokiAkiyama06/server-sentinel/issues/10)
