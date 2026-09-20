@@ -399,8 +399,12 @@ Progressively degrade lighting/blur/visibility.
 
 Use only the deployment owner's own enrollment during manual testing. Never upload enrollment/reference images or real-person result clips to GitHub.
 
+Issue #25 currently validates private local persistence, authorization/generation/quality boundaries and no-egress normal/error smoke with generated shapes and a synthetic verifier only. No production face model/weights/threshold is selected. Keep all real-model/Owner/room checks below open; record the Owner-approved code/weights/license/artifact/threshold decision locally before enabling the adapter.
+
 - [ ] explicit biometric explanation;
 - [ ] owner enroll/delete/re-enroll;
+- [ ] re-enrollment/deletion invalidates old and in-flight match receipts; shared/general diagnostics and explicit Owner exports never include the private template DB/journals/backups;
+- [ ] separate face crops in one frame each need their own sufficient quality assessment; one clear face cannot lend its quality to another blurred/dark face;
 - [ ] poor enrollment image rejected/retried;
 - [ ] template remains local and absent from logs/normal diagnostics;
 - [ ] normal frontal/angle/distance variations tested;
@@ -419,6 +423,7 @@ Where room geometry supports entrance logic:
 - [ ] multiple people close together;
 - [ ] partial occlusion;
 - [ ] reversal/loiter near line does not spam events;
+- [ ] crossing back within hysteresis and then walking around the finite line endpoint does not create a false entry; frame gaps/occlusion/session reset do not infer unseen crossings;
 - [ ] unknown people receive no real names;
 - [ ] no cross-camera biometric re-identification claim;
 

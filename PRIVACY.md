@@ -113,11 +113,15 @@ This is biometric processing. Therefore:
 - verification is probabilistic;
 - insufficient visual quality returns `unknown` rather than a forced match/non-match.
 
+The internal #25 store keeps one Owner template and local model provenance in a separate deployment-private database. Owner-authorized replacement/deletion advances its generation so previous templates/results are no longer accepted. Diagnostic snapshots expose only enrollment state and generation; the private database, journals and backups are excluded from all diagnostic exports, even explicit Owner exports. `secure_delete` is a logical database deletion aid, not a promise of forensic SSD/backup erasure. No face model/weights or external-biometric-service option is installed. Generated test adapters do not establish recognition accuracy.
+
 ## Other observed people
 
 The MVP must not enroll or name non-owner people or maintain persistent facial identity profiles for them, whether named or anonymous.
 
 Other people may receive anonymous/ephemeral track IDs for limited event correlation. Cross-camera biometric re-identification is outside MVP scope.
+
+The internal same-camera tracker retains only bounded transient positions and random session-local IDs. Quality tickets use weak references to the exact immutable candidate and do not retain extra crops or face fingerprints. Resetting a session clears tracking/verification receipts; the verifier must release candidate/intermediate data after success or failure. Neither anonymous IDs nor verification results create a persistent non-owner face library.
 
 The system must not label a person as thief, attacker, culprit, or cause merely because they appeared near a critical event.
 
