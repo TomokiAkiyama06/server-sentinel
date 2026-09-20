@@ -538,7 +538,7 @@ person/face candidate
    -> match / no-match / unknown
 ```
 
-Owner template/model metadata stays local; enrollment/delete/re-enroll require owner authorization; raw template is not logged/general-exported. Persistent non-owner face-template/profile libraries are prohibited whether named or anonymous; ordinary authorized video recordings remain distinct from such a library.
+Owner biometric processing, including face-crop analysis/comparison, and template/model metadata stay deployment-local. External biometric processing/storage is not an opt-in MVP option, and configured third-party media infrastructure does not authorize sending faces/crops to a biometric service. Enrollment/delete/re-enroll require owner authorization; raw template/embedding is never logged or included in diagnostic exports, including explicit Owner-initiated exports. Persistent non-owner face-template/profile libraries are prohibited whether named or anonymous; ordinary authorized video recordings remain distinct from such a library.
 
 ### 7.7 Anonymous tracking and entrance
 

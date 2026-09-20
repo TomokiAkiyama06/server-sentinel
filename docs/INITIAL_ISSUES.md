@@ -596,6 +596,7 @@ Acceptance:
 - enrollment/delete/re-enroll are Owner-only and audited; deleted/replaced templates are no longer used and raw biometrics stay out of ordinary diagnostics;
 - entry/exit requires suitable direction/geometry/quality; Owner entry/exit additionally requires sufficient verification quality and anonymous crossing never names the Owner;
 - templates/inference stay deployment-local; record model/version, code/weight license, pinned upstream artifact, and network/download behavior; final model/weights/threshold remain Owner decisions.
+- synthetic tests verify enrollment/verification/error/opt-in paths never send face images/crops/templates to external biometric services; all diagnostic export paths, including explicit Owner exports, exclude owner templates/embeddings; permitted media export is not a biometric-service exception.
 
 ## Plan 16 — Presence + unified factual timeline
 

@@ -221,7 +221,8 @@ Owner-only verification requirements:
 
 - raw owner template/embedding never logged;
 - normal settings/list APIs do not return raw biometric material;
-- normal diagnostics exclude raw biometric material;
+- owner biometric processing and template storage remain deployment-local; external biometric services are not an opt-in MVP option;
+- all diagnostic exports exclude owner templates/embeddings, including explicit Owner-initiated exports;
 - enrollment/replacement/deletion require owner authorization and are audited;
 - persistent non-owner face-template/profile libraries are prohibited, whether named or anonymous; ordinary authorized recordings may still contain people and are not a separate biometric identity library;
 - low-quality observation returns `unknown`, not a forced identity conclusion.

@@ -78,7 +78,7 @@ This is biometric processing. Therefore:
 - owner template/embedding and biometric processing stay inside the deployment;
 - template is not sent to the ServerSentinel developer;
 - enrollment can be deleted/replaced;
-- raw template is excluded from logs/normal diagnostics;
+- raw template/embedding is excluded from logs and all diagnostic exports, including explicit Owner-initiated exports;
 - verification is probabilistic;
 - insufficient visual quality returns `unknown` rather than a forced match/non-match.
 
@@ -132,7 +132,7 @@ If the owner enables Slack, configured event information/thumbnails may be sent 
 
 Diagnostics remain local unless explicitly exported/shared.
 
-Exports should redact/exclude credentials, pairing secrets, private keys, sensitive headers, owner biometric templates, and raw monitoring media unless the owner explicitly chooses otherwise.
+Exports redact/exclude credentials, pairing secrets, private keys, and sensitive headers. Owner biometric templates/embeddings are always excluded, including when the Owner explicitly initiates an export. Raw monitoring media is excluded unless the Owner explicitly selects it for export; that media exception does not authorize template/embedding export or external biometric processing/storage.
 
 ## Public repository safety
 
