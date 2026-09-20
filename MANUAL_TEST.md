@@ -314,6 +314,18 @@ Demand-driven processing:
 
 Use test identities/accounts appropriate for the deployment. ServerSentinel does **not** modify Tailscale ACLs/Grants or store Tailscale administrative credentials; any policy administration remains outside the application and existing policy may remain unchanged.
 
+### Shared Tailscale account
+
+The research-room Tailnet is shared, so run these with two people (or two browser profiles) using the **same** Tailscale login.
+
+- [ ] an invited person with a registered ServerSentinel credential passes authentication;
+- [ ] an uninvited person on the same Tailscale login and the same device is refused;
+- [ ] the refusal is the generic response: no product/version string, camera names/counts, recording or timeline data, or deployment metadata, and the credential prompt itself carries none of them;
+- [ ] a revoked person receives the same response as an uninvited person;
+- [ ] revoking one credential (one device) leaves the principal's other credentials working, and revoking the principal blocks all of them promptly;
+- [ ] no human route grants access on the proxy identity header alone;
+- [ ] record that reachability is expected for every holder of the shared account and is not treated as a finding.
+
 ### Uninvited ordinary Tailnet member
 
 - [ ] if existing Tailnet policy makes the Main Server node visible/reachable, document that fact rather than claiming node invisibility;

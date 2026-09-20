@@ -182,6 +182,17 @@ Do not trust arbitrary forwarded identity headers.
 
 If Tailscale Serve/equivalent provides authenticated identity headers, the backend accepts them only on a non-bypassable local trusted-proxy path. Requests from LAN/other interfaces cannot directly set such headers and gain identity.
 
+## Shared Tailnet account
+
+The research-room Tailnet uses one shared Tailscale account, so a verified identity header names the shared login rather than the person behind the request. Application authorization therefore rests on a ServerSentinel-issued per-person credential (WebAuthn/passkey as the default design target) created from an owner invitation and individually revocable.
+
+Consequences to keep in mind while reviewing code:
+
+- a route that authorizes on the proxy identity header alone grants access to everyone holding the shared account;
+- network reachability is not a boundary in this deployment; assume an uninvited person can reach every listener the shared account can reach;
+- the unauthenticated response, including the credential prompt, stays generic: no product/version strings, camera names or counts, recording or timeline data, or deployment metadata, and the same response for uninvited and revoked people;
+- approving a device is not identifying a person; a shared lab machine is used by whoever sits at it.
+
 ## Capture-node pairing
 
 Pairing credentials:

@@ -748,9 +748,11 @@ Tailscale provides private transport/reachability. ServerSentinel authorization 
 ```text
 Tailnet reachability
        +
-verified Tailscale/trusted-proxy identity
+verified Tailscale/trusted-proxy identity (account-level, supplementary)
        +
 ServerSentinel owner invitation
+       +
+verified ServerSentinel per-person credential
        +
 per-user permission
        =
@@ -758,6 +760,8 @@ application access
 ```
 
 Tailnet membership by itself grants no ServerSentinel application data.
+
+In this deployment the Tailnet account is shared by the research room, so "verified Tailscale/trusted-proxy identity" identifies the account the request arrived under, not the person. The ServerSentinel credential below is what identifies the person; see §11.8.
 
 ### 11.2 Tailnet policy is not managed by ServerSentinel
 
@@ -780,16 +784,30 @@ Logical model:
 ```text
 access_principal
 - id
-- external_identity (e.g. verified Tailscale login identity)
 - display_name
 - status: invited/active/revoked
 - created_at
+- revoked_at
+- external_identity (optional, supplementary: verified Tailscale login/device
+  as observed at authentication; not authoritative, see §11.8)
+
+principal_credential
+- id
+- principal_id
+- kind (default design target: WebAuthn/passkey)
+- label (owner-visible device label)
+- created_at
+- last_used_at
 - revoked_at
 
 principal_permission
 - principal_id
 - permission
 ```
+
+A principal is created by an owner invitation that carries a short-lived,
+single-use enrollment code; the invited person redeems it once to register a
+credential. Credentials are revocable individually and with the principal.
 
 Initial non-owner permissions:
 
@@ -827,6 +845,29 @@ This is not DRM. A user who can view video may still screen-record or use advanc
 ### 11.7 Revocation
 
 ServerSentinel permission revocation invalidates application access promptly. Tailnet membership/policy remains a separate Tailscale administrative concern.
+
+Revoking a single `principal_credential` (for example a lost or shared device) invalidates that credential only; revoking the `access_principal` invalidates all of its credentials and active sessions.
+
+### 11.8 Shared Tailnet account
+
+The research-room Tailnet uses one shared Tailscale account for cost reasons, so
+multiple people authenticate to Tailscale as the same login and any of them can
+add devices.
+
+Therefore:
+
+- application authorization is decided by the ServerSentinel credential
+  (`principal_credential`), not by the Tailscale login;
+- a verified proxy identity header may be recorded and may be required in
+  addition, but never substitutes for the credential check;
+- device-scoped approval is supplementary. A shared lab PC is used by whoever
+  sits at it, so device approval must not be described as identifying a person;
+- unauthenticated requests receive the §11.5 generic response. The response for
+  an uninvited person and for a revoked person is the same, and the
+  authentication prompt carries no product/version string, camera information,
+  or deployment metadata;
+- reachability guarantees nothing here: everyone with the shared account can
+  reach the listener, which is the expected state, not an incident.
 
 ## 12. Dashboard UI
 

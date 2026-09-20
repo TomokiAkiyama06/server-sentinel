@@ -1,258 +1,260 @@
-# AGENTS.md — Mandatory Rules for Coding Agents
+# AGENTS.md — Coding Agent 向け必須ルール
 
-This file is normative. Agents working in this repository MUST follow it unless the repository owner explicitly overrides a rule for a specific task.
+このファイルは規範文書です。このリポジトリで作業する agent は、リポジトリ所有者が特定のタスクについて明示的に上書きしない限り、本書に従わなければなりません。
 
 ## 1. Mission
 
-Build ServerSentinel as a free, self-hosted, privacy-first physical-security monitor consisting of:
+ServerSentinel を、無償・self-hosted・privacy-first の物理セキュリティ監視として構築します。構成は次のとおりです。
 
-- a main Ubuntu backend;
-- a React web dashboard;
-- a generic Camera Source layer;
+- main Ubuntu backend;
+- React web dashboard;
+- 汎用の Camera Source layer;
 - local UVC capture;
-- remote Linux `media-capture-agent` capture over a private LAN;
-- private phone/Mac/desktop live viewing for explicitly invited users.
+- private LAN 経由のリモート Linux `media-capture-agent` capture;
+- 明示的に招待された利用者による private な phone / Mac / desktop からの live 閲覧。
 
-The MVP supports 1–4 active video sources. It does not require an iPhone/browser to act as a camera source, a native iOS app, Apple Developer Program membership, or App Store distribution.
+MVP は 1〜4 の active video source を扱います。iPhone / browser を camera source にすること、native iOS app、Apple Developer Program 加入、App Store 配布は必要としません。
 
-## 2. Authoritative documents
+## 2. 権威ある文書
 
-Priority order:
+優先順位:
 
-1. explicit repository-owner instruction for the current task/Issue;
+1. 現在のタスク / Issue に対するリポジトリ所有者の明示的な指示;
 2. `REQUIREMENTS.md`;
 3. `SPECIFICATION.md`;
-4. accepted ADRs;
-5. this file;
-6. existing implementation.
+4. 承認済み ADR;
+5. 本ファイル;
+6. 既存実装。
 
-Ask the owner before inventing a security/privacy/biometric/access-control product decision.
+security / privacy / biometric / access-control に関する製品判断を独断で作らず、所有者に確認してください。
 
-## 3. Work/merge policy
+## 3. 作業・マージ方針
 
-For non-trivial changes:
+軽微でない変更では次の順序を守ります。
 
-1. map work to an Issue;
-2. branch from the intended base;
-3. implement/test/document;
-4. open/update PR;
-5. wait for CI;
-6. wait for Codex and Claude review of the current PR **HEAD against the current base/diff context**;
-7. fix blocking findings and resolve/respond to threads;
-8. rerun reviews after material HEAD/base changes;
-9. merge only when gates pass.
+1. 作業を Issue に対応付ける;
+2. 意図した base から branch を切る;
+3. 実装・テスト・文書化を行う;
+4. PR を作成・更新する;
+5. CI を待つ;
+6. **current HEAD を current base / diff context に対して** レビューした Codex と Claude の結果を待つ;
+7. blocking finding を修正し、スレッドに応答・解決する;
+8. HEAD / base が実質的に変わったらレビューを再実行する;
+9. すべての gate を通過した場合にのみマージする。
 
-Never commit directly to `main`.
+`main` へ直接コミットしないでください。
 
-Until Issue #4 hardens repository-level enforcement, same-repository write access is a trusted-maintainer capability and the merge actor manually verifies review provenance/current HEAD+base context.
+Issue #4 によるリポジトリレベルの強制が整うまでは、同一リポジトリへの write 権限は trusted maintainer の能力として扱い、マージ実行者がレビューの出所と current HEAD + base context を手動で確認します。
 
-## 4. Hardware-unavailable policy
+## 4. 実機が使えない場合の方針
 
-Use mocks, synthetic/generated fixtures, dependency injection, virtual sources, and transport mocks. Do not claim hardware/network/browser behavior was verified when it was not. Exact physical tests belong in `MANUAL_TEST.md`.
+mock、synthetic / 生成した fixture、dependency injection、仮想 source、transport mock を使ってください。検証していない hardware / network / browser の挙動を「確認済み」と記載してはいけません。実機での確認手順は `MANUAL_TEST.md` に置きます。
 
-## 5. Privacy/security invariants
+## 5. Privacy / security の不変条件
 
-Default invariants:
+既定の不変条件:
 
-- no developer-operated account/video service;
-- no telemetry/analytics/ads/tracking;
-- no developer relay for Slack;
-- no hidden data upload;
-- video-only monitoring in MVP;
-- owner face verification optional/local;
-- no named non-owner face database;
-- no cross-camera biometric re-identification;
-- no automatic culprit/guilt inference;
-- no public Internet dashboard exposure by default;
-- Tailnet membership alone never authorizes ServerSentinel;
-- ServerSentinel does not modify Tailscale ACLs/Grants or store Tailscale administrative credentials; existing Tailnet policy may remain unchanged;
-- do not promise concealment from Tailnet Owners/Admins or infrastructure administrators.
+- 開発者が運用する account / video service を持たない;
+- telemetry / analytics / 広告 / tracking を行わない;
+- Slack 用の開発者 relay を持たない;
+- 隠れたデータ送信を行わない;
+- MVP は video のみの監視;
+- owner の face verification は任意かつ local;
+- non-owner の名前付き顔データベースを作らない;
+- camera 横断の biometric re-identification を行わない;
+- 犯人性・有責性の自動推論を行わない;
+- 既定で dashboard を public Internet に公開しない;
+- Tailnet membership だけでは ServerSentinel を認可しない;
+- ServerSentinel は Tailscale ACL / Grants を変更せず、Tailscale の管理 credential を保持しない。既存の Tailnet policy は変更せずに使える;
+- Tailnet の Owner / Admin やインフラ管理者からの秘匿を約束しない。
 
-## 6. Secret/sensitive-data handling
+## 6. Secret / 機微データの扱い
 
-Never commit/log real:
+実物を commit / log してはいけません。
 
-- `.env` secrets;
-- Slack webhook/token;
-- Tailscale auth/admin key;
-- private keys/certificates;
-- private deployment IP/hostname/SSID/Tailnet values;
-- owner biometric templates/embeddings;
-- recordings or real-person/real-room monitoring media.
+- `.env` の secret;
+- Slack の webhook / token;
+- Tailscale の auth / admin key;
+- private key / 証明書;
+- private な deployment の IP / hostname / SSID / Tailnet 値;
+- owner の biometric template / embedding;
+- 録画、実在の人物・実際の部屋を写した監視 media。
 
-Repository/CI media fixtures MUST be synthetic/generated only. Publicly licensed real-person images are still not repository fixtures. External benchmark datasets may be used locally under their terms and never attached to GitHub PR/issues/actions artifacts.
+リポジトリ / CI の media fixture は synthetic / 生成物のみとします。公開ライセンスの実在人物画像であってもリポジトリ fixture にはしません。外部 benchmark dataset は各ライセンスの条件下で手元利用のみとし、GitHub の PR / Issue / Actions artifact へ添付しません。
 
-## 7. Camera Source invariants
+## 7. Camera Source の不変条件
 
-MVP source types:
+MVP の source type:
 
 - `local_uvc`;
-- `remote_agent`.
+- `remote_agent`。
 
-Rules:
+ルール:
 
-- system works with one active source;
-- default active limit four;
-- no fixed `front/rear` schema;
-- source type and role remain separate;
-- profiles configured per source;
-- `/dev/videoN` alone is not durable identity;
-- do not auto-bind an ambiguous identical non-serial UVC candidate after reconnect;
-- ambiguous reconnect => `manual_intervention_required` until explicit owner re-approval;
-- audio is not captured in MVP;
-- browser/iPhone camera capture is outside the current product scope; phone/Mac/desktop browsers are viewers.
+- active source が 1 台でも動作する;
+- 既定の active 上限は 4;
+- `front` / `rear` のような固定 schema を持たない;
+- source type と role は別概念として保つ;
+- profile は source ごとに設定する;
+- `/dev/videoN` だけでは durable identity にならない;
+- reconnect 後、serial を持たない同型 UVC の曖昧な候補を自動 bind しない;
+- 曖昧な reconnect は、owner の明示的な再承認まで `manual_intervention_required` とする;
+- MVP では audio を取得しない;
+- browser / iPhone camera capture は現在の product scope 外。phone / Mac / desktop browser は viewer とする。
 
-## 8. `media-capture-agent` invariants
+## 8. `media-capture-agent` の不変条件
 
-- service/process name: `media-capture-agent`;
-- no impersonation of unrelated system/vendor software;
-- no desktop UI/tray requirement;
-- normal runtime under dedicated non-root account;
-- capture video only in MVP;
-- agent initiates connection to main host;
-- one-time owner-approved pairing then revocable mutually authenticated encrypted identity;
-- capture-node credential grants no human/admin API rights;
-- agent does not need Tailscale when private LAN reachability exists;
-- agent health and camera health are separate;
-- capture ingest listener is separate from human dashboard listener;
-- main host does not SSH/admin into the capture machine merely to receive video;
-- agent keeps a compressed-video disk ring buffer; owner selects duration or capacity mode; unexpected Main Server loss protects T-10/T+10 minutes; protected incidents expire from the agent after 60 days by default.
+- service / process 名は `media-capture-agent`;
+- 無関係なシステム / ベンダーソフトウェアを騙らない;
+- desktop UI / tray を必須にしない;
+- 通常時は専用の非 root account で動作する;
+- MVP では video のみを capture する;
+- 接続は agent から main host へ開始する;
+- 一度きりの owner 承認による pairing の後、失効可能な相互認証付き暗号化 identity を用いる;
+- capture node の credential は human / admin API の権限を与えない;
+- private LAN で到達できるなら agent に Tailscale は不要;
+- agent health と camera health は別に扱う;
+- capture ingest listener と human dashboard listener を分離する;
+- 映像を受け取るためだけに main host から capture machine へ SSH / 管理接続しない;
+- agent は compressed video の disk ring buffer を持つ。owner が duration または capacity mode を選択し、Main Server との予期しない通信断では T-10 分 / T+10 分を保護する。保護した incident は既定 60 日で agent から失効する。
 
-## 9. Human-access invariants
+## 9. Human access の不変条件
 
-Human remote access has two independent gates:
+human remote access には独立した 2 つの gate があります。
 
-1. network-level private/Tailscale permission;
-2. ServerSentinel application invitation/permission.
+1. network レベルの private / Tailscale 許可;
+2. ServerSentinel application の invitation / permission。
 
-Initial non-owner permissions:
+初期の non-owner permission:
 
 ```text
 live:view
 recordings:view
 ```
 
-They are independent.
+これらは独立しています。
 
-Non-owner recording access is browser playback only in MVP; do not add a download/export route/button unless the owner explicitly changes the requirement. Do not claim browser playback prevents screen recording/client capture.
+MVP の non-owner recording access は browser playback のみです。所有者が要件を明示的に変更しない限り、download / export の route / button を追加しないでください。browser playback が画面録画や client 側の capture を防ぐとは説明しないでください。
 
-Historical timeline/event access is included with `recordings:view`; never expose it to `live:view` alone.
+historical timeline / event へのアクセスは `recordings:view` に含めます。`live:view` だけの相手へは決して公開しません。
 
-If trusted proxy/Tailscale identity headers are used, backend access to that listener must be non-bypassable from ordinary LAN clients.
+trusted proxy / Tailscale の identity header を使う場合、その listener への backend アクセスは通常の LAN client から迂回できないようにしてください。
 
-## 10. Detection invariants
+対象 deployment では研究室で 1 つの Tailscale account を共有するため、Tailscale login は account を示すだけで人を特定しません。application 認可は、ServerSentinel が発行する個人単位かつ個別に失効できる credential に依存させてください。Tailscale の identity / device 情報は補助的な扱いに留めます。proxy identity header だけで human route を認可しないこと、device の承認を人物の特定であるかのように説明しないことを守ってください。
 
-- person detection != server movement proof;
-- compensate global camera motion where relevant;
-- handle occlusion/temporal persistence;
-- confidence is not certainty;
-- image-quality gating is detector-specific;
-- if person detection cannot run reliably, result is `unknown`/unavailable, never a trustworthy `no person`;
-- low-quality owner verification => `unknown`;
-- no named non-owner identities;
-- timeline reports observations, not guilt/causality.
+## 10. Detection の不変条件
 
-## 11. Presence invariants
+- person detection は server movement の証明ではない;
+- 必要な場面では camera 全体の動きを補正する;
+- occlusion と時間方向の持続性を扱う;
+- confidence は確実性ではない;
+- image-quality gating は detector ごとに定める;
+- person detection を信頼できる形で実行できない場合の結果は `unknown` / 利用不可であり、信頼できる `no person` にしてはならない;
+- 品質の低い owner verification は `unknown` とする;
+- non-owner に名前付き identity を与えない;
+- timeline は観測を報告するものであり、有責性や因果を述べない。
 
-States: `PRESENT`, `PROBABLY_PRESENT`, `ABSENT`, `UNKNOWN`.
+## 11. Presence の不変条件
 
-Manual override has precedence. Only explicit/high-confidence `PRESENT` suppresses ordinary occupancy automation by default. Server movement/camera tamper remain armed in all states.
+状態: `PRESENT`、`PROBABLY_PRESENT`、`ABSENT`、`UNKNOWN`。
 
-## 12. Media/storage invariants
+manual override が優先されます。既定で通常の occupancy automation を抑制するのは、明示的または高信頼の `PRESENT` だけです。server movement / camera tamper の検知はすべての状態で動作し続けます。
 
-- capture, recording, inference, and viewer profiles are independent;
-- prefer compatible stream copy before unnecessary transcoding;
-- viewer-only processing should stop/scale down with zero subscribers;
-- remote viewers connect to the main host, never directly to capture agent;
-- default event target 30 s pre + 120 s post, max 20 min;
-- manual recording max 20 min;
-- use bounded compressed pre-roll where practical rather than long decoded-frame histories;
-- recording retention default 20 days;
-- audit retention default 90 days;
-- starred recordings never auto-delete;
-- preserve hard filesystem safety reserve;
-- explicit `STORAGE_PRESSURE` / `STORAGE_HARD_STOP`;
-- no silent healthy state during known loss/overload;
-- Agent media root is deployment-configured outside the repository; expected mount loss/substitution refuses unsafe writes and never silently creates a root-filesystem fallback;
-- Main Server compares an Owner-approved hardware baseline at startup and at least daily;
-- Main Server performs a recording-health self-test at least daily; changed/missing approved hardware or recording-health failures trigger immediate Owner notification.
+## 12. Media / storage の不変条件
 
-## 13. Dependency/model licenses
+- capture / recording / inference / viewer の profile は互いに独立;
+- 不要な transcode より、互換性のある stream copy を優先する;
+- subscriber が 0 のとき viewer 専用処理は停止・縮小する;
+- remote viewer は main host へ接続し、capture agent へ直接接続しない;
+- event の既定目標は前 30 秒 + 後 120 秒、最大 20 分;
+- manual recording の最大は 20 分;
+- 長時間の decoded frame history ではなく、実務上可能な範囲で bounded な compressed pre-roll を使う;
+- recording retention の既定は 20 日;
+- audit retention の既定は 90 日;
+- starred recording を自動削除しない;
+- filesystem の hard safety reserve を守る;
+- `STORAGE_PRESSURE` / `STORAGE_HARD_STOP` を明示する;
+- 既知の loss / overload の最中に healthy 状態を黙って表示しない;
+- Agent media root はリポジトリ外の deployment 設定で受け取る。想定 mount の消失・置換時は unsafe write を拒否し、root filesystem 上の代替を黙って作らない;
+- Main Server は owner 承認済みの hardware baseline を startup 時と最低 1 日 1 回比較する;
+- Main Server は最低 1 日 1 回 recording-health の self-test を行う。承認済み hardware の変更・欠落や self-test の失敗は、即時の Owner 通知を発生させる。
 
-Verify upstream, exact license, material transitive obligations, and pinning. For ML, review implementation code and model/weights separately.
+## 13. 依存・model の license
 
-Preferred: Apache-2.0, MIT, BSD-2/3-Clause, similarly permissive after review.
+upstream、正確な license、実質的な transitive 義務、pinning を確認してください。ML では実装コードと model / weights を別々にレビューします。
 
-Blocked by default without explicit owner approval: AGPL, incompatible GPL obligations, SSPL, BSL/source-available/non-OSI, ambiguous licensing.
+推奨: Apache-2.0、MIT、BSD-2/3-Clause、レビュー後に同等とみなせる permissive license。
 
-YOLOX is an initial person-detector evaluation candidate only. Owner face-verification model/weights need separate review.
+所有者の明示的な承認なしには既定で不可: AGPL、両立しない GPL 義務、SSPL、BSL / source-available / 非 OSI、ライセンスが曖昧なもの。
 
-## 14. Destructive-operation policy
+YOLOX は person detector の初期評価候補に過ぎません。owner face verification の model / weights は別途レビューが必要です。
 
-Without explicit owner approval never:
+## 14. 破壊的操作の方針
 
-- wipe/format disks;
-- delete all recordings/database/tables;
-- destroy data-bearing volumes;
-- disable firewall globally or expose service publicly;
-- modify Tailscale Grants/ACLs using administrative credentials;
-- rotate unrelated credentials;
-- change SSH rules that could lock out owner;
-- force-push protected/shared history.
+所有者の明示的な承認なしに次を行わないでください。
 
-## 15. Logging/API rules
+- disk の消去 / format;
+- すべての録画 / データベース / テーブルの削除;
+- データを保持する volume の破棄;
+- firewall の全面無効化やサービスの公開;
+- 管理 credential を用いた Tailscale Grants / ACL の変更;
+- 無関係な credential の rotate;
+- 所有者を締め出しうる SSH 設定の変更;
+- 保護された / 共有された履歴への force-push。
 
-Do not log raw pairing credentials, agent keys/certs, Tailscale/Slack secrets, biometric templates, sensitive headers, or media content.
+## 15. Logging / API のルール
 
-Every media/API route enforces server-side authorization. Capture ingest accepts only agent protocol actions. Human UI routes are not reachable through the ingest listener.
+raw な pairing credential、agent の key / 証明書、Tailscale / Slack の secret、biometric template、機微な header、media の内容を log に出さないでください。
 
-## 16. Testing
+すべての media / API route は server 側で認可を強制します。capture ingest は agent protocol の action だけを受け付けます。human UI の route は ingest listener から到達できません。
 
-As applicable cover:
+## 16. テスト
 
-- 1–4 source topology;
-- local UVC stable identity/reconnect;
-- ambiguous identical non-serial camera reconnect;
-- agent pairing/revocation/mTLS;
-- agent-online/camera-offline separation;
+該当する範囲で次を扱います。
+
+- 1〜4 source の topology;
+- local UVC の安定した identity と reconnect;
+- serial を持たない同型 camera の曖昧な reconnect;
+- agent の pairing / 失効 / mTLS;
+- agent online と camera offline の分離;
 - clock skew;
-- LAN interruption/backpressure;
-- phone/Mac live viewing;
-- Tailscale/private reachability + ServerSentinel application authorization;
-- `live:view` vs `recordings:view` isolation, including historical timeline only with `recordings:view`;
-- duration/capacity ring-buffer modes, T-10/T+10 protection, 60-day default expiry, and agent disk pressure;
-- detector-specific quality gate including person false-negative prevention;
-- owner verification/anonymous tracking/presence;
+- LAN の中断と backpressure;
+- phone / Mac からの live 閲覧;
+- Tailscale / private 到達性と ServerSentinel application 認可;
+- `live:view` と `recordings:view` の分離（historical timeline が `recordings:view` でのみ見えることを含む）;
+- duration / capacity の ring-buffer mode、T-10 / T+10 の保護、既定 60 日の失効、agent の disk pressure;
+- detector ごとの quality gate（person の false negative 防止を含む）;
+- owner verification / anonymous tracking / presence;
 - storage pressure;
-- migrations/mock E2E.
+- migration と mock E2E。
 
-## 17. Documentation discipline
+## 17. 文書の更新規律
 
-When behavior changes update:
+挙動が変わったら次を更新します。
 
-- `REQUIREMENTS.md` — product decisions;
-- `SPECIFICATION.md` — technical contracts;
-- ADR — architectural decisions;
-- `MANUAL_TEST.md` — real-hardware/network/browser checks;
-- `SECURITY.md` / `PRIVACY.md` — security/data behavior;
-- `docs/INITIAL_ISSUES.md` / `ROADMAP.md` — implementation sequence.
+- `REQUIREMENTS.md` — 製品判断;
+- `SPECIFICATION.md` — 技術契約;
+- ADR — アーキテクチャ上の決定;
+- `MANUAL_TEST.md` — 実機 / network / browser の確認;
+- `SECURITY.md` / `PRIVACY.md` — security / データの挙動;
+- `docs/INITIAL_ISSUES.md` / `ROADMAP.md` — 実装順序。
 
-## 18. Stop conditions
+## 18. 停止条件
 
-Stop and request explicit owner decision before:
+次を行う前に作業を止め、所有者の明示的な判断を求めてください。
 
-- developer-hosted cloud;
-- analytics/ads/payment;
-- project license change;
-- incompatible/uncertain dependency/model license;
-- default public Internet exposure;
-- weakening two-gate access control or capture-node authentication;
-- automatically storing powerful Tailscale admin credentials;
-- collecting audio;
-- enrolling/naming non-owner faces;
-- cross-camera biometric re-identification;
-- automatic culprit/guilt inference;
-- introducing browser/iPhone camera capture without a new explicit product decision/ADR;
-- adding a non-owner recording download/export function;
-- changing the established `recordings:view` -> historical timeline permission mapping without owner approval;
-- weakening the 10-minute pre/10-minute post agent protection or 60-day default agent expiry without owner approval.
+- 開発者が hosting する cloud の導入;
+- analytics / 広告 / 決済の導入;
+- プロジェクト license の変更;
+- 両立しない、または不確かな依存 / model license の採用;
+- 既定での public Internet 公開;
+- 2 段階の access control や capture node 認証の弱体化;
+- 強力な Tailscale admin credential の自動保存;
+- audio の収集;
+- non-owner の顔の登録・命名;
+- camera 横断の biometric re-identification;
+- 犯人性・有責性の自動推論;
+- 新たな明示的 product decision / ADR なしの browser / iPhone camera capture の導入;
+- non-owner 向け録画 download / export 機能の追加;
+- 確立した `recordings:view` → historical timeline の permission 対応を所有者承認なしに変更すること;
+- agent の 前 10 分 / 後 10 分 保護や既定 60 日失効を所有者承認なしに弱めること。

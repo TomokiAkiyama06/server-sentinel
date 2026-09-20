@@ -375,6 +375,8 @@ ServerSentinel checks an owner-managed invitation/allowlist before serving dashb
 ### AUTH-005 Trusted Tailscale identity path
 When Tailscale Serve or an equivalent trusted proxy supplies user identity, the backend accepts those identity headers only from the trusted local proxy path. The dashboard/API should bind to loopback or another non-bypassable local boundary so arbitrary LAN clients cannot spoof proxy identity headers.
 
+A verified proxy identity header states which Tailscale login the request arrived under. Per AUTH-011 it does not by itself state which person is making the request, so it shall not be the sole basis for application authorization.
+
 ### AUTH-006 Granular invited-user permissions
 At minimum support independent permissions:
 - `live:view` — browser live view and current source health needed for live viewing;
@@ -395,6 +397,19 @@ Application permission revocation shall invalidate active ServerSentinel authori
 When an ordinary Tailnet user is not invited in ServerSentinel, the application shall minimize disclosure that ServerSentinel is running. Unauthorized responses should be generic/non-branding (for example not-found style), and shall not expose ServerSentinel product/version strings, camera/source counts, API schemas, health details, thumbnails, recordings, timeline data, or other deployment metadata.
 
 This is application-level non-disclosure only. With unchanged Tailscale policy, the existence/reachability of the underlying Tailscale node or listening service cannot be guaranteed hidden.
+
+### AUTH-011 Shared Tailnet account deployments
+The target deployment shares a single Tailscale account across the research room to reduce Tailscale cost. Several people sign in to the Tailnet with the same Tailscale login, and any of them can enroll additional devices.
+
+Consequences for this product:
+
+- Tailscale login identity shall **not** be the authoritative application principal, because it cannot distinguish invited people from uninvited people in this deployment;
+- ServerSentinel shall issue and verify its own per-person credential, created from an owner invitation and individually revocable. WebAuthn/passkey is the default design target unless an ADR selects an equivalent mechanism;
+- verified Tailscale login/device information may be used only as a supplementary signal (for example logging or an additional restriction), never as the only check;
+- device-scoped approval may be offered in addition, but the product shall not claim that approving a device identifies a person; a shared or borrowed device is used by whoever holds it;
+- network reachability is not a boundary in this deployment: anyone holding the shared account can reach the node, so every human route depends on the application credential;
+- an authenticated session shall remain bound to one principal, and revoking a principal or one of its credentials shall take effect promptly per AUTH-009;
+- before authentication succeeds the application responds per AUTH-010, and an uninvited person and a revoked person receive the same response.
 
 ## 14. Dashboard requirements
 
