@@ -93,13 +93,19 @@ class ReleaseLifecycleTests(unittest.TestCase):
             values.update(artifact=artifact, sha256=digest, python=Path(sys.executable))
         return argparse.Namespace(**values)
 
-    def perform(self, arguments, *, mount=True):
+    def perform(self, arguments, *, mount=True, root_device=None):
         account = pwd.getpwuid(self.uid)
+        if root_device is None:
+            # The fixture's temporary runtime directory ordinarily shares the
+            # test runner's filesystem.  Model the separately mounted runtime
+            # volume that a real installation requires.
+            root_device = self.runtime.stat().st_dev + 1
         with patch("install.os.geteuid", return_value=0), patch(
                 "install._protected_parent"), patch(
                 "install._trusted_python", side_effect=lambda path: path.resolve()), patch(
                 "install._installed_unit", side_effect=lambda path: path.read_text()), patch(
                 "app.deployment.os.path.ismount", return_value=mount), patch(
+                "app.deployment._operating_system_root_device", return_value=root_device), patch(
                 "install.pwd.getpwuid", return_value=account):
             execute(arguments, runner=self.runner)
 
@@ -236,10 +242,11 @@ class ReleaseLifecycleTests(unittest.TestCase):
         self.assertFalse((self.installation / "releases").exists())
 
     def test_runtime_mount_cannot_be_backed_by_the_root_filesystem_device(self):
-        with patch("app.deployment._operating_system_root_device",
-                   return_value=self.runtime.stat().st_dev):
-            with self.assertRaisesRegex(ConfigurationError, "root filesystem device"):
-                self.perform(self.arguments("install", "1.0.0"))
+        with self.assertRaisesRegex(ConfigurationError, "root filesystem device"):
+            self.perform(
+                self.arguments("install", "1.0.0"),
+                root_device=self.runtime.stat().st_dev,
+            )
         self.assertFalse((self.installation / "releases").exists())
 
     def test_artifact_is_versioned_allow_list_without_tests_or_private_config(self):
