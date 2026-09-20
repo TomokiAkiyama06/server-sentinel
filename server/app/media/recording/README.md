@@ -9,10 +9,10 @@ policy, audited codec validator/muxer and authorization prerequisites are wired.
 ## Integration contract
 
 - Supply a caller-owned SQLite connection, with no open transaction and at least
-  `synchronous=FULL` plus a durable journal mode (in-memory/off are rejected). The final
-  application migration aggregator must assign `recording_migration(version)` a
-  contiguous slot after earlier migrations. This branch intentionally does not
-  fork or renumber their history; isolated tests assign recording slot 2.
+  `synchronous=FULL` plus a durable journal mode (in-memory/off are rejected).
+  The application migration aggregator assigns `recording_migration(4)` after
+  the existing v1–v3 history without forking or renumbering it. The runtime
+  recording worker and its lifecycle integration remain unavailable.
 - Supply an already existing, private (`0700`), service-owned media directory
   outside a checkout and its deployment-approved `RootIdentity(device, inode)`.
   The constructor never creates that directory. It verifies every path component
@@ -138,8 +138,8 @@ The owning service must treat the metadata database and media directory as one
 deployment binding, use durable SQLite settings and supply its private database
 location through the backend configuration. Sharing one media directory between
 databases, replacing the database, migrations or manual file edits while a writer
-is live are unsupported. The main application aggregator and worker lifecycle
-integration remain pending the upstream issue merges.
+is live are unsupported. The main application aggregator is integrated; the
+worker lifecycle integration remains pending the upstream issue merges.
 
 ## Verification
 

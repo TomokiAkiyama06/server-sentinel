@@ -63,10 +63,11 @@ no browser preview or physical device result is claimed.
 - [ ] phone/Mac/desktop 1–4 source live grid, with stability/reconnect prioritized over minimum latency
 - [ ] demand-driven viewer transcoding/packaging
 
-Issue #18 now has bounded compressed storage primitives, source/event manifests
-and synthetic crash/integrity coverage. Its runtime worker, final migration slot,
-codec adapter, shared storage guard and authorization integration remain open;
-these primitives do not establish playable-video or hardware acceptance.
+Issue #18 now has bounded compressed storage primitives, source/event manifests,
+application migration v4 integration, and synthetic crash/integrity coverage. Its
+runtime worker, codec adapter, shared storage guard and authorization integration
+remain open; these primitives do not establish playable-video or hardware
+acceptance.
 
 ## Phase 4 — Human private access
 
