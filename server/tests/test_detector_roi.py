@@ -432,6 +432,20 @@ class CalibrationAndDeliveryTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             archive.load(SOURCE, PROFILE)
 
+    def test_record_stored_under_another_key_is_refused(self):
+        connection = sqlite3.connect(":memory:", isolation_level=None)
+        migrate(connection, APPLICATION_MIGRATIONS)
+        archive = CalibrationArchive(connection)
+        stored = calibration()
+        OwnerCalibrationOperations(archive, owner_authorized=lambda: True).save(stored)
+        metadata = connection.execute("SELECT metadata FROM roi_calibration_history").fetchone()[0]
+        other = UUID(int=306)
+        connection.execute("INSERT INTO roi_calibration_history VALUES (?,?,?,?,?)",
+                           (str(SOURCE), str(other), 1, str(UUID(int=500)), metadata))
+        with self.assertRaises(ValueError):
+            archive.load(SOURCE, other)
+        self.assertEqual(stored.identifier, archive.load(SOURCE, PROFILE).identifier)
+
     def test_archive_refuses_history_table_carrying_a_media_column(self):
         connection = sqlite3.connect(":memory:", isolation_level=None)
         connection.execute(

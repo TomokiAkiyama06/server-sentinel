@@ -189,7 +189,8 @@ class CalibrationArchive:
 
     def load(self, source_id: UUID, profile_id: UUID, version: int | None = None):
         """Return stored provenance only; a reference image is never returned."""
-        query = "SELECT metadata FROM roi_calibration_history WHERE source_id=? AND profile_id=?"
+        query = ("SELECT source_id, profile_id, version, identifier, metadata "
+                 "FROM roi_calibration_history WHERE source_id=? AND profile_id=?")
         parameters = [str(source_id), str(profile_id)]
         if version is not None:
             query += " AND version=?"
@@ -202,13 +203,22 @@ class CalibrationArchive:
         if row is None:
             return None
         try:
-            return _decode(*row)
+            record = _decode(row[4])
         except Exception:
             # A stored record that cannot be decoded is corrupt history, not an
             # unavailable database. Reporting it as unavailable would hide an
             # integrity problem behind a transient-looking failure; the stored
             # content stays out of the message either way.
             raise ValueError("calibration history record is unreadable") from None
+        # The decoded provenance must be the row that was looked up. Logical
+        # corruption or a manual recovery can leave another calibration's
+        # metadata under these keys, and the embedded identities would then
+        # validate against themselves, binding a detector to a source or
+        # profile the caller never asked for.
+        if (str(record.source_id), str(record.profile_id), record.version,
+                str(record.identifier)) != tuple(row[:4]):
+            raise ValueError("calibration history record does not match its key")
+        return record
 
 
 class OwnerCalibrationOperations:
