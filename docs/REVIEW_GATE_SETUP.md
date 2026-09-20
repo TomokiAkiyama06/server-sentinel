@@ -185,7 +185,7 @@ review gate; this candidate only encodes #4's additional review requirements.
 
 ## Acceptance and recovery
 
-Run the actual GitHub test-PR matrix in [MANUAL_TEST.md](../MANUAL_TEST.md#u-github-review-gate-enforcement)
+Run the actual GitHub test-PR matrix in [MANUAL_TEST.md](../MANUAL_TEST.md#v-github-review-gate-enforcement)
 on an isolated synthetic test branch with an equivalent rule first. Record public
 test PR/run/check IDs, head/base/merge-base/diff digests, actual issuer IDs, API
 rule snapshots and merge refusals; never secret values. Unit tests prove only the
