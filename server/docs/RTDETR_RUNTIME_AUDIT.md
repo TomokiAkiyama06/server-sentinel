@@ -12,7 +12,7 @@ Audited 2026-09-20. This supplies model-license/provenance and exact Linux CPyth
 
 ## Exact Python distribution closure
 
-`requirements-rtdetr-cpu-linux-py312.lock` has five exact wheel hashes: ONNX Runtime1.28.0, NumPy2.3.5, flatbuffers25.12.19, packaging25.0, protobuf6.33.5. Each wheel was fetched directly from PyPI distribution metadata, SHA256 checked, and retained under wheels/. The four latter distributions declare no runtime dependencies; ORT requires only these four without extras. Do not install symbolic/quantization/training extras, Transformers, HF Hub, OpenCV, Torch, or a model downloader.
+`../requirements-detector.lock` has five exact wheel hashes: ONNX Runtime1.28.0, NumPy2.3.5, flatbuffers25.12.19, packaging25.0, protobuf6.33.5. Each wheel was fetched directly from PyPI distribution metadata, SHA256 checked, and retained under wheels/. The four latter distributions declare no runtime dependencies; ORT requires only these four without extras. Do not install symbolic/quantization/training extras, Transformers, HF Hub, OpenCV, Torch, or a model downloader.
 
 Licenses: ORT MIT; flatbuffers Apache-2.0; packaging Apache-2.0 OR BSD-2-Clause; protobuf BSD-3-Clause. NumPy is BSD-3-Clause with additional bundled licenses described below. Copy full installed notices, not only top-level metadata. Flatbuffers wheel omits a LICENSE file, so preserve the upstream v25.12.19 LICENSE (saved flatbuffers-LICENSE) with distribution notices.
 
@@ -26,15 +26,42 @@ ORT full universal ThirdPartyNotices.txt is saved under wheel-notices/onnxruntim
 
 ## Linux telemetry path
 
-ORT1.28.0 fixed code revision da9b5e364c465de65c49d91e696cd6485270757f, CPU wheel uploaded2026-07-25. Official Privacy.md says collection is implemented only on Windows at this revision. Source proof: core/platform/posix/env.cc uses a plain Telemetry instance; core/platform/telemetry.cc IsEnabled returnsfalse and EnableTelemetryEvents is empty. Thus the Linux provider cannot be switched into remote reporting via that API; merely disabling an otherwise-active uploader is not the claim.
+ORT 1.28.0 actual wheel code revision 45de2a8b06d62989b3ab55ba7dc58a27ca83f9fc, CPU wheel uploaded2026-07-25. Official Privacy.md says collection is implemented only on Windows at this revision. Source proof: core/platform/posix/env.cc uses a plain Telemetry instance; core/platform/telemetry.cc IsEnabled returnsfalse and EnableTelemetryEvents is empty. Thus the Linux provider cannot be switched into remote reporting via that API; merely disabling an otherwise-active uploader is not the claim.
 
 Source links:
-- https://github.com/microsoft/onnxruntime/blob/da9b5e364c465de65c49d91e696cd6485270757f/docs/Privacy.md
-- https://github.com/microsoft/onnxruntime/blob/da9b5e364c465de65c49d91e696cd6485270757f/onnxruntime/core/platform/posix/env.cc
-- https://github.com/microsoft/onnxruntime/blob/da9b5e364c465de65c49d91e696cd6485270757f/onnxruntime/core/platform/telemetry.cc
+- https://github.com/microsoft/onnxruntime/blob/45de2a8b06d62989b3ab55ba7dc58a27ca83f9fc/docs/Privacy.md
+- https://github.com/microsoft/onnxruntime/blob/45de2a8b06d62989b3ab55ba7dc58a27ca83f9fc/onnxruntime/core/platform/posix/env.cc
+- https://github.com/microsoft/onnxruntime/blob/45de2a8b06d62989b3ab55ba7dc58a27ca83f9fc/onnxruntime/core/platform/telemetry.cc
 
 ORT1.29/1.30 official builds add cross-platform1DS reporting and are excluded. Do not relax the exactpin or Linux platform restriction automatically. Missing/mismatched runtime or model yields unavailable/unknown. A network-isolated synthetic smoke and request/socket-attempt monitoring remain needed; no claim about observed runtime network behavior follows solely from this source audit.
 
 ## Integration verification
 
 The verified ONNX artifact ran successfully with only CPUExecutionProvider in a read-only, non-root, network-isolated CPython 3.12 container on 2026-09-20. Runtime build info was `git-branch=HEAD, git-commit-id=45de2a8b06, fp8-kv-cache=1, build type=Release`. Available providers were AzureExecutionProvider and CPUExecutionProvider; the enabled session contained only CPUExecutionProvider. Adapter construction now explicitly sets enable_fallback=False and also disables later fallback. Generated 640x640 RGB inference completed, malformed grayscale returned unknown, and Python socket/DNS/process audit hooks observed no attempts. Native syscall monitoring was not performed; the Linux reporting conclusion also rests on the exact source audit above. Full run details and limits are in DETECTOR_FOUNDATION.md. No real-person or real-room data was used. Target Main Server performance, scene accuracy, GPU, production worker isolation and final thresholds remain unaccepted.
+
+## Verified converted artifact structure
+
+Downloaded the explicitly Apache-2.0 converted artifact to `/tmp/server-sentinel-rtdetr-audit/rtdetr-v2-r18vd.onnx`; both publisher LFS SHA256 and size matched. At this metadata-only audit stage, no model execution occurred; the later CPU smoke is recorded above. A standard-library protobuf wire reader inspected metadata only: IR8, producer PyTorch2.6.0, standard-domain opset16, no nonstandard node domains or external-data initializers. Input `pixel_values` float32 `[batch_size,3,height,width]`; outputs `logits` float32 `[batch_size,300,80]` and `pred_boxes` float32 `[batch_size,300,4]`. Adapter should constrain batch1, height640,width640 even though axes are dynamic. Complete observed operator list is in `graph-metadata.json`; it includes standard GridSample. The later synthetic runtime smoke above confirmed CPU kernel support for this exact graph.
+
+## Actual wheel build revision correction and Azure provider audit
+
+The integrated wheel reports git-commit-id=45de2a8b06. Resolved full build source is **45de2a8b06d62989b3ab55ba7dc58a27ca83f9fc**. Use this exact40-character hash in the manifest.
+
+The tag da9b5e364c465de65c49d91e696cd6485270757f is one commit later; the sole diff copies `.inc` headers in Windows artifact packaging YAML. No runtime/build dependency/license source changed. The actual commit's Linux PosixEnv, empty Telemetry implementation, LICENSE, ThirdPartyNotices, deps.txt, common CMake and main CMake were fetched and byte-compared equal to the previously reviewed tag. This resolves the source/binary-provenance discrepancy explicitly; the wheel's published SHA remains unchanged.
+
+Comparison: https://github.com/microsoft/onnxruntime/compare/45de2a8b06d62989b3ab55ba7dc58a27ca83f9fc...da9b5e364c465de65c49d91e696cd6485270757f
+
+Actual-code Linux references:
+- https://github.com/microsoft/onnxruntime/blob/45de2a8b06d62989b3ab55ba7dc58a27ca83f9fc/onnxruntime/core/platform/posix/env.cc
+- https://github.com/microsoft/onnxruntime/blob/45de2a8b06d62989b3ab55ba7dc58a27ca83f9fc/onnxruntime/core/platform/telemetry.cc
+- https://github.com/microsoft/onnxruntime/blob/45de2a8b06d62989b3ab55ba7dc58a27ca83f9fc/docs/Privacy.md
+
+Integration observed `get_available_providers()` returning AzureExecutionProvider and CPUExecutionProvider, with the session explicitly enabling CPU only. The exact Azure provider sources comprise a provider class storing a configuration map and a factory constructing it; there is no HTTP client, uploader, or overridden inference/kernel implementation in these provider files. Its CMake target links ORT/ONNX core and declares MIT source headers. Provider availability is therefore not evidence of an outbound request or analytics feature. Do not claim the wheel was built without Azure support: it demonstrably contains the provider name/factory.
+
+Exact Azure source:
+- https://github.com/microsoft/onnxruntime/blob/45de2a8b06d62989b3ab55ba7dc58a27ca83f9fc/onnxruntime/core/providers/azure/azure_execution_provider.cc
+- https://github.com/microsoft/onnxruntime/blob/45de2a8b06d62989b3ab55ba7dc58a27ca83f9fc/onnxruntime/core/providers/azure/azure_execution_provider.h
+- https://github.com/microsoft/onnxruntime/blob/45de2a8b06d62989b3ab55ba7dc58a27ca83f9fc/onnxruntime/core/providers/azure/azure_provider_factory_creator.cc
+- https://github.com/microsoft/onnxruntime/blob/45de2a8b06d62989b3ab55ba7dc58a27ca83f9fc/cmake/onnxruntime_providers_azure.cmake
+
+The product adapter must keep `providers=["CPUExecutionProvider"]`, no provider/session configuration supplied by callers, no EP plugin registration, only the digest-approved standard-domain model, and validate session.get_providers()==["CPUExecutionProvider"]. Set constructor `enable_fallback=False` as well as `disable_fallback()` after creation: disabling after construction alone does not disable constructor retries (the inspected1.28 wrapper accepts enable_fallback through kwargs). Neither constructor nor run fallback lists Azure in this wrapper; constraining both still makes failures report unknown rather than silently retrying. Test initialization, inference, and corrupt-model/error paths while monitoring attempts. This is a specific reachability restriction under existing no-cloud/no-reporting policy, not permission to enable cloud inference.
