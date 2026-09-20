@@ -10,6 +10,7 @@ from dataclasses import dataclass, replace
 from typing import Callable, Protocol
 from uuid import UUID
 
+from .admission import AdmissionLease
 from .model import (
     CompressedPacket, InferenceProfile, QueueLimits, SourceProfiles, ViewerProfile,
 )
@@ -198,6 +199,17 @@ class OfferResult:
     reason: str
 
 
+@dataclass(frozen=True)
+class PipelineStatus:
+    """Source-level state suitable for health reporting without media details."""
+
+    state: str
+    reasons: tuple[str, ...]
+    capture_discontinuities: int
+    recording: PathStatus
+    viewer: PathStatus | None
+
+
 class SourcePipeline:
     """One logical source and one negotiated stream generation.
 
@@ -211,15 +223,24 @@ class SourcePipeline:
     def __init__(self, source_id: UUID, stream_id: UUID, profiles: SourceProfiles,
                  recording_limits: QueueLimits, viewer_limits: QueueLimits,
                  recording_factory: AdapterFactory | None = None,
-                 viewer_factory: AdapterFactory | None = None):
+                 viewer_factory: AdapterFactory | None = None,
+                 admission: AdmissionLease | None = None):
         if not isinstance(source_id, UUID) or not isinstance(stream_id, UUID):
             raise ValueError("source and stream identities must be UUIDs")
         if not profiles.capture.format.verified or not profiles.capture.format.video_only:
             raise ValueError("capture must be verified as video-only before ingest")
         if not profiles.recording.format.video_only or not profiles.viewer.format.video_only:
             raise ValueError("recording and viewer output must be video-only")
+        claim = None
+        if admission is not None:
+            if not isinstance(admission, AdmissionLease) or admission.source_id != source_id:
+                raise ValueError("profiles are not admitted for this source")
+            claim = admission._claim(profiles)
+            if claim is None:
+                raise ValueError("profiles are not admitted for this source")
         self.source_id = source_id
         self.stream_id = stream_id
+        self._claim = claim
         self._profiles = profiles
         self._viewer_limits = viewer_limits
         self._viewer_factory = viewer_factory
@@ -232,6 +253,8 @@ class SourcePipeline:
         self._sequence: int | None = None
         self._dts: int | None = None
         self._renegotiation_required = False
+        self._capture_discontinuities = 0
+        self._capture_reasons: set[str] = set()
         self._closed = False
 
     @property
@@ -258,6 +281,38 @@ class SourcePipeline:
     def subscriber_count(self) -> int:
         return len(self._viewers)
 
+    @property
+    def status(self) -> PipelineStatus:
+        recording = self.recording_status
+        last_viewer = self.viewer_status
+        # An idle viewer normally has no bearing on source health.  A failed
+        # cleanup is different: its resources remain allocated and block the
+        # next viewer/profile lifecycle, so it must remain observable.
+        viewer = (last_viewer if self._viewers
+                  or (last_viewer is not None and last_viewer.failed) else None)
+        reasons = set(self._capture_reasons)
+        if self._claim is not None and not self._claim.active:
+            reasons.add("admission_expired")
+        if self._closed:
+            reasons.add("pipeline_closed")
+        if self._renegotiation_required:
+            reasons.add("capture_renegotiation_required")
+        if not recording.available:
+            reasons.add("recording_unavailable")
+        elif not recording.healthy:
+            reasons.add(f"recording_{recording.reason}")
+        if viewer is not None:
+            if not viewer.available:
+                reasons.add("viewer_unavailable")
+            elif not viewer.healthy:
+                reasons.add(f"viewer_{viewer.reason}")
+        unavailable = (self._closed or "admission_expired" in reasons
+                       or self._renegotiation_required
+                       or not recording.available or recording.failed)
+        state = "unavailable" if unavailable else ("degraded" if reasons else "healthy")
+        return PipelineStatus(state, tuple(sorted(reasons)), self._capture_discontinuities,
+                              recording, viewer)
+
     def add_viewer(self, subscriber_id: UUID) -> None:
         self._ensure_open()
         if not isinstance(subscriber_id, UUID):
@@ -277,15 +332,24 @@ class SourcePipeline:
             raise ValueError("viewer output must be video-only")
         if self._profiles.viewer == profile:
             return
+        updated = replace(self._profiles, viewer=profile)
+        self._check_admission(updated)
         self._close_viewer()
-        self._profiles = replace(self._profiles, viewer=profile)
+        # A failed close leaves an old codec process/path alive.  Do not publish
+        # a new selected profile while that path still owns the old one.
+        if self._viewer is not None:
+            raise RuntimeError("viewer cleanup must finish before profile replacement")
+        self._ensure_admitted(updated)
+        self._profiles = updated
         if self._viewers:
             self._start_viewer()
 
     def replace_inference_profile(self, profile: InferenceProfile) -> None:
         self._ensure_open()
+        updated = replace(self._profiles, inference=profile)
+        self._ensure_admitted(updated)
         self.inference.replace_profile(profile)
-        self._profiles = replace(self._profiles, inference=profile)
+        self._profiles = updated
 
     def offer(self, packet: CompressedPacket) -> OfferResult:
         self._ensure_open()
@@ -325,6 +389,8 @@ class SourcePipeline:
         return recording, viewer
 
     def _discontinuity(self, reason: str) -> None:
+        self._capture_discontinuities += 1
+        self._capture_reasons.add(reason)
         self._recording.discontinuity(reason)
         if self._viewer:
             self._viewer.discontinuity(reason)
@@ -347,12 +413,29 @@ class SourcePipeline:
         if self._closed:
             self._recording.close()
             self._close_viewer()
+            self._release_admission_if_clean()
             return
         self._closed = True
         self._recording.close()
         self._close_viewer()
         self._viewers.clear()
+        self._release_admission_if_clean()
+
+    def _release_admission_if_clean(self) -> None:
+        if (self._claim is not None and not self._recording.status.available
+                and (self._viewer is None or not self._viewer.status.available)):
+            self._claim.release()
 
     def _ensure_open(self) -> None:
         if self._closed:
             raise RuntimeError("pipeline is closed")
+        if self._claim is not None and not self._claim.active:
+            raise RuntimeError("pipeline admission is no longer active")
+
+    def _ensure_admitted(self, profiles: SourceProfiles) -> None:
+        if self._claim is not None and not self._claim.transition(profiles):
+            raise ValueError("profiles are not admitted for this source")
+
+    def _check_admission(self, profiles: SourceProfiles) -> None:
+        if self._claim is not None and not self._claim.permits(profiles):
+            raise ValueError("profiles are not admitted for this source")

@@ -499,7 +499,10 @@ Acceptance:
 Implementation progress: `server/app/media/profiles/` contains the independent
 profile planner, decoded-frame cadence control and bounded compressed-packet
 adapter lifecycle, with synthetic tests for quality isolation and no-subscriber
-cleanup. Codec/transport adapters and measured Main Server / Capture Node / UVC
+cleanup. It also contains atomic per-source exact-allowlist admission and a
+source-level truthful status that keeps capture loss/renegotiation, mandatory
+recording failure, and demanded viewer degradation visible without guessing
+hardware defaults. Codec/transport adapters and measured Main Server / Capture Node / UVC
 resource use remain pending; this is not completion of Issue #17.
 
 ## Plan 11 — Durable recording + main-host compressed pre-roll
