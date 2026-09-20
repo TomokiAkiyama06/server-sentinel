@@ -19,7 +19,8 @@ the synthetic harness is not a claim that production capture is operational.
 `SegmentProfile` takes a source UUID, bounded/expected bitrate in bits per second,
 fixed segment duration in integer microseconds, and an explicit per-segment
 container/segment overhead bound. There is no guessed bitrate, reserve or
-overhead default. Each complete input segment must match that duration and stay
+overhead default. `DiskRing` also requires an explicit `ledger_maximum_bytes`
+limit for the SQLite main database; it has no deployment default. Each complete input segment must match that duration and stay
 within its compressed byte bound. Different sources may have different profiles.
 Overlapping/out-of-order segments, unconfigured sources and violations of the
 profile bound are refused. Real segmenters must provide this bounded cadence
@@ -39,7 +40,7 @@ are not identity/session implementations, and no human API is enabled.
 
 `observe_connection` receives observations from an authenticated transport
 adapter. Only a previously authenticated connected state followed by an
-unexpected loss creates a loss incident; repeated offline observations do not
+unexpected loss of either authentication or connectivity creates a loss incident; repeated offline observations do not
 create new incidents. Initial unpaired/offline startup creates none. A reconnect
 does not remove or shorten existing protection. Future transport integration
 must distinguish deliberate revocation/shutdown from unexpected loss and enforce
@@ -69,12 +70,13 @@ For a candidate configuration:
   Protected, writing, unknown/orphan and required pre-loss files provide no
   reclaim credit.
 - `B20` and `Bpost` are bounded aggregate estimates for 20 and 10 minutes.
-- Admission requires `free + R - reserve >= max(Bpost, B20 - P)`.
+- `L` is the conservative ledger completion headroom when runtime/media share a filesystem; otherwise it is zero on the media filesystem.
+- Admission requires `free + R - reserve >= max(Bpost, B20 - P) + L`.
 
 The pre-loss setting must itself hold at least ten minutes: duration is at least
 600 seconds, and capacity is at least the bounded ten-minute estimate. The
 selected whole duration/capacity target must also fit `free + existing ordinary
-allocations - reserve`. This separate conservative setting check prevents choosing
+allocations - reserve - L`. This separate conservative setting check prevents choosing
 a known impossible buffer size; existing ordinary allocations are part of that
 target, not a claim that required pre-loss media can immediately be deleted.
 
@@ -84,7 +86,7 @@ are still held by another process cannot provide fictional free space. Existing
 protected incidents and other processes' disk usage can therefore cause a new
 configuration to be rejected even when the ordinary limit alone appears valid.
 
-Every write rechecks actual safety reserve and uses the store's exclusive
+Every media write retains `L` in addition to the hard reserve, and uses the store's exclusive
 allocation/write/fsync path. Runtime status recomputes full protection headroom;
 later external disk consumption yields explicit `STORAGE_PRESSURE` or
 `STORAGE_HARD_STOP`, coverage/gaps and refused unsafe writes. Capacity limits use
@@ -94,6 +96,35 @@ admitted to the ring. The core never overwrites an unexpired protected segment t
 make its status look healthy. Unrelated external filesystem writers remain a
 deployment concurrency limitation; the storage layer verifies admission and
 allocation outcomes, rather than claiming to control those writers.
+
+## Ledger filesystem budget
+
+Before creating the database, SQLite startup/hot-journal recovery, or any
+transaction, the ledger checks available runtime-filesystem blocks against the
+same explicitly configured safety reserve plus bounded metadata headroom. An
+independent runtime filesystem gets its own check; a shared filesystem also
+retains this headroom in every media admission and write. Pressure refuses new
+mutations and reports `ledger_reserve_unavailable`; it does not delete protected
+media. Recovery can require the operator to restore free space first.
+
+The main database uses 4096-byte pages and an enforced `max_page_count` derived
+from `ledger_maximum_bytes`. Oversized/unsupported existing databases and unsafe
+journal/WAL sidecars are rejected before SQLite may perform recovery. The bound
+allows the full maximum database plus every possible original journal page,
+eight record bytes per page, one worst-case sector header and alignment per
+page, a final sector and two filesystem allocation units for directory updates.
+It conservatively retains the full bound even when current metadata already
+occupies blocks; it never credits those occupied blocks as free.
+
+The derivation follows SQLite's [rollback-journal format](https://www.sqlite.org/fileformat2.html#the_rollback_journal)
+(each original page appears at most once, with an eight-byte record overhead)
+and its [pager sector limit](https://github.com/sqlite/sqlite/blob/master/src/pager.c)
+of 65536 bytes. The page-size/cap and DELETE-journal assumptions are enforced;
+SQLite temporary stores stay in memory. The bound does not purport to reserve
+exclusive disk capacity against unrelated processes or a filesystem failure.
+DB-cap exhaustion is an explicit failure; schema history and incidents are never
+reset to make capacity available. Interrupted transactions roll back even for
+`KeyboardInterrupt` / `SystemExit`.
 
 ## Durable recovery, time and deletion
 
@@ -144,7 +175,8 @@ estimated capacity-mode duration, physical ordinary/protected/orphan usage,
 filesystem free, reserve, required future bytes, pressure state and per-source
 pre-loss intervals/gaps. `incident()` includes trigger, target interval,
 completion, expiry, logical/allocated bytes, integrity/time gaps and deletion
-state. On unavailable storage, free space is `None` and the state is a hard stop;
+state. Known damaged protected evidence keeps overall status degraded even after
+its interval leaves the current pre-loss window. On unavailable storage, free space is `None` and the state is a hard stop;
 the UI must not turn unknown capacity into a healthy zero/default.
 
 Tests use temporary Linux filesystems, generated compressed patterns, a fake

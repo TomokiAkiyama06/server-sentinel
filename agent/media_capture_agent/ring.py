@@ -8,6 +8,7 @@ from contextlib import contextmanager
 from dataclasses import asdict
 import hashlib
 import json
+import os
 import sqlite3
 import threading
 from uuid import UUID, uuid4
@@ -19,16 +20,18 @@ from .storage import StorageRefused
 
 
 class DiskRing:
-    def __init__(self, settings, store, *, authority=None):
+    def __init__(self, settings, store, *, ledger_maximum_bytes, authority=None, ledger_space=os.fstatvfs):
         self.settings, self.store = settings, store
         self.authority = authority or DenyControls()
         self.lock = threading.RLock()
-        self.ledger = Ledger(settings)
+        self.ledger = Ledger(settings, maximum_bytes=ledger_maximum_bytes, space=ledger_space)
         self.db = self.ledger.connection
         self.config, self.profiles = None, {}
         self.connected = False
         self.state, self.reason = "degraded", "not_configured"
         try:
+            self.ledger_headroom = (self.ledger.headroom if os.stat(settings.media_root, follow_symlinks=False).st_dev
+                                    == os.fstat(self.ledger.fd).st_dev else 0)
             row = self.db.execute("SELECT value FROM settings WHERE key='configuration'").fetchone()
             if row:
                 value = json.loads(row[0])
@@ -37,7 +40,7 @@ class DiskRing:
                     **{**item, "source_id": UUID(item["source_id"])}
                 ) for item in value["profiles"]}
             self._recover()
-        except Exception:
+        except BaseException:
             self.close()
             raise
 
@@ -59,6 +62,10 @@ class DiskRing:
             except (sqlite3.Error, OSError) as exc:
                 self.state, self.reason = "STORAGE_HARD_STOP", "ledger_unavailable"
                 raise RingRefused("ledger_unavailable") from exc
+            except RingRefused as exc:
+                if str(exc).startswith("ledger_"):
+                    self.state, self.reason = "STORAGE_HARD_STOP", str(exc)
+                raise
             except StorageRefused as exc:
                 self.state, self.reason = "STORAGE_HARD_STOP", str(exc)
                 raise RingRefused("media_storage_unavailable") from exc
@@ -141,11 +148,11 @@ class DiskRing:
         reclaimable = sum(allocations.get(UUID(row["id"]), 0)
                           for row in self._reclaimable(now))
         post = self._estimate(profiles, POST)
-        additional = max(post, self._estimate(profiles, PRE + POST) - pre)
+        additional = max(post, self._estimate(profiles, PRE + POST) - pre) + self.ledger_headroom
         return {
             "filesystem_free": free, "required_additional": additional,
             "required_pre_allocated": pre, "reclaimable_allocated": reclaimable,
-            "safety_reserve": self.settings.safety_reserve_bytes,
+            "safety_reserve": self.settings.safety_reserve_bytes, "ledger_headroom": self.ledger_headroom,
         }
 
     def configure(self, config, profiles, *, now_us):
@@ -200,7 +207,7 @@ class DiskRing:
                        if not self._protected(row["id"]))
         # Existing ordinary allocations already occupy part of this selected
         # target. They are not credited as immediately reclaimable pre-data.
-        if self.store.check(require_reserve=False) + ordinary < selected + self.settings.safety_reserve_bytes:
+        if self.store.check(require_reserve=False) + ordinary < selected + self.settings.safety_reserve_bytes + self.ledger_headroom:
             raise RingRefused("selected_target_exceeds_safe_filesystem")
 
     def _remove_segment(self, identifier):
@@ -231,13 +238,13 @@ class DiskRing:
     def _free_for_write(self, length, now):
         for row in self._reclaimable(now):
             try:
-                self.store.check(length)
+                self.store.check(length + self.ledger_headroom)
                 return
             except StorageRefused as exc:
                 if str(exc) != "STORAGE_HARD_STOP":
                     raise
             self._remove_segment(row["id"])
-        self.store.check(length)
+        self.store.check(length + self.ledger_headroom)
 
     def append(self, source_id, start_us, end_us, data, *, now_us, clock_trusted):
         integer(start_us)
@@ -326,7 +333,7 @@ class DiskRing:
         with self._operation():
             clock_trusted = self._clock(now_us, clock_trusted)
             incident = None
-            if self.connected and not connected and unexpected:
+            if self.connected and not (authenticated and connected) and unexpected:
                 incident = self._preserve("main_connection_lost", now_us - PRE,
                                           now_us + POST, now_us, clock_trusted)
             self.connected = authenticated and connected
@@ -465,6 +472,7 @@ class DiskRing:
     def _status(self, now, *, clock_trusted):
         if self.config is None:
             return {"state": "degraded", "reason": "not_configured"}
+        self.ledger.check_space()
         budget = self._budget(self.profiles, now)
         clock_trusted = self._clock(now, clock_trusted, record=False)
         allocated = self.store.segment_allocations()
@@ -486,6 +494,8 @@ class DiskRing:
             self.state, self.reason = "STORAGE_PRESSURE", "post_loss_headroom_reduced"
         elif not clock_trusted:
             self.state, self.reason = "degraded", "clock_uncertain"
+        elif any(row["state"] != "stored" and self._protected(row["id"]) for row in rows):
+            self.state, self.reason = "degraded", "protected_evidence_integrity_gap"
         elif orphan_bytes:
             self.state, self.reason = "degraded", "orphan_media_present"
         elif any(item["gaps_us"] for item in coverage.values()):

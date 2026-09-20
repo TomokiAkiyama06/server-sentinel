@@ -427,6 +427,14 @@ At install/startup/runtime admission, the Agent shall verify:
 
 If the expected media filesystem is unavailable or resolves unexpectedly, Agent recording/buffering becomes explicit degraded/failed state and unsafe writes are refused until the Owner resolves or re-approves the target.
 
+The Issue #16 ring core requires an explicit SQLite ledger size bound in addition
+to media-profile/reserve inputs. It guards runtime-filesystem metadata growth
+before schema creation, hot-journal recovery and transactions, and reserves
+conservative completion headroom in shared-filesystem media admission. Unexpected
+authentication loss is an effective Main loss even while the raw socket remains
+connected; known protected-evidence damage stays degraded outside current pre-roll.
+See `agent/docs/RING_BUFFER.md` for the implemented budget and integration limits.
+
 ## 6. Media architecture
 
 ### 6.1 Separation of concerns

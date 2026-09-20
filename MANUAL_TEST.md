@@ -569,3 +569,9 @@ explicitly. Do not alter production protection to make a negative test pass.
 Never use a real secret as a fixture or publish an App key/token, reviewer token,
 raw private API response, or monitoring data. Cleanup only the identified
 synthetic test branches/PRs; no production data or unrelated rule deletion.
+
+
+### Agent ring ledger budget follow-up (#16)
+
+- [ ] Configure an explicit ledger maximum, fill runtime storage toward its reserve on shared and separate filesystems, and verify startup/recovery/metadata writes refuse safely without deleting protected media.
+- [ ] Trigger an unexpected authentication loss with the socket still open; verify one T-10/T+10 incident. Remove a synthetic older protected segment after fresh pre-roll is complete and verify overall status remains degraded.

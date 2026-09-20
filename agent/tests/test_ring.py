@@ -2,6 +2,7 @@
 
 import hashlib
 import os
+import sqlite3
 from pathlib import Path
 import tempfile
 import unittest
@@ -10,6 +11,7 @@ from uuid import UUID, uuid4
 import zlib
 
 from media_capture_agent.ring import DiskRing
+from media_capture_agent.ring_ledger import Ledger
 from media_capture_agent.ring_models import (POST, PRE, RETENTION, SECOND, RingConfig,
                                             RingRefused, SegmentProfile)
 from media_capture_agent.storage import MediaStore, StorageRefused
@@ -29,7 +31,7 @@ class AllowControls:
 
 
 class Quota:
-    def __init__(self, root, capacity=4096 * 1000):
+    def __init__(self, root, capacity=4096 * 4000):
         self.root, self.capacity, self.other = root, capacity, 0
 
     def used(self):
@@ -50,7 +52,7 @@ class RingTests(unittest.TestCase):
         self.quota = Quota(self.settings.media_root)
         self.store = MediaStore(self.settings, space=self.quota)
         self.addCleanup(self.store.close)
-        self.ring = DiskRing(self.settings, self.store, authority=AllowControls())
+        self.ring = DiskRing(self.settings, self.store, ledger_maximum_bytes=128 * 1024, authority=AllowControls())
         self.addCleanup(lambda: self.ring.close())
         self.profile = SegmentProfile(SOURCE, 800, 400, 60 * SECOND, 100)
 
@@ -79,11 +81,11 @@ class RingTests(unittest.TestCase):
 
     def restart(self):
         self.ring.close()
-        self.ring = DiskRing(self.settings, self.store, authority=AllowControls())
+        self.ring = DiskRing(self.settings, self.store, ledger_maximum_bytes=128 * 1024, authority=AllowControls())
 
     def test_owner_controls_and_preserve_commands_default_deny(self):
         self.ring.close()
-        self.ring = DiskRing(self.settings, self.store)
+        self.ring = DiskRing(self.settings, self.store, ledger_maximum_bytes=128 * 1024)
         with self.assertRaisesRegex(RingRefused, "owner_authorization_required"):
             self.configure()
         with self.assertRaisesRegex(RingRefused, "authenticated_preserve_required"):
@@ -109,7 +111,7 @@ class RingTests(unittest.TestCase):
 
     def test_exact_conservative_twenty_minute_budget_is_accepted(self):
         self.quota.capacity = (self.profile.bytes_for(PRE + POST, self.store.allocation_unit)
-                               + self.settings.safety_reserve_bytes)
+                               + self.settings.safety_reserve_bytes + self.ring.ledger_headroom)
         status = self.configure()
         self.assertEqual(status["state"], "degraded")
         self.assertEqual(status["reason"], "pre_loss_coverage_gap")
@@ -263,7 +265,7 @@ class RingTests(unittest.TestCase):
     def test_ledger_is_private_single_writer_and_durable(self):
         self.configure()
         with self.assertRaises(RingRefused):
-            DiskRing(self.settings, self.store)
+            DiskRing(self.settings, self.store, ledger_maximum_bytes=128 * 1024)
         self.assertEqual((self.settings.runtime_root / "ring.sqlite3").stat().st_mode & 0o777, 0o600)
         self.restart()
         self.assertEqual(self.ring.config, RingConfig("duration", 600))
@@ -390,7 +392,7 @@ class RingTests(unittest.TestCase):
         with self.assertRaisesRegex(RingRefused, "selected_target_exceeds_safe_filesystem"):
             self.configure("capacity", self.quota.capacity * 2)
         with self.assertRaisesRegex(RingRefused, "selected_target_exceeds_safe_filesystem"):
-            self.configure("duration", 86400)
+            self.configure("duration", 86400 * 10)
 
     def test_replaced_ledger_is_a_hard_stop_and_never_recreated(self):
         self.configure()
@@ -401,3 +403,101 @@ class RingTests(unittest.TestCase):
         self.assertEqual(result["state"], "STORAGE_HARD_STOP")
         self.assertEqual(result["reason"], "ledger_file_replaced")
         self.assertEqual(original.read_bytes(), b"synthetic-replacement")
+
+
+    def test_authentication_loss_protects_even_when_socket_stays_connected(self):
+        self.warm()
+        self.ring.observe_connection(authenticated=True, connected=True, unexpected=False,
+                                     now_us=T0, clock_trusted=True)
+        incident = self.ring.observe_connection(authenticated=False, connected=True, unexpected=True,
+                                                now_us=T0, clock_trusted=True)
+        self.assertIsInstance(incident, UUID)
+        self.assertIsNone(self.ring.observe_connection(authenticated=False, connected=False, unexpected=True,
+                                                       now_us=T0, clock_trusted=True))
+        self.finish()
+        self.assertEqual(self.ring.incident(incident, now_us=T0 + POST)["state"], "complete")
+        self.assertEqual(self.ring.db.execute("SELECT count(*) FROM incidents").fetchone()[0], 1)
+
+    def test_old_protected_integrity_loss_remains_degraded_with_complete_current_pre(self):
+        self.warm()
+        self.loss()
+        self.finish()
+        for start in range(T0 + POST, T0 + POST + PRE, 60 * SECOND):
+            self.append(start)
+        now = T0 + POST + PRE
+        old = self.ring._rows()[0]
+        self.store.delete_segment(UUID(old["id"]))
+        status = self.ring.status(now_us=now, clock_trusted=True)
+        self.assertFalse(status["pre_loss_coverage"][str(SOURCE)]["gaps_us"])
+        self.assertEqual(status["reason"], "protected_evidence_integrity_gap")
+        self.restart()
+        self.assertEqual(self.ring.status(now_us=now, clock_trusted=True)["state"], "degraded")
+
+    def test_ledger_transaction_rolls_back_process_interruptions(self):
+        for exception in (KeyboardInterrupt, SystemExit):
+            with self.assertRaises(exception):
+                with self.ring.ledger.transaction():
+                    self.ring.db.execute("INSERT INTO settings VALUES ('interrupted','synthetic')")
+                    raise exception()
+            self.assertFalse(self.ring.db.in_transaction)
+            self.assertIsNone(self.ring.db.execute("SELECT value FROM settings WHERE key='interrupted'").fetchone())
+        self.configure()
+
+    def test_ledger_startup_refuses_before_database_creation_at_reserve(self):
+        self.ring.close()
+        database = self.settings.runtime_root / "ring.sqlite3"
+        database.unlink()  # Only this test's generated temporary database.
+        def shortage(descriptor):
+            values = list(os.fstatvfs(descriptor))
+            values[4] = self.settings.safety_reserve_bytes // values[1]
+            return os.statvfs_result(values)
+        with self.assertRaisesRegex(RingRefused, "ledger_reserve_unavailable"):
+            Ledger(self.settings, maximum_bytes=128 * 1024, space=shortage)
+        self.assertFalse(database.exists())
+
+    def test_separate_runtime_pressure_blocks_ledger_mutation_and_reports_hard_stop(self):
+        self.warm()
+        incident = self.loss()
+        before = self.store.segment_allocations()
+        def shortage(descriptor):
+            values = list(os.fstatvfs(descriptor))
+            values[4] = 0
+            return os.statvfs_result(values)
+        self.ring.ledger.space = shortage
+        with self.assertRaisesRegex(RingRefused, "ledger_reserve_unavailable"):
+            self.ring.tick(now_us=T0 + POST, clock_trusted=True)
+        self.assertEqual(self.store.segment_allocations(), before)
+        self.assertEqual(self.ring.db.execute("SELECT state FROM incidents WHERE id=?", (str(incident),)).fetchone()[0], "active")
+        self.assertEqual(self.ring.status(now_us=T0, clock_trusted=True)["reason"], "ledger_reserve_unavailable")
+
+    def test_sqlite_growth_is_bounded_and_rolls_back_at_explicit_page_limit(self):
+        before = self.settings.runtime_root.joinpath("ring.sqlite3").stat().st_size
+        with self.assertRaises(sqlite3.Error):
+            with self.ring.ledger.transaction():
+                self.ring.db.execute("INSERT INTO settings VALUES ('oversize',?)", ("x" * 256 * 1024,))
+        self.assertFalse(self.ring.db.in_transaction)
+        self.assertIsNone(self.ring.db.execute("SELECT value FROM settings WHERE key='oversize'").fetchone())
+        self.assertLessEqual(self.settings.runtime_root.joinpath("ring.sqlite3").stat().st_size, 128 * 1024)
+        self.assertGreater(before, 0)
+
+    def test_media_write_retains_shared_filesystem_ledger_headroom(self):
+        self.warm()
+        self.loss()
+        before = self.store.segment_allocations()
+        # There is space above the hard reserve for compressed bytes, but not
+        # above the additional metadata completion budget on the same device.
+        self.quota.other = (self.quota.capacity - self.quota.used() - self.settings.safety_reserve_bytes
+                            - self.ring.ledger_headroom + self.store.allocation_unit)
+        with self.assertRaisesRegex(RingRefused, "segment_storage_refused"):
+            self.append(T0)
+        self.assertEqual(self.store.segment_allocations(), before)
+
+    def test_unsafe_journal_sidecar_is_rejected_before_sqlite_recovery(self):
+        self.ring.close()
+        sidecar = self.settings.runtime_root / "ring.sqlite3-journal"
+        target = self.settings.runtime_root / "synthetic-target"
+        target.write_bytes(b"generated")
+        sidecar.symlink_to(target)
+        with self.assertRaisesRegex(RingRefused, "ledger_sidecar_refused"):
+            Ledger(self.settings, maximum_bytes=128 * 1024)
+        self.assertEqual(target.read_bytes(), b"generated")
