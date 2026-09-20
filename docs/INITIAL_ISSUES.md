@@ -193,6 +193,12 @@ Acceptance:
 
 GitHub Issue: [#8](https://github.com/TomokiAkiyama06/server-sentinel/issues/8)
 
+Implementation: `web/` provides the Japanese/English responsive React shell,
+denied-by-default session, same-origin client, six placeholders and synthetic
+collection tests. CI includes Chrome viewport/request interception and isolated
+normal/error preview smoke. Production access/asset serving remains #10;
+private live playback remains #19/#28.
+
 Depends on: [#5](https://github.com/TomokiAkiyama06/server-sentinel/issues/5)
 
 Labels: `frontend`, `security`

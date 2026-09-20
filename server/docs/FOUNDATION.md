@@ -9,6 +9,8 @@ and Issue #10's enforcement are prerequisites to opening human routes.
 
 Use the reviewed wheels in `requirements-ci.lock` with CPython 3.12 on Linux
 x86_64/aarch64, or CPython 3.14 on Linux x86_64. CI uses 3.12 x86_64.
+CPython 3.13 is not supported by the current reviewed wheel hashes and is
+explicitly excluded by the project metadata.
 
 ```sh
 cd server
