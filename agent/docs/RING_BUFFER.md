@@ -189,6 +189,9 @@ before writing. Status exposes insufficient room
 for the next incident as `STORAGE_PRESSURE / insufficient_ledger_capacity`.
 Late media that reactivates a completed/partial incident must also fit that
 incident's segment/reference reservation before reactivation or media writes.
+A request that recovers trusted time also materializes any held pending loss
+before its own incident is inserted, so admission is rechecked against the
+combined incident set instead of the requested interval alone.
 
 The admission bound deliberately does not assume average SQLite page packing.
 Schema-v1 bounded UUID/numeric records and indexes need no overflow pages. The

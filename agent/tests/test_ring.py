@@ -938,6 +938,29 @@ class RingTests(unittest.TestCase):
         incompatible = {**row, "id": str(uuid4()), "end": T0 + 30 * SECOND}
         self.assertEqual(self.ring._future_segment_rows(profiles, windows, [row, row, untrusted, incompatible]), 9)
 
+    def test_pending_loss_materialization_rechecks_preserve_admission(self):
+        self.ring.close()
+        self.ring = DiskRing(self.settings, self.store, ledger_maximum_bytes=400 * 4096,
+                             authority=AllowControls())
+        self.configure()
+        self.ring.observe_connection(authenticated=True, connected=True, unexpected=False,
+                                     now_us=T0, clock_trusted=False)
+        self.assertIsNone(self.ring.observe_connection(authenticated=True, connected=False,
+                                                       unexpected=True, now_us=T0, clock_trusted=False))
+        self.assertTrue(self.ring._pending_loss())
+        # Recovered time materializes the held loss inside this request, so the
+        # combined reservation, not the requested incident alone, decides.
+        with self.assertRaisesRegex(RingRefused, "insufficient_ledger_capacity"):
+            self.ring.preserve("camera_tamper", T0 - PRE, T0 + POST, now_us=T0, clock_trusted=True)
+        self.assertFalse(self.ring._pending_loss())
+        self.assertEqual(self.ring.db.execute("SELECT count(*) FROM incidents").fetchone()[0], 1)
+        identifier = UUID(self.ring.db.execute("SELECT id FROM incidents").fetchone()["id"])
+        self.finish()
+        result = self.ring.incident(identifier, now_us=T0 + POST)
+        self.assertEqual(result["coverage"][str(SOURCE)]["intervals_us"], [(T0, T0 + POST)])
+        self.assertTrue(result["has_gaps"])
+        self.assertNotEqual(self.ring.status(now_us=T0 + POST, clock_trusted=True)["state"], "healthy")
+
     def test_existing_tombstones_are_counted_without_reset_or_deletion(self):
         with self.ring.ledger.transaction():
             self.ring.db.executemany("INSERT INTO incidents VALUES (?, 'camera_tamper', ?, ?, ?, ?, 'deleted', 0, ?)",

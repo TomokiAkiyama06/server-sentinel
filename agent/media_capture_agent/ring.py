@@ -580,6 +580,10 @@ class DiskRing:
             raise RingRefused("invalid_preservation_window")
         self._ledger_capacity(self.config, self.profiles, proposal=(start, end))
         trusted = self._clock(now, trusted)
+        # Recovered trusted time can materialize a durable pending loss here,
+        # adding an incident and its own future rows before this request is
+        # inserted. Readmit the combined reservation against that new set.
+        self._ledger_capacity(self.config, self.profiles, proposal=(start, end))
         identifier = str(uuid4())
         with self.ledger.transaction():
             self.db.execute("INSERT INTO incidents VALUES (?,?,?,?,NULL,NULL,'active',?,?)",
