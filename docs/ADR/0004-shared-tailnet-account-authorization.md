@@ -1,9 +1,11 @@
-# ADR 0003: Shared Tailnet Account and Per-Person Application Credentials
+# ADR 0004: Shared Tailnet Account and Per-Person Application Credentials
 
 Status: Accepted
 Date: 2026-09-20
 
 Recorded for Issue #6 (Owner authorization / trusted Tailscale identity) and enforced by Issue #10 (human access enforcement). The shared research-room Tailscale account and the requirement for per-person application credentials are deployment constraints stated by the repository owner; this ADR takes effect when the owner merges the pull request that adds it. Issue #6 stays Open until its implementation and manual verification land, so this ADR records the decision only, not its enforcement.
+
+Relationship to ADR-0003 (*Owner authentication and the trusted human-access boundary*, also Issue #6): this ADR records the deployment constraint — one shared Tailscale account — and the resulting decision to authorize on a per-person ServerSentinel credential, while ADR-0003 works out the implementation boundary around it (owner bootstrap and recovery, the trusted-proxy path, and session/revocation mechanics). ADR-0003 is still `Proposed`, so the concrete parameters of that boundary, including session lifetimes and the exact identity-header handling, are settled there and in Issue #6 rather than here. Where the two overlap, a verified Tailscale/trusted-proxy identity is supplementary under this ADR and never sufficient on its own.
 
 ## Context
 

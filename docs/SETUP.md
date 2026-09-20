@@ -101,7 +101,7 @@ Explain that two separate approvals are required:
 
 Public port forwarding is not the normal setup.
 
-Where the room shares one Tailscale account, the Tailscale login does not identify the person; the ServerSentinel credential does. Register each credential on an authenticator the invited person controls and keep authenticator user verification required. On a machine whose OS account or device unlock is shared, use a per-person OS account or a portable authenticator instead of a passkey stored in the shared profile. See ADR 0003.
+Where the room shares one Tailscale account, the Tailscale login does not identify the person; the ServerSentinel credential does. Register each credential on an authenticator the invited person controls and keep authenticator user verification required. On a machine whose OS account or device unlock is shared, use a per-person OS account or a portable authenticator instead of a passkey stored in the shared profile. See ADR 0004.
 
 ## Add local USB camera
 

@@ -98,7 +98,7 @@ ServerSentinel owner invitation/permission
 
 Tailnet membership alone grants nothing.
 
-The target deployment shares one Tailscale account across the research room, so the Tailscale login identifies the account rather than the person. Both gates remain required, but only the application gate distinguishes individuals: every human route verifies the per-person credential (WebAuthn/passkey, ADR 0003) and the requested permission server-side. Approving a device does not identify a person.
+The target deployment shares one Tailscale account across the research room, so the Tailscale login identifies the account rather than the person. Both gates remain required, but only the application gate distinguishes individuals: every human route verifies the per-person credential (WebAuthn/passkey, ADR 0004) and the requested permission server-side. Approving a device does not identify a person.
 
 The recommended human path is:
 

@@ -797,7 +797,7 @@ access_principal
 principal_credential
 - id
 - principal_id
-- kind (WebAuthn/passkey, per ADR-0003)
+- kind (WebAuthn/passkey, per ADR-0004)
 - credential_id
 - public_key (public material only; never a biometric template)
 - user_verification: required (asserted at registration, verified again at
