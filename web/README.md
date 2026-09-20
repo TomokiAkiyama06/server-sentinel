@@ -46,7 +46,9 @@ and configuration events, whose reported state is not image-quality gated, keep
 their value with the quality shown beside it, and the value labels cover every
 source/node health transition, including `manual_intervention_required` and
 `revoked`. The `critical` badge names the detector category, not a confirmed
-event, and a quality-gated result is never labelled confirmed. Rows follow the
+event, and a result is labelled confirmed only when it also meets the core's
+confirmation prerequisites: sufficient quality, an observed value and a
+reported confidence. Rows follow the
 Main Server receipt order the core reports and each row also shows its own
 observation time, and a `next_cursor` offers the older part of the window
 through a load-more control so a limited response cannot hide older events; a
@@ -59,7 +61,9 @@ culpability. A kind filter selects all, people/motion, critical, device and
 recording, or configuration entries. `src/views/presence.tsx` shows the current
 state, its basis, manual-override expiry and cancel affordance, the fact that
 only `PRESENT` suppresses ordinary occupancy automation, and today's
-audited Owner control history. Suppression is judged against the state *and*
+audited Owner control history, and reports the timing trust of the record
+behind the current basis separately from the timing trust of observation
+receipt. Suppression is judged against the state *and*
 clock trust, because the core suppresses ordinary automation only for a trusted
 `PRESENT`; a report that disagrees raises a degraded alert with the reported
 suppression instead of a contradictory statement. The four critical paths
