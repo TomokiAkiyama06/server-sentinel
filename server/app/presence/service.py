@@ -200,25 +200,34 @@ class PresenceService:
         # interval leaves submitting/queued visibly unresolved; it never causes
         # a blind retry of a potentially completed external side effect.
         #
-        # The bounded batch is ordered, so a backlog of still unavailable or
-        # repeatedly attempted work cannot starve newly queued critical
-        # evidence and notification jobs: never attempted rows lead, pending
-        # precedes unavailable, and equal work is dispatched in receipt order.
+        # Batches alternate durably between fresh work and a recovered action's
+        # unavailable backlog whenever both exist. Thus either stream remains
+        # live under continuous arrival from the other.
         available = tuple(action for action, port in
                           (("evidence", self.evidence), ("notification", self.notifications))
                           if port is not None)
-        eligibility = "job.state='pending'"
-        arguments = []
-        if available:
-            eligibility += " OR (job.state='unavailable' AND job.action IN (" + ",".join("?" * len(available)) + "))"
-            arguments.extend(available)
-        with closing(self.database.connect()) as db:
-            pending = db.execute(
+        with self._transaction() as db:
+            next_row = db.execute("SELECT next_state FROM presence_delivery_fairness WHERE singleton=1").fetchone()
+            fresh = db.execute(
                 "SELECT job.observation,job.action FROM presence_deliveries job "
                 "JOIN presence_observations item ON item.id=job.observation "
-                "WHERE " + eligibility + " "
-                "ORDER BY job.attempts, job.state='unavailable', item.sequence, job.action "
-                "LIMIT ?", (*arguments, limit)).fetchall()
+                "WHERE job.state='pending' ORDER BY job.attempts,item.sequence,job.action LIMIT ?", (limit,)).fetchall()
+            recovered = []
+            if available:
+                recovered = db.execute(
+                    "SELECT job.observation,job.action FROM presence_deliveries job "
+                    "JOIN presence_observations item ON item.id=job.observation "
+                    "WHERE job.state='unavailable' AND job.action IN (" + ",".join("?" * len(available)) + ") "
+                    "ORDER BY job.attempts,item.sequence,job.action LIMIT ?", (*available, limit)).fetchall()
+            groups = {"pending": fresh, "unavailable": recovered}
+            selected_state = next_row[0] if next_row else "pending"
+            if not groups[selected_state]:
+                selected_state = "unavailable" if selected_state == "pending" else "pending"
+            pending = groups[selected_state]
+            if fresh and recovered:
+                following = "unavailable" if selected_state == "pending" else "pending"
+                db.execute("INSERT INTO presence_delivery_fairness VALUES (1,?) "
+                           "ON CONFLICT(singleton) DO UPDATE SET next_state=excluded.next_state", (following,))
         for row in pending:
             with self._transaction() as db:
                 job = db.execute("SELECT * FROM presence_deliveries WHERE observation=? AND action=?",
@@ -338,7 +347,7 @@ class PresenceService:
             failed = db.execute("SELECT count(*) FROM presence_deliveries "
                                 "WHERE state NOT IN ('delivered','disabled')").fetchone()[0]
             disabled = {row[0] for row in db.execute("SELECT DISTINCT action FROM presence_deliveries "
-                                                      "WHERE state='disabled'")}
+                                                      "WHERE state IN ('disabled','unavailable')")}
         return {"state": state.value, "basis": basis, "override_expires_at": expires,
                 "clock_degraded": not trusted,
                 "suppress_ordinary": state == PresenceState.PRESENT and trusted,

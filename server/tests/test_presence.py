@@ -210,6 +210,17 @@ class PresenceTests(unittest.TestCase):
         recovered.dispatch_pending()
         self.assertEqual([item.identifier for item in self.notifications], [UUID(int=1), UUID(int=2), UUID(int=3)])
 
+    def test_fresh_arrivals_do_not_starve_recovered_delivery(self):
+        unavailable = self.make_service(evidence=None, notifications=None)
+        old = unavailable.record(observation(Kind.CAMERA_TAMPER, identifier=UUID(int=1)))
+        unavailable.dispatch_pending()
+        recovered = self.make_service(notifications=None)
+        fresh = recovered.record(observation(Kind.CAMERA_TAMPER, identifier=UUID(int=2)))
+        recovered.dispatch_pending(limit=1)
+        recovered.record(observation(Kind.CAMERA_TAMPER, identifier=UUID(int=3)))
+        recovered.dispatch_pending(limit=1)
+        self.assertEqual([fresh.identifier, old.identifier], [item.identifier for item in self.evidence])
+
     def test_disabled_critical_action_stays_visible_as_degraded(self):
         event = self.service.record(observation(Kind.SERVER_MOVEMENT))
         self.service.complete_action(event.identifier, "notification", ActionResult.DISABLED)
@@ -217,6 +228,13 @@ class PresenceTests(unittest.TestCase):
         status = self.status()
         self.assertEqual(status["pending_critical_actions"], 0)
         self.assertEqual(status["critical_notifications"], "unavailable")
+        self.assertTrue(status["critical_paths_degraded"])
+
+    def test_unavailable_critical_action_stays_visible_as_degraded(self):
+        event = self.service.record(observation(Kind.SERVER_MOVEMENT))
+        self.service.complete_action(event.identifier, "evidence", ActionResult.UNAVAILABLE)
+        status = self.status()
+        self.assertEqual(status["critical_evidence"], "unavailable")
         self.assertTrue(status["critical_paths_degraded"])
 
     def test_critical_paths_reported_from_configuration_and_known_health(self):

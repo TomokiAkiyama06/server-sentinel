@@ -23,4 +23,6 @@ def presence_migration(version: int) -> Migration:
         "CREATE TABLE presence_source_clock (source TEXT PRIMARY KEY, latest_occurred TEXT NOT NULL)",
         "CREATE TABLE presence_deliveries (observation TEXT REFERENCES presence_observations(id), "
         "action TEXT NOT NULL, state TEXT NOT NULL, attempts INTEGER NOT NULL, PRIMARY KEY(observation, action))",
+        "CREATE TABLE presence_delivery_fairness (singleton INTEGER PRIMARY KEY CHECK(singleton=1), "
+        "next_state TEXT NOT NULL CHECK(next_state IN ('pending','unavailable')))",
     ))
