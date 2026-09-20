@@ -22,17 +22,32 @@ let recordingLoads = 0;
 Object.defineProperty(window, 'syntheticRecordingLoads', { get: () => recordingLoads });
 // Synthetic latency so tests can observe in-flight mutation handling.
 let syntheticMutations = 0;
-const settle = () => new Promise<void>(resolve => setTimeout(resolve, 150));
 // The synthetic write still asks the server, so failures and aborts are real.
 let syntheticMutationPath = '/api/mock/mutation';
 Object.defineProperty(window, 'failNextMutations', {
   value: (path: string) => { syntheticMutationPath = path; },
 });
-const accepted = (signal: AbortSignal) => api.read(syntheticMutationPath, value => {
+const accepted = (path: string, signal: AbortSignal) => api.read(path, value => {
   if (typeof value !== 'object' || value === null || !('accepted' in value) || value.accepted !== true) throw new Error();
   return true;
 }, signal);
 Object.defineProperty(window, 'syntheticMutations', { get: () => syntheticMutations });
+// Per-recording outcome and latency, so a test can overlap two writes and let
+// the reload one of them triggers start before the other one fails.
+let plan: Record<string, { delay?: number; fail?: boolean }> = {};
+Object.defineProperty(window, 'mutationPlan', {
+  value: (next: Record<string, { delay?: number; fail?: boolean }>) => { plan = next; },
+});
+let recordingLoadDelay = 0;
+let recordingLoadFails = false;
+Object.defineProperty(window, 'slowRecordingLoads', { value: (ms: number) => { recordingLoadDelay = ms; } });
+Object.defineProperty(window, 'failRecordingLoads', { value: (fails: boolean) => { recordingLoadFails = fails; } });
+const runMutation = async (id: string, signal: AbortSignal) => {
+  syntheticMutations += 1;
+  const entry = plan[id] ?? {};
+  await new Promise<void>(resolve => setTimeout(resolve, entry.delay ?? 150));
+  await accepted(entry.fail === true ? '/api/mock/mutation-refused' : syntheticMutationPath, signal);
+};
 const services = {
   loadSession: (signal: AbortSignal) => api.read('/api/mock/session', session, signal),
   loadSources: (signal: AbortSignal) => api.read('/api/mock/sources', value => {
@@ -47,7 +62,10 @@ const services = {
         return value as RecordingSummary[];
       }, signal);
       loaded = true;
+    } else if (recordingLoadDelay) {
+      await new Promise<void>(resolve => setTimeout(resolve, recordingLoadDelay));
     }
+    if (recordingLoadFails) throw new Error();
     return recordings;
   },
   loadStorage: (signal: AbortSignal) => api.read('/api/mock/storage', value => {
@@ -56,16 +74,12 @@ const services = {
   }, signal),
   // Synthetic local mutations: this harness has no write route and never gets one.
   starRecording: async (id: string, starred: boolean, signal: AbortSignal) => {
-    syntheticMutations += 1;
-    await settle();
-    await accepted(signal);
+    await runMutation(id, signal);
     recordings = recordings.map(recording => recording.id === id
       ? { ...recording, starred, retention_days_left: starred ? null : 7 } : recording);
   },
   deleteRecording: async (id: string, signal: AbortSignal) => {
-    syntheticMutations += 1;
-    await settle();
-    await accepted(signal);
+    await runMutation(id, signal);
     recordings = recordings.filter(recording => recording.id !== id);
   },
 };

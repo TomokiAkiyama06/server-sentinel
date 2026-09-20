@@ -197,8 +197,18 @@ try {
         await page.evaluate("Array.from(document.querySelectorAll('button')).find(el => el.textContent === 'やめる').click()");
         await page.wait(`document.querySelectorAll('[data-recording-id]').length === ${recordings}`);
         await page.evaluate("Array.from(document.querySelectorAll('[data-recording-id] button')).find(el => el.textContent === '削除').click()");
+        // Hold the reload open so the window between the write succeeding and
+        // the new list arriving is observable rather than a single frame.
+        await page.evaluate("window.slowRecordingLoads(600)");
         await page.evaluate("Array.from(document.querySelectorAll('button')).find(el => el.textContent === '削除を確定').click()");
+        // The success drops the list in the same commit, so the deleted row can
+        // never be clicked again while its reload is still in flight.
+        const deletions = await page.evaluate('window.syntheticMutations');
+        await page.wait("document.querySelectorAll('[data-recording-id]').length === 0");
+        await page.evaluate("Array.from(document.querySelectorAll('[data-recording-id] button')).forEach(el => el.click())");
         await page.wait(`document.querySelectorAll('[data-recording-id]').length === ${recordings - 1}`);
+        assert.equal(await page.evaluate('window.syntheticMutations'), deletions);
+        await page.evaluate("window.slowRecordingLoads(0)");
         // A repeated click while the write is in flight must not issue a second
         // mutation, and the row's owner controls say so.
         const before = await page.evaluate('window.syntheticMutations');
@@ -285,6 +295,42 @@ try {
       await page.wait("document.querySelectorAll('[data-recording-id]').length === 3");
       assert.equal(await page.evaluate("document.querySelectorAll('.write-alert').length"), 0);
       assert.equal(await page.evaluate("document.querySelectorAll('[data-write-failed=\"true\"]').length"), 0);
+    });
+    // A write failing while a reload is already in flight may have happened
+    // after the server took its snapshot, so that reload must not answer for it.
+    await scenario(viewport, { recordings: 3 }, async page => {
+      await page.click('録画');
+      await page.wait("document.querySelectorAll('[data-recording-id]').length === 3");
+      await page.evaluate("window.slowRecordingLoads(900)");
+      // recording-0 fails late; recording-1 succeeds early and starts the reload.
+      await page.evaluate("window.mutationPlan({ 'synthetic-recording-0': { delay: 600, fail: true } })");
+      await page.evaluate("document.querySelector('[data-recording-id=\"synthetic-recording-0\"] .row-actions button').click()");
+      await page.evaluate("document.querySelector('[data-recording-id=\"synthetic-recording-1\"] .row-actions button').click()");
+      await page.wait("document.querySelectorAll('[data-recording-id]').length === 3 && document.querySelectorAll('.write-alert').length === 1");
+      assert.deepEqual(await page.evaluate("Array.from(document.querySelectorAll('[data-write-failed=\"true\"]')).map(el => el.dataset.recordingId)"),
+        ['synthetic-recording-0']);
+      await page.evaluate("window.slowRecordingLoads(0); window.mutationPlan({})");
+    });
+    // The reload control must not clear the markers before a reload succeeds.
+    await scenario(viewport, { recordings: 3 }, async page => {
+      await page.click('録画');
+      await page.wait("document.querySelectorAll('[data-recording-id]').length === 3");
+      await page.evaluate("window.mutationPlan({ 'synthetic-recording-0': { fail: true } })");
+      await page.evaluate("document.querySelector('[data-recording-id=\"synthetic-recording-0\"] .row-actions button').click()");
+      await page.wait("document.querySelectorAll('[data-write-failed=\"true\"]').length === 1");
+      // Reloading and failing leaves no list, so the unknown result must still
+      // be reported instead of being cleared by the attempt itself.
+      await page.evaluate("window.failRecordingLoads(true)");
+      await page.evaluate("document.querySelector('.write-alert .primary').click()");
+      await page.wait("document.querySelectorAll('[role=alert]').length === 1 && document.querySelectorAll('[data-recording-id]').length === 0");
+      assert.match(await page.evaluate('document.body.innerText'), /録画の一覧を取得できません/);
+      assert.equal(await page.evaluate("document.querySelectorAll('[data-write-failed=\"true\"]').length"), 1);
+      // Only a successful reload clears it.
+      await page.evaluate("window.failRecordingLoads(false); window.mutationPlan({})");
+      await page.evaluate("document.querySelector('[role=alert] .primary').click()");
+      await page.wait("document.querySelectorAll('[data-recording-id]').length === 3");
+      assert.equal(await page.evaluate("document.querySelectorAll('[data-write-failed=\"true\"]').length"), 0);
+      assert.equal(await page.evaluate("document.querySelectorAll('.write-alert').length"), 0);
     });
     // A rejected write reports itself without discarding the loaded list.
     await scenario(viewport, { recordings: 3, mutationStatus: 503 }, async page => {

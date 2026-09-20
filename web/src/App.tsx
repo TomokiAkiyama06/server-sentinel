@@ -100,15 +100,18 @@ export function App({ services = deniedServices }: { services?: DashboardService
     // sign-in. Re-opening the list must obtain the current server snapshot.
     if (!loader || access.state !== 'allowed' || !canVisit(access, 'recordings') || view !== 'recordings') return;
     const controller = new AbortController();
+    // The markers this reload can answer for are the ones that existed when it
+    // began. `failedWrites` is deliberately not a dependency: a write failing
+    // while the request is in flight may have happened after the server took
+    // its snapshot, so that marker must survive until a later reload.
+    const answered = new Set(failedWrites);
     setRecordings({ state: 'loading' });
     void (async () => {
       try {
         const items = await loader(controller.signal);
         if (!controller.signal.aborted) {
           setRecordings({ state: 'ready', items });
-          // This snapshot is authoritative, so no earlier write's result is
-          // unknown any more; a later failure re-marks its own recording.
-          setFailedWrites(current => current.length ? [] : current);
+          setFailedWrites(current => current.filter(value => !answered.has(value)));
         }
       } catch {
         if (!controller.signal.aborted) setRecordings({ state: 'failed' });
@@ -156,6 +159,10 @@ export function App({ services = deniedServices }: { services?: DashboardService
       // Per recording: one write succeeding never clears another's unknown
       // result, and an aborted write belongs to a replaced session.
       if (outcome === 'done') {
+        // Drop the list in the same commit: a deleted row must not stay
+        // interactive, and a star must not keep showing its previous state,
+        // while the reload this triggers is still in flight.
+        setRecordings(stale);
         setFailedWrites(current => current.filter(value => value !== id));
         setRefresh(value => value + 1);
       } else if (outcome === 'failed') {
@@ -205,9 +212,11 @@ export function App({ services = deniedServices }: { services?: DashboardService
               : selected === 'sources' && sources.state === 'loading' ? <p role="status">{t.checking}</p>
               : selected === 'recordings' && recordings.state === 'ready'
                 ? <RecordingsView t={t} recordings={recordings.items} owner={access.role === 'owner'} actions={actions} busy={busy}
-                    failedWrites={failedWrites} onReload={() => { setFailedWrites([]); setRefresh(value => value + 1); }} />
+                    failedWrites={failedWrites} onReload={() => { setRecordings(stale); setRefresh(value => value + 1); }} />
                 : selected === 'recordings' && recordings.state === 'failed'
-                  ? <section className="notice" role="alert"><p>{t.recordingsUnavailable}</p><button className="primary" onClick={() => setRefresh(value => value + 1)}>{t.retry}</button></section>
+                  ? <section className="notice" role="alert"><p>{t.recordingsUnavailable}</p>
+                    {failedWrites.length > 0 && <p data-write-failed="true">{t.actionFailed}</p>}
+                    <button className="primary" onClick={() => setRefresh(value => value + 1)}>{t.retry}</button></section>
                   : selected === 'recordings' && recordings.state === 'loading' ? <p role="status">{t.checking}</p>
                     : selected === 'storage' && access.role === 'owner' && storage.state === 'ready'
                       ? <StorageView t={t} storage={storage.item} onRefresh={() => { setStorage(stale); setRefresh(value => value + 1); }} />
