@@ -12,6 +12,15 @@ static assets and errors. No unauthenticated HTTP health exception is provided.
 
 ## Test metadata
 
+Issue #16's disk-ring core has only synthetic filesystem/quota/clock acceptance.
+Before closing #16, run the existing Agent buffer/outage checks with the real
+segmenter/profile and authenticated transport: verify each source retains the
+full T−10/T+10 interval, confirm real segment/container/block overhead fits the
+admission bound, and inspect partial/gap reporting during actual disk pressure
+and mount loss. Verify Owner-only mode/value/deletion controls and DTO rendering
+through #10-authorized routes. Do not record those physical/UI checks as passed
+because the temporary-filesystem tests succeeded.
+
 ```text
 Date:
 ServerSentinel version / Git commit:
@@ -254,6 +263,7 @@ Unexpected Main Server communication loss:
 - [ ] segment gaps/shortened protection are reported truthfully;
 - [ ] protected incident has a 60-day agent-side expiry;
 - [ ] expiry cleanup removes it automatically after 60 days (use test clock/accelerated retention harness rather than waiting 60 real days where available);
+- [ ] restart or trusted-clock recovery after that deadline expires the incident immediately; delayed finalization/late media never extends `ended_at + 60 days`;
 - [ ] ordinary ring-buffer pressure does not delete an unexpired protected incident;
 - [ ] disk pressure produces explicit warning/hard-stop behavior before unsafe writes.
 
@@ -705,6 +715,11 @@ explicitly. Do not alter production protection to make a negative test pass.
 Never use a real secret as a fixture or publish an App key/token, reviewer token,
 raw private API response, or monitoring data. Cleanup only the identified
 synthetic test branches/PRs; no production data or unrelated rule deletion.
+
+### Agent ring ledger budget follow-up (#16)
+
+- [ ] Configure an explicit ledger maximum, fill runtime storage toward its reserve on shared and separate filesystems, and verify startup/recovery/metadata writes refuse safely without deleting protected media.
+- [ ] Trigger an unexpected authentication loss with the socket still open; verify one T-10/T+10 incident. Remove a synthetic older protected segment after fresh pre-roll is complete and verify overall status remains degraded.
 
 ## Issue #20 — Target Main detector acceptance (pending)
 

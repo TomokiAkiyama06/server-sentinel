@@ -295,6 +295,12 @@ class MediaStore:
                 fcntl.flock(self._fd, fcntl.LOCK_UN)
 
     @property
+    def filesystem_device(self):
+        """Verified device of the pinned media directory, independent of path races."""
+        self.check(require_reserve=False)
+        return os.fstat(self._fd).st_dev
+
+    @property
     def allocation_unit(self):
         self.check(require_reserve=False)
         return self.space(self._fd).f_frsize
