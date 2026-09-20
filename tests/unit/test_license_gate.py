@@ -111,9 +111,10 @@ class LicenseGateTests(unittest.TestCase):
                 with self.assertRaises(license_gate.GateError):
                     license_gate.audit(self.root)
 
-    def test_blocked_families_require_exact_owner_approval(self):
+    def test_nonallowlisted_licenses_require_exact_owner_approval(self):
         for blocked in ("AGPL-3.0-only", "GPL-3.0-only", "SSPL-1.0", "BUSL-1.1",
-                        "source-available-custom", "unclear"):
+                        "source-available-custom", "unclear", "Proprietary",
+                        "Elastic-2.0", "Commons-Clause", "LicenseRef-Unknown"):
             with self.subTest(license=blocked):
                 self.components = [self.component(license=blocked)]
                 self.approvals = []
@@ -230,6 +231,12 @@ class LicenseGateTests(unittest.TestCase):
                 with self.assertRaises(license_gate.GateError):
                     license_gate.audit(self.root)
 
+    def test_requirement_include_is_rejected_before_nested_package_can_bypass_inventory(self):
+        self.write("vendor.lock", "unreviewed==9.9.9 --hash=sha256:" + "b" * 64 + "\n")
+        self.write("requirements.lock", "-r vendor.lock\n")
+        with self.assertRaisesRegex(license_gate.GateError, "include is not a reviewed input"):
+            license_gate.audit(self.root)
+
     def test_unknown_dependency_ecosystem_fails_closed(self):
         self.write("transport/Cargo.lock", "# synthetic lock\n")
         with self.assertRaisesRegex(license_gate.GateError, "reviewed parser"):
@@ -338,6 +345,15 @@ class LicenseGateTests(unittest.TestCase):
         self.assertEqual(repository_guard.audit(self.root), [])
         self.assertIn(path, license_gate.model_files(self.root))
         self.assertNotIn(ordinary, license_gate.model_files(self.root))
+        with self.assertRaisesRegex(license_gate.GateError, "model artifact set differs"):
+            license_gate.audit(self.root)
+
+    def test_ci_rejects_tracked_model_artifact_under_build_or_dist(self):
+        path = "build/models/person.onnx"
+        self.write(path, b"synthetic opaque model")
+        subprocess.run(["git", "-C", str(self.root), "init", "--quiet"], check=True)
+        subprocess.run(["git", "-C", str(self.root), "add", "."], check=True)
+        self.assertIn(path, license_gate.model_files(self.root))
         with self.assertRaisesRegex(license_gate.GateError, "model artifact set differs"):
             license_gate.audit(self.root)
 
