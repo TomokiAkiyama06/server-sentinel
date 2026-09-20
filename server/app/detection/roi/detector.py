@@ -120,9 +120,8 @@ class SceneDetector:
         return (result is not None and result.error <= self.policy.maximum_match_error
                 and result.margin >= self.policy.minimum_match_margin)
 
-    def inspect(self, frame: GrayFrame, *, monotonic_ns: int, observed_at,
-                movement_quality: Quality, tamper_quality: Quality,
-                roi_occluded: bool | None = None):
+    def _accept(self, frame, monotonic_ns, observed_at, movement_quality, tamper_quality,
+                roi_occluded):
         observed_at = timestamp(observed_at)
         if type(monotonic_ns) is not int or monotonic_ns < 0:
             raise ValueError("observation clock must be monotonic nanoseconds")
@@ -130,9 +129,24 @@ class SceneDetector:
             raise ValueError("detector-specific quality is required")
         if roi_occluded is not None and type(roi_occluded) is not bool:
             raise ValueError("occlusion context must be explicit")
-        c = self.calibration
-        if not isinstance(frame, GrayFrame) or frame.source_id != c.source_id:
+        if not isinstance(frame, GrayFrame) or frame.source_id != self.calibration.source_id:
             raise ValueError("frame does not belong to this calibration")
+        return observed_at
+
+    def inspect(self, frame: GrayFrame, *, monotonic_ns: int, observed_at,
+                movement_quality: Quality, tamper_quality: Quality,
+                roi_occluded: bool | None = None):
+        try:
+            observed_at = self._accept(frame, monotonic_ns, observed_at, movement_quality,
+                                       tamper_quality, roi_occluded)
+        except Exception:
+            # A refused sample breaks continuity exactly as a missing one does.
+            # Ending confirmation here stops a later confirmed observation from
+            # spanning a frame this detector never evaluated, such as one that
+            # belongs to a different source.
+            self._interrupt()
+            raise
+        c = self.calibration
         if (frame.channels != 1 or (frame.width, frame.height) != (c.reference.width, c.reference.height)):
             self._interrupt()
             return self._observation(frame, monotonic_ns, observed_at, movement_reason="reference_shape_mismatch",
@@ -194,11 +208,15 @@ class SceneDetector:
                                             or global_match.transform.rotated > 0)
             obscured = dark >= self.policy.camera_dark_fraction
             # A covered or redirected camera often cannot register at all. Such a
-            # scene is a persistence candidate when it also differs measurably;
-            # an ambiguous registration of an otherwise unchanged scene stays
-            # indeterminate and is never confirmed or called untampered.
+            # scene is a persistence candidate when it also differs measurably.
+            # A scene whose best transform is acceptable but ambiguous is not:
+            # on a repetitive scene the untransformed difference is large even
+            # when the registered transform is small, so that case stays
+            # indeterminate instead of being confirmed or called untampered.
+            registered = (global_match is not None
+                          and global_match.error <= self.policy.maximum_match_error)
             difference = 0.0 if global_good else dissimilarity(c.reference, frame, self.background)
-            unmatched = not global_good and difference > self.policy.maximum_match_error
+            unmatched = not registered and difference > self.policy.maximum_match_error
             indeterminate = not (global_good or obscured or unmatched)
             changed = global_shift or obscured or unmatched
             if global_shift:

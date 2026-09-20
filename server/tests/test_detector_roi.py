@@ -68,13 +68,19 @@ def covered():
     return bytes((x * 3 + y * 5) % 37 + 210 for y in range(HEIGHT) for x in range(WIDTH))
 
 
-def calibration(source_type=SourceType.LOCAL_UVC, *, version=1, rules=None):
+def repetitive(shift=0):
+    """Generated period-two stripes: several bounded transforms match equally."""
+    return bytes(40 if (x - shift) % 2 == 0 else 200
+                 for y in range(HEIGHT) for x in range(WIDTH))
+
+
+def calibration(source_type=SourceType.LOCAL_UVC, *, version=1, rules=None, reference=None):
     return Calibration(UUID(int=400 + version), SOURCE, source_type, PROFILE, version, NOW,
-                       POLYGON, frame(0), rules or policy())
+                       POLYGON, frame(0, reference), rules or policy())
 
 
-def detector(source_type=SourceType.LOCAL_UVC, *, rules=None):
-    return SceneDetector(calibration(source_type, rules=rules))
+def detector(source_type=SourceType.LOCAL_UVC, *, rules=None, reference=None):
+    return SceneDetector(calibration(source_type, rules=rules, reference=reference))
 
 
 def inspect_scene(instance, sample, monotonic_ns, *, movement=Quality.SUFFICIENT,
@@ -211,6 +217,32 @@ class SceneDetectorTests(unittest.TestCase):
         self.assertEqual("stream_or_sampling_discontinuity", gap.movement_reason)
         self.assertEqual(Observation.UNKNOWN, after_gap.movement)
         self.assertFalse(after_gap.critical)
+
+    def test_low_margin_match_stays_indeterminate_instead_of_confirming_tamper(self):
+        rules = policy(camera_shift_pixels=2)
+        instance = detector(rules=rules, reference=repetitive())
+        jittered = repetitive(1)
+        inspect_scene(instance, frame(0, repetitive()), 0)
+        samples = [inspect_scene(instance, frame(index, jittered), index * 10)
+                   for index in range(1, 5)]
+        for sample in samples:
+            self.assertEqual(Observation.UNKNOWN, sample.tamper)
+            self.assertEqual("global_alignment_unavailable", sample.tamper_reason)
+            self.assertIsNone(sample.tamper_confidence)
+            self.assertEqual(Observation.UNKNOWN, sample.movement)
+            self.assertFalse(sample.critical)
+
+    def test_frame_from_another_source_ends_temporal_confirmation(self):
+        moved = transformed(pixels(), (1, 0), region=(4, 4, 8, 7))
+        instance = detector()
+        inspect_scene(instance, frame(0), 0)
+        inspect_scene(instance, frame(1, moved), 10)
+        with self.assertRaises(ValueError):
+            inspect_scene(instance, frame(2, moved, source=UUID(int=399)), 20)
+        after = inspect_scene(instance, frame(3, moved), 30)
+        self.assertEqual(Observation.UNKNOWN, after.movement)
+        self.assertEqual("awaiting_confirmation", after.movement_reason)
+        self.assertFalse(after.critical)
 
     def test_confirmation_after_an_interruption_reports_new_critical_evidence(self):
         moved = transformed(pixels(), (1, 0), region=(4, 4, 8, 7))

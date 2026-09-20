@@ -28,7 +28,9 @@ translation/quarter-turn transforms, then compares the ROI relative to that
 transform. It only emits `server_movement` after the configured number and
 duration of corroborating samples. An explicit ROI-occlusion signal, sampling
 gap, stream restart, regression, mismatched frame, or insufficient movement
-quality resets confirmation and yields `unknown`, never `no movement`.
+quality resets confirmation and yields `unknown`, never `no movement`. A
+sample the detector refuses outright, such as a frame belonging to another
+source, ends the episode too, so no later confirmation spans it.
 Ending an episode that way also clears its emitted latch: a condition that is
 confirmed again after the interruption is new evidence and is reported again
 rather than dropped as a duplicate. Person presence is deliberately not an
@@ -37,9 +39,11 @@ input.
 Camera tamper has its own quality input and temporal confirmation. It can
 report a bounded global scene shift, a persistent near-dark scene, or a scene
 that stops registering while differing measurably from the calibrated
-background — a covered or redirected camera. A registration that is merely
-ambiguous on an otherwise unchanged scene stays `unknown` and confirms
-neither tamper nor absence of tamper. A trusted source-loss signal produces a
+background — a covered or redirected camera. A registration whose best
+transform is acceptable but ambiguous, as on a repetitive scene where several
+bounded transforms score alike, stays `unknown` and confirms neither tamper
+nor absence of tamper: its untransformed difference is large even when the
+registered transform is small, so it is never treated as a changed scene. A trusted source-loss signal produces a
 critical observation only if it closely follows a tracked global scene shift,
 and at most once per tracked shift episode; source loss by itself stays
 `unknown`. The scene-difference measurement is a
@@ -52,6 +56,7 @@ must remain armed in every presence state.
 `server/tests/test_detector_roi.py` generates all pixel inputs in memory for
 local and remote-agent calibration, relative movement, global camera motion,
 temporary ROI occlusion, dark-scene tamper, persistent unmatched scenes,
-ambiguous registration, source-loss correlation, quality isolation,
-media-free calibration history, and failed critical delivery. Hardware,
+ambiguous and low-margin registration, refused foreign-source samples,
+source-loss correlation, quality isolation, media-free calibration history,
+and failed critical delivery. Hardware,
 lighting, camera pose, and source-health integration are not verified here.
