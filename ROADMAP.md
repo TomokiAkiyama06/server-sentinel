@@ -103,6 +103,11 @@ acceptance.
 
 ## Phase 7 — Timeline, recordings, storage, notifications
 
+Issue #21 has internal Main policy/retention/Owner action and optional Slack/daily
+scheduler primitives with disposable filesystem and mock transport coverage.
+Production authorization/timer/outbox integration, playback and the Owner-planned
+UI remain pending; these phase boxes represent integrated acceptance.
+
 - [ ] unified factual timeline
 - [ ] neutral wording/no culprit inference
 - [ ] recording browser/playback

@@ -1,4 +1,4 @@
-# Python 3.12 / 3.14, Linux x86_64; Python 3.12 Linux aarch64.
+# CI lock: Linux x86_64 / CPython 3.12 only, because it includes the detector lock.
 # Exact verified wheel hashes; install --require-hashes --only-binary=:all:.
 -r requirements.lock
 pycodestyle==2.14.0 \
