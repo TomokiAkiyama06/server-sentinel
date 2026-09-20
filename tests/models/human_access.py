@@ -149,31 +149,51 @@ class Enrollment:
 
     identity: Identity
     secret: str
+    issued: int
     expires: int
+    # The authorization state it was issued against. Recovery, revocation, and
+    # any other generation change void it without tracking it individually.
+    principal_generation: int
+    deployment_generation: int
     used: bool = False
 
 
-def bootstrap(identity, local_admin_confirmed, now, secret, lifetime=15 * 60):
+def authorize_enrollment(policy, principal, now, secret, lifetime=15 * 60):
+    """Model the local console authorizing exactly one registration.
+
+    The command's authority and console handling are outside the model; only
+    the resulting authorization state is here.
+    """
+    return Enrollment(principal.identity, secret, now, now + lifetime,
+                      principal.generation, policy.deployment_generation)
+
+
+def bootstrap(policy, identity, local_admin_confirmed, now, secret,
+              lifetime=15 * 60):
     """Model the local administrative bootstrap of the single Owner.
 
-    It creates the Owner principal with no credential yet and authorizes exactly
-    one enrollment. The command's authority, uniqueness transaction, and console
-    handling are outside the model; only the resulting policy state is here.
+    It creates the Owner principal with no credential yet and authorizes
+    exactly one enrollment for it.
     """
     if not local_admin_confirmed:
         raise PermissionError("local administration required")
-    return (Principal(identity, owner=True),
-            Enrollment(identity, secret, now + lifetime))
+    owner = Principal(identity, owner=True)
+    return owner, authorize_enrollment(policy, owner, now, secret, lifetime)
 
 
-def redeem(enrollment, principal, identity, secret, credential, now):
-    """Model the single-use redemption that registers the first credential.
+def redeem(policy, enrollment, principal, identity, secret, credential, now):
+    """Model the single-use redemption that registers one credential.
 
     A verified identity alone never enrolls: under a shared Tailscale login the
-    presented secret is what the holder of the local console has. Every refusal
-    is the one generic denial.
+    presented secret is what the holder of the local console has. A time before
+    issuance is a clock anomaly rather than an early redemption, and a
+    generation that has moved means the authorization state it was issued
+    against is gone. Every refusal is the one generic denial.
     """
-    if (enrollment.used or now >= enrollment.expires
+    if (enrollment.used
+            or not enrollment.issued <= now < enrollment.expires
+            or enrollment.principal_generation != principal.generation
+            or enrollment.deployment_generation != policy.deployment_generation
             or secret != enrollment.secret
             or identity != enrollment.identity
             or identity != principal.identity):
@@ -211,7 +231,12 @@ def fresh_session(principal, policy, now, credential=None):
 
 
 def recover(policy, owner, new_identity, local_admin_confirmed):
-    """Model an atomic, already-authorized local recovery outcome."""
+    """Model an atomic, already-authorized local recovery outcome.
+
+    Advancing both generations is what voids outstanding enrollments, so a
+    pending authorization cannot register a credential after recovery even when
+    the external identity is unchanged.
+    """
     if not local_admin_confirmed or not owner.owner:
         raise PermissionError("local administration required")
     return (replace(policy, deployment_generation=policy.deployment_generation + 1),

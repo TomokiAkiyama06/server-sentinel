@@ -6,8 +6,8 @@ import unittest
 
 from tests.models.human_access import (
     Capability, Evidence, Identity, OriginEvidence, Policy, Principal,
-    bootstrap, change_grants, enroll_credential, fresh_session, permits,
-    recover, redeem, revoke_credential,
+    authorize_enrollment, bootstrap, change_grants, enroll_credential,
+    fresh_session, permits, recover, redeem, revoke_credential,
 )
 
 
@@ -220,18 +220,21 @@ class HumanAccessContractTests(unittest.TestCase):
         # An unstated gate must never read as verified.
         self.assertFalse(self.allowed(evidence=Evidence(self.identity)))
 
+    def bootstrapped(self, now=100):
+        return bootstrap(self.policy, self.identity, local_admin_confirmed=True,
+                         now=now, secret="enrollment-secret")
+
     def test_bootstrap_provisions_the_owner_credential_locally(self):
         with self.assertRaises(PermissionError):
-            bootstrap(self.identity, local_admin_confirmed=False, now=100,
-                      secret="enrollment-secret")
-        owner, enrollment = bootstrap(self.identity, local_admin_confirmed=True,
-                                      now=100, secret="enrollment-secret")
+            bootstrap(self.policy, self.identity, local_admin_confirmed=False,
+                      now=100, secret="enrollment-secret")
+        owner, enrollment = self.bootstrapped()
         # The Owner exists but holds no credential, so nothing authorizes yet.
         self.assertEqual(owner.credentials, frozenset())
         for capability in Capability:
             with self.subTest(capability=capability):
                 self.assertFalse(self.allowed(capability, principal=owner))
-        enrolled, spent = redeem(enrollment, owner, self.identity,
+        enrolled, spent = redeem(self.policy, enrollment, owner, self.identity,
                                  "enrollment-secret", "credential-owner", now=100)
         self.assertEqual(enrolled.credentials, frozenset({"credential-owner"}))
         self.assertTrue(self.allowed(
@@ -239,26 +242,65 @@ class HumanAccessContractTests(unittest.TestCase):
             session=fresh_session(enrolled, self.policy, 100)))
         # One use only: a second redemption is refused like any other.
         with self.assertRaises(PermissionError):
-            redeem(spent, enrolled, self.identity, "enrollment-secret",
-                   "credential-second", now=100)
+            redeem(self.policy, spent, enrolled, self.identity,
+                   "enrollment-secret", "credential-second", now=100)
 
     def test_shared_login_alone_cannot_redeem_the_bootstrap_enrollment(self):
-        owner, enrollment = bootstrap(self.identity, local_admin_confirmed=True,
-                                      now=100, secret="enrollment-secret")
+        owner, enrollment = self.bootstrapped()
         other = Identity(self.identity.issuer, "roommate@example.invalid")
         refusals = (
             # Same shared Tailscale login, no local authorization.
-            (owner, self.identity, "guessed-secret", 100),
+            (self.identity, "guessed-secret", 100),
             # Another login of the same shared account.
-            (owner, other, "enrollment-secret", 100),
+            (other, "enrollment-secret", 100),
             # Expired authorization.
-            (owner, self.identity, "enrollment-secret", 100 + 15 * 60),
+            (self.identity, "enrollment-secret", 100 + 15 * 60),
+            # Backward clock step: a time before issuance is not an early
+            # redemption, and must not extend the short lifetime.
+            (self.identity, "enrollment-secret", 0),
+            (self.identity, "enrollment-secret", 99),
         )
-        for principal, identity, secret, now in refusals:
+        for identity, secret, now in refusals:
             with self.subTest(identity=identity, secret=secret, now=now):
                 with self.assertRaises(PermissionError):
-                    redeem(enrollment, principal, identity, secret,
+                    redeem(self.policy, enrollment, owner, identity, secret,
                            "credential-owner", now)
+
+    def test_recovery_voids_outstanding_enrollment_authorizations(self):
+        owner, pending = self.bootstrapped()
+        enrolled, _ = redeem(self.policy, pending, owner, self.identity,
+                             "enrollment-secret", "credential-owner", now=100)
+        # A second authorization is issued and still outstanding when the same
+        # Owner recovers after losing every authenticator.
+        outstanding = authorize_enrollment(self.policy, enrolled, 100,
+                                           "enrollment-secret")
+        policy, new_owner = recover(self.policy, enrolled, self.identity,
+                                    local_admin_confirmed=True)
+        for current_policy, principal in ((policy, new_owner),
+                                          (self.policy, new_owner),
+                                          (policy, enrolled)):
+            with self.subTest(deployment=current_policy.deployment_generation,
+                              principal=principal.generation):
+                with self.assertRaises(PermissionError):
+                    redeem(current_policy, outstanding, principal,
+                           self.identity, "enrollment-secret",
+                           "credential-stale", now=100)
+        # Recovery is completed with an authorization issued after it.
+        reissued = authorize_enrollment(policy, new_owner, 100,
+                                        "enrollment-secret")
+        recovered, _ = redeem(policy, reissued, new_owner, self.identity,
+                              "enrollment-secret", "credential-owner-2", now=100)
+        self.assertTrue(self.allowed(
+            Capability.OWNER, policy=policy, principal=recovered,
+            session=fresh_session(recovered, policy, 100)))
+
+    def test_grant_change_voids_an_outstanding_enrollment(self):
+        pending = authorize_enrollment(self.policy, self.principal, 100,
+                                       "enrollment-secret")
+        changed = change_grants(self.principal, {"recordings:view"})
+        with self.assertRaises(PermissionError):
+            redeem(self.policy, pending, changed, self.identity,
+                   "enrollment-secret", "credential-2", now=100)
 
     def test_recovery_requires_local_admin_evidence_and_invalidates_every_session(self):
         owner = replace(self.principal, owner=True)

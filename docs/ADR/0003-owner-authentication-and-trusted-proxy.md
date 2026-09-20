@@ -58,28 +58,46 @@ recovery.
    none exists. Record an audit event without raw identity headers or credentials.
    Concurrent bootstrap attempts cannot create a second Owner.
 4. In the same local step, authorize exactly one credential enrollment for that
-   Owner principal: a single-use, short-lived authorization bound to the
-   principal, shown only on the local administrative console, never transmitted,
-   logged, or stored in reusable form. Access stays closed until it is redeemed.
-5. The Owner redeems it once from a browser on the reserved origin and registers
-   an authenticator with user verification, which is the invitation-redemption
-   path of the shared-account ADR rather than a new route. Redemption requires
-   both the local authorization and a verified identity matching the binding, is
-   rate-limited, returns no application data, and grants no access by itself.
-   Where the Main Server has a usable local browser, the same ceremony runs over
-   the loopback boundary and the authorization never leaves the host.
-6. An expired, unredeemed, or already-redeemed authorization leaves human access
-   closed; only the local administrator can issue another. The first browser
-   connection therefore cannot enroll on verified identity alone. The
-   authorization is not a bearer credential for application data, is not
-   remotely reusable, and bypasses neither the private-network gate nor any
-   later credential assertion.
+   Owner principal: a single-use, short-lived authorization carrying the
+   principal, its issue time, its expiry, and the principal and deployment
+   authorization generations it was issued against. The server keeps only a
+   digest of the secret. It is displayed on the local administrative console
+   and nowhere else; it never enters logs, diagnostics, audit records, URLs,
+   query strings, referrers, or any reusable plaintext storage. Access stays
+   closed until it is redeemed.
+5. The Owner carries it from that console to the browser they will use and
+   submits it once to the redemption endpoint on the reserved origin, over the
+   private-network HTTPS path this design already requires, and registers an
+   authenticator with user verification. That is the invitation-redemption path
+   of the shared-account ADR rather than a new route: the value travels in a
+   request body, never in a URL, and the response sets no cookie and returns no
+   application data. Where the Main Server has a usable local browser, the same
+   ceremony runs over the loopback boundary and the authorization does not
+   leave the host; the remote case is the one that accepts the manual transfer
+   and is bounded by the short lifetime, the single use, and rate limiting.
+6. Redemption requires the authorization, a verified identity matching the
+   binding, and both current generations. It is refused when the authorization
+   is spent or expired, when the current time predates its issue time, when
+   expiry cannot be reliably established after a restart or clock step, or when
+   either generation has advanced — so recovery, revocation, and any other
+   generation change void every outstanding authorization atomically without
+   tracking them individually. Redemption is rate-limited, grants no
+   application access by itself, and the Owner authenticates afterwards like
+   anyone else. Every refusal is the one generic response.
+7. An expired, unredeemed, voided, or already-redeemed authorization leaves
+   human access closed; only the local administrator can issue another. The
+   first browser connection therefore cannot enroll on verified identity alone.
+   The authorization is not a bearer credential for application data, is not
+   reusable, and bypasses neither the private-network gate nor any later
+   credential assertion.
 
 Recovery requires the same administrative local boundary and explicit
 confirmation of the replacement identity. Stop admission of human requests,
 increment a deployment authorization generation, invalidate all human sessions,
 cancel active delivery, revoke the old Owner binding together with every
-credential enrolled under it, and bind exactly one new Owner atomically. The
+credential enrolled under it, void every outstanding enrollment
+authorization by that generation change, and bind exactly one new Owner
+atomically. The
 replacement Owner enrolls a credential through the same locally authorized,
 single-use enrollment as bootstrap step 4 before any session exists, so
 recovery never leaves a usable credential behind. Persist the audit outcome
@@ -333,6 +351,7 @@ capture credentials are never accepted by the human boundary.
 
 | Threat or transition | Design evidence |
 |---|---|
+| Stale enrollment authorization survives recovery; redemption replayed after a backward clock step | Generation-bound, single-use authorization refused outside its issue-to-expiry window |
 | First visitor claims Owner; shared-login holder enrolls the Owner credential; replay/concurrent bootstrap | Local-only explicit bootstrap, single-use local enrollment authorization, uniqueness transaction, no bootstrap HTTP route |
 | LAN/forwarded-header spoof; ingest-to-human bypass | Actual peer and listener separation; deployment reachability tests required |
 | Missing/duplicate/tagged/shared-but-uninvited identity | Strict adapter, no identity fallback, application allowlist |

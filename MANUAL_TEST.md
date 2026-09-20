@@ -739,7 +739,14 @@ They are not completed by the Issue #6 synthetic policy model.
   access stays closed until it is redeemed once from the reserved origin with a
   matching identity and user verification, and a second redemption, an expired
   authorization, or a browser connection carrying only the shared login is
-  refused with the generic response.
+  refused with the generic response. Confirm the value appears only on the local
+  console and never in logs, audit records, URLs, referrers or diagnostics on
+  either the local or the manually transferred remote path.
+- Issue an enrollment authorization, run recovery for the same Owner identity
+  before redeeming it, and confirm the pending authorization is refused
+  afterwards and that only a newly issued one completes recovery. Step the clock
+  backwards past its issue time and confirm redemption is refused rather than
+  effectively extending the short lifetime.
 - Confirm a verified shared-account login with an active invitation but no
   credential-backed session is refused like an uninvited one, that user
   verification is required at every authentication, that revoking one credential
