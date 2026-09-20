@@ -5,6 +5,7 @@
 !build_installer.py
 !install.py
 !pyproject.toml
+!requirements-detector.lock
 !app/
 !app/**
 !tests/

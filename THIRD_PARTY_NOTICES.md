@@ -67,3 +67,7 @@ If distributing any tool source or binary, retain its upstream copyright and
 license text and all applicable bundled notices, including Apache notices.
 This inventory does not replace those redistribution obligations. Existing
 Claude review automation remains documented in `docs/CLAUDE_REVIEW_SETUP.md`.
+
+## Optional CPU person detector (Issue #20)
+
+RT-DETRv2 original implementation and original/converted model cards separately declare Apache-2.0. Only the digest-pinned local ONNX artifact is supported; no weights are redistributed in this repository. The Linux x86_64/CPython 3.12 CPU closure pins ONNX Runtime 1.28.0, NumPy 2.3.5, flatbuffers 25.12.19, packaging 25.0 and protobuf 6.33.5. See [exact audit, sources and material native obligations](server/docs/RTDETR_RUNTIME_AUDIT.md) and [preserved full notices](server/docs/DETECTOR_THIRD_PARTY_LICENSE_TEXTS.md), including GCC runtime exception, LGPL and MPL requirements. Binary/image redistribution requires fulfilling those source/relinking/notice obligations; this PR publishes source and locks only.
