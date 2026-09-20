@@ -251,6 +251,8 @@ Owner-only verification requirements:
 
 Model output is probabilistic and is not proof of identity or culpability.
 
+The #25 internal singleton template store requires an existing private `0700` runtime directory and `0600` regular single-link database under the service UID, outside checkout. It rejects symlinks/FIFOs/shared permissions and root/file substitution, holds an exclusive directory lock, and confines operations to one worker. Metadata reservations cover transactional enrollment/delete/audit; generation checks invalidate replacement/deletion races. The default Owner authorizer denies. No human listener/route is added before #6/#10. A separate local template DB is excluded from every diagnostic archive; normal recording exports cannot include it. Permissions do not claim encryption or protection from local administrators, and logical deletion does not promise forensic erasure from snapshots/backups. Audited local model adapters and 90-day audit-retention integration remain deployment prerequisites.
+
 ## Video-only MVP
 
 The MVP does not open microphones/audio streams or capture, store, or forward monitoring audio. This applies to local capture, `media-capture-agent`, recordings, and viewer delivery; no audio opt-in is offered in MVP. No event decision depends on audio.

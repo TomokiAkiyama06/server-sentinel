@@ -593,6 +593,8 @@ Acceptance:
 
 GitHub Issue: [#25](https://github.com/TomokiAkiyama06/server-sentinel/issues/25)
 
+Implementation status: internal Owner-only private singleton template/audit/generation store, candidate-bound quality/verification receipts, and ephemeral geometric same-camera entrance primitives are implemented with generated tests and isolated no-egress smoke. No face model/weights/threshold, human route, UI, real detector/worker or #26 timeline integration is enabled. #25 remains OPEN for Owner model/license decisions, #6/#10 authorization, storage/audit lifecycle wiring and actual hardware/room acceptance.
+
 Depends on: [#22](https://github.com/TomokiAkiyama06/server-sentinel/issues/22), [#10](https://github.com/TomokiAkiyama06/server-sentinel/issues/10)
 
 Labels: `ai`, `backend`, `hardware-required`, `manual-test-required`, `security`, `server-required`
