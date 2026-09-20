@@ -308,6 +308,7 @@ those sources do not select the proposed product timeout values.
 | Invitations, permission changes, camera/node configuration, retention/security settings, biometric changes, destructive recording operations | Owner |
 | Non-owner recording download/export | Unavailable in MVP, including with both viewer grants |
 | Product/version/schema/detailed health and application assets | Active authorized principal with the endpoint's explicit permission; no pre-auth exposure |
+| Enrollment redemption and credential assertion, before any credential or session exists | Verified identity, and for redemption an unspent, unexpired authorization current for both generations. Rate-limited, no application data, assets, or deployment metadata, no session cookie on failure, generic response on every refusal |
 | Unknown/unregistered route, unsupported method, human route through ingest | Deny |
 
 The generic denial is the same non-branding response for absent, malformed,
@@ -325,8 +326,13 @@ service workers, and application configuration must not be deployed from a
 separate unauthenticated static host or public bucket. The human listener guards
 the entire asset namespace before any file/fallback response. A minimal neutral
 same-origin session handshake may be supplied only after verified identity and
-active invitation; it cannot expose dashboard assets to arbitrary visitors.
-Unknown routes and SPA fallback pass through the same gate. UI permission hiding
+active invitation; it cannot expose dashboard assets to arbitrary visitors. The
+only surface reachable before a credential exists is the enumerated pair above —
+enrollment redemption and credential assertion — together with the minimal
+neutral markup and script those two need; the listener serves no other path,
+asset, or fallback to a request without a credential-backed session, and the
+pair itself returns no application data. Unknown routes and SPA fallback pass
+through the same gate. UI permission hiding
 is presentation only and never substitutes for server authorization.
 
 Permissions are read from current authoritative application state; sessions do
@@ -375,7 +381,9 @@ same way, and every evidence field defaults to the value that denies. The model
 checks that a deployment without a verified reservation stays closed, that a
 bootstrapped Owner authorizes nothing until the single-use local enrollment is
 redeemed once, and that a session whose credential was revoked stops
-authorizing. It cannot enumerate listeners, inspect proxy configuration, or
+authorizing. The pre-credential redemption path is a separate function there,
+because the request gate itself denies everything without a credential-backed
+session. It cannot enumerate listeners, inspect proxy configuration, or
 verify an authenticator. Session timeout/watchdog numbers remain proposals even
 though tests can exercise boundary values.
 

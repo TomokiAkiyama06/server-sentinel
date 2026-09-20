@@ -714,8 +714,9 @@ synthetic test branches/PRs; no production data or unrelated rule deletion.
 
 ## ADR-0003 follow-up: proposed human-access boundary
 
-These checks belong to #10/#19/#28 after Owner approval and runtime integration.
-They are not completed by the Issue #6 synthetic policy model.
+These checks belong to #10/#19/#27/#28 after Owner approval and runtime
+integration, matching the follow-up recorded in ADR-0003. They are not completed
+by the Issue #6 synthetic policy model.
 
 - Verify the reserved hostname serves ServerSentinel alone on every scheme and
   port: enumerate the Serve/reverse-proxy mappings for that name, request
