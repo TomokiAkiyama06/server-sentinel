@@ -43,6 +43,12 @@ the action to `approve_hardware_baseline` and prevents baseline approval from
 committing without its successful audit record; it is not evidence that the
 hardware baseline service or probes already exist.
 
+`RecordingBrowser` in `app/storage/retention.py` performs Owner star/delete
+only through an injected `OwnerAdministration`; without one it refuses with
+`RECORDING_AUDIT_UNAVAILABLE` instead of mutating the store directly, and
+`LocalUvcAdapter` exposes no public unaudited camera approval. An Owner change
+therefore cannot reach a recording or a camera approval without its record.
+
 Owner recording deletion commits its `deleting` journal transition and
 `delete_recording` audit together. Media cleanup then follows the recording
 store's existing recoverable deletion lifecycle. A cleanup interruption leaves

@@ -3,7 +3,7 @@
 from app.storage.migrations import Migration
 
 
-AUDIT_MIGRATION = Migration(5, "security_admin_audit", (
+AUDIT_STATEMENTS = (
     "CREATE TABLE security_admin_audit_records ("
     "id TEXT PRIMARY KEY, actor_category TEXT NOT NULL, action TEXT NOT NULL, "
     "target_kind TEXT NOT NULL, target_logical_id TEXT NOT NULL, "
@@ -15,4 +15,12 @@ AUDIT_MIGRATION = Migration(5, "security_admin_audit", (
     "CREATE TRIGGER security_admin_audit_no_update "
     "BEFORE UPDATE ON security_admin_audit_records BEGIN "
     "SELECT RAISE(ABORT, 'audit records are immutable'); END",
-))
+)
+
+
+def audit_migration(version: int) -> Migration:
+    """Place the audit DDL at a caller-assigned slot, like other modules."""
+    return Migration(version, "security_admin_audit", AUDIT_STATEMENTS)
+
+
+AUDIT_MIGRATION = audit_migration(5)

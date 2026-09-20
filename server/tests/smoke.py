@@ -25,6 +25,8 @@ import io  # noqa: E402
 from pathlib import Path  # noqa: E402
 import tempfile  # noqa: E402
 
+from app.audit import AuditAction, AuditOutcome, AuditStore, OwnerAuditService  # noqa: E402
+from app.audit.integration import OwnerAdministration  # noqa: E402
 from app.cameras.registry import ActiveSourceLimitError, CameraRegistry, CaptureProfile, SourceType  # noqa: E402
 from app.cameras.uvc.identity import DeviceEvidence  # noqa: E402
 from app.cameras.uvc.registry_adapter import LocalUvcAdapter  # noqa: E402
@@ -37,6 +39,14 @@ from tests.quality_smoke import run_quality_smoke  # noqa: E402
 from tests.recording_smoke import run_recording_smoke  # noqa: E402
 from tests.storage_smoke import run_storage_smoke  # noqa: E402
 from tests.test_uvc_session import Discovery, SyntheticCapture  # noqa: E402
+
+
+class SyntheticOwner:
+    """Stands in for the Issue #6 Owner boundary in this offline scenario."""
+
+    def require_owner(self, actor_context):
+        if actor_context != "synthetic-owner":
+            raise PermissionError("not the deployment owner")
 
 
 async def run(scenario):
@@ -71,7 +81,15 @@ async def run(scenario):
                 adapter = LocalUvcAdapter(registry, emit_audit=events.append,
                                           on_frame=lambda identity, frame: frames.append(frame),
                                           discovery=discovery, capture_factory=SyntheticCapture)
-                adapter.approve_source(source.id, candidate)
+                # The Owner approval path is the audited boundary only.
+                audit = AuditStore(application.state.database)
+                administration = OwnerAdministration(
+                    OwnerAuditService(audit, SyntheticOwner()), registry,
+                )
+                administration.approve_uvc("synthetic-owner", adapter, source.id, candidate)
+                records = audit.list_records()
+                assert [record.action for record in records] == [AuditAction.APPROVE_CAMERA]
+                assert records[0].outcome == AuditOutcome.SUCCEEDED
                 assert adapter.poll_source(source.id)
                 assert len(frames) == 1
                 discovery.devices = []

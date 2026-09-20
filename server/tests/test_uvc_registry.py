@@ -293,7 +293,7 @@ class UvcRegistryTests(unittest.TestCase):
         self.assertEqual(self.frames, [])
 
     def test_approval_negotiation_health_and_disable_are_persisted(self):
-        self.adapter.approve_source(self.source.id, self.camera)
+        self.adapter._approve_live_session(self.source.id, self.camera)
         self.assertEqual(self.registry.get_source(self.source.id).health_state, SourceHealthState.DEGRADED)
         self.assertTrue(self.adapter.poll_source(self.source.id))
         source = self.registry.get_source(self.source.id)
@@ -307,7 +307,7 @@ class UvcRegistryTests(unittest.TestCase):
         self.assertIsNone(self.registry.get_source(source.id).negotiated_capture_profile)
 
     def test_unplug_and_restart_keep_uuid_and_ambiguity_latch(self):
-        self.adapter.approve_source(self.source.id, self.camera)
+        self.adapter._approve_live_session(self.source.id, self.camera)
         self.adapter.poll_source(self.source.id)
         self.discovery.devices = []
         self.assertFalse(self.adapter.poll_source(self.source.id))
@@ -321,12 +321,12 @@ class UvcRegistryTests(unittest.TestCase):
         self.assertFalse(restarted.poll_source(self.source.id))
         self.assertEqual(self.registry.get_source(self.source.id).health_state,
                          SourceHealthState.MANUAL_INTERVENTION_REQUIRED)
-        restarted.approve_source(self.source.id, self.camera)
+        restarted._approve_live_session(self.source.id, self.camera)
         self.assertTrue(restarted.poll_source(self.source.id))
         self.assertEqual(self.registry.get_source(self.source.id).id, self.source.id)
 
     def test_clean_shutdown_closes_capture_without_reporting_unplug(self):
-        self.adapter.approve_source(self.source.id, self.camera)
+        self.adapter._approve_live_session(self.source.id, self.camera)
         self.assertTrue(self.adapter.poll_source(self.source.id))
         capture = self.adapter.sessions[self.source.id].capture
         self.events.clear()
@@ -337,7 +337,7 @@ class UvcRegistryTests(unittest.TestCase):
         self.assertIsNone(self.adapter.store.load(self.source.id).session_token)
 
     def test_clean_shutdown_of_disabled_source_does_not_report_unplug(self):
-        self.adapter.approve_source(self.source.id, self.camera)
+        self.adapter._approve_live_session(self.source.id, self.camera)
         self.registry.update_source(self.source.id, enabled=False)
         self.assertFalse(self.adapter.poll_source(self.source.id))
         self.events.clear()
@@ -346,7 +346,7 @@ class UvcRegistryTests(unittest.TestCase):
         self.assertEqual(self.registry.get_source(self.source.id).health_state, SourceHealthState.OFFLINE)
 
     def test_clean_shutdown_preserves_manual_state_without_reporting_unplug(self):
-        self.adapter.approve_source(self.source.id, self.camera)
+        self.adapter._approve_live_session(self.source.id, self.camera)
         self.adapter.sessions[self.source.id].close()
         self.discovery.devices.append(replace(self.camera, device_path="/dev/video2"))
         self.assertFalse(self.adapter.poll_source(self.source.id))
@@ -366,8 +366,8 @@ class UvcRegistryTests(unittest.TestCase):
         )
         other_camera = replace(self.camera, serial="other-synthetic", device_path="/dev/video1")
         self.discovery.devices.append(other_camera)
-        self.adapter.approve_source(self.source.id, self.camera)
-        self.adapter.approve_source(other.id, other_camera)
+        self.adapter._approve_live_session(self.source.id, self.camera)
+        self.adapter._approve_live_session(other.id, other_camera)
         self.adapter.poll_source(self.source.id)
         self.adapter.poll_source(other.id)
         self.discovery.devices = [other_camera]
@@ -378,12 +378,12 @@ class UvcRegistryTests(unittest.TestCase):
     def test_failed_weak_reapproval_does_not_reopen_closed_binding(self):
         weak = replace(self.camera, serial=None, instance_token=(1, 2, 3))
         self.discovery.devices = [weak]
-        self.adapter.approve_source(self.source.id, weak)
+        self.adapter._approve_live_session(self.source.id, weak)
         self.assertTrue(self.adapter.poll_source(self.source.id))
         closed_capture = self.adapter.sessions[self.source.id].capture
         with patch.object(self.adapter.store, "save", side_effect=ApprovalStorageError("synthetic failure")):
             with self.assertRaises(ApprovalStorageError):
-                self.adapter.approve_source(self.source.id, weak)
+                self.adapter._approve_live_session(self.source.id, weak)
         self.assertTrue(closed_capture.closed)
         self.assertIsNone(self.adapter.sessions[self.source.id].controller.bound)
         self.assertEqual(self.registry.get_source(self.source.id).health_state, SourceHealthState.OFFLINE)
@@ -393,7 +393,7 @@ class UvcRegistryTests(unittest.TestCase):
                          SourceHealthState.MANUAL_INTERVENTION_REQUIRED)
 
     def test_restart_without_profile_keeps_durable_manual_state_without_churn(self):
-        self.adapter.approve_source(self.source.id, self.camera)
+        self.adapter._approve_live_session(self.source.id, self.camera)
         self.adapter.sessions[self.source.id].close()
         self.discovery.devices.append(replace(self.camera, device_path="/dev/video2"))
         self.assertFalse(self.adapter.poll_source(self.source.id))
@@ -412,7 +412,7 @@ class UvcRegistryTests(unittest.TestCase):
     def test_failed_first_approval_never_promotes_candidate_even_after_clean_restart(self):
         with patch.object(self.adapter.store, "save", side_effect=ApprovalStorageError("synthetic failure")):
             with self.assertRaises(ApprovalStorageError):
-                self.adapter.approve_source(self.source.id, self.camera)
+                self.adapter._approve_live_session(self.source.id, self.camera)
         self.assertTrue(self.adapter.store.load(self.source.id).requires_approval)
         self.assertFalse(self.adapter.poll_source(self.source.id))
         self.assertEqual(self.frames, [])
@@ -421,7 +421,7 @@ class UvcRegistryTests(unittest.TestCase):
         self.addCleanup(restarted.close)
         self.assertFalse(restarted.poll_source(self.source.id))
         self.assertEqual(self.frames, [])
-        restarted.approve_source(self.source.id, self.camera)
+        restarted._approve_live_session(self.source.id, self.camera)
         self.assertTrue(restarted.poll_source(self.source.id))
 
 

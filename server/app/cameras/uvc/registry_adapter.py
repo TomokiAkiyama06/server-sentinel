@@ -35,10 +35,12 @@ class PreparedApproval:
 class LocalUvcAdapter:
     """Owns independent source sessions; provides no HTTP routes or network client.
 
-    approve_source() is only for an authenticated Owner operation after the
-    human authorization boundary is implemented. poll_source() is driven by a
-    per-source worker. Do not execute different operations on the same source
-    concurrently; the runtime supervisor owns that serialization.
+    The only Owner approval entry point is the audited boundary
+    `OwnerAdministration.approve_uvc()`, which commits the selection with its
+    `approve_camera` record; this class exposes no unaudited public approval.
+    poll_source() is driven by a per-source worker. Do not execute different
+    operations on the same source concurrently; the runtime supervisor owns
+    that serialization.
     """
 
     def __init__(self, registry, *, emit_audit, on_frame,
@@ -99,8 +101,15 @@ class LocalUvcAdapter:
         self.sessions[source.id] = session
         return session
 
-    def approve_source(self, source_id, candidate):
-        """Owner selects an exact current device; stale selections are rejected."""
+    def _approve_live_session(self, source_id, candidate):
+        """Run the in-memory approval ceremony on an already live session.
+
+        Internal only: it has no audit record, so it is not an Owner entry
+        point. It exists for the offline session/reconnect fixtures that need
+        the live-controller transition the audited idle path deliberately
+        avoids, because an in-memory/physical transition cannot roll back with
+        a SQLite transaction.
+        """
         source = self._source(source_id)
         scan = self.discovery.scan()
         if not source.enabled or scan.failures or scan.devices.count(candidate) != 1:
