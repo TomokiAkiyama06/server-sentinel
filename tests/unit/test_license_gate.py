@@ -26,6 +26,13 @@ class LicenseGateTests(unittest.TestCase):
             self.review("transport"), self.review("model_code"), self.review("model_weight"),
         ]
         self.components = [self.component()]
+        self.pins = [{
+            "path": "requirements.lock",
+            "ecosystem": "python-requirements",
+            "name": "demo",
+            "version": "1.2.3",
+            "digests": ["sha256:" + "a" * 64],
+        }]
         self.approvals = []
         self.save()
 
@@ -67,6 +74,9 @@ class LicenseGateTests(unittest.TestCase):
         }))
         self.write(license_gate.APPROVALS, json.dumps({
             "schema": 1, "approvals": self.approvals,
+        }))
+        self.write(license_gate.PINS, json.dumps({
+            "schema": 1, "pins": self.pins,
         }))
 
     def test_permissive_exact_component_passes(self):
@@ -193,6 +203,13 @@ class LicenseGateTests(unittest.TestCase):
         self.inputs.append({
             "path": "frontend/package-lock.json", "ecosystem": "npm-lock", "scope": "frontend",
         })
+        self.pins.append({
+            "path": "frontend/package-lock.json",
+            "ecosystem": "npm-lock",
+            "name": "transitive",
+            "version": "4.5.6",
+            "digests": ["sha512-synthetic"],
+        })
         self.save()
         with self.assertRaisesRegex(license_gate.GateError, "locked dependencies differ"):
             license_gate.audit(self.root)
@@ -207,6 +224,64 @@ class LicenseGateTests(unittest.TestCase):
     def test_unknown_dependency_ecosystem_fails_closed(self):
         self.write("transport/Cargo.lock", "# synthetic lock\n")
         with self.assertRaisesRegex(license_gate.GateError, "reviewed parser"):
+            license_gate.audit(self.root)
+
+    def test_model_roots_scan_zip_h5_and_extensionless_files(self):
+        paths = {
+            "server/assets/models/archive.zip",
+            "agent/runtime/weights/owner.h5",
+            "checkpoints/person-v1",
+        }
+        for path in paths:
+            self.write(path, b"synthetic artifact")
+        self.assertEqual(set(license_gate.model_files(self.root)), paths)
+        with self.assertRaisesRegex(license_gate.GateError, "model artifact set differs"):
+            license_gate.audit(self.root)
+
+    def test_python_hash_change_is_rejected_for_same_name_and_version(self):
+        self.assertEqual(license_gate.audit(self.root), (1, 1, 0))
+        self.write("requirements.lock", "demo==1.2.3 --hash=sha256:" + "b" * 64 + "\n")
+        with self.assertRaisesRegex(license_gate.GateError, "lock digests differ"):
+            license_gate.audit(self.root)
+
+    def test_npm_sri_change_is_rejected_for_same_name_version_and_resolved(self):
+        resolved = "https://example.test/transitive-4.5.6.tgz"
+        package = {
+            "lockfileVersion": 3,
+            "packages": {
+                "": {},
+                "node_modules/transitive": {
+                    "version": "4.5.6", "resolved": resolved, "integrity": "sha512-YWJj",
+                },
+            },
+        }
+        self.write("frontend/package-lock.json", json.dumps(package))
+        self.inputs.append({
+            "path": "frontend/package-lock.json", "ecosystem": "npm-lock", "scope": "frontend",
+        })
+        self.components.append(self.component(
+            id="npm:transitive@4.5.6",
+            name="transitive",
+            version="4.5.6",
+            upstream=resolved,
+            locations=[{
+                "path": "frontend/package-lock.json",
+                "ecosystem": "npm-lock",
+                "scope": "frontend",
+            }],
+        ))
+        self.pins.append({
+            "path": "frontend/package-lock.json",
+            "ecosystem": "npm-lock",
+            "name": "transitive",
+            "version": "4.5.6",
+            "digests": ["sha512-YWJj"],
+        })
+        self.save()
+        self.assertEqual(license_gate.audit(self.root), (2, 2, 0))
+        package["packages"]["node_modules/transitive"]["integrity"] = "sha512-ZGVm"
+        self.write("frontend/package-lock.json", json.dumps(package))
+        with self.assertRaisesRegex(license_gate.GateError, "lock digests differ"):
             license_gate.audit(self.root)
 
 

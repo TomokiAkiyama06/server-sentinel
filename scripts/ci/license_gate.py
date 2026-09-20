@@ -19,8 +19,10 @@ from urllib.parse import unquote
 
 INVENTORY = "license/components.json"
 APPROVALS = "license/owner-approvals.json"
+PINS = "license/pins.json"
+MODEL_DIRECTORIES = {"models", "weights", "checkpoints", "model-artifacts"}
 MODEL_SUFFIXES = {
-    ".bin", ".ckpt", ".engine", ".mlmodel", ".onnx", ".pb", ".pt",
+    ".bin", ".ckpt", ".engine", ".h5", ".mlmodel", ".onnx", ".pb", ".pt",
     ".pth", ".safetensors", ".tflite", ".weights",
 }
 REQUIRED_SCOPE_REVIEWS = {"transport", "model_code", "model_weight"}
@@ -52,6 +54,15 @@ class LockedComponent:
     name: str
     version: str
     artifact: str = ""
+
+
+@dataclass(frozen=True, order=True)
+class LockedPin:
+    path: str
+    ecosystem: str
+    name: str
+    version: str
+    digests: tuple[str, ...]
 
 
 def unique_object(pairs):
@@ -101,6 +112,7 @@ def python_lock(path: Path, relative: str, scope: str):
     text = path.read_text(encoding="utf-8")
     logical = text.replace("\\\n", " ").splitlines()
     found = []
+    pins = []
     for line in logical:
         line = line.strip()
         if not line or line.startswith("#") or line.startswith(("-r ", "--requirement ")):
@@ -113,7 +125,10 @@ def python_lock(path: Path, relative: str, scope: str):
             raise GateError(f"requirement has no SHA256 evidence in {relative}")
         found.append(LockedComponent(relative, "python-requirements", scope,
                                      match.group(1).lower().replace("_", "-"), match.group(2)))
-    return found
+        pins.append(LockedPin(relative, "python-requirements",
+                              match.group(1).lower().replace("_", "-"), match.group(2),
+                              tuple(sorted("sha256:" + value for value in hashes))))
+    return found, pins
 
 
 def npm_lock(path: Path, relative: str, scope: str):
@@ -121,6 +136,7 @@ def npm_lock(path: Path, relative: str, scope: str):
     if data.get("lockfileVersion") != 3 or not isinstance(data.get("packages"), dict):
         raise GateError(f"unsupported npm lock in {relative}")
     found = []
+    pins = []
     for location, package in data["packages"].items():
         if not location:
             continue
@@ -130,10 +146,15 @@ def npm_lock(path: Path, relative: str, scope: str):
         name = location.rsplit(prefix, 1)[-1]
         version = nonempty_string(package.get("version"), "npm version")
         nonempty_string(package.get("resolved"), "npm resolved artifact")
-        nonempty_string(package.get("integrity"), "npm integrity")
+        integrity = nonempty_string(package.get("integrity"), "npm integrity")
+        digests = tuple(sorted(integrity.split()))
+        if not digests or any(not re.fullmatch(r"sha(?:256|384|512)-[A-Za-z0-9+/=]+", value)
+                              for value in digests):
+            raise GateError(f"invalid npm integrity in {relative}")
         found.append(LockedComponent(relative, "npm-lock", scope, name, version,
                                      unquote(package["resolved"])))
-    return found
+        pins.append(LockedPin(relative, "npm-lock", name, version, digests))
+    return found, pins
 
 
 def python_project(path: Path, relative: str, scope: str):
@@ -171,14 +192,52 @@ def npm_project(path: Path, relative: str, scope: str):
 
 
 def model_files(root: Path):
-    found = []
+    found = set()
     excluded = {".git", ".venv", "node_modules", "dist", "build", "__pycache__"}
     for path in sorted(root.rglob("*")):
-        if not path.is_file() or set(path.relative_to(root).parts) & excluded:
+        relative = path.relative_to(root)
+        if set(relative.parts) & excluded:
             continue
-        if path.suffix.lower() in MODEL_SUFFIXES:
-            found.append(path.relative_to(root).as_posix())
-    return found
+        in_model_directory = bool(set(relative.parts[:-1]) & MODEL_DIRECTORIES)
+        has_model_suffix = path.suffix.lower() in MODEL_SUFFIXES
+        if path.is_symlink() and (in_model_directory or has_model_suffix):
+            raise GateError("model artifacts must be regular files")
+        if path.is_file() and (in_model_directory or has_model_suffix):
+            found.add(relative.as_posix())
+    return sorted(found)
+
+
+def reviewed_pins(root: Path):
+    data = load_json(root / PINS)
+    if set(data) != {"schema", "pins"} or data["schema"] != 1 or not isinstance(data["pins"], list):
+        raise GateError("invalid pinning evidence registry")
+    result = []
+    required = {"path", "ecosystem", "name", "version", "digests"}
+    for pin in data["pins"]:
+        if not isinstance(pin, dict) or set(pin) != required:
+            raise GateError("invalid pinning evidence record")
+        path = relative_path(pin["path"], field="pin path")
+        ecosystem = pin["ecosystem"]
+        if ecosystem not in {"python-requirements", "npm-lock"}:
+            raise GateError("invalid pin ecosystem")
+        name = nonempty_string(pin["name"], "pin name")
+        version = nonempty_string(pin["version"], "pin version")
+        digests = pin["digests"]
+        if not isinstance(digests, list) or not digests or digests != sorted(set(digests)):
+            raise GateError("pin digests must be a sorted nonempty unique list")
+        if ecosystem == "python-requirements":
+            valid = all(isinstance(value, str)
+                        and re.fullmatch(r"sha256:[0-9a-f]{64}", value) for value in digests)
+        else:
+            valid = all(isinstance(value, str)
+                        and re.fullmatch(r"sha(?:256|384|512)-[A-Za-z0-9+/=]+", value)
+                        for value in digests)
+        if not valid:
+            raise GateError("invalid reviewed digest")
+        result.append(LockedPin(path, ecosystem, name, version, tuple(digests)))
+    if len(result) != len(set(result)):
+        raise GateError("duplicate pinning evidence record")
+    return result
 
 
 def approvals_by_id(root: Path):
@@ -217,6 +276,7 @@ def audit(root: Path, inventory_path=INVENTORY):
     if not isinstance(inputs, list) or not inputs:
         raise GateError("inputs must be nonempty")
     discovered = []
+    discovered_pins = []
     input_paths = set()
     for item in inputs:
         if not isinstance(item, dict) or set(item) != {"path", "ecosystem", "scope"}:
@@ -230,13 +290,17 @@ def audit(root: Path, inventory_path=INVENTORY):
             raise GateError("duplicate or missing inventory input")
         input_paths.add(relative)
         if ecosystem == "python-requirements":
-            discovered.extend(python_lock(root / relative, relative, scope))
+            components, pins = python_lock(root / relative, relative, scope)
+            discovered.extend(components)
+            discovered_pins.extend(pins)
         elif ecosystem == "python-project":
             discovered.extend(python_project(root / relative, relative, scope))
         elif ecosystem == "npm-project":
             discovered.extend(npm_project(root / relative, relative, scope))
         else:
-            discovered.extend(npm_lock(root / relative, relative, scope))
+            components, pins = npm_lock(root / relative, relative, scope)
+            discovered.extend(components)
+            discovered_pins.extend(pins)
 
     tracked_inputs = set()
     for pattern in ("**/requirements*.lock", "**/requirements*.txt", "**/package-lock.json",
@@ -254,6 +318,8 @@ def audit(root: Path, inventory_path=INVENTORY):
         raise GateError("unsupported dependency manifest requires a reviewed parser")
     if tracked_inputs != input_paths:
         raise GateError("dependency input set differs from reviewed inventory")
+    if sorted(discovered_pins) != sorted(reviewed_pins(root)):
+        raise GateError("lock digests differ from reviewed pinning evidence")
 
     reviews = data["scope_reviews"]
     if not isinstance(reviews, list):

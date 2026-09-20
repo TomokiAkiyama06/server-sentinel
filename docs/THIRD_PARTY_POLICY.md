@@ -111,11 +111,15 @@ CI runs `python scripts/ci/license_gate.py` and fails when a reviewed dependency
 input, exact locked dependency, or committed model artifact is absent or differs.
 The inventory keeps exact upstream and license evidence, material transitive
 evidence, notices, and redistribution obligations for each component.
+Python lock SHA256 values and npm lock SRI values are independently allowlisted
+in `license/pins.json`; changing only a digest is therefore a gate failure.
 
 Model implementation code and weights use distinct `model_code` and
-`model_weight` records. Weight records bind the artifact path and SHA256; a code
-license record never covers weights. Scopes with no selected third-party
-transport/model component have an evidence-backed `reviewed-empty` record so
+`model_weight` records. Weight records bind the artifact path and SHA256; all
+files under reserved model artifact directories are inspected without relying on a
+suffix allowlist. A code license record never covers weights. Scopes with no
+selected third-party transport/model component have an evidence-backed
+`reviewed-empty` record so
 their absence is explicit rather than assumed.
 
 Blocked-by-default licenses require an exact record in

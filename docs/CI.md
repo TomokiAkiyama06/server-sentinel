@@ -100,7 +100,8 @@ implemented by this repository. Python dependencies install into a temporary
 virtual environment with pip hash verification. Declare every required tool
 and dependency in that component's reviewed lockfile. The same change must
 register each new lockfile and exact package in `license/components.json`;
-otherwise the license gate fails before component installation.
+otherwise the license gate fails before component installation. Lockfile
+SHA256/SRI values must also match `license/pins.json` exactly.
 
 Node components require `package.json`, `package-lock.json`, and nonempty `lint`
 and `test` scripts. CI runs `npm ci --ignore-scripts --no-audit --no-fund`,
@@ -123,9 +124,11 @@ deployment environment, root privileges, or writable root filesystem. Resource
 limits, a bounded temporary filesystem, timeouts, and container cleanup apply.
 The image and all its dependencies require the usual license and pinning review.
 
-Committed model artifacts use an allowlisted extension and require a distinct
-`model_weight` record with the exact path and SHA256. Model implementation
-packages require `model_code` records. Restricted or unclear licenses remain
+Committed model artifacts require a distinct `model_weight` record with the
+exact path and SHA256. All files in a reserved model artifact directory are
+checked regardless of extension; common model suffixes are also checked in
+other directories. Model implementation packages require `model_code` records.
+Restricted or unclear licenses remain
 blocked unless `license/owner-approvals.json` contains an exact, decision-backed
 Owner approval for that component version and license.
 
