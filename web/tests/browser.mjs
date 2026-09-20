@@ -218,13 +218,19 @@ try {
       assert.equal(await page.evaluate("document.querySelectorAll('nav button:disabled').length"), 7);
     });
     // A recovered NORMAL state must still surface sticky backend faults.
-    await scenario(viewport, { storageState: 'NORMAL', storageFaults: true }, async page => {
+    await scenario(viewport, { storageState: 'NORMAL', storageFaults: true }, async (page, requests) => {
+      assert.equal(requests.filter(path => path === '/api/mock/storage').length, 0);
       await page.click('ストレージと通知');
       await page.wait("document.querySelectorAll('[data-fault]').length === 4");
+      assert.equal(requests.filter(path => path === '/api/mock/storage').length, 1);
       assert.equal(await page.evaluate("document.querySelectorAll('.fault-alert[role=alert]').length"), 2);
       assert.match(await page.evaluate('document.body.innerText'), /監査記録に書き込めませんでした/);
       assert.match(await page.evaluate('document.body.innerText'), /Slack へ通知を送信できませんでした/);
       assert.equal(await page.evaluate('document.documentElement.scrollWidth <= window.innerWidth'), true, 'fault alerts fit viewport');
+      await page.click('概要');
+      await page.click('ストレージと通知');
+      for (let attempt = 0; attempt < 20 && requests.filter(path => path === '/api/mock/storage').length < 2; attempt++) await delay(10);
+      assert.equal(requests.filter(path => path === '/api/mock/storage').length, 2);
     });
     // One recording's successful write must not clear another's unknown result.
     await scenario(viewport, { recordings: 3 }, async page => {

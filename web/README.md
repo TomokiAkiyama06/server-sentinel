@@ -86,7 +86,8 @@ Backend faults stay visible instead of being smoothed over: a lost storage
 transition audit, an unfinished retention cleanup, an undelivered Slack
 notification and an unrecorded notification each raise their own owner-visible
 alert, even once capacity has recovered to `NORMAL` and even while Slack still
-reads as configured.
+reads as configured. Opening the Storage screen always obtains a fresh
+operational snapshot; returning to it does not reuse an earlier healthy state.
 
 Replacing the provider or retrying the session resets the cached session,
 sources, recordings, storage and pending writes during render rather than in a

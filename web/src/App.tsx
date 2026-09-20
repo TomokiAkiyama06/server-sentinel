@@ -99,7 +99,10 @@ export function App({ services = deniedServices }: { services?: DashboardService
 
   useEffect(() => {
     const loader = services.loadStorage;
-    if (!loader || access.state !== 'allowed' || access.role !== 'owner') return;
+    // This is operational state, not an immutable setup record. Load it only
+    // for an owner actively opening Storage so re-entry samples current policy
+    // and sticky backend faults instead of retaining an old healthy snapshot.
+    if (!loader || access.state !== 'allowed' || access.role !== 'owner' || view !== 'storage') return;
     const controller = new AbortController();
     setStorage({ state: 'loading' });
     void (async () => {
@@ -111,7 +114,7 @@ export function App({ services = deniedServices }: { services?: DashboardService
       }
     })();
     return () => controller.abort();
-  }, [services, access, refresh]);
+  }, [services, access, refresh, view]);
 
   useEffect(() => {
     setBusy(current => current.length ? [] : current);
