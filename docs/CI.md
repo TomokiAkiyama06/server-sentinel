@@ -25,8 +25,6 @@ trusted issuer or required Codex/Claude enforcement.
 The Main Server foundation has configured lint, synthetic tests and isolated
 normal/error ASGI smoke. Its smoke additionally observes Python outbound and
 process-spawn attempts; see `server/docs/FOUNDATION.md` for the precise limits.
-README-only components still report **not implemented**. These checks do not
-constitute camera, browser, trusted-proxy or physical-network acceptance.
 
 The `web/` React foundation is implemented and activates locked dependency
 installation, TypeScript/JavaScript checks, Node tests, production bundling,

@@ -59,6 +59,7 @@ class Settings:
                  source_root: Path | None = None) -> "Settings":
         values = os.environ if environ is None else environ
         prefix = "SERVERSENTINEL_"
+        # CI markers are runner metadata only; they do not alter runtime policy.
         allowed = {"DATA_DIRECTORY", "HUMAN_HOST", "HUMAN_PORT", "LOG_LEVEL",
                    "CI_SYNTHETIC_ONLY", "CI_SCENARIO"}
         if any(key.startswith(prefix) and key[len(prefix):] not in allowed for key in values):
