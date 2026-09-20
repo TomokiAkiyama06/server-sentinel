@@ -907,7 +907,7 @@ GitHub Issue: [#47](https://github.com/TomokiAkiyama06/server-sentinel/issues/47
 
 Depends on: [#7](https://github.com/TomokiAkiyama06/server-sentinel/issues/7), [#10](https://github.com/TomokiAkiyama06/server-sentinel/issues/10)
 
-Labels: `backend`, `security`, `storage`, `documentation`, `server-required`, `manual-test-required`
+Labels: `backend`, `security`, `storage`, `documentation`, `server-required`, `hardware-required`, `manual-test-required`
 
 実機要件: Main Server: 必要; Capture Node: 不要; UVC Camera: 不要; Manual test: 必要
 
@@ -928,7 +928,7 @@ GitHub Issue: [#48](https://github.com/TomokiAkiyama06/server-sentinel/issues/48
 
 Depends on: [#7](https://github.com/TomokiAkiyama06/server-sentinel/issues/7), [#8](https://github.com/TomokiAkiyama06/server-sentinel/issues/8), [#10](https://github.com/TomokiAkiyama06/server-sentinel/issues/10)
 
-Labels: `backend`, `frontend`, `security`, `storage`, `server-required`, `manual-test-required`
+Labels: `backend`, `frontend`, `security`, `storage`, `server-required`, `hardware-required`, `manual-test-required`
 
 実機要件: Main Server: 必要; Capture Node: 不要; UVC Camera: 不要; Manual test: 必要
 
@@ -948,7 +948,7 @@ GitHub Issue: [#49](https://github.com/TomokiAkiyama06/server-sentinel/issues/49
 
 Depends on: [#7](https://github.com/TomokiAkiyama06/server-sentinel/issues/7), [#10](https://github.com/TomokiAkiyama06/server-sentinel/issues/10)
 
-Labels: `backend`, `security`, `documentation`, `server-required`, `manual-test-required`
+Labels: `backend`, `security`, `documentation`, `server-required`, `hardware-required`, `manual-test-required`
 
 実機要件: Main Server: 必要; Capture Node: 不要; UVC Camera: 不要; Manual test: 必要
 
@@ -959,6 +959,7 @@ Scope:
 Acceptance:
 - Owner biometric template / embeddingは常に除外し、exportをexternal biometric processing / storageの例外にしない;
 - raw monitoring mediaはOwnerが個別に選択した場合だけ含め、default bundleは含めない;
+- exportの作成・bundle取得・個別media選択はserver-side Owner authorizationを必須とし、uninvited/invited non-owner/capture-node credentialからのcopied URL・direct APIアクセスを拒否する;
 - synthetic testsでautomatic upload不在とexclude / redact pathを検証する;
 - `MANUAL_TEST.md` Uのdeployed export受入で、明示Owner action、default media exclusion、sensitive-value exclusion/redaction、automatic upload不在を、bundle内容をGitHubへ出さずに確認する。
 
@@ -968,7 +969,7 @@ GitHub Issue: [#50](https://github.com/TomokiAkiyama06/server-sentinel/issues/50
 
 Depends on: [#7](https://github.com/TomokiAkiyama06/server-sentinel/issues/7), [#10](https://github.com/TomokiAkiyama06/server-sentinel/issues/10)
 
-Labels: `backend`, `security`, `storage`, `server-required`, `manual-test-required`
+Labels: `backend`, `security`, `storage`, `server-required`, `hardware-required`, `manual-test-required`
 
 実機要件: Main Server: 必要; Capture Node: 不要; UVC Camera: 不要; Manual test: 必要
 

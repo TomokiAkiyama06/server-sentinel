@@ -584,6 +584,7 @@ credentials and captured media private.
 Run this only on the intended Main Server using synthetic, non-production diagnostic inputs. Do not upload, commit, attach, or paste the generated bundle, its manifest, private deployment data, raw identifiers, monitoring media, credentials, or biometric material into GitHub.
 
 - [ ] an Owner initiates a diagnostic export from the deployed application; no background, scheduled, or error path creates or transfers a bundle without that explicit action;
+- [ ] an uninvited client, invited non-Owner identity, and capture-node credential each fail to create, list, retrieve, or select media for an export through every browser and direct API/copied-URL path; the response reveals no bundle metadata or media;
 - [ ] before export, the bundle remains deployment-local; observe the controlled export operation locally and verify that it does not automatically upload/share to a developer or third-party endpoint;
 - [ ] use harmless synthetic sentinel inputs to verify credentials, pairing secrets, private keys, and sensitive headers are excluded;
 - [ ] verify Owner biometric templates/embeddings are excluded even from an explicitly initiated export, and no selected export authorizes external biometric processing/storage;
