@@ -104,9 +104,14 @@ def install(args):
     artifact = read_artifact(args.artifact)
     if hashlib.sha256(artifact).hexdigest() != args.sha256:
         raise ValueError("artifact digest mismatch")
+    # Bind a relative deployment path to the administrator's invocation
+    # directory before the preflight changes cwd and before writing the unit.
+    # Do not resolve it: read_protected_configuration must retain its final
+    # symlink refusal when it opens the configuration.
+    config = Path(os.path.abspath(args.config))
     code_root = Path(__file__).resolve().parents[1]
     value, config_owner = read_protected_configuration(
-        args.config, forbidden_roots=(args.destination, code_root)
+        config, forbidden_roots=(args.destination, code_root)
     )
     settings = Settings.parse(value, code_root=args.destination)
     if any(root.is_relative_to(code_root) for root in (settings.runtime_root, settings.media_root)):
@@ -133,12 +138,12 @@ def install(args):
         executable.chmod(0o555)
         # Verify ownership/writability/mount/reserve under the actual service UID,
         # not administrator capabilities. No network, capture or media writes.
-        subprocess.run([str(executable), "--config", str(args.config), "--check"],
+        subprocess.run([str(executable), "--config", str(config), "--check"],
                        check=True, timeout=30, user=account.pw_uid, group=account.pw_gid,
                        extra_groups=[], env={"PATH": "/usr/bin:/bin",
                                              "PYTHONDONTWRITEBYTECODE": "1"},
                        cwd="/", stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        content = render_unit(executable, args.config, settings, account.pw_name,
+        content = render_unit(executable, config, settings, account.pw_name,
                               account.pw_gid, args.video_device)
         with args.unit.open("x", encoding="utf-8") as stream:
             unit_created = True

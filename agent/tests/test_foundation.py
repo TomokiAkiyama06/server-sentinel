@@ -544,7 +544,7 @@ raise SystemExit(1)
         config.chmod(0o600)
         artifact = self.root / "bounded-artifact"
         artifact.write_bytes(b"synthetic-artifact-not-executed")
-        args = argparse.Namespace(artifact=artifact, config=config, version="0.1.0",
+        args = argparse.Namespace(artifact=artifact, config=Path(os.path.relpath(config)), version="0.1.0",
                                   destination=destination, video_device=[],
                                   unit=self.root / "media-capture-agent.service",
                                   sha256=hashlib.sha256(artifact.read_bytes()).hexdigest())
@@ -561,6 +561,8 @@ raise SystemExit(1)
             os.umask(previous)
         self.assertEqual((destination / "0.1.0").stat().st_mode & 0o777, 0o755)
         self.assertEqual((destination / "0.1.0/media-capture-agent").stat().st_mode & 0o777, 0o555)
+        self.assertEqual(preflight.call_args.args[0][2], str(config.absolute()))
+        self.assertIn(str(config.absolute()), args.unit.read_text(encoding="utf-8"))
 
     def test_checkout_named_agent_accepts_external_sibling_data(self):
         component = self.root / "agent" / "agent"
