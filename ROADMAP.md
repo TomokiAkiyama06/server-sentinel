@@ -86,8 +86,8 @@ acceptance.
 
 - [x] synthetic CPU general-motion foundation (#20; runtime integration and target-host acceptance remain open)
 - [ ] permissively licensed person-detector evaluation
-- [ ] detector-specific image-quality gating
-- [ ] no false `no person` when quality is insufficient
+- [x] detector-specific image-quality gating (internal metrics/recovery/unknown contracts; real-camera calibration pending)
+- [x] no false `no person` when quality is insufficient (synthetic gate/scheduler regression tests)
 - [x] bounded per-source inference-cadence primitive (#20; Main worker integration remains open)
 - [ ] server ROI calibration/movement
 - [ ] camera tamper/occlusion/source-health correlation
@@ -105,6 +105,11 @@ acceptance.
 - [ ] no cross-camera biometric re-identification
 
 ## Phase 7 — Timeline, recordings, storage, notifications
+
+Issue #21 has internal Main policy/retention/Owner action and optional Slack/daily
+scheduler primitives with disposable filesystem and mock transport coverage.
+Production authorization/timer/outbox integration, playback and the Owner-planned
+UI remain pending; these phase boxes represent integrated acceptance.
 
 - [ ] unified factual timeline
 - [ ] neutral wording/no culprit inference
