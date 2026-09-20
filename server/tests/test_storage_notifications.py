@@ -2,6 +2,7 @@
 
 from datetime import datetime, timezone
 from pathlib import Path
+from queue import Full
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 from urllib.error import HTTPError
@@ -337,24 +338,40 @@ class DeliveryWorkerTests(unittest.TestCase):
             time.sleep(0.01)
         return False
 
-    def test_full_completion_queue_neither_drops_a_result_nor_ends_delivery(self):
+    def test_unacknowledged_completion_bounds_work_instead_of_losing_it(self):
         worker = self.worker(1)
         worker.submit('first', 'a')
         self.assertTrue(self.transport.finished.acquire(timeout=2))
         self.assertTrue(worker.ready.wait(2))
-        # The single completion slot is still occupied, so this delivery cannot
-        # hand its result over until the owner drains. Dropping it, or losing
-        # the delivery thread, would strand the event as pending forever.
+        # The single capacity slot stays held until the owner drains, so new
+        # work is refused here rather than accepted into a queue whose
+        # completion could not be handed back and would strand the event.
+        with self.assertRaises(Full):
+            worker.submit('second', 'b')
+        self.assertEqual([('first', DeliveryResult.SENT)], list(worker.results()))
+
         worker.submit('second', 'b')
-        self.assertTrue(self.transport.finished.acquire(timeout=2))
-        time.sleep(0.1)
-        collected = {}
-        deadline = time.monotonic() + 10
-        while len(collected) < 2 and time.monotonic() < deadline:
-            worker.ready.wait(0.5)
-            collected.update(worker.results())
-        self.assertEqual({'first': DeliveryResult.SENT, 'second': DeliveryResult.SENT}, collected)
+        self.assertTrue(worker.ready.wait(2))
+        self.assertEqual([('second', DeliveryResult.SENT)], list(worker.results()))
         self.assertTrue(worker._thread.is_alive())
+
+    def test_finished_delivery_is_reported_after_close(self):
+        entered, release = threading.Event(), threading.Event()
+        class Blocking(self.Accepting):
+            def send(inner, text):
+                entered.set()
+                release.wait(2)
+                return super().send(text)
+        worker = DeliveryWorker(Blocking(), 1)
+        self.addCleanup(worker.close)
+        worker.submit('first', 'a')
+        self.assertTrue(entered.wait(2))
+        worker.close()
+        release.set()
+        # Closing must not discard the outcome of a delivery that finished; the
+        # owner still needs its real result instead of a stranded pending row.
+        self.assertTrue(worker.ready.wait(2))
+        self.assertEqual([('first', DeliveryResult.SENT)], list(worker.results()))
 
     def test_partial_drain_keeps_a_queued_completion_signalled(self):
         worker = self.worker(2)
@@ -377,20 +394,3 @@ class DeliveryWorkerTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             worker.submit('second', 'b')
         self.assertEqual([('first', DeliveryResult.SENT)], list(worker.results()))
-
-    def test_close_keeps_completion_waiting_for_a_full_queue(self):
-        worker = self.worker(1)
-        worker.submit('first', 'a')
-        self.assertTrue(self.transport.finished.acquire(timeout=2))
-        self.assertTrue(worker.ready.wait(2))
-        worker.submit('second', 'b')
-        self.assertTrue(self.transport.finished.acquire(timeout=2))
-        worker.close()
-
-        self.assertEqual(('first', DeliveryResult.SENT), next(iter(worker.results())))
-        collected = []
-        deadline = time.monotonic() + 2
-        while not collected and time.monotonic() < deadline:
-            collected.extend(worker.results())
-            time.sleep(0.01)
-        self.assertEqual([('second', DeliveryResult.SENT)], collected)
