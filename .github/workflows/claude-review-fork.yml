@@ -265,6 +265,9 @@ jobs:
               summary.extend(["", "場所は同じHEAD/baseの固定diffの1始まり行番号です。再生成手順は docs/CLAUDE_REVIEW_SETUP.md を参照してください。", ""])
               with Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a", encoding="utf-8") as output:
                   output.write("\n".join(summary))
+              # The REST/CLI job API does not expose step-summary contents.
+              # Emit only this already validated, fixed-vocabulary report too.
+              print("\n".join(summary))
               if severity in {"critical", "important"}:
                   print("Claudeレビューに重大・重要指摘があります。", file=sys.stderr)
                   return 1
