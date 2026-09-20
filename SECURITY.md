@@ -195,7 +195,7 @@ Consequences to keep in mind while reviewing code:
 - the unauthenticated response, including the credential prompt, stays generic: no product/version strings, camera names or counts, recording or timeline data, or deployment metadata, and the same response for uninvited and revoked people;
 - approving a device is not identifying a person; a shared lab machine is used by whoever sits at it;
 - a credential is person-bound only when authenticator user verification is required at registration and at every authentication and the authenticator is not kept inside a shared OS account or behind a shared device unlock. A platform passkey sitting in a shared lab profile is a shared credential;
-- sessions are bound to the credential that created them and end on a bounded idle and absolute timeout; an explicit sign-out control is expected for shared machines;
+- sessions are server-side records bound to one principal and to the credential that created them. Sign-out, idle/absolute expiry and revocation invalidate the server-side record, so a retained cookie or token grants nothing afterwards; the check runs on every human/media route, never in the browser. Shared machines get an explicit sign-out control, and owner-only operations require a fresh user-verification step instead of an old session;
 - the server stores only the credential id, its public key and owner-visible metadata. No fingerprint or face template reaches ServerSentinel, and credential records are not an identity or biometric database.
 
 Residual limits are documented, not claimed away: a credential its holder deliberately lends, and a session left unlocked on an unattended machine, are outside what the application can observe.

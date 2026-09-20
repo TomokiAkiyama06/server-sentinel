@@ -800,7 +800,8 @@ principal_credential
 - kind (WebAuthn/passkey, per ADR-0003)
 - credential_id
 - public_key (public material only; never a biometric template)
-- user_verification: required
+- user_verification: required (asserted at registration, verified again at
+  every authentication)
 - label (owner-visible device label)
 - created_at
 - last_used_at
@@ -819,9 +820,16 @@ Registration and every authentication require authenticator user verification,
 and the authenticator must be one the invited person controls. A platform
 authenticator kept inside a shared OS account or behind a shared device unlock
 is a shared credential and does not satisfy §11.8; such a machine needs a
-per-person OS account or a portable authenticator the person carries. A session
-is bound to the credential that created it and ends on a bounded idle lifetime
-and a bounded absolute lifetime, with an explicit sign-out available.
+per-person OS account or a portable authenticator the person carries.
+
+A session is a server-side record bound to one principal and to the credential
+that created it. Sign-out, idle/absolute expiry and revocation invalidate that
+record, so a retained cookie or token authorizes nothing afterwards; §11.5
+authorization re-checks it on every human/media route and never relies on
+client-side state. Idle and absolute lifetimes are deployment-configured and
+server-enforced, an explicit sign-out is available for shared machines, and
+owner-only routes require a fresh user-verification step rather than an older
+session.
 
 User verification runs on the viewer's own device. The server receives the
 credential id and public key only; no fingerprint or face template reaches
