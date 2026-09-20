@@ -341,6 +341,30 @@ class PipelineTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             value.add_viewer(SUBSCRIBER)
 
+    def test_stale_packet_cannot_force_time_base_renegotiation(self):
+        factory = SyntheticFactory()
+        value = pipeline(recording=factory)
+        value.offer(packet(0, keyframe=True))
+        value.pump(1)
+        duplicate = packet(0, time_base=Fraction(1, 90_000))
+        self.assertEqual(value.offer(duplicate).reason, "stale_or_duplicate_packet")
+        self.assertTrue(value.offer(packet(1)).recording_queued)
+        self.assertTrue(value.recording_status.healthy)
+        self.assertEqual(factory.adapters[0].resets, 0)
+
+    def test_video_only_invariant_applies_to_every_output_profile(self):
+        invalid_format = video_format(video_only=False)
+        for field, profile in (("recording", RecordingProfile(invalid_format)),
+                               ("viewer", ViewerProfile(invalid_format))):
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                SourcePipeline(SOURCE, STREAM, replace(source_profiles(), **{field: profile}),
+                               QueueLimits(8, 1024), QueueLimits(8, 1024))
+        value = pipeline()
+        original = value.profiles.viewer
+        with self.assertRaises(ValueError):
+            value.replace_viewer_profile(ViewerProfile(invalid_format))
+        self.assertEqual(value.profiles.viewer, original)
+
 
 if __name__ == "__main__":
     unittest.main()

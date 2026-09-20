@@ -213,6 +213,8 @@ class SourcePipeline:
             raise ValueError("source and stream identities must be UUIDs")
         if not profiles.capture.format.verified or not profiles.capture.format.video_only:
             raise ValueError("capture must be verified as video-only before ingest")
+        if not profiles.recording.format.video_only or not profiles.viewer.format.video_only:
+            raise ValueError("recording and viewer output must be video-only")
         self.source_id = source_id
         self.stream_id = stream_id
         self._profiles = profiles
@@ -268,6 +270,8 @@ class SourcePipeline:
 
     def replace_viewer_profile(self, profile: ViewerProfile) -> None:
         self._ensure_open()
+        if not profile.format.video_only:
+            raise ValueError("viewer output must be video-only")
         if self._profiles.viewer == profile:
             return
         self._close_viewer()
@@ -284,14 +288,14 @@ class SourcePipeline:
         self._ensure_open()
         if packet.source_id != self.source_id or packet.stream_id != self.stream_id:
             return OfferResult(False, False, "foreign_source_or_stream")
+        if self._sequence is not None and packet.sequence <= self._sequence:
+            return OfferResult(False, False, "stale_or_duplicate_packet")
         if self._renegotiation_required:
             return OfferResult(False, False, "renegotiation_required")
         if packet.time_base != self._profiles.capture.format.time_base:
             self._renegotiation_required = True
             self._discontinuity("time_base_changed")
             return OfferResult(False, False, "renegotiation_required")
-        if self._sequence is not None and packet.sequence <= self._sequence:
-            return OfferResult(False, False, "stale_or_duplicate_packet")
         reason = "accepted"
         if self._sequence is not None and packet.sequence != self._sequence + 1:
             reason = "sequence_gap"
