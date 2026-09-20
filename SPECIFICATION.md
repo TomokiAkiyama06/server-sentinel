@@ -539,6 +539,16 @@ quality/gap metadata
 
 Critical incident protection on `media-capture-agent` is a deliberate secondary-evidence exception, not a full mirror.
 
+The internal `server/app/media/recording/` storage implementation uses generated
+segment UUID filenames, byte digests, a pending-publication journal and per-source
+event manifests. Its pre-roll has duration, byte and segment-count limits;
+recording windows carry explicit clip intervals and integrity/gap/discontinuity
+state. Restart retains committed media, cleans only journal-owned pending files
+and marks active recordings interrupted. Runtime admission and codec validation
+are mandatory injected boundaries; no human routes are enabled by this module.
+See its README for the remaining worker integration and the distinction between
+storage integrity and playable-media validation.
+
 ### 6.7 Main-host event ring buffer
 
 Maintain recent **compressed** media where practical for pre-event evidence. Default target 30 s pre / 120 s post, max event 20 min.
