@@ -24,11 +24,12 @@ function filterLabel(t: Catalog, filter: Filter): string {
   return t[`kind_${filter}`];
 }
 
-export function RecordingsView({ t, recordings, owner = false, actions }: {
+export function RecordingsView({ t, recordings, owner = false, actions, busy = [] }: {
   t: Catalog;
   recordings: readonly RecordingSummary[];
   owner?: boolean;
   actions?: RecordingActions | undefined;
+  busy?: readonly string[];
 }) {
   const [filter, setFilter] = useState<Filter>('all');
   const [playing, setPlaying] = useState<string | null>(null);
@@ -36,6 +37,7 @@ export function RecordingsView({ t, recordings, owner = false, actions }: {
   const visible = recordings.filter(recording => matches(recording, filter));
   const selected = visible.find(recording => recording.id === playing);
   const manageable = owner && actions ? actions : undefined;
+  const waiting = new Set(busy);
 
   return <section className="recordings">
     <div className="filters" role="group" aria-label={t.filterLabel}>
@@ -56,7 +58,8 @@ export function RecordingsView({ t, recordings, owner = false, actions }: {
         <th scope="col">{t.columnPlayback}</th>
         {manageable && <th scope="col">{t.columnActions}</th>}
       </tr></thead>
-      <tbody>{visible.map(recording => <tr key={recording.id} data-recording-id={recording.id}>
+      <tbody>{visible.map(recording => <tr key={recording.id} data-recording-id={recording.id}
+        aria-busy={waiting.has(recording.id) || undefined}>
         <td className="numeric">{timestamp(recording.start_ms)}</td>
         <td>{recording.source_name}</td>
         <td><span className={`kind kind-${recording.kind}`}>{t[`kind_${recording.kind}`]}</span></td>
@@ -68,13 +71,14 @@ export function RecordingsView({ t, recordings, owner = false, actions }: {
         <td><button type="button" aria-expanded={selected?.id === recording.id} aria-controls="playback"
           onClick={() => setPlaying(current => current === recording.id ? null : recording.id)}>{t.play}</button></td>
         {manageable && <td className="row-actions">
-          <button type="button" onClick={() => manageable.star(recording)}>
+          <button type="button" disabled={waiting.has(recording.id)} onClick={() => manageable.star(recording)}>
             {recording.starred ? t.starOff : t.starOn}</button>
           {confirming === recording.id ? <>
-            <button type="button" className="danger" onClick={() => { setConfirming(null); manageable.remove(recording); }}>
-              {t.confirmDelete}</button>
-            <button type="button" onClick={() => setConfirming(null)}>{t.cancel}</button>
-          </> : <button type="button" onClick={() => setConfirming(recording.id)}>{t.deleteRecording}</button>}
+            <button type="button" className="danger" disabled={waiting.has(recording.id)}
+              onClick={() => { setConfirming(null); manageable.remove(recording); }}>{t.confirmDelete}</button>
+            <button type="button" disabled={waiting.has(recording.id)} onClick={() => setConfirming(null)}>{t.cancel}</button>
+          </> : <button type="button" disabled={waiting.has(recording.id)}
+            onClick={() => setConfirming(recording.id)}>{t.deleteRecording}</button>}
         </td>}
       </tr>)}</tbody>
     </table></div>}

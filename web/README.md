@@ -43,7 +43,12 @@ embedded media element for any role, and the screen states plainly that
 in-browser playback does not prevent screen recording or client-side copying.
 Star, unstar and delete controls render only for an owner session that also has
 an authorized mutation provider, and deletion needs a second confirmation in the
-same row. The server repeats every one of these checks.
+same row. The server repeats every one of these checks. `src/shared/mutations.ts`
+allows only one in-flight write per recording, so a repeated click cannot issue a
+second conflicting mutation; that row's owner controls are disabled and marked
+`aria-busy` while the write runs. Replacing the provider or the session aborts
+outstanding mutations, and an aborted write is reported as neither a result nor
+an error.
 
 `src/setup/storage.tsx` is owner-only. It shows the three backend storage states
 (`NORMAL`, `STORAGE_PRESSURE`, `STORAGE_HARD_STOP`), marks the current one, and
@@ -91,7 +96,9 @@ localization keys, the denied default, and production bundle isolation. Rendered
 component tests cover owner-only star/delete, the absence of any download,
 export or media element, starred recordings shown as never auto-deleted, the
 three separate retention periods, storage state display, and Slack disabled
-until configured.
+until configured. Mutation tests cover the one-write-per-recording guard,
+independent recordings, session abort reported as `aborted`, and rejection
+reported as `failed`.
 Chrome CDP tests cover phone/Mac-sized/desktop viewports, zero through four
 synthetic sources, all seven screens, locale switching, session permission
 combinations, synthetic recording lists with owner star/delete confirmation,

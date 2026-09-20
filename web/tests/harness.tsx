@@ -18,6 +18,10 @@ function session(value: unknown): Session {
 }
 let recordings: RecordingSummary[] = [];
 let loaded = false;
+// Synthetic latency so tests can observe in-flight mutation handling.
+let syntheticMutations = 0;
+const settle = () => new Promise<void>(resolve => setTimeout(resolve, 150));
+Object.defineProperty(window, 'syntheticMutations', { get: () => syntheticMutations });
 const services = {
   loadSession: (signal: AbortSignal) => api.read('/api/mock/session', session, signal),
   loadSources: (signal: AbortSignal) => api.read('/api/mock/sources', value => {
@@ -40,10 +44,14 @@ const services = {
   }, signal),
   // Synthetic local mutations: this harness has no write route and never gets one.
   starRecording: async (id: string, starred: boolean) => {
+    syntheticMutations += 1;
+    await settle();
     recordings = recordings.map(recording => recording.id === id
       ? { ...recording, starred, retention_days_left: starred ? null : 7 } : recording);
   },
   deleteRecording: async (id: string) => {
+    syntheticMutations += 1;
+    await settle();
     recordings = recordings.filter(recording => recording.id !== id);
   },
 };

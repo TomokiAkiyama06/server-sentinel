@@ -175,8 +175,20 @@ try {
         await page.evaluate("Array.from(document.querySelectorAll('[data-recording-id] button')).find(el => el.textContent === '削除').click()");
         await page.evaluate("Array.from(document.querySelectorAll('button')).find(el => el.textContent === '削除を確定').click()");
         await page.wait(`document.querySelectorAll('[data-recording-id]').length === ${recordings - 1}`);
-        await page.evaluate("Array.from(document.querySelectorAll('button')).find(el => el.textContent === '★ を付ける').click()");
-        await page.wait("Array.from(document.querySelectorAll('button')).some(el => el.textContent === '★ を外す')");
+        // A repeated click while the write is in flight must not issue a second
+        // mutation, and the row's owner controls say so.
+        const before = await page.evaluate('window.syntheticMutations');
+        const star = "Array.from(document.querySelectorAll('button')).find(el => el.textContent === '★ を付ける')";
+        await page.evaluate(`(${star}).click()`);
+        await page.wait("document.querySelectorAll('[aria-busy=\"true\"]').length === 1");
+        assert.equal(await page.evaluate("Array.from(document.querySelectorAll('[aria-busy=\"true\"] .row-actions button')).every(el => el.disabled)"), true);
+        await page.evaluate(`for (let i = 0; i < 3; i++) { const button = ${star}; if (button) button.click(); }`);
+        // Every remaining row is starred only once this single write lands.
+        await page.wait(`Array.from(document.querySelectorAll('button')).filter(el => el.textContent === '★ を外す').length === ${recordings - 1}`);
+        await page.wait("document.querySelectorAll('[aria-busy=\"true\"]').length === 0");
+        assert.equal(await page.evaluate('window.syntheticMutations'), before + 1);
+        assert.equal(await page.evaluate("document.querySelectorAll('[aria-busy=\"true\"]').length"), 0);
+        assert.equal(await page.evaluate("document.querySelectorAll('.row-actions button:disabled').length"), 0);
       });
     }
     for (const storageState of ['NORMAL', 'STORAGE_PRESSURE', 'STORAGE_HARD_STOP']) {

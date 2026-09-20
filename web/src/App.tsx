@@ -3,6 +3,7 @@ import { canVisit, deniedServices, views, type CameraSourceSummary, type Dashboa
 import { messages, type Locale } from './i18n';
 import { RecordingsView } from './recordings/view';
 import { StorageView } from './setup/storage';
+import { MutationQueue } from './shared/mutations';
 
 type Access = { state: 'loading' | 'failed' } | Session;
 type Sources = { state: 'loading' | 'failed' | 'pending' } | { state: 'ready'; items: readonly CameraSourceSummary[] };
@@ -27,6 +28,8 @@ export function App({ services = deniedServices }: { services?: DashboardService
   const [view, setView] = useState<View>('overview');
   const [attempt, setAttempt] = useState(0);
   const [refresh, setRefresh] = useState(0);
+  const [busy, setBusy] = useState<readonly string[]>([]);
+  const [mutations] = useState(() => new MutationQueue());
   const t = messages[locale];
 
   useEffect(() => { document.documentElement.lang = locale; }, [locale]);
@@ -94,17 +97,30 @@ export function App({ services = deniedServices }: { services?: DashboardService
     return () => controller.abort();
   }, [services, access, refresh]);
 
+  useEffect(() => {
+    setBusy(current => current.length ? [] : current);
+    return () => mutations.abortAll();
+  }, [services, access, mutations]);
+
   const session: Session = access.state === 'allowed' ? access : { state: 'denied' };
   const selected = canVisit(session, view) ? view : 'overview';
   const hint = `${selected}Hint` as const;
   const star = services.starRecording;
   const remove = services.deleteRecording;
-  const mutate = (task: Promise<void>) =>
-    void task.then(() => setRefresh(value => value + 1), () => setRecordings({ state: 'failed' }));
+  const mutate = (id: string, run: (signal: AbortSignal) => Promise<void>) => {
+    if (!mutations.start(id, run, outcome => {
+      setBusy(mutations.pending);
+      // An aborted mutation belongs to a replaced session: no result, no error.
+      if (outcome === 'done') setRefresh(value => value + 1);
+      else if (outcome === 'failed') setRecordings({ state: 'failed' });
+    })) return;
+    setBusy(mutations.pending);
+  };
   // Owner-only star/delete; rendered only when the authorized provider exists.
   const actions = session.state === 'allowed' && session.role === 'owner' && star && remove ? {
-    star: (recording: RecordingSummary) => mutate(star(recording.id, !recording.starred, new AbortController().signal)),
-    remove: (recording: RecordingSummary) => mutate(remove(recording.id, new AbortController().signal)),
+    star: (recording: RecordingSummary) =>
+      mutate(recording.id, signal => star(recording.id, !recording.starred, signal)),
+    remove: (recording: RecordingSummary) => mutate(recording.id, signal => remove(recording.id, signal)),
   } : undefined;
 
   return <div className="shell">
@@ -140,7 +156,7 @@ export function App({ services = deniedServices }: { services?: DashboardService
             </> : selected === 'sources' && sources.state === 'failed' ? <p role="alert">{t.sourcesUnavailable}</p>
               : selected === 'sources' && sources.state === 'loading' ? <p role="status">{t.checking}</p>
               : selected === 'recordings' && recordings.state === 'ready'
-                ? <RecordingsView t={t} recordings={recordings.items} owner={access.role === 'owner'} actions={actions} />
+                ? <RecordingsView t={t} recordings={recordings.items} owner={access.role === 'owner'} actions={actions} busy={busy} />
                 : selected === 'recordings' && recordings.state === 'failed'
                   ? <section className="notice" role="alert"><p>{t.recordingsUnavailable}</p><button className="primary" onClick={() => setRefresh(value => value + 1)}>{t.retry}</button></section>
                   : selected === 'recordings' && recordings.state === 'loading' ? <p role="status">{t.checking}</p>

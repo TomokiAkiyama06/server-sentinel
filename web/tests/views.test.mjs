@@ -76,6 +76,19 @@ test('star and delete controls are owner-only', () => {
   assert.ok(owner.includes(messages.ja.columnActions));
 });
 
+test('an in-flight mutation disables that row\'s owner controls only', () => {
+  const markup = recordingsMarkup(true, { actions, busy: ['synthetic-recording-1'] });
+  const rows = markup.split('<tr').filter(row => row.includes('data-recording-id='));
+  assert.equal(rows.length, recordings.length);
+  for (const row of rows) {
+    const inflight = row.includes('data-recording-id="synthetic-recording-1"');
+    assert.equal(/aria-busy="true"/.test(row), inflight);
+    assert.equal(/<button[^>]*disabled[^>]*>/.test(row), inflight);
+  }
+  // Without an in-flight mutation nothing is disabled.
+  assert.doesNotMatch(recordingsMarkup(true, { actions }), /<button[^>]*disabled/);
+});
+
 test('starred recordings are shown as never auto-deleted and keep their day counts separate', () => {
   const markup = recordingsMarkup(true, { actions });
   assert.match(markup, new RegExp(`★ ${messages.ja.neverAutoDeleted}`));
