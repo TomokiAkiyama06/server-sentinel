@@ -91,7 +91,7 @@ class RingTests(unittest.TestCase):
         with self.assertRaisesRegex(RingRefused, "authenticated_preserve_required"):
             self.ring.preserve("camera_tamper", T0 - PRE, T0 + POST, now_us=T0, clock_trusted=True)
         with self.assertRaisesRegex(RingRefused, "owner_authorization_required"):
-            self.ring.delete_incident(uuid4())
+            self.ring.delete_incident(uuid4(), now_us=T0, clock_trusted=True)
 
     def test_duration_and_capacity_reject_less_than_pre_window(self):
         with self.assertRaises(RingRefused):
@@ -152,9 +152,12 @@ class RingTests(unittest.TestCase):
         status = self.ring.status(now_us=T0 + POST, clock_trusted=True)
         self.assertEqual(one["allocated_bytes"], two["allocated_bytes"])
         self.assertEqual(status["protected_allocated_bytes"], one["allocated_bytes"])
-        self.ring.delete_incident(first)
+        self.ring.delete_incident(first, now_us=T0 + POST, clock_trusted=True)
         self.assertEqual(self.quota.used(), two["allocated_bytes"])
-        self.ring.delete_incident(second)
+        self.ring.delete_incident(second, now_us=T0 + POST, clock_trusted=True)
+        self.assertGreater(self.quota.used(), 0)
+        self.assertFalse(self.ring.status(now_us=T0 + POST, clock_trusted=True)["pre_loss_coverage"][str(SOURCE)]["gaps_us"])
+        self.ring.tick(now_us=T0 + POST + PRE, clock_trusted=True)
         self.assertEqual(self.quota.used(), 0)
 
     def test_expiry_is_sixty_days_after_completion_and_requires_trusted_clock(self):
@@ -318,7 +321,7 @@ class RingTests(unittest.TestCase):
         self.finish()
         with patch.object(self.store, "delete_segment", side_effect=StorageRefused("storage_unavailable")):
             with self.assertRaises(RingRefused):
-                self.ring.delete_incident(first)
+                self.ring.delete_incident(first, now_us=T0 + POST + PRE, clock_trusted=True)
         self.restart()
         self.assertEqual(self.ring.incident(first, now_us=T0 + POST)["state"], "deleted")
         result = self.ring.incident(shared, now_us=T0 + POST)
@@ -501,3 +504,36 @@ class RingTests(unittest.TestCase):
         with self.assertRaisesRegex(RingRefused, "ledger_sidecar_refused"):
             Ledger(self.settings, maximum_bytes=128 * 1024)
         self.assertEqual(target.read_bytes(), b"generated")
+
+
+    def test_missing_ordinary_media_inside_selected_duration_stays_degraded(self):
+        self.configure("duration", 1800)
+        for start in range(T0 - 1800 * SECOND, T0, 60 * SECOND):
+            self.append(start)
+        old = UUID(self.ring._rows()[0]["id"])
+        self.store.delete_segment(old)
+        status = self.ring.status(now_us=T0, clock_trusted=True)
+        self.assertFalse(status["pre_loss_coverage"][str(SOURCE)]["gaps_us"])
+        self.assertEqual(status["reason"], "ordinary_ring_integrity_gap")
+        self.restart()
+        self.assertEqual(self.ring.status(now_us=T0, clock_trusted=True)["state"], "degraded")
+
+    def test_owner_incident_deletion_retains_independent_ordinary_pre_ownership(self):
+        self.warm()
+        incident = self.loss()
+        before = self.store.segment_allocations()
+        self.ring.delete_incident(incident, now_us=T0, clock_trusted=True)
+        self.assertEqual(self.store.segment_allocations(), before)
+        self.assertEqual(self.ring.incident(incident, now_us=T0)["state"], "deleted")
+        self.restart()
+        status = self.ring.status(now_us=T0, clock_trusted=True)
+        self.assertFalse(status["pre_loss_coverage"][str(SOURCE)]["gaps_us"])
+        self.assertEqual(status["protected_allocated_bytes"], 0)
+        self.ring.tick(now_us=T0 + PRE, clock_trusted=True)
+        self.assertEqual(self.store.segment_allocations(), {})
+
+    def test_uncertain_future_clock_cannot_fifo_delete_current_ordinary_media(self):
+        self.warm()
+        before = self.store.segment_allocations()
+        self.ring.tick(now_us=T0 + RETENTION, clock_trusted=False)
+        self.assertEqual(self.store.segment_allocations(), before)

@@ -27,7 +27,8 @@ There is no required ServerSentinel developer cloud/account/data plane.
 
 The Agent disk-ring core keeps segment bytes and its interval/protection ledger
 on deployment-configured local storage. It introduces no network client, remote
-reporting or media export. Completed protected media expires after 60 days;
+reporting or media export. Completed incident protection expires after 60 days; media is removed when no
+other incident or selected ordinary-ring reference retains it.
 clock uncertainty suspends automatic deletion and is reported explicitly.
 Deleted-incident tombstones expose deletion state to the future authorized UI;
 the core does not enable that UI or a playback/download route. Synthetic tests

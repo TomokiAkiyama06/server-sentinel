@@ -220,8 +220,8 @@ class DiskRing:
             self.db.execute("DELETE FROM protection WHERE segment=?", (identifier,))
             self.db.execute("DELETE FROM segments WHERE id=?", (identifier,))
 
-    def _trim(self, now):
-        if self.config is None:
+    def _trim(self, now, *, trusted=True):
+        if not trusted or self.config is None:
             return
         allocations = self.store.segment_allocations()
         ordinary = sum(allocations.get(UUID(row["id"]), 0) for row in self._rows()
@@ -235,8 +235,8 @@ class DiskRing:
             self._remove_segment(row["id"])
             ordinary -= allocations.get(UUID(row["id"]), 0)
 
-    def _free_for_write(self, length, now):
-        for row in self._reclaimable(now):
+    def _free_for_write(self, length, now, *, trusted):
+        for row in self._reclaimable(now) if trusted else ():
             try:
                 self.store.check(length + self.ledger_headroom)
                 return
@@ -272,7 +272,7 @@ class DiskRing:
                 "AND start<? AND end>? AND (expires IS NULL OR expires>?)", (end_us, start_us, now_us)
             ).fetchall()
             incidents = [row for row in incidents if str(source_id) in json.loads(row["sources"])]
-            self._trim(now_us)
+            self._trim(now_us, trusted=clock_trusted)
             # Ordinary capacity remains a physical allocation limit, separate
             # from protected bytes. Never evict required pre-loss coverage.
             if self.config.mode == "capacity" and not incidents:
@@ -281,7 +281,7 @@ class DiskRing:
                                if not self._protected(row["id"]))
                 needed = ((len(data) + self.store.allocation_unit - 1)
                           // self.store.allocation_unit) * self.store.allocation_unit
-                for row in self._reclaimable(now_us):
+                for row in self._reclaimable(now_us) if clock_trusted else ():
                     if ordinary + needed <= self.config.value:
                         break
                     self._remove_segment(row["id"])
@@ -301,7 +301,7 @@ class DiskRing:
                         self.db.execute("UPDATE incidents SET state='active', completed=NULL, expires=NULL WHERE id=?",
                                         (incident["id"],))
             try:
-                self._free_for_write(len(data), now_us)
+                self._free_for_write(len(data), now_us, trusted=clock_trusted)
                 self.store.write_segment(UUID(identifier), data)
                 allocated = self.store.segment_allocations()[UUID(identifier)]
                 if self.config.mode == "capacity" and not incidents:
@@ -322,7 +322,7 @@ class DiskRing:
                 self.db.execute("UPDATE segments SET state='stored', allocated=? WHERE id=?",
                                 (allocated, identifier))
             self._tick(now_us, clock_trusted)
-            self._trim(now_us)
+            self._trim(now_us, trusted=clock_trusted)
             self._status(now_us, clock_trusted=clock_trusted)
             return UUID(identifier)
 
@@ -372,13 +372,13 @@ class DiskRing:
         with self._operation():
             clock_trusted = self._clock(now_us, clock_trusted)
             self._tick(now_us, clock_trusted)
-            self._trim(now_us)
+            self._trim(now_us, trusted=clock_trusted)
             return self._status(now_us, clock_trusted=clock_trusted)
 
     def _tick(self, now, trusted):
         integer(now + RETENTION)
         for row in self.db.execute("SELECT id FROM incidents WHERE state='deleting'").fetchall():
-            self._delete_incident(row["id"])
+            self._delete_incident(row["id"], now=now, trusted=trusted)
         if not trusted:
             with self.ledger.transaction():
                 self.db.execute("UPDATE incidents SET clock_uncertain=1 WHERE state='active'")
@@ -391,29 +391,44 @@ class DiskRing:
                                 (state, now, now + RETENTION, row["id"]))
         for row in self.db.execute("SELECT id FROM incidents WHERE "
                                    "state IN ('complete','partial') AND expires<=?", (now,)).fetchall():
-            self._delete_incident(row["id"])
+            self._delete_incident(row["id"], now=now, trusted=True)
 
-    def delete_incident(self, identifier):
+    def delete_incident(self, identifier, *, now_us, clock_trusted):
         self.authority.require_owner("delete_incident")
         if not isinstance(identifier, UUID):
             raise RingRefused("invalid_incident_identity")
+        integer(now_us)
+        if type(clock_trusted) is not bool:
+            raise RingRefused("clock_trust_required")
         with self._operation():
-            self._delete_incident(str(identifier))
+            trusted = self._clock(now_us, clock_trusted)
+            self._delete_incident(str(identifier), now=now_us, trusted=trusted)
+            self._trim(now_us, trusted=trusted)
 
-    def _delete_incident(self, identifier):
+    def _ordinary_owned(self, row, now, trusted):
+        # On recovery/uncertain time, retaining an ordinary reference is safer
+        # than asserting a FIFO cutoff. The next trusted tick applies limits.
+        if self.config is None:
+            return False
+        return (not trusted or self.config.mode == "capacity"
+                or row["end"] > now - self.config.value * SECOND)
+
+    def _delete_incident(self, identifier, *, now=None, trusted=False):
         incident = self.db.execute("SELECT * FROM incidents WHERE id=?", (identifier,)).fetchone()
         if incident is None or incident["state"] == "deleted":
             return
         with self.ledger.transaction():
             self.db.execute("UPDATE incidents SET state='deleting' WHERE id=?", (identifier,))
-        segments = self.db.execute("SELECT segment FROM protection WHERE incident=?", (identifier,)).fetchall()
+        segments = self.db.execute("SELECT s.* FROM segments s JOIN protection p ON p.segment=s.id "
+                                   "WHERE p.incident=?", (identifier,)).fetchall()
         for row in segments:
-            segment = row["segment"]
+            segment = row["id"]
+            keep_ordinary = self._ordinary_owned(row, now, trusted)
             with self.ledger.transaction():
                 self.db.execute("DELETE FROM protection WHERE incident=? AND segment=?", (identifier, segment))
-                if not self._protected(segment):
+                if not self._protected(segment) and not keep_ordinary:
                     self.db.execute("UPDATE segments SET state='deleting' WHERE id=?", (segment,))
-            if not self._protected(segment):
+            if not self._protected(segment) and not keep_ordinary:
                 self._remove_segment(segment)
         with self.ledger.transaction():
             self.db.execute("UPDATE incidents SET state='deleted' WHERE id=?", (identifier,))
@@ -500,6 +515,9 @@ class DiskRing:
             self.state, self.reason = "degraded", "orphan_media_present"
         elif any(item["gaps_us"] for item in coverage.values()):
             self.state, self.reason = "degraded", "pre_loss_coverage_gap"
+        elif any(row["state"] != "stored" and not self._protected(row["id"])
+                 and self._ordinary_owned(row, now, clock_trusted) for row in rows):
+            self.state, self.reason = "degraded", "ordinary_ring_integrity_gap"
         else:
             self.state, self.reason = "healthy", "protection_ready"
         selected_duration = self.config.value * SECOND if self.config.mode == "duration" else PRE

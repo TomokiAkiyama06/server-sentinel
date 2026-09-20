@@ -192,3 +192,17 @@ Run from `agent/`: `python -m unittest discover -s tests -p 'test_*.py' -v`.
 Physical throughput, camera codecs, real 20-minute outage continuity, systemd,
 mount behavior under deployment privileges, authenticated commands, UI permissions
 and real browser rendering remain unchecked in `MANUAL_TEST.md`.
+
+
+Incident deletion removes that incident's protection references. A segment is
+physically unlinked only after every other incident and the current ordinary
+ring have released it. In particular, deleting a recent incident never erases
+the independent T-10 pre-roll. Duration/capacity FIFO then applies normally, so
+unreferenced media outside the selected ring does not accumulate indefinitely.
+`delete_incident` requires the current timestamp and explicit clock trust;
+uncertain time/recovery conservatively retains ordinary ownership until a trusted
+tick can apply the cutoff. No API promises secure erasure of other references.
+
+Missing ordinary segments still within the selected duration/capacity window
+keep status degraded even when the most recent ten minutes are complete.
+Untrusted forward clock jumps do not authorize ordinary FIFO deletion.
