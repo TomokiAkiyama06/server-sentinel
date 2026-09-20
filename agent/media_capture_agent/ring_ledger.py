@@ -23,10 +23,15 @@ CREATE TABLE incidents (
   end INTEGER NOT NULL, completed INTEGER, expires INTEGER, state TEXT NOT NULL,
   clock_uncertain INTEGER NOT NULL DEFAULT 0, sources TEXT NOT NULL
 );
+-- Membership is read by segment for every retained row and by incident for
+-- each incident's media, so the key order serves the per-segment lookup and
+-- the secondary index serves the per-incident one. Keeping this a WITHOUT
+-- ROWID table leaves protection at two B-trees for the ledger reservation.
 CREATE TABLE protection (
   incident TEXT REFERENCES incidents(id), segment TEXT REFERENCES segments(id),
-  PRIMARY KEY(incident, segment)
-);
+  PRIMARY KEY(segment, incident)
+) WITHOUT ROWID;
+CREATE INDEX protection_incident ON protection(incident);
 PRAGMA user_version = 1;
 """
 
@@ -100,6 +105,13 @@ class Ledger:
                 os.fsync(self.fd)
             elif version != 1:
                 raise RingRefused("unsupported_ledger_version")
+            # Protection membership is looked up by segment on every retained
+            # row. A ledger without that index would silently fall back to
+            # scanning the whole table instead of keeping the ring's cadence.
+            indexes = {row[0] for row in self.connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='index' AND name NOT LIKE 'sqlite_%'").fetchall()}
+            if indexes != {"segment_time", "protection_incident"}:
+                raise RingRefused("unsupported_ledger_format")
             if self.connection.execute("PRAGMA quick_check").fetchone()[0] != "ok":
                 raise RingRefused("ledger_integrity_failure")
         except (OSError, sqlite3.Error) as exc:

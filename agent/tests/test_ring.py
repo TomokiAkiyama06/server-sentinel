@@ -998,6 +998,36 @@ class RingTests(unittest.TestCase):
         self.assertEqual(self.ring.db.execute("SELECT count(*) FROM incidents").fetchone()[0], 1)
         self.assertTrue(self.ring._protected(str(identifier)))
 
+    def test_protection_membership_lookups_stay_indexed_for_both_directions(self):
+        self.warm()
+        self.loss()
+        self.assertGreater(self.ring.db.execute("SELECT count(*) FROM protection").fetchone()[0], 0)
+        # Membership is read per retained segment on every admission, trim and
+        # status pass; a table scan there cannot keep the ring's cadence.
+        plan = self.ring.db.execute(
+            "EXPLAIN QUERY PLAN SELECT 1 FROM protection p JOIN incidents i ON i.id=p.incident "
+            "WHERE p.segment=? AND i.state!='deleted' LIMIT 1", (str(uuid4()),)).fetchall()
+        detail = " ".join(row["detail"] for row in plan)
+        self.assertIn("SEARCH p", detail)
+        self.assertNotIn("SCAN p", detail)
+        plan = self.ring.db.execute(
+            "EXPLAIN QUERY PLAN SELECT s.* FROM segments s JOIN protection p ON p.segment=s.id "
+            "WHERE p.incident=?", (str(uuid4()),)).fetchall()
+        detail = " ".join(row["detail"] for row in plan)
+        self.assertIn("SEARCH p", detail)
+        self.assertNotIn("SCAN p", detail)
+
+    def test_ledger_missing_expected_membership_index_is_refused(self):
+        self.warm()
+        self.ring.close()
+        with sqlite3.connect(self.settings.runtime_root / "ring.sqlite3") as connection:
+            connection.execute("DROP INDEX protection_incident")
+        with self.assertRaisesRegex(RingRefused, "unsupported_ledger_format"):
+            DiskRing(self.settings, self.store, ledger_maximum_bytes=LEDGER_BYTES,
+                     authority=AllowControls())
+        # A refused ledger never touches the media it cannot account for.
+        self.assertEqual(len(self.store.list_segments()), 10)
+
     def test_existing_tombstones_are_counted_without_reset_or_deletion(self):
         with self.ring.ledger.transaction():
             self.ring.db.executemany("INSERT INTO incidents VALUES (?, 'camera_tamper', ?, ?, ?, ?, 'deleted', 0, ?)",

@@ -178,7 +178,11 @@ size. New zero-allocation media is refused before admission; such existing media
 is uncertain at inventory/recovery. Maximum bitrate is never treated as a
 minimum payload. Existing protected segments, incident tombstones and every
 protection reference consume metadata capacity, including separate references
-when incidents share one media file. Missing, untrusted or incompatible ordinary
+when incidents share one media file. Protection membership is keyed by
+segment and indexed by incident, so both the per-segment lookup used for every
+retained row and the per-incident listing are index searches at dense one-second
+cadences; keeping that table `WITHOUT ROWID` holds it to the same two B-trees
+the reservation already budgets. Missing, untrusted or incompatible ordinary
 rows consume additional capacity; they cannot replace future selected-ring rows.
 New preservation requests must fit before any incident is created; active
 incidents keep room for their remaining segment and reference rows across append
