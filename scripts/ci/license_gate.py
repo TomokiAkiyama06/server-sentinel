@@ -6,6 +6,8 @@ would be installed; they are not accepted as independent license evidence.
 """
 
 import argparse
+import base64
+import binascii
 import datetime
 import hashlib
 import json
@@ -108,6 +110,25 @@ def evidence(root: Path, values, field):
             raise GateError(f"{field} references a missing file")
 
 
+def valid_sri(value):
+    if not isinstance(value, str) or "-" not in value:
+        return False
+    algorithm, encoded = value.split("-", 1)
+    sizes = {"sha256": 32, "sha384": 48, "sha512": 64}
+    if algorithm not in sizes or not re.fullmatch(r"[A-Za-z0-9+/]+={0,2}", encoded):
+        return False
+    try:
+        decoded = base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError):
+        return False
+    canonical = base64.b64encode(decoded).decode("ascii")
+    return len(decoded) == sizes[algorithm] and encoded == canonical
+
+
+def reserved_model_path(value):
+    return bool(set(PurePosixPath(value).parts[:-1]) & MODEL_DIRECTORIES)
+
+
 def python_lock(path: Path, relative: str, scope: str):
     text = path.read_text(encoding="utf-8")
     logical = text.replace("\\\n", " ").splitlines()
@@ -148,8 +169,7 @@ def npm_lock(path: Path, relative: str, scope: str):
         nonempty_string(package.get("resolved"), "npm resolved artifact")
         integrity = nonempty_string(package.get("integrity"), "npm integrity")
         digests = tuple(sorted(integrity.split()))
-        if not digests or any(not re.fullmatch(r"sha(?:256|384|512)-[A-Za-z0-9+/=]+", value)
-                              for value in digests):
+        if not digests or any(not valid_sri(value) for value in digests):
             raise GateError(f"invalid npm integrity in {relative}")
         found.append(LockedComponent(relative, "npm-lock", scope, name, version,
                                      unquote(package["resolved"])))
@@ -229,9 +249,7 @@ def reviewed_pins(root: Path):
             valid = all(isinstance(value, str)
                         and re.fullmatch(r"sha256:[0-9a-f]{64}", value) for value in digests)
         else:
-            valid = all(isinstance(value, str)
-                        and re.fullmatch(r"sha(?:256|384|512)-[A-Za-z0-9+/=]+", value)
-                        for value in digests)
+            valid = all(valid_sri(value) for value in digests)
         if not valid:
             raise GateError("invalid reviewed digest")
         result.append(LockedPin(path, ecosystem, name, version, tuple(digests)))
@@ -390,6 +408,8 @@ def audit(root: Path, inventory_path=INVENTORY):
             path = relative_path(location["path"], field="model artifact path")
             if location != {"path": path, "ecosystem": "model-artifact", "scope": "model_weight"}:
                 raise GateError("invalid model artifact classification")
+            if not reserved_model_path(path):
+                raise GateError("model weight must be stored in a reserved model artifact directory")
             artifact = root / path
             if not artifact.is_file() or not re.fullmatch(r"[0-9a-f]{64}", str(sha256)):
                 raise GateError("missing model artifact or SHA256")

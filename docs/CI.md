@@ -127,7 +127,8 @@ The image and all its dependencies require the usual license and pinning review.
 Committed model artifacts require a distinct `model_weight` record with the
 exact path and SHA256. All files in a reserved model artifact directory are
 checked regardless of extension; common model suffixes are also checked in
-other directories. Model implementation packages require `model_code` records.
+other directories. Model weight inventory locations outside the reserved
+directories are rejected. Model implementation packages require `model_code` records.
 Restricted or unclear licenses remain
 blocked unless `license/owner-approvals.json` contains an exact, decision-backed
 Owner approval for that component version and license.

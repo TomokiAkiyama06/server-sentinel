@@ -1,6 +1,7 @@
 """License gate regressions use synthetic manifests and artifacts only."""
 
 import hashlib
+import base64
 import json
 import tempfile
 import unittest
@@ -64,6 +65,11 @@ class LicenseGateTests(unittest.TestCase):
         }
         value.update(changes)
         return value
+
+    def sri(self, byte, algorithm="sha512"):
+        sizes = {"sha256": 32, "sha384": 48, "sha512": 64}
+        encoded = base64.b64encode(bytes([byte]) * sizes[algorithm]).decode("ascii")
+        return algorithm + "-" + encoded
 
     def save(self):
         self.write(license_gate.INVENTORY, json.dumps({
@@ -187,6 +193,7 @@ class LicenseGateTests(unittest.TestCase):
         self.assertEqual(license_gate.audit(self.root), (2, 1, 1))
 
     def test_unreviewed_lockfile_and_npm_transitive_are_detected(self):
+        integrity = self.sri(1)
         self.write("frontend/package-lock.json", json.dumps({
             "lockfileVersion": 3,
             "packages": {
@@ -194,7 +201,7 @@ class LicenseGateTests(unittest.TestCase):
                 "node_modules/transitive": {
                     "version": "4.5.6",
                     "resolved": "https://example.test/transitive.tgz",
-                    "integrity": "sha512-synthetic",
+                    "integrity": integrity,
                 },
             },
         }))
@@ -208,7 +215,7 @@ class LicenseGateTests(unittest.TestCase):
             "ecosystem": "npm-lock",
             "name": "transitive",
             "version": "4.5.6",
-            "digests": ["sha512-synthetic"],
+            "digests": [integrity],
         })
         self.save()
         with self.assertRaisesRegex(license_gate.GateError, "locked dependencies differ"):
@@ -246,12 +253,13 @@ class LicenseGateTests(unittest.TestCase):
 
     def test_npm_sri_change_is_rejected_for_same_name_version_and_resolved(self):
         resolved = "https://example.test/transitive-4.5.6.tgz"
+        approved_sri = self.sri(2)
         package = {
             "lockfileVersion": 3,
             "packages": {
                 "": {},
                 "node_modules/transitive": {
-                    "version": "4.5.6", "resolved": resolved, "integrity": "sha512-YWJj",
+                    "version": "4.5.6", "resolved": resolved, "integrity": approved_sri,
                 },
             },
         }
@@ -275,14 +283,56 @@ class LicenseGateTests(unittest.TestCase):
             "ecosystem": "npm-lock",
             "name": "transitive",
             "version": "4.5.6",
-            "digests": ["sha512-YWJj"],
+            "digests": [approved_sri],
         })
         self.save()
         self.assertEqual(license_gate.audit(self.root), (2, 2, 0))
-        package["packages"]["node_modules/transitive"]["integrity"] = "sha512-ZGVm"
+        package["packages"]["node_modules/transitive"]["integrity"] = self.sri(3)
         self.write("frontend/package-lock.json", json.dumps(package))
         with self.assertRaisesRegex(license_gate.GateError, "lock digests differ"):
             license_gate.audit(self.root)
+        package["packages"]["node_modules/transitive"]["integrity"] = "sha512-synthetic"
+        self.write("frontend/package-lock.json", json.dumps(package))
+        with self.assertRaisesRegex(license_gate.GateError, "invalid npm integrity"):
+            license_gate.audit(self.root)
+
+    def test_model_weight_location_outside_reserved_directory_is_rejected(self):
+        artifact = b"synthetic opaque model archive"
+        self.write("server/assets/ml/model.zip", artifact)
+        self.components.append({
+            "id": "model:opaque-weight@1",
+            "name": "opaque-weight",
+            "version": "1",
+            "kind": "model_weight",
+            "upstream": "https://example.test/models/opaque/1",
+            "license": "Apache-2.0",
+            "license_evidence": ["docs/evidence.md"],
+            "transitive_evidence": ["docs/evidence.md"],
+            "obligations": ["preserve-license-and-copyright", "preserve-notice"],
+            "notice_files": ["docs/evidence.md"],
+            "locations": [{
+                "path": "server/assets/ml/model.zip",
+                "ecosystem": "model-artifact",
+                "scope": "model_weight",
+            }],
+            "sha256": hashlib.sha256(artifact).hexdigest(),
+        })
+        self.reviews = [self.review("transport"), self.review("model_code")]
+        self.save()
+        with self.assertRaisesRegex(license_gate.GateError, "reserved model artifact directory"):
+            license_gate.audit(self.root)
+
+    def test_npm_sri_requires_canonical_base64_and_algorithm_digest_length(self):
+        for invalid in (
+            "sha512-synthetic",
+            "sha512-YWJj",
+            "sha512-YWJj====",
+            "sha256-" + base64.b64encode(bytes(31)).decode("ascii"),
+        ):
+            with self.subTest(integrity=invalid):
+                self.assertFalse(license_gate.valid_sri(invalid))
+        for algorithm in ("sha256", "sha384", "sha512"):
+            self.assertTrue(license_gate.valid_sri(self.sri(4, algorithm)))
 
 
 if __name__ == "__main__":

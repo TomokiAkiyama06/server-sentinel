@@ -116,11 +116,14 @@ in `license/pins.json`; changing only a digest is therefore a gate failure.
 
 Model implementation code and weights use distinct `model_code` and
 `model_weight` records. Weight records bind the artifact path and SHA256; all
-files under reserved model artifact directories are inspected without relying on a
-suffix allowlist. A code license record never covers weights. Scopes with no
+files under reserved model artifact directories are inspected without relying
+on a suffix allowlist. A code license record never covers weights. Scopes with no
 selected third-party transport/model component have an evidence-backed
 `reviewed-empty` record so
 their absence is explicit rather than assumed.
+Committed model weights must live under `models/`, `weights/`, `checkpoints/`,
+or `model-artifacts/` at any repository depth. Inventory records outside those
+reserved directories are invalid, including opaque archives.
 
 Blocked-by-default licenses require an exact record in
 [`license/owner-approvals.json`](../license/owner-approvals.json), including the
