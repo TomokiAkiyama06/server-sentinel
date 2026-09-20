@@ -102,10 +102,10 @@ def compare(approved: Inventory | None, current: Inventory) -> tuple[Finding, ..
                 match = partial[0]
         if match is None:
             match = next(((index, item) for index, item in candidates
-                          if item.location == old.location), None)
+                          if (not old.identity or not item.identity) and item.properties == old.properties), None)
         if match is None:
             match = next(((index, item) for index, item in candidates
-                          if (not old.identity or not item.identity) and item.properties == old.properties), None)
+                          if item.location == old.location), None)
         if match is None:
             findings.append(Finding(old.kind, State.MISSING, "APPROVED_COMPONENT_ABSENT"))
             continue

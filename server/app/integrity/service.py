@@ -5,7 +5,7 @@ import math
 import time
 
 from .model import Inventory, Kind, compare
-from .store import IntegrityStore
+from .store import IntegrityOutboxFull, IntegrityStore
 
 
 class IntegrityService:
@@ -46,7 +46,13 @@ class IntegrityService:
             current = Inventory((), frozenset(Kind))
         _, baseline = self.store.baseline()
         findings = compare(baseline, current)
-        self.store.record(findings, self.utcnow())
+        try:
+            self.store.record(findings, self.utcnow())
+        except IntegrityOutboxFull:
+            # record committed the warning to durable bounded overflow. Keep
+            # its failed-delivery status visible and retry delivery each tick,
+            # without rerunning expensive hardware probes on every worker tick.
+            pass
         self._last_check = started
         self.store.deliver(self.sink)
         return findings

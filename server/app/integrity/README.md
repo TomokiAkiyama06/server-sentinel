@@ -59,7 +59,10 @@ acceptance. Pending rows have an explicit capacity limit. Saturation also has
 sixteen bounded durable overflow slots (four hardware kinds by four non-OK
 states), coalescing repeated observations of the same category/state and
 retaining their first observation time. It sets `delivery_blocked` and raises
-`INTEGRITY_OUTBOX_FULL`. A later healthy status cannot erase these warnings.
+`IntegrityOutboxFull` (`INTEGRITY_OUTBOX_FULL`). The service catches only this
+committed-overflow condition, preserves daily probe cadence, and keeps retrying
+delivery each worker tick; storage transaction failures still propagate.
+A later healthy status cannot erase these warnings.
 Reserved acknowledgement transactions promote overflow into the normal outbox
 with the fixed `COALESCED_PENDING_WARNING` reason and fresh monotonic event IDs;
 the sink must continue draining on subsequent ticks. Retry drains pending events

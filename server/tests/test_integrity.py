@@ -72,6 +72,10 @@ class CompareTests(TestCase):
         new = Component(Kind.STORAGE, "disk9", (), (("serial", "synthetic-a"), ("wwid", "synthetic-replaced")))
         self.assertEqual([item.state for item in compare(Inventory((old,)), Inventory((new,)))], [State.CHANGED])
 
+    def test_identityless_moved_disk_is_unknown_before_reused_location(self):
+        findings = compare(Inventory((disk(),)), Inventory((disk("synthetic-replacement"), disk("", slot="disk9"))))
+        self.assertEqual([item.state for item in findings], [State.UNVERIFIABLE, State.NEW_DEVICE])
+
     def test_duplicate_unique_identity_not_ok(self):
         findings = compare(Inventory((disk(),)), Inventory((disk(), disk(slot="disk1"))))
         self.assertEqual(findings[0].state, State.UNVERIFIABLE)
@@ -168,6 +172,30 @@ class StoreTests(TestCase):
         findings = IntegrityService(self.store, Probe(), lambda *args: None).startup()
         self.assertEqual(len(findings), 4)
         self.assertNotIn("synthetic-secret", str(findings))
+
+    def test_full_outbox_preserves_daily_probe_cadence_and_retries_delivery(self):
+        store = IntegrityStore(self.db, reservation=self.reservation, max_pending_events=1)
+        store.record(compare(None, Inventory(())), NOW)
+        class Probe:
+            calls = 0
+            def collect(self):
+                self.calls += 1
+                return Inventory(())
+        probe = Probe()
+        attempts = []
+        def unavailable(*args):
+            attempts.append(True)
+            raise OSError("synthetic-unavailable")
+        clock = [0.0]
+        service = IntegrityService(store, probe, unavailable, monotonic=lambda: clock[0], utcnow=lambda: NOW)
+        self.assertTrue(service.startup())
+        for _ in range(3):
+            clock[0] += 1
+            self.assertIsNone(service.tick())
+        self.assertEqual(probe.calls, 1)
+        self.assertEqual(len(attempts), 5)
+        self.assertEqual(self.db.execute("SELECT delivery_blocked FROM integrity_status").fetchone()[0], 1)
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM integrity_overflow").fetchone()[0], 4)
 
     def test_autocommit_required_and_worker_confined(self):
         db = sqlite3.connect(":memory:")

@@ -40,6 +40,10 @@ class DenyApproval:
         raise PermissionError("OWNER_APPROVAL_REQUIRED")
 
 
+class IntegrityOutboxFull(RuntimeError):
+    """The warning is durable in bounded overflow; delivery is still blocked."""
+
+
 def timestamp(at: datetime) -> str:
     if at.tzinfo is None or at.utcoffset() is None:
         raise ValueError("AWARE_TIME_REQUIRED")
@@ -134,7 +138,7 @@ class IntegrityStore:
                 self.db.execute("INSERT INTO integrity_outbox(at,immediate,findings) VALUES(?,?,?)",
                                 (when, int(any(item.immediate for item in findings)), payload))
         if blocked:
-            raise RuntimeError("INTEGRITY_OUTBOX_FULL")
+            raise IntegrityOutboxFull("INTEGRITY_OUTBOX_FULL")
 
     def _promote_overflow(self):
         """Run inside the reserved acknowledgement transaction, without loss."""
