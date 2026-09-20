@@ -382,6 +382,14 @@ If the intended recording filesystem is missing or substituted, refuse recording
 
 Hardware inventory/SMART collection must use least privilege. If a privileged helper is needed for a narrow probe, do not grant the whole application broad root access.
 
+The Issue #23 foundation uses fixed read-only command arguments, bounded output
+and time, a minimal environment, and no sudo or shell. Baseline approval denies by
+default, checks the expected revision and audits the approved principal. Raw
+inventory never enters the fixed-category fault outbox. Self-test I/O shares the
+recorder worker's pinned root and reservations; only a journaled UUID artifact
+can be cleaned. Domain interfaces do not enable a human API or replace pending
+application authorization integration.
+
 ## Vision/timeline interpretation
 
 Allowed observations include:
