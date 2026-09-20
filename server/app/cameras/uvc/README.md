@@ -61,6 +61,8 @@ pipeline; actual browser viewing remains a downstream task. Discovery and
 negotiation remain `degraded` until the first video frame arrives. Unplug emits
 `offline`; another source's worker can continue. Enable/disable comes from the
 registry, and quality remains `unknown` until a detector evaluates it.
+Graceful shutdown closes capture without claiming a physical unplug, and it
+preserves any outstanding manual-intervention state.
 
 The backend launcher does not start physical capture automatically. No physical
 webcam, actual preview/browser path, Ubuntu permission setup or arm64 host was

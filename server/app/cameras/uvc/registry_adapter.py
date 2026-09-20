@@ -133,7 +133,6 @@ class LocalUvcAdapter:
         for session in self.sessions.values():
             try:
                 session.close()
-                session.controller.disconnected()
                 session.controller.shutdown()
             except BaseException as error:
                 # Close every source even when one database/health sink fails.

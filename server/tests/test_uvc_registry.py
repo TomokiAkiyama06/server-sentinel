@@ -76,6 +76,40 @@ class UvcRegistryTests(unittest.TestCase):
         self.assertTrue(restarted.poll_source(self.source.id))
         self.assertEqual(self.registry.get_source(self.source.id).id, self.source.id)
 
+    def test_clean_shutdown_closes_capture_without_reporting_unplug(self):
+        self.adapter.approve_source(self.source.id, self.camera)
+        self.assertTrue(self.adapter.poll_source(self.source.id))
+        capture = self.adapter.sessions[self.source.id].capture
+        self.events.clear()
+        self.adapter.close()
+        self.assertTrue(capture.closed)
+        self.assertEqual([event.reason for event in self.events], ["video_capture_closed"])
+        self.assertEqual(self.registry.get_source(self.source.id).health_state, SourceHealthState.OFFLINE)
+        self.assertIsNone(self.adapter.store.load(self.source.id).session_token)
+
+    def test_clean_shutdown_of_disabled_source_does_not_report_unplug(self):
+        self.adapter.approve_source(self.source.id, self.camera)
+        self.registry.update_source(self.source.id, enabled=False)
+        self.assertFalse(self.adapter.poll_source(self.source.id))
+        self.events.clear()
+        self.adapter.close()
+        self.assertEqual(self.events, [])
+        self.assertEqual(self.registry.get_source(self.source.id).health_state, SourceHealthState.OFFLINE)
+
+    def test_clean_shutdown_preserves_manual_state_without_reporting_unplug(self):
+        self.adapter.approve_source(self.source.id, self.camera)
+        self.adapter.sessions[self.source.id].close()
+        self.discovery.devices.append(replace(self.camera, device_path="/dev/video2"))
+        self.assertFalse(self.adapter.poll_source(self.source.id))
+        self.events.clear()
+        self.adapter.close()
+        self.assertEqual(self.events, [])
+        self.assertEqual(self.registry.get_source(self.source.id).health_state,
+                         SourceHealthState.MANUAL_INTERVENTION_REQUIRED)
+        saved = self.adapter.store.load(self.source.id)
+        self.assertTrue(saved.requires_approval)
+        self.assertIsNone(saved.session_token)
+
     def test_source_failure_does_not_stop_other_camera(self):
         other = self.registry.create_source(
             source_type=SourceType.LOCAL_UVC, name="Other synthetic source", enabled=True,
