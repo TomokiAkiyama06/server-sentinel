@@ -556,7 +556,11 @@ class RecordingStore:
             "WHERE recording_id=? AND start_ms<? AND end_ms>? ORDER BY start_ms",
             (str(recording_id), end, row["start_ms"]),
         ).fetchall()
-        result["discontinuities"] = [dict(item) for item in discontinuities]
+        result["discontinuities"] = [
+            {"start_ms": max(row["start_ms"], item["start_ms"]),
+             "end_ms": min(end, item["end_ms"]), "reason": item["reason"]}
+            for item in discontinuities
+        ]
         for previous, current in zip(segments, segments[1:]):
             if (previous["stream_id"] != current["stream_id"]
                     or current["sequence"] != previous["sequence"] + 1):

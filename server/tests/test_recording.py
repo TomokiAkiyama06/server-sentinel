@@ -379,6 +379,17 @@ class RecordingTests(unittest.TestCase):
         with self.assertRaisesRegex(RecordingError, "TIMELINE_REGRESSION"):
             self.store.append(self.segment())
 
+    def test_discontinuity_crossing_start_is_clipped_to_recording_window(self):
+        self.store.append(self.segment(10_000, 20_000))
+        recording = self.store.start_manual(self.source, 30_000, duration_ms=20_000)
+        self.store.append(self.segment(40_000, 50_000, 2))
+        result = self.store.finish(recording)
+        self.assertEqual("gapped", result["status"])
+        self.assertEqual([{"start_ms": 30_000, "end_ms": 40_000,
+                           "reason": "stream_discontinuity"}], result["discontinuities"])
+        self.assertEqual((30_000, 40_000),
+                         (result["gaps"][0]["start_ms"], result["gaps"][0]["end_ms"]))
+
     def test_source_limit_and_explicit_release_preserve_recordings(self):
         sources = [self.source, uuid4(), uuid4(), uuid4()]
         for source in sources:
