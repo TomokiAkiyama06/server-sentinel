@@ -162,6 +162,12 @@ Acceptance:
 
 GitHub Issue: [#7](https://github.com/TomokiAkiyama06/server-sentinel/issues/7)
 
+Implementation: `server/app/` and `server/tests/` provide the closed FastAPI
+foundation, validated deployment settings, transactional SQLite migration and
+value-free structured logging. See [`server/docs/FOUNDATION.md`](../server/docs/FOUNDATION.md).
+Human routes remain unavailable; final acceptance retains the #6 dependency and
+does not treat this foundation as #10 permission enforcement.
+
 Depends on: [#5](https://github.com/TomokiAkiyama06/server-sentinel/issues/5), [#6](https://github.com/TomokiAkiyama06/server-sentinel/issues/6)
 
 Labels: `backend`, `security`
@@ -229,6 +235,8 @@ Acceptance:
 - logical source identity survives reconnect/role changes; local sources have no capture node and remote node/source identities remain separate;
 - source health, node health, image-quality state, desired/negotiated capture profile, last-seen, and versioned/enabled/threshold detection bindings follow SPECIFICATION section 3;
 - over-limit activation returns an explicit validation error without replacing/disabling existing sources; human management routes remain unavailable before Plan 17.
+
+Implementation: `server/app/cameras/registry/` provides the internal SQLite registry and migration. `server/tests/test_registry.py` covers mixed 1–4 sources, concurrent admission and limit changes, atomic fifth-source rejection, migration/restart persistence, independent node/source health, and profiles/bindings. HTTP management remains unavailable before #10. Issue acceptance still requires its dependency #7 and the PR's current-HEAD/base review and CI gates.
 
 ## Blocking prerequisite — Owner authorization / trusted Tailscale identity ADR
 
