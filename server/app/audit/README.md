@@ -46,8 +46,12 @@ hardware baseline service or probes already exist.
 `RecordingBrowser` in `app/storage/retention.py` performs Owner star/delete
 only through an injected `OwnerAdministration`; without one it refuses with
 `RECORDING_AUDIT_UNAVAILABLE` instead of mutating the store directly, and
-`LocalUvcAdapter` exposes no public unaudited camera approval. An Owner change
-therefore cannot reach a recording or a camera approval without its record.
+`LocalUvcAdapter` exposes no public unaudited camera approval. `CameraRegistry`
+refuses its own privileged write wrappers with `UnauditedWriteError` unless it
+was explicitly constructed for non-runtime fixtures or bootstrap, while reads
+and runtime health observations stay available. An Owner change therefore
+cannot reach a recording, a camera approval or privileged registry
+configuration without its record.
 
 Owner recording deletion commits its `deleting` journal transition and
 `delete_recording` audit together. Media cleanup then follows the recording

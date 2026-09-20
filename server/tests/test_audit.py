@@ -15,7 +15,9 @@ from app.audit import (
     OwnerAuditService, OwnerAuthorizationError, TargetKind,
 )
 from app.audit.integration import OwnerAdministration
-from app.cameras.registry import CameraRegistry, NodeHealthState, SourceType
+from app.cameras.registry import (
+    CameraRegistry, NodeHealthState, SourceHealthState, SourceType, UnauditedWriteError,
+)
 from app.storage.database import Database
 from app.storage.migrations import migrate
 from app.storage.schema import APPLICATION_MIGRATIONS
@@ -499,6 +501,52 @@ class AuditTests(unittest.TestCase):
         self.now += timedelta(days=91)
         self.assertEqual(1, store.cleanup_expired())
         self.assertEqual(0, self.remaining())
+
+    def test_privileged_registry_writes_require_the_audited_boundary(self):
+        runtime = CameraRegistry(self.database, clock=lambda: self.now)
+        node = self.admin.create_capture_node("synthetic-owner-session", "Synthetic node")
+        source = self.admin.create_source(
+            "synthetic-owner-session", source_type=SourceType.REMOTE_AGENT,
+            capture_node_id=node.id, name="Synthetic source", enabled=True,
+        )
+        for operation in (
+            lambda: runtime.set_active_limit(2),
+            lambda: runtime.create_capture_node("Bypass node"),
+            lambda: runtime.update_capture_node(node.id, name="Bypass"),
+            lambda: runtime.create_source(source_type=SourceType.LOCAL_UVC, name="Bypass"),
+            lambda: runtime.update_source(source.id, name="Bypass"),
+        ):
+            with self.subTest(operation=operation):
+                with self.assertRaises(UnauditedWriteError):
+                    operation()
+        # No privileged change happened outside the audited boundary.
+        self.assertEqual(4, runtime.max_active_video_sources)
+        self.assertEqual("Synthetic node", runtime.get_capture_node(node.id).name)
+        self.assertEqual((source.id,), tuple(row.id for row in runtime.list_sources()))
+        self.assertEqual("Synthetic source", runtime.get_source(source.id).name)
+        self.assertEqual(
+            {AuditAction.CREATE_CAPTURE_NODE, AuditAction.CREATE_SOURCE},
+            {record.action for record in self.store.list_records()},
+        )
+
+        # Runtime health observation is not an Owner decision and still works,
+        # and the audited boundary performs the same privileged change.
+        runtime.update_source_health(source.id, health_state=SourceHealthState.OFFLINE)
+        self.admin.update_source("synthetic-owner-session", source.id, name="Renamed")
+        self.admin.set_active_source_limit("synthetic-owner-session", 2)
+        self.assertEqual("Renamed", runtime.get_source(source.id).name)
+        self.assertEqual(2, runtime.max_active_video_sources)
+        self.assertEqual(
+            {AuditOutcome.SUCCEEDED},
+            {record.outcome for record in self.store.list_records()},
+        )
+
+        # Fixture and bootstrap tooling may opt in explicitly.
+        fixtures = CameraRegistry(self.database, clock=lambda: self.now,
+                                  unaudited_writes=True)
+        self.assertEqual("Fixture", fixtures.update_source(source.id, name="Fixture").name)
+        with self.assertRaises(ValueError):
+            CameraRegistry(self.database, unaudited_writes="yes")
 
     def test_plan23_baseline_approval_contract_uses_fixed_atomic_action(self):
         baseline_id = uuid4()

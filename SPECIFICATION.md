@@ -712,7 +712,12 @@ from factual timeline events and owns only its own rows. Every audit write —
 success, failure, denial and retention cleanup — passes the deployment storage
 admission; the subsystem consumes that reserve and defines no numeric reserve of
 its own, and until a deployment binds its storage policy the application refuses
-audit writes rather than admitting them against an unverified reserve. Retention
+audit writes rather than admitting them against an unverified reserve. Owner-facing
+mutations reach the registry, the UVC approval store and the recording store
+only through that audited boundary: the registry refuses its own privileged
+write wrappers outside explicitly non-runtime fixture use, the recording
+browser refuses Owner star/delete without it, and no unaudited camera approval
+entry point is exposed. Retention
 computes one cutoff per run and deletes expired rows oldest first in bounded
 admitted transactions, so an interrupted run stays consistent, the next run
 resumes, and a repeated run deletes nothing more; it never touches recording,

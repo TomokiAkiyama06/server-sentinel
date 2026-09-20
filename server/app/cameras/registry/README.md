@@ -40,25 +40,38 @@ management operations.
   UTC. Image-quality state is descriptive adapter metadata, initially `unknown`;
   the registry never converts unknown quality into a negative detection result.
 
-The public contract is exported from `app.cameras.registry`:
+The public contract is exported from `app.cameras.registry`. Privileged
+configuration changes — creating or changing a source or capture node and
+changing the active-source limit — run through the audited Owner boundary, so
+each one commits with its durable security/admin audit record:
 
 ```python
+from app.audit.integration import OwnerAdministration
 from app.cameras.registry import CameraRegistry, SourceType
 
 registry = CameraRegistry(database)
-source = registry.create_source(
+administration = OwnerAdministration(owner_audit_service, registry)
+source = administration.create_source(
+    actor_context,
     source_type=SourceType.LOCAL_UVC,
     name="Configured source",
     role_label="custom role",
     enabled=True,
 )
-registry.update_source(source.id, role_label="another custom role")
+administration.update_source(actor_context, source.id, role_label="another custom role")
 ```
 
-`create_capture_node`, `get_capture_node`, and `update_capture_node` handle node
-records. `get_source`, `list_sources`, and `update_source` handle source
+The registry's own `set_active_limit`, `create_capture_node`,
+`update_capture_node`, `create_source` and `update_source` wrappers commit
+their own transaction with no authorization, audit record or storage
+admission, so a runtime registry refuses them with `UnauditedWriteError`.
+Fixture, bootstrap and migration tooling that is explicitly not the runtime
+opts in with `CameraRegistry(database, unaudited_writes=True)`.
+
+`get_capture_node`, `get_source` and `list_sources` read node and source
 configuration. `update_source_health` accepts independent camera observations
-and an optional negotiated profile. `NotFoundError` and `ValidationError` give
+and an optional negotiated profile; health is an observation rather than an
+Owner decision, so it stays available without the audited boundary. `NotFoundError` and `ValidationError` give
 explicit domain failures; storage exceptions expose a fixed message without
 submitted configuration, SQL values, or private deployment paths.
 

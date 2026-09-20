@@ -29,7 +29,7 @@ class UvcRegistryTests(unittest.TestCase):
         connection = database.connect()
         migrate(connection, APPLICATION_MIGRATIONS)
         connection.close()
-        self.registry = CameraRegistry(database)
+        self.registry = CameraRegistry(database, unaudited_writes=True)
         self.source = self.registry.create_source(
             source_type=SourceType.LOCAL_UVC, name="Synthetic source", enabled=True,
             desired_capture_profile=CaptureProfile(640, 480, 10, "MJPG"),

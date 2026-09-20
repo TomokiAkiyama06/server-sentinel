@@ -28,6 +28,10 @@ class ActiveSourceLimitError(ValidationError):
     """Admission would exceed the configured active-source limit."""
 
 
+class UnauditedWriteError(RuntimeError):
+    """A privileged registry write was attempted outside the audited boundary."""
+
+
 _UNSET = object()
 
 
@@ -76,11 +80,31 @@ class CameraRegistry:
     Each operation owns a fresh connection. Mutations serialize before reading
     admission state. Enabled sources reserve capacity even while offline; health
     never silently removes a source from the configured active collection.
+
+    Privileged configuration writes — creating or changing a source or capture
+    node and changing the active-source limit — commit their own transaction
+    with no authorization, no audit record and no storage admission. A runtime
+    registry therefore refuses them: they must go through the audited Owner
+    boundary `app.audit.integration.OwnerAdministration`, which commits the
+    same mutation together with its durable audit record. Fixture, bootstrap
+    and migration tooling that is explicitly not the runtime may opt in with
+    ``unaudited_writes=True``. Reads and runtime health updates, which are
+    observations rather than Owner decisions, stay available either way.
     """
 
-    def __init__(self, database: Database, *, clock: Callable[[], datetime] | None = None):
+    def __init__(self, database: Database, *, clock: Callable[[], datetime] | None = None,
+                 unaudited_writes: bool = False):
+        if type(unaudited_writes) is not bool:
+            raise ValidationError("invalid registry write mode")
         self.database = database
         self._clock = clock or (lambda: datetime.now(timezone.utc))
+        self.unaudited_writes = unaudited_writes
+
+    def _require_unaudited_writes(self) -> None:
+        if not self.unaudited_writes:
+            raise UnauditedWriteError(
+                "privileged registry writes require the audited owner boundary"
+            )
 
     @contextmanager
     def _transaction(self, *, write=False):
@@ -117,6 +141,8 @@ class CameraRegistry:
             return self._limit(connection)
 
     def set_active_limit(self, limit: int) -> None:
+        """Non-runtime write; the audited boundary owns runtime limit changes."""
+        self._require_unaudited_writes()
         positive_integer(limit, "active source limit")
         with self._transaction(write=True) as connection:
             self.set_active_limit_on(connection, limit)
@@ -141,7 +167,11 @@ class CameraRegistry:
         )
 
     def create_capture_node(self, name: str) -> CaptureNode:
-        """Record an independent node identity; this does not pair or authorize it."""
+        """Record an independent node identity; this does not pair or authorize it.
+
+        Non-runtime write: the audited boundary owns runtime node creation.
+        """
+        self._require_unaudited_writes()
         text_value(name, "node name")
         with self._transaction(write=True) as connection:
             return self.create_capture_node_on(connection, uuid4(), name)
@@ -179,6 +209,8 @@ class CameraRegistry:
 
     def update_capture_node(self, node_id: UUID, *, name=_UNSET,
                             health_state=_UNSET, last_seen_at=_UNSET) -> CaptureNode:
+        """Non-runtime write; the audited boundary owns runtime node changes."""
+        self._require_unaudited_writes()
         with self._transaction(write=True) as connection:
             return self.update_capture_node_on(
                 connection, node_id, name=name, health_state=health_state,
@@ -234,6 +266,8 @@ class CameraRegistry:
                       enabled: bool = False, capabilities: dict | None = None,
                       desired_capture_profile: CaptureProfile | None = None,
                       detection_bindings: tuple[DetectionBinding, ...] = ()) -> CameraSource:
+        """Non-runtime write; the audited boundary owns runtime source creation."""
+        self._require_unaudited_writes()
         with self._transaction(write=True) as connection:
             return self.create_source_on(
                 connection, uuid4(), source_type=source_type, name=name,
@@ -310,7 +344,11 @@ class CameraRegistry:
     def update_source(self, source_id: UUID, *, name=_UNSET, role_label=_UNSET,
                       enabled=_UNSET, capabilities=_UNSET, desired_capture_profile=_UNSET,
                       detection_bindings=_UNSET) -> CameraSource:
-        """Update metadata/configuration without changing source or node identities."""
+        """Update metadata/configuration without changing source or node identities.
+
+        Non-runtime write: the audited boundary owns runtime source changes.
+        """
+        self._require_unaudited_writes()
         with self._transaction(write=True) as connection:
             return self.update_source_on(
                 connection, source_id, name=name, role_label=role_label, enabled=enabled,

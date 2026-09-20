@@ -46,7 +46,7 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
             with closing(self.application.state.database.connect()) as connection:
                 self.assertEqual(connection.execute("SELECT count(*) FROM schema_migrations").fetchone()[0],
                                  len(APPLICATION_MIGRATIONS))
-            registry = CameraRegistry(self.application.state.database)
+            registry = CameraRegistry(self.application.state.database, unaudited_writes=True)
             source = registry.create_source(source_type=SourceType.LOCAL_UVC, name="Synthetic", enabled=True)
             self.assertEqual(source, registry.get_source(source.id))
         self.assertFalse(self.application.state.ready)
