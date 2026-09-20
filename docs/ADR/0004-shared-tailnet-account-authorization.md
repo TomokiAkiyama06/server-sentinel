@@ -5,11 +5,11 @@ Date: 2026-09-20
 
 ## What this status covers
 
-Accepted means the repository owner has settled the decisions below: the research room shares one Tailscale account, and application authorization rests on per-person ServerSentinel credentials.
+Accepted covers exactly what this record decides: the research room shares one Tailscale account, application authorization rests on per-person ServerSentinel credentials, WebAuthn/passkey is the mechanism, and the invariants stated below hold. [ADR-0003](0003-owner-authentication-and-trusted-proxy.md) leaves the authoritative per-person application credential to be decided separately for Issue #6; this record is that decision.
 
-It does not open human access, and by itself it does not discharge the Issue #6 prerequisite. That prerequisite is met only when the companion record for owner authentication and the trusted human-access boundary is accepted as well. Human routes stay closed until Issue #10 implements and tests both, which is what `docs/INITIAL_ISSUES.md` and `server/docs/FOUNDATION.md` continue to say.
+It does not open human access, and by itself it does not discharge the Issue #6 prerequisite. That prerequisite is met only when ADR-0003, *Owner authentication and the trusted human-access boundary*, is accepted as well. Human routes stay closed until Issue #10 implements and tests both, which is what `docs/INITIAL_ISSUES.md` and `server/docs/FOUNDATION.md` continue to say.
 
-That companion record is [ADR-0003](0003-owner-authentication-and-trusted-proxy.md), *Owner authentication and the trusted human-access boundary*, also for Issue #6. It is in the repository and still `Proposed`, awaiting the Owner's decision, so the parameters of that boundary — session idle and absolute lifetimes, the owner step-up freshness window, the local bootstrap and recovery choices, and the exact identity-header handling — are settled there rather than here.
+Accepted here does **not** accept anything from ADR-0003 by reference. That record is in the repository and still `Proposed`, so its parameters — the session idle and absolute lifetimes, the owner step-up freshness window, the local bootstrap and recovery mechanics, and the exact identity-header handling — remain proposals awaiting the Owner. Where this record mentions them, it is describing that proposal, not adopting it.
 
 The division of labour: this ADR records the deployment constraint (one shared Tailscale account) and the resulting decision to authorize on a per-person credential; ADR-0003 works out the boundary around it (owner bootstrap and recovery, the trusted-proxy path, session and revocation mechanics). Where they overlap, a verified Tailscale/trusted-proxy identity is supplementary under this ADR and never sufficient on its own.
 

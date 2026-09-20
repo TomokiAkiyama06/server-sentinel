@@ -943,8 +943,9 @@ A session is a server-side record bound to one principal and to the credential
 that created it. Sign-out, idle/absolute expiry and revocation invalidate that
 record, so a retained cookie or token authorizes nothing afterwards; §11.5
 authorization re-checks it on every human/media route and never relies on
-client-side state. Idle and absolute lifetimes are deployment-configured and
-server-enforced, an explicit sign-out is available for shared machines, and
+client-side state. Idle and absolute lifetimes are server-enforced, with the
+values proposed in ADR-0003 (30 minutes idle, 12 hours absolute) and any change
+recorded there before implementation; an explicit sign-out is available for shared machines, and
 owner-only routes require a fresh user-verification step rather than an older
 session.
 
@@ -1034,9 +1035,9 @@ POST biometric enroll/delete            -> owner + fresh user verification
 DELETE recording                         -> owner + fresh user verification
 ```
 
-"Fresh" means a user verification newer than a bounded freshness window, so an
-older or unattended owner session cannot perform an AUTH-008 operation by
-itself. Freshness is evaluated server-side from
+"Fresh" means a user verification newer than a bounded freshness window — ADR-0003
+proposes five minutes — so an older or unattended owner session cannot perform an
+AUTH-008 operation by itself. Freshness is evaluated server-side from
 `principal_session.last_user_verification_at`; a client cannot assert it.
 
 The main-to-Web contract for the step-up is explicit, because the dashboard has
@@ -1169,7 +1170,8 @@ instead of preventing the bind. Owner bootstrap also provisions the Owner's
 first per-person credential through the local administrative boundary, since no
 session exists without one. A verified trusted-proxy identity stays a supplementary check
 there; the authoritative per-person application credential is decided separately
-for Issue #6.
+for Issue #6, by §11.8 and ADR-0004: a per-person WebAuthn credential, which is
+the credential that local bootstrap provisions and that a session is bound to.
 
 ## 12. Dashboard UI
 
