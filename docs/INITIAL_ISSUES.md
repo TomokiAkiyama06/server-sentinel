@@ -311,6 +311,11 @@ Acceptance:
 - backend rejects spoofed identity headers from untrusted LAN paths;
 - no developer-operated identity/cloud.
 
+Design progress: [ADR-0003](ADR/0003-owner-authentication-and-trusted-proxy.md)
+is Proposed with synthetic policy-model coverage. Owner decisions remain pending;
+this does not close #6 or permit #10 authentication activation. Actual proxy,
+session, recovery, and stream tests remain #10/#19/#27/#28 work.
+
 ## Plan 5 — Local UVC discovery and stable identity
 
 Implementation progress: video-only V4L2 discovery/MMAP, conservative identity,
@@ -473,6 +478,14 @@ Acceptance:
 - source/session identity and timestamp continuity survive reconnect with truthful missing-interval/gap reporting.
 
 ## Plan 9A — Agent disk ring buffer + autonomous incident evidence
+
+Delivery note: the stdlib ring core now performs real immutable segment/SQLite
+writes, shared incident protection, bounded 20-minute admission, coverage/gap
+reporting and 60-day expiry with synthetic fault tests. It exposes default-deny
+control boundaries and UI DTOs; production capture/transport/profile integration,
+Owner authorization/dashboard wiring and physical acceptance remain open. See
+[`agent/docs/RING_BUFFER.md`](../agent/docs/RING_BUFFER.md). This is not Issue
+completion and does not resolve any pending transport or reserve-value decision.
 
 GitHub Issue: [#16](https://github.com/TomokiAkiyama06/server-sentinel/issues/16)
 
