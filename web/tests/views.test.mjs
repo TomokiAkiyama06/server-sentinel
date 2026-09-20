@@ -36,8 +36,8 @@ const storage = {
 const actions = { star() { assert.fail('render must not mutate'); }, remove() { assert.fail('render must not mutate'); } };
 const recordingsMarkup = (owner, { recordings: items = recordings, ...extra } = {}) =>
   renderToStaticMarkup(createElement(RecordingsView, { t: messages.ja, recordings: items, owner, ...extra }));
-const storageMarkup = (locale = 'ja', value = storage) =>
-  renderToStaticMarkup(createElement(StorageView, { t: messages[locale], storage: value }));
+const storageMarkup = (locale = 'ja', value = storage, extra = {}) =>
+  renderToStaticMarkup(createElement(StorageView, { t: messages[locale], storage: value, ...extra }));
 
 test('storage stays owner-only and recording metadata needs recordings:view', () => {
   for (const permissions of [[], ['live:view'], ['recordings:view'], ['live:view', 'recordings:view']]) {
@@ -265,4 +265,10 @@ test('a configured Slack that lost a notification is not reported as healthy', (
     assert.doesNotMatch(storageMarkup(locale, { ...storage, notification_delivery_failed: true }),
       /hooks\.slack\.com|xox[baprs]-|webhook/i);
   }
+});
+
+test('the storage snapshot offers a refresh only when one is wired', () => {
+  const markup = storageMarkup('ja', storage, { onRefresh() {} });
+  assert.match(markup, new RegExp(`<button[^>]*>${messages.ja.refreshStatus}</button>`));
+  assert.equal(storageMarkup().includes(messages.ja.refreshStatus), false);
 });

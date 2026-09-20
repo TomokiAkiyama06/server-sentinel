@@ -192,7 +192,7 @@ export function App({ services = deniedServices }: { services?: DashboardService
                   ? <section className="notice" role="alert"><p>{t.recordingsUnavailable}</p><button className="primary" onClick={() => setRefresh(value => value + 1)}>{t.retry}</button></section>
                   : selected === 'recordings' && recordings.state === 'loading' ? <p role="status">{t.checking}</p>
                     : selected === 'storage' && access.role === 'owner' && storage.state === 'ready'
-                      ? <StorageView t={t} storage={storage.item} />
+                      ? <StorageView t={t} storage={storage.item} onRefresh={() => setRefresh(value => value + 1)} />
                       : selected === 'storage' && storage.state === 'failed'
                         ? <section className="notice" role="alert"><p>{t.storageUnavailable}</p><button className="primary" onClick={() => setRefresh(value => value + 1)}>{t.retry}</button></section>
                         : selected === 'storage' && storage.state === 'loading' ? <p role="status">{t.checking}</p>

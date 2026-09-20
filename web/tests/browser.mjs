@@ -241,6 +241,23 @@ try {
       for (let attempt = 0; attempt < 20 && requests.filter(path => path === '/api/mock/storage').length < 2; attempt++) await delay(10);
       assert.equal(requests.filter(path => path === '/api/mock/storage').length, 2);
     });
+    // The operational snapshot is re-read whenever the screen is opened and on
+    // demand, so a backend that later enters hard stop cannot stay hidden.
+    await scenario(viewport, {}, async (page, requests) => {
+      await page.click('ストレージと通知');
+      await page.wait("document.querySelectorAll('[data-storage-state]').length === 3");
+      const first = requests.filter(path => path === '/api/mock/storage').length;
+      assert.equal(first, 1);
+      await page.click('概要');
+      await page.heading('概要');
+      await page.click('ストレージと通知');
+      await page.wait("document.querySelectorAll('[data-storage-state]').length === 3");
+      assert.equal(requests.filter(path => path === '/api/mock/storage').length, first + 1);
+      await page.evaluate("Array.from(document.querySelectorAll('.storage button')).find(el => el.textContent === '最新の状態を取得').click()");
+      await delay(300);
+      assert.equal(requests.filter(path => path === '/api/mock/storage').length, first + 2);
+      await page.wait("document.querySelectorAll('[data-storage-state]').length === 3");
+    });
     // One recording's successful write must not clear another's unknown result.
     await scenario(viewport, { recordings: 3 }, async page => {
       await page.click('録画');

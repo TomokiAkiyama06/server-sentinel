@@ -3,7 +3,9 @@ import { type Catalog } from '../i18n';
 import { bytes } from '../shared/format';
 
 /** Owner-only capacity, retention and notification status; no credential is displayed. */
-export function StorageView({ t, storage }: { t: Catalog; storage: StorageSummary }) {
+export function StorageView({ t, storage, onRefresh }: {
+  t: Catalog; storage: StorageSummary; onRefresh?: (() => void) | undefined;
+}) {
   const starred = Math.min(Math.max(0, storage.starred_bytes), Math.max(0, storage.recording_bytes));
   // The policy reports raw filesystem availability and keeps active write
   // reservations separately. Capacity safety is based on their difference.
@@ -42,6 +44,7 @@ export function StorageView({ t, storage }: { t: Catalog; storage: StorageSummar
     </div>
     <p>{t.currentState}: <strong>{t[`state_${storage.state}`]}</strong></p>
     <p className="muted">{t.hysteresis}</p>
+    {onRefresh && <p><button type="button" onClick={onRefresh}>{t.refreshStatus}</button></p>}
     {faults.length > 0 && <div className="fault-alert" role="alert">{faults.map(([name]) =>
       <p key={name} data-fault={name}>{t[`fault_${name}`]}</p>)}</div>}
 
