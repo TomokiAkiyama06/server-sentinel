@@ -7,13 +7,13 @@ from unittest.mock import patch
 from uuid import UUID
 
 from app.detection.foundation import (
-    Detection, DetectorKind, GrayFrame, InferenceScheduler, Observation, Quality,
-    Reason, RgbFrame, SourcePolicy,
+    Detection, DetectorKind, GrayFrame, Health, InferenceScheduler, Observation,
+    Quality, Reason, RgbFrame, SourcePolicy,
 )
 from app.detection.quality import (
     DetectorQualityPolicy, Execution, FrameIdentity, MeasurementUnavailable,
     Metric, MetricRule, QualityContext, QualityGate, QualityReason, measure,
-    obstruction_fraction,
+    obstruction_fraction, unavailable_reason,
 )
 
 SOURCE, OTHER, STREAM = UUID(int=1), UUID(int=2), UUID(int=10)
@@ -63,6 +63,36 @@ def context(sample, **values):
 
 def assess(gate, sample, **values):
     return gate.assess(sample, execution=Execution.READY, context=context(sample, **values))
+
+
+class SyntheticNegative:
+    """Generated stand-in detector; it never reads a real person or media file."""
+
+    kind = DetectorKind.PERSON
+    implementation = "synthetic-negative"
+    version = "1"
+    calls = 0
+
+    def reset(self):
+        pass
+
+    def evaluate(self, sample):
+        self.calls += 1
+        return Detection(Observation.ABSENT, Reason.EVALUATED)
+
+
+def published_negative(now, *, recovery_frames=2):
+    """Scheduler publishing one synthetic ABSENT, with the gate that allowed it."""
+    scheduler = InferenceScheduler(clock_ns=lambda: now[0])
+    scheduler.register(SOURCE, SyntheticNegative(), SourcePolicy(1, 8, 10**6, 10**6, 10**6, 4096))
+    gate = QualityGate(SOURCE, calibrated_policy(recovery_frames=recovery_frames), results=scheduler)
+    for sequence in range(recovery_frames + 1):
+        now[0] = sequence + 1
+        sample = synthetic_person(sequence)
+        decision = assess(gate, sample)
+        scheduler.offer(sample, quality=decision.quality)
+        scheduler.run_one()
+    return scheduler, gate, decision
 
 
 def ready_gate(detector="person"):
@@ -263,13 +293,20 @@ class QualityGateTests(unittest.TestCase):
             self.assertEqual(Quality.DEGRADED, assess(gate, synthetic_person(3)).quality)
 
     def test_inference_must_actually_complete_and_result_remains_unknown_on_failure(self):
-        gate, decision = ready_gate()
         for execution in Execution:
             if execution is Execution.SUCCEEDED:
                 continue
+            gate, decision = ready_gate()
             result = gate.guard_result(decision, Detection(Observation.ABSENT, Reason.EVALUATED),
                                        execution=execution, frame=decision.frame)
             self.assertEqual(Observation.UNKNOWN, result.observation)
+            if execution is not Execution.READY:
+                # An unavailable batch also drops the assessment it never completed.
+                self.assertEqual(Reason.STALE, gate.guard_result(
+                    decision, Detection(Observation.ABSENT, Reason.EVALUATED),
+                    execution=Execution.SUCCEEDED, frame=decision.frame,
+                ).reason)
+        gate, decision = ready_gate()
         for result in (None, Detection(Observation.UNKNOWN, Reason.MODEL_UNAVAILABLE)):
             guarded = gate.guard_result(decision, result, execution=Execution.SUCCEEDED, frame=decision.frame)
             self.assertEqual(Observation.UNKNOWN, guarded.observation)
@@ -280,7 +317,8 @@ class QualityGateTests(unittest.TestCase):
 
     def test_worker_stop_without_new_frame_invalidates_pending_conclusion(self):
         gate, decision = ready_gate()
-        gate.invalidate(execution=Execution.STOPPED)
+        self.assertEqual(Detection(Observation.UNKNOWN, Reason.NOT_STARTED),
+                         gate.invalidate(execution=Execution.STOPPED))
         result = gate.guard_result(decision, Detection(Observation.ABSENT, Reason.EVALUATED),
                                    execution=Execution.SUCCEEDED, frame=decision.frame)
         self.assertEqual(Observation.UNKNOWN, result.observation)
@@ -344,19 +382,6 @@ class QualityGateTests(unittest.TestCase):
 
 class QualitySchedulerIntegrationTests(unittest.TestCase):
     def test_skipped_quality_does_not_turn_person_owner_or_dependents_into_absence(self):
-        class SyntheticNegative:
-            kind = DetectorKind.PERSON
-            implementation = "synthetic-negative"
-            version = "1"
-            calls = 0
-
-            def reset(self):
-                pass
-
-            def evaluate(self, sample):
-                self.calls += 1
-                return Detection(Observation.ABSENT, Reason.EVALUATED)
-
         now = [0]
         scheduler = InferenceScheduler(clock_ns=lambda: now[0])
         detector = SyntheticNegative()
@@ -383,6 +408,101 @@ class QualitySchedulerIntegrationTests(unittest.TestCase):
             guarded = dependent_gate.guard_result(decision, snapshot.result,
                                                   execution=Execution.SUCCEEDED, frame=decision.frame)
             self.assertEqual(Observation.UNKNOWN, guarded.observation)
+
+
+class QualityLifecycleInvalidationTests(unittest.TestCase):
+    """A published conclusion never outlives the quality that authorized it."""
+
+    def setUp(self):
+        self.now = [0]
+        self.scheduler, self.gate, self.decision = published_negative(self.now)
+        self.assertEqual(Observation.ABSENT, self.scheduler.snapshot(SOURCE).result.observation)
+
+    def published(self):
+        self.now[0] += 1
+        return self.scheduler.snapshot(SOURCE).result
+
+    def test_worker_stop_or_failure_invalidates_the_published_negative(self):
+        for execution in (Execution.STOPPED, Execution.FAILED, Execution.SKIPPED,
+                          Execution.UNAVAILABLE):
+            with self.subTest(execution=execution):
+                self.setUp()
+                reason = unavailable_reason(execution)
+                self.assertEqual(Detection(Observation.UNKNOWN, reason),
+                                 self.gate.invalidate(execution=execution))
+                published = self.published()
+                self.assertEqual(Observation.UNKNOWN, published.observation)
+                self.assertEqual(reason, published.reason)
+                self.assertEqual(Health.UNAVAILABLE, self.scheduler.snapshot(SOURCE).health)
+                self.assertEqual(Observation.UNKNOWN, self.gate.guard_result(
+                    self.decision, Detection(Observation.ABSENT, Reason.EVALUATED),
+                    execution=Execution.SUCCEEDED, frame=self.decision.frame,
+                ).observation)
+
+    def test_incomplete_batch_invalidates_the_published_negative(self):
+        for execution in (Execution.FAILED, Execution.STOPPED, Execution.SKIPPED,
+                          Execution.UNAVAILABLE):
+            with self.subTest(execution=execution):
+                self.setUp()
+                guarded = self.gate.guard_result(
+                    self.decision, Detection(Observation.ABSENT, Reason.EVALUATED),
+                    execution=execution, frame=self.decision.frame)
+                self.assertEqual(Observation.UNKNOWN, guarded.observation)
+                published = self.published()
+                self.assertEqual(Observation.UNKNOWN, published.observation)
+                self.assertEqual(unavailable_reason(execution), published.reason)
+                self.assertEqual(Reason.STALE, self.gate.guard_result(
+                    self.decision, Detection(Observation.ABSENT, Reason.EVALUATED),
+                    execution=Execution.SUCCEEDED, frame=self.decision.frame,
+                ).reason)
+
+    def test_recovery_after_a_stop_never_republishes_the_old_conclusion(self):
+        self.gate.invalidate(execution=Execution.STOPPED)
+        self.assertEqual(Observation.UNKNOWN, self.published().observation)
+        recovering = assess(self.gate, synthetic_person(3))
+        self.assertEqual(QualityReason.RECOVERING, recovering.findings[0].reason)
+        published = self.published()
+        self.assertEqual(Observation.UNKNOWN, published.observation)
+        self.assertEqual(Reason.QUALITY, published.reason)
+        self.assertEqual(Observation.UNKNOWN, self.gate.guard_result(
+            self.decision, Detection(Observation.ABSENT, Reason.EVALUATED),
+            execution=Execution.SUCCEEDED, frame=self.decision.frame,
+        ).observation)
+        self.assertTrue(assess(self.gate, synthetic_person(4)).allows_conclusion)
+        self.assertEqual(Observation.UNKNOWN, self.published().observation)
+
+    def test_unusable_frame_invalidates_the_published_negative_on_its_own(self):
+        # Fail-unknown does not depend on the caller remembering to offer it.
+        self.assertEqual(Quality.INSUFFICIENT,
+                         assess(self.gate, synthetic_person(3, condition="dark")).quality)
+        published = self.published()
+        self.assertEqual(Observation.UNKNOWN, published.observation)
+        self.assertEqual(Reason.QUALITY, published.reason)
+
+    def test_invalidation_drops_the_pending_frame_as_well(self):
+        self.now[0] += 8
+        self.assertTrue(self.scheduler.offer(synthetic_person(3), quality=Quality.SUFFICIENT))
+        self.assertTrue(self.scheduler.snapshot(SOURCE).pending)
+        self.gate.invalidate(execution=Execution.STOPPED)
+        snapshot = self.scheduler.snapshot(SOURCE)
+        self.assertFalse(snapshot.pending)
+        self.assertEqual(Observation.UNKNOWN, snapshot.result.observation)
+
+    def test_result_sink_and_invalidation_reason_are_explicit(self):
+        for sink in (object(), self.scheduler.snapshot, 0, "scheduler"):
+            with self.assertRaises(ValueError):
+                QualityGate(SOURCE, calibrated_policy(), results=sink)
+        for reason in (Reason.EVALUATED, Reason.WARMUP, "inference_stale", None):
+            with self.assertRaises(ValueError):
+                self.scheduler.invalidate(SOURCE, reason=reason)
+        with self.assertRaises(ValueError):
+            self.scheduler.invalidate(str(SOURCE), reason=Reason.NOT_STARTED)
+        self.assertEqual(Observation.ABSENT, self.scheduler.snapshot(SOURCE).result.observation)
+        # An unregistered source publishes no snapshot, so it revokes nothing.
+        self.assertIsNone(self.scheduler.invalidate(OTHER, reason=Reason.NOT_STARTED))
+        for execution in (Execution.READY, Execution.SUCCEEDED, "stopped", None):
+            with self.assertRaises(ValueError):
+                unavailable_reason(execution)
 
 
 if __name__ == '__main__':

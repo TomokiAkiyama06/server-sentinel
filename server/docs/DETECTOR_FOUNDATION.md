@@ -11,6 +11,9 @@ runtime remains explicit work; importing this module does not enable detection.
 `GrayFrame` and `RgbFrame` have source and stream UUIDs, a nonnegative sequence, dimensions, and
 one or three immutable channel bytes per pixel respectively. Upstream validates stream provenance;
 a new stream UUID resets temporal state. Sequence ordering is per stream.
+The scheduler retains the four most recent retired stream UUIDs per source. A delayed frame from
+that bounded history, or a non-increasing sequence, is rejected without invalidating a newer
+pending or in-progress evaluation. An identifier outside the retained history begins a new stream.
 Pixels never appear in frame repr, diagnostics, files, or network messages.
 This is an inference frame, not a recording or pre-roll representation.
 
@@ -67,7 +70,13 @@ state, active cadence, intentional samples, drops and processed counts. A later
 successful inference remains `degraded` after known loss until the control
 plane explicitly acknowledges recovery; throttling remains visible until
 `restore_cadence()` is called. Neither operation erases an unavailable result.
-Observations expire to `unknown` when a feed stops. Plugin exceptions are
+`invalidate(source_id, reason=...)` is the explicit control-plane operation for
+a detector stop, failure or unusable quality that arrives without a frame: it
+drops the pending frame and replaces the published observation with `unknown`
+immediately, instead of waiting for `maximum_observation_age_ns`. It publishes
+no conclusion, rejects `evaluated`/`warmup` reasons, and ignores an unregistered
+source, which exposes no snapshot at all. Observations also expire to `unknown`
+when a feed stops. Plugin exceptions are
 reduced to a fixed reason; exception messages are not logged or returned.
 
 An evaluation budget is checked **after** a plugin returns. This primitive
