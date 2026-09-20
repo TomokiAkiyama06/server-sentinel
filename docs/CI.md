@@ -142,8 +142,10 @@ commands are allowlisted rather than pattern-matched: a pip invocation must be
 `-rfile` and `--requirement=file` forms, must resolve to a reviewed requirements
 input. npm must use a `ci`-family command with reviewed options only, so
 every documented `install` alias, a path-changing option such as `--prefix`, a
-positional argument, and `npx`/`pnpm`/`yarn` fail closed. Build tokens must be
-plain literals; shell escaping, expansion and globbing are rejected.
+positional argument, and `npx`/`pnpm`/`yarn` fail closed. `npm ci` must pass `--ignore-scripts`, and a build that runs
+`npm run` needs a reviewed `package.json` whose script bodies are audited with
+the same rules. Executable and option tokens must be plain literals, so shell
+escaping and expansion cannot hide an installer.
 
 Committed model artifacts require a distinct `model_weight` record whose pin
 evidence binds the exact path and SHA256 digest. All files in a reserved model
@@ -151,7 +153,9 @@ artifact directory are checked regardless of extension; common serialized model
 suffixes, including `.pkl`, `.joblib`, `.npz` and `.safetensors`, are checked in
 other directories, and any other opaque non-text file outside the reviewed media
 and Web asset formats is treated as a model artifact until it has its own
-record. A source package that only shares a reserved directory name needs a
+record. Tracked files inside `node_modules` or `.venv` stay in the scan; only untracked
+cache content and nested checkouts are skipped. A source package that only
+shares a reserved directory name needs a
 reviewed `model_scan_exemptions` record, which covers text-only Python sources;
 an opaque or model-suffixed file below it still requires weight review, and an
 exemption that matches nothing fails as stale. A recognized media or Web asset

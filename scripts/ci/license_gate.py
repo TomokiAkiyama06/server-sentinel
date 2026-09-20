@@ -22,6 +22,7 @@ import json
 import os
 import posixpath
 import re
+import subprocess
 import sys
 import tomllib
 from dataclasses import dataclass
@@ -165,8 +166,10 @@ ALLOWED_NPM_FLAGS = {
 }
 ALLOWED_NPM_VALUE_FLAGS = {"--loglevel", "--omit", "--progress"}
 # Docker's default shell resolves quoting, escaping and expansion before the
-# command runs, so a token that is not a plain literal is never classified.
+# command runs, so an executable or option token that is not a plain literal is
+# never classified. Positional arguments may additionally use path globs.
 SHELL_LITERAL = re.compile(r"[A-Za-z0-9._:/=@,+-]+")
+SHELL_ARGUMENT = re.compile(r"[A-Za-z0-9._:/=@,+*?\[\]-]+")
 MAX_TEXT_SCAN_BYTES = 16 * 1024 * 1024
 REJECTED_PACKAGE_MANAGERS = {"bun", "npx", "pnpm", "yarn"}
 SOURCE_SCAN_SUFFIXES = {".py", ".pyi"}
@@ -354,17 +357,42 @@ def opaque_bytes(path: Path):
     return False
 
 
+def tracked_files(root: Path):
+    """Committed paths, so a pruned cache cannot hide a tracked artifact."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(root), "ls-files", "-z"],
+            capture_output=True, check=True,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ()
+    return tuple(sorted(value for value in result.stdout.decode(
+        "utf-8", "surrogateescape").split("\0") if value))
+
+
 def scan_paths(root: Path):
-    """Yield repository files, skipping tool caches and nested checkouts."""
+    """Yield repository files, skipping untracked caches and nested checkouts."""
+    pruned = []
     for directory, names, files in os.walk(root):
         current = Path(directory)
-        names[:] = sorted(
-            name for name in names
-            if name not in SCAN_EXCLUDED_DIRECTORIES
-            and not (current != root and (current / name / ".git").exists())
-        )
+        kept = []
+        for name in sorted(names):
+            if (name in SCAN_EXCLUDED_DIRECTORIES
+                    or (current != root and (current / name / ".git").exists())):
+                pruned.append(current / name)
+                continue
+            kept.append(name)
+        names[:] = kept
         for name in sorted(files):
             yield current / name
+    if not pruned:
+        return
+    for value in tracked_files(root):
+        path = root / value
+        if not path.is_file():
+            continue
+        if any(path.is_relative_to(directory) for directory in pruned):
+            yield path
 
 
 def python_lock(path: Path, relative: str, scope: str):
@@ -429,6 +457,19 @@ def npm_lock(path: Path, relative: str, scope: str):
         pin = Pin("lockfile-entry", digests, unquote(resolved))
         found.append(LockedComponent(relative, "npm-lock", scope, name, version, pin))
     return found
+
+
+def npm_scripts(path: Path, relative: str):
+    """Audit the package scripts an `npm run` in a build would execute."""
+    data = load_json(path)
+    scripts = data.get("scripts", {})
+    if not isinstance(scripts, dict):
+        raise GateError(f"invalid scripts in {relative}")
+    for name, body in scripts.items():
+        if not isinstance(name, str) or not isinstance(body, str) or not body.strip():
+            raise GateError(f"invalid script declaration in {relative}")
+        if run_commands([body], relative):
+            raise GateError(f"package script installs Python requirements in {relative}")
 
 
 def python_project(path: Path, relative: str, scope: str):
@@ -521,6 +562,7 @@ def container_file(path: Path, relative: str, scope: str):
     """Audit base images and install commands of a reviewed Dockerfile."""
     images = []
     requirements = []
+    scripts = set()
     stages = set()
     for words in dockerfile_words(path, relative):
         instruction = words[0].upper()
@@ -544,10 +586,12 @@ def container_file(path: Path, relative: str, scope: str):
                     continue
                 images.append(image_use(source, relative, scope, relative))
         elif instruction == "RUN":
-            requirements.extend(run_commands(arguments, relative))
+            requirements.extend(run_commands(arguments, relative, scripts))
     if not images:
         raise GateError(f"no reviewed base image in {relative}")
-    return images, requirements
+    projects = {posixpath.normpath(str(PurePosixPath(value).parent / "package.json"))
+                for value in scripts}
+    return images, requirements, projects
 
 
 def shell_tokens(command):
@@ -557,7 +601,7 @@ def shell_tokens(command):
 
 def requirement_targets(target, relative):
     """Repository paths a Dockerfile requirement option can refer to."""
-    if (not target or "://" in target or "\\" in target
+    if (not target or not SHELL_LITERAL.fullmatch(target) or "://" in target
             or PurePosixPath(target).is_absolute()):
         raise GateError(f"pip install uses an unreviewed source in {relative}")
     parent = PurePosixPath(relative).parent
@@ -639,22 +683,29 @@ def npm_command(words, index, relative):
             raise GateError(f"unreviewed npm argument in {relative}")
     if command is None:
         raise GateError(f"unclassified npm command in {relative}")
+    if command not in NPM_SCRIPT_COMMANDS and "--ignore-scripts" not in words:
+        raise GateError(f"npm ci must use --ignore-scripts in {relative}")
+    return command
 
 
-def run_commands(arguments, relative):
+def run_commands(arguments, relative, scripts=None):
     """Reject unpinned installs and report requirement files a build installs."""
     requirements = []
+    scripts = scripts if scripts is not None else set()
     for command in re.split(r"&&|;|\|+", " ".join(arguments)):
         words = shell_tokens(command)
-        for word in words:
-            if not SHELL_LITERAL.fullmatch(word):
+        for position, word in enumerate(words):
+            expression = (SHELL_ARGUMENT if position and not word.startswith("-")
+                          else SHELL_LITERAL)
+            if not expression.fullmatch(word):
                 raise GateError(f"unreviewed shell syntax in {relative}")
         for index, word in enumerate(words):
             name = PurePosixPath(word).name
             if name in REJECTED_PACKAGE_MANAGERS:
                 raise GateError(f"unreviewed package manager in {relative}")
             if name == "npm":
-                npm_command(words, index + 1, relative)
+                if npm_command(words, index + 1, relative) in NPM_SCRIPT_COMMANDS:
+                    scripts.add(relative)
                 break
             if PIP_BINARY.fullmatch(name):
                 requirements.extend(pip_command(words, index + 1, relative))
@@ -853,6 +904,7 @@ def audit(root: Path, inventory_path=INVENTORY):
     discovered = []
     discovered_images = []
     build_requirements = set()
+    build_projects = set()
     include_graph = {}
     input_paths = set()
     input_ecosystems = {}
@@ -876,12 +928,15 @@ def audit(root: Path, inventory_path=INVENTORY):
             discovered.extend(python_project(root / relative, relative, scope))
         elif ecosystem == "npm-project":
             discovered.extend(npm_project(root / relative, relative, scope))
+            npm_scripts(root / relative, relative)
         elif ecosystem == "npm-lock":
             discovered.extend(npm_lock(root / relative, relative, scope))
         else:
-            images, requirements = container_file(root / relative, relative, scope)
+            images, requirements, projects = container_file(
+                root / relative, relative, scope)
             discovered_images.extend(images)
             build_requirements.update(requirements)
+            build_projects.update(projects)
 
     tracked_inputs = set()
     unsupported = []
@@ -905,6 +960,9 @@ def audit(root: Path, inventory_path=INVENTORY):
         raise GateError("npm-shrinkwrap.json and package-lock.json are ambiguous")
     if tracked_inputs != input_paths:
         raise GateError("dependency input set differs from reviewed inventory")
+    for target in sorted(build_projects):
+        if input_ecosystems.get(target) != "npm-project":
+            raise GateError(f"container build runs unreviewed package scripts: {target}")
     for candidates in sorted(build_requirements):
         if not any(input_ecosystems.get(target) == "python-requirements"
                    for target in candidates):

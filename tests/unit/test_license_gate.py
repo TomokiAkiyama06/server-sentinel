@@ -137,6 +137,16 @@ class GateFixture(unittest.TestCase):
         value.update(changes)
         return value
 
+    def add_npm_project(self, scripts=None):
+        self.write("package.json", json.dumps({
+            "dependencies": {},
+            "scripts": scripts if scripts is not None else {"build": "node scripts/build.mjs"},
+        }))
+        self.inputs.append({
+            "path": "package.json", "ecosystem": "npm-project", "scope": "frontend",
+        })
+        self.save()
+
     def add_container(self, content="FROM demo/base:1.0@" + IMAGE_DIGEST + "\n"):
         self.write("Dockerfile.ci", content)
         self.inputs.append({
@@ -669,6 +679,19 @@ version = {attr = "package.__version__"}
         with self.assertRaisesRegex(license_gate.GateError, "model artifact set differs"):
             license_gate.audit(self.root)
 
+    def test_tracked_artifacts_inside_dependency_caches_are_scanned(self):
+        """A force-added weight below node_modules is still a tracked artifact."""
+        self.write("node_modules/models/person.onnx", b"synthetic weight bytes")
+        self.write("node_modules/left-pad/index.js", "module.exports = 1;\n")
+        subprocess.run(["git", "-C", str(self.root), "init", "--quiet"], check=True)
+        subprocess.run(["git", "-C", str(self.root), "add", "-f",
+                        "node_modules/models/person.onnx"], check=True)
+        found = license_gate.model_files(self.root)
+        self.assertIn("node_modules/models/person.onnx", found)
+        self.assertNotIn("node_modules/left-pad/index.js", found)
+        with self.assertRaisesRegex(license_gate.GateError, "model artifact set differs"):
+            license_gate.audit(self.root)
+
     def test_tracked_build_and_dist_model_artifacts_are_not_excluded(self):
         paths = {"build/opaque-model.zip", "dist/opaque-weight.binpack"}
         for path in paths:
@@ -949,11 +972,18 @@ class ContainerImageGateTests(GateFixture):
 
     def test_container_build_must_use_a_lock_driven_npm_command(self):
         """npm install aliases and option-first forms must not slip through."""
+        self.add_npm_project()
         self.add_container(
             "FROM demo/base:1.0@" + IMAGE_DIGEST + "\n"
             "RUN npm ci --ignore-scripts\n"
             "RUN npm run build\n")
         self.assertEqual(license_gate.audit(self.root), (1, 1, 0, 1))
+
+        self.write("Dockerfile.ci",
+                   "FROM demo/base:1.0@" + IMAGE_DIGEST + "\n"
+                   "RUN npm ci\n")
+        with self.assertRaisesRegex(license_gate.GateError, "--ignore-scripts"):
+            license_gate.audit(self.root)
 
         rejected = {
             "RUN npm install --ignore-scripts\n": "unclassified npm command",
@@ -982,6 +1012,7 @@ class ContainerImageGateTests(GateFixture):
 
     def test_container_build_rejects_path_changing_npm_options(self):
         """`npm ci --prefix /tmp` would install an undiscovered dependency tree."""
+        self.add_npm_project()
         self.add_container(
             "FROM demo/base:1.0@" + IMAGE_DIGEST + "\n"
             "RUN npm ci --ignore-scripts --no-audit --no-fund --omit=dev\n"
@@ -989,12 +1020,14 @@ class ContainerImageGateTests(GateFixture):
         self.assertEqual(license_gate.audit(self.root), (1, 1, 0, 1))
 
         rejected = {
-            "RUN npm ci --prefix /tmp\n": "unreviewed npm option",
-            "RUN npm ci -C /tmp\n": "unreviewed npm option",
-            "RUN npm ci --registry=https://example.test\n": "unreviewed npm option",
-            "RUN npm ci --global\n": "unreviewed npm option",
-            "RUN npm ci --userconfig=/tmp/npmrc\n": "unreviewed npm option",
-            "RUN npm ci unreviewed-package\n": "unreviewed npm argument",
+            "RUN npm ci --ignore-scripts --prefix /tmp\n": "unreviewed npm option",
+            "RUN npm ci --ignore-scripts -C /tmp\n": "unreviewed npm option",
+            "RUN npm ci --ignore-scripts --registry=https://example.test\n":
+                "unreviewed npm option",
+            "RUN npm ci --ignore-scripts --global\n": "unreviewed npm option",
+            "RUN npm ci --ignore-scripts --userconfig=/tmp/npmrc\n":
+                "unreviewed npm option",
+            "RUN npm ci --ignore-scripts unreviewed-package\n": "unreviewed npm argument",
         }
         for command, message in rejected.items():
             with self.subTest(command=command.strip()):
@@ -1003,6 +1036,39 @@ class ContainerImageGateTests(GateFixture):
                 with self.assertRaisesRegex(license_gate.GateError, message):
                     license_gate.audit(self.root)
 
+    def test_package_scripts_behind_npm_run_are_audited(self):
+        """`npm run build` executes a package script, so the body is reviewed."""
+        self.add_npm_project({"build": "node scripts/build.mjs",
+                              "test": "node --test tests/*.test.mjs"})
+        self.add_container(
+            "FROM demo/base:1.0@" + IMAGE_DIGEST + "\n"
+            "RUN npm ci --ignore-scripts\n"
+            "RUN npm run build\n")
+        self.assertEqual(license_gate.audit(self.root), (1, 1, 0, 1))
+
+        rejected = {
+            "npm install unreviewed-package": "unclassified npm command",
+            "npm run build && npm i unreviewed-package": "unclassified npm command",
+            "pip install unreviewed-package": "reviewed requirement file",
+            "p${EMPTY}ip install unreviewed-package": "unreviewed shell syntax",
+            "npx unreviewed-package": "unreviewed package manager",
+        }
+        for body, message in rejected.items():
+            with self.subTest(script=body):
+                self.write("package.json", json.dumps({
+                    "dependencies": {}, "scripts": {"build": body},
+                }))
+                with self.assertRaisesRegex(license_gate.GateError, message):
+                    license_gate.audit(self.root)
+
+    def test_container_running_package_scripts_needs_a_reviewed_manifest(self):
+        self.add_container(
+            "FROM demo/base:1.0@" + IMAGE_DIGEST + "\n"
+            "RUN npm run build\n")
+        with self.assertRaisesRegex(
+                license_gate.GateError, "runs unreviewed package scripts"):
+            license_gate.audit(self.root)
+
     def test_container_build_rejects_shell_expanded_installer_names(self):
         """The default shell resolves escaping and expansion before the command."""
         self.write("requirements.lock", "demo==1.2.3 --hash=" + DIGEST + "\n")
@@ -1010,7 +1076,6 @@ class ContainerImageGateTests(GateFixture):
         for command in ("RUN pi\\p install unreviewed-package\n",
                         "RUN p${EMPTY}ip install unreviewed-package\n",
                         "RUN $PIP install unreviewed-package\n",
-                        "RUN python -m pip install --require-hashes -r req*.lock\n",
                         "RUN python -m pip install --require-hashes -r $LOCK\n"):
             with self.subTest(command=command.strip()):
                 self.write("Dockerfile.ci",
@@ -1076,6 +1141,8 @@ class ContainerImageGateTests(GateFixture):
             "RUN python -m pip install --require-hashes "
             "-r https://example.test/requirements.lock\n": "unreviewed source",
             "RUN python -m pip install --require-hashes -r ../requirements.lock\n":
+                "unreviewed source",
+            "RUN python -m pip install --require-hashes -r req*.lock\n":
                 "unreviewed source",
         }
         for command, message in rejected.items():

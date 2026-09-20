@@ -147,9 +147,11 @@ allowlisted rather than pattern-matched: pip must run `install` with
 that resolve to reviewed inputs in every option form, while npm must use a
 `ci`-family command with reviewed options only, so `npm install` with any
 documented alias, a path-changing option such as `--prefix`, a positional
-argument, and `npx`/`pnpm`/`yarn` fail closed. Build tokens must be plain
-literals, so shell escaping, quoting obfuscation, expansion and globbing cannot
-hide an installer.
+argument, and `npx`/`pnpm`/`yarn` fail closed. `npm ci` must pass `--ignore-scripts`, executable and option
+tokens must be plain literals so escaping, quoting obfuscation and expansion
+cannot hide an installer, and a build that runs `npm run` needs a reviewed
+`package.json` whose scripts are audited with the same rules. Tracked files
+inside `node_modules` or `.venv` remain in the model artifact scan.
 
 Blocked-by-default licenses require an exact record in
 [`license/owner-approvals.json`](../license/owner-approvals.json), including the

@@ -29,7 +29,9 @@ extension; common serialized model suffixes elsewhere, including `.pkl`,
 opaque non-text file outside the reviewed media and Web asset formats is treated
 as a model artifact until it has its own record. The whole file is decoded, so a
 readable prefix followed by artifact bytes is still opaque, and a file larger
-than the bounded text scan is opaque rather than trusted unread. `model_scan_exemptions` records
+than the bounded text scan is opaque rather than trusted unread. Tracked files are scanned even inside `node_modules` or `.venv`, so a
+force-added weight cannot hide in a dependency cache; only untracked cache
+content and nested checkouts are skipped. `model_scan_exemptions` records
 the reviewed source packages that only share a reserved directory name, such as
 `tests/models`; the exemption covers text-only Python sources, an opaque or
 model-suffixed file below the path still needs weight review, and an exemption
@@ -57,9 +59,13 @@ requirement or constraint files, including the attached `-rfile` and
 `--requirement=file` forms. npm must use a `ci`-family command with reviewed options only, so `npm install`
 and every documented alias, a path-changing option such as `--prefix` before or
 after the command, a positional argument, and `npx`/`pnpm`/`yarn` fail closed.
-Every RUN token must be a plain literal: escaping, quoting-based obfuscation,
-variable expansion and globbing are rejected instead of being read as an
-unrelated word.
+`npm ci` must also pass `--ignore-scripts`. An executable or option token in a
+build command must be a plain literal, so escaping, quoting-based obfuscation and
+variable expansion cannot hide an installer; a positional argument may use a path
+glob, but a requirement file value may not. A build that runs `npm run` needs a
+reviewed `package.json` beside its Dockerfile, and every package script in a
+reviewed manifest is audited with the same rules, so moving an install into a
+script body does not bypass the gate.
 
 Only licenses in the gate's explicit permissive SPDX allowlist pass directly.
 AGPL, GPL, SSPL, BSL/source-available, proprietary, Elastic, Commons Clause,
