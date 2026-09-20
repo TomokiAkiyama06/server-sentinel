@@ -162,13 +162,15 @@ def compare(approved: Inventory | None, current: Inventory) -> tuple[Finding, ..
 
     # First reserve all full identities, including ambiguity, independent of
     # baseline/sysfs order. Do not diff properties of an arbitrary duplicate.
+    # Duplicated approved identities are only ambiguous while an observation
+    # exists to choose among; with none, the later phases still prove absence.
     for index, old in enumerate(old_items):
         if old.kind in current.unavailable:
             results[index] = Finding(old.kind, State.UNVERIFIABLE, "PROBE_UNAVAILABLE")
             continue
         exact = {candidate for candidate, item in enumerate(new_items)
                  if item.kind == old.kind and old.identity and item.identity == old.identity}
-        if len(exact) > 1 or (old.identity and baseline_counts[(old.kind, old.identity)] > 1):
+        if len(exact) > 1 or (exact and baseline_counts[(old.kind, old.identity)] > 1):
             ambiguous(index)
             uncertain.update(exact)
             identified[index] = set(exact)

@@ -182,6 +182,26 @@ class CompareTests(TestCase):
             findings = compare(baseline, Inventory(current))
             self.assertEqual([item.state for item in findings], [State.UNVERIFIABLE, State.UNVERIFIABLE])
 
+    def test_duplicated_baseline_identity_is_missing_without_any_observation(self):
+        """A successful probe returning nothing proves absence, duplicates or not."""
+        def module(slot):
+            return Component(Kind.MEMORY, slot, (("capacity_bytes", "8"),),
+                             (("serial", "synthetic-vendor-default"),))
+        findings = compare(Inventory((module("slot0"), module("slot1"))), Inventory(()))
+        self.assertEqual([item.state for item in findings], [State.MISSING, State.MISSING])
+        self.assertTrue(all(item.immediate for item in findings))
+        self.assertTrue(all(item.reason == "APPROVED_COMPONENT_ABSENT" for item in findings))
+
+    def test_duplicated_baseline_identity_stays_unknown_while_a_candidate_remains(self):
+        """A duplicate still refuses arbitrary drift when an observation exists."""
+        def module(slot, serial):
+            return Component(Kind.MEMORY, slot, (("capacity_bytes", "8"),), (("serial", serial),))
+        baseline = Inventory((module("slot0", "synthetic-vendor-default"),
+                              module("slot1", "synthetic-vendor-default")))
+        findings = compare(baseline, Inventory((module("slot0", "synthetic-other"),)))
+        self.assertEqual([item.state for item in findings], [State.UNVERIFIABLE, State.MISSING])
+        self.assertEqual(findings[0].reason, "AMBIGUOUS_IDENTITY")
+
     def test_shared_partial_and_anonymous_candidates_are_resolved_globally(self):
         def observed(slot, size, identity):
             return Component(Kind.STORAGE, slot, (("capacity_bytes", size),), identity)
