@@ -22,9 +22,12 @@ class CaptureSession:
         self.capture = None
 
     def close(self):
-        if self.capture is not None:
-            self.capture.close()
+        try:
+            if self.capture is not None:
+                self.capture.close()
+        finally:
             self.capture = None
+            self.controller.capture_closed()
 
     def configure(self, *, enabled, profile):
         if enabled != self.controller.enabled or profile != self.profile:

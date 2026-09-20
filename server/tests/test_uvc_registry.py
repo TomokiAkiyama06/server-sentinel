@@ -2,9 +2,11 @@ from dataclasses import replace
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from app.cameras.registry import CameraRegistry, CaptureProfile, HealthState, SourceType
 from app.cameras.uvc.identity import DeviceEvidence
+from app.cameras.uvc.persistence import ApprovalStorageError
 from app.cameras.uvc.registry_adapter import LocalUvcAdapter
 from app.storage.database import Database
 from app.storage.migrations import migrate
@@ -89,6 +91,23 @@ class UvcRegistryTests(unittest.TestCase):
         self.assertFalse(self.adapter.poll_source(self.source.id))
         self.assertTrue(self.adapter.poll_source(other.id))
         self.assertEqual(self.registry.get_source(other.id).health_state, HealthState.ONLINE)
+
+    def test_failed_weak_reapproval_does_not_reopen_closed_binding(self):
+        weak = replace(self.camera, serial=None, instance_token=(1, 2, 3))
+        self.discovery.devices = [weak]
+        self.adapter.approve_source(self.source.id, weak)
+        self.assertTrue(self.adapter.poll_source(self.source.id))
+        closed_capture = self.adapter.sessions[self.source.id].capture
+        with patch.object(self.adapter.store, "save", side_effect=ApprovalStorageError("synthetic failure")):
+            with self.assertRaises(ApprovalStorageError):
+                self.adapter.approve_source(self.source.id, weak)
+        self.assertTrue(closed_capture.closed)
+        self.assertIsNone(self.adapter.sessions[self.source.id].controller.bound)
+        self.assertEqual(self.registry.get_source(self.source.id).health_state, HealthState.OFFLINE)
+        self.assertFalse(self.adapter.poll_source(self.source.id))
+        self.assertEqual(len(self.frames), 1)
+        self.assertEqual(self.registry.get_source(self.source.id).health_state,
+                         HealthState.MANUAL_INTERVENTION_REQUIRED)
 
 
 if __name__ == "__main__":

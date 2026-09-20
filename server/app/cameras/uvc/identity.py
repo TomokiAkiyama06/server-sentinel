@@ -180,6 +180,13 @@ class ReconnectController:
         self.bound = None
         self._transition(CameraState.OFFLINE, "video_capture_failed")
 
+    def capture_closed(self):
+        # Only a continuously open capture descriptor can retain a weak live
+        # binding. Invalidate it even when a subsequent approval operation fails.
+        self.bound = None
+        if self.state in (CameraState.DEGRADED, CameraState.ONLINE):
+            self._transition(CameraState.OFFLINE, "video_capture_closed")
+
     def set_enabled(self, enabled):
         if type(enabled) is not bool:
             raise ValueError("enabled must be boolean")
