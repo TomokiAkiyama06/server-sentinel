@@ -437,7 +437,7 @@ Limits that shall be documented rather than claimed away: ServerSentinel cannot 
 AUTH-011 cannot apply to the requests that create the first credential, so the exceptions are enumerated and closed:
 
 - initial owner bootstrap is a privileged local administrative action on the Main Server that issues a single-use, short-lived enrollment authorization shown only on the local console. The first owner redeems it once from a browser at the reserved origin through the redemption path below; no separate owner route, and no remote first-visitor setup path, is added;
-- invitation redemption accepts only a valid, unexpired, unredeemed enrollment code, is single-use and rate-limited, and registers exactly one credential for the named principal. The owner's bootstrap authorization uses this same path;
+- invitation redemption accepts only a valid, unexpired, unredeemed enrollment code, is single-use and rate-limited, and registers exactly one credential for the named principal. The owner's bootstrap authorization uses this same path. Single use shall be enforced atomically rather than by a check followed by a write, so that concurrent redemptions of one code produce exactly one credential, the losing request gets the generic response, no partial state remains, and a retried redemption is idempotent;
 - the authentication/assertion route itself.
 
 Every other human/media route requires a verified credential and an active session per AUTH-011.

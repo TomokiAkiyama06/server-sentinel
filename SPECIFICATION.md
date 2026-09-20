@@ -1092,6 +1092,17 @@ remote first-visitor setup exist. Invitation redemption is single-use and
 rate-limited and registers exactly one `principal_credential` for the named
 principal.
 
+Single use is enforced atomically, not by a check followed by a write. Marking
+`principal_enrollment.redeemed_at` and inserting the credential happen in one
+transaction whose update is conditional on the row still being unredeemed and
+unexpired, so of two concurrent redemptions of the same code exactly one
+succeeds and the other receives the same generic response as an unknown code,
+with no second credential and no partially applied state. A retry after a lost
+response is idempotent in the same way: either the ceremony completed and the
+code is spent, or nothing happened and the code is still redeemable until it
+expires. `attempt_count` is incremented in the same conditional update so
+concurrent guesses cannot slip past the rate limit.
+
 Both the invitation code and the bootstrap authorization are bearer
 authorizations on a path every holder of the shared account can reach, so both
 come from a cryptographically secure random generator with at least 128 bits of
