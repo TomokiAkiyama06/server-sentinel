@@ -630,6 +630,36 @@ class RecordingTests(unittest.TestCase):
         self.assertEqual(AuditOutcome.FAILED, outcomes[missing])
         self.assertEqual(AuditOutcome.DENIED, outcomes[denied])
 
+    def test_cleanup_failure_survives_an_undeliverable_post_commit_audit(self):
+        class PermitOwner:
+            def require_owner(self, actor_context):
+                return None
+
+        self.store.append(self.segment())
+        recording = self.store.start_manual(self.source, 30_000, duration_ms=10_000)
+        self.store.finish(recording)
+        self.store.release_source(self.source)
+        database = Database(self.base / "metadata.sqlite")
+        audit = AuditStore(database)
+        service = OwnerAuditService(audit, PermitOwner())
+        admin = OwnerAdministration(service, CameraRegistry(database))
+        private_detail = "synthetic-private-cleanup-detail"
+        with patch.object(self.store, "_trim",
+                          side_effect=RecordingError(private_detail)):
+            with patch.object(audit, "append",
+                              side_effect=AuditStorageError("synthetic unavailable")):
+                # The audit append failure must not replace the real cleanup
+                # failure the Owner needs to see.
+                with self.assertRaisesRegex(RecordingError, private_detail):
+                    admin.delete_recording("synthetic-owner", self.store, recording)
+        self.assertTrue(service.audit_delivery_failed)
+        self.assertEqual(1, service.undelivered_audit_records)
+        self.assertEqual(
+            {(AuditAction.DELETE_RECORDING, AuditOutcome.SUCCEEDED)},
+            {(record.action, record.outcome) for record in audit.list_records()
+             if record.target_logical_id == recording},
+        )
+
     def test_owner_recording_audit_never_writes_past_the_hard_reserve(self):
         class PermitOwner:
             def require_owner(self, actor_context):

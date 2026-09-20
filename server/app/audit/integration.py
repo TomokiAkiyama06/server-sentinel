@@ -16,6 +16,10 @@ class OwnerAdministration:
         self.service = service
         self.registry = registry
 
+    def list_audit_records(self, actor_context, *, limit=100, before=None):
+        """Owner-only audit reading through the same authorization boundary."""
+        return self.service.list_records(actor_context, limit=limit, before=before)
+
     def set_active_source_limit(self, actor_context, limit):
         return self.service.execute_transactional(
             actor_context, action=AuditAction.CHANGE_ADMIN_SETTING,

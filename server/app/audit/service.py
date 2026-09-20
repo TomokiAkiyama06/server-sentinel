@@ -164,10 +164,31 @@ class OwnerAuditService:
     def record_owner_post_commit_failure(self, *, action: AuditAction,
                                          target_kind: TargetKind,
                                          target_logical_id: UUID):
-        """Record a bounded failure after an authorized durable journal commit."""
+        """Record a bounded failure after an authorized durable journal commit.
+
+        This runs while the operation's own failure is propagating, so it never
+        replaces that failure with a storage/admission error of its own. An
+        undeliverable record becomes visible health instead.
+        """
         validate_action_target(action, target_kind, target_logical_id)
-        return self.store.append(
-            actor_category=ActorCategory.OWNER, action=action,
-            target_kind=target_kind, target_logical_id=target_logical_id,
-            outcome=AuditOutcome.FAILED,
-        )
+        try:
+            return self.store.append(
+                actor_category=ActorCategory.OWNER, action=action,
+                target_kind=target_kind, target_logical_id=target_logical_id,
+                outcome=AuditOutcome.FAILED,
+            )
+        except Exception:
+            self._delivery_failed()
+            return None
+
+    def list_records(self, actor_context: object, *, limit: int = 100,
+                     before=None) -> tuple:
+        """Read audit history for the deployment Owner only.
+
+        Audit reading is a privileged security operation: no invited principal
+        and no capture-node credential may reach it, and the underlying store
+        is never exposed as a readable API to them. Reads are not themselves
+        audited, so an unauthorized caller cannot grow the audit table.
+        """
+        self.authorizer.require_owner(actor_context)
+        return self.store.list_records(limit=limit, before=before)

@@ -415,6 +415,42 @@ class AuditTests(unittest.TestCase):
                 operation=lambda connection: None, reservation="reservation",
             )
 
+    def test_audit_reading_requires_owner_authorization(self):
+        target = uuid4()
+        self.execute(target_id=target)
+        records = self.admin.list_audit_records("synthetic-owner-session")
+        self.assertEqual([target], [record.target_logical_id for record in records])
+
+        for actor in ({"invited": "recordings:view"}, "synthetic-capture-node", None):
+            with self.subTest(actor=actor):
+                with self.assertRaises(OwnerAuthorizationError):
+                    self.admin.list_audit_records(actor)
+                with self.assertRaises(OwnerAuthorizationError):
+                    self.service.list_records(actor, limit=1)
+        # A refused read never records a row, so it cannot grow the table.
+        self.assertEqual(1, self.remaining())
+        self.assertEqual(
+            1, len(self.admin.list_audit_records("synthetic-owner-session", limit=1)),
+        )
+
+    def test_post_commit_failure_record_never_masks_the_original_failure(self):
+        reservation = SyntheticReservation()
+        service = OwnerAuditService(self.reserved_store(reservation),
+                                    SyntheticOwnerAuthorizer())
+        reservation.denial = "STORAGE_HARD_STOP"
+        self.assertIsNone(service.record_owner_post_commit_failure(
+            action=AuditAction.DELETE_RECORDING_CLEANUP,
+            target_kind=TargetKind.RECORDING, target_logical_id=uuid4(),
+        ))
+        self.assertTrue(service.audit_delivery_failed)
+        self.assertEqual(1, service.undelivered_audit_records)
+        self.assertEqual(0, self.remaining())
+        with self.assertRaises(AuditValidationError):
+            service.record_owner_post_commit_failure(
+                action=AuditAction.DELETE_RECORDING_CLEANUP,
+                target_kind=TargetKind.SOURCE, target_logical_id=uuid4(),
+            )
+
     def test_plan23_baseline_approval_contract_uses_fixed_atomic_action(self):
         baseline_id = uuid4()
         with closing(self.database.connect()) as connection:

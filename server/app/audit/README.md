@@ -13,7 +13,12 @@ hardware, monitoring media, network values, and submitted setting values must
 not be passed as logical IDs.
 
 `OwnerAdministration` is the runtime-facing integration boundary for privileged
-registry, UVC approval, and recording-state mutations. Its injected authorizer
+registry, UVC approval, and recording-state mutations, and for Owner-only audit
+reading through `list_audit_records()`. Reading audit history is itself a
+privileged security operation: it passes the same Owner authorizer, so no
+invited principal and no capture-node credential can reach it, and `AuditStore`
+stays an internal primitive used by that boundary and by retention. A refused
+read records nothing, so an unauthorized caller cannot grow the audit table. Its injected authorizer
 must fail closed unless the current deployment Owner is established. The actor
 context is used only by that authorizer and is never stored or represented. A
 denied operation is not run; successful and failed operations are recorded
