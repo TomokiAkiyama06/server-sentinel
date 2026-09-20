@@ -342,6 +342,7 @@ from unittest.mock import patch
 from install import install
 artifact, fifo = Path(sys.argv[1]), Path(sys.argv[2])
 args = argparse.Namespace(artifact=artifact, config=fifo, version="0.1.0",
+                          destination=fifo.parent / "installation",
                           sha256=hashlib.sha256(artifact.read_bytes()).hexdigest())
 with patch("install.os.geteuid", return_value=0):
     try:
@@ -400,6 +401,38 @@ raise SystemExit(1)
                             ):
                                 install(args)
             self.assertEqual(reads, [MAX_CONFIGURATION_BYTES + 1] * 2)
+
+    def test_configuration_in_source_or_installation_tree_is_rejected(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            code = root / "code"
+            destination = root / "installation"
+            code.mkdir()
+            destination.mkdir()
+            alias = root / "external-alias"
+            alias.symlink_to(code, target_is_directory=True)
+            value = configuration(root)
+            for parent in (code, destination, root):
+                config = parent / "deployment.json"
+                config.write_text(json.dumps(value))
+                config.chmod(0o600)
+            for path in (code / "deployment.json", alias / "deployment.json"):
+                with self.subTest(path=path.name), self.assertRaises(ConfigurationError):
+                    Settings.load(path, code_root=code)
+            self.assertEqual(Settings.load(root / "deployment.json", code_root=code).service_uid,
+                             os.geteuid())
+            for parent in (code, destination, alias):
+                args = argparse.Namespace(artifact=root / "unused", version="0.1.0",
+                                          config=parent / "deployment.json", destination=destination,
+                                          sha256=hashlib.sha256(b"synthetic").hexdigest())
+                with self.subTest(parent=parent.name), patch("install.os.geteuid", return_value=0), patch(
+                    "install.read_artifact", return_value=b"synthetic"
+                ), patch("install.__file__", str(code / "agent/install.py")), patch(
+                    "install.protected_parent"
+                ) as deployment:
+                    with self.assertRaises(ConfigurationError):
+                        install(args)
+                    deployment.assert_not_called()
 
     def test_config_owner_only_and_redacted_errors(self):
         with tempfile.TemporaryDirectory() as temporary:
