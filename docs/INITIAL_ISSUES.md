@@ -919,7 +919,8 @@ Acceptance:
 - record individual 1-, 2-, 3-, and 4-source performance and a long-duration run (including the 24-hour stability checklist); never substitute simulated results for unperformed physical tests;
 - publish only sanitized results: no real-person/real-room media, hardware serial/UUID, private IP/hostname/Tailnet values, credentials, or biometric material on GitHub.
 - inspect deployed Main/Agent/Web dependencies and controlled runtime/browser outbound traffic for PRIV-003 compliance, including error/configuration paths; keep any trace deployment-local and publish only sanitized pass/fail results;
-- in PRESENT/PROBABLY_PRESENT/ABSENT/UNKNOWN and manual presence overrides, verify critical movement/tamper detection, safe evidence preservation, and configured critical notifications through the actual deployment paths; detector-armed status alone is insufficient.
+- in PRESENT/PROBABLY_PRESENT/ABSENT/UNKNOWN and manual presence overrides, verify critical movement/tamper detection, safe evidence preservation, and configured critical notifications through the actual deployment paths; detector-armed status alone is insufficient;
+- re-run the `MANUAL_TEST.md` X audit-retention cleanup comparison on the complete deployment, including the factual timeline events and capture-agent protected incidents that Plan 25 could record as not applicable while those capabilities were missing.
 
 ## Plan 22 — Main Server deployment / install / release lifecycle
 
@@ -1002,7 +1003,8 @@ Acceptance:
 - recordsにはactor category、action、logical target ID、time、outcomeを持たせ、secret、raw biometric、raw serial/UUID、raw mediaを含めない;
 - cleanupはexpired auditだけに適用し、recording / protected incident lifecycleを変更しない;
 - synthetic testsでredaction、retention、Owner-only security action、failure outcomeを検証する;
-- `MANUAL_TEST.md` Xのdeployed audit受入で、Owner action、non-owner denial、記録項目とredaction、local-only database permission、default 90-day retentionのcleanupがexpired audit rowsだけに適用されrecording / protected incident lifecycleを変更しないことを、private dataを公開せずに確認する。
+- `MANUAL_TEST.md` Xのdeployed audit受入で、Owner action、non-owner denial、記録項目とredaction、local-only database permission、default 90-day retentionのcleanupがexpired audit rowsだけに適用されrecording / protected incident lifecycleを変更しないことを、private dataを公開せずに確認する;
+- audit fixtureは独立にseedし、cleanup前後の比較はdeployment上に実在するnon-audit lifecycle inventoryを対象とする。未deployのfactual timeline (#26) / capture-agent protected incidents (#16) はPASSではなくnot applicableとして記録し、完全なdeploymentでの再実行は`MANUAL_TEST.md`基準のPlan 21 (#28) が引き取る。
 
 ## Plan 26 — Dependency / model license compliance gate
 
