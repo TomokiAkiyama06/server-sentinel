@@ -103,6 +103,19 @@ class AuditStore:
             return nullcontext()
         return self.reservation()
 
+    @staticmethod
+    def _discard(connection) -> None:
+        """Close an open transaction without losing the original failure."""
+        if connection is None:
+            return
+        try:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+        except sqlite3.Error:
+            # The transaction is already closed or the connection is unusable.
+            # Closing it discards uncommitted work either way.
+            pass
+
     @contextmanager
     def transaction(self, *, write=False):
         with self._admission(write):
@@ -111,14 +124,15 @@ class AuditStore:
                 connection = self.database.connect()
                 connection.execute("BEGIN IMMEDIATE" if write else "BEGIN")
                 yield connection
-                connection.commit()
+                # Connection.commit() is a documented no-op when Python sqlite3
+                # runs with autocommit=True, even after an explicit BEGIN. Use
+                # SQL so an audit record is durable in either mode.
+                connection.execute("COMMIT")
             except sqlite3.Error:
-                if connection is not None:
-                    connection.rollback()
+                self._discard(connection)
                 raise AuditStorageError("audit storage operation failed") from None
             except BaseException:
-                if connection is not None:
-                    connection.rollback()
+                self._discard(connection)
                 raise
             finally:
                 if connection is not None:

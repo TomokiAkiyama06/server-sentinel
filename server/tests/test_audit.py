@@ -451,6 +451,35 @@ class AuditTests(unittest.TestCase):
                 target_kind=TargetKind.SOURCE, target_logical_id=uuid4(),
             )
 
+    def test_audit_transactions_close_with_python_sqlite_autocommit(self):
+        class AutocommitDatabase:
+            """A deployment connection factory running in autocommit mode."""
+
+            def __init__(self, database):
+                self.database = database
+
+            def connect(self):
+                connection = self.database.connect()
+                if not hasattr(connection, "autocommit"):
+                    connection.close()
+                    raise unittest.SkipTest("Python sqlite3 has no autocommit mode")
+                connection.autocommit = True
+                return connection
+
+        store = AuditStore(AutocommitDatabase(self.database), clock=lambda: self.now)
+        store.append(
+            actor_category=ActorCategory.OWNER,
+            action=AuditAction.CHANGE_SECURITY_SETTING,
+            target_kind=TargetKind.SECURITY_SETTINGS,
+            target_logical_id=uuid4(), outcome=AuditOutcome.SUCCEEDED,
+        )
+        # A no-op Connection.commit() would discard the record when its
+        # connection closed; the row must be durable for other readers.
+        self.assertEqual(1, self.remaining())
+        self.now += timedelta(days=91)
+        self.assertEqual(1, store.cleanup_expired())
+        self.assertEqual(0, self.remaining())
+
     def test_plan23_baseline_approval_contract_uses_fixed_atomic_action(self):
         baseline_id = uuid4()
         with closing(self.database.connect()) as connection:

@@ -684,6 +684,20 @@ Defaults: recording retention 20 days; audit retention 90 days.
 
 Agent disk-buffer safety is tracked separately from Main Server storage because the two filesystems may be different machines.
 
+The Issue #50 security/admin audit subsystem in `server/app/audit/` is separate
+from factual timeline events and owns only its own rows. Every audit write —
+success, failure, denial and retention cleanup — passes the deployment storage
+admission; the subsystem consumes that reserve and defines no numeric reserve of
+its own, and until a deployment binds its storage policy the application refuses
+audit writes rather than admitting them against an unverified reserve. Retention
+computes one cutoff per run and deletes expired rows oldest first in bounded
+admitted transactions, so an interrupted run stays consistent, the next run
+resumes, and a repeated run deletes nothing more; it never touches recording,
+starred, protected-incident or timeline lifecycles. Cleanup runs at startup and
+daily; a failed run is visible as degraded retention health and is retried on a
+shorter interval instead of stopping monitoring. Audit reading is Owner-only and
+records nothing. See `server/app/audit/README.md`.
+
 The internal Issue #21 policy in `server/app/storage/` holds media plus configured
 metadata/journal/temp reservations through the serialized recorder operation.
 Physical-only control reservations cover startup recovery before inventory binding
