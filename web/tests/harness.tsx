@@ -2,7 +2,7 @@
 import { createRoot } from 'react-dom/client';
 import { App } from '../src/App';
 import { createApiClient } from '../src/api';
-import { type CameraSourceSummary, type Session } from '../src/domain';
+import { type CameraSourceSummary, type RecordingSummary, type Session, type StorageSummary } from '../src/domain';
 import '../src/style.css';
 
 const api = createApiClient(window.location.origin);
@@ -16,12 +16,36 @@ function session(value: unknown): Session {
   }
   throw new Error();
 }
+let recordings: RecordingSummary[] = [];
+let loaded = false;
 const services = {
   loadSession: (signal: AbortSignal) => api.read('/api/mock/session', session, signal),
   loadSources: (signal: AbortSignal) => api.read('/api/mock/sources', value => {
     if (!Array.isArray(value)) throw new Error();
     return value as CameraSourceSummary[];
   }, signal),
+  loadRecordings: async (signal: AbortSignal) => {
+    if (!loaded) {
+      recordings = await api.read('/api/mock/recordings', value => {
+        if (!Array.isArray(value)) throw new Error();
+        return value as RecordingSummary[];
+      }, signal);
+      loaded = true;
+    }
+    return recordings;
+  },
+  loadStorage: (signal: AbortSignal) => api.read('/api/mock/storage', value => {
+    if (typeof value !== 'object' || value === null) throw new Error();
+    return value as StorageSummary;
+  }, signal),
+  // Synthetic local mutations: this harness has no write route and never gets one.
+  starRecording: async (id: string, starred: boolean) => {
+    recordings = recordings.map(recording => recording.id === id
+      ? { ...recording, starred, retention_days_left: starred ? null : 7 } : recording);
+  },
+  deleteRecording: async (id: string) => {
+    recordings = recordings.filter(recording => recording.id !== id);
+  },
 };
 const root = document.getElementById('root');
 if (root) createRoot(root).render(<App services={services} />);

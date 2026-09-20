@@ -25,9 +25,24 @@ const fixture = count => Array.from({ length: count }, (_, index) => ({
   source_type: index % 2 ? 'remote_agent' : 'local_uvc', role: index % 2 ? 'custom role' : null,
   enabled: true, health: ['online', 'offline', 'degraded', 'manual_intervention_required'][index % 4],
 }));
+const recordingFixture = count => Array.from({ length: count }, (_, index) => ({
+  id: `synthetic-recording-${index}`, source_id: `synthetic-source-${index % 2}`,
+  source_name: `生成カメラ ${(index % 2) + 1}`,
+  kind: ['event', 'critical', 'continuous'][index % 3],
+  start_ms: 1_700_000_000_000 + index * 600_000, duration_ms: 150_000 + index * 1_000,
+  size_bytes: 536_870_912 * (index + 1), starred: index % 3 === 1,
+  retention_days_left: index % 3 === 1 ? null : 20 - index,
+}));
+const storageFixture = state => ({
+  state, recording_bytes: 64_424_509_440, starred_bytes: 10_737_418_240,
+  available_bytes: 21_474_836_480, hard_reserve_bytes: 5_368_709_120,
+  recording_limit_bytes: 85_899_345_920, critical_allowance_bytes: 2_147_483_648,
+  recording_retention_days: 20, audit_retention_days: 90, agent_incident_retention_days: 60,
+  slack_configured: false, daily_summary_local_time: '23:00',
+});
 let cases = 0;
 
-async function scenario(viewport, { production = false, status = 200, session = owner, count = 1, optIn = false, sourceStatus = 200, positiveControl = false } = {}, assertions) {
+async function scenario(viewport, { production = false, status = 200, session = owner, count = 1, optIn = false, sourceStatus = 200, positiveControl = false, recordings = 3, recordingStatus = 200, storageState = 'STORAGE_PRESSURE', storageStatus = 200 } = {}, assertions) {
   const page = await pageFor(browser, viewport);
   // Chrome applies bypass when parsing a document's policy. Set it before
   // navigation, only for the dedicated interception positive control.
@@ -66,6 +81,12 @@ async function scenario(viewport, { production = false, status = 200, session = 
     if (!production && url.pathname === '/api/mock/sources') {
       await fulfill(JSON.stringify(sourceStatus === 200 ? fixture(count) : { detail: 'synthetic private error' }), 'application/json', sourceStatus); return;
     }
+    if (!production && url.pathname === '/api/mock/recordings') {
+      await fulfill(JSON.stringify(recordingStatus === 200 ? recordingFixture(recordings) : { detail: 'synthetic private error' }), 'application/json', recordingStatus); return;
+    }
+    if (!production && url.pathname === '/api/mock/storage') {
+      await fulfill(JSON.stringify(storageStatus === 200 ? storageFixture(storageState) : { detail: 'synthetic private error' }), 'application/json', storageStatus); return;
+    }
     unexpected.push('unexpected path');
     await page.command('Fetch.failRequest', { requestId, errorReason: 'BlockedByClient' });
   }
@@ -102,7 +123,7 @@ try {
       await scenario(viewport, { production: true, optIn }, async (page, requests) => {
         await page.heading('アクセスの確認が必要です');
         assert.equal(await page.evaluate('document.documentElement.lang'), 'ja');
-        assert.equal(await page.evaluate("document.querySelectorAll('nav button:disabled').length"), 6);
+        assert.equal(await page.evaluate("document.querySelectorAll('nav button:disabled').length"), 7);
         assert.equal(requests.some(path => path.startsWith('/api/')), false);
       });
       await scenario(viewport, { status: 500, optIn }, async page => {
@@ -116,13 +137,54 @@ try {
         await page.click('カメラソース');
         await page.wait(`document.querySelectorAll('[data-source-id]').length === ${count} && Boolean(document.querySelector('.source-count'))`);
         assert.equal(await page.evaluate('document.documentElement.scrollWidth <= window.innerWidth'), true, 'source collection fits viewport');
-        for (const title of ['概要', 'キャプチャノード', 'ライブ', '録画', 'アクセス']) {
+        for (const title of ['概要', 'キャプチャノード', 'ライブ', '録画', 'ストレージと通知', 'アクセス']) {
           await page.click(title); await page.heading(title);
-          assert.equal(await page.evaluate('document.documentElement.scrollWidth <= window.innerWidth'), true, 'placeholder fits viewport');
+          assert.equal(await page.evaluate('document.documentElement.scrollWidth <= window.innerWidth'), true, 'each screen fits viewport');
         }
         await page.evaluate("document.querySelector('select').value = 'en'; document.querySelector('select').dispatchEvent(new Event('change', { bubbles: true }))");
         await page.heading('Access');
         assert.equal(await page.evaluate('document.documentElement.lang'), 'en');
+      });
+    }
+    await scenario(viewport, { recordingStatus: 503, storageStatus: 503 }, async page => {
+      await page.click('録画');
+      await page.wait("Boolean(document.querySelector('[role=alert]'))");
+      assert.equal(await page.evaluate("document.querySelectorAll('[data-recording-id]').length"), 0);
+      await page.click('ストレージと通知');
+      await page.wait("Boolean(document.querySelector('[role=alert]'))");
+      assert.equal(await page.evaluate("document.querySelectorAll('[data-storage-state]').length"), 0);
+    });
+    for (const recordings of [0, 3]) {
+      await scenario(viewport, { recordings }, async page => {
+        await page.click('録画');
+        await page.wait(`document.querySelectorAll('[data-recording-id]').length === ${recordings}`);
+        assert.equal(await page.evaluate('document.documentElement.scrollWidth <= window.innerWidth'), true, 'recording list fits viewport');
+        assert.equal(await page.evaluate("document.querySelectorAll('#main a[href], #main a[download], video, source, iframe').length"), 0);
+        if (!recordings) return;
+        assert.equal(await page.evaluate("document.querySelectorAll('.row-actions').length"), recordings);
+        // Owner deletion requires an explicit second confirmation in the same row.
+        await page.evaluate("Array.from(document.querySelectorAll('[data-recording-id] button')).find(el => el.textContent === '削除').click()");
+        await page.wait("Array.from(document.querySelectorAll('button')).some(el => el.textContent === '削除を確定')");
+        await page.evaluate("Array.from(document.querySelectorAll('button')).find(el => el.textContent === 'やめる').click()");
+        await page.wait(`document.querySelectorAll('[data-recording-id]').length === ${recordings}`);
+        await page.evaluate("Array.from(document.querySelectorAll('[data-recording-id] button')).find(el => el.textContent === '削除').click()");
+        await page.evaluate("Array.from(document.querySelectorAll('button')).find(el => el.textContent === '削除を確定').click()");
+        await page.wait(`document.querySelectorAll('[data-recording-id]').length === ${recordings - 1}`);
+        await page.evaluate("Array.from(document.querySelectorAll('button')).find(el => el.textContent === '★ を付ける').click()");
+        await page.wait("Array.from(document.querySelectorAll('button')).some(el => el.textContent === '★ を外す')");
+      });
+    }
+    for (const storageState of ['NORMAL', 'STORAGE_PRESSURE', 'STORAGE_HARD_STOP']) {
+      await scenario(viewport, { storageState }, async page => {
+        await page.click('ストレージと通知');
+        await page.wait("document.querySelectorAll('[data-storage-state]').length === 3");
+        await page.wait(`document.querySelector('[data-storage-state=${storageState}]').getAttribute('aria-current') === 'true'`);
+        await page.wait("document.querySelectorAll('[data-retention]').length === 3");
+        assert.deepEqual(await page.evaluate("Array.from(document.querySelectorAll('[data-retention] .retention-days')).map(el => el.textContent)"),
+          ['20 日', '90 日', '60 日']);
+        assert.equal(await page.evaluate('document.documentElement.scrollWidth <= window.innerWidth'), true, 'storage screen fits viewport');
+        assert.match(await page.evaluate('document.body.innerText'), /未設定/);
+        assert.match(await page.evaluate('document.body.innerText'), /23:00/);
       });
     }
     await scenario(viewport, { sourceStatus: 503 }, async page => {
@@ -136,7 +198,17 @@ try {
         assert.equal(await page.enabled('ライブ'), permissions.includes('live:view'));
         assert.equal(await page.enabled('録画'), permissions.includes('recordings:view'));
         assert.equal(await page.enabled('アクセス'), false);
+        assert.equal(await page.enabled('ストレージと通知'), false);
+        if (permissions.includes('recordings:view')) {
+          await page.click('録画');
+          await page.wait("document.querySelectorAll('[data-recording-id]').length === 3");
+          // Non-owner: no star/delete control and no download or media route.
+          assert.equal(await page.evaluate("document.querySelectorAll('.row-actions').length"), 0);
+          assert.equal(await page.evaluate("document.querySelectorAll('#main a[href], #main a[download], video, source, iframe').length"), 0);
+        }
         assert.equal(requests.includes('/api/mock/sources'), false);
+        assert.equal(requests.includes('/api/mock/storage'), false);
+        assert.equal(requests.includes('/api/mock/recordings'), permissions.includes('recordings:view'));
       });
     }
     process.stdout.write(`${name}: responsive synthetic UI and request interception passed\n`);

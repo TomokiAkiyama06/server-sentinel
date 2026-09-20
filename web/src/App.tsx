@@ -1,9 +1,13 @@
 import { Component, useEffect, useState, type ReactNode } from 'react';
-import { canVisit, deniedServices, views, type CameraSourceSummary, type DashboardServices, type Session, type View } from './domain';
+import { canVisit, deniedServices, views, type CameraSourceSummary, type DashboardServices, type RecordingSummary, type Session, type StorageSummary, type View } from './domain';
 import { messages, type Locale } from './i18n';
+import { RecordingsView } from './recordings/view';
+import { StorageView } from './setup/storage';
 
 type Access = { state: 'loading' | 'failed' } | Session;
 type Sources = { state: 'loading' | 'failed' | 'pending' } | { state: 'ready'; items: readonly CameraSourceSummary[] };
+type Recordings = { state: 'loading' | 'failed' | 'pending' } | { state: 'ready'; items: readonly RecordingSummary[] };
+type Storage = { state: 'loading' | 'failed' | 'pending' } | { state: 'ready'; item: StorageSummary };
 
 /** Deliberately no external reporter, error details, or automatic retry loop. */
 class LocalBoundary extends Component<{ children: ReactNode; message: string }, { failed: boolean }> {
@@ -18,8 +22,11 @@ export function App({ services = deniedServices }: { services?: DashboardService
   const [locale, setLocale] = useState<Locale>('ja');
   const [access, setAccess] = useState<Access>({ state: 'loading' });
   const [sources, setSources] = useState<Sources>({ state: 'pending' });
+  const [recordings, setRecordings] = useState<Recordings>({ state: 'pending' });
+  const [storage, setStorage] = useState<Storage>({ state: 'pending' });
   const [view, setView] = useState<View>('overview');
   const [attempt, setAttempt] = useState(0);
+  const [refresh, setRefresh] = useState(0);
   const t = messages[locale];
 
   useEffect(() => { document.documentElement.lang = locale; }, [locale]);
@@ -27,6 +34,8 @@ export function App({ services = deniedServices }: { services?: DashboardService
     const controller = new AbortController();
     setAccess({ state: 'loading' });
     setSources({ state: 'pending' });
+    setRecordings({ state: 'pending' });
+    setStorage({ state: 'pending' });
     setView('overview');
     void (async () => {
       try {
@@ -51,9 +60,52 @@ export function App({ services = deniedServices }: { services?: DashboardService
     return () => controller.abort();
   }, [services, attempt]);
 
+  // Historical recording metadata follows `recordings:view`; the server repeats
+  // the check and no client state can widen it.
+  useEffect(() => {
+    const loader = services.loadRecordings;
+    if (!loader || access.state !== 'allowed' || !canVisit(access, 'recordings')) return;
+    const controller = new AbortController();
+    setRecordings({ state: 'loading' });
+    void (async () => {
+      try {
+        const items = await loader(controller.signal);
+        if (!controller.signal.aborted) setRecordings({ state: 'ready', items });
+      } catch {
+        if (!controller.signal.aborted) setRecordings({ state: 'failed' });
+      }
+    })();
+    return () => controller.abort();
+  }, [services, access, refresh]);
+
+  useEffect(() => {
+    const loader = services.loadStorage;
+    if (!loader || access.state !== 'allowed' || access.role !== 'owner') return;
+    const controller = new AbortController();
+    setStorage({ state: 'loading' });
+    void (async () => {
+      try {
+        const item = await loader(controller.signal);
+        if (!controller.signal.aborted) setStorage({ state: 'ready', item });
+      } catch {
+        if (!controller.signal.aborted) setStorage({ state: 'failed' });
+      }
+    })();
+    return () => controller.abort();
+  }, [services, access, refresh]);
+
   const session: Session = access.state === 'allowed' ? access : { state: 'denied' };
   const selected = canVisit(session, view) ? view : 'overview';
   const hint = `${selected}Hint` as const;
+  const star = services.starRecording;
+  const remove = services.deleteRecording;
+  const mutate = (task: Promise<void>) =>
+    void task.then(() => setRefresh(value => value + 1), () => setRecordings({ state: 'failed' }));
+  // Owner-only star/delete; rendered only when the authorized provider exists.
+  const actions = session.state === 'allowed' && session.role === 'owner' && star && remove ? {
+    star: (recording: RecordingSummary) => mutate(star(recording.id, !recording.starred, new AbortController().signal)),
+    remove: (recording: RecordingSummary) => mutate(remove(recording.id, new AbortController().signal)),
+  } : undefined;
 
   return <div className="shell">
     <a className="skip-link" href="#main">{t.skip}</a>
@@ -87,7 +139,17 @@ export function App({ services = deniedServices }: { services?: DashboardService
               {sources.items.length === 0 && <p>{t.noSources}</p>}
             </> : selected === 'sources' && sources.state === 'failed' ? <p role="alert">{t.sourcesUnavailable}</p>
               : selected === 'sources' && sources.state === 'loading' ? <p role="status">{t.checking}</p>
-                : <section className="placeholder"><span className="placeholder-mark" aria-hidden="true">◇</span><h2>{t[selected]}</h2><p>{t.foundation}</p></section>}
+              : selected === 'recordings' && recordings.state === 'ready'
+                ? <RecordingsView t={t} recordings={recordings.items} owner={access.role === 'owner'} actions={actions} />
+                : selected === 'recordings' && recordings.state === 'failed'
+                  ? <section className="notice" role="alert"><p>{t.recordingsUnavailable}</p><button className="primary" onClick={() => setRefresh(value => value + 1)}>{t.retry}</button></section>
+                  : selected === 'recordings' && recordings.state === 'loading' ? <p role="status">{t.checking}</p>
+                    : selected === 'storage' && access.role === 'owner' && storage.state === 'ready'
+                      ? <StorageView t={t} storage={storage.item} />
+                      : selected === 'storage' && storage.state === 'failed'
+                        ? <section className="notice" role="alert"><p>{t.storageUnavailable}</p><button className="primary" onClick={() => setRefresh(value => value + 1)}>{t.retry}</button></section>
+                        : selected === 'storage' && storage.state === 'loading' ? <p role="status">{t.checking}</p>
+                          : <section className="placeholder"><span className="placeholder-mark" aria-hidden="true">◇</span><h2>{t[selected]}</h2><p>{t.foundation}</p></section>}
           </>}
         </LocalBoundary>
       </main>

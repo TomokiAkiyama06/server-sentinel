@@ -15,10 +15,10 @@ const decode = value => {
   return value.items;
 };
 
-test('default session denies access to all six sections without a provider', async () => {
+test('default session denies access to all seven sections without a provider', async () => {
   const session = await deniedServices.loadSession(new AbortController().signal);
   assert.deepEqual(session, { state: 'denied' });
-  assert.equal(views.length, 6);
+  assert.equal(views.length, 7);
   for (const view of views) assert.equal(canVisit(session, view), false);
 });
 
@@ -27,7 +27,7 @@ test('view permissions remain independent; viewer never gains owner metadata', (
     const session = { state: 'allowed', role: 'viewer', permissions };
     assert.equal(canVisit(session, 'live'), permissions.includes('live:view'));
     assert.equal(canVisit(session, 'recordings'), permissions.includes('recordings:view'));
-    for (const view of ['sources', 'nodes', 'access']) assert.equal(canVisit(session, view), false);
+    for (const view of ['sources', 'nodes', 'access', 'storage']) assert.equal(canVisit(session, view), false);
   }
 });
 

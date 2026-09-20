@@ -1,0 +1,145 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { createElement } from 'react';
+import { renderToStaticMarkup } from 'react-dom/server';
+import { compile } from './compile.mjs';
+
+await compile('src/domain.ts', 'build/domain.mjs');
+await compile('src/i18n.ts', 'build/i18n.mjs');
+await compile('src/recordings/view.tsx', 'build/recordings-view.mjs');
+await compile('src/setup/storage.tsx', 'build/storage-view.mjs');
+const { canVisit, deniedServices, storageStates } = await import('../build/domain.mjs');
+const { messages } = await import('../build/i18n.mjs');
+const { RecordingsView } = await import('../build/recordings-view.mjs');
+const { StorageView } = await import('../build/storage-view.mjs');
+
+const recordings = [
+  { id: 'synthetic-recording-1', source_id: 'synthetic-source-1', source_name: '生成カメラ 1',
+    kind: 'event', start_ms: 1_700_000_000_000, duration_ms: 150_000,
+    size_bytes: 536_870_912, starred: false, retention_days_left: 12 },
+  { id: 'synthetic-recording-2', source_id: 'synthetic-source-2', source_name: '生成カメラ 2',
+    kind: 'critical', start_ms: 1_700_003_600_000, duration_ms: 900_000,
+    size_bytes: 3_221_225_472, starred: true, retention_days_left: null },
+  { id: 'synthetic-recording-3', source_id: 'synthetic-source-1', source_name: '生成カメラ 1',
+    kind: 'continuous', start_ms: 1_700_007_200_000, duration_ms: 1_200_000,
+    size_bytes: 104_857_600, starred: false, retention_days_left: 3 },
+];
+const storage = {
+  state: 'STORAGE_PRESSURE', recording_bytes: 64_424_509_440, starred_bytes: 10_737_418_240,
+  available_bytes: 21_474_836_480, hard_reserve_bytes: 5_368_709_120,
+  recording_limit_bytes: 85_899_345_920, critical_allowance_bytes: 2_147_483_648,
+  recording_retention_days: 20, audit_retention_days: 90, agent_incident_retention_days: 60,
+  slack_configured: false, daily_summary_local_time: '23:00',
+};
+const actions = { star() { assert.fail('render must not mutate'); }, remove() { assert.fail('render must not mutate'); } };
+const recordingsMarkup = (owner, extra = {}) =>
+  renderToStaticMarkup(createElement(RecordingsView, { t: messages.ja, recordings, owner, ...extra }));
+const storageMarkup = (locale = 'ja', value = storage) =>
+  renderToStaticMarkup(createElement(StorageView, { t: messages[locale], storage: value }));
+
+test('storage stays owner-only and recording metadata needs recordings:view', () => {
+  for (const permissions of [[], ['live:view'], ['recordings:view'], ['live:view', 'recordings:view']]) {
+    const viewer = { state: 'allowed', role: 'viewer', permissions };
+    assert.equal(canVisit(viewer, 'storage'), false);
+    assert.equal(canVisit(viewer, 'recordings'), permissions.includes('recordings:view'));
+  }
+  assert.equal(canVisit({ state: 'allowed', role: 'owner', permissions: [] }, 'storage'), true);
+  for (const view of ['recordings', 'storage']) assert.equal(canVisit({ state: 'denied' }, view), false);
+  for (const name of ['loadRecordings', 'loadStorage', 'starRecording', 'deleteRecording']) {
+    assert.equal(name in deniedServices, false);
+  }
+});
+
+test('recording rows expose no download, export or direct media route', () => {
+  for (const markup of [recordingsMarkup(false, { actions }), recordingsMarkup(true, { actions })]) {
+    assert.doesNotMatch(markup, /<a\b|href=|\bdownload\b|<video|<source|<iframe|<object|<embed/);
+    assert.doesNotMatch(markup, /\.mp4|\.m3u8|\.mpd|blob:|data:video/);
+  }
+  const markup = recordingsMarkup(false, { actions });
+  assert.match(markup, /data-recording-id="synthetic-recording-1"/);
+  assert.match(markup, /生成カメラ 2/);
+  assert.ok(markup.includes(messages.ja.recordingsCaption));
+  assert.equal(markup.includes(messages.ja.columnActions), false);
+});
+
+test('star and delete controls are owner-only', () => {
+  const controls = [messages.ja.starOn, messages.ja.starOff, messages.ja.deleteRecording, messages.ja.ownerOnlyActions];
+  for (const markup of [recordingsMarkup(false, { actions }), recordingsMarkup(true)]) {
+    // An owner without an authorized mutation provider also gets no control.
+    for (const label of controls) assert.doesNotMatch(markup, new RegExp(`>${label}<`));
+    assert.doesNotMatch(markup, /row-actions/);
+    assert.equal(markup.includes(messages.ja.columnActions), false);
+  }
+  const owner = recordingsMarkup(true, { actions });
+  for (const label of controls) assert.match(owner, new RegExp(`>${label}<`));
+  assert.match(owner, /row-actions/);
+  assert.ok(owner.includes(messages.ja.columnActions));
+});
+
+test('starred recordings are shown as never auto-deleted and keep their day counts separate', () => {
+  const markup = recordingsMarkup(true, { actions });
+  assert.match(markup, new RegExp(`★ ${messages.ja.neverAutoDeleted}`));
+  assert.match(markup, /12 日/);
+  assert.match(markup, /3 日/);
+});
+
+test('recording filters keep every kind selectable', () => {
+  const markup = recordingsMarkup(false);
+  for (const label of [messages.ja.filterAll, messages.ja.kind_event, messages.ja.kind_critical, messages.ja.filterStarred]) {
+    assert.match(markup, new RegExp(`aria-pressed="(true|false)"[^>]*>${label}<`));
+  }
+  assert.match(markup, /role="group"/);
+});
+
+test('storage shows all three states with the current one marked', () => {
+  assert.deepEqual([...storageStates], ['NORMAL', 'STORAGE_PRESSURE', 'STORAGE_HARD_STOP']);
+  const markup = storageMarkup();
+  for (const state of storageStates) assert.match(markup, new RegExp(`data-storage-state="${state}"`));
+  assert.match(markup, /aria-current="true"[^>]*state-STORAGE_PRESSURE|state-STORAGE_PRESSURE[^>]*aria-current="true"/);
+  assert.ok(markup.includes(messages.ja.state_STORAGE_PRESSURE));
+  assert.ok(markup.includes(messages.ja.hysteresis));
+});
+
+test('disk breakdown separates recordings, starred, free space and the hard reserve', () => {
+  const markup = storageMarkup();
+  for (const name of ['recordings', 'starred', 'free', 'reserve']) {
+    assert.match(markup, new RegExp(`id="disk-${name}"`));
+    assert.match(markup, new RegExp(`aria-labelledby="disk-${name}"`));
+  }
+  // Starred bytes are a subset of recording bytes and must not be counted twice.
+  assert.match(markup, /50\.0 GiB/);
+  assert.match(markup, /10\.0 GiB/);
+  assert.match(markup, /15\.0 GiB/);
+  assert.match(markup, /5\.0 GiB/);
+  assert.ok(markup.includes(messages.ja.reserveNote));
+  assert.match(markup, /class="numeric"/);
+});
+
+test('the three retention periods are displayed as separate lifecycles', () => {
+  for (const locale of ['ja', 'en']) {
+    const markup = storageMarkup(locale);
+    for (const [name, days] of [['main', 20], ['audit', 90], ['agent', 60]]) {
+      assert.match(markup, new RegExp(`data-retention="${name}"`));
+      assert.match(markup, new RegExp(`${days} ${messages[locale].daysUnit}`));
+    }
+    assert.ok(markup.includes(messages[locale].retentionAgentNote));
+  }
+});
+
+test('Slack is disabled until configured and no credential is rendered', () => {
+  const markup = storageMarkup();
+  assert.ok(markup.includes(messages.ja.slackDisabled));
+  assert.ok(markup.includes(messages.ja.slackUnconfiguredNote));
+  assert.ok(markup.includes(messages.ja.slackCredential));
+  assert.match(markup, /23:00/);
+  assert.doesNotMatch(markup, /hooks\.slack\.com|xox[baprs]-|webhook/i);
+  const configured = storageMarkup('ja', { ...storage, slack_configured: true });
+  assert.ok(configured.includes(messages.ja.slackEnabled));
+  assert.doesNotMatch(configured, /hooks\.slack\.com|xox[baprs]-|webhook/i);
+});
+
+test('hard-stop storage never reports negative free space', () => {
+  const markup = storageMarkup('ja', { ...storage, state: 'STORAGE_HARD_STOP', available_bytes: 1_073_741_824 });
+  assert.doesNotMatch(markup, /-\d/);
+  assert.match(markup, /aria-current="true"/);
+});

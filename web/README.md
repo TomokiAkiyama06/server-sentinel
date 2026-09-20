@@ -9,8 +9,8 @@ Browsers are viewers in MVP: no browser/iPhone camera capture, audio controls, d
 ## Foundation implemented for #8
 
 The React/TypeScript shell defaults to Japanese and includes an English catalog,
-responsive navigation, and six placeholders: Overview, Camera Sources, Capture
-Nodes, Live, Recordings, and Access. Camera summaries are an ID-keyed collection
+responsive navigation, and placeholders for Overview, Camera Sources, Capture
+Nodes, Live, and Access. Camera summaries are an ID-keyed collection
 with independent type/role, never fixed camera slots. These are foundation
 screens, not implemented live playback or access management.
 
@@ -33,6 +33,36 @@ worker/config files must be served through the protected human listener after
 the preview server as a deployment dashboard. This change mounts no assets on
 the backend or ingest listener.
 
+## Recording browser and storage/notification screens for #21
+
+`src/recordings/view.tsx` lists authorized recordings with time, camera, type
+(event / continuous / critical evidence), length, size and remaining Main
+retention. Starred recordings are shown as never auto-deleted instead of a day
+count. Playback is in-browser only: there is no download, export, media link or
+embedded media element for any role, and the screen states plainly that
+in-browser playback does not prevent screen recording or client-side copying.
+Star, unstar and delete controls render only for an owner session that also has
+an authorized mutation provider, and deletion needs a second confirmation in the
+same row. The server repeats every one of these checks.
+
+`src/setup/storage.tsx` is owner-only. It shows the three backend storage states
+(`NORMAL`, `STORAGE_PRESSURE`, `STORAGE_HARD_STOP`), marks the current one, and
+states that recovery uses hysteresis. The disk breakdown meters unstarred
+recordings, starred recordings, free space and the hard filesystem reserve
+separately, with tabular numerals, and notes that other processes' usage is part
+of the admission decision. The three retention periods are displayed as separate
+lifecycles: Main recordings 20 days, audit 90 days, and agent protected
+incidents 60 days, with an explicit note that Main retention and cleanup never
+shorten or delete the agent-owned incidents. Slack is shown as disabled until
+configured, with the 23:00 local daily summary, immediate critical/hardware/
+self-test alerts, and ordinary person/motion aggregated into the summary. No
+Slack credential is rendered.
+
+`canVisit` keeps `storage` owner-only and `recordings` behind `recordings:view`;
+`live:view` alone reaches neither the recording list nor historical metadata.
+The production entry still uses `deniedServices`, which supplies no recording,
+storage or mutation provider. Server wiring for these screens is #42.
+
 ## Local build and tests
 
 Use Node 24 and the committed lockfile:
@@ -53,10 +83,15 @@ no browser is downloaded. Tests execute the built production bundle and a
 separate synthetic harness.
 
 Node tests cover API failure/redirect/path restrictions, independent permissions,
-localization keys, the denied default, and production bundle isolation.
+localization keys, the denied default, and production bundle isolation. Rendered
+component tests cover owner-only star/delete, the absence of any download,
+export or media element, starred recordings shown as never auto-deleted, the
+three separate retention periods, storage state display, and Slack disabled
+until configured.
 Chrome CDP tests cover phone/Mac-sized/desktop viewports, zero through four
-synthetic sources, all six screens, locale switching, session permission
-combinations, and normal/error paths with hostile opt-in configuration.
+synthetic sources, all seven screens, locale switching, session permission
+combinations, synthetic recording lists with owner star/delete confirmation,
+each storage state, and normal/error paths with hostile opt-in configuration.
 Every page request is intercepted and fulfilled locally or rejected. CSP
 violations and WebSocket attempts fail tests. A dedicated external `.invalid`
 positive-control request proves interception detects/aborts attempted egress;
