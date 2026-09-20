@@ -146,6 +146,8 @@ trusted proxy / Tailscale の identity header を使う場合、その listener 
 
 credential を人に紐づけるための条件も守ってください。登録時と毎回の認証で authenticator の user verification を必須にし、authenticator は招待された本人が管理するものとします。OS account や端末の unlock を共有する機器では、その共有 profile に置かれた platform authenticator は共有 credential であり条件を満たしません。session は生成元 credential に紐づけ、idle / 絶対時間両方の上限で終了させます。意図的に貸し与えられた credential や、放置された unlock 済み session を application が検知できるとは説明しないでください。
 
+credential がまだ存在しない request の例外は、local の owner bootstrap、短命・使い捨て enrollment code による招待 redemption、認証 route 自体の 3 つだけです。これらは application data を返さず、無効 / 期限切れ / 使用済み code には未招待と同じ汎用応答を返します。AUTH-008 の owner 操作には fresh な user verification を要求し、step-up 失敗 / キャンセル時は何も実行しないでください。
+
 2 つの gate 自体は弱めません。共有 account で変わるのは、network gate が個人を区別しなくなる点だけです。
 
 ## 10. Detection の不変条件
@@ -210,7 +212,7 @@ YOLOX は person detector の初期評価候補に過ぎません。owner face v
 
 ## 15. Logging / API のルール
 
-raw な pairing credential、agent の key / 証明書、Tailscale / Slack の secret、biometric template、機微な header、media の内容を log に出さないでください。
+raw な pairing credential、human の enrollment code、agent の key / 証明書、Tailscale / Slack の secret、biometric template、機微な header、media の内容を log に出さないでください。
 
 すべての media / API route は server 側で認可を強制します。capture ingest は agent protocol の action だけを受け付けます。human UI の route は ingest listener から到達できません。
 
@@ -227,6 +229,8 @@ raw な pairing credential、agent の key / 証明書、Tailscale / Slack の s
 - LAN の中断と backpressure;
 - phone / Mac からの live 閲覧;
 - Tailscale / private 到達性と ServerSentinel application 認可;
+- 個人単位 credential の検証と、bootstrap / enrollment / 認証だけが credential なしで到達できること（無効 / 期限切れ / 使用済み code は未招待と同一応答）;
+- owner 操作の fresh user verification（stale session の拒否、step-up 失敗 / キャンセル時に状態が変わらないこと）;
 - `live:view` と `recordings:view` の分離（historical timeline が `recordings:view` でのみ見えることを含む）;
 - duration / capacity の ring-buffer mode、T-10 / T+10 の保護、既定 60 日の失効、agent の disk pressure;
 - detector ごとの quality gate（person の false negative 防止を含む）;

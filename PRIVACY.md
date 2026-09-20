@@ -95,6 +95,8 @@ For each credential the main host stores:
 
 Authenticator user verification (device PIN, device unlock, fingerprint or face unlock) runs on the viewer's own device. ServerSentinel never receives or stores a viewer's fingerprint or face template. These records are an access-control list, not an identity or biometric database, and they are unrelated to the optional owner face verification described below. Revoking a credential or its principal permanently disables the corresponding record.
 
+Invitations carry a short-lived, single-use enrollment code that is delivered out of band and is never written to logs. Redeeming it registers one credential and returns no camera, recording, timeline or deployment information.
+
 Approving a device is not the same as identifying a person. The application cannot detect a credential whose holder lends it out, or a session left unlocked on an unattended shared machine; the deployment owner manages those risks outside the application.
 
 ## Tailscale/private remote access

@@ -47,21 +47,31 @@ A passkey alone does not separate people who share a machine. Therefore:
 - the authenticator MUST be one the invited person controls. On a machine whose OS account or device unlock is shared, a platform authenticator stored in that shared profile is a **shared** credential and does not satisfy this ADR; that deployment uses a per-person OS account or a portable authenticator the person carries;
 - a session is bound to the credential that created it and ends on a bounded idle lifetime and a bounded absolute lifetime, with an explicit sign-out available for shared machines.
 
-### 4. Device approval is not person identification
+### 4. Bootstrap and enrollment are the only pre-credential paths
+
+A credential check cannot apply to the request that creates the first credential, so the exceptions are enumerated and closed: the initial owner bootstrap (a privileged local administrative action on the Main Server, never a remote first-visitor route), invitation redemption against a valid short-lived single-use enrollment code, and the authentication/assertion route itself. Every other human/media route requires a verified credential and an active session.
+
+Redemption is rate-limited, registers exactly one credential for the named principal, returns no camera/recording/timeline/deployment data, and grants no application access on its own; the invited person authenticates afterwards like anyone else. An absent, unknown, expired or already-redeemed code gets the same generic response as an uninvited person, and logs never carry the raw code.
+
+### 5. Owner operations need a fresh user verification
+
+The AUTH-008 owner operations require a user verification newer than a bounded freshness window, so a long-lived or unattended owner session cannot revoke users, change retention/security settings or delete recordings by itself. A failed, cancelled or declined step-up leaves the operation unperformed, changes no state and returns only the generic failure. The exact freshness window is a parameter of ADR-0003/Issue #6.
+
+### 6. Device approval is not person identification
 
 Device-scoped approval may be offered as an additional restriction, but the product MUST NOT describe approving a device as identifying a person.
 
-### 5. Both access gates stay, with changed roles
+### 7. Both access gates stay, with changed roles
 
 The two-gate rule is unchanged: a network-level private/Tailscale permission path **and** ServerSentinel application authorization are both required. What the shared account changes is that the network gate no longer distinguishes individuals, so it MUST NOT be presented as the barrier that keeps an uninvited person out. Every human route therefore verifies the application credential and the requested permission server-side.
 
 `live:view` and `recordings:view` remain independent, `recordings:view` keeps historical timeline/events, and non-owner recording access stays browser playback only. This ADR does not change them.
 
-### 6. Pre-authentication disclosure
+### 8. Pre-authentication disclosure
 
 Before authentication succeeds, responses follow `REQUIREMENTS.md` AUTH-010: generic and non-branding, with no product/version string, camera names or counts, API schema, health detail, recording or timeline data, or other deployment metadata. The credential prompt itself carries none of them. An uninvited person and a revoked person receive the **same** response.
 
-### 7. Credential data is not biometric data
+### 9. Credential data is not biometric data
 
 Authenticator user verification runs on the viewer's own device. ServerSentinel receives and stores only public credential material (credential id and public key) plus owner-visible metadata: label, created/last-used/revoked timestamps. No viewer fingerprint or face template reaches the server. `principal_credential` is an access-control record; it is unrelated to the optional owner face verification and never becomes a non-owner identity or biometric database.
 
@@ -85,6 +95,7 @@ Authenticator user verification runs on the viewer's own device. ServerSentinel 
 
 - `MANUAL_TEST.md` "Shared Tailscale account" covers two people on the same Tailscale login, user verification, signed-out refusal, generic and identical responses for uninvited/revoked, per-credential versus per-principal revocation, session timeout and sign-out.
 - Automated tests for Issue #10 must cover: no human route authorizing on a proxy identity header alone, credential verification on every human/media route, `live:view` / `recordings:view` isolation including historical timeline, prompt revocation at both levels, and identical generic pre-authentication responses.
+- They must also cover the pre-credential paths and the step-up: enrollment succeeds once and only with a valid unexpired code; absent/unknown/expired/redeemed codes return the same generic response; enrollment alone returns no application data; an AUTH-008 owner operation is refused without a fresh user verification; and a failed or cancelled step-up performs nothing and leaks nothing.
 
 ## Follow-up
 

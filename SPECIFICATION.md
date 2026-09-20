@@ -897,11 +897,35 @@ GET /api/recordings                     -> recordings:view
 GET /api/recordings/<id>/playback       -> recordings:view
 GET /api/events                         -> recordings:view
 GET /api/timeline                       -> recordings:view
-POST/DELETE camera/agent/settings       -> owner
-POST access invitations/permissions     -> owner
-POST biometric enroll/delete            -> owner
-DELETE recording                         -> owner
+POST/DELETE camera/agent/settings       -> owner + fresh user verification
+POST access invitations/permissions     -> owner + fresh user verification
+POST biometric enroll/delete            -> owner + fresh user verification
+DELETE recording                         -> owner + fresh user verification
 ```
+
+"Fresh" means a user verification newer than a bounded freshness window, so an
+older or unattended owner session cannot perform an AUTH-008 operation by
+itself. A step-up that fails, is cancelled or is declined leaves the operation
+unperformed, changes no state, and returns only the generic failure.
+
+Exactly three request classes run before a credential exists, and the set is
+closed:
+
+```text
+local owner bootstrap      -> privileged local action on the main host, not a remote route
+invitation redemption      -> valid, unexpired, unredeemed enrollment code only
+credential authentication  -> the assertion route itself
+```
+
+Owner bootstrap is a privileged local administrative action on the Main Server;
+there is no remote first-visitor setup. Invitation redemption is single-use and
+rate-limited and registers exactly one `principal_credential` for the named
+principal. It returns no camera, recording, timeline or deployment data and
+grants no application access by itself: the invited person then authenticates
+like anyone else. An absent, unknown, expired or already-redeemed code receives
+the same generic response as an uninvited person, and logs record the attempt
+without the raw code. Every other human/media route requires a verified
+credential and an active session.
 
 Unauthorized users get no ServerSentinel deployment metadata, camera names/counts, thumbnails, event details, or recordings. For an uninvited identity, prefer a generic/non-branding denial such as a not-found-style response and do not expose product/version headers, API schema, health details, or other ServerSentinel fingerprints. This does not claim that the underlying Tailscale node/service is network-invisible when Tailnet policy is unchanged.
 

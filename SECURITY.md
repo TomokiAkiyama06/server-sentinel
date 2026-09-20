@@ -208,6 +208,10 @@ Consequences to keep in mind while reviewing code:
 
 Residual limits are documented, not claimed away: a credential its holder deliberately lends, and a session left unlocked on an unattended machine, are outside what the application can observe.
 
+Three request classes necessarily run before a credential exists, and the set is closed: the local owner bootstrap (a privileged local action on the Main Server, never a remote first-visitor route), invitation redemption against a valid short-lived single-use enrollment code, and the authentication route. They return no application data, redemption is rate-limited and succeeds at most once, an absent/unknown/expired/redeemed code gets the same generic response as an uninvited person, and enrollment codes never reach logs. Every other human route requires a verified credential and an active session.
+
+Owner-only operations additionally require a user verification newer than a bounded freshness window, so a stale or unattended owner session cannot revoke users, change retention/security settings or delete recordings; a failed or cancelled step-up performs nothing and reveals nothing.
+
 ## Capture-node pairing
 
 Pairing credentials:

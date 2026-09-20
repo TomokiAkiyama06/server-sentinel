@@ -73,6 +73,11 @@ acceptance.
 
 - [ ] unchanged-Tailnet-policy compatible application authorization
 - [ ] application invitation/allowlist
+- [ ] per-person ServerSentinel credential (WebAuthn/passkey) verified on every human/media route, with required authenticator user verification
+- [ ] invitation enrollment and local owner bootstrap as the only pre-credential paths
+- [ ] credential-bound server-side sessions with idle/absolute expiry and explicit sign-out
+- [ ] credential-level and principal-level revocation
+- [ ] fresh user-verification step-up for owner operations
 - [ ] independent `live:view` / `recordings:view`
 - [ ] browser-only non-owner playback
 - [ ] prompt revocation

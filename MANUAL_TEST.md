@@ -328,6 +328,10 @@ The research-room Tailnet is shared, so run these with two people (or two browse
 - [ ] no human route grants access on the proxy identity header alone;
 - [ ] record that reachability is expected for every holder of the shared account and is not treated as a finding.
 
+- [ ] a first-time invitee redeems an enrollment code and registers a credential without already holding one, and the same code cannot be redeemed twice;
+- [ ] an absent, unknown, expired or already-redeemed code returns the same generic response as an uninvited person, and the enrollment step returns no camera, recording or timeline data;
+- [ ] an owner operation (revoke a user, change a retention/security setting, delete a recording) asks for a fresh user verification even inside an existing owner session, and cancelling it leaves everything unchanged.
+
 Record the residual limits instead of testing them away: a credential its holder deliberately lends, and a session left unlocked on an unattended machine, are outside what the application can detect.
 
 ### Uninvited ordinary Tailnet member

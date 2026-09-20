@@ -263,6 +263,7 @@ Scope:
 - application principal/allowlist;
 - per-person ServerSentinel credential (`principal_credential`) with invitation enrollment, required authenticator user verification, and individual revocation;
 - session/revocation/recovery;
+- the closed set of pre-credential routes (local owner bootstrap, enrollment-code redemption, authentication) and the freshness window for owner step-up;
 - exact handling of verified external identity headers, which in the shared-Tailscale-account deployment are supplementary only;
 - keep Tailnet policy separately Owner-managed outside ServerSentinel; existing ACLs/Grants may remain unchanged, and ServerSentinel performs no policy mutation or admin-credential storage.
 
@@ -271,7 +272,9 @@ The authorization decision is recorded in ADR 0004 (shared Tailnet account, per-
 Acceptance:
 - Tailnet membership alone is insufficient;
 - verified Tailscale/trusted-proxy identity alone is insufficient; no human route authorizes on an identity header alone;
-- every human route verifies the requesting principal's own credential before returning application data;
+- every human route verifies the requesting principal's own credential before returning application data, except the enumerated AUTH-012 pre-credential routes, which return no application data themselves;
+- initial owner bootstrap and first-credential enrollment are reachable without an existing credential, so a fresh deployment and a first-time invitee are not deadlocked;
+- AUTH-008 owner operations require a fresh user verification, and a cancelled or failed step-up changes nothing;
 - uninvited identity receives no deployment metadata, and an uninvited and a revoked person receive the same generic response;
 - owner can revoke app access, at both the single-credential and the whole-principal level;
 - backend rejects spoofed identity headers from untrusted LAN paths;
@@ -690,6 +693,8 @@ Scope:
 - trusted proxy identity, treated as supplementary in the shared-Tailscale-account deployment;
 - app principal allowlist;
 - per-person credential verification on every human/media route, per ADR 0004;
+- the closed set of pre-credential routes: local owner bootstrap, invitation redemption against a short-lived single-use enrollment code, and the authentication route itself;
+- fresh user-verification step-up for the AUTH-008 owner operations;
 - generic/non-branding denial for uninvited users;
 - independent `live:view` and `recordings:view`;
 - `recordings:view` includes historical timeline/events;
@@ -702,6 +707,9 @@ Acceptance:
 - existing Tailnet policy may remain unchanged;
 - docs do not promise Main Server node invisibility when Tailnet policy exposes it;
 - every human/media request requires verified Tailscale/trusted-proxy identity plus an active invitation, that principal's own verified credential, and the required permission; a request carrying only a verified identity header is refused;
+- the only exceptions are the enumerated pre-credential routes of AUTH-012: local owner bootstrap (a privileged local action, not a remote route), invitation redemption gated by a valid unexpired single-use enrollment code, and the authentication route. A fresh deployment reaches its first owner and an invitee redeems a first credential without a deadlock, and neither path returns camera, recording, timeline or deployment data;
+- an absent, unknown, expired or already-redeemed enrollment code receives the same generic response as an uninvited person, redemption succeeds at most once, attempts are rate-limited, and logs carry no raw code;
+- AUTH-008 owner operations require a user verification newer than the configured freshness window; a credential-bearing but stale session is refused, and a failed or cancelled step-up performs no state change and returns only the generic failure;
 - the shared Tailscale account is assumed: a second person on the same Tailscale login and the same device, without a credential of their own, receives the same generic response as any uninvited person;
 - revoking one credential invalidates that credential and its sessions only; revoking the principal invalidates all of them promptly;
 - uninvited identity receives no camera names/counts, thumbnails, live, recordings, timeline, storage state, product/version, API schema, or detailed health; use generic/non-branding denial where practical;

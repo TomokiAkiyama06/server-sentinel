@@ -103,6 +103,8 @@ Public port forwarding is not the normal setup.
 
 Where the room shares one Tailscale account, the Tailscale login does not identify the person; the ServerSentinel credential does. Register each credential on an authenticator the invited person controls and keep authenticator user verification required. On a machine whose OS account or device unlock is shared, use a per-person OS account or a portable authenticator instead of a passkey stored in the shared profile. See ADR 0004.
 
+The first owner is created by a privileged local administrative command on the Main Server, not by a remote setup page. Everyone else starts from an owner invitation: the enrollment code is short-lived and single-use, it is delivered out of band, redeeming it registers exactly one credential, and the person then signs in normally. A used or expired code behaves like no invitation at all.
+
 ## Add local USB camera
 
 ```text

@@ -390,6 +390,8 @@ Non-owner invited users do not receive an official recording download/export end
 ### AUTH-008 Owner operations
 Only the owner (or a future explicitly defined privileged role) may add/revoke users, change permissions, register/revoke capture agents/cameras, configure agent ring-buffer mode/value, enroll/delete owner biometrics, alter retention/security settings, or delete recordings.
 
+These operations shall additionally require a user verification newer than a bounded freshness window, so an older or unattended session cannot perform them on its own. A step-up that fails, is cancelled, or is declined shall leave the operation unperformed, change no state, and disclose nothing beyond the generic failure.
+
 ### AUTH-009 Immediate application revocation
 Application permission revocation shall invalidate active ServerSentinel authorization promptly. Tailnet membership/policy remains separately administered outside ServerSentinel.
 
@@ -419,6 +421,17 @@ Consequences for this product:
 Both gates of AUTH-001/AUTH-004 remain mandatory and unchanged. What the shared account changes is that the network gate no longer distinguishes individuals, so it shall not be presented as the barrier that keeps an uninvited person out.
 
 Limits that shall be documented rather than claimed away: ServerSentinel cannot detect a credential whose holder deliberately lends it, a session left unlocked on an unattended machine, or an authenticator that the deployment registered inside a shared profile against this requirement. The product shall not claim that the application separates two people who share a workstation and a device unlock.
+
+### AUTH-012 Bootstrap and enrollment before a credential exists
+AUTH-011 cannot apply to the requests that create the first credential, so the exceptions are enumerated and closed:
+
+- initial owner bootstrap is a privileged local administrative action on the Main Server, not a remote route, and it does not create a remote first-visitor setup path;
+- invitation redemption accepts only a valid, unexpired, unredeemed enrollment code, is single-use and rate-limited, and registers exactly one credential for the named principal;
+- the authentication/assertion route itself.
+
+Every other human/media route requires a verified credential and an active session per AUTH-011.
+
+These pre-authentication routes shall return no camera names or counts, recordings, timeline data, product/version strings, API schema, or other deployment metadata, and enrollment shall grant no application data by itself; the invited person authenticates afterwards like anyone else. A request with an absent, unknown, expired or already-redeemed code shall receive the same generic AUTH-010 response as an uninvited person, and logs shall record the attempt without the raw code.
 
 ## 14. Dashboard requirements
 
