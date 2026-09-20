@@ -377,6 +377,20 @@ class PresenceTests(unittest.TestCase):
         self.assertEqual(len(self.service.audit("owner")), 1)
         self.assertEqual(len(self.history()["items"]), 2)
 
+    def test_presence_audit_retention_is_bounded_and_oldest_first(self):
+        self.service.override("owner", PresenceState.ABSENT, now=NOW, clock_trusted=True)
+        self.service.set_hint("owner", PresenceState.PRESENT, now=NOW + timedelta(days=1),
+                              valid_until=NOW + timedelta(days=2), clock_trusted=True)
+        self.service.cancel_override("owner", now=NOW + timedelta(days=2), clock_trusted=True)
+        self.assertEqual(1, self.service.expire_audit(now=NOW + timedelta(days=92), limit=1))
+        self.assertEqual(["hint_set", "override_cancelled"],
+                         [row["action"] for row in self.service.audit("owner")])
+        # The cutoff is exclusive, so the audit record exactly 90 days old is retained.
+        self.assertEqual(1, self.service.expire_audit(now=NOW + timedelta(days=92)))
+        self.assertEqual(["override_cancelled"], [row["action"] for row in self.service.audit("owner")])
+        with self.assertRaisesRegex(ValueError, "audit retention"):
+            self.service.expire_audit(now=NOW + timedelta(days=92), limit=1001)
+
     def test_history_bounded_cursor_prevents_duplicate_rows(self):
         for _ in range(3):
             self.service.record(observation(Kind.PERSON, confirmed=False))

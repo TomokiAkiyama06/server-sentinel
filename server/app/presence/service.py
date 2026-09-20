@@ -1,6 +1,7 @@
 """Durable precedence, neutral history, and presence-independent critical work."""
 
 from contextlib import closing, contextmanager
+from datetime import timedelta
 import json
 from uuid import UUID
 
@@ -8,6 +9,7 @@ from .access import DenyAccess
 from .delivery import ActionResult
 from .models import (CRITICAL, Kind, Observation, PresenceState, Quality, Value,
                      timestamp, utc)
+from app.storage.retention import RetentionPeriods
 
 
 ARMED = "armed"
@@ -352,6 +354,22 @@ class PresenceService:
         self._owner(context)
         with closing(self.database.connect()) as db:
             return [dict(row) for row in db.execute("SELECT * FROM presence_audit ORDER BY sequence")]
+
+    def expire_audit(self, *, now, limit=1000):
+        """Apply the main 90-day audit policy to owner-control history.
+
+        This is a maintenance operation for the same retention workflow that
+        expires storage-state audit rows. It is bounded and storage-admitted so
+        a full or unsafe volume cannot silently report a completed cleanup.
+        """
+        if type(limit) is not int or not 1 <= limit <= 1000:
+            raise ValueError("invalid audit retention limit")
+        cutoff = timestamp(utc(now) - timedelta(days=RetentionPeriods().audit_days))
+        with self._transaction() as db:
+            cursor = db.execute("DELETE FROM presence_audit WHERE sequence IN "
+                                "(SELECT sequence FROM presence_audit WHERE at<? "
+                                "ORDER BY at,sequence LIMIT ?)", (cutoff, limit))
+        return cursor.rowcount
 
     @staticmethod
     def _cursor(after):

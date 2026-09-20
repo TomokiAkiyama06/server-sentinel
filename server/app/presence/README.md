@@ -41,6 +41,9 @@ liveness guarantee for an external worker. An expired manual override stops
 applying even when its durable retirement write is refused, and the snapshot
 reports that retirement as still pending.
 
+Owner-control audit records use the main 90-day audit retention period. The
+maintenance operation is bounded and deletes the oldest expired rows first.
+
 Timeline ordering uses main-host receipt order, with the durable sequence only
 as a tie-break, as the single key for the SQL page, the cursor and the
 response, so concatenated pages stay complete and in the advertised order. It
