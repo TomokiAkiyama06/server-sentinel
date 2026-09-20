@@ -1,6 +1,7 @@
 """SQLite security/admin audit persistence and bounded retention cleanup."""
 
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import sqlite3
 from typing import Callable
@@ -19,6 +20,23 @@ MAX_PAGE_SIZE = 1000
 
 class AuditStorageError(RuntimeError):
     """Audit persistence failed without disclosing database paths or values."""
+
+
+@dataclass(frozen=True)
+class AuditCursor:
+    occurred_at: datetime
+    id: UUID
+
+    def __post_init__(self):
+        object.__setattr__(self, "occurred_at", utc_timestamp(self.occurred_at))
+        if not isinstance(self.id, UUID):
+            raise AuditValidationError("invalid audit cursor identity")
+
+    @classmethod
+    def after(cls, record: AuditRecord):
+        if not isinstance(record, AuditRecord):
+            raise AuditValidationError("invalid audit cursor record")
+        return cls(record.occurred_at, record.id)
 
 
 def _microseconds(value: datetime) -> int:
@@ -106,10 +124,12 @@ class AuditStore:
         )
 
     def list_records(self, *, limit: int = 100,
-                     before: datetime | None = None) -> tuple[AuditRecord, ...]:
+                     before: AuditCursor | None = None) -> tuple[AuditRecord, ...]:
         if type(limit) is not int or not 1 <= limit <= MAX_PAGE_SIZE:
             raise AuditValidationError("invalid audit page size")
-        cutoff = _microseconds(before) if before is not None else None
+        if before is not None and not isinstance(before, AuditCursor):
+            raise AuditValidationError("invalid audit cursor")
+        cutoff = _microseconds(before.occurred_at) if before is not None else None
         with self.transaction() as connection:
             if cutoff is None:
                 rows = connection.execute(
@@ -118,8 +138,10 @@ class AuditStore:
                 ).fetchall()
             else:
                 rows = connection.execute(
-                    "SELECT * FROM security_admin_audit_records WHERE occurred_at_us < ? "
-                    "ORDER BY occurred_at_us DESC, id DESC LIMIT ?", (cutoff, limit),
+                    "SELECT * FROM security_admin_audit_records "
+                    "WHERE occurred_at_us < ? OR (occurred_at_us = ? AND id < ?) "
+                    "ORDER BY occurred_at_us DESC, id DESC LIMIT ?",
+                    (cutoff, cutoff, str(before.id), limit),
                 ).fetchall()
         return tuple(self._record(row) for row in rows)
 

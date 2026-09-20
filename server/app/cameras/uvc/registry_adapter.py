@@ -113,8 +113,9 @@ class LocalUvcAdapter:
         """
         source = self._source(source_id)
         scan = self.discovery.scan()
-        if (source_id in self.sessions or not source.enabled or scan.failures
-                or scan.devices.count(candidate) != 1):
+        session = self.sessions.get(source_id)
+        if ((session is not None and not session.stopped) or not source.enabled
+                or scan.failures or scan.devices.count(candidate) != 1):
             raise ValueError("candidate is unavailable or approval session is active")
         peers = sum(
             candidate.strong_key is not None and device.strong_key == candidate.strong_key
@@ -127,6 +128,12 @@ class LocalUvcAdapter:
             connection, source.id, candidate,
             serial_ambiguous=candidate.strong_key is not None and peers > 1,
         )
+        if session is not None:
+            # Runtime supervisor serializes this source. Discarding a stopped
+            # cache is safe even if the transaction later rolls back: the next
+            # poll reconstructs the prior durable approval and recovery latch.
+            session.supersede_stopped_session()
+            del self.sessions[source_id]
 
     def poll_source(self, source_id, *, timeout=1.0):
         source = self._source(source_id)

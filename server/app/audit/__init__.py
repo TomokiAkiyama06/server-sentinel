@@ -4,11 +4,11 @@ from .model import (
     ActorCategory, AuditAction, AuditOutcome, AuditRecord, AuditValidationError, TargetKind,
 )
 from .service import DenyAllOwners, OwnerAuditService, OwnerAuthorizationError, OwnerAuthorizer
-from .store import AuditStorageError, AuditStore, DEFAULT_RETENTION
+from .store import AuditCursor, AuditStorageError, AuditStore, DEFAULT_RETENTION
 
 
 __all__ = [
-    "ActorCategory", "AuditAction", "AuditOutcome", "AuditRecord",
+    "ActorCategory", "AuditAction", "AuditCursor", "AuditOutcome", "AuditRecord",
     "AuditStorageError", "AuditStore", "AuditValidationError", "DEFAULT_RETENTION",
     "DenyAllOwners",
     "OwnerAuditService", "OwnerAuthorizationError", "OwnerAuthorizer", "TargetKind",

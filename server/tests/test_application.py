@@ -11,9 +11,11 @@ from fastapi import FastAPI, Request
 from app.api.system import router
 from app.auth.boundary import DenyAll
 from app.audit import (
-    ActorCategory, AuditAction, AuditOutcome, AuditStore, OwnerAuthorizationError,
+    ActorCategory, AuditAction, AuditOutcome, AuditStorageError, AuditStore,
+    OwnerAuthorizationError,
     TargetKind,
 )
+from app.audit.runtime import AuditRetentionHealth, AuditRetentionRuntime
 from app.cameras.registry import CameraRegistry, SourceType
 from app.main import create_app
 from app.settings import Settings
@@ -68,6 +70,36 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
             )
             await asyncio.sleep(0.03)
             self.assertEqual((), application.state.audit_store.list_records())
+
+    async def test_scheduled_cleanup_retries_and_reports_transient_failure(self):
+        class TransientStore:
+            def __init__(self):
+                self.calls = 0
+
+            def cleanup_expired(self):
+                self.calls += 1
+                if self.calls == 1:
+                    raise AuditStorageError("synthetic transient failure")
+                return 2
+
+        store = TransientStore()
+        runtime = AuditRetentionRuntime(store, interval_seconds=0.001)
+        task = asyncio.create_task(runtime.run())
+        try:
+            for _ in range(100):
+                if store.calls >= 2:
+                    break
+                await asyncio.sleep(0.001)
+            self.assertGreaterEqual(store.calls, 2)
+            self.assertEqual(1, runtime.total_failures)
+            self.assertEqual(0, runtime.consecutive_failures)
+            self.assertEqual(AuditRetentionHealth.HEALTHY, runtime.health)
+            self.assertEqual(2, runtime.last_deleted_count)
+            self.assertIsNotNone(runtime.last_success_at)
+        finally:
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
 
     async def test_runtime_owner_admin_defaults_to_denial_with_audit(self):
         async with self.application.router.lifespan_context(self.application):

@@ -217,6 +217,15 @@ class ReconnectController:
             self._session_token = None
         self._finished = True
 
+    def supersede_stopped_session(self):
+        """Discard only in-memory state after an audited approval supersedes it."""
+        if self.bound is not None:
+            raise ValueError("capture binding must stop before reapproval")
+        # The audited transaction replaces/fences the durable session token.
+        # Never save this stale controller during disposal.
+        self._session_token = None
+        self._finished = True
+
     def set_enabled(self, enabled):
         if self._finished or type(enabled) is not bool:
             raise ValueError("enabled must be boolean")

@@ -78,6 +78,35 @@ class UvcRegistryTests(unittest.TestCase):
         self.assertIsNone(self.adapter.store.load(self.source.id))
         self.assertEqual(before, self.registry.get_source(self.source.id))
 
+    def test_audited_owner_reapproval_replaces_stopped_cached_session(self):
+        class PermitOwner:
+            def require_owner(self, actor_context):
+                return None
+
+        audit = AuditStore(self.database)
+        admin = OwnerAdministration(
+            OwnerAuditService(audit, PermitOwner()), self.registry,
+        )
+        admin.approve_uvc("owner", self.adapter, self.source.id, self.camera)
+        self.assertTrue(self.adapter.poll_source(self.source.id))
+        self.adapter.sessions[self.source.id].close()
+        duplicate = replace(self.camera, device_path="/dev/video2")
+        self.discovery.devices = [self.camera, duplicate]
+        self.assertFalse(self.adapter.poll_source(self.source.id))
+        cached = self.adapter.sessions[self.source.id]
+        self.assertTrue(cached.stopped)
+        self.assertTrue(cached.controller.requires_approval)
+
+        self.discovery.devices = [self.camera]
+        admin.approve_uvc("owner", self.adapter, self.source.id, self.camera)
+        self.assertNotIn(self.source.id, self.adapter.sessions)
+        self.assertTrue(self.adapter.poll_source(self.source.id))
+        approvals = [record for record in audit.list_records()
+                     if record.action is AuditAction.APPROVE_CAMERA]
+        self.assertEqual(2, len(approvals))
+        self.assertTrue(all(record.outcome is AuditOutcome.SUCCEEDED
+                            for record in approvals))
+
     def make_adapter(self):
         return LocalUvcAdapter(self.registry, emit_audit=self.events.append,
                                on_frame=lambda source_id, frame: self.frames.append((source_id, frame)),

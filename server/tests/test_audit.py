@@ -10,7 +10,7 @@ from unittest.mock import patch
 from uuid import uuid4
 
 from app.audit import (
-    ActorCategory, AuditAction, AuditOutcome, AuditStorageError, AuditStore,
+    ActorCategory, AuditAction, AuditCursor, AuditOutcome, AuditStorageError, AuditStore,
     AuditValidationError,
     OwnerAuditService, OwnerAuthorizationError, TargetKind,
 )
@@ -194,6 +194,23 @@ class AuditTests(unittest.TestCase):
         for retention in (timedelta(0), timedelta(days=-1), 90, None):
             with self.subTest(retention=retention), self.assertRaises(AuditValidationError):
                 AuditStore(self.database, retention=retention)
+
+    def test_compound_cursor_does_not_skip_equal_timestamp_records(self):
+        targets = [uuid4() for _ in range(7)]
+        for target in targets:
+            self.execute(target_id=target)
+        seen = []
+        cursor = None
+        while True:
+            page = self.store.list_records(limit=2, before=cursor)
+            if not page:
+                break
+            seen.extend(record.id for record in page)
+            cursor = AuditCursor.after(page[-1])
+        self.assertEqual(7, len(seen))
+        self.assertEqual(7, len(set(seen)))
+        with self.assertRaises(AuditValidationError):
+            self.store.list_records(before=self.now)
 
     def test_runtime_admin_integrates_node_source_success_and_failure(self):
         node = self.admin.create_capture_node("synthetic-owner-session", "Synthetic node")

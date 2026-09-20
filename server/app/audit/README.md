@@ -40,4 +40,8 @@ deletion journal committed, not that physical cleanup completed.
 
 `AuditStore.cleanup_expired()` defaults to 90 days and deletes only rows from
 the audit table that are strictly older than the cutoff. The Main Server runs it
-at startup and every 24 hours through `AuditRetentionRuntime`.
+at startup and every 24 hours through `AuditRetentionRuntime`. Scheduled
+failures set bounded degraded health and are retried at the next interval;
+exception details are not retained. Audit browsing uses `AuditCursor`, whose
+timestamp plus record UUID matches the stable descending database order so
+equal-timestamp records remain reachable across pages.
