@@ -274,6 +274,11 @@ Acceptance:
 
 ## Plan 5 — Local UVC discovery and stable identity
 
+Implementation progress: video-only V4L2 discovery/MMAP, conservative identity,
+durable ambiguity latch and registry/session integration are implemented and
+synthetically tested. Owner management, running worker/preview integration and
+real UVC acceptance remain pending; Issue #11 stays OPEN. See `MANUAL_TEST.md` A.
+
 GitHub Issue: [#11](https://github.com/TomokiAkiyama06/server-sentinel/issues/11)
 
 Depends on: [#9](https://github.com/TomokiAkiyama06/server-sentinel/issues/9), [#6](https://github.com/TomokiAkiyama06/server-sentinel/issues/6)
