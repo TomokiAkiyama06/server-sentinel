@@ -66,18 +66,21 @@ class PathStatus:
 
 class _PacketPath:
     def __init__(self, plan: EncodePlan, factory: AdapterFactory | None,
-                 limits: QueueLimits):
+                 limits: QueueLimits, previous_status: PathStatus | None = None):
         self.plan = plan
         self.limits = limits
         self._queue: deque[CompressedPacket] = deque()
         self._bytes = 0
-        self._dropped = 0
-        self._skipped = 0
-        self._discontinuities = 0
+        # Adapters may be replaced within one stream generation. Resource
+        # recovery must not erase that generation's observed media loss.
+        self._dropped = previous_status.dropped_packets if previous_status else 0
+        self._skipped = previous_status.skipped_until_keyframe if previous_status else 0
+        self._discontinuities = previous_status.discontinuities if previous_status else 0
         self._awaiting_keyframe = True
         self._closed = False
         self._failed = False
-        self._reason = "awaiting_keyframe"
+        self._reason = ("prior_viewer_loss" if self._dropped or self._discontinuities
+                        else "awaiting_keyframe")
         self._adapter: PacketAdapter | None = None
         if factory is None:
             self._reason = "adapter_unavailable"
@@ -338,7 +341,7 @@ class SourcePipeline:
         # visible and never open another until its resources are released.
         if self._viewer is None:
             self._viewer = _PacketPath(self.viewer_plan, self._viewer_factory,
-                                       self._viewer_limits)
+                                       self._viewer_limits, self._last_viewer_status)
 
     def close(self) -> None:
         if self._closed:

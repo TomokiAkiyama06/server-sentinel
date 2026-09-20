@@ -239,6 +239,56 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual([item.sequence for item in recording.adapters[0].packets], [0, 1, 2])
         self.assertFalse(value.viewer_status.healthy)  # A known gap stays visible.
 
+    def test_viewer_replacement_preserves_generation_loss_without_double_counting(self):
+        for fault in ("backpressure", "write_failure"):
+            for restart in ("profile", "resubscribe"):
+                with self.subTest(fault=fault, restart=restart):
+                    recording, viewer = SyntheticFactory(), SyntheticFactory()
+                    value = pipeline(recording=recording, viewer=viewer,
+                                     viewer_limits=QueueLimits(1, 64))
+                    self.addCleanup(value.close)
+                    value.add_viewer(SUBSCRIBER)
+                    value.offer(packet(0, keyframe=True))
+                    sequence = 1
+                    if fault == "backpressure":
+                        value.offer(packet(sequence))
+                        sequence += 1
+                    else:
+                        viewer.adapters[0].fail_write = True
+                    value.pump(8)
+                    loss = value.viewer_status
+                    self.assertGreater(loss.dropped_packets, 0)
+                    for width in (1280, 640):
+                        if restart == "profile":
+                            value.replace_viewer_profile(ViewerProfile(video_format(width=width)))
+                        else:
+                            value.remove_viewer(SUBSCRIBER)
+                            value.add_viewer(SUBSCRIBER)
+                        self.assertTrue(value.offer(packet(sequence, keyframe=True)).viewer_queued)
+                        value.pump(8)
+                        sequence += 1
+                        status = value.viewer_status
+                        self.assertTrue(status.active and status.available)
+                        self.assertFalse(status.failed or status.awaiting_keyframe)
+                        self.assertFalse(status.healthy)
+                        self.assertEqual(status.reason, "prior_viewer_loss")
+                        self.assertEqual(status.dropped_packets, loss.dropped_packets)
+                        self.assertEqual(status.discontinuities, loss.discontinuities)
+                        self.assertTrue(value.recording_status.healthy)
+
+    def test_loss_free_profile_replacement_can_be_healthy(self):
+        value = pipeline(viewer=SyntheticFactory())
+        self.addCleanup(value.close)
+        value.add_viewer(SUBSCRIBER)
+        value.offer(packet(0))  # Initial join between keyframes is not loss.
+        value.offer(packet(1, keyframe=True))
+        value.pump(8)
+        value.replace_viewer_profile(ViewerProfile(video_format(width=1280)))
+        value.offer(packet(2, keyframe=True))
+        value.pump(8)
+        self.assertTrue(value.viewer_status.healthy)
+        self.assertEqual(value.viewer_status.skipped_until_keyframe, 1)
+
     def test_byte_limit_oversized_packet_and_recording_loss_are_explicit(self):
         factory = SyntheticFactory()
         value = pipeline(recording=factory, recording_limits=QueueLimits(20, 20))

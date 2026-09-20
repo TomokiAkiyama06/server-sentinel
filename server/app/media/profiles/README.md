@@ -53,6 +53,11 @@ call `remove_viewer()` or `close()` again to retry. Subscription IDs carry no
 authorization: a future human route must enforce the established access gates
 before invoking this internal API.
 
+Viewer loss counters belong to the stream generation and survive profile
+replacement and zero-subscriber restart. A recovered adapter can produce video
+while status still exposes `prior_viewer_loss`; a fresh keyframe does not erase
+earlier drops or gaps. Only a new `SourcePipeline` generation starts new counters.
+
 `InferenceSampler` accepts presentation-ordered **decoded frame** timestamps and
 returns whether to emit a frame at the configured inference dimensions. It uses
 exact rational deadlines and constant state, skips missed deadlines without a
