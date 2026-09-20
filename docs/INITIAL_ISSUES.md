@@ -100,6 +100,7 @@ flowchart TD
   i9 --> i11
   i6 --> i11
   i11 --> i12
+  i51 --> i12
   i12 --> i13
   i6 --> i13
   i13 --> i14
@@ -351,7 +352,7 @@ acceptance remain pending; Issue #12 stays OPEN.
 
 GitHub Issue: [#12](https://github.com/TomokiAkiyama06/server-sentinel/issues/12)
 
-Depends on: [#11](https://github.com/TomokiAkiyama06/server-sentinel/issues/11)
+Depends on: [#11](https://github.com/TomokiAkiyama06/server-sentinel/issues/11), [#51](https://github.com/TomokiAkiyama06/server-sentinel/issues/51)
 
 Labels: `backend`, `camera-source`, `hardware-required`, `manual-test-required`, `remote-agent`, `security`, `server-required`, `storage`
 
