@@ -54,6 +54,11 @@ class OwnerVerificationService:
     def enroll(self, candidate: FaceCandidate, gate: QualityGate, decision: OwnerAssessment, *,
                expected_generation: int, at: datetime):
         current = self.store.status()
+        # The audited label cannot go stale: generation is monotonic, and the
+        # transaction re-checks it, so a concurrent enroll/delete aborts the
+        # mutation instead of committing under the other operation's name.
+        # Authorization stays first so an unauthorized caller learns nothing
+        # about the current enrollment state.
         operation = Operation.REPLACE if current.enrolled else Operation.ENROLL
         actor = self.store._authorize(operation)
         if current.generation != expected_generation:

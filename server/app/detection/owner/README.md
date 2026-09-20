@@ -13,6 +13,10 @@ private regular file (`0600`, one hard link), with a private contiguous migratio
 history. It is never part of a main-database/diagnostic archive. A directory lock
 and creating-worker checks enforce a single owner; symlink/FIFO/shared-file,
 root/file substitution and missing-root errors fail closed without mkdir fallback.
+The connection is opened through the already verified directory descriptor
+(`/proc/self/fd/<dirfd>`) and re-verified before any schema write, so a symlink
+or directory substituted after those checks cannot redirect it; an unavailable
+descriptor fails closed instead of reopening by re-resolved path.
 Deployment wiring must reserve worst-case database, rollback journal and audit
 growth before construction/mutation, and integrate 90-day audit retention. No
 production storage policy/lifecycle is silently installed by this module.

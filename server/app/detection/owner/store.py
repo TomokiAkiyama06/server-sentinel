@@ -93,11 +93,14 @@ class OwnerTemplateStore:
                 finally:
                     os.close(descriptor)
                 self._check()
-                self._db = sqlite3.connect(root / "owner-template.sqlite3", isolation_level=None)
+                self._db = sqlite3.connect(self._verified_database_path(), isolation_level=None)
                 self._db.row_factory = sqlite3.Row
                 self._db.execute("PRAGMA journal_mode=DELETE")
                 self._db.execute("PRAGMA synchronous=FULL")
                 self._db.execute("PRAGMA secure_delete=ON")
+                # Re-verify before any schema write, so a root/file swap racing
+                # the open cannot leave a connection bound elsewhere.
+                self._check()
                 migrate(self._db, _MIGRATIONS)
                 os.fsync(self._fd)
         except (OSError, sqlite3.Error, MigrationError):
@@ -108,6 +111,27 @@ class OwnerTemplateStore:
         except BaseException:
             self.close()
             raise
+
+    def _verified_database_path(self) -> str:
+        """Bind the connection to the already verified directory descriptor.
+
+        Reopening by plain path would resolve every component again and follow
+        a symlink or substituted directory installed after the `O_NOFOLLOW`
+        checks above. `/proc/self/fd/<dirfd>` is the kernel's handle for the
+        directory this store verified, so those components cannot be swapped.
+        A missing handle or a changed directory/file identity fails closed;
+        there is no silent fallback to the re-resolved path.
+        """
+        directory = f"/proc/self/fd/{self._fd}"
+        info = os.stat(directory)
+        if (info.st_dev, info.st_ino) != self._identity:
+            raise OwnerError("PRIVATE_TEMPLATE_ROOT_UNAVAILABLE")
+        path = f"{directory}/owner-template.sqlite3"
+        entry = os.stat(path, follow_symlinks=False)
+        if ((entry.st_dev, entry.st_ino) != self._file_identity or not stat.S_ISREG(entry.st_mode)
+                or entry.st_nlink != 1 or entry.st_uid != os.geteuid() or entry.st_mode & 0o077):
+            raise OwnerError("PRIVATE_TEMPLATE_FILE_UNAVAILABLE")
+        return path
 
     def close(self):
         if self._db is not None:

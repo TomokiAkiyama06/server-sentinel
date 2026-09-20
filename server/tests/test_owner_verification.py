@@ -289,6 +289,50 @@ class OwnerTests(TestCase):
         self.assertTrue(self.store.status().enrolled)
         self.assertEqual(self.store._db.execute("SELECT COUNT(*) FROM owner_template_audit").fetchone()[0], 1)
 
+    def test_file_swapped_after_verification_never_opens_another_file(self):
+        # A plain path reopen would resolve the path again and follow a symlink
+        # installed after the O_NOFOLLOW checks, writing the private schema into
+        # an attacker-chosen file.
+        self.store.close()
+        decoy = Path(self.temp.name) / "decoy.sqlite3"
+        decoy.touch(mode=0o600)
+        database = self.root / "owner-template.sqlite3"
+        verified = OwnerTemplateStore._check
+        swapped = []
+
+        def racing_check(store):
+            verified(store)
+            if not swapped:
+                swapped.append(True)
+                database.unlink()
+                database.symlink_to(decoy)
+
+        with patch.object(OwnerTemplateStore, "_check", racing_check):
+            with self.assertRaises(OwnerError):
+                self.open_store()
+        self.assertTrue(swapped)
+        self.assertEqual(decoy.read_bytes(), b"")
+        database.unlink()
+        self.store = self.open_store()
+        self.assertEqual(self.store.status(), EnrollmentStatus(False, 0))
+
+    def test_connection_opens_through_the_verified_directory_descriptor(self):
+        self.store.close()
+        opened = []
+        connect = sqlite3.connect
+
+        def recording(path, **keywords):
+            opened.append(str(path))
+            return connect(path, **keywords)
+
+        with patch.object(sqlite3, "connect", recording):
+            self.store = self.open_store()
+        # The path names the already verified descriptor, so no component of
+        # the private root is resolved again after its O_NOFOLLOW checks.
+        self.assertTrue(opened[0].startswith("/proc/self/fd/"), opened[0])
+        self.assertEqual(os.stat(opened[0]).st_ino,
+                         (self.root / "owner-template.sqlite3").stat().st_ino)
+
     def test_migration_drift_is_the_fixed_owner_storage_error(self):
         # Edited/newer private migration history must not leak MigrationError
         # to callers that only handle owner-store unavailability.
