@@ -2,6 +2,8 @@
 """Install, update or roll back a verified Main Server release."""
 
 import argparse
+from contextlib import contextmanager
+import fcntl
 import hashlib
 import io
 import json
@@ -189,6 +191,37 @@ def _trusted_python(path: Path) -> Path:
     return resolved
 
 
+@contextmanager
+def _release_lock(root: Path):
+    """Serialize release-pointer and service-unit transactions."""
+    path = root / ".release.lock"
+    descriptor = None
+    try:
+        descriptor = os.open(
+            path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+            0o600,
+        )
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise ValueError("release operation lock is invalid")
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+    except OSError:
+        if descriptor is not None:
+            os.close(descriptor)
+        raise ValueError("release operation lock is unavailable") from None
+    except Exception:
+        if descriptor is not None:
+            os.close(descriptor)
+        raise
+    try:
+        yield
+    finally:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
+
+
 def _switch(root: Path, target: str, runner, *, restore_service=None) -> None:
     old_current = _link_target(root, "current")
     old_previous = _link_target(root, "previous")
@@ -324,6 +357,12 @@ def execute(args, *, runner=subprocess.run) -> None:
     _protected_parent(args.unit.parent)
     args.destination.mkdir(mode=0o755, exist_ok=True)
     _protected_parent(args.destination)
+    args.destination.chmod(0o755)
+    with _release_lock(args.destination):
+        _execute_locked(args, runner)
+
+
+def _execute_locked(args, runner) -> None:
     args.config = Path(os.path.abspath(args.config))
     deployment = Deployment.load(args.config, code_root=Path(__file__).resolve().parent,
                                  install_root=args.destination)

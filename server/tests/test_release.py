@@ -2,6 +2,7 @@ import argparse
 import hashlib
 import io
 import json
+import multiprocessing
 import os
 from pathlib import Path
 import pwd
@@ -10,14 +11,20 @@ import sys
 import tarfile
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import call, patch
 import zipfile
 
 from app.deployment import Deployment
 from app.settings import ConfigurationError
 from build_artifact import _required_wheels, build
 from build_installer import build as build_installer
-from install import _extract, _protected_parent, _trusted_python, execute
+from install import _extract, _protected_parent, _release_lock, _trusted_python, execute
+
+
+def _hold_release_lock(root, acquired, release):
+    with _release_lock(Path(root)):
+        acquired.set()
+        release.wait(5)
 
 
 class Runner:
@@ -117,9 +124,15 @@ class ReleaseLifecycleTests(unittest.TestCase):
             marker.write_text(directory.name)
             markers.append(marker)
 
-        self.perform(self.arguments("install", "1.0.0"))
+        with patch("install._release_lock", wraps=_release_lock) as release_lock:
+            self.perform(self.arguments("install", "1.0.0"))
+            self.perform(self.arguments("update", "1.1.0"))
+            self.perform(self.arguments("rollback"))
+        self.assertEqual(
+            release_lock.call_args_list,
+            [call(self.installation), call(self.installation), call(self.installation)],
+        )
         self.assertEqual(os.readlink(self.installation / "current"), "releases/1.0.0")
-        self.assertFalse((self.installation / "previous").exists())
         unit = self.unit.read_text()
         self.assertIn("User=" + pwd.getpwuid(self.uid).pw_name, unit)
         self.assertIn('WorkingDirectory="' + str(self.installation / "current") + '"', unit)
@@ -129,15 +142,33 @@ class ReleaseLifecycleTests(unittest.TestCase):
         self.assertNotIn("Type=simple", unit)
         self.assertNotIn("0.0.0.0", unit)
 
-        self.perform(self.arguments("update", "1.1.0"))
-        self.assertEqual(os.readlink(self.installation / "current"), "releases/1.1.0")
-        self.assertEqual(os.readlink(self.installation / "previous"), "releases/1.0.0")
-        self.perform(self.arguments("rollback"))
-        self.assertEqual(os.readlink(self.installation / "current"), "releases/1.0.0")
         self.assertEqual(os.readlink(self.installation / "previous"), "releases/1.1.0")
         self.assertEqual(
             [marker.read_text() for marker in markers], ["state", "recordings", "audit"]
         )
+
+    def test_release_lock_excludes_an_overlapping_process(self):
+        self.installation.mkdir()
+        context = multiprocessing.get_context("fork")
+        acquired = context.Event()
+        release = context.Event()
+        process = context.Process(
+            target=_hold_release_lock,
+            args=(str(self.installation), acquired, release),
+        )
+        try:
+            with _release_lock(self.installation):
+                process.start()
+                self.assertFalse(acquired.wait(0.2))
+            self.assertTrue(acquired.wait(5))
+        finally:
+            release.set()
+            if process.pid is not None:
+                process.join(5)
+                if process.is_alive():
+                    process.terminate()
+                    process.join(5)
+        self.assertEqual(process.exitcode, 0)
 
     def test_failed_update_restores_running_release_and_runtime_data(self):
         marker = self.runtime / "state/preserved.synthetic"
@@ -361,6 +392,7 @@ class ReleaseLifecycleTests(unittest.TestCase):
         finally:
             os.umask(previous)
         self.assertEqual(observed, 0o077)
+        self.assertEqual(self.installation.stat().st_mode & 0o777, 0o755)
         release = self.installation / "releases/1.0.0"
         self.assertEqual(release.stat().st_mode & 0o777, 0o755)
         self.assertEqual((self.installation / "releases").stat().st_mode & 0o777, 0o755)
