@@ -697,7 +697,9 @@ class PresenceTests(unittest.TestCase):
         status = self.status(now=later)
         self.assertEqual(status["critical_notifications"], "armed")
         self.assertFalse(status["critical_paths_degraded"])
-        self.assertEqual(self.service.audit("owner")[-1]["action"], "critical_degradation_cleared")
+        cleared = self.service.audit("owner")[-1]
+        self.assertEqual((cleared["action"], cleared["target"]),
+                         ("critical_degradation_cleared", "notification"))
         with self.assertRaisesRegex(ValueError, "no expired critical degradation"):
             self.service.clear_expired_degradation("owner", "notification", now=later, clock_trusted=True)
 
@@ -727,6 +729,44 @@ class PresenceTests(unittest.TestCase):
         self.service.record(observation(identifier=UUID(int=41)),
                             presence_valid_until=NOW + timedelta(hours=1))
         self.assertEqual(self.status()["basis"], "hint")
+
+    def test_stale_callback_cannot_cancel_an_owner_requeued_attempt(self):
+        callbacks = []
+
+        def queueing(item, complete):
+            callbacks.append(complete)
+            return ActionResult.QUEUED
+
+        service = self.make_service(evidence=queueing, notifications=None)
+        event = service.record(observation(Kind.SERVER_MOVEMENT, identifier=UUID(int=71)))
+        service.dispatch_pending()
+        self.assertEqual(len(callbacks), 1)
+        service.requeue_action("owner", event.identifier, "evidence", now=NOW, clock_trusted=True)
+        # The first attempt's callback arrives after the Owner requeue and must
+        # not cancel the approved resubmission.
+        callbacks[0](ActionResult.FAILED)
+        service.dispatch_pending()
+        self.assertEqual(len(callbacks), 2)
+        # A stale callback also cannot overwrite the newer attempt's outcome.
+        callbacks[0](ActionResult.FAILED)
+        callbacks[1](ActionResult.DELIVERED)
+        status = service.snapshot(now=NOW, clock_trusted=True)
+        self.assertEqual(status["critical_evidence"], "armed")
+        self.assertEqual(status["pending_critical_actions"], 1)  # notification port absent
+
+    def test_owner_recovery_audit_names_the_recovered_target(self):
+        first = self.service.record(observation(Kind.SERVER_MOVEMENT, identifier=UUID(int=81)))
+        second = self.service.record(observation(Kind.CAMERA_TAMPER, identifier=UUID(int=82)))
+        for event in (first, second):
+            self.service.complete_action(event.identifier, "notification", ActionResult.FAILED)
+            self.service.requeue_action("owner", event.identifier, "notification",
+                                        now=NOW, clock_trusted=True)
+        entries = [row for row in self.service.audit("owner")
+                   if row["action"] == "critical_action_requeued"]
+        # The audit distinguishes which duplicate-risk resubmission was approved.
+        self.assertEqual([row["target"] for row in entries],
+                         [f"notification:{first.identifier}", f"notification:{second.identifier}"])
+        self.assertTrue(all(row["actor"] == str(OWNER) for row in entries))
 
     def test_owner_requeued_action_leads_fresh_zero_attempt_work(self):
         def failing(item, complete):

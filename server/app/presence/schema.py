@@ -16,8 +16,11 @@ def presence_migration(version: int) -> Migration:
         "observed TEXT NOT NULL, valid_until TEXT NOT NULL, observation TEXT)",
         "CREATE TABLE presence_override (singleton INTEGER PRIMARY KEY CHECK(singleton=1), "
         "state TEXT NOT NULL, actor TEXT NOT NULL, started TEXT NOT NULL, expires TEXT)",
+        # `target` names the logical object an Owner operation acted on, such as
+        # the critical action and event identity of an approved resubmission. It
+        # holds no observation content.
         "CREATE TABLE presence_audit (sequence INTEGER PRIMARY KEY AUTOINCREMENT, "
-        "action TEXT NOT NULL, actor TEXT, at TEXT NOT NULL, state TEXT)",
+        "action TEXT NOT NULL, actor TEXT, at TEXT NOT NULL, state TEXT, target TEXT)",
         "CREATE INDEX presence_audit_time ON presence_audit(at, sequence)",
         "CREATE TABLE presence_clock (singleton INTEGER PRIMARY KEY CHECK(singleton=1), latest TEXT NOT NULL)",
         # Owner-control time is tracked apart from source observation time, so a
@@ -27,9 +30,12 @@ def presence_migration(version: int) -> Migration:
         "CREATE TABLE presence_source_clock (source TEXT PRIMARY KEY, latest_occurred TEXT NOT NULL)",
         # `requeued` marks work an Owner explicitly recovered, so its retained
         # attempt count cannot push it behind an endless stream of fresh jobs.
+        # `generation` identifies the claim a completion callback belongs to, so
+        # a callback from a superseded attempt cannot overwrite a newer one.
         "CREATE TABLE presence_deliveries (observation TEXT REFERENCES presence_observations(id), "
         "action TEXT NOT NULL, state TEXT NOT NULL, attempts INTEGER NOT NULL, "
-        "requeued INTEGER NOT NULL DEFAULT 0 CHECK(requeued IN (0,1)), PRIMARY KEY(observation, action))",
+        "requeued INTEGER NOT NULL DEFAULT 0 CHECK(requeued IN (0,1)), "
+        "generation INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(observation, action))",
         "CREATE TABLE presence_delivery_fairness (singleton INTEGER PRIMARY KEY CHECK(singleton=1), "
         "next_state TEXT NOT NULL CHECK(next_state IN ('pending','unavailable')))",
         # Identity-only tombstones for completed critical events whose timeline

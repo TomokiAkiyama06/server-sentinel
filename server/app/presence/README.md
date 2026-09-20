@@ -58,7 +58,13 @@ work is recovered only through `requeue_action()`, an audited Owner decision
 that accepts the risk of a duplicate preservation or notification. A requeued
 job keeps its attempt count for diagnostics but is dispatched ahead of fresh
 zero-attempt work, so a continuous stream of new events cannot starve the
-action an Owner explicitly recovered. An expired
+action an Owner explicitly recovered. Each Owner recovery is audited with the
+action and event identity it approved.
+
+Every claim carries a generation, and a completion callback only resolves the
+attempt it belongs to. A callback from a superseded attempt, including one that
+arrives after an Owner requeue, is therefore ignored instead of cancelling the
+approved resubmission or overwriting a newer attempt's outcome. An expired
 degradation marker is cleared the same way, through `clear_expired_degradation()`,
 never automatically.
 

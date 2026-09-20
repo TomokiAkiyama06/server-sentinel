@@ -235,15 +235,30 @@ class PresenceService:
                                (str(observation.identifier), action))
         return observation
 
-    def complete_action(self, identifier, action, result):
+    def complete_action(self, identifier, action, result, *, generation=None):
+        """Record the outcome of one critical delivery attempt.
+
+        `generation` binds the completion to the claim that produced the
+        callback. A callback from a superseded attempt, such as one arriving
+        after an Owner requeue or after a later claim, is then ignored instead
+        of cancelling the resubmission or overwriting a newer outcome.
+        Completing without a generation stays available for an operator who
+        resolves a stranded action deliberately and out of band.
+        """
         if not isinstance(identifier, UUID) or action not in {"evidence", "notification"}:
             raise ValueError("invalid action identity")
         if not isinstance(result, ActionResult):
             raise ValueError("explicit delivery result required")
+        if generation is not None and type(generation) is not int:
+            raise ValueError("invalid delivery generation")
         with self._transaction() as db:
             # A later failure cannot erase an already confirmed completion.
+            scope = "" if generation is None else " AND generation=?"
+            arguments = [result.value, str(identifier), action]
+            if generation is not None:
+                arguments.append(generation)
             db.execute("UPDATE presence_deliveries SET state=? WHERE observation=? AND action=? "
-                       "AND state!='delivered'", (result.value, str(identifier), action))
+                       "AND state!='delivered'" + scope, tuple(arguments))
 
     def requeue_action(self, context, identifier, action, *, now, clock_trusted):
         """Owner-approved resubmission of an unresolved critical action.
@@ -266,11 +281,15 @@ class PresenceService:
                 raise ValueError("no unresolved critical action")
             # The retained attempt count would otherwise sort this recovered
             # action behind every fresh zero-attempt job, so an explicit Owner
-            # recovery leads the queue instead of being starved by new work.
-            db.execute("UPDATE presence_deliveries SET state='pending',requeued=1 "
-                       "WHERE observation=? AND action=?", (str(identifier), action))
-            db.execute("INSERT INTO presence_audit(action,actor,at,state) "
-                       "VALUES ('critical_action_requeued',?,?,NULL)", (actor, timestamp(now)))
+            # recovery leads the queue instead of being starved by new work. The
+            # new generation retires callbacks from the superseded attempt.
+            db.execute("UPDATE presence_deliveries SET state='pending',requeued=1,"
+                       "generation=generation+1 WHERE observation=? AND action=?",
+                       (str(identifier), action))
+            # The audit names which duplicate-risk resubmission was approved.
+            db.execute("INSERT INTO presence_audit(action,actor,at,state,target) "
+                       "VALUES ('critical_action_requeued',?,?,NULL,?)",
+                       (actor, timestamp(now), f"{action}:{identifier}"))
         return action
 
     def clear_expired_degradation(self, context, action, *, now, clock_trusted):
@@ -289,8 +308,9 @@ class PresenceService:
             cursor = db.execute("DELETE FROM presence_expired_unresolved WHERE action=?", (action,))
             if not cursor.rowcount:
                 raise ValueError("no expired critical degradation")
-            db.execute("INSERT INTO presence_audit(action,actor,at,state) "
-                       "VALUES ('critical_degradation_cleared',?,?,NULL)", (actor, timestamp(now)))
+            db.execute("INSERT INTO presence_audit(action,actor,at,state,target) "
+                       "VALUES ('critical_degradation_cleared',?,?,NULL,?)",
+                       (actor, timestamp(now), action))
 
     def dispatch_pending(self, *, limit=100):
         if type(limit) is not int or not 1 <= limit <= 500:
@@ -347,10 +367,13 @@ class PresenceService:
                     continue
                 payload = db.execute("SELECT payload FROM presence_observations WHERE id=?", (row["observation"],)).fetchone()[0]
                 observation = Observation.from_payload(json.loads(payload))
-                db.execute("UPDATE presence_deliveries SET state='submitting',attempts=attempts+1 "
-                           "WHERE observation=? AND action=?", tuple(row))
-            def complete(result, identifier=observation.identifier, action=row["action"]):
-                self.complete_action(identifier, action, result)
+                # Each claim gets its own generation, so a callback can only
+                # complete the attempt it belongs to.
+                claim = job["generation"] + 1
+                db.execute("UPDATE presence_deliveries SET state='submitting',attempts=attempts+1,"
+                           "generation=? WHERE observation=? AND action=?", (claim, *row))
+            def complete(result, identifier=observation.identifier, action=row["action"], claim=claim):
+                self.complete_action(identifier, action, result, generation=claim)
             try:
                 result = port(observation, complete)
                 if not isinstance(result, ActionResult):
@@ -358,9 +381,11 @@ class PresenceService:
             except Exception:
                 result = ActionResult.UNCERTAIN
             with self._transaction() as db:
-                # Synchronous callbacks may already have completed the job.
+                # Synchronous callbacks may already have completed the job, and
+                # a later claim or an Owner requeue supersedes this one.
                 db.execute("UPDATE presence_deliveries SET state=? WHERE observation=? AND action=? "
-                           "AND state='submitting'", (result.value, row["observation"], row["action"]))
+                           "AND state='submitting' AND generation=?",
+                           (result.value, row["observation"], row["action"], claim))
 
     def process_critical(self, detector):
         """Run the supplied critical detector in every presence state."""
