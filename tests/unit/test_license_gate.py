@@ -111,10 +111,10 @@ class LicenseGateTests(unittest.TestCase):
                 with self.assertRaises(license_gate.GateError):
                     license_gate.audit(self.root)
 
-    def test_nonallowlisted_licenses_require_exact_owner_approval(self):
+    def test_blocked_families_require_exact_owner_approval(self):
         for blocked in ("AGPL-3.0-only", "GPL-3.0-only", "SSPL-1.0", "BUSL-1.1",
-                        "source-available-custom", "unclear", "Proprietary",
-                        "Elastic-2.0", "Commons-Clause", "LicenseRef-Unknown"):
+                        "source-available-custom", "unclear", "Proprietary", "Elastic-2.0",
+                        "Commons-Clause", "Custom-Permissive-Sounding"):
             with self.subTest(license=blocked):
                 self.components = [self.component(license=blocked)]
                 self.approvals = []
@@ -231,26 +231,78 @@ class LicenseGateTests(unittest.TestCase):
                 with self.assertRaises(license_gate.GateError):
                     license_gate.audit(self.root)
 
-    def test_requirement_include_is_rejected_before_nested_package_can_bypass_inventory(self):
-        self.write("vendor.lock", "unreviewed==9.9.9 --hash=sha256:" + "b" * 64 + "\n")
-        self.write("requirements.lock", "-r vendor.lock\n")
-        with self.assertRaisesRegex(license_gate.GateError, "include is not a reviewed input"):
-            license_gate.audit(self.root)
-
     def test_unknown_dependency_ecosystem_fails_closed(self):
         self.write("transport/Cargo.lock", "# synthetic lock\n")
         with self.assertRaisesRegex(license_gate.GateError, "reviewed parser"):
             license_gate.audit(self.root)
 
+    def test_nested_requirement_dependency_is_recursively_audited(self):
+        self.write("requirements.lock", "-r requirements-nested.lock\n")
+        self.write("requirements-nested.lock", "nested==9.8.7 --hash=sha256:" + "c" * 64 + "\n")
+        self.inputs.append({
+            "path": "requirements-nested.lock",
+            "ecosystem": "python-requirements",
+            "scope": "backend",
+        })
+        self.pins = [{
+            "path": "requirements-nested.lock",
+            "ecosystem": "python-requirements",
+            "name": "nested",
+            "version": "9.8.7",
+            "digests": ["sha256:" + "c" * 64],
+        }]
+        self.save()
+        with self.assertRaisesRegex(license_gate.GateError, "locked dependencies differ"):
+            license_gate.audit(self.root)
+
+    def test_remote_unreviewed_and_cyclic_requirement_includes_fail(self):
+        for directive in ("-r https://example.test/requirements.txt\n", "-r ../outside.lock\n"):
+            with self.subTest(directive=directive.strip()):
+                self.write("requirements.lock", directive)
+                with self.assertRaises(license_gate.GateError):
+                    license_gate.audit(self.root)
+
+        self.write("requirements.lock", "-r requirements-other.lock\n")
+        self.write("requirements-other.lock", "-r requirements.lock\n")
+        self.inputs.append({
+            "path": "requirements-other.lock",
+            "ecosystem": "python-requirements",
+            "scope": "backend",
+        })
+        self.pins = []
+        self.save()
+        with self.assertRaisesRegex(license_gate.GateError, "include cycle"):
+            license_gate.audit(self.root)
+
     def test_model_roots_scan_zip_h5_and_extensionless_files(self):
         paths = {
             "server/assets/models/archive.zip",
+            "server/assets/models/manifest.json",
             "agent/runtime/weights/owner.h5",
             "checkpoints/person-v1",
         }
         for path in paths:
             self.write(path, b"synthetic artifact")
         self.assertEqual(set(license_gate.model_files(self.root)), paths)
+        with self.assertRaisesRegex(license_gate.GateError, "model artifact set differs"):
+            license_gate.audit(self.root)
+
+    def test_tracked_build_and_dist_model_artifacts_are_not_excluded(self):
+        paths = {"build/opaque-model.zip", "dist/opaque-weight.binpack"}
+        for path in paths:
+            self.write(path, b"synthetic committed model output")
+        self.write("build/app.js", "console.log('synthetic reviewed static output');\n")
+        self.write("dist/worker.wasm", b"\x00asm synthetic web worker")
+        subprocess.run(["git", "-C", str(self.root), "init", "--quiet"], check=True)
+        subprocess.run(["git", "-C", str(self.root), "add", *sorted(paths)], check=True)
+        tracked = subprocess.run(
+            ["git", "-C", str(self.root), "ls-files"], check=True,
+            stdout=subprocess.PIPE, text=True,
+        ).stdout.splitlines()
+        self.assertEqual(set(tracked), paths)
+        self.assertEqual(set(license_gate.model_files(self.root)), paths)
+        self.assertNotIn("dist/worker.wasm", license_gate.model_files(self.root))
+        self.assertEqual(repository_guard.audit(self.root), [])
         with self.assertRaisesRegex(license_gate.GateError, "model artifact set differs"):
             license_gate.audit(self.root)
 
@@ -345,15 +397,6 @@ class LicenseGateTests(unittest.TestCase):
         self.assertEqual(repository_guard.audit(self.root), [])
         self.assertIn(path, license_gate.model_files(self.root))
         self.assertNotIn(ordinary, license_gate.model_files(self.root))
-        with self.assertRaisesRegex(license_gate.GateError, "model artifact set differs"):
-            license_gate.audit(self.root)
-
-    def test_ci_rejects_tracked_model_artifact_under_build_or_dist(self):
-        path = "build/models/person.onnx"
-        self.write(path, b"synthetic opaque model")
-        subprocess.run(["git", "-C", str(self.root), "init", "--quiet"], check=True)
-        subprocess.run(["git", "-C", str(self.root), "add", "."], check=True)
-        self.assertIn(path, license_gate.model_files(self.root))
         with self.assertRaisesRegex(license_gate.GateError, "model artifact set differs"):
             license_gate.audit(self.root)
 

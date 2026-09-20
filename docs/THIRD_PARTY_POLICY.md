@@ -133,3 +133,14 @@ Blocked-by-default licenses require an exact record in
 component version, license, date, `repository-owner` approver, and a committed
 Owner decision under `docs/decisions/`. CI rejects stale, missing, mismatched,
 or unused approval records.
+
+Requirements `-r` and `-c` includes are recursively covered: each target must be
+a separate reviewed repository input, paths may not escape or use a remote URL,
+and cycles fail. The permissive license set is explicit; unknown free-form,
+proprietary, Elastic, Commons Clause, source-available, and other unlisted terms
+need exact Owner approval rather than being accepted because they do not match a
+known copyleft name. Committed `build/` and `dist/` archives, extensionless
+artifacts, and unknown opaque output types remain in the artifact scan and
+require independent weight evidence and checksum review. Recognized Web/static
+asset suffixes, including `.wasm`, are not classified as model artifacts merely
+because they are in a build output directory.

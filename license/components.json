@@ -57,14 +57,6 @@
       ]
     },
     {
-      "scope": "model_code",
-      "status": "reviewed-empty",
-      "evidence": [
-        "server/app/detection/README.md",
-        "docs/THIRD_PARTY_POLICY.md"
-      ]
-    },
-    {
       "scope": "model_weight",
       "status": "reviewed-empty",
       "evidence": [
@@ -1572,21 +1564,21 @@
       "id": "pypi:onnxruntime@1.28.0",
       "name": "onnxruntime",
       "version": "1.28.0",
-      "kind": "source",
+      "kind": "model_code",
       "upstream": "https://pypi.org/project/onnxruntime/1.28.0/",
       "license": "MIT",
       "license_evidence": [
         "https://pypi.org/pypi/onnxruntime/1.28.0/json",
-        "server/docs/RTDETR_RUNTIME_AUDIT.md",
-        "server/docs/detector-wheel-audit.json"
+        "server/docs/detector-wheel-audit.json",
+        "server/docs/RTDETR_RUNTIME_AUDIT.md"
       ],
       "transitive_evidence": [
-        "server/docs/RTDETR_RUNTIME_AUDIT.md",
-        "server/docs/detector-wheel-audit.json"
+        "server/docs/detector-wheel-audit.json",
+        "server/docs/RTDETR_RUNTIME_AUDIT.md"
       ],
       "obligations": [
         "preserve-license-and-copyright",
-        "preserve-third-party-notices"
+        "preserve-notice"
       ],
       "notice_files": [
         "server/docs/DETECTOR_THIRD_PARTY_LICENSE_TEXTS.md"
@@ -1609,16 +1601,18 @@
       "license": "BSD-3-Clause",
       "license_evidence": [
         "https://pypi.org/pypi/numpy/2.3.5/json",
-        "server/docs/RTDETR_RUNTIME_AUDIT.md",
-        "server/docs/detector-wheel-audit.json"
+        "server/docs/detector-wheel-audit.json",
+        "server/docs/RTDETR_RUNTIME_AUDIT.md"
       ],
       "transitive_evidence": [
-        "server/docs/RTDETR_RUNTIME_AUDIT.md",
-        "server/docs/detector-wheel-audit.json"
+        "server/docs/detector-wheel-audit.json",
+        "server/docs/RTDETR_RUNTIME_AUDIT.md"
       ],
       "obligations": [
         "preserve-license-and-copyright",
-        "preserve-bundled-native-notices-and-source-conditions"
+        "preserve-notice",
+        "provide-corresponding-source",
+        "provide-relinkable-objects"
       ],
       "notice_files": [
         "server/docs/DETECTOR_THIRD_PARTY_LICENSE_TEXTS.md"
@@ -1641,12 +1635,12 @@
       "license": "Apache-2.0",
       "license_evidence": [
         "https://pypi.org/pypi/flatbuffers/25.12.19/json",
-        "server/docs/RTDETR_RUNTIME_AUDIT.md",
-        "server/docs/detector-wheel-audit.json"
+        "server/docs/detector-wheel-audit.json",
+        "server/docs/RTDETR_RUNTIME_AUDIT.md"
       ],
       "transitive_evidence": [
-        "server/docs/RTDETR_RUNTIME_AUDIT.md",
-        "server/docs/detector-wheel-audit.json"
+        "server/docs/detector-wheel-audit.json",
+        "server/docs/RTDETR_RUNTIME_AUDIT.md"
       ],
       "obligations": [
         "preserve-license-and-copyright",
@@ -1673,12 +1667,12 @@
       "license": "Apache-2.0 OR BSD-2-Clause",
       "license_evidence": [
         "https://pypi.org/pypi/packaging/25.0/json",
-        "server/docs/RTDETR_RUNTIME_AUDIT.md",
-        "server/docs/detector-wheel-audit.json"
+        "server/docs/detector-wheel-audit.json",
+        "server/docs/RTDETR_RUNTIME_AUDIT.md"
       ],
       "transitive_evidence": [
-        "server/docs/RTDETR_RUNTIME_AUDIT.md",
-        "server/docs/detector-wheel-audit.json"
+        "server/docs/detector-wheel-audit.json",
+        "server/docs/RTDETR_RUNTIME_AUDIT.md"
       ],
       "obligations": [
         "preserve-license-and-copyright",
@@ -1705,12 +1699,12 @@
       "license": "BSD-3-Clause",
       "license_evidence": [
         "https://pypi.org/pypi/protobuf/6.33.5/json",
-        "server/docs/RTDETR_RUNTIME_AUDIT.md",
-        "server/docs/detector-wheel-audit.json"
+        "server/docs/detector-wheel-audit.json",
+        "server/docs/RTDETR_RUNTIME_AUDIT.md"
       ],
       "transitive_evidence": [
-        "server/docs/RTDETR_RUNTIME_AUDIT.md",
-        "server/docs/detector-wheel-audit.json"
+        "server/docs/detector-wheel-audit.json",
+        "server/docs/RTDETR_RUNTIME_AUDIT.md"
       ],
       "obligations": [
         "preserve-license-and-copyright"

@@ -11,8 +11,8 @@ import binascii
 import datetime
 import hashlib
 import json
+import posixpath
 import re
-import subprocess
 import sys
 import tomllib
 from dataclasses import dataclass
@@ -25,22 +25,22 @@ APPROVALS = "license/owner-approvals.json"
 PINS = "license/pins.json"
 MODEL_DIRECTORIES = {"models", "weights", "checkpoints", "model-artifacts"}
 MODEL_ASSET_PATHS = {("assets", "ml"), ("assets", "ai")}
+BUILD_OUTPUT_DIRECTORIES = {"build", "dist"}
+RECOGNIZED_STATIC_OUTPUT_SUFFIXES = {
+    ".avif", ".cjs", ".css", ".gif", ".html", ".ico", ".jpeg", ".jpg",
+    ".js", ".json", ".license", ".map", ".md", ".mjs", ".otf", ".png",
+    ".svg", ".ttf", ".txt", ".wasm", ".webp", ".woff", ".woff2", ".xml",
+}
 MODEL_SUFFIXES = {
     ".bin", ".ckpt", ".engine", ".h5", ".mlmodel", ".onnx", ".pb", ".pt",
     ".pth", ".safetensors", ".tflite", ".weights",
 }
 REQUIRED_SCOPE_REVIEWS = {"transport", "model_code", "model_weight"}
-# This is deliberately a small exact SPDX policy.  A nonempty free-form
-# string is not license evidence: new expressions, source-available terms and
-# ambiguous identifiers all require an exact Owner decision before admission.
-PERMISSIVE_LICENSES = frozenset({
-    "Apache-2.0",
-    "Apache-2.0 OR BSD-2-Clause",
-    "BSD-2-Clause",
-    "BSD-3-Clause",
-    "MIT",
-    "PSF-2.0",
-})
+PERMISSIVE_LICENSES = {
+    "0BSD", "Apache-2.0", "Apache-2.0 OR BSD-2-Clause", "BSD-2-Clause",
+    "BSD-3-Clause", "ISC", "MIT", "PSF-2.0", "Python-2.0", "Unicode-3.0",
+    "Unicode-DFS-2016", "Zlib",
+}
 PACKAGE = re.compile(r"^([A-Za-z0-9_.-]+)==([^\s\\]+)")
 HASH = re.compile(r"--hash=sha256:([0-9a-f]{64})")
 SAFE_ID = re.compile(r"[a-z0-9][a-z0-9._@/+:-]*")
@@ -145,32 +145,33 @@ def model_like_path(value):
     )
 
 
-def python_lock(path: Path, relative: str, scope: str, *, root=None, input_paths=None):
+def opaque_build_output(value):
+    path = PurePosixPath(value)
+    return (bool(set(path.parts[:-1]) & BUILD_OUTPUT_DIRECTORIES)
+            and path.suffix.lower() not in RECOGNIZED_STATIC_OUTPUT_SUFFIXES)
+
+
+def python_lock(path: Path, relative: str, scope: str):
     text = path.read_text(encoding="utf-8")
     logical = text.replace("\\\n", " ").splitlines()
     found = []
     pins = []
+    includes = []
     for line in logical:
         line = line.strip()
         if not line or line.startswith("#"):
             continue
-        # Included requirements must be registered as their own reviewed input,
-        # where the normal inventory pass parses their exact pins.  This also
-        # handles nested includes: every included path receives the same check
-        # when its own input is parsed.
-        include = re.fullmatch(r"(?:-r|--requirement)(?:[ \t]+|=)(\S+)", line)
-        if include:
-            if root is None or input_paths is None:
-                raise GateError(f"requirement include is not a reviewed input in {relative}")
-            nested = relative_path(
-                (PurePosixPath(relative).parent / include.group(1)).as_posix(),
-                field="included requirement path",
-            )
-            if nested not in input_paths or not (root / nested).is_file():
-                raise GateError(f"requirement include is not a reviewed input in {relative}")
+        directive = re.fullmatch(r"(?:-r|--requirement|-c|--constraint)\s+(\S+)", line)
+        if directive:
+            raw_target = directive.group(1)
+            if "://" in raw_target or "\\" in raw_target or PurePosixPath(raw_target).is_absolute():
+                raise GateError(f"unsafe requirement include in {relative}")
+            target = posixpath.normpath(str(PurePosixPath(relative).parent / raw_target))
+            relative_path(target, field="requirement include")
+            includes.append(target)
             continue
         if line.startswith(("-r", "--requirement", "-c", "--constraint")):
-            raise GateError(f"requirement directive is not supported in {relative}")
+            raise GateError(f"invalid requirement include in {relative}")
         match = PACKAGE.match(line)
         if not match:
             raise GateError(f"unparsed or unpinned requirement in {relative}")
@@ -182,7 +183,7 @@ def python_lock(path: Path, relative: str, scope: str, *, root=None, input_paths
         pins.append(LockedPin(relative, "python-requirements",
                               match.group(1).lower().replace("_", "-"), match.group(2),
                               tuple(sorted("sha256:" + value for value in hashes))))
-    return found, pins
+    return found, pins, includes
 
 
 def npm_lock(path: Path, relative: str, scope: str):
@@ -247,36 +248,17 @@ def npm_project(path: Path, relative: str, scope: str):
 def model_files(root: Path):
     found = set()
     excluded = {".git", ".venv", "node_modules", "__pycache__"}
-    try:
-        tracked = subprocess.run(
-            ("git", "-C", str(root), "ls-files", "-z"),
-            check=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-        ).stdout.split(b"\0")
-        tracked_paths = {
-            relative_path(value.decode("utf-8", errors="strict"), field="tracked path")
-            for value in tracked if value
-        }
-    except (OSError, UnicodeError, subprocess.SubprocessError, GateError):
-        # Unit fixtures are not necessarily Git worktrees.  CI always is; in
-        # that environment this fallback is unreachable and cannot hide a
-        # committed build/dist artifact.
-        tracked_paths = None
     for path in sorted(root.rglob("*")):
         relative = path.relative_to(root)
         if set(relative.parts) & excluded:
             continue
-        relative_text = relative.as_posix()
-        # Generated build trees may exist locally.  A committed model artifact
-        # in either tree remains release input and must be inventoried.
-        if (set(relative.parts) & {"build", "dist"}
-                and tracked_paths is not None and relative_text not in tracked_paths):
-            continue
-        in_model_directory = model_like_path(relative_text)
+        in_model_directory = model_like_path(relative.as_posix())
+        opaque_output = opaque_build_output(relative.as_posix())
         has_model_suffix = path.suffix.lower() in MODEL_SUFFIXES
-        if path.is_symlink() and (in_model_directory or has_model_suffix):
+        if path.is_symlink() and (in_model_directory or opaque_output or has_model_suffix):
             raise GateError("model artifacts must be regular files")
-        if path.is_file() and (in_model_directory or has_model_suffix):
-            found.add(relative_text)
+        if path.is_file() and (in_model_directory or opaque_output or has_model_suffix):
+            found.add(relative.as_posix())
     return sorted(found)
 
 
@@ -346,8 +328,11 @@ def audit(root: Path, inventory_path=INVENTORY):
     inputs = data["inputs"]
     if not isinstance(inputs, list) or not inputs:
         raise GateError("inputs must be nonempty")
-    input_records = []
+    discovered = []
+    discovered_pins = []
+    include_graph = {}
     input_paths = set()
+    input_ecosystems = {}
     for item in inputs:
         if not isinstance(item, dict) or set(item) != {"path", "ecosystem", "scope"}:
             raise GateError("invalid inventory input")
@@ -359,15 +344,12 @@ def audit(root: Path, inventory_path=INVENTORY):
         if relative in input_paths or not (root / relative).is_file():
             raise GateError("duplicate or missing inventory input")
         input_paths.add(relative)
-        input_records.append((relative, ecosystem, scope))
-    discovered = []
-    discovered_pins = []
-    for relative, ecosystem, scope in input_records:
+        input_ecosystems[relative] = ecosystem
         if ecosystem == "python-requirements":
-            components, pins = python_lock(root / relative, relative, scope,
-                                           root=root, input_paths=input_paths)
+            components, pins, includes = python_lock(root / relative, relative, scope)
             discovered.extend(components)
             discovered_pins.extend(pins)
+            include_graph[relative] = includes
         elif ecosystem == "python-project":
             discovered.extend(python_project(root / relative, relative, scope))
         elif ecosystem == "npm-project":
@@ -393,6 +375,26 @@ def audit(root: Path, inventory_path=INVENTORY):
         raise GateError("unsupported dependency manifest requires a reviewed parser")
     if tracked_inputs != input_paths:
         raise GateError("dependency input set differs from reviewed inventory")
+    for source, targets in include_graph.items():
+        for target in targets:
+            if target not in input_paths or input_ecosystems[target] != "python-requirements":
+                raise GateError(f"requirement include is not a reviewed input: {source}")
+    visiting = set()
+    visited = set()
+
+    def visit(path):
+        if path in visiting:
+            raise GateError("requirement include cycle")
+        if path in visited:
+            return
+        visiting.add(path)
+        for target in include_graph.get(path, []):
+            visit(target)
+        visiting.remove(path)
+        visited.add(path)
+
+    for path in include_graph:
+        visit(path)
     if sorted(discovered_pins) != sorted(reviewed_pins(root)):
         raise GateError("lock digests differ from reviewed pinning evidence")
 
@@ -449,7 +451,7 @@ def audit(root: Path, inventory_path=INVENTORY):
             approval = approvals.get(component_id)
             expected = (version, license_name)
             if approval is None or (approval["version"], approval["license"]) != expected:
-                raise GateError(f"non-permissive license lacks exact owner approval: {component_id}")
+                raise GateError(f"blocked license lacks exact owner approval: {component_id}")
             if re.search(r"(?:^|[^A-Z])A?GPL(?:[^A-Z]|$)", license_name, re.IGNORECASE):
                 if "provide-corresponding-source" not in obligations:
                     raise GateError("GPL-family corresponding-source obligation is required")
