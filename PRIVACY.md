@@ -25,6 +25,15 @@ There is no required ServerSentinel developer cloud/account/data plane.
 
 ## Developer data collection
 
+The Agent disk-ring core keeps segment bytes and its interval/protection ledger
+on deployment-configured local storage. It introduces no network client, remote
+reporting or media export. Completed incident protection expires after 60 days; media is removed when no
+other incident or selected ordinary-ring reference retains it.
+clock uncertainty suspends automatic deletion and is reported explicitly.
+Deleted-incident tombstones expose deletion state to the future authorized UI;
+the core does not enable that UI or a playback/download route. Synthetic tests
+use generated compressed patterns, not real camera/room/person media.
+
 The internal recording store writes compressed media and source/event/integrity
 metadata only to deployment-local storage. It has no network client, telemetry,
 codec download or export endpoint. Tests generate compressed non-video bytes in
