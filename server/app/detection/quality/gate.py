@@ -6,7 +6,7 @@ from uuid import UUID
 from app.detection.foundation import Detection, GrayFrame, Observation, Quality, Reason
 from .contracts import (
     DetectorQualityPolicy, Execution, FrameIdentity, QualityContext, QualityDecision,
-    QualityFinding, QualityReason,
+    QualityFinding, QualityReason, ResultSink, unavailable_reason,
 )
 from .metrics import MeasurementUnavailable, measure
 
@@ -17,13 +17,21 @@ class QualityGate:
     Poor/missing evidence takes effect immediately. Only consecutive, in-order
     good frames in the same stream and geometry can recover a gate. Decisions
     contain measurements/identities, and retain no frame or pixel buffer.
+
+    Immediacy covers the already published result, not only the next one.
+    Register the detector's `ResultSink` so that a stop, a failure, a pending
+    recovery or an unusable frame revokes an earlier `present`/`absent` at
+    once, instead of leaving it readable until its observation age expires.
     """
 
-    def __init__(self, source_id: UUID, policy: DetectorQualityPolicy):
-        if not isinstance(source_id, UUID) or not isinstance(policy, DetectorQualityPolicy):
+    def __init__(self, source_id: UUID, policy: DetectorQualityPolicy, *,
+                 results: ResultSink | None = None):
+        if (not isinstance(source_id, UUID) or not isinstance(policy, DetectorQualityPolicy)
+                or (results is not None and not callable(getattr(results, "invalidate", None)))):
             raise ValueError("invalid quality gate registration")
         self._source_id = source_id
         self._policy = policy
+        self._results = results
         self._stream = None
         self._sequence = -1
         self._shape = None
@@ -50,7 +58,12 @@ class QualityGate:
             raise ValueError("invalid quality assessment input")
         with self._lock:
             self._latest = self._assess(frame, execution, context)
-            return self._latest
+            decision = self._latest
+        if not decision.allows_conclusion:
+            # Degraded, recovering, unusable or unavailable evidence revokes the
+            # published conclusion now; it never waits for the next result.
+            self._revoke(self._reason(execution))
+        return decision
 
     def _assess(self, frame, execution, context):
         if frame.source_id != self.source_id:
@@ -109,21 +122,54 @@ class QualityGate:
             self._good = 0
         return self._decision(frame, quality, findings, metrics)
 
-    def invalidate(self, *, execution: Execution) -> None:
-        """Invalidate on worker stop/failure even when no new frame arrives."""
+    def invalidate(self, *, execution: Execution) -> Detection:
+        """Fail unknown on worker stop/failure even when no new frame arrives.
+
+        Returns the unknown result the caller must publish, and revokes the
+        registered sink's published conclusion so that no trustworthy
+        `present`/`absent` survives a detector that is no longer running.
+        """
         if not isinstance(execution, Execution) or execution in (Execution.READY, Execution.SUCCEEDED):
             raise ValueError("quality invalidation requires unavailable execution")
+        reason = unavailable_reason(execution)
         with self._lock:
             self._good = 0
             self._latest = None
+        self._revoke(reason)
+        return Detection(Observation.UNKNOWN, reason)
 
     def guard_result(self, decision: QualityDecision, result: Detection | None, *, execution: Execution,
                      frame: FrameIdentity) -> Detection:
-        """Only the latest assessment may authorize this detector's conclusion."""
+        """Only the latest assessment may authorize this detector's conclusion.
+
+        An incomplete batch is also a stop for this gate: unavailable execution
+        drops the latest assessment and revokes the published conclusion, so a
+        later replay of the same assessment cannot resurrect it.
+        """
+        unavailable = isinstance(execution, Execution) and execution not in (
+            Execution.READY, Execution.SUCCEEDED)
         with self._lock:
-            if decision is not self._latest:
-                return Detection(Observation.UNKNOWN, Reason.STALE)
-            return _guard_result(decision, result, execution=execution, frame=frame)
+            latest = self._latest
+            if unavailable:
+                self._good, self._latest = 0, None
+            if decision is not latest:
+                guarded = Detection(Observation.UNKNOWN, Reason.STALE)
+            else:
+                guarded = _guard_result(decision, result, execution=execution, frame=frame)
+        if unavailable:
+            self._revoke(unavailable_reason(execution))
+        return guarded
+
+    @staticmethod
+    def _reason(execution: Execution) -> Reason:
+        if execution in (Execution.READY, Execution.SUCCEEDED):
+            return Reason.QUALITY
+        return unavailable_reason(execution)
+
+    def _revoke(self, reason: Reason) -> None:
+        """Publish unknown through the result owner; never publish a conclusion."""
+        if self._results is not None:
+            self._results.invalidate(self.source_id, reason=reason)
 
 
 def _guard_result(decision: QualityDecision, result: Detection | None, *, execution: Execution,

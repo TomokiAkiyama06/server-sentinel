@@ -206,6 +206,112 @@ class DetectorFoundationTests(unittest.TestCase):
         self.assertFalse(result.pending)
         self.assertEqual(result.result.reason, Reason.RESOURCE_LIMIT)
 
+    def test_oversize_frame_advances_stream_and_sequence_watermarks(self):
+        self.register()
+        self.assertTrue(self.offer(frame(0)))
+        self.scheduler.run_one()
+        replacement = UUID(int=99)
+        self.clock.value = 10
+        self.assertFalse(self.offer(frame(10, stream=replacement, width=5)))
+        self.assertEqual(replacement, self.scheduler.snapshot(SOURCE).stream_id)
+        self.assertFalse(self.offer(frame(9, stream=replacement)))
+        self.assertFalse(self.offer(frame(1)))
+
+    def test_bounded_retired_stream_history_rejects_older_generation(self):
+        self.register()
+        stream_b, stream_c = UUID(int=11), UUID(int=12)
+        self.offer(frame())
+        self.scheduler.run_one()
+        self.clock.value = 10
+        self.offer(frame(0, stream=stream_b))
+        self.scheduler.run_one()
+        self.clock.value = 20
+        self.offer(frame(0, stream=stream_c))
+        self.scheduler.run_one()
+        self.clock.value = 30
+        self.assertFalse(self.offer(frame(1)))
+        result = self.scheduler.snapshot(SOURCE)
+        self.assertEqual((result.stream_id, result.sequence), (stream_c, 0))
+        self.assertEqual(result.result.reason, Reason.EVALUATED)
+
+    def test_retired_stream_rejection_preserves_current_pending_and_inflight(self):
+        replacement = UUID(int=11)
+        self.register()
+        self.offer(frame())
+        self.scheduler.run_one()
+        self.clock.value = 10
+        self.assertTrue(self.offer(frame(0, stream=replacement)))
+        self.assertFalse(self.offer(frame(1)))
+        self.assertTrue(self.scheduler.snapshot(SOURCE).pending)
+        self.assertEqual(self.scheduler.run_one().stream_id, replacement)
+
+        started, release = threading.Event(), threading.Event()
+
+        def blocking(sample):
+            if sample.sequence == 1:
+                started.set()
+                if not release.wait(2):
+                    raise RuntimeError("test worker deadline")
+            return Detection(Observation.ABSENT, Reason.EVALUATED)
+
+        scheduler = InferenceScheduler(clock_ns=self.clock)
+        scheduler.register(SOURCE, StubDetector(blocking), POLICY)
+        scheduler.offer(frame(), quality=Quality.SUFFICIENT)
+        scheduler.run_one()
+        self.clock.value = 20
+        scheduler.offer(frame(0, stream=replacement), quality=Quality.SUFFICIENT)
+        scheduler.run_one()
+        self.clock.value = 30
+        scheduler.offer(frame(1, stream=replacement), quality=Quality.SUFFICIENT)
+        results = []
+        worker = threading.Thread(target=lambda: results.append(scheduler.run_one()))
+        worker.start()
+        try:
+            self.assertTrue(started.wait(2))
+            self.assertFalse(scheduler.offer(frame(1), quality=Quality.SUFFICIENT))
+        finally:
+            release.set()
+            worker.join(2)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual((results[0].stream_id, results[0].sequence), (replacement, 1))
+
+    def test_backward_sequence_rejection_preserves_pending_and_inflight(self):
+        self.register()
+        self.offer(frame())
+        self.scheduler.run_one()
+        self.clock.value = 10
+        self.assertTrue(self.offer(frame(1)))
+        self.assertFalse(self.offer(frame()))
+        self.assertTrue(self.scheduler.snapshot(SOURCE).pending)
+        self.assertEqual(self.scheduler.run_one().sequence, 1)
+
+        started, release = threading.Event(), threading.Event()
+
+        def blocking(sample):
+            if sample.sequence == 2:
+                started.set()
+                if not release.wait(2):
+                    raise RuntimeError("test worker deadline")
+            return Detection(Observation.ABSENT, Reason.EVALUATED)
+
+        scheduler = InferenceScheduler(clock_ns=self.clock)
+        scheduler.register(SOURCE, StubDetector(blocking), POLICY)
+        scheduler.offer(frame(), quality=Quality.SUFFICIENT)
+        scheduler.run_one()
+        self.clock.value = 20
+        scheduler.offer(frame(2), quality=Quality.SUFFICIENT)
+        results = []
+        worker = threading.Thread(target=lambda: results.append(scheduler.run_one()))
+        worker.start()
+        try:
+            self.assertTrue(started.wait(2))
+            self.assertFalse(scheduler.offer(frame(1), quality=Quality.SUFFICIENT))
+        finally:
+            release.set()
+            worker.join(2)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(results[0].sequence, 2)
+
     def test_late_result_becomes_unknown_and_throttles(self):
         def slow(_sample):
             self.clock.value += 21
@@ -294,6 +400,35 @@ class DetectorFoundationTests(unittest.TestCase):
             worker.join(2)
         self.assertFalse(worker.is_alive())
         self.assertEqual(results[0].result.reason, Reason.DROPPED)
+
+    def test_expired_published_result_does_not_cancel_fresh_inflight_evaluation(self):
+        started, release = threading.Event(), threading.Event()
+        def evaluate(sample):
+            if sample.sequence == 1:
+                started.set()
+                if not release.wait(2):
+                    raise RuntimeError("test worker deadline")
+            return Detection(Observation.ABSENT, Reason.EVALUATED)
+        self.register(StubDetector(evaluate))
+        self.offer(frame())
+        self.scheduler.run_one()
+        self.clock.value = 90
+        self.offer(frame(1))
+        results = []
+        worker = threading.Thread(target=lambda: results.append(self.scheduler.run_one()))
+        worker.start()
+        try:
+            self.assertTrue(started.wait(2))
+            self.clock.value = 101
+            self.assertEqual(self.scheduler.snapshot(SOURCE).result.reason, Reason.STALE)
+            self.clock.value = 105
+        finally:
+            release.set()
+            worker.join(2)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(results[0].result.observation, Observation.ABSENT)
+        self.assertEqual((results[0].received_at_ns, results[0].evaluated_at_ns), (90, 105))
+        self.assertEqual(self.scheduler.snapshot(SOURCE).result.observation, Observation.ABSENT)
 
     def test_baseline_and_failure_make_no_network_attempts(self):
         with patch.object(socket, "socket", side_effect=AssertionError("network attempted")) as network:

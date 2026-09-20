@@ -4,6 +4,7 @@ Capture calls offer(), which never calls a detector. A dedicated inference
 worker calls run_one(); it must not run on capture/recording/health threads.
 """
 
+from collections import deque
 from dataclasses import dataclass, field
 import threading
 import time
@@ -12,6 +13,8 @@ from uuid import UUID
 
 from .contracts import (Detection, Detector, DetectorKind, GrayFrame, Health,
                         Observation, Quality, Reason, positive_integer)
+
+_RETIRED_STREAM_HISTORY = 4
 
 
 @dataclass(frozen=True)
@@ -63,6 +66,8 @@ class _Source:
     cadence_ns: int
     pending: _Pending | None = None
     stream_id: UUID | None = None
+    retired_stream_ids: deque[UUID] = field(
+        default_factory=lambda: deque(maxlen=_RETIRED_STREAM_HISTORY))
     sequence: int = -1
     result_sequence: int | None = None
     result: Detection = field(default_factory=lambda: Detection(Observation.UNKNOWN, Reason.NOT_STARTED))
@@ -76,6 +81,7 @@ class _Source:
     processed: int = 0
     epoch: int = 0
     reset_required: bool = True
+    evaluating: bool = False
 
 
 class InferenceScheduler:
@@ -151,23 +157,27 @@ class InferenceScheduler:
         with self._lock:
             now = self._now()
             state = self._sources[frame.source_id]
+            if state.stream_id != frame.stream_id:
+                if frame.stream_id in state.retired_stream_ids:
+                    state.dropped += 1
+                    state.loss_unacknowledged = True
+                    return False
+                state.pending = None
+                if state.stream_id is not None:
+                    state.retired_stream_ids.append(state.stream_id)
+                state.stream_id, state.sequence = frame.stream_id, -1
+                state.next_admission = now
+                self._unknown(state, Reason.DISCONTINUITY)
+            if frame.sequence <= state.sequence:
+                state.dropped += 1
+                state.loss_unacknowledged = True
+                return False
+            state.sequence = frame.sequence
             if frame.width * frame.height > state.policy.maximum_pixels:
                 state.pending = None
                 state.dropped += 1
                 self._overload(state, Reason.RESOURCE_LIMIT, now)
                 return False
-            if state.stream_id != frame.stream_id:
-                state.pending = None
-                state.stream_id, state.sequence = frame.stream_id, -1
-                state.next_admission = now
-                self._unknown(state, Reason.DISCONTINUITY)
-            if frame.sequence <= state.sequence:
-                state.pending = None
-                state.dropped += 1
-                state.loss_unacknowledged = True
-                self._unknown(state, Reason.DISCONTINUITY)
-                return False
-            state.sequence = frame.sequence
             if quality is not Quality.SUFFICIENT:
                 state.pending = None
                 self._unknown(state, Reason.QUALITY)
@@ -188,12 +198,36 @@ class InferenceScheduler:
             state.pending = None
             self._unknown(state, Reason.NOT_STARTED)
 
+    def invalidate(self, source_id: UUID, *, reason: Reason) -> SourceSnapshot | None:
+        """Replace a published conclusion with unknown without a new frame.
+
+        Detector stop/failure and unusable quality must take effect at once;
+        waiting for maximum_observation_age_ns would keep publishing a result
+        that is no longer trustworthy. An unregistered source publishes no
+        snapshot at all, so it has no conclusion left to invalidate.
+        """
+        if (not isinstance(source_id, UUID) or not isinstance(reason, Reason)
+                or reason in (Reason.EVALUATED, Reason.WARMUP)):
+            raise ValueError("invalidation requires an unavailable reason")
+        with self._lock:
+            state = self._sources.get(source_id)
+            if state is None:
+                return None
+            state.pending = None
+            self._unknown(state, reason)
+            return self._snapshot(source_id, state)
+
     def snapshot(self, source_id: UUID) -> SourceSnapshot:
         with self._lock:
             now = self._now()
             state = self._sources[source_id]
             if state.result_ns is not None and now - state.result_ns > state.policy.maximum_observation_age_ns:
-                self._unknown(state, Reason.STALE)
+                # Expire only the published old observation. A fresh in-flight
+                # frame remains eligible unless its own input/quality changes.
+                state.result = Detection(Observation.UNKNOWN, Reason.STALE)
+                state.result_sequence = state.result_ns = state.evaluated_ns = None
+                if not state.evaluating:
+                    state.reset_required = True
             return self._snapshot(source_id, state)
 
     @staticmethod
@@ -247,6 +281,7 @@ class InferenceScheduler:
             epoch, needs_reset = state.epoch, state.reset_required
             state.reset_required = False
             self._running = True
+            state.evaluating = True
         try:
             if needs_reset:
                 state.detector.reset()
@@ -259,9 +294,11 @@ class InferenceScheduler:
         except BaseException:
             with self._lock:
                 self._running = False
+                state.evaluating = False
             raise
         with self._lock:
             self._running = False
+            state.evaluating = False
             finished = self._now()
             state.processed += 1
             if state.epoch != epoch:

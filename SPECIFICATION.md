@@ -217,6 +217,28 @@ When devices reappear:
 
 This rule applies on both the main host and remote capture nodes.
 
+### 4.4 Local adapter implementation boundary
+
+The local adapter stores private approval evidence and a durable ambiguity latch
+in the application database. A live approved weak binding does not constitute
+proof for a subsequent reconnect or process restart. Discovery alone is never
+`online`; successful frame capture is required. The initial implementation uses
+bounded single-planar V4L2 MMAP on Linux x86_64/aarch64, reports the actual
+negotiated dimensions/FPS/FourCC, and requires an explicit capture profile.
+Unsupported multi-planar capture or codec/bitrate controls fail explicitly.
+Source workers, Owner management and the preview frame sink are internal
+interfaces; physical capture is not auto-started by the backend launcher and no
+unauthenticated preview route is added. See `server/app/cameras/uvc/README.md`.
+
+Identity reconciliation starts only after an active-session marker is durable.
+An unclean session, including a failed ambiguity-latch write, requires Owner
+reapproval at restart; it cannot fall back to an older clean approval record.
+Clean shutdown releases this marker after closing capture while retaining any
+manual-approval latch. A missing capture profile does not hide that latch.
+Known duplicated serials remain unsuitable for automatic reconnect even after the current physical
+candidate is explicitly approved. This confidence is stored separately from raw
+device evidence. A different unique serial may establish a new strong identity.
+
 ## 5. `media-capture-agent`
 
 ### 5.1 Purpose
@@ -236,6 +258,14 @@ GUI/tray: none required
 ```
 
 Installation may require `sudo` to install the binary, create the account/unit, and configure narrow device permissions.
+
+The Issue #12 native foundation uses Python 3.12+ standard-library modules under
+`agent/media_capture_agent/`, with an executable zipapp release artifact and an
+explicit systemd installer. Runtime/config/media directories are outside source
+and installation trees. Until approved capture and authenticated transport adapters
+are integrated, the production CLI remains visibly unconfigured and never starts
+unauthenticated network communication. This foundation does not complete physical
+Capture Node acceptance.
 
 ### 5.3 Audio
 
@@ -411,7 +441,7 @@ The Agent media root is a deployment-configured path outside the source tree tha
 
 At install/startup/runtime admission, the Agent shall verify:
 - the configured media root exists or can be created only by the intended installer/owner workflow;
-- it resolves to the expected filesystem/mount identity when an expected device/mount is configured;
+- it resolves to the expected filesystem/mount/device and backing-filesystem-root identity; a narrow systemd namespace bind must map to the approved parent root plus the configured relative media path;
 - sufficient free space and safety reserve remain;
 - it is writable by the dedicated Agent service account;
 - loss/unmount/substitution of the expected media filesystem does **not** silently redirect ring-buffer or incident writes into a directory on the root filesystem.
@@ -453,6 +483,17 @@ For wide room coverage, real-hardware tests should compare at minimum:
 - ring-buffer disk throughput/capacity at candidate capture profiles.
 
 Final defaults are measured, not guessed.
+
+The transport-independent implementation in `server/app/media/profiles/` uses
+explicit immutable profiles, conservative exact-descriptor copy eligibility,
+bounded per-path compressed queues, and demand-driven viewer adapter lifetimes.
+Inference sampling applies to presentation-ordered decoded frames, never to
+compressed reference packets before decoding. Packet gaps reset dependency state
+and require a keyframe; the capture profile also sets an explicit maximum forward
+timestamp gap, independent of inference cadence. Known loss remains visible after
+recovery. Missing codec
+adapters report unavailable. Real codec/transport integration and measured
+deployment defaults are still required; see that directory's integration contract.
 
 ### 6.4 Agent-to-main transport
 
@@ -497,6 +538,16 @@ quality/gap metadata
 ```
 
 Critical incident protection on `media-capture-agent` is a deliberate secondary-evidence exception, not a full mirror.
+
+The internal `server/app/media/recording/` storage implementation uses generated
+segment UUID filenames, byte digests, a pending-publication journal and per-source
+event manifests. Its pre-roll has duration, byte and segment-count limits;
+recording windows carry explicit clip intervals and integrity/gap/discontinuity
+state. Restart retains committed media, cleans only journal-owned pending files
+and marks active recordings interrupted. Runtime admission and codec validation
+are mandatory injected boundaries; no human routes are enabled by this module.
+See its README for the remaining worker integration and the distinction between
+storage integrity and playable-media validation.
 
 ### 6.7 Main-host event ring buffer
 
@@ -548,7 +599,7 @@ If the person detector's prerequisites are insufficient, the result is `unknown`
 
 The internal implementation in `server/app/detection/quality/` uses explicit per-source/detector policy ranges and an explicit pixel budget; it provides no production thresholds. It measures bounded grayscale/RGB luminance, neighboring-pixel sharpness, clipping and resolution, and accepts frame-attributed calibrated target-size/obstruction/confidence context. Missing required context never defaults to adequate target size or zero obstruction. All configured prerequisites apply to both positive and negative conclusions.
 
-Quality failure is immediate. Recovery requires the configured number of consecutive good frames (at least two); stream/sequence/geometry discontinuities and unavailable execution reset recovery. Reason codes, numeric metrics, profile version and source/stream/sequence are available for authorized UI integration. Detector stop/failure can invalidate the last assessment without a new frame. The result guard rejects obsolete assessments and mismatched frame identities; the inference scheduler remains responsible for observation age. Live/recording delivery and unrelated critical detector profiles remain independent. Real-camera calibration is not established by synthetic quality tests.
+Quality failure is immediate. Recovery requires the configured number of consecutive good frames (at least two); stream/sequence/geometry discontinuities and unavailable execution reset recovery. Reason codes, numeric metrics, profile version and source/stream/sequence are available for authorized UI integration. Detector stop/failure invalidates the last assessment without a new frame and, through the registered result sink, immediately replaces the source's published `present`/`absent` with `unknown`; an unusable frame, a pending recovery and an incomplete inference batch do the same. A stopped or failed detector never leaves a trustworthy conclusion readable until its observation age expires. The result guard rejects obsolete assessments and mismatched frame identities; the inference scheduler remains responsible for observation age. Live/recording delivery and unrelated critical detector profiles remain independent. Real-camera calibration is not established by synthetic quality tests.
 
 ### 7.6 Owner-only face verification
 
@@ -616,6 +667,35 @@ Admission loop:
 Defaults: recording retention 20 days; audit retention 90 days.
 
 Agent disk-buffer safety is tracked separately from Main Server storage because the two filesystems may be different machines.
+
+The internal Issue #21 policy in `server/app/storage/` holds media plus configured
+metadata/journal/temp reservations through the serialized recorder operation.
+Physical-only control reservations cover startup recovery before inventory binding
+and never recursively invoke retention. Expected media-root identity and the
+private metadata file's filesystem are checked without symlink following or
+fallback creation. All numeric reserve/quota/hysteresis/overhead limits are
+explicit deployment configuration; only the specified retention defaults apply.
+The critical allowance conservatively bounds resident critical evidence plus the
+new reservation, surviving restart. Filesystem sampling includes other processes
+but cannot prevent unrelated writes after the sample. A failed state-audit write
+remains visible as a failure flag. The domain recording browser defaults to deny,
+requires `recordings:view` for history and Owner for star/unstar/single deletion;
+it mounts no human endpoint pending #10.
+
+`server/app/notifications/` provides optional direct Slack incoming-webhook
+delivery using verified HTTPS, no environment proxy/redirect, bounded timeout and
+redacted failures. Unconfigured delivery performs no network operation. The
+current payload is a fixed critical category or validated daily aggregate, with
+no image/media, source identity or arbitrary probe details. Both immediate and
+daily notifications enqueue on a bounded delivery worker; the recorder worker
+never waits for network IO. Local pending/result events share an ID and are
+persisted only on the owning worker. Full queues and failed persistence remain
+visible; completion-persistence retry never resends a message. The persisted daily
+scheduler defaults to 23:00 configured local time and claims one dispatch per
+local date across restart/DST/clock rollback; missed dates are not replayed.
+An uncertain crash remains `pending`, failed delivery is visible, and no implicit
+retry floods the channel. Production timers, durable event-outbox integration,
+human authorization and recording playback remain separate integration work.
 
 ## 10. Host hardware integrity and recording self-check
 
