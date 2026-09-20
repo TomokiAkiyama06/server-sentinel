@@ -42,6 +42,10 @@ const timelineFixture = {
   ordering_basis: 'received_at', ordering_degraded: true, causality: 'not_inferred',
   next_cursor: { received_at: '2026-09-21T09:00:01.000000+00:00', sequence: 1 },
 };
+const olderTimelineFixture = {
+  items: [observation('storage', { value: 'degraded', quality: 'unknown', confidence: null, source_id: null, sequence: 2 })],
+  ordering_basis: 'received_at', ordering_degraded: false, causality: 'not_inferred', next_cursor: null,
+};
 const presenceFixture = {
   snapshot: {
     state: 'PRESENT', basis: 'manual_override', override_expires_at: '2026-09-21T18:30:00.000000+00:00',
@@ -98,7 +102,8 @@ async function scenario(viewport, { production = false, status = 200, session = 
       await fulfill(JSON.stringify(sourceStatus === 200 ? fixture(count) : { detail: 'synthetic private error' }), 'application/json', sourceStatus); return;
     }
     if (!production && url.pathname === '/api/mock/timeline') {
-      await fulfill(JSON.stringify(timelineFixture), 'application/json'); return;
+      await fulfill(JSON.stringify(url.searchParams.has('after') ? olderTimelineFixture : timelineFixture),
+        'application/json'); return;
     }
     if (!production && url.pathname === '/api/mock/presence') {
       await fulfill(JSON.stringify(presenceFixture), 'application/json'); return;
@@ -176,6 +181,13 @@ try {
       await page.evaluate("Array.from(document.querySelectorAll('.timeline-filter button')).find(el => el.textContent === 'critical').click()");
       await page.wait("document.querySelectorAll('[data-observation-kind]').length === 1");
       assert.equal(await page.evaluate("document.querySelector('[data-observation-kind]').dataset.observationKind"), 'server_movement');
+      // A non-null cursor offers older history; the next page ends the window.
+      await page.evaluate("Array.from(document.querySelectorAll('.timeline-filter button')).find(el => el.textContent === 'すべて').click()");
+      await page.wait("document.querySelectorAll('[data-observation-kind]').length === 4");
+      await page.evaluate("document.querySelector('.timeline-screen > button').click()");
+      await page.wait("document.querySelectorAll('[data-observation-kind]').length === 5");
+      assert.equal(await page.evaluate("Boolean(document.querySelector('.timeline-screen > button'))"), false);
+      assert.match(await page.evaluate('document.body.innerText'), /この期間の観測をすべて読み込みました。/);
       await page.click('プレゼンス');
       await page.wait("Boolean(document.querySelector('.presence-value'))");
       const presenceText = await page.evaluate('document.body.innerText');

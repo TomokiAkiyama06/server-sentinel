@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import type { DashboardServices, Observation, ObservationKind, ObservationValue, TimelinePage } from '../domain';
+import type { TimelineCursor } from '../domain';
 import type { Messages } from '../i18n';
 
 export const kindGroup: Record<ObservationKind, TimelineGroup> = {
@@ -81,8 +82,9 @@ function Row({ item, t }: { item: Observation; t: Messages }) {
   </li>;
 }
 
-export function TimelineBody({ page, filter, t, onFilter }: {
+export function TimelineBody({ page, filter, t, onFilter, onMore, loadingMore, complete }: {
   page: TimelinePage; filter: TimelineFilter; t: Messages; onFilter: (value: TimelineFilter) => void;
+  onMore?: (() => void) | undefined; loadingMore?: boolean | undefined; complete?: boolean | undefined;
 }) {
   const items = page.items.filter(item => matches(filter, item.kind));
   return <section className="timeline-screen">
@@ -103,10 +105,24 @@ export function TimelineBody({ page, filter, t, onFilter }: {
       {span.degraded && <p className="timeline-degraded" role="status">{t.timelineDegraded}</p>}
       <ol className="timeline-list">{span.items.map(item => <Row key={item.id} item={item} t={t} />)}</ol>
     </section>)}
+    {onMore && <button type="button" className="primary" disabled={loadingMore}
+      onClick={onMore}>{loadingMore ? t.timelineMoreLoading : t.timelineMore}</button>}
+    {complete && page.items.length > 0 && <p className="muted" role="status">{t.timelineComplete}</p>}
   </section>;
 }
 
-type State = { state: 'pending' } | { state: 'loading' } | { state: 'failed' } | { state: 'ready'; page: TimelinePage };
+type State = { state: 'pending' } | { state: 'loading' } | { state: 'failed' }
+  | { state: 'ready'; page: TimelinePage; complete: boolean; more: boolean };
+
+/** Pages concatenate in receipt order; a page without items ends the window. */
+function extend(previous: TimelinePage, next: TimelinePage): TimelinePage {
+  const seen = new Set(previous.items.map(item => item.id));
+  return {
+    ...next,
+    items: [...previous.items, ...next.items.filter(item => !seen.has(item.id))],
+    ordering_degraded: previous.ordering_degraded || next.ordering_degraded,
+  };
+}
 
 export function TimelineScreen({ services, t }: { services: DashboardServices; t: Messages }) {
   const [data, setData] = useState<State>({ state: 'pending' });
@@ -120,8 +136,10 @@ export function TimelineScreen({ services, t }: { services: DashboardServices; t
     setData({ state: 'loading' });
     void (async () => {
       try {
-        const page = await load(controller.signal);
-        if (!controller.signal.aborted) setData({ state: 'ready', page });
+        const page = await load(controller.signal, null);
+        if (!controller.signal.aborted) {
+          setData({ state: 'ready', page, complete: page.next_cursor === null, more: false });
+        }
       } catch {
         if (!controller.signal.aborted) setData({ state: 'failed' });
       }
@@ -135,5 +153,21 @@ export function TimelineScreen({ services, t }: { services: DashboardServices; t
     return <section className="placeholder"><span className="placeholder-mark" aria-hidden="true">◇</span>
       <h2>{t.timeline}</h2><p>{t.foundation}</p></section>;
   }
-  return <TimelineBody page={data.page} filter={filter} t={t} onFilter={setFilter} />;
+  const cursor: TimelineCursor | null = data.page.next_cursor;
+  const load = services.loadTimeline?.bind(services);
+  const more = load && cursor && !data.complete ? () => {
+    setData({ ...data, more: true });
+    const controller = new AbortController();
+    void (async () => {
+      try {
+        const next = await load(controller.signal, cursor);
+        setData({
+          state: 'ready', page: extend(data.page, next), more: false,
+          complete: next.items.length === 0 || next.next_cursor === null,
+        });
+      } catch { setData({ state: 'failed' }); }
+    })();
+  } : undefined;
+  return <TimelineBody page={data.page} filter={filter} t={t} onFilter={setFilter}
+    onMore={more} loadingMore={data.more} complete={data.complete} />;
 }

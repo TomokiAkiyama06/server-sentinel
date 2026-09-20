@@ -21,7 +21,8 @@ export function PresenceBody({ report, t, onCancel, failed }: {
   const paths: readonly CriticalPath[] = [snapshot.critical_detection, snapshot.critical_persistence,
     snapshot.critical_evidence, snapshot.critical_notifications];
   // Claim continuity only when every reported path is armed and none degraded.
-  const armed = paths.every(state => state === 'armed') && !snapshot.critical_paths_degraded;
+  const allArmed = paths.every(state => state === 'armed');
+  const armed = allArmed && !snapshot.critical_paths_degraded;
   // The backend suppresses ordinary automation only for a trusted PRESENT.
   const expectedSuppression = snapshot.state === 'PRESENT' && !snapshot.clock_degraded;
   return <section className="presence-screen">
@@ -50,7 +51,8 @@ export function PresenceBody({ report, t, onCancel, failed }: {
       </> : snapshot.suppress_ordinary ? <p>{t.suppressOn}</p>
         : <p>{snapshot.state === 'PRESENT' ? t.suppressClockDegraded : t.suppressOff}</p>}
       {armed ? <p>{t.criticalArmed}</p>
-        : <p className="timeline-degraded" role="alert">{t.criticalNotArmed}</p>}
+        : <p className="timeline-degraded" role="alert">
+          {allArmed ? t.criticalAggregateDegraded : t.criticalNotArmed}</p>}
       <h2>{t.criticalPaths}</h2>
       <dl className="presence-armed-list">
         <Path label={t.armedDetection} state={snapshot.critical_detection} t={t} />

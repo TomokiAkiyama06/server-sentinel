@@ -51,8 +51,8 @@ const snapshot = (overrides = {}) => ({
 const reported = (state, clockDegraded = false) => snapshot({
   state, clock_degraded: clockDegraded, suppress_ordinary: state === 'PRESENT' && !clockDegraded,
 });
-const timeline = (value, locale = 'ja', filter = 'all') => renderToStaticMarkup(createElement(TimelineBody,
-  { page: value, filter, t: messages[locale], onFilter: () => undefined }));
+const timeline = (value, locale = 'ja', filter = 'all', extra = {}) => renderToStaticMarkup(createElement(TimelineBody,
+  { page: value, filter, t: messages[locale], onFilter: () => undefined, ...extra }));
 const presence = (report, locale = 'ja', extra = {}) => renderToStaticMarkup(createElement(PresenceBody,
   { report, t: messages[locale], ...extra }));
 
@@ -145,6 +145,20 @@ test('rows are ordered by receipt and still carry their own observation time', (
   assert.match(degraded, /時刻ずれまたは不連続が報告されています。/);
   assert.equal(page([item]).next_cursor.sequence, item.sequence);
   assert.equal(page([]).next_cursor, null);
+});
+
+test('older history stays reachable while a cursor is offered', () => {
+  const items = [observation('motion'), observation('person')];
+  const offered = timeline(page(items), 'ja', 'all', { onMore: () => undefined, complete: false });
+  assert.match(offered, /<button[^>]*>古い観測をさらに読み込む<\/button>/);
+  assert.doesNotMatch(offered, /この期間の観測をすべて読み込みました。/);
+  const loading = timeline(page(items), 'ja', 'all', { onMore: () => undefined, loadingMore: true });
+  assert.match(loading, /<button[^>]*disabled[^>]*>読み込んでいます<\/button>/);
+  const exhausted = timeline(page(items, { next_cursor: null }), 'ja', 'all', { complete: true });
+  assert.doesNotMatch(exhausted, /古い観測をさらに読み込む/);
+  assert.match(exhausted, /この期間の観測をすべて読み込みました。/);
+  // Without a provider there is no load-more affordance at all.
+  assert.doesNotMatch(timeline(page(items)), /古い観測をさらに読み込む/);
 });
 
 test('degraded timing is reported per span and never presented as ordering certainty', () => {
@@ -340,7 +354,10 @@ test('a critical path that is not armed replaces the continuity statement with a
   // The aggregate degraded flag alone also withdraws the continuity claim.
   const degraded = presence({ snapshot: snapshot({ critical_paths_degraded: true }), audit: [] });
   assert.doesNotMatch(degraded, /すべての presence state で継続します。/);
-  assert.match(degraded, /critical 対応の経路に armed でないものがあります。/);
+  // Aggregate degradation with every path armed gets its own wording.
+  const aggregate = presence({ snapshot: snapshot({ critical_paths_degraded: true }), audit: [] });
+  assert.match(aggregate, /<p class="timeline-degraded" role="alert">各経路は armed と報告されていますが、critical 対応全体として劣化が報告されています。/);
+  assert.doesNotMatch(aggregate, /critical 対応の経路に armed でないものがあります。/);
   const armed = presence({ snapshot: snapshot(), audit: [] });
   assert.match(armed, /すべての presence state で継続します。/);
   assert.equal((armed.match(/armed（継続中）/g) || []).length, 4);

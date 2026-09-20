@@ -2,7 +2,7 @@
 import { createRoot } from 'react-dom/client';
 import { App } from '../src/App';
 import { createApiClient } from '../src/api';
-import { type CameraSourceSummary, type PresenceReport, type Session, type TimelinePage } from '../src/domain';
+import { type CameraSourceSummary, type PresenceReport, type Session, type TimelineCursor, type TimelinePage } from '../src/domain';
 import '../src/style.css';
 
 const api = createApiClient(window.location.origin);
@@ -31,8 +31,9 @@ class SyntheticServices {
       return value as CameraSourceSummary[];
     }, signal);
   }
-  loadTimeline(signal: AbortSignal) {
-    return this.client.read('/api/mock/timeline', value => {
+  loadTimeline(signal: AbortSignal, after?: TimelineCursor | null) {
+    const path = after ? `/api/mock/timeline?after=${encodeURIComponent(String(after.sequence))}` : '/api/mock/timeline';
+    return this.client.read(path, value => {
       if (typeof value !== 'object' || value === null || !Array.isArray((value as TimelinePage).items)) throw new Error();
       return value as TimelinePage;
     }, signal);

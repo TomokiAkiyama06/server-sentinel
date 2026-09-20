@@ -17,7 +17,7 @@ export interface CameraSourceSummary {
 export interface DashboardServices {
   loadSession(signal: AbortSignal): Promise<Session>;
   loadSources?(signal: AbortSignal): Promise<readonly CameraSourceSummary[]>;
-  loadTimeline?(signal: AbortSignal): Promise<TimelinePage>;
+  loadTimeline?(signal: AbortSignal, after?: TimelineCursor | null): Promise<TimelinePage>;
   loadPresence?(signal: AbortSignal): Promise<PresenceReport>;
   cancelPresenceOverride?(signal: AbortSignal): Promise<PresenceReport>;
 }

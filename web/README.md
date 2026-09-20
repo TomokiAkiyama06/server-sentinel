@@ -47,7 +47,8 @@ source/node health transition, including `manual_intervention_required` and
 `revoked`. The `critical` badge names the detector category, not a confirmed
 event, and a quality-gated result is never labelled confirmed. Rows follow the
 Main Server receipt order the core reports and each row also shows its own
-observation time. The ordering statement follows `ordering_basis` while
+observation time, and a `next_cursor` offers the older part of the window
+through a load-more control so a limited response cannot hide older events. The ordering statement follows `ordering_basis` while
 `ordering_degraded` adds the warning. Clock skew or timestamp discontinuity is
 reported per span and by that ordering notice;
 the UI does not present that order as established causality, cause or
@@ -62,7 +63,8 @@ suppression instead of a contradictory statement. The four critical paths
 (detection, persistence, evidence, notification) are shown with their reported
 `armed` / `unavailable` / `unknown` state, a known failure is never merged with
 an unreported one, and the continuity statement appears only while every path is
-armed and `critical_paths_degraded` is false; an evidence or notification path
+armed and `critical_paths_degraded` is false; aggregate degradation with every
+path armed gets its own wording rather than contradicting the breakdown; an evidence or notification path
 also reports `unavailable` while a submission is in flight or accepted but
 unconfirmed. An incomplete override expiry (`override_expiry_pending`) is
 reported so an expired override cannot look active. The control history
