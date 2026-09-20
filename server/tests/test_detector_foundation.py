@@ -206,6 +206,17 @@ class DetectorFoundationTests(unittest.TestCase):
         self.assertFalse(result.pending)
         self.assertEqual(result.result.reason, Reason.RESOURCE_LIMIT)
 
+    def test_oversize_frame_advances_stream_and_sequence_watermarks(self):
+        self.register()
+        self.assertTrue(self.offer(frame(0)))
+        self.scheduler.run_one()
+        replacement = UUID(int=99)
+        self.clock.value = 10
+        self.assertFalse(self.offer(frame(10, stream=replacement, width=5)))
+        self.assertEqual(replacement, self.scheduler.snapshot(SOURCE).stream_id)
+        self.assertFalse(self.offer(frame(9, stream=replacement)))
+        self.assertFalse(self.offer(frame(1)))
+
     def test_late_result_becomes_unknown_and_throttles(self):
         def slow(_sample):
             self.clock.value += 21

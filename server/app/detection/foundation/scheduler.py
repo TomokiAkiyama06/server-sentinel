@@ -63,6 +63,7 @@ class _Source:
     cadence_ns: int
     pending: _Pending | None = None
     stream_id: UUID | None = None
+    retired_stream_id: UUID | None = None
     sequence: int = -1
     result_sequence: int | None = None
     result: Detection = field(default_factory=lambda: Detection(Observation.UNKNOWN, Reason.NOT_STARTED))
@@ -152,14 +153,16 @@ class InferenceScheduler:
         with self._lock:
             now = self._now()
             state = self._sources[frame.source_id]
-            if frame.width * frame.height > state.policy.maximum_pixels:
-                state.pending = None
-                state.dropped += 1
-                self._overload(state, Reason.RESOURCE_LIMIT, now)
-                return False
             if state.stream_id != frame.stream_id:
+                if frame.stream_id == state.retired_stream_id:
+                    state.pending = None
+                    state.dropped += 1
+                    state.loss_unacknowledged = True
+                    self._unknown(state, Reason.DISCONTINUITY)
+                    return False
                 state.pending = None
-                state.stream_id, state.sequence = frame.stream_id, -1
+                state.retired_stream_id, state.stream_id, state.sequence = (
+                    state.stream_id, frame.stream_id, -1)
                 state.next_admission = now
                 self._unknown(state, Reason.DISCONTINUITY)
             if frame.sequence <= state.sequence:
@@ -169,6 +172,11 @@ class InferenceScheduler:
                 self._unknown(state, Reason.DISCONTINUITY)
                 return False
             state.sequence = frame.sequence
+            if frame.width * frame.height > state.policy.maximum_pixels:
+                state.pending = None
+                state.dropped += 1
+                self._overload(state, Reason.RESOURCE_LIMIT, now)
+                return False
             if quality is not Quality.SUFFICIENT:
                 state.pending = None
                 self._unknown(state, Reason.QUALITY)
