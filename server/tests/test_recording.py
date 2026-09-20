@@ -532,6 +532,17 @@ class RecordingTests(unittest.TestCase):
         self.assertEqual((), self.store.list_recordings(limit=1))
         self.assertEqual([], list(self.root.iterdir()))
 
+    def test_recovery_refuses_inconsistent_deletion_journal_with_evidence_links(self):
+        segment = self.store.append(self.segment())
+        recording = self.store.start_manual(self.source, 30_000, duration_ms=10_000)
+        self.store.finish(recording)
+        self.db.execute("UPDATE recordings SET status='deleting' WHERE id=?", (str(recording),))
+        self.store.close()
+        with self.assertRaisesRegex(RecordingError, "RECORDING_RECOVERY_REQUIRED"):
+            self.open_store()
+        self.assertTrue((self.root / (segment.hex + ".seg")).exists())
+        self.assertEqual(1, self.db.execute("SELECT COUNT(*) FROM recording_links").fetchone()[0])
+
     def test_critical_usage_counts_shared_and_interrupted_pending_bytes_once(self):
         self.store.append(self.segment())
         first = self.store.start_event(uuid4(), (self.source,), 30_000, pre_ms=0,

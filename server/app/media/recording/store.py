@@ -197,6 +197,15 @@ class RecordingStore:
                 "start_ms)) WHERE status='active'"
             )
         self._trim()
+        # A normal delete transaction removes links before its cleanup can be
+        # interrupted. Do not turn an inconsistent deletion journal into media
+        # loss during startup: preserve the linked evidence and leave the
+        # worker unavailable for an explicit recovery decision.
+        if self.db.execute(
+                "SELECT 1 FROM recordings r JOIN recording_links l ON l.recording_id=r.id "
+                "WHERE r.status='deleting' LIMIT 1"
+        ).fetchone():
+            raise RecordingError("RECORDING_RECOVERY_REQUIRED")
         with self._transaction():
             self.db.execute("DELETE FROM recordings WHERE status='deleting'")
 
