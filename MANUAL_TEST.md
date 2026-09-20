@@ -453,6 +453,27 @@ Use a disposable/test volume.
 
 Never intentionally fill a production filesystem to zero free bytes.
 
+## Q2. Security/admin audit retention
+
+Use a disposable Main Server database and synthetic logical target IDs. Do not
+enter real secrets, biometric material, hardware serials/UUIDs, private network
+values, or monitoring media for this test.
+
+- [ ] approve a hardware baseline as the deployment Owner and verify one
+  `approve_hardware_baseline` success record with the baseline logical ID;
+- [ ] change a security/admin setting and revoke one test camera/source/capture
+  node, verifying the fixed action, target kind, logical ID, UTC time, and
+  outcome for each operation;
+- [ ] attempt an Owner-only operation as an invited/non-owner principal, verify
+  the mutation does not run, and verify a denied audit outcome;
+- [ ] induce a safe synthetic mutation failure and verify a failed audit outcome
+  without the submitted value or exception text in the database;
+- [ ] run retention with a test clock just past 90 days and verify only expired
+  audit rows are removed while boundary/newer rows, recordings, factual timeline
+  events, and capture-agent protected incidents remain unchanged;
+- [ ] inspect the deployed database permissions and confirm the audit database
+  remains deployment-local with no upload/reporting path.
+
 ## R. Long-duration / performance
 
 Run at least:
