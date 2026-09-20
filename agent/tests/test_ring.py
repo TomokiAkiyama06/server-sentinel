@@ -1028,6 +1028,32 @@ class RingTests(unittest.TestCase):
         # A refused ledger never touches the media it cannot account for.
         self.assertEqual(len(self.store.list_segments()), 10)
 
+    def test_admission_statements_do_not_grow_with_retained_rows(self):
+        self.ring.close()
+        self.quota.capacity = 4 * 1024 * 1024 * 1024
+        self.ring = DiskRing(self.settings, self.store, ledger_maximum_bytes=64 * 1024 * 1024,
+                             authority=AllowControls())
+        profile = SegmentProfile(SOURCE, 800, 400, SECOND, 100)
+        self.configure(profiles=(profile,))
+        counts, start = {}, T0 - PRE
+        for retained in (40, 120):
+            while len(self.ring._rows()) < retained:
+                self.ring.append(SOURCE, start, start + SECOND, PAYLOAD,
+                                 now_us=start + SECOND, clock_trusted=True)
+                start += SECOND
+            statements = []
+            self.ring.db.set_trace_callback(statements.append)
+            try:
+                self.ring.append(SOURCE, start, start + SECOND, PAYLOAD,
+                                 now_us=start + SECOND, clock_trusted=True)
+            finally:
+                self.ring.db.set_trace_callback(None)
+            start += SECOND
+            counts[retained] = len(statements)
+        # Membership is read in bulk, so tripling the retained rows must not
+        # multiply the synchronous statements one captured second costs.
+        self.assertLess(counts[120], 2 * counts[40])
+
     def test_existing_tombstones_are_counted_without_reset_or_deletion(self):
         with self.ring.ledger.transaction():
             self.ring.db.executemany("INSERT INTO incidents VALUES (?, 'camera_tamper', ?, ?, ?, ?, 'deleted', 0, ?)",

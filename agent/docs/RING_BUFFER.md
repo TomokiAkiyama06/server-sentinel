@@ -182,7 +182,10 @@ when incidents share one media file. Protection membership is keyed by
 segment and indexed by incident, so both the per-segment lookup used for every
 retained row and the per-incident listing are index searches at dense one-second
 cadences; keeping that table `WITHOUT ROWID` holds it to the same two B-trees
-the reservation already budgets. Missing, untrusted or incompatible ordinary
+the reservation already budgets. Admission, trimming and status read that
+membership once per pass rather than per retained row, so the statements one
+captured second costs stay constant as an incident grows; deletion paths still
+re-read membership per segment because they mutate it. Missing, untrusted or incompatible ordinary
 rows consume additional capacity; they cannot replace future selected-ring rows.
 New preservation requests must fit before any incident is created; active
 incidents keep room for their remaining segment and reference rows across append

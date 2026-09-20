@@ -161,12 +161,26 @@ class DiskRing:
             values.append(excluding)
         return self.db.execute(query + " LIMIT 1", values).fetchone() is not None
 
+    def _protected_segments(self):
+        # One aggregate read per accounting pass. A per-row membership query
+        # does not scale to four sources at the supported one-second cadence,
+        # where a complete incident holds thousands of references and every
+        # append repeats admission, trimming and status passes.
+        return {row[0] for row in self.db.execute(
+            "SELECT p.segment FROM protection p JOIN incidents i ON i.id=p.incident "
+            "WHERE i.state!='deleted'").fetchall()}
+
+    def _ordinary_bytes(self, allocations, protected):
+        return sum(allocations.get(UUID(row["id"]), 0) for row in self._rows()
+                   if row["id"] not in protected)
+
     def _reclaimable(self, now):
         if self._pending_loss():
             return []
+        protected = self._protected_segments()
         return [row for row in self._rows()
                 if row["end"] <= now - PRE and row["state"] != "writing"
-                and not self._protected(row["id"])]
+                and row["id"] not in protected]
 
     def _selected_reclaimable(self, now, config):
         rows = self._reclaimable(now)
@@ -183,8 +197,7 @@ class DiskRing:
         current = self._selected_reclaimable(now, self.config)
         if self.config.mode == "capacity":
             allocations = self.store.segment_allocations()
-            excess = sum(allocations.get(UUID(row["id"]), 0) for row in self._rows()
-                         if not self._protected(row["id"])) - self.config.value
+            excess = self._ordinary_bytes(allocations, self._protected_segments()) - self.config.value
             eligible = []
             for row in current:
                 if excess <= 0:
@@ -233,10 +246,11 @@ class DiskRing:
     def _ledger_capacity(self, config, profiles, *, proposal=None, additional_segments=0, additional_protections=0,
                          reactivating=()):
         rows = self._rows()
-        protected = sum(self._protected(row["id"]) for row in rows)
+        membership = self._protected_segments()
+        protected = sum(row["id"] in membership for row in rows)
         carryover = 0
         for row in rows:
-            if self._protected(row["id"]):
+            if row["id"] in membership:
                 continue
             if (row["state"] != "stored" or row["allocated"] < 512
                     or not self._trusted_profile_row(row, profiles)):
@@ -266,7 +280,7 @@ class DiskRing:
             # Ordinary carryover already occupies a separate row reservation.
             # Only compatible ordinary rows newly leaving the projected ring
             # need an additional reservation when they become protected.
-            projected = sum(not self._protected(row["id"]) and row["state"] == "stored"
+            projected = sum(row["id"] not in membership and row["state"] == "stored"
                             and row["allocated"] >= 512 and self._trusted_profile_row(row, profiles)
                             for row in matching)
             segments += projected
@@ -358,8 +372,7 @@ class DiskRing:
         selected = (self._estimate(profiles, config.value * SECOND)
                     if config.mode == "duration" else config.value)
         allocations = self.store.segment_allocations()
-        ordinary = sum(allocations.get(UUID(row["id"]), 0) for row in self._rows()
-                       if not self._protected(row["id"]))
+        ordinary = self._ordinary_bytes(allocations, self._protected_segments())
         # Existing ordinary allocations already occupy part of this selected
         # target. They are not credited as immediately reclaimable pre-data.
         if self.store.check(require_reserve=False) + ordinary < selected + self.settings.safety_reserve_bytes + self.ledger_headroom:
@@ -369,9 +382,10 @@ class DiskRing:
         if config.mode != "capacity":
             return
         allocations = self.store.segment_allocations()
+        membership = self._protected_segments()
         retained = carryover = 0
         for row in self._rows():
-            if self._protected(row["id"]) or (trusted and row["end"] <= now - PRE):
+            if row["id"] in membership or (trusted and row["end"] <= now - PRE):
                 continue
             allocated = allocations.get(UUID(row["id"]), 0)
             retained += allocated
@@ -393,9 +407,10 @@ class DiskRing:
         if config.mode != "duration":
             return
         allocations = self.store.segment_allocations()
+        membership = self._protected_segments()
         compatible = 0
         for row in self._rows():
-            if (not trusted or self._protected(row["id"]) or row["state"] != "stored"
+            if (not trusted or row["id"] in membership or row["state"] != "stored"
                     or row["end"] <= now - config.value * SECOND
                     or not self._trusted_profile_row(row, profiles)):
                 continue
@@ -424,8 +439,9 @@ class DiskRing:
         if not trusted or self.config is None:
             return
         allocations = self.store.segment_allocations()
-        ordinary = sum(allocations.get(UUID(row["id"]), 0) for row in self._rows()
-                       if not self._protected(row["id"]))
+        # Reclamation removes only unprotected media, so one membership
+        # snapshot stays accurate for the whole pass.
+        ordinary = self._ordinary_bytes(allocations, self._protected_segments())
         for row in self._selected_reclaimable(now, self.config):
             outside = row["end"] <= now - self.config.value * SECOND
             if self.config.mode == "duration" and not outside:
@@ -489,8 +505,7 @@ class DiskRing:
             # from protected bytes. Never evict required pre-loss coverage.
             if self.config.mode == "capacity" and not incidents:
                 allocations = self.store.segment_allocations()
-                ordinary = sum(allocations.get(UUID(row["id"]), 0) for row in self._rows()
-                               if not self._protected(row["id"]))
+                ordinary = self._ordinary_bytes(allocations, self._protected_segments())
                 needed = ((len(data) + self.store.allocation_unit - 1)
                           // self.store.allocation_unit) * self.store.allocation_unit
                 for row in self._reclaimable(now_us) if clock_trusted else ():
@@ -524,8 +539,7 @@ class DiskRing:
                     raise StorageRefused("unsupported_segment_allocation")
                 if self.config.mode == "capacity" and not incidents:
                     allocations = self.store.segment_allocations()
-                    total = sum(allocations.get(UUID(row["id"]), 0) for row in self._rows()
-                                if not self._protected(row["id"]))
+                    total = self._ordinary_bytes(allocations, self._protected_segments())
                     if total > self.config.value:
                         # This provisional write never becomes an admitted ring
                         # segment when actual allocation exceeds its bound.
@@ -739,8 +753,9 @@ class DiskRing:
         rows = self._rows()
         known_ids = {UUID(row["id"]) for row in rows}
         orphan_bytes = sum(size for identifier, size in allocated.items() if identifier not in known_ids)
-        ordinary = sum(allocated.get(UUID(row["id"]), 0) for row in rows if not self._protected(row["id"]))
-        protected = sum(allocated.get(UUID(row["id"]), 0) for row in rows if self._protected(row["id"]))
+        membership = self._protected_segments()
+        ordinary = sum(allocated.get(UUID(row["id"]), 0) for row in rows if row["id"] not in membership)
+        protected = sum(allocated.get(UUID(row["id"]), 0) for row in rows if row["id"] in membership)
         coverage = {}
         for source in self.profiles:
             intervals, gaps = intervals_and_gaps([(row["start"], row["end"]) for row in rows
@@ -761,7 +776,7 @@ class DiskRing:
         elif not clock_trusted or self.db.execute(
                 "SELECT 1 FROM incidents WHERE state='active' AND clock_uncertain=1 LIMIT 1").fetchone():
             self.state, self.reason = "degraded", "clock_uncertain"
-        elif any(row["state"] != "stored" and self._protected(row["id"]) for row in rows):
+        elif any(row["state"] != "stored" and row["id"] in membership for row in rows):
             self.state, self.reason = "degraded", "protected_evidence_integrity_gap"
         elif self.db.execute("SELECT 1 FROM incidents WHERE state='partial' AND expires>? LIMIT 1", (now,)).fetchone():
             self.state, self.reason = "degraded", "protected_incident_partial"
@@ -769,7 +784,7 @@ class DiskRing:
             self.state, self.reason = "degraded", "orphan_media_present"
         elif any(item["gaps_us"] for item in coverage.values()):
             self.state, self.reason = "degraded", "pre_loss_coverage_gap"
-        elif any(row["state"] != "stored" and not self._protected(row["id"])
+        elif any(row["state"] != "stored" and row["id"] not in membership
                  and self._ordinary_owned(row, now, clock_trusted) for row in rows):
             self.state, self.reason = "degraded", "ordinary_ring_integrity_gap"
         else:
