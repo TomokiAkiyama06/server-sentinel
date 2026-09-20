@@ -34,7 +34,7 @@ the gate does not claim to re-fetch or independently reinterpret legal terms.
 Python `-r`/`-c` includes must resolve inside the repository to another reviewed
 requirements input. Every included file is audited and include cycles fail.
 Every Python project dependency must match a reviewed, hash-pinned requirements
-entry by normalized name, exact version, and scope.
+entry by PEP 503 canonical name, exact version, and scope.
 Dynamic `dependencies` and `optional-dependencies`, including setuptools file
 indirection, fail closed until the gate has a reviewed parser for their source.
 Tracked `build/` and `dist/` trees are scanned for model artifacts like any other

@@ -136,7 +136,7 @@ or unused approval records.
 
 Requirements `-r` and `-c` includes are recursively covered: each target must be
 a separate reviewed repository input, paths may not escape or use a remote URL,
-and cycles fail. Each Python project dependency must correspond by normalized
+and cycles fail. Each Python project dependency must correspond by PEP 503 canonical
 name, exact version, and scope to a reviewed requirements lock entry whose
 hashes match `license/pins.json`. Dynamic dependency fields and setuptools
 dynamic dependency sources fail closed until a reviewed parser covers them.

@@ -84,6 +84,10 @@ def unique_object(pairs):
     return result
 
 
+def canonical_python_name(value):
+    return re.sub(r"[-_.]+", "-", value).lower()
+
+
 def load_json(path: Path):
     try:
         return json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=unique_object)
@@ -178,10 +182,11 @@ def python_lock(path: Path, relative: str, scope: str):
         hashes = HASH.findall(line)
         if not hashes:
             raise GateError(f"requirement has no SHA256 evidence in {relative}")
+        name = canonical_python_name(match.group(1))
         found.append(LockedComponent(relative, "python-requirements", scope,
-                                     match.group(1).lower().replace("_", "-"), match.group(2)))
+                                     name, match.group(2)))
         pins.append(LockedPin(relative, "python-requirements",
-                              match.group(1).lower().replace("_", "-"), match.group(2),
+                              name, match.group(2),
                               tuple(sorted("sha256:" + value for value in hashes))))
     return found, pins, includes
 
@@ -253,7 +258,7 @@ def python_project(path: Path, relative: str, scope: str):
         if not match:
             raise GateError(f"project dependency is not exact in {relative}")
         found.append(LockedComponent(relative, "python-project", scope,
-                                     match.group(1).lower().replace("_", "-"), match.group(2)))
+                                     canonical_python_name(match.group(1)), match.group(2)))
     return found
 
 

@@ -87,6 +87,16 @@ class LicenseGateTests(unittest.TestCase):
             "schema": 1, "pins": self.pins,
         }))
 
+    def assert_dynamic_python_dependency_rejected(self, project):
+        self.write("deps.in", "unreviewed-package==9.8.7\n")
+        self.write("pyproject.toml", project)
+        self.inputs.append({
+            "path": "pyproject.toml", "ecosystem": "python-project", "scope": "backend",
+        })
+        self.save()
+        with self.assertRaisesRegex(license_gate.GateError, "unsupported project dependency section"):
+            license_gate.audit(self.root)
+
     def test_permissive_exact_component_passes(self):
         self.assertEqual(license_gate.audit(self.root), (1, 1, 0))
 
@@ -127,6 +137,24 @@ class LicenseGateTests(unittest.TestCase):
             license_gate.audit(self.root)
 
         project_location["scope"] = "backend"
+        self.save()
+        self.assertEqual(license_gate.audit(self.root), (1, 2, 0))
+
+    def test_python_names_use_pep503_canonicalization_for_lock_correspondence(self):
+        digest = "sha256:" + "a" * 64
+        self.write("requirements.lock", "zope...interface==1.2.3 --hash=" + digest + "\n")
+        self.write("pyproject.toml", '[project]\ndependencies = ["Zope.Interface==1.2.3"]\n')
+        project_location = {
+            "path": "pyproject.toml", "ecosystem": "python-project", "scope": "backend",
+        }
+        self.inputs.append(project_location)
+        self.pins[0].update(name="zope-interface", digests=[digest])
+        self.components = [self.component(
+            id="pypi:zope-interface@1.2.3",
+            name="zope-interface",
+            upstream="https://example.test/zope-interface/1.2.3",
+            locations=[self.location(), project_location],
+        )]
         self.save()
         self.assertEqual(license_gate.audit(self.root), (1, 2, 0))
 
@@ -300,22 +328,37 @@ requires = ["build-backend==1.2.3"]
         with self.assertRaisesRegex(license_gate.GateError, "unsupported project dependency section"):
             license_gate.audit(self.root)
 
-    def test_dynamic_setuptools_dependencies_require_reviewed_parser(self):
-        self.write("deps.in", "unreviewed-package==9.8.7\n")
-        self.write("pyproject.toml", """\
+    def test_pep621_dynamic_dependencies_require_reviewed_parser(self):
+        self.assert_dynamic_python_dependency_rejected("""\
 [project]
 dependencies = []
 dynamic = ["dependencies"]
+""")
+
+    def test_pep621_dynamic_optional_dependencies_require_reviewed_parser(self):
+        self.assert_dynamic_python_dependency_rejected("""\
+[project]
+dependencies = []
+dynamic = ["optional-dependencies"]
+""")
+
+    def test_setuptools_dynamic_dependencies_require_reviewed_parser(self):
+        self.assert_dynamic_python_dependency_rejected("""\
+[project]
+dependencies = []
 
 [tool.setuptools.dynamic]
 dependencies = {file = ["deps.in"]}
 """)
-        self.inputs.append({
-            "path": "pyproject.toml", "ecosystem": "python-project", "scope": "backend",
-        })
-        self.save()
-        with self.assertRaisesRegex(license_gate.GateError, "unsupported project dependency section"):
-            license_gate.audit(self.root)
+
+    def test_setuptools_dynamic_optional_dependencies_require_reviewed_parser(self):
+        self.assert_dynamic_python_dependency_rejected("""\
+[project]
+dependencies = []
+
+[tool.setuptools.dynamic]
+optional-dependencies = {test = {file = ["deps.in"]}}
+""")
 
     def test_empty_and_non_dependency_dynamic_metadata_are_allowed(self):
         self.write("pyproject.toml", """\
