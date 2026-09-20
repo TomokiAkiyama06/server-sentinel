@@ -9,19 +9,24 @@ from app.notifications.slack import DeliveryResult
 class DeliveryWorker:
     """Hands completions to the owning thread without losing one or a wake-up.
 
-    The delivery thread publishes a completion and raises `ready` under the same
-    lock the owner uses to drain, and the owner lowers `ready` only after it has
-    observed the completion queue empty under that lock. A completion can
-    therefore never be acknowledged by a flag that was already lowered. The
-    thread also survives a transiently full completion queue: dropping a
-    completion, or letting the thread exit, would strand the event as pending
-    forever and silently lose a critical alert's outcome.
+    One capacity budget covers an accepted delivery from submission until the
+    owner drains its completion, so queued work plus unacknowledged completions
+    never exceed it and the completion queue cannot be full when the delivery
+    thread publishes. A completion is therefore never dropped or retried, and
+    the thread never exits on backpressure; a lost completion would strand the
+    event as pending forever and silently lose a critical alert's outcome.
+
+    The thread publishes a completion and raises `ready` under the same lock the
+    owner uses to drain, and the owner lowers `ready` only after observing the
+    completion queue empty under that lock, so a queued completion can never be
+    acknowledged by a flag that was already lowered.
     """
 
     def __init__(self, transport, capacity: int):
         self._transport = transport
         self._work = Queue(maxsize=capacity)
         self._results = Queue(maxsize=capacity)
+        self._budget = threading.Semaphore(capacity)
         self._stop = threading.Event()
         self._handoff = threading.Lock()
         self.ready = threading.Event()
@@ -30,9 +35,15 @@ class DeliveryWorker:
     def submit(self, identifier, text: str) -> None:
         if self._stop.is_set():
             raise RuntimeError('notification worker closed')
-        # The owner also caps unacknowledged completions, preventing growth of
-        # either queue while delivery outruns persistence.
-        self._work.put_nowait((identifier, text))
+        # Holding the budget until the owner drains the completion keeps both
+        # queues bounded while delivery outruns persistence.
+        if not self._budget.acquire(blocking=False):
+            raise Full
+        try:
+            self._work.put_nowait((identifier, text))
+        except BaseException:
+            self._budget.release()
+            raise
         if self._thread is None:
             self._thread = threading.Thread(target=self._run, name='serversentinel-notifications', daemon=True)
             self._thread.start()
@@ -49,24 +60,11 @@ class DeliveryWorker:
                     result = DeliveryResult.FAILED
             except Exception:
                 result = DeliveryResult.FAILED
-            self._complete(identifier, result)
-
-    def _complete(self, identifier, result) -> None:
-        # A finished delivery is always offered, including after close, so the
-        # owner can persist its real outcome instead of a stranded pending row.
-        while True:
+            # This delivery still holds its budget slot, so the completion queue
+            # has room for it even after close; no finished delivery is lost.
             with self._handoff:
-                try:
-                    self._results.put_nowait((identifier, result))
-                    published = True
-                except Full:
-                    published = False
-                # Raised while the queue may hold completions, including while
-                # this one still waits for the owner to make room for it.
+                self._results.put_nowait((identifier, result))
                 self.ready.set()
-            if published or self._stop.is_set():
-                return
-            self._stop.wait(0.01)
 
     def results(self):
         while True:
@@ -76,6 +74,7 @@ class DeliveryWorker:
                 except Empty:
                     self.ready.clear()
                     return
+            self._budget.release()
             yield completion
 
     def close(self) -> None:
