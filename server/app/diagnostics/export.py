@@ -14,7 +14,7 @@ import os
 from pathlib import Path
 import re
 import secrets
-from typing import ContextManager, Protocol, TypeAlias
+from typing import BinaryIO, ContextManager, Protocol, TypeAlias
 from zipfile import ZIP64_LIMIT, ZIP_STORED, ZipFile, ZipInfo
 
 from app.media.recording.model import StoragePolicy
@@ -22,10 +22,17 @@ from app.media.recording.model import StoragePolicy
 
 JsonScalar: TypeAlias = str | int | float | bool | None
 _SAFE_NAME = re.compile(r"^[a-z][a-z0-9_.-]{0,63}$")
+_MEDIA_CHUNK_BYTES = 64 * 1024
+_MAX_MEDIA_ITEM_BYTES = 512 * 1024 * 1024
+_MAX_DIAGNOSTIC_BUNDLE_BYTES = 1024 * 1024 * 1024
 
 
 class DiagnosticExportError(RuntimeError):
     """A value-free export failure safe to show to an authorized Owner."""
+
+
+class _DiagnosticCleanupUncertain(RuntimeError):
+    """Internal signal that storage reservation must remain held."""
 
 
 class DiagnosticFieldKind(StrEnum):
@@ -198,14 +205,14 @@ class DiagnosticDocument:
 
 @dataclass(frozen=True)
 class MediaAsset:
-    """One raw media item resolved only after individual Owner selection."""
+    """Bounded reader for one individually selected raw media item."""
 
-    content: bytes
+    reader: BinaryIO = dataclass_field(repr=False)
     media_type: str = "application/octet-stream"
 
     def __post_init__(self) -> None:
-        if not isinstance(self.content, bytes):
-            raise TypeError("media content must be bytes")
+        if not callable(getattr(self.reader, "readinto", None)):
+            raise TypeError("media reader must support bounded readinto")
         if not isinstance(self.media_type, str) or not _SAFE_NAME.fullmatch(
                 self.media_type.replace("/", ".")):
             raise ValueError("media type is invalid")
@@ -217,7 +224,8 @@ class MediaDescriptor:
     media_type: str = "application/octet-stream"
 
     def __post_init__(self) -> None:
-        if type(self.size_bytes) is not int or self.size_bytes <= 0:
+        if (type(self.size_bytes) is not int or self.size_bytes <= 0
+                or self.size_bytes > _MAX_MEDIA_ITEM_BYTES):
             raise ValueError("media size is invalid")
         if not isinstance(self.media_type, str) or not _SAFE_NAME.fullmatch(
                 self.media_type.replace("/", ".")):
@@ -321,7 +329,8 @@ def _zip_size(entries: Iterable[tuple[str, int]]) -> int:
         name_size = len(name.encode("ascii"))
         total += content_size + 76 + 2 * name_size
         count += 1
-    if count > 65535 or total >= ZIP64_LIMIT:
+    if (count > 65535 or total >= ZIP64_LIMIT
+            or total > _MAX_DIAGNOSTIC_BUNDLE_BYTES):
         raise DiagnosticExportError("diagnostic bundle is too large")
     return total
 
@@ -456,9 +465,10 @@ class _DiagnosticBundleWriter:
         temporary_name = f".{bundle_name}.part"
         temporary_path = prepared.output_directory / temporary_name
         bundle_path = prepared.output_directory / bundle_name
-        published = False
+        owned_path: Path | None = None
         try:
             descriptor = os.open(temporary_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            owned_path = temporary_path
             with os.fdopen(descriptor, "w+b") as stream, ZipFile(
                     stream, "w", compression=ZIP_STORED) as archive:
                 for name, value in prepared.static_entries:
@@ -471,12 +481,12 @@ class _DiagnosticBundleWriter:
                     with self._media_source.open_selected(media_id) as supplied:
                         if not isinstance(supplied, MediaAsset):
                             raise TypeError
-                        asset = MediaAsset(supplied.content, supplied.media_type)
-                        if (len(asset.content) != expected.size_bytes
-                                or asset.media_type != expected.media_type):
+                        asset = MediaAsset(supplied.reader, supplied.media_type)
+                        if asset.media_type != expected.media_type:
                             raise ValueError
-                        self._write_bytes(
-                            archive, f"media/{index:04d}.bin", asset.content)
+                        self._write_stream(
+                            archive, f"media/{index:04d}.bin", asset.reader,
+                            expected.size_bytes)
                         del asset
                     del supplied
                 stream.flush()
@@ -484,7 +494,7 @@ class _DiagnosticBundleWriter:
             if temporary_path.stat().st_size != prepared.reserved_bytes:
                 raise OSError("unexpected diagnostic bundle size")
             os.replace(temporary_path, bundle_path)
-            published = True
+            owned_path = bundle_path
             directory_fd = os.open(
                 prepared.output_directory, os.O_RDONLY | os.O_DIRECTORY)
             try:
@@ -492,13 +502,14 @@ class _DiagnosticBundleWriter:
             finally:
                 os.close(directory_fd)
         except Exception:
-            try:
-                (bundle_path if published else temporary_path).unlink()
-            except FileNotFoundError:
-                pass
-            except OSError:
-                pass
-            if published:
+            cleanup_durable = True
+            if owned_path is not None:
+                try:
+                    owned_path.unlink()
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    cleanup_durable = False
                 try:
                     directory_fd = os.open(
                         prepared.output_directory, os.O_RDONLY | os.O_DIRECTORY)
@@ -507,7 +518,9 @@ class _DiagnosticBundleWriter:
                     finally:
                         os.close(directory_fd)
                 except OSError:
-                    pass
+                    cleanup_durable = False
+            if not cleanup_durable:
+                raise _DiagnosticCleanupUncertain from None
             raise DiagnosticExportError("diagnostic bundle write failed") from None
         return DiagnosticExportResult(
             bundle_path=bundle_path,
@@ -528,6 +541,27 @@ class _DiagnosticBundleWriter:
         info.compress_type = ZIP_STORED
         archive.writestr(info, value)
 
+    @staticmethod
+    def _write_stream(archive: ZipFile, name: str, reader: BinaryIO,
+                      expected_size: int) -> None:
+        info = ZipInfo(name)
+        info.external_attr = 0o600 << 16
+        info.compress_type = ZIP_STORED
+        info.file_size = expected_size
+        buffer = bytearray(_MEDIA_CHUNK_BYTES)
+        remaining = expected_size
+        with archive.open(info, "w") as target:
+            while remaining:
+                view = memoryview(buffer)[:min(len(buffer), remaining)]
+                count = reader.readinto(view)
+                if type(count) is not int or not 0 < count <= len(view):
+                    raise ValueError("selected media size changed")
+                target.write(view[:count])
+                remaining -= count
+        extra = bytearray(1)
+        if reader.readinto(extra) != 0:
+            raise ValueError("selected media size changed")
+
 
 class DiagnosticExportService:
     """The sole public bundle creation path, with pre-write confirmation."""
@@ -539,22 +573,59 @@ class DiagnosticExportService:
         self.__storage_policy = storage_policy
         self.__writer = _DiagnosticBundleWriter(source, media_source)
         self.__worker_slot = asyncio.Semaphore(1)
+        self.__storage_uncertain = False
 
     def __write_reserved(self, prepared: _PreparedBundle) -> DiagnosticExportResult:
         admitted = False
+        retain_reservation = False
         try:
+            if self.__storage_uncertain:
+                raise DiagnosticExportError("diagnostic storage state is uncertain")
             self.__storage_policy.admit(prepared.reserved_bytes, critical=False)
             admitted = True
             return self.__writer.write(prepared)
+        except _DiagnosticCleanupUncertain:
+            self.__storage_uncertain = True
+            retain_reservation = True
+            raise DiagnosticExportError(
+                "diagnostic storage state is uncertain") from None
         finally:
-            if admitted:
-                self.__storage_policy.release()
+            if admitted and not retain_reservation:
+                try:
+                    self.__storage_policy.release()
+                except Exception:
+                    self.__storage_uncertain = True
+                    raise DiagnosticExportError(
+                        "diagnostic storage state is uncertain") from None
+
+    @staticmethod
+    async def __run_worker(call):
+        worker = asyncio.create_task(asyncio.to_thread(call))
+        try:
+            return await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            while not worker.done():
+                try:
+                    await asyncio.shield(worker)
+                except asyncio.CancelledError:
+                    continue
+                except BaseException:
+                    break
+            if not worker.cancelled():
+                try:
+                    worker.exception()
+                except BaseException:
+                    pass
+            raise
 
     async def export(self, action: DiagnosticExportAction) -> DiagnosticExportResult:
         async with self.__worker_slot:
-            prepared = await asyncio.to_thread(self.__writer.prepare, action)
+            if self.__storage_uncertain:
+                raise DiagnosticExportError("diagnostic storage state is uncertain")
+            prepared = await self.__run_worker(
+                partial(self.__writer.prepare, action))
             await self._authorizer.require_owner_export(action, prepared.confirmation)
-            return await asyncio.to_thread(
+            return await self.__run_worker(
                 partial(self.__write_reserved, prepared))
 
 

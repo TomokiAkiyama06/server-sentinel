@@ -11,12 +11,16 @@ export primitive.
 
 The service dispatches collection, selected-media access, ZIP writing and fsync
 through a one-slot worker boundary so the ASGI event loop is not blocked. Before
+releasing that slot after caller cancellation, it shields and drains the active
+worker so no second export can overlap its files or storage reservation. Before
 opening a temporary bundle, it reserves the exact `ZIP_STORED` byte count through
 the shared storage admission policy; the policy owns filesystem allocation and
 metadata overhead, pressure/hard-stop state and the deployment hard reserve.
 Admission remains held through publication and directory fsync. Failure removes
-the temporary file, or removes and fsyncs an already-renamed bundle when final
-directory fsync fails, before releasing the reservation.
+and directory-fsyncs the temporary file, or an already-renamed bundle when final
+directory fsync fails, before releasing the reservation. If durable cleanup
+cannot be confirmed, the service retains the reservation and blocks later
+exports for its lifetime rather than admitting writes against uncertain space.
 
 Every diagnostic producer must use an allowlisted category, label scalar fields,
 and use a centrally reviewed `SafeDiagnosticFieldName` for included fields.
@@ -32,7 +36,9 @@ media are always excluded. Hardware serials/UUIDs receive a keyed per-bundle
 digest; the ephemeral key is never exported. Raw monitoring media uses a separate resolver which cannot enumerate
 media and is called only for IDs individually selected in the authorized action.
 Selected metadata is sized before admission; after approval each item is opened,
-size/type checked, written and released before the next item is opened.
+type checked, copied through a bounded 64 KiB reader and released before the next
+item is opened. Individual media is capped at 512 MiB and the complete diagnostic
+bundle at 1 GiB; short, growing, or contract-breaking streams fail closed.
 
 `app.api.diagnostics` provides the prepared integration route. Application
 composition accepts only a `DiagnosticExportEndpoint` with a fixed local output

@@ -1,4 +1,6 @@
 from contextlib import contextmanager
+import asyncio
+from io import BytesIO
 import json
 import os
 from pathlib import Path
@@ -56,6 +58,7 @@ class SelectedMedia:
         self.active = 0
         self.max_active = 0
         self.worker_threads = []
+        self.read_requests = []
 
     @staticmethod
     def content(media_id):
@@ -78,7 +81,14 @@ class SelectedMedia:
             raise AssertionError("selected media retained across writes")
         self.resolved.append(media_id)
         try:
-            yield MediaAsset(self.content(media_id))
+            source = BytesIO(self.content(media_id))
+
+            class ObservedReader:
+                def readinto(inner_self, buffer):
+                    self.read_requests.append(len(buffer))
+                    return source.readinto(buffer)
+
+            yield MediaAsset(ObservedReader())
         finally:
             self.active -= 1
             self.released.append(media_id)
@@ -192,6 +202,8 @@ class DiagnosticExportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.media.released, ["clip_b", "clip_a"])
         self.assertEqual(self.media.max_active, 1)
         self.assertEqual(self.media.active, 0)
+        self.assertTrue(self.media.read_requests)
+        self.assertLessEqual(max(self.media.read_requests), 64 * 1024)
         self.assertEqual(result.included_media_count, 2)
         self.assertEqual(len([name for name in files if name.startswith("media/")]), 2)
         self.assertFalse(any(media_id.encode() in result.bundle_path.read_bytes()
@@ -273,6 +285,203 @@ class DiagnosticExportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(list(self.output.iterdir()), [])
         self.assertEqual(self.policy.releases, 1)
         self.assertFalse(self.policy.active)
+
+    async def test_cleanup_fsync_failure_retains_reservation_and_blocks_service(self):
+        calls = []
+
+        class Permit:
+            async def require_owner_export(inner_self, action, confirmation):
+                return None
+
+        def fail_publication_and_cleanup_fsync(descriptor):
+            calls.append(descriptor)
+            if len(calls) in {2, 3}:
+                raise OSError("synthetic directory fsync failure")
+
+        service = DiagnosticExportService(Permit(), self.source, self.policy)
+        with patch("app.diagnostics.export.os.fsync",
+                   side_effect=fail_publication_and_cleanup_fsync):
+            with self.assertRaisesRegex(
+                    DiagnosticExportError, "diagnostic storage state is uncertain"):
+                await service.export(DiagnosticExportAction(self.output))
+
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(list(self.output.iterdir()), [])
+        self.assertEqual(len(self.policy.reservations), 1)
+        self.assertEqual(self.policy.releases, 0)
+        self.assertTrue(self.policy.active)
+        with self.assertRaisesRegex(
+                DiagnosticExportError, "diagnostic storage state is uncertain"):
+            await service.export(DiagnosticExportAction(self.output))
+        self.assertEqual(len(self.policy.reservations), 1)
+
+    async def test_cancelled_write_drains_worker_before_next_export(self):
+        entered = threading.Event()
+        proceed = threading.Event()
+
+        class Permit:
+            async def require_owner_export(inner_self, action, confirmation):
+                return None
+
+        class BlockingMedia(SelectedMedia):
+            @contextmanager
+            def open_selected(inner_self, media_id):
+                inner_self.worker_threads.append(threading.get_ident())
+                inner_self.active += 1
+                inner_self.max_active = max(inner_self.max_active, inner_self.active)
+                inner_self.resolved.append(media_id)
+                source = BytesIO(inner_self.content(media_id))
+
+                class BlockingReader:
+                    def readinto(reader_self, buffer):
+                        entered.set()
+                        if not proceed.wait(timeout=5):
+                            raise AssertionError("timed out waiting to continue")
+                        inner_self.read_requests.append(len(buffer))
+                        return source.readinto(buffer)
+
+                try:
+                    yield MediaAsset(BlockingReader())
+                finally:
+                    inner_self.active -= 1
+                    inner_self.released.append(media_id)
+
+        media = BlockingMedia()
+        service = DiagnosticExportService(Permit(), self.source, self.policy, media)
+        first = asyncio.create_task(service.export(
+            DiagnosticExportAction(self.output, ("clip_a",))))
+        while not entered.is_set():
+            await asyncio.sleep(0)
+        first.cancel()
+        second = asyncio.create_task(service.export(
+            DiagnosticExportAction(self.output, ("clip_b",))))
+        await asyncio.sleep(0.01)
+        self.assertEqual(len(self.policy.reservations), 1)
+        self.assertEqual(media.max_active, 1)
+        self.assertEqual(media.resolved, ["clip_a"])
+
+        proceed.set()
+        with self.assertRaises(asyncio.CancelledError):
+            await first
+        second_result = await second
+        self.assertTrue(second_result.bundle_path.exists())
+        self.assertEqual(media.max_active, 1)
+        self.assertEqual(media.released, ["clip_a", "clip_b"])
+        self.assertEqual(self.policy.releases, 2)
+        self.assertFalse(self.policy.active)
+
+    async def test_cancelled_prepare_drains_worker_and_repeated_cancel_keeps_slot(self):
+        entered = threading.Event()
+        proceed = threading.Event()
+
+        class BlockingDiagnostics(SyntheticDiagnostics):
+            def __init__(inner_self):
+                inner_self.calls = 0
+                inner_self.active = 0
+                inner_self.max_active = 0
+
+            def collect(inner_self):
+                inner_self.calls += 1
+                inner_self.active += 1
+                inner_self.max_active = max(
+                    inner_self.max_active, inner_self.active)
+                try:
+                    entered.set()
+                    if not proceed.wait(timeout=5):
+                        raise AssertionError("timed out waiting to continue")
+                    return super().collect()
+                finally:
+                    inner_self.active -= 1
+
+        class Permit:
+            async def require_owner_export(inner_self, action, confirmation):
+                return None
+
+        source = BlockingDiagnostics()
+        service = DiagnosticExportService(Permit(), source, self.policy)
+        first = asyncio.create_task(service.export(DiagnosticExportAction(self.output)))
+        while not entered.is_set():
+            await asyncio.sleep(0)
+        first.cancel()
+        await asyncio.sleep(0)
+        first.cancel()
+        second = asyncio.create_task(service.export(DiagnosticExportAction(self.output)))
+        await asyncio.sleep(0.01)
+        self.assertEqual(source.calls, 1)
+        self.assertEqual(source.max_active, 1)
+        self.assertFalse(first.done())
+
+        proceed.set()
+        with self.assertRaises(asyncio.CancelledError):
+            await first
+        second_result = await second
+        self.assertTrue(second_result.bundle_path.exists())
+        self.assertEqual(source.calls, 2)
+        self.assertEqual(source.max_active, 1)
+
+    async def test_media_stream_is_generated_and_copied_in_bounded_chunks(self):
+        media_size = 3 * 64 * 1024 + 17
+        requests = []
+
+        class Permit:
+            async def require_owner_export(inner_self, action, confirmation):
+                return None
+
+        class GeneratedMedia:
+            def describe_selected(inner_self, media_id):
+                return MediaDescriptor(media_size)
+
+            @contextmanager
+            def open_selected(inner_self, media_id):
+                remaining = media_size
+
+                class GeneratedReader:
+                    def readinto(reader_self, buffer):
+                        nonlocal remaining
+                        requests.append(len(buffer))
+                        count = min(len(buffer), remaining)
+                        buffer[:count] = b"x" * count
+                        remaining -= count
+                        return count
+
+                yield MediaAsset(GeneratedReader())
+
+        result = await DiagnosticExportService(
+            Permit(), self.source, self.policy, GeneratedMedia()).export(
+                DiagnosticExportAction(self.output, ("clip_a",)))
+        with ZipFile(result.bundle_path) as archive:
+            with archive.open("media/0001.bin") as stored:
+                self.assertEqual(len(stored.read()), media_size)
+        self.assertGreater(len(requests), 3)
+        self.assertLessEqual(max(requests), 64 * 1024)
+
+    async def test_media_stream_size_and_bundle_caps_fail_before_authorization(self):
+        authorized = []
+
+        class MustNotAuthorize:
+            async def require_owner_export(inner_self, action, confirmation):
+                authorized.append(confirmation)
+
+        class OversizedMedia(SelectedMedia):
+            def describe_selected(inner_self, media_id):
+                return MediaDescriptor(512 * 1024 * 1024 + 1)
+
+        with self.assertRaises(DiagnosticExportError):
+            await DiagnosticExportService(
+                MustNotAuthorize(), self.source, self.policy, OversizedMedia()).export(
+                    DiagnosticExportAction(self.output, ("clip_a",)))
+
+        class ExcessiveAggregateMedia(SelectedMedia):
+            def describe_selected(inner_self, media_id):
+                return MediaDescriptor(400 * 1024 * 1024)
+
+        with self.assertRaisesRegex(DiagnosticExportError, "too large"):
+            await DiagnosticExportService(
+                MustNotAuthorize(), self.source, self.policy,
+                ExcessiveAggregateMedia()).export(DiagnosticExportAction(
+                    self.output, ("clip_a", "clip_b", "clip_c")))
+        self.assertEqual(authorized, [])
+        self.assertEqual(self.policy.reservations, [])
 
     async def test_media_size_change_removes_partial_bundle_and_releases_each_item(self):
         class Permit:
