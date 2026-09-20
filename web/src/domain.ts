@@ -15,20 +15,28 @@ export interface CameraSourceSummary {
 }
 
 /** `manual` has no event_id in RecordingStore; ordinary/critical event rows do. */
+// These are UI projections, not a mirror of a backend payload: no route serves
+// them yet (#10). Fields marked "derived" have no column or attribute of that
+// name; an adapter must compute or join them. See web/README.md for the audit.
 export type RecordingKind = 'event' | 'manual' | 'critical';
 export type RecordingStatus = 'active' | 'complete' | 'gapped' | 'interrupted';
 export interface RecordingSummary {
   id: string;
   source_id: string;
+  /** Derived: joined from the camera registry, not a `recordings` column. */
   source_name: string;
+  /** Derived: no `event_id` is manual, the `critical` flag is critical evidence. */
   kind: RecordingKind;
   /** Store coverage state; `gapped` and `interrupted` are never presented as complete. */
   status: RecordingStatus;
   start_ms: number;
+  /** Derived from `start_ms` and `ended_ms`; the store keeps no duration. */
   duration_ms: number;
+  /** Derived: summed from the linked `recording_segments.byte_length`. */
   size_bytes: number;
   starred: boolean;
-  /** Remaining Main retention; `null` means the owner starred it and it never auto-deletes. */
+  /** Derived from `ended_ms` and `RetentionPeriods.recording_days`. `null`
+   *  means the owner starred it and it never auto-deletes. */
   retention_days_left: number | null;
 }
 
@@ -45,17 +53,27 @@ export interface StorageSummary {
   hard_reserve_bytes: number;
   recording_limit_bytes: number;
   critical_allowance_bytes: number;
+  /** `RetentionPeriods.recording_days` (renamed). */
   recording_retention_days: number;
+  /** `RetentionPeriods.audit_days` (renamed). */
   audit_retention_days: number;
-  /** Agent-owned protected incidents; a separate lifecycle Main retention never shortens. */
+  /** Agent-owned protected incidents; a separate lifecycle Main retention never
+   *  shortens. No Main-server field supplies this today: the 60-day default is
+   *  documented policy (agent/storage/README.md) and Plan 9A owns it. */
   agent_incident_retention_days: number;
+  /** `SlackDelivery.configured` (renamed). */
   slack_configured: boolean;
+  /** Derived: formatted from the daily scheduler's hour, minute and zone. */
   daily_summary_local_time: string;
-  /** Sticky backend faults. A recovered state never hides a lost audit record,
-   *  an unfinished cleanup, or a notification that was never delivered. */
+  // Sticky backend faults. A recovered state never hides a lost audit record,
+  // an unfinished cleanup, or a notification that was never delivered.
+  /** `StorageStatus.audit_delivery_failed`. */
   audit_delivery_failed: boolean;
+  /** `StorageStatus.cleanup_failed`. */
   cleanup_failed: boolean;
+  /** `NotificationService.delivery_failed` (renamed for this payload). */
   notification_delivery_failed: boolean;
+  /** `NotificationService.local_delivery_failed` (renamed for this payload). */
   notification_log_failed: boolean;
 }
 

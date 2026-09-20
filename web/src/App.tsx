@@ -8,6 +8,9 @@ import { MutationQueue } from './shared/mutations';
 type Access = { state: 'loading' | 'failed' } | Session;
 type Sources = { state: 'loading' | 'failed' | 'pending' } | { state: 'ready'; items: readonly CameraSourceSummary[] };
 type Recordings = { state: 'loading' | 'failed' | 'pending' } | { state: 'ready'; items: readonly RecordingSummary[] };
+/** Drop a loaded snapshot so a pending reload cannot keep painting the old answer. */
+const stale = <T extends { state: string }>(current: T) =>
+  current.state === 'ready' ? { state: 'loading' as const } : current;
 type Storage = { state: 'loading' | 'failed' | 'pending' } | { state: 'ready'; item: StorageSummary };
 
 /** Deliberately no external reporter, error details, or automatic retry loop. */
@@ -54,8 +57,6 @@ export function App({ services = deniedServices }: { services?: DashboardService
   // rather than in the passive effect that requests the new one.
   if (openedView !== view) {
     setOpenedView(view);
-    const stale = <T extends { state: string }>(current: T) =>
-      current.state === 'ready' ? { state: 'loading' as const } : current;
     if (view === 'recordings') setRecordings(stale);
     if (view === 'storage') setStorage(stale);
   }
@@ -103,7 +104,12 @@ export function App({ services = deniedServices }: { services?: DashboardService
     void (async () => {
       try {
         const items = await loader(controller.signal);
-        if (!controller.signal.aborted) setRecordings({ state: 'ready', items });
+        if (!controller.signal.aborted) {
+          setRecordings({ state: 'ready', items });
+          // This snapshot is authoritative, so no earlier write's result is
+          // unknown any more; a later failure re-marks its own recording.
+          setFailedWrites(current => current.length ? [] : current);
+        }
       } catch {
         if (!controller.signal.aborted) setRecordings({ state: 'failed' });
       }
@@ -204,7 +210,7 @@ export function App({ services = deniedServices }: { services?: DashboardService
                   ? <section className="notice" role="alert"><p>{t.recordingsUnavailable}</p><button className="primary" onClick={() => setRefresh(value => value + 1)}>{t.retry}</button></section>
                   : selected === 'recordings' && recordings.state === 'loading' ? <p role="status">{t.checking}</p>
                     : selected === 'storage' && access.role === 'owner' && storage.state === 'ready'
-                      ? <StorageView t={t} storage={storage.item} onRefresh={() => setRefresh(value => value + 1)} />
+                      ? <StorageView t={t} storage={storage.item} onRefresh={() => { setStorage(stale); setRefresh(value => value + 1); }} />
                       : selected === 'storage' && storage.state === 'failed'
                         ? <section className="notice" role="alert"><p>{t.storageUnavailable}</p><button className="primary" onClick={() => setRefresh(value => value + 1)}>{t.retry}</button></section>
                         : selected === 'storage' && storage.state === 'loading' ? <p role="status">{t.checking}</p>

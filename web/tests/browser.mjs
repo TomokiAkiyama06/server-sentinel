@@ -256,6 +256,9 @@ try {
       await page.wait("document.querySelectorAll('[data-storage-state]').length === 3");
       assert.equal(requests.filter(path => path === '/api/mock/storage').length, first + 1);
       await page.evaluate("Array.from(document.querySelectorAll('.storage button')).find(el => el.textContent === '最新の状態を取得').click()");
+      // An explicit refresh does not change the view, so it must drop the
+      // displayed snapshot itself instead of leaving stale health painted.
+      assert.equal(await page.evaluate("document.querySelectorAll('[data-storage-state]').length"), 0);
       await delay(300);
       assert.equal(requests.filter(path => path === '/api/mock/storage').length, first + 2);
       await page.wait("document.querySelectorAll('[data-storage-state]').length === 3");
@@ -267,13 +270,21 @@ try {
       await page.evaluate("window.failNextMutations('/api/mock/mutation-refused')");
       await page.evaluate("document.querySelector('[data-recording-id=\"synthetic-recording-0\"] .row-actions button').click()");
       await page.wait("document.querySelectorAll('[data-write-failed=\"true\"]').length === 1");
-      await page.evaluate("window.failNextMutations('/api/mock/mutation')");
-      await page.evaluate("document.querySelector('[data-recording-id=\"synthetic-recording-2\"] .row-actions button').click()");
-      await page.wait("document.querySelector('[data-recording-id=\"synthetic-recording-2\"]').innerText.includes('★ を外す')");
-      // The other recording's failure is still reported.
-      assert.equal(await page.evaluate("document.querySelectorAll('.write-alert').length"), 1);
+      // A second failure does not replace the first: each recording keeps its
+      // own unknown result, and only the failing rows are marked.
+      await page.evaluate("document.querySelector('[data-recording-id=\"synthetic-recording-1\"] .row-actions button').click()");
+      await page.wait("document.querySelectorAll('[data-write-failed=\"true\"]').length === 2");
       assert.deepEqual(await page.evaluate("Array.from(document.querySelectorAll('[data-write-failed=\"true\"]')).map(el => el.dataset.recordingId)"),
-        ['synthetic-recording-0']);
+        ['synthetic-recording-0', 'synthetic-recording-1']);
+      assert.equal(await page.evaluate("document.querySelectorAll('.write-alert').length"), 1);
+      // Re-opening the list obtains an authoritative snapshot, so the markers
+      // must not keep asking for a reload that already succeeded.
+      await page.evaluate("window.failNextMutations('/api/mock/mutation')");
+      await page.click('概要');
+      await page.click('録画');
+      await page.wait("document.querySelectorAll('[data-recording-id]').length === 3");
+      assert.equal(await page.evaluate("document.querySelectorAll('.write-alert').length"), 0);
+      assert.equal(await page.evaluate("document.querySelectorAll('[data-write-failed=\"true\"]').length"), 0);
     });
     // A rejected write reports itself without discarding the loaded list.
     await scenario(viewport, { recordings: 3, mutationStatus: 503 }, async page => {

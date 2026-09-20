@@ -103,6 +103,38 @@ sources, recordings, storage and pending writes during render rather than in a
 passive effect, so the previous session's rows are never committed to the screen
 under a new provider.
 
+### How these types relate to the backend
+
+No route serves these screens yet, so `src/domain.ts` holds UI projections, not
+a mirror of a payload some endpoint already returns. Checked against
+`server/app/storage/policy.py`, `server/app/storage/retention.py`,
+`server/app/notifications/` and `server/app/media/recording/` on main:
+
+- Same name, same meaning as `StorageStatus`: `state`, `recording_bytes`,
+  `starred_bytes`, `reserved_bytes`, `available_bytes`, `hard_reserve_bytes`,
+  `recording_limit_bytes`, `critical_allowance_bytes`, `audit_delivery_failed`,
+  `cleanup_failed`.
+- Renamed from another backend object: `recording_retention_days` and
+  `audit_retention_days` are `RetentionPeriods.recording_days` / `.audit_days`;
+  `slack_configured` is `SlackDelivery.configured`;
+  `notification_delivery_failed` and `notification_log_failed` are
+  `NotificationService.delivery_failed` / `.local_delivery_failed`, renamed
+  because "delivery failed" is ambiguous inside a storage payload.
+- Derived, with no backend field of that name: `daily_summary_local_time`
+  (formatted from the daily scheduler's hour, minute and zone) and, on
+  `RecordingSummary`, `source_name` (joined from the camera registry), `kind`
+  (no `event_id` is manual, the `critical` flag is critical evidence),
+  `duration_ms`, `size_bytes` (summed from linked segments) and
+  `retention_days_left`.
+- **No backend source at all**: `agent_incident_retention_days`. The 60-day
+  protected-incident default is documented policy (`agent/storage/README.md`,
+  `AGENTS.md`) owned by Plan 9A; nothing on the Main Server produces it today,
+  so the screen shows the documented default.
+
+Straight from the `recordings` table: `id`, `source_id`, `status` and `starred`.
+`status` uses the store's `active` / `complete` / `gapped` / `interrupted`;
+`deleting` never reaches a client because `list_recordings()` excludes it.
+
 `canVisit` keeps `storage` owner-only and `recordings` behind `recordings:view`;
 `live:view` alone reaches neither the recording list nor historical metadata.
 The production entry still uses `deniedServices`, which supplies no recording,
