@@ -25,7 +25,7 @@ Issue #1 closed when PR #2 merged after documentation/bootstrap acceptance and c
 - [ ] Docker Compose where appropriate
 - [ ] versioned Main Server install / update / rollback lifecycle (#47)
 - [ ] first-run setup wizard and resumable initial configuration flow (#48)
-- [ ] deployment-owner authorization ADR/bootstrap
+- [ ] deployment-owner authorization ADR/bootstrap — ADR-0003 Proposed; Owner decision pending, synthetic policy model only
 - [ ] trusted Tailscale/private-proxy identity boundary
 
 ## Phase 2 — Camera Source + Capture Node platform
@@ -77,7 +77,7 @@ acceptance.
 - [ ] application invitation/allowlist
 - [ ] per-person ServerSentinel credential (WebAuthn/passkey) verified on every human/media route, with required authenticator user verification
 - [ ] invitation enrollment and local owner bootstrap as the only pre-credential paths
-- [ ] reserved, secure-context dashboard origin with a startup/daily reservation check and Owner notification
+- [ ] reserved, secure-context dashboard origin with a startup/daily reservation check that closes access and notifies the Owner
 - [ ] credential-bound server-side sessions with idle/absolute expiry and explicit sign-out
 - [ ] credential-level and principal-level revocation
 - [ ] fresh user-verification step-up for owner operations

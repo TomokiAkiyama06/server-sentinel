@@ -192,6 +192,27 @@ Do not trust arbitrary forwarded identity headers.
 
 If Tailscale Serve/equivalent provides authenticated identity headers, the backend accepts them only on a non-bypassable local trusted-proxy path. Requests from LAN/other interfaces cannot directly set such headers and gain identity.
 
+The concrete Owner-bootstrap/session design is [ADR-0003](docs/ADR/0003-owner-authentication-and-trusted-proxy.md), currently **Proposed** pending Owner approval.
+It states the proposed trusted-host loopback limitation and upstream login-reuse
+risk, and defines recovery/revocation transitions for review. No session lifetime,
+identity-binding choice, or local recovery implementation is accepted by that
+proposal alone. Human routes and dashboard assets remain closed until the design
+is accepted and implemented/tested under #10. Its model tests do not validate a
+real Tailscale installation, LAN bypass resistance, or active stream cancellation.
+
+That proposal also requires a hostname reserved for the human listener on every
+scheme and port. No other application, static tree, alias, port, or catch-all
+may answer for that name: one sharing a path would run in the same browser
+origin, and one on another HTTPS port would still receive the host-only session
+cookie, because cookies are not port-scoped. The reservation is a deployment
+obligation — a dedicated network identity for ServerSentinel, or a
+single-purpose node enforced outside the application — because a local process
+can bind another port on that address without appearing in any proxy
+configuration. Startup and daily checks enumerate actual listeners and proxy
+routes for the whole name and close human access on any other answer, which
+bounds rather than removes that exposure; the application cannot prevent a
+local process from binding.
+
 ## Shared Tailnet account
 
 The research-room Tailnet uses one shared Tailscale account, so a verified identity header names the shared login rather than the person behind the request. Application authorization therefore rests on a ServerSentinel-issued per-person credential (WebAuthn/passkey as the default design target) created from an owner invitation and individually revocable.
@@ -207,7 +228,7 @@ Consequences to keep in mind while reviewing code:
 - the server verifies the transient WebAuthn data a registration or assertion carries — its own challenge, client data, authenticator data, the signature counter, the user-verification flag, and the relying-party id and origin — and persists only the credential id, its public key, the last accepted signature counter and owner-visible metadata; the rest is discarded once verified. An assertion's signature is always verified against the stored public key; a registration carries an attestation statement only sometimes, so `none` attestation is accepted while a present-but-invalid statement fails. A review that sees those fields skipped, or accepted from an unexpected origin, is looking at a broken check, not at data minimization;
 - no fingerprint or face template reaches ServerSentinel: it never leaves the authenticator. Credential records are not an identity or biometric database;
 - relying-party checks only hold if the dashboard owns its browser origin, with no other application sharing it, as AUTH-011 requires; a co-hosted application on that origin would put the credential within its reach;
-- reserving the origin is a deployment obligation (dedicated host, VM or namespace, or an OS/service policy that blocks another binder). The startup and daily check enumerates real listeners and every proxy route across all schemes and ports and notifies the Owner when something else answers there, but it detects rather than prevents: a process binding between two checks collects credentials and cookies for that origin until the next one;
+- reserving the origin is a deployment obligation, described above and in ADR-0003. The startup and daily check closes human access and notifies the Owner when anything else answers on that name, which bounds the exposure window rather than preventing the bind: a process binding between two checks collects credentials and cookies for that origin until the next one;
 - the origin must be a secure context (HTTPS, or `http://localhost` for a strictly local browser). Browsers withhold WebAuthn otherwise, so plain HTTP on a non-loopback host is not a usable human path;
 - the pending challenge lives server-side for one bounded, single-use ceremony and is then dropped;
 - the signature counter persists as `principal_credential.sign_count` and advances only on an accepted assertion. The comparison applies whenever the stored or the received counter is non-zero, and the received value must be strictly greater: a received 0 after a stored non-zero is a regression, not an exemption. A regression refuses the assertion and notifies the Owner as a possible cloned authenticator. Only a stored-and-received 0 is exempt, which is the ordinary passkey case;
@@ -216,6 +237,8 @@ Consequences to keep in mind while reviewing code:
 - revocation is credential-scoped, not device-scoped. A synced passkey is one credential across several of its owner's devices, so revoking it applies everywhere it synced; a deployment that needs device-scoped control registers device-bound authenticators and refuses backup-eligible credentials.
 
 Residual limits are documented, not claimed away: a credential its holder deliberately lends, and a session left unlocked on an unattended machine, are outside what the application can observe.
+
+Enrollment codes and owner bootstrap authorizations are bearer authorizations reachable by everyone holding the shared account, so they are CSPRNG-generated with at least 128 bits of entropy, stored only as a hash, compared in constant time, short-lived, single-use and rate-limited per code and per source. A code short enough to guess is a finding regardless of the lifetime and rate limits around it.
 
 Three request classes necessarily run before a credential exists, and the set is closed: the local owner bootstrap (a privileged local action on the Main Server that issues a single-use, short-lived enrollment authorization shown only on the console, redeemed once from a browser at the reserved origin through the ordinary redemption path — never a remote first-visitor route), invitation redemption against a valid short-lived single-use enrollment code, and the authentication route. They return no application data, redemption is rate-limited and succeeds at most once, an absent/unknown/expired/redeemed code gets the same generic response as an uninvited person, and enrollment codes never reach logs. Every other human route requires a verified credential and an active session.
 

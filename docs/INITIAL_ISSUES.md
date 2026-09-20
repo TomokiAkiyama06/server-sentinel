@@ -301,6 +301,7 @@ Scope:
 - loopback/non-bypassable backend listener;
 - application principal/allowlist;
 - per-person ServerSentinel credential (`principal_credential`) with invitation enrollment, required authenticator user verification, and individual revocation;
+- CSPRNG-backed enrollment codes and bootstrap authorizations with a stated minimum entropy, hashed storage and constant-time comparison;
 - session/revocation/recovery;
 - the closed set of pre-credential routes (local owner bootstrap issuing a console-displayed single-use authorization, enrollment-code redemption, authentication) and the freshness window for owner step-up;
 - the reserved, secure-context dashboard origin, whose reservation is a deployment obligation the application can only check;
@@ -323,6 +324,11 @@ Acceptance:
 - the signature-counter comparison runs whenever the stored or the received counter is non-zero, so a received 0 after a stored non-zero is refused as a regression and notified to the Owner;
 - revocation is credential-scoped: a synced passkey is revoked everywhere it synced, and nothing promises per-device revocation;
 - no developer-operated identity/cloud.
+
+Design progress: [ADR-0003](ADR/0003-owner-authentication-and-trusted-proxy.md)
+is Proposed with synthetic policy-model coverage. Owner decisions remain pending;
+this does not close #6 or permit #10 authentication activation. Actual proxy,
+session, recovery, and stream tests remain #10/#19/#27/#28 work.
 
 ## Plan 5 — Local UVC discovery and stable identity
 
@@ -761,8 +767,9 @@ Acceptance:
 - where the deployment configures a trusted proxy identity, it is additionally verified on the trusted local path and recorded, per AUTH-005; where the private-network path supplies no identity header, the absence alone does not deny access and does not weaken the credential check;
 - the only exceptions are the enumerated pre-credential routes of AUTH-012: local owner bootstrap, invitation redemption gated by a valid unexpired single-use enrollment code, and the authentication route. Bootstrap issues a single-use, short-lived enrollment authorization shown only on the local console, and the first owner redeems it once from a browser at the reserved origin through the ordinary redemption path, so no owner-specific route is added. A fresh deployment reaches its first owner and an invitee redeems a first credential without a deadlock, and neither path returns camera, recording, timeline or deployment data;
 - the dashboard origin is reserved for ServerSentinel and served as a secure context (HTTPS, or `http://localhost` for a strictly local browser); an ordinary-HTTP non-loopback origin fails acceptance because browsers withhold WebAuthn there;
-- the reservation check runs at startup and at least daily, enumerates real listeners and every proxy route across all schemes and ports, and notifies the Owner when something else answers on that origin. Tests treat it as detection with a gap between checks, not as prevention;
-- an absent, unknown, expired or already-redeemed enrollment code receives the same generic response as an uninvited person, redemption succeeds at most once, attempts are rate-limited, and logs carry no raw code;
+- the reservation check runs at startup and at least daily, enumerates real listeners and every proxy route for the whole name across all schemes and ports, and closes human access and notifies the Owner on any other answer. Tests treat it as a bounded exposure window with a gap between checks, not as prevention;
+- an absent, unknown, expired or already-redeemed enrollment code receives the same generic response as an uninvited person, redemption succeeds at most once, attempts are rate-limited per code and per source, and logs carry no raw code;
+- enrollment codes and owner bootstrap authorizations come from a cryptographically secure random generator with at least 128 bits of entropy in the value actually checked, are stored only as a hash and compared in constant time; tests cover the entropy floor and reject a short or predictable code even when lifetime, single use and rate limiting are present;
 - AUTH-008 owner operations require a user verification newer than the configured freshness window; a credential-bearing but stale session is refused, and a failed or cancelled step-up performs no state change and returns only the generic failure;
 - the shared Tailscale account is assumed: a second person on the same Tailscale login and the same device, without a credential of their own, receives the same generic response as any uninvited person;
 - revoking one credential invalidates that credential and its sessions only; revoking the principal invalidates all of them promptly;

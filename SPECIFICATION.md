@@ -881,10 +881,11 @@ principal_credential
 principal_enrollment
 - id
 - principal_id
-- code_hash (the raw enrollment code is never stored or logged)
+- code_hash (of a CSPRNG value with at least 128 bits of entropy; the raw
+  enrollment code is never stored or logged, and comparison is constant-time)
 - expires_at
 - redeemed_at (single use)
-- attempt_count (bounded; redemption is rate-limited)
+- attempt_count (bounded; redemption is rate-limited per code and per source)
 
 principal_session
 - id
@@ -972,14 +973,13 @@ Per AUTH-011 the dashboard is served from an origin reserved for it, with no
 other application sharing it; a co-hosted application on that origin would put
 the credential within its reach.
 
-The reservation itself is a deployment obligation — a dedicated host, VM or
-namespace, or an OS/service policy that keeps another process from binding the
-name. The application verifies it at startup and at least daily by enumerating
-the host's real listeners and every proxy route that reaches them, across all
-schemes and ports, and notifies the Owner when anything else answers on the
-reserved origin. That is detection, not prevention: a process that binds between
-two checks receives credentials and cookies for that origin until the next
-check.
+The reservation itself is a deployment obligation, stated in full in §11.9 and
+ADR-0003: the name serves ServerSentinel alone on every scheme and port. The
+application verifies it at startup and at least daily by enumerating the host's
+real listeners and every proxy route for that name, and closes human access and
+notifies the Owner on any other answer. That bounds the exposure window rather
+than preventing the bind: a process that binds between two checks receives
+credentials and cookies for that origin until the next check.
 
 The origin must also be a secure context — HTTPS, or `http://localhost` for a
 strictly local browser — because browsers expose WebAuthn only there. Plain
@@ -1050,7 +1050,16 @@ the local console; the first owner redeems it once from a browser at the
 reserved origin through the redemption path, so no owner-specific route and no
 remote first-visitor setup exist. Invitation redemption is single-use and
 rate-limited and registers exactly one `principal_credential` for the named
-principal. It returns no camera, recording, timeline or deployment data and
+principal.
+
+Both the invitation code and the bootstrap authorization are bearer
+authorizations on a path every holder of the shared account can reach, so both
+come from a cryptographically secure random generator with at least 128 bits of
+entropy. A friendlier encoding may be used for reading a code aloud or typing it,
+but the entropy floor applies to the value actually checked, not to a shortened
+display form, and the comparison is constant-time against `code_hash`. Lifetime,
+single use and rate limiting bound how long and how often a guess may be tried;
+they are not a substitute for the entropy. It returns no camera, recording, timeline or deployment data and
 grants no application access by itself: the invited person then authenticates
 like anyone else. An absent, unknown, expired or already-redeemed code receives
 the same generic response as an uninvited person, and logs record the attempt
@@ -1099,6 +1108,32 @@ Therefore:
 - ServerSentinel cannot observe a deliberately lent credential or a session left
   unlocked on an unattended machine. Documentation states this limit instead of
   claiming the application separates people who share a workstation.
+
+### 11.9 Owner bootstrap and session decision status
+
+[ADR-0003](docs/ADR/0003-owner-authentication-and-trusted-proxy.md) is a
+**Proposed** implementation design for Issue #6, pending explicit Owner approval.
+Its timeout values, exact identity binding, local bootstrap, and recovery choices
+are not accepted product defaults. Until approval and Issue #10 implementation,
+the backend shell denies human requests, including application assets,
+health/version/schema, and SPA/error fallbacks. Issue #8's static shell remains
+a development/mock artifact until integrated with this protected delivery path.
+The ADR's synthetic design model proves only policy composition, not deployed
+proxy, session, cryptographic, or browser behavior.
+
+The proposal also reserves a whole hostname: that name serves ServerSentinel
+alone on every scheme and port. Path-based co-hosting shares one browser origin,
+and another port of the same name still shares the cookie scope because cookies
+are not port-scoped, so neither is supported. Holding the name is a deployment
+obligation (a dedicated network identity, or a single-purpose node enforced
+outside the application), because a directly bound listener never appears in
+proxy configuration; the application's startup and daily listener/route checks
+close access when another answer is found, which bounds the exposure window
+instead of preventing the bind. Owner bootstrap also provisions the Owner's
+first per-person credential through the local administrative boundary, since no
+session exists without one. A verified trusted-proxy identity stays a supplementary check
+there; the authoritative per-person application credential is decided separately
+for Issue #6.
 
 ## 12. Dashboard UI
 
