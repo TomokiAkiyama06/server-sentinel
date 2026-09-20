@@ -4,6 +4,12 @@ This document contains checks that cannot be truthfully completed using software
 
 Do not mark an item PASS without performing it on the stated hardware/network/browser environment. Do not commit or attach real monitoring footage, real-person images/video/audio, owner biometric templates, or private deployment values to GitHub.
 
+Issue #7's backend foundation uses temporary SQLite and in-process ASGI tests;
+it does not mark any check here PASS. Before opening human routes under #10,
+verify the documented launcher binds only to the intended loopback boundary,
+the proxy cannot be bypassed, and generic denial also covers schema/version,
+static assets and errors. No unauthenticated HTTP health exception is provided.
+
 ## Test metadata
 
 ```text

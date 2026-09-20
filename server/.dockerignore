@@ -1,0 +1,11 @@
+*
+!requirements-ci.lock
+!requirements.lock
+!app/
+!app/**
+!tests/
+!tests/**
+!docs/
+!docs/**
+**/__pycache__
+**/*.pyc

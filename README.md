@@ -12,9 +12,11 @@ ServerSentinel is a free, self-hosted physical-security monitoring system for va
 
 ## Current project status
 
-Foundation implementation is underway. The [React dashboard shell](web/README.md)
+CI, the [Main Server foundation](server/docs/FOUNDATION.md), and the
+[React dashboard shell](web/README.md) are implemented. The dashboard
 provides Japanese/English placeholders with synthetic browser/CI validation.
-Its production entry denies access; authentication and protected deployment
+The backend human HTTP surface and dashboard production entry deny access;
+authentication and protected deployment
 integration remain separate work. Camera capture, live playback and full-system
 hardware/network acceptance are not established by this foundation. See
 [ROADMAP.md](ROADMAP.md) and GitHub Issues for component progress.
