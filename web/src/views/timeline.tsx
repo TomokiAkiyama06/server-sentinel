@@ -55,14 +55,13 @@ function attribution(item: Observation, t: Messages): string {
   return `${where} · ${t.detector}: ${t[`kind_${item.kind}`]}`;
 }
 
-function Row({ item, t, orderingBasis }: {
-  item: Observation; t: Messages; orderingBasis: TimelinePage['ordering_basis'];
-}) {
+function Row({ item, t }: { item: Observation; t: Messages }) {
   const group = kindGroup[item.kind];
   const value = displayValue(item);
-  const displayedAt = orderingBasis === 'received_at' ? item.received_at : item.occurred_at;
+  // Receipt time is the ordering key; the occurrence time stays on the row.
   return <li className={`timeline-row timeline-${group}`} data-observation-kind={item.kind}>
-    <time className="timeline-time" dateTime={displayedAt}>{stamp(displayedAt)}</time>
+    <time className="timeline-time" dateTime={item.received_at}
+      aria-label={`${t.receivedLabel}: ${stamp(item.received_at)}`}>{stamp(item.received_at)}</time>
     <span className={`timeline-dot timeline-dot-${group}`} aria-hidden="true" />
     <div className="timeline-detail">
       <p className="timeline-body">
@@ -76,7 +75,7 @@ function Row({ item, t, orderingBasis }: {
         <span>{attribution(item, t)}</span>
         <span>{t.confidenceLabel}: {item.confidence === null ? t.confidenceUnknown : `${Math.round(item.confidence * 100)}%`}</span>
         <span>{t.qualityLabel}: {t[`quality_${item.quality}`]}</span>
-        {untrusted(item) && <span>{t.receivedLabel}: {stamp(item.received_at)}</span>}
+        <span>{t.occurredLabel}: {stamp(item.occurred_at)}</span>
       </p>
     </div>
   </li>;
@@ -91,8 +90,7 @@ export function TimelineBody({ page, filter, t, onFilter }: {
     <p className="muted">{t.utcNote} {t.confidenceCaveat}</p>
     <p className={page.ordering_degraded ? 'timeline-notice timeline-notice-degraded' : 'timeline-notice'}
       role={page.ordering_degraded ? 'status' : undefined}>
-      {page.ordering_basis === 'received_at' ? t.orderingReceived : t.orderingOccurred}
-      {page.ordering_degraded ? ` ${t.orderingDegraded}` : ''}
+      {t.orderingReceived}{page.ordering_degraded ? ` ${t.orderingDegraded}` : ''}
     </p>
     <div className="timeline-filter" role="group" aria-label={t.filter}>
       {filters.map(name => <button key={name} type="button" aria-pressed={filter === name}
@@ -103,8 +101,7 @@ export function TimelineBody({ page, filter, t, onFilter }: {
     {spans(items).map(span => <section key={span.items[0].id}
       className={span.degraded ? 'timeline-span timeline-span-degraded' : 'timeline-span'}>
       {span.degraded && <p className="timeline-degraded" role="status">{t.timelineDegraded}</p>}
-      <ol className="timeline-list">{span.items.map(item => <Row key={item.id} item={item} t={t}
-        orderingBasis={page.ordering_basis} />)}</ol>
+      <ol className="timeline-list">{span.items.map(item => <Row key={item.id} item={item} t={t} />)}</ol>
     </section>)}
   </section>;
 }

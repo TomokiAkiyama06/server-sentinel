@@ -44,7 +44,10 @@ factual detection, including the detector contract's `degraded` quality. Status
 and configuration events, whose reported state is not image-quality gated, keep
 their value with the quality shown beside it, and the value labels cover every
 source/node health transition, including `manual_intervention_required` and
-`revoked`. The ordering statement follows `ordering_basis` while
+`revoked`. The `critical` badge names the detector category, not a confirmed
+event, and a quality-gated result is never labelled confirmed. Rows follow the
+Main Server receipt order the core reports and each row also shows its own
+observation time. The ordering statement follows `ordering_basis` while
 `ordering_degraded` adds the warning. Clock skew or timestamp discontinuity is
 reported per span and by that ordering notice;
 the UI does not present that order as established causality, cause or
@@ -52,9 +55,16 @@ culpability. A kind filter selects all, people/motion, critical, device and
 recording, or configuration entries. `src/views/presence.tsx` shows the current
 state, its basis, manual-override expiry and cancel affordance, the fact that
 only `PRESENT` suppresses ordinary occupancy automation, and today's
-transitions. When the reported `suppress_ordinary` flag disagrees with the
-reported state, the screen raises a degraded alert with the reported
-suppression instead of a statement that contradicts the state. The critical-continuity statement is shown only while every
+audited Owner control history. Suppression is judged against the state *and*
+clock trust, because the core suppresses ordinary automation only for a trusted
+`PRESENT`; a report that disagrees raises a degraded alert with the reported
+suppression instead of a contradictory statement. The four critical paths
+(detection, persistence, evidence, notification) are shown with their reported
+`armed` / `unavailable` / `unknown` state, a known failure is never merged with
+an unreported one, and the continuity statement appears only while every path is
+armed and `critical_paths_degraded` is false. An incomplete override expiry
+(`override_expiry_pending`) is reported so an expired override cannot look
+active. The critical-continuity statement is shown only while every
 reported `critical_*_armed` flag is true; otherwise the screen raises a degraded
 alert instead of reassuring the Owner.
 
@@ -62,8 +72,11 @@ alert instead of reassuring the Owner.
 Owner. This remains UI projection only: the production entry still denies
 access, these screens make no request without an injected provider, and #10
 must supply server-side authorization before any human route is published.
-Timeline and presence data are loaded through optional `DashboardServices`
-providers that only tests supply, using synthetic observations. Providers are
+The projections follow the presence/timeline core contract (Issue #26 core PR):
+receipt-ordered pages with a `next_cursor`, the presence snapshot's three-valued
+critical paths, and the audited Owner control history. Timeline and presence
+data are loaded through optional `DashboardServices` providers that only tests
+supply, using synthetic observations. Providers are
 invoked bound to their service, so a class-based implementation keeps its
 receiver; the browser harness is class-based to hold that contract. A
 quality-gated result is never labelled confirmed.

@@ -85,3 +85,5 @@ p { margin: .5rem 0 1rem; }
   .timeline-row { grid-template-columns: .75rem minmax(0, 1fr); }
   .timeline-time { grid-column: 1 / -1; }
 }
+.presence-path-unavailable dd { color: #ad3940; font-weight: 650; }
+.presence-path-unknown dd { color: #9b6100; font-weight: 650; }

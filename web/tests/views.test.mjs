@@ -23,6 +23,7 @@ const values = ['observed', 'not_observed', 'unknown', 'online', 'offline', 'deg
 const qualities = ['sufficient', 'degraded', 'insufficient', 'unknown'];
 const states = ['PRESENT', 'PROBABLY_PRESENT', 'ABSENT', 'UNKNOWN'];
 const bases = ['manual_override', 'owner_observation', 'hint', 'unknown'];
+const actions = ['override_set', 'override_cancelled', 'override_expired', 'hint_set'];
 let counter = 0;
 const observation = (kind, overrides = {}) => ({
   id: `generated-observation-${counter += 1}`, kind, value: 'observed',
@@ -32,13 +33,22 @@ const observation = (kind, overrides = {}) => ({
   presence_state: null, sequence: counter, ...overrides,
 });
 const page = (items, overrides = {}) => ({
-  items, ordering_basis: 'occurred_at', ordering_degraded: false,
-  causality: 'not_inferred', next_sequence: items.length, ...overrides,
+  items, ordering_basis: 'received_at', ordering_degraded: false, causality: 'not_inferred',
+  next_cursor: items.length
+    ? { received_at: items[items.length - 1].received_at, sequence: items[items.length - 1].sequence }
+    : null,
+  ...overrides,
 });
+const paths = ['critical_detection', 'critical_persistence', 'critical_evidence', 'critical_notifications'];
 const snapshot = (overrides = {}) => ({
   state: 'UNKNOWN', basis: 'unknown', override_expires_at: null, clock_degraded: false,
-  suppress_ordinary: false, critical_detection_armed: true, critical_evidence_armed: true,
-  critical_notifications_armed: true, pending_critical_actions: 0, ...overrides,
+  suppress_ordinary: false, critical_detection: 'armed', critical_persistence: 'armed',
+  critical_evidence: 'armed', critical_notifications: 'armed', critical_paths_degraded: false,
+  override_expiry_pending: false, pending_critical_actions: 0, ...overrides,
+});
+// The backend suppresses ordinary automation only for a trusted PRESENT.
+const reported = (state, clockDegraded = false) => snapshot({
+  state, clock_degraded: clockDegraded, suppress_ordinary: state === 'PRESENT' && !clockDegraded,
 });
 const timeline = (value, locale = 'ja', filter = 'all') => renderToStaticMarkup(createElement(TimelineBody,
   { page: value, filter, t: messages[locale], onFilter: () => undefined }));
@@ -120,21 +130,20 @@ test('low-quality detector positives are not presented as factual results', () =
   }
 });
 
-test('ordering statement follows ordering_basis and the warning follows ordering_degraded', () => {
+test('rows are ordered by receipt and still carry their own observation time', () => {
   const item = observation('motion', {
     occurred_at: '2026-09-21T09:00:00.000000+00:00', received_at: '2026-09-21T09:04:00.000000+00:00',
   });
-  const received = timeline(page([item], { ordering_basis: 'received_at', ordering_degraded: false }));
-  assert.match(received, /受信順で表示しています。/);
-  assert.match(received, /<time[^>]*dateTime="2026-09-21T09:04:00.000000\+00:00"[^>]*>2026-09-21 09:04:00<\/time>/);
-  assert.doesNotMatch(received, /<time[^>]*>2026-09-21 09:00:00<\/time>/);
-  assert.doesNotMatch(received, /観測時刻順で表示しています。|時刻ずれまたは不連続が報告されています。/);
-  const occurred = timeline(page([item], { ordering_basis: 'occurred_at', ordering_degraded: true }));
-  assert.match(occurred, /観測時刻順で表示しています。/);
-  assert.match(occurred, /<time[^>]*dateTime="2026-09-21T09:00:00.000000\+00:00"[^>]*>2026-09-21 09:00:00<\/time>/);
-  assert.match(occurred, /時刻ずれまたは不連続が報告されています。/);
-  assert.doesNotMatch(occurred, /受信順で表示しています。/);
-  assert.doesNotMatch(timeline(page([item])), /時刻ずれまたは不連続が報告されています。/);
+  const markup = timeline(page([item]));
+  assert.match(markup, /メインサーバーの受信順で表示しています。/);
+  assert.match(markup, /<time[^>]*dateTime="2026-09-21T09:04:00.000000\+00:00"[^>]*>2026-09-21 09:04:00<\/time>/);
+  assert.match(markup, /観測時刻: 2026-09-21 09:00:00/);
+  assert.doesNotMatch(markup, /時刻ずれまたは不連続が報告されています。/);
+  const degraded = timeline(page([item], { ordering_degraded: true }));
+  assert.match(degraded, /メインサーバーの受信順で表示しています。/);
+  assert.match(degraded, /時刻ずれまたは不連続が報告されています。/);
+  assert.equal(page([item]).next_cursor.sequence, item.sequence);
+  assert.equal(page([]).next_cursor, null);
 });
 
 test('degraded timing is reported per span and never presented as ordering certainty', () => {
@@ -144,12 +153,12 @@ test('degraded timing is reported per span and never presented as ordering certa
   const items = [trusted[0], skewed, uncertain, trusted[1]];
   assert.deepEqual(spans(items).map(span => [span.degraded, span.items.length]),
     [[false, 1], [true, 2], [false, 1]]);
-  const markup = timeline(page(items, { ordering_basis: 'received_at', ordering_degraded: true }));
+  const markup = timeline(page(items, { ordering_degraded: true }));
   assert.equal((markup.match(/timeline-span-degraded/g) || []).length, 1);
   assert.equal((markup.match(/この区間は時刻の信頼性が低下しています/g) || []).length, 1);
-  assert.match(markup, /受信順で表示しています/);
-  assert.match(markup, /受信時刻: 2026-09-21 09:05:00/);
-  assert.doesNotMatch(timeline(page(trusted)), /timeline-span-degraded|受信順で表示しています/);
+  assert.match(markup, /時刻ずれまたは不連続が報告されています/);
+  assert.match(markup, />2026-09-21 09:05:00</);
+  assert.doesNotMatch(timeline(page(trusted)), /timeline-span-degraded|時刻ずれまたは不連続が報告されています/);
 });
 
 test('timeline rows always carry source attribution plus confidence and quality', () => {
@@ -172,7 +181,9 @@ test('timeline rows always carry source attribution plus confidence and quality'
 test('every projected kind, value, quality, state and basis has a label in both locales', () => {
   const required = [...kinds.map(kind => `kind_${kind}`), ...values.map(value => `value_${value}`),
     ...qualities.map(quality => `quality_${quality}`), ...states.map(state => `state_${state}`),
-    ...bases.map(basis => `basis_${basis}`)];
+    ...bases.map(basis => `basis_${basis}`),
+    ...['armed', 'unavailable', 'unknown'].map(path => `path_${path}`),
+    ...actions.map(action => `action_${action}`)];
   for (const locale of ['ja', 'en']) {
     for (const key of required) {
       assert.equal(typeof messages[locale][key], 'string', `${locale} is missing ${key}`);
@@ -231,31 +242,37 @@ test('neutral wording only: no culprit, attacker or cause claim in either locale
   const forbidden = [/犯人/, /加害者/, /容疑/, /不審/, /侵入者/, /のせい/, /culprit/i, /attacker/i, /suspect/i, /intruder/i, /blame/i];
   const everything = [timeline(page(kinds.map(kind => observation(kind))), 'ja'),
     timeline(page(kinds.map(kind => observation(kind))), 'en'),
-    presence({ snapshot: snapshot(), transitions: [] }, 'ja'),
-    presence({ snapshot: snapshot(), transitions: [] }, 'en'),
+    presence({ snapshot: snapshot(), audit: [] }, 'ja'),
+    presence({ snapshot: snapshot(), audit: [] }, 'en'),
     JSON.stringify(messages)].join('\n');
   for (const pattern of forbidden) assert.doesNotMatch(everything, pattern);
 });
 
-test('presence shows state, basis and transitions; only PRESENT suppresses ordinary automation', () => {
-  for (const state of ['PRESENT', 'PROBABLY_PRESENT', 'ABSENT', 'UNKNOWN']) {
+test('presence shows state, basis and the owner control history', () => {
+  for (const state of states) {
     const markup = presence({
-      snapshot: snapshot({ state, basis: 'owner_observation', suppress_ordinary: state === 'PRESENT' }),
-      transitions: [{ at: '2026-09-21T08:00:00.000000+00:00', state, basis: 'owner_observation' }],
+      snapshot: { ...reported(state), basis: 'owner_observation' },
+      audit: [{ sequence: 1, action: 'override_cancelled', at: '2026-09-21T08:00:00.000000+00:00', state }],
     });
     assert.match(markup, new RegExp(`presence-${state}`));
     assert.match(markup, /根拠: 管理者の入退室観測/);
     assert.match(markup, /2026-09-21 08:00:00/);
+    assert.match(markup, /手動上書きを取り消し/);
+    assert.match(markup, /data-control-action="override_cancelled"/);
     // Critical work continues in every presence state.
-    assert.match(markup, /サーバー移動・カメラ妨害の検知、証拠保護、critical 通知はすべての状態で継続します。/);
-    assert.equal(/PRESENT のため通常の occupancy automation を抑制しています。/.test(markup), state === 'PRESENT');
+    assert.match(markup, /サーバー移動・カメラ妨害の検知、記録、証拠保護、critical 通知はすべての presence state で継続します。/);
+    assert.equal(/PRESENT かつ時刻が信頼できるため、通常の occupancy automation を抑制しています。/.test(markup), state === 'PRESENT');
     assert.equal(/PRESENT 以外のため通常の occupancy automation は抑制しません。/.test(markup), state !== 'PRESENT');
   }
-  assert.match(presence({ snapshot: snapshot(), transitions: [] }), /本日の推移はありません。/);
+  for (const action of actions) {
+    const markup = presence({ snapshot: snapshot(), audit: [{ sequence: 2, action, at: '2026-09-21T08:00:00.000000+00:00', state: null }] });
+    assert.match(markup, new RegExp(`data-control-action="${action}"`));
+  }
+  assert.match(presence({ snapshot: snapshot(), audit: [] }), /記録された管理者の操作はありません。/);
 });
 
 test('manual override reports precedence, expiry and a cancel affordance', () => {
-  const active = { snapshot: snapshot({ state: 'PRESENT', basis: 'manual_override', suppress_ordinary: true, override_expires_at: '2026-09-21T18:30:00.000000+00:00' }), transitions: [] };
+  const active = { snapshot: snapshot({ state: 'PRESENT', basis: 'manual_override', suppress_ordinary: true, override_expires_at: '2026-09-21T18:30:00.000000+00:00' }), audit: [] };
   const wired = presence(active, 'ja', { onCancel: () => undefined });
   assert.match(wired, /手動上書きが有効です。/);
   assert.match(wired, /手動上書きは推定とスケジュールより優先します。/);
@@ -264,47 +281,76 @@ test('manual override reports precedence, expiry and a cancel affordance', () =>
   assert.doesNotMatch(wired, /<button[^>]*disabled/);
   const unwired = presence(active);
   assert.match(unwired, /<button[^>]*disabled/);
-  const open = presence({ snapshot: snapshot({ basis: 'manual_override' }), transitions: [] }, 'ja', { onCancel: () => undefined });
+  const open = presence({ snapshot: snapshot({ basis: 'manual_override' }), audit: [] }, 'ja', { onCancel: () => undefined });
   assert.match(open, /期限なし（取り消すまで有効）/);
-  assert.match(presence({ snapshot: snapshot(), transitions: [] }), /手動上書きはありません。/);
+  assert.match(presence({ snapshot: snapshot(), audit: [] }), /手動上書きはありません。/);
 });
 
-test('suppression that disagrees with the presence state raises an alert, not a causal claim', () => {
+test('suppression is judged against the state and clock trust, not the state alone', () => {
   for (const state of states) {
-    const expected = state === 'PRESENT';
-    const mismatch = presence({ snapshot: snapshot({ state, suppress_ordinary: !expected }), transitions: [] });
-    assert.match(mismatch, /<p class="timeline-degraded" role="alert">通常の occupancy automation の抑制状態が現在の presence state と一致していません。/);
-    assert.doesNotMatch(mismatch, /PRESENT のため通常の occupancy automation を抑制しています。/);
-    assert.doesNotMatch(mismatch, /PRESENT 以外のため通常の occupancy automation は抑制しません。/);
-    assert.match(mismatch, expected ? /報告された抑制状態: 抑制なし/ : /報告された抑制状態: 抑制あり/);
-    const agreed = presence({ snapshot: snapshot({ state, suppress_ordinary: expected }), transitions: [] });
-    assert.doesNotMatch(agreed, /一致していません/);
-    assert.equal(/PRESENT のため通常の occupancy automation を抑制しています。/.test(agreed), expected);
+    for (const clockDegraded of [false, true]) {
+      // Combinations the core can actually report never raise the alert.
+      const agreed = presence({ snapshot: reported(state, clockDegraded), audit: [] });
+      assert.doesNotMatch(agreed, /一致していません/);
+      assert.equal(/PRESENT かつ時刻が信頼できるため、通常の occupancy automation を抑制しています。/.test(agreed),
+        state === 'PRESENT' && !clockDegraded);
+      assert.equal(/PRESENT ですが時刻の信頼性が低下しているため、通常の occupancy automation は抑制しません。/.test(agreed),
+        state === 'PRESENT' && clockDegraded);
+      // An inconsistent report is surfaced instead of a contradictory sentence.
+      const inconsistent = reported(state, clockDegraded);
+      const mismatch = presence({ snapshot: { ...inconsistent, suppress_ordinary: !inconsistent.suppress_ordinary }, audit: [] });
+      assert.match(mismatch, /<p class="timeline-degraded" role="alert">報告された抑制状態が、presence state と時刻の信頼性から導かれる状態と一致していません。/);
+      assert.doesNotMatch(mismatch, /通常の occupancy automation を抑制しています。/);
+      assert.doesNotMatch(mismatch, /通常の occupancy automation は抑制しません。/);
+      assert.match(mismatch, inconsistent.suppress_ordinary ? /報告された抑制状態: 抑制なし/ : /報告された抑制状態: 抑制あり/);
+    }
   }
 });
 
-test('an unarmed critical protection replaces the continuity statement with an alert', () => {
-  for (const flag of ['critical_detection_armed', 'critical_evidence_armed', 'critical_notifications_armed']) {
-    const markup = presence({ snapshot: snapshot({ [flag]: false }), transitions: [] });
-    assert.doesNotMatch(markup, /すべての状態で継続します。/);
-    assert.match(markup, /<p class="timeline-degraded" role="alert">critical 対応の一部が継続中であると確認できていません。/);
-    assert.match(markup, /未確認/);
+test('a critical path that is not armed replaces the continuity statement with an alert', () => {
+  for (const path of paths) {
+    for (const state of ['unavailable', 'unknown']) {
+      const markup = presence({ snapshot: snapshot({ [path]: state, critical_paths_degraded: true }), audit: [] });
+      assert.doesNotMatch(markup, /すべての presence state で継続します。/);
+      assert.match(markup, /<p class="timeline-degraded" role="alert">critical 対応の経路に armed でないものがあります。/);
+      // A known failure and an unreported path are never merged into one label.
+      assert.match(markup, state === 'unavailable' ? /unavailable（既知の異常）/ : /unknown（未報告）/);
+      assert.doesNotMatch(markup, state === 'unavailable' ? /unknown（未報告）/ : /unavailable（既知の異常）/);
+    }
   }
+  // The aggregate degraded flag alone also withdraws the continuity claim.
+  const degraded = presence({ snapshot: snapshot({ critical_paths_degraded: true }), audit: [] });
+  assert.doesNotMatch(degraded, /すべての presence state で継続します。/);
+  assert.match(degraded, /critical 対応の経路に armed でないものがあります。/);
+  const armed = presence({ snapshot: snapshot(), audit: [] });
+  assert.match(armed, /すべての presence state で継続します。/);
+  assert.equal((armed.match(/armed（継続中）/g) || []).length, 4);
+});
+
+test('an incomplete override expiry is reported instead of a silently active override', () => {
+  const markup = presence({ snapshot: snapshot({ basis: 'manual_override', override_expiry_pending: true,
+    override_expires_at: '2026-09-21T07:00:00.000000+00:00' }), audit: [] });
+  assert.match(markup, /<p class="timeline-degraded" role="alert">手動上書きの期限切れ処理が完了していません。/);
+  assert.doesNotMatch(presence({ snapshot: snapshot({ basis: 'manual_override' }), audit: [] }), /期限切れ処理が完了していません/);
 });
 
 test('degraded clock and pending critical work stay visible on presence', () => {
-  const markup = presence({ snapshot: snapshot({ clock_degraded: true, pending_critical_actions: 2 }), transitions: [] });
+  const markup = presence({ snapshot: snapshot({ clock_degraded: true, pending_critical_actions: 2 }), audit: [] });
   assert.match(markup, /時刻の信頼性が低下しています。状態の根拠と手動上書きを確認してください。/);
   assert.match(markup, /未完了の critical 対応: 2/);
-  assert.doesNotMatch(presence({ snapshot: snapshot(), transitions: [] }), /未完了の critical 対応/);
+  assert.doesNotMatch(presence({ snapshot: snapshot(), audit: [] }), /未完了の critical 対応/);
 });
 
 test('degraded timing preserves a manual override state without claiming it became unknown', () => {
+  // Manual override applies even with untrusted timing, and the core then
+  // reports suppress_ordinary false for that PRESENT state.
   const markup = presence({ snapshot: snapshot({
-    state: 'PRESENT', basis: 'manual_override', suppress_ordinary: true, clock_degraded: true,
-  }), transitions: [] });
+    state: 'PRESENT', basis: 'manual_override', suppress_ordinary: false, clock_degraded: true,
+  }), audit: [] });
   assert.match(markup, /presence-PRESENT/);
   assert.match(markup, /手動上書きが有効です。/);
   assert.match(markup, /時刻の信頼性が低下しています。状態の根拠と手動上書きを確認してください。/);
+  assert.match(markup, /PRESENT ですが時刻の信頼性が低下しているため、通常の occupancy automation は抑制しません。/);
+  assert.doesNotMatch(markup, /一致していません/);
   assert.doesNotMatch(markup, /状態は不明側に倒して表示します。/);
 });

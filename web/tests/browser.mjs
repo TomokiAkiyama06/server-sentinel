@@ -39,19 +39,22 @@ const timelineFixture = {
     observation('camera_health', { value: 'offline', quality: 'unknown', confidence: null, clock_trusted: false }),
     observation('person', { value: 'not_observed', quality: 'insufficient', confidence: null }),
   ],
-  ordering_basis: 'received_at', ordering_degraded: true, causality: 'not_inferred', next_sequence: 4,
+  ordering_basis: 'received_at', ordering_degraded: true, causality: 'not_inferred',
+  next_cursor: { received_at: '2026-09-21T09:00:01.000000+00:00', sequence: 1 },
 };
 const presenceFixture = {
   snapshot: {
     state: 'PRESENT', basis: 'manual_override', override_expires_at: '2026-09-21T18:30:00.000000+00:00',
-    clock_degraded: false, suppress_ordinary: true, critical_detection_armed: true,
-    critical_evidence_armed: true, critical_notifications_armed: true, pending_critical_actions: 0,
+    clock_degraded: false, suppress_ordinary: true, critical_detection: 'armed',
+    critical_persistence: 'armed', critical_evidence: 'armed', critical_notifications: 'armed',
+    critical_paths_degraded: false, override_expiry_pending: false, pending_critical_actions: 0,
   },
-  transitions: [{ at: '2026-09-21T08:00:00.000000+00:00', state: 'UNKNOWN', basis: 'unknown' }],
+  audit: [{ sequence: 1, action: 'override_set', at: '2026-09-21T08:00:00.000000+00:00', state: 'PRESENT' }],
 };
 const cancelledPresenceFixture = {
   snapshot: { ...presenceFixture.snapshot, state: 'UNKNOWN', basis: 'unknown', override_expires_at: null, suppress_ordinary: false },
-  transitions: [...presenceFixture.transitions],
+  audit: [...presenceFixture.audit,
+    { sequence: 2, action: 'override_cancelled', at: '2026-09-21T08:30:00.000000+00:00', state: 'PRESENT' }],
 };
 let cases = 0;
 
@@ -177,13 +180,16 @@ try {
       await page.wait("Boolean(document.querySelector('.presence-value'))");
       const presenceText = await page.evaluate('document.body.innerText');
       assert.match(presenceText, /手動上書きが有効です。/);
-      assert.match(presenceText, /PRESENT のため通常の occupancy automation を抑制しています。/);
-      assert.match(presenceText, /すべての状態で継続します。/);
+      assert.match(presenceText, /PRESENT かつ時刻が信頼できるため、通常の occupancy automation を抑制しています。/);
+      assert.match(presenceText, /すべての presence state で継続します。/);
+      assert.match(presenceText, /手動上書きを設定/);
       assert.equal(await page.evaluate('document.documentElement.scrollWidth <= window.innerWidth'), true, 'timeline and presence fit viewport');
       // Provider methods are invoked on their service; a lost receiver fails here.
       await page.evaluate("document.querySelector('.presence-override button').click()");
       await page.wait("document.querySelector('.presence-value').textContent === '不明'");
-      assert.match(await page.evaluate('document.body.innerText'), /手動上書きはありません。/);
+      const cancelledText = await page.evaluate('document.body.innerText');
+      assert.match(cancelledText, /手動上書きはありません。/);
+      assert.match(cancelledText, /手動上書きを取り消し/);
     });
     await scenario(viewport, { sourceStatus: 503 }, async page => {
       await page.click('カメラソース');

@@ -44,12 +44,18 @@ export function canVisit(session: Session, view: View): boolean {
 export type ObservationKind = 'person' | 'motion' | 'owner_entry' | 'owner_exit' | 'anonymous_entry'
   | 'anonymous_exit' | 'server_movement' | 'camera_tamper' | 'camera_health' | 'node_health'
   | 'recording' | 'storage' | 'presence' | 'configuration';
+// Superset of the presence Value/Quality enums: it also covers the source and
+// node health transitions and the detector quality states that reach the
+// timeline as those producers are wired, so no reported state renders blank.
 export type ObservationValue = 'observed' | 'not_observed' | 'unknown' | 'online' | 'offline'
   | 'degraded' | 'manual_intervention_required' | 'revoked' | 'ready' | 'failed' | 'created'
   | 'deleted' | 'changed';
 export type Quality = 'sufficient' | 'degraded' | 'insufficient' | 'unknown';
 export type PresenceState = 'PRESENT' | 'PROBABLY_PRESENT' | 'ABSENT' | 'UNKNOWN';
 export type PresenceBasis = 'manual_override' | 'owner_observation' | 'hint' | 'unknown';
+/** `unknown` is unreported availability; `unavailable` is a known failure. */
+export type CriticalPath = 'armed' | 'unavailable' | 'unknown';
+export type PresenceAuditAction = 'override_set' | 'override_cancelled' | 'override_expired' | 'hint_set';
 
 /** Neutral observation projection: never a culprit, cause or identity claim. */
 export interface Observation {
@@ -69,12 +75,18 @@ export interface Observation {
   sequence: number;
 }
 
+/** Main-host receipt order with the durable sequence only as a tie-break. */
+export interface TimelineCursor {
+  received_at: string;
+  sequence: number;
+}
+
 export interface TimelinePage {
   items: readonly Observation[];
-  ordering_basis: 'occurred_at' | 'received_at';
+  ordering_basis: 'received_at';
   ordering_degraded: boolean;
   causality: 'not_inferred';
-  next_sequence: number;
+  next_cursor: TimelineCursor | null;
 }
 
 export interface PresenceSnapshot {
@@ -83,19 +95,24 @@ export interface PresenceSnapshot {
   override_expires_at: string | null;
   clock_degraded: boolean;
   suppress_ordinary: boolean;
-  critical_detection_armed: boolean;
-  critical_evidence_armed: boolean;
-  critical_notifications_armed: boolean;
+  critical_detection: CriticalPath;
+  critical_persistence: CriticalPath;
+  critical_evidence: CriticalPath;
+  critical_notifications: CriticalPath;
+  critical_paths_degraded: boolean;
+  override_expiry_pending: boolean;
   pending_critical_actions: number;
 }
 
-export interface PresenceTransition {
+/** Audited Owner control history; it carries no biometric or viewer identity. */
+export interface PresenceAuditEntry {
+  sequence: number;
+  action: PresenceAuditAction;
   at: string;
-  state: PresenceState;
-  basis: PresenceBasis;
+  state: PresenceState | null;
 }
 
 export interface PresenceReport {
   snapshot: PresenceSnapshot;
-  transitions: readonly PresenceTransition[];
+  audit: readonly PresenceAuditEntry[];
 }

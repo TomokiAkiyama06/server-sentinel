@@ -1,14 +1,15 @@
 import { useEffect, useState } from 'react';
-import type { DashboardServices, PresenceReport, PresenceSnapshot } from '../domain';
+import type { CriticalPath, DashboardServices, PresenceReport, PresenceSnapshot } from '../domain';
 import type { Messages } from '../i18n';
 
 function stamp(value: string): string {
   return value.slice(0, 19).replace('T', ' ');
 }
 
-function Armed({ label, armed, t }: { label: string; armed: boolean; t: Messages }) {
-  return <div className="presence-armed">
-    <dt>{label}</dt><dd>{armed ? t.armedYes : t.armedNo}</dd>
+/** Reports the three path states separately: unknown is not a known failure. */
+function Path({ label, state, t }: { label: string; state: CriticalPath; t: Messages }) {
+  return <div className={`presence-armed presence-path-${state}`}>
+    <dt>{label}</dt><dd>{t[`path_${state}`]}</dd>
   </div>;
 }
 
@@ -17,9 +18,12 @@ export function PresenceBody({ report, t, onCancel, failed }: {
 }) {
   const snapshot: PresenceSnapshot = report.snapshot;
   const override = snapshot.basis === 'manual_override';
-  // Report the invariant only while every critical protection is actually armed.
-  const armed = snapshot.critical_detection_armed && snapshot.critical_evidence_armed
-    && snapshot.critical_notifications_armed;
+  const paths: readonly CriticalPath[] = [snapshot.critical_detection, snapshot.critical_persistence,
+    snapshot.critical_evidence, snapshot.critical_notifications];
+  // Claim continuity only when every reported path is armed and none degraded.
+  const armed = paths.every(state => state === 'armed') && !snapshot.critical_paths_degraded;
+  // The backend suppresses ordinary automation only for a trusted PRESENT.
+  const expectedSuppression = snapshot.state === 'PRESENT' && !snapshot.clock_degraded;
   return <section className="presence-screen">
     <section className={`presence-state presence-${snapshot.state}`} aria-label={t.presenceCurrent}>
       <p className="eyebrow">{t.presenceCurrent}</p>
@@ -36,36 +40,38 @@ export function PresenceBody({ report, t, onCancel, failed }: {
       {override && <button type="button" className="primary" disabled={!onCancel}
         onClick={() => onCancel?.()}>{t.overrideCancel}</button>}
       {override && !onCancel && <p className="muted">{t.foundation}</p>}
+      {snapshot.override_expiry_pending && <p className="timeline-degraded" role="alert">{t.overrideExpiryPending}</p>}
       {failed && <p role="alert">{t.overrideFailed}</p>}
     </section>
     <section className="presence-automation" aria-label={t.armedNotification}>
-      {snapshot.suppress_ordinary === (snapshot.state === 'PRESENT')
-        ? <p>{snapshot.suppress_ordinary ? t.suppressOn : t.suppressOff}</p>
-        : <>
-          <p className="timeline-degraded" role="alert">{t.suppressMismatch}</p>
-          <p className="muted">{t.suppressReported}: {snapshot.suppress_ordinary ? t.suppressActive : t.suppressInactive}</p>
-        </>}
+      {snapshot.suppress_ordinary !== expectedSuppression ? <>
+        <p className="timeline-degraded" role="alert">{t.suppressMismatch}</p>
+        <p className="muted">{t.suppressReported}: {snapshot.suppress_ordinary ? t.suppressActive : t.suppressInactive}</p>
+      </> : snapshot.suppress_ordinary ? <p>{t.suppressOn}</p>
+        : <p>{snapshot.state === 'PRESENT' ? t.suppressClockDegraded : t.suppressOff}</p>}
       {armed ? <p>{t.criticalArmed}</p>
         : <p className="timeline-degraded" role="alert">{t.criticalNotArmed}</p>}
+      <h2>{t.criticalPaths}</h2>
       <dl className="presence-armed-list">
-        <Armed label={t.armedDetection} armed={snapshot.critical_detection_armed} t={t} />
-        <Armed label={t.armedEvidence} armed={snapshot.critical_evidence_armed} t={t} />
-        <Armed label={t.armedNotification} armed={snapshot.critical_notifications_armed} t={t} />
+        <Path label={t.armedDetection} state={snapshot.critical_detection} t={t} />
+        <Path label={t.armedPersistence} state={snapshot.critical_persistence} t={t} />
+        <Path label={t.armedEvidence} state={snapshot.critical_evidence} t={t} />
+        <Path label={t.armedNotification} state={snapshot.critical_notifications} t={t} />
       </dl>
       {snapshot.pending_critical_actions > 0
         && <p role="status">{t.pendingCritical}: {snapshot.pending_critical_actions}</p>}
     </section>
-    <section className="presence-transitions" aria-label={t.transitions}>
-      <h2>{t.transitions}</h2>
+    <section className="presence-transitions" aria-label={t.controlHistory}>
+      <h2>{t.controlHistory}</h2>
       <p className="muted">{t.utcNote}</p>
-      {report.transitions.length === 0 ? <p>{t.transitionsEmpty}</p>
-        : <ol className="timeline-list">{report.transitions.map(entry =>
-          <li className="timeline-row" key={`${entry.at}-${entry.state}`}>
+      {report.audit.length === 0 ? <p>{t.controlHistoryEmpty}</p>
+        : <ol className="timeline-list">{report.audit.map(entry =>
+          <li className="timeline-row" key={entry.sequence} data-control-action={entry.action}>
             <time className="timeline-time" dateTime={entry.at}>{stamp(entry.at)}</time>
             <span className="timeline-dot timeline-dot-configuration" aria-hidden="true" />
             <div className="timeline-detail">
-              <p className="timeline-body">{t[`state_${entry.state}`]}</p>
-              <p className="timeline-meta"><span>{t.presenceBasis}: {t[`basis_${entry.basis}`]}</span></p>
+              <p className="timeline-body">{t[`action_${entry.action}`]}</p>
+              {entry.state && <p className="timeline-meta"><span>{t[`state_${entry.state}`]}</span></p>}
             </div>
           </li>)}</ol>}
     </section>
