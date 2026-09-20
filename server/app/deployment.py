@@ -61,13 +61,35 @@ def _administrator_file(path: Path, info: os.stat_result) -> None:
             "deployment configuration must not be runtime-writable or world-readable"
         )
     try:
-        parent_info = path.parent.resolve(strict=True).stat()
+        directory = path.parent.resolve(strict=True)
     except (OSError, RuntimeError, ValueError):
         raise ConfigurationError("deployment configuration is unavailable") from None
-    if parent_info.st_uid != ADMINISTRATOR_UID or parent_info.st_mode & 0o022:
-        raise ConfigurationError(
-            "deployment configuration directory must be administrator-controlled"
-        )
+    _administrator_directory(directory)
+
+
+def _administrator_directory(directory: Path) -> None:
+    """Require every component of the configuration directory to be controlled.
+
+    Checking only the immediate parent would let an ancestor that another
+    account can rename or replace substitute the directory holding the
+    configuration.  Walk the resolved path with ``lstat`` so a component
+    replaced by a symbolic link is caught too.  A component may be writable by
+    others only when it is sticky, where non-owners cannot replace existing
+    entries.
+    """
+    current = Path(directory.anchor)
+    try:
+        for part in directory.parts[1:]:
+            current /= part
+            info = current.lstat()
+            shared_writable = info.st_mode & 0o022 and not info.st_mode & stat.S_ISVTX
+            if (stat.S_ISLNK(info.st_mode) or shared_writable
+                    or info.st_uid not in {ADMINISTRATOR_UID, 0}):
+                raise ConfigurationError(
+                    "deployment configuration directory must be administrator-controlled"
+                )
+    except OSError:
+        raise ConfigurationError("deployment configuration is unavailable") from None
 
 
 def _runtime_roots() -> tuple[Path, Path | None]:

@@ -134,8 +134,8 @@ Runtime-data assumptions:
 - deployment configuration is administrator-owned and readable but not writable
   by the dedicated runtime account, is refused if it is world-readable,
   group-writable, inside the installation or release tree, inside the
-  runtime-writable data tree, or in a directory the administrator does not
-  control;
+  runtime-writable data tree, or under any directory path component the
+  administrator does not control;
 - the Owner-approved runtime filesystem is pinned by a stable filesystem UUID.
   Linux major/minor device numbers are reused by a replaced or reformatted disk,
   so they only corroborate that identity. A runtime mount that is missing,

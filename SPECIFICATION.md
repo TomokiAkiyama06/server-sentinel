@@ -123,8 +123,8 @@ filesystem, which is pinned by its Owner-approved filesystem UUID; Linux
 major/minor device numbers only corroborate that identity because a replaced or
 reformatted disk can reuse them. Deployment configuration is administrator-owned
 and runtime-readable but not runtime-writable, and is refused inside the
-installation tree, inside the runtime-writable data tree, or in a directory the
-administrator does not control. Both release pointers and the service unit move
+installation tree, inside the runtime-writable data tree, or under any
+directory path component the administrator does not control. Both release pointers and the service unit move
 inside one guarded transaction under a service-global lock, and each recovery
 step is attempted independently. Root-only environment construction uses an
 isolated, root-controlled Python interpreter from a fixed working directory and

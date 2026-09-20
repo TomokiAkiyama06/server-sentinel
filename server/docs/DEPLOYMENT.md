@@ -41,8 +41,8 @@ or a directory left on the root filesystem by a missing mount.
 
 The configuration file itself is administrator-managed, not runtime data. Place
 it in an administrator-controlled directory outside the installation tree and
-outside the runtime root, owned by `root`, in a directory that is root-owned and
-not group- or world-writable. Give it group read for the service account's group
+outside the runtime root, owned by `root`, in a directory whose every path
+component is root-owned and not writable by others unless it is sticky. Give it group read for the service account's group
 and nothing more, for example `root:server-sentinel` with mode `0640`. The
 runtime account must be able to read it and must never be able to rewrite it; a
 world-readable, group-writable, service-owned, or runtime-root-resident

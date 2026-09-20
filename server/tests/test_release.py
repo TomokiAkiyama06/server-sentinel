@@ -882,6 +882,23 @@ class DeploymentConfigurationTests(unittest.TestCase):
                 with self.assertRaisesRegex(
                         ConfigurationError, "directory must be administrator-controlled"):
                     load(config)
+                # A sticky shared directory cannot have its entries replaced by
+                # non-owners, so it stays acceptable.
+                administrator.chmod(0o1777)
+                self.assertEqual(load(config).service_uid, os.geteuid())
+                administrator.chmod(0o755)
+
+                # An ancestor above the immediate parent must be controlled too.
+                nested = administrator / "nested"
+                nested.mkdir(mode=0o755)
+                deeper = nested / "deployment.json"
+                deeper.write_text(json.dumps(value))
+                deeper.chmod(0o640)
+                self.assertEqual(load(deeper).service_uid, os.geteuid())
+                administrator.chmod(0o777)
+                with self.assertRaisesRegex(
+                        ConfigurationError, "directory must be administrator-controlled"):
+                    load(deeper)
                 administrator.chmod(0o755)
 
                 # Configuration inside the service-writable runtime tree is refused
