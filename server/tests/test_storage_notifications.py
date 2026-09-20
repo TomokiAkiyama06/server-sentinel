@@ -377,3 +377,20 @@ class DeliveryWorkerTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             worker.submit('second', 'b')
         self.assertEqual([('first', DeliveryResult.SENT)], list(worker.results()))
+
+    def test_close_keeps_completion_waiting_for_a_full_queue(self):
+        worker = self.worker(1)
+        worker.submit('first', 'a')
+        self.assertTrue(self.transport.finished.acquire(timeout=2))
+        self.assertTrue(worker.ready.wait(2))
+        worker.submit('second', 'b')
+        self.assertTrue(self.transport.finished.acquire(timeout=2))
+        worker.close()
+
+        self.assertEqual(('first', DeliveryResult.SENT), next(iter(worker.results())))
+        collected = []
+        deadline = time.monotonic() + 2
+        while not collected and time.monotonic() < deadline:
+            collected.extend(worker.results())
+            time.sleep(0.01)
+        self.assertEqual([('second', DeliveryResult.SENT)], collected)

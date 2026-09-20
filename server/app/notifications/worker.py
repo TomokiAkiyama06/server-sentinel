@@ -23,7 +23,7 @@ class DeliveryWorker:
         self._work = Queue(maxsize=capacity)
         self._results = Queue(maxsize=capacity)
         self._stop = threading.Event()
-        self._handoff = threading.Lock()
+        self._handoff = threading.Condition()
         self.ready = threading.Event()
         self._thread = None
 
@@ -54,19 +54,18 @@ class DeliveryWorker:
     def _complete(self, identifier, result) -> None:
         # A finished delivery is always offered, including after close, so the
         # owner can persist its real outcome instead of a stranded pending row.
-        while True:
-            with self._handoff:
+        with self._handoff:
+            while True:
                 try:
                     self._results.put_nowait((identifier, result))
-                    published = True
                 except Full:
-                    published = False
-                # Raised while the queue may hold completions, including while
-                # this one still waits for the owner to make room for it.
+                    # A close never joins this daemon. Keep the finished result
+                    # until the owner drains a slot instead of silently losing it.
+                    self.ready.set()
+                    self._handoff.wait()
+                    continue
                 self.ready.set()
-            if published or self._stop.is_set():
                 return
-            self._stop.wait(0.01)
 
     def results(self):
         while True:
@@ -76,6 +75,7 @@ class DeliveryWorker:
                 except Empty:
                     self.ready.clear()
                     return
+                self._handoff.notify()
             yield completion
 
     def close(self) -> None:
