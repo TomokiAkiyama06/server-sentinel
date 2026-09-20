@@ -583,6 +583,8 @@ Use a pluggable backend. Requirements: project-compatible license, CPU fallback,
 
 YOLOX is an initial evaluation candidate only.
 
+The Issue #20 foundation in `server/app/detection/foundation` uses transient grayscale frames, one bounded pending frame per source, independent Main-monotonic inference cadence, and an explicit worker entry point. Quality failure, missing models, stale observations, dropped frames, and evaluation failure produce `unknown`; known loss/throttling remains visible in health snapshots. No model is implicitly downloaded or enabled. The CPU motion baseline detects image change only. An optional RT-DETRv2 CPU adapter loads only a separately licensed, locally supplied, digest-pinned ONNX artifact on the audited Linux x86_64/CPython 3.12 runtime; no runtime model download or cloud/provider fallback is exposed. See `server/docs/DETECTOR_FOUNDATION.md` for limits and `server/docs/DETECTOR_MODEL_AUDIT.md` for separate code/weight evidence. Target-host performance and production worker isolation remain acceptance work.
+
 ### 7.3 Server movement
 
 Per source/profile calibration stores server ROI/polygon, reference descriptors, background context, thresholds, and calibration version/time.
