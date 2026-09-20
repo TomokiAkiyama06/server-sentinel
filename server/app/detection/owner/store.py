@@ -175,8 +175,14 @@ class OwnerTemplateStore:
         self._check()
         if at.tzinfo is None or at.utcoffset() is None:
             raise ValueError("AWARE_TIME_REQUIRED")
-        if template is not None and (type(template) is not bytes or not 0 < len(template) <= self._max_bytes
-                                     or not isinstance(provenance, ModelProvenance)):
+        # A null template means deletion only. A verifier that returns no
+        # template must fail enrollment instead of silently clearing the
+        # current one, advancing the generation and auditing it as ENROLL.
+        if operation is Operation.DELETE:
+            if template is not None or provenance is not None:
+                raise OwnerError("INVALID_OWNER_TEMPLATE")
+        elif (type(template) is not bytes or not 0 < len(template) <= self._max_bytes
+                or not isinstance(provenance, ModelProvenance)):
             raise OwnerError("INVALID_OWNER_TEMPLATE")
         encoded = None
         if provenance is not None:

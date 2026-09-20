@@ -17,7 +17,7 @@ import threading
 from app.detection.owner.contracts import (Comparison, DenyOwner, FaceCandidate, ModelProvenance,
                                            Operation, OwnerError, Verdict, VerificationReason)
 from app.detection.owner.service import OwnerVerificationService
-from app.detection.owner.store import OwnerTemplateStore
+from app.detection.owner.store import EnrollmentStatus, OwnerTemplateStore
 from app.detection.quality import Execution, QualityGate
 from tests.test_detector_quality import SOURCE, assess, calibrated_policy, context, synthetic_person
 
@@ -207,6 +207,25 @@ class OwnerTests(TestCase):
         with self.assertRaisesRegex(OwnerError, "INVALID_OWNER_TEMPLATE"):
             self.enroll()
         self.assertEqual(self.store.status().generation, 1)
+
+    def test_null_template_never_enrolls_deletes_or_audits_as_enrollment(self):
+        self.verifier.template = None
+        with self.assertRaisesRegex(OwnerError, "INVALID_OWNER_TEMPLATE"):
+            self.enroll()
+        self.assertEqual(self.store.status(), EnrollmentStatus(False, 0))
+        self.verifier.template = b"synthetic-owner-template-v1"
+        self.assertEqual(self.enroll().generation, 1)
+        self.verifier.template = None
+        with self.assertRaisesRegex(OwnerError, "INVALID_OWNER_TEMPLATE"):
+            self.enroll()
+        # A verifier that returns no template must not clear the enrolled one.
+        self.assertEqual(self.store.status(), EnrollmentStatus(True, 1))
+        rows = self.store._db.execute("SELECT operation FROM owner_template_audit ORDER BY id").fetchall()
+        self.assertEqual([row["operation"] for row in rows], [Operation.ENROLL])
+        with self.assertRaisesRegex(OwnerError, "INVALID_OWNER_TEMPLATE"):
+            self.store._replace(b"synthetic", PROVENANCE, operation=Operation.DELETE,
+                                actor=UUID(int=123), expected_generation=1, at=NOW)
+        self.assertEqual(self.store.status(), EnrollmentStatus(True, 1))
 
     def test_no_default_model_and_mismatched_model_are_unknown(self):
         self.enroll()

@@ -35,6 +35,9 @@ external service, opt-in upload path or production adapter. Missing adapter,
 unenrolled template, stale generation/provenance, invalid quality or failed
 comparison yields `unknown`; storage failures propagate fixed unavailable errors.
 Adapter cleanup failure cannot return a trusted match or complete enrollment.
+A null template is reserved for Owner deletion: an adapter that returns no
+template fails enrollment/replacement instead of clearing the enrolled template,
+advancing the generation or auditing a non-enrollment as `ENROLL`/`REPLACE`.
 This boundary is not a sandbox for untrusted Python plugins.
 
 Call `service.assess(candidate, gate, context=target_context)` on an
