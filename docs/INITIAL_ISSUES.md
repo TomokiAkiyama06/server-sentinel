@@ -654,6 +654,14 @@ Acceptance:
 - record calibration/reference version/time and source/confidence/quality; insufficient input/source loss is not trustworthy no-movement;
 - critical detection events remain available in all presence states for Plan 16 integration.
 
+Implementation progress (Issue #24 remains OPEN):
+`server/app/detection/spatial/` provides bounded, per-source in-memory ROI and
+camera-tamper contracts. Generated-frame regression tests cover calibration
+validation, global-translation compensation, temporal confirmation, occlusion,
+quality failure, source/stream mismatch and coverage bounds. It has no capture,
+event/timeline, persistence, notification, Agent preservation, or real-hardware
+integration; those acceptance paths remain pending.
+
 ## Plan 15 — Owner-only verification / anonymous tracking / entrance
 
 GitHub Issue: [#25](https://github.com/TomokiAkiyama06/server-sentinel/issues/25)
