@@ -36,7 +36,7 @@ all runtime/media data outside the Git checkout and the application install:
 | `node_id` | Stable node UUID, independent of source UUIDs |
 | `runtime_root` | Existing private directory, dedicated UID, mode 0700 |
 | `media_root` | Existing dedicated-UID directory on the approved filesystem; no group/world write |
-| `expected_mount` | `mount_point`, `filesystem`, `source`, device `major` and `minor`, and `filesystem_root` (mountinfo field 4), approved locally |
+| `expected_mount` | `mount_point`, `filesystem`, `source`, device `major` and `minor`, `filesystem_root` (mountinfo field 4), and the Owner-approved local `filesystem_uuid` |
 | `service_uid` | Dedicated non-root numeric UID |
 | `safety_reserve_bytes` | Positive Owner-configured hard reserve |
 | `max_segment_bytes` | Positive bound for each opaque video segment |
@@ -53,8 +53,10 @@ read from pinned-directory fdinfo and compared with mountinfo, including stacked
 bind mounts; a mount ID change during execution refuses writes. A systemd
 `ReadWritePaths` bind at exactly `media_root` is accepted only while the approved
 parent mount remains present and source/filesystem/device plus backing filesystem
-root match the approved parent and relative media path. A same-device bind of
-another backing directory fails. This preserves the narrow write allowlist and
+root match the approved parent and relative media path. At every admission, the
+configured UUID must still resolve through `/dev/disk/by-uuid/` to the approved
+block-device major/minor; unavailable or replaced identity refuses writes. A
+same-device bind of another backing directory fails. This preserves the narrow write allowlist and
 `ProtectSystem=strict`; it does not approve arbitrary bind mounts.
 
 `MediaStore` serializes admissions with a directory lock, reserves physical blocks

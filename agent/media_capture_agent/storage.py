@@ -1,6 +1,6 @@
 """Descriptor-pinned Linux media storage admission; never create fallback roots."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import fcntl
 import hashlib
 import hmac
@@ -42,6 +42,18 @@ def descriptor_mount_id(descriptor):
     raise StorageRefused("mount_inventory_unavailable")
 
 
+def stable_device_matches(expected):
+    """Match the Owner-approved filesystem UUID to its current block device."""
+    try:
+        if expected.filesystem_uuid is None:
+            return False
+        info = os.stat(Path("/dev/disk/by-uuid") / expected.filesystem_uuid)
+        return (stat.S_ISBLK(info.st_mode) and os.major(info.st_rdev) == expected.major
+                and os.minor(info.st_rdev) == expected.minor)
+    except OSError:
+        return False
+
+
 def parse_mounts(text):
     mounts = []
     try:
@@ -52,6 +64,7 @@ def parse_mounts(text):
             mounts.append(Mount(ExpectedMount(
                 Path(decode_mount(fields[4])), filesystem[0],
                 decode_mount(filesystem[1]), major, minor, Path(decode_mount(fields[3])),
+                None,
             ), int(fields[0]), "ro" in fields[5].split(",")
                 or "ro" in filesystem[2].split(",")))
     except (ValueError, IndexError) as exc:
@@ -86,11 +99,12 @@ class MediaStore:
     """
 
     def __init__(self, settings, *, mounts=read_mounts, space=os.fstatvfs,
-                 mount_id=descriptor_mount_id):
+                 mount_id=descriptor_mount_id, stable_device=stable_device_matches):
         self.settings = settings
         self.mounts = mounts
         self.space = space
         self.mount_id = mount_id
+        self.stable_device = stable_device
         self._lock = threading.Lock()
         self._mount_id = None
         self._fd = open_directory(settings.media_root)
@@ -141,6 +155,8 @@ class MediaStore:
             mount = max(applicable, key=lambda entry: len(entry.identity.mount_point.parts))
             if not self._approved_mount(mount.identity, mounts) or mount.readonly:
                 raise StorageRefused("mount_identity_mismatch")
+            if not self.stable_device(self.settings.expected_mount):
+                raise StorageRefused("stable_device_mismatch")
             if (os.major(info.st_dev), os.minor(info.st_dev)) != (
                 mount.identity.major, mount.identity.minor
             ):
@@ -168,11 +184,12 @@ class MediaStore:
         The approved parent mount must remain visible in the namespace inventory.
         """
         expected = self.settings.expected_mount
-        if actual == expected:
+        mountinfo_expected = replace(expected, filesystem_uuid=None)
+        if actual == mountinfo_expected:
             return True
         if actual.mount_point != self.settings.media_root:
             return False
-        if not any(mount.identity == expected for mount in mounts):
+        if not any(mount.identity == mountinfo_expected for mount in mounts):
             return False
         relative = self.settings.media_root.relative_to(expected.mount_point)
         return (

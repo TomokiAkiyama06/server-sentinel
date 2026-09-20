@@ -26,7 +26,7 @@ def run(scenario):
     sys.addaudithook(observe)
     with tempfile.TemporaryDirectory(prefix="agent-smoke-") as temporary:
         config = settings(Path(temporary))
-        store = MediaStore(config)
+        store = MediaStore(config, stable_device=lambda _expected: True)
         capture, session = SyntheticCapture(), MockSession()
         agent = Agent(config, store, capture=capture, session=session)
         try:
