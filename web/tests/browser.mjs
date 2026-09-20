@@ -29,6 +29,9 @@ let cases = 0;
 
 async function scenario(viewport, { production = false, status = 200, session = owner, count = 1, optIn = false, sourceStatus = 200, positiveControl = false } = {}, assertions) {
   const page = await pageFor(browser, viewport);
+  // Chrome applies bypass when parsing a document's policy. Set it before
+  // navigation, only for the dedicated interception positive control.
+  if (positiveControl) await page.command('Page.setBypassCSP', { enabled: true });
   const requests = [];
   const unexpected = [];
   const exceptions = [];
@@ -84,7 +87,6 @@ async function scenario(viewport, { production = false, status = 200, session = 
     if (positiveControl) {
       // Dedicated instrumentation check: bypass CSP only here so the synthetic
       // external request reaches the interceptor; interception aborts delivery.
-      await page.command('Page.setBypassCSP', { enabled: true });
       await page.evaluate("fetch('https://egress-probe.invalid/probe').catch(() => undefined)");
       assert.deepEqual(unexpected, ['unexpected origin or method']);
     } else assert.deepEqual(unexpected, [], 'all browser requests must be explicitly expected');
@@ -113,7 +115,11 @@ try {
       await scenario(viewport, { count }, async page => {
         await page.click('カメラソース');
         await page.wait(`document.querySelectorAll('[data-source-id]').length === ${count} && Boolean(document.querySelector('.source-count'))`);
-        for (const title of ['概要', 'キャプチャノード', 'ライブ', '録画', 'アクセス']) { await page.click(title); await page.heading(title); }
+        assert.equal(await page.evaluate('document.documentElement.scrollWidth <= window.innerWidth'), true, 'source collection fits viewport');
+        for (const title of ['概要', 'キャプチャノード', 'ライブ', '録画', 'アクセス']) {
+          await page.click(title); await page.heading(title);
+          assert.equal(await page.evaluate('document.documentElement.scrollWidth <= window.innerWidth'), true, 'placeholder fits viewport');
+        }
         await page.evaluate("document.querySelector('select').value = 'en'; document.querySelector('select').dispatchEvent(new Event('change', { bubbles: true }))");
         await page.heading('Access');
         assert.equal(await page.evaluate('document.documentElement.lang'), 'en');
