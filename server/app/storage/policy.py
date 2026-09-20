@@ -71,6 +71,12 @@ class ExpectedFilesystem:
                 next_descriptor = os.open(part, flags | (os.O_DIRECTORY if directory else 0), dir_fd=descriptor)
                 os.close(descriptor)
                 descriptor = next_descriptor
+                if directory and index == len(self.metadata.parts) - 3:
+                    parent = os.fstat(descriptor)
+                    if (not stat.S_ISDIR(parent.st_mode) or parent.st_uid != os.geteuid()
+                            or parent.st_mode & 0o077 or not parent.st_mode & stat.S_IWUSR
+                            or not parent.st_mode & stat.S_IXUSR):
+                        raise OSError()
             info = os.fstat(descriptor)
             if (info.st_dev != device or not stat.S_ISREG(info.st_mode)
                     or info.st_uid != os.geteuid() or info.st_mode & 0o077
@@ -95,6 +101,7 @@ class ExpectedFilesystem:
             if (RootIdentity(info.st_dev, info.st_ino) != self.expected
                     or info.st_uid != os.geteuid() or info.st_mode & 0o077
                     or not info.st_mode & stat.S_IWUSR
+                    or not info.st_mode & stat.S_IXUSR
                     or not stat.S_ISDIR(info.st_mode)):
                 raise OSError()
             self._check_metadata(info.st_dev)

@@ -262,10 +262,18 @@ class ExpectedFilesystemTests(unittest.TestCase):
             with self.assertRaises(RecordingError):
                 checker.snapshot()
             root.chmod(0o700)
+            root.chmod(0o600)
+            with self.assertRaises(RecordingError):
+                checker.snapshot()
+            root.chmod(0o700)
             metadata.chmod(0o400)
             with self.assertRaises(RecordingError):
                 checker.snapshot()
             metadata.chmod(0o600)
+            Path(temp).chmod(0o500)
+            with self.assertRaises(RecordingError):
+                checker.snapshot()
+            Path(temp).chmod(0o700)
             metadata.chmod(0o644)
             with self.assertRaises(RecordingError):
                 checker.snapshot()
