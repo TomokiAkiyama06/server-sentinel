@@ -10,7 +10,9 @@ source type, profile ID, explicit search/quality thresholds, version, and
 timestamp. A policy is refused when a bounded search window cannot reach its
 own displacement threshold, because such a configuration cannot express the
 movement or camera shift it asks for and would report a matching geometry
-instead. `CalibrationArchive` is a small append-only SQLite port: the Main
+instead. A calibration whose reference already meets the obscured-scene
+threshold is refused for the same reason: every unchanged sample would look
+obscured and confirm a tamper that never happened. `CalibrationArchive` is a small append-only SQLite port: the Main
 runtime must supply its already-open private database after application
 migration (`roi_calibration_history`) has run. The table holds provenance
 only — identities, polygon, policy, reference geometry and the reference
@@ -54,7 +56,8 @@ nor absence of tamper: its untransformed difference is large even when the
 registered transform is small, so it is never treated as a changed scene. A trusted source-loss signal produces a
 critical observation only if it closely follows a tracked global scene shift,
 and at most once per tracked shift episode; source loss by itself stays
-`unknown`. The scene-difference measurement is a
+`unknown`, and a source-loss report this core cannot accept ends confirmation
+before it is refused. The scene-difference measurement is a
 bounded scalar over background support points; it never describes who or what
 is in view. The core records neutral observation provenance and offers
 `CriticalDelivery` for bounded, explicit local handoff. A later runtime owns

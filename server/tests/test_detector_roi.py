@@ -68,6 +68,11 @@ def covered():
     return bytes((x * 3 + y * 5) % 37 + 210 for y in range(HEIGHT) for x in range(WIDTH))
 
 
+def near_dark():
+    """Generated scene already at the obscured threshold, yet still textured."""
+    return bytes(255 if index % 16 == 0 else 0 for index in range(WIDTH * HEIGHT))
+
+
 def repetitive(shift=0):
     """Generated period-two stripes: several bounded transforms match equally."""
     return bytes(40 if (x - shift) % 2 == 0 else 200
@@ -270,6 +275,26 @@ class SceneDetectorTests(unittest.TestCase):
             detector(rules=policy(**dict(rules, maximum_comparisons=registered_only)), shape=small)
         detector(rules=policy(**dict(rules, maximum_comparisons=registered_only - roi_work + background)),
                  shape=small)
+
+    def test_reference_already_at_the_dark_threshold_is_refused(self):
+        reference = near_dark()
+        rules = policy()
+        dark = sum(value <= rules.dark_pixel_ceiling for value in reference) / len(reference)
+        self.assertGreaterEqual(dark, rules.camera_dark_fraction)
+        with self.assertRaises(ValueError):
+            detector(reference=reference)
+
+    def test_rejected_source_loss_observation_ends_temporal_confirmation(self):
+        moved = transformed(pixels(), (1, 0), region=(4, 4, 8, 7))
+        instance = detector()
+        inspect_scene(instance, frame(0), 0)
+        inspect_scene(instance, frame(1, moved), 10)
+        with self.assertRaises(ValueError):
+            instance.source_lost(monotonic_ns=-1, observed_at=NOW, health_signal_trusted=True)
+        after = inspect_scene(instance, frame(2, moved), 20)
+        self.assertEqual(Observation.UNKNOWN, after.movement)
+        self.assertEqual("awaiting_confirmation", after.movement_reason)
+        self.assertFalse(after.critical)
 
     def test_search_window_must_reach_its_own_displacement_thresholds(self):
         with self.assertRaises(ValueError):

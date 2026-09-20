@@ -609,7 +609,10 @@ API, retain decoded media, make a presence decision, or issue a notification.
 
 A calibration policy whose bounded search window cannot reach its own movement
 or camera-shift threshold is refused: such a configuration cannot express the
-displacement it asks to detect and would report a matching geometry instead.
+displacement it asks to detect and would report a matching geometry instead. A
+calibration whose reference already meets the obscured-scene threshold is
+refused as well, since every unchanged sample would then confirm a tamper that
+never happened.
 
 It first estimates a bounded global translation/quarter-turn transform from
 background support, then compares the ROI relative to that transform. A

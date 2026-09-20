@@ -70,6 +70,12 @@ class SceneDetector:
         if (variance(reference, self.background) < self.policy.minimum_background_variance
                 or variance(reference, self.roi_points) < self.policy.minimum_roi_variance):
             raise ValueError("calibration lacks distinctive ROI or background texture")
+        # A reference that already meets the obscured-scene threshold would make
+        # every unchanged sample look obscured and confirm a tamper that never
+        # happened, so it cannot serve as this policy's baseline.
+        dark = sum(value <= self.policy.dark_pixel_ceiling for value in reference.pixels)
+        if dark / len(reference.pixels) >= self.policy.camera_dark_fraction:
+            raise ValueError("calibration reference already meets the obscured-scene threshold")
         self.global_candidates = candidates(self.policy.global_search_pixels, self.policy.global_quarter_turns)
         self.roi_candidates = candidates(self.policy.roi_search_pixels, self.policy.roi_quarter_turns)
         # Budget the costlier of the two per-sample paths. A registered scene
@@ -264,9 +270,16 @@ class SceneDetector:
                                  relative_transform=relative, critical=tuple(critical))
 
     def source_lost(self, *, monotonic_ns: int, observed_at, health_signal_trusted: bool):
-        observed_at = timestamp(observed_at)
-        if type(monotonic_ns) is not int or monotonic_ns < 0 or type(health_signal_trusted) is not bool:
-            raise ValueError("invalid source-health observation")
+        try:
+            observed_at = timestamp(observed_at)
+            if type(monotonic_ns) is not int or monotonic_ns < 0 or type(health_signal_trusted) is not bool:
+                raise ValueError("invalid source-health observation")
+        except Exception:
+            # A health observation this detector cannot accept still marks an
+            # outage it could not evaluate, so the episode ends here too rather
+            # than letting a later sample confirm across it.
+            self._interrupt()
+            raise
         self._interrupt()
         critical = ()
         correlated = (health_signal_trusted and self.last_scene_shift_ns is not None
