@@ -8,7 +8,7 @@ FastAPI 0.141.1 + Uvicorn 0.53.0, both WITHOUT extras. Do not use `fastapi[stand
 FastAPI >= current release requires Pydantic >=2.9; using Pydantic v1 would require deliberately selecting older FastAPI.
 Latest stable package wheels are compatible with Python 3.12; local Python 3.14 x86_64 and Linux Python 3.12 aarch64 pydantic-core wheels were also downloaded and hash verified.
 
-`../requirements.lock` and `../requirements-ci.lock` contain the 13 runtime / 2 development packages with exact SHA256 hashes of downloaded wheels. Only the three selected native wheels are permitted by the reviewed lock.
+`../requirements.lock` and `../requirements-ci.lock` contain the 13 runtime / 2 development packages with exact SHA256 hashes of downloaded wheels. Only the three selected native wheels are permitted by the reviewed lock. `wheel-audit.json` records all 17 permitted artifacts individually, including each native wheel's filename, SHA256, release metadata URL, download URL, dependencies, and included license-file hashes. The CPython 3.12 aarch64 and CPython 3.14 x86_64 wheels' MIT license bytes match the CPython 3.12 x86_64 wheel; the same source-version Rust dependency audit and accompanying notices apply. An offline CI check requires exact agreement between every permitted lock hash and the audit inventory.
 
 | Package | Exact version | Declared license |
 |---|---|---|
