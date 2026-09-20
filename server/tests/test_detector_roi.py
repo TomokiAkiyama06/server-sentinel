@@ -212,6 +212,35 @@ class SceneDetectorTests(unittest.TestCase):
         self.assertEqual(Observation.UNKNOWN, after_gap.movement)
         self.assertFalse(after_gap.critical)
 
+    def test_confirmation_after_an_interruption_reports_new_critical_evidence(self):
+        moved = transformed(pixels(), (1, 0), region=(4, 4, 8, 7))
+        instance = detector()
+        inspect_scene(instance, frame(0), 0)
+        inspect_scene(instance, frame(1, moved), 10)
+        first = inspect_scene(instance, frame(2, moved), 20)
+        self.assertEqual((CriticalKind.SERVER_MOVEMENT,), tuple(item.kind for item in first.critical))
+        inspect_scene(instance, frame(3, moved), 30, movement=Quality.INSUFFICIENT)
+        inspect_scene(instance, frame(4, moved), 40)
+        again = inspect_scene(instance, frame(5, moved), 50)
+        self.assertEqual(Observation.PRESENT, again.movement)
+        self.assertEqual((CriticalKind.SERVER_MOVEMENT,), tuple(item.kind for item in again.critical))
+        self.assertNotEqual(first.critical[0].identifier, again.critical[0].identifier)
+
+    def test_tamper_after_a_stream_restart_is_not_silently_deduplicated(self):
+        instance = detector()
+        dark = bytes(WIDTH * HEIGHT)
+        restarted = UUID(int=304)
+        inspect_scene(instance, frame(0), 0)
+        inspect_scene(instance, frame(1, dark), 10)
+        first = inspect_scene(instance, frame(2, dark), 20)
+        self.assertEqual((CriticalKind.CAMERA_TAMPER,), tuple(item.kind for item in first.critical))
+        inspect_scene(instance, frame(0, dark, stream=restarted), 30)
+        inspect_scene(instance, frame(1, dark, stream=restarted), 40)
+        again = inspect_scene(instance, frame(2, dark, stream=restarted), 50)
+        self.assertEqual(Observation.PRESENT, again.tamper)
+        self.assertEqual((CriticalKind.CAMERA_TAMPER,), tuple(item.kind for item in again.critical))
+        self.assertNotEqual(first.critical[0].identifier, again.critical[0].identifier)
+
     def test_person_presence_is_not_an_input_to_movement_proof(self):
         parameters = inspect.signature(SceneDetector.inspect).parameters
         self.assertNotIn("person", parameters)

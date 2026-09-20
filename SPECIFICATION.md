@@ -546,7 +546,10 @@ confirmed ROI movement requires the policy's multiple samples and elapsed time.
 An explicit ROI-occlusion signal, insufficient movement quality, sampling gap,
 stream restart, regression, incompatible frame, or inadequate calibration
 returns `unknown` and resets confirmation; none is converted into a trustworthy
-no-movement result. Person presence is not an input to this conclusion.
+no-movement result. Because such an interruption ends the episode, a condition
+confirmed again afterwards is emitted again instead of being suppressed as a
+duplicate, so no confirmed critical observation is silently lost. Person
+presence is not an input to this conclusion.
 
 Camera tamper has an independent quality input and confirmation state. The core
 can report a persistent near-dark scene, a global scene shift, or a scene that
@@ -554,10 +557,10 @@ stops registering while differing measurably from the calibrated background,
 which covers a covered or redirected camera. That difference is a bounded
 scene-change scalar and never an identity or a culprit attribution. A merely
 ambiguous registration of an otherwise unchanged scene remains `unknown` and
-confirms neither tamper nor its absence. Trusted
-source loss becomes critical only when it occurs within the configured interval
-after a recorded global scene shift; uncorrelated or untrusted loss stays
-`unknown`. A later runtime must durably handle a confirmed critical observation
+confirms neither tamper nor its absence. Trusted source loss becomes critical
+only when it occurs within the configured interval after a recorded global
+scene shift, and at most once per tracked shift episode; uncorrelated or
+untrusted loss stays `unknown`. A later runtime must durably handle a confirmed critical observation
 for evidence preservation and configured notifications in every presence state.
 Synthetic tests do not establish physical-camera, lighting, pose, or
 source-health behavior.

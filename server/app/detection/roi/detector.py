@@ -17,12 +17,18 @@ class _Confirmation:
     emitted: bool = False
 
     def interrupt(self):
-        self.first_ns, self.count = None, 0
+        """End the episode so a later confirmation is reported as new evidence.
+
+        The emitted latch is cleared as well: after occlusion, quality loss, a
+        stream restart or a sampling gap, a re-confirmed condition is a new
+        confirmed observation and must not be silently dropped as a duplicate
+        of an episode whose continuity this detector already lost.
+        """
+        self.first_ns, self.count, self.emitted = None, 0, False
 
     def observe(self, present, now, policy):
         if not present:
             self.interrupt()
-            self.emitted = False
             return False, False
         if self.first_ns is None:
             self.first_ns = now
@@ -76,6 +82,10 @@ class SceneDetector:
         self.last_ns = -1
         self.last_scene_shift_ns = None
         self.last_scene_shift_confidence = None
+        # One correlated source-loss event per tracked scene-shift episode. This
+        # deduplication is deliberately separate from confirmation state, which
+        # must never suppress a newly confirmed critical observation.
+        self.shift_reported = False
         self.movement = _Confirmation()
         self.tamper = _Confirmation()
 
@@ -193,6 +203,8 @@ class SceneDetector:
             changed = global_shift or obscured or unmatched
             if global_shift:
                 tamper_reason, tamper_confidence = "global_scene_shift", 1 - global_match.error
+                if self.last_scene_shift_ns is None:
+                    self.shift_reported = False
                 self.last_scene_shift_ns, self.last_scene_shift_confidence = monotonic_ns, tamper_confidence
             elif obscured:
                 tamper_reason, tamper_confidence = "scene_obscured_or_changed", dark
@@ -201,13 +213,17 @@ class SceneDetector:
             elif indeterminate:
                 tamper_reason, tamper_confidence = "global_alignment_unavailable", None
             else:
+                # The calibrated background registers again: the tracked shift
+                # episode is over and must not correlate a later source loss.
                 tamper_reason, tamper_confidence = "background_matches", 1 - global_match.error
+                self.last_scene_shift_ns, self.last_scene_shift_confidence = None, None
             if indeterminate:
                 self.tamper.interrupt()
             else:
                 confirmed, emit = self.tamper.observe(changed, monotonic_ns, self.policy)
                 tamper = Observation.PRESENT if confirmed else Observation.UNKNOWN if changed else Observation.ABSENT
                 if emit:
+                    self.shift_reported = self.shift_reported or global_shift
                     critical.append(self._event(CriticalKind.CAMERA_TAMPER, frame, monotonic_ns,
                                                 observed_at, tamper_confidence, tamper_reason))
         else:
@@ -229,10 +245,10 @@ class SceneDetector:
         correlated = (health_signal_trusted and self.last_scene_shift_ns is not None
                       and self.last_ns <= monotonic_ns
                       and 0 <= monotonic_ns - self.last_scene_shift_ns <= self.policy.loss_correlation_ns)
-        if correlated and not self.tamper.emitted:
+        if correlated and not self.shift_reported:
             critical = (self._event(CriticalKind.CAMERA_TAMPER, None, monotonic_ns, observed_at,
                                     self.last_scene_shift_confidence, "source_loss_after_scene_shift"),)
-            self.tamper.emitted = True
+            self.shift_reported = True
         self.last_ns = max(self.last_ns, monotonic_ns)
         return self._observation(None, monotonic_ns, observed_at, movement_reason="source_unavailable",
                                  tamper=Observation.PRESENT if correlated else Observation.UNKNOWN,

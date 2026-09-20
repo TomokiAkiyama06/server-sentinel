@@ -29,7 +29,10 @@ transform. It only emits `server_movement` after the configured number and
 duration of corroborating samples. An explicit ROI-occlusion signal, sampling
 gap, stream restart, regression, mismatched frame, or insufficient movement
 quality resets confirmation and yields `unknown`, never `no movement`.
-Person presence is deliberately not an input.
+Ending an episode that way also clears its emitted latch: a condition that is
+confirmed again after the interruption is new evidence and is reported again
+rather than dropped as a duplicate. Person presence is deliberately not an
+input.
 
 Camera tamper has its own quality input and temporal confirmation. It can
 report a bounded global scene shift, a persistent near-dark scene, or a scene
@@ -37,8 +40,9 @@ that stops registering while differing measurably from the calibrated
 background — a covered or redirected camera. A registration that is merely
 ambiguous on an otherwise unchanged scene stays `unknown` and confirms
 neither tamper nor absence of tamper. A trusted source-loss signal produces a
-critical observation only if it closely follows a tracked global scene shift;
-source loss by itself stays `unknown`. The scene-difference measurement is a
+critical observation only if it closely follows a tracked global scene shift,
+and at most once per tracked shift episode; source loss by itself stays
+`unknown`. The scene-difference measurement is a
 bounded scalar over background support points; it never describes who or what
 is in view. The core records neutral observation provenance and offers
 `CriticalDelivery` for bounded, explicit local handoff. A later runtime owns
