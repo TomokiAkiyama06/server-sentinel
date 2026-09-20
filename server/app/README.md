@@ -12,3 +12,7 @@
 - `storage/`: durable metadata, retention, and write admission.
 
 Do not mix human authorization with capture-node credentials or embed deployment-specific paths/data.
+
+The prepared diagnostic route remains unmounted while the human surface is
+closed. Future mounting must use the composed `DiagnosticExportEndpoint`; the
+internal bundle writer is not a route or application integration point.

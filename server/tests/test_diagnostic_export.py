@@ -4,41 +4,40 @@ import tempfile
 import unittest
 from zipfile import ZipFile
 
+from fastapi import FastAPI, Request
+
+from app.api.diagnostics import router
 from app.diagnostics import (
+    DiagnosticCategory,
     DiagnosticDocument,
     DiagnosticExportAction,
+    DiagnosticExportEndpoint,
     DiagnosticExportService,
-    DiagnosticExporter,
     DiagnosticField,
     DiagnosticFieldKind,
     MediaAsset,
 )
+from tests.asgi import request
 
 
 class SyntheticDiagnostics:
     marker = "SYNTHETIC_PRIVATE_VALUE"
 
     def collect(self):
-        kinds = (
-            DiagnosticFieldKind.CREDENTIAL,
-            DiagnosticFieldKind.PAIRING_SECRET,
-            DiagnosticFieldKind.PRIVATE_KEY,
-            DiagnosticFieldKind.SENSITIVE_HEADER,
-            DiagnosticFieldKind.OWNER_BIOMETRIC,
-            DiagnosticFieldKind.RAW_MONITORING_MEDIA,
-        )
         return (
-            DiagnosticDocument("runtime", (
-                DiagnosticField("status", "degraded", DiagnosticFieldKind.SAFE),
-                DiagnosticField("camera_serial", self.marker,
-                                DiagnosticFieldKind.HARDWARE_IDENTIFIER),
-                DiagnosticField("forged_token", self.marker, DiagnosticFieldKind.SAFE),
-                DiagnosticField("pairing_code", self.marker, DiagnosticFieldKind.SAFE),
-                DiagnosticField("owner_embedding", self.marker, DiagnosticFieldKind.SAFE),
+            DiagnosticDocument(DiagnosticCategory.RUNTIME, (
+                DiagnosticField("status", "degraded"),
+                DiagnosticField("hardware_identifier.camera_serial", self.marker),
             )),
-            DiagnosticDocument("private", tuple(
-                DiagnosticField(f"item_{index}", self.marker, kind)
-                for index, kind in enumerate(kinds)
+            DiagnosticDocument(DiagnosticCategory.SECURITY, tuple(
+                DiagnosticField(name, self.marker) for name in (
+                    "credential.access_key",
+                    "pairing_secret.code",
+                    "private_key.pem",
+                    "sensitive_header.authorization",
+                    "owner_biometric.embedding",
+                    "raw_monitoring_media.frame",
+                )
             )),
         )
 
@@ -65,36 +64,45 @@ class DiagnosticExportTests(unittest.IsolatedAsyncioTestCase):
             return ({name: archive.read(name) for name in archive.namelist()},
                     json.loads(archive.read("manifest.json")))
 
-    async def test_denial_writes_nothing_and_does_not_collect_or_resolve(self):
+    async def test_denial_gets_safe_confirmation_but_writes_and_resolves_nothing(self):
+        confirmations = []
+
         class Deny:
-            async def require_owner_export(inner_self, action):
+            async def require_owner_export(inner_self, action, confirmation):
+                confirmations.append(confirmation)
                 raise PermissionError("denied")
 
-        class MustNotCollect:
-            def collect(inner_self):
-                raise AssertionError("collection before authorization")
-
-        service = DiagnosticExportService(
-            Deny(), DiagnosticExporter(MustNotCollect(), self.media))
+        service = DiagnosticExportService(Deny(), self.source, self.media)
         with self.assertRaises(PermissionError):
             await service.export(DiagnosticExportAction(self.output, ("clip_a",)))
         self.assertEqual(list(self.output.iterdir()), [])
         self.assertEqual(self.media.resolved, [])
+        self.assertEqual(
+            [(item.category, item.item_count)
+             for item in confirmations[0].included_categories],
+            [("runtime", 2), ("raw_monitoring_media", 1)],
+        )
+        self.assertEqual(confirmations[0].selected_media_ids, ("clip_a",))
+        self.assertFalse(hasattr(confirmations[0], "included_values"))
 
     async def test_authorized_default_bundle_excludes_and_hashes_sensitive_values(self):
         seen = []
 
         class Permit:
-            async def require_owner_export(inner_self, action):
-                seen.append(action)
+            async def require_owner_export(inner_self, action, confirmation):
+                seen.append((action, confirmation))
 
         action = DiagnosticExportAction(self.output)
         result = await DiagnosticExportService(
-            Permit(), DiagnosticExporter(self.source, self.media)).export(action)
+            Permit(), self.source, self.media).export(action)
         files, manifest = self.read_bundle(result)
         runtime = json.loads(files["diagnostics/runtime.json"])
 
-        self.assertEqual(seen, [action])
+        self.assertEqual(seen[0][0], action)
+        self.assertEqual(
+            [(item.category, item.item_count)
+             for item in seen[0][1].included_categories], [("runtime", 2)])
+        self.assertEqual(seen[0][1].selected_media_ids, ())
         self.assertEqual(self.media.resolved, [])
         self.assertFalse(any(self.source.marker.encode() in value
                              for value in files.values()))
@@ -107,17 +115,17 @@ class DiagnosticExportTests(unittest.IsolatedAsyncioTestCase):
             "owner_biometric", "raw_monitoring_media", "not_owner_selected",
         })
         self.assertNotIn("identifier_salt", manifest)
-        self.assertNotIn("private", result.included_categories)
+        self.assertNotIn("security", result.included_categories)
         self.assertEqual(result.bundle_path.stat().st_mode & 0o777, 0o600)
 
     async def test_only_individually_selected_raw_media_is_resolved_and_included(self):
         class Permit:
-            async def require_owner_export(inner_self, action):
+            async def require_owner_export(inner_self, action, confirmation):
                 return None
 
         action = DiagnosticExportAction(self.output, ("clip_b", "clip_a"))
         result = await DiagnosticExportService(
-            Permit(), DiagnosticExporter(self.source, self.media)).export(action)
+            Permit(), self.source, self.media).export(action)
         files, manifest = self.read_bundle(result)
 
         self.assertEqual(self.media.resolved, ["clip_b", "clip_a"])
@@ -136,5 +144,53 @@ class DiagnosticExportTests(unittest.IsolatedAsyncioTestCase):
 
     def test_non_scalar_values_require_explicit_flattening(self):
         with self.assertRaises(TypeError):
-            DiagnosticField("headers", {"authorization": self.source.marker},
-                            DiagnosticFieldKind.SAFE)
+            DiagnosticField("status", {"authorization": self.source.marker})
+
+    def test_unrecognized_safe_names_fail_closed_instead_of_using_regex(self):
+        for name in ("access_key", "client_cert", "pairing_code", "owner_vector",
+                     "x_forwarded_user", "monitoring_payload"):
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                DiagnosticField(name, self.source.marker)
+
+        with self.assertRaises(TypeError):
+            DiagnosticField("hardware_identifier.access_key", self.source.marker,
+                            DiagnosticFieldKind.CREDENTIAL)
+        with self.assertRaises(ValueError):
+            DiagnosticField("hardware_identifier.access_key", self.source.marker)
+
+    def test_categories_are_allowlisted_before_reaching_manifest_or_confirmation(self):
+        with self.assertRaises(TypeError):
+            DiagnosticDocument("private-hostname", ())
+
+    async def test_prepared_route_uses_fixed_endpoint_and_both_authorizers(self):
+        observed = []
+
+        class SystemPermit:
+            async def require_system_access(inner_self, route_request: Request):
+                observed.append("system")
+
+        class OwnerPermit:
+            async def require_owner_export(inner_self, action, confirmation):
+                observed.append((action.output_directory, confirmation))
+
+        application = FastAPI()
+        application.state.human_authorizer = SystemPermit()
+        application.state.diagnostic_export_endpoint = DiagnosticExportEndpoint(
+            DiagnosticExportService(OwnerPermit(), self.source, self.media), self.output)
+        application.include_router(router)
+        body = json.dumps({"selected_media_ids": []}).encode()
+        result = await request(
+            application, "/diagnostics/export", method="POST", body=body,
+            headers=((b"content-type", b"application/json"),))
+
+        self.assertEqual(result[0]["status"], 200)
+        self.assertEqual(observed[0], "system")
+        self.assertEqual(observed[1][0], self.output)
+        self.assertEqual(
+            [(item.category, item.item_count)
+             for item in observed[1][1].included_categories], [("runtime", 2)])
+
+    def test_public_package_has_no_unconditionally_writable_exporter(self):
+        import app.diagnostics as diagnostics
+
+        self.assertFalse(hasattr(diagnostics, "DiagnosticExporter"))

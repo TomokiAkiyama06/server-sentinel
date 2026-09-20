@@ -2,7 +2,7 @@
 
 from collections import Counter
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field as dataclass_field
 from enum import StrEnum
 import hashlib
 import hmac
@@ -35,42 +35,71 @@ class DiagnosticFieldKind(StrEnum):
     RAW_MONITORING_MEDIA = "raw_monitoring_media"
 
 
-_INFERRED_KINDS = (
-    (re.compile(r"(^|[._-])(serial|uuid)([._-]|$)"),
-     DiagnosticFieldKind.HARDWARE_IDENTIFIER),
-    (re.compile(r"(^|[._-])(biometric|embedding|face[._-]?template)([._-]|$)"),
-     DiagnosticFieldKind.OWNER_BIOMETRIC),
-    (re.compile(r"(^|[._-])(private[._-]?key)([._-]|$)"),
-     DiagnosticFieldKind.PRIVATE_KEY),
-    (re.compile(r"(^|[._-])(pairing)([._-]|$)"),
-     DiagnosticFieldKind.PAIRING_SECRET),
-    (re.compile(r"(^|[._-])(authorization|cookie|sensitive[._-]?header)([._-]|$)"),
-     DiagnosticFieldKind.SENSITIVE_HEADER),
-    (re.compile(r"(^|[._-])(credential|password|secret|token|api[._-]?key)([._-]|$)"),
-     DiagnosticFieldKind.CREDENTIAL),
-    (re.compile(r"(^|[._-])(raw[._-]?(media|frame|video)|face[._-]?crop)([._-]|$)"),
-     DiagnosticFieldKind.RAW_MONITORING_MEDIA),
-)
+class DiagnosticCategory(StrEnum):
+    RUNTIME = "runtime"
+    CAMERA_HEALTH = "camera_health"
+    RECORDING_HEALTH = "recording_health"
+    STORAGE = "storage"
+    HARDWARE_INVENTORY = "hardware_inventory"
+    SECURITY = "security"
 
 
-def _effective_kind(field: "DiagnosticField") -> DiagnosticFieldKind:
-    if field.kind is not DiagnosticFieldKind.SAFE:
-        return field.kind
-    return next((kind for pattern, kind in _INFERRED_KINDS
-                 if pattern.search(field.name)), DiagnosticFieldKind.SAFE)
+class SafeDiagnosticFieldName(StrEnum):
+    """Centrally reviewed names which may carry non-sensitive scalar values."""
+
+    STATUS = "status"
+    STATE = "state"
+    HEALTH = "health"
+    VERSION = "version"
+    COMPONENT = "component"
+    REASON_CODE = "reason_code"
+    COUNT = "count"
+    ENABLED = "enabled"
+
+
+_SAFE_FIELD_NAMES = frozenset(item.value for item in SafeDiagnosticFieldName)
+_CLASSIFIED_FIELD_NAMES = {
+    "hardware_identifier.camera_serial": DiagnosticFieldKind.HARDWARE_IDENTIFIER,
+    "hardware_identifier.device_serial": DiagnosticFieldKind.HARDWARE_IDENTIFIER,
+    "hardware_identifier.filesystem_uuid": DiagnosticFieldKind.HARDWARE_IDENTIFIER,
+    "hardware_identifier.gpu_uuid": DiagnosticFieldKind.HARDWARE_IDENTIFIER,
+    "hardware_identifier.hardware_uuid": DiagnosticFieldKind.HARDWARE_IDENTIFIER,
+    "credential.access_key": DiagnosticFieldKind.CREDENTIAL,
+    "credential.api_key": DiagnosticFieldKind.CREDENTIAL,
+    "credential.password": DiagnosticFieldKind.CREDENTIAL,
+    "credential.token": DiagnosticFieldKind.CREDENTIAL,
+    "pairing_secret.code": DiagnosticFieldKind.PAIRING_SECRET,
+    "pairing_secret.secret": DiagnosticFieldKind.PAIRING_SECRET,
+    "private_key.key": DiagnosticFieldKind.PRIVATE_KEY,
+    "private_key.pem": DiagnosticFieldKind.PRIVATE_KEY,
+    "sensitive_header.authorization": DiagnosticFieldKind.SENSITIVE_HEADER,
+    "sensitive_header.cookie": DiagnosticFieldKind.SENSITIVE_HEADER,
+    "sensitive_header.proxy_identity": DiagnosticFieldKind.SENSITIVE_HEADER,
+    "owner_biometric.embedding": DiagnosticFieldKind.OWNER_BIOMETRIC,
+    "owner_biometric.template": DiagnosticFieldKind.OWNER_BIOMETRIC,
+    "raw_monitoring_media.face_crop": DiagnosticFieldKind.RAW_MONITORING_MEDIA,
+    "raw_monitoring_media.frame": DiagnosticFieldKind.RAW_MONITORING_MEDIA,
+    "raw_monitoring_media.media": DiagnosticFieldKind.RAW_MONITORING_MEDIA,
+    "raw_monitoring_media.video": DiagnosticFieldKind.RAW_MONITORING_MEDIA,
+}
 
 
 @dataclass(frozen=True)
 class DiagnosticField:
     name: str
     value: JsonScalar
-    kind: DiagnosticFieldKind
+    kind: DiagnosticFieldKind = dataclass_field(init=False)
 
     def __post_init__(self) -> None:
-        if not isinstance(self.kind, DiagnosticFieldKind):
-            raise TypeError("diagnostic field kind is required")
         if not isinstance(self.name, str) or not _SAFE_NAME.fullmatch(self.name):
             raise ValueError("diagnostic field name is invalid")
+        if self.name in _SAFE_FIELD_NAMES:
+            derived_kind = DiagnosticFieldKind.SAFE
+        else:
+            derived_kind = _CLASSIFIED_FIELD_NAMES.get(self.name)
+            if derived_kind is None:
+                raise ValueError("diagnostic field name is not allowlisted")
+        object.__setattr__(self, "kind", derived_kind)
         if type(self.value) is float and not math.isfinite(self.value):
             raise ValueError("diagnostic field value is invalid")
         if not (self.value is None or type(self.value) in {str, int, float, bool}):
@@ -79,12 +108,12 @@ class DiagnosticField:
 
 @dataclass(frozen=True)
 class DiagnosticDocument:
-    category: str
+    category: DiagnosticCategory
     fields: tuple[DiagnosticField, ...]
 
     def __post_init__(self) -> None:
-        if not isinstance(self.category, str) or not _SAFE_NAME.fullmatch(self.category):
-            raise ValueError("diagnostic category is invalid")
+        if not isinstance(self.category, DiagnosticCategory):
+            raise TypeError("diagnostic category must be allowlisted")
         if len({field.name for field in self.fields}) != len(self.fields):
             raise ValueError("diagnostic field names must be unique")
 
@@ -132,8 +161,32 @@ class DiagnosticExportAction:
 
 
 class OwnerDiagnosticExportAuthorizer(Protocol):
-    async def require_owner_export(self, action: DiagnosticExportAction) -> None:
-        """Deny unless this exact export is an explicit Owner action."""
+    async def require_owner_export(
+            self, action: DiagnosticExportAction,
+            confirmation: "DiagnosticExportConfirmation") -> None:
+        """Confirm the sanitized contents and deny unless the Owner approves."""
+
+
+@dataclass(frozen=True)
+class DiagnosticExclusion:
+    category: str
+    reason: str
+    count: int | None = None
+
+
+@dataclass(frozen=True)
+class DiagnosticIncludedCategory:
+    category: str
+    item_count: int
+
+
+@dataclass(frozen=True)
+class DiagnosticExportConfirmation:
+    """Value-free summary shown before the authorized local write."""
+
+    included_categories: tuple[DiagnosticIncludedCategory, ...]
+    exclusions: tuple[DiagnosticExclusion, ...]
+    selected_media_ids: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -153,14 +206,21 @@ _EXCLUDED_KINDS = {
 }
 
 
-class DiagnosticExporter:
-    """Writes one local archive. It has no transport, share or upload hook."""
+@dataclass(frozen=True)
+class _PreparedBundle:
+    output_directory: Path
+    included: dict[str, dict[str, JsonScalar]]
+    confirmation: DiagnosticExportConfirmation
+
+
+class _DiagnosticBundleWriter:
+    """Internal writer reachable only through the authorizing service."""
 
     def __init__(self, source: DiagnosticSource, media_source: MediaSource | None = None) -> None:
         self._source = source
         self._media_source = media_source
 
-    def write(self, action: DiagnosticExportAction) -> DiagnosticExportResult:
+    def prepare(self, action: DiagnosticExportAction) -> _PreparedBundle:
         try:
             output = action.output_directory.resolve(strict=True)
         except (OSError, RuntimeError):
@@ -178,55 +238,72 @@ class DiagnosticExporter:
         for document in documents:
             values: dict[str, JsonScalar] = {}
             for field in document.fields:
-                kind = _effective_kind(field)
+                kind = field.kind
                 if kind in _EXCLUDED_KINDS:
-                    exclusions[(document.category, kind.value)] += 1
+                    exclusions[(document.category.value, kind.value)] += 1
                 elif kind is DiagnosticFieldKind.HARDWARE_IDENTIFIER:
                     encoded = json.dumps(field.value, separators=(",", ":"), ensure_ascii=True)
-                    values[field.name] = "hmac-sha256:" + hmac.new(
+                    output_name = field.name.partition(".")[2]
+                    values[output_name] = "hmac-sha256:" + hmac.new(
                         identifier_key, encoded.encode("ascii"), hashlib.sha256
                     ).hexdigest()
                 else:
                     values[field.name] = field.value
             if values:
-                included[document.category] = values
+                included[document.category.value] = values
 
-        media: list[tuple[str, MediaAsset]] = []
+        exclusion_summary = [
+            DiagnosticExclusion(category, reason, count)
+            for (category, reason), count in sorted(exclusions.items())
+        ]
+        if not action.selected_media_ids:
+            exclusion_summary.append(DiagnosticExclusion(
+                "raw_monitoring_media", "not_owner_selected"))
+        categories = tuple(DiagnosticIncludedCategory(category, len(values))
+                           for category, values in sorted(included.items()))
+        if action.selected_media_ids:
+            categories += (DiagnosticIncludedCategory(
+                "raw_monitoring_media", len(action.selected_media_ids)),)
+        confirmation = DiagnosticExportConfirmation(
+            included_categories=categories,
+            exclusions=tuple(exclusion_summary),
+            selected_media_ids=action.selected_media_ids,
+        )
+        return _PreparedBundle(output, included, confirmation)
+
+    def write(self, action: DiagnosticExportAction,
+              prepared: _PreparedBundle) -> DiagnosticExportResult:
+        media: list[MediaAsset] = []
         if action.selected_media_ids:
             if self._media_source is None:
                 raise DiagnosticExportError("selected diagnostic media is unavailable")
-            for media_id in action.selected_media_ids:
-                media.append((media_id, self._media_source.resolve_selected(media_id)))
+            media = [self._media_source.resolve_selected(media_id)
+                     for media_id in action.selected_media_ids]
 
         bundle_name = f"serversentinel-diagnostics-{secrets.token_hex(12)}.zip"
         temporary_name = f".{bundle_name}.part"
-        temporary_path = output / temporary_name
-        bundle_path = output / bundle_name
+        temporary_path = prepared.output_directory / temporary_name
+        bundle_path = prepared.output_directory / bundle_name
         try:
             descriptor = os.open(temporary_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             with os.fdopen(descriptor, "w+b") as stream, ZipFile(
                     stream, "w", compression=ZIP_DEFLATED) as archive:
-                for category, values in sorted(included.items()):
+                for category, values in sorted(prepared.included.items()):
                     self._write_json(archive, f"diagnostics/{category}.json", values)
-                for index, (_, asset) in enumerate(media, start=1):
+                for index, asset in enumerate(media, start=1):
                     self._write_bytes(archive, f"media/{index:04d}.bin", asset.content)
                 exclusion_manifest = [
-                    {"category": category, "reason": reason, "count": count}
-                    for (category, reason), count in sorted(exclusions.items())
+                    ({"category": item.category, "reason": item.reason,
+                      **({"count": item.count} if item.count is not None else {})})
+                    for item in prepared.confirmation.exclusions
                 ]
-                if not media:
-                    exclusion_manifest.append({
-                        "category": "raw_monitoring_media",
-                        "reason": "not_owner_selected",
-                    })
                 manifest = {
                     "format": 1,
                     "transfer": "none_local_bundle_only",
                     "included_categories": [
-                        {"category": category, "field_count": len(values)}
-                        for category, values in sorted(included.items())
-                    ] + ([{"category": "raw_monitoring_media", "item_count": len(media)}]
-                         if media else []),
+                        {"category": item.category, "item_count": item.item_count}
+                        for item in prepared.confirmation.included_categories
+                    ],
                     "exclusions": exclusion_manifest,
                     "identifier_transform": "ephemeral_keyed_sha256",
                 }
@@ -234,7 +311,8 @@ class DiagnosticExporter:
                 stream.flush()
                 os.fsync(stream.fileno())
             os.replace(temporary_path, bundle_path)
-            directory_fd = os.open(output, os.O_RDONLY | os.O_DIRECTORY)
+            directory_fd = os.open(
+                prepared.output_directory, os.O_RDONLY | os.O_DIRECTORY)
             try:
                 os.fsync(directory_fd)
             finally:
@@ -249,13 +327,14 @@ class DiagnosticExporter:
             raise
         return DiagnosticExportResult(
             bundle_path=bundle_path,
-            included_categories=tuple(sorted(included)),
+            included_categories=tuple(
+                item.category for item in prepared.confirmation.included_categories),
             included_media_count=len(media),
         )
 
     @staticmethod
     def _write_json(archive: ZipFile, name: str, value: object) -> None:
-        DiagnosticExporter._write_bytes(
+        _DiagnosticBundleWriter._write_bytes(
             archive, name,
             json.dumps(value, separators=(",", ":"), sort_keys=True,
                        ensure_ascii=True).encode("ascii"),
@@ -270,13 +349,29 @@ class DiagnosticExporter:
 
 
 class DiagnosticExportService:
-    """Fail-closed orchestration for the future Owner-authorized API."""
+    """The sole public bundle creation path, with pre-write confirmation."""
 
     def __init__(self, authorizer: OwnerDiagnosticExportAuthorizer,
-                 exporter: DiagnosticExporter) -> None:
+                 source: DiagnosticSource,
+                 media_source: MediaSource | None = None) -> None:
         self._authorizer = authorizer
-        self._exporter = exporter
+        self.__writer = _DiagnosticBundleWriter(source, media_source)
 
     async def export(self, action: DiagnosticExportAction) -> DiagnosticExportResult:
-        await self._authorizer.require_owner_export(action)
-        return self._exporter.write(action)
+        prepared = self.__writer.prepare(action)
+        await self._authorizer.require_owner_export(action, prepared.confirmation)
+        return self.__writer.write(action, prepared)
+
+
+class DiagnosticExportEndpoint:
+    """Future human-route integration with a fixed local output directory."""
+
+    def __init__(self, service: DiagnosticExportService, output_directory: Path) -> None:
+        if not isinstance(output_directory, Path):
+            raise TypeError("output_directory must be a path")
+        self.__service = service
+        self.__output_directory = output_directory
+
+    async def export(self, selected_media_ids: tuple[str, ...]) -> DiagnosticExportResult:
+        return await self.__service.export(DiagnosticExportAction(
+            self.__output_directory, selected_media_ids))
