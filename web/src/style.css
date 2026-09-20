@@ -54,6 +54,10 @@ p { margin: .5rem 0 1rem; }
 .kind { border-left: 3px solid #617780; padding-left: .5rem; }
 .kind-critical { border-color: #ad3940; }
 .kind-event { border-color: #176e85; }
+.recording-status { display: inline-block; border-left: 3px solid #617780; padding-left: .5rem; font-size: .8rem; }
+.recording-status-active { border-color: #176e85; }
+.recording-status-gapped, .recording-status-interrupted { border-color: #9b6100; }
+.coverage-warning { margin: .35rem 0 0; max-width: 16rem; white-space: normal; font-size: .75rem; color: #6d4400; }
 .row-actions { display: flex; gap: .4rem; flex-wrap: wrap; }
 .row-actions button { border: 1px solid #cad7dc; border-radius: .5rem; background: #fff; color: #344f5b; padding: .35rem .7rem; font-size: .8rem; }
 .danger { border-color: #ad3940; color: #8a2a30; font-weight: 650; }

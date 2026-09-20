@@ -36,9 +36,17 @@ the backend or ingest listener.
 ## Recording browser and storage/notification screens for #21
 
 `src/recordings/view.tsx` lists authorized recordings with time, camera, type
-(event / manual / critical evidence), recording coverage state, length, size and remaining Main
-retention. Starred recordings are shown as never auto-deleted instead of a day
-count. Playback is in-browser only: there is no download, export, media link or
+(event / manual / critical evidence), coverage state, length, size and remaining
+Main retention. The type follows the recorder: manual recordings are the rows
+`RecordingStore` starts without an `event_id`, and there is no `continuous`
+recorder kind. The store's `active`, `complete`, `gapped` and `interrupted`
+status is carried through and shown, a known coverage gap is called out instead
+of being presented as a complete recording, and an active recording offers no
+delete control because `delete_recording()` always refuses one. Starring stays
+available for an active recording because the store permits it. Starred
+recordings are shown as never auto-deleted instead of a day count.
+
+Playback is in-browser only: there is no download, export, media link or
 embedded media element for any role, and the screen states plainly that
 in-browser playback does not prevent screen recording or client-side copying.
 Star, unstar and delete controls render only for an owner session that also has
