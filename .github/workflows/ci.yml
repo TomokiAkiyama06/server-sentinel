@@ -28,6 +28,8 @@ jobs:
           python-version: '3.12'
       - name: Scan tracked files and synthetic provenance
         run: python scripts/ci/repository_guard.py
+      - name: Validate dependency and model license inventory
+        run: python scripts/ci/license_gate.py
       - name: Install hash-pinned CI tools
         env:
           PIP_DISABLE_PIP_VERSION_CHECK: '1'

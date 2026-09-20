@@ -103,3 +103,23 @@ Recommended:
 - `THIRD_PARTY_NOTICES.md`;
 - machine-generated license report in CI artifacts where practical;
 - separate model/weight inventory with provenance/license/checksum.
+
+## Enforced release inventory
+
+[`license/components.json`](../license/components.json) is the release allowlist.
+CI runs `python scripts/ci/license_gate.py` and fails when a reviewed dependency
+input, exact locked dependency, or committed model artifact is absent or differs.
+The inventory keeps exact upstream and license evidence, material transitive
+evidence, notices, and redistribution obligations for each component.
+
+Model implementation code and weights use distinct `model_code` and
+`model_weight` records. Weight records bind the artifact path and SHA256; a code
+license record never covers weights. Scopes with no selected third-party
+transport/model component have an evidence-backed `reviewed-empty` record so
+their absence is explicit rather than assumed.
+
+Blocked-by-default licenses require an exact record in
+[`license/owner-approvals.json`](../license/owner-approvals.json), including the
+component version, license, date, `repository-owner` approver, and a committed
+Owner decision under `docs/decisions/`. CI rejects stale, missing, mismatched,
+or unused approval records.

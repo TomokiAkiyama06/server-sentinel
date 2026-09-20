@@ -42,6 +42,8 @@ The repository job always runs:
 - synthetic media provenance checks;
 - known prohibited SDK/reporting signature checks in component inventories,
   lockfiles, source/configuration, and available generated output;
+- fail-closed dependency/model license inventory validation, including exact
+  lock entries, separate model code/weight evidence, notices and Owner approvals;
 - Pyflakes and pycodestyle lint checks for Python tooling/tests;
 - synthetic positive/negative unit tests for the guards and component runner;
 - whitespace checks on the checked-out change.
@@ -58,6 +60,7 @@ python3 -m venv .venv
 . .venv/bin/activate
 python -m pip install --require-hashes --only-binary=:all: -r .ci/requirements.txt
 python scripts/ci/repository_guard.py
+python scripts/ci/license_gate.py
 python -m pyflakes scripts tests
 python -m pycodestyle --select=E4,E7,E9 scripts tests
 python -m unittest discover -s tests/unit -p 'test_*.py' -v
@@ -95,7 +98,9 @@ error = ["python", "-m", "tests.smoke", "error"]
 These are onboarding examples, not dependencies or runtime modules already
 implemented by this repository. Python dependencies install into a temporary
 virtual environment with pip hash verification. Declare every required tool
-and dependency in that component's reviewed lockfile.
+and dependency in that component's reviewed lockfile. The same change must
+register each new lockfile and exact package in `license/components.json`;
+otherwise the license gate fails before component installation.
 
 Node components require `package.json`, `package-lock.json`, and nonempty `lint`
 and `test` scripts. CI runs `npm ci --ignore-scripts --no-audit --no-fund`,
@@ -117,6 +122,12 @@ Containers run without a network, host mounts, published ports, inherited
 deployment environment, root privileges, or writable root filesystem. Resource
 limits, a bounded temporary filesystem, timeouts, and container cleanup apply.
 The image and all its dependencies require the usual license and pinning review.
+
+Committed model artifacts use an allowlisted extension and require a distinct
+`model_weight` record with the exact path and SHA256. Model implementation
+packages require `model_code` records. Restricted or unclear licenses remain
+blocked unless `license/owner-approvals.json` contains an exact, decision-backed
+Owner approval for that component version and license.
 
 Network isolation prevents external delivery during these smoke commands. It
 does not prove that software never attempts reporting or that a future deployed

@@ -1,0 +1,1567 @@
+{
+  "schema": 1,
+  "inputs": [
+    {
+      "path": ".ci/requirements.txt",
+      "ecosystem": "python-requirements",
+      "scope": "tooling"
+    },
+    {
+      "path": "agent/requirements-ci.lock",
+      "ecosystem": "python-requirements",
+      "scope": "tooling"
+    },
+    {
+      "path": "agent/pyproject.toml",
+      "ecosystem": "python-project",
+      "scope": "transport"
+    },
+    {
+      "path": "server/requirements-ci.lock",
+      "ecosystem": "python-requirements",
+      "scope": "tooling"
+    },
+    {
+      "path": "server/requirements.lock",
+      "ecosystem": "python-requirements",
+      "scope": "backend"
+    },
+    {
+      "path": "server/pyproject.toml",
+      "ecosystem": "python-project",
+      "scope": "backend"
+    },
+    {
+      "path": "web/package.json",
+      "ecosystem": "npm-project",
+      "scope": "frontend"
+    },
+    {
+      "path": "web/package-lock.json",
+      "ecosystem": "npm-lock",
+      "scope": "frontend"
+    }
+  ],
+  "scope_reviews": [
+    {
+      "scope": "transport",
+      "status": "reviewed-empty",
+      "evidence": [
+        "agent/transport/README.md",
+        "docs/THIRD_PARTY_POLICY.md"
+      ]
+    },
+    {
+      "scope": "model_code",
+      "status": "reviewed-empty",
+      "evidence": [
+        "server/app/detection/README.md",
+        "docs/THIRD_PARTY_POLICY.md"
+      ]
+    },
+    {
+      "scope": "model_weight",
+      "status": "reviewed-empty",
+      "evidence": [
+        "docs/THIRD_PARTY_POLICY.md"
+      ]
+    }
+  ],
+  "components": [
+    {
+      "id": "pypi:annotated-doc@0.0.5",
+      "name": "annotated-doc",
+      "version": "0.0.5",
+      "kind": "source",
+      "upstream": "https://pypi.org/project/annotated-doc/0.0.5/",
+      "license": "MIT",
+      "license_evidence": [
+        "https://pypi.org/pypi/annotated-doc/0.0.5/json",
+        "server/docs/DEPENDENCIES.md"
+      ],
+      "transitive_evidence": [
+        "server/docs/wheel-audit.json",
+        "server/docs/rust-audit.json"
+      ],
+      "obligations": [
+        "preserve-license-and-copyright"
+      ],
+      "notice_files": [
+        "server/docs/BACKEND_THIRD_PARTY_LICENSE_TEXTS.md"
+      ],
+      "locations": [
+        {
+          "path": "server/requirements.lock",
+          "ecosystem": "python-requirements",
+          "scope": "backend"
+        }
+      ],
+      "sha256": null
+    },
+    {
+      "id": "pypi:annotated-types@0.8.0",
+      "name": "annotated-types",
+      "version": "0.8.0",
+      "kind": "source",
+      "upstream": "https://pypi.org/project/annotated-types/0.8.0/",
+      "license": "MIT",
+      "license_evidence": [
+        "https://pypi.org/pypi/annotated-types/0.8.0/json",
+        "server/docs/DEPENDENCIES.md"
+      ],
+      "transitive_evidence": [
+        "server/docs/wheel-audit.json",
+        "server/docs/rust-audit.json"
+      ],
+      "obligations": [
+        "preserve-license-and-copyright"
+      ],
+      "notice_files": [
+        "server/docs/BACKEND_THIRD_PARTY_LICENSE_TEXTS.md"
+      ],
+      "locations": [
+        {
+          "path": "server/requirements.lock",
+          "ecosystem": "python-requirements",
+          "scope": "backend"
+        }
+      ],
+      "sha256": null
+    },
+    {
+      "id": "pypi:anyio@4.15.1",
+      "name": "anyio",
+      "version": "4.15.1",
+      "kind": "source",
+      "upstream": "https://pypi.org/project/anyio/4.15.1/",
+      "license": "MIT",
+      "license_evidence": [
+        "https://pypi.org/pypi/anyio/4.15.1/json",
+        "server/docs/DEPENDENCIES.md"
+      ],
+      "transitive_evidence": [
+        "server/docs/wheel-audit.json",
+        "server/docs/rust-audit.json"
+      ],
+      "obligations": [
+        "preserve-license-and-copyright"
+      ],
+      "notice_files": [
+        "server/docs/BACKEND_THIRD_PARTY_LICENSE_TEXTS.md"
+      ],
+      "locations": [
+        {
+          "path": "server/requirements.lock",
+          "ecosystem": "python-requirements",
+          "scope": "backend"
+        }
+      ],
+      "sha256": null
+    },
+    {
+      "id": "pypi:click@8.5.0",
+      "name": "click",
+      "version": "8.5.0",
+      "kind": "source",
+      "upstream": "https://pypi.org/project/click/8.5.0/",
+      "license": "BSD-3-Clause",
+      "license_evidence": [
+        "https://pypi.org/pypi/click/8.5.0/json",
+        "server/docs/DEPENDENCIES.md"
+      ],
+      "transitive_evidence": [
+        "server/docs/wheel-audit.json",
+        "server/docs/rust-audit.json"
+      ],
+      "obligations": [
+        "preserve-license-and-copyright"
+      ],
+      "notice_files": [
+        "server/docs/BACKEND_THIRD_PARTY_LICENSE_TEXTS.md"
+      ],
+      "locations": [
+        {
+          "path": "server/requirements.lock",
+          "ecosystem": "python-requirements",
+          "scope": "backend"
+        }
+      ],
+      "sha256": null
+    },
+    {
+      "id": "pypi:fastapi@0.141.1",
+      "name": "fastapi",
+      "version": "0.141.1",
+      "kind": "source",
+      "upstream": "https://pypi.org/project/fastapi/0.141.1/",
+      "license": "MIT",
+      "license_evidence": [
+        "https://pypi.org/pypi/fastapi/0.141.1/json",
+        "server/docs/DEPENDENCIES.md"
+      ],
+      "transitive_evidence": [
+        "server/docs/wheel-audit.json",
+        "server/docs/rust-audit.json"
+      ],
+      "obligations": [
+        "preserve-license-and-copyright"
+      ],
+      "notice_files": [
+        "server/docs/BACKEND_THIRD_PARTY_LICENSE_TEXTS.md"
+      ],
+      "locations": [
+        {
+          "path": "server/pyproject.toml",
+          "ecosystem": "python-project",
+          "scope": "backend"
+        },
+        {
+          "path": "server/requirements.lock",
+          "ecosystem": "python-requirements",
+          "scope": "backend"
+        }
+      ],
+      "sha256": null
+    },
+    {
+      "id": "pypi:h11@0.16.0",
+      "name": "h11",
+      "version": "0.16.0",
+      "kind": "source",
+      "upstream": "https://pypi.org/project/h11/0.16.0/",
+      "license": "MIT",
+      "license_evidence": [
+        "https://pypi.org/pypi/h11/0.16.0/json",
+        "server/docs/DEPENDENCIES.md"
+      ],
+      "transitive_evidence": [
+        "server/docs/wheel-audit.json",
+        "server/docs/rust-audit.json"
+      ],
+      "obligations": [
+        "preserve-license-and-copyright"
+      ],
+      "notice_files": [
+        "server/docs/BACKEND_THIRD_PARTY_LICENSE_TEXTS.md"
+      ],
+      "locations": [
+        {
+          "path": "server/requirements.lock",
+          "ecosystem": "python-requirements",
+          "scope": "backend"
+        }
+      ],
+      "sha256": null
+    },
+    {
+      "id": "pypi:idna@3.20",
+      "name": "idna",
+      "version": "3.20",
+      "kind": "source",
+      "upstream": "https://pypi.org/project/idna/3.20/",
+      "license": "BSD-3-Clause",
+      "license_evidence": [
+        "https://pypi.org/pypi/idna/3.20/json",
+        "server/docs/DEPENDENCIES.md"
+      ],
+      "transitive_evidence": [
+        "server/docs/wheel-audit.json",
+        "server/docs/rust-audit.json"
+      ],
+      "obligations": [
+        "preserve-license-and-copyright"
+      ],
+      "notice_files": [
+        "server/docs/BACKEND_THIRD_PARTY_LICENSE_TEXTS.md"
+      ],
+      "locations": [
+        {
+          "path": "server/requirements.lock",
+          "ecosystem": "python-requirements",
+          "scope": "backend"
+        }
+      ],
+      "sha256": null
+    },
+    {
+      "id": "pypi:pydantic@2.13.5",
+      "name": "pydantic",
+      "version": "2.13.5",
+      "kind": "source",
+      "upstream": "https://pypi.org/project/pydantic/2.13.5/",
+      "license": "MIT",
+      "license_evidence": [
+        "https://pypi.org/pypi/pydantic/2.13.5/json",
+        "server/docs/DEPENDENCIES.md"
+      ],
+      "transitive_evidence": [
+        "server/docs/wheel-audit.json",
+        "server/docs/rust-audit.json"
+      ],
+      "obligations": [
+        "preserve-license-and-copyright"
+      ],
+      "notice_files": [
+        "server/docs/BACKEND_THIRD_PARTY_LICENSE_TEXTS.md"
+      ],
+      "locations": [
+        {
+          "path": "server/requirements.lock",
+          "ecosystem": "python-requirements",
+          "scope": "backend"
+        }
+      ],
+      "sha256": null
+    },
+    {
+      "id": "pypi:pydantic-core@2.46.5",
+      "name": "pydantic-core",
+      "version": "2.46.5",
+      "kind": "source",
+      "upstream": "https://pypi.org/project/pydantic-core/2.46.5/",
+      "license": "MIT",
+      "license_evidence": [
+        "https://pypi.org/pypi/pydantic-core/2.46.5/json",
+        "server/docs/DEPENDENCIES.md"
+      ],
+      "transitive_evidence": [
+        "server/docs/wheel-audit.json",
+        "server/docs/rust-audit.json"
+      ],
+      "obligations": [
+        "preserve-license-and-copyright"
+      ],
+      "notice_files": [
+        "server/docs/BACKEND_THIRD_PARTY_LICENSE_TEXTS.md"
+      ],
+      "locations": [
+        {
+          "path": "server/requirements.lock",
+          "ecosystem": "python-requirements",
+          "scope": "backend"
+        }
+      ],
+      "sha256": null
+    },
+    {
+      "id": "pypi:starlette@1.6.0",
+      "name": "starlette",
+      "version": "1.6.0",
+      "kind": "source",
+      "upstream": "https://pypi.org/project/starlette/1.6.0/",
+      "license": "BSD-3-Clause",
+      "license_evidence": [
+        "https://pypi.org/pypi/starlette/1.6.0/json",
+        "server/docs/DEPENDENCIES.md"
+      ],
+      "transitive_evidence": [
+        "server/docs/wheel-audit.json",
+        "server/docs/rust-audit.json"
+      ],
+      "obligations": [
+        "preserve-license-and-copyright"
+      ],
+      "notice_files": [
+        "server/docs/BACKEND_THIRD_PARTY_LICENSE_TEXTS.md"
+      ],
+      "locations": [
+        {
+          "path": "server/requirements.lock",
+          "ecosystem": "python-requirements",
+          "scope": "backend"
+        }
+      ],
+      "sha256": null
+    },
+    {
+      "id": "pypi:typing-extensions@4.16.0",
+      "name": "typing-extensions",
+      "version": "4.16.0",
+      "kind": "source",
+      "upstream": "https://pypi.org/project/typing-extensions/4.16.0/",
+      "license": "PSF-2.0",
+      "license_evidence": [
+        "https://pypi.org/pypi/typing-extensions/4.16.0/json",
+        "server/docs/DEPENDENCIES.md"
+      ],
+      "transitive_evidence": [
+        "server/docs/wheel-audit.json",
+        "server/docs/rust-audit.json"
+      ],
+      "obligations": [
+        "preserve-license-and-copyright"
+      ],
+      "notice_files": [
+        "server/docs/BACKEND_THIRD_PARTY_LICENSE_TEXTS.md"
+      ],
+      "locations": [
+        {
+          "path": "server/requirements.lock",
+          "ecosystem": "python-requirements",
+          "scope": "backend"
+        }
+      ],
+      "sha256": null
+    },
+    {
+      "id": "pypi:typing-inspection@0.4.4",
+      "name": "typing-inspection",
+      "version": "0.4.4",
+      "kind": "source",
+      "upstream": "https://pypi.org/project/typing-inspection/0.4.4/",
+      "license": "MIT",
+      "license_evidence": [
+        "https://pypi.org/pypi/typing-inspection/0.4.4/json",
+        "server/docs/DEPENDENCIES.md"
+      ],
+      "transitive_evidence": [
+        "server/docs/wheel-audit.json",
+        "server/docs/rust-audit.json"
+      ],
+      "obligations": [
+        "preserve-license-and-copyright"
+      ],
+      "notice_files": [
+        "server/docs/BACKEND_THIRD_PARTY_LICENSE_TEXTS.md"
+      ],
+      "locations": [
+        {
+          "path": "server/requirements.lock",
+          "ecosystem": "python-requirements",
+          "scope": "backend"
+        }
+      ],
+      "sha256": null
+    },
+    {
+      "id": "pypi:uvicorn@0.53.0",
+      "name": "uvicorn",
+      "version": "0.53.0",
+      "kind": "source",
+      "upstream": "https://pypi.org/project/uvicorn/0.53.0/",
+      "license": "BSD-3-Clause",
+      "license_evidence": [
+        "https://pypi.org/pypi/uvicorn/0.53.0/json",
+        "server/docs/DEPENDENCIES.md"
+      ],
+      "transitive_evidence": [
+        "server/docs/wheel-audit.json",
+        "server/docs/rust-audit.json"
+      ],
+      "obligations": [
+        "preserve-license-and-copyright"
+      ],
+      "notice_files": [
+        "server/docs/BACKEND_THIRD_PARTY_LICENSE_TEXTS.md"
+      ],
+      "locations": [
+        {
+          "path": "server/pyproject.toml",
+          "ecosystem": "python-project",
+          "scope": "backend"
+        },
+        {
+          "path": "server/requirements.lock",
+          "ecosystem": "python-requirements",
+          "scope": "backend"
+        }
+      ],
+      "sha256": null
+    },
+    {
+      "id": "pypi:pycodestyle@2.14.0",
+      "name": "pycodestyle",
+      "version": "2.14.0",
+      "kind": "source",
+      "upstream": "https://pypi.org/project/pycodestyle/2.14.0/",
+      "license": "MIT",
+      "license_evidence": [
+        "https://pypi.org/pypi/pycodestyle/2.14.0/json",
+        "THIRD_PARTY_NOTICES.md"
+      ],
+      "transitive_evidence": [
+        "THIRD_PARTY_NOTICES.md"
+      ],
+      "obligations": [
+        "preserve-license-and-copyright"
+      ],
+      "notice_files": [
+        "THIRD_PARTY_NOTICES.md"
+      ],
+      "locations": [
+        {
+          "path": ".ci/requirements.txt",
+          "ecosystem": "python-requirements",
+          "scope": "tooling"
+        },
+        {
+          "path": "agent/requirements-ci.lock",
+          "ecosystem": "python-requirements",
+          "scope": "tooling"
+        },
+        {
+          "path": "server/requirements-ci.lock",
+          "ecosystem": "python-requirements",
+          "scope": "tooling"
+        }
+      ],
+      "sha256": null
+    },
+    {
+      "id": "pypi:pyflakes@3.4.0",
+      "name": "pyflakes",
+      "version": "3.4.0",
+      "kind": "source",
+      "upstream": "https://pypi.org/project/pyflakes/3.4.0/",
+      "license": "MIT",
+      "license_evidence": [
+        "https://pypi.org/pypi/pyflakes/3.4.0/json",
+        "THIRD_PARTY_NOTICES.md"
+      ],
+      "transitive_evidence": [
+        "THIRD_PARTY_NOTICES.md"
+      ],
+      "obligations": [
+        "preserve-license-and-copyright"
+      ],
+      "notice_files": [
+        "THIRD_PARTY_NOTICES.md"
+      ],
+      "locations": [
+        {
+          "path": ".ci/requirements.txt",
+          "ecosystem": "python-requirements",
+          "scope": "tooling"
+        },
+        {
+          "path": "agent/requirements-ci.lock",
+          "ecosystem": "python-requirements",
+          "scope": "tooling"
+        },
+        {
+          "path": "server/requirements-ci.lock",
+          "ecosystem": "python-requirements",
+          "scope": "tooling"
+        }
+      ],
+      "sha256": null
+    },
+    {
+      "id": "npm:@esbuild/aix-ppc64@0.28.2",
+      "name": "@esbuild/aix-ppc64",
+      "version": "0.28.2",
+      "kind": "source",
+      "upstream": "https://registry.npmjs.org/%40esbuild%2faix-ppc64/-/aix-ppc64-0.28.2.tgz",
+      "license": "MIT",
+      "license_evidence": [
+        "web/THIRD_PARTY_NOTICES.md",
+        "https://registry.npmjs.org/%40esbuild%2faix-ppc64/-/aix-ppc64-0.28.2.tgz"
+      ],
+      "transitive_evidence": [
+        "web/package-lock.json"
+      ],
+      "obligations": [
+        "preserve-license-and-copyright"
+      ],
+      "notice_files": [
+        "web/THIRD_PARTY_NOTICES.md"
+      ],
+      "locations": [
+        {
+          "path": "web/package-lock.json",
+          "ecosystem": "npm-lock",
+          "scope": "frontend"
+        }
+      ],
+      "sha256": null
+    },
+    {
+      "id": "npm:@esbuild/android-arm@0.28.2",
+      "name": "@esbuild/android-arm",
+      "version": "0.28.2",
+      "kind": "source",
+      "upstream": "https://registry.npmjs.org/%40esbuild%2fandroid-arm/-/android-arm-0.28.2.tgz",
+      "license": "MIT",
+      "license_evidence": [
+        "web/THIRD_PARTY_NOTICES.md",
+        "https://registry.npmjs.org/%40esbuild%2fandroid-arm/-/android-arm-0.28.2.tgz"
+      ],
+      "transitive_evidence": [
+        "web/package-lock.json"
+      ],
+      "obligations": [
+        "preserve-license-and-copyright"
+      ],
+      "notice_files": [
+        "web/THIRD_PARTY_NOTICES.md"
+      ],
+      "locations": [
+        {
+          "path": "web/package-lock.json",
+          "ecosystem": "npm-lock",
+          "scope": "frontend"
+        }
+      ],
+      "sha256": null
+    },
+    {
+      "id": "npm:@esbuild/android-arm64@0.28.2",
+      "name": "@esbuild/android-arm64",
+      "version": "0.28.2",
+      "kind": "source",
+      "upstream": "https://registry.npmjs.org/%40esbuild%2fandroid-arm64/-/android-arm64-0.28.2.tgz",
+      "license": "MIT",
+      "license_evidence": [
+        "web/THIRD_PARTY_NOTICES.md",
+        "https://registry.npmjs.org/%40esbuild%2fandroid-arm64/-/android-arm64-0.28.2.tgz"
+      ],
+      "transitive_evidence": [
+        "web/package-lock.json"
+      ],
+      "obligations": [
+        "preserve-license-and-copyright"
+      ],
+      "notice_files": [
+        "web/THIRD_PARTY_NOTICES.md"
+      ],
+      "locations": [
+        {
+          "path": "web/package-lock.json",
+          "ecosystem": "npm-lock",
+          "scope": "frontend"
+        }
+      ],
+      "sha256": null
+    },
+    {
+      "id": "npm:@esbuild/android-x64@0.28.2",
+      "name": "@esbuild/android-x64",
+      "version": "0.28.2",
+      "kind": "source",
+      "upstream": "https://registry.npmjs.org/%40esbuild%2fandroid-x64/-/android-x64-0.28.2.tgz",
+      "license": "MIT",
+      "license_evidence": [
+        "web/THIRD_PARTY_NOTICES.md",
+        "https://registry.npmjs.org/%40esbuild%2fandroid-x64/-/android-x64-0.28.2.tgz"
+      ],
+      "transitive_evidence": [
+        "web/package-lock.json"
+      ],
+      "obligations": [
+        "preserve-license-and-copyright"
+      ],
+      "notice_files": [
+        "web/THIRD_PARTY_NOTICES.md"
+      ],
+      "locations": [
+        {
+          "path": "web/package-lock.json",
+          "ecosystem": "npm-lock",
+          "scope": "frontend"
+        }
+      ],
+      "sha256": null
+    },
+    {
+      "id": "npm:@esbuild/darwin-arm64@0.28.2",
+      "name": "@esbuild/darwin-arm64",
+      "version": "0.28.2",
+      "kind": "source",
+      "upstream": "https://registry.npmjs.org/%40esbuild%2fdarwin-arm64/-/darwin-arm64-0.28.2.tgz",
+      "license": "MIT",
+      "license_evidence": [
+        "web/THIRD_PARTY_NOTICES.md",
+        "https://registry.npmjs.org/%40esbuild%2fdarwin-arm64/-/darwin-arm64-0.28.2.tgz"
+      ],
+      "transitive_evidence": [
+        "web/package-lock.json"
+      ],
+      "obligations": [
+        "preserve-license-and-copyright"
+      ],
+      "notice_files": [
+        "web/THIRD_PARTY_NOTICES.md"
+      ],
+      "locations": [
+        {
+          "path": "web/package-lock.json",
+          "ecosystem": "npm-lock",
+          "scope": "frontend"
+        }
+      ],
+      "sha256": null
+    },
+    {
+      "id": "npm:@esbuild/darwin-x64@0.28.2",
+      "name": "@esbuild/darwin-x64",
+      "version": "0.28.2",
+      "kind": "source",
+      "upstream": "https://registry.npmjs.org/%40esbuild%2fdarwin-x64/-/darwin-x64-0.28.2.tgz",
+      "license": "MIT",
+      "license_evidence": [
+        "web/THIRD_PARTY_NOTICES.md",
+        "https://registry.npmjs.org/%40esbuild%2fdarwin-x64/-/darwin-x64-0.28.2.tgz"
+      ],
+      "transitive_evidence": [
+        "web/package-lock.json"
+      ],
+      "obligations": [
+        "preserve-license-and-copyright"
+      ],
+      "notice_files": [
+        "web/THIRD_PARTY_NOTICES.md"
+      ],
+      "locations": [
+        {
+          "path": "web/package-lock.json",
+          "ecosystem": "npm-lock",
+          "scope": "frontend"
+        }
+      ],
+      "sha256": null
+    },
+    {
+      "id": "npm:@esbuild/freebsd-arm64@0.28.2",
+      "name": "@esbuild/freebsd-arm64",
+      "version": "0.28.2",
+      "kind": "source",
+      "upstream": "https://registry.npmjs.org/%40esbuild%2ffreebsd-arm64/-/freebsd-arm64-0.28.2.tgz",
+      "license": "MIT",
+      "license_evidence": [
+        "web/THIRD_PARTY_NOTICES.md",
+        "https://registry.npmjs.org/%40esbuild%2ffreebsd-arm64/-/freebsd-arm64-0.28.2.tgz"
+      ],
+      "transitive_evidence": [
+        "web/package-lock.json"
+      ],
+      "obligations": [
+        "preserve-license-and-copyright"
+      ],
+      "notice_files": [
+        "web/THIRD_PARTY_NOTICES.md"
+      ],
+      "locations": [
+        {
+          "path": "web/package-lock.json",
+          "ecosystem": "npm-lock",
+          "scope": "frontend"
+        }
+      ],
+      "sha256": null
+    },
+    {
+      "id": "npm:@esbuild/freebsd-x64@0.28.2",
+      "name": "@esbuild/freebsd-x64",
+      "version": "0.28.2",
+      "kind": "source",
+      "upstream": "https://registry.npmjs.org/%40esbuild%2ffreebsd-x64/-/freebsd-x64-0.28.2.tgz",
+      "license": "MIT",
+      "license_evidence": [
+        "web/THIRD_PARTY_NOTICES.md",
+        "https://registry.npmjs.org/%40esbuild%2ffreebsd-x64/-/freebsd-x64-0.28.2.tgz"
+      ],
+      "transitive_evidence": [
+        "web/package-lock.json"
+      ],
+      "obligations": [
+        "preserve-license-and-copyright"
+      ],
+      "notice_files": [
+        "web/THIRD_PARTY_NOTICES.md"
+      ],
+      "locations": [
+        {
+          "path": "web/package-lock.json",
+          "ecosystem": "npm-lock",
+          "scope": "frontend"
+        }
+      ],
+      "sha256": null
+    },
+    {
+      "id": "npm:@esbuild/linux-arm@0.28.2",
+      "name": "@esbuild/linux-arm",
+      "version": "0.28.2",
+      "kind": "source",
+      "upstream": "https://registry.npmjs.org/%40esbuild%2flinux-arm/-/linux-arm-0.28.2.tgz",
+      "license": "MIT",
+      "license_evidence": [
+        "web/THIRD_PARTY_NOTICES.md",
+        "https://registry.npmjs.org/%40esbuild%2flinux-arm/-/linux-arm-0.28.2.tgz"
+      ],
+      "transitive_evidence": [
+        "web/package-lock.json"
+      ],
+      "obligations": [
+        "preserve-license-and-copyright"
+      ],
+      "notice_files": [
+        "web/THIRD_PARTY_NOTICES.md"
+      ],
+      "locations": [
+        {
+          "path": "web/package-lock.json",
+          "ecosystem": "npm-lock",
+          "scope": "frontend"
+        }
+      ],
+      "sha256": null
+    },
+    {
+      "id": "npm:@esbuild/linux-arm64@0.28.2",
+      "name": "@esbuild/linux-arm64",
+      "version": "0.28.2",
+      "kind": "source",
+      "upstream": "https://registry.npmjs.org/%40esbuild%2flinux-arm64/-/linux-arm64-0.28.2.tgz",
+      "license": "MIT",
+      "license_evidence": [
+        "web/THIRD_PARTY_NOTICES.md",
+        "https://registry.npmjs.org/%40esbuild%2flinux-arm64/-/linux-arm64-0.28.2.tgz"
+      ],
+      "transitive_evidence": [
+        "web/package-lock.json"
+      ],
+      "obligations": [
+        "preserve-license-and-copyright"
+      ],
+      "notice_files": [
+        "web/THIRD_PARTY_NOTICES.md"
+      ],
+      "locations": [
+        {
+          "path": "web/package-lock.json",
+          "ecosystem": "npm-lock",
+          "scope": "frontend"
+        }
+      ],
+      "sha256": null
+    },
+    {
+      "id": "npm:@esbuild/linux-ia32@0.28.2",
+      "name": "@esbuild/linux-ia32",
+      "version": "0.28.2",
+      "kind": "source",
+      "upstream": "https://registry.npmjs.org/%40esbuild%2flinux-ia32/-/linux-ia32-0.28.2.tgz",
+      "license": "MIT",
+      "license_evidence": [
+        "web/THIRD_PARTY_NOTICES.md",
+        "https://registry.npmjs.org/%40esbuild%2flinux-ia32/-/linux-ia32-0.28.2.tgz"
+      ],
+      "transitive_evidence": [
+        "web/package-lock.json"
+      ],
+      "obligations": [
+        "preserve-license-and-copyright"
+      ],
+      "notice_files": [
+        "web/THIRD_PARTY_NOTICES.md"
+      ],
+      "locations": [
+        {
+          "path": "web/package-lock.json",
+          "ecosystem": "npm-lock",
+          "scope": "frontend"
+        }
+      ],
+      "sha256": null
+    },
+    {
+      "id": "npm:@esbuild/linux-loong64@0.28.2",
+      "name": "@esbuild/linux-loong64",
+      "version": "0.28.2",
+      "kind": "source",
+      "upstream": "https://registry.npmjs.org/%40esbuild%2flinux-loong64/-/linux-loong64-0.28.2.tgz",
+      "license": "MIT",
+      "license_evidence": [
+        "web/THIRD_PARTY_NOTICES.md",
+        "https://registry.npmjs.org/%40esbuild%2flinux-loong64/-/linux-loong64-0.28.2.tgz"
+      ],
+      "transitive_evidence": [
+        "web/package-lock.json"
+      ],
+      "obligations": [
+        "preserve-license-and-copyright"
+      ],
+      "notice_files": [
+        "web/THIRD_PARTY_NOTICES.md"
+      ],
+      "locations": [
+        {
+          "path": "web/package-lock.json",
+          "ecosystem": "npm-lock",
+          "scope": "frontend"
+        }
+      ],
+      "sha256": null
+    },
+    {
+      "id": "npm:@esbuild/linux-mips64el@0.28.2",
+      "name": "@esbuild/linux-mips64el",
+      "version": "0.28.2",
+      "kind": "source",
+      "upstream": "https://registry.npmjs.org/%40esbuild%2flinux-mips64el/-/linux-mips64el-0.28.2.tgz",
+      "license": "MIT",
+      "license_evidence": [
+        "web/THIRD_PARTY_NOTICES.md",
+        "https://registry.npmjs.org/%40esbuild%2flinux-mips64el/-/linux-mips64el-0.28.2.tgz"
+      ],
+      "transitive_evidence": [
+        "web/package-lock.json"
+      ],
+      "obligations": [
+        "preserve-license-and-copyright"
+      ],
+      "notice_files": [
+        "web/THIRD_PARTY_NOTICES.md"
+      ],
+      "locations": [
+        {
+          "path": "web/package-lock.json",
+          "ecosystem": "npm-lock",
+          "scope": "frontend"
+        }
+      ],
+      "sha256": null
+    },
+    {
+      "id": "npm:@esbuild/linux-ppc64@0.28.2",
+      "name": "@esbuild/linux-ppc64",
+      "version": "0.28.2",
+      "kind": "source",
+      "upstream": "https://registry.npmjs.org/%40esbuild%2flinux-ppc64/-/linux-ppc64-0.28.2.tgz",
+      "license": "MIT",
+      "license_evidence": [
+        "web/THIRD_PARTY_NOTICES.md",
+        "https://registry.npmjs.org/%40esbuild%2flinux-ppc64/-/linux-ppc64-0.28.2.tgz"
+      ],
+      "transitive_evidence": [
+        "web/package-lock.json"
+      ],
+      "obligations": [
+        "preserve-license-and-copyright"
+      ],
+      "notice_files": [
+        "web/THIRD_PARTY_NOTICES.md"
+      ],
+      "locations": [
+        {
+          "path": "web/package-lock.json",
+          "ecosystem": "npm-lock",
+          "scope": "frontend"
+        }
+      ],
+      "sha256": null
+    },
+    {
+      "id": "npm:@esbuild/linux-riscv64@0.28.2",
+      "name": "@esbuild/linux-riscv64",
+      "version": "0.28.2",
+      "kind": "source",
+      "upstream": "https://registry.npmjs.org/%40esbuild%2flinux-riscv64/-/linux-riscv64-0.28.2.tgz",
+      "license": "MIT",
+      "license_evidence": [
+        "web/THIRD_PARTY_NOTICES.md",
+        "https://registry.npmjs.org/%40esbuild%2flinux-riscv64/-/linux-riscv64-0.28.2.tgz"
+      ],
+      "transitive_evidence": [
+        "web/package-lock.json"
+      ],
+      "obligations": [
+        "preserve-license-and-copyright"
+      ],
+      "notice_files": [
+        "web/THIRD_PARTY_NOTICES.md"
+      ],
+      "locations": [
+        {
+          "path": "web/package-lock.json",
+          "ecosystem": "npm-lock",
+          "scope": "frontend"
+        }
+      ],
+      "sha256": null
+    },
+    {
+      "id": "npm:@esbuild/linux-s390x@0.28.2",
+      "name": "@esbuild/linux-s390x",
+      "version": "0.28.2",
+      "kind": "source",
+      "upstream": "https://registry.npmjs.org/%40esbuild%2flinux-s390x/-/linux-s390x-0.28.2.tgz",
+      "license": "MIT",
+      "license_evidence": [
+        "web/THIRD_PARTY_NOTICES.md",
+        "https://registry.npmjs.org/%40esbuild%2flinux-s390x/-/linux-s390x-0.28.2.tgz"
+      ],
+      "transitive_evidence": [
+        "web/package-lock.json"
+      ],
+      "obligations": [
+        "preserve-license-and-copyright"
+      ],
+      "notice_files": [
+        "web/THIRD_PARTY_NOTICES.md"
+      ],
+      "locations": [
+        {
+          "path": "web/package-lock.json",
+          "ecosystem": "npm-lock",
+          "scope": "frontend"
+        }
+      ],
+      "sha256": null
+    },
+    {
+      "id": "npm:@esbuild/linux-x64@0.28.2",
+      "name": "@esbuild/linux-x64",
+      "version": "0.28.2",
+      "kind": "source",
+      "upstream": "https://registry.npmjs.org/%40esbuild%2flinux-x64/-/linux-x64-0.28.2.tgz",
+      "license": "MIT",
+      "license_evidence": [
+        "web/THIRD_PARTY_NOTICES.md",
+        "https://registry.npmjs.org/%40esbuild%2flinux-x64/-/linux-x64-0.28.2.tgz"
+      ],
+      "transitive_evidence": [
+        "web/package-lock.json"
+      ],
+      "obligations": [
+        "preserve-license-and-copyright"
+      ],
+      "notice_files": [
+        "web/THIRD_PARTY_NOTICES.md"
+      ],
+      "locations": [
+        {
+          "path": "web/package-lock.json",
+          "ecosystem": "npm-lock",
+          "scope": "frontend"
+        }
+      ],
+      "sha256": null
+    },
+    {
+      "id": "npm:@esbuild/netbsd-arm64@0.28.2",
+      "name": "@esbuild/netbsd-arm64",
+      "version": "0.28.2",
+      "kind": "source",
+      "upstream": "https://registry.npmjs.org/%40esbuild%2fnetbsd-arm64/-/netbsd-arm64-0.28.2.tgz",
+      "license": "MIT",
+      "license_evidence": [
+        "web/THIRD_PARTY_NOTICES.md",
+        "https://registry.npmjs.org/%40esbuild%2fnetbsd-arm64/-/netbsd-arm64-0.28.2.tgz"
+      ],
+      "transitive_evidence": [
+        "web/package-lock.json"
+      ],
+      "obligations": [
+        "preserve-license-and-copyright"
+      ],
+      "notice_files": [
+        "web/THIRD_PARTY_NOTICES.md"
+      ],
+      "locations": [
+        {
+          "path": "web/package-lock.json",
+          "ecosystem": "npm-lock",
+          "scope": "frontend"
+        }
+      ],
+      "sha256": null
+    },
+    {
+      "id": "npm:@esbuild/netbsd-x64@0.28.2",
+      "name": "@esbuild/netbsd-x64",
+      "version": "0.28.2",
+      "kind": "source",
+      "upstream": "https://registry.npmjs.org/%40esbuild%2fnetbsd-x64/-/netbsd-x64-0.28.2.tgz",
+      "license": "MIT",
+      "license_evidence": [
+        "web/THIRD_PARTY_NOTICES.md",
+        "https://registry.npmjs.org/%40esbuild%2fnetbsd-x64/-/netbsd-x64-0.28.2.tgz"
+      ],
+      "transitive_evidence": [
+        "web/package-lock.json"
+      ],
+      "obligations": [
+        "preserve-license-and-copyright"
+      ],
+      "notice_files": [
+        "web/THIRD_PARTY_NOTICES.md"
+      ],
+      "locations": [
+        {
+          "path": "web/package-lock.json",
+          "ecosystem": "npm-lock",
+          "scope": "frontend"
+        }
+      ],
+      "sha256": null
+    },
+    {
+      "id": "npm:@esbuild/openbsd-arm64@0.28.2",
+      "name": "@esbuild/openbsd-arm64",
+      "version": "0.28.2",
+      "kind": "source",
+      "upstream": "https://registry.npmjs.org/%40esbuild%2fopenbsd-arm64/-/openbsd-arm64-0.28.2.tgz",
+      "license": "MIT",
+      "license_evidence": [
+        "web/THIRD_PARTY_NOTICES.md",
+        "https://registry.npmjs.org/%40esbuild%2fopenbsd-arm64/-/openbsd-arm64-0.28.2.tgz"
+      ],
+      "transitive_evidence": [
+        "web/package-lock.json"
+      ],
+      "obligations": [
+        "preserve-license-and-copyright"
+      ],
+      "notice_files": [
+        "web/THIRD_PARTY_NOTICES.md"
+      ],
+      "locations": [
+        {
+          "path": "web/package-lock.json",
+          "ecosystem": "npm-lock",
+          "scope": "frontend"
+        }
+      ],
+      "sha256": null
+    },
+    {
+      "id": "npm:@esbuild/openbsd-x64@0.28.2",
+      "name": "@esbuild/openbsd-x64",
+      "version": "0.28.2",
+      "kind": "source",
+      "upstream": "https://registry.npmjs.org/%40esbuild%2fopenbsd-x64/-/openbsd-x64-0.28.2.tgz",
+      "license": "MIT",
+      "license_evidence": [
+        "web/THIRD_PARTY_NOTICES.md",
+        "https://registry.npmjs.org/%40esbuild%2fopenbsd-x64/-/openbsd-x64-0.28.2.tgz"
+      ],
+      "transitive_evidence": [
+        "web/package-lock.json"
+      ],
+      "obligations": [
+        "preserve-license-and-copyright"
+      ],
+      "notice_files": [
+        "web/THIRD_PARTY_NOTICES.md"
+      ],
+      "locations": [
+        {
+          "path": "web/package-lock.json",
+          "ecosystem": "npm-lock",
+          "scope": "frontend"
+        }
+      ],
+      "sha256": null
+    },
+    {
+      "id": "npm:@esbuild/openharmony-arm64@0.28.2",
+      "name": "@esbuild/openharmony-arm64",
+      "version": "0.28.2",
+      "kind": "source",
+      "upstream": "https://registry.npmjs.org/%40esbuild%2fopenharmony-arm64/-/openharmony-arm64-0.28.2.tgz",
+      "license": "MIT",
+      "license_evidence": [
+        "web/THIRD_PARTY_NOTICES.md",
+        "https://registry.npmjs.org/%40esbuild%2fopenharmony-arm64/-/openharmony-arm64-0.28.2.tgz"
+      ],
+      "transitive_evidence": [
+        "web/package-lock.json"
+      ],
+      "obligations": [
+        "preserve-license-and-copyright"
+      ],
+      "notice_files": [
+        "web/THIRD_PARTY_NOTICES.md"
+      ],
+      "locations": [
+        {
+          "path": "web/package-lock.json",
+          "ecosystem": "npm-lock",
+          "scope": "frontend"
+        }
+      ],
+      "sha256": null
+    },
+    {
+      "id": "npm:@esbuild/sunos-x64@0.28.2",
+      "name": "@esbuild/sunos-x64",
+      "version": "0.28.2",
+      "kind": "source",
+      "upstream": "https://registry.npmjs.org/%40esbuild%2fsunos-x64/-/sunos-x64-0.28.2.tgz",
+      "license": "MIT",
+      "license_evidence": [
+        "web/THIRD_PARTY_NOTICES.md",
+        "https://registry.npmjs.org/%40esbuild%2fsunos-x64/-/sunos-x64-0.28.2.tgz"
+      ],
+      "transitive_evidence": [
+        "web/package-lock.json"
+      ],
+      "obligations": [
+        "preserve-license-and-copyright"
+      ],
+      "notice_files": [
+        "web/THIRD_PARTY_NOTICES.md"
+      ],
+      "locations": [
+        {
+          "path": "web/package-lock.json",
+          "ecosystem": "npm-lock",
+          "scope": "frontend"
+        }
+      ],
+      "sha256": null
+    },
+    {
+      "id": "npm:@esbuild/win32-arm64@0.28.2",
+      "name": "@esbuild/win32-arm64",
+      "version": "0.28.2",
+      "kind": "source",
+      "upstream": "https://registry.npmjs.org/%40esbuild%2fwin32-arm64/-/win32-arm64-0.28.2.tgz",
+      "license": "MIT",
+      "license_evidence": [
+        "web/THIRD_PARTY_NOTICES.md",
+        "https://registry.npmjs.org/%40esbuild%2fwin32-arm64/-/win32-arm64-0.28.2.tgz"
+      ],
+      "transitive_evidence": [
+        "web/package-lock.json"
+      ],
+      "obligations": [
+        "preserve-license-and-copyright"
+      ],
+      "notice_files": [
+        "web/THIRD_PARTY_NOTICES.md"
+      ],
+      "locations": [
+        {
+          "path": "web/package-lock.json",
+          "ecosystem": "npm-lock",
+          "scope": "frontend"
+        }
+      ],
+      "sha256": null
+    },
+    {
+      "id": "npm:@esbuild/win32-ia32@0.28.2",
+      "name": "@esbuild/win32-ia32",
+      "version": "0.28.2",
+      "kind": "source",
+      "upstream": "https://registry.npmjs.org/%40esbuild%2fwin32-ia32/-/win32-ia32-0.28.2.tgz",
+      "license": "MIT",
+      "license_evidence": [
+        "web/THIRD_PARTY_NOTICES.md",
+        "https://registry.npmjs.org/%40esbuild%2fwin32-ia32/-/win32-ia32-0.28.2.tgz"
+      ],
+      "transitive_evidence": [
+        "web/package-lock.json"
+      ],
+      "obligations": [
+        "preserve-license-and-copyright"
+      ],
+      "notice_files": [
+        "web/THIRD_PARTY_NOTICES.md"
+      ],
+      "locations": [
+        {
+          "path": "web/package-lock.json",
+          "ecosystem": "npm-lock",
+          "scope": "frontend"
+        }
+      ],
+      "sha256": null
+    },
+    {
+      "id": "npm:@esbuild/win32-x64@0.28.2",
+      "name": "@esbuild/win32-x64",
+      "version": "0.28.2",
+      "kind": "source",
+      "upstream": "https://registry.npmjs.org/%40esbuild%2fwin32-x64/-/win32-x64-0.28.2.tgz",
+      "license": "MIT",
+      "license_evidence": [
+        "web/THIRD_PARTY_NOTICES.md",
+        "https://registry.npmjs.org/%40esbuild%2fwin32-x64/-/win32-x64-0.28.2.tgz"
+      ],
+      "transitive_evidence": [
+        "web/package-lock.json"
+      ],
+      "obligations": [
+        "preserve-license-and-copyright"
+      ],
+      "notice_files": [
+        "web/THIRD_PARTY_NOTICES.md"
+      ],
+      "locations": [
+        {
+          "path": "web/package-lock.json",
+          "ecosystem": "npm-lock",
+          "scope": "frontend"
+        }
+      ],
+      "sha256": null
+    },
+    {
+      "id": "npm:@types/react@19.3.0",
+      "name": "@types/react",
+      "version": "19.3.0",
+      "kind": "source",
+      "upstream": "https://registry.npmjs.org/%40types%2freact/-/react-19.3.0.tgz",
+      "license": "MIT",
+      "license_evidence": [
+        "web/THIRD_PARTY_NOTICES.md",
+        "https://registry.npmjs.org/%40types%2freact/-/react-19.3.0.tgz"
+      ],
+      "transitive_evidence": [
+        "web/package-lock.json"
+      ],
+      "obligations": [
+        "preserve-license-and-copyright"
+      ],
+      "notice_files": [
+        "web/THIRD_PARTY_NOTICES.md"
+      ],
+      "locations": [
+        {
+          "path": "web/package.json",
+          "ecosystem": "npm-project",
+          "scope": "frontend"
+        },
+        {
+          "path": "web/package-lock.json",
+          "ecosystem": "npm-lock",
+          "scope": "frontend"
+        }
+      ],
+      "sha256": null
+    },
+    {
+      "id": "npm:@types/react-dom@19.3.0",
+      "name": "@types/react-dom",
+      "version": "19.3.0",
+      "kind": "source",
+      "upstream": "https://registry.npmjs.org/%40types%2freact-dom/-/react-dom-19.3.0.tgz",
+      "license": "MIT",
+      "license_evidence": [
+        "web/THIRD_PARTY_NOTICES.md",
+        "https://registry.npmjs.org/%40types%2freact-dom/-/react-dom-19.3.0.tgz"
+      ],
+      "transitive_evidence": [
+        "web/package-lock.json"
+      ],
+      "obligations": [
+        "preserve-license-and-copyright"
+      ],
+      "notice_files": [
+        "web/THIRD_PARTY_NOTICES.md"
+      ],
+      "locations": [
+        {
+          "path": "web/package.json",
+          "ecosystem": "npm-project",
+          "scope": "frontend"
+        },
+        {
+          "path": "web/package-lock.json",
+          "ecosystem": "npm-lock",
+          "scope": "frontend"
+        }
+      ],
+      "sha256": null
+    },
+    {
+      "id": "npm:csstype@3.2.3",
+      "name": "csstype",
+      "version": "3.2.3",
+      "kind": "source",
+      "upstream": "https://registry.npmjs.org/csstype/-/csstype-3.2.3.tgz",
+      "license": "MIT",
+      "license_evidence": [
+        "web/THIRD_PARTY_NOTICES.md",
+        "https://registry.npmjs.org/csstype/-/csstype-3.2.3.tgz"
+      ],
+      "transitive_evidence": [
+        "web/package-lock.json"
+      ],
+      "obligations": [
+        "preserve-license-and-copyright"
+      ],
+      "notice_files": [
+        "web/THIRD_PARTY_NOTICES.md"
+      ],
+      "locations": [
+        {
+          "path": "web/package-lock.json",
+          "ecosystem": "npm-lock",
+          "scope": "frontend"
+        }
+      ],
+      "sha256": null
+    },
+    {
+      "id": "npm:esbuild@0.28.2",
+      "name": "esbuild",
+      "version": "0.28.2",
+      "kind": "source",
+      "upstream": "https://registry.npmjs.org/esbuild/-/esbuild-0.28.2.tgz",
+      "license": "MIT",
+      "license_evidence": [
+        "web/THIRD_PARTY_NOTICES.md",
+        "https://registry.npmjs.org/esbuild/-/esbuild-0.28.2.tgz"
+      ],
+      "transitive_evidence": [
+        "web/package-lock.json"
+      ],
+      "obligations": [
+        "preserve-license-and-copyright"
+      ],
+      "notice_files": [
+        "web/THIRD_PARTY_NOTICES.md"
+      ],
+      "locations": [
+        {
+          "path": "web/package.json",
+          "ecosystem": "npm-project",
+          "scope": "frontend"
+        },
+        {
+          "path": "web/package-lock.json",
+          "ecosystem": "npm-lock",
+          "scope": "frontend"
+        }
+      ],
+      "sha256": null
+    },
+    {
+      "id": "npm:react@19.3.0",
+      "name": "react",
+      "version": "19.3.0",
+      "kind": "source",
+      "upstream": "https://registry.npmjs.org/react/-/react-19.3.0.tgz",
+      "license": "MIT",
+      "license_evidence": [
+        "web/THIRD_PARTY_NOTICES.md",
+        "https://registry.npmjs.org/react/-/react-19.3.0.tgz"
+      ],
+      "transitive_evidence": [
+        "web/package-lock.json"
+      ],
+      "obligations": [
+        "preserve-license-and-copyright"
+      ],
+      "notice_files": [
+        "web/THIRD_PARTY_NOTICES.md"
+      ],
+      "locations": [
+        {
+          "path": "web/package.json",
+          "ecosystem": "npm-project",
+          "scope": "frontend"
+        },
+        {
+          "path": "web/package-lock.json",
+          "ecosystem": "npm-lock",
+          "scope": "frontend"
+        }
+      ],
+      "sha256": null
+    },
+    {
+      "id": "npm:react-dom@19.3.0",
+      "name": "react-dom",
+      "version": "19.3.0",
+      "kind": "source",
+      "upstream": "https://registry.npmjs.org/react-dom/-/react-dom-19.3.0.tgz",
+      "license": "MIT",
+      "license_evidence": [
+        "web/THIRD_PARTY_NOTICES.md",
+        "https://registry.npmjs.org/react-dom/-/react-dom-19.3.0.tgz"
+      ],
+      "transitive_evidence": [
+        "web/package-lock.json"
+      ],
+      "obligations": [
+        "preserve-license-and-copyright"
+      ],
+      "notice_files": [
+        "web/THIRD_PARTY_NOTICES.md"
+      ],
+      "locations": [
+        {
+          "path": "web/package.json",
+          "ecosystem": "npm-project",
+          "scope": "frontend"
+        },
+        {
+          "path": "web/package-lock.json",
+          "ecosystem": "npm-lock",
+          "scope": "frontend"
+        }
+      ],
+      "sha256": null
+    },
+    {
+      "id": "npm:scheduler@0.28.0",
+      "name": "scheduler",
+      "version": "0.28.0",
+      "kind": "source",
+      "upstream": "https://registry.npmjs.org/scheduler/-/scheduler-0.28.0.tgz",
+      "license": "MIT",
+      "license_evidence": [
+        "web/THIRD_PARTY_NOTICES.md",
+        "https://registry.npmjs.org/scheduler/-/scheduler-0.28.0.tgz"
+      ],
+      "transitive_evidence": [
+        "web/package-lock.json"
+      ],
+      "obligations": [
+        "preserve-license-and-copyright"
+      ],
+      "notice_files": [
+        "web/THIRD_PARTY_NOTICES.md"
+      ],
+      "locations": [
+        {
+          "path": "web/package-lock.json",
+          "ecosystem": "npm-lock",
+          "scope": "frontend"
+        }
+      ],
+      "sha256": null
+    },
+    {
+      "id": "npm:typescript@6.0.3",
+      "name": "typescript",
+      "version": "6.0.3",
+      "kind": "source",
+      "upstream": "https://registry.npmjs.org/typescript/-/typescript-6.0.3.tgz",
+      "license": "Apache-2.0",
+      "license_evidence": [
+        "web/THIRD_PARTY_NOTICES.md",
+        "https://registry.npmjs.org/typescript/-/typescript-6.0.3.tgz"
+      ],
+      "transitive_evidence": [
+        "web/package-lock.json"
+      ],
+      "obligations": [
+        "preserve-license-and-copyright",
+        "preserve-notice"
+      ],
+      "notice_files": [
+        "web/THIRD_PARTY_NOTICES.md"
+      ],
+      "locations": [
+        {
+          "path": "web/package.json",
+          "ecosystem": "npm-project",
+          "scope": "frontend"
+        },
+        {
+          "path": "web/package-lock.json",
+          "ecosystem": "npm-lock",
+          "scope": "frontend"
+        }
+      ],
+      "sha256": null
+    }
+  ]
+}

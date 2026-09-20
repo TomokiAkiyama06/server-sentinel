@@ -1,0 +1,214 @@
+"""License gate regressions use synthetic manifests and artifacts only."""
+
+import hashlib
+import json
+import tempfile
+import unittest
+from pathlib import Path
+
+from scripts.ci import license_gate
+
+
+class LicenseGateTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.write("docs/evidence.md", "synthetic review evidence\n")
+        self.write("docs/decisions/0001-synthetic.md", "synthetic owner decision\n")
+        self.write("requirements.lock", "demo==1.2.3 --hash=sha256:" + "a" * 64 + "\n")
+        self.inputs = [{
+            "path": "requirements.lock",
+            "ecosystem": "python-requirements",
+            "scope": "backend",
+        }]
+        self.reviews = [
+            self.review("transport"), self.review("model_code"), self.review("model_weight"),
+        ]
+        self.components = [self.component()]
+        self.approvals = []
+        self.save()
+
+    def write(self, path, content):
+        target = self.root / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(content if isinstance(content, bytes) else content.encode())
+
+    def review(self, scope):
+        return {"scope": scope, "status": "reviewed-empty", "evidence": ["docs/evidence.md"]}
+
+    def location(self):
+        return {"path": "requirements.lock", "ecosystem": "python-requirements", "scope": "backend"}
+
+    def component(self, **changes):
+        value = {
+            "id": "pypi:demo@1.2.3",
+            "name": "demo",
+            "version": "1.2.3",
+            "kind": "source",
+            "upstream": "https://example.test/demo/1.2.3",
+            "license": "MIT",
+            "license_evidence": ["docs/evidence.md"],
+            "transitive_evidence": ["docs/evidence.md"],
+            "obligations": ["preserve-license-and-copyright"],
+            "notice_files": ["docs/evidence.md"],
+            "locations": [self.location()],
+            "sha256": None,
+        }
+        value.update(changes)
+        return value
+
+    def save(self):
+        self.write(license_gate.INVENTORY, json.dumps({
+            "schema": 1,
+            "inputs": self.inputs,
+            "scope_reviews": self.reviews,
+            "components": self.components,
+        }))
+        self.write(license_gate.APPROVALS, json.dumps({
+            "schema": 1, "approvals": self.approvals,
+        }))
+
+    def test_permissive_exact_component_passes(self):
+        self.assertEqual(license_gate.audit(self.root), (1, 1, 0))
+
+    def test_locked_dependency_missing_from_inventory_fails(self):
+        self.components = []
+        self.save()
+        with self.assertRaisesRegex(license_gate.GateError, "locked dependencies differ"):
+            license_gate.audit(self.root)
+
+    def test_missing_license_transitive_notice_and_upstream_evidence_fail(self):
+        mutations = [
+            {"license_evidence": []},
+            {"transitive_evidence": []},
+            {"notice_files": []},
+            {"upstream": "http://example.test/demo"},
+            {"version": ""},
+        ]
+        for mutation in mutations:
+            with self.subTest(mutation=mutation):
+                self.components = [self.component(**mutation)]
+                self.save()
+                with self.assertRaises(license_gate.GateError):
+                    license_gate.audit(self.root)
+
+    def test_blocked_families_require_exact_owner_approval(self):
+        for blocked in ("AGPL-3.0-only", "GPL-3.0-only", "SSPL-1.0", "BUSL-1.1",
+                        "source-available-custom", "unclear"):
+            with self.subTest(license=blocked):
+                self.components = [self.component(license=blocked)]
+                self.approvals = []
+                self.save()
+                with self.assertRaisesRegex(license_gate.GateError, "lacks exact owner approval"):
+                    license_gate.audit(self.root)
+
+    def test_exact_recorded_owner_approval_allows_blocked_component(self):
+        self.components = [self.component(
+            license="GPL-3.0-only",
+            obligations=["preserve-license-and-copyright", "provide-corresponding-source"],
+        )]
+        self.approvals = [{
+            "component_id": "pypi:demo@1.2.3",
+            "version": "1.2.3",
+            "license": "GPL-3.0-only",
+            "approved_by": "repository-owner",
+            "approved_on": "2026-09-21",
+            "decision": "docs/decisions/0001-synthetic.md",
+        }]
+        self.save()
+        self.assertEqual(license_gate.audit(self.root), (1, 1, 0))
+        self.approvals[0]["version"] = "1.2.2"
+        self.save()
+        with self.assertRaisesRegex(license_gate.GateError, "lacks exact owner approval"):
+            license_gate.audit(self.root)
+
+    def test_material_license_obligations_are_enforced(self):
+        self.components = [self.component(
+            license="Apache-2.0",
+            obligations=["preserve-license-and-copyright"],
+        )]
+        self.save()
+        with self.assertRaisesRegex(license_gate.GateError, "Apache notice"):
+            license_gate.audit(self.root)
+
+        self.components = [self.component(license="GPL-3.0-only")]
+        self.approvals = [{
+            "component_id": "pypi:demo@1.2.3",
+            "version": "1.2.3",
+            "license": "GPL-3.0-only",
+            "approved_by": "repository-owner",
+            "approved_on": "2026-09-21",
+            "decision": "docs/decisions/0001-synthetic.md",
+        }]
+        self.save()
+        with self.assertRaisesRegex(license_gate.GateError, "corresponding-source"):
+            license_gate.audit(self.root)
+
+    def test_model_code_does_not_approve_weight_artifact(self):
+        self.components = [self.component(kind="model_code")]
+        self.reviews = [self.review("transport"), self.review("model_weight")]
+        artifact = b"synthetic model bytes only"
+        self.write("models/demo.onnx", artifact)
+        self.save()
+        with self.assertRaisesRegex(license_gate.GateError, "model artifact set differs"):
+            license_gate.audit(self.root)
+
+        self.components.append({
+            "id": "model:demo-weight@1",
+            "name": "demo-weight",
+            "version": "1",
+            "kind": "model_weight",
+            "upstream": "https://example.test/models/demo/1",
+            "license": "Apache-2.0",
+            "license_evidence": ["docs/evidence.md"],
+            "transitive_evidence": ["docs/evidence.md"],
+            "obligations": ["preserve-license-and-copyright", "preserve-notice"],
+            "notice_files": ["docs/evidence.md"],
+            "locations": [{
+                "path": "models/demo.onnx",
+                "ecosystem": "model-artifact",
+                "scope": "model_weight",
+            }],
+            "sha256": hashlib.sha256(artifact).hexdigest(),
+        })
+        self.reviews = [self.review("transport")]
+        self.save()
+        self.assertEqual(license_gate.audit(self.root), (2, 1, 1))
+
+    def test_unreviewed_lockfile_and_npm_transitive_are_detected(self):
+        self.write("frontend/package-lock.json", json.dumps({
+            "lockfileVersion": 3,
+            "packages": {
+                "": {},
+                "node_modules/transitive": {
+                    "version": "4.5.6",
+                    "resolved": "https://example.test/transitive.tgz",
+                    "integrity": "sha512-synthetic",
+                },
+            },
+        }))
+        with self.assertRaisesRegex(license_gate.GateError, "input set differs"):
+            license_gate.audit(self.root)
+        self.inputs.append({
+            "path": "frontend/package-lock.json", "ecosystem": "npm-lock", "scope": "frontend",
+        })
+        self.save()
+        with self.assertRaisesRegex(license_gate.GateError, "locked dependencies differ"):
+            license_gate.audit(self.root)
+
+    def test_requirement_must_be_exact_and_hash_pinned(self):
+        for requirement in ("demo>=1.2.3\n", "demo==1.2.3\n"):
+            with self.subTest(requirement=requirement.strip()):
+                self.write("requirements.lock", requirement)
+                with self.assertRaises(license_gate.GateError):
+                    license_gate.audit(self.root)
+
+    def test_unknown_dependency_ecosystem_fails_closed(self):
+        self.write("transport/Cargo.lock", "# synthetic lock\n")
+        with self.assertRaisesRegex(license_gate.GateError, "reviewed parser"):
+            license_gate.audit(self.root)
+
+
+if __name__ == "__main__":
+    unittest.main()
