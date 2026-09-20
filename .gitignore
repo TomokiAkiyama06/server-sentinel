@@ -1,40 +1,3 @@
-# Environment / secrets (including synthetic fixture paths)
-# Sensitive/media extension rules below match lowercase, uppercase, and mixed case.
-.env
-.env.*
-!.env.example
-.envrc
-.secrets/
-secrets/
-credentials/
-keys/
-private-keys/
-private_keys/
-certs/
-certificates/
-.credentials
-credentials*.[jJ][sS][oO][nN]
-credentials*.[yY][aA][mM][lL]
-credentials*.[yY][mM][lL]
-credentials*.[tT][oO][mM][lL]
-.netrc
-.ssh/
-id_rsa*
-id_dsa*
-id_ecdsa*
-id_ed25519*
-*.[pP][eE][mM]
-*.[kK][eE][yY]
-*.[pP]8
-*.[pP]12
-*.[pP][fF][xX]
-*.[mM][oO][bB][iI][lL][eE][pP][rR][oO][vV][iI][sS][iI][oO][nN]
-*.[cC][eE][rR]
-*.[dD][eE][rR]
-*.[cC][rR][tT]
-*.[cC][sS][rR]
-*.[pP][rR][oO][vV][iI][sS][iI][oO][nN][pP][rR][oO][fF][iI][lL][eE]
-
 # Deployment media/data belongs outside the checkout. Root-scoped paths preserve
 # source modules such as web/src/recordings/ and server/app/media/.
 /recordings/
@@ -229,6 +192,45 @@ tests/fixtures/**/*.[tT][iI][fF][fF]
 !tests/fixtures/synthetic/**/device[-_]uuids*.[yY][mM][lL]
 !tests/fixtures/synthetic/**/device[-_]uuids*.[cC][sS][vV]
 !tests/fixtures/synthetic/**/device[-_]uuids*.[tT][xX][tT]
+
+# Environment / secrets, including synthetic fixture paths. Keep these rules
+# after fixture exceptions so secret basenames cannot be re-included as media.
+# Sensitive basenames, directories, and extensions match any letter case.
+# Only the conventional lowercase .env.example is exempt.
+.[eE][nN][vV]
+.[eE][nN][vV].*
+!.env.example
+.[eE][nN][vV][rR][cC]
+.[sS][eE][cC][rR][eE][tT][sS]/
+[sS][eE][cC][rR][eE][tT][sS]/
+[cC][rR][eE][dD][eE][nN][tT][iI][aA][lL][sS]/
+[kK][eE][yY][sS]/
+[pP][rR][iI][vV][aA][tT][eE]-[kK][eE][yY][sS]/
+[pP][rR][iI][vV][aA][tT][eE]_[kK][eE][yY][sS]/
+[cC][eE][rR][tT][sS]/
+[cC][eE][rR][tT][iI][fF][iI][cC][aA][tT][eE][sS]/
+.[cC][rR][eE][dD][eE][nN][tT][iI][aA][lL][sS]
+[cC][rR][eE][dD][eE][nN][tT][iI][aA][lL][sS]*.[jJ][sS][oO][nN]
+[cC][rR][eE][dD][eE][nN][tT][iI][aA][lL][sS]*.[yY][aA][mM][lL]
+[cC][rR][eE][dD][eE][nN][tT][iI][aA][lL][sS]*.[yY][mM][lL]
+[cC][rR][eE][dD][eE][nN][tT][iI][aA][lL][sS]*.[tT][oO][mM][lL]
+.[nN][eE][tT][rR][cC]
+.[sS][sS][hH]/
+[iI][dD]_[rR][sS][aA]*
+[iI][dD]_[dD][sS][aA]*
+[iI][dD]_[eE][cC][dD][sS][aA]*
+[iI][dD]_[eE][dD]25519*
+*.[pP][eE][mM]
+*.[kK][eE][yY]
+*.[pP]8
+*.[pP]12
+*.[pP][fF][xX]
+*.[mM][oO][bB][iI][lL][eE][pP][rR][oO][vV][iI][sS][iI][oO][nN]
+*.[cC][eE][rR]
+*.[dD][eE][rR]
+*.[cC][rR][tT]
+*.[cC][sS][rR]
+*.[pP][rR][oO][vV][iI][sS][iI][oO][nN][pP][rR][oO][fF][iI][lL][eE]
 
 # Logs / local diagnostics
 *.log

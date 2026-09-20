@@ -178,7 +178,7 @@ Owner-only configuration offers one of two modes:
 [ Capacity limit ]  -> choose maximum ring-buffer disk bytes
 ```
 
-The UI shows estimated reciprocal capacity/duration, actual usage, protected-incident usage, free space, and safety reserve. Settings determinably unable to preserve the required 10-minute pre-loss target under the bounded/negotiated media profile are rejected. Runtime uncertainty or later deterioration that shortens the window is explicitly degraded and reports actual coverage.
+The UI shows estimated reciprocal capacity/duration, actual usage, protected-incident usage, free space, and safety reserve. Before applying duration/capacity/profile settings, verify that the expected filesystem can hold the pinned 10-minute pre-loss window and the following 10 minutes simultaneously. Estimate bytes from bounded/negotiated bitrate plus segment/container overhead, account for existing protected incidents and other filesystem use, and retain hard reserve. Count shared segments once; only eligible ordinary data outside the required pre-loss window is reclaimable. Reject determinably insufficient settings, including space for just 10 minutes plus reserve. Runtime uncertainty or later loss of coverage/headroom is explicitly degraded and reports actual coverage/gaps without deleting unexpired incidents or crossing reserve.
 
 On unexpected Main Server communication loss, the Agent protects 10 minutes before + 10 minutes after the loss boundary. Completed protected incidents are retained locally for **60 days by default** and are not overwritten by the ordinary ring buffer before expiry.
 

@@ -414,7 +414,7 @@ Scope:
 - owner-selectable **duration mode** or **capacity mode**;
 - duration mode selects retained time and estimates bytes; capacity mode selects maximum ring-buffer bytes and estimates duration;
 - UI shows configured limit, current ring-buffer usage, protected-incident usage, filesystem free space, and safety reserve;
-- 10-minute pre-loss target validation;
+- configuration admission for the simultaneous pinned T-10 window and T+10 continuation, existing protected usage, other filesystem use, and hard reserve;
 - unexpected Main Server communication loss at T0 pins the existing T0-10-minute ring interval and continues Agent-only capture through T0+10 minutes;
 - critical-event preserve command while Main Server is reachable;
 - protected incidents retained on Agent for 60 days by default, then auto-deleted;
@@ -423,7 +423,8 @@ Scope:
 Acceptance:
 - only owner can change mode/value;
 - unsafe settings rejected before filesystem safety reserve is crossed;
-- selected duration/capacity/profile configurations determinably unable to retain 10 minutes of pre-loss evidence are rejected before applying them; runtime uncertainty or later coverage loss reports degraded/warning with actual retained intervals and gaps;
+- reject selected duration/capacity/profile settings determinably unable to retain T-10 or fit the pinned T-10 plus T+10 bytes simultaneously on the expected filesystem, using bounded/negotiated bitrate and segment/container overhead with existing protected usage, other filesystem use, and hard reserve; count shared segments once and reclaim only eligible ordinary data outside the required pre-loss window;
+- test rejection when only 10 minutes plus reserve fit, and when existing protected incidents remove post-loss headroom; runtime uncertainty or later headroom/coverage loss reports degraded/warning with actual intervals/gaps, never unsafe writes or unexpired-incident deletion;
 - capacity mode keeps ordinary ring-buffer data within the selected byte limit and reports protected-incident bytes separately;
 - duration mode reports projected/actual disk footprint;
 - full 20-minute incident is preserved when resources/stream continuity allow;
@@ -779,6 +780,7 @@ Acceptance:
 - no silent healthy state after known capture loss;
 - unrelated critical monitoring survives owner-verifier failure.
 - test both Agent modes, T-10 pin/T+10 autonomous capture, reconnect survival, partial/gap, critical preserve, Owner deletion, and completion-plus-60-day expiry using synthetic compressed segments/test clocks;
+- test duration/capacity/profile admission with room for pre-loss alone but not simultaneous T-10/T+10, existing protected usage, other filesystem consumption, and hard reserve; reject known insufficiency without reclaiming required pre-loss/protected segments, and report later headroom loss as degraded;
 - Agent mount loss/substitution never falls back to root; reclaim ordinary buffer first, protect unexpired incidents, and refuse writes before reserve breach;
 - verify independent Main 20-day / audit 90-day / Agent 60-day clocks, starred protection, and STORAGE_PRESSURE/STORAGE_HARD_STOP;
 - exercise uninvited/live-only/recordings-only/both/revoked identities, spoofed proxy headers, copied URLs, agent credentials denied human APIs, and recordings:view historical access;
@@ -820,6 +822,7 @@ Acceptance:
 - verify actual room-wide coverage, entrance visibility, person detection and Owner verification feasibility; compare supported 4K and 1080p candidates and record FPS, bitrate, encode path, LAN bandwidth, CPU/GPU/VRAM, and dropped frames;
 - verify duration/capacity modes, reciprocal estimates/usage, dedicated Agent media filesystem, mount loss/substitution, and no root-filesystem fallback;
 - verify T-10/T+10 protection and a complete 20-minute incident where resources allow, truthful partial/gap reports, reconnect survival, Main preserve requests, reserve safety, Owner deletion, and 60-day expiry using an accelerated/test clock where practical;
+- use disposable storage/quota tests to reject settings that fit only the 10-minute pre-loss window plus reserve, and repeat with existing protected incidents/other filesystem use; accepted bounded-profile budgets must fit pinned pre-loss plus post-loss simultaneously without deleting protected evidence or crossing reserve;
 - test phone/Mac/desktop with live-only, recordings-only, both, uninvited, and revoked identities; verify timeline permission, copied-URL rejection, Main-only media path, reconnect/adaptive quality, and multi-source live;
 - verify startup/daily hardware comparison, drift, missing hardware, mount substitution, Owner-only audited baseline approval, unavailable identifiers, and immediate alerts;
 - exercise actual bounded recording write/flush/fsync/reopen/container/duration/size/read/decode self-test, failure injection, interruption/reboot cleanup, cleanup failure, and immediate SMART/NVMe/recording-fault reporting;

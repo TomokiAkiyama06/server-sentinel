@@ -324,7 +324,9 @@ buffer_limit_mode = duration | capacity
 
 In both modes the UI displays selected mode/value, estimated equivalent duration/capacity, current ring-buffer bytes, protected-incident bytes, filesystem free space, and safety reserve.
 
-The autonomous incident design requires a **10-minute pre-loss target**. A configuration that cannot support that target under the configured/negotiated bounded media profile shall be rejected when determinable in advance. If runtime conditions later make the effective retained window shorter than 10 minutes, the agent reports degraded protection and an explicit warning; it never silently claims a complete 10-minute pre-loss buffer.
+Configuration admission for the selected duration/capacity/profile checks both the **10-minute pre-loss window** and headroom for the **next 10 minutes while that window remains pinned**. Use bounded/negotiated bitrate and segment/container overhead to estimate the complete simultaneous 20-minute footprint on the expected filesystem, including existing protected-incident bytes, other filesystem use, and hard safety reserve. Count shared segments once; only eligible ordinary segments outside the required pre-loss window may be reclaimed for this check. The pinned pre-loss window and unexpired protected incidents are not reclaimable. Reject a determinably insufficient configuration before applying it: fitting 10 minutes plus reserve alone does not satisfy admission. The ordinary ring-buffer byte limit remains distinct from protected-incident usage; this check does not require changing duration/capacity mode or define a new numeric reserve.
+
+Runtime uncertainty or later growth of protected/other filesystem usage may reduce post-loss headroom or pre-loss coverage. Reevaluate available headroom during storage admission and report degraded protection with actual coverage/gaps when it becomes insufficient; never claim a complete incident or permit writes across the safety reserve.
 
 Normal unprotected segments are FIFO. Protected incident segments are not part of ordinary ring-buffer eviction.
 
@@ -800,7 +802,7 @@ Capture-node settings additionally show:
 - projected maximum/expected and current buffer usage;
 - protected-incident usage and 60-day default expiry timestamps;
 - agent filesystem free/safety state;
-- whether the 10-minute pre-loss target is currently satisfied;
+- whether the 10-minute pre-loss target and headroom for 10-minute post-loss continuation are currently satisfied;
 - Main Server connection/heartbeat state.
 
 ## 13. Security boundaries
@@ -848,7 +850,7 @@ Required test families include:
 - camera-unplug while agent remains online;
 - clock skew/health degradation;
 - LAN interruption/reconnect/backpressure;
-- configurable bounded disk ring buffer;
+- configurable bounded disk ring buffer, including rejection of settings that fit pre-loss alone but not simultaneous T-10/T+10 protection with existing protected bytes, other filesystem use, and hard reserve;
 - Main Server heartbeat loss pins previous 10 min and records next 10 min;
 - reconnect does not silently delete protected incident;
 - agent storage-pressure behavior and 60-day protected-incident expiry;

@@ -114,7 +114,7 @@ The dashboard adapts to 1–4 sources. Viewer streaming should be demand-driven:
 1. network-level permission to reach the ServerSentinel node; and
 2. an active ServerSentinel invitation/allowlist entry.
 
-ServerSentinel does not require changing existing Tailscale ACLs/Grants and does not store Tailscale administrative credentials. Tailnet membership alone still grants no ServerSentinel application data: every human request must pass the ServerSentinel invitation/permission check. With unchanged Tailnet policy, the underlying Main Server node may remain visible/reachable to other Tailnet members, so node-level concealment is not guaranteed. Uninvited users receive generic/non-branding denial and no ServerSentinel deployment metadata.
+ServerSentinel does not modify Tailscale ACLs/Grants or store Tailscale administrative credentials; policy administration remains outside the application. Tailnet membership alone still grants no ServerSentinel application data: every human request must pass the ServerSentinel invitation/permission check. With unchanged Tailnet policy, the underlying Main Server node may remain visible/reachable to other Tailnet members, so node-level concealment is not guaranteed. Uninvited users receive generic/non-branding denial and no ServerSentinel deployment metadata.
 
 The dashboard itself should bind only to a trusted local proxy path (for example loopback behind Tailscale Serve). LAN camera ingestion uses a **separate** narrowly exposed endpoint and must not expose dashboard routes.
 

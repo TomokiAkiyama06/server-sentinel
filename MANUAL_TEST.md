@@ -187,8 +187,10 @@ Ring-buffer configuration:
 - [ ] non-owner cannot change buffer mode/value;
 - [ ] current bytes, protected-incident bytes, filesystem free space, and safety reserve are visible;
 - [ ] unsafe values produce warning and are rejected before violating safety reserve;
-- [ ] configuration that cannot support the 10-minute pre-loss target is rejected when determinable;
-- [ ] runtime loss of effective pre-loss coverage becomes degraded/warning rather than silently healthy.
+- [ ] duration/capacity/profile admission verifies space for pinned T-10 plus T+10 capture simultaneously, estimated from bounded/negotiated bitrate and segment/container overhead with existing protected incidents, other filesystem use, and hard reserve; shared segments count once and only eligible ordinary data outside required pre-loss is reclaimable;
+- [ ] a disposable filesystem/quota that fits only 10 minutes plus reserve causes configuration rejection; repeat with existing protected incidents and unrelated filesystem consumption removing post-loss headroom, without deleting unexpired evidence;
+- [ ] a sufficient bounded-profile budget admits the setting and supports the complete window without crossing reserve; no new numeric reserve threshold is inferred from the test;
+- [ ] runtime uncertainty or later loss of effective pre-loss coverage/post-loss headroom becomes degraded/warning with actual coverage/gaps rather than silently healthy.
 
 Unexpected Main Server communication loss:
 
@@ -260,7 +262,7 @@ Demand-driven processing:
 
 ## J. Tailscale / invitation visibility and authorization
 
-Use test identities/accounts appropriate for the deployment. The MVP does **not** require changing existing Tailscale ACLs/Grants.
+Use test identities/accounts appropriate for the deployment. ServerSentinel does **not** modify Tailscale ACLs/Grants or store Tailscale administrative credentials; any policy administration remains outside the application and existing policy may remain unchanged.
 
 ### Uninvited ordinary Tailnet member
 

@@ -151,7 +151,7 @@ The deployment owner selects one of two configuration modes in ServerSentinel:
 
 The UI shall always show current ring-buffer usage, configured limit, agent-filesystem free space, protected-incident usage, and safety reserve. It shall warn before a selected value approaches an unsafe disk state and reject values that would violate the filesystem safety reserve.
 
-Because autonomous incident protection requires 10 minutes of pre-loss evidence, the configured ring buffer must be capable of retaining the target **10-minute pre-loss window** under the bounded/negotiated media profile. If the selected duration/capacity and bounded/negotiated media profile make a shorter-than-10-minute window determinable before applying the configuration, the system shall reject the setting. Runtime uncertainty or later loss of effective coverage shall instead surface a degraded/warning state with the actual retained interval and gaps; it shall never silently claim full protection.
+Configuration admission must support the complete **10-minute pre-loss + 10-minute post-loss** incident under the bounded/negotiated media profile. Reject a selected duration/capacity/profile when it determinably cannot retain the pre-loss window or fit that pinned window and the next 10 minutes of capture simultaneously on the expected filesystem. Estimate bytes from bounded/negotiated bitrate and segment/container overhead, accounting for existing protected incidents, other filesystem use, and the hard safety reserve. Count shared segments once; reclaim only eligible ordinary data outside the required pre-loss window, never the pinned window or unexpired protected incidents. A filesystem that fits only 10 minutes plus reserve is insufficient even if the ring setting itself is valid. Runtime uncertainty or later loss of headroom/coverage shall instead surface a degraded/warning state with actual retained intervals and gaps; never claim full protection or cross the safety reserve.
 
 Changing ring-buffer mode/value is an owner-only operation.
 
@@ -415,7 +415,7 @@ Owner UI shall expose:
 - current ring-buffer bytes;
 - protected-incident bytes and expiry dates;
 - agent filesystem free space and safety reserve;
-- clear warning/degraded/error states when the requested 10-minute pre-loss window or disk safety cannot be maintained.
+- clear warning/degraded/error states when the requested 10-minute pre-loss window, headroom for the following 10 minutes, or disk safety cannot be maintained.
 
 ## 15. Performance and overload requirements
 
