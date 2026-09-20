@@ -479,6 +479,51 @@
       "digests": [
         "sha512-y2TvuxSZPDyQakkFRPZHKFm+KKVqIisdg9/CZwm9ftvKXLP8NRWj38/ODjNbr43SsoXqNuAisEf1GdCxqWcdBw=="
       ]
+    },
+    {
+      "path": "server/requirements-detector.lock",
+      "ecosystem": "python-requirements",
+      "name": "onnxruntime",
+      "version": "1.28.0",
+      "digests": [
+        "sha256:0a83bdb70d143cede762b677789bf2a7acca54b3fb82565601d5c30695aa933c"
+      ]
+    },
+    {
+      "path": "server/requirements-detector.lock",
+      "ecosystem": "python-requirements",
+      "name": "numpy",
+      "version": "2.3.5",
+      "digests": [
+        "sha256:0d8163f43acde9a73c2a33605353a4f1bc4798745a8b1d73183b28e5b435ae28"
+      ]
+    },
+    {
+      "path": "server/requirements-detector.lock",
+      "ecosystem": "python-requirements",
+      "name": "flatbuffers",
+      "version": "25.12.19",
+      "digests": [
+        "sha256:7634f50c427838bb021c2d66a3d1168e9d199b0607e6329399f04846d42e20b4"
+      ]
+    },
+    {
+      "path": "server/requirements-detector.lock",
+      "ecosystem": "python-requirements",
+      "name": "packaging",
+      "version": "25.0",
+      "digests": [
+        "sha256:29572ef2b1f17581046b3a2227d5c611fb25ec70ca1ba8554b24b0e69331a484"
+      ]
+    },
+    {
+      "path": "server/requirements-detector.lock",
+      "ecosystem": "python-requirements",
+      "name": "protobuf",
+      "version": "6.33.5",
+      "digests": [
+        "sha256:cbf16ba3350fb7b889fca858fb215967792dc125b35c7976ca4818bee3521cf0"
+      ]
     }
   ]
 }

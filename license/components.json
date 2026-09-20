@@ -22,6 +22,11 @@
       "scope": "tooling"
     },
     {
+      "path": "server/requirements-detector.lock",
+      "ecosystem": "python-requirements",
+      "scope": "backend"
+    },
+    {
       "path": "server/requirements.lock",
       "ecosystem": "python-requirements",
       "scope": "backend"
@@ -48,14 +53,6 @@
       "status": "reviewed-empty",
       "evidence": [
         "agent/transport/README.md",
-        "docs/THIRD_PARTY_POLICY.md"
-      ]
-    },
-    {
-      "scope": "model_code",
-      "status": "reviewed-empty",
-      "evidence": [
-        "server/app/detection/README.md",
         "docs/THIRD_PARTY_POLICY.md"
       ]
     },
@@ -1559,6 +1556,167 @@
           "path": "web/package-lock.json",
           "ecosystem": "npm-lock",
           "scope": "frontend"
+        }
+      ],
+      "sha256": null
+    },
+    {
+      "id": "pypi:onnxruntime@1.28.0",
+      "name": "onnxruntime",
+      "version": "1.28.0",
+      "kind": "model_code",
+      "upstream": "https://pypi.org/project/onnxruntime/1.28.0/",
+      "license": "MIT",
+      "license_evidence": [
+        "https://pypi.org/pypi/onnxruntime/1.28.0/json",
+        "server/docs/detector-wheel-audit.json",
+        "server/docs/RTDETR_RUNTIME_AUDIT.md"
+      ],
+      "transitive_evidence": [
+        "server/docs/detector-wheel-audit.json",
+        "server/docs/RTDETR_RUNTIME_AUDIT.md"
+      ],
+      "obligations": [
+        "preserve-license-and-copyright",
+        "preserve-notice"
+      ],
+      "notice_files": [
+        "server/docs/DETECTOR_THIRD_PARTY_LICENSE_TEXTS.md"
+      ],
+      "locations": [
+        {
+          "path": "server/requirements-detector.lock",
+          "ecosystem": "python-requirements",
+          "scope": "backend"
+        }
+      ],
+      "sha256": null
+    },
+    {
+      "id": "pypi:numpy@2.3.5",
+      "name": "numpy",
+      "version": "2.3.5",
+      "kind": "source",
+      "upstream": "https://pypi.org/project/numpy/2.3.5/",
+      "license": "BSD-3-Clause",
+      "license_evidence": [
+        "https://pypi.org/pypi/numpy/2.3.5/json",
+        "server/docs/detector-wheel-audit.json",
+        "server/docs/RTDETR_RUNTIME_AUDIT.md"
+      ],
+      "transitive_evidence": [
+        "server/docs/detector-wheel-audit.json",
+        "server/docs/RTDETR_RUNTIME_AUDIT.md"
+      ],
+      "obligations": [
+        "preserve-license-and-copyright",
+        "preserve-notice",
+        "provide-corresponding-source",
+        "provide-relinkable-objects"
+      ],
+      "notice_files": [
+        "server/docs/DETECTOR_THIRD_PARTY_LICENSE_TEXTS.md"
+      ],
+      "locations": [
+        {
+          "path": "server/requirements-detector.lock",
+          "ecosystem": "python-requirements",
+          "scope": "backend"
+        }
+      ],
+      "sha256": null
+    },
+    {
+      "id": "pypi:flatbuffers@25.12.19",
+      "name": "flatbuffers",
+      "version": "25.12.19",
+      "kind": "source",
+      "upstream": "https://pypi.org/project/flatbuffers/25.12.19/",
+      "license": "Apache-2.0",
+      "license_evidence": [
+        "https://pypi.org/pypi/flatbuffers/25.12.19/json",
+        "server/docs/detector-wheel-audit.json",
+        "server/docs/RTDETR_RUNTIME_AUDIT.md"
+      ],
+      "transitive_evidence": [
+        "server/docs/detector-wheel-audit.json",
+        "server/docs/RTDETR_RUNTIME_AUDIT.md"
+      ],
+      "obligations": [
+        "preserve-license-and-copyright",
+        "preserve-notice"
+      ],
+      "notice_files": [
+        "server/docs/DETECTOR_THIRD_PARTY_LICENSE_TEXTS.md"
+      ],
+      "locations": [
+        {
+          "path": "server/requirements-detector.lock",
+          "ecosystem": "python-requirements",
+          "scope": "backend"
+        }
+      ],
+      "sha256": null
+    },
+    {
+      "id": "pypi:packaging@25.0",
+      "name": "packaging",
+      "version": "25.0",
+      "kind": "source",
+      "upstream": "https://pypi.org/project/packaging/25.0/",
+      "license": "Apache-2.0 OR BSD-2-Clause",
+      "license_evidence": [
+        "https://pypi.org/pypi/packaging/25.0/json",
+        "server/docs/detector-wheel-audit.json",
+        "server/docs/RTDETR_RUNTIME_AUDIT.md"
+      ],
+      "transitive_evidence": [
+        "server/docs/detector-wheel-audit.json",
+        "server/docs/RTDETR_RUNTIME_AUDIT.md"
+      ],
+      "obligations": [
+        "preserve-license-and-copyright",
+        "preserve-notice"
+      ],
+      "notice_files": [
+        "server/docs/DETECTOR_THIRD_PARTY_LICENSE_TEXTS.md"
+      ],
+      "locations": [
+        {
+          "path": "server/requirements-detector.lock",
+          "ecosystem": "python-requirements",
+          "scope": "backend"
+        }
+      ],
+      "sha256": null
+    },
+    {
+      "id": "pypi:protobuf@6.33.5",
+      "name": "protobuf",
+      "version": "6.33.5",
+      "kind": "source",
+      "upstream": "https://pypi.org/project/protobuf/6.33.5/",
+      "license": "BSD-3-Clause",
+      "license_evidence": [
+        "https://pypi.org/pypi/protobuf/6.33.5/json",
+        "server/docs/detector-wheel-audit.json",
+        "server/docs/RTDETR_RUNTIME_AUDIT.md"
+      ],
+      "transitive_evidence": [
+        "server/docs/detector-wheel-audit.json",
+        "server/docs/RTDETR_RUNTIME_AUDIT.md"
+      ],
+      "obligations": [
+        "preserve-license-and-copyright"
+      ],
+      "notice_files": [
+        "server/docs/DETECTOR_THIRD_PARTY_LICENSE_TEXTS.md"
+      ],
+      "locations": [
+        {
+          "path": "server/requirements-detector.lock",
+          "ecosystem": "python-requirements",
+          "scope": "backend"
         }
       ],
       "sha256": null
