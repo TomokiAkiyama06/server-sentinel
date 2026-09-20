@@ -338,6 +338,14 @@ Runtime uncertainty or later growth of protected/other filesystem usage may redu
 
 Normal unprotected segments are FIFO. Protected incident segments are not part of ordinary ring-buffer eviction.
 
+The implemented core is `agent/media_capture_agent/ring.py`, with a private
+transactional SQLite ledger and #12's descriptor-pinned media store. Admission
+uses physical allocated bytes, unique shared references, explicit per-source
+bitrate/cadence/overhead bounds, and verified free space after any eligible
+reclamation. Its DTOs expose intervals/gaps, completion/expiry, pressure and
+deletion state. The concrete contract and incomplete production/UI integration
+are documented in [`agent/docs/RING_BUFFER.md`](agent/docs/RING_BUFFER.md).
+
 ### 5.11 Unexpected main-host communication loss
 
 If the agent unexpectedly loses the authenticated connection/heartbeat to the main host, it automatically creates a temporary protected incident window:

@@ -6,6 +6,15 @@ Do not mark an item PASS without performing it on the stated hardware/network/br
 
 ## Test metadata
 
+Issue #16's disk-ring core has only synthetic filesystem/quota/clock acceptance.
+Before closing #16, run the existing Agent buffer/outage checks with the real
+segmenter/profile and authenticated transport: verify each source retains the
+full T−10/T+10 interval, confirm real segment/container/block overhead fits the
+admission bound, and inspect partial/gap reporting during actual disk pressure
+and mount loss. Verify Owner-only mode/value/deletion controls and DTO rendering
+through #10-authorized routes. Do not record those physical/UI checks as passed
+because the temporary-filesystem tests succeeded.
+
 ```text
 Date:
 ServerSentinel version / Git commit:

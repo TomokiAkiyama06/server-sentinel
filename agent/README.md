@@ -8,6 +8,12 @@ binding (#11/#14), media transport (#15) and ring management (#16) plug into the
 core before it can become an operational capture node. This is not hardware
 acceptance or a claim of functional remote video delivery.
 
+Issue #16 adds the tested disk-ring/incident core under `ring.py`, `ring_models.py`
+and `ring_ledger.py`. It uses real immutable disk segments and private SQLite;
+its production capture/transport/Owner-UI integration is still pending. See
+[`docs/RING_BUFFER.md`](docs/RING_BUFFER.md) for bounds, safe admission, coverage,
+expiry, recovery and validation limits.
+
 Implemented runtime modules live in `media_capture_agent/`: `config.py`,
 `storage.py`, `health.py`, `runtime.py`, and `cli.py`. Existing responsibility
 folders describe subsequent capture/pairing/transport work. Synthetic adapters
