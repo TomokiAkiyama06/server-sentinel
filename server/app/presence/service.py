@@ -571,15 +571,26 @@ class PresenceService:
         row must not let the snapshot report that path as armed again, because
         the action still did not happen and the tombstone stops a replay from
         re-queuing it.
+
+        The retention exception is bounded by the main audit-retention period.
+        A permanently unresolved action would otherwise keep its observation,
+        and every later one, on disk without limit. At that horizon the payload
+        is released like any other expired observation while the identity
+        tombstone and the per-action degradation marker remain, so the path
+        stays degraded and the work is never reported as completed.
         """
         if type(limit) is not int or not 1 <= limit <= 1000:
             raise ValueError("invalid timeline retention limit")
-        cutoff = timestamp(utc(now) - timedelta(days=RetentionPeriods().recording_days))
+        periods = RetentionPeriods()
+        cutoff = timestamp(utc(now) - timedelta(days=periods.recording_days))
+        horizon = timestamp(utc(now) - timedelta(days=periods.audit_days))
         with self._transaction() as db:
             rows = db.execute("SELECT item.id FROM presence_observations item "
-                              "WHERE item.received<? AND NOT EXISTS (SELECT 1 FROM presence_deliveries job "
-                              "WHERE job.observation=item.id AND job.state NOT IN ('delivered','disabled')) "
-                              "ORDER BY item.received,item.sequence LIMIT ?", (cutoff, limit)).fetchall()
+                              "WHERE (item.received<? AND NOT EXISTS (SELECT 1 FROM presence_deliveries job "
+                              "WHERE job.observation=item.id AND job.state NOT IN ('delivered','disabled'))) "
+                              "OR item.received<? "
+                              "ORDER BY item.received,item.sequence LIMIT ?",
+                              (cutoff, horizon, limit)).fetchall()
             identifiers = [(row[0],) for row in rows]
             db.executemany("INSERT OR IGNORE INTO presence_completed_events(id,expired_at) "
                            "SELECT DISTINCT observation,? FROM presence_deliveries WHERE observation=?",

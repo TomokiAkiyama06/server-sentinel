@@ -683,6 +683,27 @@ class PresenceTests(unittest.TestCase):
             self.service.requeue_action("owner", event.identifier, "owner_alert", now=NOW, clock_trusted=True)
         self.assertEqual(self.service.audit("owner"), [])
 
+    def test_unresolved_critical_history_is_bounded_by_the_audit_horizon(self):
+        event = self.service.record(observation(Kind.SERVER_MOVEMENT, identifier=UUID(int=91)))
+        self.service.complete_action(event.identifier, "evidence", ActionResult.FAILED)
+        periods = RetentionPeriods()
+        recording = NOW + timedelta(days=periods.recording_days + 1)
+        # Unfinished critical work keeps its payload past ordinary retention.
+        self.assertEqual(self.service.expire_history(now=recording), 0)
+        self.assertEqual(len(self.history()["items"]), 1)
+        audit = NOW + timedelta(days=periods.audit_days + 1)
+        # The exception is bounded, so the payload cannot accumulate forever.
+        self.assertEqual(self.service.expire_history(now=audit), 1)
+        self.assertEqual(self.history()["items"], [])
+        status = self.status(now=audit)
+        self.assertEqual(status["critical_evidence"], "unavailable")
+        self.assertEqual(status["critical_notifications"], "unavailable")
+        self.assertTrue(status["critical_paths_degraded"])
+        # The identity stays a duplicate, so a replay cannot re-queue the work.
+        self.service.record(observation(Kind.SERVER_MOVEMENT, identifier=event.identifier,
+                                        at=audit, received=audit))
+        self.assertEqual(self.status(now=audit)["pending_critical_actions"], 0)
+
     def test_owner_clears_an_expired_critical_degradation(self):
         event = self.service.record(observation(Kind.SERVER_MOVEMENT))
         self.service.complete_action(event.identifier, "notification", ActionResult.DISABLED)
