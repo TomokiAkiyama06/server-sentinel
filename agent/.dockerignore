@@ -6,3 +6,5 @@
 !media_capture_agent/**
 !tests/
 !tests/**
+**/__pycache__/
+**/*.pyc
