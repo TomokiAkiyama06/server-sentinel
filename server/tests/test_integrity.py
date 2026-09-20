@@ -145,6 +145,25 @@ class CompareTests(TestCase):
         findings = compare(Inventory((first,)), Inventory((first, second)))
         self.assertEqual([item.state for item in findings], [State.UNVERIFIABLE])
 
+    def test_ambiguous_partial_candidates_remain_available_to_anonymous_baseline(self):
+        first = Component(Kind.STORAGE, "old-a", (("model", "Synthetic"),),
+                          (("serial", "a"), ("wwid", "x")))
+        second = Component(Kind.STORAGE, "old-b", (("capacity_bytes", "2000"),), ())
+        current = (Component(Kind.STORAGE, "new-a", (("capacity_bytes", "1000"),), (("serial", "a"),)),
+                   Component(Kind.STORAGE, "new-b", (("capacity_bytes", "2000"),), (("wwid", "x"),)))
+        for old_order in permutations((first, second)):
+            for new_order in permutations(current):
+                self.assertEqual([item.state for item in compare(Inventory(old_order), Inventory(new_order))],
+                                 [State.UNVERIFIABLE, State.UNVERIFIABLE])
+
+    def test_ambiguous_exact_candidates_remain_available_to_anonymous_baseline(self):
+        first = disk("synthetic-a", slot="old-a")
+        second = disk("", slot="old-b", size="2000")
+        current = (disk("synthetic-a", slot="new-a"), disk("synthetic-a", slot="new-b", size="2000"))
+        for old_order in permutations((first, second)):
+            self.assertEqual([item.state for item in compare(Inventory(old_order), Inventory(current))],
+                             [State.UNVERIFIABLE, State.UNVERIFIABLE])
+
     def test_unapproved_inventory_never_becomes_baseline(self):
         findings = compare(None, Inventory((disk(),)))
         self.assertEqual(len(findings), 4)

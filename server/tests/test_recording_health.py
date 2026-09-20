@@ -99,6 +99,36 @@ class RecordingHealthTests(TestCase):
             self.service.startup()
         self.assertFalse(self.adapter.leftover)
         self.assertEqual(self.recorded[-1][0].state, HealthState.FAILED)
+        self.assertNotIn("health", self.adapter.calls)
+
+    def test_device_health_cancellation_records_failure_before_propagating(self):
+        for exception in (KeyboardInterrupt, SystemExit):
+            self.recorded.clear()
+            def cancel():
+                raise exception()
+            self.adapter.storage_health = cancel
+            with self.assertRaises(exception):
+                self.service.startup()
+            self.assertFalse(self.adapter.leftover)
+            self.assertEqual(self.recorded[-1][0].state, HealthState.FAILED)
+            self.assertEqual(self.recorded[-1][0].stages, (Stage.DEVICE_HEALTH,))
+            self.assertIsNone(self.service._last_check)
+
+    def test_final_cleanup_cancellation_records_failure_without_another_probe(self):
+        cleanup = self.adapter.cleanup
+        calls = []
+        def cancel_final_cleanup():
+            calls.append(True)
+            if len(calls) == 2:
+                raise KeyboardInterrupt()
+            cleanup()
+        self.adapter.cleanup = cancel_final_cleanup
+        with self.assertRaises(KeyboardInterrupt):
+            self.service.startup()
+        self.assertEqual(self.recorded[-1][0].state, HealthState.FAILED)
+        self.assertEqual(self.recorded[-1][0].stages, (Stage.CLEANUP,))
+        self.assertNotIn("health", self.adapter.calls)
+        self.assertTrue(self.adapter.leftover)
 
     def test_smart_critical_and_unavailable_never_healthy(self):
         self.adapter.health = ("CRITICAL",)

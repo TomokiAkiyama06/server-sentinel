@@ -126,16 +126,23 @@ class RecordingHealthService:
                     adapter.cleanup()
                 except Exception:
                     failures.append(Stage.CLEANUP)
-            try:
-                health = adapter.storage_health()
-                if not health or any(value not in {"OK", "CRITICAL", "UNVERIFIABLE"} for value in health):
+                except BaseException as exc:
+                    cancelled = cancelled or exc
+                    failures.append(Stage.CLEANUP)
+            if cancelled is None:
+                try:
+                    health = adapter.storage_health()
+                    if not health or any(value not in {"OK", "CRITICAL", "UNVERIFIABLE"} for value in health):
+                        unavailable = True
+                    if "CRITICAL" in health:
+                        failures.append(Stage.DEVICE_HEALTH)
+                    if "UNVERIFIABLE" in health:
+                        unavailable = True
+                except Exception:
                     unavailable = True
-                if "CRITICAL" in health:
+                except BaseException as exc:
+                    cancelled = exc
                     failures.append(Stage.DEVICE_HEALTH)
-                if "UNVERIFIABLE" in health:
-                    unavailable = True
-            except Exception:
-                unavailable = True
             failed = bool(failures)
             if unavailable:
                 failures.append(Stage.DEVICE_HEALTH)

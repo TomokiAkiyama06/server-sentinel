@@ -89,6 +89,7 @@ def compare(approved: Inventory | None, current: Inventory) -> tuple[Finding, ..
     old_items, new_items = approved.components, current.components
     results = [None] * len(old_items)
     used = set()
+    uncertain = set()
     identity_counts = Counter((item.kind, item.identity) for item in new_items if item.identity)
     baseline_counts = Counter((item.kind, item.identity) for item in old_items if item.identity)
     fields = Counter((item.kind, key, value) for item in new_items for key, value in item.identity)
@@ -121,9 +122,10 @@ def compare(approved: Inventory | None, current: Inventory) -> tuple[Finding, ..
                  if item.kind == old.kind and old.identity and item.identity == old.identity}
         if len(exact) > 1 or (old.identity and baseline_counts[(old.kind, old.identity)] > 1):
             ambiguous(index)
+            uncertain.update(exact)
         elif exact:
             matched(index, next(iter(exact)))
-        used.update(exact)
+            used.update(exact)
 
     # A unique serial/WWID can survive loss of another field. The entire
     # bipartite graph must be one-to-one before drawing a property conclusion.
@@ -142,9 +144,12 @@ def compare(approved: Inventory | None, current: Inventory) -> tuple[Finding, ..
             continue
         if len(candidates) == 1 and partial_reverse[next(iter(candidates))] == 1:
             matched(index, next(iter(candidates)))
+            used.update(candidates)
         else:
             ambiguous(index)
-    used.update(candidate for candidates in partial.values() for candidate in candidates)
+            # Ambiguity claims no exclusive ownership. These observations may
+            # also cover identity-less baselines in the following weak graph.
+            uncertain.update(candidates)
 
     # Resolve every compatible weak link together. Missing values are not
     # contradictions, including partial non-unique serial/WWID observations.
@@ -178,12 +183,13 @@ def compare(approved: Inventory | None, current: Inventory) -> tuple[Finding, ..
                          if candidate not in used and item.kind == old.kind and item.location == old.location), None)
         if location is None:
             results[index] = Finding(old.kind, State.MISSING, "APPROVED_COMPONENT_ABSENT")
-        elif location in weak_used:
+        elif location in weak_used or location in uncertain:
             ambiguous(index)
         else:
             matched(index, location)
             used.add(location)
     used.update(weak_used)
+    used.update(uncertain)
     covered = {item.kind for item in old_items}
     for kind in (current.unavailable | approved.unavailable) - covered:
         results.append(Finding(kind, State.UNVERIFIABLE, "PROBE_UNAVAILABLE"))
