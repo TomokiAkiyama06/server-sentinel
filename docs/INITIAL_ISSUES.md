@@ -477,6 +477,12 @@ Acceptance:
 - no-viewer state avoids unnecessary viewer-only transcode;
 - measured resource use recorded.
 
+Implementation progress: `server/app/media/profiles/` contains the independent
+profile planner, decoded-frame cadence control and bounded compressed-packet
+adapter lifecycle, with synthetic tests for quality isolation and no-subscriber
+cleanup. Codec/transport adapters and measured Main Server / Capture Node / UVC
+resource use remain pending; this is not completion of Issue #17.
+
 ## Plan 11 — Durable recording + main-host compressed pre-roll
 
 GitHub Issue: [#18](https://github.com/TomokiAkiyama06/server-sentinel/issues/18)
