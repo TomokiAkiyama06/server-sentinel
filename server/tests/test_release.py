@@ -587,6 +587,15 @@ class ReleaseLifecycleTests(unittest.TestCase):
         working = [line for line in unit.splitlines()
                    if line.startswith("WorkingDirectory=")]
         self.assertEqual(working, ["WorkingDirectory=" + str(self.installation / "current")])
+        # Write access is granted to the runtime subdirectories only, so the
+        # service account cannot replace or remove them or the runtime root.
+        writable = [line for line in unit.splitlines()
+                    if line.startswith("ReadWritePaths=")]
+        self.assertEqual(writable, ['ReadWritePaths="' + str(self.runtime / "state")
+                                    + '" "' + str(self.runtime / "recordings")
+                                    + '" "' + str(self.runtime / "audit") + '"'])
+        self.assertNotIn('ReadWritePaths="' + str(self.runtime) + '"', unit)
+        self.assertIn('RequiresMountsFor="' + str(self.runtime) + '"', unit)
         # systemd would keep command-line quotes as part of this single path and
         # reject the unit with "path is not absolute".
         self.assertNotIn('"', working[0])

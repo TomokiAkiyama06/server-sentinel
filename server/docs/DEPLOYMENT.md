@@ -139,7 +139,9 @@ directory only as a deliberate administrator action, never the release named by
 never state, recordings, or audit data.
 
 The generated systemd unit runs without capabilities as the dedicated account,
-gives write access only to the runtime root, checks mount/config before every
+gives write access only to the `state`, `recordings` and `audit` directories —
+not to the runtime root itself, so the service cannot replace or remove them —
+checks mount/config before every
 start, and invokes the loopback-enforcing launcher. It uses `Type=notify`; the
 launcher sends readiness only after ASGI lifespan/database migration and Uvicorn
 listener startup both succeed. `systemctl restart` therefore remains pending or

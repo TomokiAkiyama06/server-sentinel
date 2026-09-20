@@ -119,6 +119,13 @@ def render_unit(root: Path, config: Path, deployment: Deployment,
     python = current / "venv/bin/python"
     if not re.fullmatch(r"[a-z_][a-z0-9_-]*[$]?", account.pw_name):
         raise ValueError("invalid dedicated account")
+    # Grant write access to the runtime subdirectories only.  The runtime root
+    # itself stays read-only under ProtectSystem=strict, so the service account
+    # cannot replace or remove the state, recording, or audit directories.
+    writable = " ".join(_quote(directory) for directory in (
+        deployment.state_directory, deployment.recordings_directory,
+        deployment.audit_directory,
+    ))
     return f"""[Unit]
 Description=ServerSentinel Main Server
 After=local-fs.target network.target
@@ -139,7 +146,7 @@ NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
-ReadWritePaths={_quote(deployment.runtime_root)}
+ReadWritePaths={writable}
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 CapabilityBoundingSet=
 AmbientCapabilities=

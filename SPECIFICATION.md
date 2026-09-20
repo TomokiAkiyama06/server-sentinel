@@ -115,7 +115,8 @@ dedicated non-root account, then atomically switches `current`/`previous` releas
 pointers. Failed service activation restores the prior pointer and attempts to
 restart it. Configuration, state, recordings, and audit data remain outside both
 the checkout and install tree. The systemd launcher keeps the human listener on
-loopback and grants write access only to the configured runtime root. A
+loopback and grants write access only to the configured state, recording and
+audit directories, not to the runtime root itself. A
 `Type=notify` unit does not complete activation until database migration,
 application lifespan startup, and listener creation succeed. Runtime
 subdirectories are resolved and must remain contained on the approved runtime

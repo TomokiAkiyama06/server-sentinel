@@ -141,6 +141,9 @@ Runtime-data assumptions:
   so they only corroborate that identity. A runtime mount that is missing,
   substituted, backed by the root filesystem device, or carrying a different
   filesystem is refused, and no root-filesystem fallback directory is created;
+- the generated unit grants the runtime account write access to the state,
+  recording, and audit directories only. The runtime root itself stays
+  read-only, so a compromised service cannot replace or remove them;
 - install, update, and rollback move release pointers and the unit only; they
   never delete, truncate, or rewrite state, recordings, or audit data. A failed
   transaction restores both release pointers and the previous unit and restarts
