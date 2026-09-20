@@ -307,6 +307,12 @@ Acceptance:
 
 ## Plan 6 — `media-capture-agent` foundation
 
+Delivery note: the #12 native foundation now includes explicit protected config,
+non-root lifecycle, separate source/node/clock health, descriptor-pinned mount and
+reserve admission, versioned executable artifact and systemd installer. Synthetic
+CI covers failure paths. Capture/paired transport integration and physical
+acceptance remain pending; Issue #12 stays OPEN.
+
 GitHub Issue: [#12](https://github.com/TomokiAkiyama06/server-sentinel/issues/12)
 
 Depends on: [#11](https://github.com/TomokiAkiyama06/server-sentinel/issues/11)

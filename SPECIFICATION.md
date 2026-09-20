@@ -259,6 +259,14 @@ GUI/tray: none required
 
 Installation may require `sudo` to install the binary, create the account/unit, and configure narrow device permissions.
 
+The Issue #12 native foundation uses Python 3.12+ standard-library modules under
+`agent/media_capture_agent/`, with an executable zipapp release artifact and an
+explicit systemd installer. Runtime/config/media directories are outside source
+and installation trees. Until approved capture and authenticated transport adapters
+are integrated, the production CLI remains visibly unconfigured and never starts
+unauthenticated network communication. This foundation does not complete physical
+Capture Node acceptance.
+
 ### 5.3 Audio
 
 MVP agent capture is video-only. Do not open microphone/audio devices. No event/detection logic depends on audio.
@@ -433,7 +441,7 @@ The Agent media root is a deployment-configured path outside the source tree tha
 
 At install/startup/runtime admission, the Agent shall verify:
 - the configured media root exists or can be created only by the intended installer/owner workflow;
-- it resolves to the expected filesystem/mount identity when an expected device/mount is configured;
+- it resolves to the expected filesystem/mount/device and backing-filesystem-root identity; a narrow systemd namespace bind must map to the approved parent root plus the configured relative media path;
 - sufficient free space and safety reserve remain;
 - it is writable by the dedicated Agent service account;
 - loss/unmount/substitution of the expected media filesystem does **not** silently redirect ring-buffer or incident writes into a directory on the root filesystem.

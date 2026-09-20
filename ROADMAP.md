@@ -39,7 +39,7 @@ Issue #11 now has a V4L2 discovery/MMAP adapter, durable approval latch and
 registry integration with synthetic tests. The UVC items remain unchecked until
 Owner management/worker integration and real-webcam acceptance are complete;
 no browser preview or physical device result is claimed.
-- [ ] `media-capture-agent` native service
+- [ ] `media-capture-agent` native service — #12 foundation implemented; capture/paired transport integration and physical acceptance pending
 - [ ] video-only capture
 - [ ] one-time pairing + mTLS/revocation
 - [ ] separate LAN ingest listener
