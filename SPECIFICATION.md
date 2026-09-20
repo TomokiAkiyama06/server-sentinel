@@ -597,6 +597,10 @@ A profile returns `sufficient`, `degraded`, or `insufficient` plus metrics/reaso
 
 If the person detector's prerequisites are insufficient, the result is `unknown`/unavailable. It is **not** converted to `no person`. The same fail-unknown principle applies to owner verification and dependent presence/entrance conclusions.
 
+The internal implementation in `server/app/detection/quality/` uses explicit per-source/detector policy ranges and an explicit pixel budget; it provides no production thresholds. It measures bounded grayscale/RGB luminance, neighboring-pixel sharpness, clipping and resolution, and accepts frame-attributed calibrated target-size/obstruction/confidence context. Missing required context never defaults to adequate target size or zero obstruction. All configured prerequisites apply to both positive and negative conclusions.
+
+Quality failure is immediate. Recovery requires the configured number of consecutive good frames (at least two); stream/sequence/geometry discontinuities and unavailable execution reset recovery. Reason codes, numeric metrics, profile version and source/stream/sequence are available for authorized UI integration. Detector stop/failure invalidates the last assessment without a new frame and, through the registered result sink, immediately replaces the source's published `present`/`absent` with `unknown`; an unusable frame, a pending recovery and an incomplete inference batch do the same. A stopped or failed detector never leaves a trustworthy conclusion readable until its observation age expires. The result guard rejects obsolete assessments and mismatched frame identities; the inference scheduler remains responsible for observation age. Live/recording delivery and unrelated critical detector profiles remain independent. Real-camera calibration is not established by synthetic quality tests.
+
 ### 7.6 Owner-only face verification
 
 This is 1:1 verification against one explicitly enrolled deployment owner.
@@ -659,6 +663,35 @@ Admission loop:
 Defaults: recording retention 20 days; audit retention 90 days.
 
 Agent disk-buffer safety is tracked separately from Main Server storage because the two filesystems may be different machines.
+
+The internal Issue #21 policy in `server/app/storage/` holds media plus configured
+metadata/journal/temp reservations through the serialized recorder operation.
+Physical-only control reservations cover startup recovery before inventory binding
+and never recursively invoke retention. Expected media-root identity and the
+private metadata file's filesystem are checked without symlink following or
+fallback creation. All numeric reserve/quota/hysteresis/overhead limits are
+explicit deployment configuration; only the specified retention defaults apply.
+The critical allowance conservatively bounds resident critical evidence plus the
+new reservation, surviving restart. Filesystem sampling includes other processes
+but cannot prevent unrelated writes after the sample. A failed state-audit write
+remains visible as a failure flag. The domain recording browser defaults to deny,
+requires `recordings:view` for history and Owner for star/unstar/single deletion;
+it mounts no human endpoint pending #10.
+
+`server/app/notifications/` provides optional direct Slack incoming-webhook
+delivery using verified HTTPS, no environment proxy/redirect, bounded timeout and
+redacted failures. Unconfigured delivery performs no network operation. The
+current payload is a fixed critical category or validated daily aggregate, with
+no image/media, source identity or arbitrary probe details. Both immediate and
+daily notifications enqueue on a bounded delivery worker; the recorder worker
+never waits for network IO. Local pending/result events share an ID and are
+persisted only on the owning worker. Full queues and failed persistence remain
+visible; completion-persistence retry never resends a message. The persisted daily
+scheduler defaults to 23:00 configured local time and claims one dispatch per
+local date across restart/DST/clock rollback; missed dates are not replayed.
+An uncertain crash remains `pending`, failed delivery is visible, and no implicit
+retry floods the channel. Production timers, durable event-outbox integration,
+human authorization and recording playback remain separate integration work.
 
 ## 10. Host hardware integrity and recording self-check
 
