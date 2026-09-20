@@ -142,6 +142,7 @@ flowchart TD
   i19 --> i27
   i23 --> i27
   i27 --> i28
+  i47 --> i28
   i50 --> i28
   i7 --> i47
   i10 --> i47
@@ -168,7 +169,7 @@ flowchart TD
   i5 --> i51
 ```
 
-Issue #7 explicitly depends on #6 (authorization design before health/version endpoint contracts), #16 on #17 (bounded media profiles for buffer estimates/admission), and #26 on #16 / #21 (critical preservation and configured notification integration). Plans 22–25 additionally depend on the capabilities their own mandatory acceptance invokes, so that none of them can be scheduled as closable before its deployed acceptance is executable: #47 re-runs #23's hardware-integrity comparison and recording-health self-test after update/rollback, compares #50's audit records across the lifecycle, and cannot publish a stable artifact until #51 has applied the repository-wide dependency/model license and immutable-pin gate; #48 drives the #9 source registry, #17 profiles, #21 storage settings, #23 baseline/recorder self-check and the #50 audit of Owner approval inside the wizard; #49 must show that #23 hardware identifiers are redacted and #25 Owner biometric material is excluded from an export; #50 audits #23 baseline approval and #9 / #13 source and capture-node revocation. #28 depends on #50 because its full-deployment acceptance re-runs the audit-retention cleanup comparison that #50 implements, together with the capture-agent and timeline inventories that Plans 22 and 25 must record as not applicable in their own smaller environments. Plan 26 depends on the CI guard. These prerequisites bound acceptance/closure only; independent mock, contract and shell work may proceed in parallel, and unfinished areas stay explicitly pending. A hardware-free Plan whose Issue is already closed (#5, #8, #18) may sit before still-open prerequisites in this graph: that closure records delivered, separately verified work, and the remaining integration is tracked in its Plan section rather than in the edge order.
+Issue #7 explicitly depends on #6 (authorization design before health/version endpoint contracts), #16 on #17 (bounded media profiles for buffer estimates/admission), and #26 on #16 / #21 (critical preservation and configured notification integration). Plans 22–25 additionally depend on the capabilities their own mandatory acceptance invokes, so that none of them can be scheduled as closable before its deployed acceptance is executable: #47 re-runs #23's hardware-integrity comparison and recording-health self-test after update/rollback, compares #50's audit records across the lifecycle, and cannot publish a stable artifact until #51 has applied the repository-wide dependency/model license and immutable-pin gate; #48 drives the #9 source registry, #17 profiles, #21 storage settings, #23 baseline/recorder self-check and the #50 audit of Owner approval inside the wizard; #49 must show that #23 hardware identifiers are redacted and #25 Owner biometric material is excluded from an export; #50 audits #23 baseline approval and #9 / #13 source and capture-node revocation. #28 depends on #47 and #50 because its full-deployment acceptance re-runs the Plan 22 update/rollback lifecycle and the audit-retention cleanup comparison that #50 implements, together with the capture-agent and timeline inventories that Plans 22 and 25 must record as not applicable in their own smaller environments. Plan 26 depends on the CI guard. These prerequisites bound acceptance/closure only; independent mock, contract and shell work may proceed in parallel, and unfinished areas stay explicitly pending. A hardware-free Plan whose Issue is already closed (#5, #8, #18) may sit before still-open prerequisites in this graph: that closure records delivered, separately verified work, and the remaining integration is tracked in its Plan section rather than in the edge order.
 
 ## Plan 1 — CI / repository guardrails
 
@@ -891,7 +892,7 @@ Acceptance:
 
 GitHub Issue: [#28](https://github.com/TomokiAkiyama06/server-sentinel/issues/28)
 
-Depends on: [#27](https://github.com/TomokiAkiyama06/server-sentinel/issues/27), [#50](https://github.com/TomokiAkiyama06/server-sentinel/issues/50)
+Depends on: [#27](https://github.com/TomokiAkiyama06/server-sentinel/issues/27), [#47](https://github.com/TomokiAkiyama06/server-sentinel/issues/47), [#50](https://github.com/TomokiAkiyama06/server-sentinel/issues/50)
 
 Labels: `documentation`, `camera-source`, `hardware-required`, `manual-test-required`, `remote-agent`, `server-required`
 
