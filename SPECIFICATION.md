@@ -938,9 +938,11 @@ here. `principal_credential` is an access-control record, unrelated to the
 optional owner face verification of §7.6 and never a non-owner identity or
 biometric database (see `PRIVACY.md`).
 
-Relying-party verification depends on ServerSentinel owning its browser origin:
-the dashboard is served from an origin reserved for it, with no other
-application sharing it, as ADR-0003 requires.
+Relying-party verification depends on ServerSentinel owning its browser origin.
+Per AUTH-011 the dashboard is served from an origin reserved for it, with no
+other application sharing it; a co-hosted application on that origin would put
+the credential within its reach. The Issue #6 boundary record carries the same
+reservation.
 
 Initial non-owner permissions:
 
