@@ -141,6 +141,7 @@ flowchart TD
   i19 --> i27
   i23 --> i27
   i27 --> i28
+  i50 --> i28
   i7 --> i47
   i10 --> i47
   i23 --> i47
@@ -884,7 +885,7 @@ Acceptance:
 
 GitHub Issue: [#28](https://github.com/TomokiAkiyama06/server-sentinel/issues/28)
 
-Depends on: [#27](https://github.com/TomokiAkiyama06/server-sentinel/issues/27)
+Depends on: [#27](https://github.com/TomokiAkiyama06/server-sentinel/issues/27), [#50](https://github.com/TomokiAkiyama06/server-sentinel/issues/50)
 
 Labels: `documentation`, `camera-source`, `hardware-required`, `manual-test-required`, `remote-agent`, `server-required`
 
@@ -942,7 +943,7 @@ Acceptance:
 - stable install / update / rollback後にもruntime dataを保持し、暗黙のroot-filesystem fallbackを作らない;
 - disposable environmentでinstall、update、rollback、missing runtime mount/configurationを検証する;
 - documented Main Ubuntu / Compose pathとrelease lifecycleを一致させ、実Main Server受入はprivate deployment dataを公開せずに行う;
-- `MANUAL_TEST.md` Vのdeployed lifecycle受入で、install / update / rollback、runtime-data分離、private listener境界に加えて、rollback後もrecordings、starred recordings、protected incidents、audit recordsが破壊されないこと、runtime mount欠落/置換時にsilent root-filesystem fallbackを作らないことを、private deployment valuesを公開せずに確認する。
+- `MANUAL_TEST.md` Vのdeployed lifecycle受入で、install / update / rollback、runtime-data分離、private listener境界に加えて、rollback後もrecordings、starred recordings、audit recordsが破壊されないこと、runtime mount欠落/置換時にsilent root-filesystem fallbackを作らないことを、private deployment valuesを公開せずに確認する。
 
 ## Plan 23 — First-run setup wizard と初期設定フロー
 
