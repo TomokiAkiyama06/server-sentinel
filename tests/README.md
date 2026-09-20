@@ -10,7 +10,9 @@ Use mocks, virtual sources, dependency injection, and synthetic/generated data. 
 
 `models/human_access.py` and `unit/test_human_access_contract.py` exercise the
 proposed ADR-0003 policy conjunction and state transitions using invented
-identities and a synthetic clock. They do not open listeners, generate real
-credentials, establish transport trust, implement authentication, or verify
-browser/network behavior. Approved runtime handlers still need independent
+identities and a synthetic clock. Origin exclusivity, per-request origin
+evidence, and the credential behind a session are explicit inputs there. They do
+not open listeners, generate real credentials, verify proxy configuration,
+establish transport trust, implement authentication, or verify browser/network
+behavior. Approved runtime handlers still need independent
 integration tests under #10/#19/#27; manual checks remain in `MANUAL_TEST.md`.

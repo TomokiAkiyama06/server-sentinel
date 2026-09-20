@@ -637,6 +637,16 @@ synthetic test branches/PRs; no production data or unrelated rule deletion.
 These checks belong to #10/#19/#28 after Owner approval and runtime integration.
 They are not completed by the Issue #6 synthetic policy model.
 
+- Verify the reserved browser origin serves ServerSentinel alone: enumerate the
+  Serve/reverse-proxy mappings for that scheme/host/port, request unrelated paths
+  and a co-hosted name, and confirm nothing else answers. Then add a second
+  mapping, alias, or path route on the same origin and confirm startup refuses to
+  serve instead of continuing, including when the configuration cannot be read.
+- Confirm a verified shared-account login with an active invitation but no
+  credential-backed session is refused like an uninvited one, that user
+  verification is required at every authentication, that revoking one credential
+  ends only its own sessions, and that an Owner operation with a stale
+  verification performs nothing.
 - From ordinary LAN and Tailnet clients, attempt direct IPv4/IPv6 upstream access
   and forged identity/forwarded headers, including Docker-published ports. Verify
   no bypass to human routes, assets, health, schema, or SPA/error fallbacks.

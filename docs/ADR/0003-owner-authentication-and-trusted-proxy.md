@@ -22,8 +22,9 @@ implementation/review of the full boundary.
 | Decision | Recommended choice | Alternative and consequence |
 |---|---|---|
 | Initial Owner and recovery | A privileged local administrative command on the Main Server creates/rebinds the single Owner. No remote first-visitor setup or remote account recovery. | A local browser ceremony needs a separate short-lived bootstrap credential and another attack surface. |
-| Human identity and trust | Tailscale Serve over private HTTPS, forwarding to a loopback-only human backend on a host whose local processes are trusted. Match a deployment-scoped exact login identity to the application allowlist. | An equivalent isolated authentication proxy can supply a stable issuer/subject, but needs its own reviewed adapter and deployment validation before support. |
-| Sessions and revocation | Server-side opaque sessions bound to verified identity; 30-minute idle and 12-hour absolute lifetimes. Recheck current grants on every request and cancel active delivery on revocation, with a maximum five-second watchdog. | Different lifetimes or a stricter stream-revocation bound change usability/resource tradeoffs and must be recorded before implementation. |
+| Human identity and trust | Tailscale Serve over private HTTPS, forwarding to a loopback-only human backend on a host whose local processes are trusted. Match a deployment-scoped exact login identity to the application allowlist as a supplementary check, never as the authoritative authenticator. | An equivalent isolated authentication proxy can supply a stable issuer/subject, but needs its own reviewed adapter and deployment validation before support. |
+| Browser origin reservation | A dedicated scheme/host/port serves ServerSentinel alone. Deployment and startup verification refuse an origin that also routes another application. | Sharing one HTTPS host by path keeps a single cookie scope and a single browser origin, so a compromised co-hosted application acts as the current user; supporting it would need a different session and credential design. |
+| Sessions and revocation | Server-side opaque sessions bound to verified identity and to the per-person credential that established them; 30-minute idle and 12-hour absolute lifetimes, and a 5-minute user-verification freshness window for Owner operations. Recheck current grants on every request and cancel active delivery on revocation, with a maximum five-second watchdog. | Different lifetimes, a different freshness window, or a stricter stream-revocation bound change usability/resource tradeoffs and must be recorded before implementation. |
 
 No option permits Tailnet membership alone, automatic Tailscale policy changes,
 public Internet exposure, a developer identity service, or capture-node access to
@@ -55,13 +56,16 @@ ServerSentinel does not configure SSH or grant remote administration.
 Recovery requires the same administrative local boundary and explicit
 confirmation of the replacement identity. Stop admission of human requests,
 increment a deployment authorization generation, invalidate all human sessions,
-cancel active delivery, revoke the old Owner binding, and bind exactly one new
-Owner atomically. Persist the audit outcome before reopening admission; crash or
-storage failure leaves access closed. Media and non-owner invitations are
-preserved, but prior sessions must be re-established. Recovery does not erase
-recordings, alter biometric enrollment, change capture-node credentials, or
-operate Tailscale administration. Restoring an authorization database backup must
-also advance the generation and invalidate all restored sessions before serving.
+cancel active delivery, revoke the old Owner binding together with every
+credential enrolled under it, and bind exactly one new Owner atomically. The
+replacement Owner enrolls a credential through the same local boundary before
+any session exists, so recovery never leaves a usable credential behind.
+Persist the audit outcome before reopening admission; crash or storage failure
+leaves access closed. Media and non-owner invitations are preserved, but prior
+sessions must be re-established. Recovery does not erase recordings, alter
+biometric enrollment, change capture-node credentials, or operate Tailscale
+administration. Restoring an authorization database backup must also advance
+the generation and invalidate all restored sessions before serving.
 
 ## Proposed proxy and identity boundary
 
@@ -96,6 +100,22 @@ app-capability, subnet-address, or tag value grants application access. Profile
 image URLs are not fetched or embedded. See [Tailscale Serve identity
 headers](https://tailscale.com/docs/features/tailscale-serve#identity-headers).
 
+The verified proxy identity is a supplementary gate, not the authoritative
+authenticator. The target deployment shares one Tailscale account across a
+research room, so a verified login names that account rather than the person
+behind the request, and every holder of it reaches this listener from the same
+network position. Application authorization therefore rests on a per-person
+ServerSentinel credential that the Owner issues by invitation and can revoke
+individually; WebAuthn/passkey is the design goal. That deployment constraint
+and the choice of mechanism belong to a separate shared-Tailnet-account ADR
+added by its own pull request, while this record keeps the boundary mechanics
+around it: Owner bootstrap and recovery, the trusted-proxy path, and sessions
+and revocation. Where the two overlap, a verified login never suffices alone; a
+request carrying a verified login and an active invitation but no
+credential-backed session is denied exactly like an uninvited one. The identity
+key rules that follow define that supplementary check, not the application
+principal.
+
 The identity key is `(deployment-configured proxy issuer, exact login)`. The
 issuer is server-side configuration, never an HTTP header. Require exactly one
 nonempty login header, bounded length, and no control characters or ambiguous
@@ -122,14 +142,45 @@ There is no assertion of concealment from Tailnet or infrastructure admins.
 
 ## Proposed session contract
 
-After verified identity and an active Owner-approved invitation, a same-origin
-session-establishment operation creates a cryptographically random opaque
-session ID. Persist only its digest and bind the record to the principal, exact
-identity key, authorization generation, issue time, last use, and expiry. The
-cookie is host-only with a neutral `__Host-` name, `Secure`, `HttpOnly`, `Path=/`,
-no `Domain`, and `SameSite=Strict`. No URL/session parameter, localStorage token,
-client-selected session identifier, or self-contained permission-bearing JWT is
-accepted. Rotate the ID at establishment and privilege changes.
+After verified identity, an active Owner-approved invitation, and a successful
+per-person credential assertion, a same-origin session-establishment operation
+creates a cryptographically random opaque session ID. Persist only its digest
+and bind the record to the principal, exact identity key, the credential handle
+that established it, the time of that user verification, authorization
+generation, issue time, last use, and expiry. Revoking one credential
+invalidates the sessions bound to it without revoking the principal's other
+credentials or its invitation. The cookie is host-only with a neutral `__Host-`
+name, `Secure`, `HttpOnly`, `Path=/`, no `Domain`, and `SameSite=Strict`. No
+URL/session parameter, localStorage token, client-selected session identifier,
+or self-contained permission-bearing JWT is accepted. Rotate the ID at
+establishment and privilege changes.
+
+ServerSentinel requires an exclusive browser origin. The configured
+`https://<host>[:<port>]` serves this deployment alone: no other application,
+static tree, alias, or catch-all forward is routed on that scheme/host/port,
+and path-based co-hosting is unsupported. The cookie attributes above cannot
+contain a co-hosted application. `Path=/` sends the session cookie to every
+path of that host, and script served from another path of it runs in this same
+browser origin, so one compromised neighbor can call session establishment and
+API paths as the currently proxy-verified user, present the exact reserved
+`Origin`, read any CSRF token handed to the frontend, and reach Owner
+operations. Nothing in
+the request distinguishes that script from the dashboard, so host-only cookies,
+`SameSite`, and same-origin checks cannot be the boundary; reserving the origin
+is. A second application takes its own host or port. A different path prefix,
+subdirectory, or shared `__Host-` cookie scope does not separate it, and
+neither does a reverse proxy that merges both behind one name.
+
+Reserving the origin is verified, not assumed. Deployment enumerates the
+Serve/reverse-proxy configuration for the configured origin and records that it
+has exactly one route target, this human listener. Startup reads that same
+configuration and refuses to serve when another mapping, alias, wildcard, or
+fallback also claims the scheme/host/port, when the expected single mapping is
+absent, or when the configuration cannot be read; it fails closed instead of
+guessing. Any proxy configuration change repeats the check, and a deployment
+that cannot demonstrate exclusivity keeps human access closed. The check is a
+deployment-boundary condition and precedes identity, session, and permission
+evaluation.
 
 The session is an additional application state boundary. Every human request
 still needs the same verified proxy identity and current invitation/grant; a
@@ -142,15 +193,25 @@ active streams. Because Tailscale identity remains authenticated, a user with an
 active invitation can explicitly establish another session; logout is not user
 revocation and does not force upstream identity-provider reauthentication.
 
-Validate an exact configured HTTPS Host/origin, require exact same-origin Origin
-for session establishment and state-changing requests, deny cross-origin CORS,
-and use a session-bound CSRF token for subsequent changes. Read requests must
-have no state-changing side effects. WebSocket handshakes require the configured
-Origin and current authorization. Token material and raw identity/cookie headers
-never enter logs, diagnostics, URLs, or public CI artifacts. The cookie and
-lifetime choices follow the design principles in [OWASP Session
+Validate an exact configured HTTPS Host/origin, require exact same-origin
+Origin for session establishment and state-changing requests, deny cross-origin
+CORS, and use a session-bound CSRF token for subsequent changes. Read requests
+must have no state-changing side effects. WebSocket handshakes require the
+configured Origin and current authorization. A present `Origin` that is not
+exactly the reserved origin is rejected on every request, including reads. An
+absent `Origin` is accepted only for non-mutating reads, because browsers omit
+it for same-origin navigations; establishment, state-changing requests, and
+handshakes require the exact value and deny an absent one. Owner operations
+under AUTH-008 additionally require a user verification newer than a proposed
+five-minute freshness window, evaluated server-side from the session record;
+the response for an otherwise authorized but stale Owner session is defined
+with the shared-account ADR, and a failed or cancelled step-up performs
+nothing. Token material and raw identity/cookie headers never enter logs,
+diagnostics, URLs, or public CI artifacts. The cookie and lifetime choices
+follow the design principles in [OWASP Session
 Management](https://cheatsheetseries.owasp.org/cheatsheets/Session_Management_Cheat_Sheet.html)
-and [OWASP CSRF Prevention](https://cheatsheetseries.owasp.org/cheatsheets/Cross-Site_Request_Forgery_Prevention_Cheat_Sheet.html);
+and [OWASP CSRF
+Prevention](https://cheatsheetseries.owasp.org/cheatsheets/Cross-Site_Request_Forgery_Prevention_Cheat_Sheet.html);
 those sources do not select the proposed product timeout values.
 
 ## Proposed permission and revocation contract
@@ -208,6 +269,8 @@ capture credentials are never accepted by the human boundary.
 | First visitor claims Owner; replay/concurrent bootstrap | Local-only explicit bootstrap, uniqueness transaction, no bootstrap HTTP route |
 | LAN/forwarded-header spoof; ingest-to-human bypass | Actual peer and listener separation; deployment reachability tests required |
 | Missing/duplicate/tagged/shared-but-uninvited identity | Strict adapter, no identity fallback, application allowlist |
+| Co-hosted application on the same origin reads the cookie scope or CSRF token | Reserved exclusive origin; deployment and startup verification of a single route target |
+| Shared Tailscale account holder without an invitation or per-person credential | Supplementary proxy identity; credential-backed session required on every human route |
 | Copied cookie/URL; wrong issuer; identity reassignment | Session identity binding; documented upstream login-reuse limitation |
 | Permission change, expiry, logout, recovery, re-invitation | Current state and generation validation; delivery cancellation |
 | `live:view` requests historical data or both grants request export | Independent permission matrix; unavailable non-owner export |
@@ -215,13 +278,18 @@ capture credentials are never accepted by the human boundary.
 | Auth database unavailable; recovery crash; missing boundary configuration | Fail closed with no application metadata |
 
 `tests/models/human_access.py` is an executable, dependency-free design model.
-Its synthetic tests exercise the gate combinations and authorization transitions;
-it is neither production authentication code nor evidence that sockets, proxy
-headers, cryptographic cookies, CSRF, database transactions, clock handling, or
-real stream cancellation have been implemented. The model receives evidence as
-explicit inputs and tests policy composition, rather than pretending to verify
-those inputs. Session timeout/watchdog numbers remain proposals even though tests
-can exercise boundary values.
+Its synthetic tests exercise the gate combinations and authorization
+transitions; it is neither production authentication code nor evidence that
+sockets, proxy headers, cryptographic cookies, CSRF, database transactions,
+clock handling, or real stream cancellation have been implemented. The model
+receives evidence as explicit inputs and tests policy composition, rather than
+pretending to verify those inputs. Origin exclusivity, the origin evidence of a
+request, and the credential that established a session enter the same way: the
+model checks that a deployment without a verified exclusive origin stays closed
+and that a session whose credential was revoked stops authorizing, but it
+cannot inspect proxy configuration or verify an authenticator. Session
+timeout/watchdog numbers remain proposals even though tests can exercise
+boundary values.
 
 ## Alternatives and consequences
 
