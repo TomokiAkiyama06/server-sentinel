@@ -951,6 +951,7 @@ Acceptance:
 - documented Main Ubuntu / Compose pathとrelease lifecycleを一致させ、実Main Server受入はprivate deployment dataを公開せずに行う;
 - `MANUAL_TEST.md` Vのdeployed lifecycle受入で、install / update / rollback、runtime-data分離、private listener境界に加えて、rollback後もrecordings、starred recordings、audit recordsが破壊されないこと、runtime mount欠落/置換時にsilent root-filesystem fallbackを作らないことを、private deployment valuesを公開せずに確認する;
 - 比較が空inventoryで成立しないようupdate前にrecording / starred recording / camera source / audit recordをseedし、Capture Node不要の本環境で作れないcapture-agent protected incidents (#16) はnot applicableとして記録して、完全なdeploymentでの確認はPlan 21 (#28) が引き取る。
+- Owner presenceと匿名化したinvitationの`live:view` / `recordings:view` / revocation stateもseed・比較し、update/rollbackがOwner・招待・権限を失わせないことを確認する。rollback refusal後のintegrity/self-testは、documented recoveryでstartable stateを復旧してから実施する。
 
 ## Plan 23 — First-run setup wizard と初期設定フロー
 
