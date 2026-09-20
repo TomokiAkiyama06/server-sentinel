@@ -12,7 +12,9 @@ management operations.
 - `local_uvc` has a null `capture_node_id`. `remote_agent` refers to an existing
   capture-node UUID distinct from the source UUID. Several sources may share a
   node. Creating a node record does not pair or authorize a capture machine.
-- Source and node health are persisted separately. A node heartbeat cannot make
+- `SourceHealthState` and `NodeHealthState` are distinct types persisted with
+  separate state sets. Nodes use online/degraded/offline/revoked; sources use
+  online/degraded/offline/manual_intervention_required. A node heartbeat cannot make
   an offline or ambiguous camera healthy. The UVC adapter owns identity matching
   and the Owner re-approval required to resolve an ambiguous reconnect.
 - `enabled` reserves an active-source slot even when health is offline,

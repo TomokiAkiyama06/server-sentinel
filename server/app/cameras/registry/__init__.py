@@ -2,7 +2,7 @@
 
 from .models import (
     CameraSource, CaptureNode, CaptureProfile, DetectionBinding, DetectionKind,
-    HealthState, SourceType, ValidationError,
+    NodeHealthState, SourceHealthState, SourceType, ValidationError,
 )
 from .repository import (
     ActiveSourceLimitError, CameraRegistry, NotFoundError, RegistryError,
@@ -10,6 +10,6 @@ from .repository import (
 
 __all__ = [
     "ActiveSourceLimitError", "CameraRegistry", "CameraSource", "CaptureNode",
-    "CaptureProfile", "DetectionBinding", "DetectionKind", "HealthState",
+    "CaptureProfile", "DetectionBinding", "DetectionKind", "NodeHealthState", "SourceHealthState",
     "NotFoundError", "RegistryError", "SourceType", "ValidationError",
 ]

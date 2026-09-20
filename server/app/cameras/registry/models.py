@@ -17,11 +17,18 @@ class SourceType(StrEnum):
     REMOTE_AGENT = "remote_agent"
 
 
-class HealthState(StrEnum):
+class SourceHealthState(StrEnum):
     ONLINE = "online"
     DEGRADED = "degraded"
     OFFLINE = "offline"
     MANUAL_INTERVENTION_REQUIRED = "manual_intervention_required"
+
+
+class NodeHealthState(StrEnum):
+    ONLINE = "online"
+    DEGRADED = "degraded"
+    OFFLINE = "offline"
+    REVOKED = "revoked"
 
 
 class DetectionKind(StrEnum):
@@ -151,7 +158,7 @@ class DetectionBinding:
 class CaptureNode:
     id: UUID
     name: str
-    health_state: HealthState
+    health_state: NodeHealthState
     last_seen_at: datetime | None
     created_at: datetime
     updated_at: datetime
@@ -168,7 +175,7 @@ class CameraSource:
     capabilities: dict
     desired_capture_profile: CaptureProfile | None
     negotiated_capture_profile: CaptureProfile | None
-    health_state: HealthState
+    health_state: SourceHealthState
     image_quality_state: str
     last_seen_at: datetime | None
     created_at: datetime

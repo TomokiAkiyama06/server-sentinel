@@ -11,7 +11,7 @@ from uuid import UUID, uuid4
 from app.storage.database import Database
 from .models import (
     CameraSource, CaptureNode, CaptureProfile, DetectionBinding, DetectionKind,
-    HealthState, SourceType, ValidationError, json_object, positive_integer,
+    NodeHealthState, SourceHealthState, SourceType, ValidationError, json_object, positive_integer,
     text_value, timestamp,
 )
 
@@ -146,7 +146,7 @@ class CameraRegistry:
         if row is None:
             raise NotFoundError("capture node does not exist")
         return CaptureNode(
-            UUID(row["id"]), row["name"], HealthState(row["health_state"]),
+            UUID(row["id"]), row["name"], NodeHealthState(row["health_state"]),
             _parsed_time(row["last_seen_at"]), _parsed_time(row["created_at"]),
             _parsed_time(row["updated_at"]),
         )
@@ -163,7 +163,7 @@ class CameraRegistry:
             old = self._node(connection, identity)
             name = old.name if name is _UNSET else text_value(name, "node name")
             health = old.health_state if health_state is _UNSET else health_state
-            if not isinstance(health, HealthState):
+            if not isinstance(health, NodeHealthState):
                 raise ValidationError("invalid node health")
             seen = old.last_seen_at if last_seen_at is _UNSET else last_seen_at
             connection.execute(
@@ -248,7 +248,7 @@ class CameraRegistry:
             SourceType(row["source_type"]), row["name"], row["role_label"], bool(row["enabled"]),
             json.loads(row["capabilities"]), CaptureProfile(**json.loads(desired)) if desired else None,
             CaptureProfile(**json.loads(negotiated)) if negotiated else None,
-            HealthState(row["health_state"]), row["image_quality_state"],
+            SourceHealthState(row["health_state"]), row["image_quality_state"],
             _parsed_time(row["last_seen_at"]), _parsed_time(row["created_at"]),
             _parsed_time(row["updated_at"]), bindings,
         )
@@ -288,7 +288,7 @@ class CameraRegistry:
             self._write_bindings(connection, identity, bindings)
             return self._source(connection, identity)
 
-    def update_source_health(self, source_id: UUID, *, health_state: HealthState,
+    def update_source_health(self, source_id: UUID, *, health_state: SourceHealthState,
                              negotiated_capture_profile=_UNSET, image_quality_state=_UNSET,
                              last_seen_at=_UNSET) -> CameraSource:
         """Persist adapter observations, independently of node liveness.
@@ -298,7 +298,7 @@ class CameraRegistry:
         Quality is descriptive; unknown quality never means a negative detection.
         """
         identity = _identity(source_id)
-        if not isinstance(health_state, HealthState):
+        if not isinstance(health_state, SourceHealthState):
             raise ValidationError("invalid source health")
         with self._transaction(write=True) as connection:
             old = self._source(connection, identity)

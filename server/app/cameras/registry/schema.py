@@ -11,7 +11,7 @@ REGISTRY_MIGRATION = Migration(2, "camera_registry", (
     "CREATE TABLE capture_nodes ("
     "id TEXT PRIMARY KEY, name TEXT NOT NULL, "
     "health_state TEXT NOT NULL CHECK (health_state IN "
-    "('online', 'degraded', 'offline', 'manual_intervention_required')), "
+    "('online', 'degraded', 'offline', 'revoked')), "
     "last_seen_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)",
     "CREATE TABLE camera_sources ("
     "id TEXT PRIMARY KEY, capture_node_id TEXT REFERENCES capture_nodes(id), "
