@@ -165,6 +165,7 @@ try {
     });
     for (const recordings of [0, 3]) {
       await scenario(viewport, { recordings }, async page => {
+        await page.wait("typeof window.syntheticRecordingLoads === 'number'");
         assert.equal(await page.evaluate('window.syntheticRecordingLoads'), 0);
         await page.click('録画');
         await page.wait(`document.querySelectorAll('[data-recording-id]').length === ${recordings}`);
