@@ -139,5 +139,8 @@ a separate reviewed repository input, paths may not escape or use a remote URL,
 and cycles fail. The permissive license set is explicit; unknown free-form,
 proprietary, Elastic, Commons Clause, source-available, and other unlisted terms
 need exact Owner approval rather than being accepted because they do not match a
-known copyleft name. Committed `build/` and `dist/` model artifacts remain in the
-artifact scan and require independent weight evidence and checksum review.
+known copyleft name. Committed `build/` and `dist/` archives, extensionless
+artifacts, and unknown opaque output types remain in the artifact scan and
+require independent weight evidence and checksum review. Recognized Web/static
+asset suffixes are not classified as model artifacts merely because they are in
+a build output directory.

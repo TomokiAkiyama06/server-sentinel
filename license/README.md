@@ -34,4 +34,6 @@ the gate does not claim to re-fetch or independently reinterpret legal terms.
 Python `-r`/`-c` includes must resolve inside the repository to another reviewed
 requirements input. Every included file is audited and include cycles fail.
 Tracked `build/` and `dist/` trees are scanned for model artifacts like any other
-repository path; generated-output directory names do not waive review.
+repository path. Recognized Web/static output suffixes remain allowed, while
+archives, extensionless files, and unknown opaque output suffixes require model
+inventory review; generated-output directory names do not waive review.

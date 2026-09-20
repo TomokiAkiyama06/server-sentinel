@@ -287,9 +287,10 @@ class LicenseGateTests(unittest.TestCase):
             license_gate.audit(self.root)
 
     def test_tracked_build_and_dist_model_artifacts_are_not_excluded(self):
-        paths = {"build/models/opaque.zip", "dist/weights/person-v1"}
+        paths = {"build/opaque-model.zip", "dist/opaque-weight.binpack"}
         for path in paths:
             self.write(path, b"synthetic committed model output")
+        self.write("build/app.js", "console.log('synthetic reviewed static output');\n")
         subprocess.run(["git", "-C", str(self.root), "init", "--quiet"], check=True)
         subprocess.run(["git", "-C", str(self.root), "add", *sorted(paths)], check=True)
         tracked = subprocess.run(
@@ -298,6 +299,7 @@ class LicenseGateTests(unittest.TestCase):
         ).stdout.splitlines()
         self.assertEqual(set(tracked), paths)
         self.assertEqual(set(license_gate.model_files(self.root)), paths)
+        self.assertEqual(repository_guard.audit(self.root), [])
         with self.assertRaisesRegex(license_gate.GateError, "model artifact set differs"):
             license_gate.audit(self.root)
 

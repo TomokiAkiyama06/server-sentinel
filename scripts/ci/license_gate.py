@@ -25,6 +25,12 @@ APPROVALS = "license/owner-approvals.json"
 PINS = "license/pins.json"
 MODEL_DIRECTORIES = {"models", "weights", "checkpoints", "model-artifacts"}
 MODEL_ASSET_PATHS = {("assets", "ml"), ("assets", "ai")}
+BUILD_OUTPUT_DIRECTORIES = {"build", "dist"}
+RECOGNIZED_STATIC_OUTPUT_SUFFIXES = {
+    ".avif", ".cjs", ".css", ".gif", ".html", ".ico", ".jpeg", ".jpg",
+    ".js", ".json", ".license", ".map", ".md", ".mjs", ".otf", ".png",
+    ".svg", ".ttf", ".txt", ".webp", ".woff", ".woff2", ".xml",
+}
 MODEL_SUFFIXES = {
     ".bin", ".ckpt", ".engine", ".h5", ".mlmodel", ".onnx", ".pb", ".pt",
     ".pth", ".safetensors", ".tflite", ".weights",
@@ -139,6 +145,12 @@ def model_like_path(value):
     )
 
 
+def opaque_build_output(value):
+    path = PurePosixPath(value)
+    return (bool(set(path.parts[:-1]) & BUILD_OUTPUT_DIRECTORIES)
+            and path.suffix.lower() not in RECOGNIZED_STATIC_OUTPUT_SUFFIXES)
+
+
 def python_lock(path: Path, relative: str, scope: str):
     text = path.read_text(encoding="utf-8")
     logical = text.replace("\\\n", " ").splitlines()
@@ -241,10 +253,11 @@ def model_files(root: Path):
         if set(relative.parts) & excluded:
             continue
         in_model_directory = model_like_path(relative.as_posix())
+        opaque_output = opaque_build_output(relative.as_posix())
         has_model_suffix = path.suffix.lower() in MODEL_SUFFIXES
-        if path.is_symlink() and (in_model_directory or has_model_suffix):
+        if path.is_symlink() and (in_model_directory or opaque_output or has_model_suffix):
             raise GateError("model artifacts must be regular files")
-        if path.is_file() and (in_model_directory or has_model_suffix):
+        if path.is_file() and (in_model_directory or opaque_output or has_model_suffix):
             found.add(relative.as_posix())
     return sorted(found)
 
