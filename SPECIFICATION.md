@@ -770,6 +770,18 @@ This is not DRM. A user who can view video may still screen-record or use advanc
 
 ServerSentinel permission revocation invalidates application access promptly. Tailnet membership/policy remains a separate Tailscale administrative concern.
 
+### 11.8 Owner bootstrap and session decision status
+
+[ADR-0003](docs/ADR/0003-owner-authentication-and-trusted-proxy.md) is a
+**Proposed** implementation design for Issue #6, pending explicit Owner approval.
+Its timeout values, exact identity binding, local bootstrap, and recovery choices
+are not accepted product defaults. Until approval and Issue #10 implementation,
+the backend shell denies human requests, including application assets,
+health/version/schema, and SPA/error fallbacks. Issue #8's static shell remains
+a development/mock artifact until integrated with this protected delivery path.
+The ADR's synthetic design model proves only policy composition, not deployed
+proxy, session, cryptographic, or browser behavior.
+
 ## 12. Dashboard UI
 
 Primary views:

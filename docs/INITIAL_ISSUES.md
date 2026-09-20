@@ -256,6 +256,11 @@ Acceptance:
 - backend rejects spoofed identity headers from untrusted LAN paths;
 - no developer-operated identity/cloud.
 
+Design progress: [ADR-0003](ADR/0003-owner-authentication-and-trusted-proxy.md)
+is Proposed with synthetic policy-model coverage. Owner decisions remain pending;
+this does not close #6 or permit #10 authentication activation. Actual proxy,
+session, recovery, and stream tests remain #10/#19/#27/#28 work.
+
 ## Plan 5 — Local UVC discovery and stable identity
 
 GitHub Issue: [#11](https://github.com/TomokiAkiyama06/server-sentinel/issues/11)

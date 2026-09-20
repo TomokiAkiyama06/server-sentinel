@@ -492,3 +492,29 @@ Do not upload hardware serials, local mount identifiers, real temporary test med
 - [ ] inspect controlled startup, ordinary operation, error handling, and configuration paths using browser request inspection/local network observation; no prohibited reporting occurs;
 - [ ] explicitly configured product integrations are checked separately and never excuse unrelated reporting; no telemetry feature is introduced without a new explicit Owner decision and ADR changing PRIV-003;
 - [ ] traces and deployment identifiers remain local; publish only sanitized pass/fail results, never raw monitoring data, secrets, or private network logs.
+
+## ADR-0003 follow-up: proposed human-access boundary
+
+These checks belong to #10/#19/#28 after Owner approval and runtime integration.
+They are not completed by the Issue #6 synthetic policy model.
+
+- From ordinary LAN and Tailnet clients, attempt direct IPv4/IPv6 upstream access
+  and forged identity/forwarded headers, including Docker-published ports. Verify
+  no bypass to human routes, assets, health, schema, or SPA/error fallbacks.
+- On the installed Serve version, verify spoofed headers are replaced, tagged
+  devices have no human identity, and shared-but-uninvited users receive the same
+  generic denial. Reject malformed/duplicate/unsupported-encoding identities.
+- Verify first-visitor ownership is impossible; local administrator confirmation
+  creates exactly one Owner, and a concurrent attempt cannot add a second Owner.
+- Check phone/Mac/desktop same-origin session establishment, cookie attributes,
+  CSRF rejection, logout, expiry, restart/clock discontinuity, copied cookie/URL
+  rejection, and independent live/recordings/history permissions.
+- While each supported live/playback transport is actively delivering, revoke
+  access from another session. New requests fail after commit; measure delivery
+  cancellation across workers and blocked writes against the Owner-approved bound.
+  Distinguish server delivery from bytes already buffered in the browser.
+- Interrupt local recovery before/after durable commit, restore an authorization
+  backup, and simulate unavailable state. Verify fail-closed admission and no
+  restored sessions, media deletion, or network-policy mutation.
+- Keep real identities, network details, credentials, and media deployment-local.
+  Record sanitized outcomes only. No real execution is claimed by the ADR PR.
