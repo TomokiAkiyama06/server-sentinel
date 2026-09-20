@@ -687,11 +687,15 @@ person/face candidate
 
 Owner biometric processing, including face-crop analysis/comparison, and template/model metadata stay deployment-local. External biometric processing/storage is not an opt-in MVP option, and configured third-party media infrastructure does not authorize sending faces/crops to a biometric service. Enrollment/delete/re-enroll require owner authorization; raw template/embedding is never logged or included in diagnostic exports, including explicit Owner-initiated exports. Persistent non-owner face-template/profile libraries are prohibited whether named or anonymous; ordinary authorized video recordings remain distinct from such a library.
 
+The Issue #25 internal implementation uses a separate private singleton SQLite template store with Owner-only, revision-checked enrollment/replacement/deletion and atomic audit. Generation changes invalidate old/in-flight verification. `OwnerVerificationService.assess` runs the actual immutable candidate crop through its detector-specific gate and binds an opaque assessment to that candidate; source/stream/sequence alone cannot bind distinct face crops. Match receipts require the same issued object, current template generation and current quality assessment. Verifier/model absence, invalid quality or failed comparison is `unknown`. No production face model, weights, threshold, human route or external processing is supplied. See `server/app/detection/owner/README.md` for private-file, local-adapter and export contracts.
+
 ### 7.7 Anonymous tracking and entrance
 
 Non-owner observations may use ephemeral anonymous track IDs. Same-camera temporal tracking is allowed. Cross-camera biometric re-identification is not MVP.
 
 Entrance/zone profile may emit anonymous/owner entry-exit observations only when direction/quality conditions are met.
+
+The internal tracker associates geometry only within one camera stream/session, with explicit resource/gap/distance limits. Ambiguity, quality failure, unmatched observations and session discontinuities discard continuity; a finite directed line plus hysteresis requires observed crossing evidence and cancels reversals inside the deadband. Owner crossing additionally needs a current same-candidate/frame verification receipt; otherwise it remains anonymous. Public crossing DTOs omit ephemeral track/session IDs and biometrics. These primitives do not enable presence automation or timeline routes; see `server/app/detection/tracking/README.md`.
 
 ## 8. Presence and timeline
 
