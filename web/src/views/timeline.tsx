@@ -18,13 +18,15 @@ export function matches(filter: TimelineFilter, kind: ObservationKind): boolean 
   return filter === 'all' || kindGroup[kind] === filter;
 }
 
-const identityKinds: readonly ObservationKind[] = ['person', 'owner_entry', 'owner_exit',
-  'anonymous_entry', 'anonymous_exit'];
+/** Detector results are image-quality gated; status and configuration events are not. */
+export function detectorObservation(kind: ObservationKind): boolean {
+  return kindGroup[kind] === 'activity' || kindGroup[kind] === 'critical';
+}
 
-/** Unreliable results stay unknown: never a negative, never a factual person result. */
+/** Unreliable results stay unknown: never a negative, never a factual detection. */
 export function displayValue(item: Observation): ObservationValue {
   if (item.quality === 'sufficient') return item.value;
-  return item.value === 'not_observed' || identityKinds.includes(item.kind) ? 'unknown' : item.value;
+  return item.value === 'not_observed' || detectorObservation(item.kind) ? 'unknown' : item.value;
 }
 
 export function untrusted(item: Observation): boolean {

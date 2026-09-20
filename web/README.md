@@ -38,8 +38,10 @@ the backend or ingest listener.
 `src/views/timeline.tsx` lists one observation per row with its time, kind dot,
 neutral text, source/detector attribution and confidence/quality. Unreliable or
 unavailable results stay `unknown`: a quality-gated negative is never shown as
-"no person", and a low-quality person/owner/anonymous observation is never shown
-as a factual detection. The ordering statement follows `ordering_basis` while
+"no person", and a low-quality detector observation (person, motion, owner and
+anonymous entry/exit, server movement, camera tamper) is never shown as a
+factual detection. Status and configuration events, whose reported state is not
+image-quality gated, keep their value with the quality shown beside it. The ordering statement follows `ordering_basis` while
 `ordering_degraded` adds the warning. Clock skew or timestamp discontinuity is
 reported per span and by that ordering notice;
 the UI does not present that order as established causality, cause or

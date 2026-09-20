@@ -10,7 +10,7 @@ await compile('src/views/timeline.tsx', 'build/timeline.mjs');
 await compile('src/views/presence.tsx', 'build/presence.mjs');
 const { canVisit, views } = await import('../build/domain.mjs');
 const { messages } = await import('../build/i18n.mjs');
-const { TimelineBody, displayValue, filters, kindGroup, matches, spans } = await import('../build/timeline.mjs');
+const { TimelineBody, detectorObservation, displayValue, filters, kindGroup, matches, spans } = await import('../build/timeline.mjs');
 const { PresenceBody } = await import('../build/presence.mjs');
 
 // Synthetic only: no real person, deployment, camera or identity value appears here.
@@ -90,18 +90,28 @@ test('unreliable or unavailable results stay unknown instead of becoming a negat
   assert.equal(displayValue(observation('camera_health', { value: 'offline', quality: 'unknown' })), 'offline');
 });
 
-test('low-quality person and owner observations are not presented as factual results', () => {
-  for (const kind of ['person', 'owner_entry', 'owner_exit', 'anonymous_entry', 'anonymous_exit']) {
+test('low-quality detector positives are not presented as factual results', () => {
+  const detectors = kinds.filter(kind => detectorObservation(kind));
+  assert.deepEqual(detectors, ['person', 'motion', 'owner_entry', 'owner_exit', 'anonymous_entry',
+    'anonymous_exit', 'server_movement', 'camera_tamper']);
+  for (const kind of detectors) {
     for (const quality of ['insufficient', 'unknown']) {
       const item = observation(kind, { value: 'observed', quality, confidence: 0.3 });
       assert.equal(displayValue(item), 'unknown');
-      assert.match(timeline(page([item])), /判定できません/);
+      const markup = timeline(page([item]));
+      assert.match(markup, /判定できません/);
+      assert.doesNotMatch(markup, /: 検出/);
+      // The observation itself stays visible with its kind, attribution and quality.
+      assert.match(markup, new RegExp(`data-observation-kind="${kind}"`));
     }
     assert.equal(displayValue(observation(kind, { value: 'observed', quality: 'sufficient' })), 'observed');
   }
-  // Device and recording states keep their reported value; quality is shown beside it.
-  assert.equal(displayValue(observation('node_health', { value: 'offline', quality: 'unknown', source_id: null, node_id: '00000000-0000-4000-8000-0000000012ef' })), 'offline');
-  assert.equal(displayValue(observation('recording', { value: 'failed', quality: 'unknown' })), 'failed');
+  // Status and configuration events are not image-quality gated; the value stands.
+  for (const [kind, value] of [['camera_health', 'offline'], ['node_health', 'offline'],
+    ['recording', 'failed'], ['storage', 'degraded'], ['presence', 'changed'], ['configuration', 'changed']]) {
+    assert.equal(detectorObservation(kind), false);
+    assert.equal(displayValue(observation(kind, { value, quality: 'unknown' })), value);
+  }
 });
 
 test('ordering statement follows ordering_basis and the warning follows ordering_degraded', () => {
