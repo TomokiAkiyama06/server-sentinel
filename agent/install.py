@@ -15,6 +15,24 @@ from media_capture_agent.config import ConfigurationError, Settings
 from media_capture_agent.storage import StorageRefused, open_directory
 
 
+MAX_ARTIFACT_BYTES = 16 * 1024 * 1024
+
+
+def read_artifact(path):
+    """Never block on a special file or read an unbounded root-owned input."""
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
+    with os.fdopen(fd, "rb") as stream:
+        before = os.fstat(stream.fileno())
+        if not stat.S_ISREG(before.st_mode) or not 0 < before.st_size <= MAX_ARTIFACT_BYTES:
+            raise ValueError("artifact must be a bounded regular file")
+        data = stream.read(MAX_ARTIFACT_BYTES + 1)
+        after = os.fstat(stream.fileno())
+        if (len(data) != before.st_size or (before.st_size, before.st_mtime_ns, before.st_ctime_ns)
+                != (after.st_size, after.st_mtime_ns, after.st_ctime_ns)):
+            raise ValueError("artifact changed during verification")
+        return data
+
+
 def quote(value):
     value = str(value)
     if any(ord(char) < 32 for char in value) or "$" in value:
@@ -84,7 +102,7 @@ def install(args):
         raise ValueError("invalid release version")
     if not re.fullmatch(r"[0-9a-f]{64}", args.sha256):
         raise ValueError("verified artifact digest required")
-    artifact = args.artifact.read_bytes()
+    artifact = read_artifact(args.artifact)
     if hashlib.sha256(artifact).hexdigest() != args.sha256:
         raise ValueError("artifact digest mismatch")
     fd = os.open(args.config, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)

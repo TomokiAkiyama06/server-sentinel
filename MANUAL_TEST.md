@@ -512,6 +512,9 @@ The synthetic CI tests do not complete these checks. On an isolated Capture Node
   explicit video-node allowlist and empty capabilities; account/device permissions
   remain narrowly configured. Verify process command line and unit name (Linux
   kernel `comm` truncates names longer than 15 visible bytes).
+- [ ] Confirm `--check` succeeds both outside and inside the generated systemd
+  mount namespace when the media root is a subdirectory of an approved mount.
+  A bind of another backing directory on the same device must be rejected.
 - [ ] Start/stop through systemd after #11/#13/#14 integration; verify no GUI/tray,
   no microphone opens, no audio setting and no inbound listener/SSH dependency.
 - [ ] Unplug an approved UVC camera: source becomes offline while node heartbeat

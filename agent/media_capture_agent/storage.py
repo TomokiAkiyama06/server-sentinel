@@ -51,7 +51,7 @@ def parse_mounts(text):
             major, minor = map(int, fields[2].split(":"))
             mounts.append(Mount(ExpectedMount(
                 Path(decode_mount(fields[4])), filesystem[0],
-                decode_mount(filesystem[1]), major, minor,
+                decode_mount(filesystem[1]), major, minor, Path(decode_mount(fields[3])),
             ), int(fields[0]), "ro" in fields[5].split(",")
                 or "ro" in filesystem[2].split(",")))
     except (ValueError, IndexError) as exc:
@@ -132,13 +132,14 @@ class MediaStore:
             if not info.st_mode & stat.S_IWUSR or not info.st_mode & stat.S_IXUSR:
                 raise StorageRefused("media_root_not_writable")
             actual_mount_id = self.mount_id(self._fd)
-            applicable = [mount for mount in self.mounts()
+            mounts = self.mounts()
+            applicable = [mount for mount in mounts
                           if mount.mount_id == actual_mount_id
                           and self.settings.media_root.is_relative_to(mount.identity.mount_point)]
             if not applicable:
                 raise StorageRefused("mount_missing")
             mount = max(applicable, key=lambda entry: len(entry.identity.mount_point.parts))
-            if mount.identity != self.settings.expected_mount or mount.readonly:
+            if not self._approved_mount(mount.identity, mounts) or mount.readonly:
                 raise StorageRefused("mount_identity_mismatch")
             if (os.major(info.st_dev), os.minor(info.st_dev)) != (
                 mount.identity.major, mount.identity.minor
@@ -157,6 +158,28 @@ class MediaStore:
             return available
         except OSError as exc:
             raise StorageRefused("storage_unavailable") from exc
+
+    def _approved_mount(self, actual, mounts):
+        """Allow only the exact approved filesystem or its narrow service bind.
+
+        systemd ReadWritePaths creates a namespace bind at media_root. Its root
+        in the backing filesystem must equal the approved parent root plus the
+        configured relative path; a same-device bind of another directory fails.
+        The approved parent mount must remain visible in the namespace inventory.
+        """
+        expected = self.settings.expected_mount
+        if actual == expected:
+            return True
+        if actual.mount_point != self.settings.media_root:
+            return False
+        if not any(mount.identity == expected for mount in mounts):
+            return False
+        relative = self.settings.media_root.relative_to(expected.mount_point)
+        return (
+            actual.filesystem == expected.filesystem and actual.source == expected.source
+            and actual.major == expected.major and actual.minor == expected.minor
+            and actual.filesystem_root == expected.filesystem_root / relative
+        )
 
     def write_segment(self, segment_id, data):
         """Write a bounded opaque video segment; caller owns video provenance."""

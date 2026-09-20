@@ -12,7 +12,7 @@ from unittest.mock import patch
 from uuid import uuid4
 
 from build_artifact import build
-from install import render_unit
+from install import MAX_ARTIFACT_BYTES, read_artifact, render_unit
 from media_capture_agent.cli import main
 from media_capture_agent.config import ConfigurationError, Settings
 from media_capture_agent.health import ClockExchange, assess_clock
@@ -202,6 +202,32 @@ class StorageTests(DeploymentCase):
         with self.assertRaisesRegex(StorageRefused, "mount_replaced"):
             store.check()
 
+    def test_systemd_narrow_writable_bind_preserves_approved_backing_identity(self):
+        expected = self.settings.expected_mount
+        relative = self.settings.media_root.relative_to(expected.mount_point)
+        namespace = dataclasses.replace(expected, mount_point=self.settings.media_root,
+                                        filesystem_root=expected.filesystem_root / relative)
+        mounts = [Mount(expected, 10, True), Mount(namespace, 11, False)]
+        store = self.store(mounts=lambda: mounts, mount_id=lambda _: 11)
+        identity = uuid4()
+        store.write_segment(identity, b"synthetic namespace capture")
+        self.assertIn(identity, store.list_segments())
+        mounts.pop(0)
+        with self.assertRaisesRegex(StorageRefused, "mount_identity_mismatch"):
+            store.write_segment(uuid4(), b"missing approved parent")
+
+    def test_same_device_bind_of_unapproved_backing_directory_is_rejected(self):
+        expected = self.settings.expected_mount
+        substituted = dataclasses.replace(expected, mount_point=self.settings.media_root,
+                                          filesystem_root=Path("/synthetic-unapproved"))
+        mounts = [Mount(expected, 10, True), Mount(substituted, 11, False)]
+        with self.assertRaisesRegex(StorageRefused, "mount_identity_mismatch"):
+            self.store(mounts=lambda: mounts, mount_id=lambda _: 11)
+        same_point_wrong_root = dataclasses.replace(expected, filesystem_root=Path("/substitute"))
+        with self.assertRaisesRegex(StorageRefused, "mount_identity_mismatch"):
+            self.store(mounts=lambda: [Mount(same_point_wrong_root, 11, False)],
+                       mount_id=lambda _: 11)
+
     def test_mount_parser_escapes_and_readonly_superblock(self):
         mount = parse_mounts("31 20 8:1 / /synthetic\\040mount rw - ext4 /dev/synthetic ro\n")[0]
         self.assertEqual(mount.identity.mount_point, Path("/synthetic mount"))
@@ -358,6 +384,7 @@ class DistributionTests(DeploymentCase):
         values["runtime_root"] = str(values["runtime_root"])
         values["media_root"] = str(values["media_root"])
         values["expected_mount"]["mount_point"] = str(values["expected_mount"]["mount_point"])
+        values["expected_mount"]["filesystem_root"] = str(values["expected_mount"]["filesystem_root"])
         config.write_text(json.dumps(values))
         config.chmod(0o600)
         checked = subprocess.run([sys.executable, str(artifact), "--config", str(config), "--check"],
@@ -368,6 +395,36 @@ class DistributionTests(DeploymentCase):
             self.assertIn("LICENSE", archive.namelist())
             self.assertFalse(any("test" in name or name.endswith(".pyc")
                                  for name in archive.namelist()))
+
+    def test_artifact_fifo_device_symlink_and_oversize_are_rejected_before_read(self):
+        fifo = self.root / "artifact.fifo"
+        os.mkfifo(fifo, mode=0o600)
+        script = """
+import sys
+from pathlib import Path
+from install import read_artifact
+try:
+    read_artifact(Path(sys.argv[1]))
+except ValueError:
+    raise SystemExit(0)
+raise SystemExit(1)
+"""
+        subprocess.run([sys.executable, "-c", script, str(fifo)],
+                       check=True, timeout=2, capture_output=True)
+        with self.assertRaises(ValueError):
+            read_artifact(Path("/dev/zero"))
+        large = self.root / "oversized-artifact"
+        with large.open("wb") as stream:
+            stream.truncate(MAX_ARTIFACT_BYTES + 1)
+        with self.assertRaises(ValueError):
+            read_artifact(large)
+        valid = self.root / "bounded-artifact"
+        valid.write_bytes(b"bounded synthetic artifact")
+        self.assertEqual(read_artifact(valid), valid.read_bytes())
+        alias = self.root / "artifact-alias"
+        alias.symlink_to(valid)
+        with self.assertRaises(OSError):
+            read_artifact(alias)
 
     def test_unit_dedicated_account_and_video_only_devices(self):
         unit = render_unit(Path("/opt/example/0.1.0/media-capture-agent"),

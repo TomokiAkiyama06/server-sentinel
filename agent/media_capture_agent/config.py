@@ -33,11 +33,12 @@ class ExpectedMount:
     source: str
     major: int
     minor: int
+    filesystem_root: Path
 
     @classmethod
     def parse(cls, value):
         if not isinstance(value, dict) or set(value) != {
-            "mount_point", "filesystem", "source", "major", "minor"
+            "mount_point", "filesystem", "source", "major", "minor", "filesystem_root"
         }:
             raise ConfigurationError("expected mount identity is required")
         for key in ("filesystem", "source"):
@@ -49,7 +50,8 @@ class ExpectedMount:
             if type(value[key]) is not int or value[key] < 0:
                 raise ConfigurationError("invalid device identity")
         return cls(absolute_path(value["mount_point"]), value["filesystem"],
-                   value["source"], value["major"], value["minor"])
+                   value["source"], value["major"], value["minor"],
+                   absolute_path(value["filesystem_root"]))
 
 
 @dataclass(frozen=True)
