@@ -11,6 +11,7 @@ from app.logging import Event
 from app.settings import Settings
 from app.storage.database import Database
 from app.storage.migrations import migrate
+from app.storage.schema import APPLICATION_MIGRATIONS
 
 
 class ClosedHumanSurface:
@@ -47,7 +48,7 @@ def create_app(settings: Settings, *, database: Database | None = None,
         application.state.ready = False
         try:
             with closing(store.connect()) as connection:
-                migrate(connection)
+                migrate(connection, APPLICATION_MIGRATIONS)
         except Exception:
             logging.getLogger(__name__).error(Event.STARTUP_FAILED)
             # Lifespan failures must not pass SQLite/config values to servers.

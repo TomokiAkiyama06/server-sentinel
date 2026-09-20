@@ -355,6 +355,9 @@ class RecordingTests(unittest.TestCase):
         self.assertEqual("gapped", result["status"])
         self.assertEqual([], result["gaps"])
         self.assertEqual("stream_discontinuity", result["discontinuities"][0]["reason"])
+        self.assertEqual((40_000, 40_000),
+                         (result["discontinuities"][0]["start_ms"],
+                          result["discontinuities"][0]["end_ms"]))
         next_recording = self.store.start_manual(self.source, 50_000, duration_ms=10_000)
         self.store.append(self.segment(50_000, 60_000, 0, stream_id=uuid4()))
         # The new recording begins at this independently decodable generation;
@@ -379,6 +382,17 @@ class RecordingTests(unittest.TestCase):
         with self.assertRaisesRegex(RecordingError, "TIMELINE_REGRESSION"):
             self.store.append(self.segment())
 
+    def test_discontinuity_crossing_start_is_clipped_to_recording_window(self):
+        self.store.append(self.segment(10_000, 20_000))
+        recording = self.store.start_manual(self.source, 30_000, duration_ms=20_000)
+        self.store.append(self.segment(40_000, 50_000, 2))
+        result = self.store.finish(recording)
+        self.assertEqual("gapped", result["status"])
+        self.assertEqual([{"start_ms": 30_000, "end_ms": 40_000,
+                           "reason": "stream_discontinuity"}], result["discontinuities"])
+        self.assertEqual((30_000, 40_000),
+                         (result["gaps"][0]["start_ms"], result["gaps"][0]["end_ms"]))
+
     def test_source_limit_and_explicit_release_preserve_recordings(self):
         sources = [self.source, uuid4(), uuid4(), uuid4()]
         for source in sources:
@@ -389,6 +403,15 @@ class RecordingTests(unittest.TestCase):
         self.store.release_source(self.source)
         self.store.append(self.segment(source_id=uuid4()))
         self.assertEqual("complete", self.store.finish(recording)["status"])
+
+    def test_late_stop_clips_discontinuity_crossing_both_window_boundaries(self):
+        self.store.append(self.segment(10_000, 20_000))
+        recording = self.store.start_manual(self.source, 30_000, duration_ms=70_000)
+        self.store.append(self.segment(90_000, 100_000, 2))
+        result = self.store.finish(recording, stop_ms=50_000)
+        self.assertEqual([], result["segments"])
+        self.assertEqual([{"start_ms": 30_000, "end_ms": 50_000,
+                           "reason": "stream_discontinuity"}], result["discontinuities"])
 
     def test_row_and_active_recording_limits(self):
         self.store.close()

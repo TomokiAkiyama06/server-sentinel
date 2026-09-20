@@ -28,10 +28,10 @@ Issue #1 closed when PR #2 merged after documentation/bootstrap acceptance and c
 
 ## Phase 2 — Camera Source + Capture Node platform
 
-- [ ] generic Camera Source registry
-- [ ] `local_uvc` / `remote_agent`
-- [ ] active-source limit default 4
-- [ ] capabilities/health/profile model
+- [x] generic Camera Source registry
+- [x] `local_uvc` / `remote_agent`
+- [x] active-source limit default 4
+- [x] capabilities/health/profile model
 - [ ] local UVC discovery/ingest
 - [ ] stable/ambiguous UVC identity handling
 - [ ] `media-capture-agent` native service

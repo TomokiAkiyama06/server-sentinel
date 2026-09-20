@@ -577,6 +577,17 @@ class RecordingStore:
                           "reason": "stream_discontinuity"}
                 if marker not in result["discontinuities"]:
                     result["discontinuities"].append(marker)
+        bounded = []
+        seen = set()
+        for marker in result["discontinuities"]:
+            if marker["start_ms"] >= end or marker["end_ms"] <= row["start_ms"]:
+                continue
+            key = (max(row["start_ms"], marker["start_ms"]),
+                   min(end, marker["end_ms"]), marker["reason"])
+            if key not in seen:
+                bounded.append({"start_ms": key[0], "end_ms": key[1], "reason": key[2]})
+                seen.add(key)
+        result["discontinuities"] = bounded
         result["byte_length"] = sum(item["byte_length"] for item in result["segments"])
         if result["status"] == "complete" and (result["gaps"] or result["discontinuities"]):
             result["status"] = "gapped"
