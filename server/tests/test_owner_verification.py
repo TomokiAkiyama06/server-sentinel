@@ -11,18 +11,20 @@ from uuid import UUID, uuid4
 import json
 import os
 import socket
+import sqlite3
 import stat
 import threading
 
 from app.detection.owner.contracts import (Comparison, DenyOwner, FaceCandidate, ModelProvenance,
                                            Operation, OwnerError, Verdict, VerificationReason)
 from app.detection.owner.service import OwnerVerificationService
-from app.detection.owner.store import EnrollmentStatus, OwnerTemplateStore
+from app.detection.owner.store import _MIGRATIONS, EnrollmentStatus, OwnerTemplateStore
 from app.detection.quality import Execution, QualityGate
 from tests.test_detector_quality import SOURCE, assess, calibrated_policy, context, synthetic_person
 
 
 NOW = datetime(2026, 1, 1, tzinfo=timezone.utc)
+MIGRATION = _MIGRATIONS[0]
 PROVENANCE = ModelProvenance("generated-test-adapter", "fixture-1", "Apache-2.0", "Apache-2.0",
                              "https://example.invalid/generated-fixture", "a" * 64, "b" * 64, UUID(int=99))
 
@@ -286,6 +288,30 @@ class OwnerTests(TestCase):
         self.assertEqual(self.store.status().generation, 1)
         self.assertTrue(self.store.status().enrolled)
         self.assertEqual(self.store._db.execute("SELECT COUNT(*) FROM owner_template_audit").fetchone()[0], 1)
+
+    def test_migration_drift_is_the_fixed_owner_storage_error(self):
+        # Edited/newer private migration history must not leak MigrationError
+        # to callers that only handle owner-store unavailability.
+        for statement, parameters in (
+                ("UPDATE schema_migrations SET checksum=? WHERE version=1", ("0" * 64,)),
+                ("INSERT INTO schema_migrations VALUES(2,'synthetic_future',?)", ("1" * 64,))):
+            with self.subTest(statement=statement.split()[0]):
+                self.store.close()
+                connection = sqlite3.connect(self.root / "owner-template.sqlite3", isolation_level=None)
+                try:
+                    connection.execute(statement, parameters)
+                finally:
+                    connection.close()
+                with self.assertRaisesRegex(OwnerError, "PRIVATE_TEMPLATE_STORAGE_UNAVAILABLE"):
+                    self.open_store()
+                connection = sqlite3.connect(self.root / "owner-template.sqlite3", isolation_level=None)
+                try:
+                    connection.execute("DELETE FROM schema_migrations")
+                    connection.execute("INSERT INTO schema_migrations VALUES(1,?,?)",
+                                       (MIGRATION.name, MIGRATION.checksum))
+                finally:
+                    connection.close()
+                self.store = self.open_store()
 
     def test_authorization_rechecked_after_template_creation(self):
         enroll = self.verifier.enroll

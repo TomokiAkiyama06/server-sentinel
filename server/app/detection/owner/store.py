@@ -11,7 +11,7 @@ import sqlite3
 import stat
 import threading
 
-from app.storage.migrations import Migration, migrate
+from app.storage.migrations import Migration, MigrationError, migrate
 from .contracts import DenyOwner, ModelProvenance, Operation, OwnerError
 
 
@@ -100,7 +100,9 @@ class OwnerTemplateStore:
                 self._db.execute("PRAGMA secure_delete=ON")
                 migrate(self._db, _MIGRATIONS)
                 os.fsync(self._fd)
-        except (OSError, sqlite3.Error):
+        except (OSError, sqlite3.Error, MigrationError):
+            # Edited/newer migration history and failed DDL are storage
+            # unavailability too; callers see one fixed non-sensitive error.
             self.close()
             raise OwnerError("PRIVATE_TEMPLATE_STORAGE_UNAVAILABLE") from None
         except BaseException:
