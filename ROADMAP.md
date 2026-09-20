@@ -34,7 +34,7 @@ Issue #1 closed when PR #2 merged after documentation/bootstrap acceptance and c
 - [ ] capabilities/health/profile model
 - [ ] local UVC discovery/ingest
 - [ ] stable/ambiguous UVC identity handling
-- [ ] `media-capture-agent` native service
+- [ ] `media-capture-agent` native service — #12 foundation implemented; capture/paired transport integration and physical acceptance pending
 - [ ] video-only capture
 - [ ] one-time pairing + mTLS/revocation
 - [ ] separate LAN ingest listener

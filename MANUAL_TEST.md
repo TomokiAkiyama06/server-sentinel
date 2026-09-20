@@ -492,3 +492,31 @@ Do not upload hardware serials, local mount identifiers, real temporary test med
 - [ ] inspect controlled startup, ordinary operation, error handling, and configuration paths using browser request inspection/local network observation; no prohibited reporting occurs;
 - [ ] explicitly configured product integrations are checked separately and never excuse unrelated reporting; no telemetry feature is introduced without a new explicit Owner decision and ADR changing PRIV-003;
 - [ ] traces and deployment identifiers remain local; publish only sanitized pass/fail results, never raw monitoring data, secrets, or private network logs.
+
+### Issue #12 foundation acceptance (pending physical execution)
+
+The synthetic CI tests do not complete these checks. On an isolated Capture Node:
+
+- [ ] Build/verify the versioned Agent artifact and run `--check` as the dedicated
+  non-root account; runtime/media directories are outside source/install trees.
+- [ ] Inspect the generated `media-capture-agent.service`, its dedicated UID,
+  explicit video-node allowlist and empty capabilities; account/device permissions
+  remain narrowly configured. Verify process command line and unit name (Linux
+  kernel `comm` truncates names longer than 15 visible bytes).
+- [ ] Start/stop through systemd after #11/#13/#14 integration; verify no GUI/tray,
+  no microphone opens, no audio setting and no inbound listener/SSH dependency.
+- [ ] Unplug an approved UVC camera: source becomes offline while node heartbeat
+  continues. Reconnect obeys stable identity and ambiguous-device approval.
+- [ ] Inject excessive clock offset, uncertainty and wall-clock steps using mocks
+  or an isolated test process; timing degradation remains visible and is not
+  interpreted as reliable event ordering.
+- [ ] Use an isolated test filesystem to exercise mount disappearance, replacement,
+  read-only state and reserve pressure at startup and runtime. Check descriptor
+  pinning and no fallback-directory creation without altering production mounts.
+- [ ] Restart at storage hard stop: inventory and authorized cleanup remain
+  possible; new allocations and installer `--check` fail until reserve is restored.
+- [ ] Confirm network observation after authenticated transport integration shows
+  only Owner-configured Main communication, including error/reconnect paths.
+
+Publish only pass/fail summaries; keep configs, mount identity, host identifiers,
+credentials and captured media private.
