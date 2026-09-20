@@ -284,7 +284,12 @@ class SourcePipeline:
     @property
     def status(self) -> PipelineStatus:
         recording = self.recording_status
-        viewer = self.viewer_status if self._viewers else None
+        last_viewer = self.viewer_status
+        # An idle viewer normally has no bearing on source health.  A failed
+        # cleanup is different: its resources remain allocated and block the
+        # next viewer/profile lifecycle, so it must remain observable.
+        viewer = (last_viewer if self._viewers
+                  or (last_viewer is not None and last_viewer.failed) else None)
         reasons = set(self._capture_reasons)
         if self._claim is not None and not self._claim.active:
             reasons.add("admission_expired")
@@ -327,12 +332,13 @@ class SourcePipeline:
             raise ValueError("viewer output must be video-only")
         if self._profiles.viewer == profile:
             return
+        updated = replace(self._profiles, viewer=profile)
+        self._check_admission(updated)
         self._close_viewer()
         # A failed close leaves an old codec process/path alive.  Do not publish
         # a new selected profile while that path still owns the old one.
         if self._viewer is not None:
             raise RuntimeError("viewer cleanup must finish before profile replacement")
-        updated = replace(self._profiles, viewer=profile)
         self._ensure_admitted(updated)
         self._profiles = updated
         if self._viewers:
@@ -428,4 +434,8 @@ class SourcePipeline:
 
     def _ensure_admitted(self, profiles: SourceProfiles) -> None:
         if self._claim is not None and not self._claim.transition(profiles):
+            raise ValueError("profiles are not admitted for this source")
+
+    def _check_admission(self, profiles: SourceProfiles) -> None:
+        if self._claim is not None and not self._claim.permits(profiles):
             raise ValueError("profiles are not admitted for this source")

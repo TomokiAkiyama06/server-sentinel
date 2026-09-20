@@ -309,8 +309,14 @@ class AdmissionTests(unittest.TestCase):
                      admission=decision.lease)
         unsupported = ViewerProfile(video_format(width=640, height=360,
                                                   fps=Fraction(5)))
+        value.add_viewer(SUBSCRIBER)
         with self.assertRaises(ValueError):
             value.replace_viewer_profile(unsupported)
+        self.assertEqual(value.profiles, allowed)
+        self.assertEqual(admissions.admitted(SOURCE), allowed)
+        self.assertIsNotNone(value.viewer_status)
+        self.assertTrue(value.viewer_status.active)
+        self.assertEqual(value.subscriber_count, 1)
         with self.assertRaises(ValueError):
             value.replace_inference_profile(inference_profile(fps=Fraction(2)))
         self.assertEqual(value.profiles, allowed)
@@ -583,6 +589,22 @@ class PipelineTests(unittest.TestCase):
         value.add_viewer(SUBSCRIBER)
         self.assertTrue(factory.adapters[0].closed)
         self.assertEqual(len(factory.adapters), 2)
+
+    def test_failed_idle_viewer_cleanup_remains_source_degradation(self):
+        factory = SyntheticFactory()
+        value = pipeline(recording=SyntheticFactory(), viewer=factory)
+        self.addCleanup(value.close)
+        value.offer(packet(0, keyframe=True))
+        value.pump(1)
+        value.add_viewer(SUBSCRIBER)
+        factory.adapters[0].fail_close = True
+        value.remove_viewer(SUBSCRIBER)
+
+        status = value.status
+        self.assertEqual(status.state, "degraded")
+        self.assertIsNotNone(status.viewer)
+        self.assertTrue(status.viewer.failed)
+        self.assertIn("viewer_adapter_close_failed", status.reasons)
 
     def test_failed_viewer_cleanup_cannot_publish_a_replacement_profile(self):
         base = source_profiles()

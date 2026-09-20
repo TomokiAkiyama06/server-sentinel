@@ -79,6 +79,9 @@ class _PipelineClaim:
     def transition(self, profiles: SourceProfiles) -> bool:
         return self._owner._transition_pipeline(self, profiles)
 
+    def permits(self, profiles: SourceProfiles) -> bool:
+        return self._owner._permits_pipeline(self, profiles)
+
     def release(self) -> bool:
         return self._owner._release_pipeline(self)
 
@@ -194,6 +197,17 @@ class SourceProfileAdmissions:
                 return False
             self._profiles[claim.source_id] = profiles
             return True
+
+    def _permits_pipeline(self, claim: _PipelineClaim,
+                          profiles: SourceProfiles) -> bool:
+        """Check a proposed complete set without publishing a transition."""
+        if (not isinstance(claim, _PipelineClaim) or claim._owner is not self
+                or not isinstance(profiles, SourceProfiles)):
+            return False
+        with self._lock:
+            return (self._leases.get(claim.source_id) is claim.lease
+                    and self._pipeline_owners.get(claim.source_id) is claim
+                    and profiles in claim.lease.profile_sets)
 
     def admitted(self, source_id: UUID) -> SourceProfiles | None:
         if not isinstance(source_id, UUID):
