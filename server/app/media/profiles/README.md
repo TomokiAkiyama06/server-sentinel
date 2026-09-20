@@ -12,6 +12,20 @@ defaults. `replace_viewer_profile()` and `replace_inference_profile()` do not
 mutate capture or durable-recording settings. Capture/recording renegotiation
 requires closing a stream generation and constructing a new pipeline.
 
+`SourceProfileCapabilities` is an exact per-source allowlist produced after an
+adapter inspects that source. `SourceProfileAdmissions` atomically checks all
+four requested profiles against that allowlist and an explicitly configured
+active-source limit. A rejected replacement leaves the previous admitted set
+unchanged. It does not infer modes from a source role/type or provide benchmark
+defaults. The Camera Source registry remains authoritative for persisted
+configuration; this is the scheduler-side boundary before pipeline construction.
+Successful admission returns a generation-bound lease. An admission-bound
+pipeline accepts viewer/inference adaptation only when the resulting complete
+set is in that lease's allowlist. The same manager transition publishes the
+selected complete set, so admission state stays aligned with the pipeline.
+Teardown releases only the matching generation, so a delayed old teardown cannot
+remove a replacement reservation. Released or superseded leases fail closed.
+
 `plan_encoding()` permits copy only when complete verified descriptors match:
 video-only content, codec/profile, codec initialization digest, container,
 dimensions, frame rate, time base, pixel format, color space and bitrate bound.
@@ -57,6 +71,13 @@ Viewer loss counters belong to the stream generation and survive profile
 replacement and zero-subscriber restart. A recovered adapter can produce video
 while status still exposes `prior_viewer_loss`; a fresh keyframe does not erase
 earlier drops or gaps. Only a new `SourcePipeline` generation starts new counters.
+
+`SourcePipeline.status` combines capture discontinuities with the mandatory
+recording path and, only while subscribed, the viewer path. It reports
+`unavailable` for a missing/failed recording adapter, capture renegotiation, or
+a closed pipeline; known loss/backpressure remains `degraded` after delivery
+recovers. An idle viewer path is excluded, so old viewer-only loss does not imply
+that durable recording is unhealthy.
 
 `InferenceSampler` accepts presentation-ordered **decoded frame** timestamps and
 returns whether to emit a frame at the configured inference dimensions. It uses

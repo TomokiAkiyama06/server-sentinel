@@ -487,11 +487,23 @@ Final defaults are measured, not guessed.
 The transport-independent implementation in `server/app/media/profiles/` uses
 explicit immutable profiles, conservative exact-descriptor copy eligibility,
 bounded per-path compressed queues, and demand-driven viewer adapter lifetimes.
+Before pipeline construction, scheduler-side admission can bind the complete
+profile set to an exact allowlist discovered for that source and an explicit
+active-source limit. Admission is atomic, does not infer profiles from source
+type/role, and supplies no benchmark-derived defaults. The persisted Camera
+Source registry remains authoritative for configuration. Successful admission
+returns a generation-bound lease: profile adaptation must remain within its
+complete-set allowlist and atomically updates the manager's selected profile set.
+Stale generation teardown cannot release the current source reservation, and a
+released or superseded lease cannot construct or continue a pipeline.
 Inference sampling applies to presentation-ordered decoded frames, never to
 compressed reference packets before decoding. Packet gaps reset dependency state
 and require a keyframe; the capture profile also sets an explicit maximum forward
 timestamp gap, independent of inference cadence. Known loss remains visible after
-recovery. Missing codec
+recovery. Source status combines capture continuity and mandatory recording with
+viewer health only while viewers are subscribed; capture renegotiation or missing
+recording capability is unavailable, and known loss/backpressure is degraded
+rather than silently healthy. Missing codec
 adapters report unavailable. Real codec/transport integration and measured
 deployment defaults are still required; see that directory's integration contract.
 
