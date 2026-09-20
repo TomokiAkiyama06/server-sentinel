@@ -224,8 +224,12 @@ class SceneDetectorTests(unittest.TestCase):
         self.assertEqual(Observation.UNKNOWN, after_gap.movement)
         self.assertFalse(after_gap.critical)
 
+    def test_calibration_without_a_usable_threshold_transform_is_refused(self):
+        with self.assertRaises(ValueError):
+            detector(rules=policy(minimum_coverage=1))
+
     def test_low_margin_match_stays_indeterminate_instead_of_confirming_tamper(self):
-        rules = policy(camera_shift_pixels=2)
+        rules = policy(camera_shift_pixels=2, minimum_coverage=.5)
         instance = detector(rules=rules, reference=repetitive())
         jittered = repetitive(1)
         inspect_scene(instance, frame(0, repetitive()), 0)

@@ -65,6 +65,18 @@ def variance(reference, points):
     return sum((value - mean) ** 2 for value in values) / len(values)
 
 
+def coverage(points, transform, center, width, height):
+    """Fraction of support points a candidate keeps inside the frame."""
+    if not points:
+        return 0.0
+    inside = 0
+    for point in points:
+        x, y = apply(point, transform, center)
+        if 0 <= x < width and 0 <= y < height:
+            inside += 1
+    return inside / len(points)
+
+
 def dissimilarity(reference: GrayFrame, current: GrayFrame, points):
     """Mean absolute untransformed difference in [0, 1] over support points.
 

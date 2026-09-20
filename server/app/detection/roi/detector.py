@@ -6,7 +6,7 @@ from uuid import uuid4
 from app.cameras.registry.models import timestamp
 from app.detection.foundation import GrayFrame, Observation, Quality
 from .contracts import Calibration, CriticalKind, CriticalObservation, SceneObservation
-from .geometry import (candidates, contains, dissimilarity, match,
+from .geometry import (candidates, contains, coverage, dissimilarity, match,
                        validate_polygon, variance)
 
 
@@ -86,6 +86,17 @@ class SceneDetector:
                        + len(reference.pixels))
         if comparisons > self.policy.maximum_comparisons:
             raise ValueError("calibration exceeds comparison budget")
+        # The policy checks that a search radius reaches its threshold, but this
+        # support may drop those candidates at the coverage gate: background
+        # points on the frame edge leave the frame under any translation. A
+        # calibration that cannot register the displacement it must detect would
+        # report it as an unmatched scene instead, so it is refused here.
+        if not self._reachable(self.background, self.global_candidates, self.frame_center,
+                               self.policy.camera_shift_pixels, reference):
+            raise ValueError("no usable global transform reaches the camera-shift threshold")
+        if not self._reachable(self.roi_points, self.roi_candidates, self.roi_center,
+                               self.policy.movement_pixels, reference):
+            raise ValueError("no usable ROI transform reaches the movement threshold")
         self.reference_digest = calibration.reference_sha256
         self.stream_id = None
         self.last_sequence = -1
@@ -98,6 +109,16 @@ class SceneDetector:
         self.shift_reported = False
         self.movement = _Confirmation()
         self.tamper = _Confirmation()
+
+    def _reachable(self, points, transforms, center, threshold, reference):
+        """Does a candidate at or beyond the threshold survive the coverage gate?"""
+        for transform in transforms:
+            if transform.rotated == 0 and transform.dx ** 2 + transform.dy ** 2 < threshold ** 2:
+                continue
+            if coverage(points, transform, center, reference.width,
+                        reference.height) >= self.policy.minimum_coverage:
+                return True
+        return False
 
     def _interrupt(self):
         self.movement.interrupt()

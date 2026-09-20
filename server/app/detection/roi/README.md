@@ -10,9 +10,12 @@ source type, profile ID, explicit search/quality thresholds, version, and
 timestamp. A policy is refused when a bounded search window cannot reach its
 own displacement threshold, because such a configuration cannot express the
 movement or camera shift it asks for and would report a matching geometry
-instead. A calibration whose reference already meets the obscured-scene
-threshold is refused for the same reason: every unchanged sample would look
-obscured and confirm a tamper that never happened. `CalibrationArchive` is a small append-only SQLite port: the Main
+instead. A calibration is refused for the same reason when its own support
+leaves no threshold-reaching candidate above `minimum_coverage`, since the
+policy radius alone does not say which candidates survive the coverage gate.
+A calibration whose reference already meets the obscured-scene threshold is
+refused too: every unchanged sample would look obscured and confirm a tamper
+that never happened. `CalibrationArchive` is a small append-only SQLite port: the Main
 runtime must supply its already-open private database after application
 migration (`roi_calibration_history`) has run. The table holds provenance
 only — identities, polygon, policy, reference geometry and the reference
