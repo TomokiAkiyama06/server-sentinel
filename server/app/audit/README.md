@@ -18,8 +18,10 @@ through `list_audit_records()`. Its injected authorizer must fail closed unless
 the current deployment Owner is established, and `create_app()` installs
 `DenyAllOwners` until a deployment supplies one. The actor context is used only
 by that authorizer and is never stored or represented. A denied operation is not
-run; successful and failed operations are recorded without their result or
-exception details. `execute_transactional()` places the domain mutation and
+run, and its caller always receives the denial itself: if the denial record
+cannot be written, the loss becomes bounded health rather than a storage error
+that would disclose deployment state to a denied actor. Successful and failed
+operations are recorded without their result or exception details. `execute_transactional()` places the domain mutation and
 successful audit append in the same SQLite transaction, so an audit write
 failure rolls the mutation back. Plain `PermissionError` denial from an injected
 authorizer is safely classified without inspecting its detail.

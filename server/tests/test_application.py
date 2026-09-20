@@ -218,10 +218,15 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
                     target_kind=TargetKind.ADMIN_SETTINGS,
                     target_logical_id=uuid4(), outcome=AuditOutcome.SUCCEEDED,
                 )
-            with self.assertRaises(AuditStorageError):
+            # The default authorizer still denies, and an unwritable denial
+            # record never becomes a storage error for the denied caller.
+            with self.assertRaises(OwnerAuthorizationError):
                 application.state.owner_administration.create_capture_node(
                     {"synthetic": "untrusted"}, "Refused node",
                 )
+            self.assertTrue(
+                application.state.owner_administration.service.audit_delivery_failed,
+            )
             # Nothing was written, and reading audit history still works.
             self.assertEqual((), application.state.audit_store.list_records())
             with closing(application.state.database.connect()) as connection:

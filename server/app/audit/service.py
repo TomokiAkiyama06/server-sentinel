@@ -103,11 +103,12 @@ class OwnerAuditService:
                             if connection.in_transaction:
                                 connection.execute("ROLLBACK")
                             raise
-            except BaseException:
-                # Denied work never ran, so keep the denial as the caller's
-                # result and expose the undelivered record through health.
+            except Exception:
+                # A denied actor always receives the denial itself, never a
+                # storage error that would disclose deployment state or look
+                # like a transient fault worth retrying. The undelivered record
+                # stays visible in bounded health instead.
                 self._delivery_failed()
-                raise
             raise OwnerAuthorizationError(category) from None
 
     def execute_transactional(self, actor_context: object, *, action: AuditAction,

@@ -394,9 +394,12 @@ class AuditTests(unittest.TestCase):
         self.assertFalse(service.audit_delivery_failed)
 
         reservation.denial = "STORAGE_HARD_STOP"
-        with self.assertRaises(SyntheticStorageDenied):
+        # A refused denial record still denies: the caller never receives a
+        # storage error that discloses deployment state or invites a retry.
+        with self.assertRaises(OwnerAuthorizationError):
             admin.create_capture_node({"synthetic": "not-owner"}, "Denied node")
         self.assertEqual(1, self.remaining())
+        self.assertEqual(0, self.remaining("capture_nodes"))
         self.assertTrue(service.audit_delivery_failed)
         self.assertEqual(1, service.undelivered_audit_records)
 
