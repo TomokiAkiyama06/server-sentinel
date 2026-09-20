@@ -53,14 +53,18 @@ class OwnerVerificationService:
 
     def enroll(self, candidate: FaceCandidate, gate: QualityGate, decision: OwnerAssessment, *,
                expected_generation: int, at: datetime):
+        # Authorize before any private read, so an unauthorized caller cannot
+        # probe whether an Owner template exists. Every enrollment path needs
+        # the ENROLL right; overwriting an existing template additionally needs
+        # REPLACE, and both must resolve to the same Owner principal.
+        actor = self.store._authorize(Operation.ENROLL)
         current = self.store.status()
-        # The audited label cannot go stale: generation is monotonic, and the
+        operation = Operation.REPLACE if current.enrolled else Operation.ENROLL
+        if operation is not Operation.ENROLL and self.store._authorize(operation) != actor:
+            raise OwnerError("OWNER_AUTHORIZATION_REQUIRED")
+        # The audited label cannot go stale: generation is monotonic and the
         # transaction re-checks it, so a concurrent enroll/delete aborts the
         # mutation instead of committing under the other operation's name.
-        # Authorization stays first so an unauthorized caller learns nothing
-        # about the current enrollment state.
-        operation = Operation.REPLACE if current.enrolled else Operation.ENROLL
-        actor = self.store._authorize(operation)
         if current.generation != expected_generation:
             raise OwnerError("TEMPLATE_GENERATION_CHANGED")
         if self._verifier is None:

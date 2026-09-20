@@ -23,7 +23,10 @@ production storage policy/lifecycle is silently installed by this module.
 
 Enrollment/replacement/delete require `OwnerAuthorizer.require_owner(operation)`;
 the default denies, and the implementation must validate an actual current
-application principal. Mutations atomically check expected generation, advance
+application principal. Enrollment authorizes `ENROLL` before reading any
+private state, so an unauthorized caller cannot probe whether a template exists;
+overwriting an existing template additionally requires `REPLACE` from the same
+principal. Mutations atomically check expected generation, advance
 it and audit the actor UUID, operation and UTC time. Raw template/provenance is
 private to the verifier, never an audit payload. Replacement/delete invalidate
 old and in-flight results. `secure_delete=ON`, DELETE journals and FULL sync are

@@ -107,6 +107,38 @@ class OwnerTests(TestCase):
             self.store.delete(expected_generation=0, at=NOW)
         self.assertFalse(self.store.status().enrolled)
 
+    def test_unauthorized_enrollment_never_reads_private_state(self):
+        self.store._authorizer = DenyOwner()
+        reads = []
+        status = OwnerTemplateStore.status
+
+        def recording(store):
+            reads.append(True)
+            return status(store)
+
+        with patch.object(OwnerTemplateStore, "status", recording):
+            with self.assertRaisesRegex(OwnerError, "OWNER_AUTHORIZATION_REQUIRED"):
+                self.service.enroll(self.candidate, self.gate, self.decision,
+                                    expected_generation=0, at=NOW)
+        self.assertEqual(reads, [])
+
+    def test_replacement_requires_the_replace_right_from_the_same_owner(self):
+        self.enroll()
+        granted = []
+
+        class SingleRight:
+            def require_owner(inner, operation):
+                granted.append(operation)
+                if operation is Operation.REPLACE:
+                    raise OwnerError("OWNER_AUTHORIZATION_REQUIRED")
+                return UUID(int=123)
+
+        self.store._authorizer = SingleRight()
+        with self.assertRaisesRegex(OwnerError, "OWNER_AUTHORIZATION_REQUIRED"):
+            self.enroll()
+        self.assertEqual(granted, [Operation.ENROLL, Operation.REPLACE])
+        self.assertEqual(self.store.status(), EnrollmentStatus(True, 1))
+
     def test_private_persistence_and_audited_lifecycle(self):
         self.assertEqual(self.enroll().generation, 1)
         self.verifier.template = b"synthetic-owner-template-v2"
