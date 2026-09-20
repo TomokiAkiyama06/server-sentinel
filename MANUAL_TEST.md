@@ -137,6 +137,15 @@ Compare at minimum where camera capabilities allow:
 
 Choose defaults from measurements, not assumptions.
 
+The synthetic profile core tests do not satisfy the following integration checks:
+
+- [ ] run the selected real decoder on all compressed reference packets; verify independent inference cadence and actual resized image dimensions, including B-frame reordering and stream restart;
+- [ ] compare durable recording codec/profile/quality before, during, and after changing viewer quality; record any discontinuities explicitly;
+- [ ] count viewer-only codec processes, handles and memory before the first subscriber, with subscribers, and after the last leaves; confirm cleanup and bounded failure recovery;
+- [ ] apply recording and viewer queue pressure separately; verify bounded memory, visible loss, and keyframe recovery without claiming continuous evidence;
+- [ ] verify copy eligibility against actual codec configuration, container, timestamps and color metadata; unsupported copy/transcode paths remain unavailable;
+- [ ] record only sanitized aggregate resource measurements; no deployment identifiers, room imagery, media payloads, or exact private network values enter GitHub.
+
 ## D. Source registry / mixed topology
 
 Validate:
