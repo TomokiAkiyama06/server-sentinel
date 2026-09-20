@@ -27,7 +27,10 @@ Its integration ports keep the dependent stack explicit:
 Manual overrides require an injected, audited Owner identity and take
 precedence over observation and schedule hints. Only a trusted, confirmed,
 quality-sufficient Owner entry can project `PRESENT`; untrusted timing and
-insufficient quality remain `UNKNOWN`. Critical movement/tamper observations
+insufficient quality remain `UNKNOWN`. An unusable owner observation stops an
+earlier owner inference from applying, but it holds no projection of its own,
+so a still valid configured hint keeps its documented precedence instead of
+being masked by it. Critical movement/tamper observations
 always queue evidence and configured notification work regardless of presence.
 An unavailable action is not retried until that action's port recovers, so its
 backlog cannot starve the other critical action. Any durable delivery outcome
@@ -55,7 +58,10 @@ An event whose critical actions completed keeps an identity-only tombstone when
 its payload expires, so a delayed replay of the same identity stays a duplicate
 instead of preserving evidence and notifying a second time. Only events that
 carried critical delivery are tombstoned, because replaying any other expired
-observation queues no action.
+observation queues no action. A critical action that never completed, such as a
+durably disabled delivery, leaves a per-action degradation marker behind, so
+expiry cannot report that path as armed again while the tombstone stops a
+replay from re-queuing the work.
 
 Timeline ordering uses main-host receipt order, with the durable sequence only
 as a tie-break, as the single key for the SQL page, the cursor and the

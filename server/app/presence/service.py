@@ -197,6 +197,10 @@ class PresenceService:
                           and observation.value == Value.OBSERVED)
                 state = (PresenceState.PRESENT if observation.kind == Kind.OWNER_ENTRY else PresenceState.ABSENT)
                 if not usable:
+                    # The slot still records that the newest owner evidence was
+                    # unusable, so an earlier inference stops applying. It is not
+                    # a high-confidence observation, so `_effective()` falls
+                    # through to any configured hint instead of reporting it.
                     state = PresenceState.UNKNOWN
                 db.execute("INSERT OR REPLACE INTO presence_inputs VALUES ('owner_observation',?,?,?,?)",
                            (state.value, timestamp(observation.received_at), timestamp(presence_valid_until),
@@ -298,7 +302,10 @@ class PresenceService:
             for slot in ("owner_observation", "hint"):
                 item = db.execute("SELECT * FROM presence_inputs WHERE slot=? AND observed<=? AND valid_until>?",
                                   (slot, timestamp(now), timestamp(now))).fetchone()
-                if item:
+                # Only a high-confidence owner observation outranks a configured
+                # hint. An unusable one holds no projection, so it invalidates
+                # the earlier inference without masking a still valid hint.
+                if item and PresenceState(item["state"]) != PresenceState.UNKNOWN:
                     return PresenceState(item["state"]), slot, None
         return PresenceState.UNKNOWN, "unknown", None
 
@@ -383,6 +390,10 @@ class PresenceService:
             unresolved = {row[0] for row in db.execute(
                 "SELECT DISTINCT action FROM presence_deliveries "
                 "WHERE state IN ('disabled','unavailable','failed','uncertain')")}
+            # Retention expiry removes the delivery row but not the fact that
+            # the critical action never completed.
+            unresolved |= {row[0] for row in db.execute(
+                "SELECT action FROM presence_expired_unresolved")}
         return {"state": state.value, "basis": basis, "override_expires_at": expires,
                 "clock_degraded": not trusted,
                 "suppress_ordinary": state == PresenceState.PRESENT and trusted,
@@ -425,6 +436,12 @@ class PresenceService:
         replay of the same identity cannot repeat those side effects. Only
         events that carried critical delivery are tombstoned, because replaying
         any other expired observation queues no action.
+
+        A critical action that never completed, such as a durably disabled
+        delivery, leaves a per-action degradation marker behind. Expiring its
+        row must not let the snapshot report that path as armed again, because
+        the action still did not happen and the tombstone stops a replay from
+        re-queuing it.
         """
         if type(limit) is not int or not 1 <= limit <= 1000:
             raise ValueError("invalid timeline retention limit")
@@ -437,6 +454,11 @@ class PresenceService:
             identifiers = [(row[0],) for row in rows]
             db.executemany("INSERT OR IGNORE INTO presence_completed_events(id,expired_at) "
                            "SELECT DISTINCT observation,? FROM presence_deliveries WHERE observation=?",
+                           [(timestamp(now), row[0]) for row in rows])
+            db.executemany("INSERT INTO presence_expired_unresolved(action,events,since) "
+                           "SELECT action,count(*),? FROM presence_deliveries "
+                           "WHERE observation=? AND state!='delivered' GROUP BY action "
+                           "ON CONFLICT(action) DO UPDATE SET events=events+excluded.events",
                            [(timestamp(now), row[0]) for row in rows])
             db.executemany("DELETE FROM presence_deliveries WHERE observation=?", identifiers)
             db.executemany("DELETE FROM presence_observations WHERE id=?", identifiers)

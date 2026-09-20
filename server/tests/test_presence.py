@@ -353,6 +353,45 @@ class PresenceTests(unittest.TestCase):
         self.assertEqual(status["critical_notifications"], "unavailable")
         self.assertTrue(status["critical_paths_degraded"])
 
+    def test_unusable_owner_observation_never_masks_a_valid_hint(self):
+        self.service.set_hint("owner", PresenceState.ABSENT, now=NOW,
+                              valid_until=NOW + timedelta(hours=3), clock_trusted=True)
+        self.service.record(observation(confirmed=False, quality=Quality.INSUFFICIENT),
+                            presence_valid_until=NOW + timedelta(hours=2))
+        status = self.status()
+        # Only a high-confidence owner observation outranks a configured hint.
+        self.assertEqual((status["state"], status["basis"]), ("ABSENT", "hint"))
+        self.assertFalse(status["suppress_ordinary"])
+        self.service.record(observation(identifier=UUID(int=21)),
+                            presence_valid_until=NOW + timedelta(hours=2))
+        status = self.status()
+        self.assertEqual((status["state"], status["basis"]), ("PRESENT", "owner_observation"))
+        # A later unusable observation invalidates that inference without
+        # claiming presence and without hiding the still valid hint.
+        self.service.record(observation(Kind.OWNER_EXIT, confirmed=False, identifier=UUID(int=22)),
+                            presence_valid_until=NOW + timedelta(hours=2))
+        status = self.status()
+        self.assertEqual((status["state"], status["basis"]), ("ABSENT", "hint"))
+        self.assertFalse(status["suppress_ordinary"])
+
+    def test_expired_disabled_delivery_keeps_its_path_degraded(self):
+        event = self.service.record(observation(Kind.SERVER_MOVEMENT))
+        self.service.complete_action(event.identifier, "notification", ActionResult.DISABLED)
+        self.service.complete_action(event.identifier, "evidence", ActionResult.DELIVERED)
+        self.assertEqual(self.status()["critical_notifications"], "unavailable")
+        later = NOW + timedelta(days=RetentionPeriods().recording_days + 1)
+        self.assertEqual(self.service.expire_history(now=later), 1)
+        self.assertEqual(self.history()["items"], [])
+        status = self.status(now=later)
+        # The notification never happened, so expiring its row must not report
+        # the path as armed again; a replay cannot repair it either.
+        self.assertEqual(status["critical_notifications"], "unavailable")
+        self.assertEqual(status["critical_evidence"], "armed")
+        self.assertTrue(status["critical_paths_degraded"])
+        self.service.record(observation(Kind.SERVER_MOVEMENT, identifier=event.identifier,
+                                        at=later, received=later))
+        self.assertEqual(self.status(now=later)["critical_notifications"], "unavailable")
+
     def test_expired_critical_identity_is_not_replayed_into_new_side_effects(self):
         event = self.service.record(observation(Kind.SERVER_MOVEMENT))
         self.service.dispatch_pending()

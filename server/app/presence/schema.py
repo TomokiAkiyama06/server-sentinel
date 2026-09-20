@@ -28,4 +28,8 @@ def presence_migration(version: int) -> Migration:
         # Identity-only tombstones for completed critical events whose timeline
         # payload expired; they carry no observation content.
         "CREATE TABLE presence_completed_events (id TEXT PRIMARY KEY, expired_at TEXT NOT NULL)",
+        # Durable degradation markers for critical actions that never completed
+        # before their timeline payload expired; per action, no event content.
+        "CREATE TABLE presence_expired_unresolved (action TEXT PRIMARY KEY, "
+        "events INTEGER NOT NULL, since TEXT NOT NULL)",
     ))
