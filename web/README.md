@@ -70,7 +70,8 @@ occupancy automation, and the audited Owner control history, which explains the
 Owner critical-recovery actions, including that an approved requeue accepts a
 possible duplicate preservation or notification. A recovery entry also names
 the critical path it applied to and, for a requeue, the observation identifier
-the core recorded. The timing trust of the record
+the core recorded. Identifiers are shown in full, in the control history and in
+timeline attribution, because no prefix length is guaranteed to be unique. The timing trust of the record
 behind the current basis is reported separately from the timing trust of
 observation receipt.
 

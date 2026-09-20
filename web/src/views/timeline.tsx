@@ -50,8 +50,9 @@ function stamp(value: string): string {
 }
 
 function attribution(item: Observation, t: Messages): string {
-  const where = item.source_id ? `${t.attributionCamera} ${item.source_id.slice(0, 8)}`
-    : item.node_id ? `${t.attributionNode} ${item.node_id.slice(0, 8)}`
+  // Identifiers stay complete: no prefix length is guaranteed to be unique.
+  const where = item.source_id ? `${t.attributionCamera} ${item.source_id}`
+    : item.node_id ? `${t.attributionNode} ${item.node_id}`
       : t.attributionServer;
   // Only a detector result is attributed to a detector; status and control
   // events report their kind instead.

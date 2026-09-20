@@ -206,7 +206,7 @@ try {
       assert.match(presenceText, /観測の受信時刻に skew または不連続が報告されています。/);
       assert.doesNotMatch(presenceText, /現在の状態の根拠となる記録の時刻信頼性/);
       assert.match(presenceText, /手動上書きを設定/);
-      assert.match(presenceText, /対象: 証拠保護 \/ 観測 00000000/);
+      assert.match(presenceText, /対象: 証拠保護 \/ 観測 00000000-0000-4000-8000-00000000abcd/);
       assert.equal(await page.evaluate('document.documentElement.scrollWidth <= window.innerWidth'), true, 'timeline and presence fit viewport');
       // Provider methods are invoked on their service; a lost receiver fails here.
       // The refresh control re-reads the snapshot without leaving the view.

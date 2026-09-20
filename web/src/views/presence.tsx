@@ -6,14 +6,20 @@ function stamp(value: string): string {
   return value.slice(0, 19).replace('T', ' ');
 }
 
-/** Names what an Owner recovery action applied to, without inventing detail. */
+/** Names what an Owner recovery action applied to, without inventing detail.
+ *
+ * The observation identifier is shown in full: no prefix length is guaranteed
+ * to be unique, and two approvals must stay distinguishable in the audit.
+ */
 function describeTarget(value: string | null, t: Messages): string | null {
   if (!value) return null;
-  const [action, identifier] = value.split(':');
+  const separator = value.indexOf(':');
+  const action = separator === -1 ? value : value.slice(0, separator);
+  const identifier = separator === -1 ? '' : value.slice(separator + 1);
   const path = action === 'evidence' ? t.armedEvidence
     : action === 'notification' ? t.armedNotification : action;
   return identifier
-    ? `${t.targetLabel}: ${path} / ${t.targetObservation} ${identifier.slice(0, 8)}`
+    ? `${t.targetLabel}: ${path} / ${t.targetObservation} ${identifier}`
     : `${t.targetLabel}: ${path}`;
 }
 

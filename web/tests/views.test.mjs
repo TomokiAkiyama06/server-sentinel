@@ -207,9 +207,10 @@ test('timeline rows always carry source attribution plus confidence and quality'
     observation('configuration', { value: 'changed', source_id: null, confidence: null, quality: 'unknown' }),
   ];
   const markup = timeline(page(rows));
-  assert.match(markup, /カメラ 00000000 · 検知器: 人物の観測/);
+  // Identifiers are shown in full so two sources cannot read as one.
+  assert.match(markup, /カメラ 00000000-0000-4000-8000-00000000abcd · 検知器: 人物の観測/);
   // A status or control event is not attributed to a detector.
-  assert.match(markup, /キャプチャノード 00000000 · 種別: キャプチャノード状態の観測/);
+  assert.match(markup, /キャプチャノード 00000000-0000-4000-8000-0000000012ef · 種別: キャプチャノード状態の観測/);
   assert.match(markup, /メインサーバー · 種別: 設定の更新/);
   for (const kind of kinds) {
     const row = timeline(page([observation(kind)]));
@@ -348,15 +349,24 @@ test('a recovery action names what the owner approved', () => {
   }, locale);
   // Requeue targets one critical action of one observation.
   const requeued = entry('critical_action_requeued', 'evidence:00000000-0000-4000-8000-00000000abcd');
-  assert.match(requeued, /対象: 証拠保護 \/ 観測 00000000/);
+  assert.match(requeued, /対象: 証拠保護 \/ 観測 00000000-0000-4000-8000-00000000abcd/);
   const notified = entry('critical_action_requeued', 'notification:00000000-0000-4000-8000-0000000012ef');
-  assert.match(notified, /対象: critical 通知 \/ 観測 00000000/);
+  assert.match(notified, /対象: critical 通知 \/ 観測 00000000-0000-4000-8000-0000000012ef/);
+  // Two approvals that share an identifier prefix stay distinguishable.
+  const shared = presence({ snapshot: snapshot(), audit: [
+    { sequence: 5, action: 'critical_action_requeued', at: '2026-09-21T08:21:00.000000+00:00', state: null,
+      target: 'evidence:00000000-0000-4000-8000-00000000aaaa' },
+    { sequence: 6, action: 'critical_action_requeued', at: '2026-09-21T08:22:00.000000+00:00', state: null,
+      target: 'evidence:00000000-0000-4000-8000-00000000bbbb' },
+  ] });
+  assert.match(shared, /観測 00000000-0000-4000-8000-00000000aaaa/);
+  assert.match(shared, /観測 00000000-0000-4000-8000-00000000bbbb/);
   // Clearing an expired marker names the path only; no observation remains.
   const cleared = entry('critical_degradation_cleared', 'notification');
   assert.match(cleared, /対象: critical 通知/);
   assert.doesNotMatch(cleared, /観測 /);
   assert.match(entry('critical_action_requeued', 'evidence:00000000-0000-4000-8000-00000000abcd', 'en'),
-    /Target: Evidence preservation \/ Observation 00000000/);
+    /Target: Evidence preservation \/ Observation 00000000-0000-4000-8000-00000000abcd/);
   // Owner control actions carry no target.
   assert.doesNotMatch(entry('override_set', null), /対象:/);
 });
