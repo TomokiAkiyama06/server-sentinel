@@ -85,9 +85,10 @@ function Row({ item, t }: { item: Observation; t: Messages }) {
   </li>;
 }
 
-export function TimelineBody({ page, filter, t, onFilter, onMore, loadingMore, complete }: {
+export function TimelineBody({ page, filter, t, onFilter, onMore, loadingMore, complete, moreFailed }: {
   page: TimelinePage; filter: TimelineFilter; t: Messages; onFilter: (value: TimelineFilter) => void;
   onMore?: (() => void) | undefined; loadingMore?: boolean | undefined; complete?: boolean | undefined;
+  moreFailed?: boolean | undefined;
 }) {
   const items = page.items.filter(item => matches(filter, item.kind));
   return <section className="timeline-screen">
@@ -108,6 +109,7 @@ export function TimelineBody({ page, filter, t, onFilter, onMore, loadingMore, c
       {span.degraded && <p className="timeline-degraded" role="status">{t.timelineDegraded}</p>}
       <ol className="timeline-list">{span.items.map(item => <Row key={item.id} item={item} t={t} />)}</ol>
     </section>)}
+    {moreFailed && <p role="alert">{t.timelineMoreFailed}</p>}
     {onMore && <button type="button" className="primary" disabled={loadingMore}
       onClick={onMore}>{loadingMore ? t.timelineMoreLoading : t.timelineMore}</button>}
     {complete && page.items.length > 0 && <p className="muted" role="status">{t.timelineComplete}</p>}
@@ -115,7 +117,7 @@ export function TimelineBody({ page, filter, t, onFilter, onMore, loadingMore, c
 }
 
 type State = { state: 'pending' } | { state: 'loading' } | { state: 'failed' }
-  | { state: 'ready'; page: TimelinePage; complete: boolean; more: boolean };
+  | { state: 'ready'; page: TimelinePage; complete: boolean; more: boolean; moreFailed: boolean };
 
 /** Pages concatenate in receipt order; a page without items ends the window. */
 function extend(previous: TimelinePage, next: TimelinePage): TimelinePage {
@@ -141,7 +143,7 @@ export function TimelineScreen({ services, t }: { services: DashboardServices; t
       try {
         const page = await load(controller.signal, null);
         if (!controller.signal.aborted) {
-          setData({ state: 'ready', page, complete: page.next_cursor === null, more: false });
+          setData({ state: 'ready', page, complete: page.next_cursor === null, more: false, moreFailed: false });
         }
       } catch {
         if (!controller.signal.aborted) setData({ state: 'failed' });
@@ -159,18 +161,21 @@ export function TimelineScreen({ services, t }: { services: DashboardServices; t
   const cursor: TimelineCursor | null = data.page.next_cursor;
   const load = services.loadTimeline?.bind(services);
   const more = load && cursor && !data.complete ? () => {
-    setData({ ...data, more: true });
+    setData({ ...data, more: true, moreFailed: false });
     const controller = new AbortController();
     void (async () => {
       try {
         const next = await load(controller.signal, cursor);
         setData({
-          state: 'ready', page: extend(data.page, next), more: false,
+          state: 'ready', page: extend(data.page, next), more: false, moreFailed: false,
           complete: next.items.length === 0 || next.next_cursor === null,
         });
-      } catch { setData({ state: 'failed' }); }
+      } catch {
+        // Keep the history already loaded and leave the retry path in place.
+        setData({ ...data, more: false, moreFailed: true });
+      }
     })();
   } : undefined;
   return <TimelineBody page={data.page} filter={filter} t={t} onFilter={setFilter}
-    onMore={more} loadingMore={data.more} complete={data.complete} />;
+    onMore={more} loadingMore={data.more} complete={data.complete} moreFailed={data.moreFailed} />;
 }

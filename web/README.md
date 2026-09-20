@@ -49,7 +49,9 @@ source/node health transition, including `manual_intervention_required` and
 event, and a quality-gated result is never labelled confirmed. Rows follow the
 Main Server receipt order the core reports and each row also shows its own
 observation time, and a `next_cursor` offers the older part of the window
-through a load-more control so a limited response cannot hide older events. The ordering statement follows `ordering_basis` while
+through a load-more control so a limited response cannot hide older events; a
+failed page keeps the history already loaded and reports the failure beside the
+retry. The ordering statement follows `ordering_basis` while
 `ordering_degraded` adds the warning. Clock skew or timestamp discontinuity is
 reported per span and by that ordering notice;
 the UI does not present that order as established causality, cause or

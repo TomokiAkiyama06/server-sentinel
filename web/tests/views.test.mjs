@@ -154,6 +154,11 @@ test('older history stays reachable while a cursor is offered', () => {
   assert.doesNotMatch(offered, /この期間の観測をすべて読み込みました。/);
   const loading = timeline(page(items), 'ja', 'all', { onMore: () => undefined, loadingMore: true });
   assert.match(loading, /<button[^>]*disabled[^>]*>読み込んでいます<\/button>/);
+  // A failed page keeps the loaded history and the retry path.
+  const failedMore = timeline(page(items), 'ja', 'all', { onMore: () => undefined, moreFailed: true });
+  assert.match(failedMore, /<p role="alert">古い観測を読み込めませんでした。/);
+  assert.match(failedMore, /<button[^>]*>古い観測をさらに読み込む<\/button>/);
+  assert.equal((failedMore.match(/data-observation-kind=/g) || []).length, items.length);
   const exhausted = timeline(page(items, { next_cursor: null }), 'ja', 'all', { complete: true });
   assert.doesNotMatch(exhausted, /古い観測をさらに読み込む/);
   assert.match(exhausted, /この期間の観測をすべて読み込みました。/);
