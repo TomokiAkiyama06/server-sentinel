@@ -221,6 +221,15 @@ class ReleaseLifecycleTests(unittest.TestCase):
             self.perform(self.arguments("install", "1.0.0"), mount=False)
         self.assertFalse((self.installation / "releases").exists())
 
+    def test_runtime_mount_point_cannot_be_the_root_filesystem(self):
+        value = json.loads(self.config.read_text())
+        value["runtime_mount_point"] = "/"
+        self.config.write_text(json.dumps(value))
+        self.config.chmod(0o600)
+        with self.assertRaisesRegex(ConfigurationError, "must not be root"):
+            self.perform(self.arguments("install", "1.0.0"))
+        self.assertFalse((self.installation / "releases").exists())
+
     def test_artifact_is_versioned_allow_list_without_tests_or_private_config(self):
         artifact, digest = self.artifact("1.2.3")
         self.assertEqual(hashlib.sha256(artifact.read_bytes()).hexdigest(), digest)
@@ -323,6 +332,19 @@ class ReleaseLifecycleTests(unittest.TestCase):
             self.assertEqual(options["env"]["PATH"], "/usr/bin:/bin")
             self.assertNotIn("PYTHONPATH", options["env"])
             self.assertNotIn("PYTHONHOME", options["env"])
+
+    def test_release_build_uses_safe_umask_and_restores_the_administrator_setting(self):
+        previous = os.umask(0o077)
+        try:
+            self.perform(self.arguments("install", "1.0.0"))
+            observed = os.umask(0o077)
+            os.umask(observed)
+        finally:
+            os.umask(previous)
+        self.assertEqual(observed, 0o077)
+        release = self.installation / "releases/1.0.0"
+        self.assertEqual(release.stat().st_mode & 0o777, 0o755)
+        self.assertEqual((self.installation / "releases").stat().st_mode & 0o777, 0o755)
 
     def test_python_interpreter_must_be_absolute_and_root_controlled(self):
         candidate = self.root / "python"

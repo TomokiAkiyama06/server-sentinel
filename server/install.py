@@ -270,35 +270,39 @@ def _stage(args, deployment: Deployment, account: pwd.struct_passwd, runner) -> 
         raise ValueError("verified artifact digest required")
     if hashlib.sha256(content).hexdigest() != args.sha256:
         raise ValueError("artifact digest mismatch")
-    releases = args.destination / "releases"
-    releases.mkdir(mode=0o755, exist_ok=True)
-    final = releases / args.version
-    staging = releases / ("." + args.version + ".staging")
-    if final.exists() or staging.exists():
-        raise ValueError("release version already exists")
-    staging.mkdir(mode=0o755)
+    previous_umask = os.umask(0o022)
     try:
-        _extract(content, staging, args.version)
-        root_environment = {
-            "PATH": "/usr/bin:/bin", "PYTHONNOUSERSITE": "1", "PYTHONSAFEPATH": "1",
-        }
-        runner([str(args.python), "-I", "-m", "venv", str(staging / "venv")],
-               check=True, timeout=120, cwd="/", env=root_environment)
-        runner([
-            str(staging / "venv/bin/python"), "-I", "-m", "pip", "install", "--no-index",
-            "--require-hashes", "--only-binary=:all:", "--no-deps", "--no-cache-dir",
-            "--find-links", str(staging / "wheels"), "-r", str(staging / "requirements.lock"),
-        ], check=True, timeout=300, cwd="/", env=root_environment)
-        runner([
-            str(staging / "venv/bin/python"), "-m", "app.deployment", "--config",
-            str(args.config), "--check",
-        ], check=True, timeout=30, user=account.pw_uid, group=account.pw_gid,
-           extra_groups=[], cwd=str(staging), env={"PYTHONDONTWRITEBYTECODE": "1"},
-           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        staging.rename(final)
-    except Exception:
-        shutil.rmtree(staging, ignore_errors=True)
-        raise
+        releases = args.destination / "releases"
+        releases.mkdir(mode=0o755, exist_ok=True)
+        final = releases / args.version
+        staging = releases / ("." + args.version + ".staging")
+        if final.exists() or staging.exists():
+            raise ValueError("release version already exists")
+        staging.mkdir(mode=0o755)
+        try:
+            _extract(content, staging, args.version)
+            root_environment = {
+                "PATH": "/usr/bin:/bin", "PYTHONNOUSERSITE": "1", "PYTHONSAFEPATH": "1",
+            }
+            runner([str(args.python), "-I", "-m", "venv", str(staging / "venv")],
+                   check=True, timeout=120, cwd="/", env=root_environment)
+            runner([
+                str(staging / "venv/bin/python"), "-I", "-m", "pip", "install", "--no-index",
+                "--require-hashes", "--only-binary=:all:", "--no-deps", "--no-cache-dir",
+                "--find-links", str(staging / "wheels"), "-r", str(staging / "requirements.lock"),
+            ], check=True, timeout=300, cwd="/", env=root_environment)
+            runner([
+                str(staging / "venv/bin/python"), "-m", "app.deployment", "--config",
+                str(args.config), "--check",
+            ], check=True, timeout=30, user=account.pw_uid, group=account.pw_gid,
+               extra_groups=[], cwd=str(staging), env={"PYTHONDONTWRITEBYTECODE": "1"},
+               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            staging.rename(final)
+        except Exception:
+            shutil.rmtree(staging, ignore_errors=True)
+            raise
+    finally:
+        os.umask(previous_umask)
     return "releases/" + args.version
 
 

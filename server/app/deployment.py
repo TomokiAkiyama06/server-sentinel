@@ -94,6 +94,8 @@ class Deployment:
             root_info = runtime_root.stat()
         except (OSError, RuntimeError, TypeError, ValueError):
             raise ConfigurationError("runtime mount is unavailable") from None
+        if mount_point == Path(mount_point.anchor):
+            raise ConfigurationError("runtime mount must not be root filesystem")
         if (not mount_point.is_absolute() or not mount_point.is_dir()
                 or not os.path.ismount(mount_point)
                 or not runtime_root.is_relative_to(mount_point)
