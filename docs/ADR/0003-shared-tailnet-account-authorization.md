@@ -2,9 +2,8 @@
 
 Status: Accepted
 Date: 2026-09-20
-Approved by: repository owner, who stated the shared research-room Tailscale account and the per-person credential requirement for this deployment.
 
-Relates to Issue #6 (Owner authorization / trusted Tailscale identity) and Issue #10 (human access enforcement). Issue #6 stays Open until its implementation and manual verification land; this ADR records only the decision it was blocked on.
+Recorded for Issue #6 (Owner authorization / trusted Tailscale identity) and enforced by Issue #10 (human access enforcement). The shared research-room Tailscale account and the requirement for per-person application credentials are deployment constraints stated by the repository owner; this ADR takes effect when the owner merges the pull request that adds it. Issue #6 stays Open until its implementation and manual verification land, so this ADR records the decision only, not its enforcement.
 
 ## Context
 
