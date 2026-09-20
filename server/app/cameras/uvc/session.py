@@ -43,6 +43,9 @@ class CaptureSession:
 
     def step(self, *, timeout=1.0):
         """Deliver at most one frame, returning False on offline/manual/failure."""
+        if self.profile is None:
+            self.close()
+            return False
         try:
             scan = self.discovery.scan()
             if self.capture is not None and self.controller.bound not in scan.devices:
@@ -50,7 +53,7 @@ class CaptureSession:
                 self.controller.disconnected()
                 return False
             candidate = self.controller.reconcile(scan.devices)
-            if candidate is None or self.profile is None:
+            if candidate is None:
                 self.close()
                 return False
             if self.capture is None:

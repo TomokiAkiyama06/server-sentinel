@@ -92,9 +92,12 @@ class SessionTests(unittest.TestCase):
 
     def test_missing_explicit_profile_never_captures_or_reports_online(self):
         self.session.configure(enabled=True, profile=None)
+        initial_events = len(self.events)
+        self.assertFalse(self.session.step())
         self.assertFalse(self.session.step())
         self.assertNotEqual(self.controller.state, CameraState.ONLINE)
         self.assertEqual(self.frames, [])
+        self.assertEqual(len(self.events), initial_events)
 
     def test_weak_candidate_recreated_before_open_requires_new_approval(self):
         original = replace(self.camera, serial=None, instance_token=(1, 2, 3))
