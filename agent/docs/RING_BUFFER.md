@@ -53,7 +53,9 @@ An untrusted wall-clock observation cannot apply an expiry cutoff to a late
 overlapping append; retained incidents keep their protection until trusted time
 can establish expiry.
 Loss observations with an untrusted or rolled-back clock use the last accepted
-trusted timestamp as their window anchor, never the jumped wall time. Timing
+trusted timestamp and any fixed-cadence capture that continuously extends trusted
+capture as their window anchor, never the jumped wall time or disconnected legacy
+future segments. Timing
 uncertainty remains visible while the incident is active and after completion.
 If no trusted timestamp has ever been accepted, a durable pending-loss marker
 holds the current ring against FIFO and reconfiguration. The first trusted

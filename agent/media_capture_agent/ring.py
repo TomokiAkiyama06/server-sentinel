@@ -91,6 +91,25 @@ class DiskRing:
     def _pending_loss(self):
         return self.db.execute("SELECT 1 FROM settings WHERE key='pending_loss'").fetchone() is not None
 
+    def _loss_anchor(self):
+        row = self.db.execute("SELECT value FROM settings WHERE key='latest_clock'").fetchone()
+        anchors = [int(row[0])] if row else []
+        rows = sorted(self._rows(), key=lambda item: item["start"])
+        for source, profile in self.profiles.items():
+            matching = [item for item in rows if item["source"] == str(source)
+                        and item["end"] - item["start"] == profile.segment_duration_us]
+            trusted = [item["end"] for item in matching if item["clock_trusted"]]
+            if not trusted:
+                continue
+            cursor = max(trusted)
+            # Accepted uncertain capture must extend an existing cadence.
+            # A disconnected legacy future timestamp cannot move this anchor.
+            for item in matching:
+                if item["start"] == cursor:
+                    cursor = item["end"]
+            anchors.append(cursor)
+        return max(anchors) if anchors else None
+
     def _recover(self):
         physical = self.store.list_segments()
         allocated = self.store.segment_allocations()
@@ -511,8 +530,7 @@ class DiskRing:
                     raise RingRefused("invalid_preservation_window")
                 anchor = now_us
                 if not clock_trusted:
-                    row = self.db.execute("SELECT value FROM settings WHERE key='latest_clock'").fetchone()
-                    anchor = int(row[0]) if row else None
+                    anchor = self._loss_anchor()
                 if anchor is None:
                     with self.ledger.transaction():
                         self.db.execute("INSERT OR REPLACE INTO settings VALUES ('pending_loss', '1')")

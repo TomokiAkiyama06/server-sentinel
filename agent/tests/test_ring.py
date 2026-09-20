@@ -1027,6 +1027,29 @@ class RingTests(unittest.TestCase):
         self.assertFalse(result["has_gaps"])
         self.assertEqual(result["state"], "partial")
 
+    def test_uncertain_loss_anchor_follows_contiguous_capture_without_following_legacy_jumps(self):
+        self.warm()
+        self.ring.observe_connection(authenticated=True, connected=True, unexpected=False,
+                                     now_us=T0, clock_trusted=True)
+        recent = []
+        for start in range(T0, T0 + 2 * PRE, 60 * SECOND):
+            identifier = self.append(start, trusted=False)
+            if start >= T0 + PRE:
+                recent.append(identifier)
+        # Legacy untrusted future history is not part of this continuous
+        # captured cadence and must not become a loss anchor after restart.
+        with self.ring.ledger.transaction():
+            self.ring.db.execute("INSERT INTO segments VALUES (?,?,?,?,?,0,?,'missing',0)",
+                                 (str(uuid4()), str(SOURCE), T0 + RETENTION, T0 + RETENTION + 60 * SECOND,
+                                  len(PAYLOAD), hashlib.sha256(PAYLOAD).hexdigest()))
+        incident = self.ring.observe_connection(authenticated=True, connected=False, unexpected=True,
+                                                now_us=T0 + 2 * RETENTION, clock_trusted=False)
+        self.assertTrue(all(self.ring._protected(str(identifier)) for identifier in recent))
+        self.assertEqual(self.ring.incident(incident, now_us=T0 + 2 * PRE)["target_end_us"], T0 + 2 * PRE + POST)
+        for start in range(T0 + 2 * PRE, T0 + 2 * PRE + POST, 60 * SECOND):
+            self.append(start)
+        self.assertTrue(set(recent) <= set(self.store.list_segments()))
+
     def test_active_uncertain_incident_stays_degraded_after_clock_recovers(self):
         self.warm()
         incident = self.ring.preserve("camera_tamper", T0 - PRE, T0 + POST, now_us=T0, clock_trusted=False)
