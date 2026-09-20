@@ -36,11 +36,19 @@ filesystem writer on the thread that constructed it and otherwise reports
 every export or hold a reservation across an unrelated owner-worker operation.
 Before opening a temporary bundle, the service reserves the exact `ZIP_STORED`
 byte count through that policy; the policy owns filesystem allocation and
-metadata overhead, pressure/hard-stop state and the deployment hard reserve.
+metadata overhead, pressure/hard-stop state and the deployment hard reserve. A
+composed policy denies with its own error type and a fixed reason code, so
+admission translates that into this package's value-free error: reviewed codes
+such as `STORAGE_PRESSURE` and `STORAGE_HARD_STOP` are preserved and any other
+message is replaced rather than relayed to the caller.
 
 Admission covers the approved storage filesystem, so the export directory is
-pinned first: it is opened without following symlinks and must be a private
-directory owned by the service account whose device matches the approved
+pinned first. The configured target must be absolute and normalized, and every
+path component is opened without following symlinks, including parents: a
+replaced parent would otherwise redirect the bundle into another directory on
+the same admitted device, and `O_NOFOLLOW` alone protects only the final
+component. No fallback directory is created. The pinned directory must be
+private and owned by the service account, and its device must match the approved
 `RootIdentity` that composition also configured the storage policy with. Because
 an open descriptor's device cannot change and the approved identity is a fixed
 configured value, that check is atomic with admission — it is not a second

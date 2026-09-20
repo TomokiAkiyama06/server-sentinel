@@ -149,8 +149,10 @@ class StorageAdmission:
         self.admit_threads.append(threading.get_ident())
         if threading.get_ident() != self.owner:
             raise AssertionError("STORAGE_POLICY_UNAVAILABLE")
-        if self.denial:
-            raise DiagnosticExportError(self.denial)
+        if self.denial is not None:
+            # MainStoragePolicy denies with RecordingError, not with this
+            # package's error type.
+            raise self.denial
         if self.active or type(media_bytes) is not int or media_bytes <= 0 or critical:
             raise AssertionError("invalid diagnostic storage admission")
         self.reservations.append(media_bytes)
@@ -262,9 +264,10 @@ class DiagnosticExportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(media_entry["item_count"], 2)
 
     async def test_pressure_and_hard_stop_deny_before_file_or_media_open(self):
-        for reason in ("STORAGE_PRESSURE", "STORAGE_HARD_STOP"):
+        for reason in ("STORAGE_PRESSURE", "STORAGE_HARD_STOP",
+                       "STORAGE_INVALID_RESERVATION"):
             with self.subTest(reason=reason):
-                self.policy.denial = reason
+                self.policy.denial = RecordingError(reason)
                 service = self.make_service(Permit(), media=self.media)
                 with self.assertRaisesRegex(DiagnosticExportError, reason):
                     await service.export(DiagnosticExportAction(
@@ -273,6 +276,21 @@ class DiagnosticExportTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(self.media.resolved, [])
                 self.assertEqual(self.policy.releases, 0)
                 self.policy.denial = None
+
+    async def test_policy_denial_never_relays_its_own_message_to_the_caller(self):
+        """Regression: a composed policy's error type/value stays off the boundary."""
+        private = "/private/deployment/mount SYNTHETIC_PRIVATE_VALUE"
+        self.policy.denial = RecordingError(private)
+        service = self.make_service(Permit(), media=self.media)
+        with self.assertRaises(DiagnosticExportError) as raised:
+            await service.export(DiagnosticExportAction(self.output, ("clip_a",)))
+
+        self.assertEqual(str(raised.exception),
+                         "diagnostic storage admission was denied")
+        self.assertNotIn("SYNTHETIC_PRIVATE_VALUE", str(raised.exception))
+        self.assertIsNone(raised.exception.__cause__)
+        self.assertEqual(list(self.output.iterdir()), [])
+        self.assertEqual(self.media.resolved, [])
 
     async def test_media_zip_and_fsync_run_in_bounded_worker(self):
         event_loop_thread = threading.get_ident()
@@ -383,6 +401,38 @@ class DiagnosticExportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.policy.reservations, [])
         self.assertEqual(self.media.resolved, [])
         self.assertEqual(list(self.output.iterdir()), [])
+
+    async def test_symlinked_output_path_components_are_refused(self):
+        """Regression: a replaced parent must not redirect the published bundle."""
+        real = self.output / "real"
+        real.mkdir(mode=0o700)
+        leaf_link = self.output / "leaf"
+        leaf_link.symlink_to(real, target_is_directory=True)
+        parent_link = self.output / "parent"
+        parent_link.symlink_to(self.output, target_is_directory=True)
+
+        for target in (leaf_link, parent_link / "real"):
+            with self.subTest(target=str(target.relative_to(self.output))):
+                service = self.make_service(Permit(), media=self.media)
+                with self.assertRaisesRegex(DiagnosticExportError, "not admitted"):
+                    await service.export(
+                        DiagnosticExportAction(target, ("clip_a",)))
+
+        self.assertEqual(self.policy.reservations, [])
+        self.assertEqual(self.media.resolved, [])
+        self.assertEqual(list(real.iterdir()), [])
+
+        # The real directory itself is still accepted.
+        result = await self.make_service(Permit()).export(
+            DiagnosticExportAction(real))
+        self.assertEqual(result.bundle_path.parent, real)
+
+    def test_output_directory_must_be_absolute_and_normalized(self):
+        for path in (Path("relative/bundles"),
+                     self.output / ".." / self.output.name,
+                     Path(".")):
+            with self.subTest(path=str(path)), self.assertRaises(ValueError):
+                DiagnosticExportAction(path)
 
     async def test_admission_binds_the_pinned_descriptor_without_resampling_a_path(self):
         """Regression: no pathname sample may race admission on the owning worker."""

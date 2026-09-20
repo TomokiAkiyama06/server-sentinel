@@ -258,6 +258,11 @@ class DiagnosticExportAction:
     def __post_init__(self) -> None:
         if not isinstance(self.output_directory, Path):
             raise TypeError("output_directory must be a path")
+        # A relative or unnormalized target cannot be walked component by
+        # component, which is how the writer refuses a redirected directory.
+        if (not self.output_directory.is_absolute()
+                or ".." in self.output_directory.parts):
+            raise ValueError("output_directory must be absolute and normalized")
         if len(self.selected_media_ids) > 100:
             raise ValueError("too many selected media IDs")
         if len(set(self.selected_media_ids)) != len(self.selected_media_ids):
@@ -323,6 +328,13 @@ class DiagnosticExportResult:
     included_media_count: int
 
 
+_STORAGE_DENIAL_REASONS = frozenset({
+    "STORAGE_PRESSURE",
+    "STORAGE_HARD_STOP",
+    "STORAGE_INVALID_RESERVATION",
+    "STORAGE_POLICY_UNAVAILABLE",
+    "STORAGE_BINDING_UNAVAILABLE",
+})
 _EXCLUDED_KINDS = {
     DiagnosticFieldKind.CREDENTIAL,
     DiagnosticFieldKind.PAIRING_SECRET,
@@ -398,13 +410,9 @@ class _DiagnosticBundleWriter:
                 "diagnostic source returned invalid data") from None
 
     def prepare(self, action: DiagnosticExportAction) -> _PreparedBundle:
-        try:
-            output = action.output_directory.resolve(strict=True)
-        except (OSError, RuntimeError):
-            raise DiagnosticExportError(
-                "diagnostic output directory is unavailable") from None
-        if not output.is_dir():
-            raise DiagnosticExportError("diagnostic output directory is unavailable")
+        # The path is not resolved here: following symlinks now would accept a
+        # redirected target that the authoritative component walk refuses.
+        output = action.output_directory
         documents = self._collect_validated()
         if len({item.category for item in documents}) != len(documents):
             raise DiagnosticExportError("diagnostic categories must be unique")
@@ -633,12 +641,26 @@ class DiagnosticExportService:
         cannot leave the writer on an unadmitted volume. A substituted approved
         root is still refused by the policy itself, which hard stops rather than
         reserving space on a replacement filesystem.
+
+        Every path component is opened without following symlinks, so neither a
+        replaced parent nor a replaced final component can redirect the bundle
+        into another directory, and no fallback directory is ever created.
         """
         descriptor = -1
         try:
-            descriptor = os.open(
-                output_directory,
-                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+            if (not output_directory.is_absolute()
+                    or ".." in output_directory.parts):
+                raise OSError("unadmitted diagnostic output directory")
+            # Walk every component without following symlinks, including
+            # parents: `O_NOFOLLOW` alone only protects the last one, so a
+            # replaced parent could otherwise redirect the bundle into another
+            # directory on the same admitted device.
+            flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+            descriptor = os.open("/", flags)
+            for part in output_directory.parts[1:]:
+                following = os.open(part, flags, dir_fd=descriptor)
+                os.close(descriptor)
+                descriptor = following
             info = os.fstat(descriptor)
             if (info.st_dev != self.__storage_filesystem.device
                     or info.st_uid != os.geteuid() or info.st_mode & 0o077
@@ -651,6 +673,29 @@ class DiagnosticExportService:
                 os.close(descriptor)
             raise DiagnosticExportError(
                 "diagnostic output directory is not admitted") from None
+
+    @staticmethod
+    def __denial_reason(denial: BaseException) -> str:
+        """Keep only a reviewed fixed code; never relay a policy's own message."""
+        reason = str(denial)
+        if reason in _STORAGE_DENIAL_REASONS:
+            return reason
+        return "diagnostic storage admission was denied"
+
+    def __admit(self, reserved_bytes: int) -> None:
+        """Reserve through the policy and keep its error type off the boundary.
+
+        A composed `MainStoragePolicy` reports denial as `RecordingError` with a
+        fixed reason code, not as a diagnostics error. Without this translation a
+        pressure or hard-stop denial would cross the export boundary as an
+        unrelated exception type and reach the route as an unhandled failure.
+        """
+        try:
+            self.__storage_policy.admit(reserved_bytes, critical=False)
+        except DiagnosticExportError:
+            raise
+        except Exception as denial:
+            raise DiagnosticExportError(self.__denial_reason(denial)) from None
 
     def __release_reservation(self) -> None:
         try:
@@ -681,7 +726,7 @@ class DiagnosticExportService:
         directory_fd = self.__open_admitted_output(prepared.output_directory)
         try:
             directory = os.fstat(directory_fd)
-            self.__storage_policy.admit(prepared.reserved_bytes, critical=False)
+            self.__admit(prepared.reserved_bytes)
             try:
                 result = self.__writer.write(prepared, directory_fd)
             except _DiagnosticCleanupUncertain:
