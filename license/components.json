@@ -1,5 +1,5 @@
 {
-  "schema": 1,
+  "schema": 2,
   "inputs": [
     {
       "path": ".ci/requirements.txt",
@@ -7,14 +7,29 @@
       "scope": "tooling"
     },
     {
-      "path": "agent/requirements-ci.lock",
-      "ecosystem": "python-requirements",
+      "path": "agent/Dockerfile.ci",
+      "ecosystem": "container-image",
       "scope": "tooling"
     },
     {
       "path": "agent/pyproject.toml",
       "ecosystem": "python-project",
       "scope": "transport"
+    },
+    {
+      "path": "agent/requirements-ci.lock",
+      "ecosystem": "python-requirements",
+      "scope": "tooling"
+    },
+    {
+      "path": "server/Dockerfile.ci",
+      "ecosystem": "container-image",
+      "scope": "tooling"
+    },
+    {
+      "path": "server/pyproject.toml",
+      "ecosystem": "python-project",
+      "scope": "backend"
     },
     {
       "path": "server/requirements-ci.lock",
@@ -32,18 +47,18 @@
       "scope": "backend"
     },
     {
-      "path": "server/pyproject.toml",
-      "ecosystem": "python-project",
-      "scope": "backend"
-    },
-    {
-      "path": "web/package.json",
-      "ecosystem": "npm-project",
-      "scope": "frontend"
+      "path": "web/Dockerfile.ci",
+      "ecosystem": "container-image",
+      "scope": "tooling"
     },
     {
       "path": "web/package-lock.json",
       "ecosystem": "npm-lock",
+      "scope": "frontend"
+    },
+    {
+      "path": "web/package.json",
+      "ecosystem": "npm-project",
       "scope": "frontend"
     }
   ],
@@ -90,10 +105,15 @@
         {
           "path": "server/requirements.lock",
           "ecosystem": "python-requirements",
-          "scope": "backend"
+          "scope": "backend",
+          "pin": {
+            "type": "lockfile-entry",
+            "digests": [
+              "sha256:117bac03a25ede5df5440e855b32d556049ca169ead221505badf432fed4b101"
+            ]
+          }
         }
-      ],
-      "sha256": null
+      ]
     },
     {
       "id": "pypi:annotated-types@0.8.0",
@@ -120,10 +140,15 @@
         {
           "path": "server/requirements.lock",
           "ecosystem": "python-requirements",
-          "scope": "backend"
+          "scope": "backend",
+          "pin": {
+            "type": "lockfile-entry",
+            "digests": [
+              "sha256:f072f4d804ea359e4eaf198b1af7a8b0943881a87f31bb764f8bf219bb9419e0"
+            ]
+          }
         }
-      ],
-      "sha256": null
+      ]
     },
     {
       "id": "pypi:anyio@4.15.1",
@@ -150,10 +175,15 @@
         {
           "path": "server/requirements.lock",
           "ecosystem": "python-requirements",
-          "scope": "backend"
+          "scope": "backend",
+          "pin": {
+            "type": "lockfile-entry",
+            "digests": [
+              "sha256:6152fdbbf9a77fdec97731721bebf7c4c44f7c29b424b0065826173efc7ed101"
+            ]
+          }
         }
-      ],
-      "sha256": null
+      ]
     },
     {
       "id": "pypi:click@8.5.0",
@@ -180,10 +210,15 @@
         {
           "path": "server/requirements.lock",
           "ecosystem": "python-requirements",
-          "scope": "backend"
+          "scope": "backend",
+          "pin": {
+            "type": "lockfile-entry",
+            "digests": [
+              "sha256:255bc9599cf7748b4b1a446ccc735421bd08a2ae529a8b88597d3de5664ee360"
+            ]
+          }
         }
-      ],
-      "sha256": null
+      ]
     },
     {
       "id": "pypi:fastapi@0.141.1",
@@ -210,15 +245,24 @@
         {
           "path": "server/pyproject.toml",
           "ecosystem": "python-project",
-          "scope": "backend"
+          "scope": "backend",
+          "pin": {
+            "type": "lock-correspondence",
+            "lock": "server/requirements.lock"
+          }
         },
         {
           "path": "server/requirements.lock",
           "ecosystem": "python-requirements",
-          "scope": "backend"
+          "scope": "backend",
+          "pin": {
+            "type": "lockfile-entry",
+            "digests": [
+              "sha256:bfb91aa2d334c61cb35ba9a116fc123b3d3df31640b801cf57a7a78ec3f603b3"
+            ]
+          }
         }
-      ],
-      "sha256": null
+      ]
     },
     {
       "id": "pypi:h11@0.16.0",
@@ -245,10 +289,15 @@
         {
           "path": "server/requirements.lock",
           "ecosystem": "python-requirements",
-          "scope": "backend"
+          "scope": "backend",
+          "pin": {
+            "type": "lockfile-entry",
+            "digests": [
+              "sha256:63cf8bbe7522de3bf65932fda1d9c2772064ffb3dae62d55932da54b31cb6c86"
+            ]
+          }
         }
-      ],
-      "sha256": null
+      ]
     },
     {
       "id": "pypi:idna@3.20",
@@ -275,10 +324,15 @@
         {
           "path": "server/requirements.lock",
           "ecosystem": "python-requirements",
-          "scope": "backend"
+          "scope": "backend",
+          "pin": {
+            "type": "lockfile-entry",
+            "digests": [
+              "sha256:ab7ae7122974553370f0bdb919e1a960b2cd1bc1ef0276416d896db81c14582c"
+            ]
+          }
         }
-      ],
-      "sha256": null
+      ]
     },
     {
       "id": "pypi:pydantic@2.13.5",
@@ -305,10 +359,15 @@
         {
           "path": "server/requirements.lock",
           "ecosystem": "python-requirements",
-          "scope": "backend"
+          "scope": "backend",
+          "pin": {
+            "type": "lockfile-entry",
+            "digests": [
+              "sha256:346a034f080da3755d8e9cb5e00e8b07de1d39e4f6e2c87d8ab7cafa0b269a73"
+            ]
+          }
         }
-      ],
-      "sha256": null
+      ]
     },
     {
       "id": "pypi:pydantic-core@2.46.5",
@@ -335,10 +394,17 @@
         {
           "path": "server/requirements.lock",
           "ecosystem": "python-requirements",
-          "scope": "backend"
+          "scope": "backend",
+          "pin": {
+            "type": "lockfile-entry",
+            "digests": [
+              "sha256:0fc5be0abd4a407e200d844b404e33639a554e7bd0d448e7b9ae181be4789ac2",
+              "sha256:4fdc8b93a41521988916eeaa271173fcca7fa0803d62f87675aac8dcec1c8e29",
+              "sha256:54d510bac3ee52247af28ed4bb18a1e799f040ac60fd2bf5ccd4c92f1fbe786f"
+            ]
+          }
         }
-      ],
-      "sha256": null
+      ]
     },
     {
       "id": "pypi:starlette@1.6.0",
@@ -365,10 +431,15 @@
         {
           "path": "server/requirements.lock",
           "ecosystem": "python-requirements",
-          "scope": "backend"
+          "scope": "backend",
+          "pin": {
+            "type": "lockfile-entry",
+            "digests": [
+              "sha256:a86dd39d14bb45f85a3d18525215a9ef0cfd1f192ac793220e72598c90335f0c"
+            ]
+          }
         }
-      ],
-      "sha256": null
+      ]
     },
     {
       "id": "pypi:typing-extensions@4.16.0",
@@ -395,10 +466,15 @@
         {
           "path": "server/requirements.lock",
           "ecosystem": "python-requirements",
-          "scope": "backend"
+          "scope": "backend",
+          "pin": {
+            "type": "lockfile-entry",
+            "digests": [
+              "sha256:481caa481374e813c1b176ada14e97f1f67a4539ce9cfeb3f350d78d6370c2e8"
+            ]
+          }
         }
-      ],
-      "sha256": null
+      ]
     },
     {
       "id": "pypi:typing-inspection@0.4.4",
@@ -425,10 +501,15 @@
         {
           "path": "server/requirements.lock",
           "ecosystem": "python-requirements",
-          "scope": "backend"
+          "scope": "backend",
+          "pin": {
+            "type": "lockfile-entry",
+            "digests": [
+              "sha256:65b8397ba37ccbce054456aaccddfc91e6e3083c92824df348d96ca832f3f147"
+            ]
+          }
         }
-      ],
-      "sha256": null
+      ]
     },
     {
       "id": "pypi:uvicorn@0.53.0",
@@ -455,15 +536,24 @@
         {
           "path": "server/pyproject.toml",
           "ecosystem": "python-project",
-          "scope": "backend"
+          "scope": "backend",
+          "pin": {
+            "type": "lock-correspondence",
+            "lock": "server/requirements.lock"
+          }
         },
         {
           "path": "server/requirements.lock",
           "ecosystem": "python-requirements",
-          "scope": "backend"
+          "scope": "backend",
+          "pin": {
+            "type": "lockfile-entry",
+            "digests": [
+              "sha256:e8dca71ec86dce5f04e333f0d56cdedf942446e6643b9cea1af0d6d3a02cb03e"
+            ]
+          }
         }
-      ],
-      "sha256": null
+      ]
     },
     {
       "id": "pypi:pycodestyle@2.14.0",
@@ -489,20 +579,37 @@
         {
           "path": ".ci/requirements.txt",
           "ecosystem": "python-requirements",
-          "scope": "tooling"
+          "scope": "tooling",
+          "pin": {
+            "type": "lockfile-entry",
+            "digests": [
+              "sha256:dd6bf7cb4ee77f8e016f9c8e74a35ddd9f67e1d5fd4184d86c3b98e07099f42d"
+            ]
+          }
         },
         {
           "path": "agent/requirements-ci.lock",
           "ecosystem": "python-requirements",
-          "scope": "tooling"
+          "scope": "tooling",
+          "pin": {
+            "type": "lockfile-entry",
+            "digests": [
+              "sha256:dd6bf7cb4ee77f8e016f9c8e74a35ddd9f67e1d5fd4184d86c3b98e07099f42d"
+            ]
+          }
         },
         {
           "path": "server/requirements-ci.lock",
           "ecosystem": "python-requirements",
-          "scope": "tooling"
+          "scope": "tooling",
+          "pin": {
+            "type": "lockfile-entry",
+            "digests": [
+              "sha256:dd6bf7cb4ee77f8e016f9c8e74a35ddd9f67e1d5fd4184d86c3b98e07099f42d"
+            ]
+          }
         }
-      ],
-      "sha256": null
+      ]
     },
     {
       "id": "pypi:pyflakes@3.4.0",
@@ -528,20 +635,37 @@
         {
           "path": ".ci/requirements.txt",
           "ecosystem": "python-requirements",
-          "scope": "tooling"
+          "scope": "tooling",
+          "pin": {
+            "type": "lockfile-entry",
+            "digests": [
+              "sha256:f742a7dbd0d9cb9ea41e9a24a918996e8170c799fa528688d40dd582c8265f4f"
+            ]
+          }
         },
         {
           "path": "agent/requirements-ci.lock",
           "ecosystem": "python-requirements",
-          "scope": "tooling"
+          "scope": "tooling",
+          "pin": {
+            "type": "lockfile-entry",
+            "digests": [
+              "sha256:f742a7dbd0d9cb9ea41e9a24a918996e8170c799fa528688d40dd582c8265f4f"
+            ]
+          }
         },
         {
           "path": "server/requirements-ci.lock",
           "ecosystem": "python-requirements",
-          "scope": "tooling"
+          "scope": "tooling",
+          "pin": {
+            "type": "lockfile-entry",
+            "digests": [
+              "sha256:f742a7dbd0d9cb9ea41e9a24a918996e8170c799fa528688d40dd582c8265f4f"
+            ]
+          }
         }
-      ],
-      "sha256": null
+      ]
     },
     {
       "id": "npm:@esbuild/aix-ppc64@0.28.2",
@@ -567,10 +691,16 @@
         {
           "path": "web/package-lock.json",
           "ecosystem": "npm-lock",
-          "scope": "frontend"
+          "scope": "frontend",
+          "pin": {
+            "type": "lockfile-entry",
+            "resolved": "https://registry.npmjs.org/@esbuild/aix-ppc64/-/aix-ppc64-0.28.2.tgz",
+            "digests": [
+              "sha512-XExcO+dvLKvVtNTibSTBej1NCAbaGhWn9Ww1ZPx80qsahhPFe/8jgWP0IchNe0F3HwkU7n8ejhH8bjonqht8mQ=="
+            ]
+          }
         }
-      ],
-      "sha256": null
+      ]
     },
     {
       "id": "npm:@esbuild/android-arm@0.28.2",
@@ -596,10 +726,16 @@
         {
           "path": "web/package-lock.json",
           "ecosystem": "npm-lock",
-          "scope": "frontend"
+          "scope": "frontend",
+          "pin": {
+            "type": "lockfile-entry",
+            "resolved": "https://registry.npmjs.org/@esbuild/android-arm/-/android-arm-0.28.2.tgz",
+            "digests": [
+              "sha512-kXXoiPVVGQcnIYGOeaovwOURpniDBpSq4A03qkQ+BMQqtGG6HYap3xne9C1O1yo4TR3qxlCX5IqqmX6fFo2Lqg=="
+            ]
+          }
         }
-      ],
-      "sha256": null
+      ]
     },
     {
       "id": "npm:@esbuild/android-arm64@0.28.2",
@@ -625,10 +761,16 @@
         {
           "path": "web/package-lock.json",
           "ecosystem": "npm-lock",
-          "scope": "frontend"
+          "scope": "frontend",
+          "pin": {
+            "type": "lockfile-entry",
+            "resolved": "https://registry.npmjs.org/@esbuild/android-arm64/-/android-arm64-0.28.2.tgz",
+            "digests": [
+              "sha512-5YfKeeI8qWfBZIX+u2xZC3Zlb3Os/gLS2sbEKM+I4ZOcsWmHS2WLysCcQZDAFRslDUU5Oiq44gf6PYN1vGwG5A=="
+            ]
+          }
         }
-      ],
-      "sha256": null
+      ]
     },
     {
       "id": "npm:@esbuild/android-x64@0.28.2",
@@ -654,10 +796,16 @@
         {
           "path": "web/package-lock.json",
           "ecosystem": "npm-lock",
-          "scope": "frontend"
+          "scope": "frontend",
+          "pin": {
+            "type": "lockfile-entry",
+            "resolved": "https://registry.npmjs.org/@esbuild/android-x64/-/android-x64-0.28.2.tgz",
+            "digests": [
+              "sha512-O387ite7SzUyCcy3JQX4P4bLtEA7bLLkx+esve5JHnyYfNTxcVpXZo9jhdB0lTKN44gztELTdU7nS8Nr16Fs1Q=="
+            ]
+          }
         }
-      ],
-      "sha256": null
+      ]
     },
     {
       "id": "npm:@esbuild/darwin-arm64@0.28.2",
@@ -683,10 +831,16 @@
         {
           "path": "web/package-lock.json",
           "ecosystem": "npm-lock",
-          "scope": "frontend"
+          "scope": "frontend",
+          "pin": {
+            "type": "lockfile-entry",
+            "resolved": "https://registry.npmjs.org/@esbuild/darwin-arm64/-/darwin-arm64-0.28.2.tgz",
+            "digests": [
+              "sha512-n4KqkOQrraxHJcgjM1RvwbigfQKIKJVpM7xp+KsxiyUSrRdIXnt73VhrPAx0fV44hgfmIVKjxMN9J1t5jySVkw=="
+            ]
+          }
         }
-      ],
-      "sha256": null
+      ]
     },
     {
       "id": "npm:@esbuild/darwin-x64@0.28.2",
@@ -712,10 +866,16 @@
         {
           "path": "web/package-lock.json",
           "ecosystem": "npm-lock",
-          "scope": "frontend"
+          "scope": "frontend",
+          "pin": {
+            "type": "lockfile-entry",
+            "resolved": "https://registry.npmjs.org/@esbuild/darwin-x64/-/darwin-x64-0.28.2.tgz",
+            "digests": [
+              "sha512-uq6suIWYP37qzGddBKPw5QEQPi6HiLGsO7UmkpfyaYNQ3D+rN6w6WfwH+nuqcGXWvawGwxOEroO4YGnFh95azw=="
+            ]
+          }
         }
-      ],
-      "sha256": null
+      ]
     },
     {
       "id": "npm:@esbuild/freebsd-arm64@0.28.2",
@@ -741,10 +901,16 @@
         {
           "path": "web/package-lock.json",
           "ecosystem": "npm-lock",
-          "scope": "frontend"
+          "scope": "frontend",
+          "pin": {
+            "type": "lockfile-entry",
+            "resolved": "https://registry.npmjs.org/@esbuild/freebsd-arm64/-/freebsd-arm64-0.28.2.tgz",
+            "digests": [
+              "sha512-n+I0BTSRIoy+d6RPKnEVwql5UwBJolytvY4mAOIEJorKlqgPII8ix6slVVrfZ5Tnj7glIZvloylbB/EJPMWEXw=="
+            ]
+          }
         }
-      ],
-      "sha256": null
+      ]
     },
     {
       "id": "npm:@esbuild/freebsd-x64@0.28.2",
@@ -770,10 +936,16 @@
         {
           "path": "web/package-lock.json",
           "ecosystem": "npm-lock",
-          "scope": "frontend"
+          "scope": "frontend",
+          "pin": {
+            "type": "lockfile-entry",
+            "resolved": "https://registry.npmjs.org/@esbuild/freebsd-x64/-/freebsd-x64-0.28.2.tgz",
+            "digests": [
+              "sha512-78XJTJkvPs0kz2w61301PJjXl4g7q3JqiYMZ/M/yVI73EHBrCRTgkhu9oqG7vPqq+a/yadEW8aD+agKlk5xrmg=="
+            ]
+          }
         }
-      ],
-      "sha256": null
+      ]
     },
     {
       "id": "npm:@esbuild/linux-arm@0.28.2",
@@ -799,10 +971,16 @@
         {
           "path": "web/package-lock.json",
           "ecosystem": "npm-lock",
-          "scope": "frontend"
+          "scope": "frontend",
+          "pin": {
+            "type": "lockfile-entry",
+            "resolved": "https://registry.npmjs.org/@esbuild/linux-arm/-/linux-arm-0.28.2.tgz",
+            "digests": [
+              "sha512-XlDnu2q5yoqems+xay6wSAcg9DDD7K9RLKZEBOMZm3ckNpJBvOX20tSfby8KfrrhINDyv9V2YVZKY/SpoGJI8w=="
+            ]
+          }
         }
-      ],
-      "sha256": null
+      ]
     },
     {
       "id": "npm:@esbuild/linux-arm64@0.28.2",
@@ -828,10 +1006,16 @@
         {
           "path": "web/package-lock.json",
           "ecosystem": "npm-lock",
-          "scope": "frontend"
+          "scope": "frontend",
+          "pin": {
+            "type": "lockfile-entry",
+            "resolved": "https://registry.npmjs.org/@esbuild/linux-arm64/-/linux-arm64-0.28.2.tgz",
+            "digests": [
+              "sha512-pW4AC0P3it8c7do9MVM4p51FzHzdM/TZrerurgRcHJ2WTa1VQ1CIq18xncfpBJw4ojkiZZrKW2yIBWBP92j6Ug=="
+            ]
+          }
         }
-      ],
-      "sha256": null
+      ]
     },
     {
       "id": "npm:@esbuild/linux-ia32@0.28.2",
@@ -857,10 +1041,16 @@
         {
           "path": "web/package-lock.json",
           "ecosystem": "npm-lock",
-          "scope": "frontend"
+          "scope": "frontend",
+          "pin": {
+            "type": "lockfile-entry",
+            "resolved": "https://registry.npmjs.org/@esbuild/linux-ia32/-/linux-ia32-0.28.2.tgz",
+            "digests": [
+              "sha512-CYbnj78HsIeA+DhgUKgFCfvNsTHFhMMrinUrMZpDXJXKN8T3XViTZ/+wtHeVxEWY8ewSzTFN+nRmSwO2tZaLUQ=="
+            ]
+          }
         }
-      ],
-      "sha256": null
+      ]
     },
     {
       "id": "npm:@esbuild/linux-loong64@0.28.2",
@@ -886,10 +1076,16 @@
         {
           "path": "web/package-lock.json",
           "ecosystem": "npm-lock",
-          "scope": "frontend"
+          "scope": "frontend",
+          "pin": {
+            "type": "lockfile-entry",
+            "resolved": "https://registry.npmjs.org/@esbuild/linux-loong64/-/linux-loong64-0.28.2.tgz",
+            "digests": [
+              "sha512-buwkd8nsph4R+ajRvw0qM5Hja/TXQow3ptzWO2EbG/cqcIkHloRrdlBtQlshyYGTNFvfkfJ5tpPLVkY4DtsPfQ=="
+            ]
+          }
         }
-      ],
-      "sha256": null
+      ]
     },
     {
       "id": "npm:@esbuild/linux-mips64el@0.28.2",
@@ -915,10 +1111,16 @@
         {
           "path": "web/package-lock.json",
           "ecosystem": "npm-lock",
-          "scope": "frontend"
+          "scope": "frontend",
+          "pin": {
+            "type": "lockfile-entry",
+            "resolved": "https://registry.npmjs.org/@esbuild/linux-mips64el/-/linux-mips64el-0.28.2.tgz",
+            "digests": [
+              "sha512-ZVykbDyk7519VwiNb9Lcj9m8XM6v5V9uKPvrEMkkEedVewf+0itkhahp4HDpgERXhwLRpWFypsGbG/J8s0QjJA=="
+            ]
+          }
         }
-      ],
-      "sha256": null
+      ]
     },
     {
       "id": "npm:@esbuild/linux-ppc64@0.28.2",
@@ -944,10 +1146,16 @@
         {
           "path": "web/package-lock.json",
           "ecosystem": "npm-lock",
-          "scope": "frontend"
+          "scope": "frontend",
+          "pin": {
+            "type": "lockfile-entry",
+            "resolved": "https://registry.npmjs.org/@esbuild/linux-ppc64/-/linux-ppc64-0.28.2.tgz",
+            "digests": [
+              "sha512-CAXl+Dtd9UUuJd8pKKdwh6MLm3MUMiqMPmhZ3tTSXPqfyQ3vDl6R5hZdZ/kYojK4ofXtdfSv1tFq8XzWx3heNQ=="
+            ]
+          }
         }
-      ],
-      "sha256": null
+      ]
     },
     {
       "id": "npm:@esbuild/linux-riscv64@0.28.2",
@@ -973,10 +1181,16 @@
         {
           "path": "web/package-lock.json",
           "ecosystem": "npm-lock",
-          "scope": "frontend"
+          "scope": "frontend",
+          "pin": {
+            "type": "lockfile-entry",
+            "resolved": "https://registry.npmjs.org/@esbuild/linux-riscv64/-/linux-riscv64-0.28.2.tgz",
+            "digests": [
+              "sha512-GeXCej4IQtU1B+QlDV8W/RRvbzI3O/Stss+/bCXv4lZls5WGRtu2a+3JkA3i4qIUlMXpcHebWpF8AkJhATowuA=="
+            ]
+          }
         }
-      ],
-      "sha256": null
+      ]
     },
     {
       "id": "npm:@esbuild/linux-s390x@0.28.2",
@@ -1002,10 +1216,16 @@
         {
           "path": "web/package-lock.json",
           "ecosystem": "npm-lock",
-          "scope": "frontend"
+          "scope": "frontend",
+          "pin": {
+            "type": "lockfile-entry",
+            "resolved": "https://registry.npmjs.org/@esbuild/linux-s390x/-/linux-s390x-0.28.2.tgz",
+            "digests": [
+              "sha512-3H1weTYZPxt/WOhByszQZybS9w5lKzUn1FDMsgEChbHWQwHYQQRfBxgCcZvPhjHfKyJjIievvMmEUawJrdY9Dg=="
+            ]
+          }
         }
-      ],
-      "sha256": null
+      ]
     },
     {
       "id": "npm:@esbuild/linux-x64@0.28.2",
@@ -1031,10 +1251,16 @@
         {
           "path": "web/package-lock.json",
           "ecosystem": "npm-lock",
-          "scope": "frontend"
+          "scope": "frontend",
+          "pin": {
+            "type": "lockfile-entry",
+            "resolved": "https://registry.npmjs.org/@esbuild/linux-x64/-/linux-x64-0.28.2.tgz",
+            "digests": [
+              "sha512-4xTZr1FUmSoQW4XIWmit3tzQrUTZM+N3P0XV8xROKYF50XfI7xeO90+1bZvNwxIufQ9hDQVRJH5YhgPVF8A/HQ=="
+            ]
+          }
         }
-      ],
-      "sha256": null
+      ]
     },
     {
       "id": "npm:@esbuild/netbsd-arm64@0.28.2",
@@ -1060,10 +1286,16 @@
         {
           "path": "web/package-lock.json",
           "ecosystem": "npm-lock",
-          "scope": "frontend"
+          "scope": "frontend",
+          "pin": {
+            "type": "lockfile-entry",
+            "resolved": "https://registry.npmjs.org/@esbuild/netbsd-arm64/-/netbsd-arm64-0.28.2.tgz",
+            "digests": [
+              "sha512-sSATRjPeDBg3pdgHoQfoYBob11Kk1FGa9lui5RIHZCoCkJa9QKlvl3/vKz2usCmYYjs7ymJR/2Nnsqe+Hjt5nw=="
+            ]
+          }
         }
-      ],
-      "sha256": null
+      ]
     },
     {
       "id": "npm:@esbuild/netbsd-x64@0.28.2",
@@ -1089,10 +1321,16 @@
         {
           "path": "web/package-lock.json",
           "ecosystem": "npm-lock",
-          "scope": "frontend"
+          "scope": "frontend",
+          "pin": {
+            "type": "lockfile-entry",
+            "resolved": "https://registry.npmjs.org/@esbuild/netbsd-x64/-/netbsd-x64-0.28.2.tgz",
+            "digests": [
+              "sha512-lqnzCV+mM0gIADaKihiCg6ifgfU2L3h5E33rNQBN1Y4MaVGnzryzmvvf7UHxprpQdE8hpqLolJ9Rl+SkIRDpyw=="
+            ]
+          }
         }
-      ],
-      "sha256": null
+      ]
     },
     {
       "id": "npm:@esbuild/openbsd-arm64@0.28.2",
@@ -1118,10 +1356,16 @@
         {
           "path": "web/package-lock.json",
           "ecosystem": "npm-lock",
-          "scope": "frontend"
+          "scope": "frontend",
+          "pin": {
+            "type": "lockfile-entry",
+            "resolved": "https://registry.npmjs.org/@esbuild/openbsd-arm64/-/openbsd-arm64-0.28.2.tgz",
+            "digests": [
+              "sha512-AL2qJILH7lNjrDmCQDvdxMfAUIv8KMNZOvrwAQ8i8//ntL9FflhOyMJ8OZSMBb8/AWXe3/5v5S20y3zCoZWKoQ=="
+            ]
+          }
         }
-      ],
-      "sha256": null
+      ]
     },
     {
       "id": "npm:@esbuild/openbsd-x64@0.28.2",
@@ -1147,10 +1391,16 @@
         {
           "path": "web/package-lock.json",
           "ecosystem": "npm-lock",
-          "scope": "frontend"
+          "scope": "frontend",
+          "pin": {
+            "type": "lockfile-entry",
+            "resolved": "https://registry.npmjs.org/@esbuild/openbsd-x64/-/openbsd-x64-0.28.2.tgz",
+            "digests": [
+              "sha512-QtiuPytchRyC4rwUKhexJdQKvDuZ6hWloi3igqPQNUJCS1/v9EiO3UTOXR6A3FoMo4fnAKbWJdqaIwhOzh8qEw=="
+            ]
+          }
         }
-      ],
-      "sha256": null
+      ]
     },
     {
       "id": "npm:@esbuild/openharmony-arm64@0.28.2",
@@ -1176,10 +1426,16 @@
         {
           "path": "web/package-lock.json",
           "ecosystem": "npm-lock",
-          "scope": "frontend"
+          "scope": "frontend",
+          "pin": {
+            "type": "lockfile-entry",
+            "resolved": "https://registry.npmjs.org/@esbuild/openharmony-arm64/-/openharmony-arm64-0.28.2.tgz",
+            "digests": [
+              "sha512-WkhYDmpTjLvGlScA1rwjRUmhl4k8oXR3cIbtqWmELgU/dFeHHlEllxDvdWcNJV9rbzCexB5vz8gtNewWLgCT7Q=="
+            ]
+          }
         }
-      ],
-      "sha256": null
+      ]
     },
     {
       "id": "npm:@esbuild/sunos-x64@0.28.2",
@@ -1205,10 +1461,16 @@
         {
           "path": "web/package-lock.json",
           "ecosystem": "npm-lock",
-          "scope": "frontend"
+          "scope": "frontend",
+          "pin": {
+            "type": "lockfile-entry",
+            "resolved": "https://registry.npmjs.org/@esbuild/sunos-x64/-/sunos-x64-0.28.2.tgz",
+            "digests": [
+              "sha512-GPMSkTOtMnv2U2F8gxe4Io6qmVs+YKyp832Etqqxr0hFngmXQ3rzwytelm3GIn7T4VviRUlf3sOgBOiTdvaf7g=="
+            ]
+          }
         }
-      ],
-      "sha256": null
+      ]
     },
     {
       "id": "npm:@esbuild/win32-arm64@0.28.2",
@@ -1234,10 +1496,16 @@
         {
           "path": "web/package-lock.json",
           "ecosystem": "npm-lock",
-          "scope": "frontend"
+          "scope": "frontend",
+          "pin": {
+            "type": "lockfile-entry",
+            "resolved": "https://registry.npmjs.org/@esbuild/win32-arm64/-/win32-arm64-0.28.2.tgz",
+            "digests": [
+              "sha512-PIhhEkE9uPBleRBrQEJpUn7MBnibZzbGzYWPmY3x+YoVg/95zbjB4CxPPOQ8l5tYYM4mMaCthF8/1DIfBQQyWQ=="
+            ]
+          }
         }
-      ],
-      "sha256": null
+      ]
     },
     {
       "id": "npm:@esbuild/win32-ia32@0.28.2",
@@ -1263,10 +1531,16 @@
         {
           "path": "web/package-lock.json",
           "ecosystem": "npm-lock",
-          "scope": "frontend"
+          "scope": "frontend",
+          "pin": {
+            "type": "lockfile-entry",
+            "resolved": "https://registry.npmjs.org/@esbuild/win32-ia32/-/win32-ia32-0.28.2.tgz",
+            "digests": [
+              "sha512-YmJbfTlvU7Sdn9BB+4PRES4oB6pxgS37MAONj+hBr/cpXS1aBPKXxNnDbu+QCWPj0o9dgyxeq79g6c5P8KeuYA=="
+            ]
+          }
         }
-      ],
-      "sha256": null
+      ]
     },
     {
       "id": "npm:@esbuild/win32-x64@0.28.2",
@@ -1292,10 +1566,16 @@
         {
           "path": "web/package-lock.json",
           "ecosystem": "npm-lock",
-          "scope": "frontend"
+          "scope": "frontend",
+          "pin": {
+            "type": "lockfile-entry",
+            "resolved": "https://registry.npmjs.org/@esbuild/win32-x64/-/win32-x64-0.28.2.tgz",
+            "digests": [
+              "sha512-5ebpxr3nWMzrL/rnUI755Jkuee0bHL/Gq0WTF9lvcpv73wAp5eu8MfBUgWK9bhWvZjj7yX8etf/8tI8Ney695g=="
+            ]
+          }
         }
-      ],
-      "sha256": null
+      ]
     },
     {
       "id": "npm:@types/react@19.3.0",
@@ -1321,15 +1601,25 @@
         {
           "path": "web/package.json",
           "ecosystem": "npm-project",
-          "scope": "frontend"
+          "scope": "frontend",
+          "pin": {
+            "type": "lock-correspondence",
+            "lock": "web/package-lock.json"
+          }
         },
         {
           "path": "web/package-lock.json",
           "ecosystem": "npm-lock",
-          "scope": "frontend"
+          "scope": "frontend",
+          "pin": {
+            "type": "lockfile-entry",
+            "resolved": "https://registry.npmjs.org/@types/react/-/react-19.3.0.tgz",
+            "digests": [
+              "sha512-N0rFCuH9YoxG9/m61l9MfpJKfmLOVU0em7ipIz6TRgSSkvReLB9vL85GB+yr8Bs5leqpvg96JSwF4ZS1s4viQg=="
+            ]
+          }
         }
-      ],
-      "sha256": null
+      ]
     },
     {
       "id": "npm:@types/react-dom@19.3.0",
@@ -1355,15 +1645,25 @@
         {
           "path": "web/package.json",
           "ecosystem": "npm-project",
-          "scope": "frontend"
+          "scope": "frontend",
+          "pin": {
+            "type": "lock-correspondence",
+            "lock": "web/package-lock.json"
+          }
         },
         {
           "path": "web/package-lock.json",
           "ecosystem": "npm-lock",
-          "scope": "frontend"
+          "scope": "frontend",
+          "pin": {
+            "type": "lockfile-entry",
+            "resolved": "https://registry.npmjs.org/@types/react-dom/-/react-dom-19.3.0.tgz",
+            "digests": [
+              "sha512-ZI7bU42mZXXKHn/qNLEw2IrbiINU7X5+vfgdixBHkCNpYWXjKgfQ/P+uyGb5CjOLB9UcnTeg3rylQtV2hym44Q=="
+            ]
+          }
         }
-      ],
-      "sha256": null
+      ]
     },
     {
       "id": "npm:csstype@3.2.3",
@@ -1389,10 +1689,16 @@
         {
           "path": "web/package-lock.json",
           "ecosystem": "npm-lock",
-          "scope": "frontend"
+          "scope": "frontend",
+          "pin": {
+            "type": "lockfile-entry",
+            "resolved": "https://registry.npmjs.org/csstype/-/csstype-3.2.3.tgz",
+            "digests": [
+              "sha512-z1HGKcYy2xA8AGQfwrn0PAy+PB7X/GSj3UVJW9qKyn43xWa+gl5nXmU4qqLMRzWVLFC8KusUX8T/0kCiOYpAIQ=="
+            ]
+          }
         }
-      ],
-      "sha256": null
+      ]
     },
     {
       "id": "npm:esbuild@0.28.2",
@@ -1418,15 +1724,25 @@
         {
           "path": "web/package.json",
           "ecosystem": "npm-project",
-          "scope": "frontend"
+          "scope": "frontend",
+          "pin": {
+            "type": "lock-correspondence",
+            "lock": "web/package-lock.json"
+          }
         },
         {
           "path": "web/package-lock.json",
           "ecosystem": "npm-lock",
-          "scope": "frontend"
+          "scope": "frontend",
+          "pin": {
+            "type": "lockfile-entry",
+            "resolved": "https://registry.npmjs.org/esbuild/-/esbuild-0.28.2.tgz",
+            "digests": [
+              "sha512-HKVLS8dvII+xoKW9kmqxbRKrnWEXfJJr/FZhhJmiqIB0e053QNYFqOBouTMO/k5sID4MvCiUCvv8b9M4h32wIA=="
+            ]
+          }
         }
-      ],
-      "sha256": null
+      ]
     },
     {
       "id": "npm:react@19.3.0",
@@ -1452,15 +1768,25 @@
         {
           "path": "web/package.json",
           "ecosystem": "npm-project",
-          "scope": "frontend"
+          "scope": "frontend",
+          "pin": {
+            "type": "lock-correspondence",
+            "lock": "web/package-lock.json"
+          }
         },
         {
           "path": "web/package-lock.json",
           "ecosystem": "npm-lock",
-          "scope": "frontend"
+          "scope": "frontend",
+          "pin": {
+            "type": "lockfile-entry",
+            "resolved": "https://registry.npmjs.org/react/-/react-19.3.0.tgz",
+            "digests": [
+              "sha512-E8LUcbtBWt20bbl2YoHfx4ZDBdxVTfOKtCZn9cDSJ4l6/nuoApcpIBcj47t2wZoVX8g2ZHuMHbiShgCR1T5Sog=="
+            ]
+          }
         }
-      ],
-      "sha256": null
+      ]
     },
     {
       "id": "npm:react-dom@19.3.0",
@@ -1486,15 +1812,25 @@
         {
           "path": "web/package.json",
           "ecosystem": "npm-project",
-          "scope": "frontend"
+          "scope": "frontend",
+          "pin": {
+            "type": "lock-correspondence",
+            "lock": "web/package-lock.json"
+          }
         },
         {
           "path": "web/package-lock.json",
           "ecosystem": "npm-lock",
-          "scope": "frontend"
+          "scope": "frontend",
+          "pin": {
+            "type": "lockfile-entry",
+            "resolved": "https://registry.npmjs.org/react-dom/-/react-dom-19.3.0.tgz",
+            "digests": [
+              "sha512-JDk8dgif51OjFoDE70+OT9ICyYr+69HlmihNwp1+Nsfbna3t5sIiCa9ZJktDmQ4/1b/rn26hIAR2uYXDMr5r0Q=="
+            ]
+          }
         }
-      ],
-      "sha256": null
+      ]
     },
     {
       "id": "npm:scheduler@0.28.0",
@@ -1520,10 +1856,16 @@
         {
           "path": "web/package-lock.json",
           "ecosystem": "npm-lock",
-          "scope": "frontend"
+          "scope": "frontend",
+          "pin": {
+            "type": "lockfile-entry",
+            "resolved": "https://registry.npmjs.org/scheduler/-/scheduler-0.28.0.tgz",
+            "digests": [
+              "sha512-juorfCmIkIw8tT+p5BXSm6PJjQF/ycEYmKyzURCIt/RaZIhL+PulbQ9Yu2z1HdOJDdqDTlxA1+xKBmHXJsczAw=="
+            ]
+          }
         }
-      ],
-      "sha256": null
+      ]
     },
     {
       "id": "npm:typescript@6.0.3",
@@ -1550,15 +1892,25 @@
         {
           "path": "web/package.json",
           "ecosystem": "npm-project",
-          "scope": "frontend"
+          "scope": "frontend",
+          "pin": {
+            "type": "lock-correspondence",
+            "lock": "web/package-lock.json"
+          }
         },
         {
           "path": "web/package-lock.json",
           "ecosystem": "npm-lock",
-          "scope": "frontend"
+          "scope": "frontend",
+          "pin": {
+            "type": "lockfile-entry",
+            "resolved": "https://registry.npmjs.org/typescript/-/typescript-6.0.3.tgz",
+            "digests": [
+              "sha512-y2TvuxSZPDyQakkFRPZHKFm+KKVqIisdg9/CZwm9ftvKXLP8NRWj38/ODjNbr43SsoXqNuAisEf1GdCxqWcdBw=="
+            ]
+          }
         }
-      ],
-      "sha256": null
+      ]
     },
     {
       "id": "pypi:onnxruntime@1.28.0",
@@ -1587,10 +1939,15 @@
         {
           "path": "server/requirements-detector.lock",
           "ecosystem": "python-requirements",
-          "scope": "backend"
+          "scope": "backend",
+          "pin": {
+            "type": "lockfile-entry",
+            "digests": [
+              "sha256:0a83bdb70d143cede762b677789bf2a7acca54b3fb82565601d5c30695aa933c"
+            ]
+          }
         }
-      ],
-      "sha256": null
+      ]
     },
     {
       "id": "pypi:numpy@2.3.5",
@@ -1621,10 +1978,15 @@
         {
           "path": "server/requirements-detector.lock",
           "ecosystem": "python-requirements",
-          "scope": "backend"
+          "scope": "backend",
+          "pin": {
+            "type": "lockfile-entry",
+            "digests": [
+              "sha256:0d8163f43acde9a73c2a33605353a4f1bc4798745a8b1d73183b28e5b435ae28"
+            ]
+          }
         }
-      ],
-      "sha256": null
+      ]
     },
     {
       "id": "pypi:flatbuffers@25.12.19",
@@ -1653,10 +2015,15 @@
         {
           "path": "server/requirements-detector.lock",
           "ecosystem": "python-requirements",
-          "scope": "backend"
+          "scope": "backend",
+          "pin": {
+            "type": "lockfile-entry",
+            "digests": [
+              "sha256:7634f50c427838bb021c2d66a3d1168e9d199b0607e6329399f04846d42e20b4"
+            ]
+          }
         }
-      ],
-      "sha256": null
+      ]
     },
     {
       "id": "pypi:packaging@25.0",
@@ -1685,10 +2052,15 @@
         {
           "path": "server/requirements-detector.lock",
           "ecosystem": "python-requirements",
-          "scope": "backend"
+          "scope": "backend",
+          "pin": {
+            "type": "lockfile-entry",
+            "digests": [
+              "sha256:29572ef2b1f17581046b3a2227d5c611fb25ec70ca1ba8554b24b0e69331a484"
+            ]
+          }
         }
-      ],
-      "sha256": null
+      ]
     },
     {
       "id": "pypi:protobuf@6.33.5",
@@ -1716,10 +2088,88 @@
         {
           "path": "server/requirements-detector.lock",
           "ecosystem": "python-requirements",
-          "scope": "backend"
+          "scope": "backend",
+          "pin": {
+            "type": "lockfile-entry",
+            "digests": [
+              "sha256:cbf16ba3350fb7b889fca858fb215967792dc125b35c7976ca4818bee3521cf0"
+            ]
+          }
         }
+      ]
+    }
+  ],
+  "container_images": [
+    {
+      "id": "image:python@3.12.14-slim-bookworm",
+      "repository": "python",
+      "tag": "3.12.14-slim-bookworm",
+      "digest": "sha256:392307d22300de8b5986851a12d9176dfc0fc073e65bf6523ebd7dcbeb23564e",
+      "distribution": "ci-only-not-redistributed",
+      "upstream": "https://hub.docker.com/_/python",
+      "license_summary": "Unmodified Docker Official Image aggregate: PSF-2.0/Python-2.0 interpreter, permissive Debian packages, LGPL system libraries and GPL system utilities; not represented as wholly permissive and not republished by ServerSentinel.",
+      "license_evidence": [
+        "server/docs/DEPENDENCIES.md",
+        "agent/docs/DEPENDENCIES.md",
+        "https://hub.docker.com/_/python",
+        "https://docs.python.org/3.12/license.html"
       ],
-      "sha256": null
+      "transitive_evidence": [
+        "server/docs/image-dpkg-packages-amd64.json",
+        "server/docs/image-attestation-manifest-amd64.json",
+        "server/docs/DEPENDENCIES.md"
+      ],
+      "obligations": [
+        "preserve-license-and-copyright",
+        "preserve-notice",
+        "fulfill-image-redistribution-obligations"
+      ],
+      "notice_files": [
+        "server/docs/DEPENDENCIES.md",
+        "agent/docs/DEPENDENCIES.md"
+      ],
+      "locations": [
+        {
+          "path": "agent/Dockerfile.ci",
+          "scope": "tooling"
+        },
+        {
+          "path": "server/Dockerfile.ci",
+          "scope": "tooling"
+        }
+      ]
+    },
+    {
+      "id": "image:node@24.21.0-bookworm-slim",
+      "repository": "node",
+      "tag": "24.21.0-bookworm-slim",
+      "digest": "sha256:0e0ff40c39bc087845bfb27465a0df4ea419520094bc35842ff83dd8cbe6f9b6",
+      "distribution": "ci-only-not-redistributed",
+      "upstream": "https://hub.docker.com/_/node",
+      "license_summary": "Unmodified Docker Official Image aggregate: MIT Node.js with bundled notices plus permissive, LGPL and GPL Debian system utilities; not represented as wholly permissive and not republished by ServerSentinel.",
+      "license_evidence": [
+        "web/THIRD_PARTY_NOTICES.md",
+        "https://hub.docker.com/_/node",
+        "https://github.com/nodejs/node/blob/v24.21.0/LICENSE"
+      ],
+      "transitive_evidence": [
+        "web/THIRD_PARTY_NOTICES.md",
+        "https://hub.docker.com/_/node"
+      ],
+      "obligations": [
+        "preserve-license-and-copyright",
+        "preserve-notice",
+        "fulfill-image-redistribution-obligations"
+      ],
+      "notice_files": [
+        "web/THIRD_PARTY_NOTICES.md"
+      ],
+      "locations": [
+        {
+          "path": "web/Dockerfile.ci",
+          "scope": "tooling"
+        }
+      ]
     }
   ]
 }

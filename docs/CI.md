@@ -44,6 +44,9 @@ The repository job always runs:
   lockfiles, source/configuration, and available generated output;
 - fail-closed dependency/model license inventory validation, including exact
   lock entries, separate model code/weight evidence, notices and Owner approvals;
+- immutable pin validation of lock digests, resolved artifacts, model weight
+  digests and container base image digests, plus a build-time comparison of the
+  pins pip and npm actually resolved against that reviewed evidence;
 - Pyflakes and pycodestyle lint checks for Python tooling/tests;
 - synthetic positive/negative unit tests for the guards and component runner;
 - whitespace checks on the checked-out change.
@@ -100,8 +103,10 @@ implemented by this repository. Python dependencies install into a temporary
 virtual environment with pip hash verification. Declare every required tool
 and dependency in that component's reviewed lockfile. The same change must
 register each new lockfile and exact package in `license/components.json`;
-otherwise the license gate fails before component installation. Lockfile
-SHA256/SRI values must also match `license/pins.json` exactly.
+otherwise the license gate fails before component installation. Each reviewed
+location stores its own immutable pin evidence in that same record, so a lockfile
+SHA256/SRI or resolved artifact URL that changes while the version string stays
+the same is a gate failure.
 
 Node components require `package.json`, `package-lock.json`, and nonempty `lint`
 and `test` scripts. CI runs `npm ci --ignore-scripts --no-audit --no-fund`,
@@ -124,10 +129,22 @@ deployment environment, root privileges, or writable root filesystem. Resource
 limits, a bounded temporary filesystem, timeouts, and container cleanup apply.
 The image and all its dependencies require the usual license and pinning review.
 
-Committed model artifacts require a distinct `model_weight` record with the
-exact path and SHA256. All files in a reserved model artifact directory are
-checked regardless of extension; common model suffixes are also checked in
-other directories. Model weight inventory locations outside the reserved
+Every tracked `Dockerfile*` is a reviewed `container-image` inventory input. Each
+`FROM` and `COPY --from` image must name a repository, a tag, and an immutable
+`sha256` digest recorded with its license, notice and redistribution evidence in
+`license/components.json`. Floating tags, variable references, unregistered
+images and later digest substitutions fail closed, and a base image declared as
+redistributed instead of CI-only requires a new Owner decision. Container builds
+must install Python packages from a reviewed requirements input with
+`--require-hashes` and must use `npm ci`.
+
+Committed model artifacts require a distinct `model_weight` record whose pin
+evidence binds the exact path and SHA256 digest. All files in a reserved model
+artifact directory are checked regardless of extension; common serialized model
+suffixes, including `.pkl`, `.joblib`, `.npz` and `.safetensors`, are checked in
+other directories, and any other opaque non-text file outside the reviewed media
+and Web asset formats is treated as a model artifact until it has its own
+record. Model weight inventory locations outside the reserved
 directories are rejected. Detection-only `assets/ml/` and `assets/ai/` paths are
 also scanned in full so an opaque archive cannot bypass suffix detection. Model
 implementation packages require `model_code` records.

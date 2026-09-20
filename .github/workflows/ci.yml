@@ -35,6 +35,16 @@ jobs:
           PIP_DISABLE_PIP_VERSION_CHECK: '1'
         run: |
           python -m pip install --require-hashes --only-binary=:all: -r .ci/requirements.txt
+      - name: Verify resolved Python pins against reviewed evidence
+        env:
+          PIP_DISABLE_PIP_VERSION_CHECK: '1'
+        run: |
+          python -m venv "${RUNNER_TEMP}/pin-check"
+          "${RUNNER_TEMP}/pin-check/bin/python" -m pip install --require-hashes \
+            --only-binary=:all: --no-cache-dir \
+            --report "${RUNNER_TEMP}/pip-report.json" -r .ci/requirements.txt
+          python scripts/ci/license_gate.py \
+            --resolved-python "${RUNNER_TEMP}/pip-report.json" --input .ci/requirements.txt
       - name: Python lint
         run: |
           python -m pyflakes scripts tests
@@ -83,6 +93,10 @@ jobs:
         run: |
           npm ci --ignore-scripts --no-audit --no-fund
           npm run build
+      - name: Verify resolved npm pins against reviewed evidence
+        run: |
+          python3 scripts/ci/license_gate.py \
+            --resolved-npm web/node_modules/.package-lock.json --input web/package-lock.json
       - name: Synthetic viewport and browser request interception
         working-directory: web
         run: npm run test:browser

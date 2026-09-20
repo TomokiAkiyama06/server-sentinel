@@ -111,8 +111,13 @@ CI runs `python scripts/ci/license_gate.py` and fails when a reviewed dependency
 input, exact locked dependency, or committed model artifact is absent or differs.
 The inventory keeps exact upstream and license evidence, material transitive
 evidence, notices, and redistribution obligations for each component.
-Python lock SHA256 values and npm lock SRI values are independently allowlisted
-in `license/pins.json`; changing only a digest is therefore a gate failure.
+Immutable pin evidence is stored in the same record: Python lock SHA256 values,
+npm resolved artifacts with their SRI values, model weight digests and container
+base image digests. Changing only a digest, a resolved URL, or an image digest is
+therefore a gate failure even when the exact version string is unchanged, and a
+location without pin evidence is never treated as license-reviewed. CI also
+compares the pins pip and npm actually resolved during the build against the same
+records.
 
 Model implementation code and weights use distinct `model_code` and
 `model_weight` records. Weight records bind the artifact path and SHA256; all
@@ -128,23 +133,46 @@ Runtime-style `assets/ml/` and `assets/ai/` paths are detection-only model-like
 locations. Every file under them is checked, including opaque archives and
 extensionless files, but approved weights must move to a reserved directory.
 
+Container base images are tracked in a separate `container_images` inventory
+because an unmodified Docker Official Image is an operating-system aggregate
+rather than one SPDX identifier. Every tracked `Dockerfile*` is a reviewed input,
+every `FROM` and `COPY --from` image must pin repository, tag and `sha256`
+digest, and each reviewed image keeps its license summary, license and transitive
+evidence, notices and redistribution obligations. Only the reviewed CI-only,
+non-republished use is accepted; declaring an image as redistributed, using a
+floating tag or variable, adding an unregistered image, or substituting a digest
+blocks until the Owner records a new decision. Container builds must install
+Python packages from a reviewed requirements input with `--require-hashes` and
+must use `npm ci`.
+
 Blocked-by-default licenses require an exact record in
 [`license/owner-approvals.json`](../license/owner-approvals.json), including the
-component version, license, date, `repository-owner` approver, and a committed
-Owner decision under `docs/decisions/`. CI rejects stale, missing, mismatched,
+component name, version, kind, license, upstream, date, `repository-owner`
+approver, and a committed Owner decision under `docs/decisions/`. A component id
+must be the dependency coordinate itself, so an approval cannot be inherited by a
+different package behind the same id. CI rejects stale, missing, mismatched,
 or unused approval records.
 
 Requirements `-r` and `-c` includes are recursively covered: each target must be
 a separate reviewed repository input, paths may not escape or use a remote URL,
 and cycles fail. Each Python project dependency must correspond by PEP 503 canonical
 name, exact version, and scope to a reviewed requirements lock entry whose
-hashes match `license/pins.json`. Dynamic dependency fields and setuptools
-dynamic dependency sources fail closed until a reviewed parser covers them.
+hashes match the pin stored in the same reviewed record. Dynamic dependency
+fields, setuptools dynamic dependency sources, `setup.py`, `setup.cfg`, `Pipfile`
+and other unparsed manifests fail closed until a reviewed parser covers them.
+`npm-shrinkwrap.json` is audited with the npm lock parser and may not sit beside
+a `package-lock.json`, because npm would silently prefer it. Version strings must
+be exact: PEP 440 wildcards, environment markers, extras and npm ranges or
+wildcard tags are rejected as non-pins.
 The permissive license set is explicit; unknown free-form,
 proprietary, Elastic, Commons Clause, source-available, and other unlisted terms
 need exact Owner approval rather than being accepted because they do not match a
 known copyleft name. Committed `build/` and `dist/` archives, extensionless
 artifacts, and unknown opaque output types remain in the artifact scan and
-require independent weight evidence and checksum review. Recognized Web/static
+require independent weight evidence and checksum review. Common serialized model
+formats such as `.pkl`, `.joblib`, `.npz`, `.gguf` and `.safetensors` are
+detected anywhere in the repository, and any other opaque non-text file outside
+the reviewed media and Web asset formats is treated as a model artifact until it
+has its own record, so renaming a model does not bypass weight review. Recognized Web/static
 asset suffixes, including `.wasm`, are not classified as model artifacts merely
 because they are in a build output directory.
