@@ -44,10 +44,14 @@ duration of corroborating samples. An explicit ROI-occlusion signal, sampling
 gap, stream restart, regression, mismatched frame, or insufficient movement
 quality resets confirmation and yields `unknown`, never `no movement`. A
 sample the detector refuses outright, such as a frame belonging to another
-source, ends the episode too, so no later confirmation spans it. A bounded
-history of replaced streams is kept, so a delayed frame from a stream this
-source already left is refused as stale imagery rather than becoming current
-again through an A-to-B-to-A transition. Every accepted
+source, ends the episode too, so no later confirmation spans it. Every stream
+this source has replaced is remembered for the detector's lifetime, so a
+delayed frame from a stream it already left is refused as stale imagery rather
+than becoming current again, and no number of later replacements lets an old
+identity age back into validity. The number of admitted transitions is bounded
+instead: after `RETIRED_STREAM_LIMIT` of them the detector stops admitting new
+streams and reports `stream_history_exhausted`, which a runtime resolves by
+binding a fresh detector rather than by accepting stale imagery. Every accepted
 sample records the observed stream, sequence and clock before any such
 `unknown` result, so a buffered frame from a superseded geometry or stream
 cannot pass the regression check afterwards. The calibration comparison budget

@@ -1,6 +1,5 @@
 """Calibrated global compensation and persistent, neutral critical observations."""
 
-from collections import deque
 from dataclasses import dataclass
 from uuid import uuid4
 
@@ -11,8 +10,13 @@ from .geometry import (candidates, contains, coverage, dissimilarity, match,
                        validate_polygon, variance)
 
 
-# Matches the inference scheduler's retired-stream admission history.
-RETIRED_STREAM_HISTORY = 4
+# A retired stream identity is never forgotten while a detector lives, so an
+# old identity cannot age back into validity after enough replacements. The
+# count of admitted transitions is bounded instead: once this many streams have
+# been retired the detector stops admitting new ones and reports every sample
+# as unknown, which a runtime resolves by binding a fresh detector rather than
+# by accepting imagery from a stream the source already left.
+RETIRED_STREAM_LIMIT = 64
 
 
 @dataclass
@@ -104,10 +108,9 @@ class SceneDetector:
             raise ValueError("no usable ROI transform reaches the movement threshold")
         self.reference_digest = calibration.reference_sha256
         self.stream_id = None
-        # Bounded history of streams this source has replaced, matching the
-        # inference scheduler's admission bound. Frames from one of them are
-        # stale imagery, never a new restart.
-        self.retired_streams = deque(maxlen=RETIRED_STREAM_HISTORY)
+        # Every stream this source has replaced. Frames from one of them are
+        # stale imagery, never a new restart, and the set is never evicted from.
+        self.retired_streams = set()
         self.last_sequence = -1
         self.last_ns = -1
         self.last_scene_shift_ns = None
@@ -207,9 +210,19 @@ class SceneDetector:
             return self._observation(frame, monotonic_ns, observed_at, stream=frame.stream_id,
                                      movement_reason="retired_stream",
                                      tamper_reason="retired_stream")
+        if restarted and len(self.retired_streams) >= RETIRED_STREAM_LIMIT:
+            # Admitting another stream would mean forgetting a retired identity,
+            # which is how stale imagery becomes acceptable again. This detector
+            # stops admitting instead; a runtime resolves it by binding a fresh
+            # one, and every sample stays unknown until then.
+            self._interrupt()
+            self.last_ns = monotonic_ns
+            return self._observation(frame, monotonic_ns, observed_at, stream=frame.stream_id,
+                                     movement_reason="stream_history_exhausted",
+                                     tamper_reason="stream_history_exhausted")
         gap = self.last_ns >= 0 and monotonic_ns - self.last_ns > self.policy.maximum_gap_ns
         if restarted:
-            self.retired_streams.append(self.stream_id)
+            self.retired_streams.add(self.stream_id)
         # Record the observed progression before any fail-unknown return. The
         # source has already advanced past this sample, so a later buffered
         # frame from the superseded geometry or stream must not pass the

@@ -15,6 +15,7 @@ from app.detection.roi import (
     CriticalDelivery, CriticalKind, OwnerCalibrationOperations, Policy,
     SceneDetector,
 )
+from app.detection.roi.detector import RETIRED_STREAM_LIMIT
 from app.storage.migrations import migrate
 from app.storage.schema import APPLICATION_MIGRATIONS
 
@@ -334,6 +335,43 @@ class SceneDetectorTests(unittest.TestCase):
         self.assertEqual("awaiting_confirmation", resumed.movement_reason)
         self.assertEqual(replacement, resumed.stream_id)
         self.assertFalse(resumed.critical)
+
+    def test_a_retired_stream_is_not_forgotten_after_later_replacements(self):
+        moved = transformed(pixels(), (1, 0), region=(4, 4, 8, 7))
+        instance = detector()
+        inspect_scene(instance, frame(0), 0)
+        inspect_scene(instance, frame(1, moved), 10)
+        for index in range(RETIRED_STREAM_LIMIT // 8 + 6):
+            inspect_scene(instance, frame(0, moved, stream=UUID(int=1000 + index)), 20 + index * 10)
+        clock = 20 + (RETIRED_STREAM_LIMIT // 8 + 6) * 10
+        stale = [inspect_scene(instance, frame(2 + index, moved), clock + index * 10)
+                 for index in range(3)]
+        for sample in stale:
+            self.assertEqual("retired_stream", sample.movement_reason)
+            self.assertEqual(Observation.UNKNOWN, sample.movement)
+            self.assertEqual(STREAM, sample.stream_id)
+            self.assertFalse(sample.critical)
+
+    def test_exhausted_stream_history_fails_closed_instead_of_forgetting(self):
+        moved = transformed(pixels(), (1, 0), region=(4, 4, 8, 7))
+        instance = detector()
+        inspect_scene(instance, frame(0), 0)
+        for index in range(RETIRED_STREAM_LIMIT):
+            inspect_scene(instance, frame(0, moved, stream=UUID(int=2000 + index)), 10 + index * 10)
+        self.assertEqual(RETIRED_STREAM_LIMIT, len(instance.retired_streams))
+        clock = 10 + RETIRED_STREAM_LIMIT * 10
+        refused = UUID(int=2000 + RETIRED_STREAM_LIMIT)
+        blocked = [inspect_scene(instance, frame(index, moved, stream=refused), clock + index * 10)
+                   for index in range(3)]
+        for sample in blocked:
+            self.assertEqual("stream_history_exhausted", sample.movement_reason)
+            self.assertEqual("stream_history_exhausted", sample.tamper_reason)
+            self.assertEqual(Observation.UNKNOWN, sample.movement)
+            self.assertEqual(Observation.UNKNOWN, sample.tamper)
+            self.assertEqual(refused, sample.stream_id)
+            self.assertFalse(sample.critical)
+        self.assertNotIn(refused, instance.retired_streams)
+        self.assertEqual(RETIRED_STREAM_LIMIT, len(instance.retired_streams))
 
     def test_confirmation_after_an_interruption_reports_new_critical_evidence(self):
         moved = transformed(pixels(), (1, 0), region=(4, 4, 8, 7))

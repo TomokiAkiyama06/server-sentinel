@@ -625,9 +625,12 @@ returns `unknown` and resets confirmation; none is converted into a trustworthy
 no-movement result. A refused sample, such as a frame from another source, ends
 the episode as well, so no later confirmation spans it, and the observed stream,
 sequence and clock advance before any such result so that a buffered frame from
-a superseded geometry cannot re-enter confirmation. A bounded history of
-replaced streams is retained, so a delayed frame from a stream the source has
-already left is refused as stale imagery instead of becoming current again. Because such an
+a superseded geometry cannot re-enter confirmation. Every replaced stream is
+retained for the detector's lifetime, so a delayed frame from a stream the
+source has already left is refused as stale imagery instead of becoming current
+again, and no number of later replacements restores an old identity. The number
+of admitted stream transitions is bounded instead, and a detector that reaches
+that bound reports every sample as unknown until a fresh detector is bound. Because such an
 interruption ends the episode, a condition
 confirmed again afterwards is emitted again instead of being suppressed as a
 duplicate, so no confirmed critical observation is silently lost. Person
