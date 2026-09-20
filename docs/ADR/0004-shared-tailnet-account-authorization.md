@@ -33,6 +33,8 @@ Issue #6 requires an Owner-approved authorization/identity decision before human
 
 Tailscale login identity MUST NOT be the authoritative application principal and MUST NOT be the only check on any human route. A verified proxy identity header may be recorded, and may additionally be required, but never substitutes for the application credential check.
 
+Where it is recorded, its lifecycle is defined rather than open-ended: the principal keeps at most the value last observed at authentication, overwritten each time, owner-visible only, cleared when the principal is revoked or deleted, and excluded from diagnostic exports. Longer history belongs to the audit log under its retention, and `PRIVACY.md` lists the field so nobody reads the credential inventory as the whole story.
+
 ### 2. ServerSentinel issues a per-person credential
 
 ServerSentinel issues and verifies its own per-person credential:
@@ -81,7 +83,7 @@ Before authentication succeeds, responses follow `REQUIREMENTS.md` AUTH-010: gen
 
 ### 9. Credential data is not biometric data
 
-Authenticator user verification runs on the viewer's own device and reaches the server as the authenticator's user-verification flag. ServerSentinel verifies the transient data a WebAuthn registration or assertion carries — its own challenge, client data, authenticator data, the attestation or assertion signature, the signature counter, the user-verification flag, and the relying-party id and origin — and persists only public credential material (credential id and public key), the last accepted signature counter, and owner-visible metadata: label, created/last-used/revoked timestamps. The rest is discarded once verified. The counter is retained deliberately, because the cloned-authenticator check has nothing to compare against without it.
+Authenticator user verification runs on the viewer's own device and reaches the server as the authenticator's user-verification flag. ServerSentinel verifies the transient data a WebAuthn registration or assertion carries — its own challenge, client data, authenticator data, the attestation or assertion signature, the signature counter, the user-verification flag, and the relying-party id and origin — and persists only public credential material (credential id and public key), the last accepted signature counter, and owner-visible metadata: label, created/last-used/revoked timestamps. A registration in the privacy-preserving `none` attestation format carries no attestation statement and is accepted on the strength of the other checks. The rest is discarded once verified. The counter is retained deliberately, because the cloned-authenticator check has nothing to compare against without it.
 
 No viewer fingerprint or face template reaches the server; it never leaves the authenticator. `principal_credential` is an access-control record; it is unrelated to the optional owner face verification and never becomes a non-owner identity or biometric database.
 

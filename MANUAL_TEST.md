@@ -330,6 +330,8 @@ The research-room Tailnet is shared, so run these with two people (or two browse
 - [ ] revoking one credential leaves the principal's other credentials working, and revoking the principal blocks all of them promptly;
 - [ ] if a synced passkey is in use, confirm that revoking it takes effect on every device it synced to, and record that revocation is credential-scoped rather than per-device; if the deployment requires device-scoped control, confirm that registration refuses backup-eligible credentials;
 - [ ] no human route grants access on the proxy identity header alone;
+- [ ] a passkey that reports `none` attestation registers successfully, and a registration whose attestation statement is present but invalid is refused;
+- [ ] where the owner screen shows a last-observed Tailscale login/device, confirm it is owner-visible only, that it is cleared when the principal is revoked or deleted, and that a diagnostic export does not contain it;
 - [ ] record that reachability is expected for every holder of the shared account and is not treated as a finding;
 - [ ] the dashboard origin is reserved for ServerSentinel and is a secure context (HTTPS, or `http://localhost` for a strictly local browser); confirm WebAuthn registration and sign-in actually work there, and record that an ordinary-HTTP non-loopback origin makes them impossible;
 - [ ] the startup and daily reservation check enumerates the real listeners and every proxy route across all schemes and ports and notifies the Owner when something else answers on that origin; record that this detects rather than prevents, so a process binding between checks can collect credentials until the next check;

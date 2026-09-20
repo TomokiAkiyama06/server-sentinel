@@ -94,6 +94,8 @@ For each credential the main host stores:
 - created/last-used/revoked timestamps;
 - the last accepted signature counter, which is what makes a cloned-authenticator check possible.
 
+The principal record may also keep the Tailscale login/device last observed when that person authenticated, where the deployment supplies such an identity. It is supplementary context, never an authorization input: it is overwritten at each authentication, visible to the owner only, cleared when the principal is revoked or deleted, and left out of diagnostic exports. Sign-in history beyond that single last-observed value lives in the audit log under the audit retention below, not on the principal.
+
 Authenticator user verification (device PIN, device unlock, fingerprint or face unlock) runs on the viewer's own device; the server learns only that it succeeded. Signing in also sends the short-lived data needed to check the sign-in itself, which is verified and then discarded rather than stored. ServerSentinel never receives or stores a viewer's fingerprint or face template. These records are an access-control list, not an identity or biometric database, and they are unrelated to the optional owner face verification described below. Revoking a credential or its principal permanently disables the corresponding record.
 
 Invitations carry a short-lived, single-use enrollment code that is delivered out of band and is never written to logs. Redeeming it registers one credential and returns no camera, recording, timeline or deployment information.
@@ -149,7 +151,7 @@ The main Ubuntu deployment stores:
 - event/timeline metadata;
 - audit logs;
 - configuration;
-- invited-viewer credential records (public key material, the last accepted signature counter, and metadata only);
+- invited-viewer credential and principal records (public key material, the last accepted signature counter, metadata, and at most the last observed Tailscale login/device);
 - optional owner biometric template.
 
 Defaults:

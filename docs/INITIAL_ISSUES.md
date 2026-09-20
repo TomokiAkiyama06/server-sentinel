@@ -318,7 +318,9 @@ Acceptance:
 - uninvited identity receives no deployment metadata, and an uninvited and a revoked person receive the same generic response;
 - owner can revoke app access, at both the single-credential and the whole-principal level;
 - backend rejects spoofed identity headers from untrusted LAN paths;
-- no viewer biometric template reaches the server; transient WebAuthn verification data is checked and discarded, and only public credential material, the last accepted signature counter, and owner-visible metadata is persisted;
+- no viewer biometric template reaches the server; transient WebAuthn verification data is checked and discarded, and only public credential material, the last accepted signature counter, owner-visible metadata, and at most the last observed proxy identity is persisted, with that last value owner-visible, cleared on revocation and out of diagnostic exports;
+- `none` attestation registrations are accepted on the strength of the challenge, origin/relying-party id, authenticator data, credential public key and user-verification flag; a present-but-invalid attestation statement fails;
+- the signature-counter comparison runs whenever the stored or the received counter is non-zero, so a received 0 after a stored non-zero is refused as a regression and notified to the Owner;
 - revocation is credential-scoped: a synced passkey is revoked everywhere it synced, and nothing promises per-device revocation;
 - no developer-operated identity/cloud.
 

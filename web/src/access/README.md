@@ -8,6 +8,8 @@ The deployment shares one Tailscale account, so the UI lists each person's own S
 
 Revocation is credential-scoped. A synced passkey can exist on several of its owner's devices, so do not label the control "revoke this device" or imply that one credential equals one device; the label is a hint entered at registration.
 
+Where the screen shows the Tailscale login/device last observed for a person, show it as context and not as identification, keep it owner-only, and expect it to disappear when the principal is revoked or deleted.
+
 Invitations hand out a short-lived single-use enrollment code; the redemption screen registers one credential and shows nothing about cameras, recordings or the deployment.
 
 Owner-only actions follow the server's step-up contract: on a step-up-required response, prompt for a fresh assertion and retry the original request; on cancellation or failure, report the generic failure and leave the action unperformed. Do not decide freshness in the client or retry silently.

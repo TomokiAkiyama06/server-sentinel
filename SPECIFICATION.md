@@ -856,8 +856,12 @@ access_principal
 - status: invited/active/revoked
 - created_at
 - revoked_at
-- external_identity (optional, supplementary: verified Tailscale login/device
-  as observed at authentication; not authoritative, see §11.8)
+- external_identity (optional, supplementary: the verified Tailscale
+  login/device last observed at authentication, overwritten each time and never
+  an authorization input; not authoritative, see §11.8. Owner-visible only,
+  cleared when the principal is revoked or deleted, and excluded from
+  diagnostic exports. Per-authentication history belongs to the audit log under
+  its own retention, not to this field)
 
 principal_credential
 - id
@@ -923,21 +927,34 @@ session.
 User verification runs on the viewer's own device, and its result reaches the
 server only as the authenticator's user-verification flag. The WebAuthn protocol
 data needed to check a registration or assertion — the server-issued challenge,
-client data, authenticator data, the attestation or assertion signature, the
-signature counter and the user-verification flag — is received and verified,
-including the relying-party id and origin. That data is transient: the pending
+client data, authenticator data, the signature counter and the user-verification
+flag — is received and verified, including the relying-party id and origin.
+
+Signatures are checked where the ceremony carries one. An assertion always does,
+and its signature is verified against the stored public key. A registration
+carries an attestation statement only sometimes: the common privacy-preserving
+`none` format has none, and such a registration is accepted — the challenge,
+origin and relying-party id, authenticator data, credential public key and
+user-verification flag are still verified. Where an attestation statement is
+present its format is verified; a present but invalid statement fails
+registration. That data is transient: the pending
 challenge is held server-side only for the bounded lifetime of one ceremony, is
 single-use and is dropped when the ceremony ends or expires; of the rest, only
 the fields of `principal_credential` and `principal_session` persist and
 everything else is discarded once verified.
 
 The signature counter is the one verification output that persists, as
-`principal_credential.sign_count`. An authenticator that reports a non-zero
-counter must report a strictly larger one each time: a regression refuses the
-assertion and notifies the Owner as a possible cloned authenticator, and the
-stored value advances only on an accepted assertion. Many passkey authenticators
-report 0 always; a counter that stays 0 is that case, not evidence of cloning,
-and the check does not apply to it.
+`principal_credential.sign_count`. The comparison applies whenever either the
+stored counter or the received one is non-zero: the received value must then be
+strictly greater than the stored one. Anything else is a regression — including
+a received 0 after a stored non-zero, which is a reset or cloned authenticator,
+not an exemption — and a regression refuses the assertion and notifies the Owner
+as a possible cloned authenticator. The stored value advances only on an
+accepted assertion.
+
+The single exempt case is an authenticator that keeps no counter at all: stored
+and received both 0. Many passkey authenticators behave this way, and it is not
+evidence of cloning.
 
 None of this material belongs in logs, diagnostics or exports: challenges,
 client and authenticator data, signatures, and enrollment codes are excluded
