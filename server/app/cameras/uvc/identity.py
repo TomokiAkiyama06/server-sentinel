@@ -120,8 +120,8 @@ class ReconnectController:
         self.emit = emit
         self.enabled = enabled
         self.state = CameraState.OFFLINE
-        self.bound = None
-        self._explicit_binding = False
+        self.bound = self.approved if saved is not None and saved.explicit_binding else None
+        self._explicit_binding = saved.explicit_binding if saved is not None else False
         self.requires_approval = saved.requires_approval if saved else False
         self._reason = "not_started"
         self._finished = False

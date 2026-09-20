@@ -100,12 +100,46 @@ class UvcRegistryTests(unittest.TestCase):
         self.discovery.devices = [self.camera]
         admin.approve_uvc("owner", self.adapter, self.source.id, self.camera)
         self.assertNotIn(self.source.id, self.adapter.sessions)
+        approved = self.adapter.store.load(self.source.id)
+        self.assertTrue(approved.serial_ambiguous)
+        self.assertTrue(approved.explicit_binding)
         self.assertTrue(self.adapter.poll_source(self.source.id))
+        self.assertFalse(self.adapter.store.load(self.source.id).explicit_binding)
+        self.adapter.sessions[self.source.id].close()
+        self.discovery.devices = [duplicate]
+        self.assertFalse(self.adapter.poll_source(self.source.id))
+        self.assertEqual(
+            SourceHealthState.MANUAL_INTERVENTION_REQUIRED,
+            self.registry.get_source(self.source.id).health_state,
+        )
+        self.assertTrue(self.adapter.store.load(self.source.id).serial_ambiguous)
         approvals = [record for record in audit.list_records()
                      if record.action is AuditAction.APPROVE_CAMERA]
         self.assertEqual(2, len(approvals))
         self.assertTrue(all(record.outcome is AuditOutcome.SUCCEEDED
                             for record in approvals))
+
+    def test_audited_weak_approval_is_explicit_for_one_live_session(self):
+        class PermitOwner:
+            def require_owner(self, actor_context):
+                return None
+
+        weak = replace(self.camera, serial=None, instance_token=(1, 2, 3))
+        self.discovery.devices = [weak]
+        audit = AuditStore(self.database)
+        admin = OwnerAdministration(
+            OwnerAuditService(audit, PermitOwner()), self.registry,
+        )
+        admin.approve_uvc("owner", self.adapter, self.source.id, weak)
+        self.assertTrue(self.adapter.store.load(self.source.id).explicit_binding)
+        self.assertTrue(self.adapter.poll_source(self.source.id))
+        self.assertFalse(self.adapter.store.load(self.source.id).explicit_binding)
+        self.adapter.sessions[self.source.id].close()
+        self.assertFalse(self.adapter.poll_source(self.source.id))
+        self.assertEqual(
+            SourceHealthState.MANUAL_INTERVENTION_REQUIRED,
+            self.registry.get_source(self.source.id).health_state,
+        )
 
     def make_adapter(self):
         return LocalUvcAdapter(self.registry, emit_audit=self.events.append,

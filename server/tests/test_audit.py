@@ -174,7 +174,7 @@ class AuditTests(unittest.TestCase):
     def test_audit_migration_upgrades_existing_application_without_data_loss(self):
         other = Database(Path(self.temporary.name) / "upgrade.sqlite3")
         with closing(other.connect()) as connection:
-            migrate(connection, APPLICATION_MIGRATIONS[:-1])
+            migrate(connection, APPLICATION_MIGRATIONS[:-2])
             connection.execute(
                 "INSERT INTO application_metadata VALUES ('synthetic-kept', 'yes')"
             )

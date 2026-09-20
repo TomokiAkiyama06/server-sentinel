@@ -16,6 +16,11 @@ SCHEMA = (
     "session_token TEXT, serial_ambiguous INTEGER NOT NULL CHECK (serial_ambiguous IN (0, 1)))"
 )
 
+EXPLICIT_BINDING_SCHEMA = (
+    "ALTER TABLE uvc_approvals ADD COLUMN explicit_binding INTEGER NOT NULL DEFAULT 0 "
+    "CHECK (explicit_binding IN (0, 1))"
+)
+
 
 class ApprovalStorageError(RuntimeError):
     """A fixed safe error, without physical identifiers or database contents."""
@@ -27,6 +32,7 @@ class ApprovalState:
     requires_approval: bool
     session_token: str | None = field(default=None, repr=False)
     serial_ambiguous: bool = False
+    explicit_binding: bool = False
 
 
 class ApprovalStore:
@@ -48,14 +54,17 @@ class ApprovalStore:
         evidence["formats"] = tuple(evidence["formats"])
         if evidence.get("instance_token") is not None:
             evidence["instance_token"] = tuple(evidence["instance_token"])
-        return ApprovalState(DeviceEvidence(**evidence), bool(row[1]), row[2], bool(row[3]))
+        return ApprovalState(
+            DeviceEvidence(**evidence), bool(row[1]), row[2], bool(row[3]), bool(row[4]),
+        )
 
     def load(self, source_id):
         connection = None
         try:
             connection = self.database.connect()
             row = connection.execute(
-                "SELECT evidence, requires_approval, session_token, serial_ambiguous "
+                "SELECT evidence, requires_approval, session_token, serial_ambiguous, "
+                "explicit_binding "
                 "FROM uvc_approvals WHERE source_id = ?",
                 (str(source_id),),
             ).fetchone()
@@ -73,12 +82,21 @@ class ApprovalStore:
             raise ApprovalStorageError("UVC approval transaction is unavailable")
         try:
             evidence = json.dumps(asdict(approved), allow_nan=False, separators=(",", ":"))
+            row = connection.execute(
+                "SELECT evidence, requires_approval, session_token, serial_ambiguous, "
+                "explicit_binding FROM uvc_approvals WHERE source_id=?", (str(source_id),)
+            ).fetchone()
+            prior = ApprovalStore._state(row)
+            preserve_latch = (prior is not None and prior.serial_ambiguous
+                              and prior.approved.strong_key == approved.strong_key)
             connection.execute(
-                "INSERT INTO uvc_approvals VALUES (?, ?, 0, NULL, ?) "
+                "INSERT INTO uvc_approvals "
+                "(source_id,evidence,requires_approval,session_token,serial_ambiguous,explicit_binding) "
+                "VALUES (?, ?, 0, NULL, ?, 1) "
                 "ON CONFLICT(source_id) DO UPDATE SET evidence=excluded.evidence, "
                 "requires_approval=0, session_token=NULL, "
-                "serial_ambiguous=excluded.serial_ambiguous",
-                (str(source_id), evidence, int(serial_ambiguous)),
+                "serial_ambiguous=excluded.serial_ambiguous, explicit_binding=1",
+                (str(source_id), evidence, int(serial_ambiguous or preserve_latch)),
             )
         except (sqlite3.Error, ValueError, TypeError):
             raise ApprovalStorageError("UVC approval state could not be saved") from None
@@ -95,7 +113,8 @@ class ApprovalStore:
             connection = self.database.connect()
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
-                "SELECT evidence, requires_approval, session_token, serial_ambiguous "
+                "SELECT evidence, requires_approval, session_token, serial_ambiguous, "
+                "explicit_binding "
                 "FROM uvc_approvals WHERE source_id = ?",
                 (str(source_id),),
             ).fetchone()
@@ -105,15 +124,19 @@ class ApprovalStore:
             # successful approve() write may clear its approval-required flag.
             required = True if prior is None else prior.requires_approval or prior.session_token is not None
             ambiguous = False if prior is None else prior.serial_ambiguous
+            explicit = False if prior is None else prior.explicit_binding
             token = str(uuid4())
             connection.execute(
-                "INSERT INTO uvc_approvals VALUES (?, ?, ?, ?, ?) ON CONFLICT(source_id) "
+                "INSERT INTO uvc_approvals "
+                "(source_id,evidence,requires_approval,session_token,serial_ambiguous,explicit_binding) "
+                "VALUES (?, ?, ?, ?, ?, 0) ON CONFLICT(source_id) "
                 "DO UPDATE SET evidence = excluded.evidence, requires_approval = excluded.requires_approval, "
-                "session_token = excluded.session_token, serial_ambiguous = excluded.serial_ambiguous",
+                "session_token = excluded.session_token, serial_ambiguous = excluded.serial_ambiguous, "
+                "explicit_binding = 0",
                 (str(source_id), json.dumps(asdict(approved), allow_nan=False), int(required), token, int(ambiguous)),
             )
             connection.commit()
-            return ApprovalState(approved, required, token, ambiguous)
+            return ApprovalState(approved, required, token, ambiguous, explicit)
         except (sqlite3.Error, ValueError, TypeError, KeyError):
             if connection is not None:
                 connection.rollback()

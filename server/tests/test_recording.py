@@ -69,7 +69,8 @@ class RecordingTests(unittest.TestCase):
         self.assertEqual(
             self.db.execute("SELECT version, name FROM schema_migrations ORDER BY version").fetchall(),
             [(1, "foundation"), (2, "camera_registry"), (3, "uvc_identity"),
-             (4, "durable_recording"), (5, "security_admin_audit")],
+             (4, "durable_recording"), (5, "security_admin_audit"),
+             (6, "uvc_explicit_binding")],
         )
         self.policy = Reservation()
         self.validator = SyntheticValidator()
