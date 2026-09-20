@@ -11,30 +11,35 @@ Phases group capabilities rather than imposing a strict completion order. The de
 - [ ] issue/PR templates
 - [x] CI/repository guards, synthetic regression tests, and conditional component checks (#5; see `docs/CI.md`)
 - [ ] dependency/model license policy
-- [ ] hardened review-gate follow-up mapped to Issue #4 (enforcement implementation remains open)
+- [ ] hardened review gate #4: capability assessment, offline policy tests and disabled ruleset generator prepared; Owner App setup, trusted publisher/collector and GitHub enforcement acceptance remain open (see `docs/REVIEW_GATE_SETUP.md`)
 
-Issue #1 closed when PR #2 merged after documentation/bootstrap acceptance and current HEAD/base reviews plus CI passed. CI foundation #5 is implemented without starting runtime components. Runtime/ADR Issues #6–#28 and the separately tracked #4 remain independent follow-up work.
+Issue #1 closed when PR #2 merged after documentation/bootstrap acceptance and current HEAD/base reviews plus CI passed. CI foundation #5 is implemented. The backend and dashboard foundations have synthetic coverage; their authorization prerequisites remain separate. Runtime/ADR progress for Issues #6–#28 and the separately tracked #4 is tracked below and in GitHub.
 
 ## Phase 1 — Main server and web foundation
 
-- [ ] FastAPI service
-- [ ] SQLite migrations
-- [ ] settings/config/storage abstraction
+- [x] closed FastAPI foundation (human routes await #6/#10)
+- [x] SQLite migration foundation
+- [x] validated deployment settings and database abstraction
 - [ ] health endpoints
-- [ ] React responsive dashboard shell
+- [x] React responsive dashboard shell (#8; synthetic/mock foundation, production access integration remains #10)
 - [ ] Docker Compose where appropriate
 - [ ] deployment-owner authorization ADR/bootstrap — ADR-0003 Proposed; Owner decision pending, synthetic policy model only
 - [ ] trusted Tailscale/private-proxy identity boundary
 
 ## Phase 2 — Camera Source + Capture Node platform
 
-- [ ] generic Camera Source registry
-- [ ] `local_uvc` / `remote_agent`
-- [ ] active-source limit default 4
-- [ ] capabilities/health/profile model
+- [x] generic Camera Source registry
+- [x] `local_uvc` / `remote_agent`
+- [x] active-source limit default 4
+- [x] capabilities/health/profile model
 - [ ] local UVC discovery/ingest
 - [ ] stable/ambiguous UVC identity handling
-- [ ] `media-capture-agent` native service
+
+Issue #11 now has a V4L2 discovery/MMAP adapter, durable approval latch and
+registry integration with synthetic tests. The UVC items remain unchecked until
+Owner management/worker integration and real-webcam acceptance are complete;
+no browser preview or physical device result is claimed.
+- [ ] `media-capture-agent` native service — #12 foundation implemented; capture/paired transport integration and physical acceptance pending
 - [ ] video-only capture
 - [ ] one-time pairing + mTLS/revocation
 - [ ] separate LAN ingest listener
@@ -57,6 +62,12 @@ Issue #1 closed when PR #2 merged after documentation/bootstrap acceptance and c
 - [ ] main->browser live transport PoC + ADR
 - [ ] phone/Mac/desktop 1–4 source live grid, with stability/reconnect prioritized over minimum latency
 - [ ] demand-driven viewer transcoding/packaging
+
+Issue #18 now has bounded compressed storage primitives, source/event manifests,
+application migration v4 integration, and synthetic crash/integrity coverage. Its
+runtime worker, codec adapter, shared storage guard and authorization integration
+remain open; these primitives do not establish playable-video or hardware
+acceptance.
 
 ## Phase 4 — Human private access
 

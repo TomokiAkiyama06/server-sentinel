@@ -49,6 +49,8 @@ Other audited Issues (outside the 24 Plans):
 
 #1 closed when PR #2 merged after current HEAD/base Codex + Claude reviews and CI passed. #3 is already closed; its authentication setup does not substitute for future reviews. #4 requires trusted review provenance for both HEAD and base/diff context, including base-only changes and issuer-spoofing rejection.
 
+#4's [deployment proposal](REVIEW_GATE_SETUP.md) records the current personal-repository capability assessment and provides offline policy validation plus a disabled ruleset generator. The independent required-CI baseline ruleset is active; dedicated App registration/installation, trusted collector/publisher implementation, review-provenance enforcement and test-PR acceptance remain pending. #4 stays OPEN.
+
 ## Dependency graph
 
 Arrows run from prerequisite to dependent. This is the direct `Depends on` graph; specification bootstrap #1 and related review work #3/#4 are not runtime prerequisites. No missing Issue numbers, self-dependencies, or cycles were found. Plan numbers are stable identifiers, not a topological execution order.
@@ -162,6 +164,12 @@ Acceptance:
 
 GitHub Issue: [#7](https://github.com/TomokiAkiyama06/server-sentinel/issues/7)
 
+Implementation: `server/app/` and `server/tests/` provide the closed FastAPI
+foundation, validated deployment settings, transactional SQLite migration and
+value-free structured logging. See [`server/docs/FOUNDATION.md`](../server/docs/FOUNDATION.md).
+Human routes remain unavailable; final acceptance retains the #6 dependency and
+does not treat this foundation as #10 permission enforcement.
+
 Depends on: [#5](https://github.com/TomokiAkiyama06/server-sentinel/issues/5), [#6](https://github.com/TomokiAkiyama06/server-sentinel/issues/6)
 
 Labels: `backend`, `security`
@@ -184,6 +192,12 @@ Acceptance:
 ## Plan 3 — React dashboard foundation
 
 GitHub Issue: [#8](https://github.com/TomokiAkiyama06/server-sentinel/issues/8)
+
+Implementation: `web/` provides the Japanese/English responsive React shell,
+denied-by-default session, same-origin client, six placeholders and synthetic
+collection tests. CI includes Chrome viewport/request interception and isolated
+normal/error preview smoke. Production access/asset serving remains #10;
+private live playback remains #19/#28.
 
 Depends on: [#5](https://github.com/TomokiAkiyama06/server-sentinel/issues/5)
 
@@ -230,6 +244,8 @@ Acceptance:
 - source health, node health, image-quality state, desired/negotiated capture profile, last-seen, and versioned/enabled/threshold detection bindings follow SPECIFICATION section 3;
 - over-limit activation returns an explicit validation error without replacing/disabling existing sources; human management routes remain unavailable before Plan 17.
 
+Implementation: `server/app/cameras/registry/` provides the internal SQLite registry and migration. `server/tests/test_registry.py` covers mixed 1–4 sources, concurrent admission and limit changes, atomic fifth-source rejection, migration/restart persistence, independent node/source health, and profiles/bindings. HTTP management remains unavailable before #10. Issue acceptance still requires its dependency #7 and the PR's current-HEAD/base review and CI gates.
+
 ## Blocking prerequisite — Owner authorization / trusted Tailscale identity ADR
 
 GitHub Issue: [#6](https://github.com/TomokiAkiyama06/server-sentinel/issues/6)
@@ -263,6 +279,11 @@ session, recovery, and stream tests remain #10/#19/#27/#28 work.
 
 ## Plan 5 — Local UVC discovery and stable identity
 
+Implementation progress: video-only V4L2 discovery/MMAP, conservative identity,
+durable ambiguity latch and registry/session integration are implemented and
+synthetically tested. Owner management, running worker/preview integration and
+real UVC acceptance remain pending; Issue #11 stays OPEN. See `MANUAL_TEST.md` A.
+
 GitHub Issue: [#11](https://github.com/TomokiAkiyama06/server-sentinel/issues/11)
 
 Depends on: [#9](https://github.com/TomokiAkiyama06/server-sentinel/issues/9), [#6](https://github.com/TomokiAkiyama06/server-sentinel/issues/6)
@@ -290,6 +311,12 @@ Acceptance:
 - real webcam verification in `MANUAL_TEST.md`.
 
 ## Plan 6 — `media-capture-agent` foundation
+
+Delivery note: the #12 native foundation now includes explicit protected config,
+non-root lifecycle, separate source/node/clock health, descriptor-pinned mount and
+reserve admission, versioned executable artifact and systemd installer. Synthetic
+CI covers failure paths. Capture/paired transport integration and physical
+acceptance remain pending; Issue #12 stays OPEN.
 
 GitHub Issue: [#12](https://github.com/TomokiAkiyama06/server-sentinel/issues/12)
 
@@ -474,6 +501,12 @@ Acceptance:
 - no-viewer state avoids unnecessary viewer-only transcode;
 - measured resource use recorded.
 
+Implementation progress: `server/app/media/profiles/` contains the independent
+profile planner, decoded-frame cadence control and bounded compressed-packet
+adapter lifecycle, with synthetic tests for quality isolation and no-subscriber
+cleanup. Codec/transport adapters and measured Main Server / Capture Node / UVC
+resource use remain pending; this is not completion of Issue #17.
+
 ## Plan 11 — Durable recording + main-host compressed pre-roll
 
 GitHub Issue: [#18](https://github.com/TomokiAkiyama06/server-sentinel/issues/18)
@@ -481,6 +514,12 @@ GitHub Issue: [#18](https://github.com/TomokiAkiyama06/server-sentinel/issues/18
 Depends on: [#17](https://github.com/TomokiAkiyama06/server-sentinel/issues/17), [#10](https://github.com/TomokiAkiyama06/server-sentinel/issues/10)
 
 Labels: `backend`, `camera-source`, `storage`
+
+Implementation status: internal storage primitives and synthetic filesystem/SQLite
+coverage are prepared in `server/app/media/recording/`. Application migration v4
+is integrated; worker integration, audited codec muxing/validation, common
+storage admission and the `#17` / `#10` prerequisites remain open; no human media
+route is enabled here.
 
 実機要件: Main Server: 不要; Capture Node: 不要; UVC Camera: 不要; Manual test: 不要
 

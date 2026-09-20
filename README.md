@@ -12,7 +12,13 @@ ServerSentinel is a free, self-hosted physical-security monitoring system for va
 
 ## Current project status
 
-The repository is in the specification/bootstrap stage. Runtime implementation has not started yet.
+CI, the closed [Main Server foundation](server/docs/FOUNDATION.md), and the
+[React dashboard shell](web/README.md) have synthetic validation. The dashboard
+provides Japanese/English placeholders. Human backend routes and production UI
+access remain denied pending authorization integration. Internal recording
+storage primitives are in progress; camera capture, live playback and full-system
+hardware/network acceptance are not established by these foundations. See
+[ROADMAP.md](ROADMAP.md) and GitHub Issues for component progress.
 
 ## Camera-source model
 

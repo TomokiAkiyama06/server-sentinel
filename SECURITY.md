@@ -1,5 +1,11 @@
 # Security Policy
 
+The #8 dashboard is a development/test shell, denied by default. Before
+production use, #10 must enforce the two access gates for every API and complete
+asset namespace through the human listener. Do not expose its loopback-only
+preview as a deployment server. Client permission visibility is not a security
+boundary; `web/README.md` records the integration contract.
+
 ## Security philosophy
 
 ServerSentinel handles private video streams, optional owner biometric verification, private-network identities, physical-security events, and persistent recordings.
@@ -17,6 +23,23 @@ Safe defaults:
 - no secrets or real monitoring media in source control.
 
 ## Threat model
+
+The internal compressed-recording store accepts no caller-controlled filenames or
+public requests. It requires a private, deployment-approved existing media root,
+an admission reservation and a trusted video-only codec validator. It rejects
+path symlinks, substituted/missing roots and competing writers; publication and
+recovery operate only on generated UUID files identified by its SQLite journal.
+Mandatory adapters and human authorization remain unwired; this module adds no
+recording playback/download route. See `server/app/media/recording/README.md`.
+
+The current backend foundation denies every human HTTP/WebSocket route,
+including system health, version, schema and framework documentation. Its
+documented launcher accepts only loopback bind settings, disables proxy-header
+parsing and access logs, and removes the server product header. The authorization
+adapter remains deny-all until the #6/#10 gates are met. Newly created SQLite
+files use mode `0600`; deployment operators must keep their parent data directory
+private. This foundation does not yet implement trusted proxy/session handling
+or Agent media-root mount enforcement. Details: `server/docs/FOUNDATION.md`.
 
 Primary threats:
 
@@ -55,6 +78,13 @@ Until Issue #4 establishes hardened repository-level enforcement:
 - ordinary `GITHUB_TOKEN` statuses/check names are not treated as unforgeable against a malicious same-repository writer;
 - any material HEAD or base change invalidates the prior review context;
 - real monitoring media, biometric templates, secrets, and private deployment values never appear in PRs.
+
+The dedicated-App deployment proposal and offline policy validator are documented
+in [`docs/REVIEW_GATE_SETUP.md`](docs/REVIEW_GATE_SETUP.md). They do not install
+enforcement or authenticate supplied JSON. App credentials must remain outside
+PR-controlled workflows/checkouts; the existing same-repository Claude workflow
+is still limited to trusted writers. Actual issuer isolation and GitHub test-PR
+acceptance remain open in #4.
 
 ## Network boundaries
 

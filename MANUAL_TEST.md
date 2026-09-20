@@ -4,6 +4,12 @@ This document contains checks that cannot be truthfully completed using software
 
 Do not mark an item PASS without performing it on the stated hardware/network/browser environment. Do not commit or attach real monitoring footage, real-person images/video/audio, owner biometric templates, or private deployment values to GitHub.
 
+Issue #7's backend foundation uses temporary SQLite and in-process ASGI tests;
+it does not mark any check here PASS. Before opening human routes under #10,
+verify the documented launcher binds only to the intended loopback boundary,
+the proxy cannot be bypassed, and generic denial also covers schema/version,
+static assets and errors. No unauthenticated HTTP health exception is provided.
+
 ## Test metadata
 
 ```text
@@ -21,6 +27,41 @@ Tester:
 ```
 
 ## A. Local UVC / USB camera
+
+Issue #11 implementation status (2026-09-20): synthetic discovery, driver-ioctl,
+identity, restart-persistence and registry integration tests passed. No physical
+camera was opened and no actual preview, audio-device trace or arm64 execution
+was verified. All hardware checkboxes below remain unverified.
+
+After the Owner-authorized management and worker/preview wiring are available,
+run the following on the intended Main Ubuntu host under its dedicated account:
+
+1. Record model, supported profile, device permission and stable evidence in a
+   private local test record; publish only pass/fail and non-sensitive counts.
+2. Enable one source with an explicit profile and select its current physical
+   candidate. Verify negotiated dimensions/FPS/FourCC and first-frame transition
+   from degraded to online. Repeat with up to four sources.
+3. Observe the service's opened descriptors locally while the camera's integrated
+   microphone is present; only the selected video device may be opened, never
+   ALSA/OSS microphone devices. Do not publish trace paths or captured media.
+4. Unplug one camera. Verify its offline audit event, continuing service process,
+   and uninterrupted second source. Reconnect a unique serial camera with changed
+   video-node numbering and verify the same source UUID returns online only after
+   a new frame. Disable it and verify its video descriptor is closed.
+5. Reorder identical non-serial devices, including the case where only one is
+   reattached. Verify manual intervention; restart the backend and verify the
+   latch still holds. Explicitly reapprove the current candidate and confirm video
+   resumes. Duplicate-serial evidence must also require manual intervention.
+6. Check unsupported profile/permission, driver timeout and corrupted-frame paths
+   are visibly unavailable, never healthy; restore the supported configuration.
+7. Using a disposable database, inject a failed ambiguity-latch write and stop the
+   worker without clean shutdown. Restart with one formerly duplicated serial
+   device remaining: it must require Owner reapproval. Repeat with no capture
+   profile; the manual-intervention state must remain visible. A normal clean
+   shutdown/restart of an unambiguous serial device may reconnect automatically.
+
+Results: **NOT RUN — hardware, authorized management and viewer integration
+remain pending. Issue #11 is not closed by synthetic tests.**
 
 For each tested camera:
 
@@ -130,6 +171,15 @@ Compare at minimum where camera capabilities allow:
 - [ ] person/entrance detection quality.
 
 Choose defaults from measurements, not assumptions.
+
+The synthetic profile core tests do not satisfy the following integration checks:
+
+- [ ] run the selected real decoder on all compressed reference packets; verify independent inference cadence and actual resized image dimensions, including B-frame reordering and stream restart;
+- [ ] compare durable recording codec/profile/quality before, during, and after changing viewer quality; record any discontinuities explicitly;
+- [ ] count viewer-only codec processes, handles and memory before the first subscriber, with subscribers, and after the last leaves; confirm cleanup and bounded failure recovery;
+- [ ] apply recording and viewer queue pressure separately; verify bounded memory, visible loss, and keyframe recovery without claiming continuous evidence;
+- [ ] verify copy eligibility against actual codec configuration, container, timestamps and color metadata; unsupported copy/transcode paths remain unavailable;
+- [ ] record only sanitized aggregate resource measurements; no deployment identifiers, room imagery, media payloads, or exact private network values enter GitHub.
 
 ## D. Source registry / mixed topology
 
@@ -492,6 +542,73 @@ Do not upload hardware serials, local mount identifiers, real temporary test med
 - [ ] inspect controlled startup, ordinary operation, error handling, and configuration paths using browser request inspection/local network observation; no prohibited reporting occurs;
 - [ ] explicitly configured product integrations are checked separately and never excuse unrelated reporting; no telemetry feature is introduced without a new explicit Owner decision and ADR changing PRIV-003;
 - [ ] traces and deployment identifiers remain local; publish only sanitized pass/fail results, never raw monitoring data, secrets, or private network logs.
+
+### Issue #12 foundation acceptance (pending physical execution)
+
+The synthetic CI tests do not complete these checks. On an isolated Capture Node:
+
+- [ ] Build/verify the versioned Agent artifact and run `--check` as the dedicated
+  non-root account; runtime/media directories are outside source/install trees.
+- [ ] Inspect the generated `media-capture-agent.service`, its dedicated UID,
+  explicit video-node allowlist and empty capabilities; account/device permissions
+  remain narrowly configured. Verify process command line and unit name (Linux
+  kernel `comm` truncates names longer than 15 visible bytes).
+- [ ] Confirm `--check` succeeds both outside and inside the generated systemd
+  mount namespace when the media root is a subdirectory of an approved mount.
+  A bind of another backing directory on the same device must be rejected.
+- [ ] Record the Owner-approved filesystem UUID only in the private deployment
+  configuration. On a disposable volume, replace the filesystem while reusing
+  the mount path and device name, restart the Agent, and verify `--check` and
+  new writes refuse the replacement rather than treating it as the approved
+  storage.
+- [ ] Start/stop through systemd after #11/#13/#14 integration; verify no GUI/tray,
+  no microphone opens, no audio setting and no inbound listener/SSH dependency.
+- [ ] Unplug an approved UVC camera: source becomes offline while node heartbeat
+  continues. Reconnect obeys stable identity and ambiguous-device approval.
+- [ ] Inject excessive clock offset, uncertainty and wall-clock steps using mocks
+  or an isolated test process; timing degradation remains visible and is not
+  interpreted as reliable event ordering.
+- [ ] Use an isolated test filesystem to exercise mount disappearance, replacement,
+  read-only state and reserve pressure at startup and runtime. Check descriptor
+  pinning and no fallback-directory creation without altering production mounts.
+- [ ] Restart at storage hard stop: inventory and authorized cleanup remain
+  possible; new allocations and installer `--check` fail until reserve is restored.
+- [ ] Confirm network observation after authenticated transport integration shows
+  only Owner-configured Main communication, including error/reconnect paths.
+
+Publish only pass/fail summaries; keep configs, mount identity, host identifiers,
+credentials and captured media private.
+
+## U. GitHub review-gate enforcement
+
+Issue #4 remains open. The offline tests do not complete these checks. Follow
+`docs/REVIEW_GATE_SETUP.md` after Owner App registration and trusted publisher
+implementation. Use harmless synthetic documentation PRs against an isolated
+test branch and an equivalent strict rule before activating protection on `main`.
+The candidate generator targets `main` only; review any test-branch adaptation
+explicitly. Do not alter production protection to make a negative test pass.
+
+- [ ] record the App ID/slug/installation, immutable trusted publisher revision, applied rules, and both required check names with expected App sources;
+- [ ] missing either review blocks merge; pending, failed, cancelled, unavailable, skipped and neutral reviewer outcomes each produce a blocking/pending App check (never a skipped/neutral check conclusion, which GitHub accepts);
+- [ ] both trusted reviews of the exact current repository/PR/HEAD/base/merge-base/diff allow merge only after independent CI and thread gates pass;
+- [ ] push a new PR HEAD and confirm old reviews cannot permit merge;
+- [ ] advance the base without changing the PR HEAD and attempt merge immediately, including before the publisher handles the base update; strict protection blocks it;
+- [ ] repeat base advancement with a new base already in the PR HEAD's ancestry: checks only on the old test-merge SHA cannot satisfy the new merge context, and no same-name success exists on PR HEAD;
+- [ ] check targets are the current GitHub test-merge commit with the pinned base/head parents; missing/stale merge refs block publication;
+- [ ] incorporate the new base into the PR, rerun both reviewers, and confirm only the new current context becomes eligible;
+- [ ] a same-repository test workflow publishes the identical check names with its ordinary `GITHUB_TOKEN`; even a success from GitHub Actions cannot satisfy the dedicated-App requirement;
+- [ ] a same-name commit status and a check from a different synthetic test App cannot satisfy the requirement;
+- [ ] copied successful receipt JSON, a forged `Reviewed commit` comment, and a wrong PR/repository/base/diff receipt fail;
+- [ ] a newer pending/failed authoritative attempt cannot be hidden by an older successful check; out-of-order completion cannot re-enable stale evidence;
+- [ ] fork review completes through the trusted path; fork/same-repository PR code never receives reviewer credentials, the App key or publisher token;
+- [ ] a PR retarget, base change during either review, missing API page, provider/API error, malformed receipt and unavailable publisher each fail closed;
+- [ ] inspect the App's selected-repository grant and verify the publisher cannot alter source, workflows, branch protection, collaborators or repository administration;
+- [ ] demonstrate recovery from a stopped publisher without disabling protection, changing expected issuers or adding bypass actors;
+- [ ] record public test PR/run/check IDs, non-secret context digests, rule snapshots and observed GitHub merge refusals, then re-read the production rule after activation.
+
+Never use a real secret as a fixture or publish an App key/token, reviewer token,
+raw private API response, or monitoring data. Cleanup only the identified
+synthetic test branches/PRs; no production data or unrelated rule deletion.
 
 ## ADR-0003 follow-up: proposed human-access boundary
 

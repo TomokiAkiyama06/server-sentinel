@@ -2,17 +2,39 @@
 
 Issue [#5](https://github.com/TomokiAkiyama06/server-sentinel/issues/5) provides
 the `CI` GitHub Actions workflow. It runs for every pull request, pushes to
-`main`, and manual dispatch. The final check is named **CI**; both repository
-and component jobs must succeed. A failed, cancelled, or skipped prerequisite
+`main`, and manual dispatch. The final check is named **CI**; repository,
+component, and Dashboard browser smoke jobs must all succeed. A failed,
+cancelled, or skipped prerequisite
 cannot produce a successful final check. Review provenance enforcement remains
-in Issue #4; the workflow does not change repository protection settings.
+in Issue #4; the workflow itself does not change repository protection settings.
+
+The Owner-authorized [baseline ruleset](https://github.com/TomokiAkiyama06/server-sentinel/rules/23728669)
+requires PRs, resolved review threads and the `CI` check from the GitHub Actions
+App on an up-to-date branch before merging to `main`. It blocks force pushes and
+deletion and has no bypass actors. That shared issuer does not distinguish a
+malicious same-repository workflow from trusted CI; same-repository writers
+remain trusted until #4's dedicated review gate is deployed and accepted.
+
+Issue #4's offline review-receipt policy tests run in the repository test job.
+The [deployment proposal](REVIEW_GATE_SETUP.md) and disabled ruleset generator
+are preparatory tooling; their successful tests do not establish a deployed
+trusted issuer or required Codex/Claude enforcement.
 
 ## Current coverage
 
-The repository currently contains CI tooling and application README skeletons.
-There is no runnable Main Server, capture agent, or web application. Consequently
-component checks explicitly report **not implemented**. This is not a runtime,
-hardware, browser, or network acceptance result.
+The Main Server foundation has configured lint, synthetic tests and isolated
+normal/error ASGI smoke. Its smoke additionally observes Python outbound and
+process-spawn attempts; see `server/docs/FOUNDATION.md` for the precise limits.
+
+The `web/` React foundation is implemented and activates locked dependency
+installation, TypeScript/JavaScript checks, Node tests, production bundling,
+Docker validation and isolated normal/error preview smoke. The additional
+Dashboard browser smoke job executes the built UI in runner-installed Chrome
+with synthetic viewport/session fixtures and intercepted page requests.
+Other components activate checks through their manifests; README-only skeletons
+continue to report **not implemented**. This coverage does not establish physical
+hardware, phone/Mac device, private network, authentication deployment or live
+media acceptance.
 
 The repository job always runs:
 
@@ -80,6 +102,14 @@ and `test` scripts. CI runs `npm ci --ignore-scripts --no-audit --no-fund`,
 `npm run lint`, and `npm run test`. Their `ci.toml` requires the same version and
 `[smoke]` section. Dependency install lifecycle scripts are not implicitly run.
 CI provides Node 24. Different package managers need an explicit CI extension.
+
+The implemented `web/` component also requires the Dashboard browser smoke job
+in the aggregate CI gate. It uses installed runner Chrome and Node's built-in
+CDP transport, with no browser-automation package or browser download. Synthetic
+viewports exercise React rendering, permissions, errors and hostile opt-in
+settings. Every page request is intercepted; an aborted external positive
+control verifies observation. Browser/OS background traffic is outside this
+scope. No media, trace, screenshot, or test-report artifact is uploaded.
 
 Smoke commands must validate synthetic normal and error scenarios and exit zero
 only when their assertions pass. Their image uses the component as build context.
