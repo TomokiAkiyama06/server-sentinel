@@ -21,7 +21,7 @@ Issue #1 closed when PR #2 merged after documentation/bootstrap acceptance and c
 - [x] SQLite migration foundation
 - [x] validated deployment settings and database abstraction
 - [ ] health endpoints
-- [ ] React responsive dashboard shell
+- [x] React responsive dashboard shell (#8; synthetic/mock foundation, production access integration remains #10)
 - [ ] Docker Compose where appropriate
 - [ ] deployment-owner authorization ADR/bootstrap
 - [ ] trusted Tailscale/private-proxy identity boundary

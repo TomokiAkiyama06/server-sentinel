@@ -1,5 +1,12 @@
 # ServerSentinel Privacy Model
 
+The #8 React foundation contains no reporting SDK or opt-in reporting path.
+Errors display fixed local messages without logging response details. Assets
+and fonts are local; the current production build denies access and makes no
+API requests. Synthetic tests intercept normal/error and hostile opt-in page
+requests; this does not establish absence of OS/browser-process background
+traffic. See `web/README.md` for scope and deployment boundaries.
+
 ServerSentinel is designed so that the project developer does not operate infrastructure that receives normal monitoring data.
 
 ## Summary

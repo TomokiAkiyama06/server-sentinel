@@ -7,6 +7,9 @@ and notice/source obligations. Preserve the bundled
 [`server/docs/BACKEND_THIRD_PARTY_LICENSE_TEXTS.md`](server/docs/BACKEND_THIRD_PARTY_LICENSE_TEXTS.md)
 with application deployments and redistributions.
 
+The #8 dashboard dependency inventory and static asset attribution obligations
+are in [web/THIRD_PARTY_NOTICES.md](web/THIRD_PARTY_NOTICES.md).
+
 Reviewed on 2026-09-20 for Issue #5. These tools are development/CI dependencies,
 not ServerSentinel runtime dependencies or vendored release contents. No model
 or weights are introduced. Install versions/hashes are in `.ci/requirements.txt`;
