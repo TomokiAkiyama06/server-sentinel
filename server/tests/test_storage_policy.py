@@ -180,6 +180,28 @@ class StoragePolicyTests(unittest.TestCase):
         self.assertEqual(StorageState.NORMAL, self.policy.status().state)
         self.policy.release()
 
+    def test_hard_stop_cleanup_reclaims_through_recovery_thresholds(self):
+        oldest = self.inventory.add(250, 80 * DAY_MS)
+        next_oldest = self.inventory.add(200, 81 * DAY_MS)
+        self.inventory.free = 99
+        self.assertEqual(StorageState.HARD_STOP, self.policy.status().state)
+        self.inventory.free = 221
+
+        self.policy.admit(100, critical=False)
+
+        self.assertEqual([oldest["id"], next_oldest["id"]], self.inventory.deleted)
+        self.assertEqual(StorageState.NORMAL, self.policy.status().state)
+        self.policy.release()
+
+    def test_cleanup_reclaims_below_pressure_allocation_boundary(self):
+        row = self.inventory.add(900, 80 * DAY_MS)
+
+        self.policy.admit(100, critical=False)
+
+        self.assertEqual([row["id"]], self.inventory.deleted)
+        self.assertEqual(StorageState.NORMAL, self.policy.status().state)
+        self.policy.release()
+
     def test_star_race_rechecks_before_delete_and_stops_admission(self):
         row = self.inventory.add(1000, DAY_MS)
         self.inventory.before_delete = lambda item: item.update(starred=True)

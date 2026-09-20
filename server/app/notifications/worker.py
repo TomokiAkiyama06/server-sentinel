@@ -11,6 +11,7 @@ class DeliveryWorker:
         self._transport = transport
         self._work = Queue(maxsize=capacity)
         self._results = Queue(maxsize=capacity)
+        self._result_lock = threading.Lock()
         self._stop = threading.Event()
         self.ready = threading.Event()
         self._thread = None
@@ -37,16 +38,19 @@ class DeliveryWorker:
                     result = DeliveryResult.FAILED
             except Exception:
                 result = DeliveryResult.FAILED
-            self._results.put_nowait((identifier, result))
-            self.ready.set()
+            with self._result_lock:
+                self._results.put_nowait((identifier, result))
+                self.ready.set()
 
     def results(self):
-        self.ready.clear()
-        while True:
-            try:
-                yield self._results.get_nowait()
-            except Empty:
-                return
+        with self._result_lock:
+            results = []
+            while True:
+                try:
+                    results.append(self._results.get_nowait())
+                except Empty:
+                    self.ready.clear()
+                    return tuple(results)
 
     def close(self) -> None:
         # Never join a possibly stuck DNS/transport call on the recorder thread.

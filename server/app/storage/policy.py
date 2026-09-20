@@ -290,15 +290,18 @@ class MainStoragePolicy:
         self.cleanup_failed = False
         try:
             self._reclaimer.expired(self._clock(), self.limits.cleanup_batch_size)
-            recovering = self.state == StorageState.PRESSURE
+            recovering = self.state != StorageState.NORMAL
             for _ in range(self.limits.cleanup_batch_size):
                 space, used, _, _ = self._read()
                 free_threshold = (self.limits.recovery_free_bytes if recovering
                                   else self.limits.pressure_free_bytes)
                 allocation_threshold = (self.limits.recovery_allocation_bytes if recovering
                                         else self.limits.recording_limit_bytes)
+                allocation_ok = used + media_bytes <= allocation_threshold
+                if not recovering:
+                    allocation_ok = used + media_bytes < allocation_threshold
                 if (space.available_bytes - total >= free_threshold
-                        and used + media_bytes <= allocation_threshold):
+                        and allocation_ok):
                     break
                 if self._reclaimer.oldest(1) == 0:
                     break

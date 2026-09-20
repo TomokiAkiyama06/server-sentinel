@@ -10,6 +10,7 @@ from zoneinfo import ZoneInfo
 import contextlib
 import io
 import json
+from queue import Queue
 import sqlite3
 import threading
 import unittest
@@ -17,6 +18,7 @@ import unittest
 from app.notifications.schedule import DailySummaryScheduler, notification_migration
 from app.notifications.service import DailySummary, NotificationKind, NotificationService
 from app.notifications.slack import DeliveryResult, NoRedirect, SlackDelivery, SlackEndpoint
+from app.notifications.worker import DeliveryWorker
 from app.storage.migrations import BUILTIN_MIGRATIONS, migrate
 from app.storage.policy import StorageState
 
@@ -64,6 +66,41 @@ class Transport:
 
 
 class NotificationTests(unittest.TestCase):
+    def test_delivery_result_readiness_is_atomic_with_poll_drain(self):
+        entered, release, drained = threading.Event(), threading.Event(), threading.Event()
+
+        class PausingResults:
+            def __init__(self):
+                self.queue = Queue()
+
+            def put_nowait(self, value):
+                self.queue.put_nowait(value)
+                entered.set()
+                release.wait(2)
+
+            def get_nowait(self):
+                return self.queue.get_nowait()
+
+        class SentTransport:
+            def send(self, _):
+                return DeliveryResult.SENT
+
+        worker = DeliveryWorker(SentTransport(), 1)
+        worker._results = PausingResults()
+        self.addCleanup(release.set)
+        self.addCleanup(worker.close)
+        worker.submit("synthetic", "summary")
+        self.assertTrue(entered.wait(2))
+        result = []
+        reader = threading.Thread(target=lambda: (result.extend(worker.results()), drained.set()))
+        reader.start()
+        self.assertFalse(drained.wait(1))
+        release.set()
+        reader.join(2)
+        self.assertFalse(reader.is_alive())
+        self.assertEqual([("synthetic", DeliveryResult.SENT)], result)
+        self.assertFalse(worker.ready.is_set())
+
     def test_disabled_default_does_not_create_transport_or_attempt_network(self):
         with patch("socket.create_connection", side_effect=AssertionError("network forbidden")), \
                 patch("app.notifications.slack.build_opener", side_effect=AssertionError("disabled")):
