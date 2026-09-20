@@ -127,6 +127,8 @@ HEADまたはbaseのどちらかが変わったら旧レビューはstaleです�
 
 Rulesets Required workflowsまたは専用GitHub App/issuer等で、PR branchの通常`GITHUB_TOKEN`から偽装できないmachine enforcementを導入/検証します。追加のwrite collaboratorを広げる前に完了させます。
 
+現状のpersonal repositoryではRequired workflowsの組織設定を利用できません。調査結果、専用AppのOwner設定・鍵分離・collector/publisher契約・復旧手順、disabled ruleset候補生成とoffline検証の範囲は[REVIEW_GATE_SETUP.md](REVIEW_GATE_SETUP.md)に記載しています。実際のApp・repository強制・test PR受入は未完了であり、Issue #4はOpenのままです。
+
 ## 11. 開発プロセスのデータ送信
 
 Claude reviewでは固定PR diffと必要なrepository contextがAnthropicのClaudeサービスへ送信されます。製品利用者の監視映像/運用データを送る機能ではありません。

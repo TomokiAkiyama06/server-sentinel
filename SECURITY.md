@@ -65,6 +65,13 @@ Until Issue #4 establishes hardened repository-level enforcement:
 - any material HEAD or base change invalidates the prior review context;
 - real monitoring media, biometric templates, secrets, and private deployment values never appear in PRs.
 
+The dedicated-App deployment proposal and offline policy validator are documented
+in [`docs/REVIEW_GATE_SETUP.md`](docs/REVIEW_GATE_SETUP.md). They do not install
+enforcement or authenticate supplied JSON. App credentials must remain outside
+PR-controlled workflows/checkouts; the existing same-repository Claude workflow
+is still limited to trusted writers. Actual issuer isolation and GitHub test-PR
+acceptance remain open in #4.
+
 ## Network boundaries
 
 ### Human dashboard path
