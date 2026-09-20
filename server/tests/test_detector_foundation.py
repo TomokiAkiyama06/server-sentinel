@@ -295,6 +295,35 @@ class DetectorFoundationTests(unittest.TestCase):
         self.assertFalse(worker.is_alive())
         self.assertEqual(results[0].result.reason, Reason.DROPPED)
 
+    def test_expired_published_result_does_not_cancel_fresh_inflight_evaluation(self):
+        started, release = threading.Event(), threading.Event()
+        def evaluate(sample):
+            if sample.sequence == 1:
+                started.set()
+                if not release.wait(2):
+                    raise RuntimeError("test worker deadline")
+            return Detection(Observation.ABSENT, Reason.EVALUATED)
+        self.register(StubDetector(evaluate))
+        self.offer(frame())
+        self.scheduler.run_one()
+        self.clock.value = 90
+        self.offer(frame(1))
+        results = []
+        worker = threading.Thread(target=lambda: results.append(self.scheduler.run_one()))
+        worker.start()
+        try:
+            self.assertTrue(started.wait(2))
+            self.clock.value = 101
+            self.assertEqual(self.scheduler.snapshot(SOURCE).result.reason, Reason.STALE)
+            self.clock.value = 105
+        finally:
+            release.set()
+            worker.join(2)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(results[0].result.observation, Observation.ABSENT)
+        self.assertEqual((results[0].received_at_ns, results[0].evaluated_at_ns), (90, 105))
+        self.assertEqual(self.scheduler.snapshot(SOURCE).result.observation, Observation.ABSENT)
+
     def test_baseline_and_failure_make_no_network_attempts(self):
         with patch.object(socket, "socket", side_effect=AssertionError("network attempted")) as network:
             self.register(MotionBaseline(pixel_delta=20, changed_fraction=0.25))

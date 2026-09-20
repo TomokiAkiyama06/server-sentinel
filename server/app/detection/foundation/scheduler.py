@@ -76,6 +76,7 @@ class _Source:
     processed: int = 0
     epoch: int = 0
     reset_required: bool = True
+    evaluating: bool = False
 
 
 class InferenceScheduler:
@@ -193,7 +194,12 @@ class InferenceScheduler:
             now = self._now()
             state = self._sources[source_id]
             if state.result_ns is not None and now - state.result_ns > state.policy.maximum_observation_age_ns:
-                self._unknown(state, Reason.STALE)
+                # Expire only the published old observation. A fresh in-flight
+                # frame remains eligible unless its own input/quality changes.
+                state.result = Detection(Observation.UNKNOWN, Reason.STALE)
+                state.result_sequence = state.result_ns = state.evaluated_ns = None
+                if not state.evaluating:
+                    state.reset_required = True
             return self._snapshot(source_id, state)
 
     @staticmethod
@@ -247,6 +253,7 @@ class InferenceScheduler:
             epoch, needs_reset = state.epoch, state.reset_required
             state.reset_required = False
             self._running = True
+            state.evaluating = True
         try:
             if needs_reset:
                 state.detector.reset()
@@ -259,9 +266,11 @@ class InferenceScheduler:
         except BaseException:
             with self._lock:
                 self._running = False
+                state.evaluating = False
             raise
         with self._lock:
             self._running = False
+            state.evaluating = False
             finished = self._now()
             state.processed += 1
             if state.epoch != epoch:
