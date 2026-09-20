@@ -902,6 +902,32 @@ This is not DRM. A user who can view video may still screen-record or use advanc
 
 ServerSentinel permission revocation invalidates application access promptly. Tailnet membership/policy remains a separate Tailscale administrative concern.
 
+### 11.8 Owner bootstrap and session decision status
+
+[ADR-0003](docs/ADR/0003-owner-authentication-and-trusted-proxy.md) is a
+**Proposed** implementation design for Issue #6, pending explicit Owner approval.
+Its timeout values, exact identity binding, local bootstrap, and recovery choices
+are not accepted product defaults. Until approval and Issue #10 implementation,
+the backend shell denies human requests, including application assets,
+health/version/schema, and SPA/error fallbacks. Issue #8's static shell remains
+a development/mock artifact until integrated with this protected delivery path.
+The ADR's synthetic design model proves only policy composition, not deployed
+proxy, session, cryptographic, or browser behavior.
+
+The proposal also reserves a whole hostname: that name serves ServerSentinel
+alone on every scheme and port. Path-based co-hosting shares one browser origin,
+and another port of the same name still shares the cookie scope because cookies
+are not port-scoped, so neither is supported. Holding the name is a deployment
+obligation (a dedicated network identity, or a single-purpose node enforced
+outside the application), because a directly bound listener never appears in
+proxy configuration; the application's startup and daily listener/route checks
+close access when another answer is found, which bounds the exposure window
+instead of preventing the bind. Owner bootstrap also provisions the Owner's
+first per-person credential through the local administrative boundary, since no
+session exists without one. A verified trusted-proxy identity stays a supplementary check
+there; the authoritative per-person application credential is decided separately
+for Issue #6.
+
 ## 12. Dashboard UI
 
 The #8 foundation is a Japanese-default React/TypeScript shell with an English
