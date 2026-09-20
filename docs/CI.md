@@ -93,6 +93,14 @@ and `test` scripts. CI runs `npm ci --ignore-scripts --no-audit --no-fund`,
 `[smoke]` section. Dependency install lifecycle scripts are not implicitly run.
 CI provides Node 24. Different package managers need an explicit CI extension.
 
+The implemented `web/` component also requires the Dashboard browser smoke job
+in the aggregate CI gate. It uses installed runner Chrome and Node's built-in
+CDP transport, with no browser-automation package or browser download. Synthetic
+viewports exercise React rendering, permissions, errors and hostile opt-in
+settings. Every page request is intercepted; an aborted external positive
+control verifies observation. Browser/OS background traffic is outside this
+scope. No media, trace, screenshot, or test-report artifact is uploaded.
+
 Smoke commands must validate synthetic normal and error scenarios and exit zero
 only when their assertions pass. Their image uses the component as build context.
 Containers run without a network, host mounts, published ports, inherited
