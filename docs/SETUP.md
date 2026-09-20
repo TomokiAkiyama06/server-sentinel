@@ -53,6 +53,8 @@ Use the strongest available stable identifiers and clearly mark fields that are 
 
 Also run/preview the recording-health self-test: expected recording filesystem, source freshness, recorder/encoder state, free-space/safety reserve, bounded temporary write + fsync + reopen/read/decode validation, and available SMART/NVMe health.
 
+Explain that self-test-owned temporary/partial media is deleted on success, failure, or cancellation; interrupted leftovers are cleaned at next startup before a new test writes media. Cleanup verifies the expected filesystem and does not touch ordinary recordings/protected incidents. If cleanup fails, show the failure and block additional self-test media writes until safe cleanup succeeds; remaining bytes still count against storage admission/reserve. Self-test media is never uploaded or retained for diagnostics, and missing mounts never cause root-filesystem fallback.
+
 ### Step 5 — Locale/time
 
 - timezone;

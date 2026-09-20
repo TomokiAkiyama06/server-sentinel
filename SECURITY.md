@@ -297,6 +297,8 @@ Security rules:
 
 At least daily, run a bounded recording-health self-test that checks source freshness, recorder/encoder state, expected recording filesystem identity, free-space/safety admission, and a temporary write + fsync + reopen/read/decode path. Where available, surface SMART/NVMe critical health indicators.
 
+Delete only self-test-owned temporary/partial media on success, failure, and cancellation. At startup, verify the expected filesystem and clean interrupted-test leftovers before new self-test media writes; never delete ordinary recordings or protected incidents. Missing/read-only storage or another cleanup failure produces an explicit failure and blocks further self-test media writes until safe cleanup succeeds. Account for leftovers in storage admission/safety reserve. Do not fall back to another filesystem, upload the artifacts, or retain them as diagnostic media.
+
 If the intended recording filesystem is missing or substituted, do not silently write to an unintended fallback filesystem while reporting healthy. A self-test failure or material recording-device mismatch is an immediate Owner-alert condition.
 
 Hardware inventory/SMART collection must use least privilege. If a privileged helper is needed for a narrow probe, do not grant the whole application broad root access.

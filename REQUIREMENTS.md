@@ -329,7 +329,7 @@ At least once per day, ServerSentinel shall run a recording-health self-test suf
 - a bounded temporary write + flush/fsync + reopen/parse/decode verification on the recording path;
 - storage-device health indicators available through SMART/NVMe telemetry.
 
-Temporary self-test media shall be bounded, deployment-local, deleted after successful validation, and never uploaded as telemetry.
+Temporary self-test media shall be bounded, deployment-local, and never uploaded as telemetry. Self-test-owned temporary/partial media shall be cleaned up on success, failure, or cancellation, and interrupted-test leftovers shall be recovered for cleanup at the next startup before another test segment is written. Cleanup shall target only identified self-test artifacts on the expected filesystem, never ordinary recordings or protected incidents. If cleanup cannot complete, report a recording-health failure, include remaining artifacts in storage admission/safety-reserve accounting, and block further self-test media writes until safe cleanup succeeds; do not silently accumulate daily leftovers or use a fallback mount.
 
 ### INTEGRITY-005 Recording-path fail-safe
 If the intended recording filesystem is missing/unmounted or resolves to an unexpected device, ServerSentinel shall not silently fall back to an unintended filesystem while reporting healthy recording. It shall expose a degraded/failed state and follow storage admission safeguards.

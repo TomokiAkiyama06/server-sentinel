@@ -578,7 +578,9 @@ Acceptance:
 - same-model hardware with no exposed unique identifier is not falsely claimed as distinguishable;
 - unexpected/unmounted recording filesystem does not silently fall back while reporting healthy;
 - test segment write/fsync/reopen/readability failure is detected;
-- successful temporary self-test media is deleted locally;
+- identified self-test temporary/partial media is cleaned on success, failure, and cancellation; interrupted-test leftovers are cleaned on next startup before new test segments;
+- cleanup failures are explicit recording-health failures; leftovers participate in storage admission/reserve accounting and further self-test media writes are blocked until safe cleanup succeeds;
+- cleanup checks the expected filesystem and never deletes ordinary recordings/protected incidents or falls back to another mount; fault-injection tests cover failed reopen/decode, cancellation, restart, and failed cleanup without accumulating new artifacts;
 - immediate alert does not wait only for daily summary;
 - Slack alert works when configured, while dashboard/audit remains authoritative when Slack is disabled;
 - raw hardware identifiers and real monitoring media are absent from repo/CI/public diagnostics.

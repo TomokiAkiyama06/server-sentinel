@@ -651,8 +651,10 @@ At least once per day, run an end-to-end recording-health check. It should verif
 5. write a short bounded temporary media segment through the recording path;
 6. flush/fsync it;
 7. reopen it and validate container/duration/size and decode/readability as appropriate;
-8. delete the temporary successful self-test artifact;
+8. clean up self-test-owned temporary/partial media whether validation succeeds, fails, or is cancelled;
 9. read available SMART/NVMe health indicators without making unsupported lifetime predictions.
+
+Run cleanup through the failure/cancellation path as well as the successful path. On startup, recover identified artifacts from interrupted tests and clean them before admitting another self-test segment. Cleanup verifies the expected filesystem and targets only self-test-owned artifacts; it never deletes ordinary recordings/protected incidents or creates a fallback on an unexpected mount. If cleanup fails (for example, a missing or read-only mount), record a recording-health failure, account for the leftovers in storage admission/safety-reserve checks, and block new self-test media writes until safe cleanup succeeds. Continue reporting the failed/blocked state rather than accumulating a new partial segment each day.
 
 A self-test failure must not be hidden behind a generic healthy state.
 

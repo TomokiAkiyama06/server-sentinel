@@ -436,7 +436,11 @@ Use controlled inventory mocks for destructive/expensive substitution cases wher
 - [ ] a bounded temporary media segment is written through the recording path;
 - [ ] the segment is flushed/fsynced;
 - [ ] the segment is reopened and container/duration/size/decode readability is validated as appropriate;
-- [ ] successful temporary test media is deleted locally after validation;
+- [ ] self-test-owned temporary/partial media is deleted locally after success, write/read/decode failure, and cancellation;
+- [ ] an interrupted test leaves only bounded self-test artifacts, which are reconciled/cleaned at next startup before new self-test media is written;
+- [ ] cleanup verifies the expected filesystem and self-test ownership and never deletes ordinary recordings or protected incidents;
+- [ ] simulated missing/read-only storage or cleanup failure reports failure and blocks further self-test media writes until safe cleanup succeeds;
+- [ ] leftover bytes count against storage admission/safety reserve, with no root-filesystem fallback or retained/uploaded diagnostic media;
 - [ ] available SMART/NVMe health data is read and surfaced without unsupported lifetime prediction;
 - [ ] a failed write/reopen/decode test creates a recording-health failure state;
 - [ ] the self-test runs at least once every 24 hours.
