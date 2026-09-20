@@ -1,6 +1,7 @@
 *
 !requirements-ci.lock
 !requirements.lock
+!requirements-detector.lock
 !app/
 !app/**
 !tests/

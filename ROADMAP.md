@@ -83,11 +83,11 @@ acceptance.
 
 ## Phase 5 — Physical-security detection
 
-- [ ] general motion
+- [x] synthetic CPU general-motion foundation (#20; runtime integration and target-host acceptance remain open)
 - [ ] permissively licensed person-detector evaluation
 - [ ] detector-specific image-quality gating
 - [ ] no false `no person` when quality is insufficient
-- [ ] per-source inference cadence
+- [x] bounded per-source inference-cadence primitive (#20; Main worker integration remains open)
 - [ ] server ROI calibration/movement
 - [ ] camera tamper/occlusion/source-health correlation
 
