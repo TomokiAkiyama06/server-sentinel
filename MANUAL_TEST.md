@@ -609,3 +609,27 @@ explicitly. Do not alter production protection to make a negative test pass.
 Never use a real secret as a fixture or publish an App key/token, reviewer token,
 raw private API response, or monitoring data. Cleanup only the identified
 synthetic test branches/PRs; no production data or unrelated rule deletion.
+
+## V. Privacy-safe diagnostic export
+
+Run this only after the Owner authorization UI/API is integrated. Use a disposable
+deployment with synthetic values and synthetic media; do not attach the resulting
+bundle or private deployment data to GitHub.
+
+- [ ] without an explicit Owner export action, no bundle is created and local
+  network observation shows no automatic upload/share traffic;
+- [ ] the confirmation identifies included categories and any individually
+  selected raw-media items before authorization;
+- [ ] the default export includes no raw monitoring media;
+- [ ] selecting one synthetic media item includes only that item, and cancelling
+  or selecting none includes no media;
+- [ ] credentials, pairing secrets, private keys, sensitive headers and Owner
+  biometric templates/embeddings remain absent even after explicit export;
+- [ ] hardware serials/UUIDs are transformed and raw values remain absent;
+- [ ] the manifest reports included categories and exclusion reasons without
+  recording excluded values, media IDs, paths or private deployment identifiers;
+- [ ] the bundle remains deployment-local until the Owner separately chooses how
+  to share it, and export does not enable external biometric processing/storage.
+
+Results: **NOT RUN — Owner authorization/UI integration and Main Server network
+observation remain pending. Synthetic tests do not complete this acceptance.**
