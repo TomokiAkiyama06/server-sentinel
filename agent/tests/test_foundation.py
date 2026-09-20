@@ -452,7 +452,7 @@ raise SystemExit(1)
 
 
 class DistributionTests(DeploymentCase):
-    def test_versioned_artifact_runs_outside_checkout(self):
+    def test_versioned_artifact_accepts_only_config_outside_installation(self):
         version = self.root / "installation" / "0.1.0"
         version.mkdir(parents=True)
         artifact = version / "media-capture-agent"
@@ -473,6 +473,22 @@ class DistributionTests(DeploymentCase):
         checked = subprocess.run([sys.executable, str(artifact), "--config", str(config), "--check"],
                                  capture_output=True, text=True, check=True, cwd="/")
         self.assertIn("validation passed", checked.stdout)
+        for parent in (version, version.parent):
+            internal = parent / "deployment.json"
+            internal.write_text(config.read_text())
+            internal.chmod(0o600)
+            rejected = subprocess.run([sys.executable, str(artifact), "--config", str(internal),
+                                       "--check"], capture_output=True, text=True, cwd="/", timeout=5)
+            self.assertEqual(rejected.returncode, 1)
+            self.assertNotIn("validation passed", rejected.stdout)
+        for key in ("runtime_root", "media_root"):
+            internal = version.parent / key
+            internal.mkdir(mode=0o700)
+            config.write_text(json.dumps(dict(values, **{key: str(internal)})))
+            rejected = subprocess.run([sys.executable, str(artifact), "--config", str(config),
+                                       "--check"], capture_output=True, text=True, cwd="/", timeout=5)
+            self.assertEqual(rejected.returncode, 1)
+            self.assertNotIn("validation passed", rejected.stdout)
         import zipfile
         with zipfile.ZipFile(artifact) as archive:
             self.assertIn("LICENSE", archive.namelist())

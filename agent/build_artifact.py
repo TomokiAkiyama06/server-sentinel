@@ -21,8 +21,12 @@ def build(destination):
         shutil.copytree(ROOT / "media_capture_agent", stage / "media_capture_agent",
                         ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
         shutil.copyfile(ROOT / "LICENSE", stage / "LICENSE")
+        (stage / "__main__.py").write_text(
+            "from media_capture_agent.cli import main\nraise SystemExit(main())\n",
+            encoding="utf-8",
+        )
         zipapp.create_archive(stage, destination, interpreter="/usr/bin/env python3",
-                              main="media_capture_agent.cli:main", compressed=True)
+                              compressed=True)
     destination.chmod(0o555)
     return hashlib.sha256(destination.read_bytes()).hexdigest()
 
