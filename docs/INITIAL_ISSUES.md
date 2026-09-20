@@ -152,8 +152,8 @@ Acceptance:
 - failing secret/fixture guard blocks CI;
 - repository media fixtures are synthetic/generated only.
 - lint/test failures block CI for existing Python/TypeScript components, and existing Docker/Compose configurations are validated.
-- audit Main/Agent/Web dependency and SDK inventories, lockfiles, and generated bundles/packages for analytics, advertising/tracking SDKs, telemetry, and developer-operated crash upload, including opt-in configuration paths;
-- CI negative fixtures for a forbidden SDK/dependency or reporting configuration fail the guard; controlled startup/smoke tests inspect outbound requests for prohibited reporting without using real deployment data;
+- audit existing Main/Agent/Web dependency and SDK inventories, lockfiles, and available generated bundles/packages for analytics, advertising/tracking SDKs, telemetry, and developer-operated crash upload, including opt-in configuration paths; missing future runtime components are not prerequisites for completing this CI framework;
+- demonstrate the guard with synthetic positive/negative fixtures: a forbidden SDK/dependency or reporting configuration fails CI; inspect prohibited outbound requests in controlled startup/smoke tests for runnable components that already exist, without real deployment data; full-runtime acceptance remains in Plans 20/21 (#27/#28);
 - PRIV-003 is an unconditional MVP gate: adding those facilities requires a new explicit Owner decision and ADR before changing requirements/acceptance; an opt-in toggle is not authorization.
 
 ## Plan 2 — Backend foundation

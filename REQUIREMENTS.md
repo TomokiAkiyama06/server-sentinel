@@ -38,7 +38,7 @@ Diagnostics may leave the user's environment only after an explicit export/share
 Camera media shall flow only inside the user's deployment/private network path, except for explicitly enabled third-party infrastructure such as Tailscale or Slack.
 
 ### PRIV-006 Owner biometric data
-Owner face verification is optional and requires explicit enrollment. The owner template/embedding is sensitive biometric data, stays deployment-local by default, is deletable/re-enrollable, and is excluded from normal diagnostics.
+Owner face verification is optional and requires explicit enrollment. The owner template/embedding is sensitive biometric data, stays deployment-local, is deletable/re-enrollable, and is excluded from normal diagnostics.
 
 ### PRIV-007 Non-owner identity minimization
 The MVP shall not enroll, name, or persist facial identity profiles or separate face-crop/template libraries for other observed people. Anonymous tracking identifiers may be used only for scoped event correlation; ordinary authorized recordings may contain people without creating a separate biometric library.

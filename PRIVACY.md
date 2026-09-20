@@ -75,7 +75,7 @@ ServerSentinel may optionally verify whether a detected face matches the explici
 
 This is biometric processing. Therefore:
 - enrollment requires explicit owner action;
-- owner template/embedding stays inside the deployment by default;
+- owner template/embedding and biometric processing stay inside the deployment;
 - template is not sent to the ServerSentinel developer;
 - enrollment can be deleted/replaced;
 - raw template is excluded from logs/normal diagnostics;

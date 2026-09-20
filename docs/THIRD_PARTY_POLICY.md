@@ -66,7 +66,7 @@ Before adding a face detector/embedding/verifier:
 - document expected accuracy/threshold evaluation method;
 - document CPU/GPU requirements;
 - check whether the package/model contacts external services or downloads artifacts at runtime;
-- confirm biometric processing remains local by default;
+- confirm biometric processing and owner templates/embeddings remain deployment-local; external biometric processing/storage is not an opt-in option in the MVP;
 - confirm the implementation does not require a named multi-person identity database;
 - keep the verification backend replaceable.
 
