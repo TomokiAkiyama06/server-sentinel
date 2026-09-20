@@ -5,7 +5,9 @@ import { bytes } from '../shared/format';
 /** Owner-only capacity, retention and notification status; no credential is displayed. */
 export function StorageView({ t, storage }: { t: Catalog; storage: StorageSummary }) {
   const starred = Math.min(Math.max(0, storage.starred_bytes), Math.max(0, storage.recording_bytes));
-  const available = Math.max(0, storage.available_bytes);
+  // The policy reports raw filesystem availability and keeps active write
+  // reservations separately. Capacity safety is based on their difference.
+  const available = Math.max(0, storage.available_bytes - Math.max(0, storage.reserved_bytes));
   const target = Math.max(0, storage.hard_reserve_bytes);
   // Once external use has consumed part of the configured reserve, show only
   // the reserve that remains on disk; the rest is not available capacity.

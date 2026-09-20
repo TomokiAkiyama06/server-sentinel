@@ -39,6 +39,8 @@ export interface StorageSummary {
   state: StorageState;
   recording_bytes: number;
   starred_bytes: number;
+  /** Bytes reserved by in-flight recording writes; unavailable until released. */
+  reserved_bytes: number;
   available_bytes: number;
   hard_reserve_bytes: number;
   recording_limit_bytes: number;

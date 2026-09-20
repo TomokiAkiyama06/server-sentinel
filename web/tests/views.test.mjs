@@ -26,7 +26,7 @@ const recordings = [
 ];
 const storage = {
   state: 'STORAGE_PRESSURE', recording_bytes: 64_424_509_440, starred_bytes: 10_737_418_240,
-  available_bytes: 21_474_836_480, hard_reserve_bytes: 5_368_709_120,
+  available_bytes: 21_474_836_480, reserved_bytes: 0, hard_reserve_bytes: 5_368_709_120,
   recording_limit_bytes: 85_899_345_920, critical_allowance_bytes: 2_147_483_648,
   recording_retention_days: 20, audit_retention_days: 90, agent_incident_retention_days: 60,
   slack_configured: false, daily_summary_local_time: '23:00',
@@ -209,6 +209,21 @@ test('a consumed hard reserve is never drawn as intact space', () => {
   // The configured target stays visible as a separate figure, not as space.
   assert.ok(markup.includes(messages.ja.reserveTarget));
   assert.match(markup, /aria-current="true"/);
+});
+
+test('an active write reservation is removed before rendering free capacity', () => {
+  const markup = storageMarkup('en', {
+    ...storage,
+    state: 'STORAGE_HARD_STOP',
+    available_bytes: 210,
+    reserved_bytes: 120,
+    hard_reserve_bytes: 100,
+  });
+  const rows = meters(markup);
+  assert.equal(rows.free, 0);
+  assert.equal(rows.reserve, 90);
+  assert.equal(rows.free + rows.reserve, 90);
+  assert.match(markup, /data-reserve-shortfall="true"/);
 });
 
 test('a healthy backend shows no fault alert', () => {

@@ -65,8 +65,11 @@ that write is unknown rather than the list being unavailable.
 states that recovery uses hysteresis. The disk breakdown meters unstarred
 recordings, starred recordings, free space and the hard filesystem reserve
 separately, with tabular numerals, and notes that other processes' usage is part
-of the admission decision. Only space the filesystem still holds is metered: if
-external consumption has already eaten into the configured reserve, the reserve
+of the admission decision. Only capacity remaining after in-flight
+recording-write reservations is metered: the backend sends raw filesystem
+availability and `reserved_bytes`, and the view subtracts the latter before
+showing free or reserve capacity. If external consumption has already eaten
+into the configured reserve, the reserve
 bar shows just the remaining part, the configured target is listed as a separate
 figure, and the missing amount is reported as an alert instead of being drawn as
 capacity. The three retention periods are displayed as separate

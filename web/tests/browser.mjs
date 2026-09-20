@@ -36,7 +36,7 @@ const recordingFixture = count => Array.from({ length: count }, (_, index) => ({
 }));
 const storageFixture = (state, available_bytes = 21_474_836_480, faults = false) => ({
   state, recording_bytes: 64_424_509_440, starred_bytes: 10_737_418_240,
-  available_bytes, hard_reserve_bytes: 5_368_709_120,
+  available_bytes, reserved_bytes: 0, hard_reserve_bytes: 5_368_709_120,
   recording_limit_bytes: 85_899_345_920, critical_allowance_bytes: 2_147_483_648,
   recording_retention_days: 20, audit_retention_days: 90, agent_incident_retention_days: 60,
   slack_configured: false, daily_summary_local_time: '23:00',
