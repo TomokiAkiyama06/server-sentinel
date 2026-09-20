@@ -24,6 +24,14 @@ Safe defaults:
 
 ## Threat model
 
+The internal compressed-recording store accepts no caller-controlled filenames or
+public requests. It requires a private, deployment-approved existing media root,
+an admission reservation and a trusted video-only codec validator. It rejects
+path symlinks, substituted/missing roots and competing writers; publication and
+recovery operate only on generated UUID files identified by its SQLite journal.
+Mandatory adapters and human authorization remain unwired; this module adds no
+recording playback/download route. See `server/app/media/recording/README.md`.
+
 The current backend foundation denies every human HTTP/WebSocket route,
 including system health, version, schema and framework documentation. Its
 documented launcher accepts only loopback bind settings, disables proxy-header

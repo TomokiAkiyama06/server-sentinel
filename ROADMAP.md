@@ -13,7 +13,7 @@ Phases group capabilities rather than imposing a strict completion order. The de
 - [ ] dependency/model license policy
 - [ ] hardened review gate #4: capability assessment, offline policy tests and disabled ruleset generator prepared; Owner App setup, trusted publisher/collector and GitHub enforcement acceptance remain open (see `docs/REVIEW_GATE_SETUP.md`)
 
-Issue #1 closed when PR #2 merged after documentation/bootstrap acceptance and current HEAD/base reviews plus CI passed. CI foundation #5 is implemented. The #7 closed backend foundation now has synthetic coverage; its authorization prerequisite remains separate. Runtime/ADR Issues #6–#28 and the separately tracked #4 retain their own acceptance gates.
+Issue #1 closed when PR #2 merged after documentation/bootstrap acceptance and current HEAD/base reviews plus CI passed. CI foundation #5 is implemented. The backend and dashboard foundations have synthetic coverage; their authorization prerequisites remain separate. Runtime/ADR progress for Issues #6–#28 and the separately tracked #4 is tracked below and in GitHub.
 
 ## Phase 1 — Main server and web foundation
 
@@ -34,7 +34,12 @@ Issue #1 closed when PR #2 merged after documentation/bootstrap acceptance and c
 - [x] capabilities/health/profile model
 - [ ] local UVC discovery/ingest
 - [ ] stable/ambiguous UVC identity handling
-- [ ] `media-capture-agent` native service
+
+Issue #11 now has a V4L2 discovery/MMAP adapter, durable approval latch and
+registry integration with synthetic tests. The UVC items remain unchecked until
+Owner management/worker integration and real-webcam acceptance are complete;
+no browser preview or physical device result is claimed.
+- [ ] `media-capture-agent` native service — #12 foundation implemented; capture/paired transport integration and physical acceptance pending
 - [ ] video-only capture
 - [ ] one-time pairing + mTLS/revocation
 - [ ] separate LAN ingest listener
@@ -57,6 +62,12 @@ Issue #1 closed when PR #2 merged after documentation/bootstrap acceptance and c
 - [ ] main->browser live transport PoC + ADR
 - [ ] phone/Mac/desktop 1–4 source live grid, with stability/reconnect prioritized over minimum latency
 - [ ] demand-driven viewer transcoding/packaging
+
+Issue #18 now has bounded compressed storage primitives, source/event manifests,
+application migration v4 integration, and synthetic crash/integrity coverage. Its
+runtime worker, codec adapter, shared storage guard and authorization integration
+remain open; these primitives do not establish playable-video or hardware
+acceptance.
 
 ## Phase 4 — Human private access
 

@@ -217,6 +217,28 @@ When devices reappear:
 
 This rule applies on both the main host and remote capture nodes.
 
+### 4.4 Local adapter implementation boundary
+
+The local adapter stores private approval evidence and a durable ambiguity latch
+in the application database. A live approved weak binding does not constitute
+proof for a subsequent reconnect or process restart. Discovery alone is never
+`online`; successful frame capture is required. The initial implementation uses
+bounded single-planar V4L2 MMAP on Linux x86_64/aarch64, reports the actual
+negotiated dimensions/FPS/FourCC, and requires an explicit capture profile.
+Unsupported multi-planar capture or codec/bitrate controls fail explicitly.
+Source workers, Owner management and the preview frame sink are internal
+interfaces; physical capture is not auto-started by the backend launcher and no
+unauthenticated preview route is added. See `server/app/cameras/uvc/README.md`.
+
+Identity reconciliation starts only after an active-session marker is durable.
+An unclean session, including a failed ambiguity-latch write, requires Owner
+reapproval at restart; it cannot fall back to an older clean approval record.
+Clean shutdown releases this marker after closing capture while retaining any
+manual-approval latch. A missing capture profile does not hide that latch.
+Known duplicated serials remain unsuitable for automatic reconnect even after the current physical
+candidate is explicitly approved. This confidence is stored separately from raw
+device evidence. A different unique serial may establish a new strong identity.
+
 ## 5. `media-capture-agent`
 
 ### 5.1 Purpose
@@ -236,6 +258,14 @@ GUI/tray: none required
 ```
 
 Installation may require `sudo` to install the binary, create the account/unit, and configure narrow device permissions.
+
+The Issue #12 native foundation uses Python 3.12+ standard-library modules under
+`agent/media_capture_agent/`, with an executable zipapp release artifact and an
+explicit systemd installer. Runtime/config/media directories are outside source
+and installation trees. Until approved capture and authenticated transport adapters
+are integrated, the production CLI remains visibly unconfigured and never starts
+unauthenticated network communication. This foundation does not complete physical
+Capture Node acceptance.
 
 ### 5.3 Audio
 
@@ -411,7 +441,7 @@ The Agent media root is a deployment-configured path outside the source tree tha
 
 At install/startup/runtime admission, the Agent shall verify:
 - the configured media root exists or can be created only by the intended installer/owner workflow;
-- it resolves to the expected filesystem/mount identity when an expected device/mount is configured;
+- it resolves to the expected filesystem/mount/device and backing-filesystem-root identity; a narrow systemd namespace bind must map to the approved parent root plus the configured relative media path;
 - sufficient free space and safety reserve remain;
 - it is writable by the dedicated Agent service account;
 - loss/unmount/substitution of the expected media filesystem does **not** silently redirect ring-buffer or incident writes into a directory on the root filesystem.
@@ -453,6 +483,17 @@ For wide room coverage, real-hardware tests should compare at minimum:
 - ring-buffer disk throughput/capacity at candidate capture profiles.
 
 Final defaults are measured, not guessed.
+
+The transport-independent implementation in `server/app/media/profiles/` uses
+explicit immutable profiles, conservative exact-descriptor copy eligibility,
+bounded per-path compressed queues, and demand-driven viewer adapter lifetimes.
+Inference sampling applies to presentation-ordered decoded frames, never to
+compressed reference packets before decoding. Packet gaps reset dependency state
+and require a keyframe; the capture profile also sets an explicit maximum forward
+timestamp gap, independent of inference cadence. Known loss remains visible after
+recovery. Missing codec
+adapters report unavailable. Real codec/transport integration and measured
+deployment defaults are still required; see that directory's integration contract.
 
 ### 6.4 Agent-to-main transport
 
@@ -497,6 +538,16 @@ quality/gap metadata
 ```
 
 Critical incident protection on `media-capture-agent` is a deliberate secondary-evidence exception, not a full mirror.
+
+The internal `server/app/media/recording/` storage implementation uses generated
+segment UUID filenames, byte digests, a pending-publication journal and per-source
+event manifests. Its pre-roll has duration, byte and segment-count limits;
+recording windows carry explicit clip intervals and integrity/gap/discontinuity
+state. Restart retains committed media, cleans only journal-owned pending files
+and marks active recordings interrupted. Runtime admission and codec validation
+are mandatory injected boundaries; no human routes are enabled by this module.
+See its README for the remaining worker integration and the distinction between
+storage integrity and playable-media validation.
 
 ### 6.7 Main-host event ring buffer
 
