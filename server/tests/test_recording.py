@@ -214,6 +214,16 @@ class RecordingTests(unittest.TestCase):
         self.reopen()
         self.assertEqual([], list(self.root.iterdir()))
 
+    def test_cancelled_publication_blocks_all_mutation_until_recovery(self):
+        with patch.object(self.store, "_write", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                self.store.append(self.segment())
+        self.assertFalse(self.policy.reserved)
+        with self.assertRaisesRegex(RecordingError, "WRITER_UNAVAILABLE"):
+            self.store.start_manual(self.source, 30_000)
+        self.reopen()
+        self.store.append(self.segment())
+
     def test_failed_cleanup_blocks_reopening_and_keeps_pending_accounting(self):
         with patch.object(self.store, "_publish", side_effect=sqlite3.OperationalError("synthetic")):
             with self.assertRaises(RecordingError):
@@ -385,6 +395,80 @@ class RecordingTests(unittest.TestCase):
             self.store.start_event(event, (uuid4(),), 30_000)
         self.assertEqual(1, len(self.store.event_manifest(event)["recordings"]))
         self.assertFalse(self.policy.reserved)
+
+    def test_starred_deletion_and_shared_segment_accounting(self):
+        self.store.append(self.segment())
+        first = self.store.start_manual(self.source, 30_000, duration_ms=10_000)
+        second = self.store.start_manual(self.source, 30_000, duration_ms=10_000)
+        self.store.finish(first)
+        self.store.finish(second)
+        self.store.release_source(self.source)
+        size = len(self.segment().data)
+        self.assertEqual(size, self.store.usage_bytes())
+        self.store.set_starred(first, True)
+        self.assertEqual(size, self.store.usage_bytes(starred_only=True))
+        self.assertEqual(0, self.store.delete_recording(second))
+        with self.assertRaisesRegex(RecordingError, "DELETE_REFUSED"):
+            self.store.delete_recording(first)
+        self.assertEqual(size, self.store.delete_recording(first, owner_requested=True))
+        self.assertEqual(0, self.store.usage_bytes())
+        self.assertEqual([], list(self.root.iterdir()))
+
+    def test_active_recording_cannot_be_deleted_even_by_owner(self):
+        recording = self.store.start_manual(self.source, 30_000)
+        for owner in (False, True):
+            with self.assertRaisesRegex(RecordingError, "DELETE_REFUSED"):
+                self.store.delete_recording(recording, owner_requested=owner)
+        self.assertEqual("active", self.store.manifest(recording)["status"])
+
+    def test_retention_candidates_order_filter_and_bounded_summaries(self):
+        oldest = self.store.start_manual(self.source, 10_000, duration_ms=10_000)
+        self.store.finish(oldest)
+        newer = self.store.start_manual(self.source, 20_000, duration_ms=10_000)
+        self.store.finish(newer)
+        self.store.start_manual(self.source, 30_000)
+        self.assertEqual([str(oldest)], [item["id"] for item in self.store.retention_candidates(
+            before_ms=20_000, limit=10)])
+        self.assertEqual([str(oldest)], [item["id"] for item in self.store.retention_candidates(
+            before_ms=None, limit=1)])
+        self.store.set_starred(oldest, True)
+        self.assertEqual([str(newer)], [item["id"] for item in self.store.retention_candidates(
+            before_ms=None, limit=10)])
+        self.assertEqual(str(newer), self.store.list_recordings(limit=1, offset=1)[0]["id"])
+        with self.assertRaises(ValueError):
+            self.store.retention_candidates(before_ms=None, limit=1001)
+
+    def test_failed_deletion_preserves_journal_and_recovery_finishes_cleanup(self):
+        self.store.append(self.segment())
+        recording = self.store.start_manual(self.source, 30_000, duration_ms=10_000)
+        self.store.finish(recording)
+        self.store.release_source(self.source)
+        with patch("app.media.recording.store.os.unlink", side_effect=PermissionError):
+            with self.assertRaises(PermissionError):
+                self.store.delete_recording(recording)
+        self.assertEqual("deleting", self.db.execute("SELECT status FROM recordings").fetchone()[0])
+        self.assertEqual(len(self.segment().data), self.store.usage_bytes())
+        self.reopen()
+        self.assertEqual(0, self.store.usage_bytes())
+        self.assertEqual((), self.store.list_recordings(limit=1))
+        self.assertEqual([], list(self.root.iterdir()))
+
+    def test_critical_usage_counts_shared_and_interrupted_pending_bytes_once(self):
+        self.store.append(self.segment())
+        first = self.store.start_event(uuid4(), (self.source,), 30_000, pre_ms=0,
+                                       post_ms=20_000, critical=True)[0]
+        self.store.start_event(uuid4(), (self.source,), 30_000, pre_ms=0,
+                               post_ms=20_000, critical=True)
+        size = len(self.segment().data)
+        self.assertEqual(size, self.store.usage_bytes(critical_only=True))
+        self.assertEqual(0, self.store.usage_bytes(starred_only=True, critical_only=True))
+        self.store.set_starred(first, True)
+        self.assertEqual(size, self.store.usage_bytes(starred_only=True, critical_only=True))
+        with patch.object(self.store, "_write", side_effect=OSError):
+            with self.assertRaises(RecordingError):
+                self.store.append(self.segment(40_000, 50_000, 1))
+        self.assertEqual(size * 2, self.store.usage_bytes(critical_only=True))
+        self.assertEqual(size * 2, self.store.usage_bytes())
 
 
 if __name__ == "__main__":

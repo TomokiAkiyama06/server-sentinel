@@ -73,13 +73,43 @@ are reported. Future coverage for an active recording is `pending`; after its
 deadline it becomes a gap. `complete` means the requested storage coverage and
 byte integrity passed, not that a browser successfully decoded the media.
 
+## Retention service boundary
+
+Issue #21 uses these domain methods synchronously on the same owning worker:
+
+- `usage_bytes(starred_only=False, critical_only=False)` counts unique journaled
+  bytes, including pending publications conservatively; filters intersect.
+  Critical pending reservations carry a durable marker, so restarting or sequential
+  writes cannot reset the storage service's accounting of emergency usage.
+  Metadata, unknown files and other filesystem use still require `statvfs` and
+  the common admission policy's separate overhead accounting.
+- `retention_candidates(before_ms=None, limit=...)` returns eligible unstarred,
+  inactive recordings in `ended_ms` / ID order, optionally restricted to an expiry
+  cutoff. `list_recordings(limit=..., offset=...)` returns local metadata summaries.
+  Both pages are bounded to 1–1000 records.
+- `set_starred(recording_id, bool)` and
+  `delete_recording(recording_id, owner_requested=False)` are internal domain
+  methods. Their calling service must first enforce Owner authorization for
+  manual changes. The flag is not an authentication credential. Automatic deletion
+  always refuses starred recordings; every deletion refuses an active recording.
+  Deletion returns actual unique media bytes reclaimed, preserves other recordings
+  and spool references, and journals `deleting` until filesystem cleanup succeeds.
+
+There is no automatic retention loop or public mutation route in this module.
+The storage service owns expiry/pressure order, configured thresholds, audit
+events and authorization. The one-worker boundary prevents an Owner star operation
+from racing a retention decision. On cleanup failure the writer blocks further
+mutation; startup retries the identified cleanup before discarding its journal.
+
 ## Crash and integrity behavior
 
 A pending SQLite journal row is committed before creating a media file. The
 writer uses an exclusive generated `.part` file, fsyncs its contents, publishes a
 generated `.seg` name without overwriting an existing file, fsyncs the directory,
 then atomically marks the segment ready and links it to active recordings.
-Failures poison that writer until reopening; the reservation is always released.
+Failures and cancellation poison that writer until reopening; the reservation is
+always released. Read-only byte accounting remains available after a publication
+failure while the approved filesystem is still accessible.
 
 Startup removes only pending artifacts identified by this journal. Arbitrary
 untracked files are never deleted. Failed cleanup blocks startup and leaves the

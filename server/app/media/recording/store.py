@@ -99,8 +99,8 @@ class RecordingStore:
     def __exit__(self, *_):
         self.close()
 
-    def _check(self) -> None:
-        if self._fd < 0 or self._failed or threading.get_ident() != self._owner:
+    def _check(self, *, allow_failed: bool = False) -> None:
+        if self._fd < 0 or (self._failed and not allow_failed) or threading.get_ident() != self._owner:
             raise RecordingError("RECORDING_WRITER_UNAVAILABLE")
         self._verify_root()
 
@@ -164,6 +164,8 @@ class RecordingStore:
                 "start_ms)) WHERE status='active'"
             )
         self._trim()
+        with self._transaction():
+            self.db.execute("DELETE FROM recordings WHERE status='deleting'")
 
     def _write(self, segment_id: str, data: bytes) -> None:
         self._verify_root()
@@ -237,13 +239,13 @@ class RecordingStore:
                 self.db.execute(
                     "INSERT INTO recording_segments "
                     "(id,source_id,capture_node_id,stream_id,sequence,start_ms,end_ms,"
-                    "codec,container,byte_length,sha256,state,spool) "
-                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,'pending',0)",
+                    "codec,container,byte_length,sha256,state,spool,critical) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,'pending',0,?)",
                     (segment_id, source_id,
                      str(segment.capture_node_id) if segment.capture_node_id else None,
                      str(segment.stream_id), segment.sequence, segment.start_ms,
                      segment.end_ms, segment.codec, segment.container, len(segment.data),
-                     hashlib.sha256(segment.data).hexdigest()),
+                     hashlib.sha256(segment.data).hexdigest(), int(critical)),
                 )
             self._write(segment_id, segment.data)
             self._publish(segment_id, segment, active, prior)
@@ -252,6 +254,11 @@ class RecordingStore:
         except (OSError, sqlite3.Error):
             self._failed = True
             raise RecordingError("RECORDING_WRITE_FAILED") from None
+        except BaseException:
+            # Cancellation and expected-root failures can also interrupt a
+            # journaled publication. Refuse all further operations until recovery.
+            self._failed = True
+            raise
         finally:
             self.policy.release()
 
@@ -370,7 +377,9 @@ class RecordingStore:
                     if count > self.limits.max_segments_per_recording:
                         raise RecordingError("RECORDING_SEGMENT_LIMIT")
                     self.db.execute(
-                        "INSERT INTO recordings VALUES (?,?,?,?,?,NULL,'active',?)",
+                        "INSERT INTO recordings "
+                        "(id,source_id,event_id,start_ms,target_end_ms,ended_ms,status,critical) "
+                        "VALUES (?,?,?,?,?,NULL,'active',?)",
                         (str(recording_id), str(source_id), str(event_id) if event_id else None,
                          start_ms, end_ms, int(critical)),
                     )
@@ -522,3 +531,90 @@ class RecordingStore:
             raise RecordingError("RECORDING_EVENT_NOT_FOUND")
         return {"event_id": str(event_id),
                 "recordings": [self.manifest(UUID(row["id"])) for row in rows]}
+
+    def set_starred(self, recording_id: UUID, starred: bool) -> None:
+        """Domain operation; an Owner-authorized caller is mandatory upstream."""
+        self._check()
+        self._recording(recording_id)
+        if type(starred) is not bool:
+            raise ValueError("invalid starred state")
+        with self._transaction():
+            self.db.execute("UPDATE recordings SET starred=? WHERE id=?",
+                            (int(starred), str(recording_id)))
+
+    def usage_bytes(self, *, starred_only: bool = False, critical_only: bool = False) -> int:
+        """Unique journaled bytes, conservatively including pending writes.
+
+        This is media accounting, not statvfs free space. The admission service
+        must separately include metadata, unknown files and other filesystem use.
+        """
+        self._check(allow_failed=True)
+        if type(starred_only) is not bool or type(critical_only) is not bool:
+            raise ValueError("invalid usage request")
+        filters = []
+        if starred_only:
+            filters.append("EXISTS (SELECT 1 FROM recording_links l JOIN recordings r "
+                           "ON r.id=l.recording_id WHERE l.segment_id=s.id AND r.starred=1)")
+        if critical_only:
+            filters.append("((s.state='pending' AND s.critical=1) OR EXISTS "
+                           "(SELECT 1 FROM recording_links l JOIN recordings r ON r.id=l.recording_id "
+                           "WHERE l.segment_id=s.id AND r.critical=1))")
+        return self.db.execute(
+            "SELECT COALESCE(SUM(byte_length),0) FROM recording_segments s "
+            + ("WHERE " + " AND ".join(filters) if filters else "")
+        ).fetchone()[0]
+
+    @staticmethod
+    def _page(limit, offset=0):
+        if (type(limit) is not int or not 1 <= limit <= 1000
+                or type(offset) is not int or offset < 0 or offset >= 2**63):
+            raise ValueError("invalid recording page")
+
+    def list_recordings(self, *, limit: int, offset: int = 0) -> tuple[dict, ...]:
+        """Bounded local summaries; human access still requires recordings:view."""
+        self._check()
+        self._page(limit, offset)
+        rows = self.db.execute(
+            "SELECT * FROM recordings WHERE status!='deleting' ORDER BY start_ms DESC,id LIMIT ? OFFSET ?",
+            (limit, offset),
+        ).fetchall()
+        return tuple(dict(row) for row in rows)
+
+    def retention_candidates(self, *, before_ms: int | None, limit: int) -> tuple[dict, ...]:
+        self._check()
+        self._page(limit)
+        if before_ms is not None and (type(before_ms) is not int or not 0 <= before_ms < 2**63):
+            raise ValueError("invalid retention cutoff")
+        rows = self.db.execute(
+            "SELECT * FROM recordings WHERE starred=0 AND status IN ('complete','gapped','interrupted') "
+            "AND (? IS NULL OR ended_ms<=?) ORDER BY ended_ms,id LIMIT ?",
+            (before_ms, before_ms, limit),
+        ).fetchall()
+        return tuple(dict(row) for row in rows)
+
+    def delete_recording(self, recording_id: UUID, *, owner_requested: bool = False) -> int:
+        """Delete one eligible recording; return actual unique media bytes reclaimed.
+
+        Owner authorization is checked by the calling service, never inferred
+        from this flag. Automatic retention cannot delete starred or active work.
+        Links held by other recordings or the pre-roll spool remain intact.
+        """
+        self._check()
+        if type(owner_requested) is not bool:
+            raise ValueError("invalid deletion request")
+        before = self.usage_bytes()
+        with self._transaction():
+            row = self._recording(recording_id)
+            if row["status"] == "active" or (row["starred"] and not owner_requested):
+                raise RecordingError("RECORDING_DELETE_REFUSED")
+            self.db.execute("UPDATE recordings SET status='deleting' WHERE id=?", (str(recording_id),))
+            self.db.execute("DELETE FROM recording_links WHERE recording_id=?", (str(recording_id),))
+            self.db.execute("DELETE FROM recording_discontinuities WHERE recording_id=?", (str(recording_id),))
+        try:
+            self._trim()
+            with self._transaction():
+                self.db.execute("DELETE FROM recordings WHERE id=?", (str(recording_id),))
+            return before - self.usage_bytes()
+        except BaseException:
+            self._failed = True
+            raise

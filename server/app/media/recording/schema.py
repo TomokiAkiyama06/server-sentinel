@@ -14,12 +14,14 @@ RECORDING_STATEMENTS = (
     "byte_length INTEGER NOT NULL, sha256 TEXT NOT NULL, "
     "state TEXT NOT NULL CHECK(state IN ('pending','ready')), "
     "spool INTEGER NOT NULL CHECK(spool IN (0,1)), "
+    "critical INTEGER NOT NULL DEFAULT 0 CHECK(critical IN (0,1)), "
     "integrity TEXT NOT NULL DEFAULT 'unchecked', "
     "UNIQUE(source_id, stream_id, sequence))",
     "CREATE INDEX recording_segment_time ON recording_segments(source_id,start_ms,end_ms)",
     "CREATE TABLE recordings (id TEXT PRIMARY KEY, source_id TEXT NOT NULL, "
     "event_id TEXT, start_ms INTEGER NOT NULL, target_end_ms INTEGER NOT NULL, "
-    "ended_ms INTEGER, status TEXT NOT NULL, critical INTEGER NOT NULL)",
+    "ended_ms INTEGER, status TEXT NOT NULL, critical INTEGER NOT NULL, "
+    "starred INTEGER NOT NULL DEFAULT 0 CHECK(starred IN (0,1)))",
     "CREATE INDEX recording_event_id ON recordings(event_id)",
     "CREATE TABLE recording_links (recording_id TEXT NOT NULL REFERENCES recordings(id), "
     "segment_id TEXT NOT NULL REFERENCES recording_segments(id), "
