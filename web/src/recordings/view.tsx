@@ -9,7 +9,7 @@ export interface RecordingActions {
   remove(recording: RecordingSummary): void;
 }
 
-const filters = ['all', 'event', 'critical', 'starred'] as const;
+const filters = ['all', 'event', 'continuous', 'critical', 'starred'] as const;
 type Filter = typeof filters[number];
 
 function matches(recording: RecordingSummary, filter: Filter): boolean {

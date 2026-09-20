@@ -33,16 +33,16 @@ const recordingFixture = count => Array.from({ length: count }, (_, index) => ({
   size_bytes: 536_870_912 * (index + 1), starred: index % 3 === 1,
   retention_days_left: index % 3 === 1 ? null : 20 - index,
 }));
-const storageFixture = state => ({
+const storageFixture = (state, available_bytes = 21_474_836_480) => ({
   state, recording_bytes: 64_424_509_440, starred_bytes: 10_737_418_240,
-  available_bytes: 21_474_836_480, hard_reserve_bytes: 5_368_709_120,
+  available_bytes, hard_reserve_bytes: 5_368_709_120,
   recording_limit_bytes: 85_899_345_920, critical_allowance_bytes: 2_147_483_648,
   recording_retention_days: 20, audit_retention_days: 90, agent_incident_retention_days: 60,
   slack_configured: false, daily_summary_local_time: '23:00',
 });
 let cases = 0;
 
-async function scenario(viewport, { production = false, status = 200, session = owner, count = 1, optIn = false, sourceStatus = 200, positiveControl = false, recordings = 3, recordingStatus = 200, storageState = 'STORAGE_PRESSURE', storageStatus = 200 } = {}, assertions) {
+async function scenario(viewport, { production = false, status = 200, session = owner, count = 1, optIn = false, sourceStatus = 200, positiveControl = false, recordings = 3, recordingStatus = 200, storageState = 'STORAGE_PRESSURE', storageAvailable, storageStatus = 200 } = {}, assertions) {
   const page = await pageFor(browser, viewport);
   // Chrome applies bypass when parsing a document's policy. Set it before
   // navigation, only for the dedicated interception positive control.
@@ -85,7 +85,7 @@ async function scenario(viewport, { production = false, status = 200, session = 
       await fulfill(JSON.stringify(recordingStatus === 200 ? recordingFixture(recordings) : { detail: 'synthetic private error' }), 'application/json', recordingStatus); return;
     }
     if (!production && url.pathname === '/api/mock/storage') {
-      await fulfill(JSON.stringify(storageStatus === 200 ? storageFixture(storageState) : { detail: 'synthetic private error' }), 'application/json', storageStatus); return;
+      await fulfill(JSON.stringify(storageStatus === 200 ? storageFixture(storageState, storageAvailable) : { detail: 'synthetic private error' }), 'application/json', storageStatus); return;
     }
     unexpected.push('unexpected path');
     await page.command('Fetch.failRequest', { requestId, errorReason: 'BlockedByClient' });
@@ -162,6 +162,11 @@ try {
         assert.equal(await page.evaluate("document.querySelectorAll('#main a[href], #main a[download], video, source, iframe').length"), 0);
         if (!recordings) return;
         assert.equal(await page.evaluate("document.querySelectorAll('.row-actions').length"), recordings);
+        // Every recording kind can be isolated, continuous included.
+        for (const [label, expected] of [['イベント', 1], ['連続', 1], ['critical 証拠', 1], ['★ 付き', 1], ['すべて', 3]]) {
+          await page.evaluate(`Array.from(document.querySelectorAll('.filter')).find(el => el.textContent === ${JSON.stringify(label)}).click()`);
+          await page.wait(`document.querySelectorAll('[data-recording-id]').length === ${expected}`);
+        }
         // Owner deletion requires an explicit second confirmation in the same row.
         await page.evaluate("Array.from(document.querySelectorAll('[data-recording-id] button')).find(el => el.textContent === '削除').click()");
         await page.wait("Array.from(document.querySelectorAll('button')).some(el => el.textContent === '削除を確定')");
@@ -185,8 +190,22 @@ try {
         assert.equal(await page.evaluate('document.documentElement.scrollWidth <= window.innerWidth'), true, 'storage screen fits viewport');
         assert.match(await page.evaluate('document.body.innerText'), /未設定/);
         assert.match(await page.evaluate('document.body.innerText'), /23:00/);
+        // An intact reserve reports no shortfall.
+        assert.equal(await page.evaluate("document.querySelectorAll('[data-reserve-shortfall]').length"), 0);
+        assert.deepEqual(await page.evaluate("Array.from(document.querySelectorAll('meter')).map(el => el.value)"),
+          [53_687_091_200, 10_737_418_240, 16_106_127_360, 5_368_709_120]);
       });
     }
+    // A reserve already eaten by external filesystem use must not be shown as
+    // remaining space: 1 GiB available under a 5 GiB configured reserve.
+    await scenario(viewport, { storageState: 'STORAGE_HARD_STOP', storageAvailable: 1_073_741_824 }, async page => {
+      await page.click('ストレージと通知');
+      await page.wait("document.querySelectorAll('[data-reserve-shortfall]').length === 1");
+      assert.deepEqual(await page.evaluate("Array.from(document.querySelectorAll('meter')).map(el => el.value)"),
+        [53_687_091_200, 10_737_418_240, 0, 1_073_741_824]);
+      assert.match(await page.evaluate('document.body.innerText'), /4\.0 GiB/);
+      assert.equal(await page.evaluate('document.documentElement.scrollWidth <= window.innerWidth'), true, 'storage screen fits viewport');
+    });
     await scenario(viewport, { sourceStatus: 503 }, async page => {
       await page.click('カメラソース');
       await page.wait("Boolean(document.querySelector('[role=alert]'))");

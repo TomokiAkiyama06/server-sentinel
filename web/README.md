@@ -50,7 +50,11 @@ same row. The server repeats every one of these checks.
 states that recovery uses hysteresis. The disk breakdown meters unstarred
 recordings, starred recordings, free space and the hard filesystem reserve
 separately, with tabular numerals, and notes that other processes' usage is part
-of the admission decision. The three retention periods are displayed as separate
+of the admission decision. Only space the filesystem still holds is metered: if
+external consumption has already eaten into the configured reserve, the reserve
+bar shows just the remaining part, the configured target is listed as a separate
+figure, and the missing amount is reported as an alert instead of being drawn as
+capacity. The three retention periods are displayed as separate
 lifecycles: Main recordings 20 days, audit 90 days, and agent protected
 incidents 60 days, with an explicit note that Main retention and cleanup never
 shorten or delete the agent-owned incidents. Slack is shown as disabled until

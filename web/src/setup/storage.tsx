@@ -5,11 +5,17 @@ import { bytes } from '../shared/format';
 /** Owner-only capacity, retention and notification status; no credential is displayed. */
 export function StorageView({ t, storage }: { t: Catalog; storage: StorageSummary }) {
   const starred = Math.min(Math.max(0, storage.starred_bytes), Math.max(0, storage.recording_bytes));
+  const available = Math.max(0, storage.available_bytes);
+  const target = Math.max(0, storage.hard_reserve_bytes);
+  // Once external use has consumed part of the configured reserve, show only
+  // the reserve that remains on disk; the rest is not available capacity.
+  const reserve = Math.min(target, available);
+  const shortfall = target - reserve;
   const segments = [
     ['recordings', Math.max(0, storage.recording_bytes) - starred],
     ['starred', starred],
-    ['free', Math.max(0, storage.available_bytes - storage.hard_reserve_bytes)],
-    ['reserve', Math.max(0, storage.hard_reserve_bytes)],
+    ['free', available - reserve],
+    ['reserve', reserve],
   ] as const;
   const total = segments.reduce((sum, [, value]) => sum + value, 0);
   const retention = [
@@ -34,11 +40,14 @@ export function StorageView({ t, storage }: { t: Catalog; storage: StorageSummar
         <dd><meter className={`meter meter-${name}`} aria-labelledby={`disk-${name}`} value={value} max={total || 1} />
           <span className="numeric">{bytes(value)}</span></dd>
       </div>)}
+      <div className="breakdown-row"><dt>{t.reserveTarget}</dt>
+        <dd><span className="numeric">{bytes(target)}</span></dd></div>
       <div className="breakdown-row"><dt>{t.recordingLimit}</dt>
         <dd><span className="numeric">{bytes(storage.recording_limit_bytes)}</span></dd></div>
       <div className="breakdown-row"><dt>{t.criticalAllowance}</dt>
         <dd><span className="numeric">{bytes(storage.critical_allowance_bytes)}</span></dd></div>
     </dl>
+    {shortfall > 0 && <p role="alert" data-reserve-shortfall="true">{t.reserveShortfall}: <span className="numeric">{bytes(shortfall)}</span></p>}
     <p className="muted">{t.reserveNote}</p>
     <p className="muted">{t.externalUsage}</p>
 

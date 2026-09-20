@@ -85,7 +85,10 @@ test('starred recordings are shown as never auto-deleted and keep their day coun
 
 test('recording filters keep every kind selectable', () => {
   const markup = recordingsMarkup(false);
-  for (const label of [messages.ja.filterAll, messages.ja.kind_event, messages.ja.kind_critical, messages.ja.filterStarred]) {
+  // Every kind in the catalog must be isolatable, continuous included.
+  const kinds = Object.keys(messages.ja).filter(key => key.startsWith('kind_')).map(key => messages.ja[key]);
+  assert.equal(kinds.length, new Set(recordings.map(recording => recording.kind)).size);
+  for (const label of [messages.ja.filterAll, ...kinds, messages.ja.filterStarred]) {
     assert.match(markup, new RegExp(`aria-pressed="(true|false)"[^>]*>${label}<`));
   }
   assert.match(markup, /role="group"/);
@@ -138,8 +141,30 @@ test('Slack is disabled until configured and no credential is rendered', () => {
   assert.doesNotMatch(configured, /hooks\.slack\.com|xox[baprs]-|webhook/i);
 });
 
-test('hard-stop storage never reports negative free space', () => {
+const meters = markup => Object.fromEntries([...markup.matchAll(/aria-labelledby="disk-(\w+)"[^>]*value="(\d+)"/g)]
+  .map(([, name, value]) => [name, Number(value)]));
+
+test('an intact hard reserve is metered without inventing capacity', () => {
+  const rows = meters(storageMarkup());
+  assert.equal(rows.reserve, storage.hard_reserve_bytes);
+  assert.equal(rows.free + rows.reserve, storage.available_bytes);
+  assert.equal(rows.recordings + rows.starred, storage.recording_bytes);
+  assert.doesNotMatch(storageMarkup(), /data-reserve-shortfall/);
+});
+
+test('a consumed hard reserve is never drawn as intact space', () => {
+  // 1 GiB available under a 5 GiB configured reserve: no free space, only the
+  // 1 GiB still on disk counts as reserve, and the 4 GiB gap is reported.
   const markup = storageMarkup('ja', { ...storage, state: 'STORAGE_HARD_STOP', available_bytes: 1_073_741_824 });
+  const rows = meters(markup);
   assert.doesNotMatch(markup, /-\d/);
+  assert.equal(rows.free, 0);
+  assert.equal(rows.reserve, 1_073_741_824);
+  assert.equal(rows.free + rows.reserve, 1_073_741_824);
+  assert.match(markup, /data-reserve-shortfall="true"/);
+  assert.ok(markup.includes(messages.ja.reserveShortfall));
+  assert.match(markup, />4\.0 GiB</);
+  // The configured target stays visible as a separate figure, not as space.
+  assert.ok(markup.includes(messages.ja.reserveTarget));
   assert.match(markup, /aria-current="true"/);
 });
