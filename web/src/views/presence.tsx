@@ -72,6 +72,10 @@ export function PresenceBody({ report, t, onCancel, failed }: {
             <div className="timeline-detail">
               <p className="timeline-body">{t[`action_${entry.action}`]}</p>
               {entry.state && <p className="timeline-meta"><span>{t[`state_${entry.state}`]}</span></p>}
+              {entry.action === 'critical_action_requeued'
+                && <p className="timeline-meta"><span>{t.note_critical_action_requeued}</span></p>}
+              {entry.action === 'critical_degradation_cleared'
+                && <p className="timeline-meta"><span>{t.note_critical_degradation_cleared}</span></p>}
             </div>
           </li>)}</ol>}
     </section>

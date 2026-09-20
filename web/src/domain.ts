@@ -55,7 +55,8 @@ export type PresenceState = 'PRESENT' | 'PROBABLY_PRESENT' | 'ABSENT' | 'UNKNOWN
 export type PresenceBasis = 'manual_override' | 'owner_observation' | 'hint' | 'unknown';
 /** `unknown` is unreported availability; `unavailable` is a known failure. */
 export type CriticalPath = 'armed' | 'unavailable' | 'unknown';
-export type PresenceAuditAction = 'override_set' | 'override_cancelled' | 'override_expired' | 'hint_set';
+export type PresenceAuditAction = 'override_set' | 'override_cancelled' | 'override_expired'
+  | 'hint_set' | 'critical_action_requeued' | 'critical_degradation_cleared';
 
 /** Neutral observation projection: never a culprit, cause or identity claim. */
 export interface Observation {

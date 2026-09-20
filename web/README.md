@@ -62,9 +62,12 @@ suppression instead of a contradictory statement. The four critical paths
 (detection, persistence, evidence, notification) are shown with their reported
 `armed` / `unavailable` / `unknown` state, a known failure is never merged with
 an unreported one, and the continuity statement appears only while every path is
-armed and `critical_paths_degraded` is false. An incomplete override expiry
-(`override_expiry_pending`) is reported so an expired override cannot look
-active. The critical-continuity statement is shown only while every
+armed and `critical_paths_degraded` is false; an evidence or notification path
+also reports `unavailable` while a submission is in flight or accepted but
+unconfirmed. An incomplete override expiry (`override_expiry_pending`) is
+reported so an expired override cannot look active. The control history
+explains the Owner critical-recovery actions, including that an approved
+requeue accepts a possible duplicate preservation or notification. The critical-continuity statement is shown only while every
 reported `critical_*_armed` flag is true; otherwise the screen raises a degraded
 alert instead of reassuring the Owner.
 

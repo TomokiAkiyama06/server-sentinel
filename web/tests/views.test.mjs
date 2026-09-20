@@ -23,7 +23,8 @@ const values = ['observed', 'not_observed', 'unknown', 'online', 'offline', 'deg
 const qualities = ['sufficient', 'degraded', 'insufficient', 'unknown'];
 const states = ['PRESENT', 'PROBABLY_PRESENT', 'ABSENT', 'UNKNOWN'];
 const bases = ['manual_override', 'owner_observation', 'hint', 'unknown'];
-const actions = ['override_set', 'override_cancelled', 'override_expired', 'hint_set'];
+const actions = ['override_set', 'override_cancelled', 'override_expired', 'hint_set',
+  'critical_action_requeued', 'critical_degradation_cleared'];
 let counter = 0;
 const observation = (kind, overrides = {}) => ({
   id: `generated-observation-${counter += 1}`, kind, value: 'observed',
@@ -269,6 +270,24 @@ test('presence shows state, basis and the owner control history', () => {
     assert.match(markup, new RegExp(`data-control-action="${action}"`));
   }
   assert.match(presence({ snapshot: snapshot(), audit: [] }), /記録された管理者の操作はありません。/);
+});
+
+test('owner critical recovery actions explain what happened in the control history', () => {
+  const entry = (action, locale) => presence({
+    snapshot: snapshot(),
+    audit: [{ sequence: 3, action, at: '2026-09-21T08:15:00.000000+00:00', state: null }],
+  }, locale);
+  const requeued = entry('critical_action_requeued', 'ja');
+  assert.match(requeued, /未完了の critical 対応を再投入（管理者承認）/);
+  assert.match(requeued, /重複する可能性を管理者が承知のうえで再投入しました。/);
+  assert.doesNotMatch(requeued, /ServerSentinel 外で対応済み/);
+  const cleared = entry('critical_degradation_cleared', 'ja');
+  assert.match(cleared, /期限切れの critical 未完了マーカーを解除（管理者確認）/);
+  assert.match(cleared, /ServerSentinel 外で対応済みと管理者が確認し、劣化表示を解除しました。/);
+  assert.match(entry('critical_action_requeued', 'en'), /may be duplicated/);
+  assert.match(entry('critical_degradation_cleared', 'en'), /handled outside ServerSentinel/);
+  // Ordinary override actions carry no critical-recovery note.
+  assert.doesNotMatch(entry('override_set', 'ja'), /再投入しました。|劣化表示を解除しました。/);
 });
 
 test('manual override reports precedence, expiry and a cancel affordance', () => {

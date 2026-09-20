@@ -81,6 +81,10 @@ export const messages = {
     controlHistory: '管理者の操作履歴', controlHistoryEmpty: '記録された管理者の操作はありません。',
     action_override_set: '手動上書きを設定', action_override_cancelled: '手動上書きを取り消し',
     action_override_expired: '手動上書きが期限切れ', action_hint_set: 'ヒント・スケジュールを設定',
+    action_critical_action_requeued: '未完了の critical 対応を再投入（管理者承認）',
+    action_critical_degradation_cleared: '期限切れの critical 未完了マーカーを解除（管理者確認）',
+    note_critical_action_requeued: '外部への証拠保護・通知がすでに実行済みだった場合、重複する可能性を管理者が承知のうえで再投入しました。',
+    note_critical_degradation_cleared: '期限切れで内容が残っていない未完了 critical 対応について、ServerSentinel 外で対応済みと管理者が確認し、劣化表示を解除しました。',
   },
   en: {
     tagline: 'Private monitoring', language: 'Language', navigation: 'Main navigation',
@@ -163,6 +167,10 @@ export const messages = {
     controlHistory: 'Owner control history', controlHistoryEmpty: 'No Owner control actions are recorded.',
     action_override_set: 'Manual override set', action_override_cancelled: 'Manual override cancelled',
     action_override_expired: 'Manual override expired', action_hint_set: 'Hint or schedule set',
+    action_critical_action_requeued: 'Unresolved critical action requeued (Owner approved)',
+    action_critical_degradation_cleared: 'Expired critical marker cleared (Owner confirmed)',
+    note_critical_action_requeued: 'The Owner requeued the action accepting that an already submitted preservation or notification may be duplicated.',
+    note_critical_degradation_cleared: 'The Owner confirmed that an expired unresolved critical action was handled outside ServerSentinel and cleared its degraded marker.',
   },
 } as const;
 export type Locale = keyof typeof messages;
