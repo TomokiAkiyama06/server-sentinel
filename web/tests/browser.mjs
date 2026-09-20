@@ -44,7 +44,8 @@ const timelineFixture = {
 };
 const newerTimelineFixture = {
   items: [observation('storage', { value: 'degraded', quality: 'unknown', confidence: null, source_id: null, sequence: 2 })],
-  ordering_basis: 'received_at', ordering_degraded: false, causality: 'not_inferred', next_cursor: null,
+  ordering_basis: 'received_at', ordering_degraded: false, causality: 'not_inferred',
+  next_cursor: { received_at: '2026-09-21T09:00:01.000000+00:00', sequence: 2 },
 };
 const presenceFixture = {
   snapshot: {
@@ -186,8 +187,12 @@ try {
       await page.wait("document.querySelectorAll('[data-observation-kind]').length === 4");
       await page.evaluate("document.querySelector('.timeline-screen > button').click()");
       await page.wait("document.querySelectorAll('[data-observation-kind]').length === 5");
-      assert.equal(await page.evaluate("Boolean(document.querySelector('.timeline-screen > button'))"), false);
-      assert.match(await page.evaluate('document.body.innerText'), /この期間の観測をすべて読み込みました。/);
+      assert.equal(await page.evaluate("document.querySelector('.timeline-screen > button').textContent"), '新しい観測をさらに読み込む');
+      // Repeating the same cursor reaches the tail, which keeps a re-check path.
+      await page.evaluate("document.querySelector('.timeline-screen > button').click()");
+      await page.wait("document.querySelector('.timeline-screen > button').textContent === '新しい観測を確認'");
+      assert.equal(await page.evaluate("document.querySelectorAll('[data-observation-kind]').length"), 5);
+      assert.match(await page.evaluate('document.body.innerText'), /受信済みの観測はすべて読み込みました。/);
       await page.click('プレゼンス');
       await page.wait("Boolean(document.querySelector('.presence-value'))");
       const presenceText = await page.evaluate('document.body.innerText');

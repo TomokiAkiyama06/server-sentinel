@@ -162,11 +162,15 @@ test('newer observations stay reachable while a cursor is offered', () => {
   assert.match(failedMore, /<p role="alert">新しい観測を読み込めませんでした。/);
   assert.match(failedMore, /<button[^>]*>新しい観測をさらに読み込む<\/button>/);
   assert.equal((failedMore.match(/data-observation-kind=/g) || []).length, items.length);
-  const exhausted = timeline(page(items, { next_cursor: null }), 'ja', 'all', { complete: true });
-  assert.doesNotMatch(exhausted, /さらに読み込む/);
-  assert.match(exhausted, /この期間の観測をすべて読み込みました。/);
+  // An append-only timeline has no permanent end: the tail keeps a re-check.
+  const tail = timeline(page(items), 'ja', 'all', { onMore: () => undefined, complete: true });
+  assert.match(tail, /<button[^>]*>新しい観測を確認<\/button>/);
+  assert.doesNotMatch(tail, /さらに読み込む/);
+  assert.match(tail, /受信済みの観測はすべて読み込みました。/);
+  assert.match(timeline(page(items), 'en', 'all', { onMore: () => undefined, complete: true }),
+    /Check for newer observations/);
   // Without a provider there is no load-more affordance at all.
-  assert.doesNotMatch(timeline(page(items)), /さらに読み込む/);
+  assert.doesNotMatch(timeline(page(items)), /さらに読み込む|新しい観測を確認/);
 });
 
 test('paging continues forward while the cursor advances, including over an empty page', () => {

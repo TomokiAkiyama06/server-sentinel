@@ -54,8 +54,11 @@ quality, an observed value and a reported confidence.
 Rows follow the Main Server receipt order the core reports, and each row also
 shows its own observation time. The core pages forward in that order, so
 `next_cursor` leads to *newer* observations; the load-more control is labelled
-accordingly, a failed page keeps the history already loaded and reports the
-failure beside the retry, and paging ends only when the cursor stops advancing.
+accordingly, and a failed page keeps the history already loaded and reports the
+failure beside the retry. A cursor that stops advancing means the tail of what
+the core has received, not a permanent end: the control stays as a check for
+newer observations, so an append-only timeline can be re-read without leaving
+the screen.
 Clock skew or timestamp discontinuity is reported per span and by the ordering
 notice; the UI does not present that order as established causality, cause or
 culpability. A kind filter selects all, people/motion, critical, device and

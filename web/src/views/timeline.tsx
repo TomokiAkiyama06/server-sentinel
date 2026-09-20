@@ -114,8 +114,10 @@ export function TimelineBody({ page, filter, t, onFilter, onMore, loadingMore, c
       <ol className="timeline-list">{span.items.map(item => <Row key={item.id} item={item} t={t} />)}</ol>
     </section>)}
     {moreFailed && <p role="alert">{t.timelineMoreFailed}</p>}
+    {/* An append-only timeline has no permanent end: the control stays. */}
     {onMore && <button type="button" className="primary" disabled={loadingMore}
-      onClick={onMore}>{loadingMore ? t.timelineMoreLoading : t.timelineMore}</button>}
+      onClick={onMore}>{loadingMore ? t.timelineMoreLoading
+        : complete ? t.timelineCheck : t.timelineMore}</button>}
     {complete && page.items.length > 0 && <p className="muted" role="status">{t.timelineComplete}</p>}
   </section>;
 }
@@ -179,7 +181,7 @@ export function TimelineScreen({ services, t }: { services: DashboardServices; t
   }
   const cursor: TimelineCursor | null = data.page.next_cursor;
   const load = services.loadTimeline?.bind(services);
-  const more = load && cursor && !data.complete ? () => {
+  const more = load ? () => {
     if (inFlight.current) return;
     inFlight.current = true;
     setData({ ...data, more: true, moreFailed: false });
