@@ -22,7 +22,7 @@ class SyntheticAuthority:
 def run_ring(scenario):
     with tempfile.TemporaryDirectory(prefix="agent-ring-smoke-") as temporary:
         config = settings(Path(temporary))
-        with MediaStore(config) as store:
+        with MediaStore(config, stable_device=lambda _expected: True) as store:
             with DiskRing(config, store, ledger_maximum_bytes=128 * 1024, authority=SyntheticAuthority()) as ring:
                 profile = SegmentProfile(SOURCE, 800, 400, 60 * SECOND, 100)
                 now = 3600 * SECOND

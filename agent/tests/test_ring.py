@@ -50,7 +50,8 @@ class RingTests(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup)
         self.settings = settings(Path(self.temporary.name))
         self.quota = Quota(self.settings.media_root)
-        self.store = MediaStore(self.settings, space=self.quota)
+        self.store = MediaStore(self.settings, space=self.quota,
+                                stable_device=lambda _expected: True)
         self.addCleanup(self.store.close)
         self.ring = DiskRing(self.settings, self.store, ledger_maximum_bytes=128 * 1024, authority=AllowControls())
         self.addCleanup(lambda: self.ring.close())
