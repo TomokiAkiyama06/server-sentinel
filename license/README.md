@@ -22,10 +22,16 @@ Files below an `assets/ml/` or `assets/ai/` path are also detected as model-like
 regardless of extension, but these paths are detection-only: move a reviewed
 weight into a reserved model directory before registering it.
 
-AGPL, GPL, SSPL, BSL/source-available, unknown, and unclear licenses require an
-exact entry in `owner-approvals.json`. An approval is valid only for the recorded
-component version and license and must point to a committed Owner decision under
+Only licenses in the gate's explicit permissive SPDX allowlist pass directly.
+AGPL, GPL, SSPL, BSL/source-available, proprietary, Elastic, Commons Clause,
+custom, unknown, and unclear terms require an exact entry in
+`owner-approvals.json`. An approval is valid only for the recorded component
+version and license and must point to a committed Owner decision under
 `docs/decisions/`. Updating a self-asserted license field is not approval.
 
 The gate is offline. URLs are durable evidence references reviewed in the commit;
 the gate does not claim to re-fetch or independently reinterpret legal terms.
+Python `-r`/`-c` includes must resolve inside the repository to another reviewed
+requirements input. Every included file is audited and include cycles fail.
+Tracked `build/` and `dist/` trees are scanned for model artifacts like any other
+repository path; generated-output directory names do not waive review.

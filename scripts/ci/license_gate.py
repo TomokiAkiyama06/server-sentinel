@@ -11,6 +11,7 @@ import binascii
 import datetime
 import hashlib
 import json
+import posixpath
 import re
 import sys
 import tomllib
@@ -29,11 +30,11 @@ MODEL_SUFFIXES = {
     ".pth", ".safetensors", ".tflite", ".weights",
 }
 REQUIRED_SCOPE_REVIEWS = {"transport", "model_code", "model_weight"}
-BLOCKED_LICENSE = re.compile(
-    r"(?:^|[^A-Z])(?:A?GPL|SSPL|BSL|BUSL)(?:[^A-Z]|$)|"
-    r"source[- ]available|unclear|unknown|noassertion|unlicensed",
-    re.IGNORECASE,
-)
+PERMISSIVE_LICENSES = {
+    "0BSD", "Apache-2.0", "Apache-2.0 OR BSD-2-Clause", "BSD-2-Clause",
+    "BSD-3-Clause", "ISC", "MIT", "PSF-2.0", "Python-2.0", "Unicode-3.0",
+    "Unicode-DFS-2016", "Zlib",
+}
 PACKAGE = re.compile(r"^([A-Za-z0-9_.-]+)==([^\s\\]+)")
 HASH = re.compile(r"--hash=sha256:([0-9a-f]{64})")
 SAFE_ID = re.compile(r"[a-z0-9][a-z0-9._@/+:-]*")
@@ -143,10 +144,22 @@ def python_lock(path: Path, relative: str, scope: str):
     logical = text.replace("\\\n", " ").splitlines()
     found = []
     pins = []
+    includes = []
     for line in logical:
         line = line.strip()
-        if not line or line.startswith("#") or line.startswith(("-r ", "--requirement ")):
+        if not line or line.startswith("#"):
             continue
+        directive = re.fullmatch(r"(?:-r|--requirement|-c|--constraint)\s+(\S+)", line)
+        if directive:
+            raw_target = directive.group(1)
+            if "://" in raw_target or "\\" in raw_target or PurePosixPath(raw_target).is_absolute():
+                raise GateError(f"unsafe requirement include in {relative}")
+            target = posixpath.normpath(str(PurePosixPath(relative).parent / raw_target))
+            relative_path(target, field="requirement include")
+            includes.append(target)
+            continue
+        if line.startswith(("-r", "--requirement", "-c", "--constraint")):
+            raise GateError(f"invalid requirement include in {relative}")
         match = PACKAGE.match(line)
         if not match:
             raise GateError(f"unparsed or unpinned requirement in {relative}")
@@ -158,7 +171,7 @@ def python_lock(path: Path, relative: str, scope: str):
         pins.append(LockedPin(relative, "python-requirements",
                               match.group(1).lower().replace("_", "-"), match.group(2),
                               tuple(sorted("sha256:" + value for value in hashes))))
-    return found, pins
+    return found, pins, includes
 
 
 def npm_lock(path: Path, relative: str, scope: str):
@@ -222,7 +235,7 @@ def npm_project(path: Path, relative: str, scope: str):
 
 def model_files(root: Path):
     found = set()
-    excluded = {".git", ".venv", "node_modules", "dist", "build", "__pycache__"}
+    excluded = {".git", ".venv", "node_modules", "__pycache__"}
     for path in sorted(root.rglob("*")):
         relative = path.relative_to(root)
         if set(relative.parts) & excluded:
@@ -304,7 +317,9 @@ def audit(root: Path, inventory_path=INVENTORY):
         raise GateError("inputs must be nonempty")
     discovered = []
     discovered_pins = []
+    include_graph = {}
     input_paths = set()
+    input_ecosystems = {}
     for item in inputs:
         if not isinstance(item, dict) or set(item) != {"path", "ecosystem", "scope"}:
             raise GateError("invalid inventory input")
@@ -316,10 +331,12 @@ def audit(root: Path, inventory_path=INVENTORY):
         if relative in input_paths or not (root / relative).is_file():
             raise GateError("duplicate or missing inventory input")
         input_paths.add(relative)
+        input_ecosystems[relative] = ecosystem
         if ecosystem == "python-requirements":
-            components, pins = python_lock(root / relative, relative, scope)
+            components, pins, includes = python_lock(root / relative, relative, scope)
             discovered.extend(components)
             discovered_pins.extend(pins)
+            include_graph[relative] = includes
         elif ecosystem == "python-project":
             discovered.extend(python_project(root / relative, relative, scope))
         elif ecosystem == "npm-project":
@@ -345,6 +362,26 @@ def audit(root: Path, inventory_path=INVENTORY):
         raise GateError("unsupported dependency manifest requires a reviewed parser")
     if tracked_inputs != input_paths:
         raise GateError("dependency input set differs from reviewed inventory")
+    for source, targets in include_graph.items():
+        for target in targets:
+            if target not in input_paths or input_ecosystems[target] != "python-requirements":
+                raise GateError(f"requirement include is not a reviewed input: {source}")
+    visiting = set()
+    visited = set()
+
+    def visit(path):
+        if path in visiting:
+            raise GateError("requirement include cycle")
+        if path in visited:
+            return
+        visiting.add(path)
+        for target in include_graph.get(path, []):
+            visit(target)
+        visiting.remove(path)
+        visited.add(path)
+
+    for path in include_graph:
+        visit(path)
     if sorted(discovered_pins) != sorted(reviewed_pins(root)):
         raise GateError("lock digests differ from reviewed pinning evidence")
 
@@ -397,7 +434,7 @@ def audit(root: Path, inventory_path=INVENTORY):
         if "Apache-" in license_name and "preserve-notice" not in obligations:
             raise GateError("Apache notice obligation is required")
         evidence(root, component["notice_files"], "notice files")
-        if BLOCKED_LICENSE.search(license_name):
+        if license_name not in PERMISSIVE_LICENSES:
             approval = approvals.get(component_id)
             expected = (version, license_name)
             if approval is None or (approval["version"], approval["license"]) != expected:
