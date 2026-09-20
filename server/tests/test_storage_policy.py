@@ -180,6 +180,35 @@ class StoragePolicyTests(unittest.TestCase):
         self.assertEqual(StorageState.NORMAL, self.policy.status().state)
         self.policy.release()
 
+    def test_hard_stop_cleanup_reaches_recovery_instead_of_latching(self):
+        starred = self.inventory.add(400, 79 * DAY_MS, starred=True)
+        oldest = self.inventory.add(300, 80 * DAY_MS)
+        self.inventory.free = 50
+        self.assertEqual(StorageState.HARD_STOP, self.policy.status().state)
+        # Space returns above the pressure boundary but below the recovery
+        # threshold. Stopping cleanup there would latch hard stop and reject
+        # every later recording while eligible unstarred recordings remain.
+        self.inventory.free = 420
+
+        self.policy.admit(100, critical=False)
+
+        self.assertEqual([oldest["id"]], self.inventory.deleted)
+        self.assertEqual([starred], self.inventory.rows)
+        self.assertEqual(StorageState.NORMAL, self.policy.state)
+        self.policy.release()
+
+    def test_allocation_boundary_reclaims_before_rejecting_the_write(self):
+        starred = self.inventory.add(700, 79 * DAY_MS, starred=True)
+        eligible = self.inventory.add(200, 80 * DAY_MS)
+        # used + request lands exactly on the quota, which admission classifies
+        # as pressure, so cleanup must not treat the same equality as safe.
+        self.policy.admit(100, critical=False)
+
+        self.assertEqual([eligible["id"]], self.inventory.deleted)
+        self.assertEqual([starred], self.inventory.rows)
+        self.assertEqual(StorageState.NORMAL, self.policy.state)
+        self.policy.release()
+
     def test_star_race_rechecks_before_delete_and_stops_admission(self):
         row = self.inventory.add(1000, DAY_MS)
         self.inventory.before_delete = lambda item: item.update(starred=True)

@@ -242,19 +242,29 @@ class MainStoragePolicy:
             self._transition(StorageState.HARD_STOP)
             raise RecordingError("STORAGE_HARD_STOP") from None
 
-    def _state_for(self, space, used, request_total=0, request_media=0):
+    def _within(self, space, used, request_total=0, request_media=0, *, recovering=False):
+        """Single free-space/allocation predicate shared by cleanup and state entry.
+
+        `recovering` selects the hysteresis recovery thresholds. Cleanup and the
+        resulting state classification must use the same boundaries, otherwise a
+        request stops reclaiming exactly where admission still rejects it.
+        """
         free_after = space.available_bytes - self._reserved_total - request_total
         use_after = used + self._reserved_media + request_media
-        if free_after < self.limits.hard_reserve_bytes:
+        if recovering:
+            return (free_after >= self.limits.recovery_free_bytes
+                    and use_after <= self.limits.recovery_allocation_bytes)
+        return (free_after >= self.limits.pressure_free_bytes
+                and use_after < self.limits.recording_limit_bytes)
+
+    def _state_for(self, space, used):
+        if space.available_bytes - self._reserved_total < self.limits.hard_reserve_bytes:
             self._transition(StorageState.HARD_STOP)
-        elif (free_after < self.limits.pressure_free_bytes
-              or used + self._reserved_media >= self.limits.recording_limit_bytes
-              or use_after > self.limits.recording_limit_bytes or self.cleanup_failed):
+        elif self.cleanup_failed or not self._within(space, used):
             self._transition(StorageState.PRESSURE)
-        elif self.state != StorageState.NORMAL:
-            if (free_after >= self.limits.recovery_free_bytes
-                    and use_after <= self.limits.recovery_allocation_bytes):
-                self._transition(StorageState.NORMAL)
+        elif (self.state != StorageState.NORMAL
+                and self._within(space, used, recovering=True)):
+            self._transition(StorageState.NORMAL)
 
     def status(self) -> StorageStatus:
         self._check()
@@ -290,15 +300,13 @@ class MainStoragePolicy:
         self.cleanup_failed = False
         try:
             self._reclaimer.expired(self._clock(), self.limits.cleanup_batch_size)
-            recovering = self.state == StorageState.PRESSURE
+            # Every non-NORMAL state, hard stop included, reclaims towards the
+            # recovery thresholds. Stopping at the entry boundary would leave the
+            # state latched and reject each following recording indefinitely.
+            recovering = self.state != StorageState.NORMAL
             for _ in range(self.limits.cleanup_batch_size):
                 space, used, _, _ = self._read()
-                free_threshold = (self.limits.recovery_free_bytes if recovering
-                                  else self.limits.pressure_free_bytes)
-                allocation_threshold = (self.limits.recovery_allocation_bytes if recovering
-                                        else self.limits.recording_limit_bytes)
-                if (space.available_bytes - total >= free_threshold
-                        and used + media_bytes <= allocation_threshold):
+                if self._within(space, used, total, media_bytes, recovering=recovering):
                     break
                 if self._reclaimer.oldest(1) == 0:
                     break

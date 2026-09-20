@@ -27,6 +27,10 @@ worker performs local persistence/completion callbacks. Queue capacity (default
 16, configurable 1–1024) includes deliveries still awaiting local acknowledgement,
 so neither work nor completion results grow without bound. A full/closed queue
 produces a local failed event and visible sticky failure, never silent success.
+A finished delivery is always handed back, retried against a transiently full
+completion queue rather than dropped, and its wake-up flag is lowered only after
+the owner has observed that queue empty, so no completion is lost or left
+unsignalled and the delivery thread does not exit on backpressure.
 If a full disk prevents local persistence, critical delivery may still proceed;
 the visible failure remains and completion is retained for local persistence retry
 without resending. Call `poll()` on each worker timer tick, not just at 23:00.

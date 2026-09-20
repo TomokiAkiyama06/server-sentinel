@@ -12,11 +12,13 @@ import io
 import json
 import sqlite3
 import threading
+import time
 import unittest
 
 from app.notifications.schedule import DailySummaryScheduler, notification_migration
 from app.notifications.service import DailySummary, NotificationKind, NotificationService
 from app.notifications.slack import DeliveryResult, NoRedirect, SlackDelivery, SlackEndpoint
+from app.notifications.worker import DeliveryWorker
 from app.storage.migrations import BUILTIN_MIGRATIONS, migrate
 from app.storage.policy import StorageState
 
@@ -309,3 +311,69 @@ class ScheduleTests(unittest.TestCase):
         self.assertEqual(1, len(self.service.poll()))
         self.assertEqual('sent', scheduler.status()['result'])
         self.assertEqual(1, len(self.transport.requests))
+
+
+class DeliveryWorkerTests(unittest.TestCase):
+    """Hand-off invariants of the bounded worker, without any network transport."""
+
+    class Accepting:
+        def __init__(self):
+            self.finished = threading.Semaphore(0)
+
+        def send(self, text):
+            self.finished.release()
+            return DeliveryResult.SENT
+
+    def worker(self, capacity):
+        self.transport = self.Accepting()
+        worker = DeliveryWorker(self.transport, capacity)
+        self.addCleanup(worker.close)
+        return worker
+
+    def queued(self, worker, count):
+        for _ in range(500):
+            if worker._results.qsize() >= count:
+                return True
+            time.sleep(0.01)
+        return False
+
+    def test_full_completion_queue_neither_drops_a_result_nor_ends_delivery(self):
+        worker = self.worker(1)
+        worker.submit('first', 'a')
+        self.assertTrue(self.transport.finished.acquire(timeout=2))
+        self.assertTrue(worker.ready.wait(2))
+        # The single completion slot is still occupied, so this delivery cannot
+        # hand its result over until the owner drains. Dropping it, or losing
+        # the delivery thread, would strand the event as pending forever.
+        worker.submit('second', 'b')
+        self.assertTrue(self.transport.finished.acquire(timeout=2))
+        time.sleep(0.1)
+        collected = {}
+        deadline = time.monotonic() + 10
+        while len(collected) < 2 and time.monotonic() < deadline:
+            worker.ready.wait(0.5)
+            collected.update(worker.results())
+        self.assertEqual({'first': DeliveryResult.SENT, 'second': DeliveryResult.SENT}, collected)
+        self.assertTrue(worker._thread.is_alive())
+
+    def test_partial_drain_keeps_a_queued_completion_signalled(self):
+        worker = self.worker(2)
+        worker.submit('first', 'a')
+        worker.submit('second', 'b')
+        self.assertTrue(self.queued(worker, 2))
+        self.assertEqual(('first', DeliveryResult.SENT), next(iter(worker.results())))
+        # An owner that stops early must not be left waiting on a lowered flag
+        # while a completion is still queued for it.
+        self.assertTrue(worker.ready.is_set())
+        self.assertEqual(1, worker._results.qsize())
+        self.assertEqual([('second', DeliveryResult.SENT)], list(worker.results()))
+        self.assertFalse(worker.ready.is_set())
+
+    def test_closed_worker_refuses_new_work_and_still_reports_a_finished_delivery(self):
+        worker = self.worker(2)
+        worker.submit('first', 'a')
+        self.assertTrue(worker.ready.wait(2))
+        worker.close()
+        with self.assertRaises(RuntimeError):
+            worker.submit('second', 'b')
+        self.assertEqual([('first', DeliveryResult.SENT)], list(worker.results()))
