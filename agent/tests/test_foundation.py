@@ -1,3 +1,4 @@
+import argparse
 import dataclasses
 import io
 import hashlib
@@ -12,9 +13,9 @@ from unittest.mock import patch
 from uuid import uuid4
 
 from build_artifact import build
-from install import MAX_ARTIFACT_BYTES, read_artifact, render_unit
+from install import MAX_ARTIFACT_BYTES, install, read_artifact, render_unit
 from media_capture_agent.cli import main
-from media_capture_agent.config import ConfigurationError, Settings
+from media_capture_agent.config import ConfigurationError, Settings, MAX_CONFIGURATION_BYTES
 from media_capture_agent.health import ClockExchange, assess_clock
 from media_capture_agent.runtime import Agent
 from media_capture_agent.storage import MediaStore, Mount, StorageRefused, parse_mounts
@@ -314,7 +315,7 @@ class ConfigurationTests(unittest.TestCase):
             script = """
 import sys
 from pathlib import Path
-from media_capture_agent.config import ConfigurationError, Settings
+from media_capture_agent.config import ConfigurationError, Settings, MAX_CONFIGURATION_BYTES
 try:
     Settings.load(Path(sys.argv[1]), code_root=Path(sys.argv[1]).parent / "code")
 except ConfigurationError:
@@ -350,6 +351,54 @@ raise SystemExit(1)
 """
             subprocess.run([sys.executable, "-c", script, str(artifact), str(fifo)],
                            check=True, timeout=2, capture_output=True)
+
+    def test_configuration_growth_is_bounded_in_agent_and_installer(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = root / "deployment.json"
+            value = configuration(root)
+            original_fdopen = os.fdopen
+            reads = []
+
+            def growing_reader(fd, mode):
+                stream = original_fdopen(fd, mode)
+
+                class Reader:
+                    def __enter__(self):
+                        return self
+
+                    def __exit__(self, *_):
+                        stream.close()
+
+                    def fileno(self):
+                        return stream.fileno()
+
+                    def read(self, size=-1):
+                        reads.append(size)
+                        if not 0 <= size <= MAX_CONFIGURATION_BYTES + 1:
+                            raise AssertionError("unbounded configuration read")
+                        with config.open("ab") as writer:
+                            writer.truncate(MAX_CONFIGURATION_BYTES * 2)
+                        return stream.read(size)
+
+                return Reader()
+
+            for caller in ("agent", "installer"):
+                config.write_text(json.dumps(value))
+                config.chmod(0o600)
+                args = argparse.Namespace(artifact=root / "unused-artifact", config=config,
+                                          version="0.1.0", destination=root / "install",
+                                          sha256=hashlib.sha256(b"synthetic").hexdigest())
+                with self.subTest(caller=caller), patch("os.fdopen", side_effect=growing_reader):
+                    with self.assertRaises(ConfigurationError):
+                        if caller == "agent":
+                            Settings.load(config, code_root=root / "code")
+                        else:
+                            with patch("install.os.geteuid", return_value=0), patch(
+                                "install.read_artifact", return_value=b"synthetic"
+                            ):
+                                install(args)
+            self.assertEqual(reads, [MAX_CONFIGURATION_BYTES + 1] * 2)
 
     def test_config_owner_only_and_redacted_errors(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -425,6 +474,37 @@ raise SystemExit(1)
         alias.symlink_to(valid)
         with self.assertRaises(OSError):
             read_artifact(alias)
+
+    def test_installer_release_is_traversable_under_restrictive_umask(self):
+        destination = self.root / "installation"
+        destination.mkdir()
+        config = self.root / "deployment.json"
+        value = dataclasses.asdict(self.settings)
+        for key in ("node_id", "runtime_root", "media_root"):
+            value[key] = str(value[key])
+        for key in ("mount_point", "filesystem_root"):
+            value["expected_mount"][key] = str(value["expected_mount"][key])
+        config.write_text(json.dumps(value))
+        config.chmod(0o600)
+        artifact = self.root / "bounded-artifact"
+        artifact.write_bytes(b"synthetic-artifact-not-executed")
+        args = argparse.Namespace(artifact=artifact, config=config, version="0.1.0",
+                                  destination=destination, video_device=[],
+                                  unit=self.root / "media-capture-agent.service",
+                                  sha256=hashlib.sha256(artifact.read_bytes()).hexdigest())
+        previous = os.umask(0o077)
+        try:
+            # Files are synthetic/non-root-owned here; actual privileged preflight
+            # remains manual. Assert installation modes without running any code.
+            with patch("install.os.geteuid", return_value=0), patch("install.protected_parent"), patch(
+                "install.subprocess.run"
+            ) as preflight:
+                install(args)
+            self.assertTrue(preflight.called)
+        finally:
+            os.umask(previous)
+        self.assertEqual((destination / "0.1.0").stat().st_mode & 0o777, 0o755)
+        self.assertEqual((destination / "0.1.0/media-capture-agent").stat().st_mode & 0o777, 0o555)
 
     def test_unit_dedicated_account_and_video_only_devices(self):
         unit = render_unit(Path("/opt/example/0.1.0/media-capture-agent"),

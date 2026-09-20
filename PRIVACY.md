@@ -33,6 +33,14 @@ Deleted-incident tombstones expose deletion state to the future authorized UI;
 the core does not enable that UI or a playback/download route. Synthetic tests
 use generated compressed patterns, not real camera/room/person media.
 
+The implemented backend foundation has no network client, reporting integration
+or media input. Its structured logs discard arbitrary strings, request metadata
+and exception contents, including values with unknown secret formats. Synthetic
+normal/error ASGI smoke observes Python socket/DNS and subprocess attempts and
+requires zero attempts; container isolation additionally blocks delivery. This
+bounded test result is not a claim about future components or all native-code
+execution paths. See `server/docs/FOUNDATION.md`.
+
 The intended official deployment does not include:
 - advertising SDKs;
 - analytics/telemetry;
