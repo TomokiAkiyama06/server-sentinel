@@ -97,6 +97,22 @@ def _quote(value: Path | str) -> str:
     return '"' + value.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%") + '"'
 
 
+def _unit_path(value: Path | str) -> str:
+    """Render a systemd single-path directive.
+
+    Settings such as ``WorkingDirectory=`` are parsed as one path and are not
+    unquoted, so command-line quoting would be kept as part of the path and
+    would make the unit invalid.  Escape only the specifier character and
+    refuse values that systemd's configuration parser would alter.
+    """
+    value = str(value)
+    if (not value.startswith("/") or value != value.strip()
+            or value.endswith("\\") or "\x7f" in value
+            or any(ord(character) < 32 for character in value)):
+        raise ValueError("invalid systemd path")
+    return value.replace("%", "%%")
+
+
 def render_unit(root: Path, config: Path, deployment: Deployment,
                 account: pwd.struct_passwd) -> str:
     current = root / "current"
@@ -114,7 +130,7 @@ NotifyAccess=main
 TimeoutStartSec=60
 User={account.pw_name}
 Group={account.pw_gid}
-WorkingDirectory={_quote(current)}
+WorkingDirectory={_unit_path(current)}
 ExecStartPre={_quote(python)} -m app.deployment --config {_quote(config)} --check
 ExecStart={_quote(python)} -m app.deployment --config {_quote(config)}
 Restart=on-failure
@@ -239,28 +255,39 @@ def _release_lock(unit: Path, *, timeout=LOCK_WAIT_SECONDS):
 
 
 def _switch(root: Path, target: str, runner, *, restore_service=None) -> None:
+    """Move both release pointers and the service as one recoverable step.
+
+    Every mutation below the initial snapshot is inside the guarded block, so a
+    failure while writing either pointer is recovered exactly like a failed
+    restart.  Each recovery step is attempted independently: one failing step
+    never skips pointer restoration, the service-unit callback, or the restart
+    of the release that was running before the attempt.
+    """
     old_current = _link_target(root, "current")
     old_previous = _link_target(root, "previous")
-    _set_link(root, "previous", old_current)
-    _set_link(root, "current", target)
     try:
+        _set_link(root, "previous", old_current)
+        _set_link(root, "current", target)
         _restart(runner)
     except Exception:
-        _set_link(root, "current", old_current)
-        _set_link(root, "previous", old_previous)
-        restoration_error = None
+        restoration_errors = []
+        for name, value in (("current", old_current), ("previous", old_previous)):
+            try:
+                _set_link(root, name, value)
+            except Exception as error:
+                restoration_errors.append(error)
         if restore_service is not None:
             try:
                 restore_service()
             except Exception as error:
-                restoration_error = error
+                restoration_errors.append(error)
         if old_current is not None:
             try:
                 _restart(runner)
             except Exception:
                 pass
-        if restoration_error is not None:
-            raise restoration_error
+        if restoration_errors:
+            raise restoration_errors[0]
         raise
 
 
@@ -287,6 +314,47 @@ def _installed_unit(path: Path) -> str:
         raise ValueError("installed service configuration differs") from None
 
 
+def _write_unit_descriptor(descriptor: int, encoded: bytes, mode: int) -> None:
+    # os.open() masks the requested mode with the administrator umask, so a
+    # restrictive umask would otherwise leave the unit unreadable and a
+    # permissive one is never allowed to widen it.  Normalize before writing.
+    with os.fdopen(descriptor, "wb") as stream:
+        os.fchmod(stream.fileno(), mode)
+        stream.write(encoded)
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+def _fsync_directory(path: Path) -> None:
+    directory = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+
+
+def _create_unit(path: Path, content: str, *, mode=0o644) -> None:
+    """Create a new service unit that is never writable during the write.
+
+    ``Path.open("x")`` would request mode ``0o666``, so a permissive
+    administrator umask leaves a window in which any local account can open the
+    unit for writing and keep that descriptor across a later ``chmod``.  Create
+    the file exclusively with the final restrictive mode instead.
+    """
+    encoded = content.encode("utf-8")
+    if len(encoded) > MAX_UNIT_BYTES or mode not in {0o444, 0o644}:
+        raise ValueError("generated service configuration is too large")
+    descriptor = os.open(
+        path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW, mode
+    )
+    try:
+        _write_unit_descriptor(descriptor, encoded, mode)
+    except BaseException:
+        path.unlink(missing_ok=True)
+        raise
+    _fsync_directory(path.parent)
+
+
 def _replace_unit(path: Path, content: str, *, mode=0o644) -> None:
     encoded = content.encode("utf-8")
     if len(encoded) > MAX_UNIT_BYTES or mode not in {0o444, 0o644}:
@@ -294,18 +362,14 @@ def _replace_unit(path: Path, content: str, *, mode=0o644) -> None:
     temporary = path.with_name("." + path.name + ".new")
     temporary.unlink(missing_ok=True)
     try:
-        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC,
-                             mode)
-        with os.fdopen(descriptor, "wb") as stream:
-            stream.write(encoded)
-            stream.flush()
-            os.fsync(stream.fileno())
+        descriptor = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+            mode,
+        )
+        _write_unit_descriptor(descriptor, encoded, mode)
         os.replace(temporary, path)
-        directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
-        try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
+        _fsync_directory(path.parent)
     except OSError:
         temporary.unlink(missing_ok=True)
         raise
@@ -372,9 +436,16 @@ def execute(args, *, runner=subprocess.run) -> None:
     _protected_parent(args.destination.parent)
     _protected_parent(args.unit.parent)
     with _release_lock(args.unit):
-        args.destination.mkdir(mode=0o755, exist_ok=True)
-        _protected_parent(args.destination)
-        args.destination.chmod(0o755)
+        # The installation root itself is created before any privilege is
+        # dropped, so a restrictive administrator umask must not leave it
+        # untraversable for the dedicated account's preflight.
+        previous_umask = os.umask(0o022)
+        try:
+            args.destination.mkdir(mode=0o755, exist_ok=True)
+            _protected_parent(args.destination)
+            args.destination.chmod(0o755)
+        finally:
+            os.umask(previous_umask)
         _execute_locked(args, runner)
 
 
@@ -405,14 +476,16 @@ def _execute_locked(args, runner) -> None:
                 _replace_unit(snapshot, previous_unit, mode=0o444)
         target = _stage(args, deployment, account, runner, unit_content)
         if args.command == "install":
+            created_unit = False
             try:
-                with args.unit.open("x", encoding="utf-8") as stream:
-                    stream.write(unit_content)
-                args.unit.chmod(0o644)
+                _create_unit(args.unit, unit_content)
+                created_unit = True
                 runner(["systemctl", "daemon-reload"], check=True, timeout=30)
                 _switch(args.destination, target, runner)
             except Exception:
-                args.unit.unlink(missing_ok=True)
+                # Only a unit this transaction created may be removed.
+                if created_unit:
+                    args.unit.unlink(missing_ok=True)
                 shutil.rmtree(args.destination / target, ignore_errors=True)
                 try:
                     runner(["systemctl", "daemon-reload"], check=True, timeout=30)

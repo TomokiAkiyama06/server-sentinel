@@ -14,6 +14,7 @@ Use ADRs for decisions that materially affect:
 
 - `0001-project-foundations.md` — Accepted. Defines the current heterogeneous Camera Source foundation around `local_uvc` + `remote_agent` and rejects the earlier iOS/browser-camera-first bootstrap concept.
 - `0002-remote-agent-buffer-and-viewer-access.md` — Accepted. Defines the remote Agent disk ring buffer, protected incident behavior, live-view stability priority, and invited-viewer access model.
+- `0003-native-main-server-release-lifecycle.md` — Accepted. Makes the versioned native release/systemd lifecycle the only implemented and advertised Main Server deployment path, and records its privileged-installer, artifact-hash, external-runtime and administrator-owned-configuration assumptions.
 
 ## Template
 

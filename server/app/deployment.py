@@ -13,10 +13,61 @@ from app.settings import ConfigurationError, Settings
 
 MAX_CONFIGURATION_BYTES = 16 * 1024
 RELEASE_VERSION = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+(?:-[a-z0-9.]+)?")
+# Administrator identity that owns deployment configuration.  The runtime
+# account is always a different, non-zero dedicated account.
+ADMINISTRATOR_UID = 0
+# Stable, reformat-sensitive filesystem identity published by udev.  A Linux
+# major/minor pair is reused by a replaced or reformatted disk, so it can only
+# corroborate this identity, never replace it.
+FILESYSTEM_UUID_ROOT = Path("/dev/disk/by-uuid")
+FILESYSTEM_UUID = re.compile(r"[0-9A-Za-z][0-9A-Za-z-]{2,63}")
 
 
 def _operating_system_root_device() -> int:
     return Path("/").stat().st_dev
+
+
+def _approved_filesystem_device(uuid: object) -> int:
+    """Resolve the Owner-approved filesystem UUID to the device now carrying it.
+
+    Reformatting or replacing the runtime disk changes its filesystem UUID even
+    when the mount path, directory layout and Linux device number are reused, so
+    the approved entry disappears or points at another device and the
+    replacement is refused instead of being written to.
+    """
+    if not isinstance(uuid, str) or not FILESYSTEM_UUID.fullmatch(uuid):
+        raise ConfigurationError("invalid runtime filesystem identity")
+    try:
+        node = (FILESYSTEM_UUID_ROOT / uuid).resolve(strict=True)
+        info = node.stat()
+    except (OSError, RuntimeError, ValueError):
+        raise ConfigurationError("approved runtime filesystem is unavailable") from None
+    if not stat.S_ISBLK(info.st_mode):
+        raise ConfigurationError("approved runtime filesystem is unavailable")
+    return info.st_rdev
+
+
+def _administrator_file(path: Path, info: os.stat_result) -> None:
+    """Require an administrator-managed, runtime-readable configuration file.
+
+    The runtime account must be able to read the configuration and must never
+    be able to rewrite it, so neither the file nor its directory may be owned or
+    writable by anything other than the administrator.
+    """
+    if info.st_uid != ADMINISTRATOR_UID:
+        raise ConfigurationError("deployment configuration must be administrator-owned")
+    if info.st_mode & 0o027:
+        raise ConfigurationError(
+            "deployment configuration must not be runtime-writable or world-readable"
+        )
+    try:
+        parent_info = path.parent.resolve(strict=True).stat()
+    except (OSError, RuntimeError, ValueError):
+        raise ConfigurationError("deployment configuration is unavailable") from None
+    if parent_info.st_uid != ADMINISTRATOR_UID or parent_info.st_mode & 0o022:
+        raise ConfigurationError(
+            "deployment configuration directory must be administrator-controlled"
+        )
 
 
 def _runtime_roots() -> tuple[Path, Path | None]:
@@ -35,7 +86,7 @@ def _read_configuration(path: Path) -> tuple[dict, os.stat_result]:
         descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK)
         with os.fdopen(descriptor, "rb") as stream:
             before = os.fstat(stream.fileno())
-            if not stat.S_ISREG(before.st_mode) or before.st_mode & 0o077:
+            if not stat.S_ISREG(before.st_mode) or before.st_mode & 0o027:
                 raise ConfigurationError("deployment configuration must be a private regular file")
             content = stream.read(MAX_CONFIGURATION_BYTES + 1)
             after = os.fstat(stream.fileno())
@@ -84,14 +135,16 @@ class Deployment:
         value, info = _read_configuration(path)
         code_root = code_root or Path(__file__).resolve().parents[1]
         allowed = {
-            "runtime_root", "runtime_mount_point", "runtime_device", "service_uid",
+            "runtime_root", "runtime_mount_point", "runtime_device",
+            "runtime_filesystem_uuid", "service_uid",
             "human_host", "human_port", "log_level",
         }
         if set(value) != allowed or type(value.get("service_uid")) is not int:
             raise ConfigurationError("invalid deployment configuration")
         uid = value["service_uid"]
-        if uid <= 0 or info.st_uid != uid:
-            raise ConfigurationError("deployment configuration must belong to the service account")
+        if uid <= 0:
+            raise ConfigurationError("deployment configuration must name a non-root account")
+        _administrator_file(path, info)
         roots = tuple(root for root in (code_root, install_root) if root is not None)
         try:
             configuration_path = path.resolve(strict=True)
@@ -101,10 +154,15 @@ class Deployment:
         except (OSError, RuntimeError, TypeError, ValueError):
             raise ConfigurationError("invalid deployment configuration") from None
         runtime_root = _private_directory(runtime_path, uid, roots)
+        if configuration_path.is_relative_to(runtime_root):
+            raise ConfigurationError(
+                "deployment configuration must be outside runtime-writable data"
+            )
         device = value["runtime_device"]
         if (not isinstance(device, list) or len(device) != 2
                 or any(type(part) is not int or part < 0 for part in device)):
             raise ConfigurationError("invalid runtime filesystem identity")
+        approved_device = _approved_filesystem_device(value["runtime_filesystem_uuid"])
         try:
             mount_point = Path(value["runtime_mount_point"]).resolve(strict=True)
             mount_info = mount_point.stat()
@@ -120,6 +178,7 @@ class Deployment:
                 or not os.path.ismount(mount_point)
                 or not runtime_root.is_relative_to(mount_point)
                 or root_info.st_dev != mount_info.st_dev
+                or root_info.st_dev != approved_device
                 or [os.major(root_info.st_dev), os.minor(root_info.st_dev)] != device
                 or any(mount_point.is_relative_to(root) for root in roots)):
             raise ConfigurationError("runtime filesystem identity mismatch")

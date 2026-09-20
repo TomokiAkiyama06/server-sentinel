@@ -86,6 +86,75 @@ PR-controlled workflows/checkouts; the existing same-repository Claude workflow
 is still limited to trusted writers. Actual issuer isolation and GitHub test-PR
 acceptance remain open in #4.
 
+## Main Server release and installer trust boundary
+
+The stable Main Server deployment path is the native versioned release lifecycle
+in ADR-0003 and [`server/docs/DEPLOYMENT.md`](server/docs/DEPLOYMENT.md). No
+Docker Compose path is implemented or advertised.
+
+Privilege assumptions:
+
+- the installer is a one-shot administrator tool, deliberately invoked with root
+  privileges; it is never a service, is never started by the application, and
+  the running application cannot invoke it;
+- it refuses to run without explicit root execution, refuses any unit path other
+  than the single canonical `server-sentinel.service`, and refuses a service
+  account of UID 0;
+- before using an installation path it rejects ancestors that are symbolic
+  links, not root-owned, or group/world-writable, so an untrusted directory
+  cannot later have code substituted beneath the active release;
+- release environments are built with a root-controlled absolute interpreter,
+  from a fixed working directory, with a sanitized environment, so a hostile
+  `PYTHONPATH` or shadowing module in the administrator's current directory is
+  not executed;
+- the non-root preflight runs as the dedicated account with no supplementary
+  groups, and directory modes are normalized independently of the administrator
+  umask so neither a restrictive nor a permissive umask changes the result;
+- the generated unit is created with a restrictive mode at creation time, never
+  widened and then narrowed, and every unit replacement is atomic and fsynced;
+- one service-global advisory lock covers each whole install, update, and
+  rollback transaction, so concurrent administrator invocations cannot interleave
+  release pointers, unit replacement, and restart.
+
+Supply-chain assumptions:
+
+- the installer performs no network access. The release archive, its published
+  SHA-256, the installer zipapp digest, and the offline wheelhouse are supplied
+  by the administrator;
+- trust comes from content hashes, not from a transport: the outer archive
+  SHA-256, the manifest version, and every member digest are verified before any
+  release code executes, the archive shape is bounded, and dependencies install
+  with `--require-hashes --only-binary=:all: --no-index --no-deps`;
+- verifying the published digests on the target host is therefore a required
+  administrator step, and a release that fails any digest check is refused
+  rather than installed.
+
+Runtime-data assumptions:
+
+- deployment configuration is administrator-owned and readable but not writable
+  by the dedicated runtime account, is refused if it is world-readable,
+  group-writable, inside the installation or release tree, inside the
+  runtime-writable data tree, or in a directory the administrator does not
+  control;
+- the Owner-approved runtime filesystem is pinned by a stable filesystem UUID.
+  Linux major/minor device numbers are reused by a replaced or reformatted disk,
+  so they only corroborate that identity. A runtime mount that is missing,
+  substituted, backed by the root filesystem device, or carrying a different
+  filesystem is refused, and no root-filesystem fallback directory is created;
+- install, update, and rollback move release pointers and the unit only; they
+  never delete, truncate, or rewrite state, recordings, or audit data. A failed
+  transaction restores both release pointers and the previous unit and restarts
+  the release that was running before the attempt.
+
+Release trees accumulate under the installation root. Pruning an old release is
+a deliberate administrator action on the installation filesystem only, and never
+touches runtime data.
+
+Deployed acceptance of this boundary — including the systemd activation, the
+trusted-proxy boundary, real mount substitution, and the recording/audit content
+comparison across update and rollback — remains the `MANUAL_TEST.md` section V
+checks for Issue #47 and is not established by the synthetic tests.
+
 ## Network boundaries
 
 ### Human dashboard path

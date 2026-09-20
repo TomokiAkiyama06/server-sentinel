@@ -15,11 +15,17 @@ import unittest
 from unittest.mock import call, patch
 import zipfile
 
-from app.deployment import Deployment, main as deployment_main
+from app.deployment import (
+    Deployment, _approved_filesystem_device, main as deployment_main,
+)
 from app.settings import ConfigurationError
 from build_artifact import _required_wheels, build
 from build_installer import build as build_installer
-from install import _extract, _protected_parent, _release_lock, _trusted_python, execute
+import install
+from install import (
+    _extract, _protected_parent, _release_lock, _trusted_python, _unit_path, execute,
+    render_unit,
+)
 
 
 def _hold_release_lock(unit, acquired, release):
@@ -29,13 +35,41 @@ def _hold_release_lock(unit, acquired, release):
 
 
 class Runner:
+    """Synthetic subprocess runner that models the dedicated-account preflight.
+
+    The installer drops to a different, unprivileged account for its preflight.
+    A test process cannot actually become that account, so model the part that
+    matters here: every directory the installer asks that account to enter must
+    be readable and traversable by an account that is neither the owner nor a
+    member of the owning group.
+    """
+
     def __init__(self, root: Path):
         self.root = root
         self.calls = []
         self.fail_version = None
 
+    def _check_foreign_account_access(self, options) -> None:
+        if options.get("user") is None:
+            return
+        working_directory = Path(options["cwd"]).resolve()
+        installation = self.root.resolve()
+        if not working_directory.is_relative_to(installation):
+            raise OSError("preflight working directory escaped the installation root")
+        candidates = [installation, working_directory]
+        candidates.extend(
+            parent for parent in working_directory.parents
+            if parent.is_relative_to(installation)
+        )
+        for candidate in candidates:
+            if candidate.stat().st_mode & 0o005 != 0o005:
+                raise OSError(
+                    "dedicated account cannot traverse the installation tree"
+                )
+
     def __call__(self, arguments, **options):
         self.calls.append((arguments, options))
+        self._check_foreign_account_access(options)
         if arguments[1:4] == ["-I", "-m", "venv"]:
             python = Path(arguments[4]) / "bin/python"
             python.parent.mkdir(parents=True)
@@ -62,10 +96,12 @@ class ReleaseLifecycleTests(unittest.TestCase):
             path.mkdir(mode=0o700)
         self.config = self.root / "deployment.json"
         device = self.runtime.stat().st_dev
+        self.filesystem_uuid = "00000000-1111-2222-3333-444444444444"
         self.config.write_text(json.dumps({
             "runtime_root": str(self.runtime),
             "runtime_mount_point": str(self.root),
             "runtime_device": [os.major(device), os.minor(device)],
+            "runtime_filesystem_uuid": self.filesystem_uuid,
             "service_uid": self.uid,
             "human_host": "127.0.0.1",
             "human_port": 8000,
@@ -101,21 +137,38 @@ class ReleaseLifecycleTests(unittest.TestCase):
             values.update(artifact=artifact, sha256=digest, python=Path(sys.executable))
         return argparse.Namespace(**values)
 
-    def perform(self, arguments, *, mount=True, root_device=None):
+    def perform(self, arguments, *, mount=True, root_device=None, approved_device=None):
         account = pwd.getpwuid(self.uid)
         if root_device is None:
             # The fixture's temporary runtime directory ordinarily shares the
             # test runner's filesystem.  Model the separately mounted runtime
             # volume that a real installation requires.
             root_device = self.runtime.stat().st_dev + 1
+        # A test process cannot create a block device node, so resolve the
+        # Owner-approved filesystem UUID through an injected lookup.  By default
+        # it still carries the fixture's runtime filesystem.
+        uuid_lookup = self.approved_device_lookup(approved_device)
         with patch("install.os.geteuid", return_value=0), patch(
                 "install.SYSTEMD_UNIT", self.unit), patch("install._protected_parent"), patch(
                 "install._trusted_python", side_effect=lambda path: path.resolve()), patch(
                 "install._installed_unit", side_effect=lambda path: path.read_text()), patch(
                 "app.deployment.os.path.ismount", return_value=mount), patch(
                 "app.deployment._operating_system_root_device", return_value=root_device), patch(
+                "app.deployment.ADMINISTRATOR_UID", self.uid), patch(
+                "app.deployment._approved_filesystem_device", side_effect=uuid_lookup), patch(
                 "install.pwd.getpwuid", return_value=account):
             execute(arguments, runner=self.runner)
+
+    def approved_device_lookup(self, approved_device=None):
+        expected = self.filesystem_uuid
+        device = self.runtime.stat().st_dev if approved_device is None else approved_device
+
+        def lookup(uuid):
+            if uuid != expected:
+                raise ConfigurationError("approved runtime filesystem is unavailable")
+            return device
+
+        return lookup
 
     def test_install_update_and_rollback_preserve_external_runtime_data(self):
         markers = []
@@ -136,7 +189,9 @@ class ReleaseLifecycleTests(unittest.TestCase):
         self.assertEqual(os.readlink(self.installation / "current"), "releases/1.0.0")
         unit = self.unit.read_text()
         self.assertIn("User=" + pwd.getpwuid(self.uid).pw_name, unit)
-        self.assertIn('WorkingDirectory="' + str(self.installation / "current") + '"', unit)
+        self.assertIn(
+            "\nWorkingDirectory=" + str(self.installation / "current") + "\n", unit
+        )
         self.assertIn("ProtectSystem=strict", unit)
         self.assertIn("Type=notify", unit)
         self.assertIn("NotifyAccess=main", unit)
@@ -517,6 +572,167 @@ class ReleaseLifecycleTests(unittest.TestCase):
         self.assertEqual(release.stat().st_mode & 0o777, 0o755)
         self.assertEqual((self.installation / "releases").stat().st_mode & 0o777, 0o755)
 
+    def test_single_path_directives_are_rendered_without_command_line_quoting(self):
+        account = pwd.getpwuid(self.uid)
+        code_root = self.root / "code"
+        code_root.mkdir()
+        with patch("app.deployment.ADMINISTRATOR_UID", self.uid), patch(
+                "app.deployment._approved_filesystem_device",
+                side_effect=self.approved_device_lookup()), patch(
+                "app.deployment.os.path.ismount", return_value=True), patch(
+                "app.deployment._operating_system_root_device",
+                return_value=self.runtime.stat().st_dev + 1):
+            deployment = Deployment.load(self.config, code_root=code_root)
+        unit = render_unit(self.installation, self.config, deployment, account)
+        working = [line for line in unit.splitlines()
+                   if line.startswith("WorkingDirectory=")]
+        self.assertEqual(working, ["WorkingDirectory=" + str(self.installation / "current")])
+        # systemd would keep command-line quotes as part of this single path and
+        # reject the unit with "path is not absolute".
+        self.assertNotIn('"', working[0])
+        self.assertTrue(working[0].partition("=")[2].startswith("/"))
+
+        for unsafe in ("relative/current", "/srv/current\n[Service]", "/srv/current ",
+                       "/srv/current\\"):
+            with self.subTest(path=unsafe), self.assertRaisesRegex(ValueError, "systemd path"):
+                _unit_path(unsafe)
+        # The specifier character is the only escaping this directive needs.
+        self.assertEqual(_unit_path("/srv/100%/current"), "/srv/100%%/current")
+
+    def test_restrictive_umask_keeps_the_installation_root_account_traversable(self):
+        previous = os.umask(0o077)
+        try:
+            self.perform(self.arguments("install", "1.0.0"))
+            self.perform(self.arguments("update", "1.1.0"))
+        finally:
+            os.umask(previous)
+        preflights = [options for arguments, options in self.runner.calls
+                      if options.get("user") is not None]
+        self.assertEqual(len(preflights), 2)
+        for options in preflights:
+            self.assertEqual(options["user"], self.uid)
+            self.assertEqual(options["extra_groups"], [])
+        for path in (self.installation, self.installation / "releases",
+                     self.installation / "releases/1.0.0",
+                     self.installation / "releases/1.1.0"):
+            self.assertEqual(path.stat().st_mode & 0o005, 0o005, path)
+
+    def test_failed_release_pointer_write_restores_both_pointers_and_the_unit(self):
+        self.perform(self.arguments("install", "1.0.0"))
+        self.perform(self.arguments("update", "1.1.0"))
+        self.assertEqual(os.readlink(self.installation / "current"), "releases/1.1.0")
+        self.assertEqual(os.readlink(self.installation / "previous"), "releases/1.0.0")
+        installed_unit = self.unit.read_text()
+        restarts = len([call for call, _ in self.runner.calls
+                        if call[:2] == ["systemctl", "restart"]])
+
+        real_set_link = install._set_link
+
+        def failing_set_link(root, name, target):
+            if name == "current":
+                raise OSError("synthetic pointer write failure")
+            return real_set_link(root, name, target)
+
+        with patch("install._set_link", side_effect=failing_set_link):
+            with patch("install.render_unit", return_value="[Service]\nProtectHome=true\n"):
+                with self.assertRaises(OSError):
+                    self.perform(self.arguments("update", "1.2.0"))
+
+        # The rollback history must not be corrupted by the failed transaction.
+        self.assertEqual(os.readlink(self.installation / "current"), "releases/1.1.0")
+        self.assertEqual(os.readlink(self.installation / "previous"), "releases/1.0.0")
+        self.assertEqual(self.unit.read_text(), installed_unit)
+        self.assertGreater(
+            len([call for call, _ in self.runner.calls
+                 if call[:2] == ["systemctl", "restart"]]),
+            restarts,
+        )
+
+    def test_recovery_continues_after_an_individual_restoration_failure(self):
+        self.perform(self.arguments("install", "1.0.0"))
+        self.perform(self.arguments("update", "1.1.0"))
+        real_set_link = install._set_link
+        attempts = []
+
+        def failing_set_link(root, name, target):
+            attempts.append((name, target))
+            if name == "current" and target == "releases/1.2.0":
+                raise OSError("synthetic pointer write failure")
+            if name == "current" and target == "releases/1.1.0":
+                raise OSError("synthetic restoration failure")
+            return real_set_link(root, name, target)
+
+        with patch("install._set_link", side_effect=failing_set_link):
+            with self.assertRaises(OSError):
+                self.perform(self.arguments("update", "1.2.0"))
+        # A failure restoring `current` must not skip `previous` restoration.
+        self.assertIn(("previous", "releases/1.0.0"), attempts)
+        self.assertEqual(os.readlink(self.installation / "previous"), "releases/1.0.0")
+
+    def test_fresh_install_never_creates_a_writable_service_unit(self):
+        created_modes = {}
+        real_open = install.os.open
+
+        def recording_open(path, flags, mode=0o777, **options):
+            if str(path) == str(self.unit) and flags & os.O_CREAT:
+                created_modes[str(path)] = mode
+            return real_open(path, flags, mode, **options)
+
+        previous = os.umask(0o000)
+        try:
+            with patch("install.os.open", side_effect=recording_open):
+                self.perform(self.arguments("install", "1.0.0"))
+        finally:
+            os.umask(previous)
+        # Under a permissive administrator umask the creation mode itself has to
+        # be restrictive; a later chmod would leave a writable-descriptor window.
+        self.assertEqual(created_modes.get(str(self.unit)), 0o644)
+        self.assertEqual(self.unit.stat().st_mode & 0o777, 0o644)
+        self.assertEqual(self.unit.stat().st_mode & 0o022, 0)
+
+    def test_fresh_install_does_not_clobber_an_existing_service_unit(self):
+        self.unit.write_text("[Service]\nExecStart=/bin/false\n")
+        with self.assertRaisesRegex(ValueError, "already installed"):
+            self.perform(self.arguments("install", "1.0.0"))
+        self.assertEqual(self.unit.read_text(), "[Service]\nExecStart=/bin/false\n")
+
+    def test_replaced_runtime_filesystem_is_refused_by_the_approved_uuid(self):
+        self.perform(self.arguments("install", "1.0.0"))
+        # A reformatted or swapped disk keeps the mount path, directory layout
+        # and Linux major/minor pair, but never the approved filesystem UUID.
+        with self.assertRaisesRegex(ConfigurationError, "filesystem identity mismatch"):
+            self.perform(
+                self.arguments("update", "1.1.0"),
+                approved_device=self.runtime.stat().st_dev + 7,
+            )
+        self.assertFalse((self.installation / "releases/1.1.0").exists())
+        self.assertEqual(os.readlink(self.installation / "current"), "releases/1.0.0")
+
+        value = json.loads(self.config.read_text())
+        value["runtime_filesystem_uuid"] = "99999999-8888-7777-6666-555555555555"
+        self.config.write_text(json.dumps(value))
+        self.config.chmod(0o600)
+        with self.assertRaisesRegex(ConfigurationError, "unavailable"):
+            self.perform(self.arguments("update", "1.1.1"))
+        self.assertFalse((self.installation / "releases/1.1.1").exists())
+
+    def test_approved_filesystem_uuid_lookup_rejects_unsafe_and_missing_entries(self):
+        directory = self.root / "by-uuid"
+        directory.mkdir()
+        impostor = directory / "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        impostor.write_text("not a block device")
+        with patch("app.deployment.FILESYSTEM_UUID_ROOT", directory):
+            for uuid in ("../../etc/passwd", "/dev/sda1", "ab", "uuid with space",
+                         "uuid\x00", 42, None):
+                with self.subTest(uuid=uuid), self.assertRaisesRegex(
+                        ConfigurationError, "invalid runtime filesystem identity"):
+                    _approved_filesystem_device(uuid)
+            with self.assertRaisesRegex(ConfigurationError, "unavailable"):
+                _approved_filesystem_device("11111111-2222-3333-4444-555555555555")
+            # A regular file standing in for the approved device is refused.
+            with self.assertRaisesRegex(ConfigurationError, "unavailable"):
+                _approved_filesystem_device(impostor.name)
+
     def test_python_interpreter_must_be_absolute_and_root_controlled(self):
         candidate = self.root / "python"
         candidate.write_text("synthetic")
@@ -541,22 +757,26 @@ class DeploymentConfigurationTests(unittest.TestCase):
             for path in (runtime, runtime / "state", runtime / "recordings", runtime / "audit"):
                 path.mkdir(mode=0o700)
             device = runtime.stat().st_dev
+            uuid = "00000000-1111-2222-3333-444444444444"
             value = {
                 "runtime_root": str(runtime), "service_uid": os.geteuid(),
                 "runtime_mount_point": str(root),
                 "runtime_device": [os.major(device), os.minor(device)],
+                "runtime_filesystem_uuid": uuid,
                 "human_host": "127.0.0.1", "human_port": 8000, "log_level": "INFO",
             }
 
             external = root / "etc/deployment.json"
-            external.parent.mkdir()
+            external.parent.mkdir(mode=0o755)
             internal = install / "deployment.json"
             release_internal = install / "current/deployment.json"
             for config in (external, internal, release_internal):
                 config.write_text(json.dumps(value))
                 config.chmod(0o600)
 
-            with patch("app.deployment.__file__", str(module)):
+            with patch("app.deployment.__file__", str(module)), patch(
+                    "app.deployment.ADMINISTRATOR_UID", os.geteuid()), patch(
+                    "app.deployment._approved_filesystem_device", return_value=device):
                 for config in (internal, release_internal):
                     with self.subTest(config=config), patch(
                             "sys.stderr", new_callable=io.StringIO) as stderr, self.assertRaises(
@@ -582,6 +802,8 @@ class DeploymentConfigurationTests(unittest.TestCase):
             source_module.parent.mkdir(parents=True)
             source_module.write_text("synthetic")
             with patch("app.deployment.__file__", str(source_module)), patch(
+                    "app.deployment.ADMINISTRATOR_UID", os.geteuid()), patch(
+                    "app.deployment._approved_filesystem_device", return_value=device), patch(
                     "app.deployment.os.path.ismount", return_value=True), patch(
                     "app.deployment._operating_system_root_device",
                     return_value=device + 1), patch(
@@ -605,11 +827,78 @@ class DeploymentConfigurationTests(unittest.TestCase):
                 "runtime_root": str(root / "runtime"), "service_uid": os.geteuid(),
                 "runtime_mount_point": str(root),
                 "runtime_device": [os.major(device), os.minor(device)],
+                "runtime_filesystem_uuid": "00000000-1111-2222-3333-444444444444",
                 "human_host": "127.0.0.1", "human_port": 8000, "log_level": "INFO",
             }))
             config.chmod(0o644)
             with self.assertRaises(ConfigurationError):
                 Deployment.load(config, code_root=root / "code")
+
+    def test_configuration_must_be_administrator_owned_and_not_runtime_writable(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runtime = root / "runtime"
+            for path in (runtime, runtime / "state", runtime / "recordings",
+                         runtime / "audit"):
+                path.mkdir(mode=0o700)
+            device = runtime.stat().st_dev
+            value = {
+                "runtime_root": str(runtime), "service_uid": os.geteuid(),
+                "runtime_mount_point": str(root),
+                "runtime_device": [os.major(device), os.minor(device)],
+                "runtime_filesystem_uuid": "00000000-1111-2222-3333-444444444444",
+                "human_host": "127.0.0.1", "human_port": 8000, "log_level": "INFO",
+            }
+            (root / "code").mkdir()
+            administrator = root / "etc"
+            administrator.mkdir(mode=0o755)
+            config = administrator / "deployment.json"
+            config.write_text(json.dumps(value))
+            config.chmod(0o640)
+
+            def load(path):
+                return Deployment.load(path, code_root=root / "code")
+
+            environment = (
+                patch("app.deployment.os.path.ismount", return_value=True),
+                patch("app.deployment._operating_system_root_device",
+                      return_value=device + 1),
+                patch("app.deployment._approved_filesystem_device", return_value=device),
+            )
+            for context in environment:
+                self.enterContext(context)
+
+            with patch("app.deployment.ADMINISTRATOR_UID", os.geteuid()):
+                # An administrator-owned, group-readable configuration is accepted.
+                self.assertEqual(load(config).service_uid, os.geteuid())
+
+                # The runtime account must never be able to rewrite it.
+                config.chmod(0o660)
+                with self.assertRaisesRegex(ConfigurationError, "unavailable"):
+                    load(config)
+                config.chmod(0o640)
+
+                administrator.chmod(0o777)
+                with self.assertRaisesRegex(
+                        ConfigurationError, "directory must be administrator-controlled"):
+                    load(config)
+                administrator.chmod(0o755)
+
+                # Configuration inside the service-writable runtime tree is refused
+                # even when its own mode is correct.
+                inside = runtime / "deployment.json"
+                inside.write_text(json.dumps(value))
+                inside.chmod(0o640)
+                with self.assertRaisesRegex(
+                        ConfigurationError, "outside runtime-writable data"):
+                    load(inside)
+
+            # A configuration owned by the runtime account rather than the
+            # administrator is refused.
+            with patch("app.deployment.ADMINISTRATOR_UID", os.geteuid() + 1):
+                with self.assertRaisesRegex(
+                        ConfigurationError, "must be administrator-owned"):
+                    load(config)
 
 
 if __name__ == "__main__":

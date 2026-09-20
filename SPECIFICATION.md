@@ -119,9 +119,18 @@ loopback and grants write access only to the configured runtime root. A
 `Type=notify` unit does not complete activation until database migration,
 application lifespan startup, and listener creation succeed. Runtime
 subdirectories are resolved and must remain contained on the approved runtime
-filesystem. Root-only environment construction uses an isolated, root-controlled
-Python interpreter from a fixed working directory and sanitized environment.
-Exact commands and limitations are in `server/docs/DEPLOYMENT.md`.
+filesystem, which is pinned by its Owner-approved filesystem UUID; Linux
+major/minor device numbers only corroborate that identity because a replaced or
+reformatted disk can reuse them. Deployment configuration is administrator-owned
+and runtime-readable but not runtime-writable, and is refused inside the
+installation tree, inside the runtime-writable data tree, or in a directory the
+administrator does not control. Both release pointers and the service unit move
+inside one guarded transaction under a service-global lock, and each recovery
+step is attempted independently. Root-only environment construction uses an
+isolated, root-controlled Python interpreter from a fixed working directory and
+sanitized environment. The native lifecycle is the only implemented Main Server
+deployment path (ADR-0003, `REQUIREMENTS.md` DIST-005/DIST-006). Exact commands
+and limitations are in `server/docs/DEPLOYMENT.md`.
 
 No Docker Compose path is currently implemented or advertised. A future Compose
 path must provide the same versioned update/rollback, external runtime mount,
