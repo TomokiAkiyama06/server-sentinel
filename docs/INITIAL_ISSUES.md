@@ -141,17 +141,27 @@ flowchart TD
   i27 --> i28
   i7 --> i47
   i10 --> i47
+  i23 --> i47
+  i50 --> i47
   i7 --> i48
   i8 --> i48
+  i9 --> i48
   i10 --> i48
+  i17 --> i48
+  i21 --> i48
+  i23 --> i48
+  i50 --> i48
   i7 --> i49
   i10 --> i49
   i7 --> i50
+  i9 --> i50
   i10 --> i50
+  i13 --> i50
+  i23 --> i50
   i5 --> i51
 ```
 
-Issue #7 explicitly depends on #6 (authorization design before health/version endpoint contracts), #16 on #17 (bounded media profiles for buffer estimates/admission), and #26 on #16 / #21 (critical preservation and configured notification integration). Plans 22–25 depend only on their required foundation and authorization work; Plan 26 depends on the CI guard. These do not prevent independent mock/contract work.
+Issue #7 explicitly depends on #6 (authorization design before health/version endpoint contracts), #16 on #17 (bounded media profiles for buffer estimates/admission), and #26 on #16 / #21 (critical preservation and configured notification integration). Plans 22–25 additionally wait for the storage, integrity, source/node, profile, and audit capabilities that their deployed acceptance invokes; Plan 26 depends on the CI guard. These completion dependencies do not prevent independent mock/contract work.
 
 ## Plan 1 — CI / repository guardrails
 
@@ -905,7 +915,7 @@ Acceptance:
 
 GitHub Issue: [#47](https://github.com/TomokiAkiyama06/server-sentinel/issues/47)
 
-Depends on: [#7](https://github.com/TomokiAkiyama06/server-sentinel/issues/7), [#10](https://github.com/TomokiAkiyama06/server-sentinel/issues/10)
+Depends on: [#7](https://github.com/TomokiAkiyama06/server-sentinel/issues/7), [#10](https://github.com/TomokiAkiyama06/server-sentinel/issues/10), [#23](https://github.com/TomokiAkiyama06/server-sentinel/issues/23), [#50](https://github.com/TomokiAkiyama06/server-sentinel/issues/50)
 
 Labels: `backend`, `security`, `storage`, `documentation`, `server-required`, `hardware-required`, `manual-test-required`
 
@@ -926,7 +936,7 @@ Acceptance:
 
 GitHub Issue: [#48](https://github.com/TomokiAkiyama06/server-sentinel/issues/48)
 
-Depends on: [#7](https://github.com/TomokiAkiyama06/server-sentinel/issues/7), [#8](https://github.com/TomokiAkiyama06/server-sentinel/issues/8), [#10](https://github.com/TomokiAkiyama06/server-sentinel/issues/10)
+Depends on: [#7](https://github.com/TomokiAkiyama06/server-sentinel/issues/7), [#8](https://github.com/TomokiAkiyama06/server-sentinel/issues/8), [#9](https://github.com/TomokiAkiyama06/server-sentinel/issues/9), [#10](https://github.com/TomokiAkiyama06/server-sentinel/issues/10), [#17](https://github.com/TomokiAkiyama06/server-sentinel/issues/17), [#21](https://github.com/TomokiAkiyama06/server-sentinel/issues/21), [#23](https://github.com/TomokiAkiyama06/server-sentinel/issues/23), [#50](https://github.com/TomokiAkiyama06/server-sentinel/issues/50)
 
 Labels: `backend`, `frontend`, `security`, `storage`, `server-required`, `hardware-required`, `manual-test-required`
 
@@ -967,7 +977,7 @@ Acceptance:
 
 GitHub Issue: [#50](https://github.com/TomokiAkiyama06/server-sentinel/issues/50)
 
-Depends on: [#7](https://github.com/TomokiAkiyama06/server-sentinel/issues/7), [#10](https://github.com/TomokiAkiyama06/server-sentinel/issues/10)
+Depends on: [#7](https://github.com/TomokiAkiyama06/server-sentinel/issues/7), [#9](https://github.com/TomokiAkiyama06/server-sentinel/issues/9), [#10](https://github.com/TomokiAkiyama06/server-sentinel/issues/10), [#13](https://github.com/TomokiAkiyama06/server-sentinel/issues/13), [#23](https://github.com/TomokiAkiyama06/server-sentinel/issues/23)
 
 Labels: `backend`, `security`, `storage`, `server-required`, `hardware-required`, `manual-test-required`
 
@@ -1000,8 +1010,9 @@ Scope:
 
 Acceptance:
 - exact version、upstream、license evidence、component種別、material transitive obligations、required notices / redistribution obligationsを記録する;
+- build inputとlicense evidenceをlockfileまたはimmutable artifact digestで結び、mutable range/tagやmissing/mismatched pinをrelease gateで拒否する;
 - AGPL/GPL/SSPL/source-available/unclearはOwnerの明示approval/documentationなしにblockする;
-- CI / release validationとsynthetic manifestsでallow、block、missing evidence、transitive-obligation / notice evidenceの欠落を検証する。
+- CI / release validationとsynthetic manifestsでallow、block、missing evidence、missing/mismatched pin、transitive-obligation / notice evidenceの欠落を検証する。
 
 ## Explicitly pending product decisions
 
