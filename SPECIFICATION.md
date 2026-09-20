@@ -927,8 +927,25 @@ DELETE recording                         -> owner + fresh user verification
 
 "Fresh" means a user verification newer than a bounded freshness window, so an
 older or unattended owner session cannot perform an AUTH-008 operation by
-itself. A step-up that fails, is cancelled or is declined leaves the operation
-unperformed, changes no state, and returns only the generic failure.
+itself. Freshness is evaluated server-side from
+`principal_session.last_user_verification_at`; a client cannot assert it.
+
+The main-to-Web contract for the step-up is explicit, because the dashboard has
+to know when to prompt:
+
+```text
+owner route, session fresh      -> the operation runs
+owner route, session stale      -> distinct step_up_required response, no other data
+step-up assertion succeeds      -> last_user_verification_at updates; client retries
+retry                           -> permission and freshness re-checked server-side
+step-up cancelled/failed        -> generic failure; nothing executed, nothing changed
+```
+
+The `step_up_required` signal is returned only to an already authenticated
+session that holds the required permission. Anything unauthenticated, uninvited
+or revoked still receives the generic response below and learns nothing about
+owner routes. Repeated failed step-ups are rate-limited and logged without
+credential material, and a stale session never partially applies an operation.
 
 Exactly three request classes run before a credential exists, and the set is
 closed:

@@ -8,6 +8,6 @@ Owns owner invitations/allowlists, independent `live:view` and `recordings:view`
 - Stores only public credential material and owner-visible metadata; authenticator user verification stays on the viewer's device and no viewer biometric template reaches the server.
 - Supports revoking a single credential and revoking a whole principal, and binds sessions to the credential that created them.
 - Exposes exactly three pre-credential paths: local owner bootstrap, enrollment-code redemption and the authentication route. They return no application data, redemption is single-use and rate-limited, an absent/unknown/expired/redeemed code gets the uninvited response, and enrollment codes stay out of logs.
-- Requires a fresh user verification for owner-only operations; a stale owner session is refused and a cancelled step-up changes nothing.
+- Requires a fresh user verification for owner-only operations. Freshness comes from the server-side session record, a stale owner session receives a distinct step-up-required response with no other data, and a cancelled or failed step-up changes nothing. Unauthenticated, uninvited and revoked requests keep receiving the generic response.
 - Keeps historical events/timeline under `recordings:view` and provides generic, non-branding denial for uninvited identities.
 - Does not modify Tailscale ACLs/Grants, store Tailscale administrative credentials, or treat an agent identity as a human/admin identity.
