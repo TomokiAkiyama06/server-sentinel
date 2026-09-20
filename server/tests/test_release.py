@@ -1,5 +1,6 @@
 import argparse
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -16,7 +17,7 @@ from app.deployment import Deployment
 from app.settings import ConfigurationError
 from build_artifact import _required_wheels, build
 from build_installer import build as build_installer
-from install import _trusted_python, execute
+from install import _extract, _trusted_python, execute
 
 
 class Runner:
@@ -92,11 +93,12 @@ class ReleaseLifecycleTests(unittest.TestCase):
             values.update(artifact=artifact, sha256=digest, python=Path(sys.executable))
         return argparse.Namespace(**values)
 
-    def perform(self, arguments):
+    def perform(self, arguments, *, mount=True):
         account = pwd.getpwuid(self.uid)
         with patch("install.os.geteuid", return_value=0), patch(
                 "install._protected_parent"), patch(
                 "install._trusted_python", side_effect=lambda path: path.resolve()), patch(
+                "app.deployment.os.path.ismount", return_value=mount), patch(
                 "install.pwd.getpwuid", return_value=account):
             execute(arguments, runner=self.runner)
 
@@ -199,6 +201,11 @@ class ReleaseLifecycleTests(unittest.TestCase):
         self.assertEqual(list(outside.iterdir()), [])
         self.assertFalse((self.installation / "releases").exists())
 
+    def test_runtime_mount_point_must_be_an_actual_mount(self):
+        with self.assertRaisesRegex(ConfigurationError, "filesystem identity"):
+            self.perform(self.arguments("install", "1.0.0"), mount=False)
+        self.assertFalse((self.installation / "releases").exists())
+
     def test_artifact_is_versioned_allow_list_without_tests_or_private_config(self):
         artifact, digest = self.artifact("1.2.3")
         self.assertEqual(hashlib.sha256(artifact.read_bytes()).hexdigest(), digest)
@@ -243,6 +250,35 @@ class ReleaseLifecycleTests(unittest.TestCase):
                 self.perform(self.arguments("rollback", version))
             self.assertEqual(os.readlink(self.installation / "current"), "releases/1.0.0")
             self.assertEqual(len(self.runner.calls), calls)
+
+    def test_relative_configuration_path_is_rejected_before_release_staging(self):
+        arguments = self.arguments("install", "1.0.0")
+        arguments.config = Path("deployment.json")
+        with self.assertRaisesRegex(ValueError, "absolute"):
+            self.perform(arguments)
+        self.assertFalse((self.installation / "releases").exists())
+
+    def test_archive_total_expansion_is_bounded(self):
+        first, second = b"a" * 600, b"b" * 600
+        manifest = {
+            "format": 1,
+            "name": "server-sentinel-main",
+            "version": "1.0.0",
+            "files": {
+                "first": hashlib.sha256(first).hexdigest(),
+                "second": hashlib.sha256(second).hexdigest(),
+            },
+        }
+        archive_data = io.BytesIO()
+        with tarfile.open(fileobj=archive_data, mode="w:gz") as archive:
+            for name, content in (("manifest.json", json.dumps(manifest).encode()),
+                                  ("first", first), ("second", second)):
+                info = tarfile.TarInfo(name)
+                info.size = len(content)
+                archive.addfile(info, io.BytesIO(content))
+        with tempfile.TemporaryDirectory() as temporary, patch("install.MAX_ARTIFACT_BYTES", 1024):
+            with self.assertRaisesRegex(ValueError, "contents exceed"):
+                _extract(archive_data.getvalue(), Path(temporary), "1.0.0")
 
     def test_root_python_helpers_are_isolated_from_invocation_directory(self):
         shadow = self.root / "venv.py"

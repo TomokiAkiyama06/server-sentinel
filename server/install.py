@@ -41,13 +41,18 @@ def _extract(content: bytes, destination: Path, expected_version: str) -> None:
     with tarfile.open(fileobj=io.BytesIO(content), mode="r:gz") as archive:
         members = archive.getmembers()
         names = [member.name for member in members]
-        if len(names) != len(set(names)) or names.count("manifest.json") != 1:
+        if (len(names) > 1024 or len(names) != len(set(names))
+                or names.count("manifest.json") != 1):
             raise ValueError("invalid artifact members")
+        total_size = 0
         for member in members:
             path = PurePosixPath(member.name)
             if (not member.isfile() or path.is_absolute() or ".." in path.parts
                     or not path.parts or member.size > MAX_ARTIFACT_BYTES):
                 raise ValueError("unsafe artifact member")
+            total_size += member.size
+            if total_size > MAX_ARTIFACT_BYTES:
+                raise ValueError("artifact contents exceed size limit")
         manifest_stream = archive.extractfile("manifest.json")
         if manifest_stream is None:
             raise ValueError("artifact manifest missing")
@@ -238,7 +243,8 @@ def _stage(args, deployment: Deployment, account: pwd.struct_passwd, runner) -> 
 def execute(args, *, runner=subprocess.run) -> None:
     if os.geteuid() != 0:
         raise ValueError("installation requires explicit administrator execution")
-    if not args.destination.is_absolute() or not args.unit.is_absolute():
+    if (not args.destination.is_absolute() or not args.config.is_absolute()
+            or not args.unit.is_absolute()):
         raise ValueError("absolute installation paths required")
     if args.unit.name != "server-sentinel.service":
         raise ValueError("service must retain its functional name")

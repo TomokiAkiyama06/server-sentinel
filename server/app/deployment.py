@@ -95,6 +95,7 @@ class Deployment:
         except (OSError, RuntimeError, TypeError, ValueError):
             raise ConfigurationError("runtime mount is unavailable") from None
         if (not mount_point.is_absolute() or not mount_point.is_dir()
+                or not os.path.ismount(mount_point)
                 or not runtime_root.is_relative_to(mount_point)
                 or root_info.st_dev != mount_info.st_dev
                 or [os.major(root_info.st_dev), os.minor(root_info.st_dev)] != device
