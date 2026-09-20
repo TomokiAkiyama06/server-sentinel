@@ -2,8 +2,9 @@
 
 Issue [#5](https://github.com/TomokiAkiyama06/server-sentinel/issues/5) provides
 the `CI` GitHub Actions workflow. It runs for every pull request, pushes to
-`main`, and manual dispatch. The final check is named **CI**; both repository
-and component jobs must succeed. A failed, cancelled, or skipped prerequisite
+`main`, and manual dispatch. The final check is named **CI**; repository,
+component, and Dashboard browser smoke jobs must all succeed. A failed,
+cancelled, or skipped prerequisite
 cannot produce a successful final check. Review provenance enforcement remains
 in Issue #4; the workflow itself does not change repository protection settings.
 
@@ -21,10 +22,15 @@ trusted issuer or required Codex/Claude enforcement.
 
 ## Current coverage
 
-The repository currently contains CI tooling and application README skeletons.
-There is no runnable Main Server, capture agent, or web application. Consequently
-component checks explicitly report **not implemented**. This is not a runtime,
-hardware, browser, or network acceptance result.
+The `web/` React foundation is implemented and activates locked dependency
+installation, TypeScript/JavaScript checks, Node tests, production bundling,
+Docker validation and isolated normal/error preview smoke. The additional
+Dashboard browser smoke job executes the built UI in runner-installed Chrome
+with synthetic viewport/session fixtures and intercepted page requests.
+Other components activate checks through their manifests; README-only skeletons
+continue to report **not implemented**. This coverage does not establish physical
+hardware, phone/Mac device, private network, authentication deployment or live
+media acceptance.
 
 The repository job always runs:
 
