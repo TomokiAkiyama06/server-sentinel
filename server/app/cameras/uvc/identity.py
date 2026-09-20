@@ -25,6 +25,7 @@ class DeviceEvidence:
     topology: str | None = field(default=None, repr=False)
     formats: tuple[str, ...] = ()
     device_number: int | None = field(default=None, repr=False)
+    instance_token: tuple[int, int, int] | None = field(default=None, repr=False)
 
     def __post_init__(self):
         for value in (self.device_path, self.vendor, self.product, self.interface):
@@ -44,6 +45,10 @@ class DeviceEvidence:
             raise ValueError("invalid video format evidence")
         if self.device_number is not None and (type(self.device_number) is not int or self.device_number < 0):
             raise ValueError("invalid device number")
+        if self.instance_token is not None:
+            if (not isinstance(self.instance_token, tuple) or len(self.instance_token) != 3
+                    or any(type(value) is not int or value < 0 for value in self.instance_token)):
+                raise ValueError("invalid device instance token")
 
     @property
     def strong_key(self):

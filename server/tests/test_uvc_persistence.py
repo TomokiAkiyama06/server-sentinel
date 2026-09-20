@@ -28,7 +28,7 @@ class PersistenceTests(unittest.TestCase):
         connection.execute(SCHEMA)
         connection.close()
         self.source_id = UUID(int=1)
-        self.camera = DeviceEvidence("/dev/video0", "synthetic", "model", "serial")
+        self.camera = DeviceEvidence("/dev/video0", "synthetic", "model", "serial", instance_token=(1, 2, 3))
         self.store = ApprovalStore(self.database)
 
     def controller(self):

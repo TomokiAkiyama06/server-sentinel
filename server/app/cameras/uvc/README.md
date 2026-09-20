@@ -14,6 +14,11 @@ state and a fixed reason. A unique serial/vendor/product/interface match can
 reconnect automatically. Port, by-id name and device number alone cannot prove
 that a non-serial camera returned.
 
+The current sysfs object's device/inode/change-time tuple is only an ephemeral
+instance marker. A recreated node invalidates a pending/live weak binding even
+when its path and product metadata are identical; this marker is never treated
+as durable physical identity for automatic reconnect.
+
 `ReconnectController` retains an explicitly approved non-serial binding only
 while that capture session remains alive. Reconnect, re-enable or process
 restart requires approval again when identity is weak. Duplicate serial evidence

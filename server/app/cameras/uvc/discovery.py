@@ -143,6 +143,8 @@ class LinuxDiscovery:
         resolved = entry.resolve(strict=True)
         if not resolved.is_relative_to(self.sys_root):
             raise ProbeError("device leaves expected sysfs tree")
+        info = resolved.stat()
+        instance_token = (info.st_dev, info.st_ino, info.st_ctime_ns)
         raw_device = _text(resolved / "dev")
         if raw_device is None or not re.fullmatch(r"[0-9]+:[0-9]+", raw_device):
             raise ProbeError("missing device number")
@@ -178,6 +180,9 @@ class LinuxDiscovery:
                     aliases.append(alias.name)
         except FileNotFoundError:
             pass
+        info = resolved.stat()
+        if instance_token != (info.st_dev, info.st_ino, info.st_ctime_ns):
+            raise ProbeError("device changed during discovery")
         return DeviceEvidence(str(path), vendor, product, serial, index,
                               tuple(sorted(aliases)), topology, capabilities.formats,
-                              os.makedev(major, minor))
+                              os.makedev(major, minor), instance_token)

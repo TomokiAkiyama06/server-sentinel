@@ -103,6 +103,19 @@ class DiscoveryTests(unittest.TestCase):
         result = LinuxDiscovery(sys_root=self.sys, dev_root=self.dev, probe=self.probe).scan()
         self.assertIsNone(result.devices[0].strong_key)
 
+    def test_recreated_sysfs_node_has_a_new_instance_not_a_durable_identity(self):
+        self.add_node("video0", 0)
+        (self.usb / "serial").unlink()
+        discovery = LinuxDiscovery(sys_root=self.sys, dev_root=self.dev, probe=self.probe)
+        before = discovery.scan().devices[0]
+        (self.usb / "video0").rename(self.usb / "removed-video0")
+        (self.classes / "video0").unlink()
+        self.add_node("video0", 0)
+        after = discovery.scan().devices[0]
+        self.assertEqual(before.device_path, after.device_path)
+        self.assertNotEqual(before.instance_token, after.instance_token)
+        self.assertIsNone(after.strong_key)
+
     def test_missing_sysfs_tree_is_empty(self):
         result = LinuxDiscovery(sys_root=self.sys / "absent", dev_root=self.dev, probe=self.probe).scan()
         self.assertEqual(result.devices, ())

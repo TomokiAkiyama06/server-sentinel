@@ -48,6 +48,8 @@ class ApprovalStore:
             evidence = json.loads(row[0])
             evidence["by_id"] = tuple(evidence["by_id"])
             evidence["formats"] = tuple(evidence["formats"])
+            if evidence.get("instance_token") is not None:
+                evidence["instance_token"] = tuple(evidence["instance_token"])
             return ApprovalState(DeviceEvidence(**evidence), bool(row[1]))
         except (sqlite3.Error, ValueError, TypeError, KeyError):
             raise ApprovalStorageError("UVC approval state is unavailable") from None

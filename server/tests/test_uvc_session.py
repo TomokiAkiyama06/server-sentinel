@@ -96,6 +96,15 @@ class SessionTests(unittest.TestCase):
         self.assertNotEqual(self.controller.state, CameraState.ONLINE)
         self.assertEqual(self.frames, [])
 
+    def test_weak_candidate_recreated_before_open_requires_new_approval(self):
+        original = replace(self.camera, serial=None, instance_token=(1, 2, 3))
+        self.controller.approve(original, [original])
+        replacement = replace(original, instance_token=(1, 4, 5))
+        self.discovery.devices = [replacement]
+        self.assertFalse(self.session.step())
+        self.assertEqual(self.controller.state, CameraState.MANUAL)
+        self.assertEqual(self.frames, [])
+
 
 if __name__ == "__main__":
     unittest.main()

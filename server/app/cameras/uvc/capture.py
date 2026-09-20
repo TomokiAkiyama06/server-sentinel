@@ -138,6 +138,8 @@ class MmapCapture:
             raise CaptureError("invalid video capture node")
         if self.candidate.device_number is None:
             raise CaptureError("video device number is unavailable")
+        if self.candidate.strong_key is None and self.candidate.instance_token is None:
+            raise CaptureError("weak video identity lacks a current instance")
         try:
             self.fd = self.opener(path, os.O_RDWR | os.O_NONBLOCK | os.O_CLOEXEC | os.O_NOFOLLOW)
             info = self.fstat(self.fd)

@@ -124,6 +124,12 @@ class CaptureTests(unittest.TestCase):
         self.assertFalse(self.calls)
         self.assertEqual(self.closed, [8])
 
+    def test_weak_candidate_without_instance_is_refused_before_open(self):
+        self.capture.candidate = replace(self.camera, serial=None)
+        with self.assertRaisesRegex(CaptureError, "lacks a current instance"):
+            self.capture.open()
+        self.assertFalse(self.opened)
+
     def test_device_number_reuse_does_not_match_other_node(self):
         capture = self.make_capture(fstat=lambda fd: SimpleNamespace(st_mode=stat.S_IFCHR, st_rdev=0))
         with self.assertRaises(CaptureError):
