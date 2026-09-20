@@ -556,6 +556,11 @@ The synthetic CI tests do not complete these checks. On an isolated Capture Node
 - [ ] Confirm `--check` succeeds both outside and inside the generated systemd
   mount namespace when the media root is a subdirectory of an approved mount.
   A bind of another backing directory on the same device must be rejected.
+- [ ] Record the Owner-approved filesystem UUID only in the private deployment
+  configuration. On a disposable volume, replace the filesystem while reusing
+  the mount path and device name, restart the Agent, and verify `--check` and
+  new writes refuse the replacement rather than treating it as the approved
+  storage.
 - [ ] Start/stop through systemd after #11/#13/#14 integration; verify no GUI/tray,
   no microphone opens, no audio setting and no inbound listener/SSH dependency.
 - [ ] Unplug an approved UVC camera: source becomes offline while node heartbeat
