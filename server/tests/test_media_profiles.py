@@ -267,12 +267,11 @@ class AdmissionTests(unittest.TestCase):
         first = admissions.admit(self.capabilities(), profiles)
         old_pipeline = pipeline(recording=SyntheticFactory(), profiles=profiles,
                                 admission=first.lease)
-        self.addCleanup(old_pipeline.close)
+        blocked = admissions.admit(self.capabilities(), profiles)
+        self.assertEqual(blocked.reasons, ("pipeline_active",))
+        self.assertTrue(old_pipeline.status.state in {"degraded", "healthy"})
+        old_pipeline.close()
         replacement = admissions.admit(self.capabilities(), profiles)
-        self.assertEqual(old_pipeline.status.state, "unavailable")
-        self.assertIn("admission_expired", old_pipeline.status.reasons)
-        with self.assertRaises(RuntimeError):
-            old_pipeline.offer(packet(0, keyframe=True))
         with self.assertRaises(RuntimeError):
             old_pipeline.replace_inference_profile(inference_profile(fps=Fraction(2)))
         with self.assertRaises(ValueError):
@@ -294,12 +293,20 @@ class AdmissionTests(unittest.TestCase):
         )
         admissions = SourceProfileAdmissions(1)
         decision = admissions.admit(capabilities, base)
+        self.assertFalse(hasattr(decision.lease, "release_pipeline"))
+        self.assertFalse(hasattr(decision.lease, "transition"))
         value = pipeline(recording=SyntheticFactory(), viewer=SyntheticFactory(),
                          profiles=base, admission=decision.lease)
         self.addCleanup(value.close)
         value.replace_viewer_profile(allowed_viewer)
         self.assertEqual(value.profiles, allowed)
         self.assertEqual(admissions.admitted(SOURCE), allowed)
+        with self.assertRaises(ValueError):
+            pipeline(recording=SyntheticFactory(), profiles=base,
+                     admission=decision.lease)
+        with self.assertRaises(ValueError):
+            pipeline(recording=SyntheticFactory(), profiles=allowed,
+                     admission=decision.lease)
         unsupported = ViewerProfile(video_format(width=640, height=360,
                                                   fps=Fraction(5)))
         with self.assertRaises(ValueError):
@@ -308,6 +315,28 @@ class AdmissionTests(unittest.TestCase):
             value.replace_inference_profile(inference_profile(fps=Fraction(2)))
         self.assertEqual(value.profiles, allowed)
         self.assertEqual(admissions.admitted(SOURCE), allowed)
+
+    def test_failed_pipeline_cleanup_retains_exclusive_lease_claim(self):
+        profiles = source_profiles()
+        admissions = SourceProfileAdmissions(1)
+        decision = admissions.admit(self.capabilities(), profiles)
+        factory = SyntheticFactory()
+        value = pipeline(recording=factory, profiles=profiles, admission=decision.lease)
+        factory.adapters[0].fail_close = True
+        value.close()
+        self.assertFalse(admissions.release(decision.lease))
+        with self.assertRaises(ValueError):
+            pipeline(recording=SyntheticFactory(), profiles=profiles,
+                     admission=decision.lease)
+
+        factory.adapters[0].fail_close = False
+        value.close()
+        replacement = pipeline(recording=SyntheticFactory(), profiles=profiles,
+                               admission=decision.lease)
+        value.close()  # The stale claim cannot release the replacement claim.
+        self.assertNotEqual(replacement.status.state, "unavailable")
+        self.assertTrue(replacement.offer(packet(0, keyframe=True)).recording_queued)
+        replacement.close()
 
 
 class PipelineTests(unittest.TestCase):

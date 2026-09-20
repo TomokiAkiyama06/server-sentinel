@@ -20,9 +20,13 @@ unchanged. It does not infer modes from a source role/type or provide benchmark
 defaults. The Camera Source registry remains authoritative for persisted
 configuration; this is the scheduler-side boundary before pipeline construction.
 Successful admission returns a generation-bound lease. An admission-bound
-pipeline accepts viewer/inference adaptation only when the resulting complete
-set is in that lease's allowlist. The same manager transition publishes the
-selected complete set, so admission state stays aligned with the pipeline.
+pipeline atomically claims that lease only when its initial profiles equal the
+manager's selected set. The resulting opaque ownership claim stays private to
+that pipeline, so a lease holder cannot release or transition another pipeline
+and a second concurrent pipeline cannot reuse it. Viewer and inference adaptation
+is accepted only when the resulting complete set is in the lease's allowlist.
+The same manager transition publishes the selected complete set, so admission
+state stays aligned with the sole pipeline owner.
 Teardown releases only the matching generation, so a delayed old teardown cannot
 remove a replacement reservation. Released or superseded leases fail closed.
 

@@ -494,8 +494,12 @@ type/role, and supplies no benchmark-derived defaults. The persisted Camera
 Source registry remains authoritative for configuration. Successful admission
 returns a generation-bound lease: profile adaptation must remain within its
 complete-set allowlist and atomically updates the manager's selected profile set.
-Stale generation teardown cannot release the current source reservation, and a
-released or superseded lease cannot construct or continue a pipeline.
+Pipeline construction atomically claims the lease only for that current selected
+set and retains an opaque pipeline-specific ownership claim; a lease holder cannot
+release or transition that claim, and the same lease cannot own two pipelines.
+Stale generation teardown cannot release a later pipeline or the current source
+reservation, and a released or superseded lease cannot construct or continue a
+pipeline.
 Inference sampling applies to presentation-ordered decoded frames, never to
 compressed reference packets before decoding. Packet gaps reset dependency state
 and require a keyframe; the capture profile also sets an explicit maximum forward

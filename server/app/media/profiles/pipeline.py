@@ -231,13 +231,16 @@ class SourcePipeline:
             raise ValueError("capture must be verified as video-only before ingest")
         if not profiles.recording.format.video_only or not profiles.viewer.format.video_only:
             raise ValueError("recording and viewer output must be video-only")
-        if admission is not None and (
-                not isinstance(admission, AdmissionLease)
-                or admission.source_id != source_id or not admission.permits(profiles)):
-            raise ValueError("profiles are not admitted for this source")
+        claim = None
+        if admission is not None:
+            if not isinstance(admission, AdmissionLease) or admission.source_id != source_id:
+                raise ValueError("profiles are not admitted for this source")
+            claim = admission._claim(profiles)
+            if claim is None:
+                raise ValueError("profiles are not admitted for this source")
         self.source_id = source_id
         self.stream_id = stream_id
-        self._admission = admission
+        self._claim = claim
         self._profiles = profiles
         self._viewer_limits = viewer_limits
         self._viewer_factory = viewer_factory
@@ -283,7 +286,7 @@ class SourcePipeline:
         recording = self.recording_status
         viewer = self.viewer_status if self._viewers else None
         reasons = set(self._capture_reasons)
-        if self._admission is not None and not self._admission.active:
+        if self._claim is not None and not self._claim.active:
             reasons.add("admission_expired")
         if self._closed:
             reasons.add("pipeline_closed")
@@ -400,18 +403,25 @@ class SourcePipeline:
         if self._closed:
             self._recording.close()
             self._close_viewer()
+            self._release_admission_if_clean()
             return
         self._closed = True
         self._recording.close()
         self._close_viewer()
         self._viewers.clear()
+        self._release_admission_if_clean()
+
+    def _release_admission_if_clean(self) -> None:
+        if (self._claim is not None and not self._recording.status.available
+                and (self._viewer is None or not self._viewer.status.available)):
+            self._claim.release()
 
     def _ensure_open(self) -> None:
         if self._closed:
             raise RuntimeError("pipeline is closed")
-        if self._admission is not None and not self._admission.active:
+        if self._claim is not None and not self._claim.active:
             raise RuntimeError("pipeline admission is no longer active")
 
     def _ensure_admitted(self, profiles: SourceProfiles) -> None:
-        if self._admission is not None and not self._admission.transition(profiles):
+        if self._claim is not None and not self._claim.transition(profiles):
             raise ValueError("profiles are not admitted for this source")

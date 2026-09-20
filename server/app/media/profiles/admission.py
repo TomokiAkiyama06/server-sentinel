@@ -60,12 +60,27 @@ class AdmissionLease:
     def permits(self, profiles: SourceProfiles) -> bool:
         return self._owner.permits(self, profiles)
 
-    def transition(self, profiles: SourceProfiles) -> bool:
-        return self._owner.transition(self, profiles)
+    def _claim(self, profiles: SourceProfiles) -> "_PipelineClaim | None":
+        return self._owner._claim_pipeline(self, profiles)
+
+
+@dataclass(frozen=True)
+class _PipelineClaim:
+    """Opaque ownership capability retained only by its SourcePipeline."""
+
+    source_id: UUID
+    lease: AdmissionLease = field(repr=False)
+    _owner: "SourceProfileAdmissions" = field(repr=False, compare=False)
 
     @property
     def active(self) -> bool:
-        return self._owner.permits(self)
+        return self._owner._owns_pipeline(self)
+
+    def transition(self, profiles: SourceProfiles) -> bool:
+        return self._owner._transition_pipeline(self, profiles)
+
+    def release(self) -> bool:
+        return self._owner._release_pipeline(self)
 
 
 class SourceProfileAdmissions:
@@ -85,6 +100,7 @@ class SourceProfileAdmissions:
         self._profiles: dict[UUID, SourceProfiles] = {}
         self._source_types: dict[UUID, SourceType] = {}
         self._leases: dict[UUID, AdmissionLease] = {}
+        self._pipeline_owners: dict[UUID, _PipelineClaim] = {}
         self._next_generation = 1
         self._lock = Lock()
 
@@ -102,6 +118,8 @@ class SourceProfileAdmissions:
             if (capabilities.source_id not in self._profiles
                     and len(self._profiles) >= self.maximum_active_sources):
                 reasons.append("active_source_limit")
+            if self._pipeline_owners.get(capabilities.source_id) is not None:
+                reasons.append("pipeline_active")
             if reasons:
                 return AdmissionDecision(False, tuple(reasons))
             lease = AdmissionLease(capabilities.source_id, self._next_generation,
@@ -118,6 +136,8 @@ class SourceProfileAdmissions:
         with self._lock:
             if self._leases.get(lease.source_id) is not lease:
                 return False
+            if self._pipeline_owners.get(lease.source_id) is not None:
+                return False
             self._profiles.pop(lease.source_id, None)
             self._leases.pop(lease.source_id, None)
             return True
@@ -128,18 +148,51 @@ class SourceProfileAdmissions:
             return False
         with self._lock:
             return (self._leases.get(lease.source_id) is lease
-                    and (profiles is None or profiles in lease.profile_sets))
+                    and (profiles is None or self._profiles.get(lease.source_id) == profiles))
 
-    def transition(self, lease: AdmissionLease, profiles: SourceProfiles) -> bool:
-        """Validate and publish a live generation's complete profile set."""
+    def _claim_pipeline(self, lease: AdmissionLease,
+                        profiles: SourceProfiles) -> _PipelineClaim | None:
+        """Atomically bind the current selected set to one pipeline instance."""
         if (not isinstance(lease, AdmissionLease) or lease._owner is not self
+                or not isinstance(profiles, SourceProfiles)):
+            return None
+        with self._lock:
+            if (self._leases.get(lease.source_id) is not lease
+                    or self._profiles.get(lease.source_id) != profiles
+                    or self._pipeline_owners.get(lease.source_id) is not None):
+                return None
+            claim = _PipelineClaim(lease.source_id, lease, self)
+            self._pipeline_owners[lease.source_id] = claim
+            return claim
+
+    def _owns_pipeline(self, claim: _PipelineClaim) -> bool:
+        if not isinstance(claim, _PipelineClaim) or claim._owner is not self:
+            return False
+        with self._lock:
+            return (self._leases.get(claim.source_id) is claim.lease
+                    and self._pipeline_owners.get(claim.source_id) is claim)
+
+    def _release_pipeline(self, claim: _PipelineClaim) -> bool:
+        if not isinstance(claim, _PipelineClaim) or claim._owner is not self:
+            return False
+        with self._lock:
+            if self._pipeline_owners.get(claim.source_id) is not claim:
+                return False
+            self._pipeline_owners.pop(claim.source_id, None)
+            return True
+
+    def _transition_pipeline(self, claim: _PipelineClaim,
+                             profiles: SourceProfiles) -> bool:
+        """Validate and publish a live generation's complete profile set."""
+        if (not isinstance(claim, _PipelineClaim) or claim._owner is not self
                 or not isinstance(profiles, SourceProfiles)):
             return False
         with self._lock:
-            if (self._leases.get(lease.source_id) is not lease
-                    or profiles not in lease.profile_sets):
+            if (self._leases.get(claim.source_id) is not claim.lease
+                    or self._pipeline_owners.get(claim.source_id) is not claim
+                    or profiles not in claim.lease.profile_sets):
                 return False
-            self._profiles[lease.source_id] = profiles
+            self._profiles[claim.source_id] = profiles
             return True
 
     def admitted(self, source_id: UUID) -> SourceProfiles | None:
