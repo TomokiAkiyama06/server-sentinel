@@ -46,10 +46,14 @@ component is root-owned and not writable by others unless it is sticky. Give it 
 and nothing more, for example `root:server-sentinel` with mode `0640`. The
 runtime account must be able to read it and must never be able to rewrite it; a
 world-readable, group-writable, service-owned, or runtime-root-resident
-configuration is refused. Do not place it under `/tmp` or `/var/tmp`: the unit
-sets `PrivateTmp=true`, so the running service would see an empty private
-temporary tree and could not reopen it. The installer refuses those locations
-and refuses installation, configuration, or unit paths containing `..`.
+configuration is refused.
+
+Keep the installation destination, the configuration, and the runtime root out
+of `/tmp`, `/var/tmp`, `/home`, `/root` and `/run/user`. The unit sets
+`PrivateTmp=true` and `ProtectHome=true`, so the running service sees empty or
+inaccessible trees there and could not enter the release directory or reopen
+the configured data. The installer refuses those locations before staging, and
+refuses installation, configuration, or unit paths containing `..`.
 
 The JSON configuration has this shape (values are examples, not deployment
 defaults):
@@ -114,6 +118,11 @@ sudo /tmp/server-sentinel-installer-1.1.0.pyz \
 `--unit` accepts exactly `/etc/systemd/system/server-sentinel.service`. Using one
 canonical administrator unit prevents another systemd search path from selecting
 a different definition when the installer restarts the logical service.
+
+`--destination` is created when it does not exist. An existing directory is
+adopted only when it is empty or is already a ServerSentinel installation root,
+and its mode is never widened otherwise, so a mistyped destination is reported
+instead of being relaxed.
 
 Each release gets its own virtual environment under `releases/<version>`.
 Dependencies install offline from the artifact with hashes and binary-only

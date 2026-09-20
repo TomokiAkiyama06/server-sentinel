@@ -145,9 +145,17 @@ Runtime-data assumptions:
 - deployment configuration is administrator-owned and readable but not writable
   by the dedicated runtime account, is refused if it is world-readable,
   group-writable, inside the installation or release tree, inside the
-  runtime-writable data tree, under `/tmp` or `/var/tmp` where the unit's
-  `PrivateTmp=true` would hide it from the service, or under any directory path
-  component the administrator does not control;
+  runtime-writable data tree, or under any directory path component the
+  administrator does not control;
+- the installation destination, the configuration, and the runtime root are
+  refused under `/tmp` and `/var/tmp`, which the unit's `PrivateTmp=true`
+  replaces with empty private trees, and under `/home`, `/root` and
+  `/run/user`, which its `ProtectHome=true` makes empty or inaccessible. They
+  would otherwise pass the installer's own preflight and fail only after
+  staging and unit mutation;
+- an existing `--destination` is adopted only when it is empty or already a
+  ServerSentinel installation root, so a mistyped destination such as `/root`
+  is never relaxed to mode `0755`;
 - the Owner-approved runtime filesystem is pinned by a stable filesystem UUID.
   Linux major/minor device numbers are reused by a replaced or reformatted disk,
   so they only corroborate that identity. A runtime mount that is missing,

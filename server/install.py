@@ -29,6 +29,9 @@ SYSTEMD_UNIT = Path("/etc/systemd/system/server-sentinel.service")
 # The generated unit sets PrivateTmp=true, so these directories are replaced by
 # empty private trees for the running service.
 PRIVATE_TMP_ROOTS = (Path("/tmp"), Path("/var/tmp"))
+# The generated unit sets ProtectHome=true, so these directories are empty or
+# inaccessible inside the service mount namespace.
+PROTECTED_HOME_ROOTS = (Path("/home"), Path("/root"), Path("/run/user"))
 VERSION = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+(?:-[a-z0-9.]+)?")
 
 
@@ -449,23 +452,57 @@ def _stage(args, deployment: Deployment, account: pwd.struct_passwd, runner,
     return "releases/" + args.version
 
 
-def _reachable_configuration(path: Path) -> None:
-    """Refuse a configuration the running service could never reopen.
+def _under(resolved: Path, roots) -> bool:
+    return any(resolved == root or resolved.is_relative_to(root) for root in roots)
 
-    The unit sets ``PrivateTmp=true``, so the service sees its own empty
-    ``/tmp`` and ``/var/tmp``.  A configuration placed there is readable by the
-    installer but unreachable from ``ExecStartPre``, which would make every
-    otherwise valid installation fail during activation.
+
+def _reachable_deployment_path(path: Path, description: str) -> None:
+    """Refuse a path the running service could never reach.
+
+    The generated unit sets ``PrivateTmp=true`` and ``ProtectHome=true``, so
+    ``/tmp`` and ``/var/tmp`` become empty private trees and ``/home``,
+    ``/root`` and ``/run/user`` become empty or inaccessible inside the service
+    mount namespace.  A release tree, configuration or runtime root placed
+    there passes the installer's own non-systemd preflight but makes activation
+    fail after staging and unit mutation, so refuse it beforehand.
     """
     try:
         resolved = path.resolve(strict=True)
     except (OSError, RuntimeError):
-        raise ValueError("deployment configuration is unavailable") from None
-    if any(resolved == root or resolved.is_relative_to(root)
-           for root in PRIVATE_TMP_ROOTS):
+        raise ValueError(description + " is unavailable") from None
+    if _under(resolved, PRIVATE_TMP_ROOTS):
         raise ValueError(
-            "deployment configuration must not live under a private temporary directory"
+            description + " must not live under a private temporary directory"
         )
+    if _under(resolved, PROTECTED_HOME_ROOTS):
+        raise ValueError(
+            description + " must not live under a protected home directory"
+        )
+
+
+def _prepare_destination(path: Path) -> None:
+    """Create or adopt the installation root without widening anything else.
+
+    ``mkdir(exist_ok=True)`` followed by an unconditional ``chmod`` would also
+    relax a pre-existing directory that the installer did not create, so a
+    mistyped ``--destination`` such as ``/root`` would gain traversal for every
+    account before the operation failed for unrelated reasons.  Normalize the
+    mode only for a directory this invocation created or an empty one, and
+    otherwise require an existing ServerSentinel installation root.
+    """
+    created = True
+    try:
+        path.mkdir(mode=0o755)
+    except FileExistsError:
+        created = False
+    _protected_parent(path)
+    if created or not any(path.iterdir()):
+        path.chmod(0o755)
+        return
+    if not (path / "releases").is_dir():
+        raise ValueError("existing destination is not a ServerSentinel installation root")
+    if path.stat().st_mode & 0o005 != 0o005:
+        raise ValueError("existing installation root is unreachable by the service account")
 
 
 def execute(args, *, runner=subprocess.run) -> None:
@@ -484,18 +521,18 @@ def execute(args, *, runner=subprocess.run) -> None:
         # untraversable for the dedicated account's preflight.
         previous_umask = os.umask(0o022)
         try:
-            args.destination.mkdir(mode=0o755, exist_ok=True)
-            _protected_parent(args.destination)
-            args.destination.chmod(0o755)
+            _prepare_destination(args.destination)
         finally:
             os.umask(previous_umask)
         _execute_locked(args, runner)
 
 
 def _execute_locked(args, runner) -> None:
-    _reachable_configuration(args.config)
+    _reachable_deployment_path(args.config, "deployment configuration")
+    _reachable_deployment_path(args.destination, "installation destination")
     deployment = Deployment.load(args.config, code_root=Path(__file__).resolve().parent,
                                  install_root=args.destination)
+    _reachable_deployment_path(deployment.runtime_root, "runtime root")
     account = pwd.getpwuid(deployment.service_uid)
     if account.pw_uid == 0:
         raise ValueError("dedicated non-root account required")

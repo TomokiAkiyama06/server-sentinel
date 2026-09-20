@@ -138,7 +138,8 @@ class ReleaseLifecycleTests(unittest.TestCase):
         return argparse.Namespace(**values)
 
     def perform(self, arguments, *, mount=True, root_device=None, approved_device=None,
-                private_tmp=(Path("/nonexistent-private-temporary-root"),)):
+                private_tmp=(Path("/nonexistent-private-temporary-root"),),
+                protected_home=(Path("/nonexistent-protected-home-root"),)):
         account = pwd.getpwuid(self.uid)
         if root_device is None:
             # The fixture's temporary runtime directory ordinarily shares the
@@ -158,6 +159,7 @@ class ReleaseLifecycleTests(unittest.TestCase):
                 "app.deployment.ADMINISTRATOR_UID", self.uid), patch(
                 "app.deployment._approved_filesystem_device", side_effect=uuid_lookup), patch(
                 "install.PRIVATE_TMP_ROOTS", private_tmp), patch(
+                "install.PROTECTED_HOME_ROOTS", protected_home), patch(
                 "install.pwd.getpwuid", return_value=account):
             execute(arguments, runner=self.runner)
 
@@ -405,7 +407,10 @@ class ReleaseLifecycleTests(unittest.TestCase):
         self.assertFalse((self.installation / "releases").exists())
 
     def test_configuration_and_runtime_cannot_live_in_release_tree(self):
-        self.installation.mkdir()
+        # Model runtime data placed inside a real installation root, so the
+        # containment check runs rather than the destination adoption guard.
+        self.installation.mkdir(mode=0o755)
+        (self.installation / "releases").mkdir(mode=0o755)
         internal = self.installation / "runtime"
         for path in (internal, internal / "state", internal / "recordings", internal / "audit"):
             path.mkdir(mode=0o700)
@@ -768,6 +773,44 @@ class ReleaseLifecycleTests(unittest.TestCase):
             self.perform(self.arguments("install", "1.0.0"), private_tmp=(self.root,))
         self.assertFalse((self.installation / "releases").exists())
         self.assertFalse(self.unit.exists())
+
+    def test_deployment_paths_under_a_protected_home_are_refused(self):
+        # ProtectHome=true empties /home, /root and /run/user inside the
+        # service mount namespace, so each required path is checked separately.
+        for root in (self.root, self.installation, self.runtime):
+            with self.subTest(root=root):
+                with self.assertRaisesRegex(ValueError, "protected home directory"):
+                    self.perform(self.arguments("rollback"), protected_home=(root,))
+        self.assertFalse((self.installation / "releases").exists())
+        self.assertFalse(self.unit.exists())
+
+    def test_existing_destination_that_is_not_an_installation_is_not_relaxed(self):
+        foreign = self.root / "foreign"
+        foreign.mkdir(mode=0o700)
+        (foreign / "private.synthetic").write_text("unrelated administrator data")
+        arguments = self.arguments("rollback")
+        arguments.destination = foreign
+        with self.assertRaisesRegex(ValueError, "not a ServerSentinel installation root"):
+            self.perform(arguments)
+        # The mistyped destination keeps its original restrictive mode.
+        self.assertEqual(foreign.stat().st_mode & 0o777, 0o700)
+        self.assertEqual((foreign / "private.synthetic").read_text(),
+                         "unrelated administrator data")
+        self.assertFalse((foreign / "releases").exists())
+        self.assertFalse(self.unit.exists())
+
+    def test_existing_empty_or_installed_destination_is_normalized(self):
+        self.installation.mkdir(mode=0o700)
+        self.perform(self.arguments("install", "1.0.0"))
+        self.assertEqual(self.installation.stat().st_mode & 0o777, 0o755)
+        # An existing installation root that the service cannot traverse is
+        # reported instead of being silently widened.
+        self.installation.chmod(0o700)
+        with self.assertRaisesRegex(ValueError, "unreachable by the service account"):
+            self.perform(self.arguments("update", "1.1.0"))
+        self.assertEqual(self.installation.stat().st_mode & 0o777, 0o700)
+        self.assertFalse((self.installation / "releases/1.1.0").exists())
+        self.assertEqual(os.readlink(self.installation / "current"), "releases/1.0.0")
 
     def test_python_interpreter_must_be_absolute_and_root_controlled(self):
         candidate = self.root / "python"
