@@ -141,17 +141,29 @@ flowchart TD
   i27 --> i28
   i7 --> i47
   i10 --> i47
+  i23 --> i47
+  i50 --> i47
   i7 --> i48
   i8 --> i48
   i10 --> i48
+  i9 --> i48
+  i17 --> i48
+  i21 --> i48
+  i23 --> i48
+  i50 --> i48
   i7 --> i49
   i10 --> i49
+  i23 --> i49
+  i25 --> i49
   i7 --> i50
   i10 --> i50
+  i9 --> i50
+  i13 --> i50
+  i23 --> i50
   i5 --> i51
 ```
 
-Issue #7 explicitly depends on #6 (authorization design before health/version endpoint contracts), #16 on #17 (bounded media profiles for buffer estimates/admission), and #26 on #16 / #21 (critical preservation and configured notification integration). Plans 22–25 depend only on their required foundation and authorization work; Plan 26 depends on the CI guard. These do not prevent independent mock/contract work.
+Issue #7 explicitly depends on #6 (authorization design before health/version endpoint contracts), #16 on #17 (bounded media profiles for buffer estimates/admission), and #26 on #16 / #21 (critical preservation and configured notification integration). Plans 22–25 additionally depend on the capabilities their own mandatory acceptance invokes, so that none of them can be scheduled as closable before its deployed acceptance is executable: #47 re-runs #23's hardware-integrity comparison and recording-health self-test after update/rollback and compares #50's audit records across the lifecycle; #48 drives the #9 source registry, #17 profiles, #21 storage settings, #23 baseline/recorder self-check and the #50 audit of Owner approval inside the wizard; #49 must show that #23 hardware identifiers are redacted and #25 Owner biometric material is excluded from an export; #50 audits #23 baseline approval and #9 / #13 source and capture-node revocation. Plan 26 depends on the CI guard. These prerequisites bound acceptance/closure only; independent mock, contract and shell work may proceed in parallel, and unfinished areas stay explicitly pending.
 
 ## Plan 1 — CI / repository guardrails
 
@@ -905,7 +917,7 @@ Acceptance:
 
 GitHub Issue: [#47](https://github.com/TomokiAkiyama06/server-sentinel/issues/47)
 
-Depends on: [#7](https://github.com/TomokiAkiyama06/server-sentinel/issues/7), [#10](https://github.com/TomokiAkiyama06/server-sentinel/issues/10)
+Depends on: [#7](https://github.com/TomokiAkiyama06/server-sentinel/issues/7), [#10](https://github.com/TomokiAkiyama06/server-sentinel/issues/10), [#23](https://github.com/TomokiAkiyama06/server-sentinel/issues/23), [#50](https://github.com/TomokiAkiyama06/server-sentinel/issues/50)
 
 Labels: `backend`, `security`, `storage`, `documentation`, `server-required`, `hardware-required`, `manual-test-required`
 
@@ -926,7 +938,7 @@ Acceptance:
 
 GitHub Issue: [#48](https://github.com/TomokiAkiyama06/server-sentinel/issues/48)
 
-Depends on: [#7](https://github.com/TomokiAkiyama06/server-sentinel/issues/7), [#8](https://github.com/TomokiAkiyama06/server-sentinel/issues/8), [#10](https://github.com/TomokiAkiyama06/server-sentinel/issues/10)
+Depends on: [#7](https://github.com/TomokiAkiyama06/server-sentinel/issues/7), [#8](https://github.com/TomokiAkiyama06/server-sentinel/issues/8), [#10](https://github.com/TomokiAkiyama06/server-sentinel/issues/10), [#9](https://github.com/TomokiAkiyama06/server-sentinel/issues/9), [#17](https://github.com/TomokiAkiyama06/server-sentinel/issues/17), [#21](https://github.com/TomokiAkiyama06/server-sentinel/issues/21), [#23](https://github.com/TomokiAkiyama06/server-sentinel/issues/23), [#50](https://github.com/TomokiAkiyama06/server-sentinel/issues/50)
 
 Labels: `backend`, `frontend`, `security`, `storage`, `server-required`, `hardware-required`, `manual-test-required`
 
@@ -946,7 +958,7 @@ Acceptance:
 
 GitHub Issue: [#49](https://github.com/TomokiAkiyama06/server-sentinel/issues/49)
 
-Depends on: [#7](https://github.com/TomokiAkiyama06/server-sentinel/issues/7), [#10](https://github.com/TomokiAkiyama06/server-sentinel/issues/10)
+Depends on: [#7](https://github.com/TomokiAkiyama06/server-sentinel/issues/7), [#10](https://github.com/TomokiAkiyama06/server-sentinel/issues/10), [#23](https://github.com/TomokiAkiyama06/server-sentinel/issues/23), [#25](https://github.com/TomokiAkiyama06/server-sentinel/issues/25)
 
 Labels: `backend`, `security`, `documentation`, `server-required`, `hardware-required`, `manual-test-required`
 
@@ -967,7 +979,7 @@ Acceptance:
 
 GitHub Issue: [#50](https://github.com/TomokiAkiyama06/server-sentinel/issues/50)
 
-Depends on: [#7](https://github.com/TomokiAkiyama06/server-sentinel/issues/7), [#10](https://github.com/TomokiAkiyama06/server-sentinel/issues/10)
+Depends on: [#7](https://github.com/TomokiAkiyama06/server-sentinel/issues/7), [#10](https://github.com/TomokiAkiyama06/server-sentinel/issues/10), [#9](https://github.com/TomokiAkiyama06/server-sentinel/issues/9), [#13](https://github.com/TomokiAkiyama06/server-sentinel/issues/13), [#23](https://github.com/TomokiAkiyama06/server-sentinel/issues/23)
 
 Labels: `backend`, `security`, `storage`, `server-required`, `hardware-required`, `manual-test-required`
 
@@ -1000,8 +1012,10 @@ Scope:
 
 Acceptance:
 - exact version、upstream、license evidence、component種別、material transitive obligations、required notices / redistribution obligationsを記録する;
+- reviewed componentごとにimmutable pinの証跡（lockfile entry、resolved artifact digest / checksum、model weightsのdigest、container base imageのdigest）をlicense evidenceと同じrecordに残し、mutable version range、branch、floating tag、digest未検証artifactをlicense-reviewed扱いにしない;
+- build / release時に実際に解決されたpinがreviewed pinと一致することを検証し、pin証跡の欠落・不一致・後からの差し替えはversion文字列が一致していてもblockする;
 - AGPL/GPL/SSPL/source-available/unclearはOwnerの明示approval/documentationなしにblockする;
-- CI / release validationとsynthetic manifestsでallow、block、missing evidence、transitive-obligation / notice evidenceの欠落を検証する。
+- CI / release validationとsynthetic manifestsでallow、block、missing evidence、transitive-obligation / notice evidenceの欠落に加えて、missing pin、mutable range / floating tag、reviewed digestとbuild digestのmismatchをrejectすることを検証する。
 
 ## Explicitly pending product decisions
 
