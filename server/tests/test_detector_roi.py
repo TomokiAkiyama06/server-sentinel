@@ -11,11 +11,10 @@ from uuid import UUID
 from app.cameras.registry.models import SourceType
 from app.detection.foundation import GrayFrame, Observation, Quality
 from app.detection.roi import (
-    MAXIMUM_BATCH, Calibration, CalibrationArchive, CalibrationRecord,
-    CriticalDelivery, CriticalKind, OwnerCalibrationOperations, Policy,
-    SceneDetector,
+    MAXIMUM_BATCH, RETIRED_STREAM_LIMIT, Calibration, CalibrationArchive,
+    CalibrationRecord, CriticalDelivery, CriticalKind,
+    OwnerCalibrationOperations, Policy, SceneDetector,
 )
-from app.detection.roi.detector import RETIRED_STREAM_LIMIT
 from app.storage.migrations import migrate
 from app.storage.schema import APPLICATION_MIGRATIONS
 
