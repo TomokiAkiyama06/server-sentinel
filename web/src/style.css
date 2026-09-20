@@ -59,6 +59,8 @@ p { margin: .5rem 0 1rem; }
 .danger { border-color: #ad3940; color: #8a2a30; font-weight: 650; }
 .row-actions button:disabled { color: #5c6e76; background: #eef3f5; border-color: #dbe5e9; }
 [aria-busy="true"] { background: #f5f9fa; }
+.write-alert { border: 1px solid #ad3940; border-left-width: 4px; border-radius: .6rem; background: #fdf4f4; padding: .8rem 1rem; margin-bottom: 1rem; }
+.write-alert p { margin: 0 0 .6rem; color: #6d2328; }
 .playback { margin-top: 1.5rem; border: 1px solid #dce5e8; border-radius: 1rem; background: #fff; padding: 1.25rem; }
 .states { display: flex; flex-wrap: wrap; gap: .5rem; }
 .state { border: 1px solid #cad7dc; border-radius: 1rem; padding: .25rem .8rem; font-size: .78rem; color: #4b6069; background: #fff; }

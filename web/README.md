@@ -48,7 +48,9 @@ allows only one in-flight write per recording, so a repeated click cannot issue 
 second conflicting mutation; that row's owner controls are disabled and marked
 `aria-busy` while the write runs. Replacing the provider or the session aborts
 outstanding mutations, and an aborted write is reported as neither a result nor
-an error.
+an error. A rejected write reports itself in its own alert and does not replace
+the loaded list with a read-failure banner, because the server-side result of
+that write is unknown rather than the list being unavailable.
 
 `src/setup/storage.tsx` is owner-only. It shows the three backend storage states
 (`NORMAL`, `STORAGE_PRESSURE`, `STORAGE_HARD_STOP`), marks the current one, and

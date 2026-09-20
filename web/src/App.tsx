@@ -29,6 +29,7 @@ export function App({ services = deniedServices }: { services?: DashboardService
   const [attempt, setAttempt] = useState(0);
   const [refresh, setRefresh] = useState(0);
   const [busy, setBusy] = useState<readonly string[]>([]);
+  const [writeFailed, setWriteFailed] = useState(false);
   const [mutations] = useState(() => new MutationQueue());
   const t = messages[locale];
 
@@ -99,6 +100,7 @@ export function App({ services = deniedServices }: { services?: DashboardService
 
   useEffect(() => {
     setBusy(current => current.length ? [] : current);
+    setWriteFailed(false);
     return () => mutations.abortAll();
   }, [services, access, mutations]);
 
@@ -110,9 +112,11 @@ export function App({ services = deniedServices }: { services?: DashboardService
   const mutate = (id: string, run: (signal: AbortSignal) => Promise<void>) => {
     if (!mutations.start(id, run, outcome => {
       setBusy(mutations.pending);
-      // An aborted mutation belongs to a replaced session: no result, no error.
-      if (outcome === 'done') setRefresh(value => value + 1);
-      else if (outcome === 'failed') setRecordings({ state: 'failed' });
+      // A failed write is not a failed read: keep the loaded list and report
+      // the write separately. An aborted mutation belongs to a replaced
+      // session and is neither a result nor an error.
+      if (outcome === 'done') { setWriteFailed(false); setRefresh(value => value + 1); }
+      else if (outcome === 'failed') setWriteFailed(true);
     })) return;
     setBusy(mutations.pending);
   };
@@ -156,7 +160,8 @@ export function App({ services = deniedServices }: { services?: DashboardService
             </> : selected === 'sources' && sources.state === 'failed' ? <p role="alert">{t.sourcesUnavailable}</p>
               : selected === 'sources' && sources.state === 'loading' ? <p role="status">{t.checking}</p>
               : selected === 'recordings' && recordings.state === 'ready'
-                ? <RecordingsView t={t} recordings={recordings.items} owner={access.role === 'owner'} actions={actions} busy={busy} />
+                ? <RecordingsView t={t} recordings={recordings.items} owner={access.role === 'owner'} actions={actions} busy={busy}
+                    writeFailed={writeFailed} onReload={() => { setWriteFailed(false); setRefresh(value => value + 1); }} />
                 : selected === 'recordings' && recordings.state === 'failed'
                   ? <section className="notice" role="alert"><p>{t.recordingsUnavailable}</p><button className="primary" onClick={() => setRefresh(value => value + 1)}>{t.retry}</button></section>
                   : selected === 'recordings' && recordings.state === 'loading' ? <p role="status">{t.checking}</p>

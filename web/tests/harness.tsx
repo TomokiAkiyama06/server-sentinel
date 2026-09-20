@@ -21,6 +21,11 @@ let loaded = false;
 // Synthetic latency so tests can observe in-flight mutation handling.
 let syntheticMutations = 0;
 const settle = () => new Promise<void>(resolve => setTimeout(resolve, 150));
+// The synthetic write still asks the server, so failures and aborts are real.
+const accepted = (signal: AbortSignal) => api.read('/api/mock/mutation', value => {
+  if (typeof value !== 'object' || value === null || !('accepted' in value) || value.accepted !== true) throw new Error();
+  return true;
+}, signal);
 Object.defineProperty(window, 'syntheticMutations', { get: () => syntheticMutations });
 const services = {
   loadSession: (signal: AbortSignal) => api.read('/api/mock/session', session, signal),
@@ -43,15 +48,17 @@ const services = {
     return value as StorageSummary;
   }, signal),
   // Synthetic local mutations: this harness has no write route and never gets one.
-  starRecording: async (id: string, starred: boolean) => {
+  starRecording: async (id: string, starred: boolean, signal: AbortSignal) => {
     syntheticMutations += 1;
     await settle();
+    await accepted(signal);
     recordings = recordings.map(recording => recording.id === id
       ? { ...recording, starred, retention_days_left: starred ? null : 7 } : recording);
   },
-  deleteRecording: async (id: string) => {
+  deleteRecording: async (id: string, signal: AbortSignal) => {
     syntheticMutations += 1;
     await settle();
+    await accepted(signal);
     recordings = recordings.filter(recording => recording.id !== id);
   },
 };

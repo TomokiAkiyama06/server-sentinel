@@ -42,7 +42,7 @@ const storageFixture = (state, available_bytes = 21_474_836_480) => ({
 });
 let cases = 0;
 
-async function scenario(viewport, { production = false, status = 200, session = owner, count = 1, optIn = false, sourceStatus = 200, positiveControl = false, recordings = 3, recordingStatus = 200, storageState = 'STORAGE_PRESSURE', storageAvailable, storageStatus = 200 } = {}, assertions) {
+async function scenario(viewport, { production = false, status = 200, session = owner, count = 1, optIn = false, sourceStatus = 200, positiveControl = false, recordings = 3, recordingStatus = 200, storageState = 'STORAGE_PRESSURE', storageAvailable, storageStatus = 200, mutationStatus = 200 } = {}, assertions) {
   const page = await pageFor(browser, viewport);
   // Chrome applies bypass when parsing a document's policy. Set it before
   // navigation, only for the dedicated interception positive control.
@@ -83,6 +83,9 @@ async function scenario(viewport, { production = false, status = 200, session = 
     }
     if (!production && url.pathname === '/api/mock/recordings') {
       await fulfill(JSON.stringify(recordingStatus === 200 ? recordingFixture(recordings) : { detail: 'synthetic private error' }), 'application/json', recordingStatus); return;
+    }
+    if (!production && url.pathname === '/api/mock/mutation') {
+      await fulfill(JSON.stringify(mutationStatus === 200 ? { accepted: true } : { detail: 'synthetic private error' }), 'application/json', mutationStatus); return;
     }
     if (!production && url.pathname === '/api/mock/storage') {
       await fulfill(JSON.stringify(storageStatus === 200 ? storageFixture(storageState, storageAvailable) : { detail: 'synthetic private error' }), 'application/json', storageStatus); return;
@@ -191,6 +194,20 @@ try {
         assert.equal(await page.evaluate("document.querySelectorAll('.row-actions button:disabled').length"), 0);
       });
     }
+    // A rejected write reports itself without discarding the loaded list.
+    await scenario(viewport, { recordings: 3, mutationStatus: 503 }, async page => {
+      await page.click('録画');
+      await page.wait("document.querySelectorAll('[data-recording-id]').length === 3");
+      await page.evaluate("Array.from(document.querySelectorAll('button')).find(el => el.textContent === '★ を付ける').click()");
+      await page.wait("Boolean(document.querySelector('.write-alert'))");
+      assert.equal(await page.evaluate("document.querySelectorAll('[data-recording-id]').length"), 3);
+      assert.equal(await page.evaluate("document.querySelectorAll('[aria-busy=\"true\"]').length"), 0);
+      assert.equal(await page.evaluate("document.querySelectorAll('.row-actions button:disabled').length"), 0);
+      assert.doesNotMatch(await page.evaluate('document.body.innerText'), /録画の一覧を取得できません/);
+      // Retrying the load clears the write alert and keeps the list.
+      await page.evaluate("document.querySelector('.write-alert .primary').click()");
+      await page.wait("document.querySelectorAll('.write-alert').length === 0 && document.querySelectorAll('[data-recording-id]').length === 3");
+    });
     for (const storageState of ['NORMAL', 'STORAGE_PRESSURE', 'STORAGE_HARD_STOP']) {
       await scenario(viewport, { storageState }, async page => {
         await page.click('ストレージと通知');
