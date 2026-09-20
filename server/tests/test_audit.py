@@ -246,3 +246,30 @@ class AuditTests(unittest.TestCase):
         self.assertEqual(AuditOutcome.DENIED, record.outcome)
         self.assertEqual(ActorCategory.UNAUTHENTICATED, record.actor_category)
         self.assertNotIn(private_value.encode(), self.database.path.read_bytes())
+
+    def test_plan23_baseline_approval_contract_uses_fixed_atomic_action(self):
+        baseline_id = uuid4()
+        with closing(self.database.connect()) as connection:
+            connection.execute(
+                "CREATE TABLE synthetic_hardware_baselines "
+                "(id TEXT PRIMARY KEY, approved INTEGER NOT NULL)"
+            )
+
+        def approve_on(connection, target):
+            connection.execute(
+                "INSERT INTO synthetic_hardware_baselines VALUES (?, 1)",
+                (str(target),),
+            )
+
+        self.admin.approve_hardware_baseline(
+            "synthetic-owner-session", baseline_id, approve_on,
+        )
+        with closing(self.database.connect()) as connection:
+            self.assertEqual(1, connection.execute(
+                "SELECT approved FROM synthetic_hardware_baselines WHERE id=?",
+                (str(baseline_id),),
+            ).fetchone()[0])
+        record = self.store.list_records()[0]
+        self.assertEqual(AuditAction.APPROVE_HARDWARE_BASELINE, record.action)
+        self.assertEqual(TargetKind.HARDWARE_BASELINE, record.target_kind)
+        self.assertEqual(AuditOutcome.SUCCEEDED, record.outcome)

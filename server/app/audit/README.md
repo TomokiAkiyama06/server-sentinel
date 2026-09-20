@@ -22,6 +22,19 @@ domain mutation and successful audit append in the same SQLite transaction, so
 an audit write failure rolls the mutation back. Plain `PermissionError` denial
 from an injected authorizer is safely classified without inspecting its detail.
 
+Hardware baseline inventory/approval is not implemented in this tree. Plan 23
+must call `OwnerAdministration.approve_hardware_baseline()` with its logical
+baseline UUID and a transaction-aware mutation callback. That contract fixes
+the action to `approve_hardware_baseline` and prevents baseline approval from
+committing without its successful audit record; it is not evidence that the
+hardware baseline service or probes already exist.
+
+Owner recording deletion commits its `deleting` journal transition and
+`delete_recording` audit together. Media cleanup then follows the recording
+store's existing recoverable deletion lifecycle. A cleanup interruption leaves
+the durable deletion journal for startup recovery rather than restoring a
+recording whose links may already have been reclaimed.
+
 `AuditStore.cleanup_expired()` defaults to 90 days and deletes only rows from
 the audit table that are strictly older than the cutoff. The Main Server runs it
 at startup and every 24 hours through `AuditRetentionRuntime`.

@@ -747,14 +747,40 @@ class RecordingStore:
         self._check()
         if type(owner_requested) is not bool:
             raise ValueError("invalid deletion request")
-        before = self.usage_bytes()
         with self._transaction():
+            before = self.prepare_delete_on(
+                self.db, recording_id, owner_requested=owner_requested,
+            )
+        return self.finish_prepared_delete(recording_id, before)
+
+    def prepare_delete_on(self, connection, recording_id: UUID, *,
+                          owner_requested: bool) -> int:
+        """Journal logical deletion inside a caller-owned audit transaction."""
+        self._check()
+        if (connection is not self.db or not connection.in_transaction
+                or type(owner_requested) is not bool):
+            raise RecordingError("RECORDING_DATABASE_BUSY")
+        with self._control_reservation():
+            before = self.usage_bytes()
             row = self._recording(recording_id)
             if row["status"] == "active" or (row["starred"] and not owner_requested):
                 raise RecordingError("RECORDING_DELETE_REFUSED")
-            self.db.execute("UPDATE recordings SET status='deleting' WHERE id=?", (str(recording_id),))
-            self.db.execute("DELETE FROM recording_links WHERE recording_id=?", (str(recording_id),))
-            self.db.execute("DELETE FROM recording_discontinuities WHERE recording_id=?", (str(recording_id),))
+            connection.execute(
+                "UPDATE recordings SET status='deleting' WHERE id=?", (str(recording_id),)
+            )
+            connection.execute(
+                "DELETE FROM recording_links WHERE recording_id=?", (str(recording_id),)
+            )
+            connection.execute(
+                "DELETE FROM recording_discontinuities WHERE recording_id=?", (str(recording_id),)
+            )
+        return before
+
+    def finish_prepared_delete(self, recording_id: UUID, before: int) -> int:
+        """Complete media cleanup after the durable deletion journal commits."""
+        self._check()
+        if type(before) is not int or before < 0:
+            raise ValueError("invalid deletion accounting")
         try:
             self._trim()
             with self._transaction():

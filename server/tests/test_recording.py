@@ -13,6 +13,7 @@ import zlib
 
 from app.audit import (
     AuditAction, AuditOutcome, AuditStorageError, AuditStore, OwnerAuditService,
+    OwnerAuthorizationError,
 )
 from app.audit.integration import OwnerAdministration
 from app.cameras.registry import CameraRegistry
@@ -553,6 +554,55 @@ class RecordingTests(unittest.TestCase):
                     "synthetic-owner", self.store, recording, False,
                 )
         self.assertTrue(self.store.manifest(recording)["starred"])
+
+    def test_owner_delete_success_failure_and_denial_are_integrated(self):
+        class PermitOwner:
+            def require_owner(self, actor_context):
+                return None
+
+        self.store.append(self.segment())
+        deleted = self.store.start_manual(self.source, 30_000, duration_ms=10_000)
+        denied = self.store.start_manual(self.source, 30_000, duration_ms=10_000)
+        self.store.finish(deleted)
+        self.store.finish(denied)
+        self.store.release_source(self.source)
+        database = Database(self.base / "metadata.sqlite")
+        audit = AuditStore(database)
+        admin = OwnerAdministration(
+            OwnerAuditService(audit, PermitOwner()), CameraRegistry(database),
+        )
+
+        admin.delete_recording("synthetic-owner", self.store, deleted)
+        with self.assertRaises(RecordingError):
+            self.store.manifest(deleted)
+        missing = uuid4()
+        with self.assertRaises(RecordingError):
+            admin.delete_recording("synthetic-owner", self.store, missing)
+
+        with patch.object(audit, "append_on",
+                          side_effect=AuditStorageError("synthetic unavailable")):
+            with self.assertRaises(AuditStorageError):
+                admin.delete_recording("synthetic-owner", self.store, denied)
+        self.assertEqual(str(denied), self.store.manifest(denied)["id"])
+
+        class GenericDeny:
+            def require_owner(self, actor_context):
+                raise PermissionError("synthetic secret detail")
+
+        denied_admin = OwnerAdministration(
+            OwnerAuditService(audit, GenericDeny()), CameraRegistry(database),
+        )
+        with self.assertRaises(OwnerAuthorizationError):
+            denied_admin.delete_recording("not-owner", self.store, denied)
+        self.assertEqual(str(denied), self.store.manifest(denied)["id"])
+        outcomes = {
+            record.target_logical_id: record.outcome
+            for record in audit.list_records()
+            if record.action is AuditAction.DELETE_RECORDING
+        }
+        self.assertEqual(AuditOutcome.SUCCEEDED, outcomes[deleted])
+        self.assertEqual(AuditOutcome.FAILED, outcomes[missing])
+        self.assertEqual(AuditOutcome.DENIED, outcomes[denied])
 
     def test_active_recording_cannot_be_deleted_even_by_owner(self):
         recording = self.store.start_manual(self.source, 30_000)

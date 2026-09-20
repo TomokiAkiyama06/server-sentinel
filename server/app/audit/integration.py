@@ -90,6 +90,17 @@ class OwnerAdministration:
             ),
         )
 
+    def approve_hardware_baseline(self, actor_context, baseline_id, approve_on):
+        """Plan 23 contract: callback mutates its baseline on this transaction."""
+        if not callable(approve_on):
+            raise TypeError("baseline approval operation is required")
+        return self.service.execute_transactional(
+            actor_context, action=AuditAction.APPROVE_HARDWARE_BASELINE,
+            target_kind=TargetKind.HARDWARE_BASELINE,
+            target_logical_id=baseline_id,
+            operation=lambda connection: approve_on(connection, baseline_id),
+        )
+
     def set_recording_starred(self, actor_context, recording_store,
                               recording_id, starred):
         return self.service.execute_transactional(
@@ -100,3 +111,15 @@ class OwnerAdministration:
                 connection, recording_id, starred,
             ),
         )
+
+    def delete_recording(self, actor_context, recording_store, recording_id):
+        """Commit Owner deletion journal and audit, then finish recoverable cleanup."""
+        before = self.service.execute_transactional(
+            actor_context, action=AuditAction.DELETE_RECORDING,
+            target_kind=TargetKind.RECORDING, target_logical_id=recording_id,
+            connection=recording_store.db,
+            operation=lambda connection: recording_store.prepare_delete_on(
+                connection, recording_id, owner_requested=True,
+            ),
+        )
+        return recording_store.finish_prepared_delete(recording_id, before)
