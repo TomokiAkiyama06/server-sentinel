@@ -17,11 +17,15 @@ from uuid import UUID
 
 from app.presence.access import AccessDenied
 from app.presence.delivery import ActionResult, NotificationAdapter
-from app.presence.models import InvalidObservation, Kind, Observation, PresenceState, Quality, Value
-from app.presence.schema import presence_migration
+from app.presence.models import (InvalidObservation, Kind, Observation, PresenceState,
+                                 Quality, Value, timestamp)
 from app.presence.service import PresenceService
 from app.storage.database import Database
-from app.storage.migrations import BUILTIN_MIGRATIONS, migrate
+from app.storage.migrations import migrate
+from app.storage.schema import APPLICATION_MIGRATIONS
+
+CRITICAL_PATHS = ("critical_detection", "critical_persistence",
+                  "critical_evidence", "critical_notifications")
 
 NOW = datetime(2026, 1, 1, tzinfo=timezone.utc)
 SOURCE, NODE, OWNER = UUID(int=1), UUID(int=2), UUID(int=3)
@@ -55,7 +59,8 @@ class PresenceTests(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         self.database = Database(Path(temporary.name) / "synthetic.sqlite3")
         with closing(self.database.connect()) as db:
-            migrate(db, BUILTIN_MIGRATIONS + (presence_migration(2),))
+            # The production catalog, so the ordinary startup path is exercised.
+            migrate(db, APPLICATION_MIGRATIONS)
         self.access = MockAccess()
         self.evidence, self.notifications = [], []
         self.service = self.make_service()
@@ -67,8 +72,8 @@ class PresenceTests(unittest.TestCase):
         def notifications(item, complete):
             self.notifications.append(item)
             return ActionResult.DELIVERED
-        ports = dict(access=self.access, evidence=evidence,
-                     notifications=notifications, write_guard=lambda: None)
+        ports = dict(access=self.access, evidence=evidence, notifications=notifications,
+                     write_guard=lambda: None, detection=lambda: True)
         ports.update(changes)
         return PresenceService(self.database, **ports)
 
@@ -94,7 +99,9 @@ class PresenceTests(unittest.TestCase):
             result = self.service.override("owner", state, now=NOW, clock_trusted=True)
             self.assertEqual(result["state"], state.value)
             self.assertEqual(result["suppress_ordinary"], state == PresenceState.PRESENT)
-            self.assertTrue(all(result[key] for key in ("critical_detection_armed", "critical_evidence_armed", "critical_notifications_armed")))
+            # No presence state, including a manual override, disarms a path.
+            self.assertEqual([result[key] for key in CRITICAL_PATHS], ["armed"] * 4)
+            self.assertFalse(result["critical_paths_degraded"])
 
     def test_manual_override_precedes_inference_and_hint_until_expired(self):
         self.service.set_hint("owner", PresenceState.ABSENT, now=NOW, valid_until=NOW + timedelta(hours=3), clock_trusted=True)
@@ -168,9 +175,75 @@ class PresenceTests(unittest.TestCase):
     def test_unconfigured_ports_visible_unconfirmed_events_do_not_dispatch(self):
         self.service = self.make_service(evidence=None, notifications=None)
         self.service.record(observation(Kind.SERVER_MOVEMENT, confirmed=False))
-        self.assertEqual(self.status()["pending_critical_actions"], 0)
+        status = self.status()
+        self.assertEqual(status["pending_critical_actions"], 0)
+        # An unconfigured preservation/notification path is never called armed.
+        self.assertEqual(status["critical_evidence"], "unavailable")
+        self.assertEqual(status["critical_notifications"], "unavailable")
+        self.assertTrue(status["critical_paths_degraded"])
         self.service.record(observation(Kind.SERVER_MOVEMENT))
         self.assertEqual(self.status()["pending_critical_actions"], 2)
+
+    def test_critical_paths_reported_from_configuration_and_known_health(self):
+        closed = PresenceService(self.database)
+        status = closed.snapshot(now=NOW, clock_trusted=True)
+        self.assertEqual([status[key] for key in CRITICAL_PATHS],
+                         ["unknown", "unavailable", "unavailable", "unavailable"])
+        self.assertTrue(status["critical_paths_degraded"])
+        stopped = self.make_service(detection=lambda: False)
+        self.assertEqual(stopped.snapshot(now=NOW, clock_trusted=True)["critical_detection"], "unavailable")
+
+        def broken():
+            raise OSError("synthetic private probe failure")
+
+        for probe in (None, broken, lambda: "armed", lambda: 1):
+            unclear = self.make_service(detection=probe)
+            snapshot = unclear.snapshot(now=NOW, clock_trusted=True)
+            self.assertEqual(snapshot["critical_detection"], "unknown")
+            self.assertTrue(snapshot["critical_paths_degraded"])
+
+    def test_status_stays_readable_and_honest_when_storage_admission_refuses(self):
+        self.service.override("owner", PresenceState.PRESENT, now=NOW,
+                              expires_at=NOW + timedelta(hours=1), clock_trusted=True)
+        self.service.record(observation(Kind.SERVER_MOVEMENT))
+
+        def full():
+            raise RuntimeError("storage admission refused")
+
+        self.service.write_guard = full
+        status = self.status(now=NOW + timedelta(hours=2))
+        # Reading status must not need a durable write, and the expired override
+        # must stop applying even while its retirement cannot be persisted.
+        self.assertEqual((status["state"], status["basis"]), ("UNKNOWN", "unknown"))
+        self.assertTrue(status["override_expiry_pending"])
+        self.assertEqual(status["critical_persistence"], "unavailable")
+        self.assertTrue(status["critical_paths_degraded"])
+        self.assertEqual(status["pending_critical_actions"], 2)
+        self.assertEqual([row["action"] for row in self.service.audit("owner")], ["override_set"])
+        self.service.write_guard = lambda: None
+        recovered = self.status(now=NOW + timedelta(hours=2))
+        self.assertFalse(recovered["override_expiry_pending"])
+        self.assertEqual(recovered["critical_persistence"], "armed")
+        self.status(now=NOW + timedelta(hours=2))
+        self.assertEqual([row["action"] for row in self.service.audit("owner")],
+                         ["override_set", "override_expired"])
+
+    def test_application_startup_migration_creates_presence_storage(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        settings = Settings(Path(directory.name))
+        application = create_app(settings)
+
+        async def start():
+            async with application.router.lifespan_context(application):
+                pass
+
+        asyncio.run(start())
+        service = PresenceService(Database(settings.database_path), access=self.access,
+                                  write_guard=lambda: None)
+        service.record(observation())
+        window = dict(received_from=NOW - timedelta(days=1), received_to=NOW + timedelta(days=1))
+        self.assertEqual(len(service.history("recordings", **window)["items"]), 1)
 
     def test_duplicate_event_does_not_repeat_completed_side_effects(self):
         value = observation(Kind.CAMERA_TAMPER)
@@ -256,12 +329,35 @@ class PresenceTests(unittest.TestCase):
         for _ in range(3):
             self.service.record(observation(Kind.PERSON, confirmed=False))
         first = self.history(limit=2)
-        second = self.history(after_sequence=first["next_sequence"])
+        second = self.history(after=first["next_cursor"])
         self.assertEqual((len(first["items"]), len(second["items"])), (2, 1))
         self.assertTrue(set(row["id"] for row in first["items"]).isdisjoint(row["id"] for row in second["items"]))
+        self.assertEqual(self.history(after=second["next_cursor"])["items"], [])
         for limit in (0, 501, True):
             with self.assertRaises(ValueError):
                 self.history(limit=limit)
+        for cursor in ("cursor", {"sequence": 1}, {"received_at": 1, "sequence": 1},
+                       {"received_at": timestamp(NOW), "sequence": True},
+                       {"received_at": timestamp(NOW), "sequence": -1},
+                       {"received_at": timestamp(NOW), "sequence": 1, "kind": "person"}):
+            with self.assertRaises(ValueError):
+                self.history(after=cursor)
+
+    def test_history_pages_share_one_ordering_key_when_occurrence_is_out_of_order(self):
+        late = self.service.record(observation(Kind.PERSON, at=NOW + timedelta(hours=5),
+                                               received=NOW + timedelta(seconds=1), confirmed=False))
+        early = self.service.record(observation(Kind.PERSON, at=NOW, source_id=UUID(int=9),
+                                                received=NOW + timedelta(seconds=2), confirmed=False))
+        page = self.history(limit=1)
+        self.assertEqual(page["ordering_basis"], "received_at")
+        self.assertFalse(page["ordering_degraded"])
+        rest = self.history(after=page["next_cursor"])
+        # Concatenated pages follow the advertised order and drop no row, even
+        # though the second source reported an earlier occurrence time.
+        self.assertEqual([row["id"] for row in page["items"] + rest["items"]],
+                         [str(late.identifier), str(early.identifier)])
+        self.assertEqual([row["occurred_at"] for row in self.history()["items"]],
+                         [timestamp(NOW + timedelta(hours=5)), timestamp(NOW)])
 
     def test_storage_guard_failure_prevents_mutation(self):
         def full():

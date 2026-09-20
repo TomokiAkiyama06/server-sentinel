@@ -10,19 +10,42 @@ from .models import (CRITICAL, Kind, Observation, PresenceState, Quality, Value,
                      timestamp, utc)
 
 
+ARMED = "armed"
+UNAVAILABLE = "unavailable"
+UNKNOWN = "unknown"
+
+
 class PresenceService:
-    def __init__(self, database, *, access=None, evidence=None, notifications=None, write_guard=None):
+    def __init__(self, database, *, access=None, evidence=None, notifications=None,
+                 write_guard=None, detection=None):
         self.database = database
         self.access = access or DenyAccess()
         self.evidence = evidence
         self.notifications = notifications
         self.write_guard = write_guard
+        # Injected by the reviewed #24 detector supervisor. Absent means unknown
+        # detection health here; this module never claims a detector is running.
+        self.detection = detection
 
     @contextmanager
-    def _transaction(self):
+    def _transaction(self, *, required=True):
+        """Admitted durable write. ``required=False`` yields ``None`` when storage refuses.
+
+        Only read-only status reporting uses the optional form, so a refused or
+        exhausted volume degrades visibly instead of hiding presence state.
+        """
         if self.write_guard is None:
+            if not required:
+                yield None
+                return
             raise RuntimeError("storage admission required")
-        self.write_guard()
+        try:
+            self.write_guard()
+        except Exception:
+            if required:
+                raise
+            yield None
+            return
         with closing(self.database.connect()) as db:
             db.execute("PRAGMA synchronous=FULL")
             db.execute("BEGIN IMMEDIATE")
@@ -34,16 +57,21 @@ class PresenceService:
                 raise
 
     @staticmethod
-    def _clock(db, now, trusted):
+    def _clock_trust(db, now, trusted):
+        """Evaluate clock trust without writing; reads never advance the marker."""
         if type(trusted) is not bool:
             raise ValueError("explicit clock trust required")
-        stamp = timestamp(now)
         previous = db.execute("SELECT latest FROM presence_clock WHERE singleton=1").fetchone()
-        if previous is not None and stamp < previous[0]:
+        if previous is not None and timestamp(now) < previous[0]:
             return False
-        if trusted:
-            db.execute("INSERT OR REPLACE INTO presence_clock VALUES (1,?)", (stamp,))
         return trusted
+
+    @classmethod
+    def _clock(cls, db, now, trusted):
+        result = cls._clock_trust(db, now, trusted)
+        if result:
+            db.execute("INSERT OR REPLACE INTO presence_clock VALUES (1,?)", (timestamp(now),))
+        return result
 
     def _owner(self, context):
         identity = self.access.require_owner(context)
@@ -203,7 +231,9 @@ class PresenceService:
     @staticmethod
     def _effective(db, now, trusted):
         override = db.execute("SELECT * FROM presence_override WHERE singleton=1").fetchone()
-        if override:
+        # An elapsed expiry stops applying immediately, whether or not the
+        # durable retirement write has been admitted yet.
+        if override and not (override["expires"] and trusted and override["expires"] <= timestamp(now)):
             return PresenceState(override["state"]), "manual_override", override["expires"]
         if trusted:
             for slot in ("owner_observation", "hint"):
@@ -213,25 +243,71 @@ class PresenceService:
                     return PresenceState(item["state"]), slot, None
         return PresenceState.UNKNOWN, "unknown", None
 
+    def _retire_override(self, now):
+        """Retire an expired override durably; report (retired, storage admitted)."""
+        retired = admitted = False
+        with self._transaction(required=False) as db:
+            if db is not None:
+                admitted = True
+                override = db.execute("SELECT * FROM presence_override WHERE singleton=1").fetchone()
+                if override is None or not override["expires"] or override["expires"] > timestamp(now):
+                    retired = True
+                elif self._clock(db, now, True):
+                    db.execute("INSERT INTO presence_audit(action,actor,at,state) VALUES ('override_expired',NULL,?,?)",
+                               (timestamp(now), override["state"]))
+                    db.execute("DELETE FROM presence_override WHERE singleton=1")
+                    self._control_observation(db, self._effective(db, now, True)[0], now)
+                    retired = True
+        return retired, admitted
+
+    def _detection_path(self):
+        if self.detection is None:
+            return UNKNOWN
+        try:
+            reported = self.detection()
+        except Exception:
+            # A failing health probe is unknown health, never a healthy claim.
+            return UNKNOWN
+        if type(reported) is not bool:
+            return UNKNOWN
+        return ARMED if reported else UNAVAILABLE
+
+    def _critical_paths(self, *, persistence_denied):
+        """Report configured/known critical-path availability, never a fixed armed.
+
+        ``armed`` means the path is configured and is not disarmed by any
+        presence state; it is not a liveness guarantee for an external worker.
+        ``pending_critical_actions`` still reports unfinished critical work.
+        """
+        paths = {
+            "critical_detection": self._detection_path(),
+            "critical_persistence": UNAVAILABLE if (self.write_guard is None or persistence_denied) else ARMED,
+            "critical_evidence": ARMED if self.evidence is not None else UNAVAILABLE,
+            "critical_notifications": ARMED if self.notifications is not None else UNAVAILABLE,
+        }
+        return {**paths, "critical_paths_degraded": any(value != ARMED for value in paths.values())}
+
     def snapshot(self, *, now, clock_trusted):
-        with self._transaction() as db:
-            trusted = self._clock(db, now, clock_trusted)
+        """Read-only status. A refused or exhausted volume never hides presence."""
+        with closing(self.database.connect()) as db:
+            trusted = self._clock_trust(db, now, clock_trusted)
             override = db.execute("SELECT * FROM presence_override WHERE singleton=1").fetchone()
-            expired = False
-            if override and override["expires"] and trusted and override["expires"] <= timestamp(now):
-                db.execute("INSERT INTO presence_audit(action,actor,at,state) VALUES ('override_expired',NULL,?,?)",
-                           (timestamp(now), override["state"]))
-                db.execute("DELETE FROM presence_override WHERE singleton=1")
-                expired = True
+        expired = bool(override and override["expires"] and trusted
+                       and override["expires"] <= timestamp(now))
+        # An expired override stops applying even when the durable retirement
+        # write is refused; the pending flag keeps that difference visible.
+        retired, admitted = self._retire_override(now) if expired else (True, True)
+        with closing(self.database.connect()) as db:
+            trusted = self._clock_trust(db, now, clock_trusted)
             state, basis, expires = self._effective(db, now, trusted)
-            if expired:
-                self._control_observation(db, state, now)
-            failed = db.execute("SELECT count(*) FROM presence_deliveries WHERE state NOT IN ('delivered','disabled')").fetchone()[0]
-            return {"state": state.value, "basis": basis, "override_expires_at": expires,
-                    "clock_degraded": not trusted,
-                    "suppress_ordinary": state == PresenceState.PRESENT and trusted,
-                    "critical_detection_armed": True, "critical_evidence_armed": True,
-                    "critical_notifications_armed": True, "pending_critical_actions": failed}
+            failed = db.execute("SELECT count(*) FROM presence_deliveries "
+                                "WHERE state NOT IN ('delivered','disabled')").fetchone()[0]
+        return {"state": state.value, "basis": basis, "override_expires_at": expires,
+                "clock_degraded": not trusted,
+                "suppress_ordinary": state == PresenceState.PRESENT and trusted,
+                **self._critical_paths(persistence_denied=not admitted),
+                "override_expiry_pending": not retired,
+                "pending_critical_actions": failed}
 
     def owner_status(self, context, *, now, clock_trusted):
         self._owner(context)
@@ -242,18 +318,42 @@ class PresenceService:
         with closing(self.database.connect()) as db:
             return [dict(row) for row in db.execute("SELECT * FROM presence_audit ORDER BY sequence")]
 
-    def history(self, context, *, received_from, received_to, limit=100, after_sequence=0):
+    @staticmethod
+    def _cursor(after):
+        if after is None:
+            return None
+        if (not isinstance(after, dict) or set(after) != {"received_at", "sequence"}
+                or type(after["received_at"]) is not str or type(after["sequence"]) is not int
+                or after["sequence"] < 0):
+            raise ValueError("invalid timeline cursor")
+        return after["received_at"], after["sequence"]
+
+    def history(self, context, *, received_from, received_to, limit=100, after=None):
+        """Receipt-ordered observation window; pages concatenate in that order.
+
+        Main-host receipt order, with the durable sequence only as a tie-break,
+        is the single key used by the SQL page, the cursor and the response.
+        Mixing it with occurrence order would make concatenated pages neither
+        chronological nor complete once sources report out of occurrence order.
+        Each item keeps its own occurrence time, quality and attribution; the
+        timeline never presents that order as established causality.
+        """
         self.access.require_recordings(context)
-        if (utc(received_from) >= utc(received_to) or type(limit) is not int or not 1 <= limit <= 500
-                or type(after_sequence) is not int or after_sequence < 0):
+        if utc(received_from) >= utc(received_to) or type(limit) is not int or not 1 <= limit <= 500:
             raise ValueError("invalid timeline window")
+        cursor = self._cursor(after)
+        window = [timestamp(received_from), timestamp(received_to)]
+        page = ""
+        if cursor is not None:
+            page = "AND (received>? OR (received=? AND sequence>?)) "
+            window += [cursor[0], cursor[0], cursor[1]]
         with closing(self.database.connect()) as db:
-            rows = db.execute("SELECT sequence,payload FROM presence_observations WHERE received>=? "
-                              "AND received<? AND sequence>? ORDER BY sequence LIMIT ?",
-                              (timestamp(received_from), timestamp(received_to), after_sequence, limit)).fetchall()
+            rows = db.execute("SELECT sequence,received,payload FROM presence_observations "
+                              "WHERE received>=? AND received<? " + page
+                              + "ORDER BY received,sequence LIMIT ?", (*window, limit)).fetchall()
         items = [{**json.loads(row["payload"]), "sequence": row["sequence"]} for row in rows]
         uncertain = any(not item["clock_trusted"] or item["uncertainty_us"] for item in items)
-        basis = "received_at" if uncertain else "occurred_at"
-        items.sort(key=lambda item: (item[basis], item["sequence"]))
-        return {"items": items, "ordering_basis": basis, "ordering_degraded": uncertain,
-                "causality": "not_inferred", "next_sequence": max((row["sequence"] for row in rows), default=after_sequence)}
+        return {"items": items, "ordering_basis": "received_at", "ordering_degraded": uncertain,
+                "causality": "not_inferred",
+                "next_cursor": ({"received_at": rows[-1]["received"], "sequence": rows[-1]["sequence"]}
+                                if rows else after)}

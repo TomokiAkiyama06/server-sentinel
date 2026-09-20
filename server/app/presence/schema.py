@@ -1,4 +1,8 @@
-"""Append at the next reviewed aggregate migration slot; no startup side effects."""
+"""Presence DDL; the application migration aggregator assigns its final slot.
+
+`app/storage/schema.py` registers this migration so the ordinary application
+startup creates these tables. No import here has startup side effects.
+"""
 
 from app.storage.migrations import Migration
 
