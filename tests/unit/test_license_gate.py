@@ -300,6 +300,43 @@ requires = ["build-backend==1.2.3"]
         with self.assertRaisesRegex(license_gate.GateError, "unsupported project dependency section"):
             license_gate.audit(self.root)
 
+    def test_dynamic_setuptools_dependencies_require_reviewed_parser(self):
+        self.write("deps.in", "unreviewed-package==9.8.7\n")
+        self.write("pyproject.toml", """\
+[project]
+dependencies = []
+dynamic = ["dependencies"]
+
+[tool.setuptools.dynamic]
+dependencies = {file = ["deps.in"]}
+""")
+        self.inputs.append({
+            "path": "pyproject.toml", "ecosystem": "python-project", "scope": "backend",
+        })
+        self.save()
+        with self.assertRaisesRegex(license_gate.GateError, "unsupported project dependency section"):
+            license_gate.audit(self.root)
+
+    def test_empty_and_non_dependency_dynamic_metadata_are_allowed(self):
+        self.write("pyproject.toml", """\
+[project]
+dependencies = []
+dynamic = ["version"]
+
+[project.optional-dependencies]
+
+[build-system]
+requires = []
+
+[tool.setuptools.dynamic]
+version = {attr = "package.__version__"}
+""")
+        self.inputs.append({
+            "path": "pyproject.toml", "ecosystem": "python-project", "scope": "backend",
+        })
+        self.save()
+        self.assertEqual(license_gate.audit(self.root), (1, 1, 0))
+
     def test_nested_requirement_dependency_is_recursively_audited(self):
         self.write("requirements.lock", "-r requirements-nested.lock\n")
         self.write("requirements-nested.lock", "nested==9.8.7 --hash=sha256:" + "c" * 64 + "\n")

@@ -222,11 +222,30 @@ def python_project(path: Path, relative: str, scope: str):
     dependencies = project.get("dependencies", [])
     if not isinstance(dependencies, list):
         raise GateError(f"invalid project dependencies in {relative}")
+    dynamic = project.get("dynamic", [])
     optional_dependencies = project.get("optional-dependencies", {})
     build_system = data.get("build-system", {})
-    if not isinstance(optional_dependencies, dict) or not isinstance(build_system, dict):
+    tool = data.get("tool", {})
+    if (not isinstance(dynamic, list)
+            or any(not isinstance(value, str) for value in dynamic)
+            or not isinstance(optional_dependencies, dict)
+            or not isinstance(build_system, dict)
+            or not isinstance(tool, dict)):
         raise GateError(f"invalid unsupported dependency section in {relative}")
-    if optional_dependencies or build_system.get("requires", []):
+    build_requires = build_system.get("requires", [])
+    if not isinstance(build_requires, list):
+        raise GateError(f"invalid unsupported dependency section in {relative}")
+    setuptools = tool.get("setuptools", {})
+    if not isinstance(setuptools, dict):
+        raise GateError(f"invalid unsupported dependency section in {relative}")
+    setuptools_dynamic = setuptools.get("dynamic", {})
+    if not isinstance(setuptools_dynamic, dict):
+        raise GateError(f"invalid unsupported dependency section in {relative}")
+    dependency_fields = {"dependencies", "optional-dependencies"}
+    if (optional_dependencies
+            or build_requires
+            or dependency_fields & set(dynamic)
+            or dependency_fields & set(setuptools_dynamic)):
         raise GateError(f"unsupported project dependency section in {relative}")
     found = []
     for dependency in dependencies:
