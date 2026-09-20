@@ -337,6 +337,11 @@ Acceptance:
 
 ## Plan 7 — Capture-node pairing + mTLS trust
 
+Status: OPEN. Proposed [ADR-0004](ADR/0004-capture-node-bootstrap-trust.md)
+documents the initial Main trust choice, one-time enrollment and revocation test
+plan. Owner approval and runtime/TLS acceptance remain outstanding; the proposal
+does not enable pairing or close Issue #13.
+
 GitHub Issue: [#13](https://github.com/TomokiAkiyama06/server-sentinel/issues/13)
 
 Depends on: [#12](https://github.com/TomokiAkiyama06/server-sentinel/issues/12), [#6](https://github.com/TomokiAkiyama06/server-sentinel/issues/6)

@@ -119,6 +119,7 @@ Issue #1 closed when PR #2 merged after documentation/bootstrap acceptance and c
 
 ## Explicit pending decisions
 
+- [ ] Owner approval of capture-node bootstrap trust/CLI enrollment (Proposed ADR-0004, #13; no listener enabled);
 - [ ] exact agent->main transport;
 - [ ] exact main->browser live transport/target latency;
 - [ ] room-overview capture/record/inference/view defaults after benchmark;
