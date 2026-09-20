@@ -12,7 +12,7 @@ from uuid import UUID, uuid4
 
 from app.cameras.registry import (
     ActiveSourceLimitError, CameraRegistry, CaptureProfile, DetectionBinding,
-    DetectionKind, HealthState, NotFoundError, RegistryError, SourceType, ValidationError,
+    DetectionKind, NodeHealthState, SourceHealthState, NotFoundError, RegistryError, SourceType, ValidationError,
 )
 from app.storage.database import Database
 from app.storage.migrations import migrate
@@ -78,7 +78,7 @@ class RegistryTests(unittest.TestCase):
         self.assertEqual(before, self.registry.list_sources())
 
     def test_offline_and_ambiguous_sources_still_reserve_capacity(self):
-        for health in HealthState:
+        for health in SourceHealthState:
             source = self.source(enabled=True)
             self.registry.update_source_health(source.id, health_state=health)
         with self.assertRaises(ActiveSourceLimitError):
@@ -164,7 +164,7 @@ class RegistryTests(unittest.TestCase):
                             role_label="custom role")
         second = self.source(source_type=SourceType.REMOTE_AGENT, capture_node_id=node.id)
         updated = self.registry.update_source(first.id, role_label="another custom role", name="Edited")
-        for state in HealthState:
+        for state in SourceHealthState:
             updated = self.registry.update_source_health(first.id, health_state=state)
             self.assertEqual(first.id, updated.id)
             self.assertEqual(node.id, updated.capture_node_id)
@@ -191,11 +191,46 @@ class RegistryTests(unittest.TestCase):
     def test_node_online_does_not_make_camera_online(self):
         node = self.registry.create_capture_node("Synthetic node")
         source = self.source(source_type=SourceType.REMOTE_AGENT, capture_node_id=node.id)
-        self.registry.update_capture_node(node.id, health_state=HealthState.ONLINE, last_seen_at=self.now)
-        self.assertEqual(HealthState.OFFLINE, self.registry.get_source(source.id).health_state)
-        self.assertEqual(HealthState.ONLINE, self.registry.get_capture_node(node.id).health_state)
-        self.registry.update_source_health(source.id, health_state=HealthState.MANUAL_INTERVENTION_REQUIRED)
-        self.assertEqual(HealthState.ONLINE, self.registry.get_capture_node(node.id).health_state)
+        self.registry.update_capture_node(node.id, health_state=NodeHealthState.ONLINE, last_seen_at=self.now)
+        self.assertEqual(SourceHealthState.OFFLINE, self.registry.get_source(source.id).health_state)
+        self.assertEqual(NodeHealthState.ONLINE, self.registry.get_capture_node(node.id).health_state)
+        self.registry.update_source_health(source.id, health_state=SourceHealthState.MANUAL_INTERVENTION_REQUIRED)
+        self.assertEqual(NodeHealthState.ONLINE, self.registry.get_capture_node(node.id).health_state)
+
+    def test_node_health_has_distinct_revocation_state_and_round_trips(self):
+        node = self.registry.create_capture_node("Synthetic node")
+        source = self.source(source_type=SourceType.REMOTE_AGENT, capture_node_id=node.id)
+        for state in NodeHealthState:
+            changed = self.registry.update_capture_node(node.id, health_state=state)
+            self.assertIsInstance(changed.health_state, NodeHealthState)
+            self.assertEqual(state, changed.health_state)
+            self.assertEqual(source, self.registry.get_source(source.id))
+        restarted = CameraRegistry(self.database)
+        self.assertEqual(NodeHealthState.REVOKED, restarted.get_capture_node(node.id).health_state)
+        self.assertEqual(node.id, restarted.get_capture_node(node.id).id)
+
+    def test_node_and_source_health_types_cannot_be_interchanged(self):
+        node = self.registry.create_capture_node("Synthetic node")
+        source = self.source(source_type=SourceType.REMOTE_AGENT, capture_node_id=node.id)
+        for state in SourceHealthState:
+            with self.assertRaises(ValidationError):
+                self.registry.update_capture_node(node.id, health_state=state)
+        for state in NodeHealthState:
+            with self.assertRaises(ValidationError):
+                self.registry.update_source_health(source.id, health_state=state)
+        self.assertEqual(node, self.registry.get_capture_node(node.id))
+        self.assertEqual(source, self.registry.get_source(source.id))
+        with closing(self.database.connect()) as connection:
+            with self.assertRaises(sqlite3.IntegrityError):
+                connection.execute(
+                    "UPDATE capture_nodes SET health_state = 'manual_intervention_required' WHERE id = ?",
+                    (str(node.id),),
+                )
+            with self.assertRaises(sqlite3.IntegrityError):
+                connection.execute("UPDATE camera_sources SET health_state = 'revoked' WHERE id = ?",
+                                   (str(source.id),))
+        self.assertEqual(node, self.registry.get_capture_node(node.id))
+        self.assertEqual(source, self.registry.get_source(source.id))
 
     def test_desired_and_negotiated_profiles_are_independent(self):
         desired = CaptureProfile(width=1920, height=1080, fps=15, codec="synthetic")
@@ -205,7 +240,7 @@ class RegistryTests(unittest.TestCase):
         self.assertEqual("unknown", source.image_quality_state)
         observed = self.now.astimezone(timezone(timedelta(hours=9)))
         updated = self.registry.update_source_health(
-            source.id, health_state=HealthState.DEGRADED, negotiated_capture_profile=negotiated,
+            source.id, health_state=SourceHealthState.DEGRADED, negotiated_capture_profile=negotiated,
             image_quality_state="synthetic_low_quality", last_seen_at=observed,
         )
         self.assertEqual(desired, updated.desired_capture_profile)
@@ -217,7 +252,7 @@ class RegistryTests(unittest.TestCase):
         self.assertIsNone(updated.desired_capture_profile)
         self.assertEqual(negotiated, updated.negotiated_capture_profile)
         updated = self.registry.update_source_health(
-            source.id, health_state=HealthState.OFFLINE, negotiated_capture_profile=None, last_seen_at=None,
+            source.id, health_state=SourceHealthState.OFFLINE, negotiated_capture_profile=None, last_seen_at=None,
         )
         self.assertIsNone(updated.negotiated_capture_profile)
         self.assertIsNone(updated.last_seen_at)
@@ -281,7 +316,7 @@ class RegistryTests(unittest.TestCase):
         source = self.source()
         for changes in ({"health_state": "online"}, {"last_seen_at": datetime(2026, 1, 1)},
                         {"image_quality_state": ""}, {"negotiated_capture_profile": {}}):
-            arguments = {"health_state": HealthState.ONLINE}
+            arguments = {"health_state": SourceHealthState.ONLINE}
             arguments.update(changes)
             with self.subTest(changes=tuple(changes)), self.assertRaises(ValidationError):
                 self.registry.update_source_health(source.id, **arguments)
