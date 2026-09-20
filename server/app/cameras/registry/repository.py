@@ -121,8 +121,14 @@ class CameraRegistry:
         with self._transaction(write=True) as connection:
             self.set_active_limit_on(connection, limit)
 
+    # Transactional integration hooks. These are process-internal primitives
+    # with no authorization of their own and no route exposure. A runtime
+    # security/admin change must reach them only through the audited Owner
+    # boundary (`app.audit.integration.OwnerAdministration`), which commits the
+    # mutation together with its audit record; calling one directly would
+    # change privileged configuration without that durable record.
     def set_active_limit_on(self, connection, limit: int) -> None:
-        """Transactional integration hook; callers own authorization/commit."""
+        """Apply the limit on a caller-owned audited Owner transaction."""
         positive_integer(limit, "active source limit")
         active = connection.execute(
             "SELECT COUNT(*) FROM camera_sources WHERE enabled = 1"
@@ -141,7 +147,11 @@ class CameraRegistry:
             return self.create_capture_node_on(connection, uuid4(), name)
 
     def create_capture_node_on(self, connection, node_id: UUID, name: str) -> CaptureNode:
-        """Transactional integration hook using an application logical ID."""
+        """Create a node on a caller-owned audited Owner transaction.
+
+        The application logical ID is chosen by that boundary so the audit
+        record and the created row identify the same target.
+        """
         identity = _identity(node_id)
         text_value(name, "node name")
         now = _time(self._clock())
@@ -177,6 +187,7 @@ class CameraRegistry:
 
     def update_capture_node_on(self, connection, node_id: UUID, *, name=_UNSET,
                                health_state=_UNSET, last_seen_at=_UNSET) -> CaptureNode:
+        """Update a node on a caller-owned audited Owner transaction."""
         identity = _identity(node_id)
         old = self._node(connection, identity)
         name = old.name if name is _UNSET else text_value(name, "node name")
@@ -237,6 +248,7 @@ class CameraRegistry:
                          capabilities: dict | None = None,
                          desired_capture_profile: CaptureProfile | None = None,
                          detection_bindings: tuple[DetectionBinding, ...] = ()) -> CameraSource:
+        """Create a source on a caller-owned audited Owner transaction."""
         identity = _identity(source_id)
         if not isinstance(source_type, SourceType):
             raise ValidationError("invalid source type")
@@ -310,6 +322,7 @@ class CameraRegistry:
                          role_label=_UNSET, enabled=_UNSET, capabilities=_UNSET,
                          desired_capture_profile=_UNSET,
                          detection_bindings=_UNSET) -> CameraSource:
+        """Update a source on a caller-owned audited Owner transaction."""
         identity = _identity(source_id)
         old = self._source(connection, identity)
         name = old.name if name is _UNSET else name
