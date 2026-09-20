@@ -16,7 +16,12 @@ root/file substitution and missing-root errors fail closed without mkdir fallbac
 The connection is opened through the already verified directory descriptor
 (`/proc/self/fd/<dirfd>`) and re-verified before any schema write, so a symlink
 or directory substituted after those checks cannot redirect it; an unavailable
-descriptor fails closed instead of reopening by re-resolved path.
+descriptor fails closed instead of reopening by re-resolved path. SQLite canonicalizes that
+filename and derives auxiliary names such as the rollback journal, which holds
+pre-update template pages, from the ordinary path, so every ancestor of the
+private root must also be unsubstitutable: owned by the service or root and not
+writable by others unless sticky. Deployments therefore cannot place the root
+under a world-writable non-sticky directory.
 Deployment wiring must reserve worst-case database, rollback journal and audit
 growth before construction/mutation, and integrate 90-day audit retention. No
 production storage policy/lifecycle is silently installed by this module.

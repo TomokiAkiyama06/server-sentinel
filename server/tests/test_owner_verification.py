@@ -348,6 +348,37 @@ class OwnerTests(TestCase):
         self.store = self.open_store()
         self.assertEqual(self.store.status(), EnrollmentStatus(False, 0))
 
+    def test_substitutable_ancestor_directory_is_rejected(self):
+        # SQLite re-resolves the canonical path for the rollback journal, which
+        # holds pre-update pages of the Owner template, so an ancestor that
+        # another user could rename or replace must not be accepted at all.
+        shared = Path(self.temp.name) / "shared"
+        shared.mkdir(mode=0o700)
+        root = shared / "private"
+        root.mkdir(mode=0o700)
+        shared.chmod(0o777)
+        with self.assertRaisesRegex(OwnerError, "PRIVATE_TEMPLATE_ROOT_UNSAFE_PATH"):
+            self.open_store(root=root)
+        self.assertEqual(list(root.iterdir()), [])
+        # Sticky shared ancestors stay usable: only an entry's owner may
+        # rename or unlink it there.
+        shared.chmod(0o1777)
+        store = self.open_store(root=root)
+        self.addCleanup(store.close)
+        self.assertEqual(store.status(), EnrollmentStatus(False, 0))
+
+    def test_ancestor_made_substitutable_later_fails_closed(self):
+        shared = Path(self.temp.name) / "late"
+        shared.mkdir(mode=0o700)
+        root = shared / "private"
+        root.mkdir(mode=0o700)
+        store = self.open_store(root=root)
+        self.addCleanup(store.close)
+        self.assertEqual(store.status(), EnrollmentStatus(False, 0))
+        shared.chmod(0o777)
+        with self.assertRaisesRegex(OwnerError, "PRIVATE_TEMPLATE_ROOT_UNSAFE_PATH"):
+            store.delete(expected_generation=0, at=NOW)
+
     def test_connection_opens_through_the_verified_directory_descriptor(self):
         self.store.close()
         opened = []

@@ -37,16 +37,33 @@ class _Template:
     provenance: ModelProvenance = field(repr=False)
 
 
+def _unsubstitutable(descriptor):
+    """Refuse a path component that another user could rename or replace.
+
+    SQLite canonicalizes the connection filename and derives auxiliary names
+    such as the rollback journal from it, so binding only the opened database
+    is not enough: every ancestor must be owned by this service or root and
+    must not be writable by others unless it is sticky, where only an entry's
+    own owner may rename or unlink it.
+    """
+    info = os.fstat(descriptor)
+    if (info.st_uid not in (0, os.geteuid())
+            or (info.st_mode & 0o022 and not info.st_mode & stat.S_ISVTX)):
+        raise OwnerError("PRIVATE_TEMPLATE_ROOT_UNSAFE_PATH")
+
+
 def _directory(path: Path):
     if not path.is_absolute() or ".." in path.parts:
         raise OwnerError("PRIVATE_TEMPLATE_ROOT_UNAVAILABLE")
     flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
     descriptor = os.open("/", flags)
     try:
+        _unsubstitutable(descriptor)
         for part in path.parts[1:]:
             next_descriptor = os.open(part, flags, dir_fd=descriptor)
             os.close(descriptor)
             descriptor = next_descriptor
+            _unsubstitutable(descriptor)
         return descriptor
     except BaseException:
         os.close(descriptor)
