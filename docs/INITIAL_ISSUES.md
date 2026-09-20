@@ -302,6 +302,11 @@ Scope:
 - Agent initiates Main Server connections without requiring Main-to-Agent SSH/admin access;
 - development-from-clone workflow;
 - standalone versioned stable release artifact/installer (for example GitHub Releases) plus systemd unit;
+- production layout separates executable/immutable artifact, config, persistent state/credentials, runtime state, and large media root; Linux paths are role-based rather than tied to the development checkout or a deployment-specific path;
+- release artifact version is traceable to a Git tag/commit and publishes a SHA-256 checksum that the install/update flow verifies before use;
+- Agent update is an explicit Capture Node administrator action; Main Server does not gain SSH/root auto-update authority over the Capture Node;
+- update/uninstall does not silently delete node credentials, Owner config, or unexpired protected incidents; failure/recovery/rollback behavior is documented;
+
 - runtime configuration/credentials/logs/media kept outside the mutable Git checkout; no deployment-specific path is a public default;
 - configurable Agent media root on a dedicated data filesystem where available;
 - installer/startup/runtime write-admission validation of expected media-root mount identity, ownership, writability, free space, and safety reserve;
@@ -315,6 +320,11 @@ Acceptance:
 - no unnecessary root runtime;
 - expected media-root mount loss/substitution is explicit degraded/failed state rather than silent fallback.
 - development runs from a checkout; the documented stable install/update path uses a versioned artifact and keeps runtime data independent of checkout changes;
+- stable installation works from the Release artifact without a Git checkout, checksum mismatch fails closed, and artifact version maps to the published tag/commit;
+- production config/state/runtime/media permissions are separated; taking over an existing Owner-prepared media root requires explicit mount/ownership validation and never performs blind recursive chmod/chown on unknown existing data;
+- update/restart preserves paired node identity and unexpired protected incidents, and uninstall/update alone never implies evidence/credential deletion;
+- Main Server never performs Agent updates by SSH/root; privileged installation/update stays an explicit Capture Node administrator operation;
+
 - the native Linux systemd service/process is named `media-capture-agent`, runs under a dedicated non-root account, and never captures/stores/forwards audio;
 - a deployment-configured media root supports a dedicated data filesystem, verifies expected mount/device identity, writability/free space/reserve, and refuses writes or root-filesystem fallback after mount loss/substitution.
 - excessive clock offset produces explicit degraded state/events rather than falsely trustworthy event timing.
@@ -812,6 +822,8 @@ Minimum intended environments:
 - one local UVC webcam;
 - two local UVC webcams where available;
 - remote Linux `media-capture-agent` with room-overview UVC camera;
+- stable Release artifact install/update path on the Capture Node once the artifact exists;
+
 - 1–4 mixed-source stress run;
 - phone browser live view;
 - Mac and desktop browser live view;
@@ -826,6 +838,9 @@ Acceptance:
 - performance/quality defaults fed back into specs/config;
 - unsupported hardware/network limits documented truthfully.
 - record exact Camera model, advertised UVC resolution/FPS/pixel-format capabilities, stable identity evidence, USB reconnect/unplug, and Agent-online/Camera-offline separation;
+- install the stable Agent from a versioned Release artifact rather than a Git checkout, verify the published checksum, confirm dedicated non-root systemd operation and config/state/runtime/media-root separation;
+- perform Agent upgrade/restart validation that preserves pairing credentials, Owner settings, and unexpired protected incidents; verify documented recovery/rollback and that Main Server does not SSH/root auto-update the Capture Node;
+
 - verify actual room-wide coverage, entrance visibility, person detection and Owner verification feasibility; compare supported 4K and 1080p candidates and record FPS, bitrate, encode path, LAN bandwidth, CPU/GPU/VRAM, and dropped frames;
 - verify duration/capacity modes, reciprocal estimates/usage, dedicated Agent media filesystem, mount loss/substitution, and no root-filesystem fallback;
 - verify T-10/T+10 protection and a complete 20-minute incident where resources allow, truthful partial/gap reports, reconnect survival, Main preserve requests, reserve safety, Owner deletion, and 60-day expiry using an accelerated/test clock where practical;
