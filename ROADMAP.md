@@ -72,8 +72,8 @@ Issue #1 closed when PR #2 merged after documentation/bootstrap acceptance and c
 
 - [x] synthetic CPU general-motion foundation (#20; runtime integration and target-host acceptance remain open)
 - [ ] permissively licensed person-detector evaluation
-- [ ] detector-specific image-quality gating
-- [ ] no false `no person` when quality is insufficient
+- [x] detector-specific image-quality gating (internal metrics/recovery/unknown contracts; real-camera calibration pending)
+- [x] no false `no person` when quality is insufficient (synthetic gate/scheduler regression tests)
 - [x] bounded per-source inference-cadence primitive (#20; Main worker integration remains open)
 - [ ] server ROI calibration/movement
 - [ ] camera tamper/occlusion/source-health correlation
