@@ -77,6 +77,7 @@ acceptance.
 - [ ] application invitation/allowlist
 - [ ] per-person ServerSentinel credential (WebAuthn/passkey) verified on every human/media route, with required authenticator user verification
 - [ ] invitation enrollment and local owner bootstrap as the only pre-credential paths
+- [ ] reserved, secure-context dashboard origin with a startup/daily reservation check and Owner notification
 - [ ] credential-bound server-side sessions with idle/absolute expiry and explicit sign-out
 - [ ] credential-level and principal-level revocation
 - [ ] fresh user-verification step-up for owner operations

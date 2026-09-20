@@ -331,6 +331,9 @@ The research-room Tailnet is shared, so run these with two people (or two browse
 - [ ] if a synced passkey is in use, confirm that revoking it takes effect on every device it synced to, and record that revocation is credential-scoped rather than per-device; if the deployment requires device-scoped control, confirm that registration refuses backup-eligible credentials;
 - [ ] no human route grants access on the proxy identity header alone;
 - [ ] record that reachability is expected for every holder of the shared account and is not treated as a finding;
+- [ ] the dashboard origin is reserved for ServerSentinel and is a secure context (HTTPS, or `http://localhost` for a strictly local browser); confirm WebAuthn registration and sign-in actually work there, and record that an ordinary-HTTP non-loopback origin makes them impossible;
+- [ ] the startup and daily reservation check enumerates the real listeners and every proxy route across all schemes and ports and notifies the Owner when something else answers on that origin; record that this detects rather than prevents, so a process binding between checks can collect credentials until the next check;
+- [ ] the first owner redeems a console-displayed single-use authorization once from a browser at the reserved origin, and it cannot be redeemed again;
 - [ ] a first-time invitee redeems an enrollment code and registers a credential without already holding one, and the same code cannot be redeemed twice;
 - [ ] an absent, unknown, expired or already-redeemed code returns the same generic response as an uninvited person, and the enrollment step returns no camera, recording or timeline data;
 - [ ] an owner operation (revoke a user, change a retention/security setting, delete a recording) asks for a fresh user verification even inside an existing owner session, and cancelling it leaves everything unchanged.

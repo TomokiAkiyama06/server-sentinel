@@ -302,7 +302,8 @@ Scope:
 - application principal/allowlist;
 - per-person ServerSentinel credential (`principal_credential`) with invitation enrollment, required authenticator user verification, and individual revocation;
 - session/revocation/recovery;
-- the closed set of pre-credential routes (local owner bootstrap, enrollment-code redemption, authentication) and the freshness window for owner step-up;
+- the closed set of pre-credential routes (local owner bootstrap issuing a console-displayed single-use authorization, enrollment-code redemption, authentication) and the freshness window for owner step-up;
+- the reserved, secure-context dashboard origin, whose reservation is a deployment obligation the application can only check;
 - exact handling of verified external identity headers, which in the shared-Tailscale-account deployment are supplementary only;
 - keep Tailnet policy separately Owner-managed outside ServerSentinel; existing ACLs/Grants may remain unchanged, and ServerSentinel performs no policy mutation or admin-credential storage.
 
@@ -317,7 +318,7 @@ Acceptance:
 - uninvited identity receives no deployment metadata, and an uninvited and a revoked person receive the same generic response;
 - owner can revoke app access, at both the single-credential and the whole-principal level;
 - backend rejects spoofed identity headers from untrusted LAN paths;
-- no viewer biometric template reaches the server; transient WebAuthn verification data is checked and discarded, and only public credential material plus owner-visible metadata is persisted;
+- no viewer biometric template reaches the server; transient WebAuthn verification data is checked and discarded, and only public credential material, the last accepted signature counter, and owner-visible metadata is persisted;
 - revocation is credential-scoped: a synced passkey is revoked everywhere it synced, and nothing promises per-device revocation;
 - no developer-operated identity/cloud.
 
@@ -738,7 +739,8 @@ Scope:
 - trusted proxy identity, treated as supplementary in the shared-Tailscale-account deployment;
 - app principal allowlist;
 - per-person credential verification on every human/media route, per ADR 0004;
-- the closed set of pre-credential routes: local owner bootstrap, invitation redemption against a short-lived single-use enrollment code, and the authentication route itself;
+- the closed set of pre-credential routes: local owner bootstrap (console-displayed single-use authorization redeemed through the ordinary redemption path), invitation redemption against a short-lived single-use enrollment code, and the authentication route itself;
+- the reserved, secure-context dashboard origin and its startup/daily reservation check with Owner notification;
 - fresh user-verification step-up for the AUTH-008 owner operations;
 - generic/non-branding denial for uninvited users;
 - independent `live:view` and `recordings:view`;
@@ -753,7 +755,9 @@ Acceptance:
 - docs do not promise Main Server node invisibility when Tailnet policy exposes it;
 - every human/media request requires an active principal, that principal's own verified credential, and the required permission; a request carrying only a verified identity header is refused;
 - where the deployment configures a trusted proxy identity, it is additionally verified on the trusted local path and recorded, per AUTH-005; where the private-network path supplies no identity header, the absence alone does not deny access and does not weaken the credential check;
-- the only exceptions are the enumerated pre-credential routes of AUTH-012: local owner bootstrap (a privileged local action, not a remote route), invitation redemption gated by a valid unexpired single-use enrollment code, and the authentication route. A fresh deployment reaches its first owner and an invitee redeems a first credential without a deadlock, and neither path returns camera, recording, timeline or deployment data;
+- the only exceptions are the enumerated pre-credential routes of AUTH-012: local owner bootstrap, invitation redemption gated by a valid unexpired single-use enrollment code, and the authentication route. Bootstrap issues a single-use, short-lived enrollment authorization shown only on the local console, and the first owner redeems it once from a browser at the reserved origin through the ordinary redemption path, so no owner-specific route is added. A fresh deployment reaches its first owner and an invitee redeems a first credential without a deadlock, and neither path returns camera, recording, timeline or deployment data;
+- the dashboard origin is reserved for ServerSentinel and served as a secure context (HTTPS, or `http://localhost` for a strictly local browser); an ordinary-HTTP non-loopback origin fails acceptance because browsers withhold WebAuthn there;
+- the reservation check runs at startup and at least daily, enumerates real listeners and every proxy route across all schemes and ports, and notifies the Owner when something else answers on that origin. Tests treat it as detection with a gap between checks, not as prevention;
 - an absent, unknown, expired or already-redeemed enrollment code receives the same generic response as an uninvited person, redemption succeeds at most once, attempts are rate-limited, and logs carry no raw code;
 - AUTH-008 owner operations require a user verification newer than the configured freshness window; a credential-bearing but stale session is refused, and a failed or cancelled step-up performs no state change and returns only the generic failure;
 - the shared Tailscale account is assumed: a second person on the same Tailscale login and the same device, without a credential of their own, receives the same generic response as any uninvited person;

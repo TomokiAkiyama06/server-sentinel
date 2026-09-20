@@ -949,8 +949,21 @@ biometric database (see `PRIVACY.md`).
 Relying-party verification depends on ServerSentinel owning its browser origin.
 Per AUTH-011 the dashboard is served from an origin reserved for it, with no
 other application sharing it; a co-hosted application on that origin would put
-the credential within its reach. The Issue #6 boundary record carries the same
-reservation.
+the credential within its reach.
+
+The reservation itself is a deployment obligation — a dedicated host, VM or
+namespace, or an OS/service policy that keeps another process from binding the
+name. The application verifies it at startup and at least daily by enumerating
+the host's real listeners and every proxy route that reaches them, across all
+schemes and ports, and notifies the Owner when anything else answers on the
+reserved origin. That is detection, not prevention: a process that binds between
+two checks receives credentials and cookies for that origin until the next
+check.
+
+The origin must also be a secure context — HTTPS, or `http://localhost` for a
+strictly local browser — because browsers expose WebAuthn only there. Plain
+HTTP on a non-loopback host leaves every human route unreachable in practice,
+since nobody can register or authenticate.
 
 Initial non-owner permissions:
 
@@ -1003,13 +1016,18 @@ Exactly three request classes run before a credential exists, and the set is
 closed:
 
 ```text
-local owner bootstrap      -> privileged local action on the main host, not a remote route
-invitation redemption      -> valid, unexpired, unredeemed enrollment code only
+local owner bootstrap      -> privileged local action on the main host; issues an
+                              enrollment authorization shown only on the console
+invitation redemption      -> valid, unexpired, unredeemed enrollment code only,
+                              including the owner's bootstrap authorization
 credential authentication  -> the assertion route itself
 ```
 
-Owner bootstrap is a privileged local administrative action on the Main Server;
-there is no remote first-visitor setup. Invitation redemption is single-use and
+Owner bootstrap is a privileged local administrative action on the Main Server
+that issues a single-use, short-lived enrollment authorization displayed only on
+the local console; the first owner redeems it once from a browser at the
+reserved origin through the redemption path, so no owner-specific route and no
+remote first-visitor setup exist. Invitation redemption is single-use and
 rate-limited and registers exactly one `principal_credential` for the named
 principal. It returns no camera, recording, timeline or deployment data and
 grants no application access by itself: the invited person then authenticates

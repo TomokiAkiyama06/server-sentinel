@@ -55,7 +55,9 @@ A passkey alone does not separate people who share a machine. Therefore:
 
 ### 4. Bootstrap and enrollment are the only pre-credential paths
 
-A credential check cannot apply to the request that creates the first credential, so the exceptions are enumerated and closed: the initial owner bootstrap (a privileged local administrative action on the Main Server, never a remote first-visitor route), invitation redemption against a valid short-lived single-use enrollment code, and the authentication/assertion route itself. Every other human/media route requires a verified credential and an active session.
+A credential check cannot apply to the request that creates the first credential, so the exceptions are enumerated and closed: the initial owner bootstrap, invitation redemption against a valid short-lived single-use enrollment code, and the authentication/assertion route itself. Every other human/media route requires a verified credential and an active session.
+
+Owner bootstrap is a privileged local administrative action on the Main Server that issues a single-use, short-lived enrollment authorization displayed only on the local console. The first owner redeems it once from a browser at the reserved origin through the same redemption path everyone else uses, so no owner-specific route and no remote first-visitor setup exist.
 
 Redemption is rate-limited, registers exactly one credential for the named principal, returns no camera/recording/timeline/deployment data, and grants no application access on its own; the invited person authenticates afterwards like anyone else. An absent, unknown, expired or already-redeemed code gets the same generic response as an uninvited person, and logs never carry the raw code.
 
@@ -79,11 +81,15 @@ Before authentication succeeds, responses follow `REQUIREMENTS.md` AUTH-010: gen
 
 ### 9. Credential data is not biometric data
 
-Authenticator user verification runs on the viewer's own device and reaches the server as the authenticator's user-verification flag. ServerSentinel verifies the transient data a WebAuthn registration or assertion carries — its own challenge, client data, authenticator data, the attestation or assertion signature, the signature counter, the user-verification flag, and the relying-party id and origin — and persists only public credential material (credential id and public key) plus owner-visible metadata: label, created/last-used/revoked timestamps. The rest is discarded once verified.
+Authenticator user verification runs on the viewer's own device and reaches the server as the authenticator's user-verification flag. ServerSentinel verifies the transient data a WebAuthn registration or assertion carries — its own challenge, client data, authenticator data, the attestation or assertion signature, the signature counter, the user-verification flag, and the relying-party id and origin — and persists only public credential material (credential id and public key), the last accepted signature counter, and owner-visible metadata: label, created/last-used/revoked timestamps. The rest is discarded once verified. The counter is retained deliberately, because the cloned-authenticator check has nothing to compare against without it.
 
 No viewer fingerprint or face template reaches the server; it never leaves the authenticator. `principal_credential` is an access-control record; it is unrelated to the optional owner face verification and never becomes a non-owner identity or biometric database.
 
-Relying-party verification assumes ServerSentinel owns its browser origin, so this ADR requires one: the dashboard is served from an origin reserved for it, with no other application sharing it, because a co-hosted application on that origin would put the credential within its reach. The pending ADR-0003 records the same reservation from the owner-authentication side; if it lands with a different arrangement, this decision is what has to be revisited with it.
+Relying-party verification assumes ServerSentinel owns its browser origin, so this ADR requires one: the dashboard is served from an origin reserved for it, with no other application sharing it, because a co-hosted application on that origin would put the credential within its reach.
+
+Reserving the origin is a deployment obligation — a dedicated host, VM or namespace, or an OS/service policy that stops another process from binding the name. ServerSentinel checks the reservation at startup and at least daily by enumerating the host's real listeners and every proxy route that reaches them, across all schemes and ports, and notifies the Owner when anything else answers there. The check detects; it does not prevent, and a process that binds between two checks can receive credentials and cookies for that origin until the next check. The pending ADR-0003 records the same obligation and the same limit from the owner-authentication side.
+
+The origin must be a secure context — HTTPS, or `http://localhost` for a strictly local browser — because browsers expose WebAuthn only there. A private-network path that terminates plain HTTP on a non-loopback host would leave the owner and every invitee unable to register or authenticate at all.
 
 ## Alternatives
 
@@ -99,7 +105,7 @@ Relying-party verification assumes ServerSentinel owns its browser origin, so th
 - The data model gains `principal_credential` and enrollment/revocation flows, and the owner access UI gains per-credential listing and revocation.
 - Shared lab machines need a per-person OS account or portable authenticators; this is a deployment/setup obligation recorded in `docs/SETUP.md` and `MANUAL_TEST.md`.
 - ServerSentinel cannot detect a credential its holder deliberately lends, a session left unlocked on an unattended machine, or an authenticator registered into a shared profile against this ADR. These limits are documented, not claimed away.
-- The dashboard needs an origin of its own: relying-party verification only means something while no other application shares it, which constrains how the deployment serves the UI.
+- The dashboard needs an origin of its own, reserved by the deployment and served as a secure context: relying-party verification only means something while no other application shares it, and WebAuthn is unavailable outside HTTPS or localhost. The application's startup and daily check reports a breach of that reservation but cannot prevent one.
 - Revocation is credential-scoped, so neither the UI nor the documentation may offer "revoke this device"; a deployment that needs device-scoped control must register device-bound authenticators.
 - Node-level concealment remains outside the application: with unchanged Tailnet policy the Main Server node and its listening service may stay visible and reachable to everyone holding the shared account, which is the expected state rather than an incident.
 

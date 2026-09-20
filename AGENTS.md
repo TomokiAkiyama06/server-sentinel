@@ -146,7 +146,9 @@ trusted proxy / Tailscale の identity header を使う場合、その listener 
 
 credential を人に紐づけるための条件も守ってください。登録時と毎回の認証で authenticator の user verification を必須にし、authenticator は招待された本人が管理するものとします。OS account や端末の unlock を共有する機器では、その共有 profile に置かれた platform authenticator は共有 credential であり条件を満たしません。session は生成元 credential に紐づけ、idle / 絶対時間両方の上限で終了させます。意図的に貸し与えられた credential や、放置された unlock 済み session を application が検知できるとは説明しないでください。
 
-credential がまだ存在しない request の例外は、local の owner bootstrap、短命・使い捨て enrollment code による招待 redemption、認証 route 自体の 3 つだけです。これらは application data を返さず、無効 / 期限切れ / 使用済み code には未招待と同じ汎用応答を返します。AUTH-008 の owner 操作には fresh な user verification を要求し、step-up 失敗 / キャンセル時は何も実行しないでください。
+credential がまだ存在しない request の例外は、local の owner bootstrap（console にだけ表示する使い捨て authorization を発行し、予約済み origin の browser から通常の redemption 経路で 1 回だけ使う）、短命・使い捨て enrollment code による招待 redemption、認証 route 自体の 3 つだけです。これらは application data を返さず、無効 / 期限切れ / 使用済み code には未招待と同じ汎用応答を返します。AUTH-008 の owner 操作には fresh な user verification を要求し、step-up 失敗 / キャンセル時は何も実行しないでください。
+
+dashboard は ServerSentinel 専用に予約した origin で、かつ secure context（HTTPS、または厳密に local な browser の `http://localhost`）で提供してください。browser はそれ以外で WebAuthn を提供しません。origin の予約自体は deployment 側の責任（専用 host / VM / namespace、または OS / service policy）で、application が startup と daily に行うのは実 listener と全 scheme・全 port の proxy route を列挙する「検出」です。防止ではなく、検査間に bind された process は次の検査まで cookie を受け取りうることを必ず明記してください。
 
 2 つの gate 自体は弱めません。共有 account で変わるのは、network gate が個人を区別しなくなる点だけです。
 

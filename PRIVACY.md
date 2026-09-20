@@ -91,7 +91,8 @@ For each credential the main host stores:
 - the credential id and its public key;
 - the principal it belongs to;
 - an owner-visible label, which is a hint chosen at registration and not proof of a device;
-- created/last-used/revoked timestamps.
+- created/last-used/revoked timestamps;
+- the last accepted signature counter, which is what makes a cloned-authenticator check possible.
 
 Authenticator user verification (device PIN, device unlock, fingerprint or face unlock) runs on the viewer's own device; the server learns only that it succeeded. Signing in also sends the short-lived data needed to check the sign-in itself, which is verified and then discarded rather than stored. ServerSentinel never receives or stores a viewer's fingerprint or face template. These records are an access-control list, not an identity or biometric database, and they are unrelated to the optional owner face verification described below. Revoking a credential or its principal permanently disables the corresponding record.
 
@@ -144,7 +145,7 @@ The main Ubuntu deployment stores:
 - event/timeline metadata;
 - audit logs;
 - configuration;
-- invited-viewer credential records (public key material and metadata only);
+- invited-viewer credential records (public key material, the last accepted signature counter, and metadata only);
 - optional owner biometric template.
 
 Defaults:

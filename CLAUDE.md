@@ -57,6 +57,7 @@ MVPの基本構成:
 - device承認や network到達性を「人物の特定」「uninvitedを排除する障壁」として説明していないか
 - credential失効を per-device revocation のように説明していないか（synced passkey は 1 credential が複数 device に存在しうる）
 - WebAuthn の transientな検証データ（challenge / client data / signature / UV flag / RP id・origin）の検証を「最小化」を理由に省いていないか
+- dashboard origin が専用予約かつ secure context であるか、origin 予約の検査を「防止」と説明していないか
 - ServerSentinelがTailscale ACL/Grants変更やadmin credentialを要求していないか、未招待identityへアプリ情報を漏らしていないか
 - `live:view` / `recordings:view`分離がserver-sideで強制されるか
 - non-owner download/exportが再導入されていないか
