@@ -159,13 +159,11 @@ flowchart TD
   i10 --> i50
   i9 --> i50
   i13 --> i50
-  i16 --> i50
   i23 --> i50
-  i26 --> i50
   i5 --> i51
 ```
 
-Issue #7 explicitly depends on #6 (authorization design before health/version endpoint contracts), #16 on #17 (bounded media profiles for buffer estimates/admission), and #26 on #16 / #21 (critical preservation and configured notification integration). Plans 22–25 additionally depend on the capabilities their own mandatory acceptance invokes, so that none of them can be scheduled as closable before its deployed acceptance is executable: #47 re-runs #23's hardware-integrity comparison and recording-health self-test after update/rollback and compares #50's audit records across the lifecycle; #48 drives the #9 source registry, #17 profiles, #21 storage settings, #23 baseline/recorder self-check and the #50 audit of Owner approval inside the wizard; #49 must show that #23 hardware identifiers are redacted and #25 Owner biometric material is excluded from an export; #50 audits #23 baseline approval and #9 / #13 source and capture-node revocation, then verifies cleanup leaves #26 factual timeline and #16 protected-incident lifecycles unchanged. Plan 26 depends on the CI guard. These prerequisites bound acceptance/closure only; independent mock, contract and shell work may proceed in parallel, and unfinished areas stay explicitly pending.
+Issue #7 explicitly depends on #6 (authorization design before health/version endpoint contracts), #16 on #17 (bounded media profiles for buffer estimates/admission), and #26 on #16 / #21 (critical preservation and configured notification integration). Plans 22–25 additionally depend on the capabilities their own mandatory acceptance invokes, so that none of them can be scheduled as closable before its deployed acceptance is executable: #47 re-runs #23's hardware-integrity comparison and recording-health self-test after update/rollback and compares #50's audit records across the lifecycle; #48 drives the #9 source registry, #17 profiles, #21 storage settings, #23 baseline/recorder self-check and the #50 audit of Owner approval inside the wizard; #49 must show that #23 hardware identifiers are redacted and #25 Owner biometric material is excluded from an export; #50 audits #23 baseline approval and #9 / #13 source and capture-node revocation. Plan 26 depends on the CI guard. These prerequisites bound acceptance/closure only; independent mock, contract and shell work may proceed in parallel, and unfinished areas stay explicitly pending.
 
 ## Plan 1 — CI / repository guardrails
 
@@ -988,7 +986,7 @@ Acceptance:
 
 GitHub Issue: [#50](https://github.com/TomokiAkiyama06/server-sentinel/issues/50)
 
-Depends on: [#7](https://github.com/TomokiAkiyama06/server-sentinel/issues/7), [#9](https://github.com/TomokiAkiyama06/server-sentinel/issues/9), [#10](https://github.com/TomokiAkiyama06/server-sentinel/issues/10), [#13](https://github.com/TomokiAkiyama06/server-sentinel/issues/13), [#16](https://github.com/TomokiAkiyama06/server-sentinel/issues/16), [#23](https://github.com/TomokiAkiyama06/server-sentinel/issues/23), [#26](https://github.com/TomokiAkiyama06/server-sentinel/issues/26)
+Depends on: [#7](https://github.com/TomokiAkiyama06/server-sentinel/issues/7), [#10](https://github.com/TomokiAkiyama06/server-sentinel/issues/10), [#9](https://github.com/TomokiAkiyama06/server-sentinel/issues/9), [#13](https://github.com/TomokiAkiyama06/server-sentinel/issues/13), [#23](https://github.com/TomokiAkiyama06/server-sentinel/issues/23)
 
 Labels: `backend`, `security`, `storage`, `server-required`, `hardware-required`, `manual-test-required`
 
