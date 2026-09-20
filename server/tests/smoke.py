@@ -32,6 +32,7 @@ from app.logging import configure_logging  # noqa: E402
 from app.main import create_app  # noqa: E402
 from app.settings import Settings  # noqa: E402
 from tests.asgi import request  # noqa: E402
+from tests.owner_smoke import run_owner_smoke  # noqa: E402
 from tests.presence_smoke import run_presence  # noqa: E402
 from tests.quality_smoke import run_quality_smoke  # noqa: E402
 from tests.recording_smoke import run_recording_smoke  # noqa: E402
@@ -43,6 +44,7 @@ async def run(scenario):
     output = io.StringIO()
     configure_logging(stream=output)
     run_quality_smoke(scenario)
+    run_owner_smoke(scenario)
     with tempfile.TemporaryDirectory(prefix="synthetic-server-") as temporary:
         run_presence(Path(temporary), scenario)
         run_recording_smoke(Path(temporary), scenario)
