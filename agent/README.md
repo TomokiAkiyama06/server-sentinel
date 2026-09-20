@@ -23,6 +23,8 @@ identity, permissions and reserve without opening devices, writing media or
 connecting to any host. Normal service execution must use a dedicated non-root
 account; configuration is a regular file with mode 0600, owned by that account.
 Agent and installer reject FIFOs/special files without waiting for a writer.
+Both read at most 65,537 bytes before parsing, enforce the 64 KiB configuration
+limit and reject metadata changes during the read.
 
 The deployment-local JSON configuration requires every field below. No private
 path, device identity, disk reserve, segment limit or clock threshold is a public

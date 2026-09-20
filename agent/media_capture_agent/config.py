@@ -100,16 +100,31 @@ class Settings:
 
     @classmethod
     def load(cls, path, *, code_root):
-        try:
-            descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
-                                 | os.O_NONBLOCK)
-            with os.fdopen(descriptor, "r", encoding="utf-8") as stream:
-                info = os.fstat(stream.fileno())
-                if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid():
-                    raise ConfigurationError("configuration must belong to service account")
-                if info.st_mode & 0o077 or info.st_size > 65536:
-                    raise ConfigurationError("configuration permissions or size rejected")
-                value = json.load(stream)
-        except (OSError, UnicodeError, ValueError) as exc:
-            raise ConfigurationError("cannot load protected deployment configuration") from exc
+        value, _owner = read_protected_configuration(path, owner_uid=os.geteuid())
         return cls.parse(value, code_root=code_root)
+
+
+MAX_CONFIGURATION_BYTES = 65536
+
+
+def read_protected_configuration(path, *, owner_uid=None):
+    """Bound every read even if the service-owned file changes after fstat."""
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
+        with os.fdopen(descriptor, "rb") as stream:
+            before = os.fstat(stream.fileno())
+            if not stat.S_ISREG(before.st_mode) or before.st_mode & 0o077:
+                raise ConfigurationError("protected regular configuration required")
+            if owner_uid is not None and before.st_uid != owner_uid:
+                raise ConfigurationError("configuration owner rejected")
+            if not 0 < before.st_size <= MAX_CONFIGURATION_BYTES:
+                raise ConfigurationError("configuration size rejected")
+            data = stream.read(MAX_CONFIGURATION_BYTES + 1)
+            after = os.fstat(stream.fileno())
+            if (len(data) > MAX_CONFIGURATION_BYTES or len(data) != before.st_size
+                    or (before.st_size, before.st_mtime_ns, before.st_ctime_ns)
+                    != (after.st_size, after.st_mtime_ns, after.st_ctime_ns)):
+                raise ConfigurationError("configuration changed while reading")
+            return json.loads(data.decode("utf-8")), before.st_uid
+    except (OSError, UnicodeError, ValueError, RecursionError) as exc:
+        raise ConfigurationError("cannot load protected deployment configuration") from exc

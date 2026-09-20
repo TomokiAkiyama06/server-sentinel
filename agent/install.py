@@ -3,7 +3,6 @@
 
 import argparse
 import hashlib
-import json
 import os
 from pathlib import Path
 import pwd
@@ -11,7 +10,7 @@ import re
 import subprocess
 import stat
 
-from media_capture_agent.config import ConfigurationError, Settings
+from media_capture_agent.config import ConfigurationError, Settings, read_protected_configuration
 from media_capture_agent.storage import StorageRefused, open_directory
 
 
@@ -105,16 +104,12 @@ def install(args):
     artifact = read_artifact(args.artifact)
     if hashlib.sha256(artifact).hexdigest() != args.sha256:
         raise ValueError("artifact digest mismatch")
-    fd = os.open(args.config, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
-    with os.fdopen(fd, encoding="utf-8") as stream:
-        info = os.fstat(stream.fileno())
-        if not stat.S_ISREG(info.st_mode) or info.st_mode & 0o077 or info.st_size > 65536:
-            raise ValueError("protected configuration required")
-        settings = Settings.parse(json.load(stream), code_root=args.destination)
+    value, config_owner = read_protected_configuration(args.config)
+    settings = Settings.parse(value, code_root=args.destination)
     code_root = Path(__file__).resolve().parents[1]
     if any(root.is_relative_to(code_root) for root in (settings.runtime_root, settings.media_root)):
         raise ValueError("runtime data must be outside the checkout")
-    if info.st_uid != settings.service_uid:
+    if config_owner != settings.service_uid:
         raise ValueError("configuration must belong to dedicated account")
     account = pwd.getpwuid(settings.service_uid)
     if pwd.getpwnam(account.pw_name).pw_uid == 0:
@@ -127,6 +122,7 @@ def install(args):
     protected_parent(args.unit.parent)
     version_root = args.destination / args.version
     version_root.mkdir(mode=0o755)
+    version_root.chmod(0o755)
     executable = version_root / "media-capture-agent"
     unit_created = False
     try:
