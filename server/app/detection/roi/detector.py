@@ -107,12 +107,20 @@ class SceneDetector:
                                self.policy.movement_pixels, reference):
             raise ValueError("no usable ROI transform reaches the movement threshold")
         self.reference_digest = calibration.reference_sha256
-        self.stream_id = None
+        # Start from the reference sample itself. A frame the source produced
+        # before the Owner calibrated is pre-calibration imagery, and accepting
+        # it would let two increasing stale samples confirm under a calibration
+        # that did not exist when they were captured.
+        self.stream_id = reference.stream_id
         # Every stream this source has replaced. Frames from one of them are
         # stale imagery, never a new restart, and the set is never evicted from.
         self.retired_streams = set()
-        self.last_sequence = -1
+        self.last_sequence = reference.sequence
         self.last_ns = -1
+        # Latched once a stream transition has to be refused for exhaustion.
+        # From then on nothing is evaluated: the detector cannot tell a live
+        # stream from a stale one without forgetting a retired identity.
+        self.exhausted = False
         self.last_scene_shift_ns = None
         self.last_scene_shift_confidence = None
         # One correlated source-loss event per tracked scene-shift episode. This
@@ -123,15 +131,15 @@ class SceneDetector:
         self.tamper = _Confirmation()
 
     def _reachable(self, points, transforms, center, threshold, reference):
-        """Does a translating candidate at the threshold survive the coverage gate?
+        """Does a pure translation at the threshold survive the coverage gate?
 
-        A usable rotation does not substitute for one. The threshold is a pixel
-        displacement, so if every translation of that size fails the coverage
-        gate, a real shift stays unregistered however many quarter turns are
-        configured.
+        Rotation does not substitute for one, not even combined with a
+        translation: a real camera shift of that size arrives unrotated, so a
+        rotated candidate surviving the coverage gate says nothing about
+        whether that shift can be registered and compensated.
         """
         for transform in transforms:
-            if transform.dx ** 2 + transform.dy ** 2 < threshold ** 2:
+            if transform.rotated or transform.dx ** 2 + transform.dy ** 2 < threshold ** 2:
                 continue
             if coverage(points, transform, center, reference.width,
                         reference.height) >= self.policy.minimum_coverage:
@@ -196,6 +204,15 @@ class SceneDetector:
             self._interrupt()
             raise
         c = self.calibration
+        if self.exhausted:
+            # Terminal: a refused transition already left this detector unable
+            # to tell a live stream from a stale one, so nothing is evaluated
+            # again until a trusted rebind replaces the instance.
+            self._interrupt()
+            self.last_ns = max(self.last_ns, monotonic_ns)
+            return self._observation(frame, monotonic_ns, observed_at, stream=frame.stream_id,
+                                     movement_reason="stream_history_exhausted",
+                                     tamper_reason="stream_history_exhausted")
         if (monotonic_ns <= self.last_ns or self.stream_id == frame.stream_id and frame.sequence <= self.last_sequence):
             self._interrupt()
             return self._observation(frame, monotonic_ns, observed_at, movement_reason="clock_or_sequence_regression",
@@ -213,8 +230,10 @@ class SceneDetector:
         if restarted and len(self.retired_streams) >= RETIRED_STREAM_LIMIT:
             # Admitting another stream would mean forgetting a retired identity,
             # which is how stale imagery becomes acceptable again. This detector
-            # stops admitting instead; a runtime resolves it by binding a fresh
-            # one, and every sample stays unknown until then.
+            # stops admitting instead and latches: leaving the previous stream
+            # current would let its delayed frames rebuild confirmation, so a
+            # runtime resolves this by binding a fresh detector.
+            self.exhausted = True
             self._interrupt()
             self.last_ns = monotonic_ns
             return self._observation(frame, monotonic_ns, observed_at, stream=frame.stream_id,
@@ -341,6 +360,14 @@ class SceneDetector:
             self._interrupt()
             raise
         self._interrupt()
+        if self.exhausted:
+            # The same terminal state as in `inspect`: a scene shift recorded
+            # before exhaustion may itself have come from a stream this
+            # detector can no longer place, so nothing correlates with it.
+            self.last_ns = max(self.last_ns, monotonic_ns)
+            return self._observation(None, monotonic_ns, observed_at,
+                                     movement_reason="stream_history_exhausted",
+                                     tamper_reason="stream_history_exhausted")
         critical = ()
         correlated = (health_signal_trusted and self.last_scene_shift_ns is not None
                       and self.last_ns <= monotonic_ns

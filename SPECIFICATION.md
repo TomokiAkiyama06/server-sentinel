@@ -634,8 +634,9 @@ A calibration policy whose bounded search window cannot reach its own movement
 or camera-shift threshold is refused: such a configuration cannot express the
 displacement it asks to detect and would report a matching geometry instead. A
 calibration is refused as well when its own support leaves no translating
-candidate at or beyond a threshold above the coverage minimum, since a quarter
-turn does not register a pixel shift, or when its reference
+pure translation at or beyond a threshold above the coverage minimum, since a
+quarter turn does not register a pixel shift even when it carries a
+translation, or when its reference
 already meets the obscured-scene threshold, since every unchanged sample would
 then confirm a tamper that never happened.
 
@@ -653,7 +654,10 @@ retained for the detector's lifetime, so a delayed frame from a stream the
 source has already left is refused as stale imagery instead of becoming current
 again, and no number of later replacements restores an old identity. The number
 of admitted stream transitions is bounded instead, and a detector that reaches
-that bound reports every sample as unknown until a fresh detector is bound. Because such an
+that bound latches: every later sample and source-loss report stays unknown
+until a fresh detector is bound. Temporal confirmation also begins at the
+reference sample, so imagery the source captured before the calibration existed
+cannot contribute to it. Because such an
 interruption ends the episode, a condition
 confirmed again afterwards is emitted again instead of being suppressed as a
 duplicate, so no confirmed critical observation is silently lost. Person

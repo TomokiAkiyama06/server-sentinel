@@ -11,10 +11,10 @@ timestamp. A policy is refused when a bounded search window cannot reach its
 own displacement threshold, because such a configuration cannot express the
 movement or camera shift it asks for and would report a matching geometry
 instead. A calibration is refused for the same reason when its own support
-leaves no translating candidate at or beyond a threshold above
-`minimum_coverage`, since the policy radius alone does not say which
-candidates survive the coverage gate and a usable quarter turn does not
-register a pixel shift.
+leaves no *pure* translation at or beyond a threshold above `minimum_coverage`,
+since the policy radius alone does not say which candidates survive the
+coverage gate, and a quarter turn does not register a pixel shift even when it
+carries a translation of its own.
 A calibration whose reference already meets the obscured-scene threshold is
 refused too: every unchanged sample would look obscured and confirm a tamper
 that never happened. `CalibrationArchive` is a small append-only SQLite port: the Main
@@ -50,8 +50,11 @@ delayed frame from a stream it already left is refused as stale imagery rather
 than becoming current again, and no number of later replacements lets an old
 identity age back into validity. The number of admitted transitions is bounded
 instead: after `RETIRED_STREAM_LIMIT` of them the detector stops admitting new
-streams and reports `stream_history_exhausted`, which a runtime resolves by
-binding a fresh detector rather than by accepting stale imagery. Every accepted
+streams and latches, reporting `stream_history_exhausted` for every later
+sample and source-loss report, which a runtime resolves by binding a fresh
+detector rather than by accepting stale imagery. Confirmation also starts from
+the reference sample itself, so a frame the source captured before the Owner
+calibrated cannot take part in it. Every accepted
 sample records the observed stream, sequence and clock before any such
 `unknown` result, so a buffered frame from a superseded geometry or stream
 cannot pass the regression check afterwards. The calibration comparison budget

@@ -13,8 +13,9 @@ from app.detection.foundation import GrayFrame, Observation, Quality
 from app.detection.roi import (
     MAXIMUM_BATCH, RETIRED_STREAM_LIMIT, Calibration, CalibrationArchive,
     CalibrationRecord, CriticalDelivery, CriticalKind,
-    OwnerCalibrationOperations, Policy, SceneDetector,
+    OwnerCalibrationOperations, Policy, SceneDetector, Transform,
 )
+from app.detection.roi.geometry import coverage
 from app.storage.migrations import migrate
 from app.storage.schema import APPLICATION_MIGRATIONS
 
@@ -24,6 +25,7 @@ PROFILE = UUID(int=302)
 STREAM = UUID(int=303)
 NOW = datetime(2026, 1, 2, tzinfo=timezone.utc)
 WIDTH = HEIGHT = 12
+REFERENCE_SEQUENCE = 0
 POLYGON = ((4, 4), (7, 4), (7, 7), (4, 7))
 
 
@@ -44,8 +46,16 @@ def transformed(source, transform, *, region=None, fill=0):
     return bytes(output)
 
 
-def frame(sequence, data=None, *, source=SOURCE, stream=STREAM):
-    return GrayFrame(source, stream, sequence, WIDTH, HEIGHT, pixels() if data is None else data)
+def reference_frame(data=None):
+    """The calibrated sample itself, which every later sample follows."""
+    return GrayFrame(SOURCE, STREAM, REFERENCE_SEQUENCE, WIDTH, HEIGHT,
+                     pixels() if data is None else data)
+
+
+def frame(index, data=None, *, source=SOURCE, stream=STREAM):
+    """A sample captured after the reference, numbered from it."""
+    return GrayFrame(source, stream, REFERENCE_SEQUENCE + 1 + index, WIDTH, HEIGHT,
+                     pixels() if data is None else data)
 
 
 def policy(**changes):
@@ -83,7 +93,7 @@ def repetitive(shift=0):
 def calibration(source_type=SourceType.LOCAL_UVC, *, version=1, rules=None, reference=None,
                 shape=POLYGON):
     return Calibration(UUID(int=400 + version), SOURCE, source_type, PROFILE, version, NOW,
-                       shape, frame(0, reference), rules or policy())
+                       shape, reference_frame(reference), rules or policy())
 
 
 def detector(source_type=SourceType.LOCAL_UVC, *, rules=None, reference=None, shape=POLYGON):
@@ -265,7 +275,8 @@ class SceneDetectorTests(unittest.TestCase):
         instance = detector()
         inspect_scene(instance, frame(0), 0)
         inspect_scene(instance, frame(1, moved), 10)
-        wider = GrayFrame(SOURCE, STREAM, 2, WIDTH + 1, HEIGHT, bytes((WIDTH + 1) * HEIGHT))
+        wider = GrayFrame(SOURCE, STREAM, frame(2).sequence, WIDTH + 1, HEIGHT,
+                          bytes((WIDTH + 1) * HEIGHT))
         mismatch = inspect_scene(instance, wider, 20)
         self.assertEqual("reference_shape_mismatch", mismatch.movement_reason)
         buffered = inspect_scene(instance, frame(2, moved), 30)
@@ -334,6 +345,58 @@ class SceneDetectorTests(unittest.TestCase):
         self.assertEqual("awaiting_confirmation", resumed.movement_reason)
         self.assertEqual(replacement, resumed.stream_id)
         self.assertFalse(resumed.critical)
+
+    def test_samples_captured_before_the_reference_are_refused(self):
+        moved = transformed(pixels(), (1, 0), region=(4, 4, 8, 7))
+        reference = GrayFrame(SOURCE, STREAM, 5, WIDTH, HEIGHT, pixels())
+        instance = SceneDetector(Calibration(UUID(int=401), SOURCE, SourceType.LOCAL_UVC,
+                                             PROFILE, 1, NOW, POLYGON, reference, policy()))
+        stale = [GrayFrame(SOURCE, STREAM, sequence, WIDTH, HEIGHT, moved)
+                 for sequence in (3, 4)]
+        for index, sample in enumerate(stale):
+            result = inspect_scene(instance, sample, 10 + index * 10)
+            self.assertEqual("clock_or_sequence_regression", result.movement_reason)
+            self.assertEqual(Observation.UNKNOWN, result.movement)
+            self.assertFalse(result.critical)
+
+    def test_translation_reachability_ignores_a_rotated_candidate(self):
+        """The threshold is a pixel shift, so only a pure translation counts."""
+        instance = detector()
+        reference = instance.calibration.reference
+        support = [(WIDTH - 1, 5)]
+        translated = Transform(1, 0, 0)
+        rotated = Transform(1, 0, 2)
+        self.assertLess(coverage(support, translated, instance.frame_center, WIDTH, HEIGHT),
+                        instance.policy.minimum_coverage)
+        self.assertGreaterEqual(coverage(support, rotated, instance.frame_center, WIDTH, HEIGHT),
+                                instance.policy.minimum_coverage)
+        self.assertFalse(instance._reachable(support, [translated, rotated],
+                                             instance.frame_center, 1, reference))
+
+    def test_stream_history_exhaustion_latches_for_every_later_sample(self):
+        moved = transformed(pixels(), (1, 0), region=(4, 4, 8, 7))
+        instance = detector()
+        inspect_scene(instance, frame(0), 0)
+        for index in range(RETIRED_STREAM_LIMIT):
+            inspect_scene(instance, frame(0, moved, stream=UUID(int=3000 + index)),
+                          10 + index * 10)
+        current = UUID(int=3000 + RETIRED_STREAM_LIMIT - 1)
+        clock = 10 + RETIRED_STREAM_LIMIT * 10
+        refused = inspect_scene(instance, frame(1, moved, stream=UUID(int=3999)), clock)
+        self.assertEqual("stream_history_exhausted", refused.movement_reason)
+        later = [inspect_scene(instance, frame(2 + index, moved, stream=current),
+                               clock + 10 + index * 10) for index in range(3)]
+        for sample in later:
+            self.assertEqual("stream_history_exhausted", sample.movement_reason)
+            self.assertEqual("stream_history_exhausted", sample.tamper_reason)
+            self.assertEqual(Observation.UNKNOWN, sample.movement)
+            self.assertEqual(Observation.UNKNOWN, sample.tamper)
+            self.assertFalse(sample.critical)
+        lost = instance.source_lost(monotonic_ns=clock + 100, observed_at=NOW,
+                                    health_signal_trusted=True)
+        self.assertEqual("stream_history_exhausted", lost.tamper_reason)
+        self.assertEqual(Observation.UNKNOWN, lost.tamper)
+        self.assertFalse(lost.critical)
 
     def test_a_retired_stream_is_not_forgotten_after_later_replacements(self):
         moved = transformed(pixels(), (1, 0), region=(4, 4, 8, 7))
