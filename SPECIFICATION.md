@@ -770,6 +770,15 @@ human authorization and recording playback remain separate integration work.
 
 ### 10.1 Hardware baseline
 
+Implementation foundation: `server/app/integrity/` provides explicit read-only
+Linux probes, a revision-checked Owner-authorized local baseline, sanitized fault
+outbox and startup/24-hour worker coordinator. `server/app/media/health/` provides
+bounded recorder-worker temporary I/O and recovery. The launcher does not enable
+these adapters before authorization, production codec/source configuration and
+notification wiring. Migration factories receive the next unused schema slots
+during integration. Module READMEs document contracts; #23 physical acceptance
+remains open.
+
 During setup, the Owner approves a baseline inventory for the main ServerSentinel host. Collect the strongest local identifiers available without pretending that unavailable identifiers exist.
 
 Representative Linux data sources may include sysfs/udev, SMBIOS/DMI, `lsblk`/block-device metadata, NVMe identify/health data, SMART data, and NVIDIA GPU UUID/serial/PCI metadata where applicable.
