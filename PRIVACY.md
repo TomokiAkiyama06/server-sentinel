@@ -25,6 +25,13 @@ There is no required ServerSentinel developer cloud/account/data plane.
 
 ## Developer data collection
 
+The internal recording store writes compressed media and source/event/integrity
+metadata only to deployment-local storage. It has no network client, telemetry,
+codec download or export endpoint. Tests generate compressed non-video bytes in
+temporary directories; these are storage fixtures and do not contain people,
+rooms or playable surveillance media. Real media adapters and authorized playback
+remain separate integration gates.
+
 The implemented backend foundation has no network client, reporting integration
 or media input. Its structured logs discard arbitrary strings, request metadata
 and exception contents, including values with unknown secret formats. Synthetic
@@ -136,6 +143,12 @@ Non-owner face crops, templates/embeddings, and facial profiles must not be stor
 If Main Server communication is unexpectedly lost, the agent protects the preceding 10 minutes and continues local capture for 10 minutes, targeting a 20-minute incident window. Protected incidents are retained on the agent for **60 days by default** and then automatically deleted. This storage is incident-focused secondary evidence, not continuous replication of all Main Server recordings.
 
 ## Hardware inventory and recorder diagnostics
+
+Local UVC approval evidence, including raw camera serials and USB topology, stays
+in the deployment's private application database. Normal UVC health/audit
+callbacks expose only logical source IDs, state and fixed reason codes. Captured
+video bytes are excluded from object representations and no frame is written to
+disk or uploaded by the UVC adapter itself. Downstream media policies still apply.
 
 The Main Server keeps its Owner-approved hardware baseline and detailed hardware identifiers deployment-local. Normal operational logs and general diagnostics redact or hash serials/UUIDs; raw identifiers are excluded from public diagnostics and GitHub artifacts. Any detailed diagnostic export requires an explicit Owner action and does not authorize automatic upload. Bounded recording-health self-test media stays local and is never uploaded. Delete self-test-owned temporary/partial media after success, failure, or cancellation, and clean interrupted-test leftovers at the next startup before creating new self-test media. Cleanup verifies the expected filesystem and self-test ownership; it never deletes ordinary recordings or protected incidents. If cleanup is unsafe or fails, report failure and block further self-test media writes until safe cleanup succeeds. Leftovers count against storage admission and the safety reserve; they are not retained diagnostic media.
 
