@@ -212,5 +212,10 @@ class OwnerAuditService:
         is never exposed as a readable API to them. Reads are not themselves
         audited, so an unauthorized caller cannot grow the audit table.
         """
-        self.authorizer.require_owner(actor_context)
+        try:
+            self.authorizer.require_owner(actor_context)
+        except PermissionError as error:
+            # Return the same bounded denial as a mutation, never an injected
+            # authorizer's message or attributes, which may carry identity.
+            raise OwnerAuthorizationError(self._denied_category(error)) from None
         return self.store.list_records(limit=limit, before=before)

@@ -436,6 +436,23 @@ class AuditTests(unittest.TestCase):
             1, len(self.admin.list_audit_records("synthetic-owner-session", limit=1)),
         )
 
+        private_value = "synthetic-private-read-denial-detail"
+
+        class GenericDeny:
+            def require_owner(self, actor_context):
+                raise PermissionError(private_value)
+
+        denied = OwnerAdministration(
+            OwnerAuditService(self.store, GenericDeny()), self.registry,
+        )
+        # A denied reader receives the same bounded denial, never the injected
+        # authorizer's message, which may carry identity.
+        with self.assertRaisesRegex(OwnerAuthorizationError,
+                                    "^owner authorization required$") as denial:
+            denied.list_audit_records({"secret": private_value})
+        self.assertEqual(ActorCategory.UNAUTHENTICATED, denial.exception.actor_category)
+        self.assertNotIn(private_value, str(denial.exception))
+
     def test_post_commit_failure_record_never_masks_the_original_failure(self):
         reservation = SyntheticReservation()
         service = OwnerAuditService(self.reserved_store(reservation),
