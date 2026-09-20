@@ -21,7 +21,8 @@ Use Python 3.12+ on Linux. Run `python3 agent/media-capture-agent --config
 `media-capture-agent` executable. `--check` validates the local account, storage
 identity, permissions and reserve without opening devices, writing media or
 connecting to any host. Normal service execution must use a dedicated non-root
-account; configuration mode is 0600 and owned by that account.
+account; configuration is a regular file with mode 0600, owned by that account.
+Agent and installer reject FIFOs/special files without waiting for a writer.
 
 The deployment-local JSON configuration requires every field below. No private
 path, device identity, disk reserve, segment limit or clock threshold is a public

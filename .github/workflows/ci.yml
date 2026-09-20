@@ -63,10 +63,32 @@ jobs:
       - name: Scan available component build output
         run: python scripts/ci/repository_guard.py
 
+  web-browser:
+    name: Dashboard browser smoke
+    needs: repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - name: Install reviewed dependencies and build local assets
+        working-directory: web
+        run: |
+          npm ci --ignore-scripts --no-audit --no-fund
+          npm run build
+      - name: Synthetic viewport and browser request interception
+        working-directory: web
+        run: npm run test:browser
+
   ci:
     name: CI
     if: ${{ always() }}
-    needs: [repository, components]
+    needs: [repository, components, web-browser]
     runs-on: ubuntu-24.04
     timeout-minutes: 2
     steps:
@@ -74,6 +96,8 @@ jobs:
         env:
           REPOSITORY_RESULT: ${{ needs.repository.result }}
           COMPONENT_RESULT: ${{ needs.components.result }}
+          WEB_BROWSER_RESULT: ${{ needs.web-browser.result }}
         run: |
           test "$REPOSITORY_RESULT" = success
           test "$COMPONENT_RESULT" = success
+          test "$WEB_BROWSER_RESULT" = success

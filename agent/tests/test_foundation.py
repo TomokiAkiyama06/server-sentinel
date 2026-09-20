@@ -281,6 +281,50 @@ class ConfigurationTests(unittest.TestCase):
                 with self.subTest(key=key), self.assertRaises(ConfigurationError):
                     Settings.parse(dict(value, **{key: bad}), code_root=root / "code")
 
+    def test_fifo_configuration_is_rejected_without_waiting_for_a_writer(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            fifo = Path(temporary) / "configuration.fifo"
+            os.mkfifo(fifo, mode=0o600)
+            script = """
+import sys
+from pathlib import Path
+from media_capture_agent.config import ConfigurationError, Settings
+try:
+    Settings.load(Path(sys.argv[1]), code_root=Path(sys.argv[1]).parent / "code")
+except ConfigurationError:
+    raise SystemExit(0)
+raise SystemExit(1)
+"""
+            subprocess.run([sys.executable, "-c", script, str(fifo)],
+                           check=True, timeout=2, capture_output=True)
+
+    def test_installer_rejects_fifo_before_parsing_or_deployment(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            artifact = root / "synthetic-artifact"
+            artifact.write_bytes(b"synthetic-not-executable")
+            fifo = root / "configuration.fifo"
+            os.mkfifo(fifo, mode=0o600)
+            script = """
+import argparse
+import hashlib
+from pathlib import Path
+import sys
+from unittest.mock import patch
+from install import install
+artifact, fifo = Path(sys.argv[1]), Path(sys.argv[2])
+args = argparse.Namespace(artifact=artifact, config=fifo, version="0.1.0",
+                          sha256=hashlib.sha256(artifact.read_bytes()).hexdigest())
+with patch("install.os.geteuid", return_value=0):
+    try:
+        install(args)
+    except ValueError:
+        raise SystemExit(0)
+raise SystemExit(1)
+"""
+            subprocess.run([sys.executable, "-c", script, str(artifact), str(fifo)],
+                           check=True, timeout=2, capture_output=True)
+
     def test_config_owner_only_and_redacted_errors(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

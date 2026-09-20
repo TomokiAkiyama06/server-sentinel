@@ -99,7 +99,8 @@ class Settings:
     @classmethod
     def load(cls, path, *, code_root):
         try:
-            descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+            descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
+                                 | os.O_NONBLOCK)
             with os.fdopen(descriptor, "r", encoding="utf-8") as stream:
                 info = os.fstat(stream.fileno())
                 if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid():
