@@ -25,7 +25,7 @@ Issue #1 closed when PR #2 merged after documentation/bootstrap acceptance and c
 - [ ] Docker Compose where appropriate
 - [ ] versioned Main Server install / update / rollback lifecycle (#47)
 - [ ] first-run setup wizard and resumable initial configuration flow (#48)
-- [ ] deployment-owner authorization ADR/bootstrap
+- [ ] deployment-owner authorization ADR/bootstrap — ADR-0003 Proposed; Owner decision pending, synthetic policy model only
 - [ ] trusted Tailscale/private-proxy identity boundary
 
 ## Phase 2 — Camera Source + Capture Node platform
