@@ -746,9 +746,7 @@ Hardware/SMART probing must use the least privilege practical. Do not run the wh
 Tailscale provides private transport/reachability. ServerSentinel authorization is independent:
 
 ```text
-Tailnet reachability
-       +
-verified Tailscale/trusted-proxy identity (account-level, supplementary)
+Tailnet/private-network reachability
        +
 ServerSentinel owner invitation
        +
@@ -757,13 +755,16 @@ verified ServerSentinel per-person credential
 per-user permission
        =
 application access
+
+supplementary, never sufficient:
+verified Tailscale/trusted-proxy identity (account-level)
 ```
 
 Tailnet membership by itself grants no ServerSentinel application data.
 
-In this deployment the Tailnet account is shared by the research room, so "verified Tailscale/trusted-proxy identity" identifies the account the request arrived under, not the person. The ServerSentinel credential below is what identifies the person; see §11.8.
-
 The two gates are unchanged: a network-level permission path and an application authorization. Inside the application gate the owner invitation names the principal and the per-person credential proves who is presenting it.
+
+A verified Tailscale/trusted-proxy identity is handled per AUTH-005: where the deployment provides one it is accepted only on the trusted local path, and it may be recorded and additionally required. It is never a term that can grant access on its own. In this deployment the Tailnet account is shared by the research room, so that identity names the account the request arrived under, not the person; see §11.8.
 
 ### 11.2 Tailnet policy is not managed by ServerSentinel
 

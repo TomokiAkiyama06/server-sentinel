@@ -1,9 +1,10 @@
 # ADR 0003: Shared Tailnet Account and Per-Person Application Credentials
 
 Status: Accepted
-Date: 2026-09-21
+Date: 2026-09-20
+Approved by: repository owner, who stated the shared research-room Tailscale account and the per-person credential requirement for this deployment.
 
-Relates to Issue #6 (Owner authorization / trusted Tailscale identity) and Issue #10 (human access enforcement).
+Relates to Issue #6 (Owner authorization / trusted Tailscale identity) and Issue #10 (human access enforcement). Issue #6 stays Open until its implementation and manual verification land; this ADR records only the decision it was blocked on.
 
 ## Context
 
