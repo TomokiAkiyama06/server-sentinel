@@ -58,7 +58,10 @@ Owner. This remains UI projection only: the production entry still denies
 access, these screens make no request without an injected provider, and #10
 must supply server-side authorization before any human route is published.
 Timeline and presence data are loaded through optional `DashboardServices`
-providers that only tests supply, using synthetic observations.
+providers that only tests supply, using synthetic observations. Providers are
+invoked bound to their service, so a class-based implementation keeps its
+receiver; the browser harness is class-based to hold that contract. A
+quality-gated result is never labelled confirmed.
 
 ## Local build and tests
 

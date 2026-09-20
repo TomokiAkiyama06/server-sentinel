@@ -163,6 +163,22 @@ test('timeline rows always carry source attribution plus confidence and quality'
   assert.match(timeline(page([]), 'en'), /Confidence is not certainty\./);
 });
 
+test('a quality-gated result is never labelled confirmed', () => {
+  for (const kind of ['person', 'motion', 'owner_entry', 'server_movement', 'camera_tamper']) {
+    for (const quality of ['insufficient', 'unknown']) {
+      // The backend rejects this combination; the UI must not trust it either.
+      const markup = timeline(page([observation(kind, { confirmed: true, quality, confidence: 0.9 })]));
+      assert.match(markup, /判定できません/);
+      assert.doesNotMatch(markup, /確認済み/);
+    }
+    assert.match(timeline(page([observation(kind, { confirmed: true, quality: 'sufficient' })])), /確認済み/);
+  }
+  const gatedNegative = observation('person', { confirmed: true, value: 'not_observed', quality: 'insufficient' });
+  assert.doesNotMatch(timeline(page([gatedNegative])), /確認済み/);
+  // Status events are not quality gated, so their confirmation still stands.
+  assert.match(timeline(page([observation('recording', { value: 'failed', quality: 'unknown', confirmed: true })])), /確認済み/);
+});
+
 test('critical observations are visually distinguished without asserting a culprit', () => {
   const markup = timeline(page([observation('server_movement', { confirmed: true }),
     observation('camera_tamper', { confirmed: true })]));

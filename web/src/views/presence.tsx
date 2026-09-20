@@ -72,10 +72,11 @@ type State = { state: 'pending' } | { state: 'loading' } | { state: 'failed' } |
 export function PresenceScreen({ services, t }: { services: DashboardServices; t: Messages }) {
   const [data, setData] = useState<State>({ state: 'pending' });
   const [failed, setFailed] = useState(false);
-  const load = services.loadPresence;
-  const cancel = services.cancelPresenceOverride;
+  // Bound to the service so class-based providers keep their receiver.
+  const cancel = services.cancelPresenceOverride?.bind(services);
 
   useEffect(() => {
+    const load = services.loadPresence?.bind(services);
     if (!load) return;
     const controller = new AbortController();
     setData({ state: 'loading' });
@@ -88,7 +89,7 @@ export function PresenceScreen({ services, t }: { services: DashboardServices; t
       }
     })();
     return () => controller.abort();
-  }, [load]);
+  }, [services]);
 
   if (data.state === 'failed') return <p role="alert">{t.presenceUnavailable}</p>;
   if (data.state === 'loading') return <p role="status">{t.checking}</p>;

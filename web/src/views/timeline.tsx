@@ -59,16 +59,18 @@ function Row({ item, t, orderingBasis }: {
   item: Observation; t: Messages; orderingBasis: TimelinePage['ordering_basis'];
 }) {
   const group = kindGroup[item.kind];
+  const value = displayValue(item);
   const displayedAt = orderingBasis === 'received_at' ? item.received_at : item.occurred_at;
   return <li className={`timeline-row timeline-${group}`} data-observation-kind={item.kind}>
     <time className="timeline-time" dateTime={displayedAt}>{stamp(displayedAt)}</time>
     <span className={`timeline-dot timeline-dot-${group}`} aria-hidden="true" />
     <div className="timeline-detail">
       <p className="timeline-body">
-        {t[`kind_${item.kind}`]}: {t[`value_${displayValue(item)}`]}
+        {t[`kind_${item.kind}`]}: {t[`value_${value}`]}
         {item.presence_state ? ` (${t[`state_${item.presence_state}`]})` : ''}
         {group === 'critical' && <span className="badge badge-critical">{t.criticalBadge}</span>}
-        {item.confirmed && <span className="badge">{t.confirmedLabel}</span>}
+        {/* A quality-gated result is never labelled confirmed. */}
+        {item.confirmed && value === item.value && <span className="badge">{t.confirmedLabel}</span>}
       </p>
       <p className="timeline-meta">
         <span>{attribution(item, t)}</span>
@@ -112,9 +114,10 @@ type State = { state: 'pending' } | { state: 'loading' } | { state: 'failed' } |
 export function TimelineScreen({ services, t }: { services: DashboardServices; t: Messages }) {
   const [data, setData] = useState<State>({ state: 'pending' });
   const [filter, setFilter] = useState<TimelineFilter>('all');
-  const load = services.loadTimeline;
 
   useEffect(() => {
+    // Bound to the service so class-based providers keep their receiver.
+    const load = services.loadTimeline?.bind(services);
     if (!load) return;
     const controller = new AbortController();
     setData({ state: 'loading' });
@@ -127,7 +130,7 @@ export function TimelineScreen({ services, t }: { services: DashboardServices; t
       }
     })();
     return () => controller.abort();
-  }, [load]);
+  }, [services]);
 
   if (data.state === 'failed') return <p role="alert">{t.timelineUnavailable}</p>;
   if (data.state === 'loading') return <p role="status">{t.checking}</p>;

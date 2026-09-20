@@ -16,20 +16,30 @@ function session(value: unknown): Session {
   }
   throw new Error();
 }
-const services = {
-  loadSession: (signal: AbortSignal) => api.read('/api/mock/session', session, signal),
-  loadSources: (signal: AbortSignal) => api.read('/api/mock/sources', value => {
-    if (!Array.isArray(value)) throw new Error();
-    return value as CameraSourceSummary[];
-  }, signal),
-  loadTimeline: (signal: AbortSignal) => api.read('/api/mock/timeline', value => {
-    if (typeof value !== 'object' || value === null || !Array.isArray((value as TimelinePage).items)) throw new Error();
-    return value as TimelinePage;
-  }, signal),
-  loadPresence: (signal: AbortSignal) => api.read('/api/mock/presence', value => {
-    if (typeof value !== 'object' || value === null || !('snapshot' in value)) throw new Error();
-    return value as PresenceReport;
-  }, signal),
-};
+function presence(value: unknown): PresenceReport {
+  if (typeof value !== 'object' || value === null || !('snapshot' in value)) throw new Error();
+  return value as PresenceReport;
+}
+
+/** Class-based on purpose: providers must keep their receiver when invoked. */
+class SyntheticServices {
+  constructor(private readonly client: typeof api) {}
+  loadSession(signal: AbortSignal) { return this.client.read('/api/mock/session', session, signal); }
+  loadSources(signal: AbortSignal) {
+    return this.client.read('/api/mock/sources', value => {
+      if (!Array.isArray(value)) throw new Error();
+      return value as CameraSourceSummary[];
+    }, signal);
+  }
+  loadTimeline(signal: AbortSignal) {
+    return this.client.read('/api/mock/timeline', value => {
+      if (typeof value !== 'object' || value === null || !Array.isArray((value as TimelinePage).items)) throw new Error();
+      return value as TimelinePage;
+    }, signal);
+  }
+  loadPresence(signal: AbortSignal) { return this.client.read('/api/mock/presence', presence, signal); }
+  cancelPresenceOverride(signal: AbortSignal) { return this.client.read('/api/mock/presence-cancelled', presence, signal); }
+}
+const services = new SyntheticServices(api);
 const root = document.getElementById('root');
 if (root) createRoot(root).render(<App services={services} />);

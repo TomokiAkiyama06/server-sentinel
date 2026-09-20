@@ -49,6 +49,10 @@ const presenceFixture = {
   },
   transitions: [{ at: '2026-09-21T08:00:00.000000+00:00', state: 'UNKNOWN', basis: 'unknown' }],
 };
+const cancelledPresenceFixture = {
+  snapshot: { ...presenceFixture.snapshot, state: 'UNKNOWN', basis: 'unknown', override_expires_at: null, suppress_ordinary: false },
+  transitions: [...presenceFixture.transitions],
+};
 let cases = 0;
 
 async function scenario(viewport, { production = false, status = 200, session = owner, count = 1, optIn = false, sourceStatus = 200, positiveControl = false } = {}, assertions) {
@@ -95,6 +99,9 @@ async function scenario(viewport, { production = false, status = 200, session = 
     }
     if (!production && url.pathname === '/api/mock/presence') {
       await fulfill(JSON.stringify(presenceFixture), 'application/json'); return;
+    }
+    if (!production && url.pathname === '/api/mock/presence-cancelled') {
+      await fulfill(JSON.stringify(cancelledPresenceFixture), 'application/json'); return;
     }
     unexpected.push('unexpected path');
     await page.command('Fetch.failRequest', { requestId, errorReason: 'BlockedByClient' });
@@ -173,6 +180,10 @@ try {
       assert.match(presenceText, /PRESENT のため通常の occupancy automation を抑制しています。/);
       assert.match(presenceText, /すべての状態で継続します。/);
       assert.equal(await page.evaluate('document.documentElement.scrollWidth <= window.innerWidth'), true, 'timeline and presence fit viewport');
+      // Provider methods are invoked on their service; a lost receiver fails here.
+      await page.evaluate("document.querySelector('.presence-override button').click()");
+      await page.wait("document.querySelector('.presence-value').textContent === '不明'");
+      assert.match(await page.evaluate('document.body.innerText'), /手動上書きはありません。/);
     });
     await scenario(viewport, { sourceStatus: 503 }, async page => {
       await page.click('カメラソース');
