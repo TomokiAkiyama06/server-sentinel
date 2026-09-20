@@ -15,7 +15,7 @@ import unittest
 from unittest.mock import call, patch
 import zipfile
 
-from app.deployment import Deployment
+from app.deployment import Deployment, main as deployment_main
 from app.settings import ConfigurationError
 from build_artifact import _required_wheels, build
 from build_installer import build as build_installer
@@ -527,6 +527,57 @@ class ReleaseLifecycleTests(unittest.TestCase):
 
 
 class DeploymentConfigurationTests(unittest.TestCase):
+    def test_runtime_launcher_rejects_install_tree_config_and_accepts_external_config(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            install = root / "installation"
+            release = install / "releases/1.0.0"
+            module = release / "app/deployment.py"
+            module.parent.mkdir(parents=True)
+            module.write_text("synthetic")
+            (install / "current").symlink_to("releases/1.0.0", target_is_directory=True)
+
+            runtime = root / "runtime"
+            for path in (runtime, runtime / "state", runtime / "recordings", runtime / "audit"):
+                path.mkdir(mode=0o700)
+            device = runtime.stat().st_dev
+            value = {
+                "runtime_root": str(runtime), "service_uid": os.geteuid(),
+                "runtime_mount_point": str(root),
+                "runtime_device": [os.major(device), os.minor(device)],
+                "human_host": "127.0.0.1", "human_port": 8000, "log_level": "INFO",
+            }
+
+            external = root / "etc/deployment.json"
+            external.parent.mkdir()
+            internal = install / "deployment.json"
+            release_internal = install / "current/deployment.json"
+            for config in (external, internal, release_internal):
+                config.write_text(json.dumps(value))
+                config.chmod(0o600)
+
+            with patch("app.deployment.__file__", str(module)):
+                for config in (internal, release_internal):
+                    with self.subTest(config=config), patch(
+                            "sys.stderr", new_callable=io.StringIO) as stderr, self.assertRaises(
+                                SystemExit) as stopped:
+                        deployment_main(["--config", str(config), "--check"])
+                    self.assertEqual(stopped.exception.code, 1)
+                    self.assertEqual(
+                        stderr.getvalue(), "ServerSentinel deployment validation failed\n"
+                    )
+
+                with patch("app.deployment.os.path.ismount", return_value=True), patch(
+                        "app.deployment._operating_system_root_device",
+                        return_value=device + 1), patch(
+                            "sys.stdout", new_callable=io.StringIO) as stdout:
+                    self.assertEqual(
+                        deployment_main(["--config", str(external), "--check"]), 0
+                    )
+                self.assertEqual(
+                    stdout.getvalue(), "ServerSentinel deployment validation passed\n"
+                )
+
     def test_configuration_is_private_bounded_and_owned(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

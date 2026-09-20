@@ -17,6 +17,15 @@ def _operating_system_root_device() -> int:
     return Path("/").stat().st_dev
 
 
+def _runtime_roots() -> tuple[Path, Path | None]:
+    try:
+        code_root = Path(__file__).resolve(strict=True).parents[1]
+    except (OSError, RuntimeError, IndexError):
+        raise ConfigurationError("deployment code location is unavailable") from None
+    install_root = code_root.parent.parent if code_root.parent.name == "releases" else None
+    return code_root, install_root
+
+
 def _read_configuration(path: Path) -> tuple[dict, os.stat_result]:
     try:
         descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK)
@@ -134,7 +143,10 @@ def main(arguments: list[str] | None = None) -> int:
     parser.add_argument("--check", action="store_true")
     args = parser.parse_args(arguments)
     try:
-        deployment = Deployment.load(args.config)
+        code_root, install_root = _runtime_roots()
+        deployment = Deployment.load(
+            args.config, code_root=code_root, install_root=install_root
+        )
         if os.geteuid() != deployment.service_uid:
             raise ConfigurationError("launcher must run as the dedicated account")
     except ConfigurationError:
