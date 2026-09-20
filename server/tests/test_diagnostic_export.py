@@ -146,6 +146,9 @@ class StorageAdmission:
         self.release_threads = []
 
     def admit(self, media_bytes, *, critical):
+        raise AssertionError("diagnostics must never use reclaiming admission")
+
+    def admit_external(self, media_bytes):
         self.admit_threads.append(threading.get_ident())
         if threading.get_ident() != self.owner:
             raise AssertionError("STORAGE_POLICY_UNAVAILABLE")
@@ -153,7 +156,7 @@ class StorageAdmission:
             # MainStoragePolicy denies with RecordingError, not with this
             # package's error type.
             raise self.denial
-        if self.active or type(media_bytes) is not int or media_bytes <= 0 or critical:
+        if self.active or type(media_bytes) is not int or media_bytes <= 0:
             raise AssertionError("invalid diagnostic storage admission")
         self.reservations.append(media_bytes)
         self.active = True
@@ -353,23 +356,30 @@ class DiagnosticExportTests(unittest.IsolatedAsyncioTestCase):
             def usage_bytes(inner_self, *, starred_only=False, critical_only=False):
                 return 0
 
-        class SyntheticReclaimer:
+        class RecordingReclaimer:
+            def __init__(inner_self):
+                inner_self.calls = []
+
             def expired(inner_self, now_ms, limit):
+                inner_self.calls.append("expired")
                 return 0
 
             def oldest(inner_self, limit):
+                inner_self.calls.append("oldest")
                 return 0
+
+        reclaimer = RecordingReclaimer()
 
         def build_on_owning_worker():
             policy = MainStoragePolicy(
                 limits, lambda: FilesystemSpace(50_000_000, 100_000_000),
                 lambda: 0, lambda transition: None)
-            policy.bind(SyntheticInventory(), SyntheticReclaimer())
+            policy.bind(SyntheticInventory(), reclaimer)
             return policy
 
         policy = self.worker.submit(build_on_owning_worker).result()
         with self.assertRaisesRegex(RecordingError, "STORAGE_POLICY_UNAVAILABLE"):
-            await asyncio.to_thread(policy.admit, 1, critical=False)
+            await asyncio.to_thread(policy.admit_external, 1)
 
         result = await self.make_service(
             Permit(), media=self.media, policy=policy).export(
@@ -377,6 +387,8 @@ class DiagnosticExportTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result.bundle_path.exists())
         self.assertEqual(
             0, self.worker.submit(lambda: policy.status().reserved_bytes).result())
+        # A support bundle must never delete monitoring evidence to fit.
+        self.assertEqual(reclaimer.calls, [])
 
     async def test_output_outside_the_admitted_filesystem_is_refused_before_admission(self):
         admitted = self.storage_filesystem
@@ -838,6 +850,18 @@ class DiagnosticExportTests(unittest.IsolatedAsyncioTestCase):
             async def require_owner_export(inner_self, action, confirmation):
                 return None
 
+        class ReclaimingPolicyOnly:
+            def admit(inner_self, media_bytes, *, critical):
+                raise AssertionError("reclaiming admission must not be reachable")
+
+            def release(inner_self):
+                return None
+
+        with self.assertRaises(TypeError):
+            DiagnosticExportService(
+                Permit(), self.source, ReclaimingPolicyOnly(), self.worker,
+                self.storage_filesystem)
+
         cases = (
             ("incomplete-owner-boundary", ContentsOnly(), self.worker,
              self.storage_filesystem),
@@ -900,6 +924,11 @@ class DiagnosticExportTests(unittest.IsolatedAsyncioTestCase):
         return application
 
     @staticmethod
+    def response_body(messages):
+        return b"".join(message.get("body", b"") for message in messages
+                        if message["type"] == "http.response.body")
+
+    @staticmethod
     async def post_export(application, selected_media_ids=()):
         body = json.dumps({"selected_media_ids": list(selected_media_ids)}).encode()
         return await request(
@@ -928,6 +957,32 @@ class DiagnosticExportTests(unittest.IsolatedAsyncioTestCase):
             [(item.category, item.item_count)
              for item in authorizer.confirmations[0][1].included_categories],
             [("runtime", 2)])
+
+    async def test_prepared_route_reports_fixed_statuses_without_failure_detail(self):
+        """Regression: a denial or rejected selection never echoes local values."""
+        class OwnerRoutePermit:
+            async def require_system_access(inner_self, route_request: Request):
+                return None
+
+            async def require_owner_access(inner_self, route_request: Request):
+                return None
+
+        application = self.prepared_route_application(
+            OwnerRoutePermit(), Permit(), self.media)
+
+        rejected = await self.post_export(application, ("../clip",))
+        self.assertEqual(rejected[0]["status"], 400)
+        self.assertNotIn(b"../clip", self.response_body(rejected))
+
+        self.policy.denial = RecordingError(
+            "/private/deployment/mount SYNTHETIC_PRIVATE_VALUE")
+        denied = await self.post_export(application, ("clip_a",))
+        body = self.response_body(denied)
+        self.assertEqual(denied[0]["status"], 503)
+        self.assertNotIn(b"SYNTHETIC_PRIVATE_VALUE", body)
+        self.assertNotIn(b"/private/deployment/mount", body)
+        self.assertNotIn(b"clip_a", body)
+        self.assertEqual(list(self.output.iterdir()), [])
 
     async def test_prepared_route_denies_an_invited_non_owner_before_the_endpoint(self):
         """Regression: system access alone must not reach a selected-media lookup."""

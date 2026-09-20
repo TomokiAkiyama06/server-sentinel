@@ -19,7 +19,6 @@ import stat
 from typing import BinaryIO, Callable, ContextManager, Protocol, TypeAlias
 from zipfile import ZIP64_LIMIT, ZIP_STORED, ZipFile, ZipInfo
 
-from app.media.recording.model import StoragePolicy
 from app.media.recording.store import RootIdentity
 
 
@@ -285,6 +284,20 @@ class OwnerDiagnosticExportAuthorizer(Protocol):
             self, action: DiagnosticExportAction,
             confirmation: "DiagnosticExportConfirmation") -> None:
         """Confirm the sanitized contents and deny unless the Owner approves."""
+
+
+class DiagnosticStoragePolicy(Protocol):
+    def admit_external(self, media_bytes: int) -> None:
+        """Reserve exactly these bytes without deleting any recording.
+
+        A support bundle is optional convenience data, not monitoring evidence,
+        so admission must never run retention or reclamation to make room for
+        it. Implementations refuse with a fixed reason code instead, preserve
+        the deployment hard reserve, and hold the reservation until release().
+        """
+
+    def release(self) -> None:
+        """Release only this writer's most recent successful reservation."""
 
 
 class StorageWorker(Protocol):
@@ -608,7 +621,8 @@ class DiagnosticExportService:
     """The sole public bundle creation path, with pre-write confirmation."""
 
     def __init__(self, authorizer: OwnerDiagnosticExportAuthorizer,
-                 source: DiagnosticSource, storage_policy: StoragePolicy,
+                 source: DiagnosticSource,
+                 storage_policy: DiagnosticStoragePolicy,
                  storage_worker: StorageWorker,
                  storage_filesystem: RootIdentity,
                  media_source: MediaSource | None = None) -> None:
@@ -617,6 +631,12 @@ class DiagnosticExportService:
                 raise TypeError("owner export authorization is incomplete")
         if not callable(getattr(storage_worker, "submit", None)):
             raise TypeError("storage worker must schedule owning-thread calls")
+        for reservation in ("admit_external", "release"):
+            if not callable(getattr(storage_policy, reservation, None)):
+                # A reclaiming admission would delete recordings to make room
+                # for an optional bundle, so only the explicit non-reclaiming
+                # contract is accepted here.
+                raise TypeError("storage policy must admit without reclamation")
         if not isinstance(storage_filesystem, RootIdentity):
             raise TypeError("storage_filesystem must be an approved RootIdentity")
         if (type(storage_filesystem.device) is not int
@@ -685,13 +705,15 @@ class DiagnosticExportService:
     def __admit(self, reserved_bytes: int) -> None:
         """Reserve through the policy and keep its error type off the boundary.
 
-        A composed `MainStoragePolicy` reports denial as `RecordingError` with a
-        fixed reason code, not as a diagnostics error. Without this translation a
-        pressure or hard-stop denial would cross the export boundary as an
-        unrelated exception type and reach the route as an unhandled failure.
+        `admit_external` never runs retention, so a bundle cannot evict
+        recordings to make room. A composed `MainStoragePolicy` reports denial
+        as `RecordingError` with a fixed reason code, not as a diagnostics
+        error. Without this translation a pressure or hard-stop denial would
+        cross the export boundary as an unrelated exception type and reach the
+        route as an unhandled failure.
         """
         try:
-            self.__storage_policy.admit(reserved_bytes, critical=False)
+            self.__storage_policy.admit_external(reserved_bytes)
         except DiagnosticExportError:
             raise
         except Exception as denial:

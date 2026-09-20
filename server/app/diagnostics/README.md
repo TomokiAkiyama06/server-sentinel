@@ -29,6 +29,12 @@ cancellation cleanup verifies it reopened the same directory; a renamed or
 replaced directory means the archive is unreachable, an absent file is not
 accepted as deletion, and the service blocks later exports instead.
 
+Admission uses the explicit non-reclaiming `admit_external` contract. A support
+bundle is optional convenience data, not monitoring evidence, so reserving space
+for it must never run retention or delete recordings to make room; a deployment
+without free space is refused with its current state instead. A policy that only
+offers reclaiming admission is rejected when the service is constructed.
+
 Admission, bundle I/O and release are submitted as one unit to the storage
 policy's owning worker. `MainStoragePolicy` admits, releases and serializes every
 filesystem writer on the thread that constructed it and otherwise reports
@@ -86,7 +92,9 @@ bundle at 1 GiB; short, growing, or contract-breaking streams fail closed.
 composition accepts only a `DiagnosticExportEndpoint` with a fixed local output
 directory. Production keeps the human surface closed until Issue #10 lands; when
 mounted, the route requires the existing human access boundary, the Owner-only
-route boundary, and the service's exact Owner confirmation.
+route boundary, and the service's exact Owner confirmation. It reports fixed
+statuses only: a rejected selection never echoes the submitted identifiers and a
+storage denial never carries a local failure detail.
 
 The manifest reports included categories, counts, exclusion reasons and the
 identifier transformation. It contains no excluded value, media ID, path,

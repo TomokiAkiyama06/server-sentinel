@@ -92,6 +92,60 @@ class StoragePolicyTests(unittest.TestCase):
         with self.assertRaisesRegex(RecordingError, "INVALID_RESERVATION"):
             self.policy.release()
 
+    def test_external_artifacts_never_reclaim_recordings_to_make_room(self):
+        """An optional local artifact must not evict monitoring evidence."""
+        self.inventory.add(400, 0)
+        self.inventory.add(400, 0)
+        self.inventory.free = 350
+
+        with self.assertRaisesRegex(RecordingError, "STORAGE_PRESSURE"):
+            self.policy.admit_external(100)
+        self.assertEqual([], self.inventory.deleted)
+        self.assertEqual(0, self.policy.status().reserved_bytes)
+
+        # Recording admission may still reclaim for the same request size.
+        self.policy.admit(100, critical=False)
+        self.assertTrue(self.inventory.deleted)
+        self.policy.release()
+
+    def test_external_artifact_reservation_covers_overhead_and_releases(self):
+        self.policy.admit_external(100)
+        self.assertEqual(120, self.policy.status().reserved_bytes)
+        with self.assertRaisesRegex(RecordingError, "INVALID_RESERVATION"):
+            self.policy.admit_external(1)
+        self.policy.release()
+        self.assertEqual(0, self.policy.status().reserved_bytes)
+        self.assertEqual([], self.inventory.deleted)
+
+    def test_external_artifact_refuses_reserve_oversize_and_failed_cleanup(self):
+        with self.assertRaisesRegex(RecordingError, "INVALID_RESERVATION"):
+            self.policy.admit_external(LIMITS.max_request_bytes + 1)
+
+        self.policy.cleanup_failed = True
+        with self.assertRaisesRegex(RecordingError, "STORAGE_PRESSURE"):
+            self.policy.admit_external(1)
+        self.policy.cleanup_failed = False
+
+        self.inventory.free = 119
+        with self.assertRaisesRegex(RecordingError, "STORAGE_HARD_STOP"):
+            self.policy.admit_external(1)
+        self.assertEqual([], self.inventory.deleted)
+        self.assertEqual(0, self.policy.status().reserved_bytes)
+
+    def test_external_artifact_admission_requires_the_owning_worker(self):
+        failures = []
+
+        def off_worker():
+            try:
+                self.policy.admit_external(1)
+            except RecordingError as error:
+                failures.append(str(error))
+
+        thread = threading.Thread(target=off_worker)
+        thread.start()
+        thread.join()
+        self.assertEqual(["STORAGE_POLICY_UNAVAILABLE"], failures)
+
     def test_other_process_consumption_is_resampled_and_reserve_never_admitted(self):
         self.policy.admit(100, critical=False)
         self.policy.release()

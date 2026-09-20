@@ -339,6 +339,37 @@ class MainStoragePolicy:
             self.release()
             raise
 
+    def admit_external(self, media_bytes: int) -> None:
+        """Reserve non-recording bytes without deleting any recording.
+
+        Optional local artifacts, such as an Owner-initiated diagnostic support
+        bundle, are not monitoring evidence and must never evict it to make
+        room. This therefore never runs retention or reclamation: it refuses
+        with the current state instead, so recordings are preserved and the
+        Owner is told the deployment lacks free space. The hard filesystem
+        reserve is protected exactly as for recording admission.
+        """
+        self._check()
+        if (type(media_bytes) is not int
+                or not 0 <= media_bytes <= self.limits.max_request_bytes
+                or self._reservation):
+            raise RecordingError("STORAGE_INVALID_RESERVATION")
+        total = media_bytes + self.limits.write_overhead_bytes
+        # Check identity before reserving, including on a substituted mount.
+        self.guard_metadata()
+        space, used, _, _ = self._read()
+        self._reservation = True
+        self._reserved_media = media_bytes
+        self._reserved_total = total
+        try:
+            self._state_for(space, used)
+            if self.state != StorageState.NORMAL:
+                # A failed earlier cleanup also keeps this optional work out.
+                raise RecordingError(self.state.value)
+        except BaseException:
+            self.release()
+            raise
+
     def release(self) -> None:
         if threading.get_ident() != self._owner or not self._reservation:
             raise RecordingError("STORAGE_INVALID_RESERVATION")

@@ -26,6 +26,10 @@ request beyond the hard safety reserve.
 
 Ordinary/manual writes stop under `STORAGE_PRESSURE`; only explicitly confirmed
 critical work supplied through the trusted recorder port can use the allowance.
+`admit_external` reserves bytes for optional non-recording local artifacts such
+as an Owner-initiated diagnostic bundle. It never runs retention or reclamation,
+so such an artifact cannot evict monitoring evidence to make room; it refuses
+with the current state whenever the deployment is not `NORMAL`.
 The allowance conservatively caps resident critical segment bytes plus the new
 reservation (including after restart), and also bounds total quota overflow.
 No evidence classifier is implemented here. Cleanup tries expired completed
