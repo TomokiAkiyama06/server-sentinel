@@ -66,3 +66,5 @@ Image source/notice references:
 Concrete material base components include glibc LGPL-2.1+, GCC runtime under its runtime-library exception, readline GPL-3+, and gdbm GPL-3+. Readline/_gdbm are optional interpreter extensions; do not add application use/linkage to these GPL APIs in this issue. No image is declared wholly permissive, no project license is changed, and no independent app code is copied from GPL utilities.
 
 This recipe is compatible unmodified OS aggregation, not a linked GPL application dependency. It does not grant an exception for a future linked GPL app/model dependency or a binary-image publication with incomplete corresponding source.
+
+The optional Issue #20 detector runtime has a separate Linux x86_64 / CPython 3.12-only [hash lock](../requirements-detector.lock) and [exact native/model audit](RTDETR_RUNTIME_AUDIT.md). Its narrower platform scope does not alter the base backend lock. CI installs both to test the optional adapter without model weights.
