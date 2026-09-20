@@ -13,19 +13,26 @@ hardware, monitoring media, network values, and submitted setting values must
 not be passed as logical IDs.
 
 `OwnerAdministration` is the runtime-facing integration boundary for privileged
-registry, UVC approval, and recording-state mutations, and for Owner-only audit
-reading through `list_audit_records()`. Reading audit history is itself a
-privileged security operation: it passes the same Owner authorizer, so no
-invited principal and no capture-node credential can reach it, and `AuditStore`
-stays an internal primitive used by that boundary and by retention. A refused
-read records nothing, so an unauthorized caller cannot grow the audit table. Its injected authorizer
-must fail closed unless the current deployment Owner is established. The actor
-context is used only by that authorizer and is never stored or represented. A
-denied operation is not run; successful and failed operations are recorded
-without their result or exception details. `execute_transactional()` places the
-domain mutation and successful audit append in the same SQLite transaction, so
-an audit write failure rolls the mutation back. Plain `PermissionError` denial
-from an injected authorizer is safely classified without inspecting its detail.
+registry, UVC approval, and recording-state mutations, and for audit reading
+through `list_audit_records()`. Its injected authorizer must fail closed unless
+the current deployment Owner is established, and `create_app()` installs
+`DenyAllOwners` until a deployment supplies one. The actor context is used only
+by that authorizer and is never stored or represented. A denied operation is not
+run; successful and failed operations are recorded without their result or
+exception details. `execute_transactional()` places the domain mutation and
+successful audit append in the same SQLite transaction, so an audit write
+failure rolls the mutation back. Plain `PermissionError` denial from an injected
+authorizer is safely classified without inspecting its detail.
+
+Reading audit history is itself a privileged security operation and passes the
+same Owner authorizer through `OwnerAuditService.list_records()`. A refused read
+writes nothing, so an unauthorized caller cannot grow the audit table.
+`AuditStore` is a process-internal primitive with no authorization of its own;
+it is called by that Owner boundary and by retention, and is not an API. This
+tree publishes no audit HTTP route. Any future route must be served only by the
+human dashboard listener behind the Owner boundary — never by the capture
+ingest listener — so that an invited `live:view` / `recordings:view` principal
+and a capture-node credential cannot read, alter, or delete audit records.
 
 Hardware baseline inventory/approval is not implemented in this tree. Plan 23
 must call `OwnerAdministration.approve_hardware_baseline()` with its logical

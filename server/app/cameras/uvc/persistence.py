@@ -16,6 +16,10 @@ SCHEMA = (
     "session_token TEXT, serial_ambiguous INTEGER NOT NULL CHECK (serial_ambiguous IN (0, 1)))"
 )
 
+# A live explicit binding is in-memory only: it proves which physical device an
+# Owner selected during one session. This column keeps that invariant visible
+# and enforced in the schema, so every durable row is written and read as 0 and
+# a restart can never restore a binding from storage.
 EXPLICIT_BINDING_SCHEMA = (
     "ALTER TABLE uvc_approvals ADD COLUMN explicit_binding INTEGER NOT NULL DEFAULT 0 "
     "CHECK (explicit_binding IN (0, 1))"
