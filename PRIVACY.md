@@ -25,6 +25,13 @@ There is no required ServerSentinel developer cloud/account/data plane.
 
 ## Developer data collection
 
+The internal recording store writes compressed media and source/event/integrity
+metadata only to deployment-local storage. It has no network client, telemetry,
+codec download or export endpoint. Tests generate compressed non-video bytes in
+temporary directories; these are storage fixtures and do not contain people,
+rooms or playable surveillance media. Real media adapters and authorized playback
+remain separate integration gates.
+
 The implemented backend foundation has no network client, reporting integration
 or media input. Its structured logs discard arbitrary strings, request metadata
 and exception contents, including values with unknown secret formats. Synthetic
@@ -164,6 +171,13 @@ The Main Server keeps its Owner-approved hardware baseline and detailed hardware
 
 If the owner enables Slack, configured event information/thumbnails may be sent directly from the deployment to the owner's Slack workspace. The ServerSentinel developer does not relay the message.
 
+The initial internal adapter sends only fixed critical categories or aggregate
+daily counts/duration/storage state, never thumbnails, source names, hardware
+identifiers or arbitrary event text. It is disabled without deployment
+configuration. Person/motion/entry and ordinary camera-offline observations do not
+generate immediate Slack messages by default. Local fault reporting remains
+independent of Slack delivery; production durable event integration is pending.
+
 ## Diagnostics
 
 Diagnostics remain local unless explicitly exported/shared.
@@ -181,3 +195,5 @@ The deployment owner is responsible for camera placement and compliance with app
 ## Future changes
 
 Any feature that sends monitoring/biometric data to infrastructure operated by the ServerSentinel developer is a fundamental privacy-model change and requires explicit owner approval plus updated requirements/security/privacy documentation before implementation.
+
+The Issue #20 detector foundation keeps only bounded transient grayscale samples and a previous motion sample per source. It performs no model download, persistence or network I/O; unavailable person inference remains `unknown`. Model/runtime adoption and their separate privacy/license acceptance are documented in `server/docs/DETECTOR_MODEL_AUDIT.md`; synthetic primitive tests are not acceptance of an external model.

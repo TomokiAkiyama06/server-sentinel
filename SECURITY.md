@@ -24,6 +24,14 @@ Safe defaults:
 
 ## Threat model
 
+The internal compressed-recording store accepts no caller-controlled filenames or
+public requests. It requires a private, deployment-approved existing media root,
+an admission reservation and a trusted video-only codec validator. It rejects
+path symlinks, substituted/missing roots and competing writers; publication and
+recovery operate only on generated UUID files identified by its SQLite journal.
+Mandatory adapters and human authorization remain unwired; this module adds no
+recording playback/download route. See `server/app/media/recording/README.md`.
+
 The current backend foundation denies every human HTTP/WebSocket route,
 including system health, version, schema and framework documentation. Its
 documented launcher accepts only loopback bind settings, disables proxy-header
@@ -320,6 +328,21 @@ For remote-agent media enforce:
 Recording root is configured by the owner; per-request arbitrary absolute paths are forbidden.
 
 Preserve a hard filesystem safety reserve and enter explicit pressure/hard-stop states before unsafe writes.
+
+The internal Main policy holds configured metadata and media reservations on one
+owning worker, including recorder startup recovery. It verifies the expected
+private media root and private metadata file on the same filesystem. Provisioning
+must separately reserve migration space before opening runtime data. State-audit
+write failure remains visible. Its recording domain facade denies by default;
+invited recording viewers cannot star/delete, and no human/download route is
+introduced before #10.
+
+The optional Slack adapter accepts only deployment-configured verified HTTPS
+incoming webhooks, follows no redirect, ignores environment proxies and closes
+error responses. Credential URLs, remote bodies and raw exceptions never enter
+its result/log surface. Unset configuration constructs no transport. Current
+payloads are fixed categories/validated aggregates, without media or arbitrary
+event details. Tests use generated dummy components and intercepted transports.
 
 The Agent's normal ring buffer is bounded by Owner-selected duration or capacity mode. Protected communication-loss/critical incidents are separate from normal overwrite and expire 60 days after completion by default. Storage pressure reclaims eligible ordinary ring data first and refuses unsafe writes; it does not silently delete unexpired protected incidents.
 

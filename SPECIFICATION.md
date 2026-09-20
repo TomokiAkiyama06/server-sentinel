@@ -539,6 +539,16 @@ quality/gap metadata
 
 Critical incident protection on `media-capture-agent` is a deliberate secondary-evidence exception, not a full mirror.
 
+The internal `server/app/media/recording/` storage implementation uses generated
+segment UUID filenames, byte digests, a pending-publication journal and per-source
+event manifests. Its pre-roll has duration, byte and segment-count limits;
+recording windows carry explicit clip intervals and integrity/gap/discontinuity
+state. Restart retains committed media, cleans only journal-owned pending files
+and marks active recordings interrupted. Runtime admission and codec validation
+are mandatory injected boundaries; no human routes are enabled by this module.
+See its README for the remaining worker integration and the distinction between
+storage integrity and playable-media validation.
+
 ### 6.7 Main-host event ring buffer
 
 Maintain recent **compressed** media where practical for pre-event evidence. Default target 30 s pre / 120 s post, max event 20 min.
@@ -556,6 +566,8 @@ Use lightweight temporal/background/flow methods as appropriate.
 Use a pluggable backend. Requirements: project-compatible license, CPU fallback, optional GPU acceleration, model/version metadata, code and weights license review separately.
 
 YOLOX is an initial evaluation candidate only.
+
+The Issue #20 foundation in `server/app/detection/foundation` uses transient grayscale frames, one bounded pending frame per source, independent Main-monotonic inference cadence, and an explicit worker entry point. Quality failure, missing models, stale observations, dropped frames, and evaluation failure produce `unknown`; known loss/throttling remains visible in health snapshots. No model is implicitly downloaded or enabled. The CPU motion baseline detects image change only. An optional RT-DETRv2 CPU adapter loads only a separately licensed, locally supplied, digest-pinned ONNX artifact on the audited Linux x86_64/CPython 3.12 runtime; no runtime model download or cloud/provider fallback is exposed. See `server/docs/DETECTOR_FOUNDATION.md` for limits and `server/docs/DETECTOR_MODEL_AUDIT.md` for separate code/weight evidence. Target-host performance and production worker isolation remain acceptance work.
 
 ### 7.3 Server movement
 
@@ -647,6 +659,35 @@ Admission loop:
 Defaults: recording retention 20 days; audit retention 90 days.
 
 Agent disk-buffer safety is tracked separately from Main Server storage because the two filesystems may be different machines.
+
+The internal Issue #21 policy in `server/app/storage/` holds media plus configured
+metadata/journal/temp reservations through the serialized recorder operation.
+Physical-only control reservations cover startup recovery before inventory binding
+and never recursively invoke retention. Expected media-root identity and the
+private metadata file's filesystem are checked without symlink following or
+fallback creation. All numeric reserve/quota/hysteresis/overhead limits are
+explicit deployment configuration; only the specified retention defaults apply.
+The critical allowance conservatively bounds resident critical evidence plus the
+new reservation, surviving restart. Filesystem sampling includes other processes
+but cannot prevent unrelated writes after the sample. A failed state-audit write
+remains visible as a failure flag. The domain recording browser defaults to deny,
+requires `recordings:view` for history and Owner for star/unstar/single deletion;
+it mounts no human endpoint pending #10.
+
+`server/app/notifications/` provides optional direct Slack incoming-webhook
+delivery using verified HTTPS, no environment proxy/redirect, bounded timeout and
+redacted failures. Unconfigured delivery performs no network operation. The
+current payload is a fixed critical category or validated daily aggregate, with
+no image/media, source identity or arbitrary probe details. Both immediate and
+daily notifications enqueue on a bounded delivery worker; the recorder worker
+never waits for network IO. Local pending/result events share an ID and are
+persisted only on the owning worker. Full queues and failed persistence remain
+visible; completion-persistence retry never resends a message. The persisted daily
+scheduler defaults to 23:00 configured local time and claims one dispatch per
+local date across restart/DST/clock rollback; missed dates are not replayed.
+An uncertain crash remains `pending`, failed delivery is visible, and no implicit
+retry floods the channel. Production timers, durable event-outbox integration,
+human authorization and recording playback remain separate integration work.
 
 ## 10. Host hardware integrity and recording self-check
 

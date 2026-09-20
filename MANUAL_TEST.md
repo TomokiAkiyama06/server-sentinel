@@ -457,6 +457,21 @@ Anonymous person exits
 
 Use a disposable/test volume.
 
+Issue #21 unit/container scenarios cover temporary synthetic files, reserved
+constructor recovery, starvation/cleanup/star races, audit failure, retention,
+mock Slack and DST/rollback scheduling. They do not establish deployed volume,
+real codec, configured Slack, browser playback or human authorization acceptance.
+Keep the following deployment checks open; do not use production data for fills.
+
+- [ ] metadata database and media use the expected filesystem, and configured
+      journal/temp overhead safely covers recovery, cleanup and migrations;
+- [ ] configured Slack receives one safe immediate critical alert and one daily
+      aggregate; a failed/unconfigured channel leaves local/UI faults visible;
+- [ ] slow/unavailable Slack does not block recording; full queues, pending
+      shutdown/crash delivery and failed completion persistence remain visible;
+- [ ] after deployment restart/DST change, summary sends at the configured local
+      time without duplicate dispatch, and uncertain `pending` delivery is visible.
+
 - [ ] retention deletes expired unstarred data;
 - [ ] allocation/free-space pressure reclaims oldest eligible unstarred data;
 - [ ] unrelated filesystem consumption affects admission;
@@ -625,3 +640,10 @@ explicitly. Do not alter production protection to make a negative test pass.
 Never use a real secret as a fixture or publish an App key/token, reviewer token,
 raw private API response, or monitoring data. Cleanup only the identified
 synthetic test branches/PRs; no production data or unrelated rule deletion.
+
+## Issue #20 — Target Main detector acceptance (pending)
+
+- On the target Main Server, run the generated motion workload for 1–4 sources; measure CPU, resident memory, cadence, drops, evaluation latency and sustained health/recording continuity. Record approved per-source budgets without exporting host identifiers.
+- Before any person model is loaded, verify exact implementation/runtime/weights licenses, immutable versions, local artifact SHA-256 and the complete dependency notices. Confirm no runtime downloads, alternative-model fallback, reporting or unapproved outbound attempts on normal and failure paths.
+- Benchmark the accepted person backend on CPU; GPU is optional and separately measured. External benchmark media stays local under its terms and is never committed or attached to GitHub/CI. No real-model accuracy or target-host performance was verified by synthetic unit tests.
+- Stop/delay inference, inject quality loss, stale frames and a wedged plugin in the isolated worker: result must become unknown, loss/throttling remain visible, and capture/recording/health/storage-safety work must continue. Verify the production watchdog/resource limits separately; the primitive cannot forcibly interrupt a native call.

@@ -11,7 +11,12 @@ opens.
 ## Running locally
 
 Use the reviewed wheels in `requirements-ci.lock` with CPython 3.12 on Linux
-x86_64/aarch64, or CPython 3.14 on Linux x86_64. CI uses 3.12 x86_64.
+x86_64, the platform CI uses. That lock also includes the optional Issue #20
+detector lock, whose reviewed wheels exist only for CPython 3.12 on Linux
+x86_64, so the commands below require exactly that combination. The base
+`requirements.lock` still resolves with CPython 3.12 on Linux x86_64/aarch64
+or CPython 3.14 on Linux x86_64, but the detector tests import the detector
+runtime, so the full suite below does not run on those other platforms.
 CPython 3.13 is not supported by the current reviewed wheel hashes and is
 explicitly excluded by the project metadata.
 
@@ -31,7 +36,8 @@ application creates only `state.sqlite3`, with mode `0600`, and SQLite's own
 journal files. It does not create a missing parent or migrate into a source-tree
 directory. This is not the Agent media-root/mount enforcement from #12/#16.
 Production environments may install `requirements.lock` without the two lint
-tools. Preserve `docs/BACKEND_THIRD_PARTY_LICENSE_TEXTS.md` with deployments.
+tools or the optional detector runtime. Preserve
+`docs/BACKEND_THIRD_PARTY_LICENSE_TEXTS.md` with deployments.
 
 Optional settings are `SERVERSENTINEL_HUMAN_HOST` (default `127.0.0.1`, literal
 loopback addresses only), `SERVERSENTINEL_HUMAN_PORT` (default `8000`, 1–65535),

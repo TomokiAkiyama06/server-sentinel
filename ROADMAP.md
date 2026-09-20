@@ -13,7 +13,7 @@ Phases group capabilities rather than imposing a strict completion order. The de
 - [ ] dependency/model license policy
 - [ ] hardened review gate #4: capability assessment, offline policy tests and disabled ruleset generator prepared; Owner App setup, trusted publisher/collector and GitHub enforcement acceptance remain open (see `docs/REVIEW_GATE_SETUP.md`)
 
-Issue #1 closed when PR #2 merged after documentation/bootstrap acceptance and current HEAD/base reviews plus CI passed. CI foundation #5 is implemented. The #7 closed backend foundation now has synthetic coverage; its authorization prerequisite remains separate. Runtime/ADR Issues #6–#28 and the separately tracked #4 retain their own acceptance gates.
+Issue #1 closed when PR #2 merged after documentation/bootstrap acceptance and current HEAD/base reviews plus CI passed. CI foundation #5 is implemented. The backend and dashboard foundations have synthetic coverage; their authorization prerequisites remain separate. Runtime/ADR progress for Issues #6–#28 and the separately tracked #4 is tracked below and in GitHub.
 
 ## Phase 1 — Main server and web foundation
 
@@ -63,6 +63,12 @@ no browser preview or physical device result is claimed.
 - [ ] phone/Mac/desktop 1–4 source live grid, with stability/reconnect prioritized over minimum latency
 - [ ] demand-driven viewer transcoding/packaging
 
+Issue #18 now has bounded compressed storage primitives, source/event manifests,
+application migration v4 integration, and synthetic crash/integrity coverage. Its
+runtime worker, codec adapter, shared storage guard and authorization integration
+remain open; these primitives do not establish playable-video or hardware
+acceptance.
+
 ## Phase 4 — Human private access
 
 - [ ] unchanged-Tailnet-policy compatible application authorization
@@ -75,11 +81,11 @@ no browser preview or physical device result is claimed.
 
 ## Phase 5 — Physical-security detection
 
-- [ ] general motion
+- [x] synthetic CPU general-motion foundation (#20; runtime integration and target-host acceptance remain open)
 - [ ] permissively licensed person-detector evaluation
 - [ ] detector-specific image-quality gating
 - [ ] no false `no person` when quality is insufficient
-- [ ] per-source inference cadence
+- [x] bounded per-source inference-cadence primitive (#20; Main worker integration remains open)
 - [ ] server ROI calibration/movement
 - [ ] camera tamper/occlusion/source-health correlation
 
@@ -96,6 +102,11 @@ no browser preview or physical device result is claimed.
 - [ ] no cross-camera biometric re-identification
 
 ## Phase 7 — Timeline, recordings, storage, notifications
+
+Issue #21 has internal Main policy/retention/Owner action and optional Slack/daily
+scheduler primitives with disposable filesystem and mock transport coverage.
+Production authorization/timer/outbox integration, playback and the Owner-planned
+UI remain pending; these phase boxes represent integrated acceptance.
 
 - [ ] unified factual timeline
 - [ ] neutral wording/no culprit inference

@@ -516,6 +516,12 @@ Depends on: [#17](https://github.com/TomokiAkiyama06/server-sentinel/issues/17),
 
 Labels: `backend`, `camera-source`, `storage`
 
+Implementation status: internal storage primitives and synthetic filesystem/SQLite
+coverage are prepared in `server/app/media/recording/`. Application migration v4
+is integrated; worker integration, audited codec muxing/validation, common
+storage admission and the `#17` / `#10` prerequisites remain open; no human media
+route is enabled here.
+
 実機要件: Main Server: 不要; Capture Node: 不要; UVC Camera: 不要; Manual test: 不要
 
 Scope:
@@ -557,6 +563,8 @@ Acceptance:
 - CPU fallback works and GPU acceleration is optional; inference defaults to Main Server and per-source cadence remains independent;
 - record upstream/model/version, separate code/weight licenses, pinned artifact/checksum, material transitive obligations, and network/telemetry/runtime-download behavior; unclear licensing remains blocked for Owner decision;
 - overload reduces inference while preserving truthful health, critical evidence, and storage safety; no opaque downloads or unapproved model switching.
+
+Implementation progress (Issue #20 remains OPEN): transient CPU motion/plugin primitives and generated-frame inference-cadence/overload tests are present in `server/app/detection/foundation`. A separately licensed RT-DETRv2 CPU adapter has a verified local-artifact synthetic smoke; deployment model settings, target Main Server benchmarks and runtime integration remain unaccepted; see `server/docs/DETECTOR_FOUNDATION.md` and its model audit.
 
 ## Plan 13 — Detector-specific image-quality / low-light gating
 
@@ -737,6 +745,12 @@ GitHub Issue: [#21](https://github.com/TomokiAkiyama06/server-sentinel/issues/21
 Depends on: [#18](https://github.com/TomokiAkiyama06/server-sentinel/issues/18), [#10](https://github.com/TomokiAkiyama06/server-sentinel/issues/10), [#8](https://github.com/TomokiAkiyama06/server-sentinel/issues/8)
 
 Labels: `backend`, `frontend`, `security`, `storage`
+
+Implementation status: internal reserved storage admission, real recorder
+retention/Owner action facade, audit retention, optional direct Slack and durable
+daily scheduling have synthetic filesystem/SQLite/transport coverage. No human
+route or playback integration is mounted; #10 authorization and the Owner's UI
+design work remain pending. This partial implementation does not close #21.
 
 実機要件: Main Server: 不要; Capture Node: 不要; UVC Camera: 不要; Manual test: 不要
 
