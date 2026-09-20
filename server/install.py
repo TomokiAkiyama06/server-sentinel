@@ -26,6 +26,9 @@ MAX_UNIT_BYTES = 64 * 1024
 LOCK_WAIT_SECONDS = 600
 LOCK_POLL_SECONDS = 0.05
 SYSTEMD_UNIT = Path("/etc/systemd/system/server-sentinel.service")
+# The generated unit sets PrivateTmp=true, so these directories are replaced by
+# empty private trees for the running service.
+PRIVATE_TMP_ROOTS = (Path("/tmp"), Path("/var/tmp"))
 VERSION = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+(?:-[a-z0-9.]+)?")
 
 
@@ -190,8 +193,22 @@ def _restart(runner) -> None:
            check=True, timeout=30)
 
 
+def _clean_absolute(path: Path) -> Path:
+    """Require an already normalized absolute path.
+
+    Removing ``..`` lexically would validate a different location from the one
+    the kernel later reaches: in ``/untrusted/link/../../opt/server-sentinel``
+    the normalized form names a protected decoy while the real operation
+    follows ``link`` first.  Refuse dot segments instead of normalizing them
+    away.  ``pathlib`` already drops the harmless ``.`` and empty components.
+    """
+    if not path.is_absolute() or ".." in path.parts:
+        raise ValueError("absolute installation paths required")
+    return path
+
+
 def _protected_parent(path: Path) -> None:
-    absolute = Path(os.path.abspath(path))
+    absolute = _clean_absolute(Path(path))
     current = Path(absolute.anchor)
     try:
         for part in absolute.parts[1:]:
@@ -432,12 +449,31 @@ def _stage(args, deployment: Deployment, account: pwd.struct_passwd, runner,
     return "releases/" + args.version
 
 
+def _reachable_configuration(path: Path) -> None:
+    """Refuse a configuration the running service could never reopen.
+
+    The unit sets ``PrivateTmp=true``, so the service sees its own empty
+    ``/tmp`` and ``/var/tmp``.  A configuration placed there is readable by the
+    installer but unreachable from ``ExecStartPre``, which would make every
+    otherwise valid installation fail during activation.
+    """
+    try:
+        resolved = path.resolve(strict=True)
+    except (OSError, RuntimeError):
+        raise ValueError("deployment configuration is unavailable") from None
+    if any(resolved == root or resolved.is_relative_to(root)
+           for root in PRIVATE_TMP_ROOTS):
+        raise ValueError(
+            "deployment configuration must not live under a private temporary directory"
+        )
+
+
 def execute(args, *, runner=subprocess.run) -> None:
     if os.geteuid() != 0:
         raise ValueError("installation requires explicit administrator execution")
-    if (not args.destination.is_absolute() or not args.config.is_absolute()
-            or not args.unit.is_absolute()):
-        raise ValueError("absolute installation paths required")
+    args.destination = _clean_absolute(args.destination)
+    args.config = _clean_absolute(args.config)
+    args.unit = _clean_absolute(args.unit)
     if args.unit != SYSTEMD_UNIT:
         raise ValueError("service unit must use the supported system path")
     _protected_parent(args.destination.parent)
@@ -457,7 +493,7 @@ def execute(args, *, runner=subprocess.run) -> None:
 
 
 def _execute_locked(args, runner) -> None:
-    args.config = Path(os.path.abspath(args.config))
+    _reachable_configuration(args.config)
     deployment = Deployment.load(args.config, code_root=Path(__file__).resolve().parent,
                                  install_root=args.destination)
     account = pwd.getpwuid(deployment.service_uid)

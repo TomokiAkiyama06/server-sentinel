@@ -100,6 +100,9 @@ Privilege assumptions:
 - it refuses to run without explicit root execution, refuses any unit path other
   than the single canonical `server-sentinel.service`, and refuses a service
   account of UID 0;
+- installation, configuration, and unit paths must be absolute and free of
+  `..` segments, because normalizing them away would validate a different
+  location from the one the kernel later reaches through a symbolic link;
 - before using an installation path it rejects ancestors that are symbolic
   links, not root-owned, or group/world-writable, so an untrusted directory
   cannot later have code substituted beneath the active release;
@@ -134,8 +137,9 @@ Runtime-data assumptions:
 - deployment configuration is administrator-owned and readable but not writable
   by the dedicated runtime account, is refused if it is world-readable,
   group-writable, inside the installation or release tree, inside the
-  runtime-writable data tree, or under any directory path component the
-  administrator does not control;
+  runtime-writable data tree, under `/tmp` or `/var/tmp` where the unit's
+  `PrivateTmp=true` would hide it from the service, or under any directory path
+  component the administrator does not control;
 - the Owner-approved runtime filesystem is pinned by a stable filesystem UUID.
   Linux major/minor device numbers are reused by a replaced or reformatted disk,
   so they only corroborate that identity. A runtime mount that is missing,

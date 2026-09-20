@@ -137,7 +137,8 @@ class ReleaseLifecycleTests(unittest.TestCase):
             values.update(artifact=artifact, sha256=digest, python=Path(sys.executable))
         return argparse.Namespace(**values)
 
-    def perform(self, arguments, *, mount=True, root_device=None, approved_device=None):
+    def perform(self, arguments, *, mount=True, root_device=None, approved_device=None,
+                private_tmp=(Path("/nonexistent-private-temporary-root"),)):
         account = pwd.getpwuid(self.uid)
         if root_device is None:
             # The fixture's temporary runtime directory ordinarily shares the
@@ -156,6 +157,7 @@ class ReleaseLifecycleTests(unittest.TestCase):
                 "app.deployment._operating_system_root_device", return_value=root_device), patch(
                 "app.deployment.ADMINISTRATOR_UID", self.uid), patch(
                 "app.deployment._approved_filesystem_device", side_effect=uuid_lookup), patch(
+                "install.PRIVATE_TMP_ROOTS", private_tmp), patch(
                 "install.pwd.getpwuid", return_value=account):
             execute(arguments, runner=self.runner)
 
@@ -741,6 +743,31 @@ class ReleaseLifecycleTests(unittest.TestCase):
             # A regular file standing in for the approved device is refused.
             with self.assertRaisesRegex(ConfigurationError, "unavailable"):
                 _approved_filesystem_device(impostor.name)
+
+    def test_dot_segment_installation_paths_are_refused_before_mutation(self):
+        # abspath() strips ".." lexically, so a validated normalized path would
+        # not be the location the kernel reaches through an intermediate
+        # symbolic link.  Refuse dot segments outright.
+        for field in ("destination", "config", "unit"):
+            arguments = self.arguments("rollback")
+            original = getattr(arguments, field)
+            setattr(arguments, field, original.parent / ".." / original.parent.name
+                    / original.name)
+            with self.subTest(field=field), self.assertRaisesRegex(
+                    ValueError, "absolute installation paths required"):
+                self.perform(arguments)
+            self.assertFalse((self.installation / "releases").exists())
+        with self.assertRaisesRegex(ValueError, "absolute installation paths required"):
+            _protected_parent(self.root / "installation" / ".." / "installation")
+        with self.assertRaisesRegex(ValueError, "absolute installation paths required"):
+            _protected_parent(Path("relative/installation"))
+
+    def test_configuration_under_a_private_temporary_directory_is_refused(self):
+        # The unit sets PrivateTmp=true, so ExecStartPre could never reopen it.
+        with self.assertRaisesRegex(ValueError, "private temporary directory"):
+            self.perform(self.arguments("install", "1.0.0"), private_tmp=(self.root,))
+        self.assertFalse((self.installation / "releases").exists())
+        self.assertFalse(self.unit.exists())
 
     def test_python_interpreter_must_be_absolute_and_root_controlled(self):
         candidate = self.root / "python"
