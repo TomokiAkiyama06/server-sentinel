@@ -43,6 +43,8 @@ reports that retirement as still pending.
 
 Owner-control audit records use the main 90-day audit retention period. The
 maintenance operation is bounded and deletes the oldest expired rows first.
+Timeline observations use the main 20-day recording-retention period; an
+unfinished critical delivery retains its observation until the work resolves.
 
 Timeline ordering uses main-host receipt order, with the durable sequence only
 as a tie-break, as the single key for the SQL page, the cursor and the

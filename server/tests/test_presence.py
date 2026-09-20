@@ -409,6 +409,16 @@ class PresenceTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "audit retention"):
             self.service.expire_audit(now=NOW + timedelta(days=92), limit=1001)
 
+    def test_timeline_retention_is_bounded_and_preserves_unfinished_critical_work(self):
+        completed = self.service.record(observation(Kind.SERVER_MOVEMENT, identifier=UUID(int=1)))
+        unfinished = self.service.record(observation(Kind.CAMERA_TAMPER, identifier=UUID(int=2)))
+        self.service.complete_action(completed.identifier, "evidence", ActionResult.DELIVERED)
+        self.service.complete_action(completed.identifier, "notification", ActionResult.DELIVERED)
+        self.assertEqual(1, self.service.expire_history(now=NOW + timedelta(days=21), limit=1))
+        self.assertEqual([str(unfinished.identifier)], [item["id"] for item in self.history()["items"]])
+        with self.assertRaisesRegex(ValueError, "timeline retention"):
+            self.service.expire_history(now=NOW + timedelta(days=21), limit=1001)
+
     def test_history_bounded_cursor_prevents_duplicate_rows(self):
         for _ in range(3):
             self.service.record(observation(Kind.PERSON, confirmed=False))

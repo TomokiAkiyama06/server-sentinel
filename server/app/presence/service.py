@@ -380,6 +380,25 @@ class PresenceService:
                                 "ORDER BY at,sequence LIMIT ?)", (cutoff, limit))
         return cursor.rowcount
 
+    def expire_history(self, *, now, limit=1000):
+        """Bound timeline metadata to the main recording-retention period.
+
+        Unfinished critical delivery is retained even after ordinary timeline
+        expiry, so cleanup cannot discard evidence or notification work.
+        """
+        if type(limit) is not int or not 1 <= limit <= 1000:
+            raise ValueError("invalid timeline retention limit")
+        cutoff = timestamp(utc(now) - timedelta(days=RetentionPeriods().recording_days))
+        with self._transaction() as db:
+            rows = db.execute("SELECT item.id FROM presence_observations item "
+                              "WHERE item.received<? AND NOT EXISTS (SELECT 1 FROM presence_deliveries job "
+                              "WHERE job.observation=item.id AND job.state NOT IN ('delivered','disabled')) "
+                              "ORDER BY item.received,item.sequence LIMIT ?", (cutoff, limit)).fetchall()
+            identifiers = [(row[0],) for row in rows]
+            db.executemany("DELETE FROM presence_deliveries WHERE observation=?", identifiers)
+            db.executemany("DELETE FROM presence_observations WHERE id=?", identifiers)
+        return len(rows)
+
     @staticmethod
     def _cursor(after):
         if after is None:
