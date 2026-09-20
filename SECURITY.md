@@ -319,6 +319,21 @@ Recording root is configured by the owner; per-request arbitrary absolute paths 
 
 Preserve a hard filesystem safety reserve and enter explicit pressure/hard-stop states before unsafe writes.
 
+The internal Main policy holds configured metadata and media reservations on one
+owning worker, including recorder startup recovery. It verifies the expected
+private media root and private metadata file on the same filesystem. Provisioning
+must separately reserve migration space before opening runtime data. State-audit
+write failure remains visible. Its recording domain facade denies by default;
+invited recording viewers cannot star/delete, and no human/download route is
+introduced before #10.
+
+The optional Slack adapter accepts only deployment-configured verified HTTPS
+incoming webhooks, follows no redirect, ignores environment proxies and closes
+error responses. Credential URLs, remote bodies and raw exceptions never enter
+its result/log surface. Unset configuration constructs no transport. Current
+payloads are fixed categories/validated aggregates, without media or arbitrary
+event details. Tests use generated dummy components and intercepted transports.
+
 The Agent's normal ring buffer is bounded by Owner-selected duration or capacity mode. Protected communication-loss/critical incidents are separate from normal overwrite and expire 60 days after completion by default. Storage pressure reclaims eligible ordinary ring data first and refuses unsafe writes; it does not silently delete unexpired protected incidents.
 
 The Agent media root is deployment-configured outside the repository. Installer/startup and runtime admission check the expected mount/filesystem/device, dedicated-account writability, free space, and safety reserve. Missing or substituted media mounts produce a visible degraded/failed state and refused unsafe writes, never silent creation of a fallback media directory on the root filesystem.
