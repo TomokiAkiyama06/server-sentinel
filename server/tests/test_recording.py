@@ -616,7 +616,10 @@ class RecordingTests(unittest.TestCase):
         self.policy.calls.clear()
         with self.assertRaises(OwnerAuthorizationError):
             denied_admin.delete_recording("not-owner", self.store, denied)
-        self.assertEqual([], self.policy.calls)
+        # The denied outcome is recorded through storage admission too, so the
+        # hard reserve also covers refused work, and no mutation runs.
+        self.assertEqual([(0, False)], self.policy.calls)
+        self.assertFalse(self.policy.reserved)
         self.assertEqual(str(denied), self.store.manifest(denied)["id"])
         outcomes = {
             record.target_logical_id: record.outcome
@@ -626,6 +629,37 @@ class RecordingTests(unittest.TestCase):
         self.assertEqual(AuditOutcome.SUCCEEDED, outcomes[deleted])
         self.assertEqual(AuditOutcome.FAILED, outcomes[missing])
         self.assertEqual(AuditOutcome.DENIED, outcomes[denied])
+
+    def test_owner_recording_audit_never_writes_past_the_hard_reserve(self):
+        class PermitOwner:
+            def require_owner(self, actor_context):
+                return None
+
+        self.store.append(self.segment())
+        recording = self.store.start_manual(self.source, 30_000, duration_ms=10_000)
+        self.store.finish(recording)
+        database = Database(self.base / "metadata.sqlite")
+        # The deployment shares one storage admission between the recording
+        # store and its audit writes.
+        audit = AuditStore(database, reservation=self.store.control_reservation)
+        service = OwnerAuditService(audit, PermitOwner())
+        admin = OwnerAdministration(service, CameraRegistry(database))
+
+        self.policy.denial = "STORAGE_HARD_STOP"
+        with self.assertRaisesRegex(RecordingError, "STORAGE_HARD_STOP"):
+            admin.set_recording_starred("synthetic-owner", self.store, recording, True)
+        # Neither the starred mutation nor a failure row may spend the reserve,
+        # and the undelivered outcome stays visible instead of silent success.
+        self.assertFalse(self.policy.reserved)
+        self.assertEqual((), audit.list_records())
+        self.assertTrue(service.audit_delivery_failed)
+        self.assertEqual(1, service.undelivered_audit_records)
+
+        self.policy.denial = None
+        self.assertFalse(self.store.manifest(recording)["starred"])
+        admin.set_recording_starred("synthetic-owner", self.store, recording, True)
+        self.assertTrue(self.store.manifest(recording)["starred"])
+        self.assertEqual(AuditOutcome.SUCCEEDED, audit.list_records()[0].outcome)
 
     def test_owner_delete_cleanup_failure_gets_distinct_failed_audit(self):
         class PermitOwner:

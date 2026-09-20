@@ -1,3 +1,4 @@
+from contextlib import closing
 from dataclasses import replace
 from pathlib import Path
 import tempfile
@@ -176,6 +177,59 @@ class UvcRegistryTests(unittest.TestCase):
         admin.approve_uvc("owner", self.adapter, self.source.id, weak)
         self.discovery.devices = [replace(weak, device_path="/dev/video2")]
         self.assertFalse(self.adapter.poll_source(self.source.id))
+        self.assertEqual(
+            SourceHealthState.MANUAL_INTERVENTION_REQUIRED,
+            self.registry.get_source(self.source.id).health_state,
+        )
+
+    def test_transient_session_failure_keeps_the_committed_handoff(self):
+        class PermitOwner:
+            def require_owner(self, actor_context):
+                return None
+
+        weak = replace(self.camera, serial=None, instance_token=(1, 2, 3))
+        self.discovery.devices = [weak]
+        admin = OwnerAdministration(
+            OwnerAuditService(AuditStore(self.database), PermitOwner()), self.registry,
+        )
+        admin.approve_uvc("owner", self.adapter, self.source.id, weak)
+        with patch.object(self.adapter, "_session",
+                          side_effect=ApprovalStorageError("synthetic transient")):
+            with self.assertRaises(ApprovalStorageError):
+                self.adapter.poll_source(self.source.id)
+        # A transient failure must not discard the only proof of the exact
+        # device the Owner selected, which would force another approval.
+        self.assertEqual(weak, self.adapter._approved_handoffs[self.source.id])
+        self.assertTrue(self.adapter.poll_source(self.source.id))
+        self.assertNotIn(self.source.id, self.adapter._approved_handoffs)
+        self.assertEqual(
+            SourceHealthState.ONLINE,
+            self.registry.get_source(self.source.id).health_state,
+        )
+
+    def test_superseded_handoff_is_discarded_for_a_newer_approval(self):
+        class PermitOwner:
+            def require_owner(self, actor_context):
+                return None
+
+        weak = replace(self.camera, serial=None, instance_token=(1, 2, 3))
+        self.discovery.devices = [weak]
+        admin = OwnerAdministration(
+            OwnerAuditService(AuditStore(self.database), PermitOwner()), self.registry,
+        )
+        admin.approve_uvc("owner", self.adapter, self.source.id, weak)
+        replacement = replace(weak, device_path="/dev/video3", instance_token=(4, 5, 6))
+        self.discovery.devices = [replacement]
+        self.adapter._approved_handoffs[self.source.id] = weak
+        with closing(self.database.connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self.adapter.approve_source_on(connection, self.source.id, replacement)
+            connection.commit()
+        # The stale handoff never binds a device the Owner did not select; the
+        # superseded approval falls back to conservative manual intervention.
+        self.assertFalse(self.adapter.poll_source(self.source.id))
+        self.assertNotIn(self.source.id, self.adapter._approved_handoffs)
+        self.assertIsNone(self.adapter.sessions[self.source.id].controller.bound)
         self.assertEqual(
             SourceHealthState.MANUAL_INTERVENTION_REQUIRED,
             self.registry.get_source(self.source.id).health_state,

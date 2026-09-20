@@ -3,6 +3,7 @@
 import asyncio
 from contextlib import asynccontextmanager, closing, suppress
 import logging
+from typing import Callable, ContextManager
 
 from fastapi import FastAPI
 from starlette.types import ASGIApp, Receive, Scope, Send
@@ -47,9 +48,13 @@ class ClosedHumanSurface:
 def create_app(settings: Settings, *, database: Database | None = None,
                human_authorizer: HumanAuthorizer | None = None,
                owner_authorizer: OwnerAuthorizer | None = None,
-               audit_cleanup_interval_seconds: float = 24 * 60 * 60) -> FastAPI:
+               audit_cleanup_interval_seconds: float = 24 * 60 * 60,
+               storage_reservation: Callable[[], ContextManager] | None = None) -> FastAPI:
     store = database or Database(settings.database_path)
-    audit_store = AuditStore(store)
+    # The deployment injects the Main Server storage admission reservation once
+    # its storage policy is bound, so audit writes and retention cleanup cannot
+    # spend the hard filesystem reserve.
+    audit_store = AuditStore(store, reservation=storage_reservation)
     audit_service = OwnerAuditService(audit_store, owner_authorizer or DenyAllOwners())
     owner_administration = OwnerAdministration(audit_service, CameraRegistry(store))
     audit_retention = AuditRetentionRuntime(

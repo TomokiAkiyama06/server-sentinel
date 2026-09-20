@@ -1,5 +1,5 @@
 import asyncio
-from contextlib import closing
+from contextlib import closing, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 import tempfile
@@ -115,6 +115,32 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(0, connection.execute(
                     "SELECT count(*) FROM capture_nodes"
                 ).fetchone()[0])
+
+    async def test_startup_and_scheduled_audit_cleanup_use_storage_admission(self):
+        acquired = []
+
+        @contextmanager
+        def reservation():
+            acquired.append(True)
+            yield
+
+        application = create_app(self.settings, storage_reservation=reservation,
+                                 audit_cleanup_interval_seconds=0.01)
+        with closing(application.state.database.connect()) as connection:
+            migrate(connection, APPLICATION_MIGRATIONS)
+        old = datetime(2020, 1, 1, tzinfo=timezone.utc)
+        AuditStore(application.state.database, clock=lambda: old,
+                   reservation=reservation).append(
+            actor_category=ActorCategory.SYSTEM,
+            action=AuditAction.CHANGE_ADMIN_SETTING,
+            target_kind=TargetKind.ADMIN_SETTINGS,
+            target_logical_id=uuid4(), outcome=AuditOutcome.SUCCEEDED,
+        )
+        seeded = len(acquired)
+        async with application.router.lifespan_context(application):
+            # Startup retention cleanup runs inside the storage reservation.
+            self.assertGreater(len(acquired), seeded)
+            self.assertEqual((), application.state.audit_store.list_records())
 
     async def test_invalid_database_fails_startup_without_leaking_exception_values(self):
         self.settings.database_path.write_text("SYNTHETIC_PRIVATE_VALUE")

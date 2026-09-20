@@ -157,8 +157,16 @@ class LocalUvcAdapter:
                 self.registry.update_source_health(source_id, health_state=SourceHealthState.OFFLINE,
                                                    negotiated_capture_profile=None)
                 return False
-            explicit = self._approved_handoffs.pop(source_id, None)
+            explicit = self._approved_handoffs.get(source_id)
+            if explicit is not None and explicit != approved.approved:
+                # A later durable approval superseded this handoff; it can no
+                # longer prove which physical device the Owner selected.
+                del self._approved_handoffs[source_id]
+                explicit = None
+            # Keep the handoff until a session actually owns it, so a transient
+            # registry/store failure cannot force another Owner approval.
             session = self._session(source, approved.approved, explicit_candidate=explicit)
+            self._approved_handoffs.pop(source_id, None)
         try:
             session.configure(enabled=source.enabled,
                               profile=capture_profile(source.desired_capture_profile))

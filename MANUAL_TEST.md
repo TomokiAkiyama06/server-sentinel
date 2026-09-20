@@ -471,27 +471,6 @@ Keep the following deployment checks open; do not use production data for fills.
 
 Never intentionally fill a production filesystem to zero free bytes.
 
-## Q2. Security/admin audit retention
-
-Use a disposable Main Server database and synthetic logical target IDs. Do not
-enter real secrets, biometric material, hardware serials/UUIDs, private network
-values, or monitoring media for this test.
-
-- [ ] approve a hardware baseline as the deployment Owner and verify one
-  `approve_hardware_baseline` success record with the baseline logical ID;
-- [ ] change a security/admin setting and revoke one test camera/source/capture
-  node, verifying the fixed action, target kind, logical ID, UTC time, and
-  outcome for each operation;
-- [ ] attempt an Owner-only operation as an invited/non-owner principal, verify
-  the mutation does not run, and verify a denied audit outcome;
-- [ ] induce a safe synthetic mutation failure and verify a failed audit outcome
-  without the submitted value or exception text in the database;
-- [ ] run retention with a test clock just past 90 days and verify only expired
-  audit rows are removed while boundary/newer rows, recordings, factual timeline
-  events, and capture-agent protected incidents remain unchanged;
-- [ ] inspect the deployed database permissions and confirm the audit database
-  remains deployment-local with no upload/reporting path.
-
 ## R. Long-duration / performance
 
 Run at least:
@@ -685,6 +664,7 @@ Issue #50 remains open. The synthetic CI tests do not complete these checks: the
 - [ ] server-side authorization restricts audit reading to Owner-level access: a non-owner identity with `live:view`, `recordings:view`, or both cannot read, alter, or delete audit records, including through copied URLs, and a capture-node credential cannot reach the audit routes at all;
 - [ ] confirm the configured audit retention default is 90 days and is independent of the 20-day recording retention: changing one does not change the other;
 - [ ] run retention with a test clock just past 90 days: only expired audit rows are removed while boundary and newer rows remain; run cleanup twice and confirm the second run is idempotent;
+- [ ] with the deployment near its storage pressure/hard-stop thresholds, confirm audit writes and retention cleanup are admitted by the same storage reservation: a refused admission fails visibly and records no row instead of spending the hard filesystem reserve;
 - [ ] immediately before and after cleanup, compare every non-audit lifecycle inventory the deployment actually has — recording inventory, starred recordings, protected incidents, and their retention/expiry times, plus factual timeline events and capture-agent protected incidents wherever those capabilities are deployed: cleanup applies only to expired audit rows and changes no recording or protected-incident lifecycle; list every inventory that was not yet available instead of reporting it as unchanged;
 - [ ] interrupt cleanup (stop the service mid-run, simulate a read-only or full audit volume): the store stays consistent, the failure is reported as a visible fault instead of a silent success, and the next run completes without losing unexpired rows;
 - [ ] audit writes survive service restart and are not lost by an unclean shutdown; a security-sensitive mutation and its durable audit record commit together, so a failed audit write fails or rolls back the mutation and surfaces a visible fault rather than silently dropping history;

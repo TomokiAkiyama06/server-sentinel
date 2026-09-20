@@ -45,6 +45,14 @@ class OwnerAuditService:
     def __init__(self, store: AuditStore, authorizer: OwnerAuthorizer):
         self.store = store
         self.authorizer = authorizer
+        # Bounded health only. A storage admission or append failure must stay
+        # visible here instead of silently dropping an audit outcome.
+        self.audit_delivery_failed = False
+        self.undelivered_audit_records = 0
+
+    def _delivery_failed(self) -> None:
+        self.audit_delivery_failed = True
+        self.undelivered_audit_records += 1
 
     @staticmethod
     def _denied_category(error: PermissionError) -> ActorCategory:
@@ -55,31 +63,41 @@ class OwnerAuditService:
         return ActorCategory.UNAUTHENTICATED
 
     def _authorize(self, actor_context, action, target_kind, target_logical_id,
-                   *, connection=None):
+                   *, connection=None, reservation=None):
         try:
             self.authorizer.require_owner(actor_context)
         except PermissionError as error:
             category = self._denied_category(error)
-            if connection is None:
-                self.store.append(
-                    actor_category=category, action=action, target_kind=target_kind,
-                    target_logical_id=target_logical_id, outcome=AuditOutcome.DENIED,
-                )
-            else:
-                if connection.in_transaction:
-                    raise AuditStorageError("audit transaction is unavailable")
-                connection.execute("BEGIN IMMEDIATE")
-                try:
-                    self.store.append_on(
-                        connection, actor_category=category, action=action,
-                        target_kind=target_kind, target_logical_id=target_logical_id,
-                        outcome=AuditOutcome.DENIED,
+            try:
+                if connection is None:
+                    # The store admits this write through its own reservation.
+                    self.store.append(
+                        actor_category=category, action=action, target_kind=target_kind,
+                        target_logical_id=target_logical_id, outcome=AuditOutcome.DENIED,
                     )
-                    connection.execute("COMMIT")
-                except BaseException:
-                    if connection.in_transaction:
-                        connection.execute("ROLLBACK")
-                    raise
+                else:
+                    # A caller-owned connection carries the caller's admission.
+                    with reservation() if reservation is not None else nullcontext():
+                        if connection.in_transaction:
+                            raise AuditStorageError("audit transaction is unavailable")
+                        connection.execute("BEGIN IMMEDIATE")
+                        try:
+                            self.store.append_on(
+                                connection, actor_category=category, action=action,
+                                target_kind=target_kind,
+                                target_logical_id=target_logical_id,
+                                outcome=AuditOutcome.DENIED,
+                            )
+                            connection.execute("COMMIT")
+                        except BaseException:
+                            if connection.in_transaction:
+                                connection.execute("ROLLBACK")
+                            raise
+            except BaseException:
+                # Denied work never ran, so keep the denial as the caller's
+                # result and expose the undelivered record through health.
+                self._delivery_failed()
+                raise
             raise OwnerAuthorizationError(category) from None
 
     def execute_transactional(self, actor_context: object, *, action: AuditAction,
@@ -96,8 +114,10 @@ class OwnerAuditService:
         can therefore never leave only the sensitive mutation committed.
         """
         validate_action_target(action, target_kind, target_logical_id)
+        if reservation is not None and not callable(reservation):
+            raise AuditValidationError("invalid audit storage reservation")
         self._authorize(actor_context, action, target_kind, target_logical_id,
-                        connection=connection)
+                        connection=connection, reservation=reservation)
 
         def run(active):
             result = operation(active)
@@ -126,8 +146,11 @@ class OwnerAuditService:
                         connection.execute("ROLLBACK")
                     raise
         except Exception:
-            # A failed success-append may also prevent this best-effort failure
-            # append. The mutation has already rolled back either way.
+            # The mutation has already rolled back. This bounded failure record
+            # is appended through the store's own storage admission, so a hard
+            # filesystem reserve is never spent to report the failure. When
+            # even that write is refused, the loss becomes visible health
+            # instead of a silently dropped outcome.
             try:
                 self.store.append(
                     actor_category=ActorCategory.OWNER, action=action,
@@ -135,7 +158,7 @@ class OwnerAuditService:
                     outcome=AuditOutcome.FAILED,
                 )
             except Exception:
-                pass
+                self._delivery_failed()
             raise
 
     def record_owner_post_commit_failure(self, *, action: AuditAction,

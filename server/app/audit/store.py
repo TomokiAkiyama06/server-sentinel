@@ -1,10 +1,10 @@
 """SQLite security/admin audit persistence and bounded retention cleanup."""
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import sqlite3
-from typing import Callable
+from typing import Callable, ContextManager
 from uuid import UUID, uuid4
 
 from app.storage.database import Database
@@ -16,6 +16,7 @@ from .model import (
 
 DEFAULT_RETENTION = timedelta(days=90)
 MAX_PAGE_SIZE = 1000
+CLEANUP_BATCH_SIZE = 500
 
 
 class AuditStorageError(RuntimeError):
@@ -55,32 +56,53 @@ class AuditStore:
     """Low-level local store; authorization is enforced by the service boundary."""
 
     def __init__(self, database: Database, *, clock: Callable[[], datetime] | None = None,
-                 retention: timedelta = DEFAULT_RETENTION):
+                 retention: timedelta = DEFAULT_RETENTION,
+                 reservation: Callable[[], ContextManager] | None = None,
+                 cleanup_batch_size: int = CLEANUP_BATCH_SIZE):
         if not isinstance(retention, timedelta) or retention <= timedelta(0):
             raise AuditValidationError("invalid audit retention")
+        if reservation is not None and not callable(reservation):
+            raise AuditValidationError("invalid audit storage reservation")
+        if type(cleanup_batch_size) is not int or not 1 <= cleanup_batch_size <= MAX_PAGE_SIZE:
+            raise AuditValidationError("invalid audit cleanup batch size")
         self.database = database
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self.retention = retention
+        self.reservation = reservation
+        self.cleanup_batch_size = cleanup_batch_size
+
+    def _admission(self, write: bool) -> ContextManager:
+        """Admit every audit write through the deployment storage reservation.
+
+        The injected reservation preserves the hard filesystem reserve for
+        audit rows, their rollback journal and this transaction's metadata.
+        Reads never reserve. A denied admission raises the storage owner's own
+        bounded error instead of writing.
+        """
+        if not write or self.reservation is None:
+            return nullcontext()
+        return self.reservation()
 
     @contextmanager
     def transaction(self, *, write=False):
-        connection = None
-        try:
-            connection = self.database.connect()
-            connection.execute("BEGIN IMMEDIATE" if write else "BEGIN")
-            yield connection
-            connection.commit()
-        except sqlite3.Error:
-            if connection is not None:
-                connection.rollback()
-            raise AuditStorageError("audit storage operation failed") from None
-        except BaseException:
-            if connection is not None:
-                connection.rollback()
-            raise
-        finally:
-            if connection is not None:
-                connection.close()
+        with self._admission(write):
+            connection = None
+            try:
+                connection = self.database.connect()
+                connection.execute("BEGIN IMMEDIATE" if write else "BEGIN")
+                yield connection
+                connection.commit()
+            except sqlite3.Error:
+                if connection is not None:
+                    connection.rollback()
+                raise AuditStorageError("audit storage operation failed") from None
+            except BaseException:
+                if connection is not None:
+                    connection.rollback()
+                raise
+            finally:
+                if connection is not None:
+                    connection.close()
 
     def append_on(self, connection: sqlite3.Connection, *,
                   actor_category: ActorCategory, action: AuditAction,
@@ -146,11 +168,27 @@ class AuditStore:
         return tuple(self._record(row) for row in rows)
 
     def cleanup_expired(self, *, now: datetime | None = None) -> int:
-        """Delete only audit rows strictly older than this store's retention."""
+        """Delete only audit rows strictly older than this store's retention.
+
+        One cutoff is computed for the whole run, and expired rows are removed
+        oldest first in bounded admitted transactions. Each committed batch is
+        durable on its own, so an interrupted run leaves a consistent store and
+        the next run resumes; repeating a completed run deletes nothing more.
+        """
         reference = utc_timestamp(self._clock() if now is None else now)
         cutoff = _microseconds(reference - self.retention)
-        with self.transaction(write=True) as connection:
-            cursor = connection.execute(
-                "DELETE FROM security_admin_audit_records WHERE occurred_at_us < ?", (cutoff,),
-            )
-            return cursor.rowcount
+        deleted = 0
+        while True:
+            with self.transaction(write=True) as connection:
+                cursor = connection.execute(
+                    "DELETE FROM security_admin_audit_records WHERE id IN ("
+                    "SELECT id FROM security_admin_audit_records "
+                    "WHERE occurred_at_us < ? ORDER BY occurred_at_us, id LIMIT ?)",
+                    (cutoff, self.cleanup_batch_size),
+                )
+                # A driver that cannot report a row count must not be read
+                # as a negative deletion total.
+                removed = max(cursor.rowcount, 0)
+            deleted += removed
+            if removed < self.cleanup_batch_size:
+                return deleted

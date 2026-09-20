@@ -39,9 +39,28 @@ the earlier immutable success continues to mean that the Owner-authorized
 deletion journal committed, not that physical cleanup completed.
 
 `AuditStore.cleanup_expired()` defaults to 90 days and deletes only rows from
-the audit table that are strictly older than the cutoff. The Main Server runs it
-at startup and every 24 hours through `AuditRetentionRuntime`. Scheduled
-failures set bounded degraded health and are retried at the next interval;
-exception details are not retained. Audit browsing uses `AuditCursor`, whose
-timestamp plus record UUID matches the stable descending database order so
-equal-timestamp records remain reachable across pages.
+the audit table that are strictly older than one cutoff computed for the whole
+run. Expired rows are removed oldest first in bounded transactions, so a large
+backlog never grows one rollback journal beyond the configured write overhead.
+Each committed batch is durable on its own: an interrupted run leaves a
+consistent store, the next run resumes, and repeating a completed run deletes
+nothing more. The Main Server runs it at startup and every 24 hours through
+`AuditRetentionRuntime`. Scheduled failures set bounded degraded health and are
+retried at the next interval; exception details are not retained. Audit
+browsing uses `AuditCursor`, whose timestamp plus record UUID matches the stable
+descending database order so equal-timestamp records remain reachable across
+pages.
+
+Every audit write — success, failure, denial and retention cleanup — is admitted
+through an injected storage reservation, so audit rows, their rollback journal
+and this subsystem's transaction metadata can never spend the hard filesystem
+reserve. `create_app(storage_reservation=...)` receives the deployment's Main
+Server storage admission; when a deployment has not bound its storage policy
+yet, no reservation is held and the remaining guarantees are unchanged. Owner
+operations that already own an admitted reservation, such as the recording
+store's starred/delete transactions, pass it as `reservation=` so the shared
+transaction stays admitted until it commits or rolls back. A refused admission
+records no row: the storage owner's bounded error propagates, and an outcome
+that could not be delivered is counted in `OwnerAuditService`'s
+`audit_delivery_failed` / `undelivered_audit_records` health instead of being
+silently dropped. Reading audit records never reserves storage.

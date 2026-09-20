@@ -1,6 +1,6 @@
 """Synthetic security/admin audit tests; no real people, devices, or secrets."""
 
-from contextlib import closing
+from contextlib import closing, contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import sqlite3
@@ -19,6 +19,32 @@ from app.cameras.registry import CameraRegistry, NodeHealthState, SourceType
 from app.storage.database import Database
 from app.storage.migrations import migrate
 from app.storage.schema import APPLICATION_MIGRATIONS
+
+
+class SyntheticStorageDenied(RuntimeError):
+    """Stands in for the Main Server storage hard-stop/pressure refusal."""
+
+
+class SyntheticReservation:
+    """Stands in for the deployment storage admission reservation."""
+
+    def __init__(self):
+        self.denial = None
+        self.acquired = 0
+        self.active = False
+
+    @contextmanager
+    def __call__(self):
+        if self.denial is not None:
+            raise SyntheticStorageDenied(self.denial)
+        if self.active:
+            raise AssertionError("overlapping reservation")
+        self.acquired += 1
+        self.active = True
+        try:
+            yield
+        finally:
+            self.active = False
 
 
 class SyntheticOwnerAuthorizer:
@@ -263,6 +289,131 @@ class AuditTests(unittest.TestCase):
         self.assertEqual(AuditOutcome.DENIED, record.outcome)
         self.assertEqual(ActorCategory.UNAUTHENTICATED, record.actor_category)
         self.assertNotIn(private_value.encode(), self.database.path.read_bytes())
+
+    def reserved_store(self, reservation, **kwargs):
+        return AuditStore(self.database, clock=lambda: self.now,
+                          reservation=reservation, **kwargs)
+
+    def expired_rows(self, count, store=None):
+        store = store or self.store
+        for _ in range(count):
+            store.append(
+                actor_category=ActorCategory.SYSTEM,
+                action=AuditAction.CHANGE_ADMIN_SETTING,
+                target_kind=TargetKind.ADMIN_SETTINGS,
+                target_logical_id=uuid4(), outcome=AuditOutcome.SUCCEEDED,
+            )
+
+    def remaining(self, table="security_admin_audit_records"):
+        with closing(self.database.connect()) as connection:
+            return connection.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
+
+    def test_retention_cleanup_runs_bounded_admitted_batches_and_is_idempotent(self):
+        reservation = SyntheticReservation()
+        store = self.reserved_store(reservation, cleanup_batch_size=2)
+        self.now -= timedelta(days=91)
+        self.expired_rows(7, store)
+        self.now += timedelta(days=91)
+        self.expired_rows(1, store)
+        reservation.acquired = 0
+
+        self.assertEqual(7, store.cleanup_expired())
+        # Seven expired rows drain as bounded two-row transactions, and every
+        # delete transaction holds the storage reservation.
+        self.assertEqual(4, reservation.acquired)
+        self.assertFalse(reservation.active)
+        self.assertEqual(1, self.remaining())
+        self.assertEqual(0, store.cleanup_expired())
+        self.assertEqual(1, self.remaining())
+
+    def test_interrupted_cleanup_keeps_committed_batches_and_unexpired_rows(self):
+        store = self.reserved_store(SyntheticReservation(), cleanup_batch_size=2)
+        self.now -= timedelta(days=91)
+        self.expired_rows(5, store)
+        self.now += timedelta(days=91)
+        self.expired_rows(2, store)
+        original = store.transaction
+        attempts = []
+
+        def interrupt(*args, **kwargs):
+            attempts.append(True)
+            if len(attempts) == 2:
+                raise AuditStorageError("synthetic interruption")
+            return original(*args, **kwargs)
+
+        with patch.object(store, "transaction", side_effect=interrupt):
+            with self.assertRaises(AuditStorageError):
+                store.cleanup_expired()
+        self.assertEqual(5, self.remaining())
+
+        self.assertEqual(3, store.cleanup_expired())
+        self.assertEqual(2, self.remaining())
+        self.assertEqual(0, store.cleanup_expired())
+
+    def test_audit_writes_are_refused_instead_of_spending_the_hard_reserve(self):
+        reservation = SyntheticReservation()
+        store = self.reserved_store(reservation)
+        self.expired_rows(1, store)
+        reservation.denial = "STORAGE_HARD_STOP"
+        with self.assertRaises(SyntheticStorageDenied):
+            self.expired_rows(1, store)
+        with self.assertRaises(SyntheticStorageDenied):
+            store.cleanup_expired()
+        self.assertEqual(1, self.remaining())
+        # Owner reading remains available while writes are refused.
+        self.assertEqual(1, len(store.list_records()))
+
+    def test_registry_mutation_audit_is_admitted_by_storage_reservation(self):
+        reservation = SyntheticReservation()
+        service = OwnerAuditService(self.reserved_store(reservation),
+                                    SyntheticOwnerAuthorizer())
+        admin = OwnerAdministration(service, self.registry)
+        admin.create_capture_node("synthetic-owner-session", "Synthetic node")
+        self.assertEqual(1, reservation.acquired)
+        self.assertFalse(reservation.active)
+
+        reservation.denial = "STORAGE_HARD_STOP"
+        with self.assertRaises(SyntheticStorageDenied):
+            admin.create_capture_node("synthetic-owner-session", "Refused node")
+        # Neither the mutation nor any unadmitted audit row was written, and
+        # the undelivered outcome stays visible as bounded health.
+        self.assertEqual(1, self.remaining())
+        self.assertEqual(1, self.remaining("capture_nodes"))
+        self.assertTrue(service.audit_delivery_failed)
+        self.assertEqual(1, service.undelivered_audit_records)
+
+    def test_denied_action_audit_is_admitted_and_never_silently_dropped(self):
+        reservation = SyntheticReservation()
+        service = OwnerAuditService(self.reserved_store(reservation),
+                                    SyntheticOwnerAuthorizer())
+        admin = OwnerAdministration(service, self.registry)
+        with self.assertRaises(OwnerAuthorizationError):
+            admin.create_capture_node({"synthetic": "not-owner"}, "Denied node")
+        self.assertEqual(1, reservation.acquired)
+        self.assertEqual(AuditOutcome.DENIED, service.store.list_records()[0].outcome)
+        self.assertFalse(service.audit_delivery_failed)
+
+        reservation.denial = "STORAGE_HARD_STOP"
+        with self.assertRaises(SyntheticStorageDenied):
+            admin.create_capture_node({"synthetic": "not-owner"}, "Denied node")
+        self.assertEqual(1, self.remaining())
+        self.assertTrue(service.audit_delivery_failed)
+        self.assertEqual(1, service.undelivered_audit_records)
+
+    def test_invalid_storage_reservation_and_batch_inputs_fail_closed(self):
+        for reservation in ("reservation", 5):
+            with self.subTest(reservation=reservation):
+                with self.assertRaises(AuditValidationError):
+                    AuditStore(self.database, reservation=reservation)
+        for batch in (0, -1, True, 1001, "10"):
+            with self.subTest(batch=batch), self.assertRaises(AuditValidationError):
+                AuditStore(self.database, cleanup_batch_size=batch)
+        with self.assertRaises(AuditValidationError):
+            self.service.execute_transactional(
+                "synthetic-owner-session", action=AuditAction.CHANGE_ADMIN_SETTING,
+                target_kind=TargetKind.ADMIN_SETTINGS, target_logical_id=uuid4(),
+                operation=lambda connection: None, reservation="reservation",
+            )
 
     def test_plan23_baseline_approval_contract_uses_fixed_atomic_action(self):
         baseline_id = uuid4()
