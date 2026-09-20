@@ -44,7 +44,7 @@ Audited 2026-09-21 against the current specification and all Open/Closed GitHub 
 | Plan 25 | [#50](https://github.com/TomokiAkiyama06/server-sentinel/issues/50) | Plan 25: Security / admin audit log と90日 retention | OPEN |
 | Plan 26 | [#51](https://github.com/TomokiAkiyama06/server-sentinel/issues/51) | Plan 26: Dependency / model license compliance gate | OPEN |
 
-Other audited Issues (outside the 29 Plans):
+Other audited Issues (outside the 28 Plans):
 
 | Issue | Title | Status | Labels | Main / Capture / UVC / Manual | Depends on |
 |---|---|---|---|---|---|
