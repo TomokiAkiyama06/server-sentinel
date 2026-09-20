@@ -11,6 +11,9 @@ runtime remains explicit work; importing this module does not enable detection.
 `GrayFrame` and `RgbFrame` have source and stream UUIDs, a nonnegative sequence, dimensions, and
 one or three immutable channel bytes per pixel respectively. Upstream validates stream provenance;
 a new stream UUID resets temporal state. Sequence ordering is per stream.
+The scheduler retains the four most recent retired stream UUIDs per source. A delayed frame from
+that bounded history, or a non-increasing sequence, is rejected without invalidating a newer
+pending or in-progress evaluation. An identifier outside the retained history begins a new stream.
 Pixels never appear in frame repr, diagnostics, files, or network messages.
 This is an inference frame, not a recording or pre-roll representation.
 

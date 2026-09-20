@@ -217,6 +217,101 @@ class DetectorFoundationTests(unittest.TestCase):
         self.assertFalse(self.offer(frame(9, stream=replacement)))
         self.assertFalse(self.offer(frame(1)))
 
+    def test_bounded_retired_stream_history_rejects_older_generation(self):
+        self.register()
+        stream_b, stream_c = UUID(int=11), UUID(int=12)
+        self.offer(frame())
+        self.scheduler.run_one()
+        self.clock.value = 10
+        self.offer(frame(0, stream=stream_b))
+        self.scheduler.run_one()
+        self.clock.value = 20
+        self.offer(frame(0, stream=stream_c))
+        self.scheduler.run_one()
+        self.clock.value = 30
+        self.assertFalse(self.offer(frame(1)))
+        result = self.scheduler.snapshot(SOURCE)
+        self.assertEqual((result.stream_id, result.sequence), (stream_c, 0))
+        self.assertEqual(result.result.reason, Reason.EVALUATED)
+
+    def test_retired_stream_rejection_preserves_current_pending_and_inflight(self):
+        replacement = UUID(int=11)
+        self.register()
+        self.offer(frame())
+        self.scheduler.run_one()
+        self.clock.value = 10
+        self.assertTrue(self.offer(frame(0, stream=replacement)))
+        self.assertFalse(self.offer(frame(1)))
+        self.assertTrue(self.scheduler.snapshot(SOURCE).pending)
+        self.assertEqual(self.scheduler.run_one().stream_id, replacement)
+
+        started, release = threading.Event(), threading.Event()
+
+        def blocking(sample):
+            if sample.sequence == 1:
+                started.set()
+                if not release.wait(2):
+                    raise RuntimeError("test worker deadline")
+            return Detection(Observation.ABSENT, Reason.EVALUATED)
+
+        scheduler = InferenceScheduler(clock_ns=self.clock)
+        scheduler.register(SOURCE, StubDetector(blocking), POLICY)
+        scheduler.offer(frame(), quality=Quality.SUFFICIENT)
+        scheduler.run_one()
+        self.clock.value = 20
+        scheduler.offer(frame(0, stream=replacement), quality=Quality.SUFFICIENT)
+        scheduler.run_one()
+        self.clock.value = 30
+        scheduler.offer(frame(1, stream=replacement), quality=Quality.SUFFICIENT)
+        results = []
+        worker = threading.Thread(target=lambda: results.append(scheduler.run_one()))
+        worker.start()
+        try:
+            self.assertTrue(started.wait(2))
+            self.assertFalse(scheduler.offer(frame(1), quality=Quality.SUFFICIENT))
+        finally:
+            release.set()
+            worker.join(2)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual((results[0].stream_id, results[0].sequence), (replacement, 1))
+
+    def test_backward_sequence_rejection_preserves_pending_and_inflight(self):
+        self.register()
+        self.offer(frame())
+        self.scheduler.run_one()
+        self.clock.value = 10
+        self.assertTrue(self.offer(frame(1)))
+        self.assertFalse(self.offer(frame()))
+        self.assertTrue(self.scheduler.snapshot(SOURCE).pending)
+        self.assertEqual(self.scheduler.run_one().sequence, 1)
+
+        started, release = threading.Event(), threading.Event()
+
+        def blocking(sample):
+            if sample.sequence == 2:
+                started.set()
+                if not release.wait(2):
+                    raise RuntimeError("test worker deadline")
+            return Detection(Observation.ABSENT, Reason.EVALUATED)
+
+        scheduler = InferenceScheduler(clock_ns=self.clock)
+        scheduler.register(SOURCE, StubDetector(blocking), POLICY)
+        scheduler.offer(frame(), quality=Quality.SUFFICIENT)
+        scheduler.run_one()
+        self.clock.value = 20
+        scheduler.offer(frame(2), quality=Quality.SUFFICIENT)
+        results = []
+        worker = threading.Thread(target=lambda: results.append(scheduler.run_one()))
+        worker.start()
+        try:
+            self.assertTrue(started.wait(2))
+            self.assertFalse(scheduler.offer(frame(1), quality=Quality.SUFFICIENT))
+        finally:
+            release.set()
+            worker.join(2)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(results[0].sequence, 2)
+
     def test_late_result_becomes_unknown_and_throttles(self):
         def slow(_sample):
             self.clock.value += 21

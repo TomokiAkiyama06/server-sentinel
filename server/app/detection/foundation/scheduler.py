@@ -4,6 +4,7 @@ Capture calls offer(), which never calls a detector. A dedicated inference
 worker calls run_one(); it must not run on capture/recording/health threads.
 """
 
+from collections import deque
 from dataclasses import dataclass, field
 import threading
 import time
@@ -12,6 +13,8 @@ from uuid import UUID
 
 from .contracts import (Detection, Detector, DetectorKind, GrayFrame, Health,
                         Observation, Quality, Reason, positive_integer)
+
+_RETIRED_STREAM_HISTORY = 4
 
 
 @dataclass(frozen=True)
@@ -63,7 +66,8 @@ class _Source:
     cadence_ns: int
     pending: _Pending | None = None
     stream_id: UUID | None = None
-    retired_stream_id: UUID | None = None
+    retired_stream_ids: deque[UUID] = field(
+        default_factory=lambda: deque(maxlen=_RETIRED_STREAM_HISTORY))
     sequence: int = -1
     result_sequence: int | None = None
     result: Detection = field(default_factory=lambda: Detection(Observation.UNKNOWN, Reason.NOT_STARTED))
@@ -154,22 +158,19 @@ class InferenceScheduler:
             now = self._now()
             state = self._sources[frame.source_id]
             if state.stream_id != frame.stream_id:
-                if frame.stream_id == state.retired_stream_id:
-                    state.pending = None
+                if frame.stream_id in state.retired_stream_ids:
                     state.dropped += 1
                     state.loss_unacknowledged = True
-                    self._unknown(state, Reason.DISCONTINUITY)
                     return False
                 state.pending = None
-                state.retired_stream_id, state.stream_id, state.sequence = (
-                    state.stream_id, frame.stream_id, -1)
+                if state.stream_id is not None:
+                    state.retired_stream_ids.append(state.stream_id)
+                state.stream_id, state.sequence = frame.stream_id, -1
                 state.next_admission = now
                 self._unknown(state, Reason.DISCONTINUITY)
             if frame.sequence <= state.sequence:
-                state.pending = None
                 state.dropped += 1
                 state.loss_unacknowledged = True
-                self._unknown(state, Reason.DISCONTINUITY)
                 return False
             state.sequence = frame.sequence
             if frame.width * frame.height > state.policy.maximum_pixels:
