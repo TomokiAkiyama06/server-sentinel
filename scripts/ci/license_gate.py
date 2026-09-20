@@ -29,7 +29,7 @@ BUILD_OUTPUT_DIRECTORIES = {"build", "dist"}
 RECOGNIZED_STATIC_OUTPUT_SUFFIXES = {
     ".avif", ".cjs", ".css", ".gif", ".html", ".ico", ".jpeg", ".jpg",
     ".js", ".json", ".license", ".map", ".md", ".mjs", ".otf", ".png",
-    ".svg", ".ttf", ".txt", ".webp", ".woff", ".woff2", ".xml",
+    ".svg", ".ttf", ".txt", ".wasm", ".webp", ".woff", ".woff2", ".xml",
 }
 MODEL_SUFFIXES = {
     ".bin", ".ckpt", ".engine", ".h5", ".mlmodel", ".onnx", ".pb", ".pt",

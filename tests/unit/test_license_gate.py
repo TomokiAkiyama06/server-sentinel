@@ -277,6 +277,7 @@ class LicenseGateTests(unittest.TestCase):
     def test_model_roots_scan_zip_h5_and_extensionless_files(self):
         paths = {
             "server/assets/models/archive.zip",
+            "server/assets/models/manifest.json",
             "agent/runtime/weights/owner.h5",
             "checkpoints/person-v1",
         }
@@ -291,6 +292,7 @@ class LicenseGateTests(unittest.TestCase):
         for path in paths:
             self.write(path, b"synthetic committed model output")
         self.write("build/app.js", "console.log('synthetic reviewed static output');\n")
+        self.write("dist/worker.wasm", b"\x00asm synthetic web worker")
         subprocess.run(["git", "-C", str(self.root), "init", "--quiet"], check=True)
         subprocess.run(["git", "-C", str(self.root), "add", *sorted(paths)], check=True)
         tracked = subprocess.run(
@@ -299,6 +301,7 @@ class LicenseGateTests(unittest.TestCase):
         ).stdout.splitlines()
         self.assertEqual(set(tracked), paths)
         self.assertEqual(set(license_gate.model_files(self.root)), paths)
+        self.assertNotIn("dist/worker.wasm", license_gate.model_files(self.root))
         self.assertEqual(repository_guard.audit(self.root), [])
         with self.assertRaisesRegex(license_gate.GateError, "model artifact set differs"):
             license_gate.audit(self.root)

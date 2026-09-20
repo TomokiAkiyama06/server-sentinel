@@ -142,5 +142,5 @@ need exact Owner approval rather than being accepted because they do not match a
 known copyleft name. Committed `build/` and `dist/` archives, extensionless
 artifacts, and unknown opaque output types remain in the artifact scan and
 require independent weight evidence and checksum review. Recognized Web/static
-asset suffixes are not classified as model artifacts merely because they are in
-a build output directory.
+asset suffixes, including `.wasm`, are not classified as model artifacts merely
+because they are in a build output directory.
