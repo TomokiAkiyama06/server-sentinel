@@ -13,6 +13,12 @@ or malformed data produce `UNVERIFIABLE`, not invented unique identities or proo
 that all devices vanished. CPU model/topology or PCI location alone cannot prove
 that the physical device is unchanged.
 
+Comparison resolves the complete inventory in phases: full identities, globally
+unique partial identity links, then all compatible weak links. Missing fields
+are not contradictions. Shared/duplicate candidates stay `UNVERIFIABLE`; a weak
+match cannot consume another baseline's only possible observation and turn it
+into `MISSING`. Kernel/baseline enumeration order is not replacement evidence.
+
 `storage_health()` reads `smartctl --json --health` for explicitly configured
 backing block-device paths and returns `OK`, `CRITICAL` or `UNVERIFIABLE`, without
 lifetime prediction. Commands have a fixed read-only allowlist, five-second

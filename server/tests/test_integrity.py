@@ -9,6 +9,7 @@ from uuid import UUID
 import json
 import sqlite3
 import threading
+from itertools import permutations
 
 from app.integrity.model import Component, Finding, Inventory, Kind, State, compare
 from app.integrity.probes import CommandRunner, LinuxProbe, ProbeUnavailable
@@ -124,6 +125,25 @@ class CompareTests(TestCase):
         for current in ((disk(size="3000"),), (disk(size="3000"), disk(slot="disk9", size="4000"))):
             findings = compare(baseline, Inventory(current))
             self.assertEqual([item.state for item in findings], [State.UNVERIFIABLE, State.UNVERIFIABLE])
+
+    def test_shared_partial_and_anonymous_candidates_are_resolved_globally(self):
+        def observed(slot, size, identity):
+            return Component(Kind.STORAGE, slot, (("capacity_bytes", size),), identity)
+        baseline = (observed("old-a", "1000", (("serial", "a"), ("wwid", "x"))),
+                    observed("old-b", "2000", (("serial", "a"), ("wwid", "y"))),
+                    observed("old-c", "1000", (("serial", "c"), ("wwid", "y"))))
+        current = (observed("new-a", "1000", (("wwid", "y"),)),
+                   observed("new-b", "2000", ()), observed("new-c", "1000", ()))
+        for old_order in permutations(baseline):
+            for new_order in permutations(current):
+                findings = compare(Inventory(old_order), Inventory(new_order))
+                self.assertEqual([item.state for item in findings], [State.UNVERIFIABLE] * 3)
+
+    def test_field_order_cannot_hide_a_duplicate_identity(self):
+        first = Component(Kind.STORAGE, "disk0", (), (("serial", "a"), ("wwid", "x")))
+        second = Component(Kind.STORAGE, "disk1", (), (("wwid", "x"), ("serial", "a")))
+        findings = compare(Inventory((first,)), Inventory((first, second)))
+        self.assertEqual([item.state for item in findings], [State.UNVERIFIABLE])
 
     def test_unapproved_inventory_never_becomes_baseline(self):
         findings = compare(None, Inventory((disk(),)))

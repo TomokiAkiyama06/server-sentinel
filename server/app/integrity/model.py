@@ -36,6 +36,10 @@ class Component:
                 raise ValueError("INVALID_COMPONENT")
             if any(not key or len(key) > 64 or len(value) > 1024 for key, value in pairs):
                 raise ValueError("INVALID_COMPONENT")
+        # These are named fields, not ordered identities. Canonical immutable
+        # pairs also prevent differently ordered duplicate IDs looking unique.
+        object.__setattr__(self, "properties", tuple(sorted(self.properties)))
+        object.__setattr__(self, "identity", tuple(sorted(self.identity)))
 
 
 @dataclass(frozen=True)
@@ -69,97 +73,121 @@ class Finding:
         )
 
 
-def compare(approved: Inventory | None, current: Inventory) -> tuple[Finding, ...]:
-    """Stable identity wins over enumeration order; no fingerprint invention.
+def _conflicts(before, after):
+    before, after = dict(before), dict(after)
+    return any(before[key] != after[key] for key in before.keys() & after.keys())
 
-    Failed category enumeration is unknown, never proof all devices vanished.
-    A same-model device without a unique identifier can never produce OK.
+
+def compare(approved: Inventory | None, current: Inventory) -> tuple[Finding, ...]:
+    """Match complete identities, unique partial identities, then weak graphs.
+
+    Every phase considers all remaining baselines before consuming observations.
+    Weak/shared observations never prove which approved device vanished.
     """
     if approved is None:
         return tuple(Finding(kind, State.UNVERIFIABLE, "BASELINE_REQUIRED") for kind in Kind)
-    findings = []
+    old_items, new_items = approved.components, current.components
+    results = [None] * len(old_items)
     used = set()
-    uncertain = set()
-    identity_counts = Counter((item.kind, item.identity) for item in current.components if item.identity)
-    baseline_counts = Counter((item.kind, item.identity) for item in approved.components if item.identity)
-    fields = Counter((item.kind, key, value) for item in current.components for key, value in item.identity)
-    approved_fields = Counter((item.kind, key, value) for item in approved.components for key, value in item.identity)
-    # Reserve identity-linked observations before weaker/location matching;
-    # an earlier anonymous baseline entry must not consume a later known disk.
-    linked = {}
-    for index, item in enumerate(current.components):
-        linked[index] = {old_index for old_index, old in enumerate(approved.components)
-                         if old.kind == item.kind and old.identity and (
-                             old.identity == item.identity or any(fields[(old.kind, key, value)] == 1
-                                                                  and approved_fields[(old.kind, key, value)] == 1
-                                                                  for key, value in set(old.identity) & set(item.identity)))}
-    for old_index, old in enumerate(approved.components):
-        if old.kind in current.unavailable:
-            findings.append(Finding(old.kind, State.UNVERIFIABLE, "PROBE_UNAVAILABLE"))
-            continue
-        candidates = [(index, item) for index, item in enumerate(current.components)
-                      if index not in used and item.kind == old.kind and (not linked[index] or old_index in linked[index])]
-        exact = [(index, item) for index, item in candidates if old.identity and item.identity == old.identity]
-        if len(exact) > 1 or (old.identity and baseline_counts[(old.kind, old.identity)] > 1):
-            # Ambiguous identity invalidates drift inference before comparing
-            # any one candidate's properties. Sysfs order is not evidence.
-            findings.append(Finding(old.kind, State.UNVERIFIABLE, "AMBIGUOUS_IDENTITY"))
-            uncertain.update(index for index, _ in exact)
-            continue
-        match = exact[0] if exact else None
-        if match is None:
-            # A retained unique serial/WWID still identifies a device when an
-            # optional field disappears and the kernel renumbers its location.
-            partial = [(index, item) for index, item in candidates
-                       if any(fields[(old.kind, key, value)] == 1
-                              and approved_fields[(old.kind, key, value)] == 1
-                              for key, value in set(old.identity) & set(item.identity))]
-            if len(partial) == 1:
-                match = partial[0]
-            elif len(partial) > 1:
-                findings.append(Finding(old.kind, State.UNVERIFIABLE, "AMBIGUOUS_IDENTITY"))
-                uncertain.update(index for index, _ in partial)
-                continue
-        if match is None:
-            # Missing values cannot contradict an approved device. A unique
-            # identity-less candidate with unreadable capacity/model still
-            # prevents a reused old location from proving substitution.
-            old_properties = dict(old.properties)
-            weak = [(index, item) for index, item in candidates
-                    if (not old.identity or not item.identity)
-                    and all(old_properties[key] == value for key, value in item.properties if key in old_properties)]
-            if len(weak) == 1:
-                match = weak[0]
-            elif len(weak) > 1:
-                findings.append(Finding(old.kind, State.UNVERIFIABLE, "AMBIGUOUS_IDENTITY"))
-                uncertain.update(index for index, _ in weak)
-                continue
-        if match is None:
-            match = next(((index, item) for index, item in candidates
-                          if item.location == old.location), None)
-        if match is None:
-            findings.append(Finding(old.kind, State.MISSING, "APPROVED_COMPONENT_ABSENT"))
-            continue
-        index, item = match
-        used.add(index)
-        old_properties, new_properties = dict(old.properties), dict(item.properties)
-        old_identity, new_identity = dict(old.identity), dict(item.identity)
-        changed = any(old_properties[key] != new_properties[key] for key in old_properties.keys() & new_properties.keys())
-        changed = changed or any(old_identity[key] != new_identity[key] for key in old_identity.keys() & new_identity.keys())
-        if changed:
-            findings.append(Finding(old.kind, State.CHANGED, "APPROVED_COMPONENT_CHANGED"))
+    identity_counts = Counter((item.kind, item.identity) for item in new_items if item.identity)
+    baseline_counts = Counter((item.kind, item.identity) for item in old_items if item.identity)
+    fields = Counter((item.kind, key, value) for item in new_items for key, value in item.identity)
+    approved_fields = Counter((item.kind, key, value) for item in old_items for key, value in item.identity)
+
+    def ambiguous(index):
+        results[index] = Finding(old_items[index].kind, State.UNVERIFIABLE, "AMBIGUOUS_IDENTITY")
+
+    def matched(index, candidate):
+        old, item = old_items[index], new_items[candidate]
+        if ((item.identity and identity_counts[(item.kind, item.identity)] != 1)
+                or (old.identity and baseline_counts[(old.kind, old.identity)] != 1)):
+            ambiguous(index)
+        elif _conflicts(old.properties, item.properties) or _conflicts(old.identity, item.identity):
+            results[index] = Finding(old.kind, State.CHANGED, "APPROVED_COMPONENT_CHANGED")
         elif not old.complete or not item.complete or old.properties != item.properties or old.identity != item.identity:
-            findings.append(Finding(old.kind, State.UNVERIFIABLE, "IDENTIFIERS_OR_PROPERTIES_INCOMPLETE"))
+            results[index] = Finding(old.kind, State.UNVERIFIABLE, "IDENTIFIERS_OR_PROPERTIES_INCOMPLETE")
         elif not old.identity or not item.identity:
-            findings.append(Finding(old.kind, State.UNVERIFIABLE, "UNIQUE_ID_UNAVAILABLE"))
-        elif identity_counts[(item.kind, item.identity)] != 1 or baseline_counts[(old.kind, old.identity)] != 1:
-            findings.append(Finding(old.kind, State.UNVERIFIABLE, "AMBIGUOUS_IDENTITY"))
+            results[index] = Finding(old.kind, State.UNVERIFIABLE, "UNIQUE_ID_UNAVAILABLE")
         else:
-            findings.append(Finding(old.kind, State.OK, "IDENTITY_AND_PROPERTIES_MATCH"))
-    covered = {item.kind for item in approved.components}
+            results[index] = Finding(old.kind, State.OK, "IDENTITY_AND_PROPERTIES_MATCH")
+
+    # First reserve all full identities, including ambiguity, independent of
+    # baseline/sysfs order. Do not diff properties of an arbitrary duplicate.
+    for index, old in enumerate(old_items):
+        if old.kind in current.unavailable:
+            results[index] = Finding(old.kind, State.UNVERIFIABLE, "PROBE_UNAVAILABLE")
+            continue
+        exact = {candidate for candidate, item in enumerate(new_items)
+                 if item.kind == old.kind and old.identity and item.identity == old.identity}
+        if len(exact) > 1 or (old.identity and baseline_counts[(old.kind, old.identity)] > 1):
+            ambiguous(index)
+        elif exact:
+            matched(index, next(iter(exact)))
+        used.update(exact)
+
+    # A unique serial/WWID can survive loss of another field. The entire
+    # bipartite graph must be one-to-one before drawing a property conclusion.
+    partial = {}
+    for index, old in enumerate(old_items):
+        if results[index] is not None:
+            continue
+        partial[index] = {candidate for candidate, item in enumerate(new_items)
+                          if candidate not in used and item.kind == old.kind
+                          and any(fields[(old.kind, key, value)] == 1
+                                  and approved_fields[(old.kind, key, value)] == 1
+                                  for key, value in set(old.identity) & set(item.identity))}
+    partial_reverse = Counter(candidate for candidates in partial.values() for candidate in candidates)
+    for index, candidates in partial.items():
+        if not candidates:
+            continue
+        if len(candidates) == 1 and partial_reverse[next(iter(candidates))] == 1:
+            matched(index, next(iter(candidates)))
+        else:
+            ambiguous(index)
+    used.update(candidate for candidates in partial.values() for candidate in candidates)
+
+    # Resolve every compatible weak link together. Missing values are not
+    # contradictions, including partial non-unique serial/WWID observations.
+    # Shared candidates remain ambiguous for ALL linked baselines; consuming
+    # one while iterating would falsely turn a later unknown into MISSING.
+    weak = {}
+    for index, old in enumerate(old_items):
+        if results[index] is not None:
+            continue
+        weak[index] = {candidate for candidate, item in enumerate(new_items)
+                       if candidate not in used and item.kind == old.kind
+                       and not _conflicts(old.properties, item.properties)
+                       and not _conflicts(old.identity, item.identity)}
+    weak_reverse = Counter(candidate for candidates in weak.values() for candidate in candidates)
+    weak_used = set(weak_reverse)
+    for index, candidates in weak.items():
+        if not candidates:
+            continue
+        if len(candidates) == 1 and weak_reverse[next(iter(candidates))] == 1:
+            matched(index, next(iter(candidates)))
+        else:
+            ambiguous(index)
+
+    # Location is only a final drift hint after compatible identity/weak links
+    # have been handled. It cannot steal a candidate reserved for another old
+    # component or convert a shared weak candidate into a proven replacement.
+    for index, old in enumerate(old_items):
+        if results[index] is not None:
+            continue
+        location = next((candidate for candidate, item in enumerate(new_items)
+                         if candidate not in used and item.kind == old.kind and item.location == old.location), None)
+        if location is None:
+            results[index] = Finding(old.kind, State.MISSING, "APPROVED_COMPONENT_ABSENT")
+        elif location in weak_used:
+            ambiguous(index)
+        else:
+            matched(index, location)
+            used.add(location)
+    used.update(weak_used)
+    covered = {item.kind for item in old_items}
     for kind in (current.unavailable | approved.unavailable) - covered:
-        findings.append(Finding(kind, State.UNVERIFIABLE, "PROBE_UNAVAILABLE"))
-    for index, item in enumerate(current.components):
-        if index not in used and index not in uncertain and item.kind not in current.unavailable:
-            findings.append(Finding(item.kind, State.NEW_DEVICE, "UNAPPROVED_COMPONENT"))
-    return tuple(findings)
+        results.append(Finding(kind, State.UNVERIFIABLE, "PROBE_UNAVAILABLE"))
+    for candidate, item in enumerate(new_items):
+        if candidate not in used and item.kind not in current.unavailable:
+            results.append(Finding(item.kind, State.NEW_DEVICE, "UNAPPROVED_COMPONENT"))
+    return tuple(results)
