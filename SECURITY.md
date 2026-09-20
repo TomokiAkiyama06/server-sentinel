@@ -24,6 +24,14 @@ Safe defaults:
 
 ## Threat model
 
+The Agent ring core's configuration/early deletion and critical-preserve controls
+use separate default-deny injected authorization boundaries; no human/control
+listener is added. Its private SQLite ledger journals protection/deletion before
+media mutation, and the approved media store validates mount identity for writes,
+inventory and cleanup. Missing/uncertain media remains a visible gap; storage
+pressure cannot remove unexpired protected incidents. Production authority and
+transport integration remain pending. See `agent/docs/RING_BUFFER.md`.
+
 The internal compressed-recording store accepts no caller-controlled filenames or
 public requests. It requires a private, deployment-approved existing media root,
 an admission reservation and a trusted video-only codec validator. It rejects
@@ -265,6 +273,27 @@ Application permission revocation invalidates active application access promptly
 Do not trust arbitrary forwarded identity headers.
 
 If Tailscale Serve/equivalent provides authenticated identity headers, the backend accepts them only on a non-bypassable local trusted-proxy path. Requests from LAN/other interfaces cannot directly set such headers and gain identity.
+
+The concrete Owner-bootstrap/session design is [ADR-0003](docs/ADR/0003-owner-authentication-and-trusted-proxy.md), currently **Proposed** pending Owner approval.
+It states the proposed trusted-host loopback limitation and upstream login-reuse
+risk, and defines recovery/revocation transitions for review. No session lifetime,
+identity-binding choice, or local recovery implementation is accepted by that
+proposal alone. Human routes and dashboard assets remain closed until the design
+is accepted and implemented/tested under #10. Its model tests do not validate a
+real Tailscale installation, LAN bypass resistance, or active stream cancellation.
+
+That proposal also requires a hostname reserved for the human listener on every
+scheme and port. No other application, static tree, alias, port, or catch-all
+may answer for that name: one sharing a path would run in the same browser
+origin, and one on another HTTPS port would still receive the host-only session
+cookie, because cookies are not port-scoped. The reservation is a deployment
+obligation — a dedicated network identity for ServerSentinel, or a
+single-purpose node enforced outside the application — because a local process
+can bind another port on that address without appearing in any proxy
+configuration. Startup and daily checks enumerate actual listeners and proxy
+routes for the whole name and close human access on any other answer, which
+bounds rather than removes that exposure; the application cannot prevent a
+local process from binding.
 
 ## Capture-node pairing
 

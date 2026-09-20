@@ -21,6 +21,8 @@ decision and ADR-0004 for the shared Tailnet account authorization decision.
 Both arrive in their own pull requests; do not reuse those numbers, and do not
 link to their files until they are merged.
 
+- `0003-owner-authentication-and-trusted-proxy.md` — Proposed, awaiting Owner decision. Specifies local Owner bootstrap/recovery, trusted proxy/session boundaries, and an executable synthetic design model for Issue #6. It does not enable human access or close #6.
+
 ## Template
 
 ```markdown

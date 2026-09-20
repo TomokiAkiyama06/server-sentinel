@@ -28,7 +28,7 @@ Issue #1 closed when PR #2 merged after documentation/bootstrap acceptance and c
   today (ADR-0005, `REQUIREMENTS.md` DIST-005)
 - [ ] versioned Main Server install / update / rollback lifecycle (#47)
 - [ ] first-run setup wizard and resumable initial configuration flow (#48)
-- [ ] deployment-owner authorization ADR/bootstrap
+- [ ] deployment-owner authorization ADR/bootstrap — ADR-0003 Proposed; Owner decision pending, synthetic policy model only
 - [ ] trusted Tailscale/private-proxy identity boundary
 
 ## Phase 2 — Camera Source + Capture Node platform
@@ -55,7 +55,7 @@ no browser preview or physical device result is claimed.
 ## Phase 3 — Media
 
 - [ ] agent->main transport PoC + ADR
-- [ ] Agent compressed disk ring buffer with Owner-selected duration/capacity modes
+- [ ] Agent compressed disk ring buffer: tested disk/ledger core and duration/capacity DTOs implemented; Owner UI, capture/transport integration and hardware acceptance pending (#16)
 - [ ] autonomous T-10/T+10 incident protection, critical preserve command, and 60-day default expiry
 - [ ] Agent storage pressure/hard stop without deleting unexpired protected evidence
 - [ ] capture/record/inference/view profile separation

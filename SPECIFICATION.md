@@ -407,6 +407,14 @@ Runtime uncertainty or later growth of protected/other filesystem usage may redu
 
 Normal unprotected segments are FIFO. Protected incident segments are not part of ordinary ring-buffer eviction.
 
+The implemented core is `agent/media_capture_agent/ring.py`, with a private
+transactional SQLite ledger and #12's descriptor-pinned media store. Admission
+uses physical allocated bytes, unique shared references, explicit per-source
+bitrate/cadence/overhead bounds, and verified free space after any eligible
+reclamation. Its DTOs expose intervals/gaps, completion/expiry, pressure and
+deletion state. The concrete contract and incomplete production/UI integration
+are documented in [`agent/docs/RING_BUFFER.md`](agent/docs/RING_BUFFER.md).
+
 ### 5.11 Unexpected main-host communication loss
 
 If the agent unexpectedly loses the authenticated connection/heartbeat to the main host, it automatically creates a temporary protected incident window:
@@ -477,6 +485,21 @@ At install/startup/runtime admission, the Agent shall verify:
 - loss/unmount/substitution of the expected media filesystem does **not** silently redirect ring-buffer or incident writes into a directory on the root filesystem.
 
 If the expected media filesystem is unavailable or resolves unexpectedly, Agent recording/buffering becomes explicit degraded/failed state and unsafe writes are refused until the Owner resolves or re-approves the target.
+
+The Issue #16 ring core requires an explicit SQLite ledger size bound in addition
+to media-profile/reserve inputs. It guards runtime-filesystem metadata growth
+before schema creation, hot-journal recovery and transactions, and reserves
+conservative completion headroom in shared-filesystem media admission. The cap
+must also cover cadence-derived segment/index/protection rows for the selected
+ring and the next complete pre/post incident, including existing retained
+metadata. Failed reconfiguration retains the active ring's selected coverage;
+only trusted clock observations advance the durable rollback watermark.
+Untrusted capture discontinuities are refused without advancing per-source trusted
+chronology. Capacity changes must fit incompatible legacy pre-roll throughout
+profile rollover, not merely fit the filesystem or one immediate new segment. Unexpected
+authentication loss is an effective Main loss even while the raw socket remains
+connected; known protected-evidence damage stays degraded outside current pre-roll.
+See `agent/docs/RING_BUFFER.md` for the implemented budget and integration limits.
 
 ## 6. Media architecture
 
@@ -922,6 +945,32 @@ This is not DRM. A user who can view video may still screen-record or use advanc
 ### 11.7 Revocation
 
 ServerSentinel permission revocation invalidates application access promptly. Tailnet membership/policy remains a separate Tailscale administrative concern.
+
+### 11.8 Owner bootstrap and session decision status
+
+[ADR-0003](docs/ADR/0003-owner-authentication-and-trusted-proxy.md) is a
+**Proposed** implementation design for Issue #6, pending explicit Owner approval.
+Its timeout values, exact identity binding, local bootstrap, and recovery choices
+are not accepted product defaults. Until approval and Issue #10 implementation,
+the backend shell denies human requests, including application assets,
+health/version/schema, and SPA/error fallbacks. Issue #8's static shell remains
+a development/mock artifact until integrated with this protected delivery path.
+The ADR's synthetic design model proves only policy composition, not deployed
+proxy, session, cryptographic, or browser behavior.
+
+The proposal also reserves a whole hostname: that name serves ServerSentinel
+alone on every scheme and port. Path-based co-hosting shares one browser origin,
+and another port of the same name still shares the cookie scope because cookies
+are not port-scoped, so neither is supported. Holding the name is a deployment
+obligation (a dedicated network identity, or a single-purpose node enforced
+outside the application), because a directly bound listener never appears in
+proxy configuration; the application's startup and daily listener/route checks
+close access when another answer is found, which bounds the exposure window
+instead of preventing the bind. Owner bootstrap also provisions the Owner's
+first per-person credential through the local administrative boundary, since no
+session exists without one. A verified trusted-proxy identity stays a supplementary check
+there; the authoritative per-person application credential is decided separately
+for Issue #6.
 
 ## 12. Dashboard UI
 
