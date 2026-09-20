@@ -11,7 +11,7 @@ Phases group capabilities rather than imposing a strict completion order. The de
 - [ ] issue/PR templates
 - [x] CI/repository guards, synthetic regression tests, and conditional component checks (#5; see `docs/CI.md`)
 - [ ] dependency/model license policy
-- [ ] hardened review-gate follow-up mapped to Issue #4 (enforcement implementation remains open)
+- [ ] hardened review gate #4: capability assessment, offline policy tests and disabled ruleset generator prepared; Owner App setup, trusted publisher/collector and GitHub enforcement acceptance remain open (see `docs/REVIEW_GATE_SETUP.md`)
 
 Issue #1 closed when PR #2 merged after documentation/bootstrap acceptance and current HEAD/base reviews plus CI passed. CI foundation #5 is implemented. The #7 closed backend foundation now has synthetic coverage; its authorization prerequisite remains separate. Runtime/ADR Issues #6–#28 and the separately tracked #4 retain their own acceptance gates.
 
