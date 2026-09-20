@@ -184,6 +184,34 @@ class QualityGateTests(unittest.TestCase):
                     frame=FrameIdentity.from_frame(sample),
                 ).observation)
 
+    def test_clipped_pixels_block_results_even_when_mean_luminance_and_sharpness_are_good(self):
+        gate, _ = ready_gate()
+        sample = GrayFrame(SOURCE, STREAM, 2, 16, 16, bytes([0, 255]) * 128)
+        decision = assess(gate, sample)
+        self.assertEqual(Quality.INSUFFICIENT, decision.quality)
+        self.assertEqual((Metric.SATURATION,), tuple(finding.metric for finding in decision.findings))
+        for observation in (Observation.PRESENT, Observation.ABSENT):
+            result = gate.guard_result(decision, Detection(observation, Reason.EVALUATED),
+                                       execution=Execution.SUCCEEDED, frame=decision.frame)
+            self.assertEqual(Observation.UNKNOWN, result.observation)
+
+    def test_obstruction_context_alone_is_a_required_prerequisite(self):
+        gate, _ = ready_gate()
+        decision = assess(gate, synthetic_person(2), occlusion_fraction=.5)
+        self.assertEqual(Quality.INSUFFICIENT, decision.quality)
+        self.assertEqual((Metric.OCCLUSION,), tuple(finding.metric for finding in decision.findings))
+
+    def test_source_and_policy_replacement_require_a_fresh_gate(self):
+        gate, _ = ready_gate()
+        with self.assertRaises(AttributeError):
+            gate.policy = replace(gate.policy, version=2)
+        with self.assertRaises(AttributeError):
+            gate.source_id = OTHER
+        replacement = QualityGate(SOURCE, replace(gate.policy, version=2))
+        decision = assess(replacement, synthetic_person(2))
+        self.assertEqual(2, decision.policy_version)
+        self.assertFalse(decision.allows_conclusion)
+
     def test_degraded_band_requires_unknown_for_both_result_directions(self):
         gate, _ = ready_gate()
         decision = assess(gate, synthetic_person(2), target_width=5)

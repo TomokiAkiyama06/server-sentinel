@@ -30,11 +30,13 @@ from app.logging import configure_logging  # noqa: E402
 from app.main import create_app  # noqa: E402
 from app.settings import Settings  # noqa: E402
 from tests.asgi import request  # noqa: E402
+from tests.quality_smoke import run_quality_smoke  # noqa: E402
 
 
 async def run(scenario):
     output = io.StringIO()
     configure_logging(stream=output)
+    run_quality_smoke(scenario)
     with tempfile.TemporaryDirectory(prefix="synthetic-server-") as temporary:
         settings = Settings(Path(temporary))
         if scenario == "error":

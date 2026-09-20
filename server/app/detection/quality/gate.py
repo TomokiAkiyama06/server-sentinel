@@ -22,14 +22,22 @@ class QualityGate:
     def __init__(self, source_id: UUID, policy: DetectorQualityPolicy):
         if not isinstance(source_id, UUID) or not isinstance(policy, DetectorQualityPolicy):
             raise ValueError("invalid quality gate registration")
-        self.source_id = source_id
-        self.policy = policy
+        self._source_id = source_id
+        self._policy = policy
         self._stream = None
         self._sequence = -1
         self._shape = None
         self._good = 0
         self._lock = threading.Lock()
         self._latest = None
+
+    @property
+    def source_id(self) -> UUID:
+        return self._source_id
+
+    @property
+    def policy(self) -> DetectorQualityPolicy:
+        return self._policy
 
     def _decision(self, frame, quality, findings=(), metrics=()):
         return QualityDecision(FrameIdentity.from_frame(frame), self.policy.detector,
