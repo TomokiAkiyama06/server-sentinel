@@ -430,12 +430,13 @@ class RecordingStore:
             self._release_reservation()
 
     def advance(self, now_ms: int) -> None:
-        """The owning worker's bounded timer closes deadlines even with no input."""
+        """The owning worker closes deadlines after the bounded segment-close grace."""
         self._check()
         if type(now_ms) is not int or now_ms < 0:
             raise ValueError("invalid clock")
         rows = self.db.execute(
-            "SELECT id FROM recordings WHERE status='active' AND target_end_ms<=?", (now_ms,)
+            "SELECT id FROM recordings WHERE status='active' "
+            "AND target_end_ms + ? <=?", (self.limits.max_segment_ms, now_ms)
         ).fetchall()
         for row in rows:
             self.finish(UUID(row["id"]))

@@ -102,7 +102,7 @@ class RecordingTests(unittest.TestCase):
             for source in (self.source, remote_source):
                 self.store.append(self.segment(start, start + 10_000, index, source_id=source,
                                               capture_node_id=node if source == remote_source else None))
-        self.store.advance(180_000)
+        self.store.advance(180_000 + self.limits.max_segment_ms)
         manifest = self.store.event_manifest(event)
         self.assertEqual(2, len(manifest["recordings"]))
         self.assertEqual({str(value) for value in recordings},
@@ -149,10 +149,22 @@ class RecordingTests(unittest.TestCase):
         active = self.store.manifest(recording)
         self.assertEqual([], active["gaps"])
         self.assertEqual("awaiting_media", active["pending"][0]["reason"])
-        self.store.advance(40_000)
+        self.store.advance(40_000 + self.limits.max_segment_ms)
         result = self.store.manifest(recording)
         self.assertEqual("gapped", result["status"])
         self.assertEqual("unavailable", result["gaps"][0]["reason"])
+
+    def test_timer_keeps_boundary_segment_linkable_until_bounded_close(self):
+        recording = self.store.start_manual(self.source, 30_000, duration_ms=15_000)
+        self.store.append(self.segment(30_000, 40_000))
+        self.store.advance(45_000)
+        self.assertEqual("active", self.store.manifest(recording)["status"])
+        boundary = self.store.append(self.segment(40_000, 50_000, 1))
+        self.store.advance(45_000 + self.limits.max_segment_ms)
+        result = self.store.manifest(recording)
+        self.assertEqual("complete", result["status"])
+        self.assertEqual([str(boundary)], [item["id"] for item in result["segments"]
+                                            if item["clip_end_ms"] == 45_000])
 
     def test_manual_and_event_limits_and_invalid_identifiers(self):
         recording = self.store.start_manual(self.source, 30_000)
