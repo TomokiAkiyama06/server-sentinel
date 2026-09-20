@@ -92,13 +92,20 @@ test('an in-flight mutation disables that row\'s owner controls only', () => {
 });
 
 test('a failed write is reported without discarding the loaded list', () => {
-  const markup = recordingsMarkup(true, { actions, writeFailed: true });
+  const markup = recordingsMarkup(true, { actions, failedWrites: ['synthetic-recording-1'] });
+  // Only the recording whose write failed is flagged.
+  assert.equal(markup.split('data-write-failed="true"').length - 1, 1);
+  const rows = markup.split('<tr').filter(row => row.includes('data-recording-id='));
+  for (const row of rows) {
+    assert.equal(row.includes('data-write-failed="true"'),
+      row.includes('data-recording-id="synthetic-recording-1"'));
+  }
   assert.match(markup, /class="write-alert" role="alert"/);
   assert.ok(markup.includes(messages.ja.actionFailed));
   // The list itself is intact: a failed write is not a failed read.
   assert.equal(markup.split('data-recording-id=').length - 1, recordings.length);
   assert.equal(markup.includes(messages.ja.recordingsUnavailable), false);
-  assert.doesNotMatch(recordingsMarkup(true, { actions }), /write-alert/);
+  assert.doesNotMatch(recordingsMarkup(true, { actions }), /write-alert|data-write-failed/);
 });
 
 test('starred recordings are shown as never auto-deleted and keep their day counts separate', () => {

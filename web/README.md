@@ -58,7 +58,9 @@ second conflicting mutation; that row's owner controls are disabled and marked
 outstanding mutations, and an aborted write is reported as neither a result nor
 an error. A rejected write reports itself in its own alert and does not replace
 the loaded list with a read-failure banner, because the server-side result of
-that write is unknown rather than the list being unavailable.
+that write is unknown rather than the list being unavailable. Those unknown
+results are tracked per recording and the affected rows are marked, so another
+recording's write succeeding never clears them.
 
 `src/setup/storage.tsx` is owner-only. It shows the three backend storage states
 (`NORMAL`, `STORAGE_PRESSURE`, `STORAGE_HARD_STOP`), marks the current one, and

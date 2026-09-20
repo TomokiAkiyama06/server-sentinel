@@ -25,13 +25,13 @@ function filterLabel(t: Catalog, filter: Filter): string {
 }
 
 export function RecordingsView({ t, recordings, owner = false, actions, busy = [],
-                                 writeFailed = false, onReload }: {
+                                 failedWrites = [], onReload }: {
   t: Catalog;
   recordings: readonly RecordingSummary[];
   owner?: boolean;
   actions?: RecordingActions | undefined;
   busy?: readonly string[];
-  writeFailed?: boolean;
+  failedWrites?: readonly string[];
   onReload?: (() => void) | undefined;
 }) {
   const [filter, setFilter] = useState<Filter>('all');
@@ -41,9 +41,10 @@ export function RecordingsView({ t, recordings, owner = false, actions, busy = [
   const selected = visible.find(recording => recording.id === playing);
   const manageable = owner && actions ? actions : undefined;
   const waiting = new Set(busy);
+  const failed = new Set(failedWrites);
 
   return <section className="recordings">
-    {writeFailed && <div className="write-alert" role="alert">
+    {failed.size > 0 && <div className="write-alert" role="alert">
       <p>{t.actionFailed}</p>
       {onReload && <button type="button" className="primary" onClick={onReload}>{t.retry}</button>}
     </div>}
@@ -67,7 +68,8 @@ export function RecordingsView({ t, recordings, owner = false, actions, busy = [
         {manageable && <th scope="col">{t.columnActions}</th>}
       </tr></thead>
       <tbody>{visible.map(recording => <tr key={recording.id} data-recording-id={recording.id}
-        aria-busy={waiting.has(recording.id) || undefined}>
+        aria-busy={waiting.has(recording.id) || undefined}
+        data-write-failed={failed.has(recording.id) || undefined}>
         <td className="numeric">{timestamp(recording.start_ms)}</td>
         <td>{recording.source_name}</td>
         <td><span className={`kind kind-${recording.kind}`}>{t[`kind_${recording.kind}`]}</span></td>

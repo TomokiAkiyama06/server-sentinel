@@ -22,7 +22,11 @@ let loaded = false;
 let syntheticMutations = 0;
 const settle = () => new Promise<void>(resolve => setTimeout(resolve, 150));
 // The synthetic write still asks the server, so failures and aborts are real.
-const accepted = (signal: AbortSignal) => api.read('/api/mock/mutation', value => {
+let syntheticMutationPath = '/api/mock/mutation';
+Object.defineProperty(window, 'failNextMutations', {
+  value: (path: string) => { syntheticMutationPath = path; },
+});
+const accepted = (signal: AbortSignal) => api.read(syntheticMutationPath, value => {
   if (typeof value !== 'object' || value === null || !('accepted' in value) || value.accepted !== true) throw new Error();
   return true;
 }, signal);

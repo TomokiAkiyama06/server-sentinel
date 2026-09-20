@@ -90,6 +90,9 @@ async function scenario(viewport, { production = false, status = 200, session = 
     if (!production && url.pathname === '/api/mock/mutation') {
       await fulfill(JSON.stringify(mutationStatus === 200 ? { accepted: true } : { detail: 'synthetic private error' }), 'application/json', mutationStatus); return;
     }
+    if (!production && url.pathname === '/api/mock/mutation-refused') {
+      await fulfill(JSON.stringify({ detail: 'synthetic private error' }), 'application/json', 503); return;
+    }
     if (!production && url.pathname === '/api/mock/storage') {
       await fulfill(JSON.stringify(storageStatus === 200 ? storageFixture(storageState, storageAvailable, storageFaults) : { detail: 'synthetic private error' }), 'application/json', storageStatus); return;
     }
@@ -222,6 +225,21 @@ try {
       assert.match(await page.evaluate('document.body.innerText'), /監査記録に書き込めませんでした/);
       assert.match(await page.evaluate('document.body.innerText'), /Slack へ通知を送信できませんでした/);
       assert.equal(await page.evaluate('document.documentElement.scrollWidth <= window.innerWidth'), true, 'fault alerts fit viewport');
+    });
+    // One recording's successful write must not clear another's unknown result.
+    await scenario(viewport, { recordings: 3 }, async page => {
+      await page.click('録画');
+      await page.wait("document.querySelectorAll('[data-recording-id]').length === 3");
+      await page.evaluate("window.failNextMutations('/api/mock/mutation-refused')");
+      await page.evaluate("document.querySelector('[data-recording-id=\"synthetic-recording-0\"] .row-actions button').click()");
+      await page.wait("document.querySelectorAll('[data-write-failed=\"true\"]').length === 1");
+      await page.evaluate("window.failNextMutations('/api/mock/mutation')");
+      await page.evaluate("document.querySelector('[data-recording-id=\"synthetic-recording-2\"] .row-actions button').click()");
+      await page.wait("document.querySelector('[data-recording-id=\"synthetic-recording-2\"]').innerText.includes('★ を外す')");
+      // The other recording's failure is still reported.
+      assert.equal(await page.evaluate("document.querySelectorAll('.write-alert').length"), 1);
+      assert.deepEqual(await page.evaluate("Array.from(document.querySelectorAll('[data-write-failed=\"true\"]')).map(el => el.dataset.recordingId)"),
+        ['synthetic-recording-0']);
     });
     // A rejected write reports itself without discarding the loaded list.
     await scenario(viewport, { recordings: 3, mutationStatus: 503 }, async page => {

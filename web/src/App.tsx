@@ -29,7 +29,7 @@ export function App({ services = deniedServices }: { services?: DashboardService
   const [attempt, setAttempt] = useState(0);
   const [refresh, setRefresh] = useState(0);
   const [busy, setBusy] = useState<readonly string[]>([]);
-  const [writeFailed, setWriteFailed] = useState(false);
+  const [failedWrites, setFailedWrites] = useState<readonly string[]>([]);
   const [mutations] = useState(() => new MutationQueue());
   const [loadedFor, setLoadedFor] = useState({ services, attempt });
   const t = messages[locale];
@@ -45,7 +45,7 @@ export function App({ services = deniedServices }: { services?: DashboardService
     setStorage({ state: 'pending' });
     setView('overview');
     setBusy([]);
-    setWriteFailed(false);
+    setFailedWrites([]);
   }
 
   useEffect(() => { document.documentElement.lang = locale; }, [locale]);
@@ -115,7 +115,7 @@ export function App({ services = deniedServices }: { services?: DashboardService
 
   useEffect(() => {
     setBusy(current => current.length ? [] : current);
-    setWriteFailed(false);
+    setFailedWrites(current => current.length ? [] : current);
     return () => mutations.abortAll();
   }, [services, access, attempt, mutations]);
 
@@ -130,8 +130,14 @@ export function App({ services = deniedServices }: { services?: DashboardService
       // A failed write is not a failed read: keep the loaded list and report
       // the write separately. An aborted mutation belongs to a replaced
       // session and is neither a result nor an error.
-      if (outcome === 'done') { setWriteFailed(false); setRefresh(value => value + 1); }
-      else if (outcome === 'failed') setWriteFailed(true);
+      // Per recording: one write succeeding never clears another's unknown
+      // result, and an aborted write belongs to a replaced session.
+      if (outcome === 'done') {
+        setFailedWrites(current => current.filter(value => value !== id));
+        setRefresh(value => value + 1);
+      } else if (outcome === 'failed') {
+        setFailedWrites(current => current.includes(id) ? current : [...current, id]);
+      }
     })) return;
     setBusy(mutations.pending);
   };
@@ -176,7 +182,7 @@ export function App({ services = deniedServices }: { services?: DashboardService
               : selected === 'sources' && sources.state === 'loading' ? <p role="status">{t.checking}</p>
               : selected === 'recordings' && recordings.state === 'ready'
                 ? <RecordingsView t={t} recordings={recordings.items} owner={access.role === 'owner'} actions={actions} busy={busy}
-                    writeFailed={writeFailed} onReload={() => { setWriteFailed(false); setRefresh(value => value + 1); }} />
+                    failedWrites={failedWrites} onReload={() => { setFailedWrites([]); setRefresh(value => value + 1); }} />
                 : selected === 'recordings' && recordings.state === 'failed'
                   ? <section className="notice" role="alert"><p>{t.recordingsUnavailable}</p><button className="primary" onClick={() => setRefresh(value => value + 1)}>{t.retry}</button></section>
                   : selected === 'recordings' && recordings.state === 'loading' ? <p role="status">{t.checking}</p>
