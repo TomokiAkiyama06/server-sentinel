@@ -863,6 +863,8 @@ principal_credential
 - public_key (public material only; never a biometric template)
 - user_verification: required (asserted at registration, verified again at
   every authentication)
+- sign_count (last accepted signature counter; 0 when the authenticator keeps
+  none)
 - label (owner-visible hint, not proof of a device)
 - created_at
 - last_used_at
@@ -923,9 +925,15 @@ including the relying-party id and origin. That data is transient: the pending
 challenge is held server-side only for the bounded lifetime of one ceremony, is
 single-use and is dropped when the ceremony ends or expires; of the rest, only
 the fields of `principal_credential` and `principal_session` persist and
-everything else is discarded once verified. The signature counter is compared,
-and a regression is surfaced as a possible cloned authenticator rather than
-silently accepted.
+everything else is discarded once verified.
+
+The signature counter is the one verification output that persists, as
+`principal_credential.sign_count`. An authenticator that reports a non-zero
+counter must report a strictly larger one each time: a regression refuses the
+assertion and notifies the Owner as a possible cloned authenticator, and the
+stored value advances only on an accepted assertion. Many passkey authenticators
+report 0 always; a counter that stays 0 is that case, not evidence of cloning,
+and the check does not apply to it.
 
 None of this material belongs in logs, diagnostics or exports: challenges,
 client and authenticator data, signatures, and enrollment codes are excluded
