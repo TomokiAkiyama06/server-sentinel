@@ -163,6 +163,12 @@ callbacks expose only logical source IDs, state and fixed reason codes. Captured
 video bytes are excluded from object representations and no frame is written to
 disk or uploaded by the UVC adapter itself. Downstream media policies still apply.
 
+The implementation's local fault status/outbox contains component categories,
+comparison states and fixed reasons, excluding serials, UUIDs, paths and media.
+Raw approved observations remain in the deployment-local baseline and omit
+private values from repr. Self-test reports contain only fixed state/stage codes;
+the temporary-file journal is separate from ordinary recording records.
+
 The Main Server keeps its Owner-approved hardware baseline and detailed hardware identifiers deployment-local. Normal operational logs and general diagnostics redact or hash serials/UUIDs; raw identifiers are excluded from public diagnostics and GitHub artifacts. Any detailed diagnostic export requires an explicit Owner action and does not authorize automatic upload. Bounded recording-health self-test media stays local and is never uploaded. Delete self-test-owned temporary/partial media after success, failure, or cancellation, and clean interrupted-test leftovers at the next startup before creating new self-test media. Cleanup verifies the expected filesystem and self-test ownership; it never deletes ordinary recordings or protected incidents. If cleanup is unsafe or fails, report failure and block further self-test media writes until safe cleanup succeeds. Leftovers count against storage admission and the safety reserve; they are not retained diagnostic media.
 
 ## Slack
