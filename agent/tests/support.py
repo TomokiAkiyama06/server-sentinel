@@ -27,7 +27,8 @@ def configuration(root):
     return {
         "node_id": str(NODE), "media_root": str(media), "runtime_root": str(runtime),
         "expected_mount": {"mount_point": str(mount.mount_point), "filesystem": mount.filesystem,
-                           "source": mount.source, "major": mount.major, "minor": mount.minor},
+                           "source": mount.source, "major": mount.major, "minor": mount.minor,
+                           "filesystem_root": str(mount.filesystem_root)},
         "service_uid": os.geteuid(), "safety_reserve_bytes": 4096, "max_segment_bytes": 16384,
         "heartbeat_seconds": 0.01, "clock_offset_limit_seconds": 2,
         "clock_uncertainty_limit_seconds": 0.5, "clock_step_limit_seconds": 0.1,

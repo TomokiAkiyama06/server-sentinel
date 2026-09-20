@@ -34,7 +34,7 @@ all runtime/media data outside the Git checkout and the application install:
 | `node_id` | Stable node UUID, independent of source UUIDs |
 | `runtime_root` | Existing private directory, dedicated UID, mode 0700 |
 | `media_root` | Existing dedicated-UID directory on the approved filesystem; no group/world write |
-| `expected_mount` | `mount_point`, `filesystem`, `source`, device `major` and `minor`, approved locally |
+| `expected_mount` | `mount_point`, `filesystem`, `source`, device `major` and `minor`, and `filesystem_root` (mountinfo field 4), approved locally |
 | `service_uid` | Dedicated non-root numeric UID |
 | `safety_reserve_bytes` | Positive Owner-configured hard reserve |
 | `max_segment_bytes` | Positive bound for each opaque video segment |
@@ -48,7 +48,12 @@ creates roots, follows path symlinks, repairs an unexpected mount, or substitute
 a root-filesystem directory. Device numbers can change after reboot; revalidate
 and explicitly re-approve configuration instead of relaxing checks. Mount IDs are
 read from pinned-directory fdinfo and compared with mountinfo, including stacked
-bind mounts; a mount ID change during execution refuses writes.
+bind mounts; a mount ID change during execution refuses writes. A systemd
+`ReadWritePaths` bind at exactly `media_root` is accepted only while the approved
+parent mount remains present and source/filesystem/device plus backing filesystem
+root match the approved parent and relative media path. A same-device bind of
+another backing directory fails. This preserves the narrow write allowlist and
+`ProtectSystem=strict`; it does not approve arbitrary bind mounts.
 
 `MediaStore` serializes admissions with a directory lock, reserves physical blocks
 before writing, rechecks actual free space and fsyncs data/directory. It creates
@@ -87,6 +92,10 @@ python3 agent/install.py --artifact <verified-artifact> --sha256 <trusted-sha256
   --config <protected-config-file> --unit <unit-directory>/media-capture-agent.service \
   --video-device /dev/video0
 ```
+
+The installer reads only a non-symlink, regular artifact of at most 16 MiB,
+through a nonblocking descriptor; FIFOs, devices and concurrent file changes
+are rejected before execution.
 
 The device path above is illustrative, never durable UVC identity. Repeat the
 option for explicitly allowed video nodes; the default device allowlist is empty.

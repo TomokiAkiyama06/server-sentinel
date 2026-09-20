@@ -402,7 +402,7 @@ The Agent media root is a deployment-configured path outside the source tree tha
 
 At install/startup/runtime admission, the Agent shall verify:
 - the configured media root exists or can be created only by the intended installer/owner workflow;
-- it resolves to the expected filesystem/mount identity when an expected device/mount is configured;
+- it resolves to the expected filesystem/mount/device and backing-filesystem-root identity; a narrow systemd namespace bind must map to the approved parent root plus the configured relative media path;
 - sufficient free space and safety reserve remain;
 - it is writable by the dedicated Agent service account;
 - loss/unmount/substitution of the expected media filesystem does **not** silently redirect ring-buffer or incident writes into a directory on the root filesystem.
