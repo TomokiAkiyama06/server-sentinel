@@ -27,8 +27,9 @@ quality-sufficient Owner entry can project `PRESENT`; untrusted timing and
 insufficient quality remain `UNKNOWN`. Critical movement/tamper observations
 always queue evidence and configured notification work regardless of presence.
 
-The status snapshot is read-only, so a refused or exhausted storage volume
-cannot hide presence state or unfinished critical work. It reports each
+The status snapshot does not create a presence write, so a refused or exhausted
+storage volume cannot hide presence state or unfinished critical work. It probes
+the injected storage-admission guard and reports each
 critical path as `armed`, `unavailable`, or `unknown` from configured ports,
 the storage admission it actually observed, and the injected detection health
 probe; no path is reported as healthy merely because nothing failed yet.

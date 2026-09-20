@@ -226,6 +226,9 @@ class PresenceTests(unittest.TestCase):
             raise RuntimeError("storage admission refused")
 
         self.service.write_guard = full
+        # No expiring override is needed for status to prove current storage
+        # admission. A configured but refusing guard never looks armed.
+        self.assertEqual(self.status()["critical_persistence"], "unavailable")
         status = self.status(now=NOW + timedelta(hours=2))
         # Reading status must not need a durable write, and the expired override
         # must stop applying even while its retirement cannot be persisted.

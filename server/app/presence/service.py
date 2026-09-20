@@ -281,7 +281,17 @@ class PresenceService:
             return UNKNOWN
         return ARMED if reported else UNAVAILABLE
 
-    def _critical_paths(self, *, persistence_denied):
+    def _persistence_path(self):
+        """Probe current storage admission without creating a presence write."""
+        if self.write_guard is None:
+            return UNAVAILABLE
+        try:
+            self.write_guard()
+        except Exception:
+            return UNAVAILABLE
+        return ARMED
+
+    def _critical_paths(self):
         """Report configured/known critical-path availability, never a fixed armed.
 
         ``armed`` means the path is configured and is not disarmed by any
@@ -290,7 +300,7 @@ class PresenceService:
         """
         paths = {
             "critical_detection": self._detection_path(),
-            "critical_persistence": UNAVAILABLE if (self.write_guard is None or persistence_denied) else ARMED,
+            "critical_persistence": self._persistence_path(),
             "critical_evidence": ARMED if self.evidence is not None else UNAVAILABLE,
             "critical_notifications": ARMED if self.notifications is not None else UNAVAILABLE,
         }
@@ -305,7 +315,7 @@ class PresenceService:
                        and override["expires"] <= timestamp(now))
         # An expired override stops applying even when the durable retirement
         # write is refused; the pending flag keeps that difference visible.
-        retired, admitted = self._retire_override(now) if expired else (True, True)
+        retired, _admitted = self._retire_override(now) if expired else (True, None)
         with closing(self.database.connect()) as db:
             trusted = self._clock_trust(db, now, clock_trusted)
             state, basis, expires = self._effective(db, now, trusted)
@@ -314,7 +324,7 @@ class PresenceService:
         return {"state": state.value, "basis": basis, "override_expires_at": expires,
                 "clock_degraded": not trusted,
                 "suppress_ordinary": state == PresenceState.PRESENT and trusted,
-                **self._critical_paths(persistence_denied=not admitted),
+                **self._critical_paths(),
                 "override_expiry_pending": not retired,
                 "pending_critical_actions": failed}
 
