@@ -141,6 +141,22 @@ class StoragePolicyTests(unittest.TestCase):
         with self.assertRaisesRegex(RecordingError, "STORAGE_HARD_STOP"):
             self.policy.admit(100, critical=True)
 
+    def test_transition_audit_shares_the_admitted_metadata_budget(self):
+        self.inventory.free = 220
+        reserved_during_audit = []
+        def audit(_):
+            with policy.control():
+                reserved_during_audit.append(policy._reserved_total)
+                self.inventory.free -= LIMITS.write_overhead_bytes
+        policy = MainStoragePolicy(LIMITS, self.inventory.space, lambda: 0, audit)
+        policy.bind(self.inventory, RetentionService(self.inventory))
+        policy.admit(100, critical=True)
+        self.assertEqual([120], reserved_during_audit)
+        # Audit consumed the metadata part of this same reservation; writing
+        # admitted media still leaves the hard reserve, with no second budget.
+        self.assertEqual(LIMITS.hard_reserve_bytes, self.inventory.free - 100)
+        policy.release()
+
     def test_recovery_hysteresis_prevents_threshold_oscillation(self):
         self.inventory.free = 299
         self.assertEqual(StorageState.PRESSURE, self.policy.status().state)

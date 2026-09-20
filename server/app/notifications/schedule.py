@@ -23,7 +23,8 @@ class DailySummaryScheduler:
     time sends that day's summary. A backward jump/fold never sends it twice.
     A durable claim is made before delivery; a crash leaves 'pending', explicitly
     indicating uncertain delivery. No automatic retry risks duplicate messages.
-    The integration supplies the same metadata write guard as the storage worker.
+    The integration supplies the same metadata reservation as the storage worker.
+    Both enqueue and completion persistence run here; network IO never does.
     """
 
     def __init__(self, connection: sqlite3.Connection, zone: ZoneInfo,
@@ -46,6 +47,7 @@ class DailySummaryScheduler:
         aware(now)
         if not isinstance(summary, DailySummary):
             raise ValueError("invalid daily summary")
+        self.service.poll()
         local = now.astimezone(self.zone)
         if (local.hour, local.minute) < (self.hour, self.minute):
             return DeliveryResult.SUPPRESSED
@@ -67,8 +69,13 @@ class DailySummaryScheduler:
             except BaseException:
                 self.db.rollback()
                 raise
-        result = self.service.daily(summary, at=now)
+        result = self.service.daily(summary, at=now,
+                                    on_complete=lambda completed: self._complete(date, completed))
+        if result != DeliveryResult.PENDING:
+            self._complete(date, result)
+        return result
+
+    def _complete(self, date: str, result: DeliveryResult) -> None:
         with self._reservation():
             self.db.execute("UPDATE notification_schedule SET result=? WHERE schedule_id=? AND local_date=?",
                             (result.value, self._key, date))
-        return result

@@ -1,9 +1,11 @@
 """Real RecordingStore integration; every database/media root is disposable."""
 
 from pathlib import Path
+from datetime import datetime, timezone
 from tempfile import TemporaryDirectory
 from uuid import uuid4
 import sqlite3
+import threading
 import unittest
 import zlib
 
@@ -17,7 +19,12 @@ from app.storage.retention import (
     Action, DAY_MS, RecordingBrowser, RetentionPeriods, RetentionService, StorageAudit,
     storage_audit_migration,
 )
+from app.notifications.schedule import DailySummaryScheduler, notification_migration
+from app.notifications.service import NotificationKind, NotificationService
+from app.notifications.slack import DeliveryResult, SlackDelivery
+from zoneinfo import ZoneInfo
 from tests.test_recording import SyntheticValidator
+from tests.test_storage_notifications import Transport, drain, endpoint, summary
 
 
 class RealRetentionTests(unittest.TestCase):
@@ -32,7 +39,7 @@ class RealRetentionTests(unittest.TestCase):
         self.db = sqlite3.connect(base / "metadata.sqlite", isolation_level=None)
         (base / "metadata.sqlite").chmod(0o600)
         self.addCleanup(self.db.close)
-        migrate(self.db, BUILTIN_MIGRATIONS + (recording_migration(2), storage_audit_migration(3)))
+        migrate(self.db, BUILTIN_MIGRATIONS + (recording_migration(len(BUILTIN_MIGRATIONS) + 1), storage_audit_migration(len(BUILTIN_MIGRATIONS) + 2)))
         self.now = 5 * DAY_MS
         self.audit = StorageAudit(self.db, reservation=lambda: self.policy.control())
         self.policy = MainStoragePolicy(
@@ -183,3 +190,45 @@ class RealRetentionTests(unittest.TestCase):
         self.assertEqual(StorageState.HARD_STOP, policy.state)
         self.assertTrue(policy.audit_delivery_failed)
         self.assertFalse(policy._reservation)
+
+    def test_audit_retention_is_bounded_and_oldest_first(self):
+        for at in (3 * DAY_MS, DAY_MS, 2 * DAY_MS):
+            self.audit.append(StorageTransition(StorageState.NORMAL, StorageState.PRESSURE, at))
+        self.assertEqual(1, self.audit.expire(100 * DAY_MS, limit=1))
+        self.assertEqual([2 * DAY_MS, 3 * DAY_MS], [row[0] for row in self.db.execute(
+            'SELECT at_ms FROM storage_state_audit ORDER BY at_ms')])
+        with self.assertRaises(RecordingError):
+            self.audit.expire(100 * DAY_MS, limit=1001)
+
+    def test_slow_slack_critical_and_daily_never_block_real_recording_or_write_from_worker(self):
+        migrate(self.db, BUILTIN_MIGRATIONS + (recording_migration(len(BUILTIN_MIGRATIONS) + 1), storage_audit_migration(len(BUILTIN_MIGRATIONS) + 2), notification_migration(len(BUILTIN_MIGRATIONS) + 3)))
+        self.db.execute('CREATE TABLE synthetic_notifications (id TEXT PRIMARY KEY, delivery TEXT)')
+        entered, release = threading.Event(), threading.Event()
+        owner = threading.get_ident()
+        def local(event):
+            self.assertEqual(owner, threading.get_ident())
+            with self.policy.control():
+                self.db.execute('INSERT INTO synthetic_notifications VALUES (?,?) ON CONFLICT(id) '
+                                'DO UPDATE SET delivery=excluded.delivery', (str(event.event_id), event.delivery.value))
+        class SlowTransport(Transport):
+            def open(self, request, *, timeout):
+                entered.set()
+                if not release.wait(2):
+                    raise RuntimeError('test release missing')
+                return super().open(request, timeout=timeout)
+        service = NotificationService(local, SlackDelivery(endpoint(), opener=SlowTransport()), queue_capacity=2)
+        self.addCleanup(release.set)
+        self.addCleanup(service.close)
+        now = datetime(2026, 1, 1, 23, tzinfo=timezone.utc)
+        self.assertEqual(DeliveryResult.PENDING, service.record(NotificationKind.RECORDING_HEALTH_FAILURE, at=now))
+        self.assertTrue(entered.wait(2))
+        scheduler = DailySummaryScheduler(self.db, ZoneInfo('UTC'), service, self.policy.control)
+        self.assertEqual(DeliveryResult.PENDING, scheduler.tick(now, summary()))
+        recording = self.completed()
+        self.assertTrue(self.store.manifest(recording)['segments'])
+        self.assertFalse(release.is_set())
+        self.assertEqual('pending', scheduler.status()['result'])
+        release.set()
+        drain(self, service)
+        self.assertEqual('sent', scheduler.status()['result'])
+        self.assertEqual(['sent', 'sent'], [row[0] for row in self.db.execute('SELECT delivery FROM synthetic_notifications')])

@@ -15,6 +15,7 @@ class DeliveryResult(StrEnum):
     SENT = "sent"
     FAILED = "failed"
     SUPPRESSED = "suppressed"
+    PENDING = "pending"
 
 
 @dataclass(frozen=True)
@@ -61,6 +62,10 @@ class SlackDelivery:
     def __repr__(self):
         return f"SlackDelivery(configured={self._endpoint is not None})"
 
+    @property
+    def configured(self) -> bool:
+        return self._endpoint is not None
+
     def send(self, text: str) -> DeliveryResult:
         if self._endpoint is None:
             return DeliveryResult.DISABLED
@@ -74,7 +79,8 @@ class SlackDelivery:
                               data=json.dumps({"text": text}, ensure_ascii=True).encode("ascii"),
                               headers={"Content-Type": "application/json"}, method="POST")
             with opener.open(request, timeout=self._timeout) as response:
-                if response.status == 200 and response.read(32) == b"ok":
+                body = response.read(33)
+                if response.status == 200 and len(body) <= 32 and body.strip() == b"ok":
                     return DeliveryResult.SENT
         except HTTPError as error:
             # HTTPError owns a response stream; close it so cleanup warnings

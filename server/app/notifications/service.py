@@ -1,11 +1,14 @@
 """Sparse immediate alerts plus fixed, aggregate daily summary data."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from enum import StrEnum
 from typing import Callable
+from uuid import UUID, uuid4
+import threading
 
 from app.notifications.slack import DeliveryResult, SlackDelivery
+from app.notifications.worker import DeliveryWorker
 from app.storage.policy import StorageState
 
 
@@ -31,6 +34,8 @@ class NotificationEvent:
     kind: NotificationKind
     at: datetime
     confirmed: bool
+    event_id: UUID = field(default_factory=uuid4)
+    delivery: DeliveryResult = DeliveryResult.SUPPRESSED
 
 
 @dataclass(frozen=True)
@@ -70,41 +75,128 @@ class DailySummary:
 
 
 class NotificationService:
+    """Owner-thread local persistence with bounded asynchronous Slack delivery.
+
+    The sink must durably upsert by event_id: the initial pending event and later
+    delivery result share that ID. poll() invokes completion callbacks only on
+    this owning thread, never on the network worker. No automatic resend occurs.
+    """
+
     def __init__(self, local_sink: Callable[[NotificationEvent], None],
-                 slack: SlackDelivery | None = None):
+                 slack: SlackDelivery | None = None, *, queue_capacity: int = 16):
+        if type(queue_capacity) is not int or not 1 <= queue_capacity <= 1024:
+            raise ValueError("invalid notification capacity")
         self._local_sink = local_sink
         self._slack = slack or SlackDelivery()
+        self._worker = DeliveryWorker(self._slack, queue_capacity)
+        self._capacity = queue_capacity
+        self._pending = {}
+        self._owner = threading.get_ident()
+        self.closed = False
         self.last_delivery = DeliveryResult.DISABLED
         self.local_delivery_failed = False
+        self.delivery_failed = False
 
-    def _local(self, event: NotificationEvent) -> None:
+    @property
+    def pending_count(self) -> int:
+        return len(self._pending)
+
+    def _check(self):
+        if threading.get_ident() != self._owner:
+            raise RuntimeError("notification owner thread required")
+
+    def _local(self, event: NotificationEvent) -> bool:
         try:
             self._local_sink(event)
+            return True
         except Exception:
             self.local_delivery_failed = True
+            return False
+
+    def _enqueue(self, event: NotificationEvent, text: str, on_complete=None) -> DeliveryResult:
+        if event.event_id in self._pending:
+            prior = self._pending[event.event_id][0]
+            if (event.kind, event.at, event.confirmed) != (prior.kind, prior.at, prior.confirmed):
+                self.delivery_failed = True
+                return DeliveryResult.FAILED
+            return DeliveryResult.PENDING
+        if not self._slack.configured:
+            result = DeliveryResult.DISABLED
+        elif self.closed or len(self._pending) >= self._capacity:
+            result = DeliveryResult.FAILED
+            self.delivery_failed = True
+        else:
+            result = DeliveryResult.PENDING
+        event = replace(event, delivery=result)
+        if not self._local(event) and result != DeliveryResult.PENDING:
+            self.last_delivery = DeliveryResult.FAILED
+            return self.last_delivery
+        self.last_delivery = result
+        if result == DeliveryResult.PENDING:
+            self._pending[event.event_id] = [event, on_complete, None]
+            try:
+                self._worker.submit(event.event_id, text)
+            except Exception:
+                self._pending[event.event_id][2] = DeliveryResult.FAILED
+                self.delivery_failed = True
+                self.poll()
+                return DeliveryResult.FAILED
+        return result
+
+    def poll(self) -> tuple[NotificationEvent, ...]:
+        """Persist completed results without waiting; failed persistence retries locally."""
+        self._check()
+        for identifier, result in self._worker.results():
+            self._pending[identifier][2] = result
+        completed = []
+        for identifier, (event, callback, result) in tuple(self._pending.items()):
+            if result is None:
+                continue
+            update = replace(event, delivery=result)
+            if result == DeliveryResult.FAILED:
+                self.delivery_failed = True
+            if not self._local(update):
+                continue
+            try:
+                if callback:
+                    callback(result)
+            except Exception:
+                self.local_delivery_failed = True
+                continue
+            self.last_delivery = result
+            completed.append(update)
+            del self._pending[identifier]
+        return tuple(completed)
 
     def record(self, kind: NotificationKind, *, at: datetime,
-               confirmed: bool = False) -> DeliveryResult:
+               confirmed: bool = False, event_id: UUID | None = None,
+               on_complete=None) -> DeliveryResult:
+        self._check()
         aware(at)
-        if not isinstance(kind, NotificationKind) or type(confirmed) is not bool:
+        if (not isinstance(kind, NotificationKind) or type(confirmed) is not bool
+                or event_id is not None and not isinstance(event_id, UUID)):
             raise ValueError("invalid notification event")
         if kind == NotificationKind.DAILY_SUMMARY:
             raise ValueError("daily summary requires aggregate data")
-        self._local(NotificationEvent(kind, at, confirmed))
+        event = NotificationEvent(kind, at, confirmed, event_id=event_id or uuid4())
         immediate = (kind in {NotificationKind.HARDWARE_INTEGRITY_FAILURE,
                               NotificationKind.RECORDING_HEALTH_FAILURE}
                      or confirmed and kind in {NotificationKind.SERVER_MOVEMENT,
                                                NotificationKind.CAMERA_TAMPER})
         if not immediate:
+            self._local(event)
             return DeliveryResult.SUPPRESSED
-        # Category text only: no room/source names, identities, frames or paths.
-        self.last_delivery = self._slack.send(f"ServerSentinel critical alert: {kind.value}")
-        return self.last_delivery
+        return self._enqueue(event, f"ServerSentinel critical alert: {kind.value}", on_complete)
 
-    def daily(self, summary: DailySummary, *, at: datetime) -> DeliveryResult:
+    def daily(self, summary: DailySummary, *, at: datetime, on_complete=None) -> DeliveryResult:
+        self._check()
         aware(at)
         if not isinstance(summary, DailySummary):
             raise ValueError("invalid daily summary")
-        self._local(NotificationEvent(NotificationKind.DAILY_SUMMARY, at, False))
-        self.last_delivery = self._slack.send(summary.text())
-        return self.last_delivery
+        return self._enqueue(NotificationEvent(NotificationKind.DAILY_SUMMARY, at, False),
+                             summary.text(), on_complete)
+
+    def close(self) -> None:
+        self._check()
+        self.closed = True
+        self._worker.close()

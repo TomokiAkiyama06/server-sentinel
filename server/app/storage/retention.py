@@ -126,10 +126,12 @@ class StorageAudit:
             self.db.execute("INSERT INTO storage_state_audit(at_ms,previous_state,current_state) "
                             "VALUES (?,?,?)", (event.at_ms, event.previous.value, event.current.value))
 
-    def expire(self, now_ms: int) -> int:
-        if self.db.in_transaction or type(now_ms) is not int or now_ms < 0:
+    def expire(self, now_ms: int, *, limit: int = 1000) -> int:
+        if (self.db.in_transaction or type(now_ms) is not int or now_ms < 0
+                or type(limit) is not int or not 1 <= limit <= 1000):
             raise RecordingError("STORAGE_AUDIT_UNAVAILABLE")
         with self._reservation():
-            cursor = self.db.execute("DELETE FROM storage_state_audit WHERE at_ms < ?",
-                                     (now_ms - self.periods.audit_days * DAY_MS,))
+            cursor = self.db.execute("DELETE FROM storage_state_audit WHERE id IN "
+                                     "(SELECT id FROM storage_state_audit WHERE at_ms < ? ORDER BY at_ms,id LIMIT ?)",
+                                     (now_ms - self.periods.audit_days * DAY_MS, limit))
         return cursor.rowcount

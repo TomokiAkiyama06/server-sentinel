@@ -40,7 +40,9 @@ hysteresis. Transitions go to an injected audit sink; persistence failure remain
 visible in `StorageStatus.audit_delivery_failed`, rather than silently healthy.
 Control/cleanup writes can continue under ordinary pressure if the reserve fits.
 The default retention periods are Main recordings 20 days and Main audit 90 days;
-Agent's separately implemented 60-day expiry is not handled by this module.
+audit expiry processes an explicit bounded batch (at most 1000 oldest rows) per
+call, so its journal work fits the configured operation budget. Agent's separately
+implemented 60-day expiry is not handled by this module.
 
 `RecordingBrowser` authorizes every read with `recordings:view` and every
 star/unstar/delete with `owner`, using a denied-by-default injected contract.

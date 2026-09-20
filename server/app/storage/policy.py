@@ -298,18 +298,24 @@ class MainStoragePolicy:
         except Exception:
             self.cleanup_failed = True
         space, used, critical_bytes, _ = self._read()
-        self._state_for(space, used, total, media_bytes)
-        if self.state == StorageState.HARD_STOP:
-            raise RecordingError("STORAGE_HARD_STOP")
-        if self.state == StorageState.PRESSURE:
-            if (not critical or self.cleanup_failed
-                    or critical_bytes + total > self.limits.critical_allowance_bytes
-                    or used + media_bytes > self.limits.recording_limit_bytes
-                    + self.limits.critical_allowance_bytes):
-                raise RecordingError("STORAGE_PRESSURE")
+        # State-audit metadata is part of this operation's overhead, not a
+        # separate allocation between the final sample and media admission.
         self._reservation = True
         self._reserved_media = media_bytes
         self._reserved_total = total
+        try:
+            self._state_for(space, used)
+            if self.state == StorageState.HARD_STOP:
+                raise RecordingError("STORAGE_HARD_STOP")
+            if self.state == StorageState.PRESSURE:
+                if (not critical or self.cleanup_failed
+                        or critical_bytes + total > self.limits.critical_allowance_bytes
+                        or used + media_bytes > self.limits.recording_limit_bytes
+                        + self.limits.critical_allowance_bytes):
+                    raise RecordingError("STORAGE_PRESSURE")
+        except BaseException:
+            self.release()
+            raise
 
     def release(self) -> None:
         if threading.get_ident() != self._owner or not self._reservation:

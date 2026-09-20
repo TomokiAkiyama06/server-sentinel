@@ -628,7 +628,11 @@ it mounts no human endpoint pending #10.
 delivery using verified HTTPS, no environment proxy/redirect, bounded timeout and
 redacted failures. Unconfigured delivery performs no network operation. The
 current payload is a fixed critical category or validated daily aggregate, with
-no image/media, source identity or arbitrary probe details. The persisted daily
+no image/media, source identity or arbitrary probe details. Both immediate and
+daily notifications enqueue on a bounded delivery worker; the recorder worker
+never waits for network IO. Local pending/result events share an ID and are
+persisted only on the owning worker. Full queues and failed persistence remain
+visible; completion-persistence retry never resends a message. The persisted daily
 scheduler defaults to 23:00 configured local time and claims one dispatch per
 local date across restart/DST/clock rollback; missed dates are not replayed.
 An uncertain crash remains `pending`, failed delivery is visible, and no implicit

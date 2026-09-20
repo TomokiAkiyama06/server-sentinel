@@ -407,6 +407,8 @@ Keep the following deployment checks open; do not use production data for fills.
       journal/temp overhead safely covers recovery, cleanup and migrations;
 - [ ] configured Slack receives one safe immediate critical alert and one daily
       aggregate; a failed/unconfigured channel leaves local/UI faults visible;
+- [ ] slow/unavailable Slack does not block recording; full queues, pending
+      shutdown/crash delivery and failed completion persistence remain visible;
 - [ ] after deployment restart/DST change, summary sends at the configured local
       time without duplicate dispatch, and uncertain `pending` delivery is visible.
 

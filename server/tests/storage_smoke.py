@@ -24,7 +24,7 @@ def run_storage_smoke(base, scenario):
     metadata = base / 'policy-metadata.sqlite'
     db = Database(metadata).connect()
     try:
-        migrate(db, BUILTIN_MIGRATIONS + (recording_migration(2), storage_audit_migration(3), notification_migration(4)))
+        migrate(db, BUILTIN_MIGRATIONS + (recording_migration(len(BUILTIN_MIGRATIONS) + 1), storage_audit_migration(len(BUILTIN_MIGRATIONS) + 2), notification_migration(len(BUILTIN_MIGRATIONS) + 3)))
         identity = RootIdentity(root.stat().st_dev, root.stat().st_ino)
         checker = ExpectedFilesystem(root, identity, metadata)
         policy = MainStoragePolicy(StorageLimits(100_000, 10_000, 4096, 8192, 16_384, 90_000,
@@ -68,9 +68,13 @@ def run_storage_smoke(base, scenario):
             assert service.record(NotificationKind.PERSON, at=now) == DeliveryResult.SUPPRESSED
             scheduler = DailySummaryScheduler(db, ZoneInfo('UTC'), service, policy.control)
             expected = DeliveryResult.FAILED if scenario == 'error' else DeliveryResult.SENT
-            assert scheduler.tick(now, summary()) == expected
+            assert scheduler.tick(now, summary()) == DeliveryResult.PENDING
+            assert service._worker.ready.wait(2)
+            service.poll()
+            assert service.last_delivery == expected
             assert scheduler.tick(now, summary()) == DeliveryResult.SUPPRESSED
             assert len(transport.requests) == 1
-            assert len(local) == 2
+            assert len(local) == 3
+            service.close()
     finally:
         db.close()
