@@ -100,18 +100,25 @@ class Settings:
 
     @classmethod
     def load(cls, path, *, code_root):
-        value, _owner = read_protected_configuration(path, owner_uid=os.geteuid())
+        value, _owner = read_protected_configuration(
+            path, owner_uid=os.geteuid(), forbidden_roots=(code_root,)
+        )
         return cls.parse(value, code_root=code_root)
 
 
 MAX_CONFIGURATION_BYTES = 65536
 
 
-def read_protected_configuration(path, *, owner_uid=None):
+def read_protected_configuration(path, *, owner_uid=None, forbidden_roots=()):
     """Bound every read even if the service-owned file changes after fstat."""
     try:
         descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
         with os.fdopen(descriptor, "rb") as stream:
+            # Inspect the opened object, so an ancestor alias/replacement cannot
+            # turn an apparently external path into configuration inside code.
+            actual_path = Path(f"/proc/self/fd/{stream.fileno()}").resolve(strict=True)
+            if any(actual_path.is_relative_to(Path(root).resolve()) for root in forbidden_roots):
+                raise ConfigurationError("configuration must be outside application code")
             before = os.fstat(stream.fileno())
             if not stat.S_ISREG(before.st_mode) or before.st_mode & 0o077:
                 raise ConfigurationError("protected regular configuration required")

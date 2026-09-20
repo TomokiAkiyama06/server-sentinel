@@ -104,9 +104,11 @@ def install(args):
     artifact = read_artifact(args.artifact)
     if hashlib.sha256(artifact).hexdigest() != args.sha256:
         raise ValueError("artifact digest mismatch")
-    value, config_owner = read_protected_configuration(args.config)
-    settings = Settings.parse(value, code_root=args.destination)
     code_root = Path(__file__).resolve().parents[1]
+    value, config_owner = read_protected_configuration(
+        args.config, forbidden_roots=(args.destination, code_root)
+    )
+    settings = Settings.parse(value, code_root=args.destination)
     if any(root.is_relative_to(code_root) for root in (settings.runtime_root, settings.media_root)):
         raise ValueError("runtime data must be outside the checkout")
     if config_owner != settings.service_uid:
