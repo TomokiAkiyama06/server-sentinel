@@ -584,6 +584,27 @@ class PipelineTests(unittest.TestCase):
         self.assertTrue(factory.adapters[0].closed)
         self.assertEqual(len(factory.adapters), 2)
 
+    def test_failed_viewer_cleanup_cannot_publish_a_replacement_profile(self):
+        base = source_profiles()
+        replacement = replace(base, viewer=ViewerProfile(video_format(width=1280)))
+        admissions = SourceProfileAdmissions(1)
+        decision = admissions.admit(SourceProfileCapabilities(
+            SOURCE, SourceType.LOCAL_UVC, (base, replacement),
+        ), base)
+        factory = SyntheticFactory()
+        value = pipeline(profiles=base, recording=SyntheticFactory(), viewer=factory,
+                         admission=decision.lease)
+        self.addCleanup(value.close)
+        value.add_viewer(SUBSCRIBER)
+        factory.adapters[0].fail_close = True
+
+        with self.assertRaises(RuntimeError):
+            value.replace_viewer_profile(replacement.viewer)
+
+        self.assertEqual(value.profiles, base)
+        self.assertEqual(admissions.admitted(SOURCE), base)
+        self.assertEqual(factory.adapters[0].plan.target, base.viewer.format)
+
     def test_time_base_change_and_closed_pipeline_cannot_continue_silently(self):
         value = pipeline(recording=SyntheticFactory())
         value.offer(packet(0, keyframe=True))

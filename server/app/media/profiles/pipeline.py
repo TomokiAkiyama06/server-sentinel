@@ -327,9 +327,13 @@ class SourcePipeline:
             raise ValueError("viewer output must be video-only")
         if self._profiles.viewer == profile:
             return
+        self._close_viewer()
+        # A failed close leaves an old codec process/path alive.  Do not publish
+        # a new selected profile while that path still owns the old one.
+        if self._viewer is not None:
+            raise RuntimeError("viewer cleanup must finish before profile replacement")
         updated = replace(self._profiles, viewer=profile)
         self._ensure_admitted(updated)
-        self._close_viewer()
         self._profiles = updated
         if self._viewers:
             self._start_viewer()
