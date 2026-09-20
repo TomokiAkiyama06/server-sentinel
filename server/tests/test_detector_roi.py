@@ -420,6 +420,18 @@ class CalibrationAndDeliveryTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 record.rehydrate(rejected)
 
+    def test_corrupt_history_is_reported_apart_from_an_unavailable_archive(self):
+        connection = sqlite3.connect(":memory:", isolation_level=None)
+        migrate(connection, APPLICATION_MIGRATIONS)
+        archive = CalibrationArchive(connection)
+        connection.execute("INSERT INTO roi_calibration_history VALUES (?,?,?,?,?)",
+                           (str(SOURCE), str(PROFILE), 1, str(UUID(int=400)), "{}"))
+        with self.assertRaises(ValueError):
+            archive.load(SOURCE, PROFILE)
+        connection.close()
+        with self.assertRaises(RuntimeError):
+            archive.load(SOURCE, PROFILE)
+
     def test_archive_refuses_history_table_carrying_a_media_column(self):
         connection = sqlite3.connect(":memory:", isolation_level=None)
         connection.execute(

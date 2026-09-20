@@ -197,9 +197,18 @@ class CalibrationArchive:
         query += " ORDER BY version DESC LIMIT 1"
         try:
             row = self.connection.execute(query, parameters).fetchone()
-            return _decode(*row) if row is not None else None
-        except Exception:
+        except sqlite3.Error:
             raise RuntimeError("calibration archive unavailable") from None
+        if row is None:
+            return None
+        try:
+            return _decode(*row)
+        except Exception:
+            # A stored record that cannot be decoded is corrupt history, not an
+            # unavailable database. Reporting it as unavailable would hide an
+            # integrity problem behind a transient-looking failure; the stored
+            # content stays out of the message either way.
+            raise ValueError("calibration history record is unreadable") from None
 
 
 class OwnerCalibrationOperations:

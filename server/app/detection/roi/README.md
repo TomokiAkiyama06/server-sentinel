@@ -23,7 +23,9 @@ migration (`roi_calibration_history`) has run. The table holds provenance
 only — identities, polygon, policy, reference geometry and the reference
 SHA-256 — so no decoded frame, crop, or other monitoring media is persisted
 and the history cannot become retention-free image storage. `load()` therefore
-returns a `CalibrationRecord` without pixels; resuming detection needs
+returns a `CalibrationRecord` without pixels, and separates a record it cannot
+decode from an unavailable database so corrupt history is not hidden behind a
+transient-looking failure; resuming detection needs
 `CalibrationRecord.rehydrate(frame)`, which re-binds an Owner-supplied
 transient frame and refuses any frame whose source, stream, sample, geometry
 or digest differs. A history table carrying a media column is rejected at
