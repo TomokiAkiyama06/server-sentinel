@@ -92,6 +92,28 @@ class PresenceService:
             db.execute("INSERT OR REPLACE INTO presence_clock VALUES (1,?)", (timestamp(now),))
         return result
 
+    @staticmethod
+    def _control_trust(db, now, trusted):
+        """Evaluate the Owner-control marker, kept apart from observation time.
+
+        Observation receipt times arrive from capture sources, so sharing one
+        marker would let a single far-future observation refuse every later
+        Owner override, cancellation and hint with no way back.
+        """
+        if type(trusted) is not bool:
+            raise ValueError("explicit clock trust required")
+        previous = db.execute("SELECT latest FROM presence_control_clock WHERE singleton=1").fetchone()
+        if previous is not None and timestamp(now) < previous[0]:
+            return False
+        return trusted
+
+    @classmethod
+    def _control_clock(cls, db, now, trusted):
+        result = cls._control_trust(db, now, trusted)
+        if result:
+            db.execute("INSERT OR REPLACE INTO presence_control_clock VALUES (1,?)", (timestamp(now),))
+        return result
+
     def _owner(self, context):
         identity = self.access.require_owner(context)
         if not isinstance(identity, UUID):
@@ -112,7 +134,7 @@ class PresenceService:
         if expires_at is not None and utc(expires_at) <= utc(now):
             raise ValueError("override expiry must be in the future")
         with self._transaction() as db:
-            if not self._clock(db, now, clock_trusted):
+            if not self._control_clock(db, now, clock_trusted):
                 raise ValueError("trusted control timestamp required")
             db.execute("INSERT OR REPLACE INTO presence_override VALUES (1,?,?,?,?)",
                        (state.value, actor, timestamp(now), timestamp(expires_at) if expires_at else None))
@@ -124,14 +146,15 @@ class PresenceService:
     def cancel_override(self, context, *, now, clock_trusted):
         actor = self._owner(context)
         with self._transaction() as db:
-            if not self._clock(db, now, clock_trusted):
+            if not self._control_clock(db, now, clock_trusted):
                 raise ValueError("trusted control timestamp required")
             row = db.execute("SELECT state FROM presence_override").fetchone()
             db.execute("DELETE FROM presence_override WHERE singleton=1")
             if row:
                 db.execute("INSERT INTO presence_audit(action,actor,at,state) VALUES ('override_cancelled',?,?,?)",
                            (actor, timestamp(now), row[0]))
-                self._control_observation(db, self._effective(db, now, True)[0], now)
+                state = self._effective(db, now, self._clock_trust(db, now, True), True)[0]
+                self._control_observation(db, state, now)
         return self.snapshot(now=now, clock_trusted=clock_trusted)
 
     def set_hint(self, context, state, *, now, valid_until, clock_trusted):
@@ -143,7 +166,7 @@ class PresenceService:
         if state == PresenceState.PRESENT:
             state = PresenceState.PROBABLY_PRESENT
         with self._transaction() as db:
-            if not self._clock(db, now, clock_trusted):
+            if not self._control_clock(db, now, clock_trusted):
                 raise ValueError("trusted control timestamp required")
             db.execute("INSERT OR REPLACE INTO presence_inputs VALUES ('hint',?,?,?,NULL)",
                        (state.value, timestamp(now), timestamp(valid_until)))
@@ -221,6 +244,50 @@ class PresenceService:
             db.execute("UPDATE presence_deliveries SET state=? WHERE observation=? AND action=? "
                        "AND state!='delivered'", (result.value, str(identifier), action))
 
+    def requeue_action(self, context, identifier, action, *, now, clock_trusted):
+        """Owner-approved resubmission of an unresolved critical action.
+
+        Automatic dispatch never retries an outcome it could not confirm,
+        because the external side effect may already have happened. Recovery is
+        therefore an explicit, audited Owner decision that accepts the risk of a
+        duplicate preservation or notification, and it is the only way a
+        stranded critical action returns to the queue.
+        """
+        actor = self._owner(context)
+        if not isinstance(identifier, UUID) or action not in {"evidence", "notification"}:
+            raise ValueError("invalid action identity")
+        with self._transaction() as db:
+            if not self._control_clock(db, now, clock_trusted):
+                raise ValueError("trusted control timestamp required")
+            job = db.execute("SELECT state FROM presence_deliveries WHERE observation=? AND action=?",
+                             (str(identifier), action)).fetchone()
+            if job is None or job["state"] in {"delivered", "pending"}:
+                raise ValueError("no unresolved critical action")
+            db.execute("UPDATE presence_deliveries SET state='pending' WHERE observation=? AND action=?",
+                       (str(identifier), action))
+            db.execute("INSERT INTO presence_audit(action,actor,at,state) "
+                       "VALUES ('critical_action_requeued',?,?,NULL)", (actor, timestamp(now)))
+        return action
+
+    def clear_expired_degradation(self, context, action, *, now, clock_trusted):
+        """Owner-confirmed clearing of an expired unresolved critical marker.
+
+        The event payload is gone, so only the Owner can decide that the
+        stranded action was handled outside ServerSentinel. Clearing is audited
+        and never happens automatically.
+        """
+        actor = self._owner(context)
+        if action not in {"evidence", "notification"}:
+            raise ValueError("invalid action identity")
+        with self._transaction() as db:
+            if not self._control_clock(db, now, clock_trusted):
+                raise ValueError("trusted control timestamp required")
+            cursor = db.execute("DELETE FROM presence_expired_unresolved WHERE action=?", (action,))
+            if not cursor.rowcount:
+                raise ValueError("no expired critical degradation")
+            db.execute("INSERT INTO presence_audit(action,actor,at,state) "
+                       "VALUES ('critical_degradation_cleared',?,?,NULL)", (actor, timestamp(now)))
+
     def dispatch_pending(self, *, limit=100):
         if type(limit) is not int or not 1 <= limit <= 500:
             raise ValueError("invalid dispatch limit")
@@ -236,6 +303,12 @@ class PresenceService:
                           (("evidence", self.evidence), ("notification", self.notifications))
                           if port is not None)
         with self._transaction() as db:
+            # A submission claimed by an earlier cycle cannot still be in
+            # flight once this serialized worker starts a new one. Its outcome
+            # is unknown, so it becomes uncertain: visibly unresolved, never
+            # blindly retried, and recoverable only through an Owner-approved
+            # requeue that accepts the duplicate-side-effect risk.
+            db.execute("UPDATE presence_deliveries SET state='uncertain' WHERE state='submitting'")
             next_row = db.execute("SELECT next_state FROM presence_delivery_fairness WHERE singleton=1").fetchone()
             fresh = db.execute(
                 "SELECT job.observation,job.action FROM presence_deliveries job "
@@ -292,11 +365,14 @@ class PresenceService:
         return self.record(observation)
 
     @staticmethod
-    def _effective(db, now, trusted):
+    def _effective(db, now, trusted, control_trusted):
         override = db.execute("SELECT * FROM presence_override WHERE singleton=1").fetchone()
         # An elapsed expiry stops applying immediately, whether or not the
-        # durable retirement write has been admitted yet.
-        if override and not (override["expires"] and trusted and override["expires"] <= timestamp(now)):
+        # durable retirement write has been admitted yet. Expiry follows the
+        # Owner-control marker, so observation timestamps cannot keep an
+        # expired override alive.
+        if override and not (override["expires"] and control_trusted
+                             and override["expires"] <= timestamp(now)):
             return PresenceState(override["state"]), "manual_override", override["expires"]
         if trusted:
             for slot in ("owner_observation", "hint"):
@@ -318,11 +394,12 @@ class PresenceService:
                 override = db.execute("SELECT * FROM presence_override WHERE singleton=1").fetchone()
                 if override is None or not override["expires"] or override["expires"] > timestamp(now):
                     retired = True
-                elif self._clock(db, now, True):
+                elif self._control_clock(db, now, True):
                     db.execute("INSERT INTO presence_audit(action,actor,at,state) VALUES ('override_expired',NULL,?,?)",
                                (timestamp(now), override["state"]))
                     db.execute("DELETE FROM presence_override WHERE singleton=1")
-                    self._control_observation(db, self._effective(db, now, True)[0], now)
+                    state = self._effective(db, now, self._clock_trust(db, now, True), True)[0]
+                    self._control_observation(db, state, now)
                     retired = True
         return retired, admitted
 
@@ -370,33 +447,43 @@ class PresenceService:
         return {**paths, "critical_paths_degraded": any(value != ARMED for value in paths.values())}
 
     def snapshot(self, *, now, clock_trusted):
-        """Read-only status. A refused or exhausted volume never hides presence."""
+        """Read-only status. A refused or exhausted volume never hides presence.
+
+        This is an internal projection with no authorization check. Critical
+        path health is Owner information, so a future route must delegate to
+        `owner_status()` and must never expose this payload to a `live:view`
+        identity or to any unauthenticated surface.
+        """
         with closing(self.database.connect()) as db:
-            trusted = self._clock_trust(db, now, clock_trusted)
+            control_trusted = self._control_trust(db, now, clock_trusted)
             override = db.execute("SELECT * FROM presence_override WHERE singleton=1").fetchone()
-        expired = bool(override and override["expires"] and trusted
+        expired = bool(override and override["expires"] and control_trusted
                        and override["expires"] <= timestamp(now))
         # An expired override stops applying even when the durable retirement
         # write is refused; the pending flag keeps that difference visible.
         retired, _admitted = self._retire_override(now) if expired else (True, None)
         with closing(self.database.connect()) as db:
             trusted = self._clock_trust(db, now, clock_trusted)
-            state, basis, expires = self._effective(db, now, trusted)
+            control_trusted = self._control_trust(db, now, clock_trusted)
+            state, basis, expires = self._effective(db, now, trusted, control_trusted)
             failed = db.execute("SELECT count(*) FROM presence_deliveries "
                                 "WHERE state NOT IN ('delivered','disabled')").fetchone()[0]
-            # Every durable outcome that left critical work undone, including a
-            # failed or uncertain submission, degrades its path. Silence after a
-            # known delivery failure would report a healthy safety path.
+            # Every delivery that has not completed its critical action degrades
+            # its path: a failed or uncertain outcome, a disabled or unavailable
+            # action, and a submission whose completion is unconfirmed, which an
+            # interrupted worker leaves behind for good. Reporting armed there
+            # would claim a healthy safety path for work that never happened.
             unresolved = {row[0] for row in db.execute(
-                "SELECT DISTINCT action FROM presence_deliveries "
-                "WHERE state IN ('disabled','unavailable','failed','uncertain')")}
+                "SELECT DISTINCT action FROM presence_deliveries WHERE state IN "
+                "('disabled','unavailable','failed','uncertain','submitting','queued')")}
             # Retention expiry removes the delivery row but not the fact that
             # the critical action never completed.
             unresolved |= {row[0] for row in db.execute(
                 "SELECT action FROM presence_expired_unresolved")}
+        timing = trusted and control_trusted
         return {"state": state.value, "basis": basis, "override_expires_at": expires,
-                "clock_degraded": not trusted,
-                "suppress_ordinary": state == PresenceState.PRESENT and trusted,
+                "clock_degraded": not timing,
+                "suppress_ordinary": state == PresenceState.PRESENT and timing,
                 **self._critical_paths(unresolved),
                 "override_expiry_pending": not retired,
                 "pending_critical_actions": failed}

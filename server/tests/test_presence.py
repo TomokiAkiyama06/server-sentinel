@@ -608,9 +608,16 @@ class PresenceTests(unittest.TestCase):
         value = self.service.record(observation(Kind.SERVER_MOVEMENT))
         self.service.dispatch_pending()
         self.assertEqual(notifications.identifier, value.identifier)
-        self.assertEqual(self.status()["pending_critical_actions"], 1)
+        queued = self.status()
+        self.assertEqual(queued["pending_critical_actions"], 1)
+        # Accepted work is not a completed critical action, and a lost callback
+        # would strand it, so the path stays degraded until completion.
+        self.assertEqual(queued["critical_notifications"], "unavailable")
+        self.assertTrue(queued["critical_paths_degraded"])
         notifications.callback(type("Result", (), {"value": "sent"})())
-        self.assertEqual(self.status()["pending_critical_actions"], 0)
+        completed = self.status()
+        self.assertEqual(completed["pending_critical_actions"], 0)
+        self.assertEqual(completed["critical_notifications"], "armed")
 
     def test_delivery_ports_run_outside_database_write_lock(self):
         def port(item, complete):
@@ -629,14 +636,86 @@ class PresenceTests(unittest.TestCase):
             calls.append(item.identifier)
             raise SystemExit()
         self.service.evidence = interrupted
-        self.service.record(observation(Kind.SERVER_MOVEMENT))
+        event = self.service.record(observation(Kind.SERVER_MOVEMENT))
         with self.assertRaises(SystemExit):
             self.service.dispatch_pending()
+        stranded = self.status()
+        # An interrupted submission is unfinished critical work, so the path is
+        # never reported as healthy while it stays stranded.
+        self.assertEqual(stranded["critical_evidence"], "unavailable")
+        self.assertTrue(stranded["critical_paths_degraded"])
+        # The interrupted evidence submission plus the notification it never
+        # reached are both still unfinished at this point.
+        self.assertEqual(stranded["pending_critical_actions"], 2)
         self.service = self.make_service()
         self.service.dispatch_pending()
         self.assertEqual(len(calls), 1)
         self.assertEqual(self.evidence, [])
-        self.assertEqual(self.status()["pending_critical_actions"], 1)
+        status = self.status()
+        self.assertEqual(status["pending_critical_actions"], 1)
+        self.assertEqual(status["critical_evidence"], "unavailable")
+        self.assertTrue(status["critical_paths_degraded"])
+        # Only an explicit Owner decision accepts the duplicate risk and puts
+        # the stranded action back in the queue.
+        self.service.requeue_action("owner", event.identifier, "evidence",
+                                    now=NOW, clock_trusted=True)
+        self.service.dispatch_pending()
+        self.assertEqual([item.identifier for item in self.evidence], [event.identifier])
+        recovered = self.status()
+        self.assertEqual(recovered["pending_critical_actions"], 0)
+        self.assertEqual(recovered["critical_evidence"], "armed")
+        self.assertFalse(recovered["critical_paths_degraded"])
+        self.assertEqual(self.service.audit("owner")[-1]["action"], "critical_action_requeued")
+
+    def test_requeue_requires_owner_and_an_unresolved_action(self):
+        event = self.service.record(observation(Kind.CAMERA_TAMPER))
+        for context in ("recordings", "live", None):
+            with self.assertRaises(AccessDenied):
+                self.service.requeue_action(context, event.identifier, "evidence",
+                                            now=NOW, clock_trusted=True)
+        # Queued and completed work is not resubmitted through this route.
+        with self.assertRaisesRegex(ValueError, "no unresolved critical action"):
+            self.service.requeue_action("owner", event.identifier, "evidence", now=NOW, clock_trusted=True)
+        self.service.dispatch_pending()
+        with self.assertRaisesRegex(ValueError, "no unresolved critical action"):
+            self.service.requeue_action("owner", event.identifier, "evidence", now=NOW, clock_trusted=True)
+        with self.assertRaises(ValueError):
+            self.service.requeue_action("owner", event.identifier, "owner_alert", now=NOW, clock_trusted=True)
+        self.assertEqual(self.service.audit("owner"), [])
+
+    def test_owner_clears_an_expired_critical_degradation(self):
+        event = self.service.record(observation(Kind.SERVER_MOVEMENT))
+        self.service.complete_action(event.identifier, "notification", ActionResult.DISABLED)
+        self.service.complete_action(event.identifier, "evidence", ActionResult.DELIVERED)
+        later = NOW + timedelta(days=RetentionPeriods().recording_days + 1)
+        self.service.expire_history(now=later)
+        self.assertEqual(self.status(now=later)["critical_notifications"], "unavailable")
+        with self.assertRaises(AccessDenied):
+            self.service.clear_expired_degradation("recordings", "notification",
+                                                   now=later, clock_trusted=True)
+        self.service.clear_expired_degradation("owner", "notification", now=later, clock_trusted=True)
+        status = self.status(now=later)
+        self.assertEqual(status["critical_notifications"], "armed")
+        self.assertFalse(status["critical_paths_degraded"])
+        self.assertEqual(self.service.audit("owner")[-1]["action"], "critical_degradation_cleared")
+        with self.assertRaisesRegex(ValueError, "no expired critical degradation"):
+            self.service.clear_expired_degradation("owner", "notification", now=later, clock_trusted=True)
+
+    def test_future_observation_timestamp_cannot_lock_out_owner_control(self):
+        far = NOW + timedelta(days=365)
+        self.service.record(observation(Kind.PERSON, at=far, received=far, confirmed=False))
+        # Owner control keeps its own monotonic marker, so a single source
+        # timestamp cannot refuse every later override, cancellation and hint.
+        result = self.service.override("owner", PresenceState.PRESENT, now=NOW, clock_trusted=True)
+        self.assertEqual(result["state"], "PRESENT")
+        self.assertTrue(result["clock_degraded"])
+        self.assertFalse(result["suppress_ordinary"])
+        self.service.cancel_override("owner", now=NOW, clock_trusted=True)
+        self.service.set_hint("owner", PresenceState.ABSENT, now=NOW,
+                              valid_until=NOW + timedelta(hours=1), clock_trusted=True)
+        self.assertEqual([row["action"] for row in self.service.audit("owner")],
+                         ["override_set", "override_cancelled", "hint_set"])
+        self.assertEqual(self.status()["state"], "UNKNOWN")
 
 
     def test_mock_api_permissions_and_production_route_stays_closed(self):

@@ -24,6 +24,12 @@ Its integration ports keep the dependent stack explicit:
 - Issue #10 supplies Owner and `recordings:view` authorization before any
   future human route delegates here.
 
+Owner control time is tracked in a marker separate from observation receipt
+time. Receipt times arrive from capture sources, so a shared marker would let a
+single far-future observation refuse every later Owner override, cancellation
+and hint with no way back. Override expiry follows the control marker for the
+same reason, while the reported `clock_degraded` covers both markers.
+
 Manual overrides require an injected, audited Owner identity and take
 precedence over observation and schedule hints. Only a trusted, confirmed,
 quality-sufficient Owner entry can project `PRESENT`; untrusted timing and
@@ -33,10 +39,24 @@ so a still valid configured hint keeps its documented precedence instead of
 being masked by it. Critical movement/tamper observations
 always queue evidence and configured notification work regardless of presence.
 An unavailable action is not retried until that action's port recovers, so its
-backlog cannot starve the other critical action. Any durable delivery outcome
-that left the critical action undone, including `disabled`, `unavailable`,
-`failed` and `uncertain`, keeps the affected path visibly unavailable until
-that work is resolved.
+backlog cannot starve the other critical action. Any delivery that has not
+completed its critical action keeps the affected path visibly unavailable:
+`disabled`, `unavailable`, `failed` and `uncertain` outcomes, and also a
+submission whose completion is unconfirmed (`submitting`, `queued`), which an
+interrupted worker or a lost completion callback would otherwise strand while
+the path still claimed to be armed. A submission claimed by an earlier dispatch
+cycle becomes `uncertain` when the next cycle starts, because it cannot still
+be in flight and its outcome is unknown.
+
+Automatic dispatch never retries an outcome it could not confirm, so stranded
+work is recovered only through `requeue_action()`, an audited Owner decision
+that accepts the risk of a duplicate preservation or notification. An expired
+degradation marker is cleared the same way, through `clear_expired_degradation()`,
+never automatically.
+
+`snapshot()` performs no authorization check. Critical-path health is Owner
+information: a future route delegates to `owner_status()` and never exposes
+this payload to a `live:view` identity.
 
 The status snapshot does not create a presence write, so a refused or exhausted
 storage volume cannot hide presence state or unfinished critical work. It
