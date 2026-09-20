@@ -71,8 +71,9 @@ path armed gets its own wording rather than contradicting the breakdown; an evid
 also reports `unavailable` while a submission is in flight or accepted but
 unconfirmed. An incomplete override expiry (`override_expiry_pending`) is
 reported so an expired override cannot look active. The snapshot is not left stale: the screen shows when it was fetched,
-offers an explicit refresh, and re-reads itself once a known override expiry
-passes. Override cancellation is serialized, so a second click cannot start a
+offers an explicit refresh, and re-reads itself once a known future override
+expiry passes (at most hourly, and never rescheduling an expiry that already
+passed). A read that a newer control result superseded is discarded. Override cancellation is serialized, so a second click cannot start a
 duplicate audited control operation. The control history
 explains the Owner critical-recovery actions, including that an approved
 requeue accepts a possible duplicate preservation or notification. The critical-continuity statement is shown only while every

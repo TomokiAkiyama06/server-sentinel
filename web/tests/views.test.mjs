@@ -11,7 +11,7 @@ await compile('src/views/presence.tsx', 'build/presence.mjs');
 const { canVisit, views } = await import('../build/domain.mjs');
 const { messages } = await import('../build/i18n.mjs');
 const { TimelineBody, detectorObservation, displayValue, filters, kindGroup, matches, spans } = await import('../build/timeline.mjs');
-const { PresenceBody } = await import('../build/presence.mjs');
+const { PresenceBody, refreshDelay } = await import('../build/presence.mjs');
 
 // Synthetic only: no real person, deployment, camera or identity value appears here.
 const kinds = ['person', 'motion', 'owner_entry', 'owner_exit', 'anonymous_entry', 'anonymous_exit',
@@ -387,15 +387,28 @@ test('presence offers a refresh path and serializes override cancellation', () =
   assert.match(idle, /<button[^>]*>最新の状態を取得<\/button>/);
   assert.match(idle, /取得時刻: 2026-09-21 09:30:00/);
   assert.match(idle, /<button[^>]*>手動上書きを取り消す<\/button>/);
-  // While a cancellation is in flight the control cannot be triggered again.
-  const pending = presence(active, 'ja', { onCancel: () => undefined, cancelling: true });
+  // While a cancellation is in flight neither control can be triggered again.
+  const pending = presence(active, 'ja', { onCancel: () => undefined, onRefresh: () => undefined, cancelling: true });
   assert.match(pending, /<button[^>]*disabled[^>]*>取り消しています<\/button>/);
+  assert.match(pending, /<button[^>]*disabled[^>]*>最新の状態を取得<\/button>/);
   assert.doesNotMatch(pending, />手動上書きを取り消す</);
   // Without providers neither affordance appears as usable.
   const plain = presence(active, 'ja');
   assert.doesNotMatch(plain, /最新の状態を取得/);
   assert.doesNotMatch(plain, /取得時刻/);
   assert.match(plain, /<button[^>]*disabled/);
+});
+
+test('only a future override expiry schedules a refresh', () => {
+  const now = Date.parse('2026-09-21T09:00:00.000Z');
+  assert.equal(refreshDelay(null, now), null);
+  // An expiry the core still reports after it passed must not loop refreshes.
+  assert.equal(refreshDelay('2026-09-21T08:59:59.000000+00:00', now), null);
+  assert.equal(refreshDelay('2026-09-21T09:00:00.000000+00:00', now), null);
+  assert.equal(refreshDelay('not a timestamp', now), null);
+  assert.equal(refreshDelay('2026-09-21T09:00:30.000000+00:00', now), 31000);
+  // Long-lived overrides re-read at most hourly.
+  assert.equal(refreshDelay('2026-09-22T09:00:00.000000+00:00', now), 3600000);
 });
 
 test('degraded clock and pending critical work stay visible on presence', () => {

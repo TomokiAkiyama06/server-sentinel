@@ -32,7 +32,8 @@ export function PresenceBody({ report, t, onCancel, failed, cancelling, onRefres
       <p className="presence-value">{t[`state_${snapshot.state}`]}</p>
       <p className="muted">{t.presenceBasis}: {t[`basis_${snapshot.basis}`]}</p>
       {fetchedAt && <p className="muted">{t.presenceFetchedAt}: {stamp(fetchedAt)}</p>}
-      {onRefresh && <button type="button" onClick={onRefresh}>{t.presenceRefresh}</button>}
+      {onRefresh && <button type="button" disabled={cancelling}
+        onClick={onRefresh}>{t.presenceRefresh}</button>}
       {snapshot.clock_degraded && <p className="timeline-degraded" role="status">{t.clockDegradedNotice}</p>}
     </section>
     <section className="presence-override" aria-label={t.overrideCancel}>
@@ -91,6 +92,14 @@ type State = { state: 'pending' } | { state: 'loading' } | { state: 'failed' } |
 
 const HOUR = 3600000;
 
+/** Only a future expiry schedules a refresh, so a stale one cannot loop. */
+export function refreshDelay(expiry: string | null, now: number): number | null {
+  if (!expiry) return null;
+  const remaining = Date.parse(expiry) - now;
+  if (Number.isNaN(remaining) || remaining <= 0) return null;
+  return Math.min(remaining + 1000, HOUR);
+}
+
 export function PresenceScreen({ services, t }: { services: DashboardServices; t: Messages }) {
   const [data, setData] = useState<State>({ state: 'pending' });
   const [failed, setFailed] = useState(false);
@@ -99,6 +108,8 @@ export function PresenceScreen({ services, t }: { services: DashboardServices; t
   const [fetchedAt, setFetchedAt] = useState<string | null>(null);
   // One audited control operation at a time, independent of render timing.
   const inFlight = useRef(false);
+  // A superseded read must never overwrite a newer control result.
+  const ticket = useRef(0);
   // Bound to the service so class-based providers keep their receiver.
   const cancel = services.cancelPresenceOverride?.bind(services);
 
@@ -106,16 +117,17 @@ export function PresenceScreen({ services, t }: { services: DashboardServices; t
     const load = services.loadPresence?.bind(services);
     if (!load) return;
     const controller = new AbortController();
+    const current = ticket.current += 1;
     setData({ state: 'loading' });
     void (async () => {
       try {
         const report = await load(controller.signal);
-        if (!controller.signal.aborted) {
+        if (!controller.signal.aborted && current === ticket.current) {
           setData({ state: 'ready', report });
           setFetchedAt(new Date().toISOString());
         }
       } catch {
-        if (!controller.signal.aborted) setData({ state: 'failed' });
+        if (!controller.signal.aborted && current === ticket.current) setData({ state: 'failed' });
       }
     })();
     return () => controller.abort();
@@ -124,11 +136,9 @@ export function PresenceScreen({ services, t }: { services: DashboardServices; t
   const expiry = data.state === 'ready' ? data.report.snapshot.override_expires_at : null;
   useEffect(() => {
     // A known expiry must not leave an expired override on screen as active.
-    if (!expiry) return;
-    const remaining = Date.parse(expiry) - Date.now();
-    if (Number.isNaN(remaining)) return;
-    const timer = setTimeout(() => setAttempt(value => value + 1),
-      Math.min(Math.max(remaining + 1000, 1000), HOUR));
+    const delay = refreshDelay(expiry, Date.now());
+    if (delay === null) return;
+    const timer = setTimeout(() => setAttempt(value => value + 1), delay);
     return () => clearTimeout(timer);
   }, [expiry]);
 
@@ -144,11 +154,14 @@ export function PresenceScreen({ services, t }: { services: DashboardServices; t
     setCancelling(true);
     setFailed(false);
     const controller = new AbortController();
+    const current = ticket.current += 1;
     void (async () => {
       try {
         const report = await cancel(controller.signal);
-        setData({ state: 'ready', report });
-        setFetchedAt(new Date().toISOString());
+        if (current === ticket.current) {
+          setData({ state: 'ready', report });
+          setFetchedAt(new Date().toISOString());
+        }
       } catch { setFailed(true); } finally {
         inFlight.current = false;
         setCancelling(false);
