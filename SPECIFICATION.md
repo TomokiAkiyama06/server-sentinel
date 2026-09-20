@@ -848,10 +848,32 @@ principal_credential
 - last_used_at
 - revoked_at
 
+principal_enrollment
+- id
+- principal_id
+- code_hash (the raw enrollment code is never stored or logged)
+- expires_at
+- redeemed_at (single use)
+- attempt_count (bounded; redemption is rate-limited)
+
+principal_session
+- id
+- principal_id
+- credential_id (the credential that created the session)
+- created_at
+- last_seen_at
+- idle_expires_at / absolute_expires_at (server-enforced)
+- last_user_verification_at (freshness source for owner step-up)
+- revoked_at
+
 principal_permission
 - principal_id
 - permission
 ```
+
+Revocation cascades through these records: revoking a `principal_credential`
+revokes the `principal_session` rows bound to it, and revoking the
+`access_principal` revokes all of its credentials, enrollments and sessions.
 
 A principal is created by an owner invitation that carries a short-lived,
 single-use enrollment code; the invited person redeems it once to register a
