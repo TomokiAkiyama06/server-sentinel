@@ -19,6 +19,7 @@ from app.settings import ConfigurationError
 
 
 MAX_ARTIFACT_BYTES = 256 * 1024 * 1024
+MAX_UNIT_BYTES = 64 * 1024
 VERSION = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+(?:-[a-z0-9.]+)?")
 
 
@@ -161,10 +162,16 @@ def _restart(runner) -> None:
 
 
 def _protected_parent(path: Path) -> None:
-    for parent in (path, *path.parents):
-        info = parent.stat()
-        if info.st_uid != 0 or info.st_mode & 0o022:
-            raise ValueError("installation ancestors must be root-controlled")
+    absolute = Path(os.path.abspath(path))
+    current = Path(absolute.anchor)
+    try:
+        for part in absolute.parts[1:]:
+            current /= part
+            info = current.lstat()
+            if stat.S_ISLNK(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+                raise ValueError("installation ancestors must be root-controlled")
+    except OSError:
+        raise ValueError("installation ancestors must be root-controlled") from None
 
 
 def _trusted_python(path: Path) -> Path:
@@ -182,7 +189,7 @@ def _trusted_python(path: Path) -> Path:
     return resolved
 
 
-def _switch(root: Path, target: str, runner) -> None:
+def _switch(root: Path, target: str, runner, *, restore_service=None) -> None:
     old_current = _link_target(root, "current")
     old_previous = _link_target(root, "previous")
     _set_link(root, "previous", old_current)
@@ -192,11 +199,66 @@ def _switch(root: Path, target: str, runner) -> None:
     except Exception:
         _set_link(root, "current", old_current)
         _set_link(root, "previous", old_previous)
+        restoration_error = None
+        if restore_service is not None:
+            try:
+                restore_service()
+            except Exception as error:
+                restoration_error = error
         if old_current is not None:
             try:
                 _restart(runner)
             except Exception:
                 pass
+        if restoration_error is not None:
+            raise restoration_error
+        raise
+
+
+def _installed_unit(path: Path) -> str:
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+        with os.fdopen(descriptor, "rb") as stream:
+            before = os.fstat(stream.fileno())
+            if (not stat.S_ISREG(before.st_mode) or before.st_uid != 0
+                    or before.st_mode & 0o022 or before.st_nlink != 1
+                    or before.st_size > MAX_UNIT_BYTES):
+                raise ValueError("installed service configuration differs")
+            content = stream.read(MAX_UNIT_BYTES + 1)
+            after = os.fstat(stream.fileno())
+    except OSError:
+        raise ValueError("installed service configuration differs") from None
+    if len(content) != before.st_size or (
+            before.st_size, before.st_mtime_ns, before.st_ctime_ns
+    ) != (after.st_size, after.st_mtime_ns, after.st_ctime_ns):
+        raise ValueError("installed service configuration differs")
+    try:
+        return content.decode("utf-8")
+    except UnicodeDecodeError:
+        raise ValueError("installed service configuration differs") from None
+
+
+def _replace_unit(path: Path, content: str) -> None:
+    encoded = content.encode("utf-8")
+    if len(encoded) > MAX_UNIT_BYTES:
+        raise ValueError("generated service configuration is too large")
+    temporary = path.with_name("." + path.name + ".new")
+    temporary.unlink(missing_ok=True)
+    try:
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC,
+                             0o644)
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(encoded)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    except OSError:
+        temporary.unlink(missing_ok=True)
         raise
 
 
@@ -264,9 +326,7 @@ def execute(args, *, runner=subprocess.run) -> None:
         if args.command == "install":
             if _link_target(args.destination, "current") is not None or args.unit.exists():
                 raise ValueError("deployment already installed")
-        elif (_link_target(args.destination, "current") is None or args.unit.is_symlink()
-              or not args.unit.is_file()
-              or args.unit.read_text(encoding="utf-8") != unit_content):
+        elif _link_target(args.destination, "current") is None:
             raise ValueError("installed service configuration differs")
         target = _stage(args, deployment, account, runner)
         if args.command == "install":
@@ -285,12 +345,27 @@ def execute(args, *, runner=subprocess.run) -> None:
                     pass
                 raise
         else:
-            _switch(args.destination, target, runner)
+            previous_unit = _installed_unit(args.unit)
+            restored = False
+
+            def restore_unit() -> None:
+                nonlocal restored
+                if not restored:
+                    _replace_unit(args.unit, previous_unit)
+                    runner(["systemctl", "daemon-reload"], check=True, timeout=30)
+                    restored = True
+
+            try:
+                _replace_unit(args.unit, unit_content)
+                runner(["systemctl", "daemon-reload"], check=True, timeout=30)
+                _switch(args.destination, target, runner, restore_service=restore_unit)
+            except Exception:
+                restore_unit()
+                raise
     else:
         if args.version is not None and not VERSION.fullmatch(args.version):
             raise ValueError("invalid rollback version")
-        if (args.unit.is_symlink() or not args.unit.is_file()
-                or args.unit.read_text(encoding="utf-8") != unit_content):
+        if _installed_unit(args.unit) != unit_content:
             raise ValueError("installed service configuration differs")
         target = "releases/" + args.version if args.version else _link_target(
             args.destination, "previous"

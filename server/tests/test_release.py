@@ -17,7 +17,7 @@ from app.deployment import Deployment
 from app.settings import ConfigurationError
 from build_artifact import _required_wheels, build
 from build_installer import build as build_installer
-from install import _extract, _trusted_python, execute
+from install import _extract, _protected_parent, _trusted_python, execute
 
 
 class Runner:
@@ -98,6 +98,7 @@ class ReleaseLifecycleTests(unittest.TestCase):
         with patch("install.os.geteuid", return_value=0), patch(
                 "install._protected_parent"), patch(
                 "install._trusted_python", side_effect=lambda path: path.resolve()), patch(
+                "install._installed_unit", side_effect=lambda path: path.read_text()), patch(
                 "app.deployment.os.path.ismount", return_value=mount), patch(
                 "install.pwd.getpwuid", return_value=account):
             execute(arguments, runner=self.runner)
@@ -144,6 +145,20 @@ class ReleaseLifecycleTests(unittest.TestCase):
         self.assertEqual(marker.read_text(), "unchanged")
         restarts = [call for call, _ in self.runner.calls if call[:2] == ["systemctl", "restart"]]
         self.assertGreaterEqual(len(restarts), 3)
+
+    def test_update_replaces_service_definition_and_restores_it_on_failed_activation(self):
+        self.perform(self.arguments("install", "1.0.0"))
+        original = self.unit.read_text()
+        with patch("install.render_unit", return_value="[Service]\nProtectSystem=strict\n"):
+            self.perform(self.arguments("update", "1.1.0"))
+        self.assertEqual(self.unit.read_text(), "[Service]\nProtectSystem=strict\n")
+
+        self.runner.fail_version = "1.2.0"
+        with patch("install.render_unit", return_value="[Service]\nProtectHome=true\n"):
+            with self.assertRaises(OSError):
+                self.perform(self.arguments("update", "1.2.0"))
+        self.assertEqual(self.unit.read_text(), "[Service]\nProtectSystem=strict\n")
+        self.assertNotEqual(self.unit.read_text(), original)
 
     def test_missing_runtime_tree_and_public_listener_fail_before_artifact_install(self):
         (self.runtime / "recordings").rmdir()
@@ -279,6 +294,16 @@ class ReleaseLifecycleTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary, patch("install.MAX_ARTIFACT_BYTES", 1024):
             with self.assertRaisesRegex(ValueError, "contents exceed"):
                 _extract(archive_data.getvalue(), Path(temporary), "1.0.0")
+
+    def test_untrusted_or_symlinked_installation_ancestor_is_rejected(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            private = root / "private"
+            private.mkdir(mode=0o700)
+            link = root / "link"
+            link.symlink_to(private, target_is_directory=True)
+            with self.assertRaisesRegex(ValueError, "root-controlled"):
+                _protected_parent(link)
 
     def test_root_python_helpers_are_isolated_from_invocation_directory(self):
         shadow = self.root / "venv.py"
