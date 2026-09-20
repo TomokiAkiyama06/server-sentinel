@@ -161,7 +161,9 @@ class LinuxProbe:
                 continue
             sectors = int(_read(device / "size"))
             if sectors <= 0:
-                continue
+                # Still enumerated: unavailable capacity is not proof that an
+                # approved device disappeared (e.g. initialization/fault).
+                raise ProbeUnavailable()
             properties = _pairs({"capacity_bytes": str(sectors * 512),
                                  "model": _optional(device / "device/model")})
             identifiers = _pairs({"serial": _identity(_optional(device / "device/serial")),

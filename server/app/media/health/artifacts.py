@@ -59,7 +59,10 @@ class RecorderSelfTestProbe:
                             raise RecordingError("SELFTEST_ARTIFACT_UNVERIFIABLE")
                         store._verify_root()
                         os.unlink(name, dir_fd=store._fd)
-                        os.fsync(store._fd)
+                    # A previous unlink may have succeeded while directory
+                    # fsync failed. Absence alone does not make deletion durable.
+                    store._verify_root()
+                    os.fsync(store._fd)
                     with store._transaction():
                         store.db.execute("DELETE FROM recording_selftest WHERE singleton=1")
         finally:

@@ -123,6 +123,29 @@ class ArtifactTests(TestCase):
         self.assertEqual(list(self.root.iterdir()), [])
         self.assertIsNone(self.db.execute("SELECT 1 FROM recording_selftest").fetchone())
 
+    def test_absent_artifact_retry_syncs_directory_before_clearing_journal(self):
+        self.adapter.check_storage()
+        self.adapter.write_test_segment()
+        with patch("app.media.health.artifacts.os.fsync", side_effect=OSError("synthetic-fsync-failure")):
+            with self.assertRaises(OSError):
+                self.adapter.cleanup()
+            self.assertEqual(list(self.root.iterdir()), [])
+            # The failed deletion sync leaves ownership in the durable journal.
+            self.assertIsNotNone(self.db.execute("SELECT 1 FROM recording_selftest").fetchone())
+            with self.assertRaises(OSError):
+                self.adapter.cleanup()
+            self.assertIsNotNone(self.db.execute("SELECT 1 FROM recording_selftest").fetchone())
+        synced_with_journal = []
+        fsync = os.fsync
+        def durable_retry(descriptor):
+            if descriptor == self.store._fd:
+                synced_with_journal.append(self.db.execute("SELECT 1 FROM recording_selftest").fetchone() is not None)
+            fsync(descriptor)
+        with patch("app.media.health.artifacts.os.fsync", side_effect=durable_retry):
+            self.adapter.cleanup()
+        self.assertEqual(synced_with_journal, [True])
+        self.assertIsNone(self.db.execute("SELECT 1 FROM recording_selftest").fetchone())
+
     def test_substituted_root_never_creates_fallback(self):
         self.root.rename(self.base / "approved-media")
         self.root.mkdir(mode=0o700)

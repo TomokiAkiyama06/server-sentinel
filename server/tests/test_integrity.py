@@ -191,6 +191,14 @@ class LinuxProbeTests(TestCase):
     def test_unavailable_hardware_is_unknown(self):
         self.assertEqual(self.probe.collect().unavailable, frozenset(Kind))
 
+    def test_zero_capacity_enumerated_device_is_not_confirmed_missing(self):
+        self.put("sys/class/block/disk0/size", "0")
+        current = self.probe.collect()
+        self.assertIn(Kind.STORAGE, current.unavailable)
+        findings = compare(Inventory((disk(),)), current)
+        storage = [item for item in findings if item.kind == Kind.STORAGE]
+        self.assertEqual([item.state for item in storage], [State.UNVERIFIABLE])
+
     def test_memory_placeholder_serial_is_not_identity(self):
         self.probe.runner = FakeRunner({"dmidecode": b"Handle 0x0001\nMemory Device\n Size: 8 GB\n Locator: DIMM 0\n Serial Number: Not Specified\n"})
         self.assertEqual(self.probe._memory()[0].identity, ())
