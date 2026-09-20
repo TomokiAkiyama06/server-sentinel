@@ -802,6 +802,8 @@ Notification delivery follows configured local/UI/Slack channels. Slack remains 
 
 Detailed hardware identifiers are deployment-local security metadata. Do not send raw serials/UUIDs through telemetry or developer infrastructure. Normal operational logs and general diagnostics must redact/hash them. A detailed diagnostic export requires an explicit Owner action and does not authorize automatic upload.
 
+A diagnostic export is optional convenience data, not monitoring evidence. Reserving space for one must not run retention or delete recordings to make room; a deployment without free space refuses the export with its explicit storage state instead. Export size is bounded twice: the implementation caps one selected media item at 512 MiB and a whole bundle at 1 GiB as a defensive upper bound, while the deployment-configured storage maximum request size remains authoritative and refuses anything larger. Selected media is copied in bounded chunks so an export never buffers a whole clip. Only reviewed fixed reason codes, never local values, reach an export caller.
+
 Hardware/SMART probing must use the least privilege practical. Do not run the whole ServerSentinel stack as root merely to obtain inventory/health data; use narrow host permissions/helper boundaries if privileged probes are required.
 
 ## 11. Human access architecture

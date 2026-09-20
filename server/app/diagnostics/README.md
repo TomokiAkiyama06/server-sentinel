@@ -29,6 +29,12 @@ cancellation cleanup verifies it reopened the same directory; a renamed or
 replaced directory means the archive is unreachable, an absent file is not
 accepted as deletion, and the service blocks later exports instead.
 
+Every submitted call is checked against the worker's first observed thread, so
+a worker that drifted onto another thread is refused before admission instead of
+splitting admission, bundle I/O and release across threads or letting two
+operations share one reservation slot. Concurrent owner-worker work queues
+behind an export rather than colliding with its reservation.
+
 Admission uses the explicit non-reclaiming `admit_external` contract. A support
 bundle is optional convenience data, not monitoring evidence, so reserving space
 for it must never run retention or delete recordings to make room; a deployment
@@ -86,15 +92,22 @@ media and is called only for IDs individually selected in the authorized action.
 Selected metadata is sized before admission; after approval each item is opened,
 type checked, copied through a bounded 64 KiB reader and released before the next
 item is opened. Individual media is capped at 512 MiB and the complete diagnostic
-bundle at 1 GiB; short, growing, or contract-breaking streams fail closed.
+bundle at 1 GiB. These are defensive implementation upper bounds; the
+deployment-configured storage maximum request size stays authoritative and
+refuses anything larger, and both bounds also limit how long one export can
+occupy the storage policy's owning worker. Short, growing, or contract-breaking
+streams fail closed.
 
 `app.api.diagnostics` provides the prepared integration route. Application
 composition accepts only a `DiagnosticExportEndpoint` with a fixed local output
 directory. Production keeps the human surface closed until Issue #10 lands; when
 mounted, the route requires the existing human access boundary, the Owner-only
 route boundary, and the service's exact Owner confirmation. It reports fixed
-statuses only: a rejected selection never echoes the submitted identifiers and a
-storage denial never carries a local failure detail.
+statuses only: a rejected selection never echoes the submitted identifiers, and a
+failure reports one reviewed fixed code. Explicit deployment conditions such as
+`STORAGE_PRESSURE` and `STORAGE_HARD_STOP` keep their code so the Owner is not
+shown a silent generic error; anything else becomes
+`DIAGNOSTIC_EXPORT_UNAVAILABLE`.
 
 The manifest reports included categories, counts, exclusion reasons and the
 identifier transformation. It contains no excluded value, media ID, path,

@@ -4,7 +4,11 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.auth.boundary import require_owner_access, require_system_access
-from app.diagnostics import DiagnosticExportEndpoint, DiagnosticExportError
+from app.diagnostics import (
+    DiagnosticExportEndpoint,
+    DiagnosticExportError,
+    export_failure_code,
+)
 
 
 class DiagnosticExportRequest(BaseModel):
@@ -28,11 +32,12 @@ async def export_diagnostics(payload: DiagnosticExportRequest,
         raise HTTPException(status_code=404, detail="Not Found")
     try:
         result = await endpoint.export(tuple(payload.selected_media_ids))
-    except DiagnosticExportError:
-        # Export errors are already value free; the route still reports only a
-        # fixed status so no local failure detail reaches the HTTP boundary.
+    except DiagnosticExportError as failure:
+        # Storage pressure and hard stop are explicit deployment conditions, so
+        # the reviewed fixed code is reported rather than collapsed into an
+        # opaque failure. Only reviewed codes are emitted; nothing local is.
         raise HTTPException(
-            status_code=503, detail="Service Unavailable") from None
+            status_code=503, detail=export_failure_code(failure)) from None
     except ValueError:
         # A rejected selection must not echo the submitted identifiers back.
         raise HTTPException(status_code=400, detail="Bad Request") from None

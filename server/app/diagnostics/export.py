@@ -16,6 +16,7 @@ from pathlib import Path
 import re
 import secrets
 import stat
+import threading
 from typing import BinaryIO, Callable, ContextManager, Protocol, TypeAlias
 from zipfile import ZIP64_LIMIT, ZIP_STORED, ZipFile, ZipInfo
 
@@ -27,6 +28,14 @@ _SAFE_NAME = re.compile(r"^[a-z][a-z0-9_.-]{0,63}$")
 _MEDIA_CHUNK_BYTES = 64 * 1024
 _MAX_MEDIA_ITEM_BYTES = 512 * 1024 * 1024
 _MAX_DIAGNOSTIC_BUNDLE_BYTES = 1024 * 1024 * 1024
+# Fixed value-free codes a composed storage policy may report.
+_STORAGE_DENIAL_REASONS = frozenset({
+    "STORAGE_PRESSURE",
+    "STORAGE_HARD_STOP",
+    "STORAGE_INVALID_RESERVATION",
+    "STORAGE_POLICY_UNAVAILABLE",
+    "STORAGE_BINDING_UNAVAILABLE",
+})
 
 
 class DiagnosticExportError(RuntimeError):
@@ -35,6 +44,19 @@ class DiagnosticExportError(RuntimeError):
 
 class _DiagnosticCleanupUncertain(RuntimeError):
     """Internal signal that storage reservation must remain held."""
+
+
+def export_failure_code(failure: DiagnosticExportError) -> str:
+    """Return a fixed reviewed code for an export failure, never a local value.
+
+    Storage pressure and hard stop are explicit deployment conditions, so the
+    reviewed reason code is preserved for a caller instead of being collapsed
+    into an opaque failure. Anything else becomes one generic code.
+    """
+    reason = str(failure)
+    if reason in _STORAGE_DENIAL_REASONS:
+        return reason
+    return "DIAGNOSTIC_EXPORT_UNAVAILABLE"
 
 
 class DiagnosticFieldKind(StrEnum):
@@ -309,6 +331,14 @@ class StorageWorker(Protocol):
         release therefore run as one submitted unit there, so the reservation is
         never held across an unrelated owner-worker operation and the ASGI event
         loop is never blocked by ZIP writing or fsync.
+
+        Implementations run every submitted call on that one thread, to
+        completion, in submission order. Concurrent owner-worker work therefore
+        queues behind an export - bounded by the per-item and whole-bundle caps
+        - instead of colliding with its reservation. A worker that ran calls on
+        more than one thread would split admission, bundle I/O and release
+        across threads and let two operations share one reservation slot, so the
+        service verifies the thread identity and refuses rather than continuing.
         """
 
 
@@ -341,13 +371,6 @@ class DiagnosticExportResult:
     included_media_count: int
 
 
-_STORAGE_DENIAL_REASONS = frozenset({
-    "STORAGE_PRESSURE",
-    "STORAGE_HARD_STOP",
-    "STORAGE_INVALID_RESERVATION",
-    "STORAGE_POLICY_UNAVAILABLE",
-    "STORAGE_BINDING_UNAVAILABLE",
-})
 _EXCLUDED_KINDS = {
     DiagnosticFieldKind.CREDENTIAL,
     DiagnosticFieldKind.PAIRING_SECRET,
@@ -649,6 +672,7 @@ class DiagnosticExportService:
         self.__writer = _DiagnosticBundleWriter(source, media_source)
         self.__worker_slot = asyncio.Semaphore(1)
         self.__storage_uncertain = False
+        self.__worker_thread: int | None = None
 
     def __open_admitted_output(self, output_directory: Path) -> int:
         """Pin the export directory to the filesystem the policy reserves on.
@@ -795,9 +819,25 @@ class DiagnosticExportService:
             if directory_fd >= 0:
                 os.close(directory_fd)
 
+    def __on_owning_worker(self, call):
+        """Refuse a worker that does not keep one policy-owning thread.
+
+        The check runs before admission, so a violation costs no reservation.
+        It is the difference between failing closed and letting admission,
+        bundle I/O and release drift onto separate threads, where the storage
+        policy would reject them and two operations could share one reservation.
+        """
+        identity = threading.get_ident()
+        if self.__worker_thread is None:
+            self.__worker_thread = identity
+        elif self.__worker_thread != identity:
+            raise DiagnosticExportError("diagnostic storage worker is unavailable")
+        return call()
+
     def __submit_storage(self, call):
         try:
-            scheduled = self.__storage_worker.submit(call)
+            scheduled = self.__storage_worker.submit(
+                partial(self.__on_owning_worker, call))
         except Exception:
             raise DiagnosticExportError(
                 "diagnostic storage worker is unavailable") from None

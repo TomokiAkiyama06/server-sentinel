@@ -330,6 +330,51 @@ class DiagnosticExportTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(item != event_loop_thread for item in worker_threads))
         self.assertEqual(self.media.max_active, 1)
 
+    async def test_a_worker_that_leaves_the_owning_thread_is_refused(self):
+        """Regression: split threads would break admission and share a reservation."""
+        class UnpinnedAdmission:
+            def __init__(inner_self):
+                inner_self.admits = []
+
+            def admit_external(inner_self, media_bytes):
+                inner_self.admits.append(threading.get_ident())
+
+            def release(inner_self):
+                return None
+
+        class AlternatingThreadWorker:
+            """Two live single-thread pools, so the identities stay distinct."""
+
+            def __init__(inner_self):
+                inner_self.pools = [ThreadPoolExecutor(max_workers=1),
+                                    ThreadPoolExecutor(max_workers=1)]
+                inner_self.calls = 0
+
+            def submit(inner_self, call):
+                inner_self.calls += 1
+                return inner_self.pools[inner_self.calls % 2].submit(call)
+
+            def shutdown(inner_self):
+                for pool in inner_self.pools:
+                    pool.shutdown()
+
+        worker = AlternatingThreadWorker()
+        self.addCleanup(worker.shutdown)
+        policy = UnpinnedAdmission()
+        service = DiagnosticExportService(
+            Permit(), self.source, policy, worker,
+            self.storage_filesystem, self.media)
+
+        first = await service.export(DiagnosticExportAction(self.output))
+        self.assertTrue(first.bundle_path.exists())
+        with self.assertRaisesRegex(
+                DiagnosticExportError, "diagnostic storage worker is unavailable"):
+            await service.export(DiagnosticExportAction(self.output))
+
+        self.assertEqual(len(policy.admits), 1)
+        self.assertEqual([item.name for item in self.output.iterdir()],
+                         [first.bundle_path.name])
+
     async def test_admission_release_and_bundle_io_use_the_policy_owning_worker(self):
         """Regression: admission off the owning worker is rejected by the policy."""
         result = await self.make_service(Permit(), media=self.media).export(
@@ -976,12 +1021,21 @@ class DiagnosticExportTests(unittest.IsolatedAsyncioTestCase):
 
         self.policy.denial = RecordingError(
             "/private/deployment/mount SYNTHETIC_PRIVATE_VALUE")
-        denied = await self.post_export(application, ("clip_a",))
-        body = self.response_body(denied)
-        self.assertEqual(denied[0]["status"], 503)
+        opaque = await self.post_export(application, ("clip_a",))
+        body = self.response_body(opaque)
+        self.assertEqual(opaque[0]["status"], 503)
+        self.assertIn(b"DIAGNOSTIC_EXPORT_UNAVAILABLE", body)
         self.assertNotIn(b"SYNTHETIC_PRIVATE_VALUE", body)
         self.assertNotIn(b"/private/deployment/mount", body)
         self.assertNotIn(b"clip_a", body)
+
+        # An explicit deployment condition keeps its reviewed fixed code.
+        for reason in ("STORAGE_PRESSURE", "STORAGE_HARD_STOP"):
+            with self.subTest(reason=reason):
+                self.policy.denial = RecordingError(reason)
+                denied = await self.post_export(application, ("clip_a",))
+                self.assertEqual(denied[0]["status"], 503)
+                self.assertIn(reason.encode(), self.response_body(denied))
         self.assertEqual(list(self.output.iterdir()), [])
 
     async def test_prepared_route_denies_an_invited_non_owner_before_the_endpoint(self):
