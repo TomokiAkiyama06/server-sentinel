@@ -591,7 +591,30 @@ Run this only on the intended Main Server using synthetic, non-production diagno
 - [ ] verify raw monitoring media is absent by default and can be included only after an additional explicit Owner selection; do not use real monitoring media for this check;
 - [ ] record only sanitized PASS/FAIL and aggregate results locally; do not retain the test bundle after the local verification policy permits deletion.
 
-## V. GitHub review-gate enforcement
+## V. Main Server deployment and first-run setup
+
+Run these checks on an intended Main Server or an isolated deployment-equivalent host. Do not publish release artifacts, configuration, mount/device identities, private listener addresses, user identities, diagnostics, or monitoring media.
+
+- [ ] install the versioned Main Server artifact or documented Compose path without relying on a mutable development checkout; verify the process uses its intended non-root runtime identity and private listener/trusted-proxy boundary;
+- [ ] perform a version update and a safe rollback using the documented lifecycle; verify deployment-configured configuration, state, recordings, and audit logs remain outside the release checkout and are retained;
+- [ ] safely simulate missing runtime configuration or an expected runtime mount and verify an explicit failure/degraded result without creating a root-filesystem fallback;
+- [ ] as the deployment Owner, run the first-run wizard through Welcome, owner bootstrap, storage, baseline/self-check, locale/time, source/profile, optional verification/Slack, and private human-access steps;
+- [ ] interrupt and resume the wizard, skip optional steps, and confirm unavailable dependent features remain explicitly pending rather than appearing complete;
+- [ ] verify the UI distinguishes Tailnet/private-network reachability from ServerSentinel invitation/permission, and no settings, secrets, raw hardware identifiers, or biometric data are exposed in general display/logs;
+- [ ] record only sanitized PASS/FAIL results locally.
+
+## W. Security/admin audit retention
+
+Use a disposable Main Server database and synthetic logical target IDs. Do not enter real secrets, biometric material, hardware serials/UUIDs, private network values, or monitoring media for this test.
+
+- [ ] approve a hardware baseline as the deployment Owner and verify one fixed-action success record with a logical target ID;
+- [ ] change a security/admin setting and revoke one test camera, source, or capture node; verify fixed action, target kind, logical ID, UTC time, and outcome;
+- [ ] attempt an Owner-only operation as an invited/non-owner principal and verify the mutation does not run while a denied audit outcome is retained;
+- [ ] induce a safe synthetic mutation failure and verify a failed audit outcome without submitted values or exception text;
+- [ ] run retention with a test clock just past 90 days and verify only expired audit rows are removed while boundary/newer rows, recordings, factual timeline events, and capture-agent protected incidents remain unchanged;
+- [ ] inspect deployed database permissions and confirm the audit database remains deployment-local with no upload/reporting path.
+
+## X. GitHub review-gate enforcement
 
 Issue #4 remains open. The offline tests do not complete these checks. Follow
 `docs/REVIEW_GATE_SETUP.md` after Owner App registration and trusted publisher

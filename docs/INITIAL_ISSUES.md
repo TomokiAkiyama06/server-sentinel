@@ -917,7 +917,8 @@ Scope:
 Acceptance:
 - stable install / update / rollback後にもruntime dataを保持し、暗黙のroot-filesystem fallbackを作らない;
 - disposable environmentでinstall、update、rollback、missing runtime mount/configurationを検証する;
-- documented Main Ubuntu / Compose pathとrelease lifecycleを一致させ、実Main Server受入はprivate deployment dataを公開せずに行う。
+- documented Main Ubuntu / Compose pathとrelease lifecycleを一致させ、実Main Server受入はprivate deployment dataを公開せずに行う;
+- `MANUAL_TEST.md` Vで、deployed Main Serverのinstall / update / rollback、runtime-data分離、private listener境界を、private deployment valuesを公開せずに確認する。
 
 ## Plan 23 — First-run setup wizard と初期設定フロー
 
@@ -936,7 +937,8 @@ Scope:
 Acceptance:
 - owner bootstrap、storage、integrity、source、profile、optional integration、private accessの各stepを再開可能な状態として実装する;
 - Tailnet membershipとapplication invitationを別の承認として明示し、秘密値・raw identifier・biometricを一般表示/diagnosticsへ出さない;
-- unit / browser integration testを実施し、実機完走はPlan 21と個別Planで受入する。
+- unit / browser integration testを実施し、実機完走はPlan 21と個別Planで受入する;
+- `MANUAL_TEST.md` Vで、deployed Ownerがfirst-run flowを再開・skipし、未完のintegrationが安全なpending状態であることを確認する。
 
 ## Plan 24 — Privacy-safe diagnostic export / support bundle
 
@@ -976,7 +978,8 @@ Scope:
 Acceptance:
 - recordsにはactor category、action、logical target ID、time、outcomeを持たせ、secret、raw biometric、raw serial/UUID、raw mediaを含めない;
 - cleanupはexpired auditだけに適用し、recording / protected incident lifecycleを変更しない;
-- synthetic testsでredaction、retention、Owner-only security action、failure outcomeを検証する。
+- synthetic testsでredaction、retention、Owner-only security action、failure outcomeを検証する;
+- `MANUAL_TEST.md` Wで、deployed Owner action、non-owner denial、90-day cleanup、local-only database permissionを、private dataを公開せずに確認する。
 
 ## Plan 26 — Dependency / model license compliance gate
 
