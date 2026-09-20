@@ -46,7 +46,6 @@ export function App({ services = deniedServices }: { services?: DashboardService
     setView('overview');
     setBusy([]);
     setWriteFailed(false);
-    mutations.abortAll();
   }
 
   useEffect(() => { document.documentElement.lang = locale; }, [locale]);
@@ -118,7 +117,7 @@ export function App({ services = deniedServices }: { services?: DashboardService
     setBusy(current => current.length ? [] : current);
     setWriteFailed(false);
     return () => mutations.abortAll();
-  }, [services, access, mutations]);
+  }, [services, access, attempt, mutations]);
 
   const session: Session = access.state === 'allowed' ? access : { state: 'denied' };
   const selected = canVisit(session, view) ? view : 'overview';
