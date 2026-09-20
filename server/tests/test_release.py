@@ -152,11 +152,16 @@ class ReleaseLifecycleTests(unittest.TestCase):
         with patch("install.render_unit", return_value="[Service]\nProtectSystem=strict\n"):
             self.perform(self.arguments("update", "1.1.0"))
         self.assertEqual(self.unit.read_text(), "[Service]\nProtectSystem=strict\n")
+        self.perform(self.arguments("rollback"))
+        self.assertEqual(self.unit.read_text(), original)
 
-        self.runner.fail_version = "1.2.0"
+        with patch("install.render_unit", return_value="[Service]\nProtectSystem=strict\n"):
+            self.perform(self.arguments("update", "1.2.0"))
+
+        self.runner.fail_version = "1.3.0"
         with patch("install.render_unit", return_value="[Service]\nProtectHome=true\n"):
             with self.assertRaises(OSError):
-                self.perform(self.arguments("update", "1.2.0"))
+                self.perform(self.arguments("update", "1.3.0"))
         self.assertEqual(self.unit.read_text(), "[Service]\nProtectSystem=strict\n")
         self.assertNotEqual(self.unit.read_text(), original)
 
@@ -228,6 +233,13 @@ class ReleaseLifecycleTests(unittest.TestCase):
         self.config.chmod(0o600)
         with self.assertRaisesRegex(ConfigurationError, "must not be root"):
             self.perform(self.arguments("install", "1.0.0"))
+        self.assertFalse((self.installation / "releases").exists())
+
+    def test_runtime_mount_cannot_be_backed_by_the_root_filesystem_device(self):
+        with patch("app.deployment._operating_system_root_device",
+                   return_value=self.runtime.stat().st_dev):
+            with self.assertRaisesRegex(ConfigurationError, "root filesystem device"):
+                self.perform(self.arguments("install", "1.0.0"))
         self.assertFalse((self.installation / "releases").exists())
 
     def test_artifact_is_versioned_allow_list_without_tests_or_private_config(self):

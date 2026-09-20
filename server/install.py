@@ -238,15 +238,15 @@ def _installed_unit(path: Path) -> str:
         raise ValueError("installed service configuration differs") from None
 
 
-def _replace_unit(path: Path, content: str) -> None:
+def _replace_unit(path: Path, content: str, *, mode=0o644) -> None:
     encoded = content.encode("utf-8")
-    if len(encoded) > MAX_UNIT_BYTES:
+    if len(encoded) > MAX_UNIT_BYTES or mode not in {0o444, 0o644}:
         raise ValueError("generated service configuration is too large")
     temporary = path.with_name("." + path.name + ".new")
     temporary.unlink(missing_ok=True)
     try:
         descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC,
-                             0o644)
+                             mode)
         with os.fdopen(descriptor, "wb") as stream:
             stream.write(encoded)
             stream.flush()
@@ -262,7 +262,12 @@ def _replace_unit(path: Path, content: str) -> None:
         raise
 
 
-def _stage(args, deployment: Deployment, account: pwd.struct_passwd, runner) -> str:
+def _release_unit(root: Path, target: str) -> Path:
+    return root / target / ".server-sentinel.service"
+
+
+def _stage(args, deployment: Deployment, account: pwd.struct_passwd, runner,
+           unit_content: str) -> str:
     if not VERSION.fullmatch(args.version):
         raise ValueError("invalid release version")
     content = read_artifact(args.artifact)
@@ -297,6 +302,7 @@ def _stage(args, deployment: Deployment, account: pwd.struct_passwd, runner) -> 
             ], check=True, timeout=30, user=account.pw_uid, group=account.pw_gid,
                extra_groups=[], cwd=str(staging), env={"PYTHONDONTWRITEBYTECODE": "1"},
                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            _replace_unit(staging / ".server-sentinel.service", unit_content, mode=0o444)
             staging.rename(final)
         except Exception:
             shutil.rmtree(staging, ignore_errors=True)
@@ -332,7 +338,17 @@ def execute(args, *, runner=subprocess.run) -> None:
                 raise ValueError("deployment already installed")
         elif _link_target(args.destination, "current") is None:
             raise ValueError("installed service configuration differs")
-        target = _stage(args, deployment, account, runner)
+        previous_unit = None
+        if args.command == "update":
+            current = _link_target(args.destination, "current")
+            previous_unit = _installed_unit(args.unit)
+            snapshot = _release_unit(args.destination, current)
+            if snapshot.exists():
+                if _installed_unit(snapshot) != previous_unit:
+                    raise ValueError("installed service configuration differs")
+            else:
+                _replace_unit(snapshot, previous_unit, mode=0o444)
+        target = _stage(args, deployment, account, runner, unit_content)
         if args.command == "install":
             try:
                 with args.unit.open("x", encoding="utf-8") as stream:
@@ -349,7 +365,7 @@ def execute(args, *, runner=subprocess.run) -> None:
                     pass
                 raise
         else:
-            previous_unit = _installed_unit(args.unit)
+            assert previous_unit is not None
             restored = False
 
             def restore_unit() -> None:
@@ -369,14 +385,32 @@ def execute(args, *, runner=subprocess.run) -> None:
     else:
         if args.version is not None and not VERSION.fullmatch(args.version):
             raise ValueError("invalid rollback version")
-        if _installed_unit(args.unit) != unit_content:
-            raise ValueError("installed service configuration differs")
         target = "releases/" + args.version if args.version else _link_target(
             args.destination, "previous"
         )
         if target is None or not (args.destination / target).is_dir():
             raise ValueError("rollback target is unavailable")
-        _switch(args.destination, target, runner)
+        current = _link_target(args.destination, "current")
+        previous_unit = _installed_unit(args.unit)
+        if current is None or _installed_unit(_release_unit(args.destination, current)) != previous_unit:
+            raise ValueError("installed service configuration differs")
+        target_unit = _installed_unit(_release_unit(args.destination, target))
+        restored = False
+
+        def restore_unit() -> None:
+            nonlocal restored
+            if not restored:
+                _replace_unit(args.unit, previous_unit)
+                runner(["systemctl", "daemon-reload"], check=True, timeout=30)
+                restored = True
+
+        try:
+            _replace_unit(args.unit, target_unit)
+            runner(["systemctl", "daemon-reload"], check=True, timeout=30)
+            _switch(args.destination, target, runner, restore_service=restore_unit)
+        except Exception:
+            restore_unit()
+            raise
 
 
 def main() -> None:

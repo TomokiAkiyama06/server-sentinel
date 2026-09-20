@@ -13,6 +13,10 @@ from app.settings import ConfigurationError, Settings
 MAX_CONFIGURATION_BYTES = 16 * 1024
 
 
+def _operating_system_root_device() -> int:
+    return Path("/").stat().st_dev
+
+
 def _read_configuration(path: Path) -> tuple[dict, os.stat_result]:
     try:
         descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK)
@@ -92,10 +96,13 @@ class Deployment:
             mount_point = Path(value["runtime_mount_point"]).resolve(strict=True)
             mount_info = mount_point.stat()
             root_info = runtime_root.stat()
+            operating_system_root_device = _operating_system_root_device()
         except (OSError, RuntimeError, TypeError, ValueError):
             raise ConfigurationError("runtime mount is unavailable") from None
         if mount_point == Path(mount_point.anchor):
             raise ConfigurationError("runtime mount must not be root filesystem")
+        if root_info.st_dev == operating_system_root_device:
+            raise ConfigurationError("runtime mount must not use root filesystem device")
         if (not mount_point.is_absolute() or not mount_point.is_dir()
                 or not os.path.ismount(mount_point)
                 or not runtime_root.is_relative_to(mount_point)
