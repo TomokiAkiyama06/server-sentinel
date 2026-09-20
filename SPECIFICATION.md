@@ -683,6 +683,35 @@ Defaults: recording retention 20 days; audit retention 90 days.
 
 Agent disk-buffer safety is tracked separately from Main Server storage because the two filesystems may be different machines.
 
+The internal Issue #21 policy in `server/app/storage/` holds media plus configured
+metadata/journal/temp reservations through the serialized recorder operation.
+Physical-only control reservations cover startup recovery before inventory binding
+and never recursively invoke retention. Expected media-root identity and the
+private metadata file's filesystem are checked without symlink following or
+fallback creation. All numeric reserve/quota/hysteresis/overhead limits are
+explicit deployment configuration; only the specified retention defaults apply.
+The critical allowance conservatively bounds resident critical evidence plus the
+new reservation, surviving restart. Filesystem sampling includes other processes
+but cannot prevent unrelated writes after the sample. A failed state-audit write
+remains visible as a failure flag. The domain recording browser defaults to deny,
+requires `recordings:view` for history and Owner for star/unstar/single deletion;
+it mounts no human endpoint pending #10.
+
+`server/app/notifications/` provides optional direct Slack incoming-webhook
+delivery using verified HTTPS, no environment proxy/redirect, bounded timeout and
+redacted failures. Unconfigured delivery performs no network operation. The
+current payload is a fixed critical category or validated daily aggregate, with
+no image/media, source identity or arbitrary probe details. Both immediate and
+daily notifications enqueue on a bounded delivery worker; the recorder worker
+never waits for network IO. Local pending/result events share an ID and are
+persisted only on the owning worker. Full queues and failed persistence remain
+visible; completion-persistence retry never resends a message. The persisted daily
+scheduler defaults to 23:00 configured local time and claims one dispatch per
+local date across restart/DST/clock rollback; missed dates are not replayed.
+An uncertain crash remains `pending`, failed delivery is visible, and no implicit
+retry floods the channel. Production timers, durable event-outbox integration,
+human authorization and recording playback remain separate integration work.
+
 ## 10. Host hardware integrity and recording self-check
 
 ### 10.1 Hardware baseline
