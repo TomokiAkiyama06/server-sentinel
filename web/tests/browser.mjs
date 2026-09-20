@@ -251,6 +251,8 @@ try {
       await page.click('概要');
       await page.heading('概要');
       await page.click('ストレージと通知');
+      // Re-entry must not paint the previous snapshot while the reload runs.
+      assert.equal(await page.evaluate("document.querySelectorAll('[data-storage-state]').length"), 0);
       await page.wait("document.querySelectorAll('[data-storage-state]').length === 3");
       assert.equal(requests.filter(path => path === '/api/mock/storage').length, first + 1);
       await page.evaluate("Array.from(document.querySelectorAll('.storage button')).find(el => el.textContent === '最新の状態を取得').click()");

@@ -94,7 +94,9 @@ reads as configured. Opening the Storage screen always obtains a fresh
 operational snapshot, an explicit refresh control re-reads it without
 navigating away, and returning to the screen does not reuse an earlier
 healthy state, so a backend that later enters `STORAGE_HARD_STOP` cannot stay
-hidden behind a stale `NORMAL`.
+hidden behind a stale `NORMAL`. Re-opening Storage or Recordings drops the
+previous snapshot during render, before the reload is requested, so a re-opened
+screen cannot briefly paint the health or coverage it held last time.
 
 Replacing the provider or retrying the session resets the cached session,
 sources, recordings, storage and pending writes during render rather than in a

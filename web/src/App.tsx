@@ -32,6 +32,7 @@ export function App({ services = deniedServices }: { services?: DashboardService
   const [failedWrites, setFailedWrites] = useState<readonly string[]>([]);
   const [mutations] = useState(() => new MutationQueue());
   const [loadedFor, setLoadedFor] = useState({ services, attempt });
+  const [openedView, setOpenedView] = useState<View>('overview');
   const t = messages[locale];
 
   // Replacing the provider or retrying must not paint the previous session's
@@ -46,6 +47,17 @@ export function App({ services = deniedServices }: { services?: DashboardService
     setView('overview');
     setBusy([]);
     setFailedWrites([]);
+  }
+
+  // Re-opening a screen must not paint the snapshot loaded last time while the
+  // reload is still in flight, so the cached data is dropped during render
+  // rather than in the passive effect that requests the new one.
+  if (openedView !== view) {
+    setOpenedView(view);
+    const stale = <T extends { state: string }>(current: T) =>
+      current.state === 'ready' ? { state: 'loading' as const } : current;
+    if (view === 'recordings') setRecordings(stale);
+    if (view === 'storage') setStorage(stale);
   }
 
   useEffect(() => { document.documentElement.lang = locale; }, [locale]);
