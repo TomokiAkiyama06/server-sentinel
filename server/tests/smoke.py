@@ -25,6 +25,7 @@ import io  # noqa: E402
 from pathlib import Path  # noqa: E402
 import tempfile  # noqa: E402
 
+from app.cameras.registry import ActiveSourceLimitError, CameraRegistry, SourceType  # noqa: E402
 from app.logging import configure_logging  # noqa: E402
 from app.main import create_app  # noqa: E402
 from app.settings import Settings  # noqa: E402
@@ -42,7 +43,16 @@ async def run(scenario):
         if scenario == "normal":
             async with application.router.lifespan_context(application):
                 assert application.state.ready
-                for path in ("/health", "/version", "/openapi.json", "/api/live/synthetic"):
+                registry = CameraRegistry(application.state.database)
+                for _ in range(4):
+                    registry.create_source(source_type=SourceType.LOCAL_UVC, name="Synthetic", enabled=True)
+                try:
+                    registry.create_source(source_type=SourceType.LOCAL_UVC, name="Synthetic", enabled=True)
+                    raise AssertionError("registry exceeded active-source limit")
+                except ActiveSourceLimitError:
+                    pass
+                assert len(registry.list_sources()) == 4
+                for path in ("/health", "/version", "/openapi.json", "/api/live/synthetic", "/api/sources"):
                     messages = await request(application, path)
                     assert messages[0]["status"] == 404
                     assert messages[1]["body"] == b'{"detail":"Not Found"}'
