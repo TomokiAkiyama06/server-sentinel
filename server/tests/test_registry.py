@@ -14,9 +14,9 @@ from app.cameras.registry import (
     ActiveSourceLimitError, CameraRegistry, CaptureProfile, DetectionBinding,
     DetectionKind, HealthState, NotFoundError, RegistryError, SourceType, ValidationError,
 )
-from app.cameras.registry.schema import REGISTRY_MIGRATION
 from app.storage.database import Database
-from app.storage.migrations import BUILTIN_MIGRATIONS, migrate
+from app.storage.migrations import migrate
+from app.storage.schema import APPLICATION_MIGRATIONS
 
 
 class RegistryTests(unittest.TestCase):
@@ -25,7 +25,7 @@ class RegistryTests(unittest.TestCase):
         self.addCleanup(self.directory.cleanup)
         self.database = Database(Path(self.directory.name) / "synthetic.sqlite3")
         with closing(self.database.connect()) as connection:
-            migrate(connection, (*BUILTIN_MIGRATIONS, REGISTRY_MIGRATION))
+            migrate(connection, APPLICATION_MIGRATIONS)
         self.now = datetime(2026, 1, 1, tzinfo=timezone.utc)
         self.registry = CameraRegistry(self.database, clock=lambda: self.now)
 
@@ -320,7 +320,7 @@ class RegistryTests(unittest.TestCase):
                              enabled=True, detection_bindings=(self.binding(),))
         self.registry.set_active_limit(2)
         with closing(self.database.connect()) as connection:
-            migrate(connection, (*BUILTIN_MIGRATIONS, REGISTRY_MIGRATION))
+            migrate(connection, APPLICATION_MIGRATIONS)
         restarted = CameraRegistry(Database(self.database.path))
         self.assertEqual(source, restarted.get_source(source.id))
         self.assertEqual(node, restarted.get_capture_node(node.id))
@@ -331,7 +331,7 @@ class RegistryTests(unittest.TestCase):
         with closing(database.connect()) as connection:
             migrate(connection)
             connection.execute("INSERT INTO application_metadata VALUES ('synthetic', 'preserved')")
-            migrate(connection, (*BUILTIN_MIGRATIONS, REGISTRY_MIGRATION))
+            migrate(connection, APPLICATION_MIGRATIONS)
             self.assertEqual("preserved", connection.execute(
                 "SELECT value FROM application_metadata WHERE key = 'synthetic'"
             ).fetchone()[0])
