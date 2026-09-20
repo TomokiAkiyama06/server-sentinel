@@ -1,5 +1,11 @@
 # Security Policy
 
+The #8 dashboard is a development/test shell, denied by default. Before
+production use, #10 must enforce the two access gates for every API and complete
+asset namespace through the human listener. Do not expose its loopback-only
+preview as a deployment server. Client permission visibility is not a security
+boundary; `web/README.md` records the integration contract.
+
 ## Security philosophy
 
 ServerSentinel handles private video streams, optional owner biometric verification, private-network identities, physical-security events, and persistent recordings.
