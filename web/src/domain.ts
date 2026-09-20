@@ -45,8 +45,9 @@ export type ObservationKind = 'person' | 'motion' | 'owner_entry' | 'owner_exit'
   | 'anonymous_exit' | 'server_movement' | 'camera_tamper' | 'camera_health' | 'node_health'
   | 'recording' | 'storage' | 'presence' | 'configuration';
 export type ObservationValue = 'observed' | 'not_observed' | 'unknown' | 'online' | 'offline'
-  | 'degraded' | 'ready' | 'failed' | 'created' | 'deleted' | 'changed';
-export type Quality = 'sufficient' | 'insufficient' | 'unknown';
+  | 'degraded' | 'manual_intervention_required' | 'revoked' | 'ready' | 'failed' | 'created'
+  | 'deleted' | 'changed';
+export type Quality = 'sufficient' | 'degraded' | 'insufficient' | 'unknown';
 export type PresenceState = 'PRESENT' | 'PROBABLY_PRESENT' | 'ABSENT' | 'UNKNOWN';
 export type PresenceBasis = 'manual_override' | 'owner_observation' | 'hint' | 'unknown';
 

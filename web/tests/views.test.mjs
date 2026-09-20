@@ -17,6 +17,12 @@ const { PresenceBody } = await import('../build/presence.mjs');
 const kinds = ['person', 'motion', 'owner_entry', 'owner_exit', 'anonymous_entry', 'anonymous_exit',
   'server_movement', 'camera_tamper', 'camera_health', 'node_health', 'recording', 'storage',
   'presence', 'configuration'];
+// Mirrors the backend enumerations the timeline projects.
+const values = ['observed', 'not_observed', 'unknown', 'online', 'offline', 'degraded',
+  'manual_intervention_required', 'revoked', 'ready', 'failed', 'created', 'deleted', 'changed'];
+const qualities = ['sufficient', 'degraded', 'insufficient', 'unknown'];
+const states = ['PRESENT', 'PROBABLY_PRESENT', 'ABSENT', 'UNKNOWN'];
+const bases = ['manual_override', 'owner_observation', 'hint', 'unknown'];
 let counter = 0;
 const observation = (kind, overrides = {}) => ({
   id: `generated-observation-${counter += 1}`, kind, value: 'observed',
@@ -163,6 +169,40 @@ test('timeline rows always carry source attribution plus confidence and quality'
   assert.match(timeline(page([]), 'en'), /Confidence is not certainty\./);
 });
 
+test('every projected kind, value, quality, state and basis has a label in both locales', () => {
+  const required = [...kinds.map(kind => `kind_${kind}`), ...values.map(value => `value_${value}`),
+    ...qualities.map(quality => `quality_${quality}`), ...states.map(state => `state_${state}`),
+    ...bases.map(basis => `basis_${basis}`)];
+  for (const locale of ['ja', 'en']) {
+    for (const key of required) {
+      assert.equal(typeof messages[locale][key], 'string', `${locale} is missing ${key}`);
+      assert.ok(messages[locale][key].length > 0, `${locale} has an empty ${key}`);
+    }
+  }
+});
+
+test('health transitions and degraded detector quality render without a blank value', () => {
+  const rows = [
+    observation('camera_health', { value: 'manual_intervention_required', quality: 'unknown', confidence: null }),
+    observation('node_health', { value: 'revoked', quality: 'unknown', confidence: null, source_id: null, node_id: '00000000-0000-4000-8000-0000000012ef' }),
+  ];
+  const markup = timeline(page(rows));
+  assert.match(markup, /カメラ状態の観測: 管理者の確認が必要な状態を観測/);
+  assert.match(markup, /キャプチャノード状態の観測: 失効を観測/);
+  assert.doesNotMatch(markup, /観測: <\/p>|観測: <span/);
+  assert.match(timeline(page(rows), 'en'), /Owner intervention required observed/);
+  assert.match(timeline(page(rows), 'en'), /Revocation observed/);
+  // Degraded detector quality is a real contract value and still fails to unknown.
+  for (const kind of kinds.filter(name => detectorObservation(name))) {
+    assert.equal(displayValue(observation(kind, { value: 'observed', quality: 'degraded' })), 'unknown');
+  }
+  const degraded = timeline(page([observation('person', { value: 'observed', quality: 'degraded' })]));
+  assert.match(degraded, /判定できません/);
+  assert.match(degraded, /品質: 低下/);
+  assert.doesNotMatch(degraded, /確認済み/);
+  assert.equal(displayValue(observation('storage', { value: 'degraded', quality: 'degraded' })), 'degraded');
+});
+
 test('a quality-gated result is never labelled confirmed', () => {
   for (const kind of ['person', 'motion', 'owner_entry', 'server_movement', 'camera_tamper']) {
     for (const quality of ['insufficient', 'unknown']) {
@@ -227,6 +267,20 @@ test('manual override reports precedence, expiry and a cancel affordance', () =>
   const open = presence({ snapshot: snapshot({ basis: 'manual_override' }), transitions: [] }, 'ja', { onCancel: () => undefined });
   assert.match(open, /期限なし（取り消すまで有効）/);
   assert.match(presence({ snapshot: snapshot(), transitions: [] }), /手動上書きはありません。/);
+});
+
+test('suppression that disagrees with the presence state raises an alert, not a causal claim', () => {
+  for (const state of states) {
+    const expected = state === 'PRESENT';
+    const mismatch = presence({ snapshot: snapshot({ state, suppress_ordinary: !expected }), transitions: [] });
+    assert.match(mismatch, /<p class="timeline-degraded" role="alert">通常の occupancy automation の抑制状態が現在の presence state と一致していません。/);
+    assert.doesNotMatch(mismatch, /PRESENT のため通常の occupancy automation を抑制しています。/);
+    assert.doesNotMatch(mismatch, /PRESENT 以外のため通常の occupancy automation は抑制しません。/);
+    assert.match(mismatch, expected ? /報告された抑制状態: 抑制なし/ : /報告された抑制状態: 抑制あり/);
+    const agreed = presence({ snapshot: snapshot({ state, suppress_ordinary: expected }), transitions: [] });
+    assert.doesNotMatch(agreed, /一致していません/);
+    assert.equal(/PRESENT のため通常の occupancy automation を抑制しています。/.test(agreed), expected);
+  }
 });
 
 test('an unarmed critical protection replaces the continuity statement with an alert', () => {

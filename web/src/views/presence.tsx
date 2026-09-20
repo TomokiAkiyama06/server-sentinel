@@ -39,7 +39,12 @@ export function PresenceBody({ report, t, onCancel, failed }: {
       {failed && <p role="alert">{t.overrideFailed}</p>}
     </section>
     <section className="presence-automation" aria-label={t.armedNotification}>
-      <p>{snapshot.suppress_ordinary ? t.suppressOn : t.suppressOff}</p>
+      {snapshot.suppress_ordinary === (snapshot.state === 'PRESENT')
+        ? <p>{snapshot.suppress_ordinary ? t.suppressOn : t.suppressOff}</p>
+        : <>
+          <p className="timeline-degraded" role="alert">{t.suppressMismatch}</p>
+          <p className="muted">{t.suppressReported}: {snapshot.suppress_ordinary ? t.suppressActive : t.suppressInactive}</p>
+        </>}
       {armed ? <p>{t.criticalArmed}</p>
         : <p className="timeline-degraded" role="alert">{t.criticalNotArmed}</p>}
       <dl className="presence-armed-list">

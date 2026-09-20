@@ -40,8 +40,11 @@ neutral text, source/detector attribution and confidence/quality. Unreliable or
 unavailable results stay `unknown`: a quality-gated negative is never shown as
 "no person", and a low-quality detector observation (person, motion, owner and
 anonymous entry/exit, server movement, camera tamper) is never shown as a
-factual detection. Status and configuration events, whose reported state is not
-image-quality gated, keep their value with the quality shown beside it. The ordering statement follows `ordering_basis` while
+factual detection, including the detector contract's `degraded` quality. Status
+and configuration events, whose reported state is not image-quality gated, keep
+their value with the quality shown beside it, and the value labels cover every
+source/node health transition, including `manual_intervention_required` and
+`revoked`. The ordering statement follows `ordering_basis` while
 `ordering_degraded` adds the warning. Clock skew or timestamp discontinuity is
 reported per span and by that ordering notice;
 the UI does not present that order as established causality, cause or
@@ -49,7 +52,9 @@ culpability. A kind filter selects all, people/motion, critical, device and
 recording, or configuration entries. `src/views/presence.tsx` shows the current
 state, its basis, manual-override expiry and cancel affordance, the fact that
 only `PRESENT` suppresses ordinary occupancy automation, and today's
-transitions. The critical-continuity statement is shown only while every
+transitions. When the reported `suppress_ordinary` flag disagrees with the
+reported state, the screen raises a degraded alert with the reported
+suppression instead of a statement that contradicts the state. The critical-continuity statement is shown only while every
 reported `critical_*_armed` flag is true; otherwise the screen raises a degraded
 alert instead of reassuring the Owner.
 
