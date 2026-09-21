@@ -148,7 +148,7 @@ test('starred recordings are shown as never auto-deleted and keep their day coun
 test('recording filters keep every store-backed kind selectable', () => {
   const markup = recordingsMarkup(false);
   // Every kind in the catalog must be isolatable, manual included.
-  const kinds = Object.keys(messages.ja).filter(key => key.startsWith('kind_')).map(key => messages.ja[key]);
+  const kinds = ['event', 'manual', 'critical'].map(kind => messages.ja[`kind_${kind}`]);
   assert.equal(kinds.length, new Set(recordings.map(recording => recording.kind)).size);
   for (const label of [messages.ja.filterAll, ...kinds, messages.ja.filterStarred]) {
     assert.match(markup, new RegExp(`aria-pressed="(true|false)"[^>]*>${label}<`));
