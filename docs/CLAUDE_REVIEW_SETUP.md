@@ -1,6 +1,8 @@
-# Claude PRレビュー初期設定
+# Claude PRレビュー設定
 
-ServerSentinelでは、PRのマージ前に **Codex + Claude の二重レビュー**を必須とします。
+> **現在停止中**: 利用可能なClaudeサブスクリプション枠が尽きているため、GitHub Actions上のClaude PRレビューはOwner判断で一時停止しています。停止中は **Codex + CI** をマージ条件とし、Claudeはマージゲートではありません。`.github/workflows/claude-review.yml` と `.github/workflows/claude-review-fork.yml` は停止期間中削除されています。再有効化する場合は、この文書の安全設計を基にworkflowと運用ゲートを同時に復元してください。
+
+以下はClaudeレビューを再有効化するときの設計・運用リファレンスです。
 
 この仕組みはレビュー品質・事故防止のための運用ゲートです。Issue #4が完了するまでは、same-repository write権限を持つ悪意ある/侵害済みmaintainerに対する完全なrepository-level security boundaryではありません。
 
@@ -108,20 +110,19 @@ Secretへアクセスするthird-party Actionはfull commit SHAへ固定しま�
 
 更新時は上流release/tagとの対応、権限影響、出力/ログの契約を確認します。現在の固定Actionは[execution JSONをrunner tempへ保存](https://github.com/anthropics/claude-code-action/blob/9cdae7f0d995e3ba7c33f226087fdf82a59cd520/base-action/src/execution-file.ts)し、[SDK resultにstructured_outputを保持](https://github.com/anthropics/claude-code-action/blob/9cdae7f0d995e3ba7c33f226087fdf82a59cd520/base-action/src/run-claude-sdk.ts)します。この契約が変わる場合はvalidatorも更新し、raw responseが公開されないことを再検証します。
 
-## 9. 暫定マージ強制モデル
+## 9. 現在の暫定マージ強制モデル
 
-Issue #4完了まではmerge actorが以下を明示確認します。
+Claudeレビュー停止中、Issue #4完了まではmerge actorが以下を明示確認します。
 
-- 両レビューの依頼時に取得した40桁のHEAD/base SHAを、レビュー依頼コメントとPRのレビュー記録へ明記;
+- Codexレビュー依頼時に取得した40桁のHEAD/base SHAを、レビュー依頼コメントとPRのレビュー記録へ明記;
 - Codexにその固定HEAD/base差分を指定して依頼し、完了時とマージ直前に`Reviewed commit`がcurrent HEAD、依頼時に固定したbase SHAがcurrent baseと一致することを照合;
-- Claude runがcurrent HEAD **かつcurrent base** の固定差分を対象に成功;
-- Codex/Claudeの重大/重要が解消;
+- Codexの重大/重要が解消;
 - 必須CI成功;
 - blocking review threadなし.
 
 Codexの`Reviewed commit`だけではbaseを検証できません。依頼時の固定baseの記録と、レビュー完了時・マージ直前のcurrent base照合を必須にします。baseの来歴が確認できないレビューを最終レビューとして採用しません。Issue #4による機械的な強制が完成するまでは、merge actorがこの照合を明示的に行います。
 
-HEADまたはbaseのどちらかが変わったら旧レビューはstaleです。HEADが同じでbaseだけ進んだ場合も、最新の固定HEAD/baseでCodexとClaudeの両方を再実行します。
+HEADまたはbaseのどちらかが変わったら旧Codexレビューはstaleです。Claudeレビューを再有効化した場合は、復元したworkflowの固定HEAD/base要件も再び満たしてください。
 
 ## 10. Issue #4後の強化
 

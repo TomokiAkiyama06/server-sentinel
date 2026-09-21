@@ -37,10 +37,12 @@ For non-trivial changes:
 3. implement/test/document;
 4. open/update PR;
 5. wait for CI;
-6. wait for Codex and Claude review of the current PR **HEAD against the current base/diff context**;
+6. wait for Codex review of the current PR **HEAD against the current base/diff context**;
 7. fix blocking findings and resolve/respond to threads;
-8. rerun reviews after material HEAD/base changes;
+8. rerun the review after material HEAD/base changes;
 9. merge only when gates pass.
+
+Claude PR review is temporarily disabled because the available Claude subscription quota is exhausted. Until the Owner explicitly restores it, Claude is not a merge gate.
 
 Never commit directly to `main`.
 

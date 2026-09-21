@@ -214,16 +214,43 @@ class LocalUvcAdapter:
             session.controller.capture_failed()
             raise
 
+    def stop_source(self, source_id):
+        """Stop one source on the same serialized worker that polls it.
+
+        Removing the cached session releases its durable active-session marker
+        only after capture has closed.  The runtime supervisor must never call
+        this concurrently with ``poll_source`` for the same source.
+        """
+        if not isinstance(source_id, UUID):
+            raise ValueError("invalid source identity")
+        session = self.sessions.pop(source_id, None)
+        if session is None:
+            self._approved_handoffs.pop(source_id, None)
+            return False
+        failures = []
+        try:
+            session.close()
+        except BaseException as error:
+            failures.append(error)
+        try:
+            session.controller.shutdown()
+        except BaseException as error:
+            # A failed release deliberately leaves the recovery marker durable.
+            failures.append(error)
+        self._approved_handoffs.pop(source_id, None)
+        if failures:
+            raise failures[0]
+        return True
+
     def close(self):
         if self.closed:
             return
         self.closed = True
         self._approved_handoffs.clear()
         failures = []
-        for session in self.sessions.values():
+        for source_id in tuple(self.sessions):
             try:
-                session.close()
-                session.controller.shutdown()
+                self.stop_source(source_id)
             except BaseException as error:
                 # Close every source even when one database/health sink fails.
                 # A failed release keeps the already durable recovery marker.
