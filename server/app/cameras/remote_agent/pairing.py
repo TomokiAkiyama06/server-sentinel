@@ -211,6 +211,8 @@ class PairingLedger:
         now = self.clock()
         if not isinstance(now, (float, int)):
             raise PairingValidationError("invalid pairing clock")
+        expired = False
+        claim = None
         with self._transaction(write=True) as connection:
             row = connection.execute(
                 "SELECT node_id, public_key_digest, code_digest, process_epoch, expires_at, state "
@@ -220,18 +222,24 @@ class PairingLedger:
                 raise PairingError("pairing enrollment is unavailable")
             if row["process_epoch"] != str(self.process_epoch) or float(now) >= row["expires_at"]:
                 connection.execute("UPDATE pairing_enrollments SET state = 'expired' WHERE id = ?", (str(enrollment),))
+                expired = True
+            elif not HmacCodeVerifier.matches(row["code_digest"], candidate):
                 raise PairingError("pairing enrollment is unavailable")
-            if not HmacCodeVerifier.matches(row["code_digest"], candidate):
+            elif not hmac.compare_digest(row["public_key_digest"], key_digest):
                 raise PairingError("pairing enrollment is unavailable")
-            if not hmac.compare_digest(row["public_key_digest"], key_digest):
-                raise PairingError("pairing enrollment is unavailable")
-            changed = connection.execute(
-                "UPDATE pairing_enrollments SET state = 'consumed' "
-                "WHERE id = ? AND state = 'pending'", (str(enrollment),)
-            ).rowcount
-            if changed != 1:
-                raise PairingError("pairing enrollment is unavailable")
-            return EnrollmentClaim(enrollment, UUID(row["node_id"]), key_digest)
+            else:
+                changed = connection.execute(
+                    "UPDATE pairing_enrollments SET state = 'consumed' "
+                    "WHERE id = ? AND state = 'pending'", (str(enrollment),)
+                ).rowcount
+                if changed != 1:
+                    raise PairingError("pairing enrollment is unavailable")
+                claim = EnrollmentClaim(enrollment, UUID(row["node_id"]), key_digest)
+        if expired:
+            raise PairingError("pairing enrollment is unavailable")
+        if claim is None:
+            raise PairingStorageError("pairing enrollment state is unavailable")
+        return claim
 
     def activate(self, claim: EnrollmentClaim, *, credential_serial_digest: str) -> None:
         """Activate a signer-produced credential reference after successful issuance.
@@ -263,11 +271,15 @@ class PairingLedger:
         self._authorize(authorizer, actor_context)
         node = _identity(node_id, "node identity")
         with self._transaction(write=True) as connection:
-            changed = connection.execute(
+            credentials = connection.execute(
                 "UPDATE pairing_node_credentials SET state = 'revoked' WHERE node_id = ? AND state = 'active'",
                 (str(node),),
             ).rowcount
-            if changed != 1:
+            enrollments = connection.execute(
+                "UPDATE pairing_enrollments SET state = 'revoked' "
+                "WHERE node_id = ? AND state IN ('pending', 'consumed')", (str(node),),
+            ).rowcount
+            if credentials + enrollments == 0:
                 raise PairingError("capture node is unavailable")
 
     def admits(self, *, node_id: UUID, public_key_digest: str,

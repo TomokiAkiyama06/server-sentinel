@@ -71,6 +71,11 @@ class PairingLedgerTests(unittest.TestCase):
         with self.assertRaises(PairingError):
             self.ledger.redeem(enrollment_id=expired.enrollment_id,
                                public_key_digest=DIGEST_A, code=expired_code.value)
+        with closing(self.database.connect()) as connection:
+            self.assertEqual("expired", connection.execute(
+                "SELECT state FROM pairing_enrollments WHERE id = ?",
+                (str(expired.enrollment_id),),
+            ).fetchone()[0])
 
     def test_restart_invalidates_pending_monotonic_approval(self):
         approval, code = self._approval()
@@ -79,6 +84,14 @@ class PairingLedgerTests(unittest.TestCase):
         with self.assertRaises(PairingError):
             restarted.redeem(enrollment_id=approval.enrollment_id,
                              public_key_digest=DIGEST_A, code=code.value)
+
+    def test_revocation_invalidates_consumed_claim_before_activation(self):
+        approval, code = self._approval()
+        claim = self.ledger.redeem(enrollment_id=approval.enrollment_id,
+                                   public_key_digest=DIGEST_A, code=code.value)
+        self.ledger.revoke(self.owner, "owner", node_id=claim.node_id)
+        with self.assertRaises(PairingError):
+            self.ledger.activate(claim, credential_serial_digest=SERIAL_A)
 
     def test_activation_and_revocation_are_current_authorization(self):
         approval, code = self._approval()
