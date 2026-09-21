@@ -613,7 +613,7 @@ Acceptance:
 - record upstream/model/version, separate code/weight licenses, pinned artifact/checksum, material transitive obligations, and network/telemetry/runtime-download behavior; unclear licensing remains blocked for Owner decision;
 - overload reduces inference while preserving truthful health, critical evidence, and storage safety; no opaque downloads or unapproved model switching.
 
-Implementation progress (Issue #20 remains OPEN): transient CPU motion/plugin primitives and generated-frame inference-cadence/overload tests are present in `server/app/detection/foundation`. A separately licensed RT-DETRv2 CPU adapter has a verified local-artifact synthetic smoke; deployment model settings, target Main Server benchmarks and runtime integration remain unaccepted; see `server/docs/DETECTOR_FOUNDATION.md` and its model audit.
+Implementation progress (Issue #20 remains OPEN): transient CPU motion/plugin primitives and generated-frame inference-cadence/overload tests are present in `server/app/detection/foundation`. A separately licensed RT-DETRv2 CPU adapter has a verified local-artifact synthetic smoke and an operator-run repeated CPU benchmark that reports p50/p95/max latency and replays one-to-four-source cadence/overload from explicit inputs. No target Main Server result or setting is selected by the harness; deployment model settings, target Main Server benchmarks and runtime integration remain unaccepted. See `server/docs/DETECTOR_FOUNDATION.md` and its model audit.
 
 ## Plan 13 — Detector-specific image-quality / low-light gating
 

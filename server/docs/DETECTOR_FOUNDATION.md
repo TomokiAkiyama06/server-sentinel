@@ -163,6 +163,37 @@ cd server
 python -m tests.detector_model_smoke /absolute/operator/model.onnx
 ```
 
+The same approved local artifact can be measured repeatedly with generated
+uniform pixels. Every policy value is required explicitly; the command does
+not choose a deployment threshold, cadence, CPU budget, or source count:
+
+```sh
+cd server
+python -m app.detection.foundation.person_benchmark \
+  --artifact /absolute/operator/model.onnx \
+  --score-threshold <evaluated-threshold> \
+  --intra-op-threads <evaluated-thread-count> \
+  --sources <1-to-4> \
+  --warmup-cycles <count> \
+  --measured-cycles <count> \
+  --capture-interval-ns <interval> \
+  --cadence-ns <initial-cadence> \
+  --maximum-cadence-ns <throttled-ceiling> \
+  --evaluation-budget-ns <budget> \
+  --maximum-queue-age-ns <queue-age> \
+  --maximum-observation-age-ns <observation-age>
+```
+
+Schema version 1 reports aggregate and per-source nearest-rank `p50`, `p95`,
+and maximum evaluation latency in nanoseconds. It also replays the measured
+latencies serially through the existing one-to-four-source scheduler and
+reports active cadence, processed/sampled/dropped counts, pending state,
+health, and the last reason. Capture ticks crossed during one inference are
+admitted before the next simulated worker selection so overload is visible.
+The replay is deterministic performance modelling, not a runtime/hardware
+verification. Output contains the approved digest but never the artifact path
+or frame bytes, and always states `deployment_acceptance: false`.
+
 The weights are not repository fixtures, and neither weights nor real media
 are uploaded as CI artifacts. CI tests use generated arrays and session doubles
 to verify preprocessing, class filtering, finite results, provider restrictions,
