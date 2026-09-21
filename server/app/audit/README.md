@@ -36,12 +36,15 @@ human dashboard listener behind the Owner boundary — never by the capture
 ingest listener — so that an invited `live:view` / `recordings:view` principal
 and a capture-node credential cannot read, alter, or delete audit records.
 
-Hardware baseline inventory/approval is not implemented in this tree. Plan 23
-must call `OwnerAdministration.approve_hardware_baseline()` with its logical
-baseline UUID and a transaction-aware mutation callback. That contract fixes
-the action to `approve_hardware_baseline` and prevents baseline approval from
-committing without its successful audit record; it is not evidence that the
-hardware baseline service or probes already exist.
+Hardware baseline approval runs through
+`OwnerAdministration.approve_integrity_baseline()`, which commits the Issue #23
+integrity store's new baseline and its `approve_hardware_baseline` record on
+the store's own connection, inside the store's storage reservation. The
+underlying `approve_hardware_baseline()` contract stays available for any other
+baseline owner: it takes a fixed logical baseline UUID and a transaction-aware
+mutation callback, and prevents a baseline from committing without its
+successful audit record. The logical ID names the single Main Server baseline
+and carries no hardware serial, device identifier or inventory value.
 
 `RecordingBrowser` in `app/storage/retention.py` performs Owner star/delete
 only through an injected `OwnerAdministration`; without one it refuses with

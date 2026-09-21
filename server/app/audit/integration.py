@@ -7,6 +7,9 @@ from .model import AuditAction, TargetKind
 
 
 ACTIVE_SOURCE_LIMIT_ID = UUID("ed83d8b4-ec44-4e27-b197-8603c03d8fd2")
+# The Main Server holds one approved hardware baseline; this fixed logical ID
+# names it without exposing any hardware serial or device identifier.
+HARDWARE_BASELINE_ID = UUID("6f5f5a2e-3f0e-4a3a-9a4c-2b0f1c7d5e41")
 
 
 class OwnerAdministration:
@@ -102,15 +105,39 @@ class OwnerAdministration:
         adapter.accept_committed_approval(source_id, approved)
         return approved
 
-    def approve_hardware_baseline(self, actor_context, baseline_id, approve_on):
-        """Plan 23 contract: callback mutates its baseline on this transaction."""
+    def approve_hardware_baseline(self, actor_context, baseline_id, approve_on,
+                                  *, connection=None, reservation=None):
+        """Commit a baseline mutation and its audit record in one transaction.
+
+        The callback mutates its baseline on the supplied transaction. A store
+        that owns the database connection passes it with its storage
+        reservation so both writes share one admitted transaction.
+        """
         if not callable(approve_on):
             raise TypeError("baseline approval operation is required")
         return self.service.execute_transactional(
             actor_context, action=AuditAction.APPROVE_HARDWARE_BASELINE,
             target_kind=TargetKind.HARDWARE_BASELINE,
             target_logical_id=baseline_id,
-            operation=lambda connection: approve_on(connection, baseline_id),
+            connection=connection, reservation=reservation,
+            operation=lambda active: approve_on(active, baseline_id),
+        )
+
+    def approve_integrity_baseline(self, actor_context, integrity_store, inventory, *,
+                                   expected_revision, at):
+        """Approve the Main Server hardware baseline through this boundary.
+
+        The new baseline, the integrity store's own approval record and the
+        `approve_hardware_baseline` security audit record commit together on
+        the integrity store's connection, inside its storage admission.
+        """
+        return self.approve_hardware_baseline(
+            actor_context, HARDWARE_BASELINE_ID,
+            lambda connection, _target: integrity_store.approve_on(
+                connection, inventory, expected_revision=expected_revision, at=at,
+            ),
+            connection=integrity_store.db,
+            reservation=integrity_store.control_reservation,
         )
 
     def set_recording_starred(self, actor_context, recording_store,

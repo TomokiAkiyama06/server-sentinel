@@ -46,7 +46,13 @@ omit private values from repr; notifications contain no raw inventory.
 `OwnerApproval.require_owner()` denies by default. Its trusted implementation
 returns a validated application-principal UUID, never a caller-controlled owner
 boolean. Approval checks the expected revision and atomically updates/audits the
-baseline. Polling never updates it. This domain boundary does not decide the
+baseline. `approve_on()` is the only approval primitive and opens no transaction
+of its own: the audited boundary
+`app.audit.integration.OwnerAdministration.approve_integrity_baseline()`
+authorizes the Owner, holds the storage reservation and commits the new
+baseline, its integrity approval row and the `approve_hardware_baseline`
+security audit record in one transaction, so a baseline change cannot commit
+without its durable audit record. Polling never updates it. This domain boundary does not decide the
 pending bootstrap/session/recovery policy or expose a human route.
 
 `IntegrityService.startup()` always compares. The owning worker calls `tick()`
