@@ -37,12 +37,16 @@ class AccessStoreTests(unittest.TestCase):
         return principal, credential
 
     def test_independent_permissions_do_not_imply_each_other(self):
-        self.enroll((Permission.LIVE_VIEW,))
+        live, live_credential = self.enroll((Permission.LIVE_VIEW,))
+        self.store.establish_session(live.id, live_credential.credential_id, b"l" * 32)
+        self.assertEqual(self.store.authorize(b"l" * 32, IDENTITY, Permission.LIVE_VIEW).id, live.id)
+        with self.assertRaises(AccessValidationError):
+            self.store.authorize(b"l" * 32, IDENTITY, Permission.RECORDINGS_VIEW)
+
         principal = self.store.invite("recording@example.invalid", "Synthetic recorder", (Permission.RECORDINGS_VIEW,))
         self.store.issue_enrollment(principal.id, b"r" * 32, NOW + timedelta(minutes=5))
         recorder = self.store.enroll_credential(b"r" * 32, principal.external_identity, b"recording-credential", PUBLIC_KEY, -7, 0)
         self.store.establish_session(principal.id, recorder.credential_id, b"s" * 32)
-        # A recordings-only session cannot open current live media.
         self.assertEqual(self.store.authorize(b"s" * 32, principal.external_identity, Permission.RECORDINGS_VIEW).id, principal.id)
         with self.assertRaises(AccessValidationError):
             self.store.authorize(b"s" * 32, principal.external_identity, Permission.LIVE_VIEW)
