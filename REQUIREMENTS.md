@@ -454,8 +454,10 @@ Cover local UVC and remote-agent discovery, ambiguous identical-device reconnect
 ### DEV-001 No direct main
 Non-trivial work uses Issue -> branch -> PR -> CI/review -> merge.
 
-### DEV-002 Dual automated review
-Codex and Claude must both review the current PR diff. A review is valid only for the current **HEAD and base revision/diff context**. If either HEAD or relevant base changes, the review must be rerun before merge.
+### DEV-002 Automated review
+Codex must review the current PR diff. A review is valid only for the current **HEAD and base revision/diff context**. If either HEAD or relevant base changes, the review must be rerun before merge.
+
+Claude review automation is temporarily disabled because the available subscription quota is exhausted. Until the Owner explicitly restores it, Claude review is not required for merge.
 
 ### DEV-003 No secrets/private deployment data
 Never commit real credentials, private keys, owner biometrics, private deployment values, or real monitoring media.
