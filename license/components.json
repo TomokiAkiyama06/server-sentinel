@@ -15,7 +15,7 @@
     },
     {
       "path": "web/tests/browser.mjs",
-      "sha256": "sha256:387361cbd80c4e4fdae2ca67210248a72adba0a159ea6a981308fa0436e69907"
+      "sha256": "sha256:75ec8547b6811c8944de239d535549bbdfa2e61711801b0a4b723624d4fd96eb"
     },
     {
       "path": "web/tests/chrome.mjs",
@@ -27,11 +27,15 @@
     },
     {
       "path": "web/tests/core.test.mjs",
-      "sha256": "sha256:ccf4c0fd60e55790aa01339f56354050cdeed618ca6d738c18def889b085cd43"
+      "sha256": "sha256:0d4876db47426a989b666f9253cdd67f16fbc05dd0922bc7b69b3f696e2e6331"
     },
     {
       "path": "web/tests/smoke.mjs",
       "sha256": "sha256:c0f2efe915588e007c886ef35a84aff90a3f6c53eb410c226f22fe74dd05900d"
+    },
+    {
+      "path": "web/tests/views.test.mjs",
+      "sha256": "sha256:9e980ce6159fc8f6e93dfac826267b8c1f54583031d53c943a9edbe425378c40"
     }
   ],
   "inputs": [
