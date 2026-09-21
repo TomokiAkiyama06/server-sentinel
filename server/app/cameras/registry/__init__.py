@@ -6,10 +6,12 @@ from .models import (
 )
 from .repository import (
     ActiveSourceLimitError, CameraRegistry, NotFoundError, RegistryError,
+    UnauditedWriteError,
 )
 
 __all__ = [
     "ActiveSourceLimitError", "CameraRegistry", "CameraSource", "CaptureNode",
     "CaptureProfile", "DetectionBinding", "DetectionKind", "NodeHealthState", "SourceHealthState",
-    "NotFoundError", "RegistryError", "SourceType", "ValidationError",
+    "NotFoundError", "RegistryError", "SourceType", "UnauditedWriteError",
+    "ValidationError",
 ]

@@ -28,6 +28,10 @@ class ActiveSourceLimitError(ValidationError):
     """Admission would exceed the configured active-source limit."""
 
 
+class UnauditedWriteError(RuntimeError):
+    """A privileged registry write was attempted outside the audited boundary."""
+
+
 _UNSET = object()
 
 
@@ -76,11 +80,31 @@ class CameraRegistry:
     Each operation owns a fresh connection. Mutations serialize before reading
     admission state. Enabled sources reserve capacity even while offline; health
     never silently removes a source from the configured active collection.
+
+    Privileged configuration writes — creating or changing a source or capture
+    node and changing the active-source limit — commit their own transaction
+    with no authorization, no audit record and no storage admission. A runtime
+    registry therefore refuses them: they must go through the audited Owner
+    boundary `app.audit.integration.OwnerAdministration`, which commits the
+    same mutation together with its durable audit record. Fixture, bootstrap
+    and migration tooling that is explicitly not the runtime may opt in with
+    ``unaudited_writes=True``. Reads and runtime health updates, which are
+    observations rather than Owner decisions, stay available either way.
     """
 
-    def __init__(self, database: Database, *, clock: Callable[[], datetime] | None = None):
+    def __init__(self, database: Database, *, clock: Callable[[], datetime] | None = None,
+                 unaudited_writes: bool = False):
+        if type(unaudited_writes) is not bool:
+            raise ValidationError("invalid registry write mode")
         self.database = database
         self._clock = clock or (lambda: datetime.now(timezone.utc))
+        self.unaudited_writes = unaudited_writes
+
+    def _require_unaudited_writes(self) -> None:
+        if not self.unaudited_writes:
+            raise UnauditedWriteError(
+                "privileged registry writes require the audited owner boundary"
+            )
 
     @contextmanager
     def _transaction(self, *, write=False):
@@ -117,28 +141,55 @@ class CameraRegistry:
             return self._limit(connection)
 
     def set_active_limit(self, limit: int) -> None:
+        """Non-runtime write; the audited boundary owns runtime limit changes."""
+        self._require_unaudited_writes()
         positive_integer(limit, "active source limit")
         with self._transaction(write=True) as connection:
-            active = connection.execute(
-                "SELECT COUNT(*) FROM camera_sources WHERE enabled = 1"
-            ).fetchone()[0]
-            if active > limit:
-                raise ActiveSourceLimitError("active sources exceed requested limit")
-            connection.execute(
-                "UPDATE camera_registry_settings SET max_active_video_sources = ? WHERE id = 1",
-                (limit,),
-            )
+            self.set_active_limit_on(connection, limit)
+
+    # Transactional integration hooks. These are process-internal primitives
+    # with no authorization of their own and no route exposure. A runtime
+    # security/admin change must reach them only through the audited Owner
+    # boundary (`app.audit.integration.OwnerAdministration`), which commits the
+    # mutation together with its audit record; calling one directly would
+    # change privileged configuration without that durable record.
+    def set_active_limit_on(self, connection, limit: int) -> None:
+        """Apply the limit on a caller-owned audited Owner transaction."""
+        positive_integer(limit, "active source limit")
+        active = connection.execute(
+            "SELECT COUNT(*) FROM camera_sources WHERE enabled = 1"
+        ).fetchone()[0]
+        if active > limit:
+            raise ActiveSourceLimitError("active sources exceed requested limit")
+        connection.execute(
+            "UPDATE camera_registry_settings SET max_active_video_sources = ? WHERE id = 1",
+            (limit,),
+        )
 
     def create_capture_node(self, name: str) -> CaptureNode:
-        """Record an independent node identity; this does not pair or authorize it."""
+        """Record an independent node identity; this does not pair or authorize it.
+
+        Non-runtime write: the audited boundary owns runtime node creation.
+        """
+        self._require_unaudited_writes()
         text_value(name, "node name")
-        node_id, now = str(uuid4()), _time(self._clock())
         with self._transaction(write=True) as connection:
-            connection.execute(
-                "INSERT INTO capture_nodes VALUES (?, ?, 'offline', NULL, ?, ?)",
-                (node_id, name, now, now),
-            )
-            return self._node(connection, node_id)
+            return self.create_capture_node_on(connection, uuid4(), name)
+
+    def create_capture_node_on(self, connection, node_id: UUID, name: str) -> CaptureNode:
+        """Create a node on a caller-owned audited Owner transaction.
+
+        The application logical ID is chosen by that boundary so the audit
+        record and the created row identify the same target.
+        """
+        identity = _identity(node_id)
+        text_value(name, "node name")
+        now = _time(self._clock())
+        connection.execute(
+            "INSERT INTO capture_nodes VALUES (?, ?, 'offline', NULL, ?, ?)",
+            (identity, name, now, now),
+        )
+        return self._node(connection, identity)
 
     @staticmethod
     def _node(connection, node_id: str) -> CaptureNode:
@@ -158,20 +209,30 @@ class CameraRegistry:
 
     def update_capture_node(self, node_id: UUID, *, name=_UNSET,
                             health_state=_UNSET, last_seen_at=_UNSET) -> CaptureNode:
-        identity = _identity(node_id)
+        """Non-runtime write; the audited boundary owns runtime node changes."""
+        self._require_unaudited_writes()
         with self._transaction(write=True) as connection:
-            old = self._node(connection, identity)
-            name = old.name if name is _UNSET else text_value(name, "node name")
-            health = old.health_state if health_state is _UNSET else health_state
-            if not isinstance(health, NodeHealthState):
-                raise ValidationError("invalid node health")
-            seen = old.last_seen_at if last_seen_at is _UNSET else last_seen_at
-            connection.execute(
-                "UPDATE capture_nodes SET name = ?, health_state = ?, last_seen_at = ?, "
-                "updated_at = ? WHERE id = ?",
-                (name, health.value, _time(seen), _time(self._clock()), identity),
+            return self.update_capture_node_on(
+                connection, node_id, name=name, health_state=health_state,
+                last_seen_at=last_seen_at,
             )
-            return self._node(connection, identity)
+
+    def update_capture_node_on(self, connection, node_id: UUID, *, name=_UNSET,
+                               health_state=_UNSET, last_seen_at=_UNSET) -> CaptureNode:
+        """Update a node on a caller-owned audited Owner transaction."""
+        identity = _identity(node_id)
+        old = self._node(connection, identity)
+        name = old.name if name is _UNSET else text_value(name, "node name")
+        health = old.health_state if health_state is _UNSET else health_state
+        if not isinstance(health, NodeHealthState):
+            raise ValidationError("invalid node health")
+        seen = old.last_seen_at if last_seen_at is _UNSET else last_seen_at
+        connection.execute(
+            "UPDATE capture_nodes SET name = ?, health_state = ?, last_seen_at = ?, "
+            "updated_at = ? WHERE id = ?",
+            (name, health.value, _time(seen), _time(self._clock()), identity),
+        )
+        return self._node(connection, identity)
 
     @staticmethod
     def _admit(connection, limit: int):
@@ -205,6 +266,24 @@ class CameraRegistry:
                       enabled: bool = False, capabilities: dict | None = None,
                       desired_capture_profile: CaptureProfile | None = None,
                       detection_bindings: tuple[DetectionBinding, ...] = ()) -> CameraSource:
+        """Non-runtime write; the audited boundary owns runtime source creation."""
+        self._require_unaudited_writes()
+        with self._transaction(write=True) as connection:
+            return self.create_source_on(
+                connection, uuid4(), source_type=source_type, name=name,
+                capture_node_id=capture_node_id, role_label=role_label, enabled=enabled,
+                capabilities=capabilities, desired_capture_profile=desired_capture_profile,
+                detection_bindings=detection_bindings,
+            )
+
+    def create_source_on(self, connection, source_id: UUID, *, source_type: SourceType,
+                         name: str, capture_node_id: UUID | None = None,
+                         role_label: str | None = None, enabled: bool = False,
+                         capabilities: dict | None = None,
+                         desired_capture_profile: CaptureProfile | None = None,
+                         detection_bindings: tuple[DetectionBinding, ...] = ()) -> CameraSource:
+        """Create a source on a caller-owned audited Owner transaction."""
+        identity = _identity(source_id)
         if not isinstance(source_type, SourceType):
             raise ValidationError("invalid source type")
         if ((source_type is SourceType.LOCAL_UVC and capture_node_id is not None)
@@ -215,20 +294,19 @@ class CameraRegistry:
             name, role_label, enabled, {} if capabilities is None else capabilities,
             desired_capture_profile, detection_bindings,
         )
-        identity, now = str(uuid4()), _time(self._clock())
-        with self._transaction(write=True) as connection:
-            if node_id is not None:
-                self._node(connection, node_id)
-            if enabled:
-                self._admit(connection, self._limit(connection))
-            connection.execute(
-                "INSERT INTO camera_sources VALUES "
-                "(?, ?, ?, ?, ?, ?, ?, ?, NULL, 'offline', 'unknown', NULL, ?, ?)",
-                (identity, node_id, source_type.value, name, role_label, int(enabled),
-                 caps, desired, now, now),
-            )
-            self._write_bindings(connection, identity, bindings)
-            return self._source(connection, identity)
+        now = _time(self._clock())
+        if node_id is not None:
+            self._node(connection, node_id)
+        if enabled:
+            self._admit(connection, self._limit(connection))
+        connection.execute(
+            "INSERT INTO camera_sources VALUES "
+            "(?, ?, ?, ?, ?, ?, ?, ?, NULL, 'offline', 'unknown', NULL, ?, ?)",
+            (identity, node_id, source_type.value, name, role_label, int(enabled),
+             caps, desired, now, now),
+        )
+        self._write_bindings(connection, identity, bindings)
+        return self._source(connection, identity)
 
     @staticmethod
     def _source(connection, identity) -> CameraSource:
@@ -266,27 +344,42 @@ class CameraRegistry:
     def update_source(self, source_id: UUID, *, name=_UNSET, role_label=_UNSET,
                       enabled=_UNSET, capabilities=_UNSET, desired_capture_profile=_UNSET,
                       detection_bindings=_UNSET) -> CameraSource:
-        """Update metadata/configuration without changing source or node identities."""
-        identity = _identity(source_id)
+        """Update metadata/configuration without changing source or node identities.
+
+        Non-runtime write: the audited boundary owns runtime source changes.
+        """
+        self._require_unaudited_writes()
         with self._transaction(write=True) as connection:
-            old = self._source(connection, identity)
-            name = old.name if name is _UNSET else name
-            role = old.role_label if role_label is _UNSET else role_label
-            active = old.enabled if enabled is _UNSET else enabled
-            caps = old.capabilities if capabilities is _UNSET else capabilities
-            desired = (old.desired_capture_profile if desired_capture_profile is _UNSET
-                       else desired_capture_profile)
-            bindings = old.detection_bindings if detection_bindings is _UNSET else detection_bindings
-            caps, desired, bindings = self._config(name, role, active, caps, desired, bindings)
-            if active and not old.enabled:
-                self._admit(connection, self._limit(connection))
-            connection.execute(
-                "UPDATE camera_sources SET name = ?, role_label = ?, enabled = ?, capabilities = ?, "
-                "desired_capture_profile = ?, updated_at = ? WHERE id = ?",
-                (name, role, int(active), caps, desired, _time(self._clock()), identity),
+            return self.update_source_on(
+                connection, source_id, name=name, role_label=role_label, enabled=enabled,
+                capabilities=capabilities, desired_capture_profile=desired_capture_profile,
+                detection_bindings=detection_bindings,
             )
-            self._write_bindings(connection, identity, bindings)
-            return self._source(connection, identity)
+
+    def update_source_on(self, connection, source_id: UUID, *, name=_UNSET,
+                         role_label=_UNSET, enabled=_UNSET, capabilities=_UNSET,
+                         desired_capture_profile=_UNSET,
+                         detection_bindings=_UNSET) -> CameraSource:
+        """Update a source on a caller-owned audited Owner transaction."""
+        identity = _identity(source_id)
+        old = self._source(connection, identity)
+        name = old.name if name is _UNSET else name
+        role = old.role_label if role_label is _UNSET else role_label
+        active = old.enabled if enabled is _UNSET else enabled
+        caps = old.capabilities if capabilities is _UNSET else capabilities
+        desired = (old.desired_capture_profile if desired_capture_profile is _UNSET
+                   else desired_capture_profile)
+        bindings = old.detection_bindings if detection_bindings is _UNSET else detection_bindings
+        caps, desired, bindings = self._config(name, role, active, caps, desired, bindings)
+        if active and not old.enabled:
+            self._admit(connection, self._limit(connection))
+        connection.execute(
+            "UPDATE camera_sources SET name = ?, role_label = ?, enabled = ?, capabilities = ?, "
+            "desired_capture_profile = ?, updated_at = ? WHERE id = ?",
+            (name, role, int(active), caps, desired, _time(self._clock()), identity),
+        )
+        self._write_bindings(connection, identity, bindings)
+        return self._source(connection, identity)
 
     def update_source_health(self, source_id: UUID, *, health_state: SourceHealthState,
                              negotiated_capture_profile=_UNSET, image_quality_state=_UNSET,

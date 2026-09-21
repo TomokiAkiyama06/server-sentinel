@@ -5,6 +5,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import TestCase
+from unittest.mock import patch
 from uuid import UUID
 import json
 import os
@@ -15,11 +16,18 @@ import sys
 import threading
 from itertools import permutations
 
+from app.audit import (
+    AuditAction, AuditOutcome, AuditStorageError, AuditStore, OwnerAuditService,
+)
+from app.audit.integration import HARDWARE_BASELINE_ID, OwnerAdministration
+from app.audit.schema import audit_migration
+from app.cameras.registry import CameraRegistry
 from app.integrity import probes
 from app.integrity.model import Component, Finding, Inventory, Kind, State, _explained, compare
 from app.integrity.probes import CommandRunner, LinuxProbe, ProbeUnavailable
 from app.integrity.service import IntegrityService
 from app.integrity.store import IntegrityStore, integrity_migration
+from app.storage.database import Database
 from app.storage.migrations import migrate
 
 
@@ -40,6 +48,14 @@ def disk(serial="synthetic-disk-a", *, slot="disk0", size="1000"):
 class Owner:
     def require_owner(self):
         return UUID("00000000-0000-4000-8000-000000000001")
+
+
+class SyntheticOwnerSession:
+    """Stands in for the Issue #6 Owner boundary of the audited facade."""
+
+    def require_owner(self, actor_context):
+        if actor_context != "synthetic-owner":
+            raise PermissionError("not the deployment owner")
 
 
 class CompareTests(TestCase):
@@ -333,12 +349,28 @@ class CompareTests(TestCase):
 
 class StoreTests(TestCase):
     def setUp(self):
-        self.db = sqlite3.connect(":memory:", isolation_level=None)
-        migrate(self.db, (integrity_migration(1),))
+        temporary = TemporaryDirectory(prefix="sentinel-synthetic-integrity-")
+        self.addCleanup(temporary.cleanup)
+        # A file database, because the audited boundary reads the same
+        # deployment database through its own connection.
+        self.database = Database(Path(temporary.name) / "integrity.sqlite")
+        self.db = self.database.connect()
+        migrate(self.db, (integrity_migration(1), audit_migration(2)))
         self.addCleanup(self.db.close)
         self.reserved = False
         self.denied = False
         self.store = IntegrityStore(self.db, reservation=self.reservation, max_pending_events=8)
+        self.audit = AuditStore(self.database, reservation=self.store.control_reservation)
+        self.administration = OwnerAdministration(
+            OwnerAuditService(self.audit, SyntheticOwnerSession()),
+            CameraRegistry(self.database),
+        )
+
+    def approve(self, inventory, *, expected_revision, at=NOW, actor="synthetic-owner"):
+        """Approve exactly as the runtime does: through the audited boundary."""
+        return self.administration.approve_integrity_baseline(
+            actor, self.store, inventory, expected_revision=expected_revision, at=at,
+        )
 
     @contextmanager
     def reservation(self):
@@ -353,21 +385,73 @@ class StoreTests(TestCase):
 
     def test_approval_denies_by_default(self):
         with self.assertRaises(PermissionError):
-            self.store.approve(Inventory((disk(),)), expected_revision=0, at=NOW)
+            self.approve(Inventory((disk(),)), expected_revision=0)
         self.assertEqual(self.store.baseline(), (0, None))
+        # The refused approval is itself recorded as a failed Owner operation.
+        self.assertEqual([AuditOutcome.FAILED],
+                         [record.outcome for record in self.audit.list_records()])
 
     def test_approval_audited_atomic_and_revision_checked(self):
         self.store.approval = Owner()
-        self.assertEqual(self.store.approve(Inventory((disk(),)), expected_revision=0, at=NOW), 1)
+        self.assertEqual(self.approve(Inventory((disk(),)), expected_revision=0), 1)
         with self.assertRaises(ValueError):
-            self.store.approve(Inventory(()), expected_revision=0, at=NOW)
+            self.approve(Inventory(()), expected_revision=0)
         self.assertEqual(self.store.baseline(), (1, Inventory((disk(),))))
         self.assertEqual(self.db.execute("SELECT COUNT(*) FROM integrity_audit").fetchone()[0], 1)
         self.assertNotIn("synthetic-disk", str(tuple(self.db.execute("SELECT * FROM integrity_audit").fetchone())))
+        # The security/admin audit log records the same approval and its
+        # stale-revision failure, with no hardware identifier.
+        records = self.audit.list_records()
+        self.assertEqual([(AuditAction.APPROVE_HARDWARE_BASELINE, AuditOutcome.FAILED),
+                          (AuditAction.APPROVE_HARDWARE_BASELINE, AuditOutcome.SUCCEEDED)],
+                         [(record.action, record.outcome) for record in records])
+        self.assertEqual({HARDWARE_BASELINE_ID},
+                         {record.target_logical_id for record in records})
+        stored = str([tuple(row) for row in self.db.execute(
+            "SELECT * FROM security_admin_audit_records"
+        )])
+        self.assertNotIn("synthetic-disk", stored)
+        self.assertNotIn("disk0", stored)
+
+    def test_baseline_never_commits_without_its_security_audit_record(self):
+        self.store.approval = Owner()
+        with patch.object(self.audit, "append_on",
+                          side_effect=AuditStorageError("synthetic unavailable")):
+            with self.assertRaises(AuditStorageError):
+                self.approve(Inventory((disk(),)), expected_revision=0)
+        # The approved baseline rolled back with its missing audit record.
+        self.assertEqual(self.store.baseline(), (0, None))
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM integrity_audit").fetchone()[0], 0)
+        self.assertFalse(self.db.in_transaction)
+        self.assertFalse(self.reserved)
+
+    def test_baseline_approval_is_refused_outside_the_audited_transaction(self):
+        self.store.approval = Owner()
+        with self.assertRaisesRegex(RuntimeError, "INTEGRITY_DATABASE_BUSY"):
+            self.store.approve_on(self.db, Inventory((disk(),)), expected_revision=0, at=NOW)
+        other = self.database.connect()
+        self.addCleanup(other.close)
+        other.execute("BEGIN IMMEDIATE")
+        try:
+            with self.assertRaisesRegex(RuntimeError, "INTEGRITY_DATABASE_BUSY"):
+                self.store.approve_on(other, Inventory((disk(),)), expected_revision=0, at=NOW)
+        finally:
+            other.execute("ROLLBACK")
+        self.assertEqual(self.store.baseline(), (0, None))
+        self.assertEqual((), self.audit.list_records())
+
+    def test_non_owner_cannot_change_the_baseline_and_is_audited(self):
+        self.store.approval = Owner()
+        with self.assertRaises(PermissionError):
+            self.approve(Inventory((disk(),)), expected_revision=0,
+                         actor={"synthetic": "not-owner"})
+        self.assertEqual(self.store.baseline(), (0, None))
+        self.assertEqual([AuditOutcome.DENIED],
+                         [record.outcome for record in self.audit.list_records()])
 
     def test_drift_does_not_rewrite_and_failed_sink_retains_fault(self):
         self.store.approval = Owner()
-        self.store.approve(Inventory((disk(),)), expected_revision=0, at=NOW)
+        self.approve(Inventory((disk(),)), expected_revision=0)
         findings = compare(self.store.baseline()[1], Inventory(()))
         self.store.record(findings, NOW)
         def broken(*args):
@@ -480,7 +564,7 @@ class StoreTests(TestCase):
     def test_python_autocommit_true_closes_reserved_success_and_failure_transactions(self):
         self.db.autocommit = True
         self.store.approval = Owner()
-        self.store.approve(Inventory((disk(),)), expected_revision=0, at=NOW)
+        self.approve(Inventory((disk(),)), expected_revision=0)
         self.store.record(compare(None, Inventory(())), NOW)
         self.assertFalse(self.db.in_transaction)
         self.db.execute("CREATE TRIGGER fail_outbox BEFORE INSERT ON integrity_outbox "
@@ -501,7 +585,7 @@ class StoreTests(TestCase):
                 writes.append(self.reserved)
         self.db.set_trace_callback(observe)
         self.store.approval = Owner()
-        self.store.approve(Inventory((disk(),)), expected_revision=0, at=NOW)
+        self.approve(Inventory((disk(),)), expected_revision=0)
         self.store.record(compare(self.store.baseline()[1], Inventory(())), NOW)
         self.store.deliver(lambda *args: self.assertFalse(self.reserved))
         self.assertTrue(writes)
