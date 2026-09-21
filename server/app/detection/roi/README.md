@@ -11,10 +11,12 @@ timestamp. A policy is refused when a bounded search window cannot reach its
 own displacement threshold, because such a configuration cannot express the
 movement or camera shift it asks for and would report a matching geometry
 instead. A calibration is refused for the same reason when its own support
-leaves no *pure* translation at or beyond a threshold above `minimum_coverage`,
-since the policy radius alone does not say which candidates survive the
-coverage gate, and a quarter turn does not register a pixel shift even when it
-carries a translation of its own.
+leaves any axis direction without a *pure* translation at or beyond a
+threshold above `minimum_coverage`, since the policy radius alone does not say
+which candidates survive the coverage gate, a quarter turn does not register a
+pixel shift even when it carries a translation of its own, and support against
+one edge can register a shift one way while the opposite shift of the same
+size has no eligible candidate at all.
 A calibration whose reference already meets the obscured-scene threshold is
 refused too: every unchanged sample would look obscured and confirm a tamper
 that never happened. `CalibrationArchive` is a small append-only SQLite port: the Main
@@ -44,7 +46,11 @@ duration of corroborating samples. An explicit ROI-occlusion signal, sampling
 gap, stream restart, regression, mismatched frame, or insufficient movement
 quality resets confirmation and yields `unknown`, never `no movement`. A
 sample the detector refuses outright, such as a frame belonging to another
-source, ends the episode too, so no later confirmation spans it. Every stream
+source, ends the episode too, so no later confirmation spans it. When only the
+metadata of an identified sample is unusable, its stream, sequence and clock
+are still recorded, and a refused source-loss report keeps a valid outage
+clock, so a buffered earlier frame cannot start an episode behind either
+refusal. Every stream
 this source has replaced is remembered for the detector's lifetime, so a
 delayed frame from a stream it already left is refused as stale imagery rather
 than becoming current again, and no number of later replacements lets an old

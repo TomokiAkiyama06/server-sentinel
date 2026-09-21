@@ -634,9 +634,10 @@ A calibration policy whose bounded search window cannot reach its own movement
 or camera-shift threshold is refused: such a configuration cannot express the
 displacement it asks to detect and would report a matching geometry instead. A
 calibration is refused as well when its own support leaves no translating
-pure translation at or beyond a threshold above the coverage minimum, since a
-quarter turn does not register a pixel shift even when it carries a
-translation, or when its reference
+pure translation at or beyond a threshold above the coverage minimum in every
+axis direction, since a quarter turn does not register a pixel shift even when
+it carries a translation and one direction does not stand for its opposite, or
+when its reference
 already meets the obscured-scene threshold, since every unchanged sample would
 then confirm a tamper that never happened.
 
@@ -649,7 +650,9 @@ returns `unknown` and resets confirmation; none is converted into a trustworthy
 no-movement result. A refused sample, such as a frame from another source, ends
 the episode as well, so no later confirmation spans it, and the observed stream,
 sequence and clock advance before any such result so that a buffered frame from
-a superseded geometry cannot re-enter confirmation. Every replaced stream is
+a superseded geometry cannot re-enter confirmation. An identified sample whose
+metadata alone is unusable, and a refused source-loss report carrying a valid
+outage clock, advance that progression too. Every replaced stream is
 retained for the detector's lifetime, so a delayed frame from a stream the
 source has already left is refused as stale imagery instead of becoming current
 again, and no number of later replacements restores an old identity. The number

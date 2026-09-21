@@ -359,18 +359,64 @@ class SceneDetectorTests(unittest.TestCase):
             self.assertEqual(Observation.UNKNOWN, result.movement)
             self.assertFalse(result.critical)
 
+    def test_malformed_metadata_still_consumes_the_sample(self):
+        moved = transformed(pixels(), (1, 0), region=(4, 4, 8, 7))
+        instance = detector()
+        inspect_scene(instance, frame(0), 0)
+        with self.assertRaises(ValueError):
+            inspect_scene(instance, frame(2, moved), 20, occluded="maybe")
+        buffered = inspect_scene(instance, frame(1, moved), 30)
+        self.assertEqual("clock_or_sequence_regression", buffered.movement_reason)
+        later = inspect_scene(instance, frame(3, moved), 40)
+        self.assertEqual(Observation.UNKNOWN, later.movement)
+        self.assertEqual("awaiting_confirmation", later.movement_reason)
+        self.assertFalse(buffered.critical)
+        self.assertFalse(later.critical)
+
+    def test_rejected_source_loss_keeps_a_valid_outage_clock(self):
+        moved = transformed(pixels(), (1, 0), region=(4, 4, 8, 7))
+        instance = detector()
+        inspect_scene(instance, frame(0), 0)
+        with self.assertRaises(ValueError):
+            instance.source_lost(monotonic_ns=50, observed_at=NOW, health_signal_trusted="yes")
+        before = inspect_scene(instance, frame(1, moved), 20)
+        self.assertEqual("clock_or_sequence_regression", before.movement_reason)
+        self.assertFalse(before.critical)
+        after = inspect_scene(instance, frame(2, moved), 60)
+        self.assertEqual(Observation.UNKNOWN, after.movement)
+        self.assertFalse(after.critical)
+
+    def test_translation_reachability_requires_every_direction(self):
+        """Support against one edge registers one way but not the other."""
+        instance = detector()
+        reference = instance.calibration.reference
+        support = [(WIDTH - 1, y) for y in range(HEIGHT)]
+        leftward = Transform(-1, 0, 0)
+        rightward = Transform(1, 0, 0)
+        self.assertGreaterEqual(coverage(support, leftward, instance.frame_center, WIDTH, HEIGHT),
+                                instance.policy.minimum_coverage)
+        self.assertLess(coverage(support, rightward, instance.frame_center, WIDTH, HEIGHT),
+                        instance.policy.minimum_coverage)
+        self.assertFalse(instance._reachable(support, [leftward, rightward],
+                                             instance.frame_center, 1, reference))
+
     def test_translation_reachability_ignores_a_rotated_candidate(self):
         """The threshold is a pixel shift, so only a pure translation counts."""
         instance = detector()
         reference = instance.calibration.reference
         support = [(WIDTH - 1, 5)]
-        translated = Transform(1, 0, 0)
+        usable = [Transform(-1, 0, 0), Transform(0, 1, 0), Transform(0, -1, 0)]
+        rightward = Transform(1, 0, 0)
         rotated = Transform(1, 0, 2)
-        self.assertLess(coverage(support, translated, instance.frame_center, WIDTH, HEIGHT),
-                        instance.policy.minimum_coverage)
-        self.assertGreaterEqual(coverage(support, rotated, instance.frame_center, WIDTH, HEIGHT),
-                                instance.policy.minimum_coverage)
-        self.assertFalse(instance._reachable(support, [translated, rotated],
+        minimum = instance.policy.minimum_coverage
+        for transform in usable + [rotated]:
+            self.assertGreaterEqual(
+                coverage(support, transform, instance.frame_center, WIDTH, HEIGHT), minimum)
+        self.assertLess(coverage(support, rightward, instance.frame_center, WIDTH, HEIGHT),
+                        minimum)
+        # Only the rotated candidate can carry the rightward direction here, so
+        # crediting it would accept a calibration that cannot register a shift.
+        self.assertFalse(instance._reachable(support, usable + [rightward, rotated],
                                              instance.frame_center, 1, reference))
 
     def test_stream_history_exhaustion_latches_for_every_later_sample(self):

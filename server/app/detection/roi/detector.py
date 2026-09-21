@@ -131,19 +131,27 @@ class SceneDetector:
         self.tamper = _Confirmation()
 
     def _reachable(self, points, transforms, center, threshold, reference):
-        """Does a pure translation at the threshold survive the coverage gate?
+        """Can a threshold shift be registered whichever way the scene moves?
 
-        Rotation does not substitute for one, not even combined with a
-        translation: a real camera shift of that size arrives unrotated, so a
-        rotated candidate surviving the coverage gate says nothing about
-        whether that shift can be registered and compensated.
+        Rotation does not substitute for a translation: a real camera shift of
+        that size arrives unrotated, so a rotated candidate surviving the
+        coverage gate says nothing about whether that shift can be registered
+        and compensated. Neither does one direction stand for the others. With
+        support against one edge, a leftward candidate can pass while the
+        rightward shift of the same size has no eligible registration at all,
+        so every axis direction is required.
         """
+        remaining = {(1, 0), (-1, 0), (0, 1), (0, -1)}
         for transform in transforms:
             if transform.rotated or transform.dx ** 2 + transform.dy ** 2 < threshold ** 2:
                 continue
-            if coverage(points, transform, center, reference.width,
-                        reference.height) >= self.policy.minimum_coverage:
-                return True
+            reached = {(x, y) for x, y in remaining
+                       if transform.dx * x + transform.dy * y >= threshold}
+            if reached and coverage(points, transform, center, reference.width,
+                                    reference.height) >= self.policy.minimum_coverage:
+                remaining -= reached
+                if not remaining:
+                    return True
         return False
 
     def _interrupt(self):
@@ -177,31 +185,52 @@ class SceneDetector:
         return (result is not None and result.error <= self.policy.maximum_match_error
                 and result.margin >= self.policy.minimum_match_margin)
 
-    def _accept(self, frame, monotonic_ns, observed_at, movement_quality, tamper_quality,
-                roi_occluded):
-        observed_at = timestamp(observed_at)
+    def _identify(self, frame, monotonic_ns):
+        """Is this a sample of this source on a usable clock?"""
         if type(monotonic_ns) is not int or monotonic_ns < 0:
             raise ValueError("observation clock must be monotonic nanoseconds")
+        if not isinstance(frame, GrayFrame) or frame.source_id != self.calibration.source_id:
+            raise ValueError("frame does not belong to this calibration")
+
+    def _describe(self, observed_at, movement_quality, tamper_quality, roi_occluded):
+        """Validate the metadata that accompanies an identified sample."""
+        observed_at = timestamp(observed_at)
         if not isinstance(movement_quality, Quality) or not isinstance(tamper_quality, Quality):
             raise ValueError("detector-specific quality is required")
         if roi_occluded is not None and type(roi_occluded) is not bool:
             raise ValueError("occlusion context must be explicit")
-        if not isinstance(frame, GrayFrame) or frame.source_id != self.calibration.source_id:
-            raise ValueError("frame does not belong to this calibration")
         return observed_at
+
+    def _consume(self, frame, monotonic_ns):
+        """Record a refused sample the source has nonetheless moved past.
+
+        The sample itself is unusable, but it existed: leaving the watermark
+        behind would let an older buffered frame start an episode that a later
+        frame completes across the refusal.
+        """
+        if self.stream_id == frame.stream_id and frame.sequence > self.last_sequence:
+            self.last_sequence = frame.sequence
+        self.last_ns = max(self.last_ns, monotonic_ns)
 
     def inspect(self, frame: GrayFrame, *, monotonic_ns: int, observed_at,
                 movement_quality: Quality, tamper_quality: Quality,
                 roi_occluded: bool | None = None):
         try:
-            observed_at = self._accept(frame, monotonic_ns, observed_at, movement_quality,
-                                       tamper_quality, roi_occluded)
+            self._identify(frame, monotonic_ns)
         except Exception:
-            # A refused sample breaks continuity exactly as a missing one does.
-            # Ending confirmation here stops a later confirmed observation from
-            # spanning a frame this detector never evaluated, such as one that
-            # belongs to a different source.
+            # Not identifiable as this source's sample on a usable clock, so
+            # there is no progression to record. Continuity still ends: a later
+            # confirmation must not span a frame this detector never evaluated.
             self._interrupt()
+            raise
+        try:
+            observed_at = self._describe(observed_at, movement_quality, tamper_quality,
+                                         roi_occluded)
+        except Exception:
+            # The sample is identified and only its metadata is unusable, so
+            # its progression is recorded before the refusal propagates.
+            self._interrupt()
+            self._consume(frame, monotonic_ns)
             raise
         c = self.calibration
         if self.exhausted:
@@ -349,15 +378,21 @@ class SceneDetector:
                                  relative_transform=relative, critical=tuple(critical))
 
     def source_lost(self, *, monotonic_ns: int, observed_at, health_signal_trusted: bool):
+        clock = type(monotonic_ns) is int and monotonic_ns >= 0
         try:
             observed_at = timestamp(observed_at)
-            if type(monotonic_ns) is not int or monotonic_ns < 0 or type(health_signal_trusted) is not bool:
+            if not clock or type(health_signal_trusted) is not bool:
                 raise ValueError("invalid source-health observation")
         except Exception:
             # A health observation this detector cannot accept still marks an
             # outage it could not evaluate, so the episode ends here too rather
-            # than letting a later sample confirm across it.
+            # than letting a later sample confirm across it. When the outage
+            # clock itself was valid, it is kept as well: a frame timestamped
+            # before the outage would otherwise start a fresh episode that a
+            # later frame completes straight across it.
             self._interrupt()
+            if clock:
+                self.last_ns = max(self.last_ns, monotonic_ns)
             raise
         self._interrupt()
         if self.exhausted:
