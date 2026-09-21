@@ -935,6 +935,28 @@ class ContainerImageGateTests(GateFixture):
             "FROM build\n")
         self.assertEqual(license_gate.audit(self.root), (1, 1, 0, 1))
 
+    def test_container_build_rejects_remote_add_sources(self):
+        """ADD must not fetch an untracked dependency or model at build time."""
+        self.add_container()
+        for source in (
+                "https://example.test/person.onnx",
+                "git://example.test/repository.git",
+                "git@example.test:owner/repository.git"):
+            with self.subTest(source=source):
+                self.write(
+                    "Dockerfile.ci",
+                    "FROM demo/base:1.0@" + IMAGE_DIGEST + "\n"
+                    f"ADD {source} /app/artifact\n")
+                with self.assertRaisesRegex(
+                        license_gate.GateError, "remote ADD source is not reviewed"):
+                    license_gate.audit(self.root)
+
+        self.write(
+            "Dockerfile.ci",
+            "FROM demo/base:1.0@" + IMAGE_DIGEST + "\n"
+            "ADD local-artifact.txt /app/artifact.txt\n")
+        self.assertEqual(license_gate.audit(self.root), (1, 1, 0, 1))
+
     def test_image_redistribution_requires_an_owner_decision(self):
         self.add_container()
         self.images[0]["distribution"] = "redistributed"
@@ -983,6 +1005,20 @@ class ContainerImageGateTests(GateFixture):
         self.write("requirements-prod.in", "unreviewed==9.9.9 --hash=" + DIGEST + "\n")
         with self.assertRaisesRegex(license_gate.GateError, "input set differs"):
             license_gate.audit(self.root)
+
+    def test_container_build_rejects_commands_outside_the_allowlist(self):
+        """A package manager cannot bypass review by using an unknown name."""
+        self.add_container(
+            "FROM demo/base:1.0@" + IMAGE_DIGEST + "\n"
+            "RUN apt-get install curl\n")
+        with self.assertRaisesRegex(license_gate.GateError, "unreviewed build command"):
+            license_gate.audit(self.root)
+
+        self.write("Dockerfile.ci",
+                   "FROM demo/base:1.0@" + IMAGE_DIGEST + "\n"
+                   "RUN node scripts/build.mjs\n"
+                   "RUN tsc --noEmit\n")
+        self.assertEqual(license_gate.audit(self.root), (1, 1, 0, 1))
 
     def test_container_build_must_use_a_lock_driven_npm_command(self):
         """npm install aliases and option-first forms must not slip through."""

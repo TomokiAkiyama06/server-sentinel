@@ -172,6 +172,11 @@ SHELL_LITERAL = re.compile(r"[A-Za-z0-9._:/=@,+-]+")
 SHELL_ARGUMENT = re.compile(r"[A-Za-z0-9._:/=@,+*?\[\]-]+")
 MAX_TEXT_SCAN_BYTES = 16 * 1024 * 1024
 REJECTED_PACKAGE_MANAGERS = {"bun", "npx", "pnpm", "yarn"}
+# Commands accepted in reviewed container builds and package scripts when they
+# are not one of the dependency installers handled below. Keeping this list
+# closed prevents a newly introduced package manager (for example apt-get)
+# from being mistaken for an unrelated command.
+ALLOWED_BUILD_EXECUTABLES = {"node", "tsc"}
 SOURCE_SCAN_SUFFIXES = {".py", ".pyi"}
 
 
@@ -592,6 +597,11 @@ def container_file(path: Path, relative: str, scope: str):
             if len(positional) == 3:
                 stages.add(positional[2].lower())
         elif instruction in {"COPY", "ADD"}:
+            if instruction == "ADD":
+                positional = [word for word in arguments if not word.startswith("--")]
+                for source in positional[:-1]:
+                    if "://" in source or source.lstrip("[\"'").startswith("git@"):
+                        raise GateError(f"remote ADD source is not reviewed in {relative}")
             for word in arguments:
                 if not word.startswith("--from="):
                     continue
@@ -708,11 +718,14 @@ def run_commands(arguments, relative, scripts=None):
     scripts = scripts if scripts is not None else set()
     for command in re.split(r"&&|;|\|+", " ".join(arguments)):
         words = shell_tokens(command)
+        if not words:
+            continue
         for position, word in enumerate(words):
             expression = (SHELL_ARGUMENT if position and not word.startswith("-")
                           else SHELL_LITERAL)
             if not expression.fullmatch(word):
                 raise GateError(f"unreviewed shell syntax in {relative}")
+        classified = False
         for index, word in enumerate(words):
             name = PurePosixPath(word).name
             if name in REJECTED_PACKAGE_MANAGERS:
@@ -720,10 +733,14 @@ def run_commands(arguments, relative, scripts=None):
             if name == "npm":
                 if npm_command(words, index + 1, relative) in NPM_SCRIPT_COMMANDS:
                     scripts.add(relative)
+                classified = True
                 break
             if PIP_BINARY.fullmatch(name):
                 requirements.extend(pip_command(words, index + 1, relative))
+                classified = True
                 break
+        if not classified and PurePosixPath(words[0]).name not in ALLOWED_BUILD_EXECUTABLES:
+            raise GateError(f"unreviewed build command in {relative}")
     return requirements
 
 
