@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import pwd
 import subprocess
 import shutil
 import stat
@@ -15,7 +16,8 @@ from unittest.mock import patch
 from uuid import uuid4
 
 from build_artifact import build
-from install import MAX_ARTIFACT_BYTES, install, read_artifact, render_unit
+from install import (MAX_ARTIFACT_BYTES, install, read_artifact, release_metadata,
+                     render_unit)
 from media_capture_agent.cli import main
 from media_capture_agent.config import ConfigurationError, Settings, MAX_CONFIGURATION_BYTES
 from media_capture_agent.health import ClockExchange, assess_clock
@@ -476,6 +478,31 @@ raise SystemExit(1)
 
 
 class DistributionTests(DeploymentCase):
+    def _release_fixture(self):
+        destination = self.root / "installation"
+        destination.mkdir()
+        config = self.root / "deployment.json"
+        value = dataclasses.asdict(self.settings)
+        for key in ("node_id", "runtime_root", "media_root"):
+            value[key] = str(value[key])
+        for key in ("mount_point", "filesystem_root"):
+            value["expected_mount"][key] = str(value["expected_mount"][key])
+        config.write_text(json.dumps(value))
+        config.chmod(0o600)
+        unit = self.root / "media-capture-agent.service"
+
+        def arguments(version, operation):
+            artifact = self.root / ("artifact-" + version)
+            build(artifact, version=version,
+                  source_commit=("a" if version == "0.1.0" else "b") * 40)
+            return argparse.Namespace(
+                artifact=artifact, config=config, version=version, destination=destination,
+                video_device=[], unit=unit, operation=operation,
+                sha256=hashlib.sha256(artifact.read_bytes()).hexdigest(),
+            )
+
+        return destination, unit, arguments
+
     def test_ci_container_context_is_allow_listed(self):
         rules = (Path(__file__).parents[1] / ".dockerignore").read_text(encoding="utf-8")
         self.assertIn("\n*\n", "\n" + rules)
@@ -486,7 +513,7 @@ class DistributionTests(DeploymentCase):
         version = self.root / "installation" / "0.1.0"
         version.mkdir(parents=True)
         artifact = version / "media-capture-agent"
-        digest = build(artifact)
+        digest = build(artifact, version="0.1.0", source_commit="a" * 40)
         self.assertEqual(len(digest), 64)
         result = subprocess.run([sys.executable, str(artifact), "--help"], capture_output=True,
                                 text=True, check=True, cwd="/")
@@ -564,7 +591,7 @@ raise SystemExit(1)
         config.write_text(json.dumps(value))
         config.chmod(0o600)
         artifact = self.root / "bounded-artifact"
-        artifact.write_bytes(b"synthetic-artifact-not-executed")
+        build(artifact, version="0.1.0", source_commit="a" * 40)
         args = argparse.Namespace(artifact=artifact, config=Path(os.path.relpath(config)), version="0.1.0",
                                   destination=destination, video_device=[],
                                   unit=self.root / "media-capture-agent.service",
@@ -582,8 +609,222 @@ raise SystemExit(1)
             os.umask(previous)
         self.assertEqual((destination / "0.1.0").stat().st_mode & 0o777, 0o755)
         self.assertEqual((destination / "0.1.0/media-capture-agent").stat().st_mode & 0o777, 0o555)
+        self.assertEqual(os.readlink(destination / "current"), "0.1.0")
         self.assertEqual(preflight.call_args.args[0][2], str(config.absolute()))
         self.assertIn(str(config.absolute()), args.unit.read_text(encoding="utf-8"))
+        self.assertIn(str(destination / "current/media-capture-agent"),
+                      args.unit.read_text(encoding="utf-8"))
+
+    def test_release_provenance_is_bound_to_verified_artifact(self):
+        artifact = self.root / "media-capture-agent"
+        digest = build(artifact, version="1.2.3", source_commit="a" * 40)
+        self.assertEqual(len(digest), 64)
+        metadata = release_metadata(artifact.read_bytes(), "1.2.3")
+        self.assertEqual(metadata["source_commit"], "a" * 40)
+        with self.assertRaisesRegex(ValueError, "provenance"):
+            build(self.root / "invalid-artifact", version="1.2.3", source_commit="0" * 40)
+        with self.assertRaisesRegex(ValueError, "provenance"):
+            release_metadata(artifact.read_bytes(), "1.2.4")
+
+    def test_explicit_update_and_rollback_switch_only_release_pointers(self):
+        destination = self.root / "installation"
+        destination.mkdir()
+        config = self.root / "deployment.json"
+        value = dataclasses.asdict(self.settings)
+        for key in ("node_id", "runtime_root", "media_root"):
+            value[key] = str(value[key])
+        for key in ("mount_point", "filesystem_root"):
+            value["expected_mount"][key] = str(value["expected_mount"][key])
+        config.write_text(json.dumps(value))
+        config.chmod(0o600)
+        unit = self.root / "media-capture-agent.service"
+
+        def arguments(version, operation):
+            artifact = self.root / ("artifact-" + version)
+            build(artifact, version=version, source_commit=("a" if version == "0.1.0" else "b") * 40)
+            return argparse.Namespace(
+                artifact=artifact, config=config, version=version, destination=destination,
+                video_device=[], unit=unit, operation=operation,
+                sha256=hashlib.sha256(artifact.read_bytes()).hexdigest(),
+            )
+
+        with patch("install.os.geteuid", return_value=0), patch(
+                "install.protected_parent"), patch("install.subprocess.run"):
+            install(arguments("0.1.0", "install"))
+            install(arguments("0.2.0", "update"))
+            self.assertEqual(os.readlink(destination / "current"), "0.2.0")
+            self.assertEqual(os.readlink(destination / "previous"), "0.1.0")
+            # Runtime/config/media are external and update never rewrites them.
+            original_config = config.read_bytes()
+            install(argparse.Namespace(operation="rollback", destination=destination))
+            self.assertEqual(os.readlink(destination / "current"), "0.1.0")
+            self.assertEqual(os.readlink(destination / "previous"), "0.2.0")
+            self.assertEqual(config.read_bytes(), original_config)
+
+    def test_update_preflight_failure_does_not_leave_staged_release(self):
+        destination, unit, arguments = self._release_fixture()
+        with patch("install.os.geteuid", return_value=0), patch(
+                "install.protected_parent"), patch("install.subprocess.run"):
+            install(arguments("0.1.0", "install"))
+            unit.unlink()
+            with self.assertRaisesRegex(ValueError, "service configuration differs"):
+                install(arguments("0.2.0", "update"))
+        self.assertFalse((destination / "0.2.0").exists())
+
+    def test_update_rejects_unavailable_current_before_staging(self):
+        destination, _unit, arguments = self._release_fixture()
+        with patch("install.os.geteuid", return_value=0), patch(
+                "install.protected_parent"), patch("install.subprocess.run"):
+            install(arguments("0.1.0", "install"))
+            (destination / "current").unlink()
+            (destination / "current").symlink_to("9.9.9")
+            with self.assertRaisesRegex(ValueError, "release is unavailable"):
+                install(arguments("0.2.0", "update"))
+        self.assertEqual(os.readlink(destination / "current"), "9.9.9")
+        self.assertFalse((destination / "previous").exists())
+        self.assertFalse((destination / "0.2.0").exists())
+
+    def test_release_install_syncs_files_and_directories(self):
+        destination, unit, arguments = self._release_fixture()
+        real_fsync = os.fsync
+        synced = []
+
+        def record_fsync(descriptor):
+            synced.append(Path(f"/proc/self/fd/{descriptor}").resolve(strict=True))
+            real_fsync(descriptor)
+
+        with patch("install.os.geteuid", return_value=0), patch(
+                "install.protected_parent"), patch("install.subprocess.run"), patch(
+                "install.os.fsync", side_effect=record_fsync):
+            install(arguments("0.1.0", "install"))
+
+        expected = {
+            destination / "0.1.0/media-capture-agent",
+            destination / "0.1.0",
+            destination,
+            unit,
+            unit.parent,
+        }
+        self.assertTrue(expected.issubset(set(synced)))
+
+    def test_update_adopts_exact_legacy_pinned_unit(self):
+        destination = self.root / "installation"
+        destination.mkdir()
+        config = self.root / "deployment.json"
+        value = dataclasses.asdict(self.settings)
+        for key in ("node_id", "runtime_root", "media_root"):
+            value[key] = str(value[key])
+        for key in ("mount_point", "filesystem_root"):
+            value["expected_mount"][key] = str(value["expected_mount"][key])
+        config.write_text(json.dumps(value))
+        config.chmod(0o600)
+        unit = self.root / "media-capture-agent.service"
+
+        def arguments(version, operation):
+            artifact = self.root / ("artifact-" + version)
+            build(artifact, version=version,
+                  source_commit=("a" if version == "0.1.0" else "b") * 40)
+            return argparse.Namespace(
+                artifact=artifact, config=config, version=version, destination=destination,
+                video_device=[], unit=unit, operation=operation,
+                sha256=hashlib.sha256(artifact.read_bytes()).hexdigest(),
+            )
+
+        with patch("install.os.geteuid", return_value=0), patch(
+                "install.protected_parent"), patch("install.subprocess.run"):
+            install(arguments("0.1.0", "install"))
+            # Reproduce the exact layout emitted by the pre-lifecycle installer.
+            (destination / "current").unlink()
+            legacy = render_unit(destination / "0.1.0/media-capture-agent", config,
+                                 self.settings, pwd.getpwuid(self.settings.service_uid).pw_name,
+                                 pwd.getpwuid(self.settings.service_uid).pw_gid, [])
+            unit.write_text(legacy, encoding="utf-8")
+            install(arguments("0.2.0", "update"))
+
+        self.assertEqual(os.readlink(destination / "current"), "0.2.0")
+        self.assertEqual(os.readlink(destination / "previous"), "0.1.0")
+        self.assertIn(str(destination / "current/media-capture-agent"),
+                      unit.read_text(encoding="utf-8"))
+
+    def test_legacy_adoption_rejects_modified_unit_without_changing_layout(self):
+        destination = self.root / "installation"
+        destination.mkdir()
+        config = self.root / "deployment.json"
+        value = dataclasses.asdict(self.settings)
+        for key in ("node_id", "runtime_root", "media_root"):
+            value[key] = str(value[key])
+        for key in ("mount_point", "filesystem_root"):
+            value["expected_mount"][key] = str(value["expected_mount"][key])
+        config.write_text(json.dumps(value))
+        config.chmod(0o600)
+        unit = self.root / "media-capture-agent.service"
+
+        def arguments(version, operation):
+            artifact = self.root / ("artifact-" + version)
+            build(artifact, version=version,
+                  source_commit=("a" if version == "0.1.0" else "b") * 40)
+            return argparse.Namespace(
+                artifact=artifact, config=config, version=version, destination=destination,
+                video_device=[], unit=unit, operation=operation,
+                sha256=hashlib.sha256(artifact.read_bytes()).hexdigest(),
+            )
+
+        with patch("install.os.geteuid", return_value=0), patch(
+                "install.protected_parent"), patch("install.subprocess.run"):
+            install(arguments("0.1.0", "install"))
+            (destination / "current").unlink()
+            legacy = render_unit(destination / "0.1.0/media-capture-agent", config,
+                                 self.settings, pwd.getpwuid(self.settings.service_uid).pw_name,
+                                 pwd.getpwuid(self.settings.service_uid).pw_gid, [])
+            unit.write_text(legacy + "# local change\n", encoding="utf-8")
+            before = unit.read_bytes()
+            with self.assertRaisesRegex(ValueError, "cannot be adopted"):
+                install(arguments("0.2.0", "update"))
+
+        self.assertFalse((destination / "current").exists())
+        self.assertFalse((destination / "previous").exists())
+        self.assertFalse((destination / "0.2.0").exists())
+        self.assertEqual(unit.read_bytes(), before)
+
+    def test_uncertain_pointer_recovery_retains_new_release(self):
+        destination = self.root / "installation"
+        destination.mkdir()
+        config = self.root / "deployment.json"
+        value = dataclasses.asdict(self.settings)
+        for key in ("node_id", "runtime_root", "media_root"):
+            value[key] = str(value[key])
+        for key in ("mount_point", "filesystem_root"):
+            value["expected_mount"][key] = str(value["expected_mount"][key])
+        config.write_text(json.dumps(value))
+        config.chmod(0o600)
+        unit = self.root / "media-capture-agent.service"
+
+        def arguments(version, operation):
+            artifact = self.root / ("artifact-" + version)
+            build(artifact, version=version, source_commit=("a" if version == "0.1.0" else "b") * 40)
+            return argparse.Namespace(
+                artifact=artifact, config=config, version=version, destination=destination,
+                video_device=[], unit=unit, operation=operation,
+                sha256=hashlib.sha256(artifact.read_bytes()).hexdigest(),
+            )
+
+        with patch("install.os.geteuid", return_value=0), patch(
+                "install.protected_parent"), patch("install.subprocess.run"):
+            install(arguments("0.1.0", "install"))
+            from install import _set_pointer
+            calls = 0
+
+            def interrupted(*args):
+                nonlocal calls
+                calls += 1
+                if calls in {2, 3}:
+                    raise OSError("synthetic pointer failure")
+                return _set_pointer(*args)
+
+            with patch("install._set_pointer", side_effect=interrupted), self.assertRaisesRegex(
+                    ValueError, "restoration"):
+                install(arguments("0.2.0", "update"))
+        self.assertTrue((destination / "0.2.0/media-capture-agent").is_file())
 
     def test_checkout_named_agent_accepts_external_sibling_data(self):
         component = self.root / "agent" / "agent"

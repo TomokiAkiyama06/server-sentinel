@@ -6,19 +6,21 @@ import { compile } from './compile.mjs';
 await compile('src/api.ts', 'build/api.mjs');
 await compile('src/domain.ts', 'build/domain.mjs');
 await compile('src/i18n.ts', 'build/i18n.mjs');
+await compile('src/shared/mutations.ts', 'build/mutations.mjs');
 const { createApiClient, ApiError } = await import('../build/api.mjs');
 const { canVisit, deniedServices, views } = await import('../build/domain.mjs');
 const { messages } = await import('../build/i18n.mjs');
+const { MutationQueue } = await import('../build/mutations.mjs');
 const origin = 'https://server-sentinel.test';
 const decode = value => {
   if (typeof value !== 'object' || value === null || !Array.isArray(value.items)) throw new Error('private response');
   return value.items;
 };
 
-test('default session denies access to all eight sections without a provider', async () => {
+test('default session denies access to all nine sections without a provider', async () => {
   const session = await deniedServices.loadSession(new AbortController().signal);
   assert.deepEqual(session, { state: 'denied' });
-  assert.equal(views.length, 8);
+  assert.equal(views.length, 9);
   for (const view of views) assert.equal(canVisit(session, view), false);
 });
 
@@ -28,7 +30,7 @@ test('view permissions remain independent; viewer never gains owner metadata', (
     assert.equal(canVisit(session, 'live'), permissions.includes('live:view'));
     assert.equal(canVisit(session, 'recordings'), permissions.includes('recordings:view'));
     assert.equal(canVisit(session, 'timeline'), permissions.includes('recordings:view'));
-    for (const view of ['sources', 'nodes', 'presence', 'access']) assert.equal(canVisit(session, view), false);
+    for (const view of ['sources', 'nodes', 'presence', 'access', 'storage']) assert.equal(canVisit(session, view), false);
   }
 });
 
@@ -90,4 +92,55 @@ test('production assets contain no test provider or runtime remote imports', asy
   assert.doesNotMatch(html, /https?:\/\//);
   assert.doesNotMatch(bundle, /\/api\/mock|synthetic-source|tests\/harness|import\s*\(\s*['"]https?:/);
   for (const name of ['react', 'react-dom', 'scheduler']) assert.match(await readFile(`dist/${name}-LICENSE.txt`, 'utf8'), /MIT License/);
+});
+
+test('a repeated mutation on the same recording is refused while one is in flight', async () => {
+  const queue = new MutationQueue();
+  const runs = [];
+  let release;
+  const blocked = new Promise(resolve => { release = resolve; });
+  const outcomes = [];
+  assert.equal(queue.start('recording-a', signal => { runs.push(['a', signal]); return blocked; }, outcome => outcomes.push(outcome)), true);
+  assert.equal(queue.start('recording-a', () => { assert.fail('second write must not run'); }, () => assert.fail('no settle')), false);
+  assert.equal(queue.has('recording-a'), true);
+  assert.deepEqual(queue.pending, ['recording-a']);
+  // A different recording is independent and not blocked by the first.
+  assert.equal(queue.start('recording-b', () => Promise.resolve(), outcome => outcomes.push(outcome)), true);
+  assert.deepEqual(queue.pending, ['recording-a', 'recording-b']);
+  release();
+  await blocked;
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(outcomes.sort(), ['done', 'done']);
+  assert.deepEqual(queue.pending, []);
+  assert.equal(runs.length, 1);
+  // Once settled the same recording can be mutated again.
+  assert.equal(queue.start('recording-a', () => Promise.resolve(), () => {}), true);
+});
+
+test('aborting a replaced session cancels mutations without reporting failure', async () => {
+  const queue = new MutationQueue();
+  const outcomes = [];
+  let release;
+  const blocked = new Promise(resolve => { release = resolve; });
+  let observed;
+  queue.start('recording-a', signal => { observed = signal; return blocked; }, outcome => outcomes.push(outcome));
+  assert.equal(observed.aborted, false);
+  queue.abortAll();
+  assert.equal(observed.aborted, true);
+  assert.deepEqual(queue.pending, []);
+  release();
+  await blocked;
+  await new Promise(resolve => setImmediate(resolve));
+  // Aborted work is neither a fresh result nor an error banner.
+  assert.deepEqual(outcomes, ['aborted']);
+});
+
+test('a rejected mutation settles as failed and frees the recording', async () => {
+  const queue = new MutationQueue();
+  const outcomes = [];
+  queue.start('recording-a', () => Promise.reject(new Error('synthetic private detail')), outcome => outcomes.push(outcome));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(outcomes, ['failed']);
+  assert.deepEqual(queue.pending, []);
+  assert.equal(queue.start('recording-a', () => Promise.resolve(), () => {}), true);
 });

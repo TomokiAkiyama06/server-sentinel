@@ -1,11 +1,29 @@
 import { Component, useEffect, useState, type ReactNode } from 'react';
-import { canVisit, deniedServices, views, type CameraSourceSummary, type DashboardServices, type Session, type View } from './domain';
+import { flushSync } from 'react-dom';
+import { canVisit, deniedServices, views, type CameraSourceSummary, type DashboardServices, type RecordingSummary, type Session, type StorageSummary, type View } from './domain';
 import { messages, type Locale } from './i18n';
+import { RecordingsView } from './recordings/view';
+import { StorageView } from './setup/storage';
+import { MutationQueue } from './shared/mutations';
 import { PresenceScreen } from './views/presence';
 import { TimelineScreen } from './views/timeline';
 
 type Access = { state: 'loading' | 'failed' } | Session;
 type Sources = { state: 'loading' | 'failed' | 'pending' } | { state: 'ready'; items: readonly CameraSourceSummary[] };
+type Recordings = { state: 'loading' | 'failed' | 'pending' } | { state: 'ready'; items: readonly RecordingSummary[] };
+/** One write whose server-side result is unknown.
+ *
+ *  A rejected write may still be applied by the server afterwards, and
+ *  `DashboardServices` offers no operation id and no causal ordering between a
+ *  write and a later read, so no list snapshot can prove what became of it.
+ *  The marker therefore survives reloads and is only resolved by a terminal
+ *  outcome the client actually observed — a later successful write to the same
+ *  recording — or by the owner acknowledging that they checked. */
+type WriteFailure = { id: string };
+/** Drop a loaded snapshot so a pending reload cannot keep painting the old answer. */
+const stale = <T extends { state: string }>(current: T) =>
+  current.state === 'ready' ? { state: 'loading' as const } : current;
+type Storage = { state: 'loading' | 'failed' | 'pending' } | { state: 'ready'; item: StorageSummary };
 
 /** Deliberately no external reporter, error details, or automatic retry loop. */
 class LocalBoundary extends Component<{ children: ReactNode; message: string }, { failed: boolean }> {
@@ -20,15 +38,48 @@ export function App({ services = deniedServices }: { services?: DashboardService
   const [locale, setLocale] = useState<Locale>('ja');
   const [access, setAccess] = useState<Access>({ state: 'loading' });
   const [sources, setSources] = useState<Sources>({ state: 'pending' });
+  const [recordings, setRecordings] = useState<Recordings>({ state: 'pending' });
+  const [storage, setStorage] = useState<Storage>({ state: 'pending' });
   const [view, setView] = useState<View>('overview');
   const [attempt, setAttempt] = useState(0);
+  const [refresh, setRefresh] = useState(0);
+  const [busy, setBusy] = useState<readonly string[]>([]);
+  const [failures, setFailures] = useState<readonly WriteFailure[]>([]);
+  const [mutations] = useState(() => new MutationQueue());
+  const [loadedFor, setLoadedFor] = useState({ services, attempt });
+  const [openedView, setOpenedView] = useState<View>('overview');
   const t = messages[locale];
+
+  // Replacing the provider or retrying must not paint the previous session's
+  // data for even one commit, so the reset happens during render rather than in
+  // a passive effect that runs after the browser already has the old rows.
+  if (loadedFor.services !== services || loadedFor.attempt !== attempt) {
+    setLoadedFor({ services, attempt });
+    setAccess({ state: 'loading' });
+    setSources({ state: 'pending' });
+    setRecordings({ state: 'pending' });
+    setStorage({ state: 'pending' });
+    setView('overview');
+    setBusy([]);
+    setFailures([]);
+  }
+
+  // Re-opening a screen must not paint the snapshot loaded last time while the
+  // reload is still in flight, so the cached data is dropped during render
+  // rather than in the passive effect that requests the new one.
+  if (openedView !== view) {
+    setOpenedView(view);
+    if (view === 'recordings') setRecordings(stale);
+    if (view === 'storage') setStorage(stale);
+  }
 
   useEffect(() => { document.documentElement.lang = locale; }, [locale]);
   useEffect(() => {
     const controller = new AbortController();
     setAccess({ state: 'loading' });
     setSources({ state: 'pending' });
+    setRecordings({ state: 'pending' });
+    setStorage({ state: 'pending' });
     setView('overview');
     void (async () => {
       try {
@@ -53,9 +104,85 @@ export function App({ services = deniedServices }: { services?: DashboardService
     return () => controller.abort();
   }, [services, attempt]);
 
+  // Historical recording metadata follows `recordings:view`; the server repeats
+  // the check and no client state can widen it.
+  useEffect(() => {
+    const loader = services.loadRecordings;
+    // Recording coverage can change from active to gapped or interrupted after
+    // sign-in. Re-opening the list must obtain the current server snapshot.
+    if (!loader || access.state !== 'allowed' || !canVisit(access, 'recordings') || view !== 'recordings') return;
+    const controller = new AbortController();
+    setRecordings({ state: 'loading' });
+    void (async () => {
+      try {
+        const items = await loader(controller.signal);
+        // A snapshot is not an answer about a write whose outcome is unknown,
+        // so loading the list never resolves a marker.
+        if (!controller.signal.aborted) setRecordings({ state: 'ready', items });
+      } catch {
+        if (!controller.signal.aborted) setRecordings({ state: 'failed' });
+      }
+    })();
+    return () => controller.abort();
+  }, [services, access, refresh, view]);
+
+  useEffect(() => {
+    const loader = services.loadStorage;
+    // This is operational state, not an immutable setup record. Load it only
+    // for an owner actively opening Storage so re-entry samples current policy
+    // and sticky backend faults instead of retaining an old healthy snapshot.
+    if (!loader || access.state !== 'allowed' || access.role !== 'owner' || view !== 'storage') return;
+    const controller = new AbortController();
+    setStorage({ state: 'loading' });
+    void (async () => {
+      try {
+        const item = await loader(controller.signal);
+        if (!controller.signal.aborted) setStorage({ state: 'ready', item });
+      } catch {
+        if (!controller.signal.aborted) setStorage({ state: 'failed' });
+      }
+    })();
+    return () => controller.abort();
+  }, [services, access, refresh, view]);
+
+  useEffect(() => {
+    setBusy(current => current.length ? [] : current);
+    setFailures(current => current.length ? [] : current);
+    return () => mutations.abortAll();
+  }, [services, access, attempt, mutations]);
+
   const session: Session = access.state === 'allowed' ? access : { state: 'denied' };
   const selected = canVisit(session, view) ? view : 'overview';
   const hint = `${selected}Hint` as const;
+  const star = services.starRecording;
+  const remove = services.deleteRecording;
+  const mutate = (id: string, run: (signal: AbortSignal) => Promise<void>) => {
+    if (!mutations.start(id, run, outcome => {
+      setBusy(mutations.pending);
+      // A failed write is not a failed read: keep the loaded list and report
+      // the write separately. An aborted mutation belongs to a replaced
+      // session and is neither a result nor an error.
+      // Per recording: one write succeeding never clears another's unknown
+      // result, and an aborted write belongs to a replaced session.
+      if (outcome === 'done') {
+        // Drop the list in the same commit: a deleted row must not stay
+        // interactive, and a star must not keep showing its previous state,
+        // while the reload this triggers is still in flight.
+        setRecordings(stale);
+        setFailures(current => current.filter(failure => failure.id !== id));
+        setRefresh(value => value + 1);
+      } else if (outcome === 'failed') {
+        setFailures(current => current.some(failure => failure.id === id) ? current : [...current, { id }]);
+      }
+    })) return;
+    setBusy(mutations.pending);
+  };
+  // Owner-only star/delete; rendered only when the authorized provider exists.
+  const actions = session.state === 'allowed' && session.role === 'owner' && star && remove ? {
+    star: (recording: RecordingSummary) =>
+      mutate(recording.id, signal => star(recording.id, !recording.starred, signal)),
+    remove: (recording: RecordingSummary) => mutate(recording.id, signal => remove(recording.id, signal)),
+  } : undefined;
 
   return <div className="shell">
     <a className="skip-link" href="#main">{t.skip}</a>
@@ -91,7 +218,25 @@ export function App({ services = deniedServices }: { services?: DashboardService
               {sources.items.length === 0 && <p>{t.noSources}</p>}
             </> : selected === 'sources' && sources.state === 'failed' ? <p role="alert">{t.sourcesUnavailable}</p>
               : selected === 'sources' && sources.state === 'loading' ? <p role="status">{t.checking}</p>
-                : <section className="placeholder"><span className="placeholder-mark" aria-hidden="true">◇</span><h2>{t[selected]}</h2><p>{t.foundation}</p></section>}
+              : selected === 'recordings' && recordings.state === 'ready'
+                ? <RecordingsView t={t} recordings={recordings.items} owner={access.role === 'owner'} actions={actions} busy={busy}
+                    failedWrites={failures.map(failure => failure.id)}
+                    onReload={() => { setRecordings(stale); setRefresh(value => value + 1); }}
+                    onDismiss={() => setFailures([])} />
+                : selected === 'recordings' && recordings.state === 'failed'
+                  ? <section className="notice" role="alert"><p>{t.recordingsUnavailable}</p>
+                    {failures.length > 0 && <p data-write-failed="true">{t.actionFailed}</p>}
+                    <button className="primary" onClick={() => setRefresh(value => value + 1)}>{t.retry}</button></section>
+                  : selected === 'recordings' && recordings.state === 'loading' ? <p role="status">{t.checking}</p>
+                    : selected === 'storage' && access.role === 'owner' && storage.state === 'ready'
+                      ? <StorageView t={t} storage={storage.item} onRefresh={() => {
+                          flushSync(() => setStorage(stale));
+                          setRefresh(value => value + 1);
+                        }} />
+                      : selected === 'storage' && storage.state === 'failed'
+                        ? <section className="notice" role="alert"><p>{t.storageUnavailable}</p><button className="primary" onClick={() => setRefresh(value => value + 1)}>{t.retry}</button></section>
+                        : selected === 'storage' && storage.state === 'loading' ? <p role="status">{t.checking}</p>
+                          : <section className="placeholder"><span className="placeholder-mark" aria-hidden="true">◇</span><h2>{t[selected]}</h2><p>{t.foundation}</p></section>}
           </>}
         </LocalBoundary>
       </main>
