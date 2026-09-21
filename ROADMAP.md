@@ -149,6 +149,8 @@ worker adapter with disposable-file cleanup/recovery tests. Authorization,
 actual codec/source wiring, notifications and physical acceptance remain open;
 see the integrity and media/health module READMEs.
 
+- [x] Owner decision for capture-node bootstrap trust/CLI enrollment (Accepted ADR-0006, #13; pairing adapter/listener remains unimplemented);
+
 - [ ] exact agent->main transport;
 - [ ] exact main->browser live transport/target latency;
 - [ ] room-overview capture/record/inference/view defaults after benchmark;
