@@ -25,7 +25,7 @@ function filterLabel(t: Catalog, filter: Filter): string {
 }
 
 export function RecordingsView({ t, recordings, owner = false, actions, busy = [],
-                                 failedWrites = [], onReload }: {
+                                 failedWrites = [], onReload, onDismiss }: {
   t: Catalog;
   recordings: readonly RecordingSummary[];
   owner?: boolean;
@@ -33,6 +33,7 @@ export function RecordingsView({ t, recordings, owner = false, actions, busy = [
   busy?: readonly string[];
   failedWrites?: readonly string[];
   onReload?: (() => void) | undefined;
+  onDismiss?: (() => void) | undefined;
 }) {
   const [filter, setFilter] = useState<Filter>('all');
   const [playing, setPlaying] = useState<string | null>(null);
@@ -47,6 +48,7 @@ export function RecordingsView({ t, recordings, owner = false, actions, busy = [
     {failed.size > 0 && <div className="write-alert" role="alert">
       <p>{t.actionFailed}</p>
       {onReload && <button type="button" className="primary" onClick={onReload}>{t.retry}</button>}
+      {onDismiss && <button type="button" onClick={onDismiss}>{t.dismissUnknown}</button>}
     </div>}
     <div className="filters" role="group" aria-label={t.filterLabel}>
       {filters.map(item => <button key={item} type="button" aria-pressed={filter === item}

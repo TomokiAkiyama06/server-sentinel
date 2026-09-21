@@ -91,6 +91,21 @@ test('an in-flight mutation disables that row\'s owner controls only', () => {
   assert.doesNotMatch(recordingsMarkup(true, { actions }), /<button[^>]*disabled/);
 });
 
+test('an unknown write result offers reload and acknowledgement, and claims neither settles it', () => {
+  const markup = recordingsMarkup(true, {
+    actions, failedWrites: ['synthetic-recording-1'], onReload() {}, onDismiss() {},
+  });
+  assert.match(markup, new RegExp(`<button[^>]*>${messages.ja.retry}</button>`));
+  assert.match(markup, new RegExp(`<button[^>]*>${messages.ja.dismissUnknown}</button>`));
+  // The wording must not promise that reloading resolves the unknown result.
+  assert.ok(messages.ja.actionFailed.includes('再読み込みしてもこの結果は確定しない'));
+  assert.ok(messages.en.actionFailed.includes('Reloading the list cannot settle that'));
+  // Without the handlers neither control is offered.
+  const bare = recordingsMarkup(true, { actions, failedWrites: ['synthetic-recording-1'] });
+  assert.equal(bare.includes(messages.ja.dismissUnknown), false);
+  assert.match(bare, /class="write-alert" role="alert"/);
+});
+
 test('a failed write is reported without discarding the loaded list', () => {
   const markup = recordingsMarkup(true, { actions, failedWrites: ['synthetic-recording-1'] });
   // Only the recording whose write failed is flagged.

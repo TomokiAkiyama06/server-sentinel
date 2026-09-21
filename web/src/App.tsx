@@ -1,4 +1,4 @@
-import { Component, useEffect, useRef, useState, type ReactNode } from 'react';
+import { Component, useEffect, useState, type ReactNode } from 'react';
 import { canVisit, deniedServices, views, type CameraSourceSummary, type DashboardServices, type RecordingSummary, type Session, type StorageSummary, type View } from './domain';
 import { messages, type Locale } from './i18n';
 import { RecordingsView } from './recordings/view';
@@ -8,10 +8,15 @@ import { MutationQueue } from './shared/mutations';
 type Access = { state: 'loading' | 'failed' } | Session;
 type Sources = { state: 'loading' | 'failed' | 'pending' } | { state: 'ready'; items: readonly CameraSourceSummary[] };
 type Recordings = { state: 'loading' | 'failed' | 'pending' } | { state: 'ready'; items: readonly RecordingSummary[] };
-/** One write whose server-side result is unknown. The sequence number says when
- *  it was raised, so a reload only answers for the failures that preceded it —
- *  a retry of the same recording raises a newer one that must survive. */
-type WriteFailure = { id: string; seq: number };
+/** One write whose server-side result is unknown.
+ *
+ *  A rejected write may still be applied by the server afterwards, and
+ *  `DashboardServices` offers no operation id and no causal ordering between a
+ *  write and a later read, so no list snapshot can prove what became of it.
+ *  The marker therefore survives reloads and is only resolved by a terminal
+ *  outcome the client actually observed — a later successful write to the same
+ *  recording — or by the owner acknowledging that they checked. */
+type WriteFailure = { id: string };
 /** Drop a loaded snapshot so a pending reload cannot keep painting the old answer. */
 const stale = <T extends { state: string }>(current: T) =>
   current.state === 'ready' ? { state: 'loading' as const } : current;
@@ -37,7 +42,6 @@ export function App({ services = deniedServices }: { services?: DashboardService
   const [refresh, setRefresh] = useState(0);
   const [busy, setBusy] = useState<readonly string[]>([]);
   const [failures, setFailures] = useState<readonly WriteFailure[]>([]);
-  const failureSeq = useRef(0);
   const [mutations] = useState(() => new MutationQueue());
   const [loadedFor, setLoadedFor] = useState({ services, attempt });
   const [openedView, setOpenedView] = useState<View>('overview');
@@ -105,19 +109,13 @@ export function App({ services = deniedServices }: { services?: DashboardService
     // sign-in. Re-opening the list must obtain the current server snapshot.
     if (!loader || access.state !== 'allowed' || !canVisit(access, 'recordings') || view !== 'recordings') return;
     const controller = new AbortController();
-    // This reload can only answer for failures raised before it began. A write
-    // failing while the request is in flight may have happened after the server
-    // took its snapshot, including a retry of a recording that was already
-    // marked, so anything stamped later must survive until a later reload.
-    const answered = failureSeq.current;
     setRecordings({ state: 'loading' });
     void (async () => {
       try {
         const items = await loader(controller.signal);
-        if (!controller.signal.aborted) {
-          setRecordings({ state: 'ready', items });
-          setFailures(current => current.filter(failure => failure.seq > answered));
-        }
+        // A snapshot is not an answer about a write whose outcome is unknown,
+        // so loading the list never resolves a marker.
+        if (!controller.signal.aborted) setRecordings({ state: 'ready', items });
       } catch {
         if (!controller.signal.aborted) setRecordings({ state: 'failed' });
       }
@@ -171,10 +169,7 @@ export function App({ services = deniedServices }: { services?: DashboardService
         setFailures(current => current.filter(failure => failure.id !== id));
         setRefresh(value => value + 1);
       } else if (outcome === 'failed') {
-        // A repeat failure replaces the earlier marker with a newer stamp so an
-        // already running reload cannot claim to have answered for it.
-        const seq = (failureSeq.current += 1);
-        setFailures(current => [...current.filter(failure => failure.id !== id), { id, seq }]);
+        setFailures(current => current.some(failure => failure.id === id) ? current : [...current, { id }]);
       }
     })) return;
     setBusy(mutations.pending);
@@ -220,7 +215,9 @@ export function App({ services = deniedServices }: { services?: DashboardService
               : selected === 'sources' && sources.state === 'loading' ? <p role="status">{t.checking}</p>
               : selected === 'recordings' && recordings.state === 'ready'
                 ? <RecordingsView t={t} recordings={recordings.items} owner={access.role === 'owner'} actions={actions} busy={busy}
-                    failedWrites={failures.map(failure => failure.id)} onReload={() => { setRecordings(stale); setRefresh(value => value + 1); }} />
+                    failedWrites={failures.map(failure => failure.id)}
+                    onReload={() => { setRecordings(stale); setRefresh(value => value + 1); }}
+                    onDismiss={() => setFailures([])} />
                 : selected === 'recordings' && recordings.state === 'failed'
                   ? <section className="notice" role="alert"><p>{t.recordingsUnavailable}</p>
                     {failures.length > 0 && <p data-write-failed="true">{t.actionFailed}</p>}

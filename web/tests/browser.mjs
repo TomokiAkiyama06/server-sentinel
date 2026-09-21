@@ -287,13 +287,23 @@ try {
       assert.deepEqual(await page.evaluate("Array.from(document.querySelectorAll('[data-write-failed=\"true\"]')).map(el => el.dataset.recordingId)"),
         ['synthetic-recording-0', 'synthetic-recording-1']);
       assert.equal(await page.evaluate("document.querySelectorAll('.write-alert').length"), 1);
-      // Re-opening the list obtains an authoritative snapshot, so the markers
-      // must not keep asking for a reload that already succeeded.
+      // A reload cannot prove what became of a write whose response was lost,
+      // so re-opening the list leaves both markers in place.
       await page.evaluate("window.failNextMutations('/api/mock/mutation')");
       await page.click('概要');
       await page.click('録画');
       await page.wait("document.querySelectorAll('[data-recording-id]').length === 3");
-      assert.equal(await page.evaluate("document.querySelectorAll('.write-alert').length"), 0);
+      assert.deepEqual(await page.evaluate("Array.from(document.querySelectorAll('[data-write-failed=\"true\"]')).map(el => el.dataset.recordingId)"),
+        ['synthetic-recording-0', 'synthetic-recording-1']);
+      // A later successful write to one recording is a terminal outcome the
+      // client observed, so only that recording's marker is resolved.
+      await page.evaluate("document.querySelector('[data-recording-id=\"synthetic-recording-0\"] .row-actions button').click()");
+      await page.wait("document.querySelectorAll('[data-recording-id]').length === 3 && document.querySelectorAll('[data-write-failed=\"true\"]').length === 1");
+      assert.deepEqual(await page.evaluate("Array.from(document.querySelectorAll('[data-write-failed=\"true\"]')).map(el => el.dataset.recordingId)"),
+        ['synthetic-recording-1']);
+      // The rest is resolved only by the owner acknowledging that they checked.
+      await page.evaluate(`Array.from(document.querySelectorAll('.write-alert button')).find(el => el.textContent === '確認したので閉じる').click()`);
+      await page.wait("document.querySelectorAll('.write-alert').length === 0");
       assert.equal(await page.evaluate("document.querySelectorAll('[data-write-failed=\"true\"]').length"), 0);
     });
     // A write failing while a reload is already in flight may have happened
@@ -324,7 +334,7 @@ try {
       await page.evaluate("document.querySelector('[data-recording-id=\"synthetic-recording-0\"] .row-actions button').click()");
       await page.evaluate("document.querySelector('.write-alert .primary').click()");
       await page.wait("document.querySelectorAll('[data-recording-id]').length === 3");
-      // The retry failed after the reload began, so its marker survives.
+      // The reload cannot answer for the retry, so its marker survives.
       assert.deepEqual(await page.evaluate("Array.from(document.querySelectorAll('[data-write-failed=\"true\"]')).map(el => el.dataset.recordingId)"),
         ['synthetic-recording-0']);
       assert.equal(await page.evaluate("document.querySelectorAll('.write-alert').length"), 1);
@@ -344,12 +354,15 @@ try {
       await page.wait("document.querySelectorAll('[role=alert]').length === 1 && document.querySelectorAll('[data-recording-id]').length === 0");
       assert.match(await page.evaluate('document.body.innerText'), /録画の一覧を取得できません/);
       assert.equal(await page.evaluate("document.querySelectorAll('[data-write-failed=\"true\"]').length"), 1);
-      // Only a successful reload clears it.
+      // Even a successful reload leaves it: the snapshot proves nothing about a
+      // write whose response was lost. Only an acknowledgement closes it.
       await page.evaluate("window.failRecordingLoads(false); window.mutationPlan({})");
       await page.evaluate("document.querySelector('[role=alert] .primary').click()");
       await page.wait("document.querySelectorAll('[data-recording-id]').length === 3");
+      assert.equal(await page.evaluate("document.querySelectorAll('[data-write-failed=\"true\"]').length"), 1);
+      await page.evaluate(`Array.from(document.querySelectorAll('.write-alert button')).find(el => el.textContent === '確認したので閉じる').click()`);
+      await page.wait("document.querySelectorAll('.write-alert').length === 0");
       assert.equal(await page.evaluate("document.querySelectorAll('[data-write-failed=\"true\"]').length"), 0);
-      assert.equal(await page.evaluate("document.querySelectorAll('.write-alert').length"), 0);
     });
     // A rejected write reports itself without discarding the loaded list.
     await scenario(viewport, { recordings: 3, mutationStatus: 503 }, async page => {
@@ -361,8 +374,11 @@ try {
       assert.equal(await page.evaluate("document.querySelectorAll('[aria-busy=\"true\"]').length"), 0);
       assert.equal(await page.evaluate("document.querySelectorAll('.row-actions button:disabled').length"), 0);
       assert.doesNotMatch(await page.evaluate('document.body.innerText'), /録画の一覧を取得できません/);
-      // Retrying the load clears the write alert and keeps the list.
+      // Reloading keeps the list and the unresolved warning; acknowledging closes it.
       await page.evaluate("document.querySelector('.write-alert .primary').click()");
+      await page.wait("document.querySelectorAll('[data-recording-id]').length === 3");
+      assert.equal(await page.evaluate("document.querySelectorAll('.write-alert').length"), 1);
+      await page.evaluate(`Array.from(document.querySelectorAll('.write-alert button')).find(el => el.textContent === '確認したので閉じる').click()`);
       await page.wait("document.querySelectorAll('.write-alert').length === 0 && document.querySelectorAll('[data-recording-id]').length === 3");
     });
     for (const storageState of ['NORMAL', 'STORAGE_PRESSURE', 'STORAGE_HARD_STOP']) {

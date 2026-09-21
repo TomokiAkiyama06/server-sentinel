@@ -64,11 +64,14 @@ an error. A rejected write reports itself in its own alert and does not replace
 the loaded list with a read-failure banner, because the server-side result of
 that write is unknown rather than the list being unavailable. Those unknown
 results are tracked per recording and the affected rows are marked. Only a
-recording-list reload that actually succeeds clears them, and it clears only the
-failures raised before that reload began. Each failure carries a sequence
-number rather than just a recording id, so retrying an already-marked recording
-raises a newer failure that an in-flight reload cannot claim to have answered
-for. Requesting a reload never
+recording-list reload that actually succeeds clears them, and reloading the list never
+clears one. A rejected write may still be applied by the server afterwards, and
+`DashboardServices` carries no operation id and no causal ordering between a
+write and a later read, so no snapshot can prove what became of it. A marker is
+resolved only by a terminal outcome the client actually observed — a later
+successful write to the same recording — or by the owner acknowledging that they
+checked. The alert says so rather than telling the owner that reloading settles
+it. Requesting a reload never
 clears anything by itself: if the reload fails, the list-unavailable notice
 still reports the unknown results. A write that succeeds drops the list in the
 same commit as its reload request, so a deleted row cannot briefly stay
