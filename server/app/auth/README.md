@@ -6,7 +6,7 @@ Owns owner invitations/allowlists, independent `live:view` and `recordings:view`
 - Requires application authorization in addition to private-network reachability. Tailnet membership alone grants no access.
 - Treats a verified Tailscale/trusted-proxy identity as supplementary: the deployment shares one Tailscale account, so authorization requires the requesting principal's own ServerSentinel credential (WebAuthn/passkey, ADR 0004) on every human route. No route authorizes on an identity header alone.
 - Verifies the transient WebAuthn data a registration or assertion carries (challenge, client data, authenticator data, signature, signature counter, user-verification flag, relying-party id and origin) and persists only public credential material, the signature counter, the backup-eligibility and backup-state flags, and owner-visible metadata. No viewer biometric template reaches the server; it never leaves the authenticator.
-- Relies on the dashboard owning its browser origin, with no other application sharing it, and on that origin being a secure context (AUTH-011); browsers withhold WebAuthn elsewhere. Reserving the name is a deployment obligation (ADR-0003), and the startup/daily check over real listeners and proxy routes closes human access and notifies the Owner rather than preventing the bind.
+- Relies on the dashboard owning its browser origin, with no other application sharing it, and on that origin being a secure context (AUTH-012); browsers withhold WebAuthn elsewhere. Reserving the name is a deployment obligation (ADR-0003), and the startup/daily check over real listeners and proxy routes closes human access and notifies the Owner rather than preventing the bind.
 - Treats revocation as credential-scoped rather than device-scoped, and persists the last accepted signature counter so the clone check has something to compare against. The comparison runs whenever the stored or received counter is non-zero, so a received 0 after a stored non-zero is a regression; only a stored-and-received 0 is exempt.
 - Accepts `none` attestation at registration, verifying the challenge, origin/relying-party id, authenticator data, credential public key and user-verification flag instead; a present-but-invalid attestation statement fails.
 - Records the authenticator's backup-eligibility and backup-state flags with the credential so the owner UI can show whether it syncs, and refuses a backup-eligible registration where the deployment requires device-bound credentials. Eligibility is fixed at registration and a differing value in a later assertion is refused and reported; backup state is refreshed from every verified assertion.
@@ -18,3 +18,14 @@ Owns owner invitations/allowlists, independent `live:view` and `recordings:view`
 - Binds the step-up to the session: the challenge allows only `principal_session.credential_id`, and an assertion from any other registered credential is refused without updating the session's verification time.
 - Keeps historical events/timeline under `recordings:view` and provides generic, non-branding denial for uninvited identities.
 - Does not modify Tailscale ACLs/Grants, store Tailscale administrative credentials, or treat an agent identity as a human/admin identity.
+- Separates general human/system access from Owner-only access. `require_owner_access` is an independent gate for Owner-only routes such as diagnostic export; an authorizer that implements no Owner check is denied rather than treated as the Owner.
+
+## Current foundation
+
+`store.py` persists application principals, independent viewer permissions,
+opaque credential records, single-use enrollment authorization digests, and
+opaque server-side session digests. It deliberately has no HTTP route, proxy
+header adapter, cookie, WebAuthn parser, signature verifier, or browser
+ceremony. A future ceremony verifies its input before calling enrollment/session
+methods; every request integration must still validate current state and its
+required permission.

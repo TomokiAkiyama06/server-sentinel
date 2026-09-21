@@ -63,6 +63,12 @@ Project source shall be licensed under Apache-2.0.
 ### DIST-004 Dependency/model compatibility
 Dependencies, models, and weights must have licenses compatible with the project's distribution goals. Source-code and model/weight licenses are reviewed separately. AGPL/GPL/SSPL/source-available/unclear components are blocked by default unless explicitly approved and documented.
 
+### DIST-005 Main Server release lifecycle
+Stable Main Server operation uses a versioned release artifact and installer, never a mutable development checkout. Install, update, and rollback are explicit administrator operations that keep runtime configuration, state/database, recordings, and audit logs outside the checkout and the installation tree, and never delete, truncate, rewrite, or destructively downgrade them. A rollback whose code cannot safely read forward-migrated state refuses to start and reports the incompatibility instead. The native release/systemd lifecycle is the only implemented and advertised Main Server deployment path; a Docker Compose path is not available and must provide equivalent external-runtime, mount-identity, non-root-identity, private-listener, update, and rollback guarantees before it is documented. See ADR-0005.
+
+### DIST-006 Release trust and privileged installation
+The installer runs only when an administrator invokes it deliberately with root privileges. It performs no network access and trusts a release only through content hashes the administrator verifies against the separately published values: the outer archive SHA-256, the release manifest, every member digest, and hash-pinned offline dependency wheels. Deployment configuration is administrator-owned and readable but not writable by the dedicated runtime account; only state/database, recordings, and audit directories are runtime-writable, on an Owner-approved runtime filesystem identified by a stable filesystem identity rather than a reusable device number.
+
 ## 5. Camera-source requirements
 
 ### CAM-001 Camera-source abstraction
@@ -121,7 +127,7 @@ The MVP agent shall capture video only. It shall not open microphone/audio devic
 The agent initiates its connection toward the main ServerSentinel host. The main host does not require SSH/admin access to the capture machine merely to receive video.
 
 ### AGENT-005 Pairing
-Initial agent enrollment uses an owner-approved, short-lived, single-use pairing credential/code. Before transmitting that credential, the Agent shall authenticate the intended Main Server using trust established through an Owner-approved trusted channel and establish encrypted bootstrap communication that protects the credential and enrollment exchange. Plaintext bootstrap and bypassing Server identity verification are prohibited; failed or missing trust verification aborts pairing without sending the code. The exact bootstrap trust mechanism shall be specified by the pairing/transport ADR. The agent generates or receives a unique revocable node identity. Long-lived media/control traffic shall use authenticated encryption, with mTLS as the default design target unless an ADR selects an equivalent design.
+Initial agent enrollment uses an owner-approved, 128-bit, five-minute, single-use pairing credential/code. Before transmitting that credential, the Agent authenticates the intended Main Server using a deployment-local CA public trust bundle transferred through an Owner-approved trusted channel, then establishes TLS 1.3 bootstrap communication that protects the credential and enrollment exchange. Plaintext bootstrap and bypassing Server identity verification are prohibited; failed or missing trust verification aborts pairing without sending the code. The local Main approval binds the code to the Agent-generated public-key digest. The agent generates a unique revocable node identity. Long-lived media/control traffic uses deployment-scoped mTLS. The detailed enrollment, persistence and revocation contract is ADR-0006.
 
 ### AGENT-006 No Tailnet requirement
 The capture agent shall be able to operate over the same private LAN without being enrolled in the owner's Tailnet.
@@ -289,6 +295,8 @@ No recording path is hard-coded to a personal disk/mount.
 ### STORE-003 Retention
 Default recording retention: **20 days**. Default audit-log retention: **90 days**.
 
+Documented exception: when a confirmed server-movement or camera-tamper event's evidence preservation or owner notification has not completed, that event's own timeline metadata is retained beyond the recording-retention default until the action completes or the owner clears it, and at most until the audit-retention period. It covers only those critical events: recorded video, thumbnails, and ordinary person/motion observations keep the configured retention, and an action the deployment durably disabled keeps it too, because disabling is a configuration decision rather than pending work. After that bound only the event identity and a count that the action never completed remain, with no observation content, and the owner sees the affected critical path as unavailable until it is resolved.
+
 ### STORE-004 Capacity ceiling
 The owner configures maximum recording allocation. Cleanup reacts to retention, configured allocation, and actual filesystem safety pressure.
 
@@ -375,7 +383,7 @@ ServerSentinel checks an owner-managed invitation/allowlist before serving dashb
 ### AUTH-005 Trusted Tailscale identity path
 When Tailscale Serve or an equivalent trusted proxy supplies user identity, the backend accepts those identity headers only from the trusted local proxy path. The dashboard/API should bind to loopback or another non-bypassable local boundary so arbitrary LAN clients cannot spoof proxy identity headers.
 
-A verified proxy identity header states which Tailscale login the request arrived under. Per AUTH-011 it does not by itself state which person is making the request, so it shall not be the sole basis for application authorization.
+A verified proxy identity header states which Tailscale login the request arrived under. Per AUTH-012 it does not by itself state which person is making the request, so it shall not be the sole basis for application authorization.
 
 ### AUTH-006 Granular invited-user permissions
 At minimum support independent permissions:
@@ -394,7 +402,10 @@ These operations shall additionally require a user verification newer than a bou
 
 The step-up shall be bound to the session: the challenge is issued for that session and accepts only the still-active credential the session was created with. An assertion from any other credential, including a valid credential belonging to a different person at the same workstation, shall be refused and shall not refresh the session's verification time. Otherwise a non-owner could use their own passkey to revive a stale owner session and run a privileged operation.
 
-### AUTH-009 Immediate application revocation
+### AUTH-009 Session lifetime and clock safety
+Server-side human sessions have a 30-minute idle lifetime and a 12-hour absolute lifetime. Authorized activity may renew the configured idle lifetime but never the absolute lifetime. A time before session establishment or before the last accepted activity invalidates authorization; restart or clock uncertainty shall fail closed rather than extend a session.
+
+### AUTH-010 Immediate application revocation
 Application permission revocation shall invalidate active ServerSentinel authorization promptly. Tailnet membership/policy remains separately administered outside ServerSentinel.
 
 Revocation is available at two levels and is credential-scoped, not device-scoped: revoking one credential of a principal shall invalidate that credential and the sessions bound to it only, while revoking the principal shall invalidate all of its credentials and sessions.
@@ -405,14 +416,14 @@ Whether a credential can sync is not a guess: registration reads the authenticat
 
 Backup state shall be refreshed from every successfully verified assertion, because a credential registered before its first sync becomes backed up later and a value kept only from registration would leave the owner UI permanently stale.
 
-Backup eligibility shall not change after registration. An assertion reporting a different eligibility shall not be accepted silently: that credential shall be refused and marked inconsistent, and the Owner shall be notified as for a signature-counter regression. The effect shall be bounded so it cannot strand a person: only that credential is refused, the principal's other credentials keep working, the owner UI shall state which credential was refused and why, and a person left with none shall be re-invited through AUTH-012 — an Owner left with none recovers through the local bootstrap path rather than being locked out of the deployment.
+Backup eligibility shall not change after registration. An assertion reporting a different eligibility shall not be accepted silently: that credential shall be refused and marked inconsistent, and the Owner shall be notified as for a signature-counter regression. The effect shall be bounded so it cannot strand a person: only that credential is refused, the principal's other credentials keep working, the owner UI shall state which credential was refused and why, and a person left with none shall be re-invited through AUTH-013 — an Owner left with none recovers through the local bootstrap path rather than being locked out of the deployment.
 
-### AUTH-010 Application fingerprint minimization for uninvited users
+### AUTH-011 Application fingerprint minimization for uninvited users
 When an ordinary Tailnet user is not invited in ServerSentinel, the application shall minimize disclosure that ServerSentinel is running. Unauthorized responses should be generic/non-branding (for example not-found style), and shall not expose ServerSentinel product/version strings, camera/source counts, API schemas, health details, thumbnails, recordings, timeline data, or other deployment metadata.
 
 This is application-level non-disclosure only. With unchanged Tailscale policy, the existence/reachability of the underlying Tailscale node or listening service cannot be guaranteed hidden.
 
-### AUTH-011 Shared Tailnet account deployments
+### AUTH-012 Shared Tailnet account deployments
 The target deployment shares a single Tailscale account across the research room to reduce Tailscale cost. Several people sign in to the Tailnet with the same Tailscale login, and any of them can enroll additional devices.
 
 Consequences for this product:
@@ -421,7 +432,7 @@ Consequences for this product:
 - ServerSentinel shall issue and verify its own per-person credential, created from an owner invitation and individually revocable. WebAuthn/passkey is the mechanism proposed in ADR-0004 and is the default design target until the Owner accepts or replaces that record;
 - the credential shall be bound to a person rather than to a workstation. Registration and every authentication shall require authenticator user verification (local PIN, device unlock, or on-device biometric), and the authenticator shall be one the invited person controls. Where a lab machine's OS account or device unlock is shared, a platform authenticator stored in that shared account is a shared credential and does not satisfy this requirement; such a deployment shall use a per-person OS account or a portable authenticator the invited person carries;
 - a session shall be a server-side record bound to one principal and to the credential that created it, and, where the deployment supplies a verified proxy identity, to the identity it was created under, so that a later request on the same session carrying a different verified identity is refused. Sign-out, expiry and revocation shall invalidate that server-side record, so a retained cookie/token authorizes nothing afterwards, and every human/media route shall re-check it server-side rather than trusting a client-side state. Sessions shall end after a bounded idle lifetime and a bounded absolute lifetime that the server enforces (ADR-0003 proposes 30 minutes idle and 12 hours absolute; a different value is recorded there before implementation, not chosen ad hoc), the UI shall offer an explicit sign-out for shared machines, and the owner operations of AUTH-008 shall require a fresh user-verification step rather than an old session alone;
-- authenticator user verification runs on the viewer's own device and reaches the server only as the authenticator's user-verification flag. ServerSentinel shall verify the transient protocol data a registration or assertion requires — its own challenge, client data, authenticator data, the attestation or assertion signature, the signature counter, the user-verification flag, and the relying-party id and origin — and shall persist only public credential material (credential id and public key), the last accepted signature counter, the authenticator's backup-eligibility and backup-state flags, and owner-visible metadata (label, created/last-used/revoked timestamps), discarding the rest once verified. The counter and the backup flags are retained deliberately: without the counter the clone check has nothing to compare against, and without the flags AUTH-009 cannot show whether a credential syncs or refuse a backup-eligible registration;
+- authenticator user verification runs on the viewer's own device and reaches the server only as the authenticator's user-verification flag. ServerSentinel shall verify the transient protocol data a registration or assertion requires — its own challenge, client data, authenticator data, the attestation or assertion signature, the signature counter, the user-verification flag, and the relying-party id and origin — and shall persist only public credential material (credential id and public key), the last accepted signature counter, the authenticator's backup-eligibility and backup-state flags, and owner-visible metadata (label, created/last-used/revoked timestamps), discarding the rest once verified. The counter and the backup flags are retained deliberately: without the counter the clone check has nothing to compare against, and without the flags AUTH-010 cannot show whether a credential syncs or refuse a backup-eligible registration;
 - no viewer fingerprint or face template shall be received, persisted or exportable: it never leaves the authenticator. Credential records are an access-control list; they are unrelated to the optional owner face verification of DET-008 and shall not become a non-owner identity or biometric database;
 - relying-party verification depends on ServerSentinel owning its browser origin; the dashboard is served from an origin reserved for it, with no other application sharing it. Reserving that origin is a deployment obligation — a dedicated host, VM or namespace, or an OS/service policy that prevents another process from binding the name — because the application cannot stop a co-located process from taking it;
 - ServerSentinel shall check the reservation at startup and at least daily by enumerating the host's actual listeners and every proxy route that reaches them, across all schemes and ports, and shall close human access and notify the Owner when anything other than ServerSentinel answers on the reserved name. This bounds the exposure window rather than preventing the bind: a process that binds between two checks can receive credentials and cookies for that origin until the next check, and the documentation shall say so rather than presenting the check as a barrier. ADR-0003 states the reservation in full, including why another port of the same name is not acceptable;
@@ -430,26 +441,26 @@ Consequences for this product:
 - where that signal is retained, its lifecycle shall be defined and disclosed: the principal keeps at most the value last observed at authentication, overwritten on each authentication, visible to the owner only, cleared when the principal is revoked or deleted, and excluded from diagnostic exports. Any per-authentication history belongs to the audit log under the default 90-day audit retention rather than to the principal record, and `PRIVACY.md` shall list it so operators are not told that only WebAuthn material and metadata persist;
 - device-scoped approval may be offered in addition, but the product shall not claim that approving a device identifies a person; a shared or borrowed device is used by whoever holds it;
 - network reachability is not a boundary in this deployment: anyone holding the shared account can reach the node, so every human route depends on the application credential;
-- an authenticated session shall remain bound to one principal, and revoking a principal or one of its credentials shall take effect promptly per AUTH-009;
-- before authentication succeeds the application responds per AUTH-010, and an uninvited person and a revoked person receive the same response.
+- an authenticated session shall remain bound to one principal, and revoking a principal or one of its credentials shall take effect promptly per AUTH-010;
+- before authentication succeeds the application responds per AUTH-011, and an uninvited person and a revoked person receive the same response.
 
 Both gates of AUTH-001/AUTH-004 remain mandatory and unchanged. What the shared account changes is that the network gate no longer distinguishes individuals, so it shall not be presented as the barrier that keeps an uninvited person out.
 
 Limits that shall be documented rather than claimed away: ServerSentinel cannot detect a credential whose holder deliberately lends it, a session left unlocked on an unattended machine, or an authenticator that the deployment registered inside a shared profile against this requirement. The product shall not claim that the application separates two people who share a workstation and a device unlock.
 
-### AUTH-012 Bootstrap and enrollment before a credential exists
-AUTH-011 cannot apply to the requests that create the first credential. Exactly two HTTP routes may therefore run without one, and the pair is closed:
+### AUTH-013 Bootstrap and enrollment before a credential exists
+AUTH-012 cannot apply to the requests that create the first credential. Exactly two HTTP routes may therefore run without one, and the pair is closed:
 
 - invitation redemption accepts only a valid, unexpired, unredeemed enrollment code, is single-use and rate-limited, and registers exactly one credential for the named principal. Single use shall be enforced atomically rather than by a check followed by a write, so that concurrent redemptions of one code produce exactly one credential, the losing request gets the generic response, no partial state remains, and a retried redemption is idempotent;
 - the authentication/assertion route itself.
 
 Initial owner bootstrap adds no third route. It is a privileged local administrative action on the Main Server that issues a single-use, short-lived enrollment authorization shown only on the local console; the first owner then redeems it through the same redemption route, from a browser at the reserved origin. There is no owner-specific route and no remote first-visitor setup path.
 
-Every other human/media route requires a verified credential and an active session per AUTH-011.
+Every other human/media route requires a verified credential and an active session per AUTH-012.
 
 An enrollment code and a bootstrap authorization are bearer authorizations: whoever presents one claims the named principal, and in this deployment everyone holding the shared Tailscale account can reach the redemption path. They shall therefore be generated by a cryptographically secure random generator with at least 128 bits of entropy, drawn from the full generated value rather than from a shortened display form, and compared in constant time against a stored hash. A human-friendly encoding may be used, but it shall not reduce the entropy below that floor; a short or guessable code does not satisfy this requirement even with a lifetime limit, single use and rate limiting in place. Redemption attempts shall be rate-limited per code and per source, and the code shall expire after a short deployment-configured lifetime.
 
-These pre-authentication routes shall return no camera names or counts, recordings, timeline data, product/version strings, API schema, or other deployment metadata, and enrollment shall grant no application data by itself; the invited person authenticates afterwards like anyone else. A request with an absent, unknown, expired or already-redeemed code shall receive the same generic AUTH-010 response as an uninvited person, and logs shall record the attempt without the raw code.
+These pre-authentication routes shall return no camera names or counts, recordings, timeline data, product/version strings, API schema, or other deployment metadata, and enrollment shall grant no application data by itself; the invited person authenticates afterwards like anyone else. A request with an absent, unknown, expired or already-redeemed code shall receive the same generic AUTH-011 response as an uninvited person, and logs shall record the attempt without the raw code.
 
 ## 14. Dashboard requirements
 
@@ -501,8 +512,10 @@ Cover local UVC and remote-agent discovery, ambiguous identical-device reconnect
 ### DEV-001 No direct main
 Non-trivial work uses Issue -> branch -> PR -> CI/review -> merge.
 
-### DEV-002 Dual automated review
-Codex and Claude must both review the current PR diff. A review is valid only for the current **HEAD and base revision/diff context**. If either HEAD or relevant base changes, the review must be rerun before merge.
+### DEV-002 Automated review
+Codex must review the current PR diff. A review is valid only for the current **HEAD and base revision/diff context**. If either HEAD or relevant base changes, the review must be rerun before merge.
+
+Claude review automation is temporarily disabled because the available subscription quota is exhausted. Until the Owner explicitly restores it, Claude review is not required for merge.
 
 ### DEV-003 No secrets/private deployment data
 Never commit real credentials, private keys, owner biometrics, private deployment values, or real monitoring media.

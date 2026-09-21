@@ -9,8 +9,13 @@ import threading
 import unittest
 import zlib
 
+from app.audit import AuditAction, AuditOutcome, AuditStore, OwnerAuditService
+from app.audit.integration import OwnerAdministration
+from app.audit.schema import audit_migration
+from app.cameras.registry import CameraRegistry
 from app.media.recording import Limits, RecordingError, RecordingStore, RootIdentity, Segment
 from app.media.recording.schema import recording_migration
+from app.storage.database import Database
 from app.storage.migrations import BUILTIN_MIGRATIONS, migrate
 from app.storage.policy import (
     ExpectedFilesystem, FilesystemSpace, MainStoragePolicy, StorageLimits, StorageState, StorageTransition,
@@ -39,7 +44,8 @@ class RealRetentionTests(unittest.TestCase):
         self.db = sqlite3.connect(base / "metadata.sqlite", isolation_level=None)
         (base / "metadata.sqlite").chmod(0o600)
         self.addCleanup(self.db.close)
-        migrate(self.db, BUILTIN_MIGRATIONS + (recording_migration(len(BUILTIN_MIGRATIONS) + 1), storage_audit_migration(len(BUILTIN_MIGRATIONS) + 2)))
+        migrate(self.db, BUILTIN_MIGRATIONS + (recording_migration(len(BUILTIN_MIGRATIONS) + 1), storage_audit_migration(len(BUILTIN_MIGRATIONS) + 2), audit_migration(len(BUILTIN_MIGRATIONS) + 3)))
+        self.metadata = Database(base / "metadata.sqlite")
         self.now = 5 * DAY_MS
         self.audit = StorageAudit(self.db, reservation=lambda: self.policy.control())
         self.policy = MainStoragePolicy(
@@ -138,13 +144,58 @@ class RealRetentionTests(unittest.TestCase):
         for operation in [lambda: browser.star(recording, True), lambda: browser.delete(recording)]:
             with self.assertRaises(RecordingError):
                 operation()
-        owner = RecordingBrowser(self.store, lambda _: None, self.policy.guard_metadata)
-        owner.star(recording, True)
+        security_audit = self.security_audit()
+        owner = RecordingBrowser(self.store, lambda _: None, self.policy.guard_metadata,
+                                 administration=self.administration(security_audit))
+        owner.star(recording, True, actor_context="synthetic-owner")
         self.assertEqual(0, self.retention.oldest(10))
-        owner.star(recording, False)
-        owner.star(recording, True)
-        self.assertGreater(owner.delete(recording), 0)
+        owner.star(recording, False, actor_context="synthetic-owner")
+        owner.star(recording, True, actor_context="synthetic-owner")
+        self.assertGreater(owner.delete(recording, actor_context="synthetic-owner"), 0)
         self.assertEqual((), owner.list())
+        # Every Owner recording change carries its security/admin record.
+        records = security_audit.list_records()
+        self.assertEqual(
+            [AuditAction.DELETE_RECORDING, AuditAction.UPDATE_RECORDING,
+             AuditAction.UPDATE_RECORDING, AuditAction.UPDATE_RECORDING],
+            [record.action for record in records],
+        )
+        self.assertEqual({AuditOutcome.SUCCEEDED},
+                         {record.outcome for record in records})
+
+    def security_audit(self):
+        return AuditStore(self.metadata, reservation=self.store.control_reservation)
+
+    def administration(self, security_audit, actor="synthetic-owner"):
+        class SyntheticOwner:
+            def require_owner(self, actor_context):
+                if actor_context != actor:
+                    raise PermissionError("not the deployment owner")
+
+        return OwnerAdministration(
+            OwnerAuditService(security_audit, SyntheticOwner()),
+            CameraRegistry(self.metadata),
+        )
+
+    def test_owner_recording_mutation_requires_the_audited_boundary(self):
+        recording = self.completed()
+        unaudited = RecordingBrowser(self.store, lambda _: None, self.policy.guard_metadata)
+        for operation in (lambda: unaudited.star(recording, True),
+                          lambda: unaudited.delete(recording)):
+            with self.assertRaisesRegex(RecordingError, "RECORDING_AUDIT_UNAVAILABLE"):
+                operation()
+        self.assertEqual(0, self.store.list_recordings(limit=1)[0]["starred"])
+
+        security_audit = self.security_audit()
+        denied = RecordingBrowser(self.store, lambda _: None, self.policy.guard_metadata,
+                                  administration=self.administration(security_audit))
+        # The facade's own permission check is not Owner authentication: the
+        # audited boundary re-authorizes and records the denial.
+        with self.assertRaises(PermissionError):
+            denied.star(recording, True, actor_context={"synthetic": "not-owner"})
+        self.assertEqual(0, self.store.list_recordings(limit=1)[0]["starred"])
+        self.assertEqual([AuditOutcome.DENIED],
+                         [record.outcome for record in security_audit.list_records()])
 
     def test_write_guard_denies_owner_mutation_and_audit_before_writing(self):
         recording = self.completed()
@@ -201,7 +252,7 @@ class RealRetentionTests(unittest.TestCase):
             self.audit.expire(100 * DAY_MS, limit=1001)
 
     def test_slow_slack_critical_and_daily_never_block_real_recording_or_write_from_worker(self):
-        migrate(self.db, BUILTIN_MIGRATIONS + (recording_migration(len(BUILTIN_MIGRATIONS) + 1), storage_audit_migration(len(BUILTIN_MIGRATIONS) + 2), notification_migration(len(BUILTIN_MIGRATIONS) + 3)))
+        migrate(self.db, BUILTIN_MIGRATIONS + (recording_migration(len(BUILTIN_MIGRATIONS) + 1), storage_audit_migration(len(BUILTIN_MIGRATIONS) + 2), audit_migration(len(BUILTIN_MIGRATIONS) + 3), notification_migration(len(BUILTIN_MIGRATIONS) + 4)))
         self.db.execute('CREATE TABLE synthetic_notifications (id TEXT PRIMARY KEY, delivery TEXT)')
         entered, release = threading.Event(), threading.Event()
         owner = threading.get_ident()

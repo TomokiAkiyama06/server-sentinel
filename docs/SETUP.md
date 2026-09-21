@@ -4,17 +4,23 @@ This document describes target UX. Exact transport commands and packaging may ch
 
 ## Main Ubuntu setup
 
-Development target:
+Development runs from a mutable checkout using the validated environment
+settings and commands in
+[`server/docs/FOUNDATION.md`](../server/docs/FOUNDATION.md). For example:
 
 ```bash
 git clone <repo-url>
 cd server-sentinel
-./install.sh
+cd server
+python3 -m pip install --require-hashes --only-binary=:all: -r requirements-ci.lock
+SERVERSENTINEL_DATA_DIRECTORY=/existing/external/development-data python3 -m app
 ```
 
-or the documented Docker Compose path where appropriate.
-
-Stable releases should provide versioned release artifacts/installers rather than requiring production operation from a development checkout.
+Stable operation uses the versioned archive, offline wheelhouse, installer,
+external runtime filesystem, and install/update/rollback commands documented in
+[`server/docs/DEPLOYMENT.md`](../server/docs/DEPLOYMENT.md). It does not run from
+the development checkout. A Docker Compose path is not currently implemented or
+documented as an available deployment method.
 
 ## First-run server wizard
 
@@ -140,6 +146,14 @@ Capture Nodes
 ### Capture-machine side
 
 During development the repository may be cloned locally and the agent run from that checkout. Stable releases should install only the versioned `media-capture-agent` artifact.
+
+Stable artifacts record their release version and full source commit internally
+and are accepted only when the separately obtained SHA-256 matches. Agent install
+and update are explicit local administrator operations. Updates retain the prior
+immutable release for explicit rollback and never rewrite or delete deployment
+configuration, node credentials, runtime state, ring ledgers, protected incidents,
+or media. The installer does not download releases, restart the service, or give
+the Main Server SSH/root update authority; see `agent/README.md` for commands.
 
 Before pairing, verify/configure the intended Main Server's public trust information through a trusted Owner-controlled local or out-of-band channel. The address alone is not trusted identity. The exact trust setup and encrypted bootstrap transport are selected by PoC/ADR before implementation; the command below assumes that trust setup is complete.
 

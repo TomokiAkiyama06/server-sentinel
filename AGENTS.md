@@ -32,17 +32,19 @@ security / privacy / biometric / access-control に関する製品判断を独�
 
 軽微でない変更では次の順序を守ります。
 
-1. 作業を Issue に対応付ける;
-2. 意図した base から branch を切る;
-3. 実装・テスト・文書化を行う;
-4. PR を作成・更新する;
-5. CI を待つ;
-6. **current HEAD を current base / diff context に対して** レビューした Codex と Claude の結果を待つ;
-7. blocking finding を修正し、スレッドに応答・解決する;
-8. HEAD / base が実質的に変わったらレビューを再実行する;
-9. すべての gate を通過した場合にのみマージする。
+1. map work to an Issue;
+2. branch from the intended base;
+3. implement/test/document;
+4. open/update PR;
+5. wait for CI;
+6. wait for Codex review of the current PR **HEAD against the current base/diff context**;
+7. fix blocking findings and resolve/respond to threads;
+8. rerun the review after material HEAD/base changes;
+9. merge only when gates pass.
 
-`main` へ直接コミットしないでください。
+Claude PR review is temporarily disabled because the available Claude subscription quota is exhausted. Until the Owner explicitly restores it, Claude is not a merge gate.
+
+Never commit directly to `main`.
 
 Issue #4 によるリポジトリレベルの強制が整うまでは、同一リポジトリへの write 権限は trusted maintainer の能力として扱い、マージ実行者がレビューの出所と current HEAD + base context を手動で確認します。
 

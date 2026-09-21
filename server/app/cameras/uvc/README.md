@@ -52,9 +52,12 @@ The adapter bounds allocations to eight buffers of at most 64 MiB each and
 returns one frame at a time without a decoded-frame history, disk recording,
 network connection or audio operation. Driver-corrupt/empty frames are rejected.
 
-`LocalUvcAdapter` connects these parts to the generic registry. An authenticated
-Owner boundary must call `approve_source()` with an exact current selection;
-the adapter exposes no HTTP management or preview route. A supervisor drives
+`LocalUvcAdapter` connects these parts to the generic registry. An Owner
+approval reaches it only through the audited boundary
+`OwnerAdministration.approve_uvc()`, which validates the exact current
+selection before its transaction and commits the approval with its
+`approve_camera` audit record; the adapter exposes no unaudited public
+approval, and no HTTP management or preview route. A supervisor drives
 `poll_source()` in each source's worker and serializes operations on that source.
 The injected frame callback can feed an authorized preview or later media
 pipeline; actual browser viewing remains a downstream task. Discovery and
@@ -63,6 +66,14 @@ negotiation remain `degraded` until the first video frame arrives. Unplug emits
 registry, and quality remains `unknown` until a detector evaluates it.
 Graceful shutdown closes capture without claiming a physical unplug, and it
 preserves any outstanding manual-intervention state.
+
+`LocalUvcSupervisor` supplies that worker boundary. It runs one synchronous,
+serialized thread per logical local source, contains and counts ordinary
+adapter failures without retaining exception text, and lets other source
+workers continue independently. Stop joins are bounded and failed cleanup is
+reported to the lifecycle owner; the supervisor never closes a session from a
+second thread while its capture poll may still be running. A source must be
+stopped before the audited Owner reapproval ceremony.
 
 The backend launcher does not start physical capture automatically. No physical
 webcam, actual preview/browser path, Ubuntu permission setup or arm64 host was

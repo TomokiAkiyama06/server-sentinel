@@ -82,7 +82,7 @@ Until Issue #4 establishes hardened repository-level enforcement:
 
 - same-repository write access is a trusted-maintainer capability;
 - external/untrusted contributors use fork PRs;
-- Codex + Claude review of the current **HEAD and current base/diff context** is a mandatory operational merge policy;
+- Codex review of the current **HEAD and current base/diff context** is the mandatory operational merge policy while Claude review automation is temporarily disabled by Owner decision due to subscription quota;
 - ordinary `GITHUB_TOKEN` statuses/check names are not treated as unforgeable against a malicious same-repository writer;
 - any material HEAD or base change invalidates the prior review context;
 - real monitoring media, biometric templates, secrets, and private deployment values never appear in PRs.
@@ -90,9 +90,98 @@ Until Issue #4 establishes hardened repository-level enforcement:
 The dedicated-App deployment proposal and offline policy validator are documented
 in [`docs/REVIEW_GATE_SETUP.md`](docs/REVIEW_GATE_SETUP.md). They do not install
 enforcement or authenticate supplied JSON. App credentials must remain outside
-PR-controlled workflows/checkouts; the existing same-repository Claude workflow
-is still limited to trusted writers. Actual issuer isolation and GitHub test-PR
+PR-controlled workflows/checkouts; the former same-repository Claude workflow was limited to trusted writers and is currently disabled. Actual issuer isolation and GitHub test-PR
 acceptance remain open in #4.
+
+## Main Server release and installer trust boundary
+
+The stable Main Server deployment path is the native versioned release lifecycle
+in ADR-0005 and [`server/docs/DEPLOYMENT.md`](server/docs/DEPLOYMENT.md). No
+Docker Compose path is implemented or advertised.
+
+Privilege assumptions:
+
+- the installer is a one-shot administrator tool, deliberately invoked with root
+  privileges; it is never a service, is never started by the application, and
+  the running application cannot invoke it;
+- it refuses to run without explicit root execution, refuses any unit path other
+  than the single canonical `server-sentinel.service`, and refuses a service
+  account of UID 0;
+- installation, configuration, and unit paths must be absolute and free of
+  `..` segments, because normalizing them away would validate a different
+  location from the one the kernel later reaches through a symbolic link;
+- before using an installation path it rejects ancestors that are symbolic
+  links, not root-owned, or group/world-writable, so an untrusted directory
+  cannot later have code substituted beneath the active release;
+- release environments are built with a root-controlled absolute interpreter,
+  from a fixed working directory, with a sanitized environment, so a hostile
+  `PYTHONPATH` or shadowing module in the administrator's current directory is
+  not executed;
+- the non-root preflight runs as the dedicated account with no supplementary
+  groups, and directory modes are normalized independently of the administrator
+  umask so neither a restrictive nor a permissive umask changes the result;
+- the generated unit is created with a restrictive mode at creation time, never
+  widened and then narrowed, and every unit replacement is atomic and fsynced;
+- one service-global advisory lock covers each whole install, update, and
+  rollback transaction, so concurrent administrator invocations cannot interleave
+  release pointers, unit replacement, and restart.
+
+Supply-chain assumptions:
+
+- the installer performs no network access. The release archive, its published
+  SHA-256, the installer zipapp digest, and the offline wheelhouse are supplied
+  by the administrator;
+- trust comes from content hashes, not from a transport: the outer archive
+  SHA-256, the manifest version, and every member digest are verified before any
+  release code executes, the archive shape is bounded, and dependencies install
+  with `--require-hashes --only-binary=:all: --no-index --no-deps`;
+- verifying the published digests on the target host is therefore a required
+  administrator step, and a release that fails any digest check is refused
+  rather than installed.
+
+Runtime-data assumptions:
+
+- deployment configuration is administrator-owned and readable but not writable
+  by the dedicated runtime account, is refused if it is world-readable,
+  group-writable, inside the installation or release tree, inside the
+  runtime-writable data tree, or under any directory path component the
+  administrator does not control;
+- the installation destination, the configuration, and the runtime root are
+  refused under `/tmp` and `/var/tmp`, which the unit's `PrivateTmp=true`
+  replaces with empty private trees, and under `/home`, `/root` and
+  `/run/user`, which its `ProtectHome=true` makes empty or inaccessible. They
+  would otherwise pass the installer's own preflight and fail only after
+  staging and unit mutation;
+- an existing `--destination` is adopted only when it is empty or already a
+  ServerSentinel installation root, so a mistyped destination such as `/root`
+  is never relaxed to mode `0755`;
+- each runtime directory must be owned by the dedicated account and keep owner
+  read, write and execute permission, so a runtime tree the service could not
+  actually write is refused instead of being reported as ready;
+- the runtime mount point must be configured as an absolute path, because a
+  relative one would identify different mounts for the administrator and for
+  the service;
+- the Owner-approved runtime filesystem is pinned by a stable filesystem UUID.
+  Linux major/minor device numbers are reused by a replaced or reformatted disk,
+  so they only corroborate that identity. A runtime mount that is missing,
+  substituted, backed by the root filesystem device, or carrying a different
+  filesystem is refused, and no root-filesystem fallback directory is created;
+- the generated unit grants the runtime account write access to the state,
+  recording, and audit directories only. The runtime root itself stays
+  read-only, so a compromised service cannot replace or remove them;
+- install, update, and rollback move release pointers and the unit only; they
+  never delete, truncate, or rewrite state, recordings, or audit data. A failed
+  transaction restores both release pointers and the previous unit and restarts
+  the release that was running before the attempt.
+
+Release trees accumulate under the installation root. Pruning an old release is
+a deliberate administrator action on the installation filesystem only, and never
+touches runtime data.
+
+Deployed acceptance of this boundary — including the systemd activation, the
+trusted-proxy boundary, real mount substitution, and the recording/audit content
+comparison across update and rollback — remains the `MANUAL_TEST.md` section V
+checks for Issue #47 and is not established by the synthetic tests.
 
 ## Network boundaries
 
@@ -235,7 +324,7 @@ Consequences to keep in mind while reviewing code:
 - sessions are server-side records bound to one principal and to the credential that created them. Sign-out, idle/absolute expiry and revocation invalidate the server-side record, so a retained cookie or token grants nothing afterwards; the check runs on every human/media route, never in the browser. Shared machines get an explicit sign-out control, and owner-only operations require a fresh user-verification step instead of an old session;
 - the server verifies the transient WebAuthn data a registration or assertion carries — its own challenge, client data, authenticator data, the signature counter, the user-verification flag, and the relying-party id and origin — and persists only the credential id, its public key, the last accepted signature counter, the backup-eligibility and backup-state flags, and owner-visible metadata; the rest is discarded once verified. An assertion's signature is always verified against the stored public key; a registration carries an attestation statement only sometimes, so `none` attestation is accepted while a present-but-invalid statement fails. A review that sees those fields skipped, or accepted from an unexpected origin, is looking at a broken check, not at data minimization;
 - no fingerprint or face template reaches ServerSentinel: it never leaves the authenticator. Credential records are not an identity or biometric database;
-- relying-party checks only hold if the dashboard owns its browser origin, with no other application sharing it, as AUTH-011 requires; a co-hosted application on that origin would put the credential within its reach;
+- relying-party checks only hold if the dashboard owns its browser origin, with no other application sharing it, as AUTH-012 requires; a co-hosted application on that origin would put the credential within its reach;
 - reserving the origin is a deployment obligation, described above and in ADR-0003. The startup and daily check closes human access and notifies the Owner when anything else answers on that name, which bounds the exposure window rather than preventing the bind: a process binding between two checks collects credentials and cookies for that origin until the next one;
 - the origin must be a secure context (HTTPS, or `http://localhost` for a strictly local browser). Browsers withhold WebAuthn otherwise, so plain HTTP on a non-loopback host is not a usable human path;
 - the pending challenge lives server-side for one bounded, single-use ceremony and is then dropped;
@@ -273,7 +362,7 @@ Before sending the pairing code:
 - fail closed on missing/mismatched trust or certificate validation failure, without sending the code;
 - do not offer plaintext or unverified-certificate fallback.
 
-The concrete bootstrap trust/transport method requires PoC/ADR selection before implementation. A short-lived code and post-pairing mTLS do not replace confidentiality and intended-server authentication during initial enrollment. Pairing secrets are entered through a non-echoing prompt or protected automation input, never command arguments, environment variables, URLs, or logs.
+ADR-0006 selects the bootstrap trust profile: a deployment-local CA public trust bundle moves through an independently trusted Owner channel; the local Main approval binds a 128-bit, five-minute, one-use code to the Agent public-key digest; and TLS 1.3 authenticates the intended Main before code submission. The transport/listener adapter remains separately staged. A short-lived code and post-pairing mTLS do not replace confidentiality and intended-server authentication during initial enrollment. Pairing secrets are entered through a non-echoing prompt or protected automation input, never command arguments, environment variables, URLs, or logs.
 
 After pairing:
 

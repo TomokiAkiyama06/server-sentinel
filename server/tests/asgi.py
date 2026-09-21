@@ -1,7 +1,8 @@
 """Tiny in-process ASGI driver, without a network client dependency."""
 
 
-async def request(application, path="/", *, method="GET", headers=(), kind="http"):
+async def request(application, path="/", *, method="GET", headers=(), kind="http",
+                  body=b""):
     messages = []
     scope = {
         "type": kind, "asgi": {"version": "3.0"}, "http_version": "1.1",
@@ -12,7 +13,7 @@ async def request(application, path="/", *, method="GET", headers=(), kind="http
     }
 
     async def receive():
-        return {"type": "http.request", "body": b"", "more_body": False}
+        return {"type": "http.request", "body": body, "more_body": False}
 
     async def send(message):
         messages.append(message)

@@ -29,6 +29,15 @@ class CaptureSession:
             self.capture = None
             self.controller.capture_closed()
 
+    @property
+    def stopped(self):
+        return self.capture is None and self.controller.bound is None
+
+    def supersede_stopped_session(self):
+        if not self.stopped:
+            raise ValueError("capture session must stop before reapproval")
+        self.controller.supersede_stopped_session()
+
     def configure(self, *, enabled, profile):
         if enabled != self.controller.enabled or profile != self.profile:
             self.close()

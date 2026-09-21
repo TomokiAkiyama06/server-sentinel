@@ -67,17 +67,36 @@ def deny_reservation():
     yield
 
 
+class DenyAuditedOwnerMutation:
+    """Default Owner mutator: refuse until the audited boundary is supplied.
+
+    An Owner star/delete must commit with its security/admin audit record, so
+    this facade never mutates a recording through the store directly.
+    """
+
+    def set_recording_starred(self, actor_context, store, recording_id, starred):
+        raise RecordingError("RECORDING_AUDIT_UNAVAILABLE")
+
+    def delete_recording(self, actor_context, store, recording_id):
+        raise RecordingError("RECORDING_AUDIT_UNAVAILABLE")
+
+
 class RecordingBrowser:
     """Domain-only facade; #10 supplies the actual authorized request adapter.
 
     No subject/session parsing, human route or download function is provided.
-    Caller authorization is checked before any metadata read or mutation.
+    Caller authorization is checked before any metadata read or mutation, and
+    Owner mutations run through the injected audited administration boundary
+    (`app.audit.integration.OwnerAdministration`) so they cannot change or
+    delete a recording without their durable audit record.
     """
 
     def __init__(self, store, authorize: Callable[[Action], None] = deny_action,
-                 write_guard: Callable[[], None] = deny_write):
+                 write_guard: Callable[[], None] = deny_write,
+                 administration=None):
         self.store, self._authorize = store, authorize
         self._write_guard = write_guard
+        self._administration = administration or DenyAuditedOwnerMutation()
 
     def list(self, *, limit: int = 50, offset: int = 0):
         self._authorize(Action.READ)
@@ -89,15 +108,21 @@ class RecordingBrowser:
         # returns a truthful read-only snapshot if that write is unsafe.
         return self.store.manifest(recording_id)
 
-    def star(self, recording_id: UUID, starred: bool) -> None:
+    def star(self, recording_id: UUID, starred: bool, *, actor_context=None) -> None:
         self._authorize(Action.OWNER)
         self._write_guard()
-        self.store.set_starred(recording_id, starred)
+        # The audited boundary re-authorizes the Owner and commits the
+        # recording change together with its audit record.
+        self._administration.set_recording_starred(
+            actor_context, self.store, recording_id, starred,
+        )
 
-    def delete(self, recording_id: UUID) -> int:
+    def delete(self, recording_id: UUID, *, actor_context=None) -> int:
         self._authorize(Action.OWNER)
         self._write_guard()
-        return self.store.delete_recording(recording_id, owner_requested=True)
+        return self._administration.delete_recording(
+            actor_context, self.store, recording_id,
+        )
 
 
 def storage_audit_migration(version: int) -> Migration:

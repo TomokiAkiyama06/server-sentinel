@@ -87,7 +87,7 @@ The two-gate rule is unchanged: a network-level private/Tailscale permission pat
 
 ### 8. Pre-authentication disclosure
 
-Before authentication succeeds, responses follow `REQUIREMENTS.md` AUTH-010: generic and non-branding, with no product/version string, camera names or counts, API schema, health detail, recording or timeline data, or other deployment metadata. The credential prompt itself carries none of them. An uninvited person and a revoked person receive the **same** response.
+Before authentication succeeds, responses follow `REQUIREMENTS.md` AUTH-011: generic and non-branding, with no product/version string, camera names or counts, API schema, health detail, recording or timeline data, or other deployment metadata. The credential prompt itself carries none of them. An uninvited person and a revoked person receive the **same** response.
 
 ### 9. Credential data is not biometric data
 

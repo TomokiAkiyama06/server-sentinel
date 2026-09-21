@@ -27,7 +27,7 @@ class RegistryTests(unittest.TestCase):
         with closing(self.database.connect()) as connection:
             migrate(connection, APPLICATION_MIGRATIONS)
         self.now = datetime(2026, 1, 1, tzinfo=timezone.utc)
-        self.registry = CameraRegistry(self.database, clock=lambda: self.now)
+        self.registry = CameraRegistry(self.database, clock=lambda: self.now, unaudited_writes=True)
 
     def source(self, **overrides):
         arguments = {"source_type": SourceType.LOCAL_UVC, "name": "Synthetic source"}
@@ -103,7 +103,7 @@ class RegistryTests(unittest.TestCase):
     def test_limit_is_configurable_durable_and_shared_between_instances(self):
         self.assertEqual(4, self.registry.max_active_video_sources)
         self.registry.set_active_limit(5)
-        other = CameraRegistry(self.database)
+        other = CameraRegistry(self.database, unaudited_writes=True)
         self.assertEqual(5, other.max_active_video_sources)
         for _ in range(5):
             self.source(enabled=True)
@@ -124,7 +124,7 @@ class RegistryTests(unittest.TestCase):
         barrier = Barrier(len(sources))
 
         def activate(source):
-            registry = CameraRegistry(self.database)
+            registry = CameraRegistry(self.database, unaudited_writes=True)
             barrier.wait(timeout=10)
             try:
                 registry.update_source(source.id, enabled=True, name="Admitted")
@@ -146,7 +146,7 @@ class RegistryTests(unittest.TestCase):
         def create(_):
             barrier.wait(timeout=10)
             try:
-                CameraRegistry(self.database).create_source(
+                CameraRegistry(self.database, unaudited_writes=True).create_source(
                     source_type=SourceType.LOCAL_UVC, name="Synthetic concurrent", enabled=True,
                 )
                 return True
@@ -205,7 +205,7 @@ class RegistryTests(unittest.TestCase):
             self.assertIsInstance(changed.health_state, NodeHealthState)
             self.assertEqual(state, changed.health_state)
             self.assertEqual(source, self.registry.get_source(source.id))
-        restarted = CameraRegistry(self.database)
+        restarted = CameraRegistry(self.database, unaudited_writes=True)
         self.assertEqual(NodeHealthState.REVOKED, restarted.get_capture_node(node.id).health_state)
         self.assertEqual(node.id, restarted.get_capture_node(node.id).id)
 
@@ -356,7 +356,7 @@ class RegistryTests(unittest.TestCase):
         self.registry.set_active_limit(2)
         with closing(self.database.connect()) as connection:
             migrate(connection, APPLICATION_MIGRATIONS)
-        restarted = CameraRegistry(Database(self.database.path))
+        restarted = CameraRegistry(Database(self.database.path), unaudited_writes=True)
         self.assertEqual(source, restarted.get_source(source.id))
         self.assertEqual(node, restarted.get_capture_node(node.id))
         self.assertEqual(2, restarted.max_active_video_sources)
@@ -388,7 +388,7 @@ class RegistryTests(unittest.TestCase):
         def lower_limit():
             barrier.wait(timeout=10)
             try:
-                CameraRegistry(self.database).set_active_limit(3)
+                CameraRegistry(self.database, unaudited_writes=True).set_active_limit(3)
             except ActiveSourceLimitError:
                 pass
 
