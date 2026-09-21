@@ -28,7 +28,8 @@ import tempfile  # noqa: E402
 from app.audit import AuditAction, AuditOutcome, AuditStore, OwnerAuditService  # noqa: E402
 from app.audit.integration import OwnerAdministration  # noqa: E402
 from app.cameras.registry import (  # noqa: E402
-    ActiveSourceLimitError, CameraRegistry, CaptureProfile, SourceType, UnauditedWriteError,
+    ActiveSourceLimitError, CameraRegistry, CaptureProfile, NodeHealthState,
+    SourceHealthState, SourceType, UnauditedWriteError,
 )
 from app.cameras.uvc.identity import DeviceEvidence  # noqa: E402
 from app.cameras.uvc.registry_adapter import LocalUvcAdapter  # noqa: E402
@@ -74,11 +75,29 @@ async def run(scenario):
                 administration = OwnerAdministration(
                     OwnerAuditService(audit, SyntheticOwner()), registry,
                 )
-                for _ in range(4):
+                # Keep the source mix explicit so this composition smoke never
+                # turns the four-source invariant into a local-UVC-only case.
+                local_sources = [
                     administration.create_source(
                         "synthetic-owner", source_type=SourceType.LOCAL_UVC,
-                        name="Synthetic", enabled=True,
+                        name=f"Synthetic local {index}", enabled=True,
                     )
+                    for index in range(2)
+                ]
+                nodes = [
+                    administration.create_capture_node(
+                        "synthetic-owner", f"Synthetic node {index}",
+                    )
+                    for index in range(2)
+                ]
+                remote_sources = [
+                    administration.create_source(
+                        "synthetic-owner", source_type=SourceType.REMOTE_AGENT,
+                        capture_node_id=node.id, name=f"Synthetic remote {index}",
+                        enabled=True,
+                    )
+                    for index, node in enumerate(nodes)
+                ]
                 try:
                     administration.create_source(
                         "synthetic-owner", source_type=SourceType.LOCAL_UVC,
@@ -92,13 +111,25 @@ async def run(scenario):
                     raise AssertionError("unaudited registry write accepted")
                 except UnauditedWriteError:
                     pass
-                assert len(registry.list_sources()) == 4
-                source = registry.list_sources()[0]
+                sources = registry.list_sources()
+                assert len(sources) == 4
+                assert {source.source_type for source in sources} == {
+                    SourceType.LOCAL_UVC, SourceType.REMOTE_AGENT,
+                }
+                administration.update_capture_node(
+                    "synthetic-owner", nodes[0].id, health_state=NodeHealthState.ONLINE,
+                )
+                assert registry.get_capture_node(nodes[0].id).health_state is NodeHealthState.ONLINE
+                # Agent reachability never promotes its camera source by itself.
+                assert registry.get_source(remote_sources[0].id).health_state is SourceHealthState.OFFLINE
+                source = local_sources[0]
                 administration.update_source(
                     "synthetic-owner", source.id,
                     desired_capture_profile=CaptureProfile(640, 480, 10, "MJPG"),
                 )
-                candidate = DeviceEvidence("/dev/video0", "synthetic", "model", "serial")
+                # Non-serial candidates are weak identities.  A later device
+                # with the same evidence must never auto-bind after reconnect.
+                candidate = DeviceEvidence("/dev/video0", "synthetic", "model", None)
                 discovery = Discovery([candidate])
                 events, frames = [], []
                 adapter = LocalUvcAdapter(registry, emit_audit=events.append,
@@ -116,6 +147,17 @@ async def run(scenario):
                 discovery.devices = []
                 assert not adapter.poll_source(source.id)
                 assert events[-1].reason == "device_disconnected"
+                assert registry.get_source(source.id).health_state is SourceHealthState.OFFLINE
+                # A local capture loss never turns an unrelated remote source
+                # into a healthy camera, and an ambiguous UVC return latches
+                # manual intervention until a future Owner reapproval.
+                assert registry.get_source(remote_sources[1].id).health_state is SourceHealthState.OFFLINE
+                discovery.devices = [candidate, DeviceEvidence(
+                    "/dev/video1", "synthetic", "model", None,
+                )]
+                assert not adapter.poll_source(source.id)
+                assert (registry.get_source(source.id).health_state
+                        is SourceHealthState.MANUAL_INTERVENTION_REQUIRED)
                 adapter.close()
                 for path in ("/health", "/version", "/openapi.json", "/api/live/synthetic", "/api/sources"):
                     messages = await request(application, path)
