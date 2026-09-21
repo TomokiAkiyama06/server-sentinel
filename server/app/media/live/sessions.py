@@ -112,6 +112,11 @@ class LiveViewerSessions:
         self._validator = validator
         self._session_id_factory = session_id_factory
         self._sessions: dict[UUID, _Session] = {}
+        # A stale caller must never have an old handle become valid again for
+        # a later session of the same principal/revision. UUID4 makes this
+        # extraordinarily unlikely in production, but preserving the
+        # invariant here also protects an injected allocator from reuse.
+        self._issued_session_ids: set[UUID] = set()
 
     def open(self, access: LiveAccess, source: LiveViewerSource) -> LiveSession:
         source_id = self._source_id(source)
@@ -126,12 +131,13 @@ class LiveViewerSessions:
             raise LiveSessionUnavailable("live session unavailable")
 
         session_id = self._session_id_factory()
-        if not isinstance(session_id, UUID) or session_id in self._sessions:
+        if not isinstance(session_id, UUID) or session_id in self._issued_session_ids:
             raise RuntimeError("session identifier allocation failed")
         # SourcePipeline starts viewer-only work here.  Publish the session only
         # after that operation succeeds, so partial opens never consume capacity.
         source.add_viewer(session_id)
         self._sessions[session_id] = _Session(access, source)
+        self._issued_session_ids.add(session_id)
         return LiveSession(session_id, source_id)
 
     def require(self, access: LiveAccess, session_id: UUID) -> LiveSession:

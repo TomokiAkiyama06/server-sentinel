@@ -206,14 +206,15 @@ class LiveViewerSessionTests(unittest.TestCase):
             self.sessions.open(self.access, replacement)
         self.assertEqual(replacement.add_calls, 0)
 
-    def test_duplicate_factory_id_fails_before_touching_second_source(self):
+    def test_reused_factory_id_fails_even_after_original_session_closed(self):
         duplicate = UUID(int=900)
         sessions = LiveViewerSessions(
             LiveSessionLimits(2, 2), self.access_state,
             session_id_factory=lambda: duplicate,
         )
         source = SyntheticSource()
-        sessions.open(self.access, source)
+        first = sessions.open(self.access, source)
+        sessions.close(self.access, first.session_id)
         with self.assertRaisesRegex(RuntimeError,
                                     "session identifier allocation failed"):
             sessions.open(self.access, source)
