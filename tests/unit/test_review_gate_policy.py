@@ -34,6 +34,52 @@ class ReviewGatePolicyTests(unittest.TestCase):
         self.validate()
         self.validate(list(reversed(self.runs)))
 
+    def test_publisher_foundation_emits_only_fixed_success_payloads(self):
+        for reviewer, name in gate.CHECK_NAMES.items():
+            with self.subTest(reviewer=reviewer):
+                request = gate.successful_check_run_request(self.context, reviewer)
+                self.assertEqual(request, {
+                    "name": name,
+                    "head_sha": self.context.test_merge_sha,
+                    "status": "completed",
+                    "conclusion": "success",
+                    "output": {
+                        "title": f"{reviewer} review passed",
+                        "summary": gate.receipt_summary(self.context, reviewer),
+                    },
+                })
+                self.assertLessEqual(len(request["output"]["summary"]), 4096)
+                synthetic_run = deepcopy(request)
+                synthetic_run["app"] = {
+                    "id": self.issuer.app_id, "slug": self.issuer.app_slug,
+                }
+                runs = deepcopy(self.runs)
+                runs[list(gate.CHECK_NAMES).index(reviewer)] = synthetic_run
+                self.validate(runs)
+
+    def test_publisher_refuses_unrecognized_reviewer_or_caller_conclusion(self):
+        for reviewer in (None, "", "Codex", "github-actions", "other"):
+            with self.subTest(reviewer=reviewer), self.assertRaises(gate.PolicyFailure):
+                gate.successful_check_run_request(self.context, reviewer)
+        signature = gate.successful_check_run_request
+        self.assertNotIn("conclusion", signature.__code__.co_varnames)
+
+    def test_publisher_receipt_is_canonical_and_binds_every_context_field(self):
+        raw = gate.receipt_summary(self.context, "codex")
+        self.assertEqual(raw, json.dumps({
+            "schema_version": gate.RECEIPT_SCHEMA_VERSION,
+            "reviewer": "codex", "outcome": "pass",
+            "context": asdict(self.context),
+        }, sort_keys=True, separators=(",", ":")))
+        for field, value in {
+            "repository_id": 900003, "pr_number": 2,
+            "base_sha": "e" * 40, "merge_base_sha": "e" * 40,
+            "diff_sha256": "e" * 64, "test_merge_sha": "e" * 40,
+        }.items():
+            with self.subTest(field=field):
+                changed = replace(self.context, **{field: value})
+                self.assertNotEqual(raw, gate.receipt_summary(changed, "codex"))
+
     def test_each_review_is_required_without_duplicate_or_extra_attempts(self):
         for runs in ([], self.runs[:1], self.runs * 2, [self.runs[0]] * 2, None):
             with self.subTest(runs=runs), self.assertRaises(gate.PolicyFailure):

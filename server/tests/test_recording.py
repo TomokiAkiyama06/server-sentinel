@@ -11,7 +11,14 @@ import threading
 import unittest
 import zlib
 
+from app.audit import (
+    AuditAction, AuditOutcome, AuditStorageError, AuditStore, OwnerAuditService,
+    OwnerAuthorizationError,
+)
+from app.audit.integration import OwnerAdministration
+from app.cameras.registry import CameraRegistry
 from app.media.recording import Limits, RecordingError, RecordingStore, RootIdentity, Segment
+from app.storage.database import Database
 from app.storage.migrations import migrate
 from app.storage.schema import APPLICATION_MIGRATIONS
 
@@ -63,7 +70,9 @@ class RecordingTests(unittest.TestCase):
             self.db.execute("SELECT version, name FROM schema_migrations ORDER BY version").fetchall(),
             [(1, "foundation"), (2, "camera_registry"), (3, "uvc_identity"),
              (4, "durable_recording"), (5, "recording_health"),
-             (6, "hardware_integrity")],
+             (6, "hardware_integrity"), (7, "roi_calibration_history"),
+             (8, "presence_timeline"), (9, "security_admin_audit"),
+             (10, "uvc_explicit_binding"), (11, "pairing_ledger")],
         )
         self.policy = Reservation()
         self.validator = SyntheticValidator()
@@ -521,6 +530,204 @@ class RecordingTests(unittest.TestCase):
         self.assertEqual(size, self.store.delete_recording(first, owner_requested=True))
         self.assertEqual(0, self.store.usage_bytes())
         self.assertEqual([], list(self.root.iterdir()))
+
+    def test_owner_recording_change_and_audit_share_transaction(self):
+        class PermitOwner:
+            def require_owner(self, actor_context):
+                return None
+
+        self.store.append(self.segment())
+        recording = self.store.start_manual(self.source, 30_000, duration_ms=10_000)
+        self.store.finish(recording)
+        database = Database(self.base / "metadata.sqlite")
+        audit = AuditStore(database)
+        admin = OwnerAdministration(
+            OwnerAuditService(audit, PermitOwner()), CameraRegistry(database),
+        )
+        original_append = audit.append_on
+
+        def append_while_reserved(*args, **kwargs):
+            self.assertTrue(self.policy.reserved)
+            return original_append(*args, **kwargs)
+
+        self.policy.calls.clear()
+        with patch.object(audit, "append_on", side_effect=append_while_reserved):
+            admin.set_recording_starred("synthetic-owner", self.store, recording, True)
+        self.assertEqual([(0, False)], self.policy.calls)
+        self.assertFalse(self.policy.reserved)
+        self.assertTrue(self.store.manifest(recording)["starred"])
+        record = audit.list_records()[0]
+        self.assertEqual(AuditAction.UPDATE_RECORDING, record.action)
+        self.assertEqual(AuditOutcome.SUCCEEDED, record.outcome)
+
+        with patch.object(audit, "append_on",
+                          side_effect=AuditStorageError("synthetic unavailable")):
+            with self.assertRaises(AuditStorageError):
+                admin.set_recording_starred(
+                    "synthetic-owner", self.store, recording, False,
+                )
+        self.assertTrue(self.store.manifest(recording)["starred"])
+
+    def test_owner_delete_success_failure_and_denial_are_integrated(self):
+        class PermitOwner:
+            def require_owner(self, actor_context):
+                return None
+
+        self.store.append(self.segment())
+        deleted = self.store.start_manual(self.source, 30_000, duration_ms=10_000)
+        denied = self.store.start_manual(self.source, 30_000, duration_ms=10_000)
+        self.store.finish(deleted)
+        self.store.finish(denied)
+        self.store.release_source(self.source)
+        database = Database(self.base / "metadata.sqlite")
+        audit = AuditStore(database)
+        admin = OwnerAdministration(
+            OwnerAuditService(audit, PermitOwner()), CameraRegistry(database),
+        )
+
+        original_append = audit.append_on
+
+        def append_while_reserved(*args, **kwargs):
+            self.assertTrue(self.policy.reserved)
+            return original_append(*args, **kwargs)
+
+        self.policy.calls.clear()
+        with patch.object(audit, "append_on", side_effect=append_while_reserved):
+            admin.delete_recording("synthetic-owner", self.store, deleted)
+        self.assertEqual([(0, False), (0, False)], self.policy.calls)
+        self.assertFalse(self.policy.reserved)
+        with self.assertRaises(RecordingError):
+            self.store.manifest(deleted)
+        missing = uuid4()
+        with self.assertRaises(RecordingError):
+            admin.delete_recording("synthetic-owner", self.store, missing)
+
+        with patch.object(audit, "append_on",
+                          side_effect=AuditStorageError("synthetic unavailable")):
+            with self.assertRaises(AuditStorageError):
+                admin.delete_recording("synthetic-owner", self.store, denied)
+        self.assertEqual(str(denied), self.store.manifest(denied)["id"])
+
+        class GenericDeny:
+            def require_owner(self, actor_context):
+                raise PermissionError("synthetic secret detail")
+
+        denied_admin = OwnerAdministration(
+            OwnerAuditService(audit, GenericDeny()), CameraRegistry(database),
+        )
+        self.policy.calls.clear()
+        with self.assertRaises(OwnerAuthorizationError):
+            denied_admin.delete_recording("not-owner", self.store, denied)
+        # The denied outcome is recorded through storage admission too, so the
+        # hard reserve also covers refused work, and no mutation runs.
+        self.assertEqual([(0, False)], self.policy.calls)
+        self.assertFalse(self.policy.reserved)
+        self.assertEqual(str(denied), self.store.manifest(denied)["id"])
+        outcomes = {
+            record.target_logical_id: record.outcome
+            for record in audit.list_records()
+            if record.action is AuditAction.DELETE_RECORDING
+        }
+        self.assertEqual(AuditOutcome.SUCCEEDED, outcomes[deleted])
+        self.assertEqual(AuditOutcome.FAILED, outcomes[missing])
+        self.assertEqual(AuditOutcome.DENIED, outcomes[denied])
+
+    def test_cleanup_failure_survives_an_undeliverable_post_commit_audit(self):
+        class PermitOwner:
+            def require_owner(self, actor_context):
+                return None
+
+        self.store.append(self.segment())
+        recording = self.store.start_manual(self.source, 30_000, duration_ms=10_000)
+        self.store.finish(recording)
+        self.store.release_source(self.source)
+        database = Database(self.base / "metadata.sqlite")
+        audit = AuditStore(database)
+        service = OwnerAuditService(audit, PermitOwner())
+        admin = OwnerAdministration(service, CameraRegistry(database))
+        private_detail = "synthetic-private-cleanup-detail"
+        with patch.object(self.store, "_trim",
+                          side_effect=RecordingError(private_detail)):
+            with patch.object(audit, "append",
+                              side_effect=AuditStorageError("synthetic unavailable")):
+                # The audit append failure must not replace the real cleanup
+                # failure the Owner needs to see.
+                with self.assertRaisesRegex(RecordingError, private_detail):
+                    admin.delete_recording("synthetic-owner", self.store, recording)
+        self.assertTrue(service.audit_delivery_failed)
+        self.assertEqual(1, service.undelivered_audit_records)
+        self.assertEqual(
+            {(AuditAction.DELETE_RECORDING, AuditOutcome.SUCCEEDED)},
+            {(record.action, record.outcome) for record in audit.list_records()
+             if record.target_logical_id == recording},
+        )
+
+    def test_owner_recording_audit_never_writes_past_the_hard_reserve(self):
+        class PermitOwner:
+            def require_owner(self, actor_context):
+                return None
+
+        self.store.append(self.segment())
+        recording = self.store.start_manual(self.source, 30_000, duration_ms=10_000)
+        self.store.finish(recording)
+        database = Database(self.base / "metadata.sqlite")
+        # The deployment shares one storage admission between the recording
+        # store and its audit writes.
+        audit = AuditStore(database, reservation=self.store.control_reservation)
+        service = OwnerAuditService(audit, PermitOwner())
+        admin = OwnerAdministration(service, CameraRegistry(database))
+
+        self.policy.denial = "STORAGE_HARD_STOP"
+        with self.assertRaisesRegex(RecordingError, "STORAGE_HARD_STOP"):
+            admin.set_recording_starred("synthetic-owner", self.store, recording, True)
+        # Neither the starred mutation nor a failure row may spend the reserve,
+        # and the undelivered outcome stays visible instead of silent success.
+        self.assertFalse(self.policy.reserved)
+        self.assertEqual((), audit.list_records())
+        self.assertTrue(service.audit_delivery_failed)
+        self.assertEqual(1, service.undelivered_audit_records)
+
+        self.policy.denial = None
+        self.assertFalse(self.store.manifest(recording)["starred"])
+        admin.set_recording_starred("synthetic-owner", self.store, recording, True)
+        self.assertTrue(self.store.manifest(recording)["starred"])
+        self.assertEqual(AuditOutcome.SUCCEEDED, audit.list_records()[0].outcome)
+
+    def test_owner_delete_cleanup_failure_gets_distinct_failed_audit(self):
+        class PermitOwner:
+            def require_owner(self, actor_context):
+                return None
+
+        self.store.append(self.segment())
+        recording = self.store.start_manual(self.source, 30_000, duration_ms=10_000)
+        self.store.finish(recording)
+        self.store.release_source(self.source)
+        database = Database(self.base / "metadata.sqlite")
+        audit = AuditStore(database)
+        admin = OwnerAdministration(
+            OwnerAuditService(audit, PermitOwner()), CameraRegistry(database),
+        )
+        private_detail = "synthetic-private-cleanup-detail"
+        with patch.object(
+                self.store, "_trim",
+                side_effect=RecordingError(private_detail)):
+            with self.assertRaisesRegex(RecordingError, private_detail):
+                admin.delete_recording("synthetic-owner", self.store, recording)
+        self.assertFalse(self.policy.reserved)
+
+        records = [record for record in audit.list_records()
+                   if record.target_logical_id == recording]
+        self.assertEqual(
+            {(AuditAction.DELETE_RECORDING, AuditOutcome.SUCCEEDED),
+             (AuditAction.DELETE_RECORDING_CLEANUP, AuditOutcome.FAILED)},
+            {(record.action, record.outcome) for record in records},
+        )
+        with sqlite3.connect(self.base / "metadata.sqlite") as connection:
+            self.assertEqual("deleting", connection.execute(
+                "SELECT status FROM recordings WHERE id=?", (str(recording),)
+            ).fetchone()[0])
+        self.assertNotIn(private_detail.encode(),
+                         (self.base / "metadata.sqlite").read_bytes())
 
     def test_active_recording_cannot_be_deleted_even_by_owner(self):
         recording = self.store.start_manual(self.source, 30_000)

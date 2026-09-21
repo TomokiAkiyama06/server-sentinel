@@ -7,7 +7,9 @@ from unittest.mock import patch
 from uuid import UUID
 
 from app.cameras.uvc.identity import CameraState, DeviceEvidence, ReconnectController
-from app.cameras.uvc.persistence import ApprovalStorageError, ApprovalStore, SCHEMA
+from app.cameras.uvc.persistence import (
+    ApprovalStorageError, ApprovalStore, EXPLICIT_BINDING_SCHEMA, SCHEMA,
+)
 
 
 class SyntheticDatabase:
@@ -27,6 +29,7 @@ class PersistenceTests(unittest.TestCase):
         connection = self.database.connect()
         connection.execute("CREATE TABLE camera_sources (id TEXT PRIMARY KEY)")
         connection.execute(SCHEMA)
+        connection.execute(EXPLICIT_BINDING_SCHEMA)
         connection.close()
         self.source_id = UUID(int=1)
         self.camera = DeviceEvidence("/dev/video0", "synthetic", "model", "serial", instance_token=(1, 2, 3))
@@ -137,6 +140,23 @@ class PersistenceTests(unittest.TestCase):
         control.shutdown()
         restarted = self.controller()
         self.assertEqual(restarted.reconcile([new_camera]), new_camera)
+
+    def test_durable_approval_never_restores_a_live_explicit_binding(self):
+        connection = self.database.connect()
+        connection.execute("BEGIN IMMEDIATE")
+        weak = replace(self.camera, serial=None)
+        self.store.approve_on(
+            connection, self.source_id, weak, serial_ambiguous=False,
+        )
+        connection.commit()
+        connection.close()
+        self.assertFalse(self.store.load(self.source_id).explicit_binding)
+        current = ReconnectController(
+            self.source_id, weak, lambda event: None, store=self.store,
+        )
+        self.assertIsNone(current.reconcile([weak]))
+        self.assertEqual(CameraState.MANUAL, current.state)
+        self.assertFalse(self.store.load(self.source_id).explicit_binding)
 
 
 if __name__ == "__main__":
