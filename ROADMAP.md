@@ -91,8 +91,8 @@ acceptance.
 - [x] detector-specific image-quality gating (internal metrics/recovery/unknown contracts; real-camera calibration pending)
 - [x] no false `no person` when quality is insufficient (synthetic gate/scheduler regression tests)
 - [x] bounded per-source inference-cadence primitive (#20; Main worker integration remains open)
-- [ ] server ROI calibration/movement
-- [ ] camera tamper/occlusion/source-health correlation
+- [x] server ROI calibration/movement (bounded synthetic core; capture-worker integration and real-scene calibration remain open)
+- [x] camera tamper/occlusion/source-health correlation (synthetic local core; source-health integration and real-camera acceptance remain open)
 
 ## Phase 6 — Entrance / owner / presence intelligence
 

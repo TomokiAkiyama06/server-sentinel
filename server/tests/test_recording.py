@@ -70,8 +70,8 @@ class RecordingTests(unittest.TestCase):
             self.db.execute("SELECT version, name FROM schema_migrations ORDER BY version").fetchall(),
             [(1, "foundation"), (2, "camera_registry"), (3, "uvc_identity"),
              (4, "durable_recording"), (5, "recording_health"),
-             (6, "hardware_integrity"), (7, "security_admin_audit"),
-             (8, "uvc_explicit_binding")],
+             (6, "hardware_integrity"), (7, "roi_calibration_history"),
+             (8, "security_admin_audit"), (9, "uvc_explicit_binding")],
         )
         self.policy = Reservation()
         self.validator = SyntheticValidator()

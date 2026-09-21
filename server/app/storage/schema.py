@@ -3,6 +3,7 @@
 from app.audit.schema import audit_migration
 from app.cameras.registry.schema import REGISTRY_MIGRATION
 from app.cameras.uvc.schema import UVC_MIGRATION, uvc_explicit_binding_migration
+from app.detection.roi.schema import roi_calibration_migration
 from app.integrity.store import integrity_migration
 from app.media.health.artifacts import recording_health_migration
 from app.media.recording.schema import recording_migration
@@ -16,6 +17,9 @@ APPLICATION_MIGRATIONS = (
     recording_migration(4),
     recording_health_migration(5),
     integrity_migration(6),
-    audit_migration(7),
-    uvc_explicit_binding_migration(8),
+    # Version 7 is already shipped by the ROI implementation on main. Keep
+    # published migration identities stable when later feature branches meet.
+    roi_calibration_migration(7),
+    audit_migration(8),
+    uvc_explicit_binding_migration(9),
 )
