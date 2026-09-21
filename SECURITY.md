@@ -82,7 +82,7 @@ Until Issue #4 establishes hardened repository-level enforcement:
 
 - same-repository write access is a trusted-maintainer capability;
 - external/untrusted contributors use fork PRs;
-- Codex + Claude review of the current **HEAD and current base/diff context** is a mandatory operational merge policy;
+- Codex review of the current **HEAD and current base/diff context** is the mandatory operational merge policy while Claude review automation is temporarily disabled by Owner decision due to subscription quota;
 - ordinary `GITHUB_TOKEN` statuses/check names are not treated as unforgeable against a malicious same-repository writer;
 - any material HEAD or base change invalidates the prior review context;
 - real monitoring media, biometric templates, secrets, and private deployment values never appear in PRs.
@@ -90,8 +90,7 @@ Until Issue #4 establishes hardened repository-level enforcement:
 The dedicated-App deployment proposal and offline policy validator are documented
 in [`docs/REVIEW_GATE_SETUP.md`](docs/REVIEW_GATE_SETUP.md). They do not install
 enforcement or authenticate supplied JSON. App credentials must remain outside
-PR-controlled workflows/checkouts; the existing same-repository Claude workflow
-is still limited to trusted writers. Actual issuer isolation and GitHub test-PR
+PR-controlled workflows/checkouts; the former same-repository Claude workflow was limited to trusted writers and is currently disabled. Actual issuer isolation and GitHub test-PR
 acceptance remain open in #4.
 
 ## Main Server release and installer trust boundary

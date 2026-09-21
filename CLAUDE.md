@@ -68,7 +68,7 @@ MVPの基本構成:
 
 ## 自動レビュー
 
-`.github/workflows/claude-review.yml` / `claude-review-fork.yml` の制約を優先します。自動Claude jobはread-onlyで、GitHubへ直接書き込まず、コード/設定/スクリプトを実行せず、固定されたHEAD/base差分だけをレビューします。
+GitHub Actions上のClaude PRレビューは、利用可能なサブスクリプション枠が尽きているため現在停止中です。Ownerが明示的に再有効化するまでは、ClaudeレビューをMerge条件として扱いません。
 
 ## マージ
 

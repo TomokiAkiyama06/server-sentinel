@@ -396,10 +396,13 @@ Non-owner invited users do not receive an official recording download/export end
 ### AUTH-008 Owner operations
 Only the owner (or a future explicitly defined privileged role) may add/revoke users, change permissions, register/revoke capture agents/cameras, configure agent ring-buffer mode/value, enroll/delete owner biometrics, alter retention/security settings, or delete recordings.
 
-### AUTH-009 Immediate application revocation
+### AUTH-009 Session lifetime and clock safety
+Server-side human sessions have a 30-minute idle lifetime and a 12-hour absolute lifetime. Authorized activity may renew the configured idle lifetime but never the absolute lifetime. A time before session establishment or before the last accepted activity invalidates authorization; restart or clock uncertainty shall fail closed rather than extend a session.
+
+### AUTH-010 Immediate application revocation
 Application permission revocation shall invalidate active ServerSentinel authorization promptly. Tailnet membership/policy remains separately administered outside ServerSentinel.
 
-### AUTH-010 Application fingerprint minimization for uninvited users
+### AUTH-011 Application fingerprint minimization for uninvited users
 When an ordinary Tailnet user is not invited in ServerSentinel, the application shall minimize disclosure that ServerSentinel is running. Unauthorized responses should be generic/non-branding (for example not-found style), and shall not expose ServerSentinel product/version strings, camera/source counts, API schemas, health details, thumbnails, recordings, timeline data, or other deployment metadata.
 
 This is application-level non-disclosure only. With unchanged Tailscale policy, the existence/reachability of the underlying Tailscale node or listening service cannot be guaranteed hidden.
@@ -454,8 +457,10 @@ Cover local UVC and remote-agent discovery, ambiguous identical-device reconnect
 ### DEV-001 No direct main
 Non-trivial work uses Issue -> branch -> PR -> CI/review -> merge.
 
-### DEV-002 Dual automated review
-Codex and Claude must both review the current PR diff. A review is valid only for the current **HEAD and base revision/diff context**. If either HEAD or relevant base changes, the review must be rerun before merge.
+### DEV-002 Automated review
+Codex must review the current PR diff. A review is valid only for the current **HEAD and base revision/diff context**. If either HEAD or relevant base changes, the review must be rerun before merge.
+
+Claude review automation is temporarily disabled because the available subscription quota is exhausted. Until the Owner explicitly restores it, Claude review is not required for merge.
 
 ### DEV-003 No secrets/private deployment data
 Never commit real credentials, private keys, owner biometrics, private deployment values, or real monitoring media.

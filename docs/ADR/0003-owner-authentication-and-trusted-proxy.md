@@ -1,7 +1,8 @@
 # ADR-0003: Owner authentication and the trusted human-access boundary
 
-Status: Proposed
+Status: Accepted
 Date: 2026-09-20
+Owner approval recorded: 2026-09-21
 Issue: [#6](https://github.com/TomokiAkiyama06/server-sentinel/issues/6)
 
 ## Context and approval boundary
@@ -12,10 +13,11 @@ revocation, and generic denial without deployment metadata. ADR-0001 and
 ADR-0002 remain authoritative. This document proposes the implementation choices
 below; it does not accept them on the Owner's behalf or activate human access.
 
-Owner confirmation is required before this record becomes Accepted. Until then,
-Issue #6 remains open. Issue #7 may build a backend that denies every human
-request; authenticated route activation in Issue #10 waits for this decision and
-implementation/review of the full boundary.
+The Owner approved the recommended choices in this record on 2026-09-21.
+Issue #6 remains open until the full boundary is implemented and verified. Issue
+#7 may build a backend that denies every human request; authenticated route
+activation in Issue #10 still waits for implementation/review of the full
+boundary.
 
 ## Proposed decisions requiring Owner confirmation
 
@@ -24,7 +26,7 @@ implementation/review of the full boundary.
 | Initial Owner and recovery | A privileged local administrative command on the Main Server creates/rebinds the single Owner and locally authorizes its one credential enrollment. No remote first-visitor setup or remote account recovery. | Per-person credentials leave no alternative: enrolling on first connection would let any holder of the shared login claim Owner, and requiring a credential first makes the first login impossible. The single-use local authorization is the residual attack surface, and it is bounded, principal-bound, and non-reusable. |
 | Human identity and trust | Tailscale Serve over private HTTPS, forwarding to a loopback-only human backend on a host whose local processes are trusted. Match a deployment-scoped exact login identity to the application allowlist as a supplementary check, never as the authoritative authenticator. | An equivalent isolated authentication proxy can supply a stable issuer/subject, but needs its own reviewed adapter and deployment validation before support. |
 | Hostname reservation | A hostname dedicated to ServerSentinel on every scheme and port, held by a dedicated network identity or a single-purpose node that the Owner records. Startup and daily checks enumerate actual listeners and proxy routes for the name and close access on any other answer. | Sharing the name by path keeps one browser origin, and sharing it by port still keeps one cookie scope because cookies are not port-scoped, so a neighbor receives or replays the Owner's session. Configuration enumeration alone cannot see a direct bind, so without the deployment isolation the checks only bound the exposure window. |
-| Sessions and revocation | Server-side opaque sessions bound to verified identity and to the per-person credential that established them; 30-minute idle and 12-hour absolute lifetimes, and a 5-minute user-verification freshness window for Owner operations. Recheck current grants on every request and cancel active delivery on revocation, with a maximum five-second watchdog. | Different lifetimes, a different freshness window, or a stricter stream-revocation bound change usability/resource tradeoffs and must be recorded before implementation. |
+| Sessions and revocation | Server-side opaque sessions bound to verified identity and to the per-person credential that established them; 30-minute idle and 12-hour absolute lifetimes, and a 5-minute user-verification freshness window for Owner operations. Recheck current grants on every request and cancel active delivery on revocation, with a maximum five-second watchdog. | Owner-approved on 2026-09-21. A future change records its usability/resource tradeoff before implementation. |
 
 No option permits Tailnet membership alone, automatic Tailscale policy changes,
 public Internet exposure, a developer identity service, or capture-node access to
@@ -266,11 +268,12 @@ evaluation.
 
 The session is an additional application state boundary. Every human request
 still needs the same verified proxy identity and current invitation/grant; a
-copied cookie or media URL alone never authorizes. Proposed timeouts are 30
+copied cookie or media URL alone never authorizes. Approved timeouts are 30
 minutes idle and 12 hours absolute, checked server-side. Active authorized
 playback counts as activity; it does not extend absolute expiry. Restart/clock
 uncertainty must not extend lifetime; invalidate sessions when expiry cannot be
-reliably established. Logout invalidates server state and closes that session's
+reliably established. A time before session establishment or before its last
+accepted activity is rejected, so a backward clock step never revives access. Logout invalidates server state and closes that session's
 active streams. Because Tailscale identity remains authenticated, a user with an
 active invitation can explicitly establish another session; logout is not user
 revocation and does not force upstream identity-provider reauthentication.
