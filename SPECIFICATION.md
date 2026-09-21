@@ -328,7 +328,7 @@ Pairing credentials are cryptographically random, single-use, short-lived, and n
 
 Before transmitting a pairing code, the Agent must authenticate the intended Main Server and establish confidentiality/integrity for the initial enrollment exchange. Private-LAN reachability or a short-lived code does not replace this server-authentication requirement. Public trust information must be obtained/verified through an Owner-controlled trusted local or out-of-band channel, independently of an unverified network endpoint. Missing/mismatched trust or certificate verification failure stops pairing without sending the code; plaintext or unverified-certificate fallback is forbidden.
 
-The concrete bootstrap trust mechanism and initial encrypted transport remain PoC/ADR decisions before pairing implementation. These requirements do not select a particular certificate/pinning protocol. Post-pairing mTLS does not retroactively protect an insecure initial code exchange.
+ADR-0006 selects the bootstrap trust mechanism: the Owner transfers a deployment-local CA public trust bundle through an independently trusted channel; the local Main approval binds a 128-bit, five-minute, one-use code to the Agent public-key digest; and TLS 1.3 authenticates the intended Main before the code is sent. Fingerprint pinning is not the selected profile. The bootstrap/ingest adapters remain separately staged and disabled until their implementation and negative validation are complete. Post-pairing mTLS does not retroactively protect an insecure initial code exchange.
 
 ### 5.5 Long-lived trust
 
