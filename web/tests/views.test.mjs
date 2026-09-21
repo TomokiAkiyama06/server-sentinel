@@ -11,7 +11,7 @@ await compile('src/views/presence.tsx', 'build/presence.mjs');
 const { canVisit, views } = await import('../build/domain.mjs');
 const { messages } = await import('../build/i18n.mjs');
 const { TimelineBody, cursorAdvanced, detectorObservation, displayValue, filters, kindGroup, matches, spans } = await import('../build/timeline.mjs');
-const { PresenceBody, refreshDelay, scheduleExpiryRefresh } = await import('../build/presence.mjs');
+const { PresenceBody, refreshDelay, scheduleExpiryRefresh, withFailure, withReport } = await import('../build/presence.mjs');
 
 // Synthetic only: no real person, deployment, camera or identity value appears here.
 const kinds = ['person', 'motion', 'owner_entry', 'owner_exit', 'anonymous_entry', 'anonymous_exit',
@@ -476,6 +476,27 @@ test('presence offers a refresh path and serializes override cancellation', () =
   assert.doesNotMatch(plain, /最新の状態を取得/);
   assert.doesNotMatch(plain, /取得時刻/);
   assert.match(plain, /<button[^>]*disabled/);
+});
+
+test('an authoritative report clears earlier read and control failures', () => {
+  const report = { snapshot: snapshot(), audit: [] };
+  // A cancellation that timed out after the core applied it must not keep its
+  // alert beside a refreshed report that shows no override.
+  const stale = withFailure(withFailure(withReport(report), 'cancel'), 'refresh');
+  assert.deepEqual([stale.cancelFailed, stale.refreshFailed], [true, true]);
+  const refreshed = withReport({ snapshot: snapshot({ basis: 'unknown' }), audit: [] });
+  assert.deepEqual([refreshed.state, refreshed.cancelFailed, refreshed.refreshFailed],
+    ['ready', false, false]);
+  // A later failure keeps the last known status and the other flag untouched.
+  const readFailed = withFailure(withReport(report), 'refresh');
+  assert.deepEqual([readFailed.state, readFailed.refreshFailed, readFailed.cancelFailed],
+    ['ready', true, false]);
+  const controlFailed = withFailure(readFailed, 'cancel');
+  assert.deepEqual([controlFailed.refreshFailed, controlFailed.cancelFailed], [true, true]);
+  assert.equal(controlFailed.report, report);
+  // Only the first read can fail closed; a control failure never blanks it.
+  assert.deepEqual(withFailure({ state: 'loading' }, 'refresh'), { state: 'failed' });
+  assert.deepEqual(withFailure({ state: 'loading' }, 'cancel'), { state: 'loading' });
 });
 
 test('only a future override expiry schedules a refresh', () => {

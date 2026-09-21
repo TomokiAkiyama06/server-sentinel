@@ -98,7 +98,10 @@ automatic re-read defers while a control operation is in flight, a read that a
 newer control result superseded is discarded, and a failed refresh keeps the
 last known status, its fetch time and the retry control. Override cancellation
 is serialized, so a second click cannot start a duplicate audited control
-operation.
+operation. Read and control failures live in the loaded status itself, so an
+authoritative report clears them: a cancellation that timed out after the core
+applied it cannot leave its alert beside a refreshed state that shows no
+override.
 
 `canVisit()` keeps the timeline with `recordings:view` and presence with the
 Owner. This remains UI projection only: the production entry still denies

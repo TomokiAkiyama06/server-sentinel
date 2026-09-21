@@ -117,7 +117,18 @@ export function PresenceBody({ report, t, onCancel, failed, cancelling, onRefres
 }
 
 type State = { state: 'pending' } | { state: 'loading' } | { state: 'failed' }
-  | { state: 'ready'; report: PresenceReport; refreshFailed: boolean };
+  | { state: 'ready'; report: PresenceReport; refreshFailed: boolean; cancelFailed: boolean };
+
+/** An authoritative report replaces every earlier read or control failure. */
+export function withReport(report: PresenceReport): State {
+  return { state: 'ready', report, refreshFailed: false, cancelFailed: false };
+}
+
+/** A failure keeps the last known status; only the first read can fail closed. */
+export function withFailure(previous: State, kind: 'refresh' | 'cancel'): State {
+  if (previous.state !== 'ready') return kind === 'refresh' ? { state: 'failed' } : previous;
+  return kind === 'refresh' ? { ...previous, refreshFailed: true } : { ...previous, cancelFailed: true };
+}
 
 const HOUR = 3600000;
 
@@ -154,7 +165,6 @@ export function scheduleExpiryRefresh(expiry: string | null, refresh: () => void
 
 export function PresenceScreen({ services, t }: { services: DashboardServices; t: Messages }) {
   const [data, setData] = useState<State>({ state: 'pending' });
-  const [failed, setFailed] = useState(false);
   const [cancelling, setCancelling] = useState(false);
   const [attempt, setAttempt] = useState(0);
   const [fetchedAt, setFetchedAt] = useState<string | null>(null);
@@ -177,13 +187,12 @@ export function PresenceScreen({ services, t }: { services: DashboardServices; t
       try {
         const report = await load(controller.signal);
         if (!controller.signal.aborted && current === ticket.current) {
-          setData({ state: 'ready', report, refreshFailed: false });
+          setData(withReport(report));
           setFetchedAt(new Date().toISOString());
         }
       } catch {
         if (!controller.signal.aborted && current === ticket.current) {
-          setData(previous => previous.state === 'ready'
-            ? { ...previous, refreshFailed: true } : { state: 'failed' });
+          setData(previous => withFailure(previous, 'refresh'));
         }
       }
     })();
@@ -205,23 +214,25 @@ export function PresenceScreen({ services, t }: { services: DashboardServices; t
     if (inFlight.current) return;
     inFlight.current = true;
     setCancelling(true);
-    setFailed(false);
+    setData(previous => previous.state === 'ready' ? { ...previous, cancelFailed: false } : previous);
     const controller = new AbortController();
     const current = ticket.current += 1;
     void (async () => {
       try {
         const report = await cancel(controller.signal);
         if (current === ticket.current) {
-          setData({ state: 'ready', report, refreshFailed: false });
+          setData(withReport(report));
           setFetchedAt(new Date().toISOString());
         }
-      } catch { setFailed(true); } finally {
+      } catch {
+        setData(previous => withFailure(previous, 'cancel'));
+      } finally {
         inFlight.current = false;
         setCancelling(false);
       }
     })();
   } : undefined;
-  return <PresenceBody report={data.report} t={t} onCancel={request} failed={failed}
+  return <PresenceBody report={data.report} t={t} onCancel={request} failed={data.cancelFailed}
     cancelling={cancelling} onRefresh={() => setAttempt(value => value + 1)}
     fetchedAt={fetchedAt ?? undefined} refreshFailed={data.refreshFailed} />;
 }
