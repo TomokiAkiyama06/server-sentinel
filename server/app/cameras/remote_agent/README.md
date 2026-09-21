@@ -28,6 +28,13 @@ message, total queued bytes, and per-node message rate. Refusals report
 `unauthorized`, size, rate, clock, or queue pressure without evicting accepted
 messages or claiming camera/node health.
 
+Per-node rate-window state is separately hard-bounded. Expired windows are
+retired when capacity is needed; if every retained window is still active, a
+new node fails closed with rate-window capacity pressure. The node lifecycle
+should also call `forget_revoked_node` after durable revocation or node removal
+to discard state promptly without exposing node identities in snapshots. A
+mere transport disconnect must not reset a node's rate budget.
+
 It opens no listener, parses no media/container, selects no transport, and
 implements neither pairing nor mTLS. The eventual listener must independently
 limit bytes before constructing an `AgentMessage`, remain separate from human

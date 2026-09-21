@@ -37,6 +37,7 @@ class IngestLimits:
     maximum_queued_bytes: int
     maximum_messages_per_window: int
     rate_window_ns: int
+    maximum_tracked_rate_windows: int = 1024
 
     def __post_init__(self) -> None:
         values = tuple(getattr(self, field) for field in self.__dataclass_fields__)
@@ -106,6 +107,7 @@ class IngestSnapshot:
     rejected: int
     backpressured: int
     rate_limited: int
+    tracked_rate_windows: int
 
 
 class AgentIngestQueue:
@@ -132,6 +134,21 @@ class AgentIngestQueue:
         self._rejected = self._backpressured = self._rate_limited = 0
         self._lock = Lock()
 
+    def _retire_expired_windows(self, now: int) -> None:
+        """Drop inactive rate state when a new authenticated node needs room.
+
+        The map is always hard-bounded.  Cleanup is deferred until capacity is
+        needed so the ordinary per-message path does not scan all tracked
+        nodes.  A start time ahead of ``now`` is retained and therefore fails
+        closed if the injected monotonic clock regresses.
+        """
+        expired = tuple(
+            node_id for node_id, (start, _) in self._windows.items()
+            if now >= start and now - start >= self.limits.rate_window_ns
+        )
+        for node_id in expired:
+            del self._windows[node_id]
+
     def _admission(self, outcome: IngestOutcome, reason: str | None) -> IngestAdmission:
         return IngestAdmission(outcome, reason, len(self._queue), self._queued_bytes)
 
@@ -151,7 +168,17 @@ class AgentIngestQueue:
             raise ValueError("ingest clock must return nonnegative integer nanoseconds")
         size = len(message.payload)
         with self._lock:
-            start, count = self._windows.get(message.node_id, (now, 0))
+            window = self._windows.get(message.node_id)
+            if window is None:
+                if len(self._windows) >= self.limits.maximum_tracked_rate_windows:
+                    self._retire_expired_windows(now)
+                if len(self._windows) >= self.limits.maximum_tracked_rate_windows:
+                    self._rate_limited += 1
+                    return self._admission(IngestOutcome.RATE_LIMITED,
+                                           "rate_window_capacity")
+                start, count = now, 0
+            else:
+                start, count = window
             if now < start:
                 self._rejected += 1
                 return self._admission(IngestOutcome.REJECTED, "clock_regression")
@@ -177,6 +204,13 @@ class AgentIngestQueue:
             self._queued_bytes += size
             return self._admission(IngestOutcome.ACCEPTED, None)
 
+    def forget_revoked_node(self, node_id: UUID) -> None:
+        """Forget rate state after durable revocation or node removal."""
+        if not isinstance(node_id, UUID):
+            raise ValueError("invalid agent node identity")
+        with self._lock:
+            self._windows.pop(node_id, None)
+
     def drain(self, maximum_messages: int) -> tuple[AgentMessage, ...]:
         """Remove a bounded batch for one downstream consumer attempt."""
         if type(maximum_messages) is not int or maximum_messages <= 0:
@@ -190,4 +224,5 @@ class AgentIngestQueue:
     def snapshot(self) -> IngestSnapshot:
         with self._lock:
             return IngestSnapshot(len(self._queue), self._queued_bytes, self._rejected,
-                                  self._backpressured, self._rate_limited)
+                                  self._backpressured, self._rate_limited,
+                                  len(self._windows))

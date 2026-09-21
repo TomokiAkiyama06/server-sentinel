@@ -8,8 +8,8 @@ from app.cameras.remote_agent.ingest import (
     IngestLimits, IngestOutcome,
 )
 
-NODE, OTHER_NODE = UUID(int=1), UUID(int=2)
-SOURCE, OTHER_SOURCE = UUID(int=11), UUID(int=12)
+NODE, OTHER_NODE, THIRD_NODE = UUID(int=1), UUID(int=2), UUID(int=3)
+SOURCE, OTHER_SOURCE, THIRD_SOURCE = UUID(int=11), UUID(int=12), UUID(int=13)
 
 
 class Authorizer:
@@ -105,17 +105,57 @@ class RemoteAgentIngestTests(unittest.TestCase):
         self.assertEqual("clock_regression", boundary.submit(message(sequence=5)).reason)
         self.assertEqual(1, boundary.snapshot().rate_limited)
 
+    def test_rate_window_state_is_bounded_and_expired_windows_make_room(self):
+        now = [0]
+        authorizer = Authorizer(
+            nodes=(NODE, OTHER_NODE, THIRD_NODE),
+            sources=((NODE, SOURCE), (OTHER_NODE, OTHER_SOURCE),
+                     (THIRD_NODE, THIRD_SOURCE)),
+        )
+        limits = IngestLimits(8, 8, 64, 10, 100,
+                              maximum_tracked_rate_windows=2)
+        boundary = queue(authorizer=authorizer, now=lambda: now[0], limits=limits)
+
+        self.assertEqual(IngestOutcome.ACCEPTED, boundary.submit(message()).outcome)
+        self.assertEqual(
+            IngestOutcome.ACCEPTED,
+            boundary.submit(message(node=OTHER_NODE, source=OTHER_SOURCE)).outcome,
+        )
+        capacity = boundary.submit(message(node=THIRD_NODE, source=THIRD_SOURCE))
+        self.assertEqual((IngestOutcome.RATE_LIMITED, "rate_window_capacity"),
+                         (capacity.outcome, capacity.reason))
+        self.assertEqual(2, boundary.snapshot().tracked_rate_windows)
+
+        now[0] = 100
+        self.assertEqual(
+            IngestOutcome.ACCEPTED,
+            boundary.submit(message(node=THIRD_NODE, source=THIRD_SOURCE)).outcome,
+        )
+        self.assertEqual(1, boundary.snapshot().tracked_rate_windows)
+
+    def test_revoked_node_lifecycle_can_release_rate_window_state(self):
+        boundary = queue(limits=IngestLimits(8, 8, 64, 10, 100, 1))
+        self.assertEqual(IngestOutcome.ACCEPTED, boundary.submit(message()).outcome)
+        self.assertEqual(1, boundary.snapshot().tracked_rate_windows)
+        boundary.forget_revoked_node(NODE)
+        self.assertEqual(0, boundary.snapshot().tracked_rate_windows)
+        boundary.forget_revoked_node(NODE)
+        with self.assertRaises(ValueError):
+            boundary.forget_revoked_node("not-a-node")
+
     def test_invalid_limits_dependencies_and_drain_are_rejected_without_network_or_health_claims(self):
         for limits in (IngestLimits(1, 1, 1, 1, 1),):
             self.assertIsInstance(limits, IngestLimits)
         with self.assertRaises(ValueError):
             IngestLimits(2, 1, 1, 1, 1)
         with self.assertRaises(ValueError):
+            IngestLimits(1, 1, 1, 1, 1, 0)
+        with self.assertRaises(ValueError):
             AgentIngestQueue(IngestLimits(1, 1, 1, 1, 1), object(), clock_ns=lambda: 0)
         boundary = queue()
         with self.assertRaises(ValueError):
             boundary.drain(0)
-        self.assertEqual((0, 0, 0, 0, 0), tuple(boundary.snapshot().__dict__.values()))
+        self.assertEqual((0, 0, 0, 0, 0, 0), tuple(boundary.snapshot().__dict__.values()))
 
 
 if __name__ == "__main__":
