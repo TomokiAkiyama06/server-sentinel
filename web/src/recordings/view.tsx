@@ -47,6 +47,15 @@ export function RecordingsView({ t, recordings, owner = false, actions, busy = [
   return <section className="recordings">
     {failed.size > 0 && <div className="write-alert" role="alert">
       <p>{t.actionFailed}</p>
+      {/* The row marker only shows while that recording is in the filtered
+          view, and a deleted one may be gone entirely, so the alert names the
+          unresolved writes itself. */}
+      <ul className="unresolved">{[...failed].map(id => {
+        const recording = recordings.find(item => item.id === id);
+        return <li key={id} data-unresolved={id}>{recording
+          ? `${recording.source_name} / ${timestamp(recording.start_ms)}`
+          : t.unresolvedMissing}</li>;
+      })}</ul>
       {onReload && <button type="button" className="primary" onClick={onReload}>{t.retry}</button>}
       {onDismiss && <button type="button" onClick={onDismiss}>{t.dismissUnknown}</button>}
     </div>}

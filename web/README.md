@@ -71,7 +71,9 @@ write and a later read, so no snapshot can prove what became of it. A marker is
 resolved only by a terminal outcome the client actually observed — a later
 successful write to the same recording — or by the owner acknowledging that they
 checked. The alert says so rather than telling the owner that reloading settles
-it. Requesting a reload never
+it, and it names the affected recordings itself: a row marker only shows while
+that recording is in the filtered view, and a deleted one may not be listed at
+all. Requesting a reload never
 clears anything by itself: if the reload fails, the list-unavailable notice
 still reports the unknown results. A write that succeeds drops the list in the
 same commit as its reload request, so a deleted row cannot briefly stay

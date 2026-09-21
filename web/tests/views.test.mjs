@@ -91,6 +91,21 @@ test('an in-flight mutation disables that row\'s owner controls only', () => {
   assert.doesNotMatch(recordingsMarkup(true, { actions }), /<button[^>]*disabled/);
 });
 
+test('the unknown-result alert names the writes even when no row shows them', () => {
+  // Filtering hides the marked row, and a deleted recording is gone entirely,
+  // so the alert itself has to say which writes are unresolved.
+  const markup = recordingsMarkup(true, {
+    actions, failedWrites: ['synthetic-recording-2', 'synthetic-recording-gone'],
+  });
+  assert.match(markup, /data-unresolved="synthetic-recording-2"/);
+  assert.match(markup, /data-unresolved="synthetic-recording-gone"/);
+  // The listed one is named by camera and time; the missing one says so.
+  assert.match(markup, /生成カメラ 2 \//);
+  assert.ok(markup.includes(messages.ja.unresolvedMissing));
+  // Only the recording still in the list carries a row marker.
+  assert.equal(markup.split('data-write-failed="true"').length - 1, 1);
+});
+
 test('an unknown write result offers reload and acknowledgement, and claims neither settles it', () => {
   const markup = recordingsMarkup(true, {
     actions, failedWrites: ['synthetic-recording-1'], onReload() {}, onDismiss() {},

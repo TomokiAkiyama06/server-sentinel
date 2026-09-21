@@ -287,6 +287,16 @@ try {
       assert.deepEqual(await page.evaluate("Array.from(document.querySelectorAll('[data-write-failed=\"true\"]')).map(el => el.dataset.recordingId)"),
         ['synthetic-recording-0', 'synthetic-recording-1']);
       assert.equal(await page.evaluate("document.querySelectorAll('.write-alert').length"), 1);
+      // Filtering the marked rows out of view must not hide which writes are
+      // unresolved: the alert names them itself.
+      await page.evaluate(`Array.from(document.querySelectorAll('.filter')).find(el => el.textContent === '★ 付き').click()`);
+      await page.wait("document.querySelectorAll('[data-recording-id]').length === 1");
+      assert.equal(await page.evaluate("document.querySelectorAll('[data-write-failed=\"true\"]').length"), 1);
+      assert.deepEqual(await page.evaluate("Array.from(document.querySelectorAll('[data-unresolved]')).map(el => el.dataset.unresolved)"),
+        ['synthetic-recording-0', 'synthetic-recording-1']);
+      assert.equal(await page.evaluate("document.querySelectorAll('.write-alert').length"), 1);
+      await page.evaluate(`Array.from(document.querySelectorAll('.filter')).find(el => el.textContent === 'すべて').click()`);
+      await page.wait("document.querySelectorAll('[data-recording-id]').length === 3");
       // A reload cannot prove what became of a write whose response was lost,
       // so re-opening the list leaves both markers in place.
       await page.evaluate("window.failNextMutations('/api/mock/mutation')");

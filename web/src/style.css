@@ -65,6 +65,8 @@ p { margin: .5rem 0 1rem; }
 [aria-busy="true"] { background: #f5f9fa; }
 .write-alert { border: 1px solid #ad3940; border-left-width: 4px; border-radius: .6rem; background: #fdf4f4; padding: .8rem 1rem; margin-bottom: 1rem; }
 .write-alert p { margin: 0 0 .6rem; color: #6d2328; }
+.unresolved { margin: .5rem 0 .8rem; padding-left: 1.2rem; color: #6d2328; font-size: .85rem; }
+.unresolved li { margin-bottom: .2rem; overflow-wrap: anywhere; }
 .fault-alert { border: 1px solid #ad3940; border-left-width: 4px; border-radius: .6rem; background: #fdf4f4; padding: .8rem 1rem; margin: 0 0 1rem; }
 .fault-alert p { margin: 0; color: #6d2328; }
 .fault-alert p + p { margin-top: .5rem; }
