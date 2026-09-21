@@ -30,6 +30,10 @@ def _time(value: int) -> datetime:
     return datetime(1970, 1, 1, tzinfo=timezone.utc) + timedelta(microseconds=value)
 
 
+def _duration_us(value: timedelta) -> int:
+    return value.days * 86_400_000_000 + value.seconds * 1_000_000 + value.microseconds
+
+
 def _digest(secret: bytes) -> bytes:
     if not isinstance(secret, bytes) or not 16 <= len(secret) <= 4096:
         raise AccessValidationError("secret is invalid")
@@ -171,9 +175,9 @@ class AccessStore:
             if row is None or row["status"] != PrincipalStatus.ACTIVE.value or row["revoked_at_us"] is not None:
                 raise AccessValidationError("session subject is unavailable")
             generation = connection.execute("SELECT authorization_generation FROM access_deployment_state WHERE singleton=1").fetchone()[0]
-            connection.execute("INSERT INTO access_sessions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)",
+            connection.execute("INSERT INTO access_sessions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)",
                                (str(session_id), token_digest, str(principal_id), credential_id, row["authorization_revision"], generation,
-                                _us(at), _us(at), _us(at + idle_lifetime), _us(at + absolute_lifetime)))
+                                _us(at), _us(at), _duration_us(idle_lifetime), _us(at + idle_lifetime), _us(at + absolute_lifetime)))
         return session_id
 
     def authorize(self, token: bytes, external_identity: str, permission: Permission, *, now: datetime | None = None) -> Principal:
@@ -184,14 +188,14 @@ class AccessStore:
         with self._transaction(write=True) as connection:
             row = connection.execute("SELECT s.*, p.id principal_id, p.external_identity, p.display_name, p.role, p.status, p.authorization_revision, p.created_at_us, p.revoked_at_us, c.revoked_at_us credential_revoked FROM access_sessions s JOIN access_principals p ON p.id=s.principal_id JOIN access_credentials c ON c.credential_id=s.credential_id WHERE s.token_digest=?", (digest,)).fetchone()
             state = connection.execute("SELECT authorization_generation FROM access_deployment_state WHERE singleton=1").fetchone()[0]
-            valid = row is not None and row["invalidated_at_us"] is None and row["external_identity"] == identity and row["status"] == PrincipalStatus.ACTIVE.value and row["credential_revoked"] is None and row["principal_revision"] == row["authorization_revision"] and row["deployment_generation"] == state and _us(at) < row["idle_expires_at_us"] and _us(at) < row["absolute_expires_at_us"]
+            valid = row is not None and row["invalidated_at_us"] is None and row["external_identity"] == identity and row["status"] == PrincipalStatus.ACTIVE.value and row["credential_revoked"] is None and row["principal_revision"] == row["authorization_revision"] and row["deployment_generation"] == state and row["established_at_us"] <= _us(at) and row["last_seen_at_us"] <= _us(at) and _us(at) < row["idle_expires_at_us"] and _us(at) < row["absolute_expires_at_us"]
             if not valid:
                 raise AccessValidationError("access is unavailable")
             granted = connection.execute("SELECT 1 FROM access_principal_permissions WHERE principal_id=? AND permission=?", (row["principal_id"], permission.value)).fetchone() is not None
             principal = self._principal(row)
             if principal.role is not PrincipalRole.OWNER and not granted:
                 raise AccessValidationError("access is unavailable")
-            next_idle = min(_us(at + IDLE_LIFETIME), row["absolute_expires_at_us"])
+            next_idle = min(_us(at) + row["idle_lifetime_us"], row["absolute_expires_at_us"])
             connection.execute("UPDATE access_sessions SET last_seen_at_us=?, idle_expires_at_us=? WHERE id=?", (_us(at), next_idle, row["id"]))
             return principal
 

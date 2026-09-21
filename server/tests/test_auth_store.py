@@ -105,6 +105,22 @@ class AccessStoreTests(unittest.TestCase):
         with self.assertRaises(AccessValidationError):
             self.store.authorize(TOKEN, IDENTITY, Permission.LIVE_VIEW, now=NOW + timedelta(seconds=1))
 
+    def test_session_rejects_clock_regression_and_keeps_its_configured_idle_lifetime(self):
+        principal, credential = self.enroll()
+        self.store.establish_session(principal.id, credential.credential_id, TOKEN,
+                                     idle_lifetime=timedelta(seconds=90),
+                                     absolute_lifetime=timedelta(minutes=5))
+        with self.assertRaises(AccessValidationError):
+            self.store.authorize(TOKEN, IDENTITY, Permission.LIVE_VIEW,
+                                 now=NOW - timedelta(microseconds=1))
+        self.store.authorize(TOKEN, IDENTITY, Permission.LIVE_VIEW,
+                             now=NOW + timedelta(seconds=60))
+        # This would be rejected if authorize reset the session to the global
+        # 30-minute default instead of its stored 90-second idle lifetime.
+        with self.assertRaises(AccessValidationError):
+            self.store.authorize(TOKEN, IDENTITY, Permission.LIVE_VIEW,
+                                 now=NOW + timedelta(seconds=150))
+
     def test_no_raw_secret_is_persisted(self):
         principal, credential = self.enroll()
         self.store.establish_session(principal.id, credential.credential_id, TOKEN)
