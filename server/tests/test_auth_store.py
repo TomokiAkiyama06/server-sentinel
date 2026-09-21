@@ -98,7 +98,7 @@ class AccessStoreTests(unittest.TestCase):
         with self.assertRaises(AccessValidationError):
             self.store.authorize(TOKEN, "other@example.invalid", Permission.LIVE_VIEW)
         with self.assertRaises(AccessValidationError):
-            self.store.authorize(TOKEN, IDENTITY, Permission.LIVE_VIEW, now=NOW + timedelta(seconds=2))
+            self.store.authorize(TOKEN, IDENTITY, Permission.LIVE_VIEW, now=NOW + timedelta(seconds=1))
 
     def test_no_raw_secret_is_persisted(self):
         principal, credential = self.enroll()

@@ -184,7 +184,7 @@ class AccessStore:
         with self._transaction(write=True) as connection:
             row = connection.execute("SELECT s.*, p.id principal_id, p.external_identity, p.display_name, p.role, p.status, p.authorization_revision, p.created_at_us, p.revoked_at_us, c.revoked_at_us credential_revoked FROM access_sessions s JOIN access_principals p ON p.id=s.principal_id JOIN access_credentials c ON c.credential_id=s.credential_id WHERE s.token_digest=?", (digest,)).fetchone()
             state = connection.execute("SELECT authorization_generation FROM access_deployment_state WHERE singleton=1").fetchone()[0]
-            valid = row is not None and row["invalidated_at_us"] is None and row["external_identity"] == identity and row["status"] == PrincipalStatus.ACTIVE.value and row["credential_revoked"] is None and row["principal_revision"] == row["authorization_revision"] and row["deployment_generation"] == state and _us(at) <= row["idle_expires_at_us"] and _us(at) <= row["absolute_expires_at_us"]
+            valid = row is not None and row["invalidated_at_us"] is None and row["external_identity"] == identity and row["status"] == PrincipalStatus.ACTIVE.value and row["credential_revoked"] is None and row["principal_revision"] == row["authorization_revision"] and row["deployment_generation"] == state and _us(at) < row["idle_expires_at_us"] and _us(at) < row["absolute_expires_at_us"]
             if not valid:
                 raise AccessValidationError("access is unavailable")
             granted = connection.execute("SELECT 1 FROM access_principal_permissions WHERE principal_id=? AND permission=?", (row["principal_id"], permission.value)).fetchone() is not None
