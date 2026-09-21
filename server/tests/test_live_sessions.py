@@ -26,6 +26,7 @@ class SyntheticSource:
         self.remove_calls = 0
         self.fail_add = False
         self.fail_remove = False
+        self.incomplete_remove = False
 
     def add_viewer(self, subscriber_id):
         self.add_calls += 1
@@ -38,6 +39,7 @@ class SyntheticSource:
         if self.fail_remove:
             raise RuntimeError("synthetic remove failure")
         self.viewers.discard(subscriber_id)
+        return not self.incomplete_remove
 
 
 class AccessState:
@@ -155,6 +157,35 @@ class LiveViewerSessionTests(unittest.TestCase):
         with self.assertRaises(LiveSessionUnavailable):
             self.sessions.require(self.access, opened.session_id)
         self.assertFalse(source.viewers)
+        self.assertEqual(self.sessions.status.active_viewers, 0)
+
+    def test_nonthrowing_pipeline_cleanup_failure_remains_retryable(self):
+        source = SyntheticSource()
+        opened = self.sessions.open(self.access, source)
+        source.incomplete_remove = True
+
+        with self.assertRaisesRegex(RuntimeError, "live viewer cleanup failed"):
+            self.sessions.close(self.access, opened.session_id)
+        self.assertEqual(self.sessions.status.cleanup_failures, 1)
+        self.assertEqual(self.sessions.status.active_viewers, 1)
+
+        source.incomplete_remove = False
+        self.assertTrue(self.sessions.disconnect(opened.session_id))
+        self.assertEqual(self.sessions.status.active_viewers, 0)
+
+    def test_unknown_disconnect_is_idempotently_not_removed(self):
+        self.assertFalse(self.sessions.disconnect(UUID(int=999)))
+
+    def test_revocation_keeps_nonthrowing_failed_cleanup_visible_and_retryable(self):
+        source = SyntheticSource()
+        opened = self.sessions.open(self.access, source)
+        source.incomplete_remove = True
+        self.assertEqual(self.sessions.revoke_principal(PRINCIPAL), 0)
+        self.assertEqual(self.sessions.status.cleanup_failures, 1)
+        self.assertEqual(self.sessions.status.active_viewers, 1)
+
+        source.incomplete_remove = False
+        self.assertTrue(self.sessions.disconnect(opened.session_id))
         self.assertEqual(self.sessions.status.active_viewers, 0)
 
     def test_principal_revocation_cleans_all_of_its_sources(self):

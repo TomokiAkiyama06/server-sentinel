@@ -20,7 +20,8 @@ class LiveViewerSource(Protocol):
     def add_viewer(self, subscriber_id: UUID) -> None:
         ...
 
-    def remove_viewer(self, subscriber_id: UUID) -> None:
+    def remove_viewer(self, subscriber_id: UUID) -> bool:
+        """Remove demand, returning false when cleanup remains incomplete."""
         ...
 
 
@@ -210,8 +211,14 @@ class LiveViewerSessions:
 
     def _cleanup(self, session_id: UUID, session: _Session) -> bool:
         try:
-            session.source.remove_viewer(session_id)
+            removed = session.source.remove_viewer(session_id)
         except Exception:
+            session.cleanup_failed = True
+            return False
+        # ``SourcePipeline`` records adapter-close errors in its status rather
+        # than raising. Treat every non-true result as incomplete so the
+        # session remains unavailable, observable, and retryable.
+        if removed is not True:
             session.cleanup_failed = True
             return False
         self._sessions.pop(session_id, None)
