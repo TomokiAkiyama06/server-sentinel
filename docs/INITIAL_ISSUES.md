@@ -303,7 +303,7 @@ Scope:
 - per-person ServerSentinel credential (`principal_credential`) with invitation enrollment, required authenticator user verification, and individual revocation;
 - CSPRNG-backed enrollment codes and bootstrap authorizations with a stated minimum entropy, hashed storage and constant-time comparison;
 - session/revocation/recovery;
-- the closed set of pre-credential routes (local owner bootstrap issuing a console-displayed single-use authorization, enrollment-code redemption, authentication) and the freshness window for owner step-up;
+- the closed pair of pre-credential routes (enrollment-code redemption and authentication), local owner bootstrap as a local action rather than a route, and the freshness window for owner step-up;
 - the reserved, secure-context dashboard origin, whose reservation is a deployment obligation the application can only check;
 - exact handling of verified external identity headers, which in the shared-Tailscale-account deployment are supplementary only;
 - keep Tailnet policy separately Owner-managed outside ServerSentinel; existing ACLs/Grants may remain unchanged, and ServerSentinel performs no policy mutation or admin-credential storage.
@@ -760,7 +760,7 @@ Scope:
 - trusted proxy identity, treated as supplementary in the shared-Tailscale-account deployment;
 - app principal allowlist;
 - per-person credential verification on every human/media route, per ADR 0004;
-- the closed set of pre-credential routes: local owner bootstrap (console-displayed single-use authorization redeemed through the ordinary redemption path), invitation redemption against a short-lived single-use enrollment code, and the authentication route itself;
+- the closed pair of pre-credential routes — invitation redemption against a short-lived single-use enrollment code, and the authentication route — plus local owner bootstrap, which is not a route and issues a console-displayed single-use authorization redeemed through that same redemption path;
 - the reserved, secure-context dashboard origin and its startup/daily reservation check with Owner notification;
 - fresh user-verification step-up for the AUTH-008 owner operations;
 - generic/non-branding denial for uninvited users;
@@ -776,7 +776,7 @@ Acceptance:
 - docs do not promise Main Server node invisibility when Tailnet policy exposes it;
 - every human/media request requires an active principal, that principal's own verified credential, and the required permission; a request carrying only a verified identity header is refused;
 - where the deployment configures a trusted proxy identity, it is additionally verified on the trusted local path and recorded, per AUTH-005; where the private-network path supplies no identity header, the absence alone does not deny access and does not weaken the credential check;
-- the only exceptions are the enumerated pre-credential routes of AUTH-012: local owner bootstrap, invitation redemption gated by a valid unexpired single-use enrollment code, and the authentication route. Bootstrap issues a single-use, short-lived enrollment authorization shown only on the local console, and the first owner redeems it once from a browser at the reserved origin through the ordinary redemption path, so no owner-specific route is added. A fresh deployment reaches its first owner and an invitee redeems a first credential without a deadlock, and neither path returns camera, recording, timeline or deployment data;
+- the only exceptions are the two pre-credential routes of AUTH-012: invitation redemption gated by a valid unexpired single-use enrollment code, and the authentication route; owner bootstrap adds no third route and feeds the same redemption path. Bootstrap issues a single-use, short-lived enrollment authorization shown only on the local console, and the first owner redeems it once from a browser at the reserved origin through the ordinary redemption path, so no owner-specific route is added. A fresh deployment reaches its first owner and an invitee redeems a first credential without a deadlock, and neither path returns camera, recording, timeline or deployment data;
 - the dashboard origin is reserved for ServerSentinel and served as a secure context (HTTPS, or `http://localhost` for a strictly local browser); an ordinary-HTTP non-loopback origin fails acceptance because browsers withhold WebAuthn there;
 - the reservation check runs at startup and at least daily, enumerates real listeners and every proxy route for the whole name across all schemes and ports, and closes human access and notifies the Owner on any other answer. Tests treat it as a bounded exposure window with a gap between checks, not as prevention;
 - an absent, unknown, expired or already-redeemed enrollment code receives the same generic response as an uninvited person, redemption succeeds at most once, attempts are rate-limited per code and per source, and logs carry no raw code;

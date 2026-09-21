@@ -928,6 +928,9 @@ principal_session
 - id
 - principal_id
 - credential_id (the credential that created the session)
+- external_identity (the verified proxy identity the session was created under,
+  where the deployment supplies one; ADR-0003 binds a session to it, so a later
+  request on this session presenting a different one is refused)
 - created_at
 - last_seen_at
 - idle_expires_at / absolute_expires_at (server-enforced)
@@ -954,7 +957,9 @@ is a shared credential and does not satisfy §11.8; such a machine needs a
 per-person OS account or a portable authenticator the person carries.
 
 A session is a server-side record bound to one principal and to the credential
-that created it. Sign-out, idle/absolute expiry and revocation invalidate that
+that created it, and, where the deployment supplies a verified proxy identity,
+to the identity it was created under: a later request on the same session
+carrying a different verified identity is refused rather than followed. Sign-out, idle/absolute expiry and revocation invalidate that
 record, so a retained cookie or token authorizes nothing afterwards; §11.5
 authorization re-checks it on every human/media route and never relies on
 client-side state. Idle and absolute lifetimes are server-enforced, with the
@@ -1084,15 +1089,18 @@ or revoked still receives the generic response below and learns nothing about
 owner routes. Repeated failed step-ups are rate-limited and logged without
 credential material, and a stale session never partially applies an operation.
 
-Exactly three request classes run before a credential exists, and the set is
-closed:
+Exactly two HTTP routes run before a credential exists, and the pair is closed.
+Owner bootstrap is not a third one: it is a local action on the host that feeds
+the same redemption route.
 
 ```text
-local owner bootstrap      -> privileged local action on the main host; issues an
-                              enrollment authorization shown only on the console
 invitation redemption      -> valid, unexpired, unredeemed enrollment code only,
                               including the owner's bootstrap authorization
 credential authentication  -> the assertion route itself
+
+local owner bootstrap      -> not a route: a privileged local action on the main
+                              host that issues an enrollment authorization shown
+                              only on the console
 ```
 
 Owner bootstrap is a privileged local administrative action on the Main Server

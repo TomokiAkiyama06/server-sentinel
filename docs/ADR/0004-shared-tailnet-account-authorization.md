@@ -61,7 +61,7 @@ A passkey alone does not separate people who share a machine. Therefore:
 
 ### 4. Bootstrap and enrollment are the only pre-credential paths
 
-A credential check cannot apply to the request that creates the first credential, so the exceptions are enumerated and closed: the initial owner bootstrap, invitation redemption against a valid short-lived single-use enrollment code, and the authentication/assertion route itself. Every other human/media route requires a verified credential and an active session.
+A credential check cannot apply to the request that creates the first credential, so exactly two HTTP routes may run without one and the pair is closed: invitation redemption against a valid short-lived single-use enrollment code, and the authentication/assertion route itself. Every other human/media route requires a verified credential and an active session.
 
 Owner bootstrap is a privileged local administrative action on the Main Server that issues a single-use, short-lived enrollment authorization displayed only on the local console. The first owner redeems it once from a browser at the reserved origin through the same redemption path everyone else uses, so no owner-specific route and no remote first-visitor setup exist.
 
