@@ -98,7 +98,10 @@ Timeline observations use the main 20-day recording-retention period. Only a
 confirmed movement/tamper event with unfinished critical delivery keeps its own
 observation past that period, until the work resolves and at most until the
 main audit-retention period, so a permanently unresolved action cannot keep
-observations on disk without limit. No other observation is held back.
+observations on disk without limit. No other observation is held back, and a
+durably disabled delivery holds none either: disabling is a configuration
+decision rather than pending work, so that observation expires on the ordinary
+schedule while its per-action degradation marker keeps the path unavailable.
 An event whose critical actions completed keeps an identity-only tombstone when
 its payload expires, so a delayed replay of the same identity stays a duplicate
 instead of preserving evidence and notifying a second time. Only events that

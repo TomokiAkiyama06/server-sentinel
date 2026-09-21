@@ -583,11 +583,13 @@ class PresenceService:
         events that carried critical delivery are tombstoned, because replaying
         any other expired observation queues no action.
 
-        A critical action that never completed, such as a durably disabled
-        delivery, leaves a per-action degradation marker behind. Expiring its
-        row must not let the snapshot report that path as armed again, because
-        the action still did not happen and the tombstone stops a replay from
-        re-queuing it.
+        A durably disabled delivery is the one unfinished action that does not
+        hold its observation back, because disabling is a configuration decision
+        rather than pending work. It expires on the ordinary schedule and leaves
+        a per-action degradation marker instead, so expiry cannot let the
+        snapshot report that path as armed again while the tombstone stops a
+        replay from re-queuing it. Any other action that never completed leaves
+        the same marker when the bounded exception below finally expires it.
 
         The retention exception is bounded by the main audit-retention period.
         A permanently unresolved action would otherwise keep its observation,
