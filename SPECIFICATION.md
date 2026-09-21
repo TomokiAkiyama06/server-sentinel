@@ -905,9 +905,11 @@ principal_credential
   every authentication)
 - sign_count (last accepted signature counter; 0 when the authenticator keeps
   none)
-- backup_eligible / backup_state (the authenticator's BE and BS flags as read
-  at registration; a backup-eligible credential can sync to the person's other
-  devices)
+- backup_eligible (the authenticator's BE flag, fixed at registration; a
+  backup-eligible credential can sync to the person's other devices)
+- backup_state (the authenticator's BS flag as of the last verified ceremony;
+  refreshed on every accepted assertion, because a credential can be backed up
+  after it was registered)
 - label (owner-visible hint, not proof of a device)
 - created_at
 - last_used_at
@@ -1149,6 +1151,15 @@ deployment that needs device-scoped control refuses a backup-eligible
 registration on that signal and tells the person why, which is a deployment
 setting rather than a promise the product makes by default. The Web client
 surfaces that refusal as an actionable message, not as a generic failure.
+
+The two flags age differently. Eligibility is a property of the credential and
+does not change, so a later assertion reporting a different BE is an
+inconsistency: the assertion is refused and reported to the Owner, as a
+signature-counter regression is. Backup state does change — a credential
+registered before its first sync becomes backed up afterwards — so every
+accepted assertion refreshes `backup_state` from the verified authenticator
+data. Recording it only at registration would leave the owner UI saying
+"not backed up" for a credential that has since synced.
 
 ### 11.8 Shared Tailnet account
 

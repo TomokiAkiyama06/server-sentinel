@@ -403,6 +403,8 @@ A synced passkey is a single credential that may exist on several of its owner's
 
 Whether a credential can sync is not a guess: registration reads the authenticator's backup-eligibility and backup-state flags and records them with the credential, and the owner UI shows the resulting state. A deployment that requires device-scoped control shall be able to refuse a backup-eligible registration on that signal, with a refusal the person can act on; a deployment that does not require it shall still record the flags rather than imply that every credential is device-bound.
 
+Backup state shall be refreshed from every successfully verified assertion, because a credential registered before its first sync becomes backed up later and a value kept only from registration would leave the owner UI permanently stale. Backup eligibility shall not change after registration; an assertion reporting a different eligibility shall be refused and reported to the Owner in the same way as a signature-counter regression.
+
 ### AUTH-010 Application fingerprint minimization for uninvited users
 When an ordinary Tailnet user is not invited in ServerSentinel, the application shall minimize disclosure that ServerSentinel is running. Unauthorized responses should be generic/non-branding (for example not-found style), and shall not expose ServerSentinel product/version strings, camera/source counts, API schemas, health details, thumbnails, recordings, timeline data, or other deployment metadata.
 

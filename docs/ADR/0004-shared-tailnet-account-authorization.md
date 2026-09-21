@@ -49,6 +49,8 @@ Revocation is credential-scoped, not device-scoped. A synced passkey is a single
 
 Whether a credential syncs is read rather than assumed: registration records the authenticator's backup-eligibility and backup-state flags, the owner UI shows them, and a deployment that needs device-scoped control refuses a backup-eligible registration on that signal. That is a deployment setting rather than a default promise.
 
+Eligibility is fixed at registration and an assertion reporting a different value is refused and reported to the Owner. Backup state is refreshed from every verified assertion, since a credential registered before its first sync becomes backed up afterwards and a registration-time snapshot would leave the owner looking at a stale answer.
+
 ### 3. The credential must be bound to a person, not to a workstation
 
 A passkey alone does not separate people who share a machine. Therefore:

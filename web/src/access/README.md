@@ -6,7 +6,7 @@ Explain private-network reachability separately from application permission. Do 
 
 The deployment shares one Tailscale account, so the UI lists each person's own ServerSentinel credentials with their label and last-used time and offers revocation per credential and per principal. Do not present a Tailscale login or an approved device as proof of who is using the dashboard.
 
-Revocation is credential-scoped. A synced passkey can exist on several of its owner's devices, so do not label the control "revoke this device" or imply that one credential equals one device; the label is a hint entered at registration. Show the backup-eligibility the server recorded instead of inferring it, and when a deployment configured for device-bound credentials refuses a registration, say what to use instead rather than showing a generic failure.
+Revocation is credential-scoped. A synced passkey can exist on several of its owner's devices, so do not label the control "revoke this device" or imply that one credential equals one device; the label is a hint entered at registration. Show the backup-eligibility and backup state the server recorded instead of inferring them, remembering that backup state follows the latest sign-in and can change after registration, and when a deployment configured for device-bound credentials refuses a registration, say what to use instead rather than showing a generic failure.
 
 Where the screen shows the Tailscale login/device last observed for a person, show it as context and not as identification, keep it owner-only, and expect it to disappear when the principal is revoked or deleted.
 
