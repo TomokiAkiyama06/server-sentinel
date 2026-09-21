@@ -569,6 +569,19 @@ class _DiagnosticBundleWriter:
                             "selected diagnostic media is unavailable")
                     for index, (media_id, expected) in enumerate(
                             prepared.selected_media, start=1):
+                        # Re-check the item on the owning worker immediately
+                        # before copying it. Sizing happened during preparation,
+                        # so a concurrent retention delete or an item that is
+                        # still being written would otherwise only be detected
+                        # after copying up to 512 MiB under the reservation,
+                        # holding that worker away from recording work for the
+                        # whole doomed copy. There is no partial retry: a
+                        # changed item fails the export closed either way.
+                        current = self._media_source.describe_selected(media_id)
+                        if (not isinstance(current, MediaDescriptor)
+                                or current.size_bytes != expected.size_bytes
+                                or current.media_type != expected.media_type):
+                            raise ValueError("selected media changed")
                         with self._media_source.open_selected(media_id) as supplied:
                             if not isinstance(supplied, MediaAsset):
                                 raise TypeError

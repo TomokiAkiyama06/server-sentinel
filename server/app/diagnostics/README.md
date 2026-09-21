@@ -96,9 +96,13 @@ secrets, private keys, sensitive headers, Owner biometric data, and embedded raw
 media are always excluded. Hardware serials/UUIDs receive a keyed per-bundle
 digest; the ephemeral key is never exported. Raw monitoring media uses a separate resolver which cannot enumerate
 media and is called only for IDs individually selected in the authorized action.
-Selected metadata is sized before admission; after approval each item is opened,
-type checked, copied through a bounded 64 KiB reader and released before the next
-item is opened. Individual media is capped at 512 MiB and the complete diagnostic
+Selected metadata is sized before admission; after approval each item is
+re-checked on the owning worker immediately before its copy, then opened, type
+checked, copied through a bounded 64 KiB reader and released before the next
+item is opened. The re-check catches a concurrent retention delete or an item
+still being written before any byte is copied, so a doomed copy does not hold
+the owning worker away from recording work; a change that appears mid-copy still
+fails the export closed. Individual media is capped at 512 MiB and the complete diagnostic
 bundle at 1 GiB. These are defensive implementation upper bounds; the
 deployment-configured storage maximum request size stays authoritative and
 refuses anything larger, and both bounds also limit how long one export can

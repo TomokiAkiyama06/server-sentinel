@@ -946,6 +946,57 @@ class DiagnosticExportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(authorizer.confirmations, [])
         self.assertEqual(self.policy.reservations, [])
 
+    async def test_media_changed_after_sizing_fails_before_any_byte_is_copied(self):
+        """Regression: a doomed copy must not hold the owning worker or reader."""
+        class ChangedAfterSizingMedia(SelectedMedia):
+            def __init__(inner_self):
+                super().__init__()
+                inner_self.describes = 0
+
+            def describe_selected(inner_self, media_id):
+                described = super().describe_selected(media_id)
+                inner_self.describes += 1
+                if inner_self.describes == 1:
+                    return described
+                # A concurrent writer or retention delete between preparation
+                # and the copy.
+                return MediaDescriptor(described.size_bytes + 1,
+                                       described.media_type)
+
+        media = ChangedAfterSizingMedia()
+        with self.assertRaisesRegex(
+                DiagnosticExportError, "diagnostic bundle write failed"):
+            await self.make_service(Permit(), media=media).export(
+                DiagnosticExportAction(self.output, ("clip_a",)))
+
+        self.assertEqual(media.describes, 2)
+        self.assertEqual(media.resolved, [])
+        self.assertEqual(media.read_requests, [])
+        self.assertEqual(media.active, 0)
+        self.assertEqual(list(self.output.iterdir()), [])
+        self.assertEqual(self.policy.releases, 1)
+        self.assertFalse(self.policy.active)
+
+        class VanishedMedia(SelectedMedia):
+            def __init__(inner_self):
+                super().__init__()
+                inner_self.describes = 0
+
+            def describe_selected(inner_self, media_id):
+                inner_self.describes += 1
+                if inner_self.describes == 1:
+                    return super().describe_selected(media_id)
+                raise KeyError("selected media is gone")
+
+        vanished = VanishedMedia()
+        with self.assertRaisesRegex(
+                DiagnosticExportError, "diagnostic bundle write failed"):
+            await self.make_service(Permit(), media=vanished).export(
+                DiagnosticExportAction(self.output, ("clip_a",)))
+        self.assertEqual(vanished.resolved, [])
+        self.assertEqual(list(self.output.iterdir()), [])
+        self.assertEqual(self.policy.releases, 2)
+
     async def test_media_size_change_removes_partial_bundle_and_releases_each_item(self):
         class ChangedMedia(SelectedMedia):
             def describe_selected(inner_self, media_id):
