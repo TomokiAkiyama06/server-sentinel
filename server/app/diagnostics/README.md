@@ -70,6 +70,13 @@ stops rather than reserving space on a replacement filesystem. Every create,
 rename, unlink and fsync then uses that single verified descriptor, so a mount
 swapped after admission cannot redirect the bundle or its cleanup.
 
+Before ordinary success is reported, the configured pathname is reopened and
+must still name the directory that received the archive. A directory renamed or
+replaced mid-export keeps receiving writes through the pinned descriptor while
+the reported bundle name would no longer be found where the Owner configured it,
+so that archive is removed through the same descriptor and the export fails
+closed instead of reporting a name the Owner cannot act on.
+
 Admission remains held through publication and directory fsync. Failure removes
 and directory-fsyncs the temporary file, or an already-renamed bundle when final
 directory fsync fails, before releasing the reservation. If durable cleanup

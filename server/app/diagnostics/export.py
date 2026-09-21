@@ -791,6 +791,21 @@ class DiagnosticExportService:
             except BaseException:
                 self.__release_reservation()
                 raise
+            if not self.__names_publication_directory(
+                    prepared.output_directory, directory.st_dev, directory.st_ino):
+                # The reported path would not find this archive, so remove it
+                # through the still-pinned descriptor and fail closed rather
+                # than report a success the Owner cannot act on.
+                if not self.__unlink_published(
+                        directory_fd, result.bundle_path.name):
+                    # Keep the reservation: the leftover bytes are unaccounted
+                    # for and the archive may still hold selected raw media.
+                    self.__storage_uncertain = True
+                    raise DiagnosticExportError(
+                        "diagnostic storage state is uncertain")
+                self.__release_reservation()
+                raise DiagnosticExportError(
+                    "diagnostic output directory is not admitted")
             try:
                 self.__release_reservation()
             except BaseException:
@@ -802,6 +817,26 @@ class DiagnosticExportService:
             return _PublishedBundle(result, directory.st_dev, directory.st_ino)
         finally:
             os.close(directory_fd)
+
+    def __names_publication_directory(self, output_directory: Path,
+                                      device: int, inode: int) -> bool:
+        """Confirm the configured pathname still names the directory written to.
+
+        Writes go through a pinned descriptor, so a directory renamed or
+        replaced mid-export keeps receiving them while the configured pathname
+        no longer leads there. Reporting success would then hand the Owner a
+        bundle name that is absent from the directory they configured.
+        """
+        descriptor = -1
+        try:
+            descriptor = self.__open_admitted_output(output_directory)
+            current = os.fstat(descriptor)
+            return current.st_dev == device and current.st_ino == inode
+        except (OSError, DiagnosticExportError):
+            return False
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
 
     def __remove_published(self, published: _PublishedBundle) -> bool:
         """Durably drop a bundle whose Owner request no longer receives its name.

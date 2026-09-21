@@ -26,6 +26,7 @@ from app.diagnostics import (
     DiagnosticFieldKind,
     MediaAsset,
     MediaDescriptor,
+    SafeDiagnosticReasonCode,
     SafeDiagnosticState,
 )
 from app.media.recording.model import RecordingError
@@ -629,6 +630,40 @@ class DiagnosticExportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([item.name for item in self.output.iterdir()],
                          [later.bundle_path.name])
 
+    async def test_export_fails_closed_when_its_directory_is_renamed_mid_write(self):
+        """Regression: success must not name a bundle the configured path misses."""
+        entered = threading.Event()
+        proceed = threading.Event()
+        target = self.output / "bundles"
+        target.mkdir(mode=0o700)
+        moved = self.output / "bundles-renamed"
+        media = self.blocking_media_class(entered, proceed)()
+        service = self.make_service(Permit(), media=media)
+
+        export = asyncio.create_task(service.export(
+            DiagnosticExportAction(target, ("clip_a",))))
+        while not entered.is_set():
+            await asyncio.sleep(0)
+        # The pinned descriptor keeps receiving writes while the configured
+        # pathname starts naming a different, equally valid directory.
+        target.rename(moved)
+        target.mkdir(mode=0o700)
+        proceed.set()
+        with self.assertRaisesRegex(DiagnosticExportError, "not admitted"):
+            await export
+
+        self.assertEqual(list(target.iterdir()), [])
+        self.assertEqual(list(moved.iterdir()), [])
+        self.assertEqual(media.released, ["clip_a"])
+        self.assertEqual(self.policy.releases, 1)
+        self.assertFalse(self.policy.active)
+
+        # The service stays usable once the pathname is stable again.
+        later = await service.export(DiagnosticExportAction(target))
+        self.assertTrue(later.bundle_path.exists())
+        self.assertEqual([item.name for item in target.iterdir()],
+                         [later.bundle_path.name])
+
     async def test_cancellation_cleanup_refuses_a_replaced_publication_directory(self):
         """Regression: an absent file in a different directory is not deletion."""
         entered = threading.Event()
@@ -797,6 +832,66 @@ class DiagnosticExportTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(value=type(value).__name__), self.assertRaises(
                     TypeError):
                 DiagnosticField("owner_biometric.template", value)
+
+    async def test_hardware_integrity_identifiers_are_hashed_or_refused(self):
+        """Issue #23 probes hold raw serials/WWIDs; export must not carry them."""
+        serial = "SYNTHETIC_DEVICE_SERIAL_0001"
+        device_uuid = "SYNTHETIC-HARDWARE-UUID-0001"
+        location = "/synthetic/deployment/bus/slot-3"
+
+        class HardwareIntegrityDiagnostics:
+            def collect(inner_self):
+                return (
+                    DiagnosticDocument(DiagnosticCategory.HARDWARE_INVENTORY, (
+                        DiagnosticField("hardware_identifier.device_serial", serial),
+                        DiagnosticField("hardware_identifier.hardware_uuid",
+                                        device_uuid),
+                        DiagnosticField("count", 4),
+                    )),
+                    DiagnosticDocument(DiagnosticCategory.RECORDING_HEALTH, (
+                        DiagnosticField("status", SafeDiagnosticState.DEGRADED),
+                        DiagnosticField("reason_code",
+                                        SafeDiagnosticReasonCode.SELF_TEST_FAILED),
+                    )),
+                )
+
+        result = await self.make_service(
+            Permit(), source=HardwareIntegrityDiagnostics()).export(
+                DiagnosticExportAction(self.output))
+        files, manifest = self.read_bundle(result)
+        raw = result.bundle_path.read_bytes()
+
+        for value in (serial, device_uuid, location):
+            self.assertNotIn(value.encode(), raw)
+        inventory = json.loads(files["diagnostics/hardware_inventory.json"])
+        self.assertRegex(inventory["device_serial"], r"^hmac-sha256:[0-9a-f]{64}$")
+        self.assertRegex(inventory["hardware_uuid"], r"^hmac-sha256:[0-9a-f]{64}$")
+        self.assertNotEqual(inventory["device_serial"], inventory["hardware_uuid"])
+        self.assertEqual(inventory["count"], 4)
+        self.assertEqual(json.loads(files["diagnostics/recording_health.json"]),
+                         {"status": "degraded", "reason_code": "self_test_failed"})
+        self.assertEqual(manifest["identifier_transform"],
+                         "ephemeral_keyed_sha256")
+
+        # Two bundles use independent ephemeral keys, so a digest is not a
+        # stable cross-bundle identifier for the same device.
+        again = await self.make_service(
+            Permit(), source=HardwareIntegrityDiagnostics()).export(
+                DiagnosticExportAction(self.output))
+        repeated, _ = self.read_bundle(again)
+        self.assertNotEqual(
+            json.loads(repeated["diagnostics/hardware_inventory.json"])[
+                "device_serial"],
+            inventory["device_serial"])
+
+        # Probe locations and free-form finding text have no allowlisted name.
+        for name, value in (("component", location),
+                            ("status", location),
+                            ("reason_code", "storage device changed"),
+                            ("hardware_location", location),
+                            ("integrity_finding", "CHANGED")):
+            with self.subTest(name=name), self.assertRaises((TypeError, ValueError)):
+                DiagnosticField(name, value)
 
     async def test_media_stream_is_generated_and_copied_in_bounded_chunks(self):
         media_size = 3 * 64 * 1024 + 17
