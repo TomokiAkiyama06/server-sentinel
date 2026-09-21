@@ -259,21 +259,17 @@ Node tests cover API failure/redirect/path restrictions, independent permissions
 localization keys, the denied default, production bundle isolation, and the
 timeline/presence screens rendered from synthetic observations (permission
 separation, kind filtering, `unknown` handling, degraded timing spans, manual
-override precedence and always-armed critical work).
+override precedence and always-armed critical work). Rendered component tests
+cover owner-only star/delete, the absence of any download, export or media
+element, starred recordings shown as never auto-deleted, the three separate
+retention periods, storage state display, and Slack disabled until configured.
+Mutation tests cover the one-write-per-recording guard, independent recordings,
+session abort reported as `aborted`, and rejection reported as `failed`.
 Chrome CDP tests cover phone/Mac-sized/desktop viewports, zero through four
-synthetic sources, all eight screens, locale switching, session permission
-combinations, and normal/error paths with hostile opt-in configuration.
-localization keys, the denied default, and production bundle isolation. Rendered
-component tests cover owner-only star/delete, the absence of any download,
-export or media element, starred recordings shown as never auto-deleted, the
-three separate retention periods, storage state display, and Slack disabled
-until configured. Mutation tests cover the one-write-per-recording guard,
-independent recordings, session abort reported as `aborted`, and rejection
-reported as `failed`.
-Chrome CDP tests cover phone/Mac-sized/desktop viewports, zero through four
-synthetic sources, all seven screens, locale switching, session permission
+synthetic sources, all nine screens, locale switching, session permission
 combinations, synthetic recording lists with owner star/delete confirmation,
-each storage state, and normal/error paths with hostile opt-in configuration.
+timeline/presence behavior, each storage state, and normal/error paths with
+hostile opt-in configuration.
 Every page request is intercepted and fulfilled locally or rejected. CSP
 violations and WebSocket attempts fail tests. A dedicated external `.invalid`
 positive-control request proves interception detects/aborts attempted egress;
