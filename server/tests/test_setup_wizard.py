@@ -15,6 +15,7 @@ from app.setup_wizard import (
 from app.storage.database import Database
 from app.storage.migrations import migrate
 from app.storage.schema import APPLICATION_MIGRATIONS
+from app.setup_wizard.schema import wizard_state_migration
 
 
 class SetupWizardTests(unittest.TestCase):
@@ -52,7 +53,7 @@ class SetupWizardTests(unittest.TestCase):
             self.transition(definition.step, WizardStatus.COMPLETED)
         self.transition(WizardStep.CAMERA_SOURCES, WizardStatus.UNAVAILABLE)
         after = self.transition(WizardStep.DETECTION_PROFILES, WizardStatus.UNAVAILABLE)
-        self.assertTrue(after.deployment_ready)
+        self.assertFalse(after.deployment_ready)
         self.assertEqual(WizardStep.OWNER_VERIFICATION, after.current_step)
         self.assertFalse(all(state.status is WizardStatus.COMPLETED
                              for state in after.states))
@@ -65,6 +66,28 @@ class SetupWizardTests(unittest.TestCase):
         after = self.transition(WizardStep.OWNER_VERIFICATION, WizardStatus.SKIPPED)
         self.assertEqual(WizardStatus.SKIPPED,
                          after.state_for(WizardStep.OWNER_VERIFICATION).status)
+
+    def test_camera_and_profile_steps_require_completion_for_readiness(self):
+        for definition in STEP_CATALOG[:5]:
+            self.transition(definition.step, WizardStatus.COMPLETED)
+        for step in (WizardStep.CAMERA_SOURCES, WizardStep.DETECTION_PROFILES):
+            with self.subTest(step=step), self.assertRaisesRegex(
+                    WizardValidationError, "required"):
+                self.transition(step, WizardStatus.SKIPPED)
+
+        self.transition(WizardStep.CAMERA_SOURCES, WizardStatus.COMPLETED)
+        self.assertFalse(self.store.snapshot().deployment_ready)
+        self.transition(WizardStep.DETECTION_PROFILES, WizardStatus.UNAVAILABLE)
+        self.assertFalse(self.store.snapshot().deployment_ready)
+        self.transition(WizardStep.DETECTION_PROFILES, WizardStatus.PENDING)
+        after = self.transition(WizardStep.DETECTION_PROFILES, WizardStatus.COMPLETED)
+        self.assertTrue(after.deployment_ready)
+
+    def test_published_wizard_migration_is_frozen(self):
+        self.assertEqual(
+            "5e093df62583d85f20c2d15ae6b285c3b9c0c2e2d78d7701a77cc09bb41b5730",
+            wizard_state_migration(11).checksum,
+        )
 
     def test_unavailable_and_skipped_steps_must_be_retried_before_completion(self):
         self.transition(WizardStep.WELCOME, WizardStatus.COMPLETED)

@@ -34,18 +34,18 @@ class StepDefinition:
     skippable: bool
 
 
-# The order is the setup contract in docs/SETUP.md. Camera/profile and remote
-# access integrations can be deferred while the shell is developed, and the
-# two explicitly optional integrations can always be skipped. Core deployment
-# ownership and safety steps cannot be presented as voluntarily skipped.
+# The order is the setup contract in docs/SETUP.md. Owner verification and
+# Slack are explicitly optional. Human remote access can be deferred while the
+# shell is developed. Core deployment, camera, and profile steps cannot be
+# presented as voluntarily skipped.
 STEP_CATALOG = (
     StepDefinition(WizardStep.WELCOME, False),
     StepDefinition(WizardStep.DEPLOYMENT_OWNER, False),
     StepDefinition(WizardStep.STORAGE, False),
     StepDefinition(WizardStep.HARDWARE_AND_RECORDER, False),
     StepDefinition(WizardStep.LOCALE_AND_TIME, False),
-    StepDefinition(WizardStep.CAMERA_SOURCES, True),
-    StepDefinition(WizardStep.DETECTION_PROFILES, True),
+    StepDefinition(WizardStep.CAMERA_SOURCES, False),
+    StepDefinition(WizardStep.DETECTION_PROFILES, False),
     StepDefinition(WizardStep.OWNER_VERIFICATION, True),
     StepDefinition(WizardStep.SLACK, True),
     StepDefinition(WizardStep.HUMAN_REMOTE_ACCESS, True),
