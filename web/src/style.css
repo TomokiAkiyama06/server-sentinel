@@ -42,6 +42,52 @@ p { margin: .5rem 0 1rem; }
 .health-online { border-color: #22714e; }
 .health-degraded, .health-manual_intervention_required { border-color: #9b6100; }
 .health-offline { border-color: #ad3940; }
+.numeric { font-variant-numeric: tabular-nums; }
+.filters { display: flex; flex-wrap: wrap; gap: .5rem; margin-bottom: .5rem; }
+.filter { border: 1px solid #cad7dc; border-radius: 1rem; background: #fff; color: #344f5b; padding: .4rem 1rem; font-size: .85rem; }
+.filter-active { background: #dcecf0; border-color: #9dc0ca; color: #123f50; font-weight: 700; }
+.table-scroll { overflow-x: auto; }
+.records { border-collapse: collapse; width: 100%; font-size: .9rem; background: #fff; border: 1px solid #dce5e8; border-radius: 1rem; }
+.records caption { text-align: left; font-size: .8rem; padding: .6rem .8rem; }
+.records th, .records td { text-align: left; padding: .6rem .8rem; border-top: 1px solid #e4ecee; white-space: nowrap; }
+.records th { color: #34505c; font-size: .8rem; }
+.kind { border-left: 3px solid #617780; padding-left: .5rem; }
+.kind-critical { border-color: #ad3940; }
+.kind-event { border-color: #176e85; }
+.recording-status { display: inline-block; border-left: 3px solid #617780; padding-left: .5rem; font-size: .8rem; }
+.recording-status-active { border-color: #176e85; }
+.recording-status-gapped, .recording-status-interrupted { border-color: #9b6100; }
+.coverage-warning { margin: .35rem 0 0; max-width: 16rem; white-space: normal; font-size: .75rem; color: #6d4400; }
+.row-actions { display: flex; gap: .4rem; flex-wrap: wrap; }
+.row-actions button { border: 1px solid #cad7dc; border-radius: .5rem; background: #fff; color: #344f5b; padding: .35rem .7rem; font-size: .8rem; }
+.danger { border-color: #ad3940; color: #8a2a30; font-weight: 650; }
+.row-actions button:disabled { color: #5c6e76; background: #eef3f5; border-color: #dbe5e9; }
+[aria-busy="true"] { background: #f5f9fa; }
+.write-alert { border: 1px solid #ad3940; border-left-width: 4px; border-radius: .6rem; background: #fdf4f4; padding: .8rem 1rem; margin-bottom: 1rem; }
+.write-alert p { margin: 0 0 .6rem; color: #6d2328; }
+.unresolved { margin: .5rem 0 .8rem; padding-left: 1.2rem; color: #6d2328; font-size: .85rem; }
+.unresolved li { margin-bottom: .2rem; overflow-wrap: anywhere; }
+.fault-alert { border: 1px solid #ad3940; border-left-width: 4px; border-radius: .6rem; background: #fdf4f4; padding: .8rem 1rem; margin: 0 0 1rem; }
+.fault-alert p { margin: 0; color: #6d2328; }
+.fault-alert p + p { margin-top: .5rem; }
+.playback { margin-top: 1.5rem; border: 1px solid #dce5e8; border-radius: 1rem; background: #fff; padding: 1.25rem; }
+.storage button { border: 1px solid #cad7dc; border-radius: .5rem; background: #fff; color: #344f5b; padding: .4rem .9rem; font-size: .85rem; }
+.states { display: flex; flex-wrap: wrap; gap: .5rem; }
+.state { border: 1px solid #cad7dc; border-radius: 1rem; padding: .25rem .8rem; font-size: .78rem; color: #4b6069; background: #fff; }
+.state-current { font-weight: 700; color: #123f50; background: #dcecf0; border-color: #6f9dab; }
+.state-STORAGE_PRESSURE.state-current { background: #fbeeda; border-color: #9b6100; color: #6d4400; }
+.state-STORAGE_HARD_STOP.state-current { background: #f9e2e3; border-color: #ad3940; color: #7f272d; }
+.breakdown { display: grid; gap: .5rem; margin: .5rem 0 1rem; }
+.breakdown-row { display: grid; grid-template-columns: minmax(8rem, 14rem) minmax(0, 1fr); gap: .8rem; align-items: center; }
+.breakdown dt { color: #34505c; font-size: .9rem; }
+.breakdown dd { margin: 0; display: flex; gap: .8rem; align-items: center; flex-wrap: wrap; }
+.breakdown meter { width: min(100%, 18rem); height: 1rem; }
+.retention-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 15rem), 1fr)); gap: 1rem; }
+.retention-card { background: #fff; border: 1px solid #dce5e8; border-radius: 1rem; padding: 1.25rem; }
+.retention-card h3 { font-size: 1rem; margin: 0 0 .3rem; }
+.retention-days { font-size: 1.6rem; font-weight: 700; margin: 0 0 .5rem; letter-spacing: -.02em; }
+.notification-rules { padding-left: 1.2rem; color: #34505c; }
+.notification-rules li { margin-bottom: .4rem; }
 @media (max-width: 700px) {
   .header { padding: 1rem; flex-wrap: wrap; }
   .language { margin-left: auto; }
@@ -50,4 +96,5 @@ p { margin: .5rem 0 1rem; }
   .navigation button { padding: .7rem .3rem; font-size: .8rem; text-align: center; overflow-wrap: anywhere; }
   .notice { margin-top: 1rem; }
   .page-heading { flex-wrap: wrap; }
+  .breakdown-row { grid-template-columns: minmax(0, 1fr); gap: .2rem; }
 }
