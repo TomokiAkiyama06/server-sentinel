@@ -327,7 +327,7 @@ Before sending the pairing code:
 - fail closed on missing/mismatched trust or certificate validation failure, without sending the code;
 - do not offer plaintext or unverified-certificate fallback.
 
-The concrete bootstrap trust/transport method requires PoC/ADR selection before implementation. A short-lived code and post-pairing mTLS do not replace confidentiality and intended-server authentication during initial enrollment. Pairing secrets are entered through a non-echoing prompt or protected automation input, never command arguments, environment variables, URLs, or logs.
+ADR-0006 selects the bootstrap trust profile: a deployment-local CA public trust bundle moves through an independently trusted Owner channel; the local Main approval binds a 128-bit, five-minute, one-use code to the Agent public-key digest; and TLS 1.3 authenticates the intended Main before code submission. The transport/listener adapter remains separately staged. A short-lived code and post-pairing mTLS do not replace confidentiality and intended-server authentication during initial enrollment. Pairing secrets are entered through a non-echoing prompt or protected automation input, never command arguments, environment variables, URLs, or logs.
 
 After pairing:
 
