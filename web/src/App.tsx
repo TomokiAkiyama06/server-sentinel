@@ -1,4 +1,5 @@
 import { Component, useEffect, useState, type ReactNode } from 'react';
+import { flushSync } from 'react-dom';
 import { canVisit, deniedServices, views, type CameraSourceSummary, type DashboardServices, type RecordingSummary, type Session, type StorageSummary, type View } from './domain';
 import { messages, type Locale } from './i18n';
 import { RecordingsView } from './recordings/view';
@@ -224,7 +225,10 @@ export function App({ services = deniedServices }: { services?: DashboardService
                     <button className="primary" onClick={() => setRefresh(value => value + 1)}>{t.retry}</button></section>
                   : selected === 'recordings' && recordings.state === 'loading' ? <p role="status">{t.checking}</p>
                     : selected === 'storage' && access.role === 'owner' && storage.state === 'ready'
-                      ? <StorageView t={t} storage={storage.item} onRefresh={() => { setStorage(stale); setRefresh(value => value + 1); }} />
+                      ? <StorageView t={t} storage={storage.item} onRefresh={() => {
+                          flushSync(() => setStorage(stale));
+                          setRefresh(value => value + 1);
+                        }} />
                       : selected === 'storage' && storage.state === 'failed'
                         ? <section className="notice" role="alert"><p>{t.storageUnavailable}</p><button className="primary" onClick={() => setRefresh(value => value + 1)}>{t.retry}</button></section>
                         : selected === 'storage' && storage.state === 'loading' ? <p role="status">{t.checking}</p>
