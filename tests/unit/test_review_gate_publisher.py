@@ -19,18 +19,27 @@ class FakeGitHub:
         self.context, self.issuer = context, issuer
         self.posts: list[tuple[str, str, dict]] = []
         self.diff = b"synthetic fixed diff\n"
+        self.graph = {
+            context.head_sha: (context.merge_base_sha,),
+            context.base_sha: (context.merge_base_sha,),
+            context.merge_base_sha: (),
+        }
 
     def get_json(self, path, token):
         c = self.context
         if path.endswith(f"/pulls/{c.pr_number}"):
             return {"number": c.pr_number, "base": {"ref": "main", "sha": c.base_sha,
                     "repo": {"id": c.repository_id}}, "head": {"sha": c.head_sha}}
-        if "/compare/" in path:
-            return {"merge_base_commit": {"sha": c.merge_base_sha}}
         if path.endswith(f"/git/ref/pull/{c.pr_number}/merge"):
             return {"object": {"sha": c.test_merge_sha}}
         if path.endswith(f"/git/commits/{c.test_merge_sha}"):
-            return {"parents": [{"sha": c.base_sha}, {"sha": c.head_sha}]}
+            return {"sha": c.test_merge_sha,
+                    "parents": [{"sha": c.base_sha}, {"sha": c.head_sha}]}
+        marker = "/git/commits/"
+        if marker in path:
+            sha = path.rsplit(marker, 1)[1]
+            return {"sha": sha,
+                    "parents": [{"sha": parent} for parent in self.graph[sha]]}
         raise AssertionError(path)
 
     def get_bytes(self, path, token, accept):
@@ -132,6 +141,44 @@ class ReviewGatePublisherTests(unittest.TestCase):
                     {**self.environ, publisher.TOKEN_ENV: "bad"}):
             with self.subTest(env=env), self.assertRaises(publisher.PublisherFailure):
                 publisher.load_app_credentials(config, env, self.checkout)
+
+    def test_github_rsa_private_key_delimiter_is_accepted(self):
+        fence = b"-" * 5
+        self.key_path.write_bytes(fence + b"BEGIN RSA PRIVATE KEY" + fence + b"\n"
+                                  + b"a" * 64 + b"\n" + fence
+                                  + b"END RSA PRIVATE KEY" + fence + b"\n")
+        credentials = self.credentials()
+        self.assertTrue(credentials.private_key_pem.startswith(
+            b"-----BEGIN RSA PRIVATE KEY-----"))
+
+    def test_unique_merge_base_rejects_criss_cross_and_incomplete_proof(self):
+        fake = FakeGitHub(self.context, self.issuer)
+        left, right = "d" * 40, "e" * 40
+        root = "9" * 40
+        fake.graph = {
+            self.context.base_sha: (left, right),
+            self.context.head_sha: (right, left),
+            left: (root,), right: (root,), root: (),
+        }
+        repo = "/repos/owner/repository"
+        with self.assertRaisesRegex(publisher.PublisherFailure,
+                                    "multiple merge bases"):
+            publisher.unique_merge_base(fake, repo, "token",
+                                        self.context.base_sha,
+                                        self.context.head_sha)
+        with self.assertRaisesRegex(publisher.PublisherFailure,
+                                    "exceeds verification limit"):
+            publisher.unique_merge_base(fake, repo, "token",
+                                        self.context.base_sha,
+                                        self.context.head_sha, max_commits=2)
+        for limit in (0, publisher._MAX_ANCESTRY_COMMITS + 1, True):
+            with self.subTest(limit=limit), self.assertRaisesRegex(
+                    publisher.PublisherFailure,
+                    "invalid ancestry verification limit"):
+                publisher.unique_merge_base(fake, repo, "token",
+                                            self.context.base_sha,
+                                            self.context.head_sha,
+                                            max_commits=limit)
 
     def test_bad_test_merge_or_post_response_fails_closed(self):
         credentials = self.credentials()

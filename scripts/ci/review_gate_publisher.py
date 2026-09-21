@@ -33,6 +33,8 @@ CONFIG_ENV = "SERVER_SENTINEL_REVIEW_GATE_CONFIG"
 TOKEN_ENV = "SERVER_SENTINEL_REVIEW_GATE_INSTALLATION_TOKEN"
 GITHUB_API = "https://api.github.com"
 _HEX = re.compile(r"[0-9a-f]{40}")
+_MAX_ANCESTRY_COMMITS = 4096
+_MAX_COMMIT_PARENTS = 64
 
 
 class PublisherFailure(RuntimeError):
@@ -68,11 +70,15 @@ class AppCredentials:
 
 
 class GitHubTransport(Protocol):
-    def get_json(self, path: str, token: str) -> dict[str, Any]: ...
+    def get_json(self, path: str, token: str) -> dict[str, Any]:
+        ...
 
-    def get_bytes(self, path: str, token: str, accept: str) -> bytes: ...
+    def get_bytes(self, path: str, token: str, accept: str) -> bytes:
+        ...
 
-    def post_json(self, path: str, token: str, payload: dict[str, Any]) -> dict[str, Any]: ...
+    def post_json(self, path: str, token: str,
+                  payload: dict[str, Any]) -> dict[str, Any]:
+        ...
 
 
 def _outside_checkout(path: Path, checkout_root: Path) -> Path:
@@ -156,8 +162,14 @@ def load_app_credentials(config: RuntimeConfig, environ: Mapping[str, str],
     an error.  The token is intentionally an environment-only runtime input.
     """
     _, key = _secure_private_bytes(config.private_key_path, checkout_root)
-    if not (64 <= len(key) <= 65536 and key.startswith(b"-----BEGIN ")
-            and key.rstrip().endswith(b"-----END PRIVATE KEY-----")):
+    pem_markers = (
+        (b"-----BEGIN PRIVATE KEY-----", b"-----END PRIVATE KEY-----"),
+        (b"-----BEGIN RSA PRIVATE KEY-----",
+         b"-----END RSA PRIVATE KEY-----"),
+    )
+    if not (64 <= len(key) <= 65536
+            and any(key.startswith(begin) and key.rstrip().endswith(end)
+                    for begin, end in pem_markers)):
         raise PublisherFailure("invalid App private key material")
     token = environ.get(TOKEN_ENV)
     if not isinstance(token, str) or not re.fullmatch(r"[A-Za-z0-9_-]{20,512}", token):
@@ -179,7 +191,8 @@ class UrllibGitHubTransport:
 
     @staticmethod
     def _url(path: str) -> str:
-        if not isinstance(path, str) or not path.startswith("/") or "?" in path:
+        if (not isinstance(path, str) or not path.startswith("/")
+                or ("?" in path and not path.endswith("?recursive=1"))):
             raise PublisherFailure("invalid GitHub API path")
         return GITHUB_API + path
 
@@ -234,6 +247,110 @@ def _path_part(value: str) -> str:
     return quote(value, safe="")
 
 
+def _commit_parents(client: GitHubTransport, repo: str, token: str,
+                    sha: str) -> tuple[str, ...]:
+    commit = client.get_json(f"{repo}/git/commits/{sha}", token)
+    try:
+        if _sha(commit["sha"]) != sha:
+            raise PublisherFailure("commit response identity mismatch")
+        parents = tuple(_sha(parent["sha"]) for parent in commit["parents"])
+    except (KeyError, TypeError) as exc:
+        raise PublisherFailure("invalid commit ancestry response") from exc
+    # Bound hostile/malformed API fan-out as well as total graph size.  GitHub
+    # permits octopus merges, so fail closed instead of assuming two parents.
+    if (len(parents) > _MAX_COMMIT_PARENTS
+            or len(set(parents)) != len(parents) or sha in parents):
+        raise PublisherFailure("invalid commit ancestry response")
+    return parents
+
+
+def _ancestor_graph(client: GitHubTransport, repo: str, token: str,
+                    starts: tuple[str, ...], max_commits: int,
+                    graph: dict[str, tuple[str, ...]]) -> None:
+    """Populate complete parent graphs, refusing an incomplete bounded proof."""
+    pending = list(starts)
+    while pending:
+        sha = pending.pop()
+        if sha in graph:
+            continue
+        if len(graph) >= max_commits:
+            raise PublisherFailure("commit ancestry exceeds verification limit")
+        parents = _commit_parents(client, repo, token, sha)
+        graph[sha] = parents
+        pending.extend(parent for parent in parents if parent not in graph)
+
+
+def _reachable(graph: Mapping[str, tuple[str, ...]], start: str) -> set[str]:
+    result: set[str] = set()
+    pending = [start]
+    while pending:
+        sha = pending.pop()
+        if sha in result:
+            continue
+        result.add(sha)
+        pending.extend(graph[sha])
+    return result
+
+
+def unique_merge_base(client: GitHubTransport, repo: str, token: str,
+                      base_sha: str, head_sha: str,
+                      max_commits: int = _MAX_ANCESTRY_COMMITS) -> str:
+    """Prove a single best common ancestor from a complete bounded DAG.
+
+    GitHub's compare response selects one merge base and cannot prove that a
+    criss-cross history has only one.  Walking parent objects to their roots is
+    more expensive, but makes ambiguity and an exhausted verification budget
+    fail closed.
+    """
+    if (type(max_commits) is not int or max_commits <= 0
+            or max_commits > _MAX_ANCESTRY_COMMITS):
+        raise PublisherFailure("invalid ancestry verification limit")
+    graph: dict[str, tuple[str, ...]] = {}
+    _ancestor_graph(client, repo, token, (base_sha, head_sha), max_commits, graph)
+    common = _reachable(graph, base_sha) & _reachable(graph, head_sha)
+    if not common:
+        raise PublisherFailure("commits have no common ancestor")
+
+    # Common ancestors are closed under ancestry.  A common commit is a best
+    # common ancestor exactly when no immediate child in the common subgraph
+    # descends from it.
+    shadowed: set[str] = set()
+    for child in common:
+        shadowed.update(parent for parent in graph[child] if parent in common)
+    best = common - shadowed
+    if len(best) != 1:
+        raise PublisherFailure("commit history has multiple merge bases")
+    return best.pop()
+
+
+def canonical_no_rename_diff(base_tree: dict[str, Any],
+                             head_tree: dict[str, Any]) -> bytes:
+    """Encode changed Git tree entries with paths, never rename detection."""
+    def entries(tree: dict[str, Any]) -> dict[str, tuple[str, str]]:
+        if tree.get("truncated") is True or not isinstance(tree.get("tree"), list):
+            raise PublisherFailure("Git tree response is incomplete")
+        result: dict[str, tuple[str, str]] = {}
+        for item in tree["tree"]:
+            if not isinstance(item, dict) or item.get("type") not in {"blob", "commit"}:
+                continue
+            path, mode, sha = item.get("path"), item.get("mode"), item.get("sha")
+            if (not isinstance(path, str) or not path or "\x00" in path
+                    or not isinstance(mode, str) or not re.fullmatch(r"[0-7]{6}", mode)
+                    or path in result):
+                raise PublisherFailure("invalid Git tree entry")
+            result[path] = (mode, _sha(sha))
+        return result
+    before, after = entries(base_tree), entries(head_tree)
+    rows = [b"server-sentinel-no-renames-tree-diff-v1\n"]
+    for path in sorted(set(before) | set(after)):
+        if before.get(path) != after.get(path):
+            old = before.get(path, ("-", "-"))
+            new = after.get(path, ("-", "-"))
+            rows.append((path + "\x00" + old[0] + "\x00" + old[1] + "\x00"
+                         + new[0] + "\x00" + new[1] + "\n").encode("utf-8"))
+    return b"".join(rows)
+
+
 def collect_live_context(client: GitHubTransport, config: RuntimeConfig,
                          token: str, pr_number: int) -> Context:
     """Build a Context from authenticated GitHub responses without git execution."""
@@ -254,11 +371,7 @@ def collect_live_context(client: GitHubTransport, config: RuntimeConfig,
             raise PublisherFailure("pull request base is not main")
     except (KeyError, TypeError) as exc:
         raise PublisherFailure("invalid pull request response") from exc
-    compare = client.get_json(f"{repo}/compare/{base_sha}...{head_sha}", token)
-    try:
-        merge_base = _sha(compare["merge_base_commit"]["sha"])
-    except (KeyError, TypeError) as exc:
-        raise PublisherFailure("invalid compare response") from exc
+    merge_base = unique_merge_base(client, repo, token, base_sha, head_sha)
     merge_ref = client.get_json(f"{repo}/git/ref/pull/{pr_number}/merge", token)
     try:
         test_merge = _sha(merge_ref["object"]["sha"])
@@ -272,8 +385,9 @@ def collect_live_context(client: GitHubTransport, config: RuntimeConfig,
         raise PublisherFailure("invalid test merge commit") from exc
     if len(parent_shas) != 2 or set(parent_shas) != {base_sha, head_sha}:
         raise PublisherFailure("test merge does not bind current base and head")
-    diff = client.get_bytes(f"{repo}/pulls/{pr_number}", token,
-                            "application/vnd.github.v3.diff")
+    base_tree = client.get_json(f"{repo}/git/trees/{base_sha}?recursive=1", token)
+    head_tree = client.get_json(f"{repo}/git/trees/{head_sha}?recursive=1", token)
+    diff = canonical_no_rename_diff(base_tree, head_tree)
     return Context(config.repository_id, pr_number, "refs/heads/main", head_sha,
                    base_sha, merge_base, hashlib.sha256(diff).hexdigest(), test_merge)
 

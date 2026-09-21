@@ -151,17 +151,23 @@ closed. The provider adapters and their hostile-input tests remain required work
 
 Construct a `Context` from the authenticated target repository ID, PR number,
 `refs/heads/main`, current head/base commit IDs, a unique merge-base commit ID,
-the current GitHub test-merge commit ID, and SHA-256 of these exact diff bytes.
-Reject multiple merge bases. Use clean,
-trusted git configuration, disable external diff/textconv, and fetch immutable
-objects without executing PR hooks or reading PR git configuration:
+the current GitHub test-merge commit ID, and SHA-256 of
+`canonical_no_rename_diff()` bytes. The isolated collector and publisher both
+read complete recursive base/head Git trees through authenticated REST, then use
+this fixed sorted manifest of changed `path`, mode and blob/gitlink SHA. A
+rename is deliberately an old-path removal plus a new-path addition. Do not use
+GitHub's rendered `.diff`, local `git diff`, compare-file patches, a web diff,
+or a PR artifact: rename detection and renderer configuration would make those
+representations differ between review and publication.
 
-```sh
-git -c core.quotePath=true diff --no-ext-diff --no-textconv --no-color \
-  --no-renames --diff-algorithm=myers --no-indent-heuristic \
-  --src-prefix=a/ --dst-prefix=b/ --unified=3 --inter-hunk-context=0 \
-  <fixed-base-sha>...<fixed-head-sha>
-```
+Do not trust the single `merge_base_commit` selected by GitHub's compare API as
+proof of uniqueness. The publisher walks authenticated Git commit parent
+objects to their roots, derives all best common ancestors, and requires exactly
+one. The traversal is bounded to 4096 distinct commits; exhausting that budget,
+a missing/malformed parent object, no common ancestor, or a criss-cross history
+with multiple best common ancestors fails closed. A deployment whose repository
+history exceeds the bound needs a separately reviewed, trusted graph collector;
+do not weaken or skip this proof.
 
 Invalidate previous successes before rerunning either review. Handle PR opens,
 updates, retargets, reopenings, review reruns and base pushes; polling must also
