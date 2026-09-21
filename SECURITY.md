@@ -289,12 +289,11 @@ Do not trust arbitrary forwarded identity headers.
 
 If Tailscale Serve/equivalent provides authenticated identity headers, the backend accepts them only on a non-bypassable local trusted-proxy path. Requests from LAN/other interfaces cannot directly set such headers and gain identity.
 
-The concrete Owner-bootstrap/session design is [ADR-0003](docs/ADR/0003-owner-authentication-and-trusted-proxy.md), currently **Proposed** pending Owner approval.
-It states the proposed trusted-host loopback limitation and upstream login-reuse
-risk, and defines recovery/revocation transitions for review. No session lifetime,
-identity-binding choice, or local recovery implementation is accepted by that
-proposal alone. Human routes and dashboard assets remain closed until the design
-is accepted and implemented/tested under #10. Its model tests do not validate a
+The concrete Owner-bootstrap/session design is [ADR-0003](docs/ADR/0003-owner-authentication-and-trusted-proxy.md), which is **Accepted**.
+It states the trusted-host loopback limitation and upstream login-reuse risk,
+and defines recovery/revocation transitions. Human routes and dashboard assets
+remain closed until ADR-0004 is accepted and both records are implemented and
+tested under #10. Its model tests do not validate a
 real Tailscale installation, LAN bypass resistance, or active stream cancellation.
 
 That proposal also requires a hostname reserved for the human listener on every

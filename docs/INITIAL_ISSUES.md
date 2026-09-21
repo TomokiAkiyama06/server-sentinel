@@ -308,7 +308,11 @@ Scope:
 - exact handling of verified external identity headers, which in the shared-Tailscale-account deployment are supplementary only;
 - keep Tailnet policy separately Owner-managed outside ServerSentinel; existing ACLs/Grants may remain unchanged, and ServerSentinel performs no policy mutation or admin-credential storage.
 
-The authorization decision is written up in ADR 0004 (shared Tailnet account, per-person WebAuthn/passkey credentials), and the surrounding owner-authentication and trusted-proxy boundary in ADR 0003. Both are Proposed and await the Owner; this Issue closes only when both are accepted and implemented.
+The authorization decision is written up in ADR 0004 (shared Tailnet account,
+per-person WebAuthn/passkey credentials), which remains Proposed and awaits the
+Owner. The surrounding owner-authentication and trusted-proxy boundary in ADR
+0003 is Accepted. This Issue closes only after ADR 0004 is accepted and both
+records are implemented and tested.
 
 Acceptance:
 - Tailnet membership alone is insufficient;

@@ -782,10 +782,10 @@ synthetic test branches/PRs; no production data or unrelated rule deletion.
 - Benchmark the accepted person backend on CPU; GPU is optional and separately measured. External benchmark media stays local under its terms and is never committed or attached to GitHub/CI. No real-model accuracy or target-host performance was verified by synthetic unit tests.
 - Stop/delay inference, inject quality loss, stale frames and a wedged plugin in the isolated worker: result must become unknown, loss/throttling remain visible, and capture/recording/health/storage-safety work must continue. Verify the production watchdog/resource limits separately; the primitive cannot forcibly interrupt a native call.
 
-## ADR-0003 follow-up: proposed human-access boundary
+## ADR-0003 follow-up: accepted human-access boundary
 
-These checks belong to #10/#19/#27/#28 after Owner approval and runtime
-integration, matching the follow-up recorded in ADR-0003. They are not completed
+These checks belong to #10/#19/#27/#28 during runtime integration, matching the
+follow-up recorded in accepted ADR-0003. They are not completed
 by the Issue #6 synthetic policy model.
 
 - Verify the reserved hostname serves ServerSentinel alone on every scheme and
