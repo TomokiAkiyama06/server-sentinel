@@ -12,6 +12,15 @@ static assets and errors. No unauthenticated HTTP health exception is provided.
 
 ## Test metadata
 
+Issue #16's disk-ring core has only synthetic filesystem/quota/clock acceptance.
+Before closing #16, run the existing Agent buffer/outage checks with the real
+segmenter/profile and authenticated transport: verify each source retains the
+full T−10/T+10 interval, confirm real segment/container/block overhead fits the
+admission bound, and inspect partial/gap reporting during actual disk pressure
+and mount loss. Verify Owner-only mode/value/deletion controls and DTO rendering
+through #10-authorized routes. Do not record those physical/UI checks as passed
+because the temporary-filesystem tests succeeded.
+
 ```text
 Date:
 ServerSentinel version / Git commit:
@@ -27,6 +36,41 @@ Tester:
 ```
 
 ## A. Local UVC / USB camera
+
+Issue #11 implementation status (2026-09-20): synthetic discovery, driver-ioctl,
+identity, restart-persistence and registry integration tests passed. No physical
+camera was opened and no actual preview, audio-device trace or arm64 execution
+was verified. All hardware checkboxes below remain unverified.
+
+After the Owner-authorized management and worker/preview wiring are available,
+run the following on the intended Main Ubuntu host under its dedicated account:
+
+1. Record model, supported profile, device permission and stable evidence in a
+   private local test record; publish only pass/fail and non-sensitive counts.
+2. Enable one source with an explicit profile and select its current physical
+   candidate. Verify negotiated dimensions/FPS/FourCC and first-frame transition
+   from degraded to online. Repeat with up to four sources.
+3. Observe the service's opened descriptors locally while the camera's integrated
+   microphone is present; only the selected video device may be opened, never
+   ALSA/OSS microphone devices. Do not publish trace paths or captured media.
+4. Unplug one camera. Verify its offline audit event, continuing service process,
+   and uninterrupted second source. Reconnect a unique serial camera with changed
+   video-node numbering and verify the same source UUID returns online only after
+   a new frame. Disable it and verify its video descriptor is closed.
+5. Reorder identical non-serial devices, including the case where only one is
+   reattached. Verify manual intervention; restart the backend and verify the
+   latch still holds. Explicitly reapprove the current candidate and confirm video
+   resumes. Duplicate-serial evidence must also require manual intervention.
+6. Check unsupported profile/permission, driver timeout and corrupted-frame paths
+   are visibly unavailable, never healthy; restore the supported configuration.
+7. Using a disposable database, inject a failed ambiguity-latch write and stop the
+   worker without clean shutdown. Restart with one formerly duplicated serial
+   device remaining: it must require Owner reapproval. Repeat with no capture
+   profile; the manual-intervention state must remain visible. A normal clean
+   shutdown/restart of an unambiguous serial device may reconnect automatically.
+
+Results: **NOT RUN — hardware, authorized management and viewer integration
+remain pending. Issue #11 is not closed by synthetic tests.**
 
 For each tested camera:
 
@@ -137,6 +181,15 @@ Compare at minimum where camera capabilities allow:
 
 Choose defaults from measurements, not assumptions.
 
+The synthetic profile core tests do not satisfy the following integration checks:
+
+- [ ] run the selected real decoder on all compressed reference packets; verify independent inference cadence and actual resized image dimensions, including B-frame reordering and stream restart;
+- [ ] compare durable recording codec/profile/quality before, during, and after changing viewer quality; record any discontinuities explicitly;
+- [ ] count viewer-only codec processes, handles and memory before the first subscriber, with subscribers, and after the last leaves; confirm cleanup and bounded failure recovery;
+- [ ] apply recording and viewer queue pressure separately; verify bounded memory, visible loss, and keyframe recovery without claiming continuous evidence;
+- [ ] verify copy eligibility against actual codec configuration, container, timestamps and color metadata; unsupported copy/transcode paths remain unavailable;
+- [ ] record only sanitized aggregate resource measurements; no deployment identifiers, room imagery, media payloads, or exact private network values enter GitHub.
+
 ## D. Source registry / mixed topology
 
 Validate:
@@ -149,6 +202,9 @@ Validate:
 - [ ] mixed `local_uvc` + `remote_agent` works;
 - [ ] source rename/role change works;
 - [ ] detection profiles remain independent of source type;
+- [ ] each local/remote source's admitted capture/recording/inference/viewer set
+  comes from that source's inspected capabilities; a profile supported only by
+  another camera/node is rejected without replacing the active configuration;
 - [ ] removing one source does not corrupt recordings/events for others.
 
 ## E. Server ROI / movement
@@ -207,6 +263,7 @@ Unexpected Main Server communication loss:
 - [ ] segment gaps/shortened protection are reported truthfully;
 - [ ] protected incident has a 60-day agent-side expiry;
 - [ ] expiry cleanup removes it automatically after 60 days (use test clock/accelerated retention harness rather than waiting 60 real days where available);
+- [ ] restart or trusted-clock recovery after that deadline expires the incident immediately; delayed finalization/late media never extends `ended_at + 60 days`;
 - [ ] ordinary ring-buffer pressure does not delete an unexpired protected incident;
 - [ ] disk pressure produces explicit warning/hard-stop behavior before unsafe writes.
 
@@ -342,8 +399,12 @@ Progressively degrade lighting/blur/visibility.
 
 Use only the deployment owner's own enrollment during manual testing. Never upload enrollment/reference images or real-person result clips to GitHub.
 
+Issue #25 currently validates private local persistence, authorization/generation/quality boundaries and no-egress normal/error smoke with generated shapes and a synthetic verifier only. No production face model/weights/threshold is selected. Keep all real-model/Owner/room checks below open; record the Owner-approved code/weights/license/artifact/threshold decision locally before enabling the adapter.
+
 - [ ] explicit biometric explanation;
 - [ ] owner enroll/delete/re-enroll;
+- [ ] re-enrollment/deletion invalidates old and in-flight match receipts; shared/general diagnostics and explicit Owner exports never include the private template DB/journals/backups;
+- [ ] separate face crops in one frame each need their own sufficient quality assessment; one clear face cannot lend its quality to another blurred/dark face;
 - [ ] poor enrollment image rejected/retried;
 - [ ] template remains local and absent from logs/normal diagnostics;
 - [ ] normal frontal/angle/distance variations tested;
@@ -362,6 +423,7 @@ Where room geometry supports entrance logic:
 - [ ] multiple people close together;
 - [ ] partial occlusion;
 - [ ] reversal/loiter near line does not spam events;
+- [ ] crossing back within hysteresis and then walking around the finite line endpoint does not create a false entry; frame gaps/occlusion/session reset do not infer unseen crossings;
 - [ ] unknown people receive no real names;
 - [ ] no cross-camera biometric re-identification claim;
 
@@ -396,6 +458,21 @@ Anonymous person exits
 ## Q. Storage pressure / hard stop
 
 Use a disposable/test volume.
+
+Issue #21 unit/container scenarios cover temporary synthetic files, reserved
+constructor recovery, starvation/cleanup/star races, audit failure, retention,
+mock Slack and DST/rollback scheduling. They do not establish deployed volume,
+real codec, configured Slack, browser playback or human authorization acceptance.
+Keep the following deployment checks open; do not use production data for fills.
+
+- [ ] metadata database and media use the expected filesystem, and configured
+      journal/temp overhead safely covers recovery, cleanup and migrations;
+- [ ] configured Slack receives one safe immediate critical alert and one daily
+      aggregate; a failed/unconfigured channel leaves local/UI faults visible;
+- [ ] slow/unavailable Slack does not block recording; full queues, pending
+      shutdown/crash delivery and failed completion persistence remain visible;
+- [ ] after deployment restart/DST change, summary sends at the configured local
+      time without duplicate dispatch, and uncertain `pending` delivery is visible.
 
 - [ ] retention deletes expired unstarred data;
 - [ ] allocation/free-space pressure reclaims oldest eligible unstarred data;
@@ -437,6 +514,13 @@ Record separate performance results for 1, 2, 3, and 4 active sources, including
 
 
 ## S. Main-host hardware integrity / recording-health self-test
+
+Current Issue #23 automation uses generated inventory and synthetic compressed
+bytes only. Before physical acceptance, wire the approved Owner authorizer,
+local schema/runtime configuration, actual source/encoder/codec callbacks and
+#21 durable notification bridge. Verify optional read-only tools under the
+dedicated non-root account; unavailable fields must stay unknown. Do not publish
+collected identifiers or self-test bytes.
 
 ### Hardware baseline and startup/daily comparison
 
@@ -499,7 +583,122 @@ Do not upload hardware serials, local mount identifiers, real temporary test med
 - [ ] explicitly configured product integrations are checked separately and never excuse unrelated reporting; no telemetry feature is introduced without a new explicit Owner decision and ADR changing PRIV-003;
 - [ ] traces and deployment identifiers remain local; publish only sanitized pass/fail results, never raw monitoring data, secrets, or private network logs.
 
-## U. GitHub review-gate enforcement
+### Issue #12 foundation acceptance (pending physical execution)
+
+The synthetic CI tests do not complete these checks. On an isolated Capture Node:
+
+- [ ] Build/verify the versioned Agent artifact and run `--check` as the dedicated
+  non-root account; runtime/media directories are outside source/install trees.
+- [ ] Inspect the generated `media-capture-agent.service`, its dedicated UID,
+  explicit video-node allowlist and empty capabilities; account/device permissions
+  remain narrowly configured. Verify process command line and unit name (Linux
+  kernel `comm` truncates names longer than 15 visible bytes).
+- [ ] Confirm `--check` succeeds both outside and inside the generated systemd
+  mount namespace when the media root is a subdirectory of an approved mount.
+  A bind of another backing directory on the same device must be rejected.
+- [ ] Record the Owner-approved filesystem UUID only in the private deployment
+  configuration. On a disposable volume, replace the filesystem while reusing
+  the mount path and device name, restart the Agent, and verify `--check` and
+  new writes refuse the replacement rather than treating it as the approved
+  storage.
+- [ ] Start/stop through systemd after #11/#13/#14 integration; verify no GUI/tray,
+  no microphone opens, no audio setting and no inbound listener/SSH dependency.
+- [ ] Unplug an approved UVC camera: source becomes offline while node heartbeat
+  continues. Reconnect obeys stable identity and ambiguous-device approval.
+- [ ] Inject excessive clock offset, uncertainty and wall-clock steps using mocks
+  or an isolated test process; timing degradation remains visible and is not
+  interpreted as reliable event ordering.
+- [ ] Use an isolated test filesystem to exercise mount disappearance, replacement,
+  read-only state and reserve pressure at startup and runtime. Check descriptor
+  pinning and no fallback-directory creation without altering production mounts.
+- [ ] Restart at storage hard stop: inventory and authorized cleanup remain
+  possible; new allocations and installer `--check` fail until reserve is restored.
+- [ ] Confirm network observation after authenticated transport integration shows
+  only Owner-configured Main communication, including error/reconnect paths.
+
+Publish only pass/fail summaries; keep configs, mount identity, host identifiers,
+credentials and captured media private.
+
+## U. Privacy-safe diagnostic export / support bundle
+
+Run this only on the intended Main Server using synthetic, non-production diagnostic inputs. Do not upload, commit, attach, or paste the generated bundle, its manifest, private deployment data, raw identifiers, monitoring media, credentials, or biometric material into GitHub.
+
+- [ ] an Owner initiates a diagnostic export from the deployed application; no background, scheduled, or error path creates or transfers a bundle without that explicit action;
+- [ ] an uninvited client, invited non-Owner identity, and capture-node credential each fail to create, list, retrieve, or select media for an export through every browser and direct API/copied-URL path; the response reveals no bundle metadata or media;
+- [ ] before export, the bundle remains deployment-local; observe the controlled export operation locally and verify that it does not automatically upload/share to a developer or third-party endpoint;
+- [ ] use harmless synthetic sentinel inputs to verify credentials, pairing secrets, private keys, and sensitive headers are excluded;
+- [ ] verify Owner biometric templates/embeddings are excluded even from an explicitly initiated export, and no selected export authorizes external biometric processing/storage;
+- [ ] verify raw hardware serials/UUIDs are absent or redacted/hashed, while the manifest reports only safe categories and exclusion reasons;
+- [ ] verify raw monitoring media is absent by default and can be included only after an additional explicit Owner selection; do not use real monitoring media for this check;
+- [ ] before authorization, the confirmation names the included categories and every individually selected raw-media item; selecting one synthetic item includes only that item and selecting none includes no media;
+- [ ] the manifest records no excluded value, media ID, path, or other private deployment identifier, and the bundle stays deployment-local until the Owner separately chooses how to share it;
+- [ ] an export directed at a directory outside the approved storage filesystem, or attempted while the approved mount is missing or substituted, is refused before any space is reserved and never falls back to the root filesystem;
+- [ ] cancelling the Owner request or disconnecting mid-export leaves no bundle, partial file, or held reservation behind; repeat the disconnect and confirm archives do not accumulate;
+- [ ] record only sanitized PASS/FAIL and aggregate results locally; do not retain the test bundle after the local verification policy permits deletion.
+
+Results: **NOT RUN — Owner authorization/UI integration and Main Server network observation remain pending. Synthetic tests do not complete this acceptance.**
+
+## V. Deployed Main Server install / update / rollback lifecycle
+
+Issue #47 remains open. The synthetic CI tests do not complete these checks: they require an actual deployed Main Ubuntu Server installed from a versioned artifact or the documented Docker Compose path, kept separate from any development checkout. Use a disposable host and disposable storage; never run the destructive cases against a production deployment. This section covers Main Server lifecycle data only: capture-agent protected incidents belong to Issue #16 and no capture node is part of this section's environment, so record them as not applicable here and verify their survival in the Issue #28 full-deployment acceptance. Do not commit, attach, or paste release artifacts, private deployment paths, hostnames/IPs, listener addresses, configuration values, credentials, mount/device identities, hardware identifiers, audit contents, or recorded media into GitHub.
+
+- [ ] install the versioned artifact / documented Compose path on a clean Main Ubuntu host without relying on a mutable development checkout; the service runs under its intended dedicated non-root runtime identity;
+- [ ] configuration and credentials resolve outside the release checkout, remain admin-managed and runtime-readable but not writable; state/database, recordings, and audit logs use their documented separate mutable locations and are writable only by the intended runtime account;
+- [ ] the human listener stays private-by-default behind the intended trusted-proxy boundary after install; it is not exposed to the public Internet and the proxy cannot be bypassed from an ordinary LAN client;
+- [ ] before updating, seed a non-vacuous baseline: at least one ordinary recording, one starred recording, one registered camera source, several audit records, and synthetic Owner/invitation records with independent `live:view` / `recordings:view` grants plus a revoked test invitation, so that the comparisons below cannot pass on empty inventories;
+- [ ] record a pre-update inventory (version/commit, recording count and sizes, starred recordings, audit record count with oldest/newest timestamps, camera source registrations, Owner presence, and nonidentifying invitation logical IDs with their permission/revocation state, plus Owner-approved hardware baseline) in local sanitized notes only; never record principal identity values, credentials, invitation values, or permission-bearing URLs, and mark each inventory that is empty or not applicable as such instead of counting it as preserved;
+- [ ] counts, sizes and boundary timestamps alone cannot detect replaced content, so also record content evidence for the same baseline: each seeded recording's stable logical ID with its locally computed file digest, container duration and a decodable playback sample, and the audit rows' per-row digests or an equivalent chained digest over the whole retained set, not only the first and last rows; keep the digests and logical IDs deployment-local;
+- [ ] update to a newer version through the documented lifecycle; the reported version changes and every item of the pre-update inventory survives except for intended, documented migrations;
+- [ ] after the update, re-verify the content evidence, not just the counts: the same recording logical IDs are present with unchanged digests, durations and decodable playback, and the audit digests match row for row apart from rows the update itself legitimately appended, each of which is accounted for; a documented migration that intentionally rewrites stored bytes states in advance which logical IDs it rewrites and how the new content is re-verified, and any other digest change is a failure;
+- [ ] when the previous version can safely read the retained state, roll back through the documented lifecycle; the service starts and the same inventory is still intact — no recording, starred recording, or audit record is deleted, truncated, or silently rewritten, proven by the same logical IDs, digests, durations, decodable playback samples and audit row digests rather than by matching counts and boundary timestamps;
+- [ ] when rolled-back code cannot safely read forward-migrated state, startup refuses and reports the incompatibility truthfully instead of destructively downgrading or discarding data; follow and record the documented recovery path, then compare the same recorded inventory after it restores a startable version/state;
+- [ ] repeat update and rollback with an in-progress recording and with storage near the safety reserve; no partial media is left counted as healthy, and the reserve is still honored afterwards;
+- [ ] on a disposable volume, safely simulate a missing/unmounted or substituted runtime mount and restart: install, update, and rollback refuse unsafe writes, report an explicit failed/degraded result, and never create or use a silent root-filesystem fallback directory;
+- [ ] start with missing or unreadable deployment configuration: the service fails closed with an actionable error and does not invent defaults for storage roots, listener boundary, or secrets;
+- [ ] after update and after every rollback that starts successfully, the startup hardware-integrity comparison and the recording-health self-test run again; after a safe rollback refusal, run them only after the documented recovery restores a startable version/state. A changed approved component still requires Owner approval and still produces the immediate Owner notification of section S;
+- [ ] record only sanitized PASS/FAIL results and version identifiers locally; keep deployment paths, host identity, configuration, audit contents, recording and audit digests, logical IDs, and media private.
+
+## W. First-run setup wizard / initial configuration
+
+Issue #48 remains open. The synthetic CI and browser integration tests do not complete these checks: they require a freshly installed deployed Main Server with no prior state, reached from a real browser over the intended private access path. Use a disposable deployment and synthetic test identities. Do not publish deployment URLs/hostnames, invitation values, secrets, raw hardware identifiers, biometric material, or monitoring media.
+
+- [ ] on a deployment with no existing state, the first-run wizard is reachable only through the intended private listener/trusted-proxy boundary; an unauthenticated or uninvited ordinary network client cannot read or complete wizard steps and learns nothing about the deployment beyond a generic denial;
+- [ ] Owner bootstrap creates exactly one Owner: with two browsers/tabs submitting the bootstrap step concurrently, and with a resubmitted/replayed bootstrap request, exactly one Owner exists afterwards and later attempts are refused rather than creating a second Owner or overwriting the first;
+- [ ] after Owner creation, re-opening the wizard does not re-run bootstrap, reset the deployment, or let an unauthenticated visitor claim ownership;
+- [ ] as the deployment Owner, run the wizard through Welcome, owner bootstrap, storage, hardware baseline / recorder self-check, locale/time, sources, profiles, optional verification/Slack, and private human-access steps;
+- [ ] interrupt the wizard at each step (close the browser, restart the service, reboot the host); it resumes at the same step, previously completed steps are preserved, and no step silently repeats Owner creation;
+- [ ] the storage step verifies the configured recording root's mount, write permission, free space, and safety reserve; on a disposable volume, a missing/unmounted or substituted filesystem is refused with a truthful error and no root-filesystem fallback is created;
+- [ ] the hardware-baseline / recorder self-check step records the Owner-approved baseline, reports unavailable identifiers as `UNVERIFIABLE` rather than as a guarantee, and audits the Owner approval;
+- [ ] the locale/time step records time configuration, and excessive clock offset/uncertainty stays visible instead of being presented as reliable event ordering;
+- [ ] the source and profile steps complete with zero sources and with 1–4 configured sources; no step assumes a fixed two-camera topology, and absent capture hardware yields a truthful pending/unavailable state rather than a false ready state;
+- [ ] skip the optional Owner face verification and Slack steps; skipping leaves them disabled, unavailable dependent features remain explicitly pending rather than appearing complete, and completing them never enrolls a non-owner identity or enables audio capture;
+- [ ] the private-access step presents network-level private/Tailscale reachability and ServerSentinel invitation/permission as two independent approvals; Tailnet membership alone never becomes an application invitation, and the wizard neither requests Tailscale administrative credentials nor offers to modify ACLs/Grants;
+- [ ] invitations created in the wizard grant `live:view` and `recordings:view` independently, and a `live:view`-only test identity still cannot reach recordings or the historical timeline after the wizard finishes;
+- [ ] wizard screens, summaries, generated diagnostics, and service logs expose no settings secrets, pairing values, raw hardware serials/UUIDs, or biometric data;
+- [ ] the wizard shell stays usable while unfinished areas remain pending, and completing it leaves the deployment in the documented post-setup state;
+- [ ] record only sanitized PASS/FAIL results locally; keep deployment identifiers, invitation values, and any captured frames private.
+
+## X. Security / admin audit log and 90-day retention
+
+Issue #50 remains open. The synthetic CI tests do not complete these checks: they require the deployment-local audit store of a running Main Server, real service restarts, and a clock advanced across the retention boundary. Use a disposable Main Server database, synthetic test actors, synthetic logical target IDs, and synthetic sentinel values; drive retention with an accelerated/test clock or back-dated synthetic audit rows, and never back-date or delete production audit data. Seed the audit fixtures independently of the other subsystems, so that these checks run on the Issue #50 audit store together with whatever recording and retention data the deployment already has. Items naming the unified factual timeline (#26) or capture-agent protected incidents (#16) apply only where those capabilities are already deployed; where they are not, record them as not applicable — never PASS — and repeat the full comparison during the Issue #28 full-deployment acceptance. Do not enter or publish real secrets, biometric material, hardware serials/UUIDs, private network values, audit contents, actor identities, or monitoring media.
+
+- [ ] approve a hardware baseline as the deployment Owner and verify one fixed-action success record with a logical target ID;
+- [ ] change a security/admin setting and revoke one test camera, source, or capture node; each record carries actor category, fixed action, target kind, logical target ID, UTC time, and outcome, and nothing more identifying than that;
+- [ ] invitation, permission grant/change/revocation, and authorization denials are recorded with their outcome; attempt an Owner-only operation as an invited non-owner principal and verify the mutation does not run while the denied audit outcome is retained;
+- [ ] induce a safe synthetic mutation failure and verify a failed audit outcome is recorded without submitted values or exception text;
+- [ ] using synthetic sentinel inputs, verify records contain no credentials, pairing secrets, private keys, sensitive headers, raw biometric templates/embeddings, raw hardware serials/UUIDs, or raw media;
+- [ ] inspect deployed database permissions and confirm the audit store stays deployment-local with no upload/reporting path; any inclusion in a diagnostic export follows the explicit-Owner-action and redaction rules of section U;
+- [ ] audit entries state observed actions and outcomes without asserting culprit, guilt, or causality; where the unified factual timeline is deployed, the audit log stays separate from it and the timeline gains no admin/security detail through it;
+- [ ] server-side authorization restricts audit reading to Owner-level access: a non-owner identity with `live:view`, `recordings:view`, or both cannot read, alter, or delete audit records, including through copied URLs, and a capture-node credential cannot reach the audit routes at all;
+- [ ] confirm the configured audit retention default is 90 days and is independent of the 20-day recording retention: changing one does not change the other;
+- [ ] run retention with a test clock just past 90 days: only expired audit rows are removed while boundary and newer rows remain; run cleanup twice and confirm the second run is idempotent;
+- [ ] with the deployment near its storage pressure/hard-stop thresholds, confirm audit writes and retention cleanup are admitted by the same storage reservation: a refused admission fails visibly and records no row instead of spending the hard filesystem reserve;
+- [ ] immediately before and after cleanup, compare every non-audit lifecycle inventory the deployment actually has — recording inventory, starred recordings, protected incidents, and their retention/expiry times, plus factual timeline events and capture-agent protected incidents wherever those capabilities are deployed: cleanup applies only to expired audit rows and changes no recording or protected-incident lifecycle; list every inventory that was not yet available instead of reporting it as unchanged;
+- [ ] interrupt cleanup (stop the service mid-run, simulate a read-only or full audit volume): the store stays consistent, the failure is reported as a visible fault instead of a silent success, and the next run completes without losing unexpired rows;
+- [ ] audit writes survive service restart and are not lost by an unclean shutdown; a security-sensitive mutation and its durable audit record commit together, so a failed audit write fails or rolls back the mutation and surfaces a visible fault rather than silently dropping history;
+- [ ] record only sanitized PASS/FAIL counts and timings locally; keep audit exports, actor identities, and deployment values private.
+
+## Y. GitHub review-gate enforcement
 
 Issue #4 remains open. The offline tests do not complete these checks. Follow
 `docs/REVIEW_GATE_SETUP.md` after Owner App registration and trusted publisher
@@ -529,3 +728,79 @@ explicitly. Do not alter production protection to make a negative test pass.
 Never use a real secret as a fixture or publish an App key/token, reviewer token,
 raw private API response, or monitoring data. Cleanup only the identified
 synthetic test branches/PRs; no production data or unrelated rule deletion.
+
+### Agent ring ledger budget follow-up (#16)
+
+- [ ] Configure an explicit ledger maximum, fill runtime storage toward its reserve on shared and separate filesystems, and verify startup/recovery/metadata writes refuse safely without deleting protected media.
+- [ ] Trigger an unexpected authentication loss with the socket still open; verify one T-10/T+10 incident. Remove a synthetic older protected segment after fresh pre-roll is complete and verify overall status remains degraded.
+
+## Issue #20 — Target Main detector acceptance (pending)
+
+- On the target Main Server, run the generated motion workload for 1–4 sources; measure CPU, resident memory, cadence, drops, evaluation latency and sustained health/recording continuity. Record approved per-source budgets without exporting host identifiers.
+- Before any person model is loaded, verify exact implementation/runtime/weights licenses, immutable versions, local artifact SHA-256 and the complete dependency notices. Confirm no runtime downloads, alternative-model fallback, reporting or unapproved outbound attempts on normal and failure paths.
+- Benchmark the accepted person backend on CPU; GPU is optional and separately measured. External benchmark media stays local under its terms and is never committed or attached to GitHub/CI. No real-model accuracy or target-host performance was verified by synthetic unit tests.
+- Stop/delay inference, inject quality loss, stale frames and a wedged plugin in the isolated worker: result must become unknown, loss/throttling remain visible, and capture/recording/health/storage-safety work must continue. Verify the production watchdog/resource limits separately; the primitive cannot forcibly interrupt a native call.
+
+## ADR-0003 follow-up: proposed human-access boundary
+
+These checks belong to #10/#19/#27/#28 after Owner approval and runtime
+integration, matching the follow-up recorded in ADR-0003. They are not completed
+by the Issue #6 synthetic policy model.
+
+- Verify the reserved hostname serves ServerSentinel alone on every scheme and
+  port: enumerate the Serve/reverse-proxy mappings for that name, request
+  unrelated paths and other ports, and confirm nothing else answers. Then add a
+  second mapping on the same origin, and separately on another HTTPS port of the
+  same hostname, and confirm startup refuses to serve instead of continuing,
+  including when the configuration cannot be read.
+- Confirm the port case really is a cookie leak before relying on the check:
+  with a session established, request the second port and observe that the
+  browser attaches the `__Host-` session cookie there, which is why the whole
+  hostname rather than one origin is reserved.
+- Bind an unrelated HTTPS listener directly to the node's Tailscale address from
+  a separate local process, creating no proxy mapping. Verify the startup and
+  daily listener enumeration detects it, closes human access and notifies the
+  Owner, and record explicitly that a bind occurring between two checks is not
+  detected until the next one. Then verify the recorded deployment isolation
+  (dedicated network identity, or single-purpose node) actually prevents that
+  bind, since the application cannot.
+- Verify Owner bootstrap provisions the first credential locally: the command
+  creates the Owner and a single-use short-lived enrollment authorization, human
+  access stays closed until it is redeemed once from the reserved origin with a
+  matching identity and user verification, and a second redemption, an expired
+  authorization, or a browser connection carrying only the shared login is
+  refused with the generic response. Confirm the value appears only on the local
+  console and never in logs, audit records, URLs, referrers or diagnostics on
+  either the local or the manually transferred remote path.
+- Issue an enrollment authorization, run recovery for the same Owner identity
+  before redeeming it, and confirm the pending authorization is refused
+  afterwards and that only a newly issued one completes recovery. Step the clock
+  backwards past its issue time and confirm redemption is refused rather than
+  effectively extending the short lifetime.
+- Confirm a verified shared-account login with an active invitation but no
+  credential-backed session is refused like an uninvited one, that user
+  verification is required at every authentication, that revoking one credential
+  ends only its own sessions, and that an Owner operation with a stale
+  verification performs nothing. Step the host clock backwards after a step-up
+  and restore a session record holding a future verification time: both must
+  require the step-up again instead of counting as fresh.
+- From ordinary LAN and Tailnet clients, attempt direct IPv4/IPv6 upstream access
+  and forged identity/forwarded headers, including Docker-published ports. Verify
+  no bypass to human routes, assets, health, schema, or SPA/error fallbacks.
+- On the installed Serve version, verify spoofed headers are replaced, tagged
+  devices have no human identity, and shared-but-uninvited users receive the same
+  generic denial. Reject malformed/duplicate/unsupported-encoding identities.
+- Verify first-visitor ownership is impossible; local administrator confirmation
+  creates exactly one Owner, and a concurrent attempt cannot add a second Owner.
+- Check phone/Mac/desktop same-origin session establishment, cookie attributes,
+  CSRF rejection, logout, expiry, restart/clock discontinuity, copied cookie/URL
+  rejection, and independent live/recordings/history permissions.
+- While each supported live/playback transport is actively delivering, revoke
+  access from another session. New requests fail after commit; measure delivery
+  cancellation across workers and blocked writes against the Owner-approved bound.
+  Distinguish server delivery from bytes already buffered in the browser.
+- Interrupt local recovery before/after durable commit, restore an authorization
+  backup, and simulate unavailable state. Verify fail-closed admission and no
+  restored sessions, media deletion, or network-policy mutation.
+- Keep real identities, network details, credentials, and media deployment-local.
+  Record sanitized outcomes only. No real execution is claimed by the ADR PR.

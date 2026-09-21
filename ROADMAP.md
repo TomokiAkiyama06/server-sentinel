@@ -10,10 +10,10 @@ Phases group capabilities rather than imposing a strict completion order. The de
 - [ ] specifications committed
 - [ ] issue/PR templates
 - [x] CI/repository guards, synthetic regression tests, and conditional component checks (#5; see `docs/CI.md`)
-- [ ] dependency/model license policy
+- [ ] dependency/model license compliance gate (#51)
 - [ ] hardened review gate #4: capability assessment, offline policy tests and disabled ruleset generator prepared; Owner App setup, trusted publisher/collector and GitHub enforcement acceptance remain open (see `docs/REVIEW_GATE_SETUP.md`)
 
-Issue #1 closed when PR #2 merged after documentation/bootstrap acceptance and current HEAD/base reviews plus CI passed. CI foundation #5 is implemented. The #7 closed backend foundation now has synthetic coverage; its authorization prerequisite remains separate. Runtime/ADR Issues #6–#28 and the separately tracked #4 retain their own acceptance gates.
+Issue #1 closed when PR #2 merged after documentation/bootstrap acceptance and current HEAD/base reviews plus CI passed. CI foundation #5 is implemented. The backend and dashboard foundations have synthetic coverage; their authorization prerequisites remain separate. Runtime/ADR progress for Issues #6–#28, #47–#51, and the separately tracked #4 is tracked below and in GitHub.
 
 ## Phase 1 — Main server and web foundation
 
@@ -22,19 +22,29 @@ Issue #1 closed when PR #2 merged after documentation/bootstrap acceptance and c
 - [x] validated deployment settings and database abstraction
 - [ ] health endpoints
 - [x] React responsive dashboard shell (#8; synthetic/mock foundation, production access integration remains #10)
-- [ ] Docker Compose where appropriate
-- [ ] deployment-owner authorization ADR/bootstrap
+- [ ] Docker Compose only if it ever provides the same external-runtime,
+  mount-identity, non-root-identity, private-listener, update and rollback
+  guarantees as the native lifecycle; none is implemented or advertised
+  today (ADR-0005, `REQUIREMENTS.md` DIST-005)
+- [ ] versioned Main Server install / update / rollback lifecycle (#47)
+- [ ] first-run setup wizard and resumable initial configuration flow (#48)
+- [ ] deployment-owner authorization ADR/bootstrap — ADR-0003 Proposed; Owner decision pending, synthetic policy model only
 - [ ] trusted Tailscale/private-proxy identity boundary
 
 ## Phase 2 — Camera Source + Capture Node platform
 
-- [ ] generic Camera Source registry
-- [ ] `local_uvc` / `remote_agent`
-- [ ] active-source limit default 4
-- [ ] capabilities/health/profile model
+- [x] generic Camera Source registry
+- [x] `local_uvc` / `remote_agent`
+- [x] active-source limit default 4
+- [x] capabilities/health/profile model
 - [ ] local UVC discovery/ingest
 - [ ] stable/ambiguous UVC identity handling
-- [ ] `media-capture-agent` native service
+
+Issue #11 now has a V4L2 discovery/MMAP adapter, durable approval latch and
+registry integration with synthetic tests. The UVC items remain unchecked until
+Owner management/worker integration and real-webcam acceptance are complete;
+no browser preview or physical device result is claimed.
+- [ ] `media-capture-agent` native service — #12 foundation implemented; capture/paired transport integration and physical acceptance pending
 - [ ] video-only capture
 - [ ] one-time pairing + mTLS/revocation
 - [ ] separate LAN ingest listener
@@ -45,7 +55,7 @@ Issue #1 closed when PR #2 merged after documentation/bootstrap acceptance and c
 ## Phase 3 — Media
 
 - [ ] agent->main transport PoC + ADR
-- [ ] Agent compressed disk ring buffer with Owner-selected duration/capacity modes
+- [ ] Agent compressed disk ring buffer: tested disk/ledger core and duration/capacity DTOs implemented; Owner UI, capture/transport integration and hardware acceptance pending (#16)
 - [ ] autonomous T-10/T+10 incident protection, critical preserve command, and 60-day default expiry
 - [ ] Agent storage pressure/hard stop without deleting unexpired protected evidence
 - [ ] capture/record/inference/view profile separation
@@ -57,6 +67,12 @@ Issue #1 closed when PR #2 merged after documentation/bootstrap acceptance and c
 - [ ] main->browser live transport PoC + ADR
 - [ ] phone/Mac/desktop 1–4 source live grid, with stability/reconnect prioritized over minimum latency
 - [ ] demand-driven viewer transcoding/packaging
+
+Issue #18 now has bounded compressed storage primitives, source/event manifests,
+application migration v4 integration, and synthetic crash/integrity coverage. Its
+runtime worker, codec adapter, shared storage guard and authorization integration
+remain open; these primitives do not establish playable-video or hardware
+acceptance.
 
 ## Phase 4 — Human private access
 
@@ -70,27 +86,34 @@ Issue #1 closed when PR #2 merged after documentation/bootstrap acceptance and c
 
 ## Phase 5 — Physical-security detection
 
-- [ ] general motion
+- [x] synthetic CPU general-motion foundation (#20; runtime integration and target-host acceptance remain open)
 - [ ] permissively licensed person-detector evaluation
-- [ ] detector-specific image-quality gating
-- [ ] no false `no person` when quality is insufficient
-- [ ] per-source inference cadence
-- [ ] server ROI calibration/movement
-- [ ] camera tamper/occlusion/source-health correlation
+- [x] detector-specific image-quality gating (internal metrics/recovery/unknown contracts; real-camera calibration pending)
+- [x] no false `no person` when quality is insufficient (synthetic gate/scheduler regression tests)
+- [x] bounded per-source inference-cadence primitive (#20; Main worker integration remains open)
+- [x] server ROI calibration/movement (bounded synthetic core; capture-worker integration and real-scene calibration remain open)
+- [x] camera tamper/occlusion/source-health correlation (synthetic local core; source-health integration and real-camera acceptance remain open)
 
 ## Phase 6 — Entrance / owner / presence intelligence
 
 - [ ] owner-only face-verification model/license evaluation
 - [ ] explicit owner enrollment/delete flow
-- [ ] anonymous same-camera tracking
+- [x] internal Owner-only template enrollment/delete/re-enroll with generation/audit and default-deny authorization (#25; human flow/model pending)
+- [x] anonymous same-camera tracking primitive (generated geometry; real detector/worker/room integration pending)
 - [ ] entrance/zone calibration where geometry supports it
 - [ ] anonymous/owner entry-exit observations
+- [x] internal candidate-bound quality/verification receipts and finite directed-line observations (#25; production adapter and #26 integration pending)
 - [ ] `PRESENT / PROBABLY_PRESENT / ABSENT / UNKNOWN`
 - [ ] manual presence override/schedule
 - [ ] no non-owner enrollment or persistent face-crop/template/embedding/profile library, whether named or anonymous
 - [ ] no cross-camera biometric re-identification
 
 ## Phase 7 — Timeline, recordings, storage, notifications
+
+Issue #21 has internal Main policy/retention/Owner action and optional Slack/daily
+scheduler primitives with disposable filesystem and mock transport coverage.
+Production authorization/timer/outbox integration, playback and the Owner-planned
+UI remain pending; these phase boxes represent integrated acceptance.
 
 - [ ] unified factual timeline
 - [ ] neutral wording/no culprit inference
@@ -102,6 +125,8 @@ Issue #1 closed when PR #2 merged after documentation/bootstrap acceptance and c
 - [ ] Main Server Owner-approved hardware baseline and startup/daily comparison
 - [ ] daily recording-health self-test, expected-filesystem validation, and bounded write/read/decode verification
 - [ ] immediate Owner alerts for changed/missing hardware and recording-health failures
+- [ ] privacy-safe Owner-initiated diagnostic export / support bundle (#49)
+- [ ] security / admin audit log with 90-day retention (#50)
 
 ## Phase 8 — Hardening / real environment
 
@@ -119,7 +144,13 @@ Issue #1 closed when PR #2 merged after documentation/bootstrap acceptance and c
 
 ## Explicit pending decisions
 
-- [ ] Owner approval of capture-node bootstrap trust/CLI enrollment (Proposed ADR-0004, #13; no listener enabled);
+Issue #23 has an independent comparison/approval/outbox core and recording-health
+worker adapter with disposable-file cleanup/recovery tests. Authorization,
+actual codec/source wiring, notifications and physical acceptance remain open;
+see the integrity and media/health module READMEs.
+
+- [x] Owner decision for capture-node bootstrap trust/CLI enrollment (Accepted ADR-0006, #13; pairing adapter/listener remains unimplemented);
+
 - [ ] exact agent->main transport;
 - [ ] exact main->browser live transport/target latency;
 - [ ] room-overview capture/record/inference/view defaults after benchmark;

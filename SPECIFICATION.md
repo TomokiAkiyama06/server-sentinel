@@ -63,6 +63,7 @@ server/app/
 ├── media/
 │   └── health/
 ├── notifications/
+├── presence/
 └── storage/
 
 agent/
@@ -107,7 +108,37 @@ values and admits only reviewed event names and bounded numeric metadata.
 The concrete settings, persistence and validation contract is documented in
 [`server/docs/FOUNDATION.md`](server/docs/FOUNDATION.md).
 
-The main application may use Docker Compose where appropriate. `media-capture-agent` is intended to run natively as a systemd service so UVC/udev/hotplug handling does not require a privileged container.
+Stable Main Server releases use a checksummed versioned archive containing the
+reviewed application, lockfile, license material, and offline wheelhouse. The
+native installer stages immutable per-version environments, validates private
+deployment configuration and its existing pinned runtime filesystem as the
+dedicated non-root account, then atomically switches `current`/`previous` release
+pointers. Failed service activation restores the prior pointer and attempts to
+restart it. Configuration, state, recordings, and audit data remain outside both
+the checkout and install tree. The systemd launcher keeps the human listener on
+loopback and grants write access only to the configured state, recording and
+audit directories, not to the runtime root itself. A
+`Type=notify` unit does not complete activation until database migration,
+application lifespan startup, and listener creation succeed. Runtime
+subdirectories are resolved and must remain contained on the approved runtime
+filesystem, which is pinned by its Owner-approved filesystem UUID; Linux
+major/minor device numbers only corroborate that identity because a replaced or
+reformatted disk can reuse them. Deployment configuration is administrator-owned
+and runtime-readable but not runtime-writable, and is refused inside the
+installation tree, inside the runtime-writable data tree, or under any
+directory path component the administrator does not control. Both release pointers and the service unit move
+inside one guarded transaction under a service-global lock, and each recovery
+step is attempted independently. Root-only environment construction uses an
+isolated, root-controlled Python interpreter from a fixed working directory and
+sanitized environment. The native lifecycle is the only implemented Main Server
+deployment path (ADR-0005, `REQUIREMENTS.md` DIST-005/DIST-006). Exact commands
+and limitations are in `server/docs/DEPLOYMENT.md`.
+
+No Docker Compose path is currently implemented or advertised. A future Compose
+path must provide the same versioned update/rollback, external runtime mount,
+dedicated identity, missing-mount refusal, and private-listener guarantees.
+`media-capture-agent` is intended to run natively as a systemd service so
+UVC/udev/hotplug handling does not require a privileged container.
 
 ## 3. Camera Source domain model
 
@@ -139,6 +170,7 @@ camera_source
 - name
 - role_label
 - enabled
+- capabilities
 - desired_capture_profile
 - negotiated_capture_profile
 - health_state
@@ -148,7 +180,13 @@ camera_source
 - updated_at
 ```
 
-`capture_node_id = null` for main-host-local sources. `role_label` is descriptive metadata, not a replacement for explicit profile configuration.
+`capture_node_id = null` for main-host-local sources. Remote sources reference a separate capture-node UUID; one node may contain multiple source UUIDs. `role_label` is descriptive metadata, not a replacement for explicit profile configuration. Configuration and health updates preserve source UUIDs.
+
+The in-process SQLite registry stores node health separately from source health. New source records start disabled, `offline`, with `unknown` image quality and no negotiated capture profile. Camera health supports `online`, `degraded`, `offline`, and `manual_intervention_required`; node liveness never implicitly changes camera health. Node health uses `online`, `degraded`, `offline`, and `revoked` as specified in section 5.8; the registry rejects node/source health types used interchangeably. Last-seen observations require timezone-aware timestamps and are normalized to UTC.
+
+Desired and negotiated video profiles are independent optional records with width, height, fps, pixel format, codec, and bitrate fields. Unset fields do not select hardware defaults. `image_quality_state` stores the adapter's descriptive state; detector-specific quality gating remains the detector's responsibility. The registry does not interpret `unknown` as evidence that no person is present.
+
+The implementation contract and bounded configuration validation are described in `server/app/cameras/registry/README.md`. Registry operations are internal only until the Owner authorization boundary in Issue #10 is implemented; no human management route is exposed by the registry.
 
 ### 3.3 Detection profile bindings
 
@@ -164,13 +202,13 @@ owner_verification
 image_quality
 ```
 
-Each profile contains config/version/thresholds/enabled state. Source type does not implicitly determine which profiles run.
+Each binding has its own UUID and contains a detector kind, JSON config, positive version, finite numeric thresholds, and enabled state. Multiple bindings may use the same detector kind, for example for distinct regions. Source type does not implicitly determine which profiles run.
 
 ### 3.4 Active-source limit
 
 Initial `max_active_video_sources = 4`.
 
-Activation that exceeds the configured limit returns an explicit validation error rather than silently replacing another source.
+Activation that exceeds the configured limit returns an explicit validation error rather than silently replacing another source. The limit is persisted with registry configuration; lowering it below the current enabled count is rejected. Enabled sources continue to reserve capacity while offline or awaiting manual intervention. Admission, metadata changes, and binding updates are one serialized SQLite transaction, so concurrent requests cannot overbook or partially apply a rejected activation.
 
 ## 4. Physical UVC identity and reconnect
 
@@ -210,6 +248,28 @@ When devices reappear:
 
 This rule applies on both the main host and remote capture nodes.
 
+### 4.4 Local adapter implementation boundary
+
+The local adapter stores private approval evidence and a durable ambiguity latch
+in the application database. A live approved weak binding does not constitute
+proof for a subsequent reconnect or process restart. Discovery alone is never
+`online`; successful frame capture is required. The initial implementation uses
+bounded single-planar V4L2 MMAP on Linux x86_64/aarch64, reports the actual
+negotiated dimensions/FPS/FourCC, and requires an explicit capture profile.
+Unsupported multi-planar capture or codec/bitrate controls fail explicitly.
+Source workers, Owner management and the preview frame sink are internal
+interfaces; physical capture is not auto-started by the backend launcher and no
+unauthenticated preview route is added. See `server/app/cameras/uvc/README.md`.
+
+Identity reconciliation starts only after an active-session marker is durable.
+An unclean session, including a failed ambiguity-latch write, requires Owner
+reapproval at restart; it cannot fall back to an older clean approval record.
+Clean shutdown releases this marker after closing capture while retaining any
+manual-approval latch. A missing capture profile does not hide that latch.
+Known duplicated serials remain unsuitable for automatic reconnect even after the current physical
+candidate is explicitly approved. This confidence is stored separately from raw
+device evidence. A different unique serial may establish a new strong identity.
+
 ## 5. `media-capture-agent`
 
 ### 5.1 Purpose
@@ -229,6 +289,14 @@ GUI/tray: none required
 ```
 
 Installation may require `sudo` to install the binary, create the account/unit, and configure narrow device permissions.
+
+The Issue #12 native foundation uses Python 3.12+ standard-library modules under
+`agent/media_capture_agent/`, with an executable zipapp release artifact and an
+explicit systemd installer. Runtime/config/media directories are outside source
+and installation trees. Until approved capture and authenticated transport adapters
+are integrated, the production CLI remains visibly unconfigured and never starts
+unauthenticated network communication. This foundation does not complete physical
+Capture Node acceptance.
 
 ### 5.3 Audio
 
@@ -260,7 +328,7 @@ Pairing credentials are cryptographically random, single-use, short-lived, and n
 
 Before transmitting a pairing code, the Agent must authenticate the intended Main Server and establish confidentiality/integrity for the initial enrollment exchange. Private-LAN reachability or a short-lived code does not replace this server-authentication requirement. Public trust information must be obtained/verified through an Owner-controlled trusted local or out-of-band channel, independently of an unverified network endpoint. Missing/mismatched trust or certificate verification failure stops pairing without sending the code; plaintext or unverified-certificate fallback is forbidden.
 
-The concrete bootstrap trust mechanism and initial encrypted transport remain PoC/ADR decisions before pairing implementation. These requirements do not select a particular certificate/pinning protocol. Post-pairing mTLS does not retroactively protect an insecure initial code exchange.
+ADR-0006 selects the bootstrap trust mechanism: the Owner transfers a deployment-local CA public trust bundle through an independently trusted channel; the local Main approval binds a 128-bit, five-minute, one-use code to the Agent public-key digest; and TLS 1.3 authenticates the intended Main before the code is sent. Fingerprint pinning is not the selected profile. The bootstrap/ingest adapters remain separately staged and disabled until their implementation and negative validation are complete. Post-pairing mTLS does not retroactively protect an insecure initial code exchange.
 
 ### 5.5 Long-lived trust
 
@@ -340,6 +408,14 @@ Runtime uncertainty or later growth of protected/other filesystem usage may redu
 
 Normal unprotected segments are FIFO. Protected incident segments are not part of ordinary ring-buffer eviction.
 
+The implemented core is `agent/media_capture_agent/ring.py`, with a private
+transactional SQLite ledger and #12's descriptor-pinned media store. Admission
+uses physical allocated bytes, unique shared references, explicit per-source
+bitrate/cadence/overhead bounds, and verified free space after any eligible
+reclamation. Its DTOs expose intervals/gaps, completion/expiry, pressure and
+deletion state. The concrete contract and incomplete production/UI integration
+are documented in [`agent/docs/RING_BUFFER.md`](agent/docs/RING_BUFFER.md).
+
 ### 5.11 Unexpected main-host communication loss
 
 If the agent unexpectedly loses the authenticated connection/heartbeat to the main host, it automatically creates a temporary protected incident window:
@@ -404,12 +480,27 @@ The Agent media root is a deployment-configured path outside the source tree tha
 
 At install/startup/runtime admission, the Agent shall verify:
 - the configured media root exists or can be created only by the intended installer/owner workflow;
-- it resolves to the expected filesystem/mount identity when an expected device/mount is configured;
+- it resolves to the expected filesystem/mount/device and backing-filesystem-root identity; a narrow systemd namespace bind must map to the approved parent root plus the configured relative media path;
 - sufficient free space and safety reserve remain;
 - it is writable by the dedicated Agent service account;
 - loss/unmount/substitution of the expected media filesystem does **not** silently redirect ring-buffer or incident writes into a directory on the root filesystem.
 
 If the expected media filesystem is unavailable or resolves unexpectedly, Agent recording/buffering becomes explicit degraded/failed state and unsafe writes are refused until the Owner resolves or re-approves the target.
+
+The Issue #16 ring core requires an explicit SQLite ledger size bound in addition
+to media-profile/reserve inputs. It guards runtime-filesystem metadata growth
+before schema creation, hot-journal recovery and transactions, and reserves
+conservative completion headroom in shared-filesystem media admission. The cap
+must also cover cadence-derived segment/index/protection rows for the selected
+ring and the next complete pre/post incident, including existing retained
+metadata. Failed reconfiguration retains the active ring's selected coverage;
+only trusted clock observations advance the durable rollback watermark.
+Untrusted capture discontinuities are refused without advancing per-source trusted
+chronology. Capacity changes must fit incompatible legacy pre-roll throughout
+profile rollover, not merely fit the filesystem or one immediate new segment. Unexpected
+authentication loss is an effective Main loss even while the raw socket remains
+connected; known protected-evidence damage stays degraded outside current pre-roll.
+See `agent/docs/RING_BUFFER.md` for the implemented budget and integration limits.
 
 ## 6. Media architecture
 
@@ -446,6 +537,33 @@ For wide room coverage, real-hardware tests should compare at minimum:
 - ring-buffer disk throughput/capacity at candidate capture profiles.
 
 Final defaults are measured, not guessed.
+
+The transport-independent implementation in `server/app/media/profiles/` uses
+explicit immutable profiles, conservative exact-descriptor copy eligibility,
+bounded per-path compressed queues, and demand-driven viewer adapter lifetimes.
+Before pipeline construction, scheduler-side admission can bind the complete
+profile set to an exact allowlist discovered for that source and an explicit
+active-source limit. Admission is atomic, does not infer profiles from source
+type/role, and supplies no benchmark-derived defaults. The persisted Camera
+Source registry remains authoritative for configuration. Successful admission
+returns a generation-bound lease: profile adaptation must remain within its
+complete-set allowlist and atomically updates the manager's selected profile set.
+Pipeline construction atomically claims the lease only for that current selected
+set and retains an opaque pipeline-specific ownership claim; a lease holder cannot
+release or transition that claim, and the same lease cannot own two pipelines.
+Stale generation teardown cannot release a later pipeline or the current source
+reservation, and a released or superseded lease cannot construct or continue a
+pipeline.
+Inference sampling applies to presentation-ordered decoded frames, never to
+compressed reference packets before decoding. Packet gaps reset dependency state
+and require a keyframe; the capture profile also sets an explicit maximum forward
+timestamp gap, independent of inference cadence. Known loss remains visible after
+recovery. Source status combines capture continuity and mandatory recording with
+viewer health only while viewers are subscribed; capture renegotiation or missing
+recording capability is unavailable, and known loss/backpressure is degraded
+rather than silently healthy. Missing codec
+adapters report unavailable. Real codec/transport integration and measured
+deployment defaults are still required; see that directory's integration contract.
 
 ### 6.4 Agent-to-main transport
 
@@ -491,6 +609,16 @@ quality/gap metadata
 
 Critical incident protection on `media-capture-agent` is a deliberate secondary-evidence exception, not a full mirror.
 
+The internal `server/app/media/recording/` storage implementation uses generated
+segment UUID filenames, byte digests, a pending-publication journal and per-source
+event manifests. Its pre-roll has duration, byte and segment-count limits;
+recording windows carry explicit clip intervals and integrity/gap/discontinuity
+state. Restart retains committed media, cleans only journal-owned pending files
+and marks active recordings interrupted. Runtime admission and codec validation
+are mandatory injected boundaries; no human routes are enabled by this module.
+See its README for the remaining worker integration and the distinction between
+storage integrity and playable-media validation.
+
 ### 6.7 Main-host event ring buffer
 
 Maintain recent **compressed** media where practical for pre-event evidence. Default target 30 s pre / 120 s post, max event 20 min.
@@ -509,6 +637,8 @@ Use a pluggable backend. Requirements: project-compatible license, CPU fallback,
 
 YOLOX is an initial evaluation candidate only.
 
+The Issue #20 foundation in `server/app/detection/foundation` uses transient grayscale frames, one bounded pending frame per source, independent Main-monotonic inference cadence, and an explicit worker entry point. Quality failure, missing models, stale observations, dropped frames, and evaluation failure produce `unknown`; known loss/throttling remains visible in health snapshots. No model is implicitly downloaded or enabled. The CPU motion baseline detects image change only. An optional RT-DETRv2 CPU adapter loads only a separately licensed, locally supplied, digest-pinned ONNX artifact on the audited Linux x86_64/CPython 3.12 runtime; no runtime model download or cloud/provider fallback is exposed. See `server/docs/DETECTOR_FOUNDATION.md` for limits and `server/docs/DETECTOR_MODEL_AUDIT.md` for separate code/weight evidence. Target-host performance and production worker isolation remain acceptance work.
+
 ### 7.3 Server movement
 
 Per source/profile calibration stores server ROI/polygon, reference descriptors, background context, thresholds, and calibration version/time.
@@ -518,6 +648,73 @@ Runtime may combine global transform compensation, edges/contours, ROI similarit
 ### 7.4 Camera tamper
 
 Candidate signals include global optical transform, persistent occlusion/near-black view, abrupt focus/exposure/scene-pose change, and disconnect closely following scene movement.
+
+The internal `server/app/detection/roi/` core operates only on transient,
+bounded grayscale frames for one immutable source/profile calibration. It stores
+source type, profile, polygon, reference digest, reference geometry, policy,
+version, and timestamp in a private append-only calibration history after
+the application's ROI calibration migration. That history is metadata only: no frame pixels, crop,
+thumbnail or other decoded monitoring media is persisted, so it cannot become
+still-image storage outside recording authorization and retention. A stored
+record therefore cannot reproduce a reference image; resuming detection re-binds
+an Owner-supplied transient frame whose digest and geometry must match the
+record. The core does not supply production thresholds, start capture, expose an
+API, retain decoded media, make a presence decision, or issue a notification.
+
+A calibration policy whose bounded search window cannot reach its own movement
+or camera-shift threshold is refused: such a configuration cannot express the
+displacement it asks to detect and would report a matching geometry instead. A
+calibration is refused as well when its own support leaves no translating
+pure translation at or beyond a threshold above the coverage minimum in every
+axis direction, since a quarter turn does not register a pixel shift even when
+it carries a translation and one direction does not stand for its opposite, or
+when its reference
+already meets the obscured-scene threshold, since every unchanged sample would
+then confirm a tamper that never happened.
+
+It first estimates a bounded global translation/quarter-turn transform from
+background support, then compares the ROI relative to that transform. A
+confirmed ROI movement requires the policy's multiple samples and elapsed time.
+An explicit ROI-occlusion signal, insufficient movement quality, sampling gap,
+stream restart, regression, incompatible frame, or inadequate calibration
+returns `unknown` and resets confirmation; none is converted into a trustworthy
+no-movement result. A refused sample, such as a frame from another source, ends
+the episode as well, so no later confirmation spans it, and the observed stream,
+sequence and clock advance before any such result so that a buffered frame from
+a superseded geometry cannot re-enter confirmation. An identified sample whose
+metadata alone is unusable, and a refused source-loss report carrying a valid
+outage clock, advance that progression too. Every replaced stream is
+retained for the detector's lifetime, so a delayed frame from a stream the
+source has already left is refused as stale imagery instead of becoming current
+again, and no number of later replacements restores an old identity. The number
+of admitted stream transitions is bounded instead, and a detector that reaches
+that bound latches: every later sample and source-loss report stays unknown
+until a fresh detector is bound. Temporal confirmation also begins at the
+reference sample, so imagery the source captured before the calibration existed
+cannot contribute to it. Because such an
+interruption ends the episode, a condition
+confirmed again afterwards is emitted again instead of being suppressed as a
+duplicate, so no confirmed critical observation is silently lost. Person
+presence is not an input to this conclusion.
+
+Camera tamper has an independent quality input and confirmation state. The core
+can report a persistent near-dark scene, a global scene shift, or a scene that
+stops registering while differing measurably from the calibrated background,
+which covers a covered or redirected camera. That difference is a bounded
+scene-change scalar and never an identity or a culprit attribution. A
+registration whose best transform is acceptable but ambiguous, as on a
+repetitive scene, remains `unknown` and confirms neither tamper nor its
+absence, because its untransformed difference is large even when the
+registered transform is small. Trusted source loss becomes critical
+only when it occurs within the configured interval after a recorded global
+scene shift, and at most once per tracked shift episode; uncorrelated or
+untrusted loss stays `unknown`. One confirmed sample may carry both a server
+movement and a camera tamper, so local critical staging always admits a whole
+batch rather than refusing evidence a caller could never resubmit.
+A later runtime must durably handle a confirmed critical observation
+for evidence preservation and configured notifications in every presence state.
+Synthetic tests do not establish physical-camera, lighting, pose, or
+source-health behavior.
 
 ### 7.5 Detector-specific image-quality gate
 
@@ -537,6 +734,10 @@ A profile returns `sufficient`, `degraded`, or `insufficient` plus metrics/reaso
 
 If the person detector's prerequisites are insufficient, the result is `unknown`/unavailable. It is **not** converted to `no person`. The same fail-unknown principle applies to owner verification and dependent presence/entrance conclusions.
 
+The internal implementation in `server/app/detection/quality/` uses explicit per-source/detector policy ranges and an explicit pixel budget; it provides no production thresholds. It measures bounded grayscale/RGB luminance, neighboring-pixel sharpness, clipping and resolution, and accepts frame-attributed calibrated target-size/obstruction/confidence context. Missing required context never defaults to adequate target size or zero obstruction. All configured prerequisites apply to both positive and negative conclusions.
+
+Quality failure is immediate. Recovery requires the configured number of consecutive good frames (at least two); stream/sequence/geometry discontinuities and unavailable execution reset recovery. Reason codes, numeric metrics, profile version and source/stream/sequence are available for authorized UI integration. Detector stop/failure invalidates the last assessment without a new frame and, through the registered result sink, immediately replaces the source's published `present`/`absent` with `unknown`; an unusable frame, a pending recovery and an incomplete inference batch do the same. A stopped or failed detector never leaves a trustworthy conclusion readable until its observation age expires. The result guard rejects obsolete assessments and mismatched frame identities; the inference scheduler remains responsible for observation age. Live/recording delivery and unrelated critical detector profiles remain independent. Real-camera calibration is not established by synthetic quality tests.
+
 ### 7.6 Owner-only face verification
 
 This is 1:1 verification against one explicitly enrolled deployment owner.
@@ -550,11 +751,15 @@ person/face candidate
 
 Owner biometric processing, including face-crop analysis/comparison, and template/model metadata stay deployment-local. External biometric processing/storage is not an opt-in MVP option, and configured third-party media infrastructure does not authorize sending faces/crops to a biometric service. Enrollment/delete/re-enroll require owner authorization; raw template/embedding is never logged or included in diagnostic exports, including explicit Owner-initiated exports. Persistent non-owner face-template/profile libraries are prohibited whether named or anonymous; ordinary authorized video recordings remain distinct from such a library.
 
+The Issue #25 internal implementation uses a separate private singleton SQLite template store with Owner-only, revision-checked enrollment/replacement/deletion and atomic audit. Generation changes invalidate old/in-flight verification. `OwnerVerificationService.assess` runs the actual immutable candidate crop through its detector-specific gate and binds an opaque assessment to that candidate; source/stream/sequence alone cannot bind distinct face crops. Match receipts require the same issued object, current template generation and current quality assessment. Verifier/model absence, invalid quality or failed comparison is `unknown`. No production face model, weights, threshold, human route or external processing is supplied. See `server/app/detection/owner/README.md` for private-file, local-adapter and export contracts.
+
 ### 7.7 Anonymous tracking and entrance
 
 Non-owner observations may use ephemeral anonymous track IDs. Same-camera temporal tracking is allowed. Cross-camera biometric re-identification is not MVP.
 
 Entrance/zone profile may emit anonymous/owner entry-exit observations only when direction/quality conditions are met.
+
+The internal tracker associates geometry only within one camera stream/session, with explicit resource/gap/distance limits. Ambiguity, quality failure, unmatched observations and session discontinuities discard continuity; a finite directed line plus hysteresis requires observed crossing evidence and cancels reversals inside the deadband. Owner crossing additionally needs a current same-candidate/frame verification receipt; otherwise it remains anonymous. Public crossing DTOs omit ephemeral track/session IDs and biometrics. These primitives do not enable presence automation or timeline routes; see `server/app/detection/tracking/README.md`.
 
 ## 8. Presence and timeline
 
@@ -580,6 +785,8 @@ Timeline correlation lists observations and relevant temporal context; it does n
 
 For invited non-owner users, historical timeline/event metadata is included with `recordings:view`. `live:view` alone exposes only current live/source-health information needed for live viewing.
 
+The Issue #26 internal implementation keeps Owner-control time in a marker separate from source observation time, so one skewed receipt timestamp can neither lock out Owner control nor withhold the suppression an accepted override asks for. Critical movement/tamper work is durably queued, dispatched outside the write transaction, and never retried automatically; every critical path is reported as armed, unavailable or unknown from configured ports, observed storage admission and injected detection health, and any delivery that has not completed keeps its path degraded. Stranded critical work returns to the queue only through an audited Owner-approved resubmission. Timeline pages use main-host receipt order as their single key. The status projection performs no authorization check, and no human timeline, override or audit route may be registered until the Issue #10 boundary lands. See `server/app/presence/README.md` for the port, retention and status contracts.
+
 ## 9. Storage/admission
 
 ServerSentinel distinguishes recording allocation from hard filesystem safety reserve.
@@ -598,11 +805,71 @@ Admission loop:
 
 Defaults: recording retention 20 days; audit retention 90 days.
 
+Documented exception: an observation for a confirmed server-movement or camera-tamper event whose critical action (evidence preservation or Owner notification) has not completed is retained past the recording-retention period, including its identity and metadata payload, so unresolved critical work is never discarded as if it had succeeded. No other observation, recording or thumbnail is held back by this exception. It returns to ordinary retention as soon as that action completes or the Owner clears the event through an audited action; clearing releases its payload and delivery rows, preserves action-only degradation markers, and adds an identity-sized tombstone so a replay cannot recreate the cleared work. The exception is bounded by the deployment's shared audit-retention period so unresolved work cannot accumulate without limit. A delivery the deployment durably disabled is the one action that does not hold its observation back: disabling is a configuration decision rather than pending work, so the observation expires on the ordinary schedule while its per-action degradation marker keeps reporting that the action never happened. After expiry an event keeps only an identity-sized tombstone plus, when its action never completed, a per-action degradation marker that keeps the critical path reported as unavailable.
+
 Agent disk-buffer safety is tracked separately from Main Server storage because the two filesystems may be different machines.
+
+The Issue #50 security/admin audit subsystem in `server/app/audit/` is separate
+from factual timeline events and owns only its own rows. Every audit write —
+success, failure, denial and retention cleanup — passes the deployment storage
+admission; the subsystem consumes that reserve and defines no numeric reserve of
+its own, and until a deployment binds its storage policy the application refuses
+audit writes rather than admitting them against an unverified reserve. Owner-facing
+mutations reach the registry, the UVC approval store, the hardware-integrity
+baseline and the recording store only through that audited boundary: the registry refuses its own privileged
+write wrappers outside explicitly non-runtime fixture use, the recording
+browser refuses Owner star/delete without it, hardware baseline approval commits
+its new baseline and its audit record in one transaction on the integrity
+store's connection, and no unaudited camera approval entry point is exposed. Retention
+computes one cutoff per run and deletes expired rows oldest first in bounded
+admitted transactions, so an interrupted run stays consistent, the next run
+resumes, and a repeated run deletes nothing more; it never touches recording,
+starred, protected-incident or timeline lifecycles. Cleanup runs at startup and
+daily; a failed run is visible as degraded retention health and is retried on a
+shorter interval instead of stopping monitoring. Audit reading is Owner-only and
+records nothing. See `server/app/audit/README.md`.
+
+The internal Issue #21 policy in `server/app/storage/` holds media plus configured
+metadata/journal/temp reservations through the serialized recorder operation.
+Physical-only control reservations cover startup recovery before inventory binding
+and never recursively invoke retention. Expected media-root identity and the
+private metadata file's filesystem are checked without symlink following or
+fallback creation. All numeric reserve/quota/hysteresis/overhead limits are
+explicit deployment configuration; only the specified retention defaults apply.
+The critical allowance conservatively bounds resident critical evidence plus the
+new reservation, surviving restart. Filesystem sampling includes other processes
+but cannot prevent unrelated writes after the sample. A failed state-audit write
+remains visible as a failure flag. The domain recording browser defaults to deny,
+requires `recordings:view` for history and Owner for star/unstar/single deletion;
+it mounts no human endpoint pending #10.
+
+`server/app/notifications/` provides optional direct Slack incoming-webhook
+delivery using verified HTTPS, no environment proxy/redirect, bounded timeout and
+redacted failures. Unconfigured delivery performs no network operation. The
+current payload is a fixed critical category or validated daily aggregate, with
+no image/media, source identity or arbitrary probe details. Both immediate and
+daily notifications enqueue on a bounded delivery worker; the recorder worker
+never waits for network IO. Local pending/result events share an ID and are
+persisted only on the owning worker. Full queues and failed persistence remain
+visible; completion-persistence retry never resends a message. The persisted daily
+scheduler defaults to 23:00 configured local time and claims one dispatch per
+local date across restart/DST/clock rollback; missed dates are not replayed.
+An uncertain crash remains `pending`, failed delivery is visible, and no implicit
+retry floods the channel. Production timers, durable event-outbox integration,
+human authorization and recording playback remain separate integration work.
 
 ## 10. Host hardware integrity and recording self-check
 
 ### 10.1 Hardware baseline
+
+Implementation foundation: `server/app/integrity/` provides explicit read-only
+Linux probes, a revision-checked Owner-authorized local baseline, sanitized fault
+outbox and startup/24-hour worker coordinator. `server/app/media/health/` provides
+bounded recorder-worker temporary I/O and recovery. The launcher does not enable
+these adapters before authorization, production codec/source configuration and
+notification wiring. Migration factories receive the next unused schema slots
+during integration. Module READMEs document contracts; #23 physical acceptance
+remains open.
 
 During setup, the Owner approves a baseline inventory for the main ServerSentinel host. Collect the strongest local identifiers available without pretending that unavailable identifiers exist.
 
@@ -688,6 +955,8 @@ Notification delivery follows configured local/UI/Slack channels. Slack remains 
 ### 10.5 Privacy and privilege
 
 Detailed hardware identifiers are deployment-local security metadata. Do not send raw serials/UUIDs through telemetry or developer infrastructure. Normal operational logs and general diagnostics must redact/hash them. A detailed diagnostic export requires an explicit Owner action and does not authorize automatic upload.
+
+A diagnostic export is optional convenience data, not monitoring evidence. Reserving space for one must not run retention or delete recordings to make room; a deployment without free space refuses the export with its explicit storage state instead. Export size is bounded twice: the implementation caps one selected media item at 512 MiB and a whole bundle at 1 GiB as a defensive upper bound, while the deployment-configured storage maximum request size remains authoritative and refuses anything larger. Selected media is copied in bounded chunks so an export never buffers a whole clip. Only reviewed fixed reason codes, never local values, reach an export caller.
 
 Hardware/SMART probing must use the least privilege practical. Do not run the whole ServerSentinel stack as root merely to obtain inventory/health data; use narrow host permissions/helper boundaries if privileged probes are required.
 
@@ -779,6 +1048,32 @@ This is not DRM. A user who can view video may still screen-record or use advanc
 ### 11.7 Revocation
 
 ServerSentinel permission revocation invalidates application access promptly. Tailnet membership/policy remains a separate Tailscale administrative concern.
+
+### 11.8 Owner bootstrap and session decision status
+
+[ADR-0003](docs/ADR/0003-owner-authentication-and-trusted-proxy.md) is a
+**Proposed** implementation design for Issue #6, pending explicit Owner approval.
+Its timeout values, exact identity binding, local bootstrap, and recovery choices
+are not accepted product defaults. Until approval and Issue #10 implementation,
+the backend shell denies human requests, including application assets,
+health/version/schema, and SPA/error fallbacks. Issue #8's static shell remains
+a development/mock artifact until integrated with this protected delivery path.
+The ADR's synthetic design model proves only policy composition, not deployed
+proxy, session, cryptographic, or browser behavior.
+
+The proposal also reserves a whole hostname: that name serves ServerSentinel
+alone on every scheme and port. Path-based co-hosting shares one browser origin,
+and another port of the same name still shares the cookie scope because cookies
+are not port-scoped, so neither is supported. Holding the name is a deployment
+obligation (a dedicated network identity, or a single-purpose node enforced
+outside the application), because a directly bound listener never appears in
+proxy configuration; the application's startup and daily listener/route checks
+close access when another answer is found, which bounds the exposure window
+instead of preventing the bind. Owner bootstrap also provisions the Owner's
+first per-person credential through the local administrative boundary, since no
+session exists without one. A verified trusted-proxy identity stays a supplementary check
+there; the authoritative per-person application credential is decided separately
+for Issue #6.
 
 ## 12. Dashboard UI
 

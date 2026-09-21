@@ -1,6 +1,6 @@
-# ADR-0004: Capture-node bootstrap trust and revocable enrollment
+# ADR-0006: Capture-node bootstrap trust and revocable enrollment
 
-Status: Proposed — explicit Owner decision required; no runtime behavior enabled.
+Status: Accepted 2026-09-21 — implementation remains staged; this ADR does not enable a listener by itself.
 
 Related Issues: #13 (Plan 7), #6 (Owner authority), #12 (Agent foundation),
 #14 (ingest isolation), #15 (media transport).
@@ -12,24 +12,21 @@ encryption **before** transmitting a pairing code, followed by a unique revocabl
 node identity. LAN reachability, a short-lived code, and later mTLS cannot establish
 that initial trust. SPECIFICATION §5.4 deliberately leaves the exact method open.
 
-This proposal makes that choice reviewable. It does not approve itself, select the
+This decision records the Owner-approved choice. It does not select the
 media protocol in #15, introduce human authentication, or complete #13. Owner
 authority still depends on #6; its proposed local administrative bootstrap is not
 silently accepted here. There is no dashboard/UI implementation in this change.
 
-## Proposed decision for Owner approval
+## Decision
 
-Recommend a deployment-local CA public trust bundle transferred through an
+The Owner accepted a deployment-local CA public trust bundle transferred through an
 Owner-controlled local/out-of-band channel. Use a local administrative Main CLI
 for enrollment approval and a non-root Agent CLI for pairing. TLS 1.3 authenticates
 the Main during bootstrap; deployment-scoped mTLS authenticates both endpoints
-afterward. The proposed code is 128 random bits, rendered as 26 Base32 characters,
-valid for five minutes and one atomic redemption. These are proposed settings,
-not approved product defaults.
+afterward. The code is 128 random bits, rendered as 26 Base32 characters, valid for five
+minutes and one atomic redemption.
 
-The Owner can approve this package or select fingerprint pinning below. Until the
-decision is recorded as Accepted, bootstrap/ingest ports remain disabled and
-unpaired Agent adapters remain unable to send network traffic.
+Fingerprint pinning remains documented as an alternative but is not selected. Bootstrap/ingest ports remain disabled until their separately scoped adapters are implemented and validated; unpaired Agent adapters remain unable to send network traffic.
 
 | Trust method | Owner operation | Rotation and risk | Recommendation |
 | --- | --- | --- | --- |
@@ -43,7 +40,7 @@ an independently authenticated Owner channel supplies the trust. ServerSentinel
 does not establish SSH access to the capture host, depend on developer services,
 or change Tailscale policy to perform the transfer.
 
-## Proposed enrollment flow
+## Enrollment flow
 
 1. On the intended capture host, the dedicated non-root Agent account creates a
    node key locally and a public enrollment request containing its public key and
@@ -166,9 +163,8 @@ camera, mount, account or network policy is modified by this proposal.
 
 ## Implementation and license plan
 
-1. Obtain Owner acceptance of the trust channel/CLI flow and proposed code
-   parameters, and finish the #6 authorization prerequisite. Record the decision
-   and sync REQUIREMENTS/SPECIFICATION/SECURITY before enabling behavior.
+1. Preserve the accepted trust channel/CLI flow and code parameters from this ADR,
+   and finish the #6 authorization prerequisite before enabling behavior.
 2. Implement internal ledger/issuer interfaces with default-deny listeners, then
    the separately authorized bootstrap and mTLS adapters. Keep protocol dispatch,
    node authorization and human authorization distinct. Integrate #12 only after
@@ -194,10 +190,6 @@ camera, mount, account or network policy is modified by this proposal.
    Update MANUAL_TEST for actual deployment interoperability and preserve #13 as
    open until its implementation acceptance criteria pass.
 
-## Owner decision record
+## Decision record
 
-Pending: recommended local-CA public bundle and trusted transfer, local privileged
-Main approval plus non-root Agent pairing, approved-public-key binding, TLS 1.3,
-and 128-bit/five-minute/one-use code. An Owner response is required to move this ADR
-to Accepted. The existing #6 Owner-authentication and #4 GitHub-App decisions remain
-separate; this proposal neither repeats nor resolves them.
+Accepted by the repository Owner on 2026-09-21: local-CA public bundle and trusted transfer, local privileged Main approval plus non-root Agent pairing, approved-public-key binding, TLS 1.3, and a 128-bit/five-minute/one-use code. The existing #6 Owner-authentication and #4 GitHub-App decisions remain separate; this ADR neither repeats nor resolves them.

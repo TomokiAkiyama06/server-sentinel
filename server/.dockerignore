@@ -1,6 +1,11 @@
 *
 !requirements-ci.lock
 !requirements.lock
+!build_artifact.py
+!build_installer.py
+!install.py
+!pyproject.toml
+!requirements-detector.lock
 !app/
 !app/**
 !tests/

@@ -1,16 +1,27 @@
 """Application construction and lifespan. No listener starts during import."""
 
-from contextlib import asynccontextmanager, closing
+import asyncio
+from contextlib import asynccontextmanager, closing, suppress
 import logging
+from typing import Callable, ContextManager, Iterable
 
 from fastapi import FastAPI
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from app.auth.boundary import DenyAll, HumanAuthorizer
+from app.audit import (
+    AuditStore, DenyAllOwners, OwnerAuditService, OwnerAuthorizer,
+    UnboundStorageAdmission,
+)
+from app.audit.integration import OwnerAdministration
+from app.audit.runtime import AuditRetentionRuntime
+from app.cameras.registry import CameraRegistry
+from app.diagnostics import DiagnosticExportEndpoint
 from app.logging import Event
 from app.settings import Settings
 from app.storage.database import Database
 from app.storage.migrations import migrate
+from app.storage.schema import APPLICATION_MIGRATIONS
 
 
 class ClosedHumanSurface:
@@ -39,24 +50,52 @@ class ClosedHumanSurface:
 
 
 def create_app(settings: Settings, *, database: Database | None = None,
-               human_authorizer: HumanAuthorizer | None = None) -> FastAPI:
+               human_authorizer: HumanAuthorizer | None = None,
+               owner_authorizer: OwnerAuthorizer | None = None,
+               audit_cleanup_interval_seconds: float = 24 * 60 * 60,
+               storage_reservation: Callable[[], ContextManager] | None = None,
+               audit_retention_stores: Iterable[object] = (),
+               diagnostic_export_endpoint: DiagnosticExportEndpoint | None = None) -> FastAPI:
     store = database or Database(settings.database_path)
+    # The deployment injects the Main Server storage admission reservation once
+    # its storage policy is bound, so audit writes and retention cleanup cannot
+    # spend the hard filesystem reserve. Until then writes are refused rather
+    # than admitted against a reserve this process cannot verify.
+    audit_store = AuditStore(store, reservation=storage_reservation
+                             or UnboundStorageAdmission())
+    audit_service = OwnerAuditService(audit_store, owner_authorizer or DenyAllOwners())
+    owner_administration = OwnerAdministration(audit_service, CameraRegistry(store))
+    audit_retention = AuditRetentionRuntime(
+        audit_store, *tuple(audit_retention_stores),
+        interval_seconds=audit_cleanup_interval_seconds,
+    )
 
     @asynccontextmanager
     async def lifespan(application: FastAPI):
         application.state.ready = False
         try:
             with closing(store.connect()) as connection:
-                migrate(connection)
+                migrate(connection, APPLICATION_MIGRATIONS)
         except Exception:
             logging.getLogger(__name__).error(Event.STARTUP_FAILED)
             # Lifespan failures must not pass SQLite/config values to servers.
             raise RuntimeError("application startup failed") from None
+        try:
+            await audit_retention.startup_cleanup()
+        except Exception:
+            # A refused storage admission or transient database fault must not
+            # take physical-security monitoring offline. The bounded degraded
+            # retention state stays visible and the scheduled run retries it.
+            logging.getLogger(__name__).error(Event.AUDIT_RETENTION_DEGRADED)
         application.state.ready = True
+        cleanup_task = asyncio.create_task(audit_retention.run())
         logging.getLogger(__name__).info(Event.STARTED)
         try:
             yield
         finally:
+            cleanup_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await cleanup_task
             application.state.ready = False
             logging.getLogger(__name__).info(Event.STOPPED)
 
@@ -67,6 +106,13 @@ def create_app(settings: Settings, *, database: Database | None = None,
     application.state.ready = False
     application.state.database = store
     application.state.human_authorizer = human_authorizer or DenyAll()
-    # Do not include api.system.router before approved permission enforcement.
+    application.state.audit_store = audit_store
+    # Whether audit writes are admitted is explicit deployment state, not an
+    # assumption: it is false until the Main Server storage policy is bound.
+    application.state.audit_storage_admitted = storage_reservation is not None
+    application.state.audit_retention = audit_retention
+    application.state.owner_administration = owner_administration
+    application.state.diagnostic_export_endpoint = diagnostic_export_endpoint
+    # Do not include human routers before approved permission enforcement.
     application.add_middleware(ClosedHumanSurface)
     return application
