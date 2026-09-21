@@ -339,7 +339,7 @@ try {
       await page.wait("document.querySelectorAll('[data-recording-id]').length === 0");
       await page.heading('アクセスを確認しています');
       assert.doesNotMatch(await page.evaluate('document.body.innerText'), /生成カメラ/);
-      assert.equal(await page.evaluate("document.querySelectorAll('nav button:disabled').length"), 7);
+      assert.equal(await page.evaluate("document.querySelectorAll('nav button:disabled').length"), 9);
     });
     // A recovered NORMAL state must still surface sticky backend faults.
     await scenario(viewport, { storageState: 'NORMAL', storageFaults: true }, async (page, requests) => {
