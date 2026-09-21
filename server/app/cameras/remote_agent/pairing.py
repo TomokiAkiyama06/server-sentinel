@@ -41,11 +41,13 @@ class PairingStorageError(PairingError):
 
 
 class OwnerAuthorizer(Protocol):
-    def require_owner(self, actor_context: object) -> None: ...
+    def require_owner(self, actor_context: object) -> None:
+        ...
 
 
 class CodeVerifier(Protocol):
-    def digest(self, code: str) -> str: ...
+    def digest(self, code: str) -> str:
+        ...
 
 
 class HmacCodeVerifier:
