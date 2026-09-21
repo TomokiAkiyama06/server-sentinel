@@ -61,11 +61,11 @@ UI変更で添付が必要な場合は、synthetic/generated/demo素材のみを
 - HEAD SHA:
 - BASE SHA:
 - Codex レビュー依頼・結果URL:
-- Claude run URL:
+- Claude レビュー: 一時停止中（Ownerが再有効化するまで非ゲート）
 
 - [ ] Codex レビュー完了（固定HEAD/base差分）
-- [ ] Claude レビュー完了（固定HEAD/base差分）
-- [ ] 完了時とマージ直前に、両レビューの対象HEAD/baseがcurrent HEAD/baseと一致すると確認（Codexは`Reviewed commit`に加えて依頼時のbase記録も照合）
+- [ ] 完了時とマージ直前に、レビュー対象HEAD/baseがcurrent HEAD/baseと一致すると確認（Codexは`Reviewed commit`に加えて依頼時のbase記録も照合）
+- [ ] Claudeレビューが再有効化されている場合のみ、そのレビューゲートも完了
 - [ ] HEADまたはbase変更後は両レビューを最新の固定差分で再実行（baseのみの変更を含む）
 - [ ] 両レビューの重大・重要な指摘を解消
 - [ ] 必須CI成功
