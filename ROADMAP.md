@@ -22,7 +22,10 @@ Issue #1 closed when PR #2 merged after documentation/bootstrap acceptance and c
 - [x] validated deployment settings and database abstraction
 - [ ] health endpoints
 - [x] React responsive dashboard shell (#8; synthetic/mock foundation, production access integration remains #10)
-- [ ] Docker Compose where appropriate
+- [ ] Docker Compose only if it ever provides the same external-runtime,
+  mount-identity, non-root-identity, private-listener, update and rollback
+  guarantees as the native lifecycle; none is implemented or advertised
+  today (ADR-0005, `REQUIREMENTS.md` DIST-005)
 - [ ] versioned Main Server install / update / rollback lifecycle (#47)
 - [ ] first-run setup wizard and resumable initial configuration flow (#48)
 - [ ] deployment-owner authorization ADR/bootstrap — ADR-0003 Proposed; Owner decision pending, synthetic policy model only

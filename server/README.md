@@ -10,5 +10,6 @@ Owns the authoritative configuration, human authorization, Camera Source registr
 
 The Issue #7 foundation now provides configuration, SQLite migrations, safe
 structured logs and an entirely closed FastAPI surface. Capture and human
-authorization remain pending. See [the runtime contract and local commands](docs/FOUNDATION.md)
-and [reviewed dependencies](docs/DEPENDENCIES.md).
+authorization remain pending. See [the runtime contract and local commands](docs/FOUNDATION.md),
+[the stable release lifecycle](docs/DEPLOYMENT.md), and
+[reviewed dependencies](docs/DEPENDENCIES.md).
