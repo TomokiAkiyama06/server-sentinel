@@ -578,14 +578,14 @@ class PipelineTests(unittest.TestCase):
         value = pipeline(viewer=factory)
         value.add_viewer(SUBSCRIBER)
         factory.adapters[0].fail_close = True
-        value.remove_viewer(SUBSCRIBER)
+        self.assertFalse(value.remove_viewer(SUBSCRIBER))
         self.assertTrue(value.viewer_status.failed)
         self.assertEqual(value.viewer_status.reason, "adapter_close_failed")
         value.add_viewer(SUBSCRIBER)
         self.assertEqual(len(factory.adapters), 1)
         self.assertFalse(value.offer(packet(0, keyframe=True)).viewer_queued)
         factory.adapters[0].fail_close = False
-        value.remove_viewer(SUBSCRIBER)
+        self.assertTrue(value.remove_viewer(SUBSCRIBER))
         value.add_viewer(SUBSCRIBER)
         self.assertTrue(factory.adapters[0].closed)
         self.assertEqual(len(factory.adapters), 2)

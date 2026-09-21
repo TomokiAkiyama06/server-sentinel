@@ -42,6 +42,7 @@ from tests.presence_smoke import run_presence  # noqa: E402
 from tests.quality_smoke import run_quality_smoke  # noqa: E402
 from tests.recording_smoke import run_recording_smoke  # noqa: E402
 from tests.storage_smoke import run_storage_smoke  # noqa: E402
+from tests.integrity_smoke import run_integrity_smoke  # noqa: E402
 from tests.test_uvc_session import Discovery, SyntheticCapture  # noqa: E402
 
 
@@ -62,6 +63,7 @@ async def run(scenario):
         run_presence(Path(temporary), scenario)
         run_recording_smoke(Path(temporary), scenario)
         run_storage_smoke(Path(temporary), scenario)
+        run_integrity_smoke(Path(temporary))
         settings = Settings(Path(temporary))
         if scenario == "error":
             settings.database_path.write_bytes(b"SYNTHETIC_PRIVATE_VALUE")
