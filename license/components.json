@@ -15,7 +15,7 @@
     },
     {
       "path": "web/tests/browser.mjs",
-      "sha256": "sha256:ed4325199db73bbccf11642ed2ad7ad53fd486fe1adbf128e5dc98f5d5c54703"
+      "sha256": "sha256:2e96f2d673c34f5d60f3943637cc456ab3a8d6e02644c68b933037a0e4b57eea"
     },
     {
       "path": "web/tests/chrome.mjs",

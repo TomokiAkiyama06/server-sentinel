@@ -87,7 +87,8 @@ let cases = 0;
 
 async function scenario(viewport, { production = false, status = 200, session = owner, count = 1, optIn = false,
   sourceStatus = 200, initialViewFailures = false, positiveControl = false, recordings = 3, recordingStatus = 200,
-  storageState = 'STORAGE_PRESSURE', storageAvailable, storageFaults = false, storageStatus = 200, mutationStatus = 200 } = {}, assertions) {
+  storageState = 'STORAGE_PRESSURE', storageAvailable, storageFaults = false, storageStatus = 200,
+  storageDelay = 0, mutationStatus = 200 } = {}, assertions) {
   const page = await pageFor(browser, viewport);
   // Chrome applies bypass when parsing a document's policy. Set it before
   // navigation, only for the dedicated interception positive control.
@@ -156,6 +157,7 @@ async function scenario(viewport, { production = false, status = 200, session = 
       await fulfill(JSON.stringify({ detail: 'synthetic private error' }), 'application/json', 503); return;
     }
     if (!production && url.pathname === '/api/mock/storage') {
+      if (storageDelay) await delay(storageDelay);
       await fulfill(JSON.stringify(storageStatus === 200 ? storageFixture(storageState, storageAvailable, storageFaults) : { detail: 'synthetic private error' }), 'application/json', storageStatus); return;
     }
     unexpected.push('unexpected path');
@@ -358,7 +360,7 @@ try {
     });
     // The operational snapshot is re-read whenever the screen is opened and on
     // demand, so a backend that later enters hard stop cannot stay hidden.
-    await scenario(viewport, {}, async (page, requests) => {
+    await scenario(viewport, { storageDelay: 150 }, async (page, requests) => {
       await page.click('ストレージと通知');
       await page.wait("document.querySelectorAll('[data-storage-state]').length === 3");
       const first = requests.filter(path => path === '/api/mock/storage').length;
