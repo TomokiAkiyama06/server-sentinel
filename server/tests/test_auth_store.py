@@ -3,7 +3,6 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import tempfile
 import unittest
-from uuid import UUID
 
 from app.auth.model import AccessValidationError, Permission, PrincipalRole, PrincipalStatus
 from app.auth.store import AccessStore
