@@ -2,19 +2,33 @@
 """Explicit local installer; never create accounts, change mounts, or start units."""
 
 import argparse
+from contextlib import contextmanager
+import fcntl
 import hashlib
+import io
+import json
 import os
 from pathlib import Path
 import pwd
 import re
 import subprocess
 import stat
+import zipfile
 
 from media_capture_agent.config import ConfigurationError, Settings, read_protected_configuration
 from media_capture_agent.storage import StorageRefused, open_directory
 
 
 MAX_ARTIFACT_BYTES = 16 * 1024 * 1024
+MAX_METADATA_BYTES = 4096
+MAX_UNIT_BYTES = 64 * 1024
+VERSION = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+(?:-[a-z0-9.]+)?")
+SOURCE_COMMIT = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?")
+RELEASE_METADATA = "MEDIA_CAPTURE_AGENT_RELEASE.json"
+
+
+class ReleaseRestorationError(ValueError):
+    """A pointer failure left state uncertain; retain every referenced release."""
 
 
 def read_artifact(path):
@@ -30,6 +44,29 @@ def read_artifact(path):
                 != (after.st_size, after.st_mtime_ns, after.st_ctime_ns)):
             raise ValueError("artifact changed during verification")
         return data
+
+
+def release_metadata(artifact, expected_version):
+    """Read provenance already bound by the separately verified outer digest."""
+    try:
+        with zipfile.ZipFile(io.BytesIO(artifact)) as archive:
+            matches = [entry for entry in archive.infolist()
+                       if entry.filename == RELEASE_METADATA]
+            if (len(matches) != 1 or matches[0].is_dir()
+                    or matches[0].file_size > MAX_METADATA_BYTES):
+                raise ValueError("release metadata missing")
+            content = archive.read(matches[0])
+        value = json.loads(content)
+    except (OSError, KeyError, UnicodeError, ValueError, zipfile.BadZipFile):
+        raise ValueError("release metadata invalid") from None
+    if (not isinstance(value, dict)
+            or set(value) != {"format", "name", "version", "source_commit"}
+            or value["format"] != 1 or value["name"] != "media-capture-agent"
+            or value["version"] != expected_version
+            or not SOURCE_COMMIT.fullmatch(str(value["source_commit"]))
+            or set(value["source_commit"]) == {"0"}):
+        raise ValueError("release provenance mismatch")
+    return value
 
 
 def quote(value):
@@ -94,10 +131,153 @@ def protected_parent(path):
             os.close(fd)
 
 
+def _pointer_target(destination, name):
+    pointer = destination / name
+    if not pointer.exists() and not pointer.is_symlink():
+        return None
+    if not pointer.is_symlink():
+        raise ValueError("release pointer must be a symbolic link")
+    target = os.readlink(pointer)
+    if not VERSION.fullmatch(target):
+        raise ValueError("release pointer is invalid")
+    return target
+
+
+def _set_pointer(destination, name, target):
+    pointer = destination / name
+    temporary = destination / ("." + name + ".new")
+    temporary.unlink(missing_ok=True)
+    if target is None:
+        pointer.unlink(missing_ok=True)
+        return
+    temporary.symlink_to(target)
+    os.replace(temporary, pointer)
+
+
+def _switch_pointers(destination, *, current, previous):
+    old_current = _pointer_target(destination, "current")
+    old_previous = _pointer_target(destination, "previous")
+    try:
+        # Publish the recovery target before changing the active release.
+        _set_pointer(destination, "previous", previous)
+        _set_pointer(destination, "current", current)
+    except BaseException:
+        restoration_errors = []
+        for name, target in (("current", old_current), ("previous", old_previous)):
+            try:
+                _set_pointer(destination, name, target)
+            except BaseException as error:
+                restoration_errors.append(error)
+        if restoration_errors:
+            raise ReleaseRestorationError(
+                "release pointer restoration failed"
+            ) from restoration_errors[0]
+        raise
+
+
+def _validate_release(destination, version):
+    try:
+        root = (destination / version).lstat()
+        executable = (destination / version / "media-capture-agent").lstat()
+        owner = destination.stat().st_uid
+    except OSError:
+        raise ValueError("release is unavailable") from None
+    if (not stat.S_ISDIR(root.st_mode) or root.st_uid != owner or root.st_mode & 0o022
+            or not stat.S_ISREG(executable.st_mode) or executable.st_uid != owner
+            or executable.st_nlink != 1 or executable.st_mode & 0o222
+            or executable.st_mode & 0o111 == 0):
+        raise ValueError("release is unavailable")
+
+
+def _installed_unit(path):
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+        with os.fdopen(descriptor, "rb") as stream:
+            before = os.fstat(stream.fileno())
+            parent = path.parent.stat()
+            if (not stat.S_ISREG(before.st_mode) or before.st_uid != parent.st_uid
+                    or before.st_nlink != 1 or before.st_mode & 0o022
+                    or before.st_size > MAX_UNIT_BYTES):
+                raise ValueError("installed service configuration differs")
+            content = stream.read(MAX_UNIT_BYTES + 1)
+            after = os.fstat(stream.fileno())
+    except OSError:
+        raise ValueError("installed service configuration differs") from None
+    if len(content) != before.st_size or (
+            before.st_size, before.st_mtime_ns, before.st_ctime_ns
+    ) != (after.st_size, after.st_mtime_ns, after.st_ctime_ns):
+        raise ValueError("installed service configuration differs")
+    try:
+        return content.decode("utf-8")
+    except UnicodeDecodeError:
+        raise ValueError("installed service configuration differs") from None
+
+
+@contextmanager
+def release_lock(destination):
+    path = destination / ".release.lock"
+    descriptor = os.open(path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
+    try:
+        info = os.fstat(descriptor)
+        parent = destination.stat()
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != parent.st_uid
+                or info.st_nlink != 1 or info.st_mode & 0o077):
+            raise ValueError("release lock is invalid")
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(descriptor)
+
+
+def _stage(args, artifact, settings, account, config):
+    version_root = args.destination / args.version
+    version_root.mkdir(mode=0o755)
+    version_root.chmod(0o755)
+    executable = version_root / "media-capture-agent"
+    try:
+        with executable.open("xb") as stream:
+            stream.write(artifact)
+        executable.chmod(0o555)
+        subprocess.run([str(executable), "--config", str(config), "--check"],
+                       check=True, timeout=30, user=account.pw_uid, group=account.pw_gid,
+                       extra_groups=[], env={"PATH": "/usr/bin:/bin",
+                                             "PYTHONDONTWRITEBYTECODE": "1"},
+                       cwd="/", stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return executable
+    except Exception:
+        executable.unlink(missing_ok=True)
+        version_root.rmdir()
+        raise
+
+
+def _remove_staged(executable):
+    executable.unlink(missing_ok=True)
+    executable.parent.rmdir()
+
+
+def rollback(args):
+    if os.geteuid() != 0:
+        raise ValueError("rollback requires explicit administrator execution")
+    if not args.destination.is_absolute():
+        raise ValueError("absolute installation paths required")
+    protected_parent(args.destination)
+    with release_lock(args.destination):
+        current = _pointer_target(args.destination, "current")
+        previous = _pointer_target(args.destination, "previous")
+        if current is None or previous is None:
+            raise ValueError("previous release is unavailable")
+        _validate_release(args.destination, previous)
+        _switch_pointers(args.destination, current=previous, previous=current)
+
+
 def install(args):
+    operation = getattr(args, "operation", "install")
+    if operation == "rollback":
+        rollback(args)
+        return
     if os.geteuid() != 0:
         raise ValueError("installation requires explicit administrator execution")
-    if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(?:-[a-z0-9.]+)?", args.version):
+    if not VERSION.fullmatch(args.version):
         raise ValueError("invalid release version")
     if not re.fullmatch(r"[0-9a-f]{64}", args.sha256):
         raise ValueError("verified artifact digest required")
@@ -114,6 +294,7 @@ def install(args):
         config, forbidden_roots=(args.destination, code_root)
     )
     settings = Settings.parse(value, code_root=args.destination)
+    release_metadata(artifact, args.version)
     if any(root.is_relative_to(code_root) for root in (settings.runtime_root, settings.media_root)):
         raise ValueError("runtime data must be outside the checkout")
     if config_owner != settings.service_uid:
@@ -127,52 +308,66 @@ def install(args):
         raise ValueError("service must retain its functional name")
     protected_parent(args.destination)
     protected_parent(args.unit.parent)
-    version_root = args.destination / args.version
-    version_root.mkdir(mode=0o755)
-    version_root.chmod(0o755)
-    executable = version_root / "media-capture-agent"
-    unit_created = False
-    try:
-        with executable.open("xb") as stream:
-            stream.write(artifact)
-        executable.chmod(0o555)
-        # Verify ownership/writability/mount/reserve under the actual service UID,
-        # not administrator capabilities. No network, capture or media writes.
-        subprocess.run([str(executable), "--config", str(config), "--check"],
-                       check=True, timeout=30, user=account.pw_uid, group=account.pw_gid,
-                       extra_groups=[], env={"PATH": "/usr/bin:/bin",
-                                             "PYTHONDONTWRITEBYTECODE": "1"},
-                       cwd="/", stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        content = render_unit(executable, config, settings, account.pw_name,
-                              account.pw_gid, args.video_device)
-        with args.unit.open("x", encoding="utf-8") as stream:
-            unit_created = True
-            stream.write(content)
-        args.unit.chmod(0o644)
-    except Exception:
-        if unit_created:
-            args.unit.unlink()
-        executable.unlink(missing_ok=True)
-        version_root.rmdir()
-        raise
+    with release_lock(args.destination):
+        executable = _stage(args, artifact, settings, account, config)
+        current = _pointer_target(args.destination, "current")
+        previous = _pointer_target(args.destination, "previous")
+        if operation == "install" and (current is not None or previous is not None):
+            _remove_staged(executable)
+            raise ValueError("release is already installed")
+        if operation == "update" and current is None:
+            _remove_staged(executable)
+            raise ValueError("current release is unavailable")
+        content = render_unit(args.destination / "current/media-capture-agent", config, settings,
+                              account.pw_name, account.pw_gid, args.video_device)
+        unit_created = False
+        try:
+            if operation == "install":
+                with args.unit.open("x", encoding="utf-8") as stream:
+                    unit_created = True
+                    stream.write(content)
+                args.unit.chmod(0o644)
+            elif _installed_unit(args.unit) != content:
+                raise ValueError("installed service configuration differs")
+        except Exception:
+            if unit_created:
+                args.unit.unlink()
+            _remove_staged(executable)
+            raise
+        try:
+            _switch_pointers(args.destination, current=args.version, previous=current)
+        except ReleaseRestorationError:
+            # A pointer may still reference the newly staged release. Preserve
+            # both it and the unit for explicit administrator recovery.
+            raise
+        except Exception:
+            if unit_created:
+                args.unit.unlink()
+            _remove_staged(executable)
+            raise
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--artifact", type=Path, required=True)
-    parser.add_argument("--sha256", required=True)
-    parser.add_argument("--version", required=True)
+    parser.add_argument("--artifact", type=Path)
+    parser.add_argument("--sha256")
+    parser.add_argument("--version")
     parser.add_argument("--destination", type=Path, required=True)
-    parser.add_argument("--config", type=Path, required=True)
-    parser.add_argument("--unit", type=Path, required=True)
+    parser.add_argument("--config", type=Path)
+    parser.add_argument("--unit", type=Path)
     parser.add_argument("--video-device", action="append", default=[])
+    parser.add_argument("--operation", choices=("install", "update", "rollback"),
+                        default="install")
     args = parser.parse_args()
     try:
+        if args.operation != "rollback" and any(value is None for value in (
+                args.artifact, args.sha256, args.version, args.config, args.unit)):
+            raise ValueError("release inputs required")
         install(args)
     except (OSError, ValueError, ConfigurationError, StorageRefused,
             KeyError, subprocess.SubprocessError):
         parser.exit(1, "media-capture-agent installation validation failed\n")
-    print("media-capture-agent installed; inspect and enable the unit explicitly")
+    print("media-capture-agent release prepared; inspect and restart/enable explicitly")
 
 
 if __name__ == "__main__":
