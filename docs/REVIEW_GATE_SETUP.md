@@ -4,8 +4,8 @@ Issue [#4](https://github.com/TomokiAkiyama06/server-sentinel/issues/4) remains
 **open**. The checked-in implementation provides an offline receipt validator,
 a disabled candidate ruleset generator, and synthetic policy tests. There is no
 App publisher, trusted evidence collector, installed enforcement, or completed
-GitHub test-PR acceptance. Continue the manual current-HEAD/current-base review
-procedure in [CLAUDE_REVIEW_SETUP.md](CLAUDE_REVIEW_SETUP.md).
+GitHub test-PR acceptance. Continue the current manual current-HEAD/current-base review
+procedure in [CLAUDE_REVIEW_SETUP.md](CLAUDE_REVIEW_SETUP.md); that document also records the temporary suspension of Claude review automation.
 
 ## Capability assessment
 
