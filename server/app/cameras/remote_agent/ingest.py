@@ -151,9 +151,6 @@ class AgentIngestQueue:
             raise ValueError("ingest clock must return nonnegative integer nanoseconds")
         size = len(message.payload)
         with self._lock:
-            if size > self.limits.maximum_message_bytes:
-                self._rejected += 1
-                return self._admission(IngestOutcome.REJECTED, "message_too_large")
             start, count = self._windows.get(message.node_id, (now, 0))
             if now < start:
                 self._rejected += 1
@@ -164,13 +161,20 @@ class AgentIngestQueue:
                 self._windows[message.node_id] = (start, count)
                 self._rate_limited += 1
                 return self._admission(IngestOutcome.RATE_LIMITED, "rate_limit")
+            # Every authenticated attempt consumes rate budget, including an
+            # oversized message or a queue-pressure refusal. This prevents a
+            # sender from repeatedly making bounded-admission work forever
+            # while preserving the first refusal's specific reason.
+            self._windows[message.node_id] = (start, count + 1)
+            if size > self.limits.maximum_message_bytes:
+                self._rejected += 1
+                return self._admission(IngestOutcome.REJECTED, "message_too_large")
             if (len(self._queue) >= self.limits.maximum_queued_messages
                     or self._queued_bytes + size > self.limits.maximum_queued_bytes):
                 self._backpressured += 1
                 return self._admission(IngestOutcome.BACKPRESSURED, "queue_limit")
             self._queue.append(message)
             self._queued_bytes += size
-            self._windows[message.node_id] = (start, count + 1)
             return self._admission(IngestOutcome.ACCEPTED, None)
 
     def drain(self, maximum_messages: int) -> tuple[AgentMessage, ...]:

@@ -3,6 +3,7 @@
 from app.audit.schema import audit_migration
 from app.cameras.registry.schema import REGISTRY_MIGRATION
 from app.cameras.uvc.schema import UVC_MIGRATION, uvc_explicit_binding_migration
+from app.cameras.remote_agent.schema import PAIRING_MIGRATION
 from app.detection.roi.schema import roi_calibration_migration
 from app.integrity.store import integrity_migration
 from app.media.health.artifacts import recording_health_migration
@@ -23,4 +24,5 @@ APPLICATION_MIGRATIONS = (
     presence_migration(8),
     audit_migration(9),
     uvc_explicit_binding_migration(10),
+    PAIRING_MIGRATION,
 )

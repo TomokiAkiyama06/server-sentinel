@@ -73,6 +73,23 @@ class RemoteAgentIngestTests(unittest.TestCase):
         self.assertEqual((1, 4, 1, 1), (boundary.snapshot().queued_messages, boundary.snapshot().queued_bytes,
                                          boundary.snapshot().rejected, boundary.snapshot().backpressured))
 
+    def test_authenticated_refusals_consume_rate_budget_but_keep_their_specific_reason(self):
+        oversized = queue(limits=IngestLimits(4, 4, 16, 2, 100))
+        self.assertEqual("message_too_large", oversized.submit(message(payload=b"12345")).reason)
+        self.assertEqual("message_too_large", oversized.submit(message(sequence=1, payload=b"12345")).reason)
+        rate_limited = oversized.submit(message(sequence=2, payload=b"12345"))
+        self.assertEqual((IngestOutcome.RATE_LIMITED, "rate_limit"),
+                         (rate_limited.outcome, rate_limited.reason))
+
+        pressured = queue(limits=IngestLimits(4, 1, 4, 2, 100))
+        self.assertEqual(IngestOutcome.ACCEPTED, pressured.submit(message(payload=b"1234")).outcome)
+        pressured_result = pressured.submit(message(sequence=1, payload=b"1"))
+        self.assertEqual((IngestOutcome.BACKPRESSURED, "queue_limit"),
+                         (pressured_result.outcome, pressured_result.reason))
+        rate_limited = pressured.submit(message(sequence=2, payload=b"1"))
+        self.assertEqual((IngestOutcome.RATE_LIMITED, "rate_limit"),
+                         (rate_limited.outcome, rate_limited.reason))
+
     def test_rate_is_per_authenticated_node_and_windowed_by_injected_monotonic_clock(self):
         now = [0]
         boundary = queue(authorizer=Authorizer(nodes=(NODE, OTHER_NODE),
