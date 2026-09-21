@@ -171,6 +171,23 @@ class NodeCredentialStoreTests(unittest.TestCase):
         with self.assertRaises(PairingRefused):
             self.store.installed()
 
+    def test_missing_committed_material_is_not_treated_as_unpaired(self):
+        self.store.install(self.material())
+        credentials = self.root / "node-credentials"
+        manifest = json.loads((credentials / "current.json").read_text(encoding="utf-8"))
+        (credentials / manifest["files"]["private_key"]["name"]).unlink()
+
+        with self.assertRaisesRegex(PairingRefused, "credential_storage_unavailable"):
+            self.store.installed()
+
+    def test_missing_companion_manifest_is_not_treated_as_unpaired(self):
+        self.store.install(self.material())
+        credentials = self.root / "node-credentials"
+        next(credentials.glob("manifest-*.json")).unlink()
+
+        with self.assertRaisesRegex(PairingRefused, "credential_file_rejected"):
+            self.store.installed()
+
     def test_invalid_committed_marker_is_never_treated_as_identity(self):
         credentials = self.root / "node-credentials"
         credentials.mkdir(mode=0o700)

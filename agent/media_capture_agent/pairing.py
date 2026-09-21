@@ -209,15 +209,21 @@ class NodeCredentialStore:
         try:
             root_fd = open_directory(self.runtime_root)
             self._validate_directory(root_fd, "runtime_root_rejected")
-            credentials_fd = os.open(
-                _CREDENTIAL_DIRECTORY,
-                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
-                dir_fd=root_fd,
-            )
+            try:
+                credentials_fd = os.open(
+                    _CREDENTIAL_DIRECTORY,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                    dir_fd=root_fd,
+                )
+            except FileNotFoundError:
+                return False
             self._validate_directory(credentials_fd, "credential_directory_rejected")
-            manifest = self._read_file(credentials_fd, _CURRENT_MANIFEST,
-                                       maximum=_MAX_MANIFEST_BYTES,
-                                       expected_links=2)
+            try:
+                manifest = self._read_file(credentials_fd, _CURRENT_MANIFEST,
+                                           maximum=_MAX_MANIFEST_BYTES,
+                                           expected_links=2)
+            except FileNotFoundError:
+                return False
             try:
                 value = json.loads(manifest.decode("utf-8"))
                 if (not isinstance(value, dict)
@@ -267,8 +273,6 @@ class NodeCredentialStore:
             except (KeyError, TypeError, ValueError, UnicodeError):
                 raise PairingRefused("credential_identity_rejected") from None
             return True
-        except FileNotFoundError:
-            return False
         except (OSError, StorageRefused):
             raise PairingRefused("credential_storage_unavailable") from None
         finally:
