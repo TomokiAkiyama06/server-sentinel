@@ -16,6 +16,7 @@ from app.audit import (
 from app.audit.integration import OwnerAdministration
 from app.audit.runtime import AuditRetentionRuntime
 from app.cameras.registry import CameraRegistry
+from app.diagnostics import DiagnosticExportEndpoint
 from app.logging import Event
 from app.settings import Settings
 from app.storage.database import Database
@@ -53,7 +54,8 @@ def create_app(settings: Settings, *, database: Database | None = None,
                owner_authorizer: OwnerAuthorizer | None = None,
                audit_cleanup_interval_seconds: float = 24 * 60 * 60,
                storage_reservation: Callable[[], ContextManager] | None = None,
-               audit_retention_stores: Iterable[object] = ()) -> FastAPI:
+               audit_retention_stores: Iterable[object] = (),
+               diagnostic_export_endpoint: DiagnosticExportEndpoint | None = None) -> FastAPI:
     store = database or Database(settings.database_path)
     # The deployment injects the Main Server storage admission reservation once
     # its storage policy is bound, so audit writes and retention cleanup cannot
@@ -110,6 +112,7 @@ def create_app(settings: Settings, *, database: Database | None = None,
     application.state.audit_storage_admitted = storage_reservation is not None
     application.state.audit_retention = audit_retention
     application.state.owner_administration = owner_administration
-    # Do not include api.system.router before approved permission enforcement.
+    application.state.diagnostic_export_endpoint = diagnostic_export_endpoint
+    # Do not include human routers before approved permission enforcement.
     application.add_middleware(ClosedHumanSurface)
     return application
