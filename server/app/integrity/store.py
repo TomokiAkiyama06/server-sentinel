@@ -102,22 +102,39 @@ class IntegrityStore:
                            for item in data["components"])
         return row["revision"], Inventory(components, frozenset(Kind(kind) for kind in data["unavailable"]))
 
-    def approve(self, inventory: Inventory, *, expected_revision: int, at: datetime) -> int:
+    def control_reservation(self):
+        """Reserve storage for one caller-owned audited approval transaction."""
         self._check()
+        return self._reservation()
+
+    def approve_on(self, connection, inventory: Inventory, *, expected_revision: int,
+                   at: datetime) -> int:
+        """Approve a baseline inside a caller-owned audited Owner transaction.
+
+        This primitive opens no transaction and holds no reservation of its
+        own: `app.audit.integration.OwnerAdministration.approve_integrity_baseline`
+        authorizes the Owner, admits the storage write and commits this new
+        baseline together with its `approve_hardware_baseline` security audit
+        record, so a baseline can never change without that durable record.
+        The store's own Owner approval still supplies the approving identity.
+        """
+        self._check()
+        if connection is not self.db or not connection.in_transaction:
+            raise RuntimeError("INTEGRITY_DATABASE_BUSY")
         actor = str(UUID(str(self.approval.require_owner())))
         when = timestamp(at)
         payload = json.dumps({"components": [asdict(item) for item in inventory.components],
                               "unavailable": sorted(inventory.unavailable)}, separators=(",", ":"))
-        with self._transaction():
-            actual, _ = self.baseline()
-            if actual != expected_revision:
-                raise ValueError("BASELINE_REVISION_CHANGED")
-            revision = actual + 1
-            self.db.execute("INSERT INTO integrity_baseline VALUES(1,?,?) "
-                            "ON CONFLICT(singleton) DO UPDATE SET revision=excluded.revision,inventory=excluded.inventory",
-                            (revision, payload))
-            self.db.execute("INSERT INTO integrity_audit(at,actor,revision) VALUES(?,?,?)", (when, actor, revision))
-            return revision
+        actual, _ = self.baseline()
+        if actual != expected_revision:
+            raise ValueError("BASELINE_REVISION_CHANGED")
+        revision = actual + 1
+        connection.execute("INSERT INTO integrity_baseline VALUES(1,?,?) "
+                           "ON CONFLICT(singleton) DO UPDATE SET revision=excluded.revision,inventory=excluded.inventory",
+                           (revision, payload))
+        connection.execute("INSERT INTO integrity_audit(at,actor,revision) VALUES(?,?,?)",
+                           (when, actor, revision))
+        return revision
 
     def record(self, findings: tuple[Finding, ...], at: datetime) -> None:
         when = timestamp(at)

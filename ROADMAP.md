@@ -22,7 +22,10 @@ Issue #1 closed when PR #2 merged after documentation/bootstrap acceptance and c
 - [x] validated deployment settings and database abstraction
 - [ ] health endpoints
 - [x] React responsive dashboard shell (#8; synthetic/mock foundation, production access integration remains #10)
-- [ ] Docker Compose where appropriate
+- [ ] Docker Compose only if it ever provides the same external-runtime,
+  mount-identity, non-root-identity, private-listener, update and rollback
+  guarantees as the native lifecycle; none is implemented or advertised
+  today (ADR-0005, `REQUIREMENTS.md` DIST-005)
 - [ ] versioned Main Server install / update / rollback lifecycle (#47)
 - [ ] first-run setup wizard and resumable initial configuration flow (#48)
 - [ ] deployment-owner authorization ADR/bootstrap — ADR-0003 Proposed; Owner decision pending, synthetic policy model only
@@ -88,8 +91,8 @@ acceptance.
 - [x] detector-specific image-quality gating (internal metrics/recovery/unknown contracts; real-camera calibration pending)
 - [x] no false `no person` when quality is insufficient (synthetic gate/scheduler regression tests)
 - [x] bounded per-source inference-cadence primitive (#20; Main worker integration remains open)
-- [ ] server ROI calibration/movement
-- [ ] camera tamper/occlusion/source-health correlation
+- [x] server ROI calibration/movement (bounded synthetic core; capture-worker integration and real-scene calibration remain open)
+- [x] camera tamper/occlusion/source-health correlation (synthetic local core; source-health integration and real-camera acceptance remain open)
 
 ## Phase 6 — Entrance / owner / presence intelligence
 
@@ -145,6 +148,8 @@ Issue #23 has an independent comparison/approval/outbox core and recording-healt
 worker adapter with disposable-file cleanup/recovery tests. Authorization,
 actual codec/source wiring, notifications and physical acceptance remain open;
 see the integrity and media/health module READMEs.
+
+- [x] Owner decision for capture-node bootstrap trust/CLI enrollment (Accepted ADR-0006, #13; pairing adapter/listener remains unimplemented);
 
 - [ ] exact agent->main transport;
 - [ ] exact main->browser live transport/target latency;

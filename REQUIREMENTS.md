@@ -63,6 +63,12 @@ Project source shall be licensed under Apache-2.0.
 ### DIST-004 Dependency/model compatibility
 Dependencies, models, and weights must have licenses compatible with the project's distribution goals. Source-code and model/weight licenses are reviewed separately. AGPL/GPL/SSPL/source-available/unclear components are blocked by default unless explicitly approved and documented.
 
+### DIST-005 Main Server release lifecycle
+Stable Main Server operation uses a versioned release artifact and installer, never a mutable development checkout. Install, update, and rollback are explicit administrator operations that keep runtime configuration, state/database, recordings, and audit logs outside the checkout and the installation tree, and never delete, truncate, rewrite, or destructively downgrade them. A rollback whose code cannot safely read forward-migrated state refuses to start and reports the incompatibility instead. The native release/systemd lifecycle is the only implemented and advertised Main Server deployment path; a Docker Compose path is not available and must provide equivalent external-runtime, mount-identity, non-root-identity, private-listener, update, and rollback guarantees before it is documented. See ADR-0005.
+
+### DIST-006 Release trust and privileged installation
+The installer runs only when an administrator invokes it deliberately with root privileges. It performs no network access and trusts a release only through content hashes the administrator verifies against the separately published values: the outer archive SHA-256, the release manifest, every member digest, and hash-pinned offline dependency wheels. Deployment configuration is administrator-owned and readable but not writable by the dedicated runtime account; only state/database, recordings, and audit directories are runtime-writable, on an Owner-approved runtime filesystem identified by a stable filesystem identity rather than a reusable device number.
+
 ## 5. Camera-source requirements
 
 ### CAM-001 Camera-source abstraction
@@ -121,7 +127,7 @@ The MVP agent shall capture video only. It shall not open microphone/audio devic
 The agent initiates its connection toward the main ServerSentinel host. The main host does not require SSH/admin access to the capture machine merely to receive video.
 
 ### AGENT-005 Pairing
-Initial agent enrollment uses an owner-approved, short-lived, single-use pairing credential/code. Before transmitting that credential, the Agent shall authenticate the intended Main Server using trust established through an Owner-approved trusted channel and establish encrypted bootstrap communication that protects the credential and enrollment exchange. Plaintext bootstrap and bypassing Server identity verification are prohibited; failed or missing trust verification aborts pairing without sending the code. The exact bootstrap trust mechanism shall be specified by the pairing/transport ADR. The agent generates or receives a unique revocable node identity. Long-lived media/control traffic shall use authenticated encryption, with mTLS as the default design target unless an ADR selects an equivalent design.
+Initial agent enrollment uses an owner-approved, 128-bit, five-minute, single-use pairing credential/code. Before transmitting that credential, the Agent authenticates the intended Main Server using a deployment-local CA public trust bundle transferred through an Owner-approved trusted channel, then establishes TLS 1.3 bootstrap communication that protects the credential and enrollment exchange. Plaintext bootstrap and bypassing Server identity verification are prohibited; failed or missing trust verification aborts pairing without sending the code. The local Main approval binds the code to the Agent-generated public-key digest. The agent generates a unique revocable node identity. Long-lived media/control traffic uses deployment-scoped mTLS. The detailed enrollment, persistence and revocation contract is ADR-0006.
 
 ### AGENT-006 No Tailnet requirement
 The capture agent shall be able to operate over the same private LAN without being enrolled in the owner's Tailnet.
@@ -288,6 +294,8 @@ No recording path is hard-coded to a personal disk/mount.
 
 ### STORE-003 Retention
 Default recording retention: **20 days**. Default audit-log retention: **90 days**.
+
+Documented exception: when a confirmed server-movement or camera-tamper event's evidence preservation or owner notification has not completed, that event's own timeline metadata is retained beyond the recording-retention default until the action completes or the owner clears it, and at most until the audit-retention period. It covers only those critical events: recorded video, thumbnails, and ordinary person/motion observations keep the configured retention, and an action the deployment durably disabled keeps it too, because disabling is a configuration decision rather than pending work. After that bound only the event identity and a count that the action never completed remain, with no observation content, and the owner sees the affected critical path as unavailable until it is resolved.
 
 ### STORE-004 Capacity ceiling
 The owner configures maximum recording allocation. Cleanup reacts to retention, configured allocation, and actual filesystem safety pressure.

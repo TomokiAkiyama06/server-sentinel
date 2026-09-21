@@ -321,10 +321,17 @@ class SourcePipeline:
             self._start_viewer()
         self._viewers.add(subscriber_id)
 
-    def remove_viewer(self, subscriber_id: UUID) -> None:
+    def remove_viewer(self, subscriber_id: UUID) -> bool:
+        """Remove viewer demand and report whether its resources are released.
+
+        A codec close failure is recorded on the packet path instead of raised,
+        so callers that own a higher-level session need this explicit result to
+        retain a retry handle rather than incorrectly declaring cleanup done.
+        """
         self._viewers.discard(subscriber_id)
         if not self._viewers:
             self._close_viewer()
+        return self._viewer is None
 
     def replace_viewer_profile(self, profile: ViewerProfile) -> None:
         self._ensure_open()

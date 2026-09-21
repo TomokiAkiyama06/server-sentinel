@@ -1,7 +1,7 @@
 """Private singleton Owner template database, separate from diagnostic data."""
 
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from uuid import UUID
 import fcntl
@@ -22,6 +22,9 @@ _MIGRATIONS = (Migration(1, "private_owner_template", (
     "CREATE TABLE owner_template_audit (id INTEGER PRIMARY KEY, at TEXT NOT NULL, "
     "actor TEXT NOT NULL, operation TEXT NOT NULL, generation INTEGER NOT NULL)",
 )),)
+
+DEFAULT_AUDIT_RETENTION = timedelta(days=90)
+DEFAULT_AUDIT_CLEANUP_BATCH_SIZE = 500
 
 
 @dataclass(frozen=True)
@@ -72,9 +75,15 @@ def _directory(path: Path):
 
 class OwnerTemplateStore:
     """Single worker, private pre-created runtime root, no template export API."""
-    def __init__(self, root: Path, *, max_template_bytes: int, reservation, authorizer=None):
+    def __init__(self, root: Path, *, max_template_bytes: int, reservation, authorizer=None,
+                 audit_retention: timedelta = DEFAULT_AUDIT_RETENTION,
+                 cleanup_batch_size: int = DEFAULT_AUDIT_CLEANUP_BATCH_SIZE):
         if type(max_template_bytes) is not int or not 0 < max_template_bytes <= 1048576:
             raise ValueError("INVALID_TEMPLATE_LIMIT")
+        if (not isinstance(audit_retention, timedelta) or audit_retention <= timedelta(0)
+                or type(cleanup_batch_size) is not int
+                or not 1 <= cleanup_batch_size <= 1000):
+            raise ValueError("INVALID_AUDIT_RETENTION")
         if any((parent / ".git").is_file() or (parent / ".git/HEAD").is_file() for parent in (root, *root.parents)):
             raise OwnerError("PRIVATE_TEMPLATE_ROOT_INSIDE_CHECKOUT")
         code_root = Path(__file__).resolve().parents[2]
@@ -87,6 +96,8 @@ class OwnerTemplateStore:
         self._identity = None
         self._file_identity = None
         self._max_bytes = max_template_bytes
+        self.audit_retention = audit_retention
+        self.cleanup_batch_size = cleanup_batch_size
         if not callable(reservation):
             raise ValueError("TEMPLATE_STORAGE_RESERVATION_REQUIRED")
         self._reservation = reservation
@@ -157,6 +168,77 @@ class OwnerTemplateStore:
         if self._fd >= 0:
             os.close(self._fd)
             self._fd = -1
+
+    def cleanup_expired_batch(self, *, now: datetime | None = None) -> int:
+        """Delete one private audit batch without exposing the template DB.
+
+        Retention uses a fresh verified connection so the scheduler may run it
+        on a bounded worker without relaxing the template connection's strict
+        creating-thread ownership. SQLite serializes it with template changes.
+        """
+        reference = now or datetime.now(timezone.utc)
+        if reference.tzinfo is None or reference.utcoffset() is None:
+            raise ValueError("AWARE_TIME_REQUIRED")
+        if self._fd < 0:
+            raise OwnerError("PRIVATE_TEMPLATE_STORE_UNAVAILABLE")
+        cutoff = (reference.astimezone(timezone.utc) - self.audit_retention).isoformat()
+        descriptor = -1
+        connection = None
+        try:
+            descriptor = _directory(self._root)
+            info = os.fstat(descriptor)
+            if ((info.st_dev, info.st_ino) != self._identity
+                    or info.st_uid != os.geteuid() or info.st_mode & 0o077):
+                raise OwnerError("PRIVATE_TEMPLATE_ROOT_UNAVAILABLE")
+            entry = os.stat("owner-template.sqlite3", dir_fd=descriptor,
+                            follow_symlinks=False)
+            if ((entry.st_dev, entry.st_ino) != self._file_identity
+                    or not stat.S_ISREG(entry.st_mode) or entry.st_nlink != 1
+                    or entry.st_uid != os.geteuid() or entry.st_mode & 0o077):
+                raise OwnerError("PRIVATE_TEMPLATE_FILE_UNAVAILABLE")
+            with self._reservation():
+                connection = sqlite3.connect(
+                    f"/proc/self/fd/{descriptor}/owner-template.sqlite3",
+                    timeout=5, isolation_level=None,
+                )
+                connection.execute("PRAGMA journal_mode=DELETE")
+                connection.execute("PRAGMA synchronous=FULL")
+                connection.execute("PRAGMA secure_delete=ON")
+                connection.execute("BEGIN IMMEDIATE")
+                cursor = connection.execute(
+                    "DELETE FROM owner_template_audit WHERE id IN ("
+                    "SELECT id FROM owner_template_audit WHERE at < ? "
+                    "ORDER BY at, id LIMIT ?)",
+                    (cutoff, self.cleanup_batch_size),
+                )
+                removed = max(cursor.rowcount, 0)
+                connection.execute("COMMIT")
+                return removed
+        except OwnerError:
+            if connection is not None and connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
+        except (OSError, sqlite3.Error):
+            if connection is not None and connection.in_transaction:
+                try:
+                    connection.execute("ROLLBACK")
+                except sqlite3.Error:
+                    pass
+            raise OwnerError("PRIVATE_TEMPLATE_STORAGE_UNAVAILABLE") from None
+        finally:
+            if connection is not None:
+                connection.close()
+            if descriptor >= 0:
+                os.close(descriptor)
+
+    def cleanup_expired(self, *, now: datetime | None = None) -> int:
+        reference = now or datetime.now(timezone.utc)
+        deleted = 0
+        while True:
+            removed = self.cleanup_expired_batch(now=reference)
+            deleted += removed
+            if removed < self.cleanup_batch_size:
+                return deleted
 
     def _check(self):
         if threading.get_ident() != self._owner or self._fd < 0:

@@ -394,6 +394,11 @@ Acceptance:
 
 ## Plan 7 — Capture-node pairing + mTLS trust
 
+Status: OPEN. Accepted [ADR-0006](ADR/0006-capture-node-bootstrap-trust.md)
+documents the initial Main trust choice, one-time enrollment and revocation test
+plan. Runtime/TLS acceptance remains outstanding; the ADR does not enable pairing
+or close Issue #13.
+
 GitHub Issue: [#13](https://github.com/TomokiAkiyama06/server-sentinel/issues/13)
 
 Depends on: [#12](https://github.com/TomokiAkiyama06/server-sentinel/issues/12), [#6](https://github.com/TomokiAkiyama06/server-sentinel/issues/6)
@@ -613,7 +618,7 @@ Acceptance:
 - record upstream/model/version, separate code/weight licenses, pinned artifact/checksum, material transitive obligations, and network/telemetry/runtime-download behavior; unclear licensing remains blocked for Owner decision;
 - overload reduces inference while preserving truthful health, critical evidence, and storage safety; no opaque downloads or unapproved model switching.
 
-Implementation progress (Issue #20 remains OPEN): transient CPU motion/plugin primitives and generated-frame inference-cadence/overload tests are present in `server/app/detection/foundation`. A separately licensed RT-DETRv2 CPU adapter has a verified local-artifact synthetic smoke; deployment model settings, target Main Server benchmarks and runtime integration remain unaccepted; see `server/docs/DETECTOR_FOUNDATION.md` and its model audit.
+Implementation progress (Issue #20 remains OPEN): transient CPU motion/plugin primitives and generated-frame inference-cadence/overload tests are present in `server/app/detection/foundation`. A separately licensed RT-DETRv2 CPU adapter has a verified local-artifact synthetic smoke and an operator-run repeated CPU benchmark that reports p50/p95/max latency and replays one-to-four-source cadence/overload from explicit inputs. No target Main Server result or setting is selected by the harness; deployment model settings, target Main Server benchmarks and runtime integration remain unaccepted. See `server/docs/DETECTOR_FOUNDATION.md` and its model audit.
 
 ## Plan 13 — Detector-specific image-quality / low-light gating
 
@@ -666,6 +671,25 @@ Acceptance:
 - person presence alone never proves movement; synthetic tests distinguish temporary occlusion, camera/global motion, server displacement/rotation, and persistent tamper;
 - record calibration/reference version/time and source/confidence/quality; insufficient input/source loss is not trustworthy no-movement;
 - critical detection events remain available in all presence states for Plan 16 integration.
+
+Implementation: `server/app/detection/roi/` provides a bounded local grayscale
+core with immutable source/profile calibration, append-only private calibration
+history that stores provenance and the reference digest but never decoded media,
+global transform compensation, relative ROI comparison, explicit
+occlusion/quality fail-unknown handling, temporal confirmation, persistent
+dark/unmatched-scene tamper, and trusted source-loss correlation. A refused or
+incompatible sample ends temporal confirmation and advances the observed frame
+progression, and a registration that is acceptable but ambiguous stays
+`unknown` instead of confirming tamper or its absence. It has no capture,
+HTTP, notification, presence, or identity integration. The generated fixtures
+in `server/tests/test_detector_roi.py` verify local and remote-agent
+calibration types, controlled ROI displacement, camera-global shift separation,
+temporary occlusion, persistent unmatched scenes, ambiguous and low-margin
+registration, refused foreign-source samples, frame-progression watermarks, the
+unmatched-path comparison budget, quality isolation, source loss, media-free
+migration/history, and bounded failed-delivery retry. Physical-camera
+calibration and integration into capture/source health, recording preservation,
+notification, and Plan 16 remain separate acceptance work.
 
 ## Plan 15 — Owner-only verification / anonymous tracking / entrance
 
