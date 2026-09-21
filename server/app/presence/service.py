@@ -363,7 +363,9 @@ class PresenceService:
             with self._transaction() as db:
                 job = db.execute("SELECT * FROM presence_deliveries WHERE observation=? AND action=?",
                                  tuple(row)).fetchone()
-                if job["state"] not in {"pending", "unavailable"}:
+                # Retention expiry or another dispatcher may have resolved or
+                # removed this row between the selection and this claim.
+                if job is None or job["state"] not in {"pending", "unavailable"}:
                     continue
                 port = self.evidence if row["action"] == "evidence" else self.notifications
                 if port is None:
@@ -460,17 +462,13 @@ class PresenceService:
         Entering a reservation here would make every status read take the
         deployment's bounded control allowance, contend with the writer that
         owns it and, on a full volume, drive a state transition from a read
-        path. The status therefore never enters a reservation. It checks that
-        the port still yields one, uses the injected read-only storage health
-        probe when one is supplied, uses the admission a write in this snapshot
-        actually observed, and otherwise reports only that the port is
-        configured, which is not a liveness claim.
+        path. The status therefore never calls the admission port at all. It
+        uses the injected read-only storage health probe when the deployment
+        supplies one, the admission a write in this snapshot actually observed,
+        and otherwise reports only that the port is configured, which is a
+        configuration statement and not a liveness claim.
         """
-        if denied:
-            return UNAVAILABLE
-        try:
-            self._admission()
-        except Exception:
+        if denied or self.reservation is None:
             return UNAVAILABLE
         if self.storage_status is None:
             return ARMED

@@ -273,8 +273,10 @@ class PresenceTests(unittest.TestCase):
             raise RuntimeError("storage admission refused")
 
         self.service.reservation = full
-        # No expiring override is needed for status to prove current storage
-        # admission. A configured but refusing guard never looks armed.
+        # A deployment that reports refused admission through its read-only
+        # probe is never shown as armed, and status takes no reservation to
+        # find that out.
+        self.service.storage_status = lambda: False
         self.assertEqual(self.status()["critical_persistence"], "unavailable")
         status = self.status(now=NOW + timedelta(hours=2))
         # Reading status must not need a durable write, and the expired override
@@ -286,6 +288,7 @@ class PresenceTests(unittest.TestCase):
         self.assertEqual(status["pending_critical_actions"], 2)
         self.assertEqual([row["action"] for row in self.service.audit("owner")], ["override_set"])
         self.service.reservation = nullcontext
+        self.service.storage_status = lambda: True
         recovered = self.status(now=NOW + timedelta(hours=2))
         self.assertFalse(recovered["override_expiry_pending"])
         self.assertEqual(recovered["critical_persistence"], "armed")
@@ -355,6 +358,23 @@ class PresenceTests(unittest.TestCase):
                              "unknown")
         self.assertEqual(entered, [True])
 
+    def test_dispatch_skips_a_job_removed_between_selection_and_claim(self):
+        event = self.service.record(observation(Kind.SERVER_MOVEMENT, identifier=UUID(int=111)))
+        self.service.complete_action(event.identifier, "evidence", ActionResult.DELIVERED)
+        self.service.complete_action(event.identifier, "notification", ActionResult.DELIVERED)
+        pending = self.service.record(observation(Kind.CAMERA_TAMPER, identifier=UUID(int=112)))
+
+        def racing(item, complete):
+            # Retention expiry removes the other selected rows mid-dispatch.
+            self.service.expire_history(now=NOW + timedelta(days=RetentionPeriods().audit_days + 1))
+            self.evidence.append(item)
+            return ActionResult.DELIVERED
+
+        self.service.evidence = racing
+        self.service.dispatch_pending()
+        self.assertEqual([item.identifier for item in self.evidence], [pending.identifier])
+        self.assertEqual(self.status()["pending_critical_actions"], 0)
+
     def test_storage_admission_port_must_supply_a_reservation_context(self):
         policy = MainStoragePolicy(STORAGE_LIMITS, lambda: FilesystemSpace(50_000, 100_000),
                                    lambda: 0, lambda transition: None)
@@ -364,9 +384,9 @@ class PresenceTests(unittest.TestCase):
             service = self.make_service(reservation=port)
             with self.assertRaisesRegex(RuntimeError, "storage admission reservation required"):
                 service.record(observation())
-            self.assertEqual(service.snapshot(now=NOW, clock_trusted=True)["critical_persistence"],
-                             "unavailable")
+        # Nothing was written under either mis-wiring.
         self.assertEqual(self.history()["items"], [])
+        self.assertEqual(self.service.audit("owner"), [])
 
     def test_failed_or_uncertain_delivery_keeps_its_path_degraded(self):
         def failing(item, complete):

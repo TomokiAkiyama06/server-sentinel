@@ -78,12 +78,12 @@ route; Owner-facing recovery goes through the audited `requeue_action()` and
 
 The status snapshot does not create a presence write, so a refused or exhausted
 storage volume cannot hide presence state or unfinished critical work. It never
-enters a storage reservation either: spending the deployment's bounded control
+calls the admission port either: spending the deployment's bounded control
 allowance on a read would contend with the writer that owns it and could drive
-a storage state transition from a read path. It instead checks that the
-admission port still yields a reservation, uses the optional read-only
-`storage_status` probe, and uses the admission a write in the same snapshot
-actually observed. Each critical path is reported as `armed`, `unavailable`,
+a storage state transition from a read path. Storage health in the status comes
+from the optional read-only `storage_status` probe a deployment injects and
+from the admission a write in the same snapshot actually observed; without a
+probe the report says only that the port is configured. Each critical path is reported as `armed`, `unavailable`,
 or `unknown` from configured ports, that storage information, the durable
 delivery outcomes, and the injected detection health probe; no path is
 reported as healthy merely because nothing failed yet.
