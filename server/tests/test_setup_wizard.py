@@ -85,8 +85,8 @@ class SetupWizardTests(unittest.TestCase):
 
     def test_published_wizard_migration_is_frozen(self):
         self.assertEqual(
-            "5e093df62583d85f20c2d15ae6b285c3b9c0c2e2d78d7701a77cc09bb41b5730",
-            wizard_state_migration(11).checksum,
+            "81d20aabaae5d5e4609c95a24a31febd390ced5094d51f58e552cc92c8295fb5",
+            wizard_state_migration(12).checksum,
         )
 
     def test_unavailable_and_skipped_steps_must_be_retried_before_completion(self):

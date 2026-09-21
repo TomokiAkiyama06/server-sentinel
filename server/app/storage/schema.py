@@ -1,6 +1,7 @@
 """Ordered application schema; feature modules never import this catalog."""
 
 from app.audit.schema import audit_migration
+from app.cameras.remote_agent.schema import PAIRING_MIGRATION
 from app.cameras.registry.schema import REGISTRY_MIGRATION
 from app.cameras.uvc.schema import UVC_MIGRATION, uvc_explicit_binding_migration
 from app.detection.roi.schema import roi_calibration_migration
@@ -24,5 +25,6 @@ APPLICATION_MIGRATIONS = (
     presence_migration(8),
     audit_migration(9),
     uvc_explicit_binding_migration(10),
-    wizard_state_migration(11),
+    PAIRING_MIGRATION,
+    wizard_state_migration(12),
 )

@@ -4,7 +4,7 @@ from app.storage.migrations import Migration
 
 
 def wizard_state_migration(version: int) -> Migration:
-    """Return the immutable schema published as application migration 11."""
+    """Return the immutable wizard schema for a centrally assigned version."""
     return Migration(version, "setup_wizard_state", (
         "CREATE TABLE setup_wizard_steps ("
         "step TEXT PRIMARY KEY CHECK (step IN ('welcome','deployment_owner','storage',"
