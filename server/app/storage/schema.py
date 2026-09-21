@@ -7,6 +7,7 @@ from app.detection.roi.schema import roi_calibration_migration
 from app.integrity.store import integrity_migration
 from app.media.health.artifacts import recording_health_migration
 from app.media.recording.schema import recording_migration
+from app.presence.schema import presence_migration
 from app.storage.migrations import BUILTIN_MIGRATIONS
 
 
@@ -17,9 +18,9 @@ APPLICATION_MIGRATIONS = (
     recording_migration(4),
     recording_health_migration(5),
     integrity_migration(6),
-    # Version 7 is already shipped by the ROI implementation on main. Keep
-    # published migration identities stable when later feature branches meet.
     roi_calibration_migration(7),
-    audit_migration(8),
-    uvc_explicit_binding_migration(9),
+    # Version 8 is already published by the presence timeline on main.
+    presence_migration(8),
+    audit_migration(9),
+    uvc_explicit_binding_migration(10),
 )
