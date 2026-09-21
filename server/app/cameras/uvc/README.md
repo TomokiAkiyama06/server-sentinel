@@ -67,6 +67,14 @@ registry, and quality remains `unknown` until a detector evaluates it.
 Graceful shutdown closes capture without claiming a physical unplug, and it
 preserves any outstanding manual-intervention state.
 
+`LocalUvcSupervisor` supplies that worker boundary. It runs one synchronous,
+serialized thread per logical local source, contains and counts ordinary
+adapter failures without retaining exception text, and lets other source
+workers continue independently. Stop joins are bounded and failed cleanup is
+reported to the lifecycle owner; the supervisor never closes a session from a
+second thread while its capture poll may still be running. A source must be
+stopped before the audited Owner reapproval ceremony.
+
 The backend launcher does not start physical capture automatically. No physical
 webcam, actual preview/browser path, Ubuntu permission setup or arm64 host was
 tested for this change. Synthetic ioctl, persistence, unplug, restart, registry

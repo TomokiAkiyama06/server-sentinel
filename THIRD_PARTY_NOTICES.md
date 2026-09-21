@@ -65,8 +65,7 @@ license, pinning, and network review under `docs/THIRD_PARTY_POLICY.md`.
 
 If distributing any tool source or binary, retain its upstream copyright and
 license text and all applicable bundled notices, including Apache notices.
-This inventory does not replace those redistribution obligations. Existing
-Claude review automation remains documented in `docs/CLAUDE_REVIEW_SETUP.md`.
+This inventory does not replace those redistribution obligations. Claude review automation is currently disabled; its status and restoration notes are documented in `docs/CLAUDE_REVIEW_SETUP.md`.
 
 ## Optional CPU person detector (Issue #20)
 
