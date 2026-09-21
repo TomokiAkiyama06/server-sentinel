@@ -66,7 +66,13 @@ variable expansion cannot hide an installer; a positional argument may use a pat
 glob, but a requirement file value may not. A build that runs `npm run` needs a
 reviewed `package.json` beside its Dockerfile, and every package script in a
 reviewed manifest is audited with the same rules, so moving an install into a
-script body does not bypass the gate.
+script body does not bypass the gate. Node entry points used by package scripts
+must also appear in `build_scripts` with their exact SHA256 digest. The inventory
+covers every committed `.mjs`/`.cjs` build/helper and every executed `.js` entry
+point, so a new helper, a changed entry point, or a path that escapes the package
+directory fails closed. Direct
+`RUN node ...`, wrapper-based installer execution, remote or variable-expanded
+`ADD` sources, and `ONBUILD` are rejected rather than inferred safe.
 
 Only licenses in the gate's explicit permissive SPDX allowlist pass directly.
 AGPL, GPL, SSPL, BSL/source-available, proprietary, Elastic, Commons Clause,

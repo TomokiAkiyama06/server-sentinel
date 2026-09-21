@@ -32,7 +32,7 @@ from urllib.parse import unquote
 
 INVENTORY = "license/components.json"
 APPROVALS = "license/owner-approvals.json"
-SCHEMA = 2
+SCHEMA = 3
 MODEL_DIRECTORIES = {"models", "weights", "checkpoints", "model-artifacts"}
 MODEL_ASSET_PATHS = {("assets", "ml"), ("assets", "ai")}
 BUILD_OUTPUT_DIRECTORIES = {"build", "dist"}
@@ -176,7 +176,8 @@ REJECTED_PACKAGE_MANAGERS = {"bun", "npx", "pnpm", "yarn"}
 # are not one of the dependency installers handled below. Keeping this list
 # closed prevents a newly introduced package manager (for example apt-get)
 # from being mistaken for an unrelated command.
-ALLOWED_BUILD_EXECUTABLES = {"node", "tsc"}
+ALLOWED_BUILD_EXECUTABLES = {"tsc"}
+ALLOWED_NODE_FLAGS = {"--test"}
 SOURCE_SCAN_SUFFIXES = {".py", ".pyi"}
 
 
@@ -478,7 +479,30 @@ def npm_lock(path: Path, relative: str, scope: str):
     return found
 
 
-def npm_scripts(path: Path, relative: str):
+def node_command(words, index, relative, project_directory, reviewed_scripts):
+    """Allow only hash-reviewed repository scripts, never eval/stdin execution."""
+    while index < len(words) and words[index].startswith("-"):
+        if words[index] not in ALLOWED_NODE_FLAGS:
+            raise GateError(f"unreviewed node option in {relative}")
+        index += 1
+    if index >= len(words):
+        raise GateError(f"node must run a reviewed repository script in {relative}")
+    targets = words[index:]
+    for target in targets:
+        target_path = PurePosixPath(target)
+        if (not SHELL_ARGUMENT.fullmatch(target) or "://" in target
+                or target_path.is_absolute() or ".." in target_path.parts):
+            raise GateError(f"node runs an unreviewed repository script in {relative}")
+        pattern = posixpath.normpath(str(project_directory / target_path))
+        if pattern.startswith(("..", "/")):
+            raise GateError(f"node runs an unreviewed repository script in {relative}")
+        matches = {path for path in reviewed_scripts
+                   if PurePosixPath(path).match(pattern)}
+        if not matches:
+            raise GateError(f"node runs an unreviewed repository script in {relative}")
+
+
+def npm_scripts(path: Path, relative: str, reviewed_scripts):
     """Audit the package scripts an `npm run` in a build would execute."""
     data = load_json(path)
     scripts = data.get("scripts", {})
@@ -487,7 +511,8 @@ def npm_scripts(path: Path, relative: str):
     for name, body in scripts.items():
         if not isinstance(name, str) or not isinstance(body, str) or not body.strip():
             raise GateError(f"invalid script declaration in {relative}")
-        if run_commands([body], relative):
+        if run_commands([body], relative, project_directory=PurePosixPath(relative).parent,
+                        reviewed_scripts=reviewed_scripts):
             raise GateError(f"package script installs Python requirements in {relative}")
 
 
@@ -586,6 +611,8 @@ def container_file(path: Path, relative: str, scope: str):
     for words in dockerfile_words(path, relative):
         instruction = words[0].upper()
         arguments = words[1:]
+        if instruction == "ONBUILD":
+            raise GateError(f"ONBUILD instruction is not reviewed in {relative}")
         if instruction == "FROM":
             positional = [word for word in arguments if not word.startswith("--")]
             if len(positional) not in (1, 3) or (
@@ -600,7 +627,8 @@ def container_file(path: Path, relative: str, scope: str):
             if instruction == "ADD":
                 positional = [word for word in arguments if not word.startswith("--")]
                 for source in positional[:-1]:
-                    if "://" in source or source.lstrip("[\"'").startswith("git@"):
+                    if ("$" in source or "://" in source
+                            or source.lstrip("[\"'").startswith("git@")):
                         raise GateError(f"remote ADD source is not reviewed in {relative}")
             for word in arguments:
                 if not word.startswith("--from="):
@@ -712,7 +740,8 @@ def npm_command(words, index, relative):
     return command
 
 
-def run_commands(arguments, relative, scripts=None):
+def run_commands(arguments, relative, scripts=None, *, project_directory=None,
+                 reviewed_scripts=frozenset()):
     """Reject unpinned installs and report requirement files a build installs."""
     requirements = []
     scripts = scripts if scripts is not None else set()
@@ -725,21 +754,25 @@ def run_commands(arguments, relative, scripts=None):
                           else SHELL_LITERAL)
             if not expression.fullmatch(word):
                 raise GateError(f"unreviewed shell syntax in {relative}")
+        executable = PurePosixPath(words[0]).name
         classified = False
-        for index, word in enumerate(words):
-            name = PurePosixPath(word).name
-            if name in REJECTED_PACKAGE_MANAGERS:
-                raise GateError(f"unreviewed package manager in {relative}")
-            if name == "npm":
-                if npm_command(words, index + 1, relative) in NPM_SCRIPT_COMMANDS:
-                    scripts.add(relative)
-                classified = True
-                break
-            if PIP_BINARY.fullmatch(name):
-                requirements.extend(pip_command(words, index + 1, relative))
-                classified = True
-                break
-        if not classified and PurePosixPath(words[0]).name not in ALLOWED_BUILD_EXECUTABLES:
+        if executable in REJECTED_PACKAGE_MANAGERS:
+            raise GateError(f"unreviewed package manager in {relative}")
+        if executable == "npm":
+            if npm_command(words, 1, relative) in NPM_SCRIPT_COMMANDS:
+                scripts.add(relative)
+            classified = True
+        elif PIP_BINARY.fullmatch(executable):
+            requirements.extend(pip_command(words, 1, relative))
+            classified = True
+        elif (executable in {"python", "python3"} and len(words) >= 3
+              and words[1] == "-m" and PIP_BINARY.fullmatch(words[2])):
+            requirements.extend(pip_command(words, 3, relative))
+            classified = True
+        elif executable == "node" and project_directory is not None:
+            node_command(words, 1, relative, project_directory, reviewed_scripts)
+            classified = True
+        if not classified and executable not in ALLOWED_BUILD_EXECUTABLES:
             raise GateError(f"unreviewed build command in {relative}")
     return requirements
 
@@ -918,13 +951,44 @@ def container_images(root: Path, data, discovered_images):
     return len(records)
 
 
+def reviewed_build_scripts(root: Path, data):
+    """Validate the exact source files Node may execute from package scripts."""
+    records = data["build_scripts"]
+    if not isinstance(records, list):
+        raise GateError("invalid build script inventory")
+    declared = set()
+    for record in records:
+        if not isinstance(record, dict) or set(record) != {"path", "sha256"}:
+            raise GateError("invalid build script record")
+        path = relative_path(record["path"], field="build script path")
+        digest = record["sha256"]
+        if path in declared or not isinstance(digest, str) or not SHA256_DIGEST.fullmatch(digest):
+            raise GateError("invalid or duplicate build script record")
+        target = root / path
+        if target.suffix not in {".js", ".cjs", ".mjs"} or not target.is_file():
+            raise GateError("reviewed build script must name a JavaScript file")
+        actual = "sha256:" + hashlib.sha256(target.read_bytes()).hexdigest()
+        if actual != digest:
+            raise GateError(f"reviewed build script digest mismatch: {path}")
+        declared.add(path)
+    discovered = {
+        path.relative_to(root).as_posix()
+        for path in scan_paths(root)
+        if path.is_file() and path.suffix in {".cjs", ".mjs"}
+    }
+    if discovered != declared:
+        raise GateError("build script set differs from reviewed inventory")
+    return frozenset(declared)
+
+
 def audit(root: Path, inventory_path=INVENTORY):
     data = load_json(root / inventory_path)
     required_root = {"schema", "inputs", "scope_reviews", "components",
-                     "container_images", "model_scan_exemptions"}
+                     "container_images", "model_scan_exemptions", "build_scripts"}
     if not isinstance(data, dict) or set(data) != required_root or data["schema"] != SCHEMA:
         raise GateError("invalid component inventory schema")
 
+    reviewed_scripts = reviewed_build_scripts(root, data)
     inputs = data["inputs"]
     if not isinstance(inputs, list) or not inputs:
         raise GateError("inputs must be nonempty")
@@ -955,7 +1019,7 @@ def audit(root: Path, inventory_path=INVENTORY):
             discovered.extend(python_project(root / relative, relative, scope))
         elif ecosystem == "npm-project":
             discovered.extend(npm_project(root / relative, relative, scope))
-            npm_scripts(root / relative, relative)
+            npm_scripts(root / relative, relative, reviewed_scripts)
         elif ecosystem == "npm-lock":
             discovered.extend(npm_lock(root / relative, relative, scope))
         else:

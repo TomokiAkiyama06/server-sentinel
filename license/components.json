@@ -1,5 +1,39 @@
 {
-  "schema": 2,
+  "schema": 3,
+  "build_scripts": [
+    {
+      "path": "web/scripts/build.mjs",
+      "sha256": "sha256:c58434d55ae91b795ff33a92329f2cbbb15d838d9a87132367dea508df460d5f"
+    },
+    {
+      "path": "web/scripts/lint.mjs",
+      "sha256": "sha256:2a310e75add90323b6427cce5a67133679ec1e446855fc5b56a5596455ba5309"
+    },
+    {
+      "path": "web/scripts/preview.mjs",
+      "sha256": "sha256:7bbbbdf7a8fcfda1ce683ca49a8cb838ed65f21729569efb55e3b77cc2dd0d64"
+    },
+    {
+      "path": "web/tests/browser.mjs",
+      "sha256": "sha256:387361cbd80c4e4fdae2ca67210248a72adba0a159ea6a981308fa0436e69907"
+    },
+    {
+      "path": "web/tests/chrome.mjs",
+      "sha256": "sha256:291f2743dec3f117281cf62566f9551deadda0b7c90a71ab757e3d2f8142b266"
+    },
+    {
+      "path": "web/tests/compile.mjs",
+      "sha256": "sha256:ca41bbfd7ce3350a20f5ab1c0e2f32d0cbbdb79bbdde50340f690bae7084e040"
+    },
+    {
+      "path": "web/tests/core.test.mjs",
+      "sha256": "sha256:ccf4c0fd60e55790aa01339f56354050cdeed618ca6d738c18def889b085cd43"
+    },
+    {
+      "path": "web/tests/smoke.mjs",
+      "sha256": "sha256:c0f2efe915588e007c886ef35a84aff90a3f6c53eb410c226f22fe74dd05900d"
+    }
+  ],
   "inputs": [
     {
       "path": ".ci/requirements.txt",

@@ -37,6 +37,7 @@ class GateFixture(unittest.TestCase):
         self.components = [self.component()]
         self.images = []
         self.exemptions = []
+        self.build_scripts = []
         self.approvals = []
         self.save()
 
@@ -138,14 +139,25 @@ class GateFixture(unittest.TestCase):
         return value
 
     def add_npm_project(self, scripts=None):
+        scripts = scripts if scripts is not None else {"build": "node scripts/build.mjs"}
         self.write("package.json", json.dumps({
             "dependencies": {},
-            "scripts": scripts if scripts is not None else {"build": "node scripts/build.mjs"},
+            "scripts": scripts,
         }))
+        self.add_build_script("scripts/build.mjs")
+        if any("tests/*.test.mjs" in body for body in scripts.values()):
+            self.add_build_script("tests/core.test.mjs")
         self.inputs.append({
             "path": "package.json", "ecosystem": "npm-project", "scope": "frontend",
         })
         self.save()
+
+    def add_build_script(self, path, content="// synthetic reviewed script\n"):
+        self.write(path, content)
+        digest = "sha256:" + hashlib.sha256(content.encode()).hexdigest()
+        self.build_scripts = [record for record in self.build_scripts
+                              if record["path"] != path]
+        self.build_scripts.append({"path": path, "sha256": digest})
 
     def add_container(self, content="FROM demo/base:1.0@" + IMAGE_DIGEST + "\n"):
         self.write("Dockerfile.ci", content)
@@ -178,7 +190,8 @@ class GateFixture(unittest.TestCase):
 
     def save(self):
         self.write(license_gate.INVENTORY, json.dumps({
-            "schema": 2,
+            "schema": 3,
+            "build_scripts": self.build_scripts,
             "inputs": self.inputs,
             "scope_reviews": self.reviews,
             "model_scan_exemptions": self.exemptions,
@@ -941,7 +954,9 @@ class ContainerImageGateTests(GateFixture):
         for source in (
                 "https://example.test/person.onnx",
                 "git://example.test/repository.git",
-                "git@example.test:owner/repository.git"):
+                "git@example.test:owner/repository.git",
+                "$REMOTE_URL",
+                "${REMOTE_URL}/artifact"):
             with self.subTest(source=source):
                 self.write(
                     "Dockerfile.ci",
@@ -1018,7 +1033,37 @@ class ContainerImageGateTests(GateFixture):
                    "FROM demo/base:1.0@" + IMAGE_DIGEST + "\n"
                    "RUN node scripts/build.mjs\n"
                    "RUN tsc --noEmit\n")
+        with self.assertRaisesRegex(license_gate.GateError, "unreviewed build command"):
+            license_gate.audit(self.root)
+
+        self.write("Dockerfile.ci",
+                   "FROM demo/base:1.0@" + IMAGE_DIGEST + "\n"
+                   "RUN tsc --noEmit\n")
         self.assertEqual(license_gate.audit(self.root), (1, 1, 0, 1))
+
+    def test_container_build_rejects_installer_names_in_wrapper_arguments(self):
+        """An argv argument named npm or pip is not the process executable."""
+        self.add_container()
+        for command in (
+                "RUN sh /tmp/npm ci --ignore-scripts\n",
+                "RUN env npm ci --ignore-scripts\n",
+                "RUN node npm install unreviewed-package\n"):
+            with self.subTest(command=command.strip()):
+                self.write("Dockerfile.ci",
+                           "FROM demo/base:1.0@" + IMAGE_DIGEST + "\n" + command)
+                with self.assertRaisesRegex(license_gate.GateError, "unreviewed build command"):
+                    license_gate.audit(self.root)
+
+    def test_container_build_rejects_onbuild_instructions(self):
+        self.add_container()
+        for command in (
+                "ONBUILD ADD https://example.test/person.onnx /app/person.onnx\n",
+                "ONBUILD RUN npm install unreviewed-package\n"):
+            with self.subTest(command=command.strip()):
+                self.write("Dockerfile.ci",
+                           "FROM demo/base:1.0@" + IMAGE_DIGEST + "\n" + command)
+                with self.assertRaisesRegex(license_gate.GateError, "ONBUILD instruction"):
+                    license_gate.audit(self.root)
 
     def test_container_build_must_use_a_lock_driven_npm_command(self):
         """npm install aliases and option-first forms must not slip through."""
@@ -1111,6 +1156,33 @@ class ContainerImageGateTests(GateFixture):
                 with self.assertRaisesRegex(license_gate.GateError, message):
                     license_gate.audit(self.root)
 
+    def test_package_node_scripts_require_reviewed_content_hashes(self):
+        self.add_npm_project()
+        self.add_container(
+            "FROM demo/base:1.0@" + IMAGE_DIGEST + "\n"
+            "RUN npm ci --ignore-scripts\n"
+            "RUN npm run build\n")
+        self.assertEqual(license_gate.audit(self.root), (1, 1, 0, 1))
+
+        self.write("scripts/build.mjs", "await fetch('https://example.test/model.onnx');\n")
+        with self.assertRaisesRegex(license_gate.GateError, "build script digest mismatch"):
+            license_gate.audit(self.root)
+
+        self.add_build_script("scripts/build.mjs")
+        self.add_build_script("scripts/download.mjs")
+        self.write("package.json", json.dumps({
+            "dependencies": {}, "scripts": {"build": "node scripts/missing.mjs"},
+        }))
+        self.save()
+        with self.assertRaisesRegex(license_gate.GateError, "unreviewed repository script"):
+            license_gate.audit(self.root)
+
+        self.write("package.json", json.dumps({
+            "dependencies": {}, "scripts": {"build": "node ../scripts/build.mjs"},
+        }))
+        with self.assertRaisesRegex(license_gate.GateError, "unreviewed repository script"):
+            license_gate.audit(self.root)
+
     def test_container_running_package_scripts_needs_a_reviewed_manifest(self):
         self.add_container(
             "FROM demo/base:1.0@" + IMAGE_DIGEST + "\n"
@@ -1133,15 +1205,19 @@ class ContainerImageGateTests(GateFixture):
                 with self.assertRaisesRegex(license_gate.GateError, "unreviewed shell syntax"):
                     license_gate.audit(self.root)
 
-        # Quoting does not hide the installer: the command is still classified.
-        for command in ("RUN 'pip' install unreviewed-package\n",
-                        "RUN eval \"pip install unreviewed-package\"\n"):
-            with self.subTest(command=command.strip()):
-                self.write("Dockerfile.ci",
-                           "FROM demo/base:1.0@" + IMAGE_DIGEST + "\n" + command)
-                with self.assertRaisesRegex(
-                        license_gate.GateError, "reviewed requirement file"):
-                    license_gate.audit(self.root)
+        # Quoting does not hide a direct installer executable.
+        self.write("Dockerfile.ci",
+                   "FROM demo/base:1.0@" + IMAGE_DIGEST + "\n"
+                   "RUN 'pip' install unreviewed-package\n")
+        with self.assertRaisesRegex(license_gate.GateError, "reviewed requirement file"):
+            license_gate.audit(self.root)
+
+        # A shell wrapper is never trusted merely because an argument names pip.
+        self.write("Dockerfile.ci",
+                   "FROM demo/base:1.0@" + IMAGE_DIGEST + "\n"
+                   "RUN eval \"pip install unreviewed-package\"\n")
+        with self.assertRaisesRegex(license_gate.GateError, "unreviewed build command"):
+            license_gate.audit(self.root)
 
     def test_container_build_parses_attached_pip_requirement_options(self):
         """`-rvendor.lock` and `--requirement=vendor.lock` install real files."""
