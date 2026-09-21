@@ -138,7 +138,11 @@ class LocalUvcSupervisor:
         if thread.is_alive():
             raise WorkerStopError("local UVC worker did not stop")
         with self._lock:
-            self._workers.pop(source_id, None)
+            # A concurrent start may have replaced this completed worker while
+            # stop() was outside the lock joining it.  Never discard that new
+            # live lifecycle from the supervisor's registry.
+            if self._workers.get(source_id) is worker:
+                self._workers.pop(source_id)
             cleanup_failed = worker.cleanup_failed
         if cleanup_failed:
             raise WorkerStopError("local UVC worker cleanup failed")

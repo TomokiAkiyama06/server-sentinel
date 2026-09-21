@@ -48,6 +48,34 @@ class SyntheticAdapter:
             raise RuntimeError("synthetic private cleanup detail")
 
 
+class PausingLock:
+    """Pause one thread before its second critical section."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.target = None
+        self.target_acquires = 0
+        self.first_released = threading.Event()
+        self.second_entered = threading.Event()
+        self.resume = threading.Event()
+
+    def __enter__(self):
+        if threading.current_thread() is self.target:
+            self.target_acquires += 1
+            if self.target_acquires == 2:
+                self.second_entered.set()
+                if not self.resume.wait(0.5):
+                    raise RuntimeError("synthetic lock pause timed out")
+        self.lock.acquire()
+        return self
+
+    def __exit__(self, *_args):
+        self.lock.release()
+        if (threading.current_thread() is self.target
+                and self.target_acquires == 1):
+            self.first_released.set()
+
+
 class LocalUvcSupervisorTests(unittest.TestCase):
     def setUp(self):
         self.adapter = SyntheticAdapter()
@@ -146,6 +174,35 @@ class LocalUvcSupervisorTests(unittest.TestCase):
         self.adapter.stop_failures.clear()
         self.adapter.prepare(source)
         self.assertTrue(self.supervisor.start(source))
+
+    def test_stop_does_not_discard_concurrent_replacement_worker(self):
+        source = uuid4()
+        self.adapter.prepare(source)
+        self.supervisor.start(source)
+        self.assertTrue(self.adapter.entered[source].wait(0.2))
+
+        lock = PausingLock()
+        self.supervisor._lock = lock
+        stopped = []
+        stopper = threading.Thread(
+            target=lambda: stopped.append(self.supervisor.stop(source)),
+        )
+        lock.target = stopper
+        stopper.start()
+        self.assertTrue(lock.first_released.wait(0.2))
+
+        self.adapter.release[source].set()
+        self.assertTrue(lock.second_entered.wait(0.2))
+        self.adapter.prepare(source)
+        self.assertTrue(self.supervisor.start(source))
+        self.assertTrue(self.adapter.entered[source].wait(0.2))
+
+        lock.resume.set()
+        stopper.join(0.2)
+        self.assertFalse(stopper.is_alive())
+        self.assertEqual([True], stopped)
+        self.assertTrue(self.supervisor.status(source).running)
+        self.assertTrue(self.supervisor.stop(source))
 
 
 if __name__ == "__main__":
