@@ -85,7 +85,24 @@ exchanges the resulting temporary code for sensitive App configuration. No
 manifest exchange or credential generation was attempted here.
 [GitHub: registering an App from a manifest](https://docs.github.com/en/apps/sharing-github-apps/registering-a-github-app-from-a-manifest).
 
-## Trusted collector and publisher contract (not implemented)
+## Trusted collector and publisher contract
+
+The checked-in foundation now contains no-network publisher primitives:
+`receipt_summary(context, reviewer)` and
+`successful_check_run_request(context, reviewer)`. They produce a canonical,
+bounded receipt and the only successful Check Run request shape. They bind the
+fixed reviewer name and every context field and target the current test-merge
+SHA. They take neither an App identity nor a credential, cannot select another
+target, and do not accept a caller-provided conclusion.
+
+They are **not** a GitHub client or a review provider adapter. The self-hosted
+deployment still needs an Owner-operated collector that verifies reviewer
+provenance and a separately reviewed App-authenticated delivery adapter. It
+must call the primitive only after the corresponding review has passed and
+after it has re-read the same live context. Any unavailable provider, unknown
+review result, stale context, or delivery error leaves the required check
+absent or blocking; it must never turn an error into `neutral`, `skipped`, or
+`success`.
 
 The publisher must execute reviewed, pinned code and load policy from its trusted
 deployment, never from the PR. Neither same-repository nor fork code may run with
