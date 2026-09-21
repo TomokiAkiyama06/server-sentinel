@@ -1051,10 +1051,11 @@ ServerSentinel permission revocation invalidates application access promptly. Ta
 
 ### 11.8 Owner bootstrap and session decision status
 
-[ADR-0003](docs/ADR/0003-owner-authentication-and-trusted-proxy.md) is a
-**Proposed** implementation design for Issue #6, pending explicit Owner approval.
-Its timeout values, exact identity binding, local bootstrap, and recovery choices
-are not accepted product defaults. Until approval and Issue #10 implementation,
+[ADR-0003](docs/ADR/0003-owner-authentication-and-trusted-proxy.md) records the
+Owner-approved human-access design for Issue #6. Its 30-minute idle and 12-hour
+absolute session lifetimes are product defaults; sessions fail closed when time
+regresses before establishment or the last accepted activity. Until Issue #10
+implements the full boundary,
 the backend shell denies human requests, including application assets,
 health/version/schema, and SPA/error fallbacks. Issue #8's static shell remains
 a development/mock artifact until integrated with this protected delivery path.
