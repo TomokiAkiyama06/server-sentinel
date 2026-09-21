@@ -136,6 +136,11 @@ def _private_directory(path: Path, uid: int, forbidden_roots: tuple[Path, ...]) 
     if (not resolved.is_dir() or info.st_uid != uid or info.st_mode & 0o077
             or any(resolved.is_relative_to(root) for root in forbidden)):
         raise ConfigurationError("runtime directory failed ownership or location checks")
+    # Owner-only modes such as 0o000 or 0o500 also pass the group/other check
+    # while making every later recording or audit write fail, so readiness
+    # would be announced for a runtime tree the service cannot actually use.
+    if info.st_mode & 0o700 != 0o700:
+        raise ConfigurationError("runtime directory is not readable and writable by the service")
     return resolved
 
 
@@ -186,7 +191,16 @@ class Deployment:
             raise ConfigurationError("invalid runtime filesystem identity")
         approved_device = _approved_filesystem_device(value["runtime_filesystem_uuid"])
         try:
-            mount_point = Path(value["runtime_mount_point"]).resolve(strict=True)
+            configured_mount = Path(value["runtime_mount_point"])
+        except (TypeError, ValueError):
+            raise ConfigurationError("invalid runtime filesystem identity") from None
+        # resolve() would silently anchor a relative value to the caller's
+        # current directory, which differs between the administrator running
+        # the installer and the service resolving it from the release tree.
+        if not configured_mount.is_absolute():
+            raise ConfigurationError("runtime_mount_point must be absolute")
+        try:
+            mount_point = configured_mount.resolve(strict=True)
             mount_info = mount_point.stat()
             root_info = runtime_root.stat()
             operating_system_root_device = _operating_system_root_device()
@@ -196,7 +210,7 @@ class Deployment:
             raise ConfigurationError("runtime mount must not be root filesystem")
         if root_info.st_dev == operating_system_root_device:
             raise ConfigurationError("runtime mount must not use root filesystem device")
-        if (not mount_point.is_absolute() or not mount_point.is_dir()
+        if (not mount_point.is_dir()
                 or not os.path.ismount(mount_point)
                 or not runtime_root.is_relative_to(mount_point)
                 or root_info.st_dev != mount_info.st_dev

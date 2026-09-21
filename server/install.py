@@ -375,11 +375,15 @@ def _create_unit(path: Path, content: str, *, mode=0o644) -> None:
         path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW, mode
     )
     try:
+        # The directory fsync belongs inside the guard: a failure after the
+        # unit exists would otherwise leave it behind while the caller's
+        # recovery removes only the staged release, so every retry would be
+        # rejected as already installed.
         _write_unit_descriptor(descriptor, encoded, mode)
+        _fsync_directory(path.parent)
     except BaseException:
         path.unlink(missing_ok=True)
         raise
-    _fsync_directory(path.parent)
 
 
 def _replace_unit(path: Path, content: str, *, mode=0o644) -> None:

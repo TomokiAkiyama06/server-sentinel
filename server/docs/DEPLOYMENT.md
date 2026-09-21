@@ -35,7 +35,11 @@ repository checkout.
 
 Create a dedicated non-root account and an Owner-selected runtime filesystem.
 Create `state`, `recordings`, and `audit` directories on it; all four
-directories must be private and owned by the service account. The installer
+directories must be private and owned by the service account, and must keep
+owner read, write and execute permission (mode `0700`). A directory that is
+owned by the service account but not writable by it — `0500`, for example — is
+refused, because readiness would otherwise be announced for a runtime tree that
+later recording or audit writes cannot use. The installer
 never creates these paths and never substitutes the checkout, installation tree,
 or a directory left on the root filesystem by a missing mount.
 
@@ -77,6 +81,11 @@ reformatting or swapping the disk changes it even when the mount path, the
 directory layout and the Linux device numbers are reused, so the replacement is
 refused instead of written to. Read it with `lsblk -no UUID <device>` or
 `blkid`, and record it only in this private configuration.
+
+`runtime_mount_point` must be an absolute path. A relative value would resolve
+against whichever directory the caller happens to be in, which differs between
+the administrator running the installer and the service resolving it from the
+release tree, so it is refused.
 
 `runtime_device` records the decimal Linux major/minor numbers of the same
 filesystem. It corroborates the UUID and catches a missing mount that leaves a

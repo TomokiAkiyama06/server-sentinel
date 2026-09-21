@@ -156,6 +156,12 @@ Runtime-data assumptions:
 - an existing `--destination` is adopted only when it is empty or already a
   ServerSentinel installation root, so a mistyped destination such as `/root`
   is never relaxed to mode `0755`;
+- each runtime directory must be owned by the dedicated account and keep owner
+  read, write and execute permission, so a runtime tree the service could not
+  actually write is refused instead of being reported as ready;
+- the runtime mount point must be configured as an absolute path, because a
+  relative one would identify different mounts for the administrator and for
+  the service;
 - the Owner-approved runtime filesystem is pinned by a stable filesystem UUID.
   Linux major/minor device numbers are reused by a replaced or reformatted disk,
   so they only corroborate that identity. A runtime mount that is missing,

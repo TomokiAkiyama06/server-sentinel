@@ -812,6 +812,60 @@ class ReleaseLifecycleTests(unittest.TestCase):
         self.assertFalse((self.installation / "releases/1.1.0").exists())
         self.assertEqual(os.readlink(self.installation / "current"), "releases/1.0.0")
 
+    def test_runtime_directories_must_stay_usable_by_the_service_account(self):
+        # Owner-only modes such as 0o000 or 0o500 pass a group/other check but
+        # make later recording or audit writes fail, so readiness would be
+        # announced for a runtime tree the service cannot actually use.
+        for name in ("state", "recordings", "audit"):
+            for mode in (0o000, 0o500, 0o600):
+                directory = self.runtime / name
+                directory.chmod(mode)
+                try:
+                    with self.subTest(directory=name, mode=oct(mode)):
+                        with self.assertRaisesRegex(
+                                ConfigurationError, "readable and writable by the service"):
+                            self.perform(self.arguments("rollback"))
+                        self.assertFalse((self.installation / "releases").exists())
+                finally:
+                    directory.chmod(0o700)
+        self.runtime.chmod(0o500)
+        try:
+            with self.assertRaisesRegex(
+                    ConfigurationError, "readable and writable by the service"):
+                self.perform(self.arguments("rollback"))
+        finally:
+            self.runtime.chmod(0o700)
+        self.assertFalse((self.installation / "releases").exists())
+
+    def test_relative_runtime_mount_point_is_rejected_before_resolution(self):
+        # resolve() would anchor a relative value to whichever directory the
+        # caller happens to be in, which differs between the administrator and
+        # the service resolving it from the release tree.
+        value = json.loads(self.config.read_text())
+        value["runtime_mount_point"] = os.path.relpath(self.root, "/")
+        self.config.write_text(json.dumps(value))
+        self.config.chmod(0o600)
+        previous = Path.cwd()
+        try:
+            os.chdir("/")
+            with self.assertRaisesRegex(ConfigurationError, "must be absolute"):
+                self.perform(self.arguments("rollback"))
+        finally:
+            os.chdir(previous)
+        self.assertFalse((self.installation / "releases").exists())
+
+    def test_failed_unit_directory_fsync_leaves_no_unit_behind(self):
+        arguments = self.arguments("install", "1.0.0")
+        with patch("install._fsync_directory", side_effect=OSError("synthetic fsync failure")):
+            with self.assertRaises(OSError):
+                self.perform(arguments)
+        # A retry must not be rejected as already installed.
+        self.assertFalse(self.unit.exists())
+        self.assertFalse((self.installation / "releases/1.0.0").exists())
+        self.perform(arguments)
+        self.assertEqual(os.readlink(self.installation / "current"), "releases/1.0.0")
+        self.assertEqual(self.unit.stat().st_mode & 0o777, 0o644)
+
     def test_python_interpreter_must_be_absolute_and_root_controlled(self):
         candidate = self.root / "python"
         candidate.write_text("synthetic")
