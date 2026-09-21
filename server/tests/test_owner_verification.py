@@ -2,12 +2,13 @@
 
 from contextlib import contextmanager
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import TestCase
 from unittest.mock import patch
 from uuid import UUID, uuid4
+import asyncio
 import json
 import os
 import socket
@@ -19,6 +20,7 @@ from app.detection.owner.contracts import (Comparison, DenyOwner, FaceCandidate,
                                            Operation, OwnerError, Verdict, VerificationReason)
 from app.detection.owner.service import OwnerVerificationService
 from app.detection.owner.store import _MIGRATIONS, EnrollmentStatus, OwnerTemplateStore
+from app.audit.runtime import AuditRetentionRuntime
 from app.detection.quality import Execution, QualityGate
 from tests.test_detector_quality import SOURCE, assess, calibrated_policy, context, synthetic_person
 
@@ -152,6 +154,36 @@ class OwnerTests(TestCase):
         self.store = self.open_store()
         self.assertFalse(self.store.status().enrolled)
         self.assertEqual(self.store.status().generation, 3)
+
+    def test_private_audit_retention_is_bounded_and_preserves_template(self):
+        retention_now = datetime.now(timezone.utc)
+        self.assertEqual(self.service.enroll(
+            self.candidate, self.gate, self.decision,
+            expected_generation=0, at=retention_now,
+        ).generation, 1)
+        old = (retention_now - timedelta(days=91)).isoformat()
+        boundary = (retention_now - timedelta(days=89)).isoformat()
+        actor = str(UUID(int=123))
+        self.store._db.execute(
+            "INSERT INTO owner_template_audit(at,actor,operation,generation) VALUES(?,?,?,?)",
+            (old, actor, Operation.REPLACE, 2),
+        )
+        self.store._db.execute(
+            "INSERT INTO owner_template_audit(at,actor,operation,generation) VALUES(?,?,?,?)",
+            (boundary, actor, Operation.REPLACE, 3),
+        )
+
+        # The production scheduler invokes the private store on its bounded
+        # worker; use that same cross-thread maintenance path here.
+        self.assertEqual(1, asyncio.run(
+            AuditRetentionRuntime(self.store).startup_cleanup()
+        ))
+        rows = self.store._db.execute(
+            "SELECT at FROM owner_template_audit ORDER BY at"
+        ).fetchall()
+        self.assertEqual([boundary, retention_now.isoformat()],
+                         [row["at"] for row in rows])
+        self.assertEqual(EnrollmentStatus(True, 1), self.store.status())
 
     def test_replacement_never_uses_old_template(self):
         self.enroll()

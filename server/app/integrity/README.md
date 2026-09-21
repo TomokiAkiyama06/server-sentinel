@@ -46,7 +46,13 @@ omit private values from repr; notifications contain no raw inventory.
 `OwnerApproval.require_owner()` denies by default. Its trusted implementation
 returns a validated application-principal UUID, never a caller-controlled owner
 boolean. Approval checks the expected revision and atomically updates/audits the
-baseline. Polling never updates it. This domain boundary does not decide the
+baseline. `approve_on()` is the only approval primitive and opens no transaction
+of its own: the audited boundary
+`app.audit.integration.OwnerAdministration.approve_integrity_baseline()`
+authorizes the Owner, holds the storage reservation and commits the new
+baseline, its integrity approval row and the `approve_hardware_baseline`
+security audit record in one transaction, so a baseline change cannot commit
+without its durable audit record. Polling never updates it. This domain boundary does not decide the
 pending bootstrap/session/recovery policy or expose a human route.
 
 `IntegrityService.startup()` always compares. The owning worker calls `tick()`
@@ -72,8 +78,9 @@ A later healthy status cannot erase these warnings.
 Reserved acknowledgement transactions promote overflow into the normal outbox
 with the fixed `COALESCED_PENDING_WARNING` reason and fresh monotonic event IDs;
 the sink must continue draining on subsequent ticks. Retry drains pending events
-before another observation. The durable #21 sink owns fault history and its retention; approval
-audit retention also needs that integration before deployment.
+before another observation. The durable #21 sink owns fault history and its retention. Hardware
+approval rows in `integrity_audit` use the Main audit runtime's 90-day cleanup;
+that cleanup never changes the approved baseline, current status or fault outbox.
 
 Tests only read generated procfs/sysfs fixtures in temporary directories and
 inject command output. They never inspect the test runner's real inventory.

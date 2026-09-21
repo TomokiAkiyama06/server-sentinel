@@ -52,9 +52,12 @@ The adapter bounds allocations to eight buffers of at most 64 MiB each and
 returns one frame at a time without a decoded-frame history, disk recording,
 network connection or audio operation. Driver-corrupt/empty frames are rejected.
 
-`LocalUvcAdapter` connects these parts to the generic registry. An authenticated
-Owner boundary must call `approve_source()` with an exact current selection;
-the adapter exposes no HTTP management or preview route. A supervisor drives
+`LocalUvcAdapter` connects these parts to the generic registry. An Owner
+approval reaches it only through the audited boundary
+`OwnerAdministration.approve_uvc()`, which validates the exact current
+selection before its transaction and commits the approval with its
+`approve_camera` audit record; the adapter exposes no unaudited public
+approval, and no HTTP management or preview route. A supervisor drives
 `poll_source()` in each source's worker and serializes operations on that source.
 The injected frame callback can feed an authorized preview or later media
 pipeline; actual browser viewing remains a downstream task. Discovery and

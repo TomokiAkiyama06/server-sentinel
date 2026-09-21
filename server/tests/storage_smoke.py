@@ -5,6 +5,10 @@ from uuid import uuid4
 from zoneinfo import ZoneInfo
 import zlib
 
+from app.audit import AuditStore, OwnerAuditService
+from app.audit.integration import OwnerAdministration
+from app.audit.schema import audit_migration
+from app.cameras.registry import CameraRegistry
 from app.media.recording import Limits, RecordingError, RecordingStore, RootIdentity, Segment
 from app.media.recording.schema import recording_migration
 from app.notifications.schedule import DailySummaryScheduler, notification_migration
@@ -18,13 +22,21 @@ from tests.test_recording import SyntheticValidator
 from tests.test_storage_notifications import Transport, endpoint, summary
 
 
+class SyntheticOwner:
+    """Stands in for the Issue #6 Owner boundary in this offline scenario."""
+
+    def require_owner(self, actor_context):
+        if actor_context != 'synthetic-owner':
+            raise PermissionError('not the deployment owner')
+
+
 def run_storage_smoke(base, scenario):
     root = base / 'policy-media'
     root.mkdir(mode=0o700)
     metadata = base / 'policy-metadata.sqlite'
     db = Database(metadata).connect()
     try:
-        migrate(db, BUILTIN_MIGRATIONS + (recording_migration(len(BUILTIN_MIGRATIONS) + 1), storage_audit_migration(len(BUILTIN_MIGRATIONS) + 2), notification_migration(len(BUILTIN_MIGRATIONS) + 3)))
+        migrate(db, BUILTIN_MIGRATIONS + (recording_migration(len(BUILTIN_MIGRATIONS) + 1), storage_audit_migration(len(BUILTIN_MIGRATIONS) + 2), notification_migration(len(BUILTIN_MIGRATIONS) + 3), audit_migration(len(BUILTIN_MIGRATIONS) + 4)))
         identity = RootIdentity(root.stat().st_dev, root.stat().st_ino)
         checker = ExpectedFilesystem(root, identity, metadata)
         policy = MainStoragePolicy(StorageLimits(100_000, 10_000, 4096, 8192, 16_384, 90_000,
@@ -41,13 +53,22 @@ def run_storage_smoke(base, scenario):
                                  zlib.compress(b'generated geometric test payload' * 4)))
             store.finish(recording)
             store.release_source(source)
-            browser = RecordingBrowser(store, lambda _: None, policy.guard_metadata)
+            security_audit = AuditStore(Database(metadata), reservation=store.control_reservation)
+            administration = OwnerAdministration(
+                OwnerAuditService(security_audit, SyntheticOwner()), CameraRegistry(Database(metadata)),
+            )
+            browser = RecordingBrowser(store, lambda _: None, policy.guard_metadata,
+                                       administration=administration)
             if scenario == 'normal':
-                browser.star(recording, True)
+                browser.star(recording, True, actor_context='synthetic-owner')
                 assert RetentionService(store).oldest(10) == 0
                 assert browser.list()[0]['starred']
-                assert browser.delete(recording) > 0
+                assert browser.delete(recording, actor_context='synthetic-owner') > 0
                 assert browser.list() == ()
+                # Owner recording changes carry their security/admin records.
+                assert [record.outcome.value for record in security_audit.list_records()] == [
+                    'succeeded', 'succeeded',
+                ]
             else:
                 root.rename(base / 'policy-detached')
                 try:
