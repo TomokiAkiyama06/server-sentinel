@@ -19,8 +19,12 @@ UNKNOWN = "unknown"
 
 class PresenceService:
     def __init__(self, database, *, access=None, evidence=None, notifications=None,
-                 reservation=None, detection=None, storage_status=None):
+                 reservation=None, detection=None, storage_status=None,
+                 periods: RetentionPeriods = RetentionPeriods()):
+        if not isinstance(periods, RetentionPeriods):
+            raise ValueError("retention periods required")
         self.database = database
+        self.periods = periods
         self.access = access or DenyAccess()
         self.evidence = evidence
         self.notifications = notifications
@@ -316,6 +320,35 @@ class PresenceService:
                        "VALUES ('critical_degradation_cleared',?,?,NULL,?)",
                        (actor, timestamp(now), action))
 
+    def clear_unresolved_critical_event(self, context, identifier, *, now, clock_trusted):
+        """Owner-confirmed release of retained unresolved critical work.
+
+        This is an explicit out-of-band resolution, never a successful delivery:
+        unresolved actions keep their action-only degradation markers while the
+        observation payload and delivery rows are released.  The identity
+        tombstone prevents a delayed replay from resubmitting the work.
+        """
+        actor = self._owner(context)
+        if not isinstance(identifier, UUID):
+            raise ValueError("invalid critical observation identity")
+        with self._transaction() as db:
+            if not self._control_clock(db, now, clock_trusted):
+                raise ValueError("trusted control timestamp required")
+            rows = db.execute("SELECT action FROM presence_deliveries WHERE observation=? "
+                              "AND state NOT IN ('delivered','disabled')", (str(identifier),)).fetchall()
+            if not rows:
+                raise ValueError("no unresolved critical event")
+            db.execute("INSERT OR IGNORE INTO presence_completed_events(id,expired_at) VALUES (?,?)",
+                       (str(identifier), timestamp(now)))
+            db.executemany("INSERT INTO presence_expired_unresolved(action,events,since) VALUES (?,1,?) "
+                           "ON CONFLICT(action) DO UPDATE SET events=events+excluded.events",
+                           [(row["action"], timestamp(now)) for row in rows])
+            db.execute("DELETE FROM presence_deliveries WHERE observation=?", (str(identifier),))
+            db.execute("DELETE FROM presence_observations WHERE id=?", (str(identifier),))
+            db.execute("INSERT INTO presence_audit(action,actor,at,state,target) "
+                       "VALUES ('critical_event_cleared',?,?,NULL,?)",
+                       (actor, timestamp(now), str(identifier)))
+
     def dispatch_pending(self, *, limit=100):
         if type(limit) is not int or not 1 <= limit <= 500:
             raise ValueError("invalid dispatch limit")
@@ -565,7 +598,7 @@ class PresenceService:
         """
         if type(limit) is not int or not 1 <= limit <= 1000:
             raise ValueError("invalid audit retention limit")
-        cutoff = timestamp(utc(now) - timedelta(days=RetentionPeriods().audit_days))
+        cutoff = timestamp(utc(now) - timedelta(days=self.periods.audit_days))
         with self._transaction() as db:
             cursor = db.execute("DELETE FROM presence_audit WHERE sequence IN "
                                 "(SELECT sequence FROM presence_audit WHERE at<? "
@@ -600,9 +633,8 @@ class PresenceService:
         """
         if type(limit) is not int or not 1 <= limit <= 1000:
             raise ValueError("invalid timeline retention limit")
-        periods = RetentionPeriods()
-        cutoff = timestamp(utc(now) - timedelta(days=periods.recording_days))
-        horizon = timestamp(utc(now) - timedelta(days=periods.audit_days))
+        cutoff = timestamp(utc(now) - timedelta(days=self.periods.recording_days))
+        horizon = timestamp(utc(now) - timedelta(days=self.periods.audit_days))
         with self._transaction() as db:
             rows = db.execute("SELECT item.id FROM presence_observations item "
                               "WHERE (item.received<? AND NOT EXISTS (SELECT 1 FROM presence_deliveries job "

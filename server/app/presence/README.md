@@ -74,7 +74,11 @@ this payload to a `live:view` identity. `complete_action()` is an internal
 worker callback with no authorization or audit of its own, and an unscoped
 call can return a degraded path to `armed`. It must never be registered as a
 route; Owner-facing recovery goes through the audited `requeue_action()` and
-`clear_expired_degradation()`, which require an Owner identity.
+`clear_expired_degradation()` and `clear_unresolved_critical_event()`, which
+require an Owner identity. The latter is an audited, explicit resolution of a
+retained event before the audit horizon: it releases its timeline payload and
+pending delivery rows, preserves only action-level degradation markers, and
+adds an identity tombstone so a delayed replay cannot recreate the work.
 
 The status snapshot does not create a presence write, so a refused or exhausted
 storage volume cannot hide presence state or unfinished critical work. It never
@@ -92,7 +96,8 @@ liveness guarantee for an external worker. An expired manual override stops
 applying even when its durable retirement write is refused, and the snapshot
 reports that retirement as still pending.
 
-Owner-control audit records use the main 90-day audit retention period. The
+Owner-control audit records and presence timeline use the deployment's shared
+`RetentionPeriods`; there is no independent presence default. Owner-control audit records use the main 90-day audit retention period. The
 maintenance operation is bounded and deletes the oldest expired rows first.
 Timeline observations use the main 20-day recording-retention period. Only a
 confirmed movement/tamper event with unfinished critical delivery keeps its own

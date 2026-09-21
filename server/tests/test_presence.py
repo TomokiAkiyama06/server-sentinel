@@ -603,6 +603,42 @@ class PresenceTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "timeline retention"):
             self.service.expire_history(now=NOW + timedelta(days=21), limit=1001)
 
+    def test_presence_retention_uses_the_deployment_periods(self):
+        self.service = self.make_service(periods=RetentionPeriods(recording_days=2, audit_days=5))
+        self.service.record(observation(Kind.PERSON, confirmed=False))
+        self.service.override("owner", PresenceState.ABSENT, now=NOW, clock_trusted=True)
+        # The explicit override records one control observation as well.
+        self.assertEqual(2, self.service.expire_history(now=NOW + timedelta(days=3)))
+        self.assertEqual([], self.history()["items"])
+        self.assertEqual(1, self.service.expire_audit(now=NOW + timedelta(days=6)))
+        self.assertEqual([], self.service.audit("owner"))
+
+    def test_owner_can_clear_retained_unresolved_critical_event_before_audit_horizon(self):
+        event = self.service.record(observation(Kind.CAMERA_TAMPER, identifier=UUID(int=212)))
+        self.service.complete_action(event.identifier, "evidence", ActionResult.DELIVERED)
+        self.service.complete_action(event.identifier, "notification", ActionResult.FAILED)
+        later = NOW + timedelta(days=RetentionPeriods().recording_days + 1)
+        # Failed critical work retains the timeline payload until Owner recovery
+        # or the audit horizon; normal expiry cannot discard it.
+        self.assertEqual(0, self.service.expire_history(now=later))
+        self.assertEqual([str(event.identifier)], [item["id"] for item in self.history()["items"]])
+
+        self.service.clear_unresolved_critical_event("owner", event.identifier,
+                                                     now=later, clock_trusted=True)
+        self.assertEqual([], self.history()["items"])
+        status = self.status(now=later)
+        self.assertEqual("armed", status["critical_evidence"])
+        self.assertEqual("unavailable", status["critical_notifications"])
+        cleared = self.service.audit("owner")[-1]
+        self.assertEqual((cleared["action"], cleared["target"]),
+                         ("critical_event_cleared", str(event.identifier)))
+        # The retained identity tombstone makes a delayed replay a no-op.
+        self.service.record(observation(Kind.CAMERA_TAMPER, identifier=event.identifier))
+        self.assertEqual([], self.history()["items"])
+        with self.assertRaisesRegex(ValueError, "no unresolved critical event"):
+            self.service.clear_unresolved_critical_event("owner", event.identifier,
+                                                         now=later, clock_trusted=True)
+
     def test_history_bounded_cursor_prevents_duplicate_rows(self):
         for _ in range(3):
             self.service.record(observation(Kind.PERSON, confirmed=False))
