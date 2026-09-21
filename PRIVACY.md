@@ -25,6 +25,15 @@ There is no required ServerSentinel developer cloud/account/data plane.
 
 ## Developer data collection
 
+The Agent disk-ring core keeps segment bytes and its interval/protection ledger
+on deployment-configured local storage. It introduces no network client, remote
+reporting or media export. Completed incident protection expires after 60 days; media is removed when no
+other incident or selected ordinary-ring reference retains it.
+clock uncertainty suspends automatic deletion and is reported explicitly.
+Deleted-incident tombstones expose deletion state to the future authorized UI;
+the core does not enable that UI or a playback/download route. Synthetic tests
+use generated compressed patterns, not real camera/room/person media.
+
 The internal recording store writes compressed media and source/event/integrity
 metadata only to deployment-local storage. It has no network client, telemetry,
 codec download or export endpoint. Tests generate compressed non-video bytes in
@@ -104,11 +113,15 @@ This is biometric processing. Therefore:
 - verification is probabilistic;
 - insufficient visual quality returns `unknown` rather than a forced match/non-match.
 
+The internal #25 store keeps one Owner template and local model provenance in a separate deployment-private database. Owner-authorized replacement/deletion advances its generation so previous templates/results are no longer accepted. Diagnostic snapshots expose only enrollment state and generation; the private database, journals and backups are excluded from all diagnostic exports, even explicit Owner exports. `secure_delete` is a logical database deletion aid, not a promise of forensic SSD/backup erasure. No face model/weights or external-biometric-service option is installed. Generated test adapters do not establish recognition accuracy.
+
 ## Other observed people
 
 The MVP must not enroll or name non-owner people or maintain persistent facial identity profiles for them, whether named or anonymous.
 
 Other people may receive anonymous/ephemeral track IDs for limited event correlation. Cross-camera biometric re-identification is outside MVP scope.
+
+The internal same-camera tracker retains only bounded transient positions and random session-local IDs. Quality tickets use weak references to the exact immutable candidate and do not retain extra crops or face fingerprints. Resetting a session clears tracking/verification receipts; the verifier must release candidate/intermediate data after success or failure. Neither anonymous IDs nor verification results create a persistent non-owner face library.
 
 The system must not label a person as thief, attacker, culprit, or cause merely because they appeared near a critical event.
 
@@ -134,6 +147,8 @@ Defaults:
 
 Starred recordings may outlive normal recording retention.
 
+Timeline metadata for a confirmed server-movement or camera-tamper event whose evidence preservation or owner notification has not completed also outlives the recording default, until that action completes or the owner clears it and at most until the audit-log retention period. This never extends the retention of recorded video, thumbnails, ordinary person/motion observations, or an action the deployment durably disabled, and after that bound only the event identity and a count that the action never completed remain, with no observation content.
+
 Non-owner face crops, templates/embeddings, and facial profiles must not be stored as separate persistent libraries. People may still appear in ordinary configured video recordings subject to recording authorization and retention; this does not permit building a persistent facial identity library from those recordings.
 
 ## Capture-agent local storage
@@ -149,6 +164,12 @@ in the deployment's private application database. Normal UVC health/audit
 callbacks expose only logical source IDs, state and fixed reason codes. Captured
 video bytes are excluded from object representations and no frame is written to
 disk or uploaded by the UVC adapter itself. Downstream media policies still apply.
+
+The implementation's local fault status/outbox contains component categories,
+comparison states and fixed reasons, excluding serials, UUIDs, paths and media.
+Raw approved observations remain in the deployment-local baseline and omit
+private values from repr. Self-test reports contain only fixed state/stage codes;
+the temporary-file journal is separate from ordinary recording records.
 
 The Main Server keeps its Owner-approved hardware baseline and detailed hardware identifiers deployment-local. Normal operational logs and general diagnostics redact or hash serials/UUIDs; raw identifiers are excluded from public diagnostics and GitHub artifacts. Any detailed diagnostic export requires an explicit Owner action and does not authorize automatic upload. Bounded recording-health self-test media stays local and is never uploaded. Delete self-test-owned temporary/partial media after success, failure, or cancellation, and clean interrupted-test leftovers at the next startup before creating new self-test media. Cleanup verifies the expected filesystem and self-test ownership; it never deletes ordinary recordings or protected incidents. If cleanup is unsafe or fails, report failure and block further self-test media writes until safe cleanup succeeds. Leftovers count against storage admission and the safety reserve; they are not retained diagnostic media.
 
@@ -169,6 +190,10 @@ Diagnostics remain local unless explicitly exported/shared.
 
 Exports redact/exclude credentials, pairing secrets, private keys, and sensitive headers. Owner biometric templates/embeddings are always excluded, including when the Owner explicitly initiates an export. Raw monitoring media is excluded unless the Owner explicitly selects it for export; that media exception does not authorize template/embedding export or external biometric processing/storage.
 
+Creating a support bundle never deletes recordings: a diagnostic export reserves space without running retention, and a deployment without free space is refused instead of reclaiming monitoring evidence.
+
+Only the deployment Owner may start an export or select media for one. An invited non-Owner identity that satisfies the general human access boundary is refused before diagnostics are collected and before any selected-media identifier is looked up, so an export route cannot be used to probe which media exist. A bundle whose Owner request is cancelled before the Owner receives its name is removed from local storage instead of being left readable.
+
 ## Public repository safety
 
 Repository/CI media fixtures are synthetic/generated only. Real-person or real-environment monitoring media is not committed or attached to GitHub, including merely publicly licensed real-person media. External benchmark datasets may be used locally under their own terms and are not repository fixtures.
@@ -180,5 +205,15 @@ The deployment owner is responsible for camera placement and compliance with app
 ## Future changes
 
 Any feature that sends monitoring/biometric data to infrastructure operated by the ServerSentinel developer is a fundamental privacy-model change and requires explicit owner approval plus updated requirements/security/privacy documentation before implementation.
+
+The Issue #24 ROI/tamper core keeps its calibration history as metadata only:
+identities, Owner polygon, policy, reference geometry, version, timestamp and
+the reference SHA-256. No reference frame, crop or other decoded monitoring
+media is written to that history, so it cannot become a persistent still-image
+store outside recording authorization and retention. Restoring a calibration
+re-binds an Owner-supplied transient frame that must match the stored digest
+and geometry. Its scene-change measurements are bounded scalars and never
+person identities, and a detector that cannot register a scene reliably reports
+`unknown` rather than a trustworthy "no tamper".
 
 The Issue #20 detector foundation keeps only bounded transient grayscale samples and a previous motion sample per source. It performs no model download, persistence or network I/O; unavailable person inference remains `unknown`. Model/runtime adoption and their separate privacy/license acceptance are documented in `server/docs/DETECTOR_MODEL_AUDIT.md`; synthetic primitive tests are not acceptance of an external model.

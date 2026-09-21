@@ -60,9 +60,11 @@ class RecordingTests(unittest.TestCase):
         self.addCleanup(self.db.close)
         migrate(self.db, APPLICATION_MIGRATIONS)
         self.assertEqual(
-            self.db.execute("SELECT version, name FROM schema_migrations ORDER BY version").fetchall(),
-            [(1, "foundation"), (2, "camera_registry"), (3, "uvc_identity"),
-             (4, "durable_recording")],
+             self.db.execute("SELECT version, name FROM schema_migrations ORDER BY version").fetchall(),
+             [(1, "foundation"), (2, "camera_registry"), (3, "uvc_identity"),
+              (4, "durable_recording"), (5, "recording_health"),
+             (6, "hardware_integrity"), (7, "roi_calibration_history"),
+             (8, "presence_timeline")],
         )
         self.policy = Reservation()
         self.validator = SyntheticValidator()

@@ -10,10 +10,10 @@ Phases group capabilities rather than imposing a strict completion order. The de
 - [ ] specifications committed
 - [ ] issue/PR templates
 - [x] CI/repository guards, synthetic regression tests, and conditional component checks (#5; see `docs/CI.md`)
-- [ ] dependency/model license policy
+- [ ] dependency/model license compliance gate (#51)
 - [ ] hardened review gate #4: capability assessment, offline policy tests and disabled ruleset generator prepared; Owner App setup, trusted publisher/collector and GitHub enforcement acceptance remain open (see `docs/REVIEW_GATE_SETUP.md`)
 
-Issue #1 closed when PR #2 merged after documentation/bootstrap acceptance and current HEAD/base reviews plus CI passed. CI foundation #5 is implemented. The backend and dashboard foundations have synthetic coverage; their authorization prerequisites remain separate. Runtime/ADR progress for Issues #6–#28 and the separately tracked #4 is tracked below and in GitHub.
+Issue #1 closed when PR #2 merged after documentation/bootstrap acceptance and current HEAD/base reviews plus CI passed. CI foundation #5 is implemented. The backend and dashboard foundations have synthetic coverage; their authorization prerequisites remain separate. Runtime/ADR progress for Issues #6–#28, #47–#51, and the separately tracked #4 is tracked below and in GitHub.
 
 ## Phase 1 — Main server and web foundation
 
@@ -22,8 +22,13 @@ Issue #1 closed when PR #2 merged after documentation/bootstrap acceptance and c
 - [x] validated deployment settings and database abstraction
 - [ ] health endpoints
 - [x] React responsive dashboard shell (#8; synthetic/mock foundation, production access integration remains #10)
-- [ ] Docker Compose where appropriate
-- [ ] deployment-owner authorization ADR/bootstrap
+- [ ] Docker Compose only if it ever provides the same external-runtime,
+  mount-identity, non-root-identity, private-listener, update and rollback
+  guarantees as the native lifecycle; none is implemented or advertised
+  today (ADR-0005, `REQUIREMENTS.md` DIST-005)
+- [ ] versioned Main Server install / update / rollback lifecycle (#47)
+- [ ] first-run setup wizard and resumable initial configuration flow (#48)
+- [ ] deployment-owner authorization ADR/bootstrap — ADR-0003 Proposed; Owner decision pending, synthetic policy model only
 - [ ] trusted Tailscale/private-proxy identity boundary
 
 ## Phase 2 — Camera Source + Capture Node platform
@@ -50,7 +55,7 @@ no browser preview or physical device result is claimed.
 ## Phase 3 — Media
 
 - [ ] agent->main transport PoC + ADR
-- [ ] Agent compressed disk ring buffer with Owner-selected duration/capacity modes
+- [ ] Agent compressed disk ring buffer: tested disk/ledger core and duration/capacity DTOs implemented; Owner UI, capture/transport integration and hardware acceptance pending (#16)
 - [ ] autonomous T-10/T+10 incident protection, critical preserve command, and 60-day default expiry
 - [ ] Agent storage pressure/hard stop without deleting unexpired protected evidence
 - [ ] capture/record/inference/view profile separation
@@ -86,16 +91,18 @@ acceptance.
 - [x] detector-specific image-quality gating (internal metrics/recovery/unknown contracts; real-camera calibration pending)
 - [x] no false `no person` when quality is insufficient (synthetic gate/scheduler regression tests)
 - [x] bounded per-source inference-cadence primitive (#20; Main worker integration remains open)
-- [ ] server ROI calibration/movement
-- [ ] camera tamper/occlusion/source-health correlation
+- [x] server ROI calibration/movement (bounded synthetic core; capture-worker integration and real-scene calibration remain open)
+- [x] camera tamper/occlusion/source-health correlation (synthetic local core; source-health integration and real-camera acceptance remain open)
 
 ## Phase 6 — Entrance / owner / presence intelligence
 
 - [ ] owner-only face-verification model/license evaluation
 - [ ] explicit owner enrollment/delete flow
-- [ ] anonymous same-camera tracking
+- [x] internal Owner-only template enrollment/delete/re-enroll with generation/audit and default-deny authorization (#25; human flow/model pending)
+- [x] anonymous same-camera tracking primitive (generated geometry; real detector/worker/room integration pending)
 - [ ] entrance/zone calibration where geometry supports it
 - [ ] anonymous/owner entry-exit observations
+- [x] internal candidate-bound quality/verification receipts and finite directed-line observations (#25; production adapter and #26 integration pending)
 - [ ] `PRESENT / PROBABLY_PRESENT / ABSENT / UNKNOWN`
 - [ ] manual presence override/schedule
 - [ ] no non-owner enrollment or persistent face-crop/template/embedding/profile library, whether named or anonymous
@@ -118,6 +125,8 @@ UI remain pending; these phase boxes represent integrated acceptance.
 - [ ] Main Server Owner-approved hardware baseline and startup/daily comparison
 - [ ] daily recording-health self-test, expected-filesystem validation, and bounded write/read/decode verification
 - [ ] immediate Owner alerts for changed/missing hardware and recording-health failures
+- [ ] privacy-safe Owner-initiated diagnostic export / support bundle (#49)
+- [ ] security / admin audit log with 90-day retention (#50)
 
 ## Phase 8 — Hardening / real environment
 
@@ -134,6 +143,11 @@ UI remain pending; these phase boxes represent integrated acceptance.
 - [ ] 24-hour mixed-source run
 
 ## Explicit pending decisions
+
+Issue #23 has an independent comparison/approval/outbox core and recording-health
+worker adapter with disposable-file cleanup/recovery tests. Authorization,
+actual codec/source wiring, notifications and physical acceptance remain open;
+see the integrity and media/health module READMEs.
 
 - [ ] exact agent->main transport;
 - [ ] exact main->browser live transport/target latency;

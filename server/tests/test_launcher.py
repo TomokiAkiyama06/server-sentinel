@@ -19,10 +19,12 @@ class LauncherTests(unittest.TestCase):
 
     def test_launcher_never_enables_proxy_headers_or_framework_access_logs(self):
         with tempfile.TemporaryDirectory() as temporary:
-            with patch.dict("os.environ", {"SERVERSENTINEL_DATA_DIRECTORY": str(Path(temporary))}, clear=True):
-                with patch("uvicorn.run") as run:
+            environment = {"SERVERSENTINEL_DATA_DIRECTORY": str(Path(temporary))}
+            with patch.dict("os.environ", environment, clear=True):
+                with patch("app.systemd.build_server") as build:
                     self.assertEqual(main(), 0)
-            options = run.call_args.kwargs
+            build.return_value.run.assert_called_once_with()
+            options = build.call_args.kwargs
             self.assertEqual(options["host"], "127.0.0.1")
             for name in ("server_header", "date_header", "access_log", "proxy_headers"):
                 self.assertIs(options[name], False)
@@ -31,6 +33,6 @@ class LauncherTests(unittest.TestCase):
             self.assertEqual(options["ws"], "none")
 
     def test_missing_settings_do_not_start_listener(self):
-        with patch.dict("os.environ", {}, clear=True), patch("uvicorn.run") as run:
+        with patch.dict("os.environ", {}, clear=True), patch("app.systemd.build_server") as build:
             self.assertEqual(main(), 1)
-            run.assert_not_called()
+            build.assert_not_called()

@@ -4,17 +4,23 @@ This document describes target UX. Exact transport commands and packaging may ch
 
 ## Main Ubuntu setup
 
-Development target:
+Development runs from a mutable checkout using the validated environment
+settings and commands in
+[`server/docs/FOUNDATION.md`](../server/docs/FOUNDATION.md). For example:
 
 ```bash
 git clone <repo-url>
 cd server-sentinel
-./install.sh
+cd server
+python3 -m pip install --require-hashes --only-binary=:all: -r requirements-ci.lock
+SERVERSENTINEL_DATA_DIRECTORY=/existing/external/development-data python3 -m app
 ```
 
-or the documented Docker Compose path where appropriate.
-
-Stable releases should provide versioned release artifacts/installers rather than requiring production operation from a development checkout.
+Stable operation uses the versioned archive, offline wheelhouse, installer,
+external runtime filesystem, and install/update/rollback commands documented in
+[`server/docs/DEPLOYMENT.md`](../server/docs/DEPLOYMENT.md). It does not run from
+the development checkout. A Docker Compose path is not currently implemented or
+documented as an available deployment method.
 
 ## First-run server wizard
 

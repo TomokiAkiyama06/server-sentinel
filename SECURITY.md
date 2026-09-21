@@ -24,6 +24,14 @@ Safe defaults:
 
 ## Threat model
 
+The Agent ring core's configuration/early deletion and critical-preserve controls
+use separate default-deny injected authorization boundaries; no human/control
+listener is added. Its private SQLite ledger journals protection/deletion before
+media mutation, and the approved media store validates mount identity for writes,
+inventory and cleanup. Missing/uncertain media remains a visible gap; storage
+pressure cannot remove unexpired protected incidents. Production authority and
+transport integration remain pending. See `agent/docs/RING_BUFFER.md`.
+
 The internal compressed-recording store accepts no caller-controlled filenames or
 public requests. It requires a private, deployment-approved existing media root,
 an admission reservation and a trusted video-only codec validator. It rejects
@@ -85,6 +93,96 @@ enforcement or authenticate supplied JSON. App credentials must remain outside
 PR-controlled workflows/checkouts; the existing same-repository Claude workflow
 is still limited to trusted writers. Actual issuer isolation and GitHub test-PR
 acceptance remain open in #4.
+
+## Main Server release and installer trust boundary
+
+The stable Main Server deployment path is the native versioned release lifecycle
+in ADR-0005 and [`server/docs/DEPLOYMENT.md`](server/docs/DEPLOYMENT.md). No
+Docker Compose path is implemented or advertised.
+
+Privilege assumptions:
+
+- the installer is a one-shot administrator tool, deliberately invoked with root
+  privileges; it is never a service, is never started by the application, and
+  the running application cannot invoke it;
+- it refuses to run without explicit root execution, refuses any unit path other
+  than the single canonical `server-sentinel.service`, and refuses a service
+  account of UID 0;
+- installation, configuration, and unit paths must be absolute and free of
+  `..` segments, because normalizing them away would validate a different
+  location from the one the kernel later reaches through a symbolic link;
+- before using an installation path it rejects ancestors that are symbolic
+  links, not root-owned, or group/world-writable, so an untrusted directory
+  cannot later have code substituted beneath the active release;
+- release environments are built with a root-controlled absolute interpreter,
+  from a fixed working directory, with a sanitized environment, so a hostile
+  `PYTHONPATH` or shadowing module in the administrator's current directory is
+  not executed;
+- the non-root preflight runs as the dedicated account with no supplementary
+  groups, and directory modes are normalized independently of the administrator
+  umask so neither a restrictive nor a permissive umask changes the result;
+- the generated unit is created with a restrictive mode at creation time, never
+  widened and then narrowed, and every unit replacement is atomic and fsynced;
+- one service-global advisory lock covers each whole install, update, and
+  rollback transaction, so concurrent administrator invocations cannot interleave
+  release pointers, unit replacement, and restart.
+
+Supply-chain assumptions:
+
+- the installer performs no network access. The release archive, its published
+  SHA-256, the installer zipapp digest, and the offline wheelhouse are supplied
+  by the administrator;
+- trust comes from content hashes, not from a transport: the outer archive
+  SHA-256, the manifest version, and every member digest are verified before any
+  release code executes, the archive shape is bounded, and dependencies install
+  with `--require-hashes --only-binary=:all: --no-index --no-deps`;
+- verifying the published digests on the target host is therefore a required
+  administrator step, and a release that fails any digest check is refused
+  rather than installed.
+
+Runtime-data assumptions:
+
+- deployment configuration is administrator-owned and readable but not writable
+  by the dedicated runtime account, is refused if it is world-readable,
+  group-writable, inside the installation or release tree, inside the
+  runtime-writable data tree, or under any directory path component the
+  administrator does not control;
+- the installation destination, the configuration, and the runtime root are
+  refused under `/tmp` and `/var/tmp`, which the unit's `PrivateTmp=true`
+  replaces with empty private trees, and under `/home`, `/root` and
+  `/run/user`, which its `ProtectHome=true` makes empty or inaccessible. They
+  would otherwise pass the installer's own preflight and fail only after
+  staging and unit mutation;
+- an existing `--destination` is adopted only when it is empty or already a
+  ServerSentinel installation root, so a mistyped destination such as `/root`
+  is never relaxed to mode `0755`;
+- each runtime directory must be owned by the dedicated account and keep owner
+  read, write and execute permission, so a runtime tree the service could not
+  actually write is refused instead of being reported as ready;
+- the runtime mount point must be configured as an absolute path, because a
+  relative one would identify different mounts for the administrator and for
+  the service;
+- the Owner-approved runtime filesystem is pinned by a stable filesystem UUID.
+  Linux major/minor device numbers are reused by a replaced or reformatted disk,
+  so they only corroborate that identity. A runtime mount that is missing,
+  substituted, backed by the root filesystem device, or carrying a different
+  filesystem is refused, and no root-filesystem fallback directory is created;
+- the generated unit grants the runtime account write access to the state,
+  recording, and audit directories only. The runtime root itself stays
+  read-only, so a compromised service cannot replace or remove them;
+- install, update, and rollback move release pointers and the unit only; they
+  never delete, truncate, or rewrite state, recordings, or audit data. A failed
+  transaction restores both release pointers and the previous unit and restarts
+  the release that was running before the attempt.
+
+Release trees accumulate under the installation root. Pruning an old release is
+a deliberate administrator action on the installation filesystem only, and never
+touches runtime data.
+
+Deployed acceptance of this boundary — including the systemd activation, the
+trusted-proxy boundary, real mount substitution, and the recording/audit content
+comparison across update and rollback — remains the `MANUAL_TEST.md` section V
+checks for Issue #47 and is not established by the synthetic tests.
 
 ## Network boundaries
 
@@ -190,6 +288,27 @@ Do not trust arbitrary forwarded identity headers.
 
 If Tailscale Serve/equivalent provides authenticated identity headers, the backend accepts them only on a non-bypassable local trusted-proxy path. Requests from LAN/other interfaces cannot directly set such headers and gain identity.
 
+The concrete Owner-bootstrap/session design is [ADR-0003](docs/ADR/0003-owner-authentication-and-trusted-proxy.md), currently **Proposed** pending Owner approval.
+It states the proposed trusted-host loopback limitation and upstream login-reuse
+risk, and defines recovery/revocation transitions for review. No session lifetime,
+identity-binding choice, or local recovery implementation is accepted by that
+proposal alone. Human routes and dashboard assets remain closed until the design
+is accepted and implemented/tested under #10. Its model tests do not validate a
+real Tailscale installation, LAN bypass resistance, or active stream cancellation.
+
+That proposal also requires a hostname reserved for the human listener on every
+scheme and port. No other application, static tree, alias, port, or catch-all
+may answer for that name: one sharing a path would run in the same browser
+origin, and one on another HTTPS port would still receive the host-only session
+cookie, because cookies are not port-scoped. The reservation is a deployment
+obligation — a dedicated network identity for ServerSentinel, or a
+single-purpose node enforced outside the application — because a local process
+can bind another port on that address without appearing in any proxy
+configuration. Startup and daily checks enumerate actual listeners and proxy
+routes for the whole name and close human access on any other answer, which
+bounds rather than removes that exposure; the application cannot prevent a
+local process from binding.
+
 ## Capture-node pairing
 
 Pairing credentials:
@@ -258,6 +377,8 @@ Owner-only verification requirements:
 - low-quality observation returns `unknown`, not a forced identity conclusion.
 
 Model output is probabilistic and is not proof of identity or culpability.
+
+The #25 internal singleton template store requires an existing private `0700` runtime directory and `0600` regular single-link database under the service UID, outside checkout. It rejects symlinks/FIFOs/shared permissions and root/file substitution, holds an exclusive directory lock, and confines operations to one worker. Every ancestor of that root must be owned by the service or root and must not be writable by other users unless sticky, because SQLite derives rollback-journal names from the canonical path; the connection itself is bound to the verified directory descriptor and re-verified before schema writes. Metadata reservations cover transactional enrollment/delete/audit; generation checks invalidate replacement/deletion races. The default Owner authorizer denies. No human listener/route is added before #6/#10. A separate local template DB is excluded from every diagnostic archive; normal recording exports cannot include it. Permissions do not claim encryption or protection from local administrators, and logical deletion does not promise forensic erasure from snapshots/backups. Audited local model adapters and 90-day audit-retention integration remain deployment prerequisites.
 
 ## Video-only MVP
 
@@ -350,6 +471,14 @@ Delete only self-test-owned temporary/partial media on success, failure, and can
 If the intended recording filesystem is missing or substituted, refuse recording and self-test media writes to that target. Never create or use a fallback directory on the root filesystem or another unintended filesystem, even while reporting degradation. A self-test failure or material recording-device mismatch is an immediate Owner-alert condition.
 
 Hardware inventory/SMART collection must use least privilege. If a privileged helper is needed for a narrow probe, do not grant the whole application broad root access.
+
+The Issue #23 foundation uses fixed read-only command arguments, bounded output
+and time, a minimal environment, and no sudo or shell. Baseline approval denies by
+default, checks the expected revision and audits the approved principal. Raw
+inventory never enters the fixed-category fault outbox. Self-test I/O shares the
+recorder worker's pinned root and reservations; only a journaled UUID artifact
+can be cleaned. Domain interfaces do not enable a human API or replace pending
+application authorization integration.
 
 ## Vision/timeline interpretation
 

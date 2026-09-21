@@ -24,6 +24,7 @@ def run(scenario):
     if scenario not in {"normal", "error"}:
         raise ValueError("unknown synthetic scenario")
     sys.addaudithook(observe)
+    from tests.ring_smoke import run_ring
     with tempfile.TemporaryDirectory(prefix="agent-smoke-") as temporary:
         config = settings(Path(temporary))
         store = MediaStore(config, stable_device=lambda _expected: True)
@@ -52,6 +53,7 @@ def run(scenario):
                 assert not config.media_root.exists()
         finally:
             agent.close()
+    run_ring(scenario)
     assert not ATTEMPTS
     print("agent synthetic " + scenario + ": core passed; zero socket/subprocess attempts")
 

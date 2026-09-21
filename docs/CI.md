@@ -42,6 +42,12 @@ The repository job always runs:
 - synthetic media provenance checks;
 - known prohibited SDK/reporting signature checks in component inventories,
   lockfiles, source/configuration, and available generated output;
+- fail-closed dependency/model license inventory validation, including exact
+  lock entries, separate model code/weight evidence, notices and Owner approvals;
+- immutable pin validation of lock digests, resolved artifacts, model weight
+  digests and container base image digests, followed by a build-time comparison
+  of the pins pip actually resolved against that reviewed evidence; the
+  dashboard browser job runs the same comparison for the packages npm installed;
 - Pyflakes and pycodestyle lint checks for Python tooling/tests;
 - synthetic positive/negative unit tests for the guards and component runner;
 - whitespace checks on the checked-out change.
@@ -58,6 +64,7 @@ python3 -m venv .venv
 . .venv/bin/activate
 python -m pip install --require-hashes --only-binary=:all: -r .ci/requirements.txt
 python scripts/ci/repository_guard.py
+python scripts/ci/license_gate.py
 python -m pyflakes scripts tests
 python -m pycodestyle --select=E4,E7,E9 scripts tests
 python -m unittest discover -s tests/unit -p 'test_*.py' -v
@@ -95,7 +102,12 @@ error = ["python", "-m", "tests.smoke", "error"]
 These are onboarding examples, not dependencies or runtime modules already
 implemented by this repository. Python dependencies install into a temporary
 virtual environment with pip hash verification. Declare every required tool
-and dependency in that component's reviewed lockfile.
+and dependency in that component's reviewed lockfile. The same change must
+register each new lockfile and exact package in `license/components.json`;
+otherwise the license gate fails before component installation. Each reviewed
+location stores its own immutable pin evidence in that same record, so a lockfile
+SHA256/SRI or resolved artifact URL that changes while the version string stays
+the same is a gate failure.
 
 Node components require `package.json`, `package-lock.json`, and nonempty `lint`
 and `test` scripts. CI runs `npm ci --ignore-scripts --no-audit --no-fund`,
@@ -117,6 +129,45 @@ Containers run without a network, host mounts, published ports, inherited
 deployment environment, root privileges, or writable root filesystem. Resource
 limits, a bounded temporary filesystem, timeouts, and container cleanup apply.
 The image and all its dependencies require the usual license and pinning review.
+
+Every tracked `Dockerfile*` is a reviewed `container-image` inventory input. Each
+`FROM` and `COPY --from` image must name a repository, a tag, and an immutable
+`sha256` digest recorded with its license, notice and redistribution evidence in
+`license/components.json`. Floating tags, variable references, unregistered
+images and later digest substitutions fail closed, and a base image declared as
+redistributed instead of CI-only requires a new Owner decision. Container build
+commands are allowlisted rather than pattern-matched: a pip invocation must be
+`install` with `--require-hashes` and only reviewed options, and every
+`-r`/`-c`/`--requirement`/`--constraint` value, including the attached
+`-rfile` and `--requirement=file` forms, must resolve to a reviewed requirements
+input. npm must use a `ci`-family command with reviewed options only, so
+every documented `install` alias, a path-changing option such as `--prefix`, a
+positional argument, and `npx`/`pnpm`/`yarn` fail closed. `npm ci` must pass `--ignore-scripts`, and a build that runs
+`npm run` needs a reviewed `package.json` whose script bodies are audited with
+the same rules. Executable and option tokens must be plain literals, so shell
+escaping and expansion cannot hide an installer.
+
+Committed model artifacts require a distinct `model_weight` record whose pin
+evidence binds the exact path and SHA256 digest. All files in a reserved model
+artifact directory are checked regardless of extension; common serialized model
+suffixes, including `.pkl`, `.joblib`, `.npz` and `.safetensors`, are checked in
+other directories, and any other opaque non-text file outside the reviewed media
+and Web asset formats is treated as a model artifact until it has its own
+record. Tracked files inside `node_modules` or `.venv` stay in the scan; only untracked
+cache content and nested checkouts are skipped, and the gate fails closed when
+the tracked file list for a skipped cache cannot be determined. A source package that only
+shares a reserved directory name needs a
+reviewed `model_scan_exemptions` record, which covers text-only Python sources;
+an opaque or model-suffixed file below it still requires weight review, and an
+exemption that matches nothing fails as stale. A recognized media or Web asset
+suffix only exempts a file whose header actually matches that format, so a
+renamed weight remains an unreviewed opaque artifact. Model weight inventory locations outside the reserved
+directories are rejected. Detection-only `assets/ml/` and `assets/ai/` paths are
+also scanned in full so an opaque archive cannot bypass suffix detection. Model
+implementation packages require `model_code` records.
+Restricted or unclear licenses remain
+blocked unless `license/owner-approvals.json` contains an exact, decision-backed
+Owner approval for that component version and license.
 
 Network isolation prevents external delivery during these smoke commands. It
 does not prove that software never attempts reporting or that a future deployed

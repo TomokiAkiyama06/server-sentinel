@@ -7,6 +7,7 @@ from fastapi import FastAPI
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from app.auth.boundary import DenyAll, HumanAuthorizer
+from app.diagnostics import DiagnosticExportEndpoint
 from app.logging import Event
 from app.settings import Settings
 from app.storage.database import Database
@@ -40,7 +41,8 @@ class ClosedHumanSurface:
 
 
 def create_app(settings: Settings, *, database: Database | None = None,
-               human_authorizer: HumanAuthorizer | None = None) -> FastAPI:
+               human_authorizer: HumanAuthorizer | None = None,
+               diagnostic_export_endpoint: DiagnosticExportEndpoint | None = None) -> FastAPI:
     store = database or Database(settings.database_path)
 
     @asynccontextmanager
@@ -68,6 +70,7 @@ def create_app(settings: Settings, *, database: Database | None = None,
     application.state.ready = False
     application.state.database = store
     application.state.human_authorizer = human_authorizer or DenyAll()
-    # Do not include api.system.router before approved permission enforcement.
+    application.state.diagnostic_export_endpoint = diagnostic_export_endpoint
+    # Do not include human routers before approved permission enforcement.
     application.add_middleware(ClosedHumanSurface)
     return application
