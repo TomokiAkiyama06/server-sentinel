@@ -341,9 +341,20 @@ The research-room Tailnet is shared, so run these with two people (or two browse
 - [ ] if a synced passkey is in use, confirm that revoking it takes effect on every device it synced to, and record that revocation is credential-scoped rather than per-device;
 - [ ] the owner screen shows each credential's backup-eligibility as read at registration; if the deployment requires device-bound credentials, registering a backup-eligible authenticator is refused with a message the person can act on;
 - [ ] register a backup-eligible passkey before it has synced, then sign in again after it syncs: the owner screen stops showing it as not backed up, because backup state follows the latest verified sign-in;
+- [ ] present an otherwise valid assertion whose backup-eligibility flag differs
+  from registration: it is refused, the credential is shown as inconsistent
+  with the reason, all sessions using it stop, and it cannot authenticate or
+  satisfy step-up again;
+- [ ] when that was a non-owner's last usable credential, re-invite the person
+  and register a replacement; separately confirm an Owner with no other usable
+  credential recovers only through the privileged local bootstrap path;
 - [ ] no human route grants access on the proxy identity header alone;
 - [ ] a passkey that reports `none` attestation registers successfully, and a registration whose attestation statement is present but invalid is refused;
 - [ ] where the owner screen shows a last-observed Tailscale login/device, confirm it is owner-visible only, that it is cleared when the principal is revoked or deleted, and that a diagnostic export does not contain it;
+- [ ] with trusted proxy identity enabled, inspect persisted sessions and confirm
+  they contain only a keyed binding, never the raw login/device; a mismatched
+  identity is refused, diagnostics/exports omit the binding, and sign-out,
+  expiry and revocation clear it;
 - [ ] record that reachability is expected for every holder of the shared account and is not treated as a finding;
 - [ ] the dashboard origin is reserved for ServerSentinel and is a secure context (HTTPS, or `http://localhost` for a strictly local browser); confirm WebAuthn registration and sign-in actually work there, and record that an ordinary-HTTP non-loopback origin makes them impossible;
 - [ ] the startup and daily reservation check enumerates the real listeners and every proxy route for the whole name across all schemes and ports, and closes human access and notifies the Owner on any other answer; record that this bounds rather than prevents, so a process binding between checks can collect credentials until the next check;

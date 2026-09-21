@@ -101,9 +101,18 @@ For each credential the main host stores:
 - the principal it belongs to;
 - an owner-visible label, which is a hint chosen at registration and not proof of a device;
 - created/last-used/revoked timestamps;
-- the last accepted signature counter, which is what makes a cloned-authenticator check possible.
+- the last accepted signature counter, which is what makes a cloned-authenticator check possible;
+- active/revoked/inconsistent status and, for an inconsistent credential, its
+  fixed owner-visible reason code and timestamp.
 
 The principal record may also keep the Tailscale login/device last observed when that person authenticated, where the deployment supplies such an identity. It is supplementary context, never an authorization input: it is overwritten at each authentication, visible to the owner only, cleared when the principal is revoked or deleted, and left out of diagnostic exports. Sign-in history beyond that single last-observed value lives in the audit log under the audit retention below, not on the principal.
+
+An active session does not copy that identity. When proxy identity binding is
+configured, it stores only an HMAC-SHA-256 binding made with a deployment-local
+secret held outside the database. The binding supports equality checks but is
+not displayed as an identity, is excluded from diagnostics and exports, and is
+cleared on sign-out, expiry or revocation. The raw last-observed value above
+remains the only persisted proxy identity outside the bounded audit history.
 
 Authenticator user verification (device PIN, device unlock, fingerprint or face unlock) runs on the viewer's own device; the server learns only that it succeeded. Signing in also sends the short-lived data needed to check the sign-in itself, which is verified and then discarded rather than stored. ServerSentinel never receives or stores a viewer's fingerprint or face template. These records are an access-control list, not an identity or biometric database, and they are unrelated to the optional owner face verification described below. Revoking a credential or its principal permanently disables the corresponding record.
 
@@ -160,7 +169,9 @@ The main Ubuntu deployment stores:
 - event/timeline metadata;
 - audit logs;
 - configuration;
-- invited-viewer credential and principal records (public key material, the last accepted signature counter, the authenticator's backup-eligibility flags, metadata, and at most the last observed Tailscale login/device), kept while the person is invited rather than on a timer;
+- invited-viewer credential and principal records (public key material, the last accepted signature counter, authenticator backup flags, credential consistency status/reason metadata, and at most the last observed Tailscale login/device), kept while the person is invited rather than on a timer;
+- an opaque keyed proxy-identity binding on each active session when configured,
+  cleared when the session is invalidated and excluded from diagnostics/exports;
 - optional owner biometric template.
 
 Defaults:

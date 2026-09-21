@@ -1034,6 +1034,10 @@ principal_credential
 - backup_state (the authenticator's BS flag as of the last verified ceremony;
   refreshed on every accepted assertion, because a credential can be backed up
   after it was registered)
+- status: active/revoked/inconsistent
+- inconsistency_reason (owner-visible fixed reason code; currently
+  `backup_eligibility_changed`, null unless status is inconsistent)
+- inconsistent_at
 - label (owner-visible hint, not proof of a device)
 - created_at
 - last_used_at
@@ -1052,9 +1056,10 @@ principal_session
 - id
 - principal_id
 - credential_id (the credential that created the session)
-- external_identity (the verified proxy identity the session was created under,
-  where the deployment supplies one; ADR-0003 binds a session to it, so a later
-  request on this session presenting a different one is refused)
+- external_identity_binding (optional HMAC-SHA-256 of the canonical verified
+  proxy identity, using a deployment-local secret stored outside the database;
+  the raw identity is not copied into the session. A later request is compared
+  in constant time against a freshly computed binding)
 - created_at
 - last_seen_at
 - idle_expires_at / absolute_expires_at (server-enforced)
@@ -1081,10 +1086,15 @@ is a shared credential and does not satisfy §11.8; such a machine needs a
 per-person OS account or a portable authenticator the person carries.
 
 A session is a server-side record bound to one principal and to the credential
-that created it, and, where the deployment supplies a verified proxy identity,
-to the identity it was created under: a later request on the same session
-carrying a different verified identity is refused rather than followed. Sign-out, idle/absolute expiry and revocation invalidate that
-record, so a retained cookie or token authorizes nothing afterwards; §11.5
+that created it. Where the deployment supplies a verified proxy identity, the
+session stores only the keyed binding described above. Each later request
+canonicalizes the newly verified identity, recomputes the binding and compares
+it in constant time; a mismatch is refused. The deployment-local HMAC secret is
+kept outside the database and is unrelated to Tailscale administrative
+credentials. Sign-out, idle/absolute expiry and revocation clear the binding and
+invalidate the record, so a retained cookie or token authorizes nothing
+afterwards; the binding is never shown in the UI or included in diagnostics or
+exports. §11.5
 authorization re-checks it on every human/media route and never relies on
 client-side state. Idle and absolute lifetimes are server-enforced, with the
 values proposed in ADR-0003 (30 minutes idle, 12 hours absolute) and any change
@@ -1286,8 +1296,15 @@ surfaces that refusal as an actionable message, not as a generic failure.
 
 The two flags age differently. Eligibility is a property of the credential and
 does not change, so a later assertion reporting a different BE is an
-inconsistency: the assertion is refused and reported to the Owner, as a
-signature-counter regression is. Backup state does change — a credential
+inconsistency: in the same transaction the assertion is refused, the credential
+is marked `inconsistent` with reason `backup_eligibility_changed` and timestamp,
+and every session bound to it is revoked. The Owner is notified and the UI shows
+the reason and recovery action. An inconsistent credential never authenticates
+or performs step-up again; the Owner revokes/replaces it, and a non-owner left
+with no usable credential is re-invited. If the Owner has no other usable
+credential, recovery uses ADR-0003's privileged local bootstrap path rather than
+leaving the deployment inaccessible. Automated tests cover the transaction,
+session invalidation and both recovery branches. Backup state does change — a credential
 registered before its first sync becomes backed up afterwards — so every
 accepted assertion refreshes `backup_state` from the verified authenticator
 data. Recording it only at registration would leave the owner UI saying

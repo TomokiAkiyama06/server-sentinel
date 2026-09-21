@@ -35,6 +35,13 @@ Tailscale login identity MUST NOT be the authoritative application principal and
 
 Where it is recorded, its lifecycle is defined rather than open-ended: the principal keeps at most the value last observed at authentication, overwritten each time, owner-visible only, cleared when the principal is revoked or deleted, and excluded from diagnostic exports. Longer history belongs to the audit log under its retention, and `PRIVACY.md` lists the field so nobody reads the credential inventory as the whole story.
 
+The raw identity is not copied into sessions. Where ADR-0003 requires session
+binding, the session retains only HMAC-SHA-256 over the canonical verified
+identity under a deployment-local secret outside the database. Each request
+recomputes and compares the binding in constant time. The binding is cleared
+with session invalidation, never displayed, and excluded from diagnostics and
+exports.
+
 ### 2. ServerSentinel issues a per-person credential
 
 ServerSentinel issues and verifies its own per-person credential:
@@ -49,7 +56,14 @@ Revocation is credential-scoped, not device-scoped. A synced passkey is a single
 
 Whether a credential syncs is read rather than assumed: registration records the authenticator's backup-eligibility and backup-state flags, the owner UI shows them, and a deployment that needs device-scoped control refuses a backup-eligible registration on that signal. That is a deployment setting rather than a default promise.
 
-Eligibility is fixed at registration and an assertion reporting a different value is refused and reported to the Owner. Backup state is refreshed from every verified assertion, since a credential registered before its first sync becomes backed up afterwards and a registration-time snapshot would leave the owner looking at a stale answer.
+Eligibility is fixed at registration. An assertion reporting a different value
+is refused while the credential is atomically marked inconsistent with a fixed
+owner-visible reason/timestamp and its sessions are revoked. It remains unusable
+until replaced. A non-owner with no other usable credential is re-invited; an
+Owner with none uses ADR-0003's privileged local bootstrap recovery. Backup
+state is refreshed from every verified assertion, since a credential registered
+before its first sync becomes backed up afterwards and a registration-time
+snapshot would leave the owner looking at a stale answer.
 
 ### 3. The credential must be bound to a person, not to a workstation
 
@@ -124,6 +138,9 @@ The origin must be a secure context — HTTPS, or `http://localhost` for a stric
 - `MANUAL_TEST.md` "Shared Tailscale account" covers two people on the same Tailscale login, user verification, signed-out refusal, generic and identical responses for uninvited/revoked, per-credential versus per-principal revocation, session timeout and sign-out.
 - Automated tests for Issue #10 must cover: no human route authorizing on a proxy identity header alone, credential verification on every human/media route, `live:view` / `recordings:view` isolation including historical timeline, prompt revocation at both levels, and identical generic pre-authentication responses.
 - They must also cover the pre-credential paths and the step-up: enrollment succeeds once and only with a valid unexpired code; absent/unknown/expired/redeemed codes return the same generic response; enrollment alone returns no application data; an AUTH-008 owner operation is refused without a fresh user verification; and a failed or cancelled step-up performs nothing and leaks nothing.
+- They must cover proxy session bindings without retained raw identities, binding
+  mismatch, clearing and export exclusion, plus the inconsistent-credential
+  transaction, session revocation and both non-owner and Owner recovery paths.
 
 ## Follow-up
 
