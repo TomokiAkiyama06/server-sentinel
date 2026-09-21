@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import pwd
 import subprocess
 import shutil
 import stat
@@ -634,6 +635,85 @@ raise SystemExit(1)
             self.assertEqual(os.readlink(destination / "current"), "0.1.0")
             self.assertEqual(os.readlink(destination / "previous"), "0.2.0")
             self.assertEqual(config.read_bytes(), original_config)
+
+    def test_update_adopts_exact_legacy_pinned_unit(self):
+        destination = self.root / "installation"
+        destination.mkdir()
+        config = self.root / "deployment.json"
+        value = dataclasses.asdict(self.settings)
+        for key in ("node_id", "runtime_root", "media_root"):
+            value[key] = str(value[key])
+        for key in ("mount_point", "filesystem_root"):
+            value["expected_mount"][key] = str(value["expected_mount"][key])
+        config.write_text(json.dumps(value))
+        config.chmod(0o600)
+        unit = self.root / "media-capture-agent.service"
+
+        def arguments(version, operation):
+            artifact = self.root / ("artifact-" + version)
+            build(artifact, version=version,
+                  source_commit=("a" if version == "0.1.0" else "b") * 40)
+            return argparse.Namespace(
+                artifact=artifact, config=config, version=version, destination=destination,
+                video_device=[], unit=unit, operation=operation,
+                sha256=hashlib.sha256(artifact.read_bytes()).hexdigest(),
+            )
+
+        with patch("install.os.geteuid", return_value=0), patch(
+                "install.protected_parent"), patch("install.subprocess.run"):
+            install(arguments("0.1.0", "install"))
+            # Reproduce the exact layout emitted by the pre-lifecycle installer.
+            (destination / "current").unlink()
+            legacy = render_unit(destination / "0.1.0/media-capture-agent", config,
+                                 self.settings, pwd.getpwuid(self.settings.service_uid).pw_name,
+                                 pwd.getpwuid(self.settings.service_uid).pw_gid, [])
+            unit.write_text(legacy, encoding="utf-8")
+            install(arguments("0.2.0", "update"))
+
+        self.assertEqual(os.readlink(destination / "current"), "0.2.0")
+        self.assertEqual(os.readlink(destination / "previous"), "0.1.0")
+        self.assertIn(str(destination / "current/media-capture-agent"),
+                      unit.read_text(encoding="utf-8"))
+
+    def test_legacy_adoption_rejects_modified_unit_without_changing_layout(self):
+        destination = self.root / "installation"
+        destination.mkdir()
+        config = self.root / "deployment.json"
+        value = dataclasses.asdict(self.settings)
+        for key in ("node_id", "runtime_root", "media_root"):
+            value[key] = str(value[key])
+        for key in ("mount_point", "filesystem_root"):
+            value["expected_mount"][key] = str(value["expected_mount"][key])
+        config.write_text(json.dumps(value))
+        config.chmod(0o600)
+        unit = self.root / "media-capture-agent.service"
+
+        def arguments(version, operation):
+            artifact = self.root / ("artifact-" + version)
+            build(artifact, version=version,
+                  source_commit=("a" if version == "0.1.0" else "b") * 40)
+            return argparse.Namespace(
+                artifact=artifact, config=config, version=version, destination=destination,
+                video_device=[], unit=unit, operation=operation,
+                sha256=hashlib.sha256(artifact.read_bytes()).hexdigest(),
+            )
+
+        with patch("install.os.geteuid", return_value=0), patch(
+                "install.protected_parent"), patch("install.subprocess.run"):
+            install(arguments("0.1.0", "install"))
+            (destination / "current").unlink()
+            legacy = render_unit(destination / "0.1.0/media-capture-agent", config,
+                                 self.settings, pwd.getpwuid(self.settings.service_uid).pw_name,
+                                 pwd.getpwuid(self.settings.service_uid).pw_gid, [])
+            unit.write_text(legacy + "# local change\n", encoding="utf-8")
+            before = unit.read_bytes()
+            with self.assertRaisesRegex(ValueError, "cannot be adopted"):
+                install(arguments("0.2.0", "update"))
+
+        self.assertFalse((destination / "current").exists())
+        self.assertFalse((destination / "previous").exists())
+        self.assertFalse((destination / "0.2.0").exists())
+        self.assertEqual(unit.read_bytes(), before)
 
     def test_uncertain_pointer_recovery_retains_new_release(self):
         destination = self.root / "installation"

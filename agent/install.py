@@ -31,6 +31,10 @@ class ReleaseRestorationError(ValueError):
     """A pointer failure left state uncertain; retain every referenced release."""
 
 
+class UnitReplacementError(ValueError):
+    """The new unit may be durable; retain its current release target."""
+
+
 def read_artifact(path):
     """Never block on a special file or read an unbounded root-owned input."""
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
@@ -213,6 +217,61 @@ def _installed_unit(path):
         raise ValueError("installed service configuration differs") from None
 
 
+def _replace_unit(path, content):
+    encoded = content.encode("utf-8")
+    if len(encoded) > MAX_UNIT_BYTES:
+        raise ValueError("service configuration is too large")
+    temporary = path.with_name("." + path.name + ".new")
+    descriptor = None
+    replaced = False
+    try:
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                             | os.O_CLOEXEC | os.O_NOFOLLOW, 0o644)
+        with os.fdopen(descriptor, "wb") as stream:
+            descriptor = None
+            os.fchmod(stream.fileno(), 0o644)
+            stream.write(encoded)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        replaced = True
+        parent = open_directory(path.parent)
+        try:
+            os.fsync(parent)
+        finally:
+            os.close(parent)
+    except Exception as error:
+        if descriptor is not None:
+            os.close(descriptor)
+        if not replaced:
+            temporary.unlink(missing_ok=True)
+            raise
+        raise UnitReplacementError("service configuration replacement is uncertain") from error
+
+
+def _legacy_release(destination, installed_unit, config, settings, account, devices):
+    """Identify legacy active code by exact regeneration, never unit parsing."""
+    matches = []
+    try:
+        entries = tuple(destination.iterdir())
+    except OSError:
+        raise ValueError("legacy release is unavailable") from None
+    for entry in entries:
+        if not VERSION.fullmatch(entry.name):
+            continue
+        try:
+            _validate_release(destination, entry.name)
+        except ValueError:
+            continue
+        expected = render_unit(entry / "media-capture-agent", config, settings,
+                               account.pw_name, account.pw_gid, devices)
+        if installed_unit == expected:
+            matches.append(entry.name)
+    if len(matches) != 1:
+        raise ValueError("legacy release cannot be adopted safely")
+    return matches[0]
+
+
 @contextmanager
 def release_lock(destination):
     path = destination / ".release.lock"
@@ -315,11 +374,35 @@ def install(args):
         if operation == "install" and (current is not None or previous is not None):
             _remove_staged(executable)
             raise ValueError("release is already installed")
-        if operation == "update" and current is None:
-            _remove_staged(executable)
-            raise ValueError("current release is unavailable")
         content = render_unit(args.destination / "current/media-capture-agent", config, settings,
                               account.pw_name, account.pw_gid, args.video_device)
+        installed_unit = _installed_unit(args.unit) if operation == "update" else None
+        adopted = False
+        if operation == "update" and current is None:
+            if previous is not None:
+                _remove_staged(executable)
+                raise ValueError("release pointers are inconsistent")
+            try:
+                legacy = _legacy_release(args.destination, installed_unit, config, settings,
+                                         account, args.video_device)
+                _switch_pointers(args.destination, current=legacy, previous=None)
+                try:
+                    _replace_unit(args.unit, content)
+                except UnitReplacementError:
+                    # The current pointer deliberately remains on the legacy
+                    # executable so either durable unit version stays valid.
+                    raise
+                except Exception:
+                    _switch_pointers(args.destination, current=None, previous=None)
+                    raise
+            except (ReleaseRestorationError, UnitReplacementError):
+                # State is uncertain. Retain every release that may be named.
+                raise
+            except Exception:
+                _remove_staged(executable)
+                raise
+            current = legacy
+            adopted = True
         unit_created = False
         try:
             if operation == "install":
@@ -327,7 +410,7 @@ def install(args):
                     unit_created = True
                     stream.write(content)
                 args.unit.chmod(0o644)
-            elif _installed_unit(args.unit) != content:
+            elif not adopted and installed_unit != content:
                 raise ValueError("installed service configuration differs")
         except Exception:
             if unit_created:
