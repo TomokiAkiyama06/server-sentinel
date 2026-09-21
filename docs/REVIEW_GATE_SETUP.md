@@ -104,6 +104,34 @@ review result, stale context, or delivery error leaves the required check
 absent or blocking; it must never turn an error into `neutral`, `skipped`, or
 `success`.
 
+`scripts/ci/review_gate_publisher.py` now supplies the narrow delivery adapter
+foundation. At runtime it accepts only an absolute path in
+`SERVER_SENTINEL_REVIEW_GATE_CONFIG`; that JSON file and its private-key path
+must be private regular files outside every checkout. It opens each file before
+checking its descriptor, so a path replacement between a metadata check and a
+read cannot substitute material. It rejects group/other permissions, final-path
+symlinks, unexpected owners, unexpected JSON fields, weak/missing installation
+tokens, malformed GitHub responses, changed context, a missing or
+incorrect test-merge parent pair, and a Check Run response from any App other
+than the configured dedicated App. It uses fixed GitHub.com HTTPS API paths,
+disables proxies and redirects, and has no subprocess, git, shell, checkout,
+webhook, ruleset, or App-registration operation.
+
+The configuration contains only routing identity:
+
+```json
+{"repository":"TomokiAkiyama06/server-sentinel","repository_id":123,
+ "app_id":456,"app_slug":"server-sentinel-review-gate",
+ "installation_id":789,"private_key_path":"/etc/server-sentinel/review-gate.pem"}
+```
+
+Keep it outside the repository, mode `0600`. Set the short-lived installation
+token only in the publisher service environment as
+`SERVER_SENTINEL_REVIEW_GATE_INSTALLATION_TOKEN`; do not write it into this
+file. A future separately reviewed App-JWT exchange component may use the
+validated external key to refresh that environment value. This foundation does
+not create a key, token, App, installation, check source, or ruleset.
+
 The publisher must execute reviewed, pinned code and load policy from its trusted
 deployment, never from the PR. Neither same-repository nor fork code may run with
 reviewer credentials, the App private key, or an installation write token. Do not
@@ -123,17 +151,23 @@ closed. The provider adapters and their hostile-input tests remain required work
 
 Construct a `Context` from the authenticated target repository ID, PR number,
 `refs/heads/main`, current head/base commit IDs, a unique merge-base commit ID,
-the current GitHub test-merge commit ID, and SHA-256 of these exact diff bytes.
-Reject multiple merge bases. Use clean,
-trusted git configuration, disable external diff/textconv, and fetch immutable
-objects without executing PR hooks or reading PR git configuration:
+the current GitHub test-merge commit ID, and SHA-256 of
+`canonical_no_rename_diff()` bytes. The isolated collector and publisher both
+read complete recursive base/head Git trees through authenticated REST, then use
+this fixed sorted manifest of changed `path`, mode and blob/gitlink SHA. A
+rename is deliberately an old-path removal plus a new-path addition. Do not use
+GitHub's rendered `.diff`, local `git diff`, compare-file patches, a web diff,
+or a PR artifact: rename detection and renderer configuration would make those
+representations differ between review and publication.
 
-```sh
-git -c core.quotePath=true diff --no-ext-diff --no-textconv --no-color \
-  --no-renames --diff-algorithm=myers --no-indent-heuristic \
-  --src-prefix=a/ --dst-prefix=b/ --unified=3 --inter-hunk-context=0 \
-  <fixed-base-sha>...<fixed-head-sha>
-```
+Do not trust the single `merge_base_commit` selected by GitHub's compare API as
+proof of uniqueness. The publisher walks authenticated Git commit parent
+objects to their roots, derives all best common ancestors, and requires exactly
+one. The traversal is bounded to 4096 distinct commits; exhausting that budget,
+a missing/malformed parent object, no common ancestor, or a criss-cross history
+with multiple best common ancestors fails closed. A deployment whose repository
+history exceeds the bound needs a separately reviewed, trusted graph collector;
+do not weaken or skip this proof.
 
 Invalidate previous successes before rerunning either review. Handle PR opens,
 updates, retargets, reopenings, review reruns and base pushes; polling must also
