@@ -103,9 +103,15 @@ Disabled by default; skip allowed; provide a safe test message.
 Explain that two separate approvals are required:
 
 1. Tailscale/private-network permission to the main node;
-2. ServerSentinel invitation/permissions.
+2. a ServerSentinel invitation, redeemed once to register that person's own credential, plus the permissions the owner grants.
 
 Public port forwarding is not the normal setup.
+
+Where the room shares one Tailscale account, the Tailscale login does not identify the person; the ServerSentinel credential does. Register each credential on an authenticator the invited person controls and keep authenticator user verification required. On a machine whose OS account or device unlock is shared, use a per-person OS account or a portable authenticator instead of a passkey stored in the shared profile. See ADR 0004.
+
+The first owner starts from a privileged local administrative command on the Main Server. It prints a single-use, short-lived enrollment authorization on the local console only; the owner then opens the dashboard at its reserved origin and redeems it once through the same screen invitees use. There is no remote setup page and no owner-specific route. Everyone else starts from an owner invitation: the enrollment code is short-lived, single-use and randomly generated with at least 128 bits of entropy, it is delivered out of band, redeeming it registers exactly one credential, and the person then signs in normally. A used or expired code behaves like no invitation at all. Do not shorten a code for convenience: everyone on the shared account can reach the redemption screen, so a guessable code lets someone else claim the invitation.
+
+Serve the dashboard from an origin reserved for ServerSentinel and from a secure context: HTTPS through Tailscale Serve or an equivalent trusted proxy, or `http://localhost` for a strictly local browser. Browsers expose WebAuthn only there, so plain HTTP on a non-loopback host makes registration and sign-in impossible. Reserving the name is the deployment's job — a dedicated host, VM or namespace, or an OS/service policy that prevents another process from binding it. ServerSentinel checks at startup and daily that only it answers on that name, across all schemes and ports, and closes human access and notifies the Owner otherwise; the check acts after the fact and cannot stop the bind. ADR-0003 explains why another port of the same name is not an acceptable neighbour: cookies are not port-scoped.
 
 ## Add local USB camera
 
@@ -229,6 +235,7 @@ Invited users access only the main ServerSentinel host.
 phone / Mac
     -> Tailscale/private network
     -> trusted proxy/Tailscale Serve
+    -> ServerSentinel credential verification
     -> ServerSentinel dashboard
 ```
 
@@ -274,6 +281,10 @@ Permissions are independent. `live:view` alone cannot access historical timeline
 Non-owner users receive no official recording download/export control in MVP. The UI must not promise that browser playback prevents screen recording/client-side capture.
 
 The screen must clearly state that Tailscale-level network permission is managed separately outside ServerSentinel. ServerSentinel does not modify ACLs/Grants or store Tailscale administrative credentials.
+
+The screen also lists each person's registered credentials with their owner-visible label and last-used time, and allows revoking one credential or the whole principal. Revoking one credential leaves the person's other credentials working; revoking the principal ends all of them and their sessions promptly.
+
+Revocation is credential-scoped. A synced passkey is one credential that may live on several of that person's devices, so revoking it applies everywhere it synced, and the label is a hint rather than proof of a device. A deployment that needs device-scoped control registers device-bound authenticators and refuses backup-eligible credentials.
 
 ## Tailscale/private-network setup
 

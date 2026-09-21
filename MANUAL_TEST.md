@@ -327,6 +327,47 @@ Demand-driven processing:
 
 Use test identities/accounts appropriate for the deployment. ServerSentinel does **not** modify Tailscale ACLs/Grants or store Tailscale administrative credentials; any policy administration remains outside the application and existing policy may remain unchanged.
 
+### Shared Tailscale account
+
+The research-room Tailnet is shared, so run these with two people (or two browser profiles) using the **same** Tailscale login.
+
+- [ ] an invited person with a registered ServerSentinel credential passes authentication, and the authenticator asks for user verification each time;
+- [ ] each credential is registered on an authenticator the invited person controls; confirm no credential is left in a shared OS profile or behind a shared device unlock;
+- [ ] with the invited person signed out, an uninvited person on the same Tailscale login and the same device is refused;
+- [ ] a session ends after its idle/absolute lifetime, and the explicit sign-out control works on a shared machine;
+- [ ] the refusal is the generic response: no product/version string, camera names/counts, recording or timeline data, or deployment metadata, and the credential prompt itself carries none of them;
+- [ ] a revoked person receives the same response as an uninvited person;
+- [ ] revoking one credential leaves the principal's other credentials working, and revoking the principal blocks all of them promptly;
+- [ ] if a synced passkey is in use, confirm that revoking it takes effect on every device it synced to, and record that revocation is credential-scoped rather than per-device;
+- [ ] the owner screen shows each credential's backup-eligibility as read at registration; if the deployment requires device-bound credentials, registering a backup-eligible authenticator is refused with a message the person can act on;
+- [ ] register a backup-eligible passkey before it has synced, then sign in again after it syncs: the owner screen stops showing it as not backed up, because backup state follows the latest verified sign-in;
+- [ ] present an otherwise valid assertion whose backup-eligibility flag differs
+  from registration: it is refused, the credential is shown as inconsistent
+  with the reason, all sessions using it stop, and it cannot authenticate or
+  satisfy step-up again;
+- [ ] when that was a non-owner's last usable credential, re-invite the person
+  and register a replacement; separately confirm an Owner with no other usable
+  credential recovers only through the privileged local bootstrap path;
+- [ ] no human route grants access on the proxy identity header alone;
+- [ ] a passkey that reports `none` attestation registers successfully, and a registration whose attestation statement is present but invalid is refused;
+- [ ] where the owner screen shows a last-observed Tailscale login/device, confirm it is owner-visible only, that it is cleared when the principal is revoked or deleted, and that a diagnostic export does not contain it;
+- [ ] with trusted proxy identity enabled, inspect persisted sessions and confirm
+  they contain only a keyed binding, never the raw login/device; a mismatched
+  identity is refused, diagnostics/exports omit the binding, and sign-out,
+  expiry and revocation clear it;
+- [ ] record that reachability is expected for every holder of the shared account and is not treated as a finding;
+- [ ] the dashboard origin is reserved for ServerSentinel and is a secure context (HTTPS, or `http://localhost` for a strictly local browser); confirm WebAuthn registration and sign-in actually work there, and record that an ordinary-HTTP non-loopback origin makes them impossible;
+- [ ] the startup and daily reservation check enumerates the real listeners and every proxy route for the whole name across all schemes and ports, and closes human access and notifies the Owner on any other answer; record that this bounds rather than prevents, so a process binding between checks can collect credentials until the next check;
+- [ ] the first owner redeems a console-displayed single-use authorization once from a browser at the reserved origin, and it cannot be redeemed again;
+- [ ] record the configured entropy of enrollment codes and bootstrap authorizations and confirm it meets the stated minimum; guessing attempts against a wrong code are rate-limited and give the same generic response;
+- [ ] a first-time invitee redeems an enrollment code and registers a credential without already holding one, and the same code cannot be redeemed twice;
+- [ ] two browsers submitting the same code at once end with exactly one credential registered; the other attempt gets the generic response and nothing is left half-applied;
+- [ ] an absent, unknown, expired or already-redeemed code returns the same generic response as an uninvited person, and the enrollment step returns no camera, recording or timeline data;
+- [ ] an owner operation (revoke a user, change a retention/security setting, delete a recording) asks for a fresh user verification even inside an existing owner session, and cancelling it leaves everything unchanged;
+- [ ] with a stale owner session open on a shared machine, a second invited person's own passkey cannot satisfy the step-up: the assertion is refused, the operation does not run, and the owner session's freshness is unchanged.
+
+Record the residual limits instead of testing them away: a credential its holder deliberately lends, and a session left unlocked on an unattended machine, are outside what the application can detect.
+
 ### Uninvited ordinary Tailnet member
 
 - [ ] if existing Tailnet policy makes the Main Server node visible/reachable, document that fact rather than claiming node invisibility;
@@ -741,10 +782,10 @@ synthetic test branches/PRs; no production data or unrelated rule deletion.
 - Benchmark the accepted person backend on CPU; GPU is optional and separately measured. External benchmark media stays local under its terms and is never committed or attached to GitHub/CI. No real-model accuracy or target-host performance was verified by synthetic unit tests.
 - Stop/delay inference, inject quality loss, stale frames and a wedged plugin in the isolated worker: result must become unknown, loss/throttling remain visible, and capture/recording/health/storage-safety work must continue. Verify the production watchdog/resource limits separately; the primitive cannot forcibly interrupt a native call.
 
-## ADR-0003 follow-up: proposed human-access boundary
+## ADR-0003 follow-up: accepted human-access boundary
 
-These checks belong to #10/#19/#27/#28 after Owner approval and runtime
-integration, matching the follow-up recorded in ADR-0003. They are not completed
+These checks belong to #10/#19/#27/#28 during runtime integration, matching the
+follow-up recorded in accepted ADR-0003. They are not completed
 by the Issue #6 synthetic policy model.
 
 - Verify the reserved hostname serves ServerSentinel alone on every scheme and
