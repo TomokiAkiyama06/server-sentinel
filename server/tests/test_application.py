@@ -116,7 +116,8 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
         task = asyncio.create_task(runtime.run())
         try:
             for _ in range(100):
-                if store.calls >= 2:
+                if (store.calls >= 2
+                        and runtime.health == AuditRetentionHealth.HEALTHY):
                     break
                 await asyncio.sleep(0.001)
             self.assertGreaterEqual(store.calls, 2)
