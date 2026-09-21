@@ -201,6 +201,29 @@ class AuditStore:
                 ).fetchall()
         return tuple(self._record(row) for row in rows)
 
+    def cleanup_expired_batch(self, *, now: datetime | None = None) -> int:
+        """Delete at most one batch across the Main database audit tables."""
+        reference = utc_timestamp(self._clock() if now is None else now)
+        cutoff_us = _microseconds(reference - self.retention)
+        cutoff_text = (reference - self.retention).isoformat()
+        with self.transaction(write=True) as connection:
+            cursor = connection.execute(
+                "DELETE FROM security_admin_audit_records WHERE id IN ("
+                "SELECT id FROM security_admin_audit_records "
+                "WHERE occurred_at_us < ? ORDER BY occurred_at_us, id LIMIT ?)",
+                (cutoff_us, self.cleanup_batch_size),
+            )
+            removed = max(cursor.rowcount, 0)
+            remaining = self.cleanup_batch_size - removed
+            if remaining:
+                cursor = connection.execute(
+                    "DELETE FROM integrity_audit WHERE id IN ("
+                    "SELECT id FROM integrity_audit WHERE at < ? ORDER BY at, id LIMIT ?)",
+                    (cutoff_text, remaining),
+                )
+                removed += max(cursor.rowcount, 0)
+        return removed
+
     def cleanup_expired(self, *, now: datetime | None = None) -> int:
         """Delete only audit rows strictly older than this store's retention.
 
@@ -210,19 +233,9 @@ class AuditStore:
         the next run resumes; repeating a completed run deletes nothing more.
         """
         reference = utc_timestamp(self._clock() if now is None else now)
-        cutoff = _microseconds(reference - self.retention)
         deleted = 0
         while True:
-            with self.transaction(write=True) as connection:
-                cursor = connection.execute(
-                    "DELETE FROM security_admin_audit_records WHERE id IN ("
-                    "SELECT id FROM security_admin_audit_records "
-                    "WHERE occurred_at_us < ? ORDER BY occurred_at_us, id LIMIT ?)",
-                    (cutoff, self.cleanup_batch_size),
-                )
-                # A driver that cannot report a row count must not be read
-                # as a negative deletion total.
-                removed = max(cursor.rowcount, 0)
+            removed = self.cleanup_expired_batch(now=reference)
             deleted += removed
             if removed < self.cleanup_batch_size:
                 return deleted

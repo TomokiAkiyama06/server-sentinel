@@ -3,6 +3,7 @@ from contextlib import closing, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
 from uuid import uuid4
@@ -172,7 +173,7 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
                                  storage_reservation=synthetic_admission)
         with closing(application.state.database.connect()) as connection:
             migrate(connection, APPLICATION_MIGRATIONS)
-        with patch.object(application.state.audit_store, "cleanup_expired",
+        with patch.object(application.state.audit_store, "cleanup_expired_batch",
                           side_effect=AuditStorageError("synthetic unavailable")):
             async with application.router.lifespan_context(application):
                 # A refused retention run is visible as degraded health, not as
@@ -197,7 +198,7 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
         runtime = AuditRetentionRuntime(store, interval_seconds=1000,
                                         retry_seconds=0.001)
         with self.assertRaises(AuditStorageError):
-            runtime.startup_cleanup()
+            await runtime.startup_cleanup()
         self.assertEqual(AuditRetentionHealth.DEGRADED, runtime.health)
         task = asyncio.create_task(runtime.run())
         try:
@@ -212,6 +213,65 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
             task.cancel()
             with self.assertRaises(asyncio.CancelledError):
                 await task
+
+    async def test_cleanup_batch_runs_off_event_loop_and_cancellation_joins_worker(self):
+        started = threading.Event()
+        release = threading.Event()
+        event_thread = threading.get_ident()
+
+        class BlockingStore:
+            cleanup_batch_size = 1
+
+            def cleanup_expired_batch(self):
+                self.worker_thread = threading.get_ident()
+                started.set()
+                release.wait(2)
+                return 0
+
+        store = BlockingStore()
+        runtime = AuditRetentionRuntime(store)
+        task = asyncio.create_task(runtime.startup_cleanup())
+        try:
+            for _ in range(100):
+                if started.is_set():
+                    break
+                await asyncio.sleep(0.001)
+            self.assertTrue(started.is_set())
+            self.assertNotEqual(event_thread, store.worker_thread)
+            # The cleanup is still blocked, but the asyncio thread can run.
+            await asyncio.sleep(0)
+            task.cancel()
+            await asyncio.sleep(0)
+            self.assertFalse(task.done())
+        finally:
+            release.set()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+
+    async def test_application_schedules_additional_private_audit_store(self):
+        class PrivateAuditStore:
+            cleanup_batch_size = 2
+
+            def __init__(self):
+                self.results = [2, 1]
+
+            def cleanup_expired_batch(self):
+                return self.results.pop(0) if self.results else 0
+
+        private = PrivateAuditStore()
+        application = create_app(
+            self.settings, storage_reservation=synthetic_admission,
+            audit_cleanup_interval_seconds=1000,
+            audit_retention_stores=(private,),
+        )
+        async with application.router.lifespan_context(application):
+            for _ in range(100):
+                if not private.results:
+                    break
+                await asyncio.sleep(0.001)
+            self.assertEqual([], private.results)
+            self.assertEqual(AuditRetentionHealth.HEALTHY,
+                             application.state.audit_retention.health)
 
     async def test_unbound_storage_admission_refuses_audit_writes(self):
         application = create_app(self.settings, audit_cleanup_interval_seconds=1000)

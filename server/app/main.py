@@ -3,7 +3,7 @@
 import asyncio
 from contextlib import asynccontextmanager, closing, suppress
 import logging
-from typing import Callable, ContextManager
+from typing import Callable, ContextManager, Iterable
 
 from fastapi import FastAPI
 from starlette.types import ASGIApp, Receive, Scope, Send
@@ -52,7 +52,8 @@ def create_app(settings: Settings, *, database: Database | None = None,
                human_authorizer: HumanAuthorizer | None = None,
                owner_authorizer: OwnerAuthorizer | None = None,
                audit_cleanup_interval_seconds: float = 24 * 60 * 60,
-               storage_reservation: Callable[[], ContextManager] | None = None) -> FastAPI:
+               storage_reservation: Callable[[], ContextManager] | None = None,
+               audit_retention_stores: Iterable[object] = ()) -> FastAPI:
     store = database or Database(settings.database_path)
     # The deployment injects the Main Server storage admission reservation once
     # its storage policy is bound, so audit writes and retention cleanup cannot
@@ -63,7 +64,8 @@ def create_app(settings: Settings, *, database: Database | None = None,
     audit_service = OwnerAuditService(audit_store, owner_authorizer or DenyAllOwners())
     owner_administration = OwnerAdministration(audit_service, CameraRegistry(store))
     audit_retention = AuditRetentionRuntime(
-        audit_store, interval_seconds=audit_cleanup_interval_seconds,
+        audit_store, *tuple(audit_retention_stores),
+        interval_seconds=audit_cleanup_interval_seconds,
     )
 
     @asynccontextmanager
@@ -77,7 +79,7 @@ def create_app(settings: Settings, *, database: Database | None = None,
             # Lifespan failures must not pass SQLite/config values to servers.
             raise RuntimeError("application startup failed") from None
         try:
-            audit_retention.startup_cleanup()
+            await audit_retention.startup_cleanup()
         except Exception:
             # A refused storage admission or transient database fault must not
             # take physical-security monitoring offline. The bounded degraded

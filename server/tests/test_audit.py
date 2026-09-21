@@ -328,6 +328,32 @@ class AuditTests(unittest.TestCase):
         self.assertEqual(0, store.cleanup_expired())
         self.assertEqual(1, self.remaining())
 
+    def test_retention_also_expires_integrity_approval_audit_only(self):
+        store = self.reserved_store(SyntheticReservation(), cleanup_batch_size=2)
+        old = (self.now - timedelta(days=90, microseconds=1)).isoformat()
+        boundary = (self.now - timedelta(days=90)).isoformat()
+        with closing(self.database.connect()) as connection:
+            connection.execute(
+                "INSERT INTO integrity_baseline VALUES(1,1,'synthetic-baseline')"
+            )
+            connection.execute(
+                "INSERT INTO integrity_audit(at,actor,revision) VALUES(?,?,?)",
+                (old, str(uuid4()), 1),
+            )
+            connection.execute(
+                "INSERT INTO integrity_audit(at,actor,revision) VALUES(?,?,?)",
+                (boundary, str(uuid4()), 1),
+            )
+        self.assertEqual(1, store.cleanup_expired())
+        with closing(self.database.connect()) as connection:
+            rows = connection.execute(
+                "SELECT at FROM integrity_audit ORDER BY at"
+            ).fetchall()
+            self.assertEqual([boundary], [row["at"] for row in rows])
+            self.assertEqual(1, connection.execute(
+                "SELECT revision FROM integrity_baseline WHERE singleton=1"
+            ).fetchone()[0])
+
     def test_interrupted_cleanup_keeps_committed_batches_and_unexpired_rows(self):
         store = self.reserved_store(SyntheticReservation(), cleanup_batch_size=2)
         self.now -= timedelta(days=91)

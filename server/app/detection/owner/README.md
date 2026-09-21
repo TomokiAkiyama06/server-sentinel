@@ -23,8 +23,12 @@ private root must also be unsubstitutable: owned by the service or root and not
 writable by others unless sticky. Deployments therefore cannot place the root
 under a world-writable non-sticky directory.
 Deployment wiring must reserve worst-case database, rollback journal and audit
-growth before construction/mutation, and integrate 90-day audit retention. No
-production storage policy/lifecycle is silently installed by this module.
+growth before construction/mutation, and pass this store to the Main Server's
+audit-retention runtime. Its bounded maintenance connection repeats the private
+root/file identity and permission checks, uses the storage reservation, and
+deletes only `owner_template_audit` rows older than the 90-day default. It never
+reads or changes `owner_template`. No production storage policy is silently
+installed by this module.
 
 Enrollment/replacement/delete require `OwnerAuthorizer.require_owner(operation)`;
 the default denies, and the implementation must validate an actual current

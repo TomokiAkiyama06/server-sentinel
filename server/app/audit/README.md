@@ -66,13 +66,20 @@ the earlier immutable success continues to mean that the Owner-authorized
 deletion journal committed, not that physical cleanup completed.
 
 `AuditStore.cleanup_expired()` defaults to 90 days and deletes only rows from
-the audit table that are strictly older than one cutoff computed for the whole
-run. Expired rows are removed oldest first in bounded transactions, so a large
+the security/admin and hardware-baseline approval audit tables that are strictly
+older than one cutoff computed for the whole run. The private Owner-template
+store exposes the same bounded cleanup contract and is supplied to
+`create_app(audit_retention_stores=...)` when that optional store is active;
+its database remains separately verified and is never attached to the Main DB.
+Expired rows are removed oldest first in bounded transactions, so a large
 backlog never grows one rollback journal beyond the configured write overhead.
 Each committed batch is durable on its own: an interrupted run leaves a
 consistent store, the next run resumes, and repeating a completed run deletes
-nothing more. The Main Server runs it at startup and every 24 hours through
-`AuditRetentionRuntime`. A failed run sets bounded degraded health and is
+nothing more. The Main Server runs one bounded batch at startup and drains any
+backlog through `AuditRetentionRuntime` on bounded worker threads, yielding
+between batches so the asyncio request loop stays responsive. Cancellation
+waits for the current SQLite transaction to finish before shutdown. A failed
+run sets bounded degraded health and is
 retried on a shorter interval, so a transient fault cannot delay expired-row
 deletion by a whole day; exception details are not retained. A degraded startup
 run is reported as `audit_retention_degraded` and does not stop the Main Server

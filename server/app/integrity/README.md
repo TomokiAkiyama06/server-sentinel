@@ -78,8 +78,9 @@ A later healthy status cannot erase these warnings.
 Reserved acknowledgement transactions promote overflow into the normal outbox
 with the fixed `COALESCED_PENDING_WARNING` reason and fresh monotonic event IDs;
 the sink must continue draining on subsequent ticks. Retry drains pending events
-before another observation. The durable #21 sink owns fault history and its retention; approval
-audit retention also needs that integration before deployment.
+before another observation. The durable #21 sink owns fault history and its retention. Hardware
+approval rows in `integrity_audit` use the Main audit runtime's 90-day cleanup;
+that cleanup never changes the approved baseline, current status or fault outbox.
 
 Tests only read generated procfs/sysfs fixtures in temporary directories and
 inject command output. They never inspect the test runner's real inventory.
