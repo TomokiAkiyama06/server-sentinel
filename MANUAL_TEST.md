@@ -630,7 +630,13 @@ Run this only on the intended Main Server using synthetic, non-production diagno
 - [ ] verify Owner biometric templates/embeddings are excluded even from an explicitly initiated export, and no selected export authorizes external biometric processing/storage;
 - [ ] verify raw hardware serials/UUIDs are absent or redacted/hashed, while the manifest reports only safe categories and exclusion reasons;
 - [ ] verify raw monitoring media is absent by default and can be included only after an additional explicit Owner selection; do not use real monitoring media for this check;
+- [ ] before authorization, the confirmation names the included categories and every individually selected raw-media item; selecting one synthetic item includes only that item and selecting none includes no media;
+- [ ] the manifest records no excluded value, media ID, path, or other private deployment identifier, and the bundle stays deployment-local until the Owner separately chooses how to share it;
+- [ ] an export directed at a directory outside the approved storage filesystem, or attempted while the approved mount is missing or substituted, is refused before any space is reserved and never falls back to the root filesystem;
+- [ ] cancelling the Owner request or disconnecting mid-export leaves no bundle, partial file, or held reservation behind; repeat the disconnect and confirm archives do not accumulate;
 - [ ] record only sanitized PASS/FAIL and aggregate results locally; do not retain the test bundle after the local verification policy permits deletion.
+
+Results: **NOT RUN — Owner authorization/UI integration and Main Server network observation remain pending. Synthetic tests do not complete this acceptance.**
 
 ## V. Deployed Main Server install / update / rollback lifecycle
 

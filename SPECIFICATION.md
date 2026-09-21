@@ -649,6 +649,73 @@ Runtime may combine global transform compensation, edges/contours, ROI similarit
 
 Candidate signals include global optical transform, persistent occlusion/near-black view, abrupt focus/exposure/scene-pose change, and disconnect closely following scene movement.
 
+The internal `server/app/detection/roi/` core operates only on transient,
+bounded grayscale frames for one immutable source/profile calibration. It stores
+source type, profile, polygon, reference digest, reference geometry, policy,
+version, and timestamp in a private append-only calibration history after
+the application's ROI calibration migration. That history is metadata only: no frame pixels, crop,
+thumbnail or other decoded monitoring media is persisted, so it cannot become
+still-image storage outside recording authorization and retention. A stored
+record therefore cannot reproduce a reference image; resuming detection re-binds
+an Owner-supplied transient frame whose digest and geometry must match the
+record. The core does not supply production thresholds, start capture, expose an
+API, retain decoded media, make a presence decision, or issue a notification.
+
+A calibration policy whose bounded search window cannot reach its own movement
+or camera-shift threshold is refused: such a configuration cannot express the
+displacement it asks to detect and would report a matching geometry instead. A
+calibration is refused as well when its own support leaves no translating
+pure translation at or beyond a threshold above the coverage minimum in every
+axis direction, since a quarter turn does not register a pixel shift even when
+it carries a translation and one direction does not stand for its opposite, or
+when its reference
+already meets the obscured-scene threshold, since every unchanged sample would
+then confirm a tamper that never happened.
+
+It first estimates a bounded global translation/quarter-turn transform from
+background support, then compares the ROI relative to that transform. A
+confirmed ROI movement requires the policy's multiple samples and elapsed time.
+An explicit ROI-occlusion signal, insufficient movement quality, sampling gap,
+stream restart, regression, incompatible frame, or inadequate calibration
+returns `unknown` and resets confirmation; none is converted into a trustworthy
+no-movement result. A refused sample, such as a frame from another source, ends
+the episode as well, so no later confirmation spans it, and the observed stream,
+sequence and clock advance before any such result so that a buffered frame from
+a superseded geometry cannot re-enter confirmation. An identified sample whose
+metadata alone is unusable, and a refused source-loss report carrying a valid
+outage clock, advance that progression too. Every replaced stream is
+retained for the detector's lifetime, so a delayed frame from a stream the
+source has already left is refused as stale imagery instead of becoming current
+again, and no number of later replacements restores an old identity. The number
+of admitted stream transitions is bounded instead, and a detector that reaches
+that bound latches: every later sample and source-loss report stays unknown
+until a fresh detector is bound. Temporal confirmation also begins at the
+reference sample, so imagery the source captured before the calibration existed
+cannot contribute to it. Because such an
+interruption ends the episode, a condition
+confirmed again afterwards is emitted again instead of being suppressed as a
+duplicate, so no confirmed critical observation is silently lost. Person
+presence is not an input to this conclusion.
+
+Camera tamper has an independent quality input and confirmation state. The core
+can report a persistent near-dark scene, a global scene shift, or a scene that
+stops registering while differing measurably from the calibrated background,
+which covers a covered or redirected camera. That difference is a bounded
+scene-change scalar and never an identity or a culprit attribution. A
+registration whose best transform is acceptable but ambiguous, as on a
+repetitive scene, remains `unknown` and confirms neither tamper nor its
+absence, because its untransformed difference is large even when the
+registered transform is small. Trusted source loss becomes critical
+only when it occurs within the configured interval after a recorded global
+scene shift, and at most once per tracked shift episode; uncorrelated or
+untrusted loss stays `unknown`. One confirmed sample may carry both a server
+movement and a camera tamper, so local critical staging always admits a whole
+batch rather than refusing evidence a caller could never resubmit.
+A later runtime must durably handle a confirmed critical observation
+for evidence preservation and configured notifications in every presence state.
+Synthetic tests do not establish physical-camera, lighting, pose, or
+source-health behavior.
+
 ### 7.5 Detector-specific image-quality gate
 
 Quality is not only for face verification. Every detector defines prerequisites required to make a trustworthy positive or negative conclusion.
@@ -868,6 +935,8 @@ Notification delivery follows configured local/UI/Slack channels. Slack remains 
 ### 10.5 Privacy and privilege
 
 Detailed hardware identifiers are deployment-local security metadata. Do not send raw serials/UUIDs through telemetry or developer infrastructure. Normal operational logs and general diagnostics must redact/hash them. A detailed diagnostic export requires an explicit Owner action and does not authorize automatic upload.
+
+A diagnostic export is optional convenience data, not monitoring evidence. Reserving space for one must not run retention or delete recordings to make room; a deployment without free space refuses the export with its explicit storage state instead. Export size is bounded twice: the implementation caps one selected media item at 512 MiB and a whole bundle at 1 GiB as a defensive upper bound, while the deployment-configured storage maximum request size remains authoritative and refuses anything larger. Selected media is copied in bounded chunks so an export never buffers a whole clip. Only reviewed fixed reason codes, never local values, reach an export caller.
 
 Hardware/SMART probing must use the least privilege practical. Do not run the whole ServerSentinel stack as root merely to obtain inventory/health data; use narrow host permissions/helper boundaries if privileged probes are required.
 

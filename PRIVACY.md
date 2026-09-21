@@ -190,6 +190,10 @@ Diagnostics remain local unless explicitly exported/shared.
 
 Exports redact/exclude credentials, pairing secrets, private keys, and sensitive headers. Owner biometric templates/embeddings are always excluded, including when the Owner explicitly initiates an export. Raw monitoring media is excluded unless the Owner explicitly selects it for export; that media exception does not authorize template/embedding export or external biometric processing/storage.
 
+Creating a support bundle never deletes recordings: a diagnostic export reserves space without running retention, and a deployment without free space is refused instead of reclaiming monitoring evidence.
+
+Only the deployment Owner may start an export or select media for one. An invited non-Owner identity that satisfies the general human access boundary is refused before diagnostics are collected and before any selected-media identifier is looked up, so an export route cannot be used to probe which media exist. A bundle whose Owner request is cancelled before the Owner receives its name is removed from local storage instead of being left readable.
+
 ## Public repository safety
 
 Repository/CI media fixtures are synthetic/generated only. Real-person or real-environment monitoring media is not committed or attached to GitHub, including merely publicly licensed real-person media. External benchmark datasets may be used locally under their own terms and are not repository fixtures.
@@ -201,5 +205,15 @@ The deployment owner is responsible for camera placement and compliance with app
 ## Future changes
 
 Any feature that sends monitoring/biometric data to infrastructure operated by the ServerSentinel developer is a fundamental privacy-model change and requires explicit owner approval plus updated requirements/security/privacy documentation before implementation.
+
+The Issue #24 ROI/tamper core keeps its calibration history as metadata only:
+identities, Owner polygon, policy, reference geometry, version, timestamp and
+the reference SHA-256. No reference frame, crop or other decoded monitoring
+media is written to that history, so it cannot become a persistent still-image
+store outside recording authorization and retention. Restoring a calibration
+re-binds an Owner-supplied transient frame that must match the stored digest
+and geometry. Its scene-change measurements are bounded scalars and never
+person identities, and a detector that cannot register a scene reliably reports
+`unknown` rather than a trustworthy "no tamper".
 
 The Issue #20 detector foundation keeps only bounded transient grayscale samples and a previous motion sample per source. It performs no model download, persistence or network I/O; unavailable person inference remains `unknown`. Model/runtime adoption and their separate privacy/license acceptance are documented in `server/docs/DETECTOR_MODEL_AUDIT.md`; synthetic primitive tests are not acceptance of an external model.
