@@ -142,7 +142,7 @@ historical timeline / event へのアクセスは `recordings:view` に含めま
 
 trusted proxy / Tailscale の identity header を使う場合、その listener への backend アクセスは通常の LAN client から迂回できないようにしてください。
 
-対象 deployment では研究室で 1 つの Tailscale account を共有するため、Tailscale login は account を示すだけで人を特定しません。application 認可は、ServerSentinel が発行する個人単位かつ個別に失効できる credential（ADR-0004 で WebAuthn / passkey を選択）に依存させてください。Tailscale の identity / device 情報は補助的な扱いに留めます。proxy identity header だけで human route を認可しないこと、device の承認を人物の特定であるかのように説明しないことを守ってください。
+対象 deployment では研究室で 1 つの Tailscale account を共有するため、Tailscale login は account を示すだけで人を特定しません。application 認可は、ServerSentinel が発行する個人単位かつ個別に失効できる credential（ADR-0004 が WebAuthn / passkey を提案、Owner 承認待ち）に依存させてください。Tailscale の identity / device 情報は補助的な扱いに留めます。proxy identity header だけで human route を認可しないこと、device の承認を人物の特定であるかのように説明しないことを守ってください。
 
 credential を人に紐づけるための条件も守ってください。登録時と毎回の認証で authenticator の user verification を必須にし、authenticator は招待された本人が管理するものとします。OS account や端末の unlock を共有する機器では、その共有 profile に置かれた platform authenticator は共有 credential であり条件を満たしません。session は生成元 credential に紐づけ、idle / 絶対時間両方の上限で終了させます。意図的に貸し与えられた credential や、放置された unlock 済み session を application が検知できるとは説明しないでください。
 
