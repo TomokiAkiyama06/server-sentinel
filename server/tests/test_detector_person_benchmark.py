@@ -110,6 +110,29 @@ class PersonBenchmarkTests(unittest.TestCase):
         self.assertTrue(all(item["reason"] in {"inference_dropped", "inference_over_budget"}
                             for item in schedulers))
 
+    def test_replay_delivers_capture_ticks_during_slow_inference(self):
+        result = run_benchmark(
+            config(warmup_cycles=0, measured_cycles=5,
+                   capture_interval_ns=5, cadence_ns=5,
+                   maximum_cadence_ns=40, evaluation_budget_ns=1_000),
+            detector_factory=lambda _index: StubDetector(),
+            timer_ns=Timer([20] * 5),
+        )
+
+        # The first 20 ns evaluation spans captures at 5, 10, 15, and 20 ns.
+        # Replaying each at its scheduled time exposes two pending overwrites;
+        # batching them at 20 ns would instead sample out three and report no
+        # drops or cadence throttling.
+        self.assertEqual(result["sources"][0]["scheduler"], {
+            "health": "degraded",
+            "reason": "evaluated",
+            "active_cadence_ns": 20,
+            "processed": 2,
+            "dropped": 2,
+            "sampled_out": 1,
+            "pending": False,
+        })
+
     def test_invalid_source_count_cycles_and_policy_are_rejected(self):
         for changes in (
             {"sources": 0}, {"sources": 5}, {"measured_cycles": 0},

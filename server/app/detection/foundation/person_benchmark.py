@@ -85,21 +85,19 @@ class _SimulationClock:
         if value > self.value:
             self.value = value
 
-    def advance(self, duration: int) -> None:
-        self.value += duration
-
 
 class _ReplayDetector:
     kind = DetectorKind.PERSON
 
-    def __init__(self, measurements: list[_Measurement], clock: _SimulationClock,
+    def __init__(self, measurements: list[_Measurement],
+                 advance_inference: Callable[[int], None],
                  *, implementation: str, version: str) -> None:
         if not measurements:
             raise ValueError("replay requires measured inference results")
         self.implementation = implementation
         self.version = version
         self._measurements = measurements
-        self._clock = clock
+        self._advance_inference = advance_inference
         self._position = 0
 
     def reset(self) -> None:
@@ -108,7 +106,7 @@ class _ReplayDetector:
     def evaluate(self, frame: RgbFrame) -> Detection:
         measurement = self._measurements[self._position % len(self._measurements)]
         self._position += 1
-        self._clock.advance(measurement.latency_ns)
+        self._advance_inference(measurement.latency_ns)
         return measurement.result
 
 
@@ -181,24 +179,42 @@ def _replay(config: BenchmarkConfig, measurements: list[list[_Measurement]],
         maximum_observation_age_ns=config.maximum_observation_age_ns,
         maximum_pixels=MODEL_INPUT_SIZE * MODEL_INPUT_SIZE,
     )
+
+    capture_tick = 0
+
+    def deliver_captures_through(finished_ns: int) -> None:
+        """Advance to an absolute time, delivering captures on the way."""
+        nonlocal capture_tick
+        if finished_ns < clock.value:
+            raise ValueError("simulation time cannot move backwards")
+        while (capture_tick < config.measured_cycles
+               and capture_tick * config.capture_interval_ns <= finished_ns):
+            captured_ns = capture_tick * config.capture_interval_ns
+            clock.advance_to(captured_ns)
+            for source_index in range(config.sources):
+                scheduler.offer(_frame(source_index, capture_tick),
+                                quality=Quality.SUFFICIENT)
+            capture_tick += 1
+        clock.advance_to(finished_ns)
+
+    def advance_inference(duration_ns: int) -> None:
+        if duration_ns < 0:
+            raise ValueError("inference duration cannot be negative")
+        deliver_captures_through(clock.value + duration_ns)
+
     for source_index, source_measurements in enumerate(measurements):
         scheduler.register(
             UUID(int=source_index + 1),
-            _ReplayDetector(source_measurements, clock,
+            _ReplayDetector(source_measurements, advance_inference,
                             implementation=implementation, version=version),
             policy,
         )
 
-    capture_tick = 0
-    # Inference is serial. If one evaluation crosses several capture ticks, all
-    # those capture admissions are delivered before the next worker selection.
+    # Inference is serial, but capture continues concurrently. The replay
+    # detector advances through each crossed capture event while run_one has
+    # released the scheduler lock, matching that production interaction.
     while capture_tick < config.measured_cycles:
-        clock.advance_to(capture_tick * config.capture_interval_ns)
-        while (capture_tick < config.measured_cycles
-               and capture_tick * config.capture_interval_ns <= clock.value):
-            for source_index in range(config.sources):
-                scheduler.offer(_frame(source_index, capture_tick), quality=Quality.SUFFICIENT)
-            capture_tick += 1
+        deliver_captures_through(capture_tick * config.capture_interval_ns)
         scheduler.run_one()
 
     # Drain work that is runnable now. Work delayed by a throttled cadence stays
