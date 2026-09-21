@@ -51,6 +51,11 @@ jobs:
           python -m pycodestyle --select=E4,E7,E9 scripts tests
       - name: Synthetic guard and component regression tests
         run: python -m unittest discover -s tests/unit -p 'test_*.py' -v
+      - name: Hardware-free mock E2E core scenarios
+        env:
+          PYTHONDONTWRITEBYTECODE: '1'
+          PYTHONPATH: server:agent:.
+        run: python -m unittest tests.e2e.test_mock_core_harness -v
       - name: Whitespace validation
         run: git diff --check HEAD^ HEAD
 
