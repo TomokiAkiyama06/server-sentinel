@@ -63,9 +63,14 @@ class AccessStoreTests(unittest.TestCase):
     def test_permission_change_invalidates_existing_session_and_requires_new_one(self):
         principal, credential = self.enroll((Permission.LIVE_VIEW, Permission.RECORDINGS_VIEW))
         self.store.establish_session(principal.id, credential.credential_id, TOKEN)
+        self.store.establish_session(principal.id, credential.credential_id, b"m" * 32)
         self.store.set_permissions(principal.id, (Permission.RECORDINGS_VIEW,))
-        with self.assertRaises(AccessValidationError):
-            self.store.authorize(TOKEN, IDENTITY, Permission.LIVE_VIEW)
+        for token in (TOKEN, b"m" * 32):
+            with self.subTest(token=token), self.assertRaises(AccessValidationError):
+                self.store.authorize(token, IDENTITY, Permission.LIVE_VIEW)
+        with closing(self.database.connect()) as connection:
+            invalidated = connection.execute("SELECT count(*) FROM access_sessions WHERE principal_id=? AND invalidated_at_us IS NOT NULL", (str(principal.id),)).fetchone()[0]
+        self.assertEqual(invalidated, 2)
         self.store.establish_session(principal.id, credential.credential_id, b"n" * 32)
         self.assertEqual(self.store.authorize(b"n" * 32, IDENTITY, Permission.RECORDINGS_VIEW).id, principal.id)
         with self.assertRaises(AccessValidationError):

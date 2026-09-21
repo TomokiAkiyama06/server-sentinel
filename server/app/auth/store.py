@@ -199,13 +199,14 @@ class AccessStore:
         if not isinstance(principal_id, UUID):
             raise AccessValidationError("principal identity is invalid")
         grants = self._permissions(permissions)
+        at = utc_time(self._clock())
         with self._transaction(write=True) as connection:
             row = connection.execute("SELECT status FROM access_principals WHERE id=?", (str(principal_id),)).fetchone()
             if row is None or row["status"] == PrincipalStatus.REVOKED.value:
                 raise AccessValidationError("principal is unavailable")
             connection.execute("DELETE FROM access_principal_permissions WHERE principal_id=?", (str(principal_id),))
             connection.executemany("INSERT INTO access_principal_permissions VALUES (?, ?)", ((str(principal_id), value.value) for value in grants))
-            self._advance_principal(connection, principal_id)
+            self._advance_principal(connection, principal_id, at)
 
     def revoke_principal(self, principal_id: UUID, *, now: datetime | None = None) -> None:
         if not isinstance(principal_id, UUID):
@@ -231,6 +232,10 @@ class AccessStore:
         return result
 
     @staticmethod
-    def _advance_principal(connection, principal_id: UUID) -> None:
+    def _advance_principal(connection, principal_id: UUID, at: datetime) -> None:
+        # Both statements are within the caller's BEGIN IMMEDIATE transaction:
+        # a commit publishes the revision and every invalidation together, while
+        # a failure rolls both back. A real invalidation timestamp avoids a
+        # sentinel value that could be misread as a valid Unix epoch session.
         connection.execute("UPDATE access_principals SET authorization_revision=authorization_revision+1 WHERE id=?", (str(principal_id),))
-        connection.execute("UPDATE access_sessions SET invalidated_at_us=0 WHERE principal_id=? AND invalidated_at_us IS NULL", (str(principal_id),))
+        connection.execute("UPDATE access_sessions SET invalidated_at_us=? WHERE principal_id=? AND invalidated_at_us IS NULL", (_us(at), str(principal_id)))
