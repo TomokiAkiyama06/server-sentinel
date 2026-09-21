@@ -208,7 +208,22 @@ class SceneDetector:
         behind would let an older buffered frame start an episode that a later
         frame completes across the refusal.
         """
-        if self.stream_id == frame.stream_id and frame.sequence > self.last_sequence:
+        if self.stream_id != frame.stream_id:
+            # Metadata can be malformed on the first frame of a replacement
+            # stream.  Consume that transition before refusing it: otherwise
+            # delayed frames from the previous stream remain current and can
+            # rebuild temporal confirmation from stale imagery.
+            if self.stream_id is not None:
+                if frame.stream_id in self.retired_streams:
+                    self.last_ns = max(self.last_ns, monotonic_ns)
+                    return
+                if len(self.retired_streams) >= RETIRED_STREAM_LIMIT:
+                    self.exhausted = True
+                    self.last_ns = max(self.last_ns, monotonic_ns)
+                    return
+                self.retired_streams.add(self.stream_id)
+            self.stream_id, self.last_sequence = frame.stream_id, frame.sequence
+        elif frame.sequence > self.last_sequence:
             self.last_sequence = frame.sequence
         self.last_ns = max(self.last_ns, monotonic_ns)
 

@@ -373,6 +373,18 @@ class SceneDetectorTests(unittest.TestCase):
         self.assertFalse(buffered.critical)
         self.assertFalse(later.critical)
 
+    def test_malformed_first_replacement_frame_retires_prior_stream(self):
+        moved = transformed(pixels(), (1, 0), region=(4, 4, 8, 7))
+        replacement = UUID(int=991)
+        instance = detector()
+        inspect_scene(instance, frame(0), 0)
+        with self.assertRaises(ValueError):
+            inspect_scene(instance, frame(0, stream=replacement), 10, occluded="maybe")
+        stale = [inspect_scene(instance, frame(index, moved), 20 + index * 10)
+                 for index in (1, 2)]
+        self.assertTrue(all(sample.movement_reason == "retired_stream" for sample in stale))
+        self.assertTrue(all(not sample.critical for sample in stale))
+
     def test_rejected_source_loss_keeps_a_valid_outage_clock(self):
         moved = transformed(pixels(), (1, 0), region=(4, 4, 8, 7))
         instance = detector()
