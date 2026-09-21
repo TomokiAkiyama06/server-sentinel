@@ -94,7 +94,9 @@ async def run(scenario):
                 assert registry.get_source(remote_sources[0].id).health_state is SourceHealthState.OFFLINE
                 source = local_sources[0]
                 registry.update_source(source.id, desired_capture_profile=CaptureProfile(640, 480, 10, "MJPG"))
-                candidate = DeviceEvidence("/dev/video0", "synthetic", "model", "serial")
+                # Non-serial candidates are weak identities.  A later device
+                # with the same evidence must never auto-bind after reconnect.
+                candidate = DeviceEvidence("/dev/video0", "synthetic", "model", None)
                 discovery = Discovery([candidate])
                 events, frames = [], []
                 adapter = LocalUvcAdapter(registry, emit_audit=events.append,
@@ -112,7 +114,7 @@ async def run(scenario):
                 # manual intervention until a future Owner reapproval.
                 assert registry.get_source(remote_sources[1].id).health_state is SourceHealthState.OFFLINE
                 discovery.devices = [candidate, DeviceEvidence(
-                    "/dev/video1", "synthetic", "model", "serial",
+                    "/dev/video1", "synthetic", "model", None,
                 )]
                 assert not adapter.poll_source(source.id)
                 assert (registry.get_source(source.id).health_state
