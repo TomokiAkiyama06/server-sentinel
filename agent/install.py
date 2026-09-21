@@ -147,15 +147,25 @@ def _pointer_target(destination, name):
     return target
 
 
+def _sync_directory(path):
+    descriptor = open_directory(path)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 def _set_pointer(destination, name, target):
     pointer = destination / name
     temporary = destination / ("." + name + ".new")
     temporary.unlink(missing_ok=True)
     if target is None:
         pointer.unlink(missing_ok=True)
+        _sync_directory(destination)
         return
     temporary.symlink_to(target)
     os.replace(temporary, pointer)
+    _sync_directory(destination)
 
 
 def _switch_pointers(destination, *, current, previous):
@@ -235,12 +245,8 @@ def _replace_unit(path, content):
             os.fsync(stream.fileno())
         os.replace(temporary, path)
         replaced = True
-        parent = open_directory(path.parent)
-        try:
-            os.fsync(parent)
-        finally:
-            os.close(parent)
-    except Exception as error:
+        _sync_directory(path.parent)
+    except BaseException as error:
         if descriptor is not None:
             os.close(descriptor)
         if not replaced:
@@ -296,14 +302,18 @@ def _stage(args, artifact, settings, account, config):
     try:
         with executable.open("xb") as stream:
             stream.write(artifact)
-        executable.chmod(0o555)
+            stream.flush()
+            os.fchmod(stream.fileno(), 0o555)
+            os.fsync(stream.fileno())
         subprocess.run([str(executable), "--config", str(config), "--check"],
                        check=True, timeout=30, user=account.pw_uid, group=account.pw_gid,
                        extra_groups=[], env={"PATH": "/usr/bin:/bin",
                                              "PYTHONDONTWRITEBYTECODE": "1"},
                        cwd="/", stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        _sync_directory(version_root)
+        _sync_directory(args.destination)
         return executable
-    except Exception:
+    except BaseException:
         executable.unlink(missing_ok=True)
         version_root.rmdir()
         raise
@@ -368,20 +378,20 @@ def install(args):
     protected_parent(args.destination)
     protected_parent(args.unit.parent)
     with release_lock(args.destination):
-        executable = _stage(args, artifact, settings, account, config)
         current = _pointer_target(args.destination, "current")
         previous = _pointer_target(args.destination, "previous")
         if operation == "install" and (current is not None or previous is not None):
-            _remove_staged(executable)
             raise ValueError("release is already installed")
         content = render_unit(args.destination / "current/media-capture-agent", config, settings,
                               account.pw_name, account.pw_gid, args.video_device)
         installed_unit = _installed_unit(args.unit) if operation == "update" else None
+        if operation == "update" and current is not None:
+            _validate_release(args.destination, current)
+        if operation == "update" and current is None and previous is not None:
+            raise ValueError("release pointers are inconsistent")
+        executable = _stage(args, artifact, settings, account, config)
         adopted = False
         if operation == "update" and current is None:
-            if previous is not None:
-                _remove_staged(executable)
-                raise ValueError("release pointers are inconsistent")
             try:
                 legacy = _legacy_release(args.destination, installed_unit, config, settings,
                                          account, args.video_device)
@@ -392,13 +402,13 @@ def install(args):
                     # The current pointer deliberately remains on the legacy
                     # executable so either durable unit version stays valid.
                     raise
-                except Exception:
+                except BaseException:
                     _switch_pointers(args.destination, current=None, previous=None)
                     raise
             except (ReleaseRestorationError, UnitReplacementError):
                 # State is uncertain. Retain every release that may be named.
                 raise
-            except Exception:
+            except BaseException:
                 _remove_staged(executable)
                 raise
             current = legacy
@@ -409,10 +419,13 @@ def install(args):
                 with args.unit.open("x", encoding="utf-8") as stream:
                     unit_created = True
                     stream.write(content)
-                args.unit.chmod(0o644)
+                    stream.flush()
+                    os.fchmod(stream.fileno(), 0o644)
+                    os.fsync(stream.fileno())
+                _sync_directory(args.unit.parent)
             elif not adopted and installed_unit != content:
                 raise ValueError("installed service configuration differs")
-        except Exception:
+        except BaseException:
             if unit_created:
                 args.unit.unlink()
             _remove_staged(executable)
@@ -423,7 +436,7 @@ def install(args):
             # A pointer may still reference the newly staged release. Preserve
             # both it and the unit for explicit administrator recovery.
             raise
-        except Exception:
+        except BaseException:
             if unit_created:
                 args.unit.unlink()
             _remove_staged(executable)

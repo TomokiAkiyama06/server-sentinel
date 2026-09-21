@@ -478,6 +478,31 @@ raise SystemExit(1)
 
 
 class DistributionTests(DeploymentCase):
+    def _release_fixture(self):
+        destination = self.root / "installation"
+        destination.mkdir()
+        config = self.root / "deployment.json"
+        value = dataclasses.asdict(self.settings)
+        for key in ("node_id", "runtime_root", "media_root"):
+            value[key] = str(value[key])
+        for key in ("mount_point", "filesystem_root"):
+            value["expected_mount"][key] = str(value["expected_mount"][key])
+        config.write_text(json.dumps(value))
+        config.chmod(0o600)
+        unit = self.root / "media-capture-agent.service"
+
+        def arguments(version, operation):
+            artifact = self.root / ("artifact-" + version)
+            build(artifact, version=version,
+                  source_commit=("a" if version == "0.1.0" else "b") * 40)
+            return argparse.Namespace(
+                artifact=artifact, config=config, version=version, destination=destination,
+                video_device=[], unit=unit, operation=operation,
+                sha256=hashlib.sha256(artifact.read_bytes()).hexdigest(),
+            )
+
+        return destination, unit, arguments
+
     def test_ci_container_context_is_allow_listed(self):
         rules = (Path(__file__).parents[1] / ".dockerignore").read_text(encoding="utf-8")
         self.assertIn("\n*\n", "\n" + rules)
@@ -635,6 +660,52 @@ raise SystemExit(1)
             self.assertEqual(os.readlink(destination / "current"), "0.1.0")
             self.assertEqual(os.readlink(destination / "previous"), "0.2.0")
             self.assertEqual(config.read_bytes(), original_config)
+
+    def test_update_preflight_failure_does_not_leave_staged_release(self):
+        destination, unit, arguments = self._release_fixture()
+        with patch("install.os.geteuid", return_value=0), patch(
+                "install.protected_parent"), patch("install.subprocess.run"):
+            install(arguments("0.1.0", "install"))
+            unit.unlink()
+            with self.assertRaisesRegex(ValueError, "service configuration differs"):
+                install(arguments("0.2.0", "update"))
+        self.assertFalse((destination / "0.2.0").exists())
+
+    def test_update_rejects_unavailable_current_before_staging(self):
+        destination, _unit, arguments = self._release_fixture()
+        with patch("install.os.geteuid", return_value=0), patch(
+                "install.protected_parent"), patch("install.subprocess.run"):
+            install(arguments("0.1.0", "install"))
+            (destination / "current").unlink()
+            (destination / "current").symlink_to("9.9.9")
+            with self.assertRaisesRegex(ValueError, "release is unavailable"):
+                install(arguments("0.2.0", "update"))
+        self.assertEqual(os.readlink(destination / "current"), "9.9.9")
+        self.assertFalse((destination / "previous").exists())
+        self.assertFalse((destination / "0.2.0").exists())
+
+    def test_release_install_syncs_files_and_directories(self):
+        destination, unit, arguments = self._release_fixture()
+        real_fsync = os.fsync
+        synced = []
+
+        def record_fsync(descriptor):
+            synced.append(Path(f"/proc/self/fd/{descriptor}").resolve(strict=True))
+            real_fsync(descriptor)
+
+        with patch("install.os.geteuid", return_value=0), patch(
+                "install.protected_parent"), patch("install.subprocess.run"), patch(
+                "install.os.fsync", side_effect=record_fsync):
+            install(arguments("0.1.0", "install"))
+
+        expected = {
+            destination / "0.1.0/media-capture-agent",
+            destination / "0.1.0",
+            destination,
+            unit,
+            unit.parent,
+        }
+        self.assertTrue(expected.issubset(set(synced)))
 
     def test_update_adopts_exact_legacy_pinned_unit(self):
         destination = self.root / "installation"
