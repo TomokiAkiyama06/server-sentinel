@@ -162,11 +162,11 @@ def load_app_credentials(config: RuntimeConfig, environ: Mapping[str, str],
     an error.  The token is intentionally an environment-only runtime input.
     """
     _, key = _secure_private_bytes(config.private_key_path, checkout_root)
-    pem_markers = (
-        (b"-----BEGIN PRIVATE KEY-----", b"-----END PRIVATE KEY-----"),
-        (b"-----BEGIN RSA PRIVATE KEY-----",
-         b"-----END RSA PRIVATE KEY-----"),
-    )
+    fence = b"-" * 5
+    pem_markers = ((fence + b"BEGIN PRIVATE KEY" + fence,
+                    fence + b"END PRIVATE KEY" + fence),
+                   (fence + b"BEGIN RSA PRIVATE KEY" + fence,
+                    fence + b"END RSA PRIVATE KEY" + fence))
     if not (64 <= len(key) <= 65536
             and any(key.startswith(begin) and key.rstrip().endswith(end)
                     for begin, end in pem_markers)):

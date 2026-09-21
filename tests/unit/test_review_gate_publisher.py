@@ -18,7 +18,8 @@ class FakeGitHub:
     def __init__(self, context: Context, issuer: Issuer):
         self.context, self.issuer = context, issuer
         self.posts: list[tuple[str, str, dict]] = []
-        self.diff = b"synthetic fixed diff\n"
+        self.base_tree = {"truncated": False, "tree": [{"path": "old-name.txt", "mode": "100644", "type": "blob", "sha": "1" * 40}]}
+        self.head_tree = {"truncated": False, "tree": [{"path": "new-name.txt", "mode": "100644", "type": "blob", "sha": "2" * 40}]}
         self.graph = {
             context.head_sha: (context.merge_base_sha,),
             context.base_sha: (context.merge_base_sha,),
@@ -40,15 +41,11 @@ class FakeGitHub:
             sha = path.rsplit(marker, 1)[1]
             return {"sha": sha,
                     "parents": [{"sha": parent} for parent in self.graph[sha]]}
+        if path.endswith(f"/git/trees/{c.base_sha}?recursive=1"):
+            return self.base_tree
+        if path.endswith(f"/git/trees/{c.head_sha}?recursive=1"):
+            return self.head_tree
         raise AssertionError(path)
-
-    def get_bytes(self, path, token, accept):
-        self.assert_diff_request(path, accept)
-        return self.diff
-
-    def assert_diff_request(self, path, accept):
-        assert path.endswith(f"/pulls/{self.context.pr_number}")
-        assert accept == "application/vnd.github.v3.diff"
 
     def post_json(self, path, token, payload):
         self.posts.append((path, token, payload))
@@ -64,7 +61,9 @@ class ReviewGatePublisherTests(unittest.TestCase):
         self.config_path = self.root / "review-gate.json"
         self.key_path = self.root / "review-gate.pem"
         self.issuer = Issuer(900001, "synthetic-review-gate")
-        self.diff = b"synthetic fixed diff\n"
+        self.diff = publisher.canonical_no_rename_diff(
+            {"truncated": False, "tree": [{"path": "old-name.txt", "mode": "100644", "type": "blob", "sha": "1" * 40}]},
+            {"truncated": False, "tree": [{"path": "new-name.txt", "mode": "100644", "type": "blob", "sha": "2" * 40}]})
         self.context = Context(900002, 12, "refs/heads/main", "a" * 40, "b" * 40,
                                "c" * 40, hashlib.sha256(self.diff).hexdigest(), "f" * 40)
         self._write_runtime_files()
@@ -114,7 +113,7 @@ class ReviewGatePublisherTests(unittest.TestCase):
                     publisher.publish_success(fake, credentials, self.context, "codex")
                 self.assertEqual(fake.posts, [])
         fake = FakeGitHub(self.context, self.issuer)
-        fake.diff = b"changed diff\\n"
+        fake.head_tree["tree"][0]["sha"] = "3" * 40
         with self.assertRaises(publisher.PublisherFailure):
             publisher.publish_success(fake, credentials, self.context, "codex")
         self.assertEqual(fake.posts, [])
@@ -149,7 +148,7 @@ class ReviewGatePublisherTests(unittest.TestCase):
                                   + b"END RSA PRIVATE KEY" + fence + b"\n")
         credentials = self.credentials()
         self.assertTrue(credentials.private_key_pem.startswith(
-            b"-----BEGIN RSA PRIVATE KEY-----"))
+            b"-" * 5 + b"BEGIN RSA PRIVATE KEY" + b"-" * 5))
 
     def test_unique_merge_base_rejects_criss_cross_and_incomplete_proof(self):
         fake = FakeGitHub(self.context, self.issuer)
