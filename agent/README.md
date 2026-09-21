@@ -86,9 +86,11 @@ No network or application credential is accepted in this foundation.
 
 ## Versioned installation
 
-Build with `python3 agent/build_artifact.py --output <new-artifact-path>`. The
-result is an executable zipapp containing only application sources and the
-Apache license. Record the printed SHA-256 through the trusted release channel;
+Build with `python3 agent/build_artifact.py --output <new-artifact-path>
+--version <release-version> --source-commit <full-lowercase-git-commit>`. The
+result is an executable zipapp containing only application sources, the Apache
+license, and digest-bound version/commit provenance. Record the printed SHA-256
+through the trusted release channel;
 an unauthenticated hash downloaded beside an artifact is not an authenticity
 check. CI executes the artifact outside its development checkout.
 
@@ -100,7 +102,7 @@ may explicitly run:
 python3 agent/install.py --artifact <verified-artifact> --sha256 <trusted-sha256> \
   --version <release-version> --destination <root-controlled-install-directory> \
   --config <protected-config-file> --unit <unit-directory>/media-capture-agent.service \
-  --video-device /dev/video0
+  --video-device /dev/video0 --operation install
 ```
 
 The installer reads only a non-symlink, regular artifact of at most 16 MiB,
@@ -119,6 +121,18 @@ explicitly install/enable it with the host's normal administration workflow.
 Config/storage paths hidden by `ProtectHome` or unavailable in the unit's mount
 namespace require a deployment path change; do not disable sandboxing casually.
 Dollar/control characters in unit paths are rejected; percent is escaped.
+
+For an explicit update, repeat the verified artifact, digest, version, config,
+unit and device arguments with `--operation update`. The installer stages and
+validates the new executable, then atomically moves `current` while retaining the
+old target as `previous`; it does not download releases or restart the service.
+Inspect the result and explicitly restart it using the Capture Node's local
+administrator workflow. If that restart fails, run
+`python3 agent/install.py --destination <installation> --operation rollback`
+and restart again. Rollback only swaps immutable release pointers. Install,
+update and rollback never modify or delete configuration, node credentials,
+runtime state, ring ledgers, protected incidents, or media. There is deliberately
+no destructive uninstall/data-removal operation in this installer.
 
 The service and executable command line retain `media-capture-agent`. Linux's
 kernel `comm` field truncates names to 15 visible bytes; verify the executable
