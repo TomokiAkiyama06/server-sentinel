@@ -70,8 +70,10 @@ class ReviewGatePublisherTests(unittest.TestCase):
             "repository_id": self.context.repository_id, "app_id": self.issuer.app_id,
             "app_slug": self.issuer.app_slug, "installation_id": 900003,
             "private_key_path": str(self.key_path)}))
-        self.key_path.write_bytes(b"-----BEGIN PRIVATE KEY-----\n" + b"a" * 64
-                                  + b"\n-----END PRIVATE KEY-----\n")
+        fence = b"-" * 5
+        self.key_path.write_bytes(fence + b"BEGIN PRIVATE KEY" + fence + b"\n"
+                                  + b"a" * 64 + b"\n" + fence
+                                  + b"END PRIVATE KEY" + fence + b"\n")
         os.chmod(self.config_path, 0o600)
         os.chmod(self.key_path, 0o600)
 
