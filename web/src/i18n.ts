@@ -94,8 +94,10 @@ export const messages = {
     action_override_expired: '手動上書きが期限切れ', action_hint_set: 'ヒント・スケジュールを設定',
     action_critical_action_requeued: '未完了の critical 対応を再投入（管理者承認）',
     action_critical_degradation_cleared: '期限切れの critical 未完了マーカーを解除（管理者確認）',
+    action_critical_event_cleared: '未解決の critical イベントを解除（管理者確認）',
     note_critical_action_requeued: '外部への証拠保護・通知がすでに実行済みだった場合、重複する可能性を管理者が承知のうえで再投入しました。',
     note_critical_degradation_cleared: '期限切れで内容が残っていない未完了 critical 対応について、ServerSentinel 外で対応済みと管理者が確認し、劣化表示を解除しました。',
+    note_critical_event_cleared: '管理者が未解決イベントを ServerSentinel 外で対応済みと確認し、保持していた観測データを解放しました。未完了経路の劣化表示は維持されます。',
   },
   en: {
     tagline: 'Private monitoring', language: 'Language', navigation: 'Main navigation',
@@ -191,8 +193,10 @@ export const messages = {
     action_override_expired: 'Manual override expired', action_hint_set: 'Hint or schedule set',
     action_critical_action_requeued: 'Unresolved critical action requeued (Owner approved)',
     action_critical_degradation_cleared: 'Expired critical marker cleared (Owner confirmed)',
+    action_critical_event_cleared: 'Unresolved critical event cleared (Owner confirmed)',
     note_critical_action_requeued: 'The Owner requeued the action accepting that an already submitted preservation or notification may be duplicated.',
     note_critical_degradation_cleared: 'The Owner confirmed that an expired unresolved critical action was handled outside ServerSentinel and cleared its degraded marker.',
+    note_critical_event_cleared: 'The Owner confirmed that the unresolved event was handled outside ServerSentinel and released its retained observation data. Degraded markers for unresolved paths remain.',
   },
 } as const;
 export type Locale = keyof typeof messages;

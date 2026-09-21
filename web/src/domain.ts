@@ -56,7 +56,8 @@ export type PresenceBasis = 'manual_override' | 'owner_observation' | 'hint' | '
 /** `unknown` is unreported availability; `unavailable` is a known failure. */
 export type CriticalPath = 'armed' | 'unavailable' | 'unknown';
 export type PresenceAuditAction = 'override_set' | 'override_cancelled' | 'override_expired'
-  | 'hint_set' | 'critical_action_requeued' | 'critical_degradation_cleared';
+  | 'hint_set' | 'critical_action_requeued' | 'critical_degradation_cleared'
+  | 'critical_event_cleared';
 
 /** Neutral observation projection: never a culprit, cause or identity claim. */
 export interface Observation {
@@ -119,7 +120,7 @@ export interface PresenceAuditEntry {
   action: PresenceAuditAction;
   at: string;
   state: PresenceState | null;
-  /** What a recovery action applied to: `<action>:<observation>` or `<action>`. */
+  /** Recovery target: `<action>:<observation>`, `<action>`, or an event observation id. */
   target: string | null;
 }
 

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import type { CriticalPath, DashboardServices, PresenceReport, PresenceSnapshot } from '../domain';
+import type { CriticalPath, DashboardServices, PresenceAuditAction, PresenceReport, PresenceSnapshot } from '../domain';
 import type { Messages } from '../i18n';
 
 function stamp(value: string): string {
@@ -11,13 +11,16 @@ function stamp(value: string): string {
  * The observation identifier is shown in full: no prefix length is guaranteed
  * to be unique, and two approvals must stay distinguishable in the audit.
  */
-function describeTarget(value: string | null, t: Messages): string | null {
+function describeTarget(value: string | null, action: PresenceAuditAction, t: Messages): string | null {
   if (!value) return null;
+  if (action === 'critical_event_cleared') {
+    return `${t.targetLabel}: ${t.targetObservation} ${value}`;
+  }
   const separator = value.indexOf(':');
-  const action = separator === -1 ? value : value.slice(0, separator);
+  const targetKind = separator === -1 ? value : value.slice(0, separator);
   const identifier = separator === -1 ? '' : value.slice(separator + 1);
-  const path = action === 'evidence' ? t.armedEvidence
-    : action === 'notification' ? t.armedNotification : action;
+  const path = targetKind === 'evidence' ? t.armedEvidence
+    : targetKind === 'notification' ? t.armedNotification : targetKind;
   return identifier
     ? `${t.targetLabel}: ${path} / ${t.targetObservation} ${identifier}`
     : `${t.targetLabel}: ${path}`;
@@ -104,12 +107,14 @@ export function PresenceBody({ report, t, onCancel, failed, cancelling, onRefres
             <div className="timeline-detail">
               <p className="timeline-body">{t[`action_${entry.action}`]}</p>
               {entry.state && <p className="timeline-meta"><span>{t[`state_${entry.state}`]}</span></p>}
-              {describeTarget(entry.target, t)
-                && <p className="timeline-meta"><span>{describeTarget(entry.target, t)}</span></p>}
+              {describeTarget(entry.target, entry.action, t)
+                && <p className="timeline-meta"><span>{describeTarget(entry.target, entry.action, t)}</span></p>}
               {entry.action === 'critical_action_requeued'
                 && <p className="timeline-meta"><span>{t.note_critical_action_requeued}</span></p>}
               {entry.action === 'critical_degradation_cleared'
                 && <p className="timeline-meta"><span>{t.note_critical_degradation_cleared}</span></p>}
+              {entry.action === 'critical_event_cleared'
+                && <p className="timeline-meta"><span>{t.note_critical_event_cleared}</span></p>}
             </div>
           </li>)}</ol>}
     </section>
@@ -204,7 +209,10 @@ export function PresenceScreen({ services, t }: { services: DashboardServices; t
   useEffect(() => scheduleExpiryRefresh(expiry, () => setAttempt(value => value + 1),
     () => inFlight.current), [expiry]);
 
-  if (data.state === 'failed') return <p role="alert">{t.presenceUnavailable}</p>;
+  if (data.state === 'failed') return <section className="notice">
+    <p role="alert">{t.presenceUnavailable}</p>
+    <button type="button" className="primary" onClick={() => setAttempt(value => value + 1)}>{t.retry}</button>
+  </section>;
   if (data.state === 'loading') return <p role="status">{t.checking}</p>;
   if (data.state === 'pending') {
     return <section className="placeholder"><span className="placeholder-mark" aria-hidden="true">◇</span>

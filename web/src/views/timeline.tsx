@@ -149,6 +149,7 @@ function extend(previous: TimelinePage, next: TimelinePage): TimelinePage {
 export function TimelineScreen({ services, t }: { services: DashboardServices; t: Messages }) {
   const [data, setData] = useState<State>({ state: 'pending' });
   const [filter, setFilter] = useState<TimelineFilter>('all');
+  const [attempt, setAttempt] = useState(0);
   // One page request at a time, independent of render timing.
   const inFlight = useRef(false);
   const paging = useRef<AbortController | null>(null);
@@ -172,9 +173,12 @@ export function TimelineScreen({ services, t }: { services: DashboardServices; t
       }
     })();
     return () => controller.abort();
-  }, [services]);
+  }, [services, attempt]);
 
-  if (data.state === 'failed') return <p role="alert">{t.timelineUnavailable}</p>;
+  if (data.state === 'failed') return <section className="notice">
+    <p role="alert">{t.timelineUnavailable}</p>
+    <button type="button" className="primary" onClick={() => setAttempt(value => value + 1)}>{t.retry}</button>
+  </section>;
   if (data.state === 'loading') return <p role="status">{t.checking}</p>;
   if (data.state === 'pending') {
     return <section className="placeholder"><span className="placeholder-mark" aria-hidden="true">◇</span>

@@ -24,7 +24,7 @@ const qualities = ['sufficient', 'degraded', 'insufficient', 'unknown'];
 const states = ['PRESENT', 'PROBABLY_PRESENT', 'ABSENT', 'UNKNOWN'];
 const bases = ['manual_override', 'owner_observation', 'hint', 'unknown'];
 const actions = ['override_set', 'override_cancelled', 'override_expired', 'hint_set',
-  'critical_action_requeued', 'critical_degradation_cleared'];
+  'critical_action_requeued', 'critical_degradation_cleared', 'critical_event_cleared'];
 let counter = 0;
 const observation = (kind, overrides = {}) => ({
   id: `generated-observation-${counter += 1}`, kind, value: 'observed',
@@ -338,6 +338,11 @@ test('owner critical recovery actions explain what happened in the control histo
   assert.match(cleared, /ServerSentinel 外で対応済みと管理者が確認し、劣化表示を解除しました。/);
   assert.match(entry('critical_action_requeued', 'en'), /may be duplicated/);
   assert.match(entry('critical_degradation_cleared', 'en'), /handled outside ServerSentinel/);
+  const eventCleared = entry('critical_event_cleared', 'ja', '00000000-0000-4000-8000-00000000c1ea');
+  assert.match(eventCleared, /未解決の critical イベントを解除（管理者確認）/);
+  assert.match(eventCleared, /保持していた観測データを解放しました。/);
+  assert.match(eventCleared, /未完了経路の劣化表示は維持されます。/);
+  assert.match(entry('critical_event_cleared', 'en'), /retained observation data/);
   // Ordinary override actions carry no critical-recovery note.
   assert.doesNotMatch(entry('override_set', 'ja'), /再投入しました。|劣化表示を解除しました。/);
 });
@@ -365,6 +370,9 @@ test('a recovery action names what the owner approved', () => {
   const cleared = entry('critical_degradation_cleared', 'notification');
   assert.match(cleared, /対象: critical 通知/);
   assert.doesNotMatch(cleared, /観測 /);
+  // Clearing a retained unresolved event targets its observation identity.
+  const eventCleared = entry('critical_event_cleared', '00000000-0000-4000-8000-00000000c1ea');
+  assert.match(eventCleared, /対象: 観測 00000000-0000-4000-8000-00000000c1ea/);
   assert.match(entry('critical_action_requeued', 'evidence:00000000-0000-4000-8000-00000000abcd', 'en'),
     /Target: Evidence preservation \/ Observation 00000000-0000-4000-8000-00000000abcd/);
   // Owner control actions carry no target.

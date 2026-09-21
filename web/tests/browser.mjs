@@ -67,7 +67,8 @@ const cancelledPresenceFixture = {
 };
 let cases = 0;
 
-async function scenario(viewport, { production = false, status = 200, session = owner, count = 1, optIn = false, sourceStatus = 200, positiveControl = false } = {}, assertions) {
+async function scenario(viewport, { production = false, status = 200, session = owner, count = 1, optIn = false,
+  sourceStatus = 200, initialViewFailures = false, positiveControl = false } = {}, assertions) {
   const page = await pageFor(browser, viewport);
   // Chrome applies bypass when parsing a document's policy. Set it before
   // navigation, only for the dedicated interception positive control.
@@ -76,6 +77,8 @@ async function scenario(viewport, { production = false, status = 200, session = 
   const unexpected = [];
   const exceptions = [];
   const routeErrors = [];
+  let timelineLoads = 0;
+  let presenceLoads = 0;
   const cleanup = [
     browser.on('Runtime.exceptionThrown', (_, sessionId) => { if (sessionId === page.sessionId) exceptions.push('unhandled error'); }),
     browser.on('Network.webSocketCreated', (_, sessionId) => { if (sessionId === page.sessionId) unexpected.push('websocket'); }),
@@ -107,10 +110,18 @@ async function scenario(viewport, { production = false, status = 200, session = 
       await fulfill(JSON.stringify(sourceStatus === 200 ? fixture(count) : { detail: 'synthetic private error' }), 'application/json', sourceStatus); return;
     }
     if (!production && url.pathname === '/api/mock/timeline') {
+      timelineLoads += 1;
+      if (initialViewFailures && timelineLoads === 1) {
+        await fulfill(JSON.stringify({ detail: 'synthetic private error' }), 'application/json', 503); return;
+      }
       await fulfill(JSON.stringify(url.searchParams.has('after') ? newerTimelineFixture : timelineFixture),
         'application/json'); return;
     }
     if (!production && url.pathname === '/api/mock/presence') {
+      presenceLoads += 1;
+      if (initialViewFailures && presenceLoads === 1) {
+        await fulfill(JSON.stringify({ detail: 'synthetic private error' }), 'application/json', 503); return;
+      }
       await fulfill(JSON.stringify(presenceFixture), 'application/json'); return;
     }
     if (!production && url.pathname === '/api/mock/presence-cancelled') {
@@ -222,6 +233,18 @@ try {
       await page.click('カメラソース');
       await page.wait("Boolean(document.querySelector('[role=alert]'))");
       assert.equal(await page.evaluate("document.querySelectorAll('[data-source-id]').length"), 0);
+    });
+    await scenario(viewport, { initialViewFailures: true }, async (page, requests) => {
+      await page.click('タイムライン');
+      await page.wait("document.querySelector('[role=alert]')?.textContent.includes('タイムライン')");
+      await page.evaluate("document.querySelector('.notice button').click()");
+      await page.wait("document.querySelectorAll('[data-observation-kind]').length === 4");
+      await page.click('プレゼンス');
+      await page.wait("document.querySelector('[role=alert]')?.textContent.includes('プレゼンス')");
+      await page.evaluate("document.querySelector('.notice button').click()");
+      await page.wait("Boolean(document.querySelector('.presence-value'))");
+      assert.equal(requests.filter(path => path === '/api/mock/timeline').length, 2);
+      assert.equal(requests.filter(path => path === '/api/mock/presence').length, 2);
     });
     for (const permissions of [[], ['live:view'], ['recordings:view'], ['live:view', 'recordings:view']]) {
       await scenario(viewport, { session: { state: 'allowed', role: 'viewer', permissions } }, async (page, requests) => {
