@@ -86,6 +86,17 @@ class AccessStoreTests(unittest.TestCase):
         with self.assertRaises(AccessValidationError):
             self.store.enroll_credential(SECRET, IDENTITY, b"other-credential", PUBLIC_KEY, -7, 0)
 
+    def test_enrollment_rejects_redemption_at_exact_expiry(self):
+        principal = self.store.invite(IDENTITY, "Synthetic viewer", ())
+        expires_at = NOW + timedelta(minutes=5)
+        self.store.issue_enrollment(principal.id, SECRET, expires_at)
+
+        with self.assertRaises(AccessValidationError):
+            self.store.enroll_credential(
+                SECRET, IDENTITY, CREDENTIAL, PUBLIC_KEY, -7, 0,
+                now=expires_at,
+            )
+
     def test_owner_has_authorization_without_viewer_permission_but_needs_credential_session(self):
         owner = self.store.bootstrap_owner(OWNER, "Synthetic owner")
         self.assertEqual(owner.role, PrincipalRole.OWNER)

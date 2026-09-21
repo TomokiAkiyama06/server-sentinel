@@ -152,7 +152,7 @@ class AccessStore:
             if (row is None or row["redeemed_at_us"] is not None or row["revoked_at_us"] is not None
                     or row["status"] == PrincipalStatus.REVOKED.value or row["external_identity"] != identity
                     or row["principal_revision"] != row["authorization_revision"]
-                    or row["deployment_generation"] != state or not row["issued_at_us"] <= _us(at) <= row["expires_at_us"]):
+                    or row["deployment_generation"] != state or not row["issued_at_us"] <= _us(at) < row["expires_at_us"]):
                 raise AccessValidationError("enrollment is unavailable")
             principal_id = UUID(row["principal_id"])
             credential = Credential(credential_id, principal_id, public_key, algorithm, sign_count, at)
