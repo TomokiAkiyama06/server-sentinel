@@ -9,6 +9,7 @@ from app.media.health.artifacts import recording_health_migration
 from app.media.recording.schema import recording_migration
 from app.presence.schema import presence_migration
 from app.storage.migrations import BUILTIN_MIGRATIONS
+from app.setup_wizard.schema import wizard_state_migration
 
 
 APPLICATION_MIGRATIONS = (
@@ -23,4 +24,5 @@ APPLICATION_MIGRATIONS = (
     presence_migration(8),
     audit_migration(9),
     uvc_explicit_binding_migration(10),
+    wizard_state_migration(11),
 )
