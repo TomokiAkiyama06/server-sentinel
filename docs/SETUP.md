@@ -141,6 +141,14 @@ Capture Nodes
 
 During development the repository may be cloned locally and the agent run from that checkout. Stable releases should install only the versioned `media-capture-agent` artifact.
 
+Stable artifacts record their release version and full source commit internally
+and are accepted only when the separately obtained SHA-256 matches. Agent install
+and update are explicit local administrator operations. Updates retain the prior
+immutable release for explicit rollback and never rewrite or delete deployment
+configuration, node credentials, runtime state, ring ledgers, protected incidents,
+or media. The installer does not download releases, restart the service, or give
+the Main Server SSH/root update authority; see `agent/README.md` for commands.
+
 Before pairing, verify/configure the intended Main Server's public trust information through a trusted Owner-controlled local or out-of-band channel. The address alone is not trusted identity. The exact trust setup and encrypted bootstrap transport are selected by PoC/ADR before implementation; the command below assumes that trust setup is complete.
 
 Target command/UX shape:
