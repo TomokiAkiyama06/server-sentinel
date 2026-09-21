@@ -154,7 +154,8 @@ suffixes, including `.pkl`, `.joblib`, `.npz` and `.safetensors`, are checked in
 other directories, and any other opaque non-text file outside the reviewed media
 and Web asset formats is treated as a model artifact until it has its own
 record. Tracked files inside `node_modules` or `.venv` stay in the scan; only untracked
-cache content and nested checkouts are skipped. A source package that only
+cache content and nested checkouts are skipped, and the gate fails closed when
+the tracked file list for a skipped cache cannot be determined. A source package that only
 shares a reserved directory name needs a
 reviewed `model_scan_exemptions` record, which covers text-only Python sources;
 an opaque or model-suffixed file below it still requires weight review, and an

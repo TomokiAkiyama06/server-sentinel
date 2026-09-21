@@ -31,7 +31,8 @@ as a model artifact until it has its own record. The whole file is decoded, so a
 readable prefix followed by artifact bytes is still opaque, and a file larger
 than the bounded text scan is opaque rather than trusted unread. Tracked files are scanned even inside `node_modules` or `.venv`, so a
 force-added weight cannot hide in a dependency cache; only untracked cache
-content and nested checkouts are skipped. `model_scan_exemptions` records
+content and nested checkouts are skipped. Skipping a cache requires knowing its
+tracked files, so the gate fails closed when that list is unavailable. `model_scan_exemptions` records
 the reviewed source packages that only share a reserved directory name, such as
 `tests/models`; the exemption covers text-only Python sources, an opaque or
 model-suffixed file below the path still needs weight review, and an exemption

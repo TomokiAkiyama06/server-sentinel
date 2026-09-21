@@ -692,6 +692,20 @@ version = {attr = "package.__version__"}
         with self.assertRaisesRegex(license_gate.GateError, "model artifact set differs"):
             license_gate.audit(self.root)
 
+    def test_dependency_cache_without_tracked_file_evidence_fails_closed(self):
+        """Skipping a cache is only safe while its tracked files are knowable."""
+        self.write("node_modules/left-pad/index.js", "module.exports = 1;\n")
+        with self.assertRaisesRegex(
+                license_gate.GateError, "cannot determine tracked files"):
+            license_gate.model_files(self.root)
+        with self.assertRaisesRegex(
+                license_gate.GateError, "cannot determine tracked files"):
+            license_gate.audit(self.root)
+
+        subprocess.run(["git", "-C", str(self.root), "init", "--quiet"], check=True)
+        self.assertEqual(license_gate.model_files(self.root), [])
+        self.assertEqual(license_gate.audit(self.root), (1, 1, 0, 0))
+
     def test_tracked_build_and_dist_model_artifacts_are_not_excluded(self):
         paths = {"build/opaque-model.zip", "dist/opaque-weight.binpack"}
         for path in paths:

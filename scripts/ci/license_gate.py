@@ -358,16 +358,29 @@ def opaque_bytes(path: Path):
 
 
 def tracked_files(root: Path):
-    """Committed paths, so a pruned cache cannot hide a tracked artifact."""
+    """Committed paths, so a pruned cache cannot hide a tracked artifact.
+
+    Failing to list them is a gate failure: silently falling back to the pruned
+    walk would drop exactly the artifacts this lookup exists to find.
+    """
+    if not (root / ".git").exists():
+        raise GateError("cannot determine tracked files outside a repository")
     try:
         result = subprocess.run(
             ["git", "-C", str(root), "ls-files", "-z"],
             capture_output=True, check=True,
         )
-    except (OSError, subprocess.SubprocessError):
-        return ()
-    return tuple(sorted(value for value in result.stdout.decode(
-        "utf-8", "surrogateescape").split("\0") if value))
+    except (OSError, subprocess.SubprocessError) as error:
+        raise GateError("cannot list tracked files") from error
+    found = []
+    for value in result.stdout.decode("utf-8", "surrogateescape").split("\0"):
+        if not value:
+            continue
+        candidate = PurePosixPath(value)
+        if candidate.is_absolute() or ".." in candidate.parts:
+            raise GateError("tracked path escapes the repository")
+        found.append(value)
+    return tuple(sorted(found))
 
 
 def scan_paths(root: Path):
@@ -377,6 +390,8 @@ def scan_paths(root: Path):
         current = Path(directory)
         kept = []
         for name in sorted(names):
+            if name == ".git":
+                continue
             if (name in SCAN_EXCLUDED_DIRECTORIES
                     or (current != root and (current / name / ".git").exists())):
                 pruned.append(current / name)
@@ -389,9 +404,8 @@ def scan_paths(root: Path):
         return
     for value in tracked_files(root):
         path = root / value
-        if not path.is_file():
-            continue
-        if any(path.is_relative_to(directory) for directory in pruned):
+        if path.is_file() and any(
+                path.is_relative_to(directory) for directory in pruned):
             yield path
 
 
@@ -781,10 +795,6 @@ def approvals_by_id(root: Path):
             raise GateError("approval must reference a committed owner decision")
         result[component_id] = record
     return result
-
-
-def component_prefix(component_id):
-    return component_id.split(":", 1)[0] if ":" in component_id else ""
 
 
 def declared_pin(value, ecosystem, upstream):
