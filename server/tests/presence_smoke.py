@@ -40,7 +40,7 @@ def run_presence(root, scenario):
 
     core = PresenceService(database, access=SyntheticAccess(), evidence=evidence,
                            notifications=notify, reservation=nullcontext,
-                           detection=lambda: True)
+                           detection=lambda: True, storage_status=lambda: True)
     now = datetime(2026, 1, 1, tzinfo=timezone.utc)
     core.override("synthetic-owner", PresenceState.PRESENT, now=now, clock_trusted=True)
     event = Observation(Kind.SERVER_MOVEMENT, now, now, source_id=UUID(int=1), confidence=0.9,

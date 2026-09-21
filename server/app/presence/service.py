@@ -463,15 +463,15 @@ class PresenceService:
         deployment's bounded control allowance, contend with the writer that
         owns it and, on a full volume, drive a state transition from a read
         path. The status therefore never calls the admission port at all. It
-        uses the injected read-only storage health probe when the deployment
-        supplies one, the admission a write in this snapshot actually observed,
-        and otherwise reports only that the port is configured, which is a
-        configuration statement and not a liveness claim.
+        uses the injected read-only storage health probe and the admission a
+        write in this snapshot actually observed. Without such a probe the
+        health of the volume is simply unknown here, and a configured port is
+        never reported as armed on configuration alone.
         """
         if denied or self.reservation is None:
             return UNAVAILABLE
         if self.storage_status is None:
-            return ARMED
+            return UNKNOWN
         try:
             reported = self.storage_status()
         except Exception:

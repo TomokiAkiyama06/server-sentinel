@@ -82,7 +82,8 @@ class PresenceTests(unittest.TestCase):
             self.notifications.append(item)
             return ActionResult.DELIVERED
         ports = dict(access=self.access, evidence=evidence, notifications=notifications,
-                     reservation=nullcontext, detection=lambda: True)
+                     reservation=nullcontext, detection=lambda: True,
+                     storage_status=lambda: True)
         ports.update(changes)
         return PresenceService(self.database, **ports)
 
@@ -345,6 +346,11 @@ class PresenceTests(unittest.TestCase):
         self.assertEqual(entered, [True])
         self.assertFalse(policy._reservation)
         self.assertEqual(status["critical_persistence"], "armed")
+        # Without a deployment health probe the volume's health is unknown
+        # here; a configured port alone is never reported as armed.
+        blind = self.make_service(reservation=reservation, storage_status=None)
+        self.assertEqual(blind.snapshot(now=NOW, clock_trusted=True)["critical_persistence"],
+                         "unknown")
         refusing = self.make_service(reservation=reservation, storage_status=lambda: False)
         self.assertEqual(refusing.snapshot(now=NOW, clock_trusted=True)["critical_persistence"],
                          "unavailable")
