@@ -98,3 +98,39 @@ p { margin: .5rem 0 1rem; }
   .page-heading { flex-wrap: wrap; }
   .breakdown-row { grid-template-columns: minmax(0, 1fr); gap: .2rem; }
 }
+.timeline-notice { font-size: .85rem; color: #476875; }
+.timeline-notice-degraded, .timeline-degraded { border-left: 3px solid #9b6100; background: #fdf6e9; color: #5d3d00; padding: .5rem .75rem; border-radius: .4rem; }
+.timeline-filter { display: flex; flex-wrap: wrap; gap: .4rem; margin: 1rem 0; }
+.timeline-filter button { border: 1px solid #cad7dc; background: #fff; color: #344f5b; border-radius: 1rem; padding: .4rem .9rem; font-size: .85rem; }
+.timeline-filter button[aria-pressed="true"] { background: #145164; border-color: #145164; color: #fff; font-weight: 650; }
+.timeline-span { margin-bottom: 1rem; }
+.timeline-span-degraded { border: 1px dashed #d8b26a; border-radius: .8rem; padding: .75rem; background: #fffaf1; }
+.timeline-list { list-style: none; margin: 0; padding: 0; display: grid; gap: .5rem; }
+.timeline-row { display: grid; grid-template-columns: 11rem .75rem minmax(0, 1fr); align-items: start; gap: .75rem; background: #fff; border: 1px solid #dce5e8; border-radius: .8rem; padding: .8rem 1rem; }
+.timeline-row-critical, .timeline-critical { border-color: #ad3940; border-left-width: 5px; background: #fff7f7; }
+.timeline-time { font-variant-numeric: tabular-nums; font-size: .85rem; color: #344f5b; }
+.timeline-dot { display: block; width: .7rem; height: .7rem; margin-top: .35rem; border-radius: 50%; background: #476875; }
+.timeline-dot-activity { background: #145164; }
+.timeline-dot-critical { background: #ad3940; box-shadow: 0 0 0 3px #f2d3d4; }
+.timeline-dot-equipment { background: #22714e; }
+.timeline-dot-configuration { background: #6b4fa0; }
+.timeline-detail { min-width: 0; overflow-wrap: anywhere; }
+.timeline-body { margin: 0; display: flex; flex-wrap: wrap; align-items: center; gap: .4rem; }
+.timeline-meta { margin: .3rem 0 0; display: flex; flex-wrap: wrap; gap: .3rem 1rem; font-size: .8rem; color: #536771; }
+.badge-critical { background: #ad3940; color: #fff; }
+.presence-state { background: #fff; border: 1px solid #dce5e8; border-left: 5px solid #476875; border-radius: 1rem; padding: 1.25rem 1.5rem; }
+.presence-PRESENT { border-left-color: #22714e; }
+.presence-PROBABLY_PRESENT { border-left-color: #9b6100; }
+.presence-ABSENT { border-left-color: #145164; }
+.presence-UNKNOWN { border-left-color: #617780; }
+.presence-value { font-size: 1.5rem; font-weight: 700; margin: .2rem 0; }
+.presence-override, .presence-automation, .presence-transitions { margin-top: 1.5rem; }
+.presence-armed-list { display: flex; flex-wrap: wrap; gap: .5rem 1.5rem; margin: .5rem 0 0; font-size: .85rem; }
+.presence-armed dt { font-weight: 650; color: #344f5b; }
+.presence-armed dd { margin: 0; color: #536771; }
+@media (max-width: 700px) {
+  .timeline-row { grid-template-columns: .75rem minmax(0, 1fr); }
+  .timeline-time { grid-column: 1 / -1; }
+}
+.presence-path-unavailable dd { color: #ad3940; font-weight: 650; }
+.presence-path-unknown dd { color: #9b6100; font-weight: 650; }

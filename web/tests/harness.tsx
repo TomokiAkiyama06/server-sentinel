@@ -2,7 +2,7 @@
 import { createRoot } from 'react-dom/client';
 import { App } from '../src/App';
 import { createApiClient } from '../src/api';
-import { type CameraSourceSummary, type RecordingSummary, type Session, type StorageSummary } from '../src/domain';
+import { type CameraSourceSummary, type PresenceReport, type RecordingSummary, type Session, type StorageSummary, type TimelineCursor, type TimelinePage } from '../src/domain';
 import '../src/style.css';
 
 const api = createApiClient(window.location.origin);
@@ -15,6 +15,10 @@ function session(value: unknown): Session {
     return { state: 'allowed', role: value.role, permissions: value.permissions };
   }
   throw new Error();
+}
+function presence(value: unknown): PresenceReport {
+  if (typeof value !== 'object' || value === null || !('snapshot' in value)) throw new Error();
+  return value as PresenceReport;
 }
 let recordings: RecordingSummary[] = [];
 let loaded = false;
@@ -72,6 +76,15 @@ const services = {
     if (typeof value !== 'object' || value === null) throw new Error();
     return value as StorageSummary;
   }, signal),
+  loadTimeline: (signal: AbortSignal, after?: TimelineCursor | null) => {
+    const path = after ? `/api/mock/timeline?after=${encodeURIComponent(String(after.sequence))}` : '/api/mock/timeline';
+    return api.read(path, value => {
+      if (typeof value !== 'object' || value === null || !Array.isArray((value as TimelinePage).items)) throw new Error();
+      return value as TimelinePage;
+    }, signal);
+  },
+  loadPresence: (signal: AbortSignal) => api.read('/api/mock/presence', presence, signal),
+  cancelPresenceOverride: (signal: AbortSignal) => api.read('/api/mock/presence-cancelled', presence, signal),
   // Synthetic local mutations: this harness has no write route and never gets one.
   starRecording: async (id: string, starred: boolean, signal: AbortSignal) => {
     await runMutation(id, signal);
