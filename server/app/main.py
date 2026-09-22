@@ -114,5 +114,5 @@ def create_app(settings: Settings, *, database: Database | None = None,
     application.state.owner_administration = owner_administration
     application.state.diagnostic_export_endpoint = diagnostic_export_endpoint
     # Do not include human routers before approved permission enforcement.
-    application.add_middleware(ClosedHumanSurface)
+    
     return application
