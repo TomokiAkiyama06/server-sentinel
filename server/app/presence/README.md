@@ -198,7 +198,12 @@ raises, so the runtime stops its producers first; a repeated close is a
 no-op. A process that exits without
 a successful close leaves its session row behind, and the next start records
 an interrupted gap: a restart is never assumed clean, and staged facts are not
-recovered. A failed close keeps the outbox open and the session row in place.
+recovered. A failed close reopens the outbox only when a read proves its
+session row still in place. When the row is gone, the close committed before
+failing, and the outbox stays closed with its session ended; when the row
+cannot be read, the outbox stays closed with the session kept, and a retried
+close records a missing row as interrupted. Either way no fact is accepted
+without a session row a restart would find.
 Only one outbox session per database can be open: `open()` takes an exclusive
 advisory lock beside the database file, which the kernel releases when the
 process dies, and a second outbox is refused while it is held. The lock file is

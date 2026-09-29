@@ -601,6 +601,19 @@ class PresenceService:
             close.release()
         return gap
 
+    def timeline_session_recorded(self, session):
+        """Read-only: whether ``session`` still has its durable session row.
+
+        Used after a close raised, to tell a close that never committed (the
+        row stays) from one that committed and then failed (the row is gone).
+        An unreadable database raises, so the outcome stays ambiguous.
+        """
+        if not isinstance(session, TimelineSession):
+            raise ValueError("timeline session required")
+        with closing(self._read()) as db:
+            return db.execute("SELECT 1 FROM presence_outbox_sessions WHERE token=?",
+                              (session.token,)).fetchone() is not None
+
     def timeline_gap(self):
         """Read-only durable timeline gap marker, or None when there is none.
 

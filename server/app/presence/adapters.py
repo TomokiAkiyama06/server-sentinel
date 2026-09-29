@@ -400,14 +400,18 @@ class TimelineOutbox:
     def close(self):
         """End the durable session cleanly, recording still-staged facts as lost.
 
-        Raises when the close cannot be persisted. The session row then stays,
-        so the next start records an interrupted gap, and this outbox remains
-        open for a retry.
+        Raises when the close cannot be persisted. When the session row is
+        then proven to still exist, the close never committed: the next start
+        records an interrupted gap, and this outbox reopens for staging and a
+        retry. When the row is gone or cannot be read, the close may have
+        committed before failing, so no fact could be proven lost after a
+        crash: staging stays refused. A committed close is completed here; an
+        unreadable outcome keeps the session so `close()` can be retried.
         """
         with self._flushing:
             with self._lock:
-                closed = self._closed
-            if closed:
+                done = self._closed and not self._session
+            if done:
                 # Repeated close is idempotent; `state()` takes the lock itself.
                 return self.state()
             with self._lock:
@@ -420,11 +424,36 @@ class TimelineOutbox:
                     raise RuntimeError("timeline outbox session unavailable")
                 self._persist(lost=lost, close=True)
             except BaseException:
-                with self._lock:
-                    self._closed = False
+                self._failed_close()
                 raise
             self._session, self._handle = False, None
             return self.state()
+
+    def _failed_close(self):
+        """Settle the outbox after a close raised; staging reopens only if proven safe."""
+        handle = self._handle
+        if handle is None:
+            # No session was ever opened, so nothing was written.
+            with self._lock:
+                self._closed = False
+            return
+        try:
+            recorded = self.service.timeline_session_recorded(handle)
+        except Exception:
+            # Ambiguous: stay closed and keep the session for a retried close,
+            # which records a missing row as interrupted rather than clean.
+            return
+        if recorded:
+            with self._lock:
+                self._closed = False
+            return
+        # The close committed and then failed: the row is gone and the counts
+        # written with it are durable, so the session is over. This outbox's
+        # own unpersisted counts are left as they are, overstating its state
+        # rather than hiding loss.
+        handle.release()
+        with self._lock:
+            self._session, self._handle = False, None
 
     def state(self):
         with self._lock:

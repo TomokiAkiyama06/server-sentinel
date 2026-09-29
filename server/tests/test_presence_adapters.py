@@ -688,6 +688,56 @@ class TimelineGapDurabilityTests(PresenceFixture, TestCase):
         with self.assertRaises(RuntimeError):
             self.outbox.close()
         self.refuse = False
+        # The row is proven to stay, so staging and a retried close reopen.
+        self.assertTrue(self.health.node(NODE, NodeHealthState.OFFLINE))
+        self.assertTrue(self.restart().degraded)
+        self.assertEqual(self.gap()[1]["interrupted"], 1)
+
+    def fail_after_commit(self):
+        """Reservations whose release raises after the transaction committed."""
+        reservation = self.presence.reservation
+
+        @contextmanager
+        def failing():
+            with reservation():
+                yield
+            raise RuntimeError("synthetic release failure after commit")
+
+        self.presence.reservation = failing
+        return reservation
+
+    def test_close_that_committed_then_failed_keeps_the_outbox_closed(self):
+        self.outbox.flush()
+        reservation = self.fail_after_commit()
+        with self.assertRaisesRegex(RuntimeError, "after commit"):
+            self.outbox.close()
+        self.presence.reservation = reservation
+        # The session row is gone, so a fact accepted now could vanish on a
+        # crash with nothing for the next start to mark as interrupted.
+        with self.assertRaises(RuntimeError):
+            self.health.node(NODE, NodeHealthState.OFFLINE)
+        with self.assertRaises(RuntimeError):
+            self.outbox.flush()
+        self.assertFalse(self.outbox.state().session)
+        self.assertEqual(self.outbox.close().pending, 0)
+        # The committed close released its session lock for the next start.
+        state = self.restart()
+        self.assertFalse(state.degraded)
+        self.assertEqual(self.gap(), (False, None))
+
+    def test_close_with_an_unreadable_outcome_stays_closed_and_can_be_retried(self):
+        self.outbox.flush()
+        reservation = self.fail_after_commit()
+        with mock.patch.object(self.presence, "timeline_session_recorded",
+                               side_effect=RuntimeError("unreadable")):
+            with self.assertRaisesRegex(RuntimeError, "after commit"):
+                self.outbox.close()
+        self.presence.reservation = reservation
+        with self.assertRaises(RuntimeError):
+            self.health.node(NODE, NodeHealthState.OFFLINE)
+        self.assertTrue(self.outbox.state().session)
+        # The retry finds the row already gone: never a clean close.
+        self.assertFalse(self.outbox.close().session)
         self.assertTrue(self.restart().degraded)
         self.assertEqual(self.gap()[1]["interrupted"], 1)
 
