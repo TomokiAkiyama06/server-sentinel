@@ -226,6 +226,8 @@ class ContinuityTracker:
             node = self._nodes.get(node_id)
             if node is None:
                 if len(self._nodes) >= self.limits.maximum_sources:
+                    self._retire_unused_nodes(now)
+                if len(self._nodes) >= self.limits.maximum_sources:
                     raise PermissionError("agent node capacity reached")
                 node = self._nodes[node_id] = _Node(0, False, now)
             self._generation += 1
@@ -233,6 +235,23 @@ class ContinuityTracker:
             node.open = True
             node.last_seen_ns = now
             return AgentSession(node_id, node.generation, self._instance)
+
+    def _retire_unused_nodes(self, now: int) -> None:
+        """Free node slots held by nodes that own no tracked source.
+
+        Only a node without sources whose session is closed, invalidated or
+        stale is retired, so node records cannot exhaust the active-source
+        bound after sources were deactivated.  A live session (fresh
+        heartbeat) keeps its slot.  Generations are tracker-wide and never
+        reissued, so a retired node's old grant can never become current.
+        """
+        owners = {state.node_id for state in self._sources.values()}
+        for node_id, node in tuple(self._nodes.items()):
+            if node_id in owners:
+                continue
+            if (not node.open or now < node.last_seen_ns
+                    or now - node.last_seen_ns > self.limits.stale_after_ns):
+                del self._nodes[node_id]
 
     def _current(self, session: AgentSession) -> _Node | None:
         node = self._nodes.get(session.node_id)

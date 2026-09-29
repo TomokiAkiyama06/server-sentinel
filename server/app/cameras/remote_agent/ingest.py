@@ -59,9 +59,10 @@ class AgentMessage:
 
     ``capture_epoch`` and ``capture_time_ns`` carry the Agent continuity
     envelope (ADR-0007) so a downstream consumer can distinguish units of
-    different capture epochs and preserve the Agent capture timestamp.  They
-    are optional only for callers that predate the envelope; when present they
-    must be nonnegative 63-bit integers.
+    different capture epochs and preserve the Agent capture timestamp.  Both
+    are required for ``MEDIA`` (a partial or missing envelope is refused) and
+    may be absent only for non-media actions; when present they must be
+    nonnegative 63-bit integers.
     """
 
     node_id: UUID
@@ -80,7 +81,8 @@ class AgentMessage:
                 or type(self.payload) is not bytes
                 or any(value is not None and (type(value) is not int
                                               or not 0 <= value <= _MAXIMUM_COUNTER)
-                       for value in envelope)):
+                       for value in envelope)
+                or (self.action is AgentAction.MEDIA and None in envelope)):
             raise ValueError("invalid agent ingest message")
 
 

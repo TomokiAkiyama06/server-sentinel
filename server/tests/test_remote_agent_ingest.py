@@ -29,6 +29,9 @@ class Authorizer:
 
 
 def message(*, node=NODE, source=SOURCE, sequence=0, payload=b"video", action=AgentAction.MEDIA):
+    if action is AgentAction.MEDIA:
+        return AgentMessage(node, source, action, sequence, payload,
+                            capture_epoch=1, capture_time_ns=sequence * 10)
     return AgentMessage(node, source, action, sequence, payload)
 
 
@@ -62,6 +65,12 @@ class RemoteAgentIngestTests(unittest.TestCase):
                          {"capture_epoch": 1.0}):
             with self.assertRaises(ValueError):
                 AgentMessage(NODE, SOURCE, AgentAction.MEDIA, 0, b"", **envelope)
+        # Media must carry the complete continuity envelope (ADR-0007).
+        for envelope in ({}, {"capture_epoch": 1}, {"capture_time_ns": 1}):
+            with self.assertRaises(ValueError):
+                AgentMessage(NODE, SOURCE, AgentAction.MEDIA, 0, b"", **envelope)
+        heartbeat = AgentMessage(NODE, SOURCE, AgentAction.HEARTBEAT, 0, b"")
+        self.assertEqual((None, None), (heartbeat.capture_epoch, heartbeat.capture_time_ns))
         boundary = queue()
         accepted = boundary.submit(message(payload=b"opaque"))
         self.assertEqual(IngestOutcome.ACCEPTED, accepted.outcome)

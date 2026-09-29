@@ -399,6 +399,33 @@ class ContinuityTrackerTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             tracker.forget_source("x")
 
+    def test_nodes_without_sources_do_not_exhaust_active_source_capacity(self):
+        pairs = {(NODES[i], SOURCES[i]) for i in range(5)}
+        tracker, _, clock, _ = build(authorizer=Authorizer(pairs), queued=8, stale=10)
+        sessions = [tracker.open_session(NODES[i]) for i in range(4)]
+        for i, session in enumerate(sessions[:2]):
+            tracker.receive(session, unit(0, source=SOURCES[i]), b"v")
+        # Replaced source on a closed host: that host no longer holds a slot.
+        tracker.forget_source(SOURCES[0])
+        tracker.close_session(sessions[0])
+        fifth = tracker.open_session(NODES[4])
+        self.assertEqual(DeliveryOutcome.ACCEPTED,
+                         tracker.receive(fifth, unit(0, source=SOURCES[4]), b"v").outcome)
+        self.assertEqual("stale_session",
+                         tracker.receive(sessions[0], unit(1, source=SOURCES[0]), b"v").reason)
+        # Live source-less sessions keep their slots; a source owner is never retired.
+        with self.assertRaises(PermissionError):
+            tracker.open_session(NODES[0])
+        # A source-less session that went stale releases its slot.
+        clock.now = 11
+        self.assertTrue(tracker.heartbeat(sessions[1]))
+        self.assertTrue(tracker.heartbeat(sessions[3]))
+        renewed = tracker.open_session(NODES[0])
+        self.assertFalse(tracker.heartbeat(sessions[2]))
+        self.assertTrue(tracker.heartbeat(renewed))
+        self.assertEqual({SOURCES[1], SOURCES[4]},
+                         {item.source_id for item in tracker.snapshot()})
+
     def test_forgotten_node_old_grant_never_becomes_current_again(self):
         tracker, ingest, _, authorizer = build()
         old = tracker.open_session(NODE)
