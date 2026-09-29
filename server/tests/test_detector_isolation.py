@@ -113,6 +113,20 @@ class IsolatedDetectorTests(unittest.TestCase):
         self.assertEqual((1, "backoff"), (status.crashes, status.state))
         self.assertUnknown(detector.evaluate(frame()), Reason.WORKER_UNAVAILABLE)
 
+    def test_idle_crash_is_never_replaced_in_the_same_maintain_call(self):
+        detector = self.detector(spec(), restart_backoff_ns=1)
+        detector.maintain()
+        detector._process.kill()
+        detector._process.join(5)
+        # Even when the backoff has already elapsed, the caller observes the
+        # dead worker before any replacement is started.
+        self.clock.value += 10
+        status = detector.maintain()
+        self.assertEqual(("backoff", 1, 1), (status.state, status.crashes, status.starts))
+        self.clock.value += 10
+        self.assertEqual("running", detector.maintain().state)
+        self.assertEqual(2, detector.status().starts)
+
     def test_plugin_exception_is_unknown_without_leaking_text(self):
         detector = self.detector(spec("raise"))
         detector.maintain()
@@ -190,6 +204,7 @@ class IsolatedDetectorTests(unittest.TestCase):
                 (b'{"id": 7, "o": "nobody", "r": "evaluated", "m": null}', 7),
                 (b'{"id": 7, "o": "absent", "r": "evaluated", "m": true}', 7),
                 (b'{"id": 7, "o": "absent", "r": "evaluated", "m": null, "x": 1}', 7),
+                (b'{"id": 7, "o": "absent", "r": "evaluated", "m": 1' + b'0' * 400 + b'}', 7),
                 (b'[1]', 7), (b'\xff', 7)):
             with self.subTest(payload=payload):
                 self.assertIsNone(_parse_detection(payload, request))

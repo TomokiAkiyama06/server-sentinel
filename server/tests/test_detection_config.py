@@ -92,6 +92,8 @@ class DetectionConfigurationTests(unittest.TestCase):
             binding(detector=dict(MOTION, pixel_delta=True)),
             binding(detector=dict(MOTION, changed_fraction=0)),
             binding(detector=dict(MOTION, changed_fraction=float("nan"))),
+            binding(detector=dict(MOTION, changed_fraction=10 ** 400)),
+            binding(detector=dict(PERSON, score_threshold=-(10 ** 400))),
             binding(detector=dict(PERSON, artifact_sha256="0" * 64)),
             binding(detector=dict(PERSON, version="main")),
             binding(detector=dict(PERSON, implementation="yolox")),
@@ -164,6 +166,31 @@ class DetectionConfigurationTests(unittest.TestCase):
         self.assertEqual("running", runtime.maintain()[key].state)
         # Restarting does not resurrect the old conclusion.
         self.assertEqual(Observation.UNKNOWN, scheduler.snapshot(key[1]).result.observation)
+
+    def test_maintain_invalidates_when_worker_was_replaced_since_last_call(self):
+        clock = Clock()
+        runtime = build_inference(parse_detection(configuration()), clock_ns=clock)
+        self.addCleanup(runtime.close)
+        key = (DetectorKind.MOTION, UUID(SOURCES[0]))
+        runtime.maintain()
+        scheduler = runtime.schedulers[DetectorKind.MOTION]
+        for sequence in range(2):
+            clock.value += CADENCE["cadence_ns"]
+            scheduler.offer(GrayFrame(key[1], UUID(int=77), sequence, 2, 2, bytes(4)),
+                            quality=Quality.SUFFICIENT)
+            snapshot = scheduler.run_one()
+        self.assertEqual(Observation.ABSENT, snapshot.result.observation)
+        # A replacement started outside InferenceRuntime.maintain() still
+        # invalidates the dead child's conclusion on the next runtime call.
+        detector = runtime.detectors[key]
+        detector._process.kill()
+        detector._process.join(5)
+        detector.maintain()
+        clock.value += WORKER["restart_backoff_ns"]
+        detector.maintain()
+        status = runtime.maintain()[key]
+        self.assertEqual(("running", 2), (status.state, status.starts))
+        self.assertEqual(Reason.WORKER_CRASHED, scheduler.snapshot(key[1]).result.reason)
 
 
 class Clock:

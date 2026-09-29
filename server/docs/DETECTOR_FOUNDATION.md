@@ -123,9 +123,12 @@ charged to an inference budget. The long-lived inference worker thread calls
 `maintain()` (or `InferenceRuntime.maintain()`) between evaluations: it reaps a
 child that died while idle, restarts after `restart_backoff_ns`, and after
 `maximum_consecutive_failures` latches the binding unavailable until the
-control plane calls `recover()`. `InferenceRuntime.maintain()` also
-invalidates the scheduler at once for any binding without a running worker, so
-an idle crash cannot leave an older conclusion published until it ages out. At
+control plane calls `recover()`. A `maintain()` call that finds its child dead
+never starts the replacement in the same call, even if the backoff has already
+elapsed. `InferenceRuntime.maintain()` also invalidates the scheduler at once
+for any binding without a running worker, or whose worker start count changed
+since its previous call, so an idle crash cannot leave an older conclusion
+published until it ages out. At
 most one child exists per binding; a child that cannot be reaped blocks any
 replacement and is reported as `reap_failed`. `WorkerStatus` exposes state and
 start/crash/timeout/protocol counters without exception text.

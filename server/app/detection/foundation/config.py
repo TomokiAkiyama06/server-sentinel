@@ -74,21 +74,29 @@ class InferenceRuntime:
 
     schedulers: dict[DetectorKind, InferenceScheduler] = field(repr=False)
     detectors: dict[tuple[DetectorKind, UUID], IsolatedDetector] = field(repr=False)
+    # Worker start count last observed per binding; a changed count means the
+    # published conclusion came from a previous (now dead) child process.
+    _starts: dict[tuple[DetectorKind, UUID], int] = field(
+        default_factory=dict, repr=False, compare=False)
 
     def maintain(self) -> dict[tuple[DetectorKind, UUID], WorkerStatus]:
         """Restart workers when permitted; call on the inference worker thread.
 
-        A binding without a running worker is invalidated at once, so a child
-        that died while idle cannot leave an earlier conclusion published
-        until its observation age expires.
+        A binding without a running worker, or whose worker was replaced since
+        the previous call, is invalidated at once, so a child that died while
+        idle cannot leave an earlier conclusion published until its
+        observation age expires.
         """
         statuses = {}
-        for (kind, source_id), detector in self.detectors.items():
+        for key, detector in self.detectors.items():
+            kind, source_id = key
             status = detector.maintain()
-            if status.state != "running":
+            previous = self._starts.get(key, 0)
+            self._starts[key] = status.starts
+            if status.state != "running" or (previous and status.starts != previous):
                 self.schedulers[kind].invalidate(
                     source_id, reason=status.last_failure or Reason.WORKER_UNAVAILABLE)
-            statuses[(kind, source_id)] = status
+            statuses[key] = status
         return statuses
 
     def close(self) -> bool:
@@ -113,8 +121,12 @@ def _positive(value: object) -> int:
 
 
 def _fraction(value: object, *, inclusive_upper: bool) -> float:
-    if type(value) not in (int, float) or not math.isfinite(value):
-        raise _invalid()
+    try:
+        if type(value) not in (int, float) or not math.isfinite(value):
+            raise _invalid()
+    except OverflowError:
+        # An integer too large for a float; keep the value-free message.
+        raise _invalid() from None
     if not 0 < value < 1 and not (inclusive_upper and value == 1):
         raise _invalid()
     return value

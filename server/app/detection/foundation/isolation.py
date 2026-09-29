@@ -227,12 +227,14 @@ def _parse_detection(payload: bytes, request: int) -> Detection | None:
     if value is None or set(value) != {"id", "o", "r", "m"} or value["id"] != request:
         return None
     measurement = value["m"]
-    if measurement is not None and (type(measurement) not in (int, float)
-                                    or not math.isfinite(measurement)):
-        return None
     try:
+        # An integer too large for a float raises OverflowError here; it is a
+        # protocol violation like any other malformed measurement.
+        if measurement is not None and (type(measurement) not in (int, float)
+                                        or not math.isfinite(measurement)):
+            return None
         return Detection(Observation(value["o"]), Reason(value["r"]), measurement)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
 
 
@@ -277,12 +279,18 @@ class IsolatedDetector:
     def maintain(self) -> WorkerStatus:
         """Reap a dead child and (re)start one when permitted. May block."""
         with self._lock:
-            if self._process is not None and not self._reap_failed and not self._process.is_alive():
+            crashed = (self._process is not None and not self._reap_failed
+                       and not self._process.is_alive())
+            if crashed:
                 self._failed(Reason.WORKER_CRASHED)
             if self._reap_failed:
                 self._reap()
-            if (self._process is None and not self._closed and not self._latched
-                    and not self._reap_failed
+            # Never replace a child in the same call that found it dead: the
+            # caller must observe a non-running state (and invalidate the
+            # dead worker's published conclusion) even when the backoff is
+            # shorter than the time this call took.
+            if (not crashed and self._process is None and not self._closed
+                    and not self._latched and not self._reap_failed
                     and (self._retry_at is None or self._clock() >= self._retry_at)):
                 self._spawn()
             return self._status()
