@@ -86,6 +86,32 @@ class NoTelemetryScenarios(unittest.TestCase):
              ("connect", "192.0.2.1")],
             guard.attempts)
 
+    def test_guard_refuses_and_records_every_resolver_entry_point(self):
+        import _socket
+
+        originals = {(module, name): getattr(module, name)
+                     for module in (socket, _socket)
+                     for name in ("getaddrinfo", "gethostbyname", "gethostbyname_ex",
+                                  "gethostbyaddr", "getnameinfo")}
+        with NetworkGuard() as guard:
+            for module in (socket, _socket):
+                for attempt in (
+                    lambda: module.getaddrinfo("telemetry.invalid", 443),
+                    lambda: module.gethostbyname("telemetry.invalid"),
+                    lambda: module.gethostbyname_ex("telemetry.invalid"),
+                    lambda: module.gethostbyaddr("192.0.2.1"),
+                    lambda: module.getnameinfo(("192.0.2.1", 443), 0),
+                ):
+                    with self.assertRaises(OutboundNetworkForbidden):
+                        attempt()
+        expected = [("getaddrinfo", "telemetry.invalid"), ("gethostbyname", "telemetry.invalid"),
+                    ("gethostbyname_ex", "telemetry.invalid"), ("gethostbyaddr", "192.0.2.1"),
+                    ("getnameinfo", "192.0.2.1")]
+        self.assertEqual(expected * 2, guard.attempts)
+        # Every patch is reverted on exit.
+        for (module, name), original in originals.items():
+            self.assertIs(getattr(module, name), original)
+
     def run_main_paths(self):
         # Hardware integrity: startup success, then a failing daily probe.
         probe = SyntheticIntegrityProbe(self.faults)

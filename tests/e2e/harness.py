@@ -259,10 +259,15 @@ class OutboundNetworkForbidden(AssertionError):
 class NetworkGuard:
     """Refuse and record every outbound socket attempt made by any thread.
 
-    Name resolution and connect/send entry points are replaced for the life of
-    the context, so telemetry, crash reporting or an unconfigured webhook would
+    Name resolution (every resolver in both ``socket`` and the ``_socket`` C
+    module) and connect/send entry points are replaced for the life of the
+    context, so telemetry, crash reporting or an unconfigured webhook would
     surface as a recorded attempt instead of reaching a network.
     """
+
+    # Every name/address resolver exposed by the stdlib socket modules.
+    RESOLVERS = ("getaddrinfo", "gethostbyname", "gethostbyname_ex",
+                 "gethostbyaddr", "getnameinfo")
 
     def __init__(self):
         self.attempts: list[tuple[str, str | None]] = []
@@ -286,19 +291,27 @@ class NetworkGuard:
         return refused
 
     def __enter__(self):
+        import _socket
         import socket
         from unittest.mock import patch
 
-        targets = (
+        targets = [
             (socket.socket, "connect"), (socket.socket, "connect_ex"),
             (socket.socket, "sendto"), (socket.socket, "sendmsg"),
-            (socket, "create_connection"), (socket, "getaddrinfo"),
-            (socket, "gethostbyname"),
-        )
-        for owner, name in targets:
-            patcher = patch.object(owner, name, self._refuse(name))
-            patcher.start()
-            self._patches.append(patcher)
+            (socket, "create_connection"),
+        ]
+        # ``socket`` re-exports the C resolvers from ``_socket``; patch both so
+        # a caller of either module is refused and recorded.
+        for owner in (socket, _socket):
+            targets.extend((owner, name) for name in self.RESOLVERS)
+        try:
+            for owner, name in targets:
+                patcher = patch.object(owner, name, self._refuse(name))
+                patcher.start()
+                self._patches.append(patcher)
+        except BaseException:
+            self.__exit__(None, None, None)
+            raise
         return self
 
     def __exit__(self, *_):

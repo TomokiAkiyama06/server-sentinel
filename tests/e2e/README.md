@@ -17,7 +17,8 @@ PYTHONPATH=server:agent:. python3 -m unittest tests.e2e.test_mock_core_harness
 Scenario modules added for Issue #27 reuse the same ports plus a synthetic
 filesystem quota (`SyntheticQuota`) and an outbound network guard
 (`NetworkGuard`) that refuses and records every socket connect/send and name
-lookup from any thread:
+lookup (`getaddrinfo`, `gethostbyname`, `gethostbyname_ex`, `gethostbyaddr`,
+`getnameinfo` in both `socket` and `_socket`) from any thread:
 
 - `test_agent_ring_scenarios.py` — duration and capacity ring modes, T-10 pin
   and autonomous T+10 continuation across reconnect/restart, partial/gap
