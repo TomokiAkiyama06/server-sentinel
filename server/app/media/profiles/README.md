@@ -55,12 +55,21 @@ options.
 factory) and an explicit `AccelerationPolicy`:
 
 - `prefer_hardware`: a missing, unsupported, failed-probe or failed-start
-  accelerator falls back to a listed software adapter; `last_selection` records
+  accelerator falls back to a listed software adapter; the selection records
   `hardware_unavailable` plus `software_fallback` (state `software_fallback`).
 - `require_hardware`: software is never substituted; no accelerator yields
   `AdapterUnavailable` (pipeline `adapter_unavailable`), and a start failure
   yields `AdapterStartFailed` (pipeline `adapter_start_failed`).
 - `software_only`: accelerators are not probed.
+
+The selection is bound to the adapter it started: each returned
+`SelectedAdapter` carries its own `selection`, `SourcePipeline` reports it per
+path as `PathStatus.adapter_state` (`ready` / `software_fallback`, `None` when
+no adapter is held), and `AdapterSelector.active_selections` /
+`fallback_active` cover every adapter not yet closed successfully. A selector
+shared by several paths or sources therefore cannot hide a path still on
+software fallback behind a later hardware start; `last_selection` is only the
+most recent attempt. Tracking is weak, so dropped adapters do not accumulate.
 
 Nothing installed is always `unavailable`. Reason codes are fixed strings; backend
 exception text and device paths are discarded. Selection reruns on every adapter
@@ -80,7 +89,9 @@ It runs 1–4 generated packet streams through `SourcePipeline` with discard-onl
 software adapters and prints JSON: process CPU seconds, sampled RSS (`null` with
 `rss_observable: false` when unreadable, never `0`), per-path maximum/final
 queue depth, drops, discontinuities, delivered packets, synthetic inference
-sample count and the adapter selection. It prints no hostname, user, path,
+sample count, each path's `adapter_state`, and an aggregate of the adapters
+active at the end (`active_paths`, `fallback_paths`, states, kinds, reasons)
+rather than one shared latest selection. It prints no hostname, user, path,
 environment value, source identity or media, and always reports
 `deployment_acceptance: false`. Exit status is `3` when any source is
 unavailable. All arguments are required and bounded; there are no defaults.

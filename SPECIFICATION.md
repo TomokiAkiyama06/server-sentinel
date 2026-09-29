@@ -531,7 +531,10 @@ falls back to a listed software adapter and the selection records
 `hardware_unavailable` + `software_fallback`; with `require_hardware`, or when no
 software adapter exists, the path is `adapter_unavailable` (or
 `adapter_start_failed`). Fallback is never silent and never reports the
-accelerated path as active.
+accelerated path as active: the selection is recorded per started adapter/path
+(`PathStatus.adapter_state`), not as one selector-wide latest result, so a path
+still on software fallback stays visible after another path starts on
+recovered hardware.
 
 ### 6.3 Room-overview benchmark
 

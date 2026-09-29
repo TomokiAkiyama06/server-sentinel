@@ -146,6 +146,7 @@ def _path_summary(status, depth: _Depth, delivered: int) -> dict | None:
         "available": status.available,
         "failed": status.failed,
         "reason": status.reason,
+        "adapter_state": status.adapter_state,
         "delivered_packets": delivered,
         "dropped_packets": status.dropped_packets,
         "skipped_until_keyframe": status.skipped_until_keyframe,
@@ -211,6 +212,10 @@ def run_measurement(config: MeasureConfig) -> dict:
         else:
             rss_peak = max(rss_peak, rss_after)
         statuses = [source.status for source in pipelines]
+        # One selector serves every source here; report the selections of the
+        # adapters that were active at the end, never one shared last result.
+        active = (recording_selector.active_selections
+                  + viewer_selector.active_selections)
     finally:
         for source in pipelines:
             source.close()
@@ -226,7 +231,6 @@ def run_measurement(config: MeasureConfig) -> dict:
                                     delivered[index][1]),
             "inference_samples": samples[index],
         })
-    selection = recording_selector.last_selection
     return {
         "workload": "generated zero-byte compressed packets; synthetic adapters only",
         "deployment_acceptance": False,
@@ -243,11 +247,12 @@ def run_measurement(config: MeasureConfig) -> dict:
             "pump_budget": config.pump_budget,
             "acceleration": config.acceleration.value,
         },
-        "adapter_selection": None if selection is None else {
-            "state": selection.state,
-            "kind": None if selection.kind is None else selection.kind.value,
-            "fallback": selection.fallback,
-            "reasons": list(selection.reasons),
+        "adapter_selection": {
+            "active_paths": len(active),
+            "fallback_paths": sum(1 for value in active if value.fallback),
+            "states": sorted({value.state for value in active}),
+            "kinds": sorted({value.kind.value for value in active}),
+            "reasons": sorted({reason for value in active for reason in value.reasons}),
         },
         "resources": {
             "cpu_seconds": round(cpu_seconds, 6),

@@ -16,6 +16,7 @@ from enum import StrEnum
 import re
 from threading import Lock
 from typing import Callable
+from weakref import WeakSet
 
 from .pipeline import AdapterFactory, AdapterUnavailable, PacketAdapter
 from .planner import EncodePlan
@@ -87,13 +88,54 @@ class AdapterSelection:
         return "software_fallback" if self.fallback else "ready"
 
 
+class SelectedAdapter:
+    """A started adapter bound to the selection that produced it.
+
+    One selector may serve several paths or sources, each started at a
+    different time. The selection therefore travels with the adapter it chose
+    (``SourcePipeline`` exposes it as ``PathStatus.adapter_state``) instead of
+    living only in one mutable selector-wide record. It stays active until the
+    wrapped adapter closes successfully; a failed close keeps it visible
+    because the adapter's resources remain allocated.
+    """
+
+    __slots__ = ("_adapter", "_selection", "_owner", "__weakref__")
+
+    def __init__(self, adapter: PacketAdapter, selection: AdapterSelection,
+                 owner: "AdapterSelector"):
+        self._adapter = adapter
+        self._selection = selection
+        self._owner = owner
+
+    @property
+    def selection(self) -> AdapterSelection:
+        return self._selection
+
+    @property
+    def selection_state(self) -> str:
+        return self._selection.state
+
+    def write(self, packet) -> None:
+        self._adapter.write(packet)
+
+    def reset(self) -> None:
+        self._adapter.reset()
+
+    def close(self) -> None:
+        self._adapter.close()
+        self._owner._released(self)
+
+
 class AdapterSelector:
     """An ``AdapterFactory`` that selects among explicit candidates.
 
-    Pass an instance as a ``SourcePipeline`` recording or viewer factory. The
-    most recent selection stays readable through ``last_selection`` so a
-    health surface can show ``hardware_unavailable`` with ``software_fallback``
-    instead of reporting the accelerated path as active.
+    Pass an instance as a ``SourcePipeline`` recording or viewer factory. Each
+    returned adapter is a ``SelectedAdapter`` carrying its own selection, and
+    ``active_selections`` lists the selections of every adapter that has not
+    yet closed, so a later start on recovered hardware cannot hide an earlier
+    path that is still on ``software_fallback``. ``last_selection`` is only the
+    most recent attempt (including failed ones), never the state of active
+    paths.
     """
 
     def __init__(self, policy: AccelerationPolicy,
@@ -110,11 +152,27 @@ class AdapterSelector:
         self._candidates = candidates
         self._lock = Lock()
         self._last: AdapterSelection | None = None
+        # Weak references: an adapter dropped without close cannot pin memory
+        # here, so tracking is bounded by the adapters callers still hold.
+        self._active: WeakSet[SelectedAdapter] = WeakSet()
 
     @property
     def last_selection(self) -> AdapterSelection | None:
         with self._lock:
             return self._last
+
+    @property
+    def active_selections(self) -> tuple[AdapterSelection, ...]:
+        with self._lock:
+            return tuple(adapter.selection for adapter in self._active)
+
+    @property
+    def fallback_active(self) -> bool:
+        return any(selection.fallback for selection in self.active_selections)
+
+    def _released(self, adapter: SelectedAdapter) -> None:
+        with self._lock:
+            self._active.discard(adapter)
 
     def _record(self, selection: AdapterSelection) -> None:
         with self._lock:
@@ -123,7 +181,7 @@ class AdapterSelector:
     def _eligible(self, kind: AdapterKind) -> tuple[AdapterCandidate, ...]:
         return tuple(value for value in self._candidates if value.kind is kind)
 
-    def __call__(self, plan: EncodePlan) -> PacketAdapter:
+    def __call__(self, plan: EncodePlan) -> SelectedAdapter:
         if not isinstance(plan, EncodePlan):
             raise ValueError("invalid encode plan")
         reasons: list[str] = []
@@ -170,9 +228,13 @@ class AdapterSelector:
                             and policy is AccelerationPolicy.PREFER_HARDWARE)
                 if fallback:
                     reasons.append("software_fallback")
-                self._record(AdapterSelection(policy, candidate.name, kind, fallback,
-                                              tuple(dict.fromkeys(reasons))))
-                return adapter
+                selection = AdapterSelection(policy, candidate.name, kind, fallback,
+                                             tuple(dict.fromkeys(reasons)))
+                selected = SelectedAdapter(adapter, selection, self)
+                with self._lock:
+                    self._last = selection
+                    self._active.add(selected)
+                return selected
             if not tier_started and kind is AdapterKind.HARDWARE:
                 reasons.append("hardware_unavailable")
         self._record(AdapterSelection(policy, None, None, False,

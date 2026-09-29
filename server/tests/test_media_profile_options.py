@@ -241,7 +241,8 @@ class AdapterSelectionTests(unittest.TestCase):
             _candidate("accel", AdapterKind.HARDWARE, hardware),
             _candidate("cpu", AdapterKind.SOFTWARE, software)))
         adapter = selector(_plan())
-        self.assertIs(adapter, hardware.adapters[0])
+        self.assertEqual(len(hardware.adapters), 1)
+        self.assertEqual(adapter.selection, selector.last_selection)
         self.assertEqual(software.probes, 0)
         selection = selector.last_selection
         self.assertEqual((selection.selected, selection.kind, selection.fallback,
@@ -251,7 +252,9 @@ class AdapterSelectionTests(unittest.TestCase):
         software = _Recorder()
         selector = AdapterSelector(AccelerationPolicy.PREFER_HARDWARE, (
             _candidate("cpu", AdapterKind.SOFTWARE, software),))
-        self.assertIs(selector(_plan()), software.adapters[0])
+        adapter = selector(_plan())
+        self.assertEqual(len(software.adapters), 1)
+        self.assertEqual(adapter.selection_state, "software_fallback")
         selection = selector.last_selection
         self.assertTrue(selection.fallback)
         self.assertEqual(selection.state, "software_fallback")
@@ -394,6 +397,56 @@ class AdapterSelectionTests(unittest.TestCase):
         pipe.close()
         self.assertTrue(all(adapter.closed for adapter in software.adapters))
 
+    def test_fallback_stays_visible_per_path_after_hardware_recovers(self):
+        # Regression: one selector serves recording and viewer. Recording
+        # starts on software fallback; the accelerator then recovers and the
+        # viewer starts on hardware. The still-running recording path must keep
+        # reporting software_fallback instead of the viewer's ready/hardware.
+        hardware, software = _Recorder(supported=False), _Recorder()
+        selector = AdapterSelector(AccelerationPolicy.PREFER_HARDWARE, (
+            _candidate("accel", AdapterKind.HARDWARE, hardware),
+            _candidate("cpu", AdapterKind.SOFTWARE, software)))
+        limits = QueueLimits(8, 1024)
+        pipe = SourcePipeline(SOURCE, STREAM, source_profiles(), limits, limits,
+                              selector, selector)
+        hardware.supported = True
+        pipe.add_viewer(SUBSCRIBER)
+        self.assertEqual(pipe.recording_status.adapter_state, "software_fallback")
+        self.assertEqual(pipe.viewer_status.adapter_state, "ready")
+        self.assertEqual(pipe.status.recording.adapter_state, "software_fallback")
+        self.assertEqual(sorted(value.state for value in selector.active_selections),
+                         ["ready", "software_fallback"])
+        self.assertTrue(selector.fallback_active)
+        self.assertFalse(selector.last_selection.fallback)  # only the latest attempt
+        self.assertTrue(pipe.remove_viewer(SUBSCRIBER))
+        self.assertIsNone(pipe.viewer_status.adapter_state)
+        self.assertEqual([value.state for value in selector.active_selections],
+                         ["software_fallback"])
+        pipe.close()
+        self.assertIsNone(pipe.recording_status.adapter_state)
+        self.assertEqual(selector.active_selections, ())
+        self.assertFalse(selector.fallback_active)
+
+    def test_failed_close_keeps_selection_active_until_released(self):
+        software = _Recorder()
+        selector = AdapterSelector(AccelerationPolicy.PREFER_HARDWARE, (
+            _candidate("cpu", AdapterKind.SOFTWARE, software),))
+        adapter = selector(_plan())
+        software.adapters[0].fail_close = True
+        with self.assertRaises(RuntimeError):
+            adapter.close()
+        self.assertTrue(selector.fallback_active)
+        software.adapters[0].fail_close = False
+        adapter.close()
+        self.assertEqual(selector.active_selections, ())
+
+    def test_dropped_adapter_does_not_grow_selector_tracking(self):
+        selector = AdapterSelector(AccelerationPolicy.SOFTWARE_ONLY, (
+            _candidate("cpu", AdapterKind.SOFTWARE, _Recorder()),))
+        for _ in range(100):
+            selector(_plan())
+        self.assertEqual(selector.active_selections, ())
+
 
 def _config(**changes):
     values = dict(sources=2, packets=300, packet_bytes=512, keyframe_interval=30,
@@ -417,10 +470,16 @@ class MeasurementHarnessTests(unittest.TestCase):
         result = measure.run_measurement(_config())
         self.assertFalse(result["deployment_acceptance"])
         self.assertEqual(len(result["sources"]), 2)
-        self.assertEqual(result["adapter_selection"]["state"], "software_fallback")
-        self.assertIn("hardware_unavailable", result["adapter_selection"]["reasons"])
+        selection = result["adapter_selection"]
+        # 2 sources x (recording + viewer), each reported on its own path.
+        self.assertEqual((selection["active_paths"], selection["fallback_paths"],
+                          selection["states"], selection["kinds"]),
+                         (4, 4, ["software_fallback"], ["software"]))
+        self.assertIn("hardware_unavailable", selection["reasons"])
         for source in result["sources"]:
             self.assertEqual(source["state"], "healthy")
+            self.assertEqual(source["recording"]["adapter_state"], "software_fallback")
+            self.assertEqual(source["viewer"]["adapter_state"], "software_fallback")
             self.assertEqual(source["recording"]["delivered_packets"], 300)
             self.assertEqual(source["viewer"]["delivered_packets"], 300)
             self.assertEqual(source["inference_samples"], 50)
