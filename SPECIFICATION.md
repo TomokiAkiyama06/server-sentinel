@@ -616,7 +616,9 @@ of an authorized node (including a duplicate or an early refusal that is never
 enqueued) consumes its per-node ingest rate budget, a unit refused for
 a reason no retry can satisfy (oversize) is recorded as loss, and any other
 ingest refusal leaves continuity unchanged and the flow `degraded`. A sequence skip reports the exact missing
-count, a new capture epoch reports a gap of unknown extent, and an in-epoch
+count, a new capture epoch reports a gap of unknown extent (also when the
+source's earlier-epoch unit was attempted but never committed; an epoch lower
+than one already attempted is refused as stale), and an in-epoch
 capture clock regression is reported. The full envelope travels with each
 admitted unit in the ingest queue, and the ingest boundary refuses a media
 unit with a missing or partial envelope. Known loss or backpressure keeps the

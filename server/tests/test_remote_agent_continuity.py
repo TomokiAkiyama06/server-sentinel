@@ -406,6 +406,72 @@ class ContinuityTrackerTests(unittest.TestCase):
                          tracker.receive(session, unit(0, source=OTHER_SOURCE), b"v").outcome)
         self.assertEqual(SourceFlow.RECEIVING, flow(tracker, OTHER_SOURCE).flow)
 
+    def _uncommitted_first_unit(self, kind):
+        """Leave OTHER_SOURCE seen (epoch 2, sequence 0) but never committed."""
+        authorizer = Authorizer({(NODE, SOURCE), (NODE, OTHER_SOURCE)})
+        clock = Clock()
+        ingest = TransientRefusalQueue(IngestLimits(8, 1, 8, 1000, 10 ** 12),
+                                       authorizer, clock_ns=clock)
+        tracker = ContinuityTracker(ContinuityLimits(4, 4, 100), authorizer, ingest,
+                                    clock_ns=clock)
+        session = tracker.open_session(NODE)
+        if kind == "backpressure":
+            tracker.receive(session, unit(0), b"v")
+            expected = DeliveryOutcome.BACKPRESSURED
+        else:
+            ingest.refusing = True
+            expected = DeliveryOutcome.REJECTED
+        self.assertEqual(expected, tracker.receive(
+            session, unit(0, source=OTHER_SOURCE, epoch=2), b"v").outcome)
+        self.assertEqual((SourceFlow.DEGRADED, None, 2),
+                         (flow(tracker, OTHER_SOURCE).flow,
+                          flow(tracker, OTHER_SOURCE).last_sequence,
+                          flow(tracker, OTHER_SOURCE).capture_epoch))
+        ingest.drain(10)
+        ingest.refusing = False
+        return tracker, ingest, session
+
+    def test_restart_before_first_commit_reports_capture_restart(self):
+        for kind in ("backpressure", "transient_refusal"):
+            with self.subTest(kind=kind):
+                tracker, ingest, session = self._uncommitted_first_unit(kind)
+                # The capture process restarted before the unit was retried:
+                # the uncommitted epoch-2 unit is known loss, not a new flow.
+                result = tracker.receive(
+                    session, unit(0, source=OTHER_SOURCE, epoch=3), b"n")
+                self.assertEqual(DeliveryOutcome.ACCEPTED, result.outcome)
+                self.assertEqual([(GapReason.CAPTURE_RESTART, 3, None, 0, None)],
+                                 [(g.reason, g.capture_epoch, g.after_sequence,
+                                   g.before_sequence, g.missing_units)
+                                  for g in result.gaps])
+                state = flow(tracker, OTHER_SOURCE)
+                self.assertEqual((SourceFlow.DEGRADED, 3, 0, 1, False),
+                                 (state.flow, state.capture_epoch, state.last_sequence,
+                                  state.pending_gaps, state.backpressured))
+
+    def test_older_epoch_after_uncommitted_first_unit_is_stale(self):
+        tracker, ingest, session = self._uncommitted_first_unit("backpressure")
+        result = tracker.receive(session, unit(0, source=OTHER_SOURCE, epoch=1), b"o")
+        self.assertEqual((DeliveryOutcome.REJECTED, "stale_capture_epoch"),
+                         (result.outcome, result.reason))
+        self.assertEqual(0, ingest.snapshot().queued_messages)
+        self.assertEqual((SourceFlow.DEGRADED, None, 2),
+                         (flow(tracker, OTHER_SOURCE).flow,
+                          flow(tracker, OTHER_SOURCE).last_sequence,
+                          flow(tracker, OTHER_SOURCE).capture_epoch))
+
+    def test_same_epoch_after_uncommitted_first_unit_is_not_a_restart(self):
+        tracker, _, session = self._uncommitted_first_unit("backpressure")
+        result = tracker.receive(session, unit(2, source=OTHER_SOURCE, epoch=2), b"s")
+        self.assertEqual(DeliveryOutcome.ACCEPTED, result.outcome)
+        self.assertEqual([(GapReason.SEQUENCE_SKIP, None, 2, 2)],
+                         [(g.reason, g.after_sequence, g.before_sequence,
+                           g.missing_units) for g in result.gaps])
+        tracker, _, session = self._uncommitted_first_unit("backpressure")
+        result = tracker.receive(session, unit(0, source=OTHER_SOURCE, epoch=2), b"r")
+        self.assertEqual((DeliveryOutcome.ACCEPTED, ()), (result.outcome, result.gaps))
+        self.assertEqual(SourceFlow.RECEIVING, flow(tracker, OTHER_SOURCE).flow)
+
     def test_uncommitted_sources_stay_within_source_capacity(self):
         authorizer = Authorizer({(NODE, s) for s in SOURCES})
         tracker, _, _, _ = build(authorizer=authorizer, queued=1)

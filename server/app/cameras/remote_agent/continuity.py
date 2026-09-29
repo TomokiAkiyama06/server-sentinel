@@ -176,6 +176,9 @@ class _Source:
 
     An uncommitted entry exists only so that pressure/refusal on a source's
     first unit is visible as ``degraded``; it occupies a bounded source slot.
+    Its ``capture_epoch`` is that of the first attempted unit, so a later
+    higher epoch is still a capture restart (known loss of the uncommitted
+    unit) and a lower epoch is still stale, exactly as for committed state.
     ``session_generation`` is the node session that last delivered this
     source; a source not yet delivered on the node's current session stays
     ``interrupted`` even though the node itself reconnected.
@@ -425,19 +428,24 @@ class ContinuityTracker:
                          header: MediaUnitHeader) -> tuple[GapEvent, ...] | str:
         """Pure check; returns gaps to record, or a refusal/duplicate reason."""
         source_id, epoch, sequence = header.source_id, header.capture_epoch, header.sequence
-        if state is None or state.last_sequence is None or epoch > state.capture_epoch:
-            gaps = []
-            if state is not None and state.last_sequence is not None:
-                # A new capture epoch means the Agent capture process
-                # restarted; the extent of any loss is not knowable here.
-                gaps.append(GapEvent(node_id, source_id, GapReason.CAPTURE_RESTART, epoch,
-                                     None, sequence, None))
-            elif sequence:
-                gaps.append(GapEvent(node_id, source_id, GapReason.SEQUENCE_SKIP, epoch,
-                                     None, sequence, sequence))
-            return tuple(gaps)
-        if epoch < state.capture_epoch:
+        if state is not None and epoch < state.capture_epoch:
+            # Also for an uncommitted state: its epoch was observed on a unit
+            # the Agent attempted, and capture epochs only increase.
             return "stale_capture_epoch"
+        if state is not None and epoch > state.capture_epoch:
+            # A new capture epoch means the Agent capture process restarted;
+            # the extent of any loss is not knowable here.  This holds for an
+            # uncommitted state too: its attempted unit(s) of the older epoch
+            # were never committed and are now known to be lost.
+            return (GapEvent(node_id, source_id, GapReason.CAPTURE_RESTART, epoch,
+                             None, sequence, None),)
+        if state is None or state.last_sequence is None:
+            # Start of the flow in this epoch (absent, or seen but uncommitted
+            # in the same epoch): leading units are reported as loss.
+            if sequence:
+                return (GapEvent(node_id, source_id, GapReason.SEQUENCE_SKIP, epoch,
+                                 None, sequence, sequence),)
+            return ()
         if sequence <= state.last_sequence:
             return "duplicate"
         gaps = []
