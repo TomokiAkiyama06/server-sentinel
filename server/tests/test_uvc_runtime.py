@@ -1005,6 +1005,58 @@ class ApplicationWiringTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0.2)
         self.assertFalse(runtime.status().sources[0].worker_running)
 
+    async def test_cancelled_shutdown_finishes_capture_stop_and_cleanup(self):
+        # An ASGI shutdown timeout or embedder cancels the lifespan while the
+        # UVC stop thread is still joining workers. The stop is not abandoned:
+        # the preview is invalidated, the stop finishes, the remaining
+        # cleanup (retention task, final state) still runs, and only then
+        # is the cancellation re-raised.
+        _database, source = self.migrated_source()
+        application = create_app(
+            self.settings, storage_reservation=synthetic_admission,
+            local_uvc=LocalUvcConfiguration((source.id,), **FAST),
+            local_uvc_dependencies=self.dependencies,
+        )
+        stopping, started = threading.Event(), asyncio.Event()
+        finished = []
+        original = LocalUvcRuntime.stop
+
+        def slow_stop(runtime):
+            stopping.set()
+            time.sleep(0.3)
+            status = original(runtime)
+            finished.append(status.state)
+            return status
+
+        exit_lifespan = asyncio.Event()
+
+        async def serve():
+            async with application.router.lifespan_context(application):
+                started.set()
+                await exit_lifespan.wait()
+
+        with patch.object(LocalUvcRuntime, "stop", slow_stop), \
+                self.assertLogs("app.main", level="INFO") as logs:
+            task = asyncio.create_task(serve())
+            await asyncio.wait_for(started.wait(), 5)
+            self.assertTrue(application.state.ready)
+            exit_lifespan.set()
+            self.assertTrue(await asyncio.to_thread(stopping.wait, 5))
+            task.cancel()
+            await asyncio.sleep(0)
+            task.cancel()  # A repeated cancellation is deferred as well.
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+        runtime = application.state.local_uvc
+        self.assertEqual([LocalUvcRuntimeState.STOPPED], finished)
+        self.assertIs(application.state.local_uvc_state, LocalUvcRuntimeState.STOPPED)
+        self.assertFalse(runtime.status().sources[0].worker_running)
+        self.assertFalse(application.state.ready)
+        preview = application.state.local_preview
+        self.assertFalse(preview.source(source.id).live)
+        self.assertEqual(0, preview.status.retained_bytes)
+        self.assertTrue(any("application_stopped" in line for line in logs.output))
+
     def test_invalid_configuration_type_is_refused(self):
         with self.assertRaises(TypeError):
             create_app(self.settings, local_uvc={"source_ids": []})
@@ -1046,6 +1098,46 @@ class MonitoringAdmissionTests(MonitoringFixture):
             with self.assertRaises(asyncio.CancelledError):
                 await task
         self.assertEqual([application.state.monitoring], stopped)
+        self.assertFalse(application.state.ready)
+
+    async def test_cancelled_shutdown_finishes_monitoring_stop(self):
+        # A shutdown cancelled while the monitoring runtime is stopping still
+        # finishes that stop (and the final state), then re-raises.
+        from app.monitoring.runtime import MonitoringRuntime
+        application = create_app(
+            self.settings, monitoring=self.configuration(),
+            monitoring_dependencies=MonitoringDependencies(
+                integrity_probe=self.probe, segment_validator=SyntheticValidator(),
+                slack_opener=self.transport, utcnow=self.clock.utcnow,
+                monotonic=lambda: self.clock.monotonic, tick_seconds=0.01,
+            ),
+        )
+        stopping, finished = asyncio.Event(), []
+        original_stop = MonitoringRuntime.stop
+
+        async def slow_stop(runtime):
+            stopping.set()
+            await asyncio.sleep(0.2)
+            await original_stop(runtime)
+            finished.append(runtime)
+
+        started, exit_lifespan = asyncio.Event(), asyncio.Event()
+
+        async def serve():
+            async with application.router.lifespan_context(application):
+                started.set()
+                await exit_lifespan.wait()
+
+        with patch.object(MonitoringRuntime, "stop", slow_stop):
+            task = asyncio.create_task(serve())
+            await asyncio.wait_for(started.wait(), 5)
+            exit_lifespan.set()
+            await asyncio.wait_for(stopping.wait(), 5)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+        self.assertEqual([application.state.monitoring], finished)
+        self.assertFalse(application.state.audit_storage_admitted)
         self.assertFalse(application.state.ready)
 
     async def test_failed_monitoring_startup_defers_capture_until_recovery(self):

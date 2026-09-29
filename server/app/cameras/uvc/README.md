@@ -107,7 +107,9 @@ A registry read failure while a camera is live closes that capture and
 delivers the offline transition; any poll that raised marks the worker
 `polling_failed` and the service `degraded` until a poll completes.
 A lifespan startup that fails or is cancelled while the runtime starts still
-stops every worker. A UUID
+stops every worker. A shutdown that is cancelled (ASGI shutdown timeout,
+embedder) first invalidates the preview, then still waits for the bounded stop
+and every remaining cleanup step before re-raising the cancellation. A UUID
 that is not a `local_uvc` source is `rejected`, never silently skipped; a worker
 that fails to start is `worker_failed` and its camera is written `offline`.
 Service state (`running` / `degraded` / `failed` / `stopped` / `stop_failed`)

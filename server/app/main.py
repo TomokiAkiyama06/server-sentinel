@@ -81,6 +81,29 @@ class ClosedHumanSurface:
             await self.app(scope, receive, send)
 
 
+async def run_to_completion(awaitable):
+    """Finish a cleanup step even when the awaiting task is cancelled.
+
+    Cancelling an ASGI lifespan (shutdown timeout, embedder cancellation)
+    must not abandon a stop thread or skip the cleanup after it, so the step
+    runs as its own task and every cancellation of the caller is deferred
+    until it finishes. The caller's cancellation is re-raised afterwards.
+    """
+    task = asyncio.ensure_future(awaitable)
+    cancelled = False
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            if not task.done():
+                cancelled = True
+    if cancelled:
+        if not task.cancelled():
+            task.exception()  # Retrieved; the caller's cancellation wins.
+        raise asyncio.CancelledError
+    return task.result()
+
+
 def create_app(settings: Settings, *, database: Database | None = None,
                human_authorizer: HumanAuthorizer | None = None,
                owner_authorizer: OwnerAuthorizer | None = None,
@@ -165,7 +188,7 @@ def create_app(settings: Settings, *, database: Database | None = None,
             # the monitoring worker exactly like a failed one.
             if monitoring_runtime is not None:
                 with suppress(Exception):
-                    await monitoring_runtime.stop()
+                    await run_to_completion(monitoring_runtime.stop())
             if not isinstance(error, Exception):
                 raise
             logging.getLogger(__name__).error(Event.STARTUP_FAILED)
@@ -219,14 +242,19 @@ def create_app(settings: Settings, *, database: Database | None = None,
         async def stop_local_uvc() -> None:
             if local_uvc_runtime is None:
                 return
+            # No retained frame is served while (or after) capture stops.
+            local_preview.clear()
             try:
                 # Bounded joins; physical capture closes before storage stops.
-                status = await asyncio.to_thread(local_uvc_runtime.stop)
+                # A cancelled shutdown still waits for the stop thread.
+                status = await run_to_completion(
+                    asyncio.to_thread(local_uvc_runtime.stop))
                 application.state.local_uvc_state = status.state
             except Exception:
                 application.state.local_uvc_state = LocalUvcRuntimeState.STOP_FAILED
                 logging.getLogger(__name__).error(Event.LOCAL_UVC_STOP_FAILED)
-            local_preview.clear()
+            finally:
+                local_preview.clear()
 
         def refresh_monitoring_state() -> None:
             # Snapshots follow the live runtime, e.g. a retried startup open
@@ -277,6 +305,34 @@ def create_app(settings: Settings, *, database: Database | None = None,
                         )
                 retry_local_uvc_start()
 
+        async def shutdown() -> None:
+            uvc_lifecycle["stopping"] = True
+            if uvc_watch_task is not None:
+                uvc_watch_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await uvc_watch_task
+            if uvc_lifecycle["deferred"] is not None:
+                # start() and stop() serialize on the runtime lock; let a
+                # deferred start finish so stop() sees its workers.
+                with suppress(Exception):
+                    await asyncio.shield(uvc_lifecycle["deferred"])
+            await stop_local_uvc()
+            if cleanup_task is not None:
+                cleanup_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await cleanup_task
+            if monitoring_task is not None:
+                monitoring_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await monitoring_task
+            if monitoring_runtime is not None:
+                runtime_admission.bind(None)
+                application.state.audit_storage_admitted = storage_reservation is not None
+                await monitoring_runtime.stop()
+                application.state.monitoring_state = monitoring_runtime.status.state
+            application.state.ready = False
+            logging.getLogger(__name__).info(Event.STOPPED)
+
         # Everything below runs under one cleanup guard.
         try:
             if monitoring_runtime is None:
@@ -318,32 +374,11 @@ def create_app(settings: Settings, *, database: Database | None = None,
             # Also reached when startup itself fails or is cancelled after the
             # monitoring worker started, so no capture worker, descriptor,
             # retention task or monitoring worker outlives a failed lifespan.
-            uvc_lifecycle["stopping"] = True
-            if uvc_watch_task is not None:
-                uvc_watch_task.cancel()
-                with suppress(asyncio.CancelledError):
-                    await uvc_watch_task
-            if uvc_lifecycle["deferred"] is not None:
-                # start() and stop() serialize on the runtime lock; let a
-                # deferred start finish so stop() sees its workers.
-                with suppress(Exception):
-                    await asyncio.shield(uvc_lifecycle["deferred"])
-            await stop_local_uvc()
-            if cleanup_task is not None:
-                cleanup_task.cancel()
-                with suppress(asyncio.CancelledError):
-                    await cleanup_task
-            if monitoring_task is not None:
-                monitoring_task.cancel()
-                with suppress(asyncio.CancelledError):
-                    await monitoring_task
-            if monitoring_runtime is not None:
-                runtime_admission.bind(None)
-                application.state.audit_storage_admitted = storage_reservation is not None
-                await monitoring_runtime.stop()
-                application.state.monitoring_state = monitoring_runtime.status.state
+            # A cancelled shutdown (ASGI shutdown timeout, embedder) does not
+            # skip any step: the whole sequence runs to completion first and
+            # the cancellation is re-raised afterwards.
             application.state.ready = False
-            logging.getLogger(__name__).info(Event.STOPPED)
+            await run_to_completion(shutdown())
 
     application = FastAPI(
         docs_url=None, redoc_url=None, openapi_url=None,
