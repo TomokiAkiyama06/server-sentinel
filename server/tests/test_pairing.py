@@ -7,6 +7,7 @@ from uuid import uuid4
 from app.cameras.remote_agent.pairing import (
     HmacCodeVerifier, PairingAuthorizationError, PairingError, PairingLedger,
 )
+from app.audit.store import AuditStore
 from app.storage.database import Database
 from app.storage.migrations import migrate
 from app.storage.schema import APPLICATION_MIGRATIONS
@@ -35,7 +36,8 @@ class PairingLedgerTests(unittest.TestCase):
             migrate(connection, APPLICATION_MIGRATIONS)
         self.now = 100.0
         self.verifier = HmacCodeVerifier(b"s" * 32)
-        self.ledger = PairingLedger(self.database, self.verifier, clock=lambda: self.now,
+        self.ledger = PairingLedger(self.database, self.verifier, audit=AuditStore(self.database),
+                                    clock=lambda: self.now,
                                     process_epoch=uuid4())
         self.owner = Owner()
 
@@ -79,7 +81,8 @@ class PairingLedgerTests(unittest.TestCase):
 
     def test_restart_invalidates_pending_monotonic_approval(self):
         approval, code = self._approval()
-        restarted = PairingLedger(self.database, self.verifier, clock=lambda: self.now,
+        restarted = PairingLedger(self.database, self.verifier, audit=AuditStore(self.database),
+                                  clock=lambda: self.now,
                                   process_epoch=uuid4())
         with self.assertRaises(PairingError):
             restarted.redeem(enrollment_id=approval.enrollment_id,

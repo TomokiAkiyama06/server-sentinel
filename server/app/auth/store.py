@@ -7,12 +7,18 @@ import sqlite3
 from typing import Callable, Iterable
 from uuid import UUID, uuid4
 
+from app.audit.model import ActorCategory, AuditAction, AuditOutcome, TargetKind
+from app.audit.store import AuditStorageError, AuditStore
 from app.storage.database import Database
 from .model import AccessValidationError, Credential, Permission, Principal, PrincipalRole, PrincipalStatus, utc_time
 
 
 class AccessStorageError(RuntimeError):
     """Storage failure without paths, identities, tokens, or credential material."""
+
+
+class UnauditedAccessWriteError(RuntimeError):
+    """An Owner-only access mutation was attempted outside the audited boundary."""
 
 
 IDLE_LIFETIME = timedelta(minutes=30)
@@ -60,11 +66,35 @@ class AccessStore:
     ``enroll_credential`` or ``establish_session``.  This module deliberately
     treats credential IDs/public keys as opaque bytes and creates no route,
     cookie, trusted-header adapter, or browser ceremony.
+
+    Owner-only mutations (invitation, grant change, principal or credential
+    revocation) are reached through ``app.audit.integration.AccessAdministration``,
+    which authorizes the Owner and commits the ``*_on`` mutation together with
+    its security audit record in one SQLite transaction. The plain wrappers
+    refuse with ``UnauditedAccessWriteError`` unless this store was explicitly
+    constructed with ``unaudited_writes=True`` for non-runtime fixtures.
+    Invitation redemption is not an Owner operation; it appends its own audit
+    record in the same transaction and therefore requires ``audit``.
     """
 
-    def __init__(self, database: Database, *, clock: Callable[[], datetime] | None = None):
+    def __init__(self, database: Database, *, clock: Callable[[], datetime] | None = None,
+                 audit: AuditStore | None = None, unaudited_writes: bool = False):
+        if type(unaudited_writes) is not bool:
+            raise AccessValidationError("unaudited write mode is invalid")
+        if audit is not None and (not isinstance(audit, AuditStore) or audit.database != database):
+            # The audit row must share the mutation's SQLite database/transaction.
+            raise AccessValidationError("audit store is invalid")
         self.database = database
+        self.audit = audit
+        self.unaudited_writes = unaudited_writes
         self._clock = clock or (lambda: datetime.now(timezone.utc))
+
+    def _require_unaudited_writes(self) -> None:
+        if not self.unaudited_writes:
+            raise UnauditedAccessWriteError("owner access mutation requires the audited boundary")
+
+    def now(self) -> datetime:
+        return utc_time(self._clock())
 
     @contextmanager
     def _transaction(self, write: bool = False):
@@ -85,6 +115,17 @@ class AccessStore:
         finally:
             if connection is not None:
                 connection.close()
+
+    @contextmanager
+    def _audited_transaction(self):
+        """Write transaction admitted through the audit store's storage reservation."""
+        if self.audit is None:
+            raise AccessStorageError("access audit is unavailable")
+        try:
+            with self.audit.transaction(write=True) as connection:
+                yield connection
+        except AuditStorageError:
+            raise AccessStorageError("access state operation failed") from None
 
     @staticmethod
     def _principal(row) -> Principal:
@@ -112,42 +153,63 @@ class AccessStore:
         return owner
 
     def invite(self, external_identity: str, display_name: str, permissions: Iterable[Permission], *, now: datetime | None = None) -> Principal:
+        self._require_unaudited_writes()
+        at = utc_time(self._clock() if now is None else now)
+        with self._transaction(write=True) as connection:
+            return self.invite_on(connection, uuid4(), external_identity, display_name, permissions, at=at)
+
+    def invite_on(self, connection, principal_id: UUID, external_identity: str, display_name: str,
+                  permissions: Iterable[Permission], *, at: datetime) -> Principal:
+        """Create an invited principal with its grants on a caller-owned transaction."""
+        if not isinstance(principal_id, UUID):
+            raise AccessValidationError("principal identity is invalid")
         identity, name = _identity(external_identity), _display(display_name)
         grants = self._permissions(permissions)
-        at = utc_time(self._clock() if now is None else now)
-        principal = Principal(uuid4(), identity, name, PrincipalRole.INVITED_USER, PrincipalStatus.INVITED, 0, at)
-        with self._transaction(write=True) as connection:
-            connection.execute("INSERT INTO access_principals VALUES (?, ?, ?, ?, ?, ?, ?, NULL)",
-                               (str(principal.id), identity, name, principal.role.value, principal.status.value, 0, _us(at)))
-            connection.executemany("INSERT INTO access_principal_permissions VALUES (?, ?)",
-                                   ((str(principal.id), grant.value) for grant in grants))
+        at = utc_time(at)
+        principal = Principal(principal_id, identity, name, PrincipalRole.INVITED_USER, PrincipalStatus.INVITED, 0, at)
+        connection.execute("INSERT INTO access_principals VALUES (?, ?, ?, ?, ?, ?, ?, NULL)",
+                           (str(principal.id), identity, name, principal.role.value, principal.status.value, 0, _us(at)))
+        connection.executemany("INSERT INTO access_principal_permissions VALUES (?, ?)",
+                               ((str(principal.id), grant.value) for grant in grants))
         return principal
 
     def issue_enrollment(self, principal_id: UUID, secret: bytes, expires_at: datetime, *, now: datetime | None = None) -> UUID:
+        self._require_unaudited_writes()
+        at = utc_time(self._clock() if now is None else now)
+        with self._transaction(write=True) as connection:
+            return self.issue_enrollment_on(connection, principal_id, secret, expires_at, at=at)
+
+    def issue_enrollment_on(self, connection, principal_id: UUID, secret: bytes, expires_at: datetime,
+                            *, at: datetime) -> UUID:
+        """Persist a single-use invitation digest on a caller-owned transaction."""
         if not isinstance(principal_id, UUID):
             raise AccessValidationError("principal identity is invalid")
         digest = _digest(secret)
-        at, expiry = utc_time(self._clock() if now is None else now), utc_time(expires_at)
+        at, expiry = utc_time(at), utc_time(expires_at)
         if expiry <= at:
             raise AccessValidationError("enrollment expiry is invalid")
         invitation_id = uuid4()
-        with self._transaction(write=True) as connection:
-            principal = connection.execute("SELECT * FROM access_principals WHERE id=?", (str(principal_id),)).fetchone()
-            if principal is None or principal["status"] == PrincipalStatus.REVOKED.value:
-                raise AccessValidationError("principal is unavailable")
-            generation = connection.execute("SELECT authorization_generation FROM access_deployment_state WHERE singleton=1").fetchone()[0]
-            connection.execute("INSERT INTO access_invitations VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL)",
-                               (str(invitation_id), digest, str(principal_id), principal["authorization_revision"], generation, _us(at), _us(expiry)))
+        principal = connection.execute("SELECT * FROM access_principals WHERE id=?", (str(principal_id),)).fetchone()
+        if principal is None or principal["status"] == PrincipalStatus.REVOKED.value:
+            raise AccessValidationError("principal is unavailable")
+        generation = connection.execute("SELECT authorization_generation FROM access_deployment_state WHERE singleton=1").fetchone()[0]
+        connection.execute("INSERT INTO access_invitations VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL)",
+                           (str(invitation_id), digest, str(principal_id), principal["authorization_revision"], generation, _us(at), _us(expiry)))
         return invitation_id
 
     def enroll_credential(self, enrollment_secret: bytes, external_identity: str, credential_id: bytes,
                           public_key: bytes, algorithm: int, sign_count: int, *, now: datetime | None = None) -> Credential:
+        """Redeem an invitation and record its audit row in the same transaction.
+
+        A rejected redemption writes nothing, so an unauthenticated caller
+        presenting unknown or stale codes cannot grow the audit table.
+        """
         digest, identity = _digest(enrollment_secret), _identity(external_identity)
         credential = Credential(credential_id, UUID(int=0), public_key, algorithm, sign_count,
                                 utc_time(self._clock() if now is None else now))
         at = credential.enrolled_at
-        with self._transaction(write=True) as connection:
-            row = connection.execute("SELECT i.*, p.external_identity, p.status, p.authorization_revision FROM access_invitations i JOIN access_principals p ON p.id=i.principal_id WHERE i.secret_digest=?", (digest,)).fetchone()
+        with self._audited_transaction() as connection:
+            row = connection.execute("SELECT i.*, p.external_identity, p.role, p.status, p.authorization_revision FROM access_invitations i JOIN access_principals p ON p.id=i.principal_id WHERE i.secret_digest=?", (digest,)).fetchone()
             state = connection.execute("SELECT authorization_generation FROM access_deployment_state WHERE singleton=1").fetchone()[0]
             if (row is None or row["redeemed_at_us"] is not None or row["revoked_at_us"] is not None
                     or row["status"] == PrincipalStatus.REVOKED.value or row["external_identity"] != identity
@@ -160,6 +222,14 @@ class AccessStore:
                                (credential.credential_id, str(principal_id), credential.public_key, credential.algorithm, credential.sign_count, _us(at)))
             connection.execute("UPDATE access_invitations SET redeemed_at_us=? WHERE id=?", (_us(at), row["id"]))
             connection.execute("UPDATE access_principals SET status=? WHERE id=? AND status=?", (PrincipalStatus.ACTIVE.value, str(principal_id), PrincipalStatus.INVITED.value))
+            # Same transaction: an audit write failure rolls the redemption back.
+            # Only the principal's logical UUID is recorded, never the secret,
+            # external identity, credential identifier or public key.
+            actor = ActorCategory.OWNER if row["role"] == PrincipalRole.OWNER.value else ActorCategory.INVITED_USER
+            self.audit.append_on(connection, actor_category=actor,
+                                 action=AuditAction.REDEEM_PRINCIPAL_INVITATION,
+                                 target_kind=TargetKind.PRINCIPAL, target_logical_id=principal_id,
+                                 outcome=AuditOutcome.SUCCEEDED)
         return credential
 
     def establish_session(self, principal_id: UUID, credential_id: bytes, token: bytes, *, now: datetime | None = None,
@@ -200,30 +270,60 @@ class AccessStore:
             return principal
 
     def set_permissions(self, principal_id: UUID, permissions: Iterable[Permission]) -> None:
+        self._require_unaudited_writes()
+        at = utc_time(self._clock())
+        with self._transaction(write=True) as connection:
+            self.set_permissions_on(connection, principal_id, permissions, at=at)
+
+    def set_permissions_on(self, connection, principal_id: UUID, permissions: Iterable[Permission],
+                           *, at: datetime) -> None:
+        """Replace grants and invalidate existing sessions on a caller-owned transaction."""
         if not isinstance(principal_id, UUID):
             raise AccessValidationError("principal identity is invalid")
         grants = self._permissions(permissions)
-        at = utc_time(self._clock())
-        with self._transaction(write=True) as connection:
-            row = connection.execute("SELECT status FROM access_principals WHERE id=?", (str(principal_id),)).fetchone()
-            if row is None or row["status"] == PrincipalStatus.REVOKED.value:
-                raise AccessValidationError("principal is unavailable")
-            connection.execute("DELETE FROM access_principal_permissions WHERE principal_id=?", (str(principal_id),))
-            connection.executemany("INSERT INTO access_principal_permissions VALUES (?, ?)", ((str(principal_id), value.value) for value in grants))
-            self._advance_principal(connection, principal_id, at)
+        at = utc_time(at)
+        row = connection.execute("SELECT status FROM access_principals WHERE id=?", (str(principal_id),)).fetchone()
+        if row is None or row["status"] == PrincipalStatus.REVOKED.value:
+            raise AccessValidationError("principal is unavailable")
+        connection.execute("DELETE FROM access_principal_permissions WHERE principal_id=?", (str(principal_id),))
+        connection.executemany("INSERT INTO access_principal_permissions VALUES (?, ?)", ((str(principal_id), value.value) for value in grants))
+        self._advance_principal(connection, principal_id, at)
 
     def revoke_principal(self, principal_id: UUID, *, now: datetime | None = None) -> None:
-        if not isinstance(principal_id, UUID):
-            raise AccessValidationError("principal identity is invalid")
+        self._require_unaudited_writes()
         at = utc_time(self._clock() if now is None else now)
         with self._transaction(write=True) as connection:
-            row = connection.execute("SELECT status FROM access_principals WHERE id=?", (str(principal_id),)).fetchone()
-            if row is None:
-                raise AccessValidationError("principal is unavailable")
-            connection.execute("UPDATE access_principals SET status=?, revoked_at_us=?, authorization_revision=authorization_revision+1 WHERE id=?", (PrincipalStatus.REVOKED.value, _us(at), str(principal_id)))
-            connection.execute("UPDATE access_credentials SET revoked_at_us=? WHERE principal_id=? AND revoked_at_us IS NULL", (_us(at), str(principal_id)))
-            connection.execute("UPDATE access_invitations SET revoked_at_us=? WHERE principal_id=? AND redeemed_at_us IS NULL AND revoked_at_us IS NULL", (_us(at), str(principal_id)))
-            connection.execute("UPDATE access_sessions SET invalidated_at_us=? WHERE principal_id=? AND invalidated_at_us IS NULL", (_us(at), str(principal_id)))
+            self.revoke_principal_on(connection, principal_id, at=at)
+
+    def revoke_principal_on(self, connection, principal_id: UUID, *, at: datetime) -> None:
+        """Revoke a principal with its credentials, invitations and sessions together."""
+        if not isinstance(principal_id, UUID):
+            raise AccessValidationError("principal identity is invalid")
+        at = utc_time(at)
+        row = connection.execute("SELECT status FROM access_principals WHERE id=?", (str(principal_id),)).fetchone()
+        if row is None:
+            raise AccessValidationError("principal is unavailable")
+        connection.execute("UPDATE access_principals SET status=?, revoked_at_us=?, authorization_revision=authorization_revision+1 WHERE id=?", (PrincipalStatus.REVOKED.value, _us(at), str(principal_id)))
+        connection.execute("UPDATE access_credentials SET revoked_at_us=? WHERE principal_id=? AND revoked_at_us IS NULL", (_us(at), str(principal_id)))
+        connection.execute("UPDATE access_invitations SET revoked_at_us=? WHERE principal_id=? AND redeemed_at_us IS NULL AND revoked_at_us IS NULL", (_us(at), str(principal_id)))
+        connection.execute("UPDATE access_sessions SET invalidated_at_us=? WHERE principal_id=? AND invalidated_at_us IS NULL", (_us(at), str(principal_id)))
+
+    def revoke_credential_on(self, connection, principal_id: UUID, credential_id: bytes, *, at: datetime) -> None:
+        """Revoke one credential of a principal and end the sessions it created.
+
+        Revocation is credential-scoped, not device-scoped: a synced passkey may
+        exist on several devices. The credential identifier is opaque WebAuthn
+        material; the audited caller records only the principal's logical UUID.
+        """
+        if not isinstance(principal_id, UUID) or not isinstance(credential_id, bytes):
+            raise AccessValidationError("credential subject is invalid")
+        at = utc_time(at)
+        changed = connection.execute(
+            "UPDATE access_credentials SET revoked_at_us=? WHERE credential_id=? AND principal_id=? AND revoked_at_us IS NULL",
+            (_us(at), credential_id, str(principal_id))).rowcount
+        if changed != 1:
+            raise AccessValidationError("credential is unavailable")
+        connection.execute("UPDATE access_sessions SET invalidated_at_us=? WHERE credential_id=? AND invalidated_at_us IS NULL", (_us(at), credential_id))
 
     @staticmethod
     def _permissions(values: Iterable[Permission]) -> tuple[Permission, ...]:

@@ -5,6 +5,7 @@ import tempfile
 import unittest
 
 from app.auth.model import AccessValidationError, Permission, PrincipalRole, PrincipalStatus
+from app.audit.store import AuditStore
 from app.auth.store import AccessStore
 from app.storage.database import Database
 from app.storage.migrations import migrate
@@ -27,7 +28,9 @@ class AccessStoreTests(unittest.TestCase):
         self.database = Database(Path(self.temp.name) / "access.sqlite3")
         with closing(self.database.connect()) as connection:
             migrate(connection, APPLICATION_MIGRATIONS)
-        self.store = AccessStore(self.database, clock=lambda: NOW)
+        self.store = AccessStore(self.database, clock=lambda: NOW,
+                                 audit=AuditStore(self.database, clock=lambda: NOW),
+                                 unaudited_writes=True)
 
     def enroll(self, permissions=(Permission.LIVE_VIEW,)):
         principal = self.store.invite(IDENTITY, "Synthetic viewer", permissions)

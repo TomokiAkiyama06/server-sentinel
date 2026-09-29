@@ -820,7 +820,14 @@ baseline and the recording store only through that audited boundary: the registr
 write wrappers outside explicitly non-runtime fixture use, the recording
 browser refuses Owner star/delete without it, hardware baseline approval commits
 its new baseline and its audit record in one transaction on the integrity
-store's connection, and no unaudited camera approval entry point is exposed. Retention
+store's connection, and no unaudited camera approval entry point is exposed.
+Human-access invitation, invitation issue, `live:view` / `recordings:view`
+grant change and principal/credential revocation run only through the audited
+`AccessAdministration` boundary; invitation redemption and capture-node
+pairing approval, redemption, activation and revocation append their record on
+the same transaction as the state change. Non-Owner attempts at Owner-only
+operations are recorded as `denied` and do not run; redemption attempts that
+match no pending invitation/enrollment record nothing. Retention
 computes one cutoff per run and deletes expired rows oldest first in bounded
 admitted transactions, so an interrupted run stays consistent, the next run
 resumes, and a repeated run deletes nothing more; it never touches recording,
