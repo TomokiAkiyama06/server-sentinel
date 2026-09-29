@@ -1,11 +1,11 @@
 """Transactional configuration registry, deliberately without HTTP endpoints."""
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import asdict
 from datetime import datetime, timezone
 import json
 import sqlite3
-from typing import Callable
+from typing import Callable, ContextManager
 from uuid import UUID, uuid4
 
 from app.storage.database import Database
@@ -90,15 +90,27 @@ class CameraRegistry:
     and migration tooling that is explicitly not the runtime may opt in with
     ``unaudited_writes=True``. Reads and runtime health updates, which are
     observations rather than Owner decisions, stay available either way.
+
+    A runtime that writes observations continuously (the local UVC capture
+    workers) passes the deployment storage ``reservation``: every write this
+    registry commits itself is then admitted by the Main storage policy
+    through commit, so a hard-stopped or missing/replaced filesystem refuses
+    the write with the policy's bounded error instead of spending the hard
+    reserve. Writes on a caller-owned connection (``*_on``) are admitted by
+    that caller's transaction. Reads never reserve.
     """
 
     def __init__(self, database: Database, *, clock: Callable[[], datetime] | None = None,
-                 unaudited_writes: bool = False):
+                 unaudited_writes: bool = False,
+                 reservation: Callable[[], ContextManager] | None = None):
         if type(unaudited_writes) is not bool:
             raise ValidationError("invalid registry write mode")
+        if reservation is not None and not callable(reservation):
+            raise ValidationError("invalid registry storage reservation")
         self.database = database
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self.unaudited_writes = unaudited_writes
+        self.reservation = reservation
 
     def _require_unaudited_writes(self) -> None:
         if not self.unaudited_writes:
@@ -108,6 +120,14 @@ class CameraRegistry:
 
     @contextmanager
     def _transaction(self, *, write=False):
+        admission = (self.reservation() if write and self.reservation is not None
+                     else nullcontext())
+        with admission:
+            with self._transaction_unadmitted(write=write) as connection:
+                yield connection
+
+    @contextmanager
+    def _transaction_unadmitted(self, *, write):
         connection = None
         try:
             connection = self.database.connect()
