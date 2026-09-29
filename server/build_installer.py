@@ -17,6 +17,13 @@ INSTALLER_MODULES = (
     "media/recording/__init__.py", "media/recording/model.py", "media/recording/store.py",
     "notifications/__init__.py", "notifications/slack.py",
     "storage/__init__.py", "storage/policy.py",
+    # The optional detection section; these modules import only the standard
+    # library at import time (the person runtime is imported inside a worker).
+    "detection/foundation/__init__.py",
+    "detection/foundation/config.py", "detection/foundation/contracts.py",
+    "detection/foundation/feed.py", "detection/foundation/isolation.py",
+    "detection/foundation/motion.py", "detection/foundation/person.py",
+    "detection/foundation/scheduler.py",
 )
 
 

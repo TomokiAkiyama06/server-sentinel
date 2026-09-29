@@ -8,6 +8,7 @@ from pathlib import Path
 import re
 import stat
 
+from app.detection.foundation.config import DetectionConfiguration, parse_detection
 from app.monitoring.config import MonitoringConfiguration, parse_monitoring
 from app.settings import ConfigurationError, Settings
 
@@ -156,6 +157,10 @@ class Deployment:
     # launcher (`main`, including `--check`) refuses to run without its
     # storage sections because the mandatory integrity/self-test checks need it.
     monitoring: MonitoringConfiguration | None = field(default=None, repr=False)
+    # Detector bindings. Absent means no inference runtime may start and every
+    # source's detector observation stays unknown/model_unavailable; there is
+    # no default model, cadence or limit (see detection/foundation/config.py).
+    detection: DetectionConfiguration | None = field(default=None, repr=False)
 
     @property
     def state_directory(self) -> Path:
@@ -171,7 +176,7 @@ class Deployment:
             "runtime_filesystem_uuid", "service_uid",
             "human_host", "human_port", "log_level",
         }
-        if (not allowed <= set(value) or not set(value) <= allowed | {"monitoring"}
+        if (not allowed <= set(value) or not set(value) <= allowed | {"monitoring", "detection"}
                 or type(value.get("service_uid")) is not int):
             raise ConfigurationError("invalid deployment configuration")
         uid = value["service_uid"]
@@ -249,7 +254,9 @@ class Deployment:
                 root_device=lambda: _operating_system_root_device(),
                 is_mount=lambda path: os.path.ismount(path),
             )
-        return cls(runtime_root, uid, settings, directories[1], directories[2], monitoring)
+        detection = parse_detection(value["detection"]) if "detection" in value else None
+        return cls(runtime_root, uid, settings, directories[1], directories[2], monitoring,
+                   detection)
 
 
 def main(arguments: list[str] | None = None) -> int:
