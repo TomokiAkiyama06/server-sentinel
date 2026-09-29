@@ -46,7 +46,12 @@ explicitly forbidden by the Issue.
    newer one. Generations come from one tracker-wide counter that is never
    reset or reissued (also across node removal and re-enrollment of the same
    UUID), and each grant is bound to one Main process lifetime, so a revoked
-   or pre-restart grant can never become current again.
+   or pre-restart grant can never become current again. Every authorization
+   that decides a session open, a heartbeat refresh, or a media outcome
+   (including the ingest queue's recheck and charged early refusals) is
+   evaluated while the lock guarding that state is held, so a call that waited
+   across a revocation can neither issue a fresh grant, refresh liveness,
+   acknowledge a revoked source, enqueue media, nor recreate a rate window.
 3. **Commit only after bounded admission.** A unit advances continuity only
    after the #14 `AgentIngestQueue` accepts it. Backpressure/rate refusal
    leaves state unchanged so the Agent retries the same sequence from its disk

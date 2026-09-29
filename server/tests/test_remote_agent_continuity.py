@@ -54,6 +54,45 @@ class RevokeDuringCheckAuthorizer(Authorizer):
                 self.pairs.discard((node_id, source_id))
 
 
+class SignallingAuthorizer(Authorizer):
+    """Signals every authorization call so a test can revoke right after it."""
+
+    def __init__(self, pairs=((NODE, SOURCE),)):
+        super().__init__(pairs)
+        self.checked = threading.Event()
+
+    def require_node(self, node_id):
+        self.checked.set()
+        super().require_node(node_id)
+
+
+def revoke_while_waiting(lock, authorizer, call, revoke):
+    """Run ``call`` while ``lock`` is held and revoke before releasing it.
+
+    A check made before waiting for the lock signals ``checked`` and is then
+    applied after the revocation; a check made under the lock cannot signal
+    until the lock is released and therefore observes the revocation.
+    """
+    result = {}
+
+    def run():
+        try:
+            result["value"] = call()
+        except PermissionError as error:
+            result["value"] = error
+
+    authorizer.checked.clear()
+    with lock:
+        thread = threading.Thread(target=run)
+        thread.start()
+        authorizer.checked.wait(0.2)
+        revoke()
+    thread.join(5)
+    if thread.is_alive():
+        raise AssertionError("call did not finish")
+    return result["value"]
+
+
 class TransientRefusalQueue(AgentIngestQueue):
     refusing = False
 
@@ -873,6 +912,68 @@ class ContinuityTrackerTests(unittest.TestCase):
                          tracker.receive(session, unit(0, source=OTHER_SOURCE), b"v").outcome)
         clock.now = 105
         self.assertEqual(SourceFlow.DEGRADED, flow(tracker, OTHER_SOURCE).flow)
+
+    def test_node_revoked_while_open_session_waits_gets_no_grant(self):
+        authorizer = SignallingAuthorizer()
+        tracker, _, _, _ = build(authorizer=authorizer)
+        session = tracker.open_session(NODE)
+        tracker.receive(session, unit(0), b"v")
+        result = revoke_while_waiting(tracker._lock, authorizer,
+                                      lambda: tracker.open_session(NODE),
+                                      lambda: authorizer.revoked.add(NODE))
+        self.assertIsInstance(result, PermissionError)
+        # No fresh grant reopened the node: once the old grant fails its
+        # heartbeat, the retained source is interrupted, not receiving.
+        self.assertFalse(tracker.heartbeat(session))
+        self.assertEqual(SourceFlow.INTERRUPTED, flow(tracker).flow)
+
+    def test_node_revoked_while_heartbeat_waits_refreshes_nothing(self):
+        authorizer = SignallingAuthorizer()
+        tracker, _, clock, _ = build(authorizer=authorizer, stale=10)
+        session = tracker.open_session(NODE)
+        tracker.receive(session, unit(0), b"v")
+        clock.now = 8
+        result = revoke_while_waiting(tracker._lock, authorizer,
+                                      lambda: tracker.heartbeat(session),
+                                      lambda: authorizer.revoked.add(NODE))
+        self.assertIs(False, result)
+        self.assertEqual(SourceFlow.INTERRUPTED, flow(tracker).flow)
+        authorizer.revoked.discard(NODE)
+        self.assertEqual("stale_session", tracker.receive(session, unit(1), b"v").reason)
+
+    def test_source_revoked_while_receive_waits_is_not_acknowledged(self):
+        authorizer = SignallingAuthorizer({(NODE, SOURCE), (NODE, OTHER_SOURCE)})
+        tracker, ingest, _, _ = build(authorizer=authorizer)
+        session = tracker.open_session(NODE)
+        tracker.receive(session, unit(0), b"v")
+        # A duplicate retry of a unit of a source revoked meanwhile is refused
+        # rather than acknowledged as already committed.
+        result = revoke_while_waiting(tracker._lock, authorizer,
+                                      lambda: tracker.receive(session, unit(0), b"v"),
+                                      lambda: authorizer.pairs.discard((NODE, SOURCE)))
+        self.assertEqual((DeliveryOutcome.REJECTED, "unauthorized"),
+                         (result.outcome, result.reason))
+        # A source-only revocation keeps the node session and its other source.
+        self.assertTrue(tracker.heartbeat(session))
+        self.assertEqual(DeliveryOutcome.ACCEPTED,
+                         tracker.receive(session, unit(0, source=OTHER_SOURCE), b"v").outcome)
+        self.assertEqual(2, ingest.snapshot().queued_messages)
+
+    def test_node_revoked_while_charged_attempt_waits_is_not_charged(self):
+        authorizer = SignallingAuthorizer()
+        tracker, ingest, _, _ = build(authorizer=authorizer)
+        session = tracker.open_session(NODE)
+        tracker.receive(session, unit(0), b"v")
+        ingest.forget_revoked_node(NODE)
+        # The tracker's own check passes; the revocation lands while the
+        # charge waits for the queue lock and must be seen by the queue.
+        result = revoke_while_waiting(ingest._lock, authorizer,
+                                      lambda: tracker.receive(session, unit(0), b"v"),
+                                      lambda: authorizer.revoked.add(NODE))
+        self.assertEqual((DeliveryOutcome.REJECTED, "unauthorized"),
+                         (result.outcome, result.reason))
+        self.assertEqual(0, ingest.snapshot().tracked_rate_windows)
+        self.assertEqual(SourceFlow.INTERRUPTED, flow(tracker).flow)
 
     def test_invalid_inputs_and_limits_are_rejected(self):
         for bad in ((0, 1, 1), (1, 0, 1), (1, 1, 0), (True, 1, 1), (1, 1, 1, 0),

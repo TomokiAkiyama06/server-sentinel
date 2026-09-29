@@ -194,8 +194,14 @@ class ContinuityTracker:
     active-source limit is four), so an authenticated but misbehaving node
     cannot grow Main Server memory by inventing sources; tracked node
     sessions are separately capped by ``maximum_nodes``.
-    The ingest queue is called while this tracker's lock is held; neither the
-    queue nor the injected authorizer may call back into the tracker.
+    The ingest queue and the injected authorizer are called while this
+    tracker's lock is held; neither may call back into the tracker.
+
+    Every node/source authorization that decides a grant, a liveness refresh
+    or a media outcome is evaluated while this lock is held, immediately
+    before the state it guards is read or changed.  A check made before
+    waiting for the lock could otherwise be applied after a concurrent
+    revocation (and ``_invalidate``/``forget_node``) that it never observed.
     """
 
     def __init__(self, limits: ContinuityLimits, authorizer: IngestAuthorizer,
@@ -231,8 +237,11 @@ class ContinuityTracker:
         """
         if not isinstance(node_id, UUID):
             raise ValueError("invalid agent node identity")
-        self._authorizer.require_node(node_id)
         with self._lock:
+            # Authorized under the lock, right before the grant is issued: a
+            # revocation that lands while this call waits for the lock must
+            # refuse the grant instead of reopening an invalidated session.
+            self._authorizer.require_node(node_id)
             # Liveness time is sampled under the lock so a delayed caller can
             # never apply an older ``now`` after a newer update (see _seen).
             now = self._now()
@@ -291,12 +300,11 @@ class ContinuityTracker:
             if node is not None:
                 node.open = False
 
-    def _invalidate(self, session: AgentSession) -> None:
+    def _invalidate_locked(self, session: AgentSession) -> None:
         """Close the current grant after its node failed reauthorization."""
-        with self._lock:
-            node = self._current(session)
-            if node is not None:
-                node.open = False
+        node = self._current(session)
+        if node is not None:
+            node.open = False
 
     def heartbeat(self, session: AgentSession) -> bool:
         """Refresh liveness only for a current grant of a still-authorized node.
@@ -307,12 +315,14 @@ class ContinuityTracker:
         """
         if not isinstance(session, AgentSession):
             raise ValueError("invalid agent session")
-        try:
-            self._authorizer.require_node(session.node_id)
-        except PermissionError:
-            self._invalidate(session)
-            return False
         with self._lock:
+            # Rechecked under the lock so a revocation that lands while this
+            # call waits can never be followed by a liveness refresh.
+            try:
+                self._authorizer.require_node(session.node_id)
+            except PermissionError:
+                self._invalidate_locked(session)
+                return False
             now = self._now()
             node = self._current(session)
             if node is None:
@@ -375,7 +385,7 @@ class ContinuityTracker:
         return tuple(gaps)
 
     def _charged(self, session: AgentSession, outcome: DeliveryOutcome,
-                 reason: str, *, locked: bool) -> Delivery:
+                 reason: str) -> Delivery:
         """Refuse/acknowledge an authorized node's attempt without enqueueing it.
 
         ``AgentIngestQueue.submit`` is otherwise the only place the per-node
@@ -387,24 +397,17 @@ class ContinuityTracker:
         Session control (``open_session``/``heartbeat``) is not media and is
         not charged here; the future listener bounds connection attempts.
 
-        Like ``submit``, the node is re-authorized first: a node revoked after
-        the earlier checks (which may itself have caused a source refusal)
-        is never charged and its grant is invalidated.  ``locked`` says
-        whether the caller holds this tracker's lock.
+        Like ``submit``, ``charge_attempt`` re-authorizes the node under the
+        queue lock first: a node revoked after the earlier checks (which may
+        itself have caused a source refusal) is never charged and its grant
+        is invalidated.  The caller holds this tracker's lock.
         """
-        try:
-            self._authorizer.require_node(session.node_id)
-        except PermissionError:
-            if not locked:
-                self._invalidate(session)
-            else:
-                node = self._current(session)
-                if node is not None:
-                    node.open = False
-            return Delivery(DeliveryOutcome.REJECTED, "unauthorized")
         refusal = self._ingest.charge_attempt(session.node_id)
         if refusal is None:
             return Delivery(outcome, reason)
+        if refusal.reason == "unauthorized":
+            self._invalidate_locked(session)
+            return Delivery(DeliveryOutcome.REJECTED, "unauthorized")
         if refusal.outcome is IngestOutcome.RATE_LIMITED:
             return Delivery(DeliveryOutcome.RATE_LIMITED, refusal.reason)
         return Delivery(DeliveryOutcome.REJECTED, refusal.reason)
@@ -415,26 +418,29 @@ class ContinuityTracker:
                 or type(payload) is not bytes):
             raise ValueError("invalid agent media unit")
         node_id, source_id = session.node_id, header.source_id
-        try:
-            self._authorizer.require_node(node_id)
-        except PermissionError:
-            # A revoked node loses its grant, not just this unit.
-            self._invalidate(session)
-            return Delivery(DeliveryOutcome.REJECTED, "unauthorized")
-        try:
-            self._authorizer.require_source(node_id, source_id)
-        except PermissionError:
-            # The source refusal may come from a node revocation that landed
-            # after the node check; ``_charged`` rechecks the node, invalidates
-            # the grant then, and charges only a source-only refusal.
-            return self._charged(session, DeliveryOutcome.REJECTED, "unauthorized",
-                                 locked=False)
         with self._lock:
+            # Node and source are authorized under the lock, so an outcome
+            # decided below (duplicate acknowledgement, stale epoch, source
+            # capacity, pending pressure) never rests on a check that a
+            # revocation landing while this call waited did not observe.
+            try:
+                self._authorizer.require_node(node_id)
+            except PermissionError:
+                # A revoked node loses its grant, not just this unit.
+                self._invalidate_locked(session)
+                return Delivery(DeliveryOutcome.REJECTED, "unauthorized")
+            try:
+                self._authorizer.require_source(node_id, source_id)
+            except PermissionError:
+                # The source refusal may come from a node revocation that
+                # landed after the node check; ``_charged`` rechecks the node,
+                # invalidates the grant then, and charges only a source-only
+                # refusal.
+                return self._charged(session, DeliveryOutcome.REJECTED, "unauthorized")
             now = self._now()
             node = self._current(session)
             if node is None:
-                return self._charged(session, DeliveryOutcome.REJECTED, "stale_session",
-                                     locked=True)
+                return self._charged(session, DeliveryOutcome.REJECTED, "stale_session")
             # Never seed or refresh activity below the node's liveness
             # watermark: a regressed clock sample must not make a new source
             # look older than the session that is delivering it.
@@ -444,18 +450,17 @@ class ContinuityTracker:
                 # Source identity is bound to the node that first delivered it;
                 # the authorizer must also refuse this, but fail closed here.
                 return self._charged(session, DeliveryOutcome.REJECTED,
-                                     "source_identity_mismatch", locked=True)
+                                     "source_identity_mismatch")
             if state is None and len(self._sources) >= self.limits.maximum_sources:
-                return self._charged(session, DeliveryOutcome.REJECTED, "source_capacity",
-                                     locked=True)
+                return self._charged(session, DeliveryOutcome.REJECTED, "source_capacity")
             checked = self._discontinuities(node_id, state, header)
             if checked == "duplicate":
                 # Idempotent acknowledgement: the Agent may release this unit.
                 # It is never enqueued again but still consumes rate budget.
                 return self._charged(session, DeliveryOutcome.DUPLICATE,
-                                     "already_committed", locked=True)
+                                     "already_committed")
             if isinstance(checked, str):
-                return self._charged(session, DeliveryOutcome.REJECTED, checked, locked=True)
+                return self._charged(session, DeliveryOutcome.REJECTED, checked)
             admission = self._ingest.submit(AgentMessage(
                 node_id, source_id, AgentAction.MEDIA, header.sequence, payload,
                 capture_epoch=header.capture_epoch,
@@ -480,8 +485,7 @@ class ContinuityTracker:
                 # authorizer is already called under this lock by the queue.
                 # The queue counts no rate for an authorization refusal, so a
                 # still-authorized node is charged like the early source check.
-                return self._charged(session, DeliveryOutcome.REJECTED, "unauthorized",
-                                     locked=True)
+                return self._charged(session, DeliveryOutcome.REJECTED, "unauthorized")
             if (admission.outcome is IngestOutcome.REJECTED
                     and admission.reason not in _PERMANENT_INGEST_REFUSALS):
                 # Transient/unknown refusal: do not commit or claim loss, but

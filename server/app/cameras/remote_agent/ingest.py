@@ -130,7 +130,11 @@ class AgentIngestQueue:
     """Thread-safe bounded queue after injected node/source authorization.
 
     A refusal never evicts accepted media, silently reports success, or changes
-    source/node health.  The future listener owns pre-read network byte limits;
+    source/node health.  Authorization is evaluated while this queue's lock is
+    held, right before rate state or the queue changes, so an attempt that
+    waited for the lock across a revocation and ``forget_revoked_node`` can
+    neither enqueue media nor recreate the revoked node's rate window.  The
+    injected authorizer must therefore not call back into this queue.  The future listener owns pre-read network byte limits;
     this domain object bounds what may remain in Main Server memory afterwards.
     """
 
@@ -210,28 +214,32 @@ class AgentIngestQueue:
 
         Used for attempts that must not be enqueued (for example an
         idempotent duplicate retry or a stale session) so they still consume
-        the node's rate budget.  The caller must already have authorized the
-        node.  Returns ``None`` when the attempt fits the budget, otherwise the
-        rate/clock refusal; nothing is ever enqueued.
+        the node's rate budget.  The node is re-authorized under this queue's
+        lock: a revoked node is refused as ``unauthorized`` and never charged.
+        Returns ``None`` when the attempt fits the budget, otherwise the
+        refusal; nothing is ever enqueued.
         """
         if not isinstance(node_id, UUID):
             raise ValueError("invalid agent node identity")
         with self._lock:
+            try:
+                self._authorizer.require_node(node_id)
+            except PermissionError:
+                self._rejected += 1
+                return self._admission(IngestOutcome.REJECTED, "unauthorized")
             return self._consume_rate_locked(node_id, self._now())
 
     def submit(self, message: AgentMessage) -> IngestAdmission:
         if not isinstance(message, AgentMessage):
             raise ValueError("invalid agent ingest message")
-        try:
-            self._authorizer.require_node(message.node_id)
-            self._authorizer.require_source(message.node_id, message.source_id)
-        except PermissionError:
-            with self._lock:
-                self._rejected += 1
-                return self._admission(IngestOutcome.REJECTED, "unauthorized")
-
         size = len(message.payload)
         with self._lock:
+            try:
+                self._authorizer.require_node(message.node_id)
+                self._authorizer.require_source(message.node_id, message.source_id)
+            except PermissionError:
+                self._rejected += 1
+                return self._admission(IngestOutcome.REJECTED, "unauthorized")
             # Sampled under the lock: a delayed caller's older sample must not
             # read as clock regression against a concurrently opened window.
             refusal = self._consume_rate_locked(message.node_id, self._now())

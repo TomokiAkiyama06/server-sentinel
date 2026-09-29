@@ -1,5 +1,6 @@
 """Synthetic coverage for the transport-neutral remote-agent ingest boundary."""
 
+import threading
 import unittest
 from uuid import UUID
 
@@ -175,6 +176,34 @@ class RemoteAgentIngestTests(unittest.TestCase):
         boundary.forget_revoked_node(NODE)
         with self.assertRaises(ValueError):
             boundary.forget_revoked_node("not-a-node")
+
+    def test_revocation_while_waiting_for_the_queue_lock_is_observed(self):
+        checked = threading.Event()
+
+        class Signalling(Authorizer):
+            def require_node(self, node_id):
+                checked.set()
+                super().require_node(node_id)
+
+        authorizer = Signalling()
+        boundary = queue(limits=IngestLimits(8, 8, 64, 10, 100), authorizer=authorizer)
+        for call in (lambda: boundary.submit(message()),
+                     lambda: boundary.charge_attempt(NODE)):
+            authorizer.nodes.add(NODE)
+            checked.clear()
+            result = {}
+            with boundary._lock:
+                thread = threading.Thread(target=lambda: result.update(value=call()))
+                thread.start()
+                checked.wait(0.2)
+                authorizer.nodes.discard(NODE)
+            thread.join(5)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual((IngestOutcome.REJECTED, "unauthorized"),
+                             (result["value"].outcome, result["value"].reason))
+            # Neither media nor a rate window of the revoked node remains.
+            self.assertEqual((0, 0), (boundary.snapshot().queued_messages,
+                                      boundary.snapshot().tracked_rate_windows))
 
     def test_invalid_limits_dependencies_and_drain_are_rejected_without_network_or_health_claims(self):
         for limits in (IngestLimits(1, 1, 1, 1, 1),):
