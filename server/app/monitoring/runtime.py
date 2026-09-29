@@ -15,6 +15,8 @@ from datetime import datetime, timedelta, timezone
 from enum import StrEnum
 import logging
 import math
+import os
+import stat
 import threading
 import time
 from typing import Callable
@@ -272,7 +274,41 @@ class MonitoringRuntime:
         return int(self.dependencies.utcnow().timestamp() * 1000)
 
     def _persist_notification(self, event) -> None:
+        if self.notification_events is None:
+            # The database was not opened yet; Slack still gets the alert.
+            raise RecordingError("NOTIFICATION_STORE_UNAVAILABLE")
         self.notification_events.upsert(event)
+
+    def _admit_database_creation(self) -> None:
+        """Refuse to create an absent database outside verified storage.
+
+        `Database.connect()` creates a missing file. Before that is allowed the
+        declared recording filesystem identity is verified, the database
+        directory must be a private directory on that same filesystem and the
+        free space must cover the hard reserve plus the write overhead. An
+        existing file is re-verified by every later policy admission.
+        """
+        path = self.database.path
+        try:
+            os.lstat(path)
+            return
+        except FileNotFoundError:
+            pass
+        except OSError:
+            raise RecordingError("STORAGE_HARD_STOP") from None
+        filesystem = IdentifiedRecordingFilesystem(self.configuration.recording_filesystem, path)
+        limits = self.configuration.storage_limits
+        try:
+            parent = os.stat(path.parent, follow_symlinks=False)
+            space = os.statvfs(path.parent)
+        except OSError:
+            raise RecordingError("STORAGE_HARD_STOP") from None
+        if (not stat.S_ISDIR(parent.st_mode) or parent.st_dev != filesystem.expected.device
+                or parent.st_uid != os.geteuid() or parent.st_mode & 0o077
+                or space.f_flag & os.ST_RDONLY
+                or space.f_bavail * space.f_frsize - limits.write_overhead_bytes
+                < limits.hard_reserve_bytes):
+            raise RecordingError("STORAGE_HARD_STOP")
 
     def _storage_transition(self, event: StorageTransition) -> None:
         self._set(storage_state=event.current)
@@ -293,19 +329,27 @@ class MonitoringRuntime:
             self._started_monotonic = self.dependencies.monotonic()
         configuration, dependencies = self.configuration, self.dependencies
         if self.notifications is None:
-            if self._connection is not None:
-                # An earlier attempt failed between connect and service setup.
-                self._connection.close()
-                self._connection = None
-            self._connection = self.database.connect()
-            self.notification_events = NotificationEventStore(self._connection,
-                                                              self._owner_reservation)
+            # Created before any database file, so a refused open still sends
+            # the immediate alert; local persistence is then refused.
             slack = (SlackDelivery(configuration.slack, opener=dependencies.slack_opener)
                      if configuration.slack is not None else None)
             self.notifications = NotificationService(
                 self._persist_notification, slack,
                 queue_capacity=dependencies.notification_queue_capacity,
             )
+        if self._connection is None:
+            try:
+                self._admit_database_creation()
+            except Exception:
+                self._startup_failed()
+                return
+            connection = self.database.connect()
+            try:
+                events = NotificationEventStore(connection, self._owner_reservation)
+            except BaseException:
+                connection.close()
+                raise
+            self._connection, self.notification_events = connection, events
         connection = self._connection
         recordings = None
         try:

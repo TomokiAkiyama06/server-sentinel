@@ -18,7 +18,11 @@ Schema migrations are metadata writes: the runtime applies pending
 recording filesystem identity and the hard reserve (plus `write_overhead_bytes`)
 were verified. A denial is a startup failure (immediate alert, retry every
 `retry_seconds`) with no tables created meanwhile; an invalid schema history or
-failed DDL on the first attempt still aborts application startup.
+failed DDL on the first attempt still aborts application startup. An absent
+database file is created only after the same identity check, a private database
+directory on that filesystem and free space above the hard reserve plus
+`write_overhead_bytes`; otherwise no file is created and the startup-failure
+alert is sent through Slack (local persistence refused).
 
 `runtime.MonitoringRuntime` creates every thread-owned component on one
 dedicated worker thread: SQLite connection, `MainStoragePolicy` over

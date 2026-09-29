@@ -166,8 +166,8 @@ class UnconfiguredTests(unittest.IsolatedAsyncioTestCase):
             settings = Settings(Path(directory))
             application = create_app(settings)
             async with application.router.lifespan_context(application):
-                with closing(sqlite3.connect(settings.database_path)) as db:
-                    self.assertEqual([], db.execute("SELECT name FROM sqlite_master").fetchall())
+                # Not even an empty database file is created.
+                self.assertFalse(settings.database_path.exists())
 
     async def test_configuration_without_storage_sections_stays_unconfigured(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -479,9 +479,10 @@ class MigrationAdmissionTests(RuntimeFixture):
             runtime = application.state.monitoring
             self.assertEqual(RuntimeState.FAILED, runtime.status.state)
             await self.settle(runtime)
-            # No schema was written before the filesystem identity was verified,
-            # and the immediate alert was still attempted.
-            self.assertEqual(set(), schema_tables(self.settings.database_path))
+            # No database file, let alone schema, was created before the
+            # filesystem identity was verified; the immediate alert was still
+            # attempted.
+            self.assertFalse(self.settings.database_path.exists())
             self.assertEqual(["ServerSentinel critical alert: recording_health_failure"],
                              self.slack_texts())
             self.approved_device = self.device
@@ -515,9 +516,26 @@ class HardReserveMigrationTests(RuntimeFixture):
             self.assertEqual(RuntimeState.FAILED, runtime.status.state)
             self.assertFalse(application.state.audit_storage_admitted)
             await self.settle(runtime)
-            self.assertEqual(set(), schema_tables(self.settings.database_path))
+            self.assertFalse(self.settings.database_path.exists())
             self.assertEqual(["ServerSentinel critical alert: recording_health_failure"],
                              self.slack_texts())
+            # Retries keep refusing and do not repeat the alert.
+            self.clock.advance(timedelta(minutes=15))
+            await runtime.call(runtime.tick)
+            await self.settle(runtime)
+            self.assertFalse(self.settings.database_path.exists())
+            self.assertEqual(1, len(self.slack_texts()))
+
+    async def test_existing_database_below_the_hard_reserve_gets_no_schema(self):
+        # A provisioned (empty, private) database file passes the creation
+        # check; the migration itself is still refused by the policy.
+        Database(self.settings.database_path).connect().close()
+        application = self.application()
+        async with application.router.lifespan_context(application):
+            runtime = application.state.monitoring
+            self.assertEqual(RuntimeState.FAILED, runtime.status.state)
+            await self.settle(runtime)
+            self.assertEqual(set(), schema_tables(self.settings.database_path))
 
 
 class FailingRecorder:
