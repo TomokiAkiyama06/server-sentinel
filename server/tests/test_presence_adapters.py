@@ -25,8 +25,9 @@ from app.presence.access import AccessDenied
 from app.presence.adapters import (CriticalTimelineRecorder, EntranceObservationAdapter, HealthTimeline,
                                    TimelineOutbox)
 from app.presence.delivery import ActionResult
-from app.presence.models import InvalidObservation, Kind, Observation, PresenceState, Quality, Value
-from app.presence.service import PresenceService
+from app.presence.models import InvalidObservation, Kind, Observation, PresenceState, Quality, Value, timestamp
+from app.presence.schema import CRITICAL_SOURCE_KINDS, STAGED_SOURCE_KINDS
+from app.presence.service import SOURCE_CLOCK, SOURCE_CLOCK_TABLES, PresenceService
 from app.storage.database import Database
 from app.storage.migrations import migrate
 from app.storage.policy import StorageState, StorageTransition
@@ -325,6 +326,38 @@ class EntranceAdapterTests(PresenceFixture, TestCase):
         for kind, items in by_kind.items():
             # The earlier-occurring fact arrived second on its own path.
             self.assertEqual([value for _, value in sorted(items)], [False, True], kind)
+
+    def test_source_clock_paths_partition_every_source_dated_kind(self):
+        self.assertEqual({kind.value for kind, table in SOURCE_CLOCK_TABLES.items()
+                          if table == "presence_source_clock"}, set(STAGED_SOURCE_KINDS))
+        self.assertEqual({kind.value for kind, table in SOURCE_CLOCK_TABLES.items()
+                          if table == "presence_critical_source_clock"}, set(CRITICAL_SOURCE_KINDS))
+        self.assertEqual(set(SOURCE_CLOCK_TABLES), SOURCE_CLOCK)
+
+    def test_upgrade_rebuilds_each_path_mark_from_retained_observations(self):
+        recorder = CriticalTimelineRecorder(self.outbox, maximum_source_latency=LATENCY)
+        self.submit(crossing(CrossingKind.OWNER_ENTRY, received=NOW + timedelta(milliseconds=100)))
+        self.clock.at = NOW + timedelta(milliseconds=600)
+        recorder(critical(at=NOW + timedelta(milliseconds=500)))
+        # A database from before the split: one shared mark that also held a
+        # later main-host dated health fact for the same camera.
+        legacy = Database(self.database.path.with_name("legacy.sqlite3"))
+        with closing(legacy.connect()) as db:
+            migrate(db, APPLICATION_MIGRATIONS[:16])
+            with closing(self.database.connect()) as current:
+                rows = current.execute("SELECT id,kind,source,received,payload FROM presence_observations").fetchall()
+            db.executemany("INSERT INTO presence_observations(id,kind,source,received,payload) "
+                           "VALUES (?,?,?,?,?)", rows)
+            db.execute("INSERT INTO presence_source_clock VALUES (?,?)",
+                       (str(SOURCE), (NOW + timedelta(milliseconds=900)).isoformat(timespec="microseconds")))
+            db.commit()
+            migrate(db, APPLICATION_MIGRATIONS)
+            marks = {table: [tuple(row) for row in db.execute(f"SELECT source,latest_occurred FROM {table}")]
+                     for table in ("presence_source_clock", "presence_critical_source_clock")}
+        self.assertEqual(marks, {
+            "presence_source_clock": [(str(SOURCE), timestamp(NOW + timedelta(milliseconds=100)))],
+            "presence_critical_source_clock": [(str(SOURCE), timestamp(NOW + timedelta(milliseconds=500)))],
+        })
 
     def test_unavailable_database_location_keeps_fact_staged(self):
         missing = Path(tempfile.gettempdir()) / f"absent-{uuid4()}" / "synthetic.sqlite3"

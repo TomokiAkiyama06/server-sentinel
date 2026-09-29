@@ -251,5 +251,7 @@ against it. Critical observations keep a separate per-source mark, because
 they are recorded synchronously while other source facts wait in the outbox:
 a later-occurring critical fact written first never makes a staged crossing
 from the same camera look reordered, and order within each path is still
-checked. It reports observations and their temporal context only; it never
+checked. An upgrade rebuilds both marks from the retained trusted observations
+of their own kinds, because the earlier shared mark also held critical and
+main-host dated health times and cannot be split. It reports observations and their temporal context only; it never
 infers cause, guilt, or identity.

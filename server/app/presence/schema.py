@@ -48,6 +48,21 @@ def presence_migration(version: int) -> Migration:
     ))
 
 
+# Source-dated kinds per ordering path, as literal DDL values so the migration
+# checksum never depends on an enum; a test checks they match `SOURCE_CLOCK`.
+STAGED_SOURCE_KINDS = ("anonymous_entry", "anonymous_exit", "motion", "owner_entry", "owner_exit", "person")
+CRITICAL_SOURCE_KINDS = ("camera_tamper", "server_movement")
+
+
+def _rebuild_source_clock(table, kinds):
+    """Recompute one path's per-source mark from its retained trusted observations."""
+    listed = ",".join(f"'{kind}'" for kind in kinds)
+    return (f"INSERT INTO {table}(source,latest_occurred) "
+            "SELECT source, MAX(json_extract(payload,'$.occurred_at')) FROM presence_observations "
+            f"WHERE source IS NOT NULL AND kind IN ({listed}) "
+            "AND json_extract(payload,'$.clock_trusted') = 1 GROUP BY source")
+
+
 def presence_gap_migration(version: int) -> Migration:
     """Durable timeline-gap marker, the outbox session that proves a clean close,
     the source-fact digests that keep restamped replays comparable, and the
@@ -78,4 +93,12 @@ def presence_gap_migration(version: int) -> Migration:
         # observations, kept apart from the staged-fact mark so the intended
         # reordering between the two paths is never mistaken for a clock fault.
         "CREATE TABLE presence_critical_source_clock (source TEXT PRIMARY KEY, latest_occurred TEXT NOT NULL)",
+        # Before this split every source-attributed kind, main-host dated
+        # health facts included, advanced one shared mark. It cannot be split
+        # after the fact, so both path marks are rebuilt from the retained
+        # trusted observations of their own kinds. A source whose rows all
+        # passed retention keeps no mark; its facts predate that horizon.
+        "DELETE FROM presence_source_clock",
+        _rebuild_source_clock("presence_source_clock", STAGED_SOURCE_KINDS),
+        _rebuild_source_clock("presence_critical_source_clock", CRITICAL_SOURCE_KINDS),
     ))
