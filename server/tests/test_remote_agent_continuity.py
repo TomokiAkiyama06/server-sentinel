@@ -373,6 +373,40 @@ class ContinuityTrackerTests(unittest.TestCase):
         self.assertEqual([GapReason.SEQUENCE_SKIP], [g.reason for g in pending])
         self.assertEqual((), tracker.snapshot())
 
+    def test_revoked_node_heartbeat_is_refused_and_session_invalidated(self):
+        tracker, _, clock, authorizer = build(stale=100)
+        session = tracker.open_session(NODE)
+        tracker.receive(session, unit(0), b"v")
+        self.assertTrue(tracker.heartbeat(session))
+        authorizer.revoked.add(NODE)
+        clock.now = 50
+        self.assertFalse(tracker.heartbeat(session))
+        # The grant is invalidated even if authorization were restored later;
+        # the node must reauthenticate and open a new session.
+        self.assertEqual(SourceFlow.INTERRUPTED, flow(tracker).flow)
+        authorizer.revoked.discard(NODE)
+        self.assertFalse(tracker.heartbeat(session))
+        self.assertEqual("stale_session", tracker.receive(session, unit(1), b"v").reason)
+        renewed = tracker.open_session(NODE)
+        self.assertTrue(tracker.heartbeat(renewed))
+
+    def test_revoked_node_media_invalidates_session(self):
+        tracker, _, _, authorizer = build()
+        session = tracker.open_session(NODE)
+        tracker.receive(session, unit(0), b"v")
+        authorizer.revoked.add(NODE)
+        self.assertEqual("unauthorized", tracker.receive(session, unit(1), b"v").reason)
+        self.assertEqual(SourceFlow.INTERRUPTED, flow(tracker).flow)
+
+    def test_unauthorized_source_does_not_invalidate_node_session(self):
+        tracker, _, _, _ = build()
+        session = tracker.open_session(NODE)
+        tracker.receive(session, unit(0), b"v")
+        self.assertEqual("unauthorized",
+                         tracker.receive(session, unit(0, source=OTHER_SOURCE), b"v").reason)
+        self.assertTrue(tracker.heartbeat(session))
+        self.assertEqual(SourceFlow.RECEIVING, flow(tracker).flow)
+
     def test_deterministic_impairment_matrix(self):
         """Link loss, slow consumer and duplicate retries over one synthetic run."""
         tracker, ingest, clock, _ = build(queued=3)

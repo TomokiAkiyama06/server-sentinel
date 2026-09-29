@@ -240,9 +240,27 @@ class ContinuityTracker:
             if node is not None:
                 node.open = False
 
+    def _invalidate(self, session: AgentSession) -> None:
+        """Close the current grant after its node failed reauthorization."""
+        with self._lock:
+            node = self._current(session)
+            if node is not None:
+                node.open = False
+
     def heartbeat(self, session: AgentSession) -> bool:
+        """Refresh liveness only for a current grant of a still-authorized node.
+
+        Node authorization is rechecked on every heartbeat so a credential
+        revoked while its session stays open cannot keep the node online; a
+        failed check invalidates the grant and its flows become interrupted.
+        """
         if not isinstance(session, AgentSession):
             raise ValueError("invalid agent session")
+        try:
+            self._authorizer.require_node(session.node_id)
+        except PermissionError:
+            self._invalidate(session)
+            return False
         now = self._now()
         with self._lock:
             node = self._current(session)
@@ -313,6 +331,11 @@ class ContinuityTracker:
         node_id, source_id = session.node_id, header.source_id
         try:
             self._authorizer.require_node(node_id)
+        except PermissionError:
+            # A revoked node loses its grant, not just this unit.
+            self._invalidate(session)
+            return Delivery(DeliveryOutcome.REJECTED, "unauthorized")
+        try:
             self._authorizer.require_source(node_id, source_id)
         except PermissionError:
             return Delivery(DeliveryOutcome.REJECTED, "unauthorized")
