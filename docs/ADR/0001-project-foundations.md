@@ -54,6 +54,7 @@ Human-access architecture:
 - ServerSentinel does not modify Tailscale ACLs/Grants and stores no Tailscale admin credential; policy administration remains outside the application;
 - human backend is reached through a trusted Tailscale Serve/equivalent proxy path and remains non-bypassable from ordinary LAN clients;
 - ServerSentinel additionally maintains its own owner-managed invitation/allowlist;
+- ADR 0004 refines this for the shared-Tailscale-account deployment: the Tailscale login is not the application principal, and a per-person ServerSentinel credential is verified on every human route;
 - minimum non-owner permissions are independent `live:view` and `recordings:view`;
 - non-owner recording access is browser playback only; no official download/export function in MVP;
 - with unchanged Tailnet policy, node-level concealment from other Tailnet members is not promised; uninvited users still receive no ServerSentinel application data.

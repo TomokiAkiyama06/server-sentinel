@@ -7,7 +7,7 @@ Issue: [#6](https://github.com/TomokiAkiyama06/server-sentinel/issues/6)
 
 ## Context and approval boundary
 
-AUTH-001 through AUTH-010 already require private reachability, independent
+AUTH-001 through AUTH-011 already require private reachability, independent
 application invitations and permissions, Owner-only administration, prompt
 revocation, and generic denial without deployment metadata. ADR-0001 and
 ADR-0002 remain authoritative. This document proposes the implementation choices
@@ -277,6 +277,12 @@ accepted activity is rejected, so a backward clock step never revives access. Lo
 active streams. Because Tailscale identity remains authenticated, a user with an
 active invitation can explicitly establish another session; logout is not user
 revocation and does not force upstream identity-provider reauthentication.
+
+The session does not retain another raw copy of the proxy identity. It stores
+only HMAC-SHA-256 over the canonical verified identity with a deployment-local
+secret kept outside the database, recomputes that binding for every request and
+compares it in constant time. Session invalidation clears the binding; it is
+never displayed and is excluded from diagnostics and exports.
 
 Validate an exact configured HTTPS Host/origin, require exact same-origin
 Origin for session establishment and state-changing requests, deny cross-origin

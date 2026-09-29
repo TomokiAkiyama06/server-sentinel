@@ -967,18 +967,25 @@ Hardware/SMART probing must use the least privilege practical. Do not run the wh
 Tailscale provides private transport/reachability. ServerSentinel authorization is independent:
 
 ```text
-Tailnet reachability
-       +
-verified Tailscale/trusted-proxy identity
+Tailnet/private-network reachability
        +
 ServerSentinel owner invitation
+       +
+verified ServerSentinel per-person credential
        +
 per-user permission
        =
 application access
+
+supplementary, never sufficient:
+verified Tailscale/trusted-proxy identity (account-level)
 ```
 
 Tailnet membership by itself grants no ServerSentinel application data.
+
+The two gates are unchanged: a network-level permission path and an application authorization. Inside the application gate the owner invitation names the principal and the per-person credential proves who is presenting it.
+
+A verified Tailscale/trusted-proxy identity is handled per AUTH-005: where the deployment provides one it is accepted only on the trusted local path, and it may be recorded and additionally required. It is never a term that can grant access on its own. In this deployment the Tailnet account is shared by the research room, so that identity names the account the request arrived under, not the person; see §11.8.
 
 ### 11.2 Tailnet policy is not managed by ServerSentinel
 
@@ -1001,16 +1008,160 @@ Logical model:
 ```text
 access_principal
 - id
-- external_identity (e.g. verified Tailscale login identity)
 - display_name
 - status: invited/active/revoked
 - created_at
+- revoked_at
+- external_identity (optional, supplementary: the verified Tailscale
+  login/device last observed at authentication, overwritten each time and never
+  an authorization input; not authoritative, see §11.8. Owner-visible only,
+  cleared when the principal is revoked or deleted, and excluded from
+  diagnostic exports. Per-authentication history belongs to the audit log under
+  its own retention, not to this field)
+
+principal_credential
+- id
+- principal_id
+- kind (WebAuthn/passkey, as proposed in ADR-0004)
+- credential_id
+- public_key (public material only; never a biometric template)
+- user_verification: required (asserted at registration, verified again at
+  every authentication)
+- sign_count (last accepted signature counter; 0 when the authenticator keeps
+  none)
+- backup_eligible (the authenticator's BE flag, fixed at registration; a
+  backup-eligible credential can sync to the person's other devices)
+- backup_state (the authenticator's BS flag as of the last verified ceremony;
+  refreshed on every accepted assertion, because a credential can be backed up
+  after it was registered)
+- status: active/revoked/inconsistent
+- inconsistency_reason (owner-visible fixed reason code; currently
+  `backup_eligibility_changed`, null unless status is inconsistent)
+- inconsistent_at
+- label (owner-visible hint, not proof of a device)
+- created_at
+- last_used_at
+- revoked_at
+
+principal_enrollment
+- id
+- principal_id
+- code_hash (of a CSPRNG value with at least 128 bits of entropy; the raw
+  enrollment code is never stored or logged, and comparison is constant-time)
+- expires_at
+- redeemed_at (single use)
+- attempt_count (bounded; redemption is rate-limited per code and per source)
+
+principal_session
+- id
+- principal_id
+- credential_id (the credential that created the session)
+- external_identity_binding (optional HMAC-SHA-256 of the canonical verified
+  proxy identity, using a deployment-local secret stored outside the database;
+  the raw identity is not copied into the session. A later request is compared
+  in constant time against a freshly computed binding)
+- created_at
+- last_seen_at
+- idle_expires_at / absolute_expires_at (server-enforced)
+- last_user_verification_at (freshness source for owner step-up)
 - revoked_at
 
 principal_permission
 - principal_id
 - permission
 ```
+
+Revocation cascades through these records: revoking a `principal_credential`
+revokes the `principal_session` rows bound to it, and revoking the
+`access_principal` revokes all of its credentials, enrollments and sessions.
+
+A principal is created by an owner invitation that carries a short-lived,
+single-use enrollment code; the invited person redeems it once to register a
+credential. Credentials are revocable individually and with the principal.
+
+Registration and every authentication require authenticator user verification,
+and the authenticator must be one the invited person controls. A platform
+authenticator kept inside a shared OS account or behind a shared device unlock
+is a shared credential and does not satisfy §11.8; such a machine needs a
+per-person OS account or a portable authenticator the person carries.
+
+A session is a server-side record bound to one principal and to the credential
+that created it. Where the deployment supplies a verified proxy identity, the
+session stores only the keyed binding described above. Each later request
+canonicalizes the newly verified identity, recomputes the binding and compares
+it in constant time; a mismatch is refused. The deployment-local HMAC secret is
+kept outside the database and is unrelated to Tailscale administrative
+credentials. Sign-out, idle/absolute expiry and revocation clear the binding and
+invalidate the record, so a retained cookie or token authorizes nothing
+afterwards; the binding is never shown in the UI or included in diagnostics or
+exports. §11.5
+authorization re-checks it on every human/media route and never relies on
+client-side state. Idle and absolute lifetimes are server-enforced, with the
+values proposed in ADR-0003 (30 minutes idle, 12 hours absolute) and any change
+recorded there before implementation; an explicit sign-out is available for shared machines, and
+owner-only routes require a fresh user-verification step rather than an older
+session.
+
+User verification runs on the viewer's own device, and its result reaches the
+server only as the authenticator's user-verification flag. The WebAuthn protocol
+data needed to check a registration or assertion — the server-issued challenge,
+client data, authenticator data, the signature counter and the user-verification
+flag — is received and verified, including the relying-party id and origin.
+
+Signatures are checked where the ceremony carries one. An assertion always does,
+and its signature is verified against the stored public key. A registration
+carries an attestation statement only sometimes: the common privacy-preserving
+`none` format has none, and such a registration is accepted — the challenge,
+origin and relying-party id, authenticator data, credential public key and
+user-verification flag are still verified. Where an attestation statement is
+present its format is verified; a present but invalid statement fails
+registration. That data is transient: the pending
+challenge is held server-side only for the bounded lifetime of one ceremony, is
+single-use and is dropped when the ceremony ends or expires; of the rest, only
+the fields of `principal_credential` and `principal_session` persist and
+everything else is discarded once verified.
+
+The signature counter is the one verification output that persists, as
+`principal_credential.sign_count`. The comparison applies whenever either the
+stored counter or the received one is non-zero: the received value must then be
+strictly greater than the stored one. Anything else is a regression — including
+a received 0 after a stored non-zero, which is a reset or cloned authenticator,
+not an exemption — and a regression refuses the assertion and notifies the Owner
+as a possible cloned authenticator. The stored value advances only on an
+accepted assertion.
+
+The single exempt case is an authenticator that keeps no counter at all: stored
+and received both 0. Many passkey authenticators behave this way, and it is not
+evidence of cloning.
+
+None of this material belongs in logs, diagnostics or exports: challenges,
+client and authenticator data, signatures, and enrollment codes are excluded
+alongside the other sensitive values of §13, and a failed verification is logged
+as a typed outcome without the payload that failed.
+
+What never reaches ServerSentinel is biometric material. No fingerprint or face
+template leaves the authenticator, so none is received, persisted or exportable
+here. `principal_credential` is an access-control record, unrelated to the
+optional owner face verification of §7.6 and never a non-owner identity or
+biometric database (see `PRIVACY.md`).
+
+Relying-party verification depends on ServerSentinel owning its browser origin.
+Per AUTH-012 the dashboard is served from an origin reserved for it, with no
+other application sharing it; a co-hosted application on that origin would put
+the credential within its reach.
+
+The reservation itself is a deployment obligation, stated in full in §11.9 and
+ADR-0003: the name serves ServerSentinel alone on every scheme and port. The
+application verifies it at startup and at least daily by enumerating the host's
+real listeners and every proxy route for that name, and closes human access and
+notifies the Owner on any other answer. That bounds the exposure window rather
+than preventing the bind: a process that binds between two checks receives
+credentials and cookies for that origin until the next check.
+
+The origin must also be a secure context — HTTPS, or `http://localhost` for a
+strictly local browser — because browsers expose WebAuthn only there. Plain
+HTTP on a non-loopback host leaves every human route unreachable in practice,
+since nobody can register or authenticate.
 
 Initial non-owner permissions:
 
@@ -1031,11 +1182,93 @@ GET /api/recordings                     -> recordings:view
 GET /api/recordings/<id>/playback       -> recordings:view
 GET /api/events                         -> recordings:view
 GET /api/timeline                       -> recordings:view
-POST/DELETE camera/agent/settings       -> owner
-POST access invitations/permissions     -> owner
-POST biometric enroll/delete            -> owner
-DELETE recording                         -> owner
+POST/DELETE camera/agent/settings       -> owner + fresh user verification
+POST access invitations/permissions     -> owner + fresh user verification
+POST biometric enroll/delete            -> owner + fresh user verification
+DELETE recording                         -> owner + fresh user verification
 ```
+
+"Fresh" means a user verification newer than a bounded freshness window — ADR-0003
+proposes five minutes — so an older or unattended owner session cannot perform an
+AUTH-008 operation by itself. Freshness is evaluated server-side from
+`principal_session.last_user_verification_at`; a client cannot assert it.
+
+The main-to-Web contract for the step-up is explicit, because the dashboard has
+to know when to prompt:
+
+```text
+owner route, session fresh      -> the operation runs
+owner route, session stale      -> distinct step_up_required response, no other data
+step-up challenge               -> issued for the session, allowing only
+                                   principal_session.credential_id
+assertion by that credential    -> last_user_verification_at updates; client retries
+assertion by any other credential-> refused; freshness unchanged
+retry                           -> permission and freshness re-checked server-side
+step-up cancelled/failed        -> generic failure; nothing executed, nothing changed
+```
+
+The step-up is bound to the session, not merely to the deployment. The challenge
+is issued for that `principal_session`, its allowed credential list contains only
+`principal_session.credential_id`, and the assertion is accepted only when it
+comes from that still-active credential of that same principal. An assertion
+from any other registered credential — including a valid one belonging to
+someone else who is standing at the same workstation — is refused and leaves
+`last_user_verification_at` untouched, so a second person cannot refresh a stale
+owner session with their own passkey. If the session's credential has been
+revoked, the session is invalid and no step-up can revive it.
+
+The `step_up_required` signal is returned only to an already authenticated
+session that holds the required permission. Anything unauthenticated, uninvited
+or revoked still receives the generic response below and learns nothing about
+owner routes. Repeated failed step-ups are rate-limited and logged without
+credential material, and a stale session never partially applies an operation.
+
+Exactly two HTTP routes run before a credential exists, and the pair is closed.
+Owner bootstrap is not a third one: it is a local action on the host that feeds
+the same redemption route.
+
+```text
+invitation redemption      -> valid, unexpired, unredeemed enrollment code only,
+                              including the owner's bootstrap authorization
+credential authentication  -> the assertion route itself
+
+local owner bootstrap      -> not a route: a privileged local action on the main
+                              host that issues an enrollment authorization shown
+                              only on the console
+```
+
+Owner bootstrap is a privileged local administrative action on the Main Server
+that issues a single-use, short-lived enrollment authorization displayed only on
+the local console; the first owner redeems it once from a browser at the
+reserved origin through the redemption path, so no owner-specific route and no
+remote first-visitor setup exist. Invitation redemption is single-use and
+rate-limited and registers exactly one `principal_credential` for the named
+principal.
+
+Single use is enforced atomically, not by a check followed by a write. Marking
+`principal_enrollment.redeemed_at` and inserting the credential happen in one
+transaction whose update is conditional on the row still being unredeemed and
+unexpired, so of two concurrent redemptions of the same code exactly one
+succeeds and the other receives the same generic response as an unknown code,
+with no second credential and no partially applied state. A retry after a lost
+response is idempotent in the same way: either the ceremony completed and the
+code is spent, or nothing happened and the code is still redeemable until it
+expires. `attempt_count` is incremented in the same conditional update so
+concurrent guesses cannot slip past the rate limit.
+
+Both the invitation code and the bootstrap authorization are bearer
+authorizations on a path every holder of the shared account can reach, so both
+come from a cryptographically secure random generator with at least 128 bits of
+entropy. A friendlier encoding may be used for reading a code aloud or typing it,
+but the entropy floor applies to the value actually checked, not to a shortened
+display form, and the comparison is constant-time against `code_hash`. Lifetime,
+single use and rate limiting bound how long and how often a guess may be tried;
+they are not a substitute for the entropy. It returns no camera, recording, timeline or deployment data and
+grants no application access by itself: the invited person then authenticates
+like anyone else. An absent, unknown, expired or already-redeemed code receives
+the same generic response as an uninvited person, and logs record the attempt
+without the raw code. Every other human/media route requires a verified
+credential and an active session.
 
 Unauthorized users get no ServerSentinel deployment metadata, camera names/counts, thumbnails, event details, or recordings. For an uninvited identity, prefer a generic/non-branding denial such as a not-found-style response and do not expose product/version headers, API schema, health details, or other ServerSentinel fingerprints. This does not claim that the underlying Tailscale node/service is network-invisible when Tailnet policy is unchanged.
 
@@ -1049,7 +1282,62 @@ This is not DRM. A user who can view video may still screen-record or use advanc
 
 ServerSentinel permission revocation invalidates application access promptly. Tailnet membership/policy remains a separate Tailscale administrative concern.
 
-### 11.8 Owner bootstrap and session decision status
+Revocation is credential-scoped, not device-scoped. Revoking a single `principal_credential` invalidates that credential and the sessions bound to it; revoking the `access_principal` invalidates all of its credentials and active sessions.
+
+A synced passkey is one credential that can exist on several of its owner's devices, so revoking it disables it everywhere it synced, and losing one device does not by itself isolate a credential to revoke. The UI and documentation therefore describe revocation as credential-scoped and treat the label as a hint.
+
+Registration reads the authenticator's backup-eligibility and backup-state flags
+and stores them as `principal_credential.backup_eligible` / `.backup_state`, so
+the owner UI can show whether a credential can sync instead of guessing. A
+deployment that needs device-scoped control refuses a backup-eligible
+registration on that signal and tells the person why, which is a deployment
+setting rather than a promise the product makes by default. The Web client
+surfaces that refusal as an actionable message, not as a generic failure.
+
+The two flags age differently. Eligibility is a property of the credential and
+does not change, so a later assertion reporting a different BE is an
+inconsistency: in the same transaction the assertion is refused, the credential
+is marked `inconsistent` with reason `backup_eligibility_changed` and timestamp,
+and every session bound to it is revoked. The Owner is notified and the UI shows
+the reason and recovery action. An inconsistent credential never authenticates
+or performs step-up again; the Owner revokes/replaces it, and a non-owner left
+with no usable credential is re-invited. If the Owner has no other usable
+credential, recovery uses ADR-0003's privileged local bootstrap path rather than
+leaving the deployment inaccessible. Automated tests cover the transaction,
+session invalidation and both recovery branches. Backup state does change — a credential
+registered before its first sync becomes backed up afterwards — so every
+accepted assertion refreshes `backup_state` from the verified authenticator
+data. Recording it only at registration would leave the owner UI saying
+"not backed up" for a credential that has since synced.
+
+### 11.8 Shared Tailnet account
+
+The research-room Tailnet uses one shared Tailscale account for cost reasons, so
+multiple people authenticate to Tailscale as the same login and any of them can
+add devices.
+
+Therefore:
+
+- application authorization is decided by the ServerSentinel credential
+  (`principal_credential`), not by the Tailscale login;
+- a verified proxy identity header may be recorded and may be required in
+  addition, but never substitutes for the credential check;
+- device-scoped approval is supplementary. A shared lab PC is used by whoever
+  sits at it, so device approval must not be described as identifying a person;
+- unauthenticated requests receive the §11.5 generic response. The response for
+  an uninvited person and for a revoked person is the same, and the
+  authentication prompt carries no product/version string, camera information,
+  or deployment metadata;
+- reachability guarantees nothing here: everyone with the shared account can
+  reach the listener, which is the expected state, not an incident;
+- a credential is person-bound only under the §11.4 user-verification and
+  authenticator-custody rules. Without them a passkey stored in a shared profile
+  authorizes whoever uses that profile;
+- ServerSentinel cannot observe a deliberately lent credential or a session left
+  unlocked on an unattended machine. Documentation states this limit instead of
+  claiming the application separates people who share a workstation.
+
+### 11.9 Owner bootstrap and session decision status
 
 [ADR-0003](docs/ADR/0003-owner-authentication-and-trusted-proxy.md) records the
 Owner-approved human-access design for Issue #6. Its 30-minute idle and 12-hour
@@ -1074,7 +1362,8 @@ instead of preventing the bind. Owner bootstrap also provisions the Owner's
 first per-person credential through the local administrative boundary, since no
 session exists without one. A verified trusted-proxy identity stays a supplementary check
 there; the authoritative per-person application credential is decided separately
-for Issue #6.
+for Issue #6, by §11.8 and ADR-0004: a per-person WebAuthn credential, which is
+the credential that local bootstrap provisions and that a session is bound to.
 
 ## 12. Dashboard UI
 
@@ -1137,6 +1426,12 @@ Validate authenticated node, expected source/session, rate/size bounds, allowed 
 ### 13.3 Biometrics
 
 Owner template is sensitive secret-adjacent data, excluded from logs/general APIs/diagnostics and limited to the verification/config path. Non-owner persistent biometric templates are prohibited.
+
+A viewer's WebAuthn user verification is not ServerSentinel biometric processing: the fingerprint/face check happens on the viewer's own device, and what reaches the server is the ceremony's verification data plus the public credential material that persists (§11.4). It creates no template, no biometric enrollment and no identity database here.
+
+### 13.4 Human credential material
+
+Enrollment codes and WebAuthn ceremony material — challenges, client and authenticator data, attestation and assertion signatures — are sensitive secret-adjacent data. They are excluded from logs, general APIs, diagnostics and exports, are held only for the bounded lifetime of the ceremony they belong to, and a failed verification is recorded as a typed outcome without the payload.
 
 ## 14. Performance/overload policy
 

@@ -300,15 +300,36 @@ Scope:
 - human dashboard path through Tailscale Serve/equivalent trusted proxy;
 - loopback/non-bypassable backend listener;
 - application principal/allowlist;
+- per-person ServerSentinel credential (`principal_credential`) with invitation enrollment, required authenticator user verification, and individual revocation;
+- CSPRNG-backed enrollment codes and bootstrap authorizations with a stated minimum entropy, hashed storage and constant-time comparison;
 - session/revocation/recovery;
-- exact handling of verified external identity headers;
+- the closed pair of pre-credential routes (enrollment-code redemption and authentication), local owner bootstrap as a local action rather than a route, and the freshness window for owner step-up;
+- the reserved, secure-context dashboard origin, whose reservation is a deployment obligation the application can only check;
+- exact handling of verified external identity headers, which in the shared-Tailscale-account deployment are supplementary only;
 - keep Tailnet policy separately Owner-managed outside ServerSentinel; existing ACLs/Grants may remain unchanged, and ServerSentinel performs no policy mutation or admin-credential storage.
+
+The authorization decision is written up in ADR 0004 (shared Tailnet account,
+per-person WebAuthn/passkey credentials), which remains Proposed and awaits the
+Owner. The surrounding owner-authentication and trusted-proxy boundary in ADR
+0003 is Accepted. This Issue closes only after ADR 0004 is accepted and both
+records are implemented and tested.
 
 Acceptance:
 - Tailnet membership alone is insufficient;
-- uninvited identity receives no deployment metadata;
-- owner can revoke app access;
+- verified Tailscale/trusted-proxy identity alone is insufficient; no human route authorizes on an identity header alone, and no route requires one where the deployment supplies none;
+- every human route verifies the requesting principal's own credential before returning application data, except the enumerated AUTH-013 pre-credential routes, which return no application data themselves;
+- initial owner bootstrap and first-credential enrollment are reachable without an existing credential, so a fresh deployment and a first-time invitee are not deadlocked;
+- AUTH-008 owner operations require a fresh user verification, and a cancelled or failed step-up changes nothing;
+- uninvited identity receives no deployment metadata, and an uninvited and a revoked person receive the same generic response;
+- owner can revoke app access, at both the single-credential and the whole-principal level;
 - backend rejects spoofed identity headers from untrusted LAN paths;
+- no viewer biometric template reaches the server; transient WebAuthn verification data is checked and discarded. Persistent access data is limited to public credential material, the last accepted signature counter, backup flags, credential consistency metadata, owner-visible metadata, at most the last observed raw proxy identity on the principal, and an opaque deployment-keyed binding on each active session. The raw value is cleared on principal revocation, the binding is cleared with session invalidation, and neither appears in diagnostic exports;
+- `none` attestation registrations are accepted on the strength of the challenge, origin/relying-party id, authenticator data, credential public key and user-verification flag; a present-but-invalid attestation statement fails;
+- the signature-counter comparison runs whenever the stored or the received counter is non-zero, so a received 0 after a stored non-zero is refused as a regression and notified to the Owner;
+- revocation is credential-scoped: a synced passkey is revoked everywhere it synced, and nothing promises per-device revocation;
+- registration records the authenticator's backup-eligibility and backup-state flags, the owner UI shows them, and a deployment configured for device-bound credentials refuses a backup-eligible registration with an actionable message;
+- backup state is refreshed from every verified assertion so a credential that syncs after registration is no longer reported as not backed up. A changed backup-eligibility value atomically makes the credential inconsistent, records the reason/timestamp, revokes its sessions, refuses the assertion and notifies the Owner; acceptance covers replacement by re-invitation and privileged local Owner recovery when no usable credential remains;
+- credential and principal records are kept while the person is invited rather than on a timer; deleting a principal removes its credentials, enrollments, sessions and last-observed login, and sign-in history ages out with the audit log;
 - no developer-operated identity/cloud.
 
 Design progress: [ADR-0003](ADR/0003-owner-authentication-and-trusted-proxy.md)
@@ -764,20 +785,48 @@ Labels: `backend`, `frontend`, `hardware-required`, `manual-test-required`, `sec
 
 Scope:
 - ServerSentinel never modifies Tailscale ACLs/Grants or stores Tailscale admin credentials;
-- trusted proxy identity;
+- trusted proxy identity, treated as supplementary in the shared-Tailscale-account deployment;
 - app principal allowlist;
+- per-person credential verification on every human/media route, per ADR 0004;
+- deployment-keyed, non-reversible session binding for a configured trusted
+  proxy identity, without copying the raw identity into each session;
+- the closed pair of pre-credential routes — invitation redemption against a short-lived single-use enrollment code, and the authentication route — plus local owner bootstrap, which is not a route and issues a console-displayed single-use authorization redeemed through that same redemption path;
+- the reserved, secure-context dashboard origin and its startup/daily reservation check with Owner notification;
+- fresh user-verification step-up for the AUTH-008 owner operations;
 - generic/non-branding denial for uninvited users;
 - independent `live:view` and `recordings:view`;
 - `recordings:view` includes historical timeline/events;
-- owner access-management UI;
-- prompt application revocation;
+- owner access-management UI, including per-credential listing and revocation;
+- persistent inconsistent-credential status/reason and recovery when verified
+  backup eligibility changes;
+- prompt application revocation at credential and principal level;
 - non-owner browser-only recording playback.
 
 Acceptance:
 - Tailnet membership without app invitation receives no ServerSentinel application data;
 - existing Tailnet policy may remain unchanged;
 - docs do not promise Main Server node invisibility when Tailnet policy exposes it;
-- every human/media request requires verified Tailscale/trusted-proxy identity plus an active invitation and the required permission;
+- every human/media request requires an active principal, that principal's own verified credential, and the required permission; a request carrying only a verified identity header is refused;
+- where the deployment configures a trusted proxy identity, it is additionally verified on the trusted local path and recorded, per AUTH-005; where the private-network path supplies no identity header, the absence alone does not deny access and does not weaken the credential check;
+- a configured proxy identity is bound to the session only as an HMAC-SHA-256
+  value made from a canonical identity and a deployment-local secret outside the
+  database; every request recomputes and compares it in constant time, while
+  sign-out, expiry and revocation clear it and diagnostics/exports omit it;
+- the only exceptions are the two pre-credential routes of AUTH-013: invitation redemption gated by a valid unexpired single-use enrollment code, and the authentication route; owner bootstrap adds no third route and feeds the same redemption path. Bootstrap issues a single-use, short-lived enrollment authorization shown only on the local console, and the first owner redeems it once from a browser at the reserved origin through the ordinary redemption path, so no owner-specific route is added. A fresh deployment reaches its first owner and an invitee redeems a first credential without a deadlock, and neither path returns camera, recording, timeline or deployment data;
+- the dashboard origin is reserved for ServerSentinel and served as a secure context (HTTPS, or `http://localhost` for a strictly local browser); an ordinary-HTTP non-loopback origin fails acceptance because browsers withhold WebAuthn there;
+- the reservation check runs at startup and at least daily, enumerates real listeners and every proxy route for the whole name across all schemes and ports, and closes human access and notifies the Owner on any other answer. Tests treat it as a bounded exposure window with a gap between checks, not as prevention;
+- an absent, unknown, expired or already-redeemed enrollment code receives the same generic response as an uninvited person, redemption succeeds at most once, attempts are rate-limited per code and per source, and logs carry no raw code;
+- enrollment codes and owner bootstrap authorizations come from a cryptographically secure random generator with at least 128 bits of entropy in the value actually checked, are stored only as a hash and compared in constant time; tests cover the entropy floor and reject a short or predictable code even when lifetime, single use and rate limiting are present;
+- concurrent redemptions of one code produce exactly one credential: the redemption and the single-use mark are one conditional transaction, the losing request receives the generic response, no partial state survives, a retry is idempotent, and the attempt counter advances in the same update so parallel guesses cannot outrun the rate limit;
+- AUTH-008 owner operations require a user verification newer than the freshness window recorded in ADR-0003; a credential-bearing but stale session is refused, and a failed or cancelled step-up performs no state change and returns only the generic failure;
+- the step-up challenge is bound to the session and accepts only the still-active credential that session was created with; an assertion from a different registered credential, including another person's valid passkey at the same workstation, is refused and does not update the session's verification time;
+- the shared Tailscale account is assumed: a second person on the same Tailscale login and the same device, without a credential of their own, receives the same generic response as any uninvited person;
+- revoking one credential invalidates that credential and its sessions only; revoking the principal invalidates all of them promptly;
+- an assertion whose backup-eligibility flag differs from registration is
+  refused in the same transaction that marks the credential inconsistent with
+  an owner-visible reason/timestamp and revokes its sessions. Tests verify that
+  it stays unusable, a non-owner with no usable credential can be re-invited,
+  and an Owner with none can recover only through privileged local bootstrap;
 - uninvited identity receives no camera names/counts, thumbnails, live, recordings, timeline, storage state, product/version, API schema, or detailed health; use generic/non-branding denial where practical;
 - `live:view` cannot list/play recordings or historical timeline;
 - `recordings:view` includes browser playback and historical timeline but does not imply live;

@@ -1,0 +1,89 @@
+import { storageStates, type StorageSummary } from '../domain';
+import { type Catalog } from '../i18n';
+import { bytes } from '../shared/format';
+
+/** Owner-only capacity, retention and notification status; no credential is displayed. */
+export function StorageView({ t, storage, onRefresh }: {
+  t: Catalog; storage: StorageSummary; onRefresh?: (() => void) | undefined;
+}) {
+  const starred = Math.min(Math.max(0, storage.starred_bytes), Math.max(0, storage.recording_bytes));
+  // The policy reports raw filesystem availability and keeps active write
+  // reservations separately. Capacity safety is based on their difference.
+  const available = Math.max(0, storage.available_bytes - Math.max(0, storage.reserved_bytes));
+  const target = Math.max(0, storage.hard_reserve_bytes);
+  // Once external use has consumed part of the configured reserve, show only
+  // the reserve that remains on disk; the rest is not available capacity.
+  const reserve = Math.min(target, available);
+  const shortfall = target - reserve;
+  const segments = [
+    ['recordings', Math.max(0, storage.recording_bytes) - starred],
+    ['starred', starred],
+    ['free', available - reserve],
+    ['reserve', reserve],
+  ] as const;
+  const total = segments.reduce((sum, [, value]) => sum + value, 0);
+  const faults = ([
+    ['audit_delivery_failed', storage.audit_delivery_failed],
+    ['cleanup_failed', storage.cleanup_failed],
+  ] as const).filter(([, failed]) => failed);
+  const notificationFaults = ([
+    ['notification_delivery_failed', storage.notification_delivery_failed],
+    ['notification_log_failed', storage.notification_log_failed],
+  ] as const).filter(([, failed]) => failed);
+  const retention = [
+    ['main', t.retentionMainRecordings, storage.recording_retention_days, t.retentionMainNote],
+    ['audit', t.retentionAudit, storage.audit_retention_days, t.retentionAuditNote],
+    ['agent', t.retentionAgentIncident, storage.agent_incident_retention_days, t.retentionAgentNote],
+  ] as const;
+
+  return <section className="storage">
+    <div className="states" role="group" aria-label={t.storageStateLabel}>
+      {storageStates.map(state => <span key={state} data-storage-state={state}
+        aria-current={state === storage.state ? 'true' : undefined}
+        className={`state state-${state}${state === storage.state ? ' state-current' : ''}`}>{state}</span>)}
+    </div>
+    <p>{t.currentState}: <strong>{t[`state_${storage.state}`]}</strong></p>
+    <p className="muted">{t.hysteresis}</p>
+    {onRefresh && <p><button type="button" onClick={onRefresh}>{t.refreshStatus}</button></p>}
+    {faults.length > 0 && <div className="fault-alert" role="alert">{faults.map(([name]) =>
+      <p key={name} data-fault={name}>{t[`fault_${name}`]}</p>)}</div>}
+
+    <h2>{t.diskBreakdown}</h2>
+    <dl className="breakdown">
+      {segments.map(([name, value]) => <div key={name} className="breakdown-row">
+        <dt id={`disk-${name}`}>{t[`disk_${name}`]}</dt>
+        <dd><meter className={`meter meter-${name}`} aria-labelledby={`disk-${name}`} value={value} max={total || 1} />
+          <span className="numeric">{bytes(value)}</span></dd>
+      </div>)}
+      <div className="breakdown-row"><dt>{t.reserveTarget}</dt>
+        <dd><span className="numeric">{bytes(target)}</span></dd></div>
+      <div className="breakdown-row"><dt>{t.recordingLimit}</dt>
+        <dd><span className="numeric">{bytes(storage.recording_limit_bytes)}</span></dd></div>
+      <div className="breakdown-row"><dt>{t.criticalAllowance}</dt>
+        <dd><span className="numeric">{bytes(storage.critical_allowance_bytes)}</span></dd></div>
+    </dl>
+    {shortfall > 0 && <p role="alert" data-reserve-shortfall="true">{t.reserveShortfall}: <span className="numeric">{bytes(shortfall)}</span></p>}
+    <p className="muted">{t.reserveNote}</p>
+    <p className="muted">{t.externalUsage}</p>
+
+    <h2>{t.retentionTitle}</h2>
+    <div className="retention-grid">{retention.map(([name, title, days, note]) =>
+      <article className="retention-card" key={name} data-retention={name}>
+        <h3>{title}</h3>
+        <p className="retention-days numeric">{days} {t.daysUnit}</p>
+        <p className="muted">{note}</p>
+      </article>)}</div>
+
+    <h2>{t.slackTitle}</h2>
+    <p><span className="badge">{storage.slack_configured ? t.slackEnabled : t.slackDisabled}</span></p>
+    <p>{storage.slack_configured ? t.slackConfiguredNote : t.slackUnconfiguredNote}</p>
+    {notificationFaults.length > 0 && <div className="fault-alert" role="alert">{notificationFaults.map(([name]) =>
+      <p key={name} data-fault={name}>{t[`fault_${name}`]}</p>)}</div>}
+    <ul className="notification-rules">
+      <li>{t.slackDailyTime}: <span className="numeric">{storage.daily_summary_local_time}</span></li>
+      <li>{t.slackImmediate}</li>
+      <li>{t.slackAggregated}</li>
+    </ul>
+    <p className="muted">{t.slackCredential}</p>
+  </section>;
+}

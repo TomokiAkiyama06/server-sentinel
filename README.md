@@ -118,7 +118,9 @@ The dashboard adapts to 1–4 sources. Viewer streaming should be demand-driven:
 **Tailnet membership is not ServerSentinel authorization.** Access requires both:
 
 1. network-level permission to reach the ServerSentinel node; and
-2. an active ServerSentinel invitation/allowlist entry.
+2. an active ServerSentinel invitation/allowlist entry, proved by that person's own ServerSentinel credential.
+
+The target deployment shares one Tailscale account across a research room, so the Tailscale login identifies the account rather than the person. Both gates stay required, but only the application gate distinguishes individuals: ServerSentinel verifies a per-person, individually revocable credential (WebAuthn/passkey; see [ADR 0004](docs/ADR/0004-shared-tailnet-account-authorization.md)) on every human request, and Tailscale identity/device information is supplementary. Approving a device is not the same as identifying a person.
 
 ServerSentinel does not modify Tailscale ACLs/Grants or store Tailscale administrative credentials; policy administration remains outside the application. Tailnet membership alone still grants no ServerSentinel application data: every human request must pass the ServerSentinel invitation/permission check. With unchanged Tailnet policy, the underlying Main Server node may remain visible/reachable to other Tailnet members, so node-level concealment is not guaranteed. Uninvited users receive generic/non-branding denial and no ServerSentinel deployment metadata.
 

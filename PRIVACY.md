@@ -92,9 +92,39 @@ Non-owner recording access is browser playback only in MVP. ServerSentinel does 
 
 Historical timeline/event access is not exposed through `live:view`; it is included with `recordings:view`.
 
+## Human viewer credentials
+
+The target deployment shares one Tailscale account across the research room, so a Tailscale login identifies the account rather than the person. ServerSentinel therefore issues each invited person its own credential from an owner invitation and verifies it on every human request; verified Tailscale login/device information is at most supplementary context.
+
+For each credential the main host stores:
+- the credential id and its public key;
+- the principal it belongs to;
+- an owner-visible label, which is a hint chosen at registration and not proof of a device;
+- created/last-used/revoked timestamps;
+- the last accepted signature counter, which is what makes a cloned-authenticator check possible;
+- active/revoked/inconsistent status and, for an inconsistent credential, its
+  fixed owner-visible reason code and timestamp.
+
+The principal record may also keep the Tailscale login/device last observed when that person authenticated, where the deployment supplies such an identity. It is supplementary context, never an authorization input: it is overwritten at each authentication, visible to the owner only, cleared when the principal is revoked or deleted, and left out of diagnostic exports. Sign-in history beyond that single last-observed value lives in the audit log under the audit retention below, not on the principal.
+
+An active session does not copy that identity. When proxy identity binding is
+configured, it stores only an HMAC-SHA-256 binding made with a deployment-local
+secret held outside the database. The binding supports equality checks but is
+not displayed as an identity, is excluded from diagnostics and exports, and is
+cleared on sign-out, expiry or revocation. The raw last-observed value above
+remains the only persisted proxy identity outside the bounded audit history.
+
+Authenticator user verification (device PIN, device unlock, fingerprint or face unlock) runs on the viewer's own device; the server learns only that it succeeded. Signing in also sends the short-lived data needed to check the sign-in itself, which is verified and then discarded rather than stored. ServerSentinel never receives or stores a viewer's fingerprint or face template. These records are an access-control list, not an identity or biometric database, and they are unrelated to the optional owner face verification described below. Revoking a credential or its principal permanently disables the corresponding record.
+
+Invitations carry a short-lived, single-use enrollment code that is delivered out of band and is never written to logs. Redeeming it registers one credential and returns no camera, recording, timeline or deployment information.
+
+Revoking a credential applies to that credential wherever it exists: a synced passkey can live on several of its owner's devices, so revocation is credential-scoped rather than per-device.
+
+Approving a device is not the same as identifying a person. The application cannot detect a credential whose holder lends it out, or a session left unlocked on an unattended shared machine; the deployment owner manages those risks outside the application.
+
 ## Tailscale/private remote access
 
-Tailnet membership is not authorization.
+Tailnet membership is not authorization. Where one Tailscale account is shared by several people, the Tailscale login does not identify the person either, and the ServerSentinel credential above is what does.
 
 ServerSentinel does not modify Tailscale ACLs/Grants or store a Tailscale administrative credential; policy administration remains outside the application. With unchanged Tailnet policy, the underlying Main Server node may remain visible/reachable to other Tailnet members.
 
@@ -139,11 +169,16 @@ The main Ubuntu deployment stores:
 - event/timeline metadata;
 - audit logs;
 - configuration;
+- invited-viewer credential and principal records (public key material, the last accepted signature counter, authenticator backup flags, credential consistency status/reason metadata, and at most the last observed Tailscale login/device), kept while the person is invited rather than on a timer;
+- an opaque keyed proxy-identity binding on each active session when configured,
+  cleared when the session is invalidated and excluded from diagnostics/exports;
 - optional owner biometric template.
 
 Defaults:
 - recordings: 20 days;
 - audit logs: 90 days.
+
+Credential and principal records are not time-expired: they last as long as the person is invited. Revoking a credential or a principal marks it revoked so the owner can see what was withdrawn and when; deleting the principal removes its credentials, enrollments, sessions and last-observed login together. Sign-in history stays in the audit log and ages out with it.
 
 Starred recordings may outlive normal recording retention.
 
@@ -188,7 +223,7 @@ independent of Slack delivery; production durable event integration is pending.
 
 Diagnostics remain local unless explicitly exported/shared.
 
-Exports redact/exclude credentials, pairing secrets, private keys, and sensitive headers. Owner biometric templates/embeddings are always excluded, including when the Owner explicitly initiates an export. Raw monitoring media is excluded unless the Owner explicitly selects it for export; that media exception does not authorize template/embedding export or external biometric processing/storage.
+Exports redact/exclude credentials, pairing secrets, human enrollment codes, WebAuthn ceremony material, private keys, and sensitive headers. Owner biometric templates/embeddings are always excluded, including when the Owner explicitly initiates an export. Raw monitoring media is excluded unless the Owner explicitly selects it for export; that media exception does not authorize template/embedding export or external biometric processing/storage.
 
 Creating a support bundle never deletes recordings: a diagnostic export reserves space without running retention, and a deployment without free space is refused instead of reclaiming monitoring evidence.
 

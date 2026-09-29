@@ -229,7 +229,9 @@ Tailnet membership is **not** ServerSentinel authorization.
 A user must have both:
 
 1. a Tailscale/private-network permission path to the main node; and
-2. an active ServerSentinel principal/invitation with the required permission.
+2. an active ServerSentinel principal/invitation, proved by that principal's own verified credential, with the required permission.
+
+Both gates stay mandatory. In the shared-account deployment below the first gate no longer distinguishes individuals, which makes the second gate the only one that does.
 
 ### Tailscale policy boundary
 
@@ -287,12 +289,11 @@ Do not trust arbitrary forwarded identity headers.
 
 If Tailscale Serve/equivalent provides authenticated identity headers, the backend accepts them only on a non-bypassable local trusted-proxy path. Requests from LAN/other interfaces cannot directly set such headers and gain identity.
 
-The concrete Owner-bootstrap/session design is [ADR-0003](docs/ADR/0003-owner-authentication-and-trusted-proxy.md), currently **Proposed** pending Owner approval.
-It states the proposed trusted-host loopback limitation and upstream login-reuse
-risk, and defines recovery/revocation transitions for review. No session lifetime,
-identity-binding choice, or local recovery implementation is accepted by that
-proposal alone. Human routes and dashboard assets remain closed until the design
-is accepted and implemented/tested under #10. Its model tests do not validate a
+The concrete Owner-bootstrap/session design is [ADR-0003](docs/ADR/0003-owner-authentication-and-trusted-proxy.md), which is **Accepted**.
+It states the trusted-host loopback limitation and upstream login-reuse risk,
+and defines recovery/revocation transitions. Human routes and dashboard assets
+remain closed until ADR-0004 is accepted and both records are implemented and
+tested under #10. Its model tests do not validate a
 real Tailscale installation, LAN bypass resistance, or active stream cancellation.
 
 That proposal also requires a hostname reserved for the human listener on every
@@ -307,6 +308,40 @@ configuration. Startup and daily checks enumerate actual listeners and proxy
 routes for the whole name and close human access on any other answer, which
 bounds rather than removes that exposure; the application cannot prevent a
 local process from binding.
+
+## Shared Tailnet account
+
+The research-room Tailnet uses one shared Tailscale account, so a verified identity header names the shared login rather than the person behind the request. Application authorization therefore rests on a ServerSentinel-issued per-person credential (WebAuthn/passkey as the default design target) created from an owner invitation and individually revocable.
+
+Consequences to keep in mind while reviewing code:
+
+- a route that authorizes on the proxy identity header alone grants access to everyone holding the shared account;
+- network reachability is not a boundary in this deployment; assume an uninvited person can reach every listener the shared account can reach;
+- the unauthenticated response, including the credential prompt, stays generic: no product/version strings, camera names or counts, recording or timeline data, or deployment metadata, and the same response for uninvited and revoked people;
+- approving a device is not identifying a person; a shared lab machine is used by whoever sits at it;
+- a credential is person-bound only when authenticator user verification is required at registration and at every authentication and the authenticator is not kept inside a shared OS account or behind a shared device unlock. A platform passkey sitting in a shared lab profile is a shared credential;
+- sessions are server-side records bound to one principal and to the credential that created them. Sign-out, idle/absolute expiry and revocation invalidate the server-side record, so a retained cookie or token grants nothing afterwards; the check runs on every human/media route, never in the browser. Shared machines get an explicit sign-out control, and owner-only operations require a fresh user-verification step instead of an old session;
+- the server verifies the transient WebAuthn data a registration or assertion carries — its own challenge, client data, authenticator data, the signature counter, the user-verification flag, and the relying-party id and origin — and persists only the credential id, its public key, the last accepted signature counter, the backup-eligibility and backup-state flags, and owner-visible metadata; the rest is discarded once verified. An assertion's signature is always verified against the stored public key; a registration carries an attestation statement only sometimes, so `none` attestation is accepted while a present-but-invalid statement fails. A review that sees those fields skipped, or accepted from an unexpected origin, is looking at a broken check, not at data minimization;
+- no fingerprint or face template reaches ServerSentinel: it never leaves the authenticator. Credential records are not an identity or biometric database;
+- relying-party checks only hold if the dashboard owns its browser origin, with no other application sharing it, as AUTH-012 requires; a co-hosted application on that origin would put the credential within its reach;
+- reserving the origin is a deployment obligation, described above and in ADR-0003. The startup and daily check closes human access and notifies the Owner when anything else answers on that name, which bounds the exposure window rather than preventing the bind: a process binding between two checks collects credentials and cookies for that origin until the next one;
+- the origin must be a secure context (HTTPS, or `http://localhost` for a strictly local browser). Browsers withhold WebAuthn otherwise, so plain HTTP on a non-loopback host is not a usable human path;
+- the pending challenge lives server-side for one bounded, single-use ceremony and is then dropped;
+- the signature counter persists as `principal_credential.sign_count` and advances only on an accepted assertion. The comparison applies whenever the stored or the received counter is non-zero, and the received value must be strictly greater: a received 0 after a stored non-zero is a regression, not an exemption. A regression refuses the assertion and notifies the Owner as a possible cloned authenticator. Only a stored-and-received 0 is exempt, which is the ordinary passkey case;
+- a retained proxy identity is bounded: the principal keeps at most the last observed raw value, owner-visible, cleared on revocation or deletion and kept out of diagnostic exports, with longer history in the audit log. A session stores only a deployment-keyed HMAC binding for constant-time equality checks; it is cleared with session invalidation, never displayed and excluded from diagnostics/exports;
+- ceremony material and enrollment codes stay out of logs, diagnostics and exports, and a failed verification is recorded as a typed outcome without the payload;
+- revocation is credential-scoped, not device-scoped. A synced passkey is one credential across several of its owner's devices, so revoking it applies everywhere it synced; a deployment that needs device-scoped control registers device-bound authenticators and refuses backup-eligible credentials;
+- backup eligibility is fixed at registration. A changed value atomically marks the credential inconsistent with a fixed reason/timestamp, revokes its sessions, refuses the assertion and notifies the Owner. The credential remains unusable until replaced; re-invitation recovers a non-owner with no usable credential, while an Owner with none uses privileged local bootstrap. Backup state is refreshed from every verified assertion, so a credential that syncs after registration stops being shown as not backed up.
+
+Residual limits are documented, not claimed away: a credential its holder deliberately lends, and a session left unlocked on an unattended machine, are outside what the application can observe.
+
+Enrollment codes and owner bootstrap authorizations are bearer authorizations reachable by everyone holding the shared account, so they are CSPRNG-generated with at least 128 bits of entropy, stored only as a hash, compared in constant time, short-lived, single-use and rate-limited per code and per source. Single use and the attempt counter are enforced in one conditional transaction, so racing redemptions of the same code cannot both register a credential and concurrent guesses cannot outrun the limit. A code short enough to guess is a finding regardless of the lifetime and rate limits around it.
+
+Two HTTP routes necessarily run before a credential exists, and the pair is closed: invitation redemption against a valid short-lived single-use enrollment code, and the authentication route. Owner bootstrap adds no third route — it is a privileged local action on the Main Server that issues a single-use, short-lived enrollment authorization shown only on the console, redeemed once from a browser at the reserved origin through that same redemption route, never a remote first-visitor route. They return no application data, redemption is rate-limited and succeeds at most once, an absent/unknown/expired/redeemed code gets the same generic response as an uninvited person, and enrollment codes never reach logs. Every other human route requires a verified credential and an active session.
+
+Owner-only operations additionally require a user verification newer than a bounded freshness window, so a stale or unattended owner session cannot revoke users, change retention/security settings or delete recordings; a failed or cancelled step-up performs nothing and reveals nothing.
+
+The step-up is bound to the session's own credential: the challenge allows only `principal_session.credential_id`, and an assertion from any other registered credential is refused without touching the session's verification time. A route that accepts any valid passkey here lets whoever is standing at a shared workstation refresh someone else's stale owner session with their own credential, which is the attack this binding exists to stop.
 
 ## Capture-node pairing
 
@@ -391,6 +426,7 @@ Repository must never contain real:
 - Slack webhook/token;
 - Tailscale auth/admin key;
 - private keys/certificates/credentials;
+- human enrollment codes and WebAuthn ceremony material (challenges, client/authenticator data, signatures);
 - private deployment IP/hostname/SSID/Tailnet values;
 - owner biometric template;
 - real monitoring footage or person images/audio.

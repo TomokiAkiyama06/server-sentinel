@@ -6,5 +6,6 @@
 - `timeline/`: historical events, observations, and evidence links.
 - `setup/`: owner-managed sources, agents, profiles, storage, integrity, and security settings.
 - `shared/`: reusable UI and authenticated API/media integration.
+- `views/`: screen components composed by `App.tsx`, including the timeline and presence screens.
 
 Keep deployment secrets out of browser bundles. UI visibility is not a substitute for server-side authorization.

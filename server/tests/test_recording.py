@@ -73,7 +73,8 @@ class RecordingTests(unittest.TestCase):
              (6, "hardware_integrity"), (7, "roi_calibration_history"),
              (8, "presence_timeline"), (9, "security_admin_audit"),
              (10, "uvc_explicit_binding"), (11, "pairing_ledger"),
-             (12, "human_access_foundation")],
+             (12, "human_access_foundation"),
+             (13, "setup_wizard_state")],
         )
         self.policy = Reservation()
         self.validator = SyntheticValidator()
