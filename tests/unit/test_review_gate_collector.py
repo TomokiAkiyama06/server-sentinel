@@ -81,12 +81,21 @@ class FakeCheckRuns:
         self.issuer = issuer
         self.posts: list[dict] = []
         self.fail = False
+        self.after_accept: str | None = None  # GitHub accepted, then ...
 
     def post_json(self, path, token, payload):
         if self.fail:
             raise publisher.PublisherFailure("GitHub API request failed")
         assert path == "/repos/owner/repository/check-runs", path
         self.posts.append(payload)
+        mode = self.after_accept if payload["conclusion"] == "success" else None
+        if mode == "raise":
+            raise publisher.PublisherFailure("GitHub API request failed")
+        if mode == "crash":
+            raise KeyboardInterrupt
+        if mode == "no_id":
+            return {**payload, "app": {"id": self.issuer.app_id,
+                                       "slug": self.issuer.app_slug}}
         return {**payload, "id": len(self.posts),
                 "app": {"id": self.issuer.app_id, "slug": self.issuer.app_slug}}
 
@@ -587,6 +596,58 @@ class CollectorTests(unittest.TestCase):
         self.assertEqual([post["conclusion"] for post in client.posts],
                          ["success", "failure", "success"])
         self.assertEqual(self.ledger()["published"]["state"], "success")
+
+    def test_ambiguous_success_publication_is_tracked_and_revoked(self):
+        original_save = collector.LedgerStore.save
+
+        def failing_success_save(store, request):
+            if request.published is not None and request.published.state == "success":
+                raise collector.CollectorFailure("review request ledger write failed")
+            return original_save(store, request)
+        for mode in ("lost_response", "malformed_response", "ledger_write"):
+            with self.subTest(mode=mode):
+                for path in self.state.glob("*.json"):
+                    path.unlink()
+                client, credentials = self.publication()
+                self.source = FakeSource()
+                self.collector.request_review("codex", self.live, self.source)
+                self.source.add(self.context.head_sha, self.late())
+                client.after_accept = {"lost_response": "raise",
+                                       "malformed_response": "no_id"}.get(mode)
+                with mock.patch.object(
+                        collector.LedgerStore, "save",
+                        failing_success_save if mode == "ledger_write" else original_save):
+                    with self.assertRaises(Exception):
+                        self.reconcile(client, credentials)
+                # GitHub accepted the success; the error path superseded it.
+                self.assertEqual([post["conclusion"] for post in client.posts],
+                                 ["success", "failure"])
+                self.assertIsNone(self.ledger()["published"])
+                client.after_accept = None
+                self.assertEqual(self.reconcile(client, credentials).status, "pass")
+                self.assertEqual(self.ledger()["published"]["state"], "success")
+
+    def test_crash_after_accepted_success_is_revoked_after_restart(self):
+        for later in ("pass", "blocked"):
+            with self.subTest(later=later):
+                for path in self.state.glob("*.json"):
+                    path.unlink()
+                client, credentials = self.publication()
+                self.source = FakeSource()
+                self.collector.request_review("codex", self.live, self.source)
+                self.source.add(self.context.head_sha, self.late())
+                client.after_accept = "crash"
+                with self.assertRaises(KeyboardInterrupt):  # the process dies
+                    self.reconcile(client, credentials)
+                self.assertEqual(self.ledger()["published"]["state"], "publishing")
+                client.after_accept = None
+                if later == "blocked":
+                    self.source.add(self.context.head_sha, self.late() + 5, body=BLOCK)
+                restarted = self.make_collector()
+                self.assertEqual(self.reconcile(client, credentials,
+                                                collector_=restarted).status, later)
+                expected = ["success", "failure"] + (["success"] if later == "pass" else [])
+                self.assertEqual([post["conclusion"] for post in client.posts], expected)
 
     def test_context_change_supersedes_success_on_the_old_test_merge(self):
         client, credentials = self.publication()

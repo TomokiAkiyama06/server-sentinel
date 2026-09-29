@@ -247,15 +247,22 @@ review text is never logged.
 GitHub evaluates a required check by the **latest** attempt with that name on
 the test-merge SHA, and nothing removes an earlier success. The collector
 therefore records, in the same private ledger record (schema version 2), the
-success it last posted per reviewer: request ID, test-merge SHA, Check Run ID
-and state (`success` / `revoking`).
+success it posted, or may have posted, per reviewer: request ID, test-merge
+SHA, Check Run ID (once confirmed) and state (`publishing` / `success` /
+`revoking`).
 
 - `collect_and_publish(reviewer, pr_number, read_live_context, source, client,
   credentials)` is one reconciliation pass. A `pass` for the ledger's current
   active request posts one success; if that exact success is already recorded
   the pass is a no-op, so polling and restart recovery do not create further
-  runs (a crash between GitHub accepting the success and the ledger write can
-  repeat that single post once).
+  runs.
+- A `publishing` record is saved **before** the success is sent. If the
+  outcome is then ambiguous (API error, lost or malformed response, crash, or
+  a failed ledger write after GitHub accepted the post), the success is still
+  tracked: the error path supersedes it immediately, and otherwise the next
+  outcome supersedes it (a later `pass` first posts a failure attempt, then a
+  new success). An untracked success therefore cannot remain the latest
+  attempt.
 - Every other outcome (`blocked`, `pending` after `force_new`, `invalidated`),
   a `pass` for a request that was superseded in the meantime, and any
   collection error supersede a standing success with a newer attempt of the

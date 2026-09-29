@@ -78,7 +78,7 @@ _TIMESTAMP = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z")
 _SHA = re.compile(r"[0-9a-f]{40}")
 _REQUEST_ID = re.compile(r"[0-9a-f]{32}")
 _PASS_STATES = frozenset({"COMMENTED", "APPROVED"})
-_PUBLICATION_STATES = frozenset({"success", "revoking"})
+_PUBLICATION_STATES = frozenset({"publishing", "success", "revoking"})
 
 
 class CollectorFailure(RuntimeError):
@@ -130,17 +130,20 @@ class ProviderIdentity:
 
 @dataclass(frozen=True)
 class Publication:
-    """The success Check Run this collector last posted for one reviewer.
+    """The success Check Run this collector posted, or may have posted.
 
+    ``state == "publishing"`` is written *before* the success is sent, so a
+    lost or malformed response, a crash, or a ledger write failure after
+    GitHub accepted the post still leaves a record that later outcomes revoke.
     ``state == "revoking"`` is written *before* a superseding failure attempt
-    is posted, so a crash or ledger write failure during revocation can never
-    leave the ledger claiming that no success stands, or that the standing
-    success is still current.
+    is posted, so an interrupted revocation is retried and never read as the
+    current success.  ``check_run_id`` is known only once GitHub confirmed the
+    success (it may be absent while publishing or revoking).
     """
 
     request_id: str
     test_merge_sha: str
-    check_run_id: int
+    check_run_id: int | None
     state: str
 
     def __post_init__(self) -> None:
@@ -148,8 +151,9 @@ class Publication:
                 or not _REQUEST_ID.fullmatch(self.request_id)
                 or not isinstance(self.test_merge_sha, str)
                 or not _SHA.fullmatch(self.test_merge_sha)
-                or type(self.check_run_id) is not int or self.check_run_id <= 0
-                or self.state not in _PUBLICATION_STATES):
+                or self.state not in _PUBLICATION_STATES
+                or not ((self.check_run_id is None and self.state != "success")
+                        or (type(self.check_run_id) is int and self.check_run_id > 0))):
             raise CollectorFailure("invalid publication record")
 
 
@@ -591,9 +595,10 @@ class ReviewCollector:
         success for that request and test merge is reused, so polling and
         restart recovery do not create further runs.  Any other standing
         success (an older request, or one being revoked) is first superseded.
-        The publisher re-reads the live context before posting.  A crash after
-        GitHub accepts the success but before the ledger write can repeat that
-        single post on the next pass; nothing else is re-posted.
+        The publisher re-reads the live context before posting.  A
+        ``publishing`` record is saved first; if the outcome is then ambiguous
+        (error, lost response, crash, failed ledger write) the next outcome
+        revokes it, and a later pass revokes it before posting a new success.
         """
         if (not isinstance(decision, CollectorDecision) or decision.status != "pass"
                 or not isinstance(decision.context, Context)
@@ -620,6 +625,9 @@ class ReviewCollector:
             request = self._revoke_locked(client, credentials, request)
             if not current:
                 return {"published": False, "check_run_id": None}
+            request = replace(request, published=Publication(
+                request.request_id, context.test_merge_sha, None, "publishing"))
+            self._store.save(request)
             response = publish_success(client, credentials, context, decision.reviewer)
             run_id = response.get("id")
             if type(run_id) is not int or run_id <= 0:
