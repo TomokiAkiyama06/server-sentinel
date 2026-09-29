@@ -189,6 +189,9 @@ The synthetic profile core tests do not satisfy the following integration checks
 - [ ] apply recording and viewer queue pressure separately; verify bounded memory, visible loss, and keyframe recovery without claiming continuous evidence;
 - [ ] verify copy eligibility against actual codec configuration, container, timestamps and color metadata; unsupported copy/transcode paths remain unavailable;
 - [ ] record only sanitized aggregate resource measurements; no deployment identifiers, room imagery, media payloads, or exact private network values enter GitHub.
+- [ ] on the Main Server and Capture Node, run `python -m app.media.profiles.measure` for 1, 2, 3 and 4 sources with and without viewers as a synthetic scheduler-overhead baseline; it does not measure codecs/cameras/GPU and its output is not a deployment default;
+- [ ] with the real room-overview camera, list the room-overview profile set with measured `RoomOverviewCriteria`; confirm admission rejects it unless the room-overview option is requested and that inference/viewer stay downscaled;
+- [ ] on a host without the accelerator (or with it disabled), confirm `prefer_hardware` selects software with visible `hardware_unavailable` / `software_fallback`, `require_hardware` reports the path unavailable, and recording never reports the accelerated path as active; re-enable the accelerator and confirm the next adapter start uses it.
 
 ## D. Source registry / mixed topology
 
@@ -803,7 +806,12 @@ synthetic test branches/PRs; no production data or unrelated rule deletion.
 - On the target Main Server, run the generated motion workload for 1–4 sources; measure CPU, resident memory, cadence, drops, evaluation latency and sustained health/recording continuity. Record approved per-source budgets without exporting host identifiers.
 - Before any person model is loaded, verify exact implementation/runtime/weights licenses, immutable versions, local artifact SHA-256 and the complete dependency notices. Confirm no runtime downloads, alternative-model fallback, reporting or unapproved outbound attempts on normal and failure paths.
 - Benchmark the accepted person backend on CPU; GPU is optional and separately measured. External benchmark media stays local under its terms and is never committed or attached to GitHub/CI. No real-model accuracy or target-host performance was verified by synthetic unit tests.
-- Stop/delay inference, inject quality loss, stale frames and a wedged plugin in the isolated worker: result must become unknown, loss/throttling remain visible, and capture/recording/health/storage-safety work must continue. Verify the production watchdog/resource limits separately; the primitive cannot forcibly interrupt a native call.
+- Stop/delay inference, inject quality loss, stale frames and a wedged plugin in the isolated worker: result must become unknown, loss/throttling remain visible, and capture/recording/health/storage-safety work must continue.
+- [ ] On the target Main Server under the production systemd unit, start each configured binding's worker via `maintain()` and record start latency, resident/virtual memory and descriptor use; size `address_space_bytes`/`open_files` so the approved person model loads with margin (native runtimes reserve large virtual ranges) and record the chosen values.
+- [ ] With the real person adapter loaded, `SIGSTOP` the worker and separately `SIGKILL` it mid-evaluation: the published result must become `unknown` (`detector_timeout` / `detector_crashed`) within the configured timeout, never `absent`; the child must be reaped (no zombie), restart only after the backoff, and latch after the configured consecutive failures until `recover()`.
+- [ ] Kill the Main service process while a worker is mid-evaluation and verify the worker exits (parent-death signal) instead of surviving as an orphan.
+- [ ] Confirm the worker inherits the unit's filesystem/network confinement and that its stdio produces no journal output on failure paths.
+- [ ] Deploy with the `detection` object omitted and then with one required key removed: `--check`/startup must not start inference, and every source's detector observation must remain `unknown`.
 
 ## ADR-0003 follow-up: accepted human-access boundary
 

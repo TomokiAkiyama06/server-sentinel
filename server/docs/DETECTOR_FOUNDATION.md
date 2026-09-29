@@ -1,10 +1,12 @@
 # Detector foundation (Issue #20)
 
 `app.detection.foundation` provides transient, local-only CPU inference primitives and a digest-pinned RT-DETRv2 person adapter.
-It does not start a listener, capture stream, process, or thread. The current
-application remains closed to human API access until #6/#10. Integration with
-profile sampling (#17), recording (#18), quality metrics (#22), and the Main
-runtime remains explicit work; importing this module does not enable detection.
+Importing it starts no listener, capture stream, process or thread; only an
+explicit `IsolatedDetector.maintain()` call starts a detector worker process.
+The current application remains closed to human API access until #6/#10.
+Profile sampling (#17) is bridged by `InferenceFeed` (below); wiring the feed,
+schedulers and workers into the Main runtime, recording (#18) and quality
+metrics (#22) remains explicit work.
 
 ## Frame, plugin and quality contracts
 
@@ -79,11 +81,99 @@ source, which exposes no snapshot at all. Observations also expire to `unknown`
 when a feed stops. Plugin exceptions are
 reduced to a fixed reason; exception messages are not logged or returned.
 
-An evaluation budget is checked **after** a plugin returns. This primitive
-cannot preempt a wedged native extension. Runtime integration must place
-inference in a separately resource-limited worker/process with a watchdog so
-that hard hangs cannot consume evidence/health/storage work. No production
-process isolation or runtime recovery is claimed by the unit tests.
+An evaluation budget is checked **after** a plugin returns; the scheduler
+alone cannot preempt a wedged native extension. `IsolatedDetector` provides
+that preemption (next section).
+
+## Isolated worker process and watchdog
+
+`foundation.isolation.IsolatedDetector` implements the `Detector` protocol for
+the scheduler, but constructs and evaluates the reviewed detector in one
+`spawn`ed child process per source binding (never `fork` of the threaded
+server). The child, before calling the detector factory (so before any model
+or native runtime loads):
+
+- sets `PR_SET_NO_NEW_PRIVS` and a parent-death `SIGKILL`, and exits if the
+  parent is already gone;
+- applies equal soft/hard `RLIMIT_AS` and `RLIMIT_NOFILE` from explicit
+  `WorkerLimits`, and zero `RLIMIT_CORE`/`RLIMIT_FSIZE`;
+- redirects stdio to `/dev/null`, so plugin diagnostics cannot carry paths or
+  runtime details into service logs.
+
+The parent sends frames as fixed binary headers plus pixels, bounded by
+`maximum_frame_bytes`, and reads at most 512-byte JSON replies; it never
+unpickles child output. A reply is accepted only with the request id, valid
+enum values, a finite fraction and a valid `Detection` combination. The start
+handshake must report exactly the configured kind/implementation/version.
+
+A wall-clock watchdog covers every request, including the frame transfer.
+Outcomes, all `unknown` and never `absent`:
+
+| Event | Result reason | Worker action |
+| --- | --- | --- |
+| no reply within `evaluation_timeout_ns` | `detector_timeout` | SIGKILL + reap |
+| child exit / broken pipe | `detector_crashed` | reap |
+| malformed/oversized reply, reset failure | `detector_failure` | SIGKILL + reap |
+| plugin exception inside the child | `detector_failure` | child kept |
+| no worker running (start failure, backoff, latched, closed) | `detector_worker_unavailable` | none |
+| frame over `maximum_frame_bytes` | `frame_resource_limit` | not sent |
+
+`evaluate()` never starts a process, so start/model-load latency is not
+charged to an inference budget. The long-lived inference worker thread calls
+`maintain()` (or `InferenceRuntime.maintain()`) between evaluations: it reaps a
+child that died while idle, restarts after `restart_backoff_ns`, and after
+`maximum_consecutive_failures` latches the binding unavailable until the
+control plane calls `recover()`. A `maintain()` call that finds its child dead
+never starts the replacement in the same call, even if the backoff has already
+elapsed. `InferenceRuntime.maintain()` also invalidates the scheduler at once
+for any binding without a running worker, or whose worker start count changed
+since its previous call, so an idle crash cannot leave an older conclusion
+published until it ages out. At
+most one child exists per binding; a child that cannot be reaped blocks any
+replacement and is reported as `reap_failed`. `WorkerStatus` exposes state and
+start/crash/timeout/protocol counters without exception text.
+
+Linux delivers the parent-death signal when the starting *thread* exits, so
+`maintain()` belongs on the long-lived worker thread. The latch is in memory; a
+service restart begins again from the deployment configuration. This is fault
+isolation, not an untrusted-code sandbox: the child keeps the service
+account's filesystem view and network namespace, so filesystem/network
+confinement remains the systemd unit's job and every plugin still needs review.
+
+## Sampling bridge
+
+`foundation.feed.InferenceFeed` connects one `SourcePipeline`'s
+`InferenceSampler` to one scheduler. The decoder calls `offer_decoded()` for
+every presentation-ordered decoded frame with the per-frame detector quality
+(`unknown` until #22 supplies one) and a `render(width, height)` callback. Only
+sampled frames are rendered, at the sampled profile dimensions, and offered;
+the feed assigns strictly increasing per-stream sequences. A frame of the
+current stream whose quality is not `sufficient` invalidates the published
+observation to `unknown/quality` whether or not it is an inference sample; it
+is never rendered or evaluated. A timestamp
+gap/reset, inference-profile change, new stream generation (`bind()`), closed
+or renegotiating pipeline, invalid input or render failure invalidates the
+published observation to `unknown` immediately. Because a pipeline can close,
+lose its admission lease or require renegotiation while no further frame is
+decoded, the pipeline's owning thread also calls `poll()` after every
+lifecycle action and on its periodic tick; `poll()` invalidates once at that
+transition (an unreadable pipeline status counts as unavailable) rather than
+leaving an earlier conclusion published until its observation age expires.
+Re-delivered frames are rejected by the sampler as duplicate timestamps.
+
+## Deployment schema
+
+`foundation.config.parse_detection` validates the deployment's optional
+`detection` object (see `server/docs/DEPLOYMENT.md`). Every detector parameter,
+cadence/policy value and worker limit is required; nothing is defaulted. Only
+the reviewed `server-sentinel-gray-difference` v1 motion baseline and the
+digest-pinned RT-DETRv2 adapter (with its exact revision and artifact SHA-256
+restated) can be named. `build_inference()` refuses without a configuration,
+so no inference runtime can start with implicit settings; until then every
+source's detector observation is `unknown`, never `absent`.
+`InferenceRuntime.close()` invalidates every binding to
+`unknown/detector_worker_unavailable` before and after stopping its worker, so
+a stopped runtime never leaves a conclusion published.
 
 ## Verification and remaining acceptance
 
@@ -109,8 +199,8 @@ measurement, not target Main Server acceptance, a real scene accuracy result,
 a person-detector benchmark, or an inference-FPS recommendation. GPU performance
 was not measured.
 
-Issue #20 remains open for profile/recording/runtime integration, production
-worker isolation, target Main CPU/optional GPU measurement,
+Issue #20 remains open for Main runtime/recording integration, target-host
+verification of the worker limits, target Main CPU/optional GPU measurement,
 and final per-source settings. No real-person or real-room benchmark media is
 committed, uploaded or attached to CI artifacts.
 
