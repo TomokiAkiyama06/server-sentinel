@@ -126,9 +126,31 @@ class InferenceFeedIntegrationTests(unittest.TestCase):
         snapshot = self.scheduler.snapshot(SOURCE)
         self.assertEqual(Detection(Observation.UNKNOWN, Reason.FAILURE), snapshot.result)
         self.render.fail = False
-        self.assertEqual("scheduler_rejected", self.offer(18, quality=Quality.UNKNOWN).reason)
+        self.assertEqual("quality_unusable", self.offer(18, quality=Quality.UNKNOWN).reason)
         self.assertEqual(Reason.QUALITY, self.scheduler.snapshot(SOURCE).result.reason)
         self.assertEqual(1, self.feed.status().render_failures)
+
+    def test_unusable_quality_between_samples_invalidates_without_rendering(self):
+        for pts in (0, 6):
+            self.offer(pts)
+            self.scheduler.run_one()
+        self.assertEqual(Observation.ABSENT, self.scheduler.snapshot(SOURCE).result.observation)
+        rendered = len(self.render.sizes)
+        # pts 7..9 fall between inference ticks (6 and 12): not sampled, but
+        # their quality still withdraws the earlier conclusion at once.
+        for pts, quality in ((7, Quality.DEGRADED), (8, Quality.INSUFFICIENT),
+                             (9, Quality.UNKNOWN)):
+            with self.subTest(quality=quality):
+                result = self.offer(pts, quality=quality)
+                self.assertEqual((False, "quality_unusable"), (result.offered, result.reason))
+                self.assertEqual(Detection(Observation.UNKNOWN, Reason.QUALITY),
+                                 self.scheduler.snapshot(SOURCE).result)
+        self.assertEqual(rendered, len(self.render.sizes))
+        self.assertEqual((2, 3), (self.feed.status().offered,
+                                  self.feed.status().quality_rejected))
+        # A sufficient frame on the next tick resumes from warmup.
+        self.assertTrue(self.offer(12).offered)
+        self.assertEqual(Reason.WARMUP, self.scheduler.run_one().result.reason)
 
     def test_closed_pipeline_blocks_and_new_generation_rebinds(self):
         self.offer(0)

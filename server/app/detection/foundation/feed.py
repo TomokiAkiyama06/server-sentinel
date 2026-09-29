@@ -6,7 +6,8 @@ inference samples; only selected frames are rendered (at the sampled profile
 dimensions) and offered to the scheduler. Offering never runs a detector.
 
 Every input discontinuity the sampler reports (timestamp gap/reset, profile
-change, new stream generation) and every render/validation failure replaces
+change, new stream generation), every non-sufficient frame quality (sampled or
+not) and every render/validation failure replaces
 the source's published conclusion with `unknown` at once through
 `InferenceScheduler.invalidate`. A failure is never converted to `absent`.
 No decoded pixels are retained after the offer.
@@ -49,6 +50,7 @@ class FeedStatus:
     render_failures: int
     discontinuities: int
     blocked: int
+    quality_rejected: int
 
 
 class InferenceFeed:
@@ -65,7 +67,7 @@ class InferenceFeed:
         self._sequence = -1
         self._decoded = self._sampled_out = self._offered = 0
         self._rejected = self._render_failures = self._discontinuities = 0
-        self._blocked = 0
+        self._blocked = self._quality_rejected = 0
         self._unavailable = False
 
     def bind(self, pipeline) -> None:
@@ -120,11 +122,19 @@ class InferenceFeed:
         except (TypeError, ValueError):
             self._invalidate(Reason.FAILURE)
             raise
+        if decision.emit and decision.reason in _DISCONTINUITIES:
+            self._invalidate(Reason.DISCONTINUITY)
+        if quality is not Quality.SUFFICIENT and decision.reason != "stale_stream":
+            # Every current-stream frame carries a quality decision, sampled or
+            # not: an unusable one withdraws the earlier conclusion now rather
+            # than when the next inference tick (or observation expiry) comes.
+            # Nothing is rendered and no detector runs.
+            self._quality_rejected += 1
+            self._scheduler.invalidate(self.source_id, reason=Reason.QUALITY)
+            return FeedResult(False, "quality_unusable")
         if not decision.emit:
             self._sampled_out += 1
             return FeedResult(False, decision.reason)
-        if decision.reason in _DISCONTINUITIES:
-            self._invalidate(Reason.DISCONTINUITY)
         if stream_id != self._stream_id:
             self._stream_id, self._sequence = stream_id, -1
         try:
@@ -147,7 +157,7 @@ class InferenceFeed:
     def status(self) -> FeedStatus:
         return FeedStatus(self._stream_id, self._decoded, self._sampled_out, self._offered,
                           self._rejected, self._render_failures, self._discontinuities,
-                          self._blocked)
+                          self._blocked, self._quality_rejected)
 
     def _pipeline_unavailable(self) -> bool:
         try:

@@ -100,8 +100,21 @@ class InferenceRuntime:
         return statuses
 
     def close(self) -> bool:
-        """Stop every worker; True only when all children are reaped."""
-        return all([detector.close() for detector in self.detectors.values()])
+        """Stop every worker; True only when all children are reaped.
+
+        Every binding is invalidated before its worker is stopped (reaping can
+        block) and again afterwards, so an evaluation that finished during the
+        shutdown cannot leave a stopped detector's conclusion published.
+        """
+        self._invalidate_all()
+        try:
+            return all([detector.close() for detector in self.detectors.values()])
+        finally:
+            self._invalidate_all()
+
+    def _invalidate_all(self) -> None:
+        for kind, source_id in self.detectors:
+            self.schedulers[kind].invalidate(source_id, reason=Reason.WORKER_UNAVAILABLE)
 
 
 def _invalid() -> ConfigurationError:

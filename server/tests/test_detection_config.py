@@ -196,6 +196,27 @@ class DetectionConfigurationTests(unittest.TestCase):
         self.assertEqual(Reason.WORKER_CRASHED, scheduler.snapshot(key[1]).result.reason)
 
 
+    def test_close_invalidates_published_results_immediately(self):
+        clock = Clock()
+        runtime = build_inference(parse_detection(configuration()), clock_ns=clock)
+        self.addCleanup(runtime.close)
+        key = (DetectorKind.MOTION, UUID(SOURCES[0]))
+        runtime.maintain()
+        scheduler = runtime.schedulers[DetectorKind.MOTION]
+        for sequence in range(2):
+            clock.value += CADENCE["cadence_ns"]
+            scheduler.offer(GrayFrame(key[1], UUID(int=77), sequence, 2, 2, bytes(4)),
+                            quality=Quality.SUFFICIENT)
+            snapshot = scheduler.run_one()
+        self.assertEqual(Observation.ABSENT, snapshot.result.observation)
+        self.assertTrue(runtime.close())
+        # No maintain() follows a close; the stopped detector's conclusion
+        # must not remain published until the observation age expires.
+        snapshot = scheduler.snapshot(key[1])
+        self.assertEqual((Observation.UNKNOWN, Reason.WORKER_UNAVAILABLE),
+                         (snapshot.result.observation, snapshot.result.reason))
+
+
 class Clock:
     value = 0
 

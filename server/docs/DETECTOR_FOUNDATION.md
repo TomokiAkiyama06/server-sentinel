@@ -147,7 +147,10 @@ confinement remains the systemd unit's job and every plugin still needs review.
 every presentation-ordered decoded frame with the per-frame detector quality
 (`unknown` until #22 supplies one) and a `render(width, height)` callback. Only
 sampled frames are rendered, at the sampled profile dimensions, and offered;
-the feed assigns strictly increasing per-stream sequences. A timestamp
+the feed assigns strictly increasing per-stream sequences. A frame of the
+current stream whose quality is not `sufficient` invalidates the published
+observation to `unknown/quality` whether or not it is an inference sample; it
+is never rendered or evaluated. A timestamp
 gap/reset, inference-profile change, new stream generation (`bind()`), closed
 or renegotiating pipeline, invalid input or render failure invalidates the
 published observation to `unknown` immediately. Because a pipeline can close,
@@ -168,6 +171,9 @@ digest-pinned RT-DETRv2 adapter (with its exact revision and artifact SHA-256
 restated) can be named. `build_inference()` refuses without a configuration,
 so no inference runtime can start with implicit settings; until then every
 source's detector observation is `unknown`, never `absent`.
+`InferenceRuntime.close()` invalidates every binding to
+`unknown/detector_worker_unavailable` before and after stopping its worker, so
+a stopped runtime never leaves a conclusion published.
 
 ## Verification and remaining acceptance
 
