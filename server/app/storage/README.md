@@ -65,3 +65,5 @@ Tests use temporary synthetic SQLite/files only. Exact threshold sizing, shared
 filesystem verification, real codecs/volumes, production timer/outbox and human
 route integration remain deployment/integration acceptance, not claims made by
 these tests. No dependency was added; all new Python code uses the stdlib.
+The lifespan binding, periodic retention and state-audit wiring live in
+`../monitoring/`.

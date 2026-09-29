@@ -153,6 +153,64 @@ class NotificationTests(unittest.TestCase):
         self.assertEqual(1, service.pending_count)
         self.assertTrue(service.local_delivery_failed)
 
+    def test_refused_local_write_of_a_final_event_is_retained_and_retried(self):
+        local, refuse = [], [True]
+        def sink(event):
+            if refuse[0]:
+                raise RuntimeError('synthetic private error')
+            local.append(event)
+        service = NotificationService(sink, queue_capacity=2)
+        self.addCleanup(service.close)
+        now = datetime.now(timezone.utc)
+        failure, warning, third = uuid4(), uuid4(), uuid4()
+        # Slack disabled: the delivery is final, only the local write failed.
+        self.assertEqual(DeliveryResult.FAILED, service.record(
+            NotificationKind.RECORDING_HEALTH_FAILURE, at=now, event_id=failure))
+        self.assertEqual(DeliveryResult.SUPPRESSED, service.record(
+            NotificationKind.RECORDING_HEALTH_WARNING, at=now, event_id=warning))
+        # The retry buffer is bounded; the overflow stays a visible failure.
+        service.record(NotificationKind.HARDWARE_INTEGRITY_FAILURE, at=now, event_id=third)
+        self.assertEqual(2, service.unpersisted_count)
+        self.assertTrue(service.local_delivery_failed)
+        # A mismatched resubmission of a retained ID is refused.
+        self.assertEqual(DeliveryResult.FAILED, service.record(
+            NotificationKind.HARDWARE_INTEGRITY_FAILURE, at=now, event_id=failure))
+        service.poll()
+        self.assertEqual([], local)
+        refuse[0] = False
+        service.poll()
+        self.assertEqual(0, service.unpersisted_count)
+        self.assertEqual({(failure, DeliveryResult.DISABLED), (warning, DeliveryResult.SUPPRESSED)},
+                         {(event.event_id, event.delivery) for event in local})
+        # Once persisted, the ID is not retained or written again by a poll.
+        service.poll()
+        self.assertEqual(2, len(local))
+
+    def test_retained_event_resubmission_retries_its_write_without_delivery(self):
+        local, refuse = [], [True]
+        def sink(event):
+            if refuse[0]:
+                raise RuntimeError('synthetic private error')
+            local.append(event)
+        transport = Transport()
+        service = NotificationService(sink, SlackDelivery(endpoint(), opener=transport),
+                                      queue_capacity=1)
+        self.addCleanup(service.close)
+        service.close()
+        now = datetime.now(timezone.utc)
+        identifier = uuid4()
+        # A closed queue makes the delivery final (failed) without a request.
+        self.assertEqual(DeliveryResult.FAILED, service.record(
+            NotificationKind.HARDWARE_INTEGRITY_FAILURE, at=now, event_id=identifier))
+        self.assertEqual(1, service.unpersisted_count)
+        refuse[0] = False
+        self.assertEqual(DeliveryResult.FAILED, service.record(
+            NotificationKind.HARDWARE_INTEGRITY_FAILURE, at=now, event_id=identifier))
+        self.assertEqual(0, service.unpersisted_count)
+        self.assertEqual([(identifier, DeliveryResult.FAILED)],
+                         [(event.event_id, event.delivery) for event in local])
+        self.assertEqual([], transport.requests)
+
     def test_full_queue_and_shutdown_leave_visible_local_failure_without_blocking(self):
         entered, release = threading.Event(), threading.Event()
         class SlowTransport(Transport):

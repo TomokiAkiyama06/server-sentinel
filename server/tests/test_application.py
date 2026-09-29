@@ -306,12 +306,12 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(
                 application.state.owner_administration.service.audit_delivery_failed,
             )
-            # Nothing was written, and reading audit history still works.
-            self.assertEqual((), application.state.audit_store.list_records())
+            # Nothing was written: not even the schema migrations, which are
+            # metadata writes that need a verified storage admission too.
             with closing(application.state.database.connect()) as connection:
-                self.assertEqual(0, connection.execute(
-                    "SELECT count(*) FROM capture_nodes"
-                ).fetchone()[0])
+                self.assertEqual([], connection.execute(
+                    "SELECT name FROM sqlite_master"
+                ).fetchall())
 
     async def test_invalid_database_fails_startup_without_leaking_exception_values(self):
         self.settings.database_path.write_text("SYNTHETIC_PRIVATE_VALUE")
