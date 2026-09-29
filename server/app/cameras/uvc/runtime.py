@@ -82,6 +82,12 @@ class LocalUvcSourceStatus:
     worker_running: bool
     worker_failures: int
     cleanup_failed: bool
+    # The latest in-memory camera transition, delivered even when persisting
+    # it was refused; ``None`` before the first transition this lifecycle.
+    camera_state: CameraState | None = None
+    # False while the latest registry health write for this source was
+    # refused (storage admission) or failed: the registry row may be stale.
+    health_persisted: bool = True
 
 
 @dataclass(frozen=True)
@@ -131,6 +137,7 @@ class LocalUvcRuntime:
         self._sink_failures = 0
         self._monotonic = monotonic
         self._last_logged: dict[UUID, float] = {}
+        self._camera: dict[UUID, CameraState] = {}
         self.health_logs_suppressed = 0
         self._state = LocalUvcRuntimeState.STARTING
         self._sources = {source_id: SourceRuntimeState.PENDING
@@ -147,6 +154,8 @@ class LocalUvcRuntime:
             if len(self._events) == self._events.maxlen:
                 self._events_dropped += 1
             self._events.append(event)
+            if event.source_id in self._sources:
+                self._camera[event.source_id] = event.state
             last = self._last_logged.get(event.source_id)
             log = (event.state is CameraState.MANUAL or last is None
                    or now - last >= HEALTH_LOG_INTERVAL_SECONDS)
@@ -248,13 +257,25 @@ class LocalUvcRuntime:
                     if state is not SourceRuntimeState.RUNNING:
                         continue
                     status = self._supervisor.status(source_id)
-                    if status is None or not status.running or status.cleanup_failed:
+                    if (status is None or not status.running or status.cleanup_failed
+                            or self._health_unpersisted(source_id)):
+                        # A live worker whose health cannot be persisted is
+                        # not a healthy service: the registry may be stale.
                         worker_problem = True
             if not worker_problem:
                 return LocalUvcRuntimeState.RUNNING
         if SourceRuntimeState.RUNNING not in states:
             return LocalUvcRuntimeState.FAILED
         return LocalUvcRuntimeState.DEGRADED
+
+    def _health_unpersisted(self, source_id: UUID) -> bool:
+        check = getattr(self.adapter, "health_unpersisted", None)
+        if check is None:
+            return False
+        try:
+            return check(source_id) is True
+        except Exception:
+            return True
 
     def stop(self) -> LocalUvcRuntimeStatus:
         """Stop every worker, then close the adapter; idempotent.
@@ -340,11 +361,14 @@ class LocalUvcRuntime:
             for source_id in self.configuration.source_ids:
                 worker = (self._supervisor.status(source_id)
                           if self._supervisor is not None else None)
+                with self._events_lock:
+                    camera = self._camera.get(source_id)
                 sources.append(LocalUvcSourceStatus(
                     source_id, self._sources[source_id],
                     bool(worker and worker.running),
                     worker.failures if worker else 0,
                     bool(worker and worker.cleanup_failed),
+                    camera, not self._health_unpersisted(source_id),
                 ))
             state = self._state
             if state in (LocalUvcRuntimeState.RUNNING, LocalUvcRuntimeState.DEGRADED):

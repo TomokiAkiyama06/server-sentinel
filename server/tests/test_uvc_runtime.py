@@ -670,7 +670,23 @@ class ApplicationWiringTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(written, admission.admitted)
             self.assertEqual(before.updated_at, registry.get_source(source.id).updated_at)
             self.assertEqual(before.last_seen_at, registry.get_source(source.id).last_seen_at)
+            # The durable row may still read ONLINE, but the capture loss is
+            # visible in memory: an OFFLINE transition, an unpersisted flag and
+            # a degraded service instead of a healthy RUNNING state.
+            status = runtime.status()
+            self.assertIs(status.state, LocalUvcRuntimeState.DEGRADED)
+            self.assertFalse(status.sources[0].health_persisted)
+            self.assertIsNot(status.sources[0].camera_state, CameraState.ONLINE)
+            self.assertIn(CameraState.OFFLINE,
+                          [event.state for event in runtime.recent_health_events()])
+            # The in-memory transition also reached the preview hub.
+            self.assertFalse(application.state.local_preview.source(source.id).live)
             admission.refuse = False
+            self.assertTrue(wait_for(lambda: runtime.status().state
+                                     is LocalUvcRuntimeState.RUNNING
+                                     and runtime.status().sources[0].health_persisted))
+            self.assertTrue(wait_for(lambda: registry.get_source(source.id).health_state
+                                     is SourceHealthState.ONLINE))
         self.assertIs(application.state.local_uvc_state, LocalUvcRuntimeState.STOPPED)
 
     def test_approval_session_marker_refused_without_admission(self):

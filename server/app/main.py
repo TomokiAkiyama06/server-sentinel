@@ -111,12 +111,19 @@ def create_app(settings: Settings, *, database: Database | None = None,
     # exactly like audit writes, so a hard stop or a missing/replaced recording
     # filesystem after startup refuses them (capture then fails visibly and
     # retries) instead of writing past the reserve or to a fallback path.
+    def local_uvc_health(event) -> None:
+        # A non-online camera transition drops that source's retained preview
+        # frame before any other sink runs, so it is never served as live.
+        local_preview.on_health(event)
+        if uvc_dependencies.health_sink is not None:
+            uvc_dependencies.health_sink(event)
+
     local_uvc_runtime = (
         LocalUvcRuntime(
             local_uvc,
             CameraRegistry(store, reservation=storage_reservation or runtime_admission),
             on_frame=local_preview.on_frame,
-            health_sink=uvc_dependencies.health_sink,
+            health_sink=local_uvc_health,
             discovery=uvc_dependencies.discovery,
             capture_factory=uvc_dependencies.capture_factory,
         ) if local_uvc is not None else None

@@ -31,6 +31,10 @@ layer without a route. `LocalPreviewHub.on_frame` runs on capture worker
 threads, is lock-protected and never raises into capture; it keeps at most one
 latest frame per configured source (bounded by `max_frame_bytes`) and only while
 that source has viewer demand, so zero subscribers retain nothing.
+`LocalPreviewHub.on_health` is wired to the runtime's camera health: any
+non-`online` transition (disconnect, capture failure, manual intervention)
+drops the retained frame and refuses new frames until the camera is `online`
+again, so a pre-loss image is never served as current live video.
 `AuthorizedLocalPreview` wraps `LiveViewerSessions`: every `open` and `read`
 re-runs the validator. The route obtains a `BoundLiveAccess` through
 `app.auth.live_access.authorize_live_access`, which runs

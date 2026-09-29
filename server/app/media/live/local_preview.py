@@ -51,6 +51,9 @@ class _PreviewSource:
         self.viewers: set[UUID] = set()
         self.latest: PreviewFrame | None = None
         self.sequence = 0
+        # Cleared by any non-online camera transition: a retained frame from
+        # before a disconnect or capture failure is never served as live.
+        self.live = True
 
     def add_viewer(self, subscriber_id: UUID) -> None:
         with self._hub._lock:
@@ -98,13 +101,31 @@ class LocalPreviewHub:
                 self._invalid += 1
             return
         with self._lock:
-            if not source.viewers:
+            if not source.viewers or not source.live:
                 return
             if len(data) > self._max_frame_bytes:
                 self._oversized += 1
                 return
             source.sequence += 1
             source.latest = PreviewFrame(source.sequence, bytes(data))
+
+    def on_health(self, event) -> None:
+        """Camera health sink; never raises into the capture worker.
+
+        Only an ``online`` transition accepts frames again. Every other state
+        (offline, degraded, manual intervention, unknown) drops the retained
+        frame at once, so a reader never receives a pre-loss image that it
+        cannot distinguish from current live video.
+        """
+        source_id = getattr(event, "source_id", None)
+        source = self._sources.get(source_id) if isinstance(source_id, UUID) else None
+        if source is None:
+            return
+        online = getattr(getattr(event, "state", None), "value", None) == "online"
+        with self._lock:
+            source.live = online
+            if not online:
+                source.latest = None
 
     def latest(self, source_id: UUID, after_sequence: int = 0) -> PreviewFrame | None:
         with self._lock:

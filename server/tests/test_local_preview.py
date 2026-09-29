@@ -279,6 +279,56 @@ class RuntimePreviewTests(RuntimeFixture):
         self.assertEqual(0, hub.status.retained_bytes)
         runtime.stop()
 
+    def test_capture_loss_drops_retained_frame_while_viewers_remain(self):
+        # After a disconnect the pre-loss frame is never served as live, not
+        # even to a newly opened session reading from sequence 0.
+        source = self.source()
+        hub = LocalPreviewHub((source.id,))
+        self.on_frame = hub.on_frame
+        runtime = self.runtime(source.id, health_sink=hub.on_health)
+        runtime.start()
+        admin = OwnerAdministration(
+            OwnerAuditService(AuditStore(self.database), PermitOwner()), self.registry,
+        )
+        runtime.reapprove(admin, "synthetic-owner", source.id, self.camera)
+        self.assertTrue(self.wait_health(source.id, SourceHealthState.ONLINE))
+        access = AccessFixture(self.database)
+        preview = AuthorizedLocalPreview(hub, LIMITS, live_view_validator(self.database, clock=lambda: NOW))
+        viewer = access.principal((Permission.LIVE_VIEW,))
+        session = preview.open(viewer, source.id)
+        self.assertTrue(wait_for(lambda: preview.read(viewer, session.session_id) is not None))
+
+        self.discovery.devices = []
+        self.assertTrue(self.wait_health(source.id, SourceHealthState.OFFLINE))
+        self.assertTrue(wait_for(lambda: hub.status.retained_bytes == 0))
+        self.assertIsNone(preview.read(viewer, session.session_id))
+        other = access.principal((Permission.LIVE_VIEW,))
+        fresh = preview.open(other, source.id)
+        self.assertIsNone(preview.read(other, fresh.session_id, 0))
+        # Frames flow again only after the camera is online again.
+        self.discovery.devices = [self.camera]
+        self.assertTrue(self.wait_health(source.id, SourceHealthState.ONLINE))
+        self.assertTrue(wait_for(lambda: preview.read(other, fresh.session_id) is not None))
+        runtime.stop()
+
+    def test_non_online_health_event_invalidates_hub_slot(self):
+        from app.cameras.uvc.identity import CameraState, HealthEvent
+        source = uuid4()
+        hub = LocalPreviewHub((source,))
+        hub.source(source).add_viewer(uuid4())
+        hub.on_frame(source, frame())
+        self.assertIsNotNone(hub.latest(source))
+        for state in (CameraState.OFFLINE, CameraState.DEGRADED, CameraState.MANUAL):
+            hub.on_health(HealthEvent(source, CameraState.ONLINE, "video_capture_ready"))
+            hub.on_frame(source, frame())
+            self.assertIsNotNone(hub.latest(source))
+            hub.on_health(HealthEvent(source, state, "synthetic"))
+            self.assertIsNone(hub.latest(source))
+            hub.on_frame(source, frame())
+            self.assertIsNone(hub.latest(source))
+        hub.on_health(object())
+        hub.on_health(HealthEvent(uuid4(), CameraState.OFFLINE, "synthetic"))
+
 
 if __name__ == "__main__":
     unittest.main()

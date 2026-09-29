@@ -87,9 +87,12 @@ once, when a later monitoring retry reaches `running`. After startup every
 capture-driven write (source health, negotiated profile, last-seen timestamp,
 approval session marker) is admitted by the same Main storage policy as audit
 writes, so a hard stop or a missing/replaced filesystem refuses it: capture
-then fails visibly (worker failure count, camera not written healthy) and
-retries instead of writing past the reserve. A lifespan startup that fails or
-is cancelled while the runtime starts still stops every worker. A UUID
+then fails visibly and retries instead of writing past the reserve. The
+in-memory camera transition is still delivered (`recent_health_events()`,
+per-source `camera_state`), `health_persisted` becomes false and the service
+reports `degraded`, because the durable row may still show an earlier state.
+A lifespan startup that fails or is cancelled while the runtime starts still
+stops every worker. A UUID
 that is not a `local_uvc` source is `rejected`, never silently skipped; a worker
 that fails to start is `worker_failed` and its camera is written `offline`.
 Service state (`running` / `degraded` / `failed` / `stopped` / `stop_failed`)
