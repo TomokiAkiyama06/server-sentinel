@@ -12,11 +12,13 @@ import base64
 import hashlib
 import hmac
 import secrets
-import sqlite3
 import time
 from typing import Callable, Protocol
 from uuid import UUID, uuid4
 
+from app.audit.model import ActorCategory, AuditAction, AuditOutcome, TargetKind
+from app.audit.service import OwnerAuthorizationError
+from app.audit.store import AuditStorageError, AuditStore
 from app.storage.database import Database
 
 _CODE_BYTES = 16
@@ -134,72 +136,116 @@ class PairingLedger:
     a previous process are rejected rather than interpreting a monotonic clock
     across restart. All admission decisions read durable revocation/activation
     state; a certificate alone can never authorize a node.
+
+    Every state change commits in the same SQLite transaction as its bounded
+    security audit record, admitted through the injected ``AuditStore``'s
+    storage reservation, so an audit write failure rolls the change back. Only
+    the capture node's application logical UUID is recorded; a pairing code,
+    its digest, the enrollment identity and key/serial digests never are. An
+    Owner-only call refused by the authorizer runs nothing and records a
+    ``denied`` outcome. Redemption attempts that match no pending enrollment
+    (unknown identity, wrong code or wrong key) record nothing, so an
+    unauthenticated caller cannot grow the audit table. When a matched
+    redemption's audit append or commit fails, the rolled-back outcome is
+    counted in the bounded ledger health instead of being appended separately,
+    so repeated attempts still cannot grow the table.
     """
 
     def __init__(self, database: Database, verifier: CodeVerifier, *,
+                 audit: AuditStore,
                  clock: Callable[[], float] = time.monotonic,
                  process_epoch: UUID | None = None):
         if not isinstance(database, Database) or not callable(getattr(verifier, "digest", None)):
+            raise PairingValidationError("invalid pairing ledger dependency")
+        if not isinstance(audit, AuditStore) or audit.database != database:
             raise PairingValidationError("invalid pairing ledger dependency")
         if not callable(clock):
             raise PairingValidationError("invalid pairing clock")
         self.database = database
         self.verifier = verifier
+        self.audit = audit
         self.clock = clock
         self.process_epoch = process_epoch or uuid4()
         if not isinstance(self.process_epoch, UUID):
             raise PairingValidationError("invalid pairing process epoch")
+        # Bounded health only: an outcome that could not be recorded outside a
+        # committed mutation stays visible instead of being silently dropped.
+        self.audit_delivery_failed = False
+        self.undelivered_audit_records = 0
 
     @contextmanager
     def _transaction(self, *, write: bool):
-        connection = None
+        # The audit store owns connection lifetime, rollback and the storage
+        # admission for writes; a refused admission propagates unchanged.
         try:
-            connection = self.database.connect()
-            connection.execute("BEGIN IMMEDIATE" if write else "BEGIN")
-            yield connection
-            connection.execute("COMMIT")
-        except sqlite3.Error:
-            if connection is not None and connection.in_transaction:
-                connection.execute("ROLLBACK")
+            with self.audit.transaction(write=write) as connection:
+                yield connection
+        except AuditStorageError:
             raise PairingStorageError("pairing ledger operation failed") from None
-        except BaseException:
-            if connection is not None and connection.in_transaction:
-                connection.execute("ROLLBACK")
-            raise
-        finally:
-            if connection is not None:
-                connection.close()
 
-    @staticmethod
-    def _authorize(authorizer: OwnerAuthorizer, actor_context: object) -> None:
-        if not callable(getattr(authorizer, "require_owner", None)):
-            raise PairingAuthorizationError("owner authorization is unavailable")
+    def _record(self, actor: ActorCategory, action: AuditAction, node: UUID,
+                outcome: AuditOutcome) -> None:
+        """Append an outcome in its own admitted transaction; never raise."""
         try:
-            authorizer.require_owner(actor_context)
-        except PermissionError:
+            self.audit.append(actor_category=actor, action=action,
+                              target_kind=TargetKind.CAPTURE_NODE,
+                              target_logical_id=node, outcome=outcome)
+        except Exception:
+            self._mark_undelivered()
+
+    def _mark_undelivered(self) -> None:
+        self.audit_delivery_failed = True
+        self.undelivered_audit_records += 1
+
+    def _append_on(self, connection, actor: ActorCategory, action: AuditAction, node: UUID,
+                   outcome: AuditOutcome) -> None:
+        self.audit.append_on(connection, actor_category=actor, action=action,
+                        target_kind=TargetKind.CAPTURE_NODE,
+                        target_logical_id=node, outcome=outcome)
+
+    def _authorize(self, authorizer: OwnerAuthorizer, actor_context: object,
+                   action: AuditAction, node: UUID) -> None:
+        gate = getattr(authorizer, "require_owner", None)
+        try:
+            if not callable(gate):
+                raise PermissionError
+            gate(actor_context)
+        except PermissionError as error:
+            # Never read an injected authorizer's message or attributes other
+            # than the bounded category of this subsystem's own denial type.
+            category = (error.actor_category if isinstance(error, OwnerAuthorizationError)
+                        else ActorCategory.UNAUTHENTICATED)
+            self._record(category, action, node, AuditOutcome.DENIED)
             raise PairingAuthorizationError("owner authorization denied") from None
 
     def approve(self, authorizer: OwnerAuthorizer, actor_context: object, *,
                 node_id: UUID, public_key_digest: str) -> tuple[EnrollmentApproval, PairingCode]:
         """Create a fresh Owner-approved enrollment and return its ephemeral code."""
-        self._authorize(authorizer, actor_context)
         node = _identity(node_id, "node identity")
-        key_digest = _digest(public_key_digest, "public key digest")
-        code = _new_code()
-        code_digest = _digest(self.verifier.digest(code.value), "pairing verifier result")
-        now = self.clock()
-        if not isinstance(now, (float, int)):
-            raise PairingValidationError("invalid pairing clock")
-        expires = float(now) + _CODE_LIFETIME_SECONDS
-        approval = EnrollmentApproval(uuid4(), node, key_digest, expires)
-        with self._transaction(write=True) as connection:
-            connection.execute(
-                "INSERT INTO pairing_enrollments "
-                "(id, node_id, public_key_digest, code_digest, process_epoch, expires_at, state) "
-                "VALUES (?, ?, ?, ?, ?, ?, 'pending')",
-                (str(approval.enrollment_id), str(node), key_digest, code_digest,
-                 str(self.process_epoch), expires),
-            )
+        action = AuditAction.APPROVE_CAPTURE_NODE_ENROLLMENT
+        self._authorize(authorizer, actor_context, action, node)
+        try:
+            key_digest = _digest(public_key_digest, "public key digest")
+            code = _new_code()
+            code_digest = _digest(self.verifier.digest(code.value), "pairing verifier result")
+            now = self.clock()
+            if not isinstance(now, (float, int)):
+                raise PairingValidationError("invalid pairing clock")
+            expires = float(now) + _CODE_LIFETIME_SECONDS
+            approval = EnrollmentApproval(uuid4(), node, key_digest, expires)
+            with self._transaction(write=True) as connection:
+                connection.execute(
+                    "INSERT INTO pairing_enrollments "
+                    "(id, node_id, public_key_digest, code_digest, process_epoch, expires_at, state) "
+                    "VALUES (?, ?, ?, ?, ?, ?, 'pending')",
+                    (str(approval.enrollment_id), str(node), key_digest, code_digest,
+                     str(self.process_epoch), expires),
+                )
+                self._append_on(connection, ActorCategory.OWNER, action, node,
+                                AuditOutcome.SUCCEEDED)
+        except Exception:
+            self._record(ActorCategory.OWNER, action, node, AuditOutcome.FAILED)
+            raise
         return approval, code
 
     def redeem(self, *, enrollment_id: UUID, public_key_digest: str,
@@ -211,30 +257,51 @@ class PairingLedger:
         now = self.clock()
         if not isinstance(now, (float, int)):
             raise PairingValidationError("invalid pairing clock")
+        action = AuditAction.REDEEM_CAPTURE_NODE_ENROLLMENT
         expired = False
         claim = None
-        with self._transaction(write=True) as connection:
-            row = connection.execute(
-                "SELECT node_id, public_key_digest, code_digest, process_epoch, expires_at, state "
-                "FROM pairing_enrollments WHERE id = ?", (str(enrollment),)
-            ).fetchone()
-            if row is None or row["state"] != "pending":
-                raise PairingError("pairing enrollment is unavailable")
-            if row["process_epoch"] != str(self.process_epoch) or float(now) >= row["expires_at"]:
-                connection.execute("UPDATE pairing_enrollments SET state = 'expired' WHERE id = ?", (str(enrollment),))
-                expired = True
-            elif not HmacCodeVerifier.matches(row["code_digest"], candidate):
-                raise PairingError("pairing enrollment is unavailable")
-            elif not hmac.compare_digest(row["public_key_digest"], key_digest):
-                raise PairingError("pairing enrollment is unavailable")
-            else:
-                changed = connection.execute(
-                    "UPDATE pairing_enrollments SET state = 'consumed' "
-                    "WHERE id = ? AND state = 'pending'", (str(enrollment),)
-                ).rowcount
-                if changed != 1:
+        # Only a matched enrollment (expiry or consumption) produces an audit
+        # outcome; ordinary unmatched denials never reach an append.
+        audit_attempted = False
+        try:
+            with self._transaction(write=True) as connection:
+                row = connection.execute(
+                    "SELECT node_id, public_key_digest, code_digest, process_epoch, expires_at, state "
+                    "FROM pairing_enrollments WHERE id = ?", (str(enrollment),)
+                ).fetchone()
+                if row is None or row["state"] != "pending":
                     raise PairingError("pairing enrollment is unavailable")
-                claim = EnrollmentClaim(enrollment, UUID(row["node_id"]), key_digest)
+                node = UUID(row["node_id"])
+                if row["process_epoch"] != str(self.process_epoch) or float(now) >= row["expires_at"]:
+                    # A pending enrollment expires at most once, so this record is
+                    # bounded by Owner approvals rather than by redemption attempts.
+                    connection.execute("UPDATE pairing_enrollments SET state = 'expired' WHERE id = ?", (str(enrollment),))
+                    audit_attempted = True
+                    self._append_on(connection, ActorCategory.CAPTURE_NODE, action, node,
+                                    AuditOutcome.FAILED)
+                    expired = True
+                elif not HmacCodeVerifier.matches(row["code_digest"], candidate):
+                    raise PairingError("pairing enrollment is unavailable")
+                elif not hmac.compare_digest(row["public_key_digest"], key_digest):
+                    raise PairingError("pairing enrollment is unavailable")
+                else:
+                    changed = connection.execute(
+                        "UPDATE pairing_enrollments SET state = 'consumed' "
+                        "WHERE id = ? AND state = 'pending'", (str(enrollment),)
+                    ).rowcount
+                    if changed != 1:
+                        raise PairingError("pairing enrollment is unavailable")
+                    audit_attempted = True
+                    self._append_on(connection, ActorCategory.CAPTURE_NODE, action, node,
+                                    AuditOutcome.SUCCEEDED)
+                    claim = EnrollmentClaim(enrollment, node, key_digest)
+        except Exception:
+            if audit_attempted:
+                # The append or its commit failed and rolled the change back.
+                # Surface the lost outcome in bounded health only: a separate
+                # append would let repeated attempts grow the audit table.
+                self._mark_undelivered()
+            raise
         if expired:
             raise PairingError("pairing enrollment is unavailable")
         if claim is None:
@@ -249,38 +316,53 @@ class PairingLedger:
         """
         if not isinstance(claim, EnrollmentClaim):
             raise PairingValidationError("invalid enrollment claim")
-        serial = _digest(credential_serial_digest, "credential serial digest")
-        with self._transaction(write=True) as connection:
-            row = connection.execute(
-                "SELECT node_id, public_key_digest, state FROM pairing_enrollments WHERE id = ?",
-                (str(claim.enrollment_id),),
-            ).fetchone()
-            if (row is None or row["state"] != "consumed" or row["node_id"] != str(claim.node_id)
-                    or not hmac.compare_digest(row["public_key_digest"], claim.public_key_digest)):
-                raise PairingError("pairing enrollment cannot be activated")
-            connection.execute(
-                "INSERT INTO pairing_node_credentials "
-                "(node_id, public_key_digest, credential_serial_digest, state) VALUES (?, ?, ?, 'active') "
-                "ON CONFLICT(node_id) DO UPDATE SET public_key_digest = excluded.public_key_digest, "
-                "credential_serial_digest = excluded.credential_serial_digest, state = 'active'",
-                (str(claim.node_id), claim.public_key_digest, serial),
-            )
-            connection.execute("UPDATE pairing_enrollments SET state = 'activated' WHERE id = ?", (str(claim.enrollment_id),))
+        node = _identity(claim.node_id, "node identity")
+        action = AuditAction.ACTIVATE_CAPTURE_NODE_CREDENTIAL
+        try:
+            serial = _digest(credential_serial_digest, "credential serial digest")
+            with self._transaction(write=True) as connection:
+                row = connection.execute(
+                    "SELECT node_id, public_key_digest, state FROM pairing_enrollments WHERE id = ?",
+                    (str(claim.enrollment_id),),
+                ).fetchone()
+                if (row is None or row["state"] != "consumed" or row["node_id"] != str(node)
+                        or not hmac.compare_digest(row["public_key_digest"], claim.public_key_digest)):
+                    raise PairingError("pairing enrollment cannot be activated")
+                connection.execute(
+                    "INSERT INTO pairing_node_credentials "
+                    "(node_id, public_key_digest, credential_serial_digest, state) VALUES (?, ?, ?, 'active') "
+                    "ON CONFLICT(node_id) DO UPDATE SET public_key_digest = excluded.public_key_digest, "
+                    "credential_serial_digest = excluded.credential_serial_digest, state = 'active'",
+                    (str(node), claim.public_key_digest, serial),
+                )
+                connection.execute("UPDATE pairing_enrollments SET state = 'activated' WHERE id = ?", (str(claim.enrollment_id),))
+                self._append_on(connection, ActorCategory.SYSTEM, action, node,
+                                AuditOutcome.SUCCEEDED)
+        except Exception:
+            self._record(ActorCategory.SYSTEM, action, node, AuditOutcome.FAILED)
+            raise
 
     def revoke(self, authorizer: OwnerAuthorizer, actor_context: object, *, node_id: UUID) -> None:
-        self._authorize(authorizer, actor_context)
         node = _identity(node_id, "node identity")
-        with self._transaction(write=True) as connection:
-            credentials = connection.execute(
-                "UPDATE pairing_node_credentials SET state = 'revoked' WHERE node_id = ? AND state = 'active'",
-                (str(node),),
-            ).rowcount
-            enrollments = connection.execute(
-                "UPDATE pairing_enrollments SET state = 'revoked' "
-                "WHERE node_id = ? AND state IN ('pending', 'consumed')", (str(node),),
-            ).rowcount
-            if credentials + enrollments == 0:
-                raise PairingError("capture node is unavailable")
+        action = AuditAction.REVOKE_CAPTURE_NODE_PAIRING
+        self._authorize(authorizer, actor_context, action, node)
+        try:
+            with self._transaction(write=True) as connection:
+                credentials = connection.execute(
+                    "UPDATE pairing_node_credentials SET state = 'revoked' WHERE node_id = ? AND state = 'active'",
+                    (str(node),),
+                ).rowcount
+                enrollments = connection.execute(
+                    "UPDATE pairing_enrollments SET state = 'revoked' "
+                    "WHERE node_id = ? AND state IN ('pending', 'consumed')", (str(node),),
+                ).rowcount
+                if credentials + enrollments == 0:
+                    raise PairingError("capture node is unavailable")
+                self._append_on(connection, ActorCategory.OWNER, action, node,
+                                AuditOutcome.SUCCEEDED)
+        except Exception:
+            self._record(ActorCategory.OWNER, action, node, AuditOutcome.FAILED)
+            raise
 
     def admits(self, *, node_id: UUID, public_key_digest: str,
                credential_serial_digest: str) -> bool:

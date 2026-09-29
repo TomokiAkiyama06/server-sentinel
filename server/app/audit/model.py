@@ -53,7 +53,15 @@ class AuditAction(StrEnum):
     CREATE_CAPTURE_NODE = "create_capture_node"
     UPDATE_CAPTURE_NODE = "update_capture_node"
     REVOKE_CAPTURE_NODE = "revoke_capture_node"
+    APPROVE_CAPTURE_NODE_ENROLLMENT = "approve_capture_node_enrollment"
+    REDEEM_CAPTURE_NODE_ENROLLMENT = "redeem_capture_node_enrollment"
+    ACTIVATE_CAPTURE_NODE_CREDENTIAL = "activate_capture_node_credential"
+    REVOKE_CAPTURE_NODE_PAIRING = "revoke_capture_node_pairing"
+    INVITE_PRINCIPAL = "invite_principal"
+    ISSUE_PRINCIPAL_INVITATION = "issue_principal_invitation"
+    REDEEM_PRINCIPAL_INVITATION = "redeem_principal_invitation"
     CHANGE_PRINCIPAL_PERMISSIONS = "change_principal_permissions"
+    REVOKE_PRINCIPAL_CREDENTIAL = "revoke_principal_credential"
     REVOKE_PRINCIPAL = "revoke_principal"
     DELETE_RECORDING = "delete_recording"
     DELETE_RECORDING_CLEANUP = "delete_recording_cleanup"
@@ -77,7 +85,15 @@ ACTION_TARGETS = {
     AuditAction.CREATE_CAPTURE_NODE: TargetKind.CAPTURE_NODE,
     AuditAction.UPDATE_CAPTURE_NODE: TargetKind.CAPTURE_NODE,
     AuditAction.REVOKE_CAPTURE_NODE: TargetKind.CAPTURE_NODE,
+    AuditAction.APPROVE_CAPTURE_NODE_ENROLLMENT: TargetKind.CAPTURE_NODE,
+    AuditAction.REDEEM_CAPTURE_NODE_ENROLLMENT: TargetKind.CAPTURE_NODE,
+    AuditAction.ACTIVATE_CAPTURE_NODE_CREDENTIAL: TargetKind.CAPTURE_NODE,
+    AuditAction.REVOKE_CAPTURE_NODE_PAIRING: TargetKind.CAPTURE_NODE,
+    AuditAction.INVITE_PRINCIPAL: TargetKind.PRINCIPAL,
+    AuditAction.ISSUE_PRINCIPAL_INVITATION: TargetKind.PRINCIPAL,
+    AuditAction.REDEEM_PRINCIPAL_INVITATION: TargetKind.PRINCIPAL,
     AuditAction.CHANGE_PRINCIPAL_PERMISSIONS: TargetKind.PRINCIPAL,
+    AuditAction.REVOKE_PRINCIPAL_CREDENTIAL: TargetKind.PRINCIPAL,
     AuditAction.REVOKE_PRINCIPAL: TargetKind.PRINCIPAL,
     AuditAction.DELETE_RECORDING: TargetKind.RECORDING,
     AuditAction.DELETE_RECORDING_CLEANUP: TargetKind.RECORDING,
