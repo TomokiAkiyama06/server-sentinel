@@ -164,6 +164,13 @@ class SourceContinuity:
 
 
 @dataclass
+class AuthorizationChange:
+    """Result of a fenced authorization change; filled only when it commits."""
+
+    released_gaps: tuple[GapEvent, ...] = ()
+
+
+@dataclass
 class _Source:
     """Per-source state; ``last_sequence`` None means nothing committed yet.
 
@@ -239,7 +246,9 @@ class ContinuityTracker:
         return now
 
     @contextmanager
-    def authorization_change(self, *, revoked_node: UUID | None = None) -> Iterator[None]:
+    def authorization_change(self, *, revoked_node: UUID | None = None,
+                             deactivated_source: UUID | None = None,
+                             ) -> Iterator["AuthorizationChange"]:
         """Serialize a durable authorization change with every grant/commit.
 
         The caller commits the revocation or source deactivation inside the
@@ -247,22 +256,33 @@ class ContinuityTracker:
         there.  Both locks are held (tracker, then queue: the same order as
         ``receive``), so every ``open_session``, ``heartbeat``, ``receive`` and
         direct queue ``submit`` authorizes and acts entirely before or
-        entirely after the commit.  When the block completes, the current
-        grant of ``revoked_node`` is closed (its sources become
-        ``interrupted``) and its rate window is discarded, so a grant issued
-        just before the commit is unusable afterwards.  If the commit raises,
-        nothing is changed.  ``forget_node``/``forget_source`` may follow to
-        release state and collect undrained gaps.
+        entirely after the commit.
+
+        When the block completes, and before this tracker's lock is released,
+        ``revoked_node`` is forgotten with every source it owns (so a grant
+        issued just before the commit is unusable afterwards) and its rate
+        window is discarded, and ``deactivated_source`` releases its active
+        source slot.  No waiting caller can therefore observe the committed
+        change with the released state still present (for example a
+        replacement source refused ``source_capacity``).  Undrained gaps of
+        the released sources are not dropped: they are handed back in the
+        yielded ``AuthorizationChange.released_gaps`` for the caller to
+        persist.  If the commit raises, nothing is changed.
         """
-        if revoked_node is not None and not isinstance(revoked_node, UUID):
-            raise ValueError("invalid agent node identity")
+        if ((revoked_node is not None and not isinstance(revoked_node, UUID))
+                or (deactivated_source is not None
+                    and not isinstance(deactivated_source, UUID))):
+            raise ValueError("invalid agent authorization change")
+        change = AuthorizationChange()
         with self._lock:
             with self._ingest.authorization_change(revoked_node=revoked_node):
-                yield
+                yield change
+            released = []
             if revoked_node is not None:
-                node = self._nodes.get(revoked_node)
-                if node is not None:
-                    node.open = False
+                released.extend(self._forget_node_locked(revoked_node))
+            if deactivated_source is not None:
+                released.extend(self._forget_source_locked(deactivated_source))
+            change.released_gaps = tuple(released)
 
     def open_session(self, node_id: UUID) -> AgentSession:
         """Grant a new session to an already mTLS-authenticated node identity.
@@ -278,7 +298,8 @@ class ContinuityTracker:
             # refuse the grant instead of reopening an invalidated session.
             # A revocation committed inside ``authorization_change`` cannot
             # land between this check and the grant; one committed after the
-            # grant closes it when that block completes.
+            # grant forgets the node (and so the grant) when that block
+            # completes.
             self._authorizer.require_node(node_id)
             # Liveness time is sampled under the lock so a delayed caller can
             # never apply an older ``now`` after a newer update (see _seen).
@@ -589,6 +610,19 @@ class ContinuityTracker:
                     result.append(state.gaps.popleft())
             return tuple(result)
 
+    def _forget_source_locked(self, source_id: UUID) -> tuple[GapEvent, ...]:
+        state = self._sources.pop(source_id, None)
+        return () if state is None else tuple(state.gaps)
+
+    def _forget_node_locked(self, node_id: UUID) -> tuple[GapEvent, ...]:
+        self._nodes.pop(node_id, None)
+        owned = [source for source, state in self._sources.items()
+                 if state.node_id == node_id]
+        pending = []
+        for source_id in owned:
+            pending.extend(self._sources.pop(source_id).gaps)
+        return tuple(pending)
+
     def forget_source(self, source_id: UUID) -> tuple[GapEvent, ...]:
         """Release one source slot after durable deactivation/replacement.
 
@@ -596,23 +630,18 @@ class ContinuityTracker:
         identities, so a deactivated source must free its slot without
         discarding continuity of the node's other sources.  Undrained gaps
         are returned so the caller can persist them; nothing is dropped
-        silently.  The authorizer must already refuse the source.
+        silently.  The authorizer must already refuse the source.  A
+        deactivation committed through ``authorization_change`` releases the
+        slot there, atomically with the commit.
         """
         if not isinstance(source_id, UUID):
             raise ValueError("invalid agent source identity")
         with self._lock:
-            state = self._sources.pop(source_id, None)
-            return () if state is None else tuple(state.gaps)
+            return self._forget_source_locked(source_id)
 
     def forget_node(self, node_id: UUID) -> tuple[GapEvent, ...]:
         """Drop state after durable revocation/removal; returns undrained gaps."""
         if not isinstance(node_id, UUID):
             raise ValueError("invalid agent node identity")
         with self._lock:
-            self._nodes.pop(node_id, None)
-            owned = [source for source, state in self._sources.items()
-                     if state.node_id == node_id]
-            pending = []
-            for source_id in owned:
-                pending.extend(self._sources.pop(source_id).gaps)
-            return tuple(pending)
+            return self._forget_node_locked(node_id)

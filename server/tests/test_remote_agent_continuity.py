@@ -128,11 +128,12 @@ def start(target):
 
 def revoke_in_fence(fence, authorizer, *, committed, hold=None, node=NODE):
     def commit():
-        with fence(revoked_node=node):
+        with fence(revoked_node=node) as change:
             authorizer.revoked.add(node)
             committed.set()
             if hold is not None and not hold.wait(5):
                 raise AssertionError("fence was never released")
+        return change
     return commit
 
 
@@ -1023,13 +1024,13 @@ class ContinuityTrackerTests(unittest.TestCase):
         authorizer = GatedAuthorizer()
         tracker, ingest, _, _ = build(authorizer=authorizer)
         first = tracker.open_session(NODE)
-        tracker.receive(first, unit(0), b"v")
+        tracker.receive(first, unit(2), b"v")
         authorizer.armed = True
         opener, opened = start(lambda: tracker.open_session(NODE))
         self.assertTrue(authorizer.passed.wait(5))
         committed = threading.Event()
-        revoker, _ = start(revoke_in_fence(tracker.authorization_change, authorizer,
-                                           committed=committed))
+        revoker, revoked = start(revoke_in_fence(tracker.authorization_change, authorizer,
+                                                 committed=committed))
         # The durable revocation cannot commit between the grant's passing
         # authorization check and the grant itself.
         self.assertFalse(committed.wait(0.2))
@@ -1040,10 +1041,13 @@ class ContinuityTrackerTests(unittest.TestCase):
         self.assertTrue(committed.is_set())
         granted = opened["value"]
         self.assertIsInstance(granted, AgentSession)
-        # The grant issued just before the commit was closed by the fence
-        # itself, before any later heartbeat or media recheck.
-        self.assertEqual(SourceFlow.INTERRUPTED, flow(tracker).flow)
+        # The grant issued just before the commit was released by the fence
+        # itself, before any later heartbeat or media recheck, and the
+        # revoked node's undrained gap is handed back rather than dropped.
         self.assertIsNone(tracker._current(granted))
+        self.assertEqual((), tracker.snapshot())
+        self.assertEqual([GapReason.SEQUENCE_SKIP],
+                         [gap.reason for gap in revoked["value"].released_gaps])
         self.assertEqual(0, ingest.snapshot().tracked_rate_windows)
         with self.assertRaises(PermissionError):
             tracker.open_session(NODE)
@@ -1067,18 +1071,55 @@ class ContinuityTrackerTests(unittest.TestCase):
         self.assertFalse(opener.is_alive() or revoker.is_alive())
         self.assertIsInstance(opened["value"], PermissionError)
 
+    def test_source_deactivation_releases_its_slot_inside_the_fence(self):
+        authorizer = Authorizer({(NODE, SOURCE)})
+        tracker, _, _, _ = build(authorizer=authorizer, sources=1)
+        session = tracker.open_session(NODE)
+        tracker.receive(session, unit(3), b"v")
+        committed, hold = threading.Event(), threading.Event()
+
+        def deactivate():
+            with tracker.authorization_change(deactivated_source=SOURCE) as change:
+                authorizer.pairs.discard((NODE, SOURCE))
+                authorizer.pairs.add((NODE, OTHER_SOURCE))
+                committed.set()
+                if not hold.wait(5):
+                    raise AssertionError("fence was never released")
+            return change
+
+        deactivator, deactivated = start(deactivate)
+        self.assertTrue(committed.wait(5))
+        # A replacement that waits for the commit must find the slot free.
+        replacer, replaced = start(
+            lambda: tracker.receive(session, unit(0, source=OTHER_SOURCE), b"v"))
+        hold.set()
+        deactivator.join(5)
+        replacer.join(5)
+        self.assertFalse(deactivator.is_alive() or replacer.is_alive())
+        self.assertEqual(DeliveryOutcome.ACCEPTED, replaced["value"].outcome)
+        self.assertEqual([OTHER_SOURCE], [item.source_id for item in tracker.snapshot()])
+        self.assertEqual([(GapReason.SEQUENCE_SKIP, 3)],
+                         [(gap.reason, gap.missing_units)
+                          for gap in deactivated["value"].released_gaps])
+        self.assertTrue(tracker.heartbeat(session))
+
     def test_failed_revocation_commit_changes_no_session_state(self):
         tracker, ingest, _, _ = build()
         session = tracker.open_session(NODE)
         tracker.receive(session, unit(0), b"v")
         with self.assertRaises(RuntimeError):
-            with tracker.authorization_change(revoked_node=NODE):
+            with tracker.authorization_change(revoked_node=NODE,
+                                              deactivated_source=SOURCE) as change:
                 raise RuntimeError("durable commit failed")
+        self.assertEqual((), change.released_gaps)
         self.assertTrue(tracker.heartbeat(session))
         self.assertEqual(SourceFlow.RECEIVING, flow(tracker).flow)
         self.assertEqual(1, ingest.snapshot().tracked_rate_windows)
         with self.assertRaises(ValueError):
             with tracker.authorization_change(revoked_node="node"):
+                pass
+        with self.assertRaises(ValueError):
+            with tracker.authorization_change(deactivated_source="source"):
                 pass
 
     def test_direct_queue_submit_is_serialized_with_revocation_commit(self):

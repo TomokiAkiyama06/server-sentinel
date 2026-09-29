@@ -56,8 +56,11 @@ explicitly forbidden by the Issue.
    node/source lifecycle commits it inside the tracker's (and, for direct
    queue users, the queue's) `authorization_change` block, which holds those
    locks for the commit: every check-then-act section runs entirely before or
-   entirely after it, and a grant issued just before the commit is closed and
-   its rate window discarded when the block completes.
+   entirely after it. Before the block releases the tracker lock, a revoked
+   node is forgotten with its sources (so a grant issued just before the
+   commit is unusable) and its rate window is discarded, and a deactivated
+   source releases its active-source slot; undrained gaps of released
+   sources are handed back to the caller for persistence, never dropped.
 3. **Commit only after bounded admission.** A unit advances continuity only
    after the #14 `AgentIngestQueue` accepts it. Backpressure/rate refusal
    leaves state unchanged so the Agent retries the same sequence from its disk
