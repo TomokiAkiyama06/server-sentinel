@@ -216,9 +216,8 @@ class AgentIngestQueue:
         """
         if not isinstance(node_id, UUID):
             raise ValueError("invalid agent node identity")
-        now = self._now()
         with self._lock:
-            return self._consume_rate_locked(node_id, now)
+            return self._consume_rate_locked(node_id, self._now())
 
     def submit(self, message: AgentMessage) -> IngestAdmission:
         if not isinstance(message, AgentMessage):
@@ -231,10 +230,11 @@ class AgentIngestQueue:
                 self._rejected += 1
                 return self._admission(IngestOutcome.REJECTED, "unauthorized")
 
-        now = self._now()
         size = len(message.payload)
         with self._lock:
-            refusal = self._consume_rate_locked(message.node_id, now)
+            # Sampled under the lock: a delayed caller's older sample must not
+            # read as clock regression against a concurrently opened window.
+            refusal = self._consume_rate_locked(message.node_id, self._now())
             if refusal is not None:
                 return refusal
             if size > self.limits.maximum_message_bytes:

@@ -799,6 +799,55 @@ class ContinuityTrackerTests(unittest.TestCase):
         self.assertEqual(32, ingest.snapshot().queued_messages)
         self.assertEqual(32, outcomes.count(DeliveryOutcome.ACCEPTED))
 
+    def test_liveness_time_is_sampled_while_holding_the_locks(self):
+        """A delayed caller must not apply a sample taken before a newer update."""
+        authorizer = Authorizer()
+        samples = []
+        holders = {}
+
+        def clock_for(name):
+            def read():
+                samples.append((name, holders[name].locked()))
+                return 5
+            return read
+
+        ingest = AgentIngestQueue(IngestLimits(8, 4, 32, 1000, 10 ** 12), authorizer,
+                                  clock_ns=clock_for("ingest"))
+        tracker = ContinuityTracker(ContinuityLimits(4, 4, 100, 64), authorizer, ingest,
+                                    clock_ns=clock_for("tracker"))
+        holders.update(tracker=tracker._lock, ingest=ingest._lock)
+        session = tracker.open_session(NODE)
+        self.assertTrue(tracker.heartbeat(session))
+        tracker.receive(session, unit(0), b"v")
+        self.assertEqual("already_committed", tracker.receive(session, unit(0), b"v").reason)
+        tracker.snapshot()
+        self.assertEqual({"tracker", "ingest"}, {name for name, _ in samples})
+        self.assertEqual([], [name for name, held in samples if not held])
+
+    def test_older_clock_sample_never_rewinds_liveness_or_retires_live_session(self):
+        pairs = {(NODES[i], SOURCES[i]) for i in range(3)}
+        tracker, _, clock, _ = build(authorizer=Authorizer(pairs), stale=10, nodes=2)
+        clock.now = 50
+        live = tracker.open_session(NODES[0])
+        tracker.open_session(NODES[1])
+        # An older sample (delayed caller or regressed clock) is not staleness:
+        # the live source-less session keeps its slot and the newcomer is refused.
+        clock.now = 45
+        with self.assertRaises(PermissionError):
+            tracker.open_session(NODES[2])
+        self.assertTrue(tracker.heartbeat(live))
+        # The older heartbeat did not rewind liveness from 50 to 45, so at 58
+        # the session is still fresh (58 - 50 <= 10) and is not retired.
+        clock.now = 58
+        with self.assertRaises(PermissionError):
+            tracker.open_session(NODES[2])
+        self.assertTrue(tracker.heartbeat(live))
+        # Genuine staleness still frees the slot of an unrefreshed session.
+        clock.now = 69
+        self.assertTrue(tracker.heartbeat(live))
+        tracker.open_session(NODES[2])
+        self.assertTrue(tracker.heartbeat(live))
+
     def test_invalid_inputs_and_limits_are_rejected(self):
         for bad in ((0, 1, 1), (1, 0, 1), (1, 1, 0), (True, 1, 1), (1, 1, 1, 0),
                     (1, 1, 1, True)):

@@ -610,6 +610,9 @@ consume the active-source allowance. The active-source limit counts active sourc
 source releases its slot (returning its undrained gap events to the caller)
 without discarding the node's other flows. A node that owns no tracked source
 and whose session is closed, invalidated or stale does not keep a slot.
+Liveness time is sampled while the tracker state is locked and never moves
+backwards, so a delayed or regressed clock sample cannot make an active flow
+look stale or retire a live session (the new session is refused instead).
 `server/app/cameras/remote_agent/continuity.py` implements this without a
 listener, protocol, or cryptography.
 

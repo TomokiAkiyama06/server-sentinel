@@ -232,8 +232,10 @@ class ContinuityTracker:
         if not isinstance(node_id, UUID):
             raise ValueError("invalid agent node identity")
         self._authorizer.require_node(node_id)
-        now = self._now()
         with self._lock:
+            # Liveness time is sampled under the lock so a delayed caller can
+            # never apply an older ``now`` after a newer update (see _seen).
+            now = self._now()
             node = self._nodes.get(node_id)
             if node is None:
                 if len(self._nodes) >= self.limits.maximum_nodes:
@@ -244,7 +246,7 @@ class ContinuityTracker:
             self._generation += 1
             node.generation = self._generation
             node.open = True
-            node.last_seen_ns = now
+            self._seen(node, now)
             return AgentSession(node_id, node.generation, self._instance)
 
     def _retire_unused_nodes(self, now: int) -> None:
@@ -255,14 +257,23 @@ class ContinuityTracker:
         bound after sources were deactivated.  A live session (fresh
         heartbeat) keeps its slot.  Generations are tracker-wide and never
         reissued, so a retired node's old grant can never become current.
+
+        A clock that reads earlier than a node's last activity says nothing
+        about that session being stale, so it never retires a node; the new
+        session is refused instead (fail closed, the live session survives).
         """
         owners = {state.node_id for state in self._sources.values()}
         for node_id, node in tuple(self._nodes.items()):
             if node_id in owners:
                 continue
-            if (not node.open or now < node.last_seen_ns
-                    or now - node.last_seen_ns > self.limits.stale_after_ns):
+            if not node.open or now - node.last_seen_ns > self.limits.stale_after_ns:
                 del self._nodes[node_id]
+
+    @staticmethod
+    def _seen(state: _Node | _Source, now: int) -> None:
+        """Advance activity time; an older sample never moves it backwards."""
+        if now > state.last_seen_ns:
+            state.last_seen_ns = now
 
     def _current(self, session: AgentSession) -> _Node | None:
         node = self._nodes.get(session.node_id)
@@ -301,12 +312,12 @@ class ContinuityTracker:
         except PermissionError:
             self._invalidate(session)
             return False
-        now = self._now()
         with self._lock:
+            now = self._now()
             node = self._current(session)
             if node is None:
                 return False
-            node.last_seen_ns = now
+            self._seen(node, now)
             return True
 
     def _record(self, state: _Source, gap: GapEvent) -> None:
@@ -418,8 +429,8 @@ class ContinuityTracker:
             # the grant then, and charges only a source-only refusal.
             return self._charged(session, DeliveryOutcome.REJECTED, "unauthorized",
                                  locked=False)
-        now = self._now()
         with self._lock:
+            now = self._now()
             node = self._current(session)
             if node is None:
                 return self._charged(session, DeliveryOutcome.REJECTED, "stale_session",
@@ -451,7 +462,8 @@ class ContinuityTracker:
                 # The Agent is still delivering: refresh activity (not the
                 # committed sequence) so sustained pressure stays ``degraded``
                 # instead of decaying to ``interrupted``.
-                pending.last_seen_ns = node.last_seen_ns = now
+                self._seen(pending, now)
+                self._seen(node, now)
                 outcome = (DeliveryOutcome.BACKPRESSURED
                            if admission.outcome is IngestOutcome.BACKPRESSURED
                            else DeliveryOutcome.RATE_LIMITED)
@@ -473,7 +485,8 @@ class ContinuityTracker:
                 # is refreshed so a persisting refusal stays ``degraded``.
                 pending = self._pending(state, node_id, header, now)
                 pending.refused = True
-                pending.last_seen_ns = node.last_seen_ns = now
+                self._seen(pending, now)
+                self._seen(node, now)
                 return Delivery(DeliveryOutcome.REJECTED, admission.reason)
             if state is None:
                 state = self._sources[source_id] = _Source(
@@ -492,15 +505,18 @@ class ContinuityTracker:
             state.capture_epoch = header.capture_epoch
             state.last_sequence = header.sequence
             state.last_capture_time_ns = header.capture_time_ns
-            state.last_seen_ns = node.last_seen_ns = now
+            self._seen(state, now)
+            self._seen(node, now)
             state.backpressured = state.refused = False
             if admission.outcome is IngestOutcome.REJECTED:
                 return Delivery(DeliveryOutcome.REJECTED, admission.reason, tuple(gaps))
             return Delivery(DeliveryOutcome.ACCEPTED, None, tuple(gaps))
 
     def snapshot(self) -> tuple[SourceContinuity, ...]:
-        now = self._now()
         with self._lock:
+            # Sampled under the lock: an older ``now`` than a concurrent
+            # update would otherwise misreport a live flow as interrupted.
+            now = self._now()
             result = []
             for source_id, state in self._sources.items():
                 node = self._nodes[state.node_id]
