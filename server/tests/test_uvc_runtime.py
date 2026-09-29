@@ -34,7 +34,7 @@ from app.cameras.uvc.runtime import (
     LocalUvcDependencies, LocalUvcRuntime, LocalUvcRuntimeState, SourceRuntimeState,
 )
 from app.deployment import Deployment
-from app.main import create_app
+from app.main import create_app, run_to_completion
 from app.monitoring.runtime import MonitoringDependencies, RuntimeState
 from app.settings import ConfigurationError, Settings
 from app.storage.database import Database, PinnedDatabase
@@ -1003,6 +1003,64 @@ class ApplicationWiringTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(runtime.status().state, LocalUvcRuntimeState.STOPPED)
         self.assertFalse(runtime.status().sources[0].worker_running)
         await asyncio.sleep(0.2)
+        self.assertFalse(runtime.status().sources[0].worker_running)
+
+    async def test_cancellation_racing_cleanup_completion_is_preserved(self):
+        # The caller is cancelled in the same loop turn the cleanup step
+        # finishes: the step's result is not returned in place of the
+        # caller's cancellation (a shutdown timeout is never swallowed).
+        gate = asyncio.get_running_loop().create_future()
+        completed = []
+
+        async def step():
+            await gate
+            completed.append(True)
+            return "done"
+
+        caller = asyncio.create_task(run_to_completion(step()))
+        for _ in range(3):
+            await asyncio.sleep(0)
+        gate.set_result(None)
+        caller.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await caller
+        self.assertEqual([True], completed)
+
+    async def test_repeated_startup_cancellation_waits_for_start_thread(self):
+        # A second cancellation while the startup already waits for the UVC
+        # start thread still does not abandon it: its workers are stopped.
+        _database, source = self.migrated_source()
+        application = create_app(
+            self.settings, storage_reservation=synthetic_admission,
+            local_uvc=LocalUvcConfiguration((source.id,), **FAST),
+            local_uvc_dependencies=self.dependencies,
+        )
+        entered, finished = threading.Event(), []
+        original = LocalUvcRuntime.start
+
+        def slow_start(runtime):
+            entered.set()
+            time.sleep(0.3)
+            status = original(runtime)
+            finished.append(status.state)
+            return status
+
+        async def serve():
+            async with application.router.lifespan_context(application):
+                await asyncio.sleep(30)
+
+        with patch.object(LocalUvcRuntime, "start", slow_start):
+            task = asyncio.create_task(serve())
+            self.assertTrue(await asyncio.to_thread(entered.wait, 5))
+            task.cancel()
+            await asyncio.sleep(0.05)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+        runtime = application.state.local_uvc
+        self.assertEqual(1, len(finished))
+        self.assertFalse(application.state.ready)
+        self.assertIs(runtime.status().state, LocalUvcRuntimeState.STOPPED)
         self.assertFalse(runtime.status().sources[0].worker_running)
 
     async def test_cancelled_shutdown_finishes_capture_stop_and_cleanup(self):

@@ -95,8 +95,10 @@ async def run_to_completion(awaitable):
         try:
             await asyncio.shield(task)
         except asyncio.CancelledError:
-            if not task.done():
-                cancelled = True
+            # Recorded even when the step finished in the same loop turn as
+            # the caller's cancellation, so that cancellation is never lost.
+            # If the step itself was cancelled, re-raising is its result too.
+            cancelled = True
     if cancelled:
         if not task.cancelled():
             task.exception()  # Retrieved; the caller's cancellation wins.
@@ -223,17 +225,14 @@ def create_app(settings: Settings, *, database: Database | None = None,
                 logging.getLogger(__name__).error(Event.LOCAL_UVC_STORAGE_UNADMITTED)
                 return
             # Registry reads and thread starts must not block the loop.
-            starting = asyncio.ensure_future(asyncio.to_thread(local_uvc_runtime.start))
             try:
-                status = await asyncio.shield(starting)
+                # Cancelling the await never stops the start thread. Even a
+                # repeated cancellation waits for it to finish, so the
+                # lifespan cleanup's stop() sees, and stops, every worker and
+                # descriptor it opened; the cancellation is then re-raised.
+                status = await run_to_completion(
+                    asyncio.to_thread(local_uvc_runtime.start))
                 application.state.local_uvc_state = status.state
-            except asyncio.CancelledError:
-                # Cancelling the await never stops the start thread. Let it
-                # finish so the lifespan cleanup's stop() sees, and stops,
-                # every worker and descriptor it opened.
-                with suppress(Exception):
-                    await starting
-                raise
             except Exception:
                 # Camera capture failure must not take audit/monitoring down.
                 application.state.local_uvc_state = LocalUvcRuntimeState.FAILED
