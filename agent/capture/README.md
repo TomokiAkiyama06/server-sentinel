@@ -49,7 +49,11 @@ gst-launch-1.0 -q v4l2src device=/proc/self/fd/<N> do-timestamp=true \
   runtime root); nothing inherited from the service environment.
 - Own process group, no stdin, stderr discarded (it can contain device details
   and is never logged). Teardown sends SIGTERM to the group, then SIGKILL to the
-  group while the exited leader is still unreaped, then reaps it.
+  group while the exited leader is still unreaped, and reaps it only after no
+  other live member of the group remains in `/proc` (a member stuck in
+  uninterruptible sleep, or an unreadable process table, keeps the source
+  `capture_cleanup_failed`). A member that leaves the group with `setsid` is
+  not tracked without cgroups.
 - The explicit profile requires the camera to advertise `MJPG`; otherwise the
   source reports `capture_unsupported` without starting a process. A profile the
   driver rejects makes the pipeline exit and reports `capture_failed`.

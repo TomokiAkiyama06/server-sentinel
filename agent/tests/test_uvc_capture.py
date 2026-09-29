@@ -31,7 +31,8 @@ from media_capture_agent.uvc_discovery import DiscoveryResult, LinuxDiscovery, V
 from media_capture_agent.uvc_identity import DeviceEvidence
 from media_capture_agent.uvc_pipeline import (FrameError, FrameQueue, GStreamerLauncher,
                                               MjpegFrameParser, MjpegProfile, PipelineError,
-                                              SubprocessLauncher, gstreamer_argv,
+                                              SubprocessLauncher, SubprocessPipeline,
+                                              gstreamer_argv,
                                               minimal_environment, require_trusted_executable)
 from tests.support import MockSession, settings
 
@@ -1122,6 +1123,41 @@ class SubprocessPipelineTests(unittest.TestCase):
             self.assertTrue(process.exited())
             self.assertTrue(wait_for(lambda: not alive(grandchild)))
             self.assertTrue(process.stop(1))  # Idempotent.
+
+    def test_surviving_group_member_keeps_leader_unreaped(self):
+        # A member stuck in uninterruptible sleep cannot be produced without
+        # hardware, so the process table is a synthetic tree listing one.
+        leader = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"],
+                                  stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                  stderr=subprocess.DEVNULL, start_new_session=True)
+        with tempfile.TemporaryDirectory() as proc:
+            member = Path(proc) / "999999"
+            member.mkdir()
+            stat = member / "stat"
+            stat.write_bytes(f"999999 (gst ) x) D {leader.pid} {leader.pid} 0 0".encode())
+            (Path(proc) / str(leader.pid)).mkdir()
+            (Path(proc) / "self").mkdir()
+            pipeline = SubprocessPipeline(leader, proc_root=proc)
+            started = time.monotonic()
+            self.assertFalse(pipeline.stop(0.3))
+            self.assertLess(time.monotonic() - started, 1)
+            self.assertTrue(pipeline.exited())
+            self.assertIsNone(leader.returncode)  # Group ID stays reserved.
+            self.assertFalse(pipeline.stop(0.0))
+            # Once the member is dead the leader is reaped.
+            stat.write_bytes(f"999999 (gst) Z {leader.pid} {leader.pid} 0 0".encode())
+            self.assertTrue(pipeline.stop(0.0))
+            self.assertIsNotNone(leader.returncode)
+        pipeline.close()
+        # Without a readable process table cleanup is never reported.
+        other = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"],
+                                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                 stderr=subprocess.DEVNULL, start_new_session=True)
+        unprovable = SubprocessPipeline(other, proc_root=os.path.join(proc, "missing"))
+        self.assertFalse(unprovable.stop(0.1))
+        self.assertIsNone(other.returncode)
+        other.wait(5)
+        other.stdout.close()
 
     def test_sigterm_ignoring_pipeline_is_killed_within_bound(self):
         process = self.launch("ignore")

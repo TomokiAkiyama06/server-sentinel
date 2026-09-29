@@ -237,11 +237,14 @@ class SubprocessPipeline:
     """A child process group whose stdout carries compressed frames.
 
     Exit is observed with ``WNOWAIT`` so the zombie leader keeps its process
-    group ID reserved while stragglers are SIGKILLed; only then is it reaped.
+    group ID reserved while stragglers are SIGKILLed; it is reaped only once no
+    other live member of the group remains (e.g. one stuck in uninterruptible
+    sleep that still holds the camera or the output pipe).
     """
 
-    def __init__(self, process):
+    def __init__(self, process, *, proc_root="/proc"):
         self.process = process
+        self._proc_root = proc_root
         self._stdout = process.stdout
         self._reaped = False
 
@@ -273,6 +276,41 @@ class SubprocessPipeline:
             time.sleep(0.01)
         return True
 
+    def _group_member_alive(self):
+        """True while a non-leader member of the group is not yet dead.
+
+        Unprovable absence (no readable process table) counts as alive, so
+        cleanup is never reported without evidence.
+        """
+        pgid = self.process.pid
+        try:
+            entries = os.listdir(self._proc_root)
+        except OSError:
+            return True
+        for name in entries:
+            if not name.isdigit() or int(name) == pgid:
+                continue
+            try:
+                with open(os.path.join(self._proc_root, name, "stat"), "rb") as stream:
+                    data = stream.read()
+            except (FileNotFoundError, ProcessLookupError, PermissionError):
+                continue  # Exited meanwhile, or another user's process.
+            except OSError:
+                return True
+            fields = data[data.rfind(b")") + 1:].split()
+            if len(fields) < 3 or not fields[2].isdigit():
+                return True
+            if int(fields[2]) == pgid and fields[0] not in (b"Z", b"X"):
+                return True
+        return False
+
+    def _wait_group_gone(self, deadline):
+        while self._group_member_alive():
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.01)
+        return True
+
     def stop(self, timeout):
         """Terminate the whole group within ``timeout``; False means not reaped."""
         if self._reaped:
@@ -284,6 +322,10 @@ class SubprocessPipeline:
         # Also removes any surviving group member of an already exited leader.
         self._signal(signal.SIGKILL)
         if not self._wait_exit(deadline):
+            return False
+        # The unreaped zombie leader keeps the group ID from being reused, so
+        # a surviving member is still identified by it on a later retry.
+        if not self._wait_group_gone(deadline):
             return False
         try:
             self.process.wait(timeout=max(0.0, deadline - time.monotonic()) or 0.01)
