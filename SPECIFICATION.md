@@ -525,6 +525,17 @@ Preferred order:
 
 Do not require a specific GPU vendor for correctness. Hardware acceleration is optimization.
 
+Adapter selection (`server/app/media/profiles/adapters.py`) takes an explicit
+acceleration policy. With `prefer_hardware`, a missing or failing accelerator
+falls back to a listed software adapter and the selection records
+`hardware_unavailable` + `software_fallback`; with `require_hardware`, or when no
+software adapter exists, the path is `adapter_unavailable` (or
+`adapter_start_failed`). Fallback is never silent and never reports the
+accelerated path as active: the selection is recorded per started adapter/path
+(`PathStatus.adapter_state`), not as one selector-wide latest result, so a path
+still on software fallback stays visible after another path starts on
+recovered hardware.
+
 ### 6.3 Room-overview benchmark
 
 For wide room coverage, real-hardware tests should compare at minimum:
@@ -537,6 +548,15 @@ For wide room coverage, real-hardware tests should compare at minimum:
 - ring-buffer disk throughput/capacity at candidate capture profiles.
 
 Final defaults are measured, not guessed.
+
+The high-resolution room-overview capture is an explicit per-source allowlist
+option (`CaptureOption.ROOM_OVERVIEW_HIGH_RESOLUTION`) with explicit minimum
+capture dimensions. Its sets must downscale inference and viewer output below
+the capture resolution without raising FPS; the option is never inferred from a
+role label or source type, and admission requires requesting it explicitly.
+`python -m app.media.profiles.measure` is a synthetic scheduler-overhead
+harness (CPU, RSS, queue depth) that prints no private values; it does not
+replace the real-hardware benchmark above.
 
 The transport-independent implementation in `server/app/media/profiles/` uses
 explicit immutable profiles, conservative exact-descriptor copy eligibility,

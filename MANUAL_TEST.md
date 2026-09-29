@@ -189,6 +189,9 @@ The synthetic profile core tests do not satisfy the following integration checks
 - [ ] apply recording and viewer queue pressure separately; verify bounded memory, visible loss, and keyframe recovery without claiming continuous evidence;
 - [ ] verify copy eligibility against actual codec configuration, container, timestamps and color metadata; unsupported copy/transcode paths remain unavailable;
 - [ ] record only sanitized aggregate resource measurements; no deployment identifiers, room imagery, media payloads, or exact private network values enter GitHub.
+- [ ] on the Main Server and Capture Node, run `python -m app.media.profiles.measure` for 1, 2, 3 and 4 sources with and without viewers as a synthetic scheduler-overhead baseline; it does not measure codecs/cameras/GPU and its output is not a deployment default;
+- [ ] with the real room-overview camera, list the room-overview profile set with measured `RoomOverviewCriteria`; confirm admission rejects it unless the room-overview option is requested and that inference/viewer stay downscaled;
+- [ ] on a host without the accelerator (or with it disabled), confirm `prefer_hardware` selects software with visible `hardware_unavailable` / `software_fallback`, `require_hardware` reports the path unavailable, and recording never reports the accelerated path as active; re-enable the accelerator and confirm the next adapter start uses it.
 
 ## D. Source registry / mixed topology
 
