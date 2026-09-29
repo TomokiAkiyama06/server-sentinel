@@ -192,6 +192,31 @@ class IsolatedDetectorTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             detector.recover()
 
+    def test_unrepresentable_limits_are_rejected_before_any_spawn(self):
+        from app.detection.foundation.isolation import MAXIMUM_RLIMIT, MAXIMUM_WATCHDOG_NS
+        for field_name in ("evaluation_timeout_ns", "start_timeout_ns"):
+            for value in (MAXIMUM_WATCHDOG_NS + 1, 10 ** 400):
+                with self.subTest(field=field_name, value=value):
+                    with self.assertRaises(ValueError):
+                        limits(**{field_name: value})
+        # 2**64 - 1 is RLIM_INFINITY: it would silently disable the limit.
+        for field_name in ("address_space_bytes", "open_files"):
+            with self.subTest(field=field_name):
+                with self.assertRaises(ValueError):
+                    limits(**{field_name: MAXIMUM_RLIMIT + 1})
+        limits(evaluation_timeout_ns=MAXIMUM_WATCHDOG_NS)
+
+    def test_unarmable_watchdog_is_a_start_failure_not_an_exception(self):
+        detector = self.detector(spec())
+        # Defence in depth behind WorkerLimits validation.
+        object.__setattr__(detector._limits, "start_timeout_ns", 10 ** 400)
+        status = detector.maintain()
+        self.assertEqual(("backoff", 0, 1), (status.state, status.starts,
+                                              status.start_failures))
+        self.assertEqual(Reason.WORKER_UNAVAILABLE, status.last_failure)
+        self.assertIsNone(detector._process)
+        self.assertUnknown(detector.evaluate(frame()), Reason.WORKER_UNAVAILABLE)
+
     def test_reply_parser_rejects_malformed_documents(self):
         good = b'{"id": 7, "o": "absent", "r": "evaluated", "m": 0.5}'
         self.assertEqual(Detection(Observation.ABSENT, Reason.EVALUATED, 0.5),

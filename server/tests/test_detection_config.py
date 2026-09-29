@@ -107,6 +107,9 @@ class DetectionConfigurationTests(unittest.TestCase):
             binding(cadence=dict(CADENCE, cadence_ns=1.5)),
             binding(worker=dict(WORKER, open_files=2)),
             binding(worker=dict(WORKER, evaluation_timeout_ns=1)),
+            binding(worker=dict(WORKER, evaluation_timeout_ns=10 ** 400)),
+            binding(worker=dict(WORKER, start_timeout_ns=10 ** 400)),
+            binding(worker=dict(WORKER, address_space_bytes=2 ** 64 - 1)),
         ]
         for value in invalid:
             with self.subTest(value=value):

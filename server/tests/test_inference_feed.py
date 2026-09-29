@@ -148,6 +148,29 @@ class InferenceFeedIntegrationTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.feed.bind(ForeignPipeline())
 
+    def test_pipeline_close_without_further_frames_invalidates_on_poll(self):
+        for pts in (0, 6):
+            self.offer(pts)
+            self.scheduler.run_one()
+        self.assertEqual(Observation.ABSENT, self.scheduler.snapshot(SOURCE).result.observation)
+        self.assertFalse(self.feed.poll())
+        self.assertEqual(Observation.ABSENT, self.scheduler.snapshot(SOURCE).result.observation)
+        # Decoding stops with the close: no offer_decoded() follows.
+        self.pipeline.close()
+        self.assertTrue(self.feed.poll())
+        self.assertEqual(Detection(Observation.UNKNOWN, Reason.DISCONTINUITY),
+                         self.scheduler.snapshot(SOURCE).result)
+        # The transition is counted once however often the owner polls.
+        self.assertTrue(self.feed.poll())
+        self.assertEqual(1, self.feed.status().discontinuities)
+
+    def test_unreadable_pipeline_status_is_unavailable_on_poll(self):
+        self.offer(0)
+        self.scheduler.run_one()
+        self.feed._pipeline = BrokenStatusPipeline()
+        self.assertTrue(self.feed.poll())
+        self.assertEqual(Reason.DISCONTINUITY, self.scheduler.snapshot(SOURCE).result.reason)
+
     def test_inference_profile_change_resets_temporal_state(self):
         for pts in (0, 6):
             self.offer(pts)
@@ -172,6 +195,14 @@ class InferenceFeedIntegrationTests(unittest.TestCase):
 
 class ForeignPipeline:
     source_id = UUID(int=99)
+
+
+class BrokenStatusPipeline:
+    source_id = SOURCE
+
+    @property
+    def status(self):
+        raise RuntimeError("device path /dev/secret must not escape")
 
 
 if __name__ == "__main__":

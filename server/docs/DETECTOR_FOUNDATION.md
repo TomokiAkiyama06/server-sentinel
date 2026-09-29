@@ -150,8 +150,13 @@ sampled frames are rendered, at the sampled profile dimensions, and offered;
 the feed assigns strictly increasing per-stream sequences. A timestamp
 gap/reset, inference-profile change, new stream generation (`bind()`), closed
 or renegotiating pipeline, invalid input or render failure invalidates the
-published observation to `unknown` immediately. Re-delivered frames are
-rejected by the sampler as duplicate timestamps.
+published observation to `unknown` immediately. Because a pipeline can close,
+lose its admission lease or require renegotiation while no further frame is
+decoded, the pipeline's owning thread also calls `poll()` after every
+lifecycle action and on its periodic tick; `poll()` invalidates once at that
+transition (an unreadable pipeline status counts as unavailable) rather than
+leaving an earlier conclusion published until its observation age expires.
+Re-delivered frames are rejected by the sampler as duplicate timestamps.
 
 ## Deployment schema
 

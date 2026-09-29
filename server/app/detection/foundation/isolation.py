@@ -42,6 +42,10 @@ _REAP_TIMEOUT_S = 5.0
 _PR_SET_PDEATHSIG = 1
 _PR_SET_NO_NEW_PRIVS = 38
 _ARGUMENT_TYPES = (str, int, float, bool, type(None))
+# Representable ceilings, not policies: poll(2) takes a C int of milliseconds
+# and rlim_t values at or above 2**63 are unrepresentable or mean "unlimited".
+MAXIMUM_WATCHDOG_NS = (2 ** 31 - 1) * 1_000_000
+MAXIMUM_RLIMIT = 2 ** 63 - 1
 
 
 class DetectorWorkerFailure(RuntimeError):
@@ -69,6 +73,12 @@ class WorkerLimits:
         # stdio, the request pipe and interpreter internals need descriptors.
         if self.open_files < 8:
             raise ValueError("open_files is too small for a worker interpreter")
+        # A watchdog that cannot be armed would fail only after the child was
+        # spawned; reject it while the configuration is still being loaded.
+        if max(self.evaluation_timeout_ns, self.start_timeout_ns) > MAXIMUM_WATCHDOG_NS:
+            raise ValueError("watchdog timeout is not representable")
+        if max(self.address_space_bytes, self.open_files) > MAXIMUM_RLIMIT:
+            raise ValueError("resource limit is not representable")
 
 
 @dataclass(frozen=True)
@@ -445,15 +455,17 @@ class IsolatedDetector:
             except (OSError, ValueError, AttributeError):
                 pass
 
-        watchdog = threading.Timer(timeout_ns / 1e9, expire)
-        watchdog.daemon = True
+        watchdog = None
         reply, failure = None, Reason.WORKER_CRASHED
         try:
             # Without a watchdog no request may be sent: fail this worker.
+            seconds = timeout_ns / 1e9
+            watchdog = threading.Timer(seconds, expire)
+            watchdog.daemon = True
             watchdog.start()
             if message is not None:
                 connection.send_bytes(message)
-            if connection.poll(timeout_ns / 1e9):
+            if connection.poll(seconds):
                 try:
                     reply = connection.recv_bytes(_MAX_REPLY_BYTES)
                 except OSError:
@@ -462,10 +474,11 @@ class IsolatedDetector:
                     self._protocol_errors += 1
             else:
                 failure = Reason.WORKER_TIMEOUT
-        except (EOFError, OSError, ValueError, RuntimeError):
+        except (EOFError, OSError, ValueError, RuntimeError, OverflowError, TypeError):
             reply = None
         finally:
-            watchdog.cancel()
+            if watchdog is not None:
+                watchdog.cancel()
             with guard:
                 state["done"] = True
                 fired = state["fired"]

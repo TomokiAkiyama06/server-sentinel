@@ -10,6 +10,12 @@ change, new stream generation) and every render/validation failure replaces
 the source's published conclusion with `unknown` at once through
 `InferenceScheduler.invalidate`. A failure is never converted to `absent`.
 No decoded pixels are retained after the offer.
+
+A pipeline can become unusable (closed, admission expired, renegotiation
+required) while no frame arrives, so the owning thread must also call
+`poll()` right after every pipeline lifecycle action and on its periodic
+tick; `poll()` invalidates at that transition instead of letting an earlier
+conclusion stand until `maximum_observation_age_ns` expires.
 """
 
 from dataclasses import dataclass
@@ -60,13 +66,30 @@ class InferenceFeed:
         self._decoded = self._sampled_out = self._offered = 0
         self._rejected = self._render_failures = self._discontinuities = 0
         self._blocked = 0
+        self._unavailable = False
 
     def bind(self, pipeline) -> None:
         """Adopt a new stream generation for the same source."""
         if pipeline.source_id != self.source_id:
             raise ValueError("pipeline belongs to another source")
         self._pipeline = pipeline
+        self._unavailable = False
         self._invalidate(Reason.DISCONTINUITY)
+
+    def poll(self) -> bool:
+        """Re-check the pipeline without a frame; True while it is unusable.
+
+        Call on the pipeline's owning thread after close/renegotiation and
+        periodically (an admission lease can expire asynchronously). The
+        published conclusion is invalidated once, at the transition.
+        """
+        if self._pipeline_unavailable():
+            if not self._unavailable:
+                self._unavailable = True
+                self._invalidate(Reason.DISCONTINUITY)
+            return True
+        self._unavailable = False
+        return False
 
     def offer_decoded(self, *, stream_id: UUID, pts: int, time_base: Fraction,
                       quality: Quality, channels: int,
@@ -81,10 +104,12 @@ class InferenceFeed:
             raise ValueError("invalid inference quality or channel count")
         self._decoded += 1
         pipeline = self._pipeline
-        if _BLOCKING_PIPELINE_REASONS.intersection(pipeline.status.reasons):
+        if self._pipeline_unavailable():
             self._blocked += 1
+            self._unavailable = True
             self._invalidate(Reason.DISCONTINUITY)
             return FeedResult(False, "pipeline_unavailable")
+        self._unavailable = False
         profile = pipeline.profiles.inference
         if profile != self._profile:
             # The sampler restarts its cadence; old temporal state is invalid.
@@ -123,6 +148,14 @@ class InferenceFeed:
         return FeedStatus(self._stream_id, self._decoded, self._sampled_out, self._offered,
                           self._rejected, self._render_failures, self._discontinuities,
                           self._blocked)
+
+    def _pipeline_unavailable(self) -> bool:
+        try:
+            reasons = self._pipeline.status.reasons
+        except Exception:
+            # An unreadable lifecycle state is treated as unusable, never live.
+            return True
+        return bool(_BLOCKING_PIPELINE_REASONS.intersection(reasons))
 
     def _invalidate(self, reason: Reason) -> None:
         if reason is Reason.DISCONTINUITY:

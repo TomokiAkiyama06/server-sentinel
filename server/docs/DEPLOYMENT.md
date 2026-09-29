@@ -193,7 +193,12 @@ equal to the pinned digest, `score_threshold` in (0, 1) and
 implementation, version or digest is refused rather than substituted. At most
 four distinct sources may be bound, each at most once per detector kind.
 `evaluation_timeout_ns` must be at least `maximum_evaluation_ns`; the worker's
-frame limit is derived as three bytes per `maximum_pixels`.
+frame limit is derived as three bytes per `maximum_pixels`. Watchdog timeouts
+must be representable by the poll(2) wait (at most `(2**31 - 1) * 1_000_000`
+ns) and `address_space_bytes` / `open_files` below `2**63`, so an oversized
+value is refused at `--check` instead of failing after a worker is spawned or
+being read as an unlimited rlimit. These are representability ceilings, not
+recommended values.
 
 Without the object, no inference runtime can be constructed and every source's
 detector observation remains `unknown`, never `absent`. An invalid object fails
