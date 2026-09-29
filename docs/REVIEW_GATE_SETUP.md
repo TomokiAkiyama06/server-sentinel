@@ -2,9 +2,12 @@
 
 Issue [#4](https://github.com/TomokiAkiyama06/server-sentinel/issues/4) remains
 **open**. The checked-in implementation provides an offline receipt validator,
-a disabled candidate ruleset generator, and synthetic policy tests. There is no
-App publisher, trusted evidence collector, installed enforcement, or completed
-GitHub test-PR acceptance. Continue the current manual current-HEAD/current-base review
+a disabled candidate ruleset generator, a self-hosted delivery adapter, a
+provider review collector, an App-JWT installation-token exchange adapter whose
+RS256 signer is deliberately **not** implemented (Owner decision below), and
+synthetic tests for all of them. There is no registered App, deployed
+publisher, installed enforcement, or completed GitHub test-PR acceptance.
+Everything here is verified only against mocks. Continue the current manual current-HEAD/current-base review
 procedure in [CLAUDE_REVIEW_SETUP.md](CLAUDE_REVIEW_SETUP.md); that document also records the temporary suspension of Claude review automation.
 
 ## Capability assessment
@@ -128,9 +131,11 @@ The configuration contains only routing identity:
 Keep it outside the repository, mode `0600`. Set the short-lived installation
 token only in the publisher service environment as
 `SERVER_SENTINEL_REVIEW_GATE_INSTALLATION_TOKEN`; do not write it into this
-file. A future separately reviewed App-JWT exchange component may use the
-validated external key to refresh that environment value. This foundation does
-not create a key, token, App, installation, check source, or ruleset.
+file. Alternatively `review_gate_app_token.py` (below) exchanges an App JWT for
+the token in memory and passes it as `installation_token=` to
+`load_app_credentials`; the environment variable is then unused. The
+`AppCredentials` repr omits the key and token. This foundation does not create
+a key, token, App, installation, check source, or ruleset.
 
 The publisher must execute reviewed, pinned code and load policy from its trusted
 deployment, never from the PR. Neither same-repository nor fork code may run with
@@ -147,7 +152,120 @@ Codex's `Reviewed commit` alone lacks a base binding and is insufficient. Record
 the exact review request context before invoking either engine. Reactions, an
 author display name, or a subsequent request comment do not establish that the
 review was performed against that context. Missing provider provenance fails
-closed. The provider adapters and their hostile-input tests remain required work.
+closed.
+
+### Provider review collector (`review_gate_collector.py`)
+
+The collector converts an authenticated Codex or Claude **GitHub pull-request
+review** into the fixed receipt from `successful_check_run_request`. It never
+executes a provider, never posts the trigger comment, and never publishes;
+`publish_collected()` hands only a `pass` decision to `publish_success`, which
+re-reads the live context again before posting.
+
+Provider policy lives in an external private JSON file named by
+`SERVER_SENTINEL_REVIEW_COLLECTOR_CONFIG` (same `0600` / outside-checkout /
+no-symlink rules as the publisher configuration):
+
+```json
+{"state_dir": "/var/lib/server-sentinel-review-gate",
+ "providers": {"codex": {"user_id": 123, "user_login": "<provider-app>[bot]",
+   "max_review_runtime_seconds": 1800,
+   "pass_markers": ["<exact no-findings phrase>"],
+   "blocking_markers": ["<P0 marker>", "<P1 marker>"],
+   "non_blocking_markers": ["<suggestion-only marker>"]}}}
+```
+
+`user_id` is the numeric account ID of the provider App's bot user; the login
+must also match and GitHub must report `type: "Bot"`. The shared GitHub Actions
+bot (`github-actions[bot]`, user ID `41898282`), anything performed via the
+Actions App (`15368`) and `dependabot[bot]` are refused as configuration and
+ignored as evidence. This is what makes a review posted by a PR workflow's
+`GITHUB_TOKEN` worthless: it can copy every word, but not the bot identity.
+Lookalike logins and a matching login with another ID are counted in the
+decision as `ignored_untrusted_reviews`, never as a pass. Codex and Claude must
+have distinct identities. The current same-repository Claude workflow posts as
+the Actions bot and therefore cannot satisfy this collector; a trusted Claude
+path needs its own App identity or an isolated trusted process (Owner decision).
+
+Flow and binding:
+
+1. Before posting any trigger (for example `@codex review`), call
+   `request_review(reviewer, live_context, source)`. It durably records the
+   complete `Context`, the highest review ID currently listed on the PR
+   (watermark) and the request time, under a per-PR lock, with an atomic
+   `0600` write and directory fsync in `state_dir` (a `0700` directory owned by
+   the publisher account, outside every checkout). A repeated call for the same
+   active context returns the same request (retrying trigger delivery never
+   creates a second request). `force_new=True` supersedes it.
+2. `collect(reviewer, read_live_context, source)` re-reads the live context
+   before and after reading the complete, paginated reviews and each candidate's
+   inline comments. Any HEAD, base, merge-base, diff or test-merge difference
+   from the request marks the request `invalidated` durably; it can never pass
+   again, even if the old context returns. A new request is required, and the
+   same-HEAD review that preceded it is below its watermark.
+3. A review counts only if it is from the configured bot, has an ID above the
+   watermark, targets the recorded HEAD, and was submitted at least
+   `max_review_runtime_seconds` + 300 s (clock skew allowance) after the
+   request. GitHub reviews carry only `commit_id`; this delay is the only way to
+   exclude a review that was started under an older base (automatic review on
+   push, a human `@codex review`) and finished after the new request.
+   Earlier passing reviews are ignored as ambiguous; earlier *failing* ones
+   still block.
+4. A counted review passes only with state `COMMENTED` or `APPROVED`, a pass
+   marker in the body, no blocking marker, and every inline comment carrying a
+   non-blocking marker and no blocking marker. Any other trusted same-HEAD
+   review above the watermark blocks. No clean review yet is `pending`.
+
+Decisions are `pass`, `pending`, `blocked` or `invalidated` with a fixed reason
+code; only `pass` carries a check-run request. Malformed or oversized evidence,
+a truncated listing (the watermark review must still be listed), a listing that
+regressed, more than 1000 reviews / 300 comments per review / 20 candidate
+reviews, a corrupt, foreign or non-private ledger record, an unavailable lock
+(30 s bound) and every API error raise `CollectorFailure`, leaving the check
+absent. Logs carry reviewer, PR, request ID, status and reason code only;
+review text is never logged.
+
+Recovery: a corrupt ledger record is not deleted automatically. The Owner
+inspects and removes `state_dir/<repository_id>-<pr>-<reviewer>.json`, then a
+new request and review are needed. Deleting a record never produces a pass by
+itself.
+
+Residual limits (need Owner decision and real GitHub acceptance): marker
+strings and the provider runtime bound are Owner policy, not verified provider
+formats; a provider that reviews longer than the bound can still be
+misattributed; a prompt-injected provider can emit a pass marker; the watermark
+assumes GitHub review IDs increase over time.
+
+### App-JWT installation token exchange (`review_gate_app_token.py`)
+
+`open_token_source(config, checkout_root, transport, signer_factory)` loads the
+external key with the publisher's descriptor checks and hands it only to the
+signer. `InstallationTokenSource.token()` builds an App JWT (`alg: RS256`,
+`iat` = now - 60 s, `exp` = now + 540 s, `iss` = App ID) and POSTs to
+`/app/installations/<id>/access_tokens` requesting `repository_ids: [<repo>]`
+and exactly `checks: write`, `contents: read`, `metadata: read`,
+`pull_requests: read`. The answer must echo exactly those permissions,
+`repository_selection: "selected"`, only the configured repository, a
+`ghs_`-form token and an expiry between 5 minutes and 1 hour (+5 minutes skew)
+away. The token is cached in memory, refreshed once fewer than 5 minutes
+remain, single-flight across threads, and dropped on any failure or
+`invalidate()`. There is no retry loop; the caller retries on its next pass.
+
+The key, JWT and token are held only in memory: never in files, `os.environ`,
+subprocess arguments, log records, `repr()` or exception text, and failures
+raise `TokenFailure` with fixed messages and a suppressed exception chain.
+Synthetic tests assert this for success, transport failure and a leaking
+signer.
+
+**RS256 is not implemented.** Python's standard library has no RSA signature
+primitive, and no already-pinned dependency in this repository provides one.
+The default `UnconfiguredRs256Signer` refuses to sign, so exchange fails closed.
+Choosing between adding a reviewed crypto dependency (for example the
+Apache-2.0/BSD `cryptography` package, pinned with hashes), signing through a
+system `openssl` binary (key path only, never key bytes, in argv), or a
+hand-written standard-library RSA implementation is an Owner / license decision
+(AGENTS.md sections 13 and 18). Until then, keep using the environment-token
+path or leave the publisher disabled.
 
 Construct a `Context` from the authenticated target repository ID, PR number,
 `refs/heads/main`, current head/base commit IDs, a unique merge-base commit ID,

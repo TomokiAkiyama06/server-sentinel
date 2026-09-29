@@ -5,13 +5,13 @@ PR checkout, executes git hooks, creates credentials, creates an App, or edits
 repository rules.  It obtains its App material at runtime from an external
 root/current-user-owned 0600 configuration and key path, re-reads GitHub's live
 PR state, and posts a policy-produced Check Run only when that entire state is
-unchanged.  Provider review collection and App-JWT token exchange deliberately
-remain separate deployment adapters.
+unchanged.  Provider review collection (``review_gate_collector``) and App-JWT
+token exchange (``review_gate_app_token``) are separate adapters.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import hashlib
 import json
 import os
@@ -35,6 +35,7 @@ GITHUB_API = "https://api.github.com"
 _HEX = re.compile(r"[0-9a-f]{40}")
 _MAX_ANCESTRY_COMMITS = 4096
 _MAX_COMMIT_PARENTS = 64
+_PAGE_QUERY = re.compile(r"per_page=100&page=[1-9][0-9]?")
 
 
 class PublisherFailure(RuntimeError):
@@ -65,8 +66,9 @@ class AppCredentials:
     """App key material from the trusted runtime boundary, never a checkout."""
 
     config: RuntimeConfig
-    private_key_pem: bytes
-    installation_token: str
+    # Never part of repr(), so a logged or raised credentials object is redacted.
+    private_key_pem: bytes = field(repr=False)
+    installation_token: str = field(repr=False)
 
 
 class GitHubTransport(Protocol):
@@ -74,6 +76,9 @@ class GitHubTransport(Protocol):
         ...
 
     def get_bytes(self, path: str, token: str, accept: str) -> bytes:
+        ...
+
+    def get_list(self, path: str, token: str) -> list[Any]:
         ...
 
     def post_json(self, path: str, token: str,
@@ -152,15 +157,8 @@ def load_runtime_config(environ: Mapping[str, str], checkout_root: Path) -> Runt
         raise PublisherFailure("invalid review gate configuration") from exc
 
 
-def load_app_credentials(config: RuntimeConfig, environ: Mapping[str, str],
-                         checkout_root: Path) -> AppCredentials:
-    """Load a private App key and short-lived installation token at runtime.
-
-    The key is loaded only to validate this trusted deployment boundary here.
-    A separately reviewed App-JWT exchange adapter may consume it to refresh the
-    installation token; this module never writes either value or returns it in
-    an error.  The token is intentionally an environment-only runtime input.
-    """
+def load_app_private_key(config: RuntimeConfig, checkout_root: Path) -> bytes:
+    """Load the external private App key after descriptor-level checks."""
     _, key = _secure_private_bytes(config.private_key_path, checkout_root)
     fence = b"-" * 5
     pem_markers = ((fence + b"BEGIN PRIVATE KEY" + fence,
@@ -171,7 +169,21 @@ def load_app_credentials(config: RuntimeConfig, environ: Mapping[str, str],
             and any(key.startswith(begin) and key.rstrip().endswith(end)
                     for begin, end in pem_markers)):
         raise PublisherFailure("invalid App private key material")
-    token = environ.get(TOKEN_ENV)
+    return key
+
+
+def load_app_credentials(config: RuntimeConfig, environ: Mapping[str, str],
+                         checkout_root: Path,
+                         installation_token: str | None = None) -> AppCredentials:
+    """Load a private App key and short-lived installation token at runtime.
+
+    ``installation_token`` comes from ``review_gate_app_token`` when the App-JWT
+    exchange adapter is used; otherwise the token is an environment-only
+    runtime input.  This module never writes either value or returns it in an
+    error.
+    """
+    key = load_app_private_key(config, checkout_root)
+    token = installation_token if installation_token is not None else environ.get(TOKEN_ENV)
     if not isinstance(token, str) or not re.fullmatch(r"[A-Za-z0-9_-]{20,512}", token):
         raise PublisherFailure("installation token is unavailable")
     return AppCredentials(config, key, token)
@@ -191,8 +203,12 @@ class UrllibGitHubTransport:
 
     @staticmethod
     def _url(path: str) -> str:
-        if (not isinstance(path, str) or not path.startswith("/")
-                or ("?" in path and not path.endswith("?recursive=1"))):
+        if not isinstance(path, str) or not path.startswith("/"):
+            raise PublisherFailure("invalid GitHub API path")
+        route, _, query = path.partition("?")
+        if ("?" in query or any(character in route for character in "#%\\")
+                or (query and query != "recursive=1"
+                    and not _PAGE_QUERY.fullmatch(query))):
             raise PublisherFailure("invalid GitHub API path")
         return GITHUB_API + path
 
@@ -220,6 +236,16 @@ class UrllibGitHubTransport:
 
     def get_bytes(self, path: str, token: str, accept: str) -> bytes:
         return self._request("GET", path, token, None, accept)
+
+    def get_list(self, path: str, token: str) -> list[Any]:
+        raw = self._request("GET", path, token, None, "application/vnd.github+json")
+        try:
+            value = json.loads(raw)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise PublisherFailure("invalid GitHub API JSON") from exc
+        if not isinstance(value, list):
+            raise PublisherFailure("unexpected GitHub API response")
+        return value
 
     def post_json(self, path: str, token: str, payload: dict[str, Any]) -> dict[str, Any]:
         body = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
