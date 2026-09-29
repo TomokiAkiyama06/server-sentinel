@@ -1026,6 +1026,33 @@ class ApplicationWiringTests(unittest.IsolatedAsyncioTestCase):
             await caller
         self.assertEqual([True], completed)
 
+    async def test_cancellation_is_preserved_when_the_step_then_fails(self):
+        # The caller is cancelled while the step runs and the step then
+        # raises: the caller still sees its cancellation, not the step's
+        # error, so a cancelled startup cannot proceed as a mere failure.
+        gate = asyncio.get_running_loop().create_future()
+
+        async def step():
+            await gate
+            raise RuntimeError("step failed")
+
+        caller = asyncio.create_task(run_to_completion(step()))
+        for _ in range(3):
+            await asyncio.sleep(0)
+        caller.cancel()
+        for _ in range(3):
+            await asyncio.sleep(0)
+        gate.set_result(None)
+        with self.assertRaises(asyncio.CancelledError):
+            await caller
+
+    async def test_step_failure_without_cancellation_propagates(self):
+        async def step():
+            raise RuntimeError("step failed")
+
+        with self.assertRaises(RuntimeError):
+            await run_to_completion(step())
+
     async def test_repeated_startup_cancellation_waits_for_start_thread(self):
         # A second cancellation while the startup already waits for the UVC
         # start thread still does not abandon it: its workers are stopped.

@@ -99,6 +99,11 @@ async def run_to_completion(awaitable):
             # the caller's cancellation, so that cancellation is never lost.
             # If the step itself was cancelled, re-raising is its result too.
             cancelled = True
+        except BaseException:
+            # The step failed. Before any cancellation this is its result;
+            # after one, the recorded cancellation still wins below.
+            if not cancelled:
+                raise
     if cancelled:
         if not task.cancelled():
             task.exception()  # Retrieved; the caller's cancellation wins.
