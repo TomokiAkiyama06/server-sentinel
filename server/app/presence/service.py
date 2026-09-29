@@ -448,6 +448,9 @@ class PresenceService:
     def _session_lock(self):
         """Exclusive advisory lock beside the database, held for a session's life.
 
+        Called only inside an admitted transaction: the first call creates the
+        lock file, which is a filesystem write like any other.
+
         The kernel releases it when the holding process dies, so a session
         row found while the lock is free belongs to an outbox that is gone.
         """
@@ -474,9 +477,13 @@ class PresenceService:
         interrupted gap: a restart is never assumed to be clean. A false
         positive is cleared by the Owner (`clear_timeline_gap`), never here.
         """
-        session = TimelineSession(str(uuid4()), self._session_lock())
+        session = None
         try:
             with self._transaction() as db:
+                # The lock file is created here, under the storage reservation
+                # the transaction already holds, so a refused volume never
+                # gains even a directory entry from an outbox start.
+                session = TimelineSession(str(uuid4()), self._session_lock())
                 stale = db.execute("SELECT count(*) FROM presence_outbox_sessions").fetchone()[0]
                 if stale:
                     self._add_gap(db, now, interrupted=stale)
@@ -485,7 +492,8 @@ class PresenceService:
                            (session.token, timestamp(now)))
                 gap = self._gap(db)
         except BaseException:
-            session.release()
+            if session is not None:
+                session.release()
             raise
         return session, gap
 
@@ -513,7 +521,13 @@ class PresenceService:
         return gap
 
     def timeline_gap(self):
-        """Read-only durable timeline gap marker, or None when there is none."""
+        """Read-only durable timeline gap marker, or None when there is none.
+
+        A missing database is an unreadable marker, never created here: this
+        read takes no storage reservation.
+        """
+        if not self.database.path.is_file():
+            raise RuntimeError("timeline gap marker unavailable")
         with closing(self.database.connect()) as db:
             return self._gap(db)
 

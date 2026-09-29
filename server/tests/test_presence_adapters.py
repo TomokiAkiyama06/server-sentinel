@@ -717,6 +717,49 @@ class TimelineGapDurabilityTests(PresenceFixture, TestCase):
         with self.assertRaises(ValueError):
             self.presence.clear_timeline_gap("owner", now=NOW, clock_trusted=True)
 
+    def test_refused_open_creates_no_lock_file(self):
+        # Under STORAGE_HARD_STOP an outbox start writes nothing at all, not
+        # even the session lock file that sits beside the database.
+        self.outbox.close()
+        lock = self.database.path.with_name(self.database.path.name + ".timeline-session.lock")
+        lock.unlink()
+        outbox = TimelineOutbox(self.presence, clock=self.clock, capacity=8)
+        self.refuse = True
+        with self.assertRaisesRegex(RuntimeError, "STORAGE_HARD_STOP"):
+            outbox.open()
+        self.assertFalse(lock.exists())
+        self.assertFalse(outbox.state().session)
+        self.refuse = False
+        outbox.open()
+        self.addCleanup(lambda: outbox._handle and outbox._handle.release())
+        self.assertTrue(lock.exists())
+        self.assertTrue(outbox.state().session)
+
+    def test_lock_file_is_created_while_the_reservation_is_held(self):
+        self.outbox.close()
+        lock = self.database.path.with_name(self.database.path.name + ".timeline-session.lock")
+        lock.unlink()
+        seen = []
+
+        @contextmanager
+        def recording():
+            seen.append(("enter", lock.exists()))
+            yield
+            seen.append(("exit", lock.exists()))
+        self.presence.reservation = recording
+        outbox = TimelineOutbox(self.presence, clock=self.clock, capacity=8)
+        outbox.open()
+        self.addCleanup(lambda: outbox._handle and outbox._handle.release())
+        self.assertEqual(seen[:2], [("enter", False), ("exit", True)])
+
+    def test_gap_read_never_creates_a_missing_database(self):
+        missing = self.database.path.with_name("absent.sqlite3")
+        self.presence.database = Database(missing)
+        with self.assertRaises(RuntimeError):
+            self.presence.timeline_gap()
+        self.assertFalse(missing.exists())
+        self.assertIsNone(self.outbox.flush().gap)
+
     def test_a_second_outbox_is_refused_while_the_first_is_open(self):
         second = TimelineOutbox(self.presence, clock=self.clock, capacity=8)
         with self.assertRaisesRegex(RuntimeError, "another timeline outbox"):
