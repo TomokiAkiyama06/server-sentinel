@@ -95,7 +95,8 @@ def create_app(settings: Settings, *, database: Database | None = None,
     # admitted against a reserve this process cannot verify.
     runtime_admission = RuntimeStorageAdmission()
     monitoring_runtime = (
-        MonitoringRuntime(monitoring, store, monitoring_dependencies)
+        MonitoringRuntime(monitoring, store, monitoring_dependencies,
+                          migrations=APPLICATION_MIGRATIONS)
         if monitoring is not None and monitoring.storage_configured else None
     )
     audit_store = AuditStore(store, reservation=storage_reservation or runtime_admission)
@@ -109,10 +110,22 @@ def create_app(settings: Settings, *, database: Database | None = None,
     @asynccontextmanager
     async def lifespan(application: FastAPI):
         application.state.ready = False
+        # Schema migrations are metadata writes and are admitted like any
+        # other: the monitoring runtime migrates on its worker inside the
+        # verified storage policy (identity + hard reserve); an embedder's
+        # injected reservation covers them otherwise. Without either admission
+        # nothing is written, so an unconfigured app never spends the reserve.
         try:
-            with closing(store.connect()) as connection:
-                migrate(connection, APPLICATION_MIGRATIONS)
+            if monitoring_runtime is not None:
+                await monitoring_runtime.start()
+            elif storage_reservation is not None:
+                with storage_reservation():
+                    with closing(store.connect()) as connection:
+                        migrate(connection, APPLICATION_MIGRATIONS)
         except Exception:
+            if monitoring_runtime is not None:
+                with suppress(Exception):
+                    await monitoring_runtime.stop()
             logging.getLogger(__name__).error(Event.STARTUP_FAILED)
             # Lifespan failures must not pass SQLite/config values to servers.
             raise RuntimeError("application startup failed") from None
@@ -132,10 +145,10 @@ def create_app(settings: Settings, *, database: Database | None = None,
             # recording self-test cannot run here, so the production entry
             # points (`app.deployment`, `python -m app`) refuse to serve in
             # this state; it is reachable only by embedding `create_app()`.
+            # No schema migration runs here without an injected reservation.
             application.state.monitoring_state = RuntimeState.UNCONFIGURED
             logging.getLogger(__name__).error(Event.MONITORING_UNCONFIGURED)
         else:
-            await monitoring_runtime.start()
             # Admission follows the live runtime state: a runtime that failed
             # startup refuses writes until its retried open succeeds.
             runtime_admission.bind(monitoring_runtime)

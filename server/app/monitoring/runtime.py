@@ -31,6 +31,7 @@ from app.notifications.schedule import DailySummaryScheduler
 from app.notifications.service import DailySummary, NotificationKind, NotificationService
 from app.notifications.slack import SlackDelivery
 from app.storage.database import Database
+from app.storage.migrations import Migration, MigrationError, migrate
 from app.storage.policy import MainStoragePolicy, StorageState, StorageTransition
 from app.storage.retention import RetentionService, StorageAudit
 
@@ -131,7 +132,8 @@ def _refused():
 
 class MonitoringRuntime:
     def __init__(self, configuration: MonitoringConfiguration, database: Database,
-                 dependencies: MonitoringDependencies | None = None):
+                 dependencies: MonitoringDependencies | None = None,
+                 migrations: tuple[Migration, ...] = ()):
         if not isinstance(configuration, MonitoringConfiguration) or not configuration.storage_configured:
             raise ValueError("monitoring storage configuration required")
         self.configuration = configuration
@@ -147,6 +149,14 @@ class MonitoringRuntime:
         self._filesystem_ok = True
         self._started_monotonic = None
         self._startup_alerted = False
+        # Pending schema migrations run on the worker inside the verified
+        # storage policy's admission, never before the reserve was checked.
+        self._migrations = tuple(migrations)
+        self._migrated = not self._migrations
+        # (state, at) of the last recording-health alert whose local status
+        # row could not be persisted, so a denied write does not re-alert on
+        # every 15-minute retry of the same failing self-test.
+        self._unpersisted_health: tuple[HealthState, datetime] | None = None
         self.notifications: NotificationService | None = None
         self.notification_events: NotificationEventStore | None = None
         self.recordings: RecordingStore | None = None
@@ -304,6 +314,14 @@ class MonitoringRuntime:
             )
             policy = MainStoragePolicy(configuration.storage_limits, self.filesystem.snapshot,
                                        self._now_ms, self._storage_transition)
+            if not self._migrated:
+                # Schema DDL and its journal are metadata writes: they are
+                # admitted only after the expected filesystem identity and the
+                # hard reserve were verified. A denial is a startup failure
+                # (alert, retry); the tables are not created meanwhile.
+                with policy.control():
+                    migrate(connection, self._migrations)
+                self._migrated = True
             self.storage_audit = StorageAudit(connection, reservation=policy.control)
             # Every admission re-verifies the filesystem identity, so a local
             # fault row may use this policy even when a later step fails.
@@ -336,6 +354,10 @@ class MonitoringRuntime:
                 adapter, self._record_recording_health,
                 monotonic=dependencies.monotonic, utcnow=dependencies.utcnow,
             )
+        except MigrationError:
+            # A future/edited schema history or failed DDL is not a storage
+            # fault; the caller decides whether it aborts startup.
+            raise
         except Exception:
             if recordings is not None:
                 with suppress(Exception):
@@ -402,16 +424,36 @@ class MonitoringRuntime:
             raise RecordingError("INTEGRITY_EVENT_NOT_PERSISTED")
 
     def _record_recording_health(self, result: HealthResult, at: datetime) -> None:
-        # Durable local/UI state first; a failure propagates to the service.
-        self.health_status.record(result, at)
+        """Persist the verdict, update the live state and alert.
+
+        A refused status write (e.g. `STORAGE_HARD_STOP`) still updates the
+        in-memory state and attempts the alert, because storage/write faults
+        are exactly when the immediate notification matters; the failure then
+        propagates so the service stays degraded and retries. While the write
+        keeps failing, the same verdict re-alerts at most once per day.
+        """
+        try:
+            self.health_status.record(result, at)
+        except Exception:
+            persisted = False
+        else:
+            persisted = True
         self._set(recording_health=result.state)
         kind = {HealthState.FAILED: NotificationKind.RECORDING_HEALTH_FAILURE,
                 HealthState.UNAVAILABLE: NotificationKind.RECORDING_HEALTH_WARNING,
                 }.get(result.state)
-        if kind is not None:
+        previous = self._unpersisted_health
+        if kind is not None and (persisted or previous is None or previous[0] != result.state
+                                 or not previous[1] <= at < previous[1] + timedelta(days=1)):
             self.notifications.record(kind, at=at, event_id=uuid5(
                 EVENT_NAMESPACE, f"recording-health:{at.isoformat()}:{result.state.value}",
             ))
+            previous = None if persisted else (result.state, at)
+        if persisted or kind is None:
+            previous = None
+        self._unpersisted_health = previous
+        if not persisted:
+            raise RecordingError("RECORDING_HEALTH_NOT_PERSISTED")
 
     # -- periodic work -----------------------------------------------------
 
@@ -514,7 +556,7 @@ class MonitoringRuntime:
 
     # -- lifespan ----------------------------------------------------------
 
-    def _attempt_open(self) -> None:
+    def _attempt_open(self, initial: bool = False) -> None:
         """Owner-thread `_open()` whose unexpected raise is still rescheduled.
 
         `_open()` handles storage failures itself. A raise from database
@@ -524,7 +566,10 @@ class MonitoringRuntime:
         """
         try:
             self._open()
-        except Exception:
+        except Exception as error:
+            if initial and isinstance(error, MigrationError):
+                # An unusable schema aborts application startup, as before.
+                raise
             if self.status.state == RuntimeState.RUNNING:
                 # Components were published; a later startup step raised.
                 logging.getLogger(__name__).error(Event.MONITORING_DEGRADED)
@@ -539,7 +584,7 @@ class MonitoringRuntime:
                                             thread_name_prefix="serversentinel-monitoring")
         # Usually a raise means the database could not be opened; the tick
         # retries it every `retry_seconds`.
-        await self.call(self._attempt_open)
+        await self.call(self._attempt_open, True)
         if self.status.state == RuntimeState.RUNNING:
             logging.getLogger(__name__).info(Event.MONITORING_STARTED)
 

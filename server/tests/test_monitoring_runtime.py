@@ -22,13 +22,14 @@ from app.audit import ActorCategory, AuditAction, AuditOutcome, AuditStorageErro
 from app.deployment import Deployment
 from app.integrity.model import Inventory
 from app.main import create_app
-from app.media.health.service import HealthState, Stage
+from app.media.health.service import HealthState, PipelineStatus, Stage
 from app.media.recording import Segment
 from app.monitoring.config import MonitoringConfiguration, RecordingFilesystem, parse_monitoring
 from app.monitoring.runtime import MonitoringDependencies, RuntimeState
 from app.settings import ConfigurationError, Settings
 from app.storage.database import Database
-from app.storage.policy import StorageLimits, StorageState
+from app.storage.policy import FilesystemSpace, StorageLimits, StorageState
+from app.storage.schema import APPLICATION_MIGRATIONS
 from app.media.recording.model import Limits
 from tests.asgi import request
 from tests.test_recording import SyntheticValidator
@@ -158,6 +159,16 @@ class UnconfiguredTests(unittest.IsolatedAsyncioTestCase):
                         outcome=AuditOutcome.SUCCEEDED,
                     )
 
+    async def test_unconfigured_app_runs_no_schema_migration(self):
+        # Migrations are metadata writes; without a verified storage policy or
+        # an injected admission the app writes no schema at all.
+        with tempfile.TemporaryDirectory() as directory:
+            settings = Settings(Path(directory))
+            application = create_app(settings)
+            async with application.router.lifespan_context(application):
+                with closing(sqlite3.connect(settings.database_path)) as db:
+                    self.assertEqual([], db.execute("SELECT name FROM sqlite_master").fetchall())
+
     async def test_configuration_without_storage_sections_stays_unconfigured(self):
         with tempfile.TemporaryDirectory() as directory:
             application = create_app(Settings(Path(directory)), monitoring=MonitoringConfiguration(
@@ -186,7 +197,7 @@ class ProductionEntryTests(unittest.TestCase):
 
 
 class FlakyDatabase(Database):
-    """Migration connects; the next `failures` connects raise."""
+    """The first `failures` connects raise."""
 
     def __init__(self, path, failures):
         super().__init__(path)
@@ -195,7 +206,7 @@ class FlakyDatabase(Database):
 
     def connect(self):
         self.calls += 1
-        if 1 < self.calls <= 1 + self.failures:
+        if self.calls <= self.failures:
             raise OSError("synthetic database fault")
         return super().connect()
 
@@ -214,20 +225,20 @@ class LifespanTests(RuntimeFixture):
         async with application.router.lifespan_context(application):
             runtime = application.state.monitoring
             self.assertEqual(RuntimeState.FAILED, runtime.status.state)
-            self.assertEqual(2, database.calls)
+            self.assertEqual(1, database.calls)
             # The first due retry raises again from connect(); it must push the
             # deadline forward instead of retrying on every following tick.
             self.clock.advance(timedelta(minutes=15))
             await runtime.call(runtime.tick)
-            self.assertEqual(3, database.calls)
+            self.assertEqual(2, database.calls)
             self.assertEqual(RuntimeState.FAILED, runtime.status.state)
             for _ in range(5):
                 self.clock.advance(timedelta(minutes=1))
                 await runtime.call(runtime.tick)
-            self.assertEqual(3, database.calls)
+            self.assertEqual(2, database.calls)
             self.clock.advance(timedelta(minutes=10))
             await runtime.call(runtime.tick)
-            self.assertEqual(4, database.calls)
+            self.assertEqual(3, database.calls)
             self.assertEqual(RuntimeState.RUNNING, runtime.status.state)
             self.assertEqual(1, self.probe.calls)
 
@@ -453,6 +464,105 @@ class LifespanTests(RuntimeFixture):
                 outcome=AuditOutcome.SUCCEEDED,
             )
             self.assertEqual(AuditOutcome.SUCCEEDED, record.outcome)
+
+
+def schema_tables(path):
+    with closing(sqlite3.connect(path)) as db:
+        return {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+
+
+class MigrationAdmissionTests(RuntimeFixture):
+    async def test_unverified_filesystem_defers_migrations_until_retry_succeeds(self):
+        self.approved_device = self.device + 1
+        application = self.application()
+        async with application.router.lifespan_context(application):
+            runtime = application.state.monitoring
+            self.assertEqual(RuntimeState.FAILED, runtime.status.state)
+            await self.settle(runtime)
+            # No schema was written before the filesystem identity was verified,
+            # and the immediate alert was still attempted.
+            self.assertEqual(set(), schema_tables(self.settings.database_path))
+            self.assertEqual(["ServerSentinel critical alert: recording_health_failure"],
+                             self.slack_texts())
+            self.approved_device = self.device
+            self.clock.advance(timedelta(minutes=15))
+            await runtime.call(runtime.tick)
+            self.assertEqual(RuntimeState.RUNNING, runtime.status.state)
+            with closing(sqlite3.connect(self.settings.database_path)) as db:
+                self.assertEqual(len(APPLICATION_MIGRATIONS), db.execute(
+                    "SELECT COUNT(*) FROM schema_migrations").fetchone()[0])
+
+    async def test_invalid_database_still_aborts_startup(self):
+        self.settings.database_path.write_bytes(b"SYNTHETIC_PRIVATE_VALUE" * 64)
+        self.settings.database_path.chmod(0o600)
+        application = self.application()
+        with self.assertRaisesRegex(RuntimeError, "^application startup failed$"):
+            async with application.router.lifespan_context(application):
+                self.fail("must not start")
+        self.assertFalse(application.state.ready)
+        self.assertIsNone(application.state.monitoring._executor)
+
+
+class HardReserveMigrationTests(RuntimeFixture):
+    # Free space can never cover this hard reserve plus the write overhead.
+    storage_limits = dict(STORAGE_LIMITS, hard_reserve_bytes=2**61,
+                          pressure_free_bytes=2**62, recovery_free_bytes=2**62 + 1)
+
+    async def test_pending_migrations_are_refused_below_the_hard_reserve(self):
+        application = self.application()
+        async with application.router.lifespan_context(application):
+            runtime = application.state.monitoring
+            self.assertEqual(RuntimeState.FAILED, runtime.status.state)
+            self.assertFalse(application.state.audit_storage_admitted)
+            await self.settle(runtime)
+            self.assertEqual(set(), schema_tables(self.settings.database_path))
+            self.assertEqual(["ServerSentinel critical alert: recording_health_failure"],
+                             self.slack_texts())
+
+
+class FailingRecorder:
+    """Synthetic adapter whose pipeline is never ready: the self-test FAILS."""
+
+    def cleanup(self):
+        pass
+
+    def pipeline_status(self):
+        return PipelineStatus((True,), False, True)
+
+    def storage_health(self):
+        return ("OK",)
+
+
+class DeniedHealthStatusTests(RuntimeFixture):
+    async def test_failure_alert_is_attempted_when_status_persistence_is_denied(self):
+        application = self.application(recorder_probe_factory=lambda store: FailingRecorder())
+        async with application.router.lifespan_context(application):
+            runtime = application.state.monitoring
+            await self.settle(runtime)
+            failure = "ServerSentinel critical alert: recording_health_failure"
+            self.assertEqual(1, self.slack_texts().count(failure))
+            # The disk falls below the hard reserve: every metadata write,
+            # including the recording-health status row, is refused.
+            runtime._policy._space = lambda: FilesystemSpace(0, 2**40)
+            self.clock.advance(DAY)
+            await runtime.call(runtime.tick)
+            await self.settle(runtime)
+            status = runtime.status
+            self.assertEqual(HealthState.FAILED, status.recording_health)
+            self.assertTrue(status.recording_health_degraded)
+            self.assertEqual(2, self.slack_texts().count(failure))
+            # The denied write is retried, but the same failing verdict does
+            # not re-alert on every retry.
+            self.clock.advance(timedelta(minutes=15))
+            await runtime.call(runtime.tick)
+            await self.settle(runtime)
+            self.assertEqual(2, self.slack_texts().count(failure))
+            self.assertTrue(runtime.status.recording_health_degraded)
+            # A still-unpersisted failure a day later alerts again.
+            self.clock.advance(DAY)
+            await runtime.call(runtime.tick)
+            await self.settle(runtime)
+            self.assertEqual(3, self.slack_texts().count(failure))
 
 
 class PressureAuditTests(RuntimeFixture):

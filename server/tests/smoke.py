@@ -21,6 +21,7 @@ def observe(event, arguments):
 sys.addaudithook(observe)
 
 import asyncio  # noqa: E402
+from contextlib import nullcontext  # noqa: E402
 import io  # noqa: E402
 from pathlib import Path  # noqa: E402
 import tempfile  # noqa: E402
@@ -69,7 +70,9 @@ async def run(scenario):
         settings = Settings(Path(temporary))
         if scenario == "error":
             settings.database_path.write_bytes(b"SYNTHETIC_PRIVATE_VALUE")
-        application = create_app(settings)
+        # A synthetic admission stands in for the bound Main Server storage
+        # policy; without one the app refuses even its schema migrations.
+        application = create_app(settings, storage_reservation=nullcontext)
         if scenario == "normal":
             async with application.router.lifespan_context(application):
                 assert application.state.ready

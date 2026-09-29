@@ -10,7 +10,15 @@ only so the standalone installer validates it too. `storage_limits`,
 `python -m app` refuse to run without them, because the mandatory
 startup/daily integrity check and recording self-test would not run; an
 embedded `create_app()` without them keeps `UnboundStorageAdmission` semantics
-and reports the explicit `unconfigured` fault at error level.
+and reports the explicit `unconfigured` fault at error level; it also runs no
+schema migration unless the embedder injects a `storage_reservation`.
+
+Schema migrations are metadata writes: the runtime applies pending
+`APPLICATION_MIGRATIONS` on its worker inside `policy.control()`, after the
+recording filesystem identity and the hard reserve (plus `write_overhead_bytes`)
+were verified. A denial is a startup failure (immediate alert, retry every
+`retry_seconds`) with no tables created meanwhile; an invalid schema history or
+failed DDL on the first attempt still aborts application startup.
 
 `runtime.MonitoringRuntime` creates every thread-owned component on one
 dedicated worker thread: SQLite connection, `MainStoragePolicy` over
@@ -39,7 +47,10 @@ Bridges: integrity outbox rows map to deterministic event IDs, are recorded as
 (local), and are acknowledged only after the local row exists. Recording-health
 results persist in `recording_health_status` before notification;
 `FAILED` → `recording_health_failure`, `UNAVAILABLE` →
-`recording_health_warning`. A recording filesystem mismatch raises one
+`recording_health_warning`. A refused status write (e.g. `STORAGE_HARD_STOP`)
+still updates the in-memory state and attempts the alert, then marks the step
+degraded for retry; while the write keeps failing the same verdict re-alerts at
+most once per day. A recording filesystem mismatch raises one
 immediate `recording_health_failure` per episode. A failed startup open is
 retried every `retry_seconds` from the tick against the same declared identity
 (also when the retry itself raises, e.g. from the database connect);
