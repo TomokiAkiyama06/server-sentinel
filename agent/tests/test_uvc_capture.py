@@ -85,6 +85,7 @@ class FakePipeline:
         self.stop_result = True
         self.stops = 0
         self.stop_timeouts = []
+        self.stop_waits = []
         self.closed = False
 
     def feed(self, data):
@@ -102,9 +103,10 @@ class FakePipeline:
     def exited(self):
         return self.dead
 
-    def stop(self, timeout):
+    def stop(self, timeout, *, wait=True):
         self.stops += 1
         self.stop_timeouts.append(timeout)
+        self.stop_waits.append(wait)
         if self.stop_result:
             self.dead = True
             self.chunks.put(b"")
@@ -536,9 +538,9 @@ class CaptureTests(CaptureCase):
         capture, pipeline = self.approved_online(FakeDiscovery(device), device)
         original_stop = pipeline.stop
 
-        def slow_stop(timeout):
+        def slow_stop(timeout, **options):
             self.clock.now += 2  # Teardown longer than the backoff.
-            return original_stop(timeout)
+            return original_stop(timeout, **options)
 
         pipeline.stop = slow_stop
         self.clock.now += 3  # Stall beyond stall_timeout.
@@ -562,9 +564,9 @@ class CaptureTests(CaptureCase):
         first = self.launcher.pipelines[0]
         original_stop = first.stop
 
-        def slow_stop(timeout):
+        def slow_stop(timeout, **options):
             self.clock.now += 1.5  # Camera 0's bounded teardown takes time.
-            return original_stop(timeout)
+            return original_stop(timeout, **options)
 
         first.stop = slow_stop
         self.clock.now += 1  # Camera 1's last frame is still inside stall_timeout.
@@ -856,9 +858,9 @@ class CaptureTests(CaptureCase):
         capture, _discovery, _devices = self.four_approved()
 
         def hanging_stop(pipeline):
-            def stop(timeout):
+            def stop(timeout, *, wait=True):
                 pipeline.stop_timeouts.append(timeout)
-                time.sleep(timeout)
+                time.sleep(timeout if wait else 0)
                 return False
             return stop
 
@@ -928,9 +930,12 @@ class CaptureTests(CaptureCase):
         started = time.monotonic()
         for _ in range(3):
             self.assertEqual(self.state(capture), ("offline", "capture_cleanup_failed"))
-        # Later attempts re-signal without waiting the full bound each poll.
+        # Later attempts re-signal without waiting the full bound each poll;
+        # the per-poll bound only caps their process-table check.
         self.assertLess(time.monotonic() - started, self.limits.stop_timeout)
-        self.assertEqual(pipeline.stop_timeouts[1:], [0.0] * 3)
+        self.assertEqual(pipeline.stop_waits, [True, False, False, False])
+        for timeout in pipeline.stop_timeouts[1:]:
+            self.assertLessEqual(timeout, self.limits.stop_timeout)
         with self.assertRaises(CaptureCleanupError):
             capture.close()
         # Shutdown still grants the stuck pipeline one more full bound.
@@ -948,9 +953,9 @@ class CaptureTests(CaptureCase):
         self.assertEqual([item.state for item in capture.poll()], ["online"] * 4)
 
         def hanging_stop(pipeline):
-            def stop(timeout):
+            def stop(timeout, *, wait=True):
                 pipeline.stop_timeouts.append(timeout)
-                time.sleep(timeout)  # A D-state process never exits.
+                time.sleep(timeout if wait else 0)  # A D-state process never exits.
                 return False
             return stop
 
@@ -1143,10 +1148,13 @@ class SubprocessPipelineTests(unittest.TestCase):
             self.assertLess(time.monotonic() - started, 1)
             self.assertTrue(pipeline.exited())
             self.assertIsNone(leader.returncode)  # Group ID stays reserved.
-            self.assertFalse(pipeline.stop(0.0))
+            # A later no-wait retry checks once without sleeping.
+            started = time.monotonic()
+            self.assertFalse(pipeline.stop(1, wait=False))
+            self.assertLess(time.monotonic() - started, 0.5)
             # Once the member is dead the leader is reaped.
             stat.write_bytes(f"999999 (gst) Z {leader.pid} {leader.pid} 0 0".encode())
-            self.assertTrue(pipeline.stop(0.0))
+            self.assertTrue(pipeline.stop(1, wait=False))
             self.assertIsNotNone(leader.returncode)
         pipeline.close()
         # Without a readable process table cleanup is never reported.
@@ -1158,6 +1166,37 @@ class SubprocessPipelineTests(unittest.TestCase):
         self.assertIsNone(other.returncode)
         other.wait(5)
         other.stdout.close()
+
+    def test_process_table_scan_is_bounded_by_the_stop_deadline(self):
+        # A large or busy /proc is synthetic: many unrelated entries whose
+        # stat reads are slowed, so a full scan would far exceed the bound.
+        leader = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"],
+                                  stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                  stderr=subprocess.DEVNULL, start_new_session=True)
+        self.addCleanup(leader.stdout.close)
+        self.addCleanup(leader.wait, 5)
+        with tempfile.TemporaryDirectory() as proc:
+            for pid in range(900000, 900200):
+                (Path(proc) / str(pid)).mkdir()
+                (Path(proc) / str(pid) / "stat").write_bytes(
+                    f"{pid} (other) S 1 {pid} 0 0".encode())
+            pipeline = SubprocessPipeline(leader, proc_root=proc)
+
+            def slow_open(*args, **kwargs):
+                time.sleep(0.02)
+                return open(*args, **kwargs)
+
+            with mock.patch("media_capture_agent.uvc_pipeline.open", slow_open, create=True):
+                for wait in (True, False):
+                    started = time.monotonic()
+                    # An unfinished scan is not evidence that the group is gone.
+                    self.assertFalse(pipeline.stop(0.3, wait=wait))
+                    self.assertLess(time.monotonic() - started, 1)
+                    self.assertIsNone(leader.returncode)  # Group ID stays reserved.
+            # A scan that completes within the bound proves the group gone.
+            self.assertTrue(pipeline.stop(2, wait=False))
+            self.assertIsNotNone(leader.returncode)
+        pipeline.close()
 
     def test_sigterm_ignoring_pipeline_is_killed_within_bound(self):
         process = self.launch("ignore")

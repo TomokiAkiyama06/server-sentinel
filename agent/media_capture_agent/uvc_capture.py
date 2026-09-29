@@ -405,14 +405,14 @@ class UvcCapture:
         return max(0.0, min(self.limits.stop_timeout,
                             self._teardown_deadline - time.monotonic()))
 
-    def _reap(self, active, timeout=None):
+    def _reap(self, active, timeout=None, *, wait=True):
         # In poll() all teardowns share one stop bound, so several cameras
         # failing together (e.g. a USB hub fault) cannot multiply the delay
         # before the heartbeat; an unfinished one is retried as stuck.
         timeout = self._stop_bound() if timeout is None else timeout
-        stopped = active.process.stop(timeout)
+        stopped = active.process.stop(timeout, wait=wait)
         if active.thread.ident is not None:
-            active.thread.join(min(timeout, self._stop_bound()))
+            active.thread.join(min(timeout, self._stop_bound()) if wait else 0.0)
         if not stopped or active.thread.is_alive():
             return False
         active.process.close()
@@ -422,7 +422,10 @@ class UvcCapture:
         # Already waited the full bound once at teardown. A process stuck in
         # uninterruptible sleep must not stall every poll (and so the node
         # heartbeat); later attempts re-signal and only check without waiting.
-        source.stuck = [active for active in source.stuck if not self._reap(active, 0.0)]
+        # The check itself (a process-table scan) stays within the shared
+        # per-poll stop bound.
+        source.stuck = [active for active in source.stuck
+                        if not self._reap(active, self._stop_bound(), wait=False)]
 
     def _storage_failure(self, source):
         self._teardown(source)

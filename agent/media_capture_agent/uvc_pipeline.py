@@ -223,7 +223,7 @@ class FrameQueue:
 class PipelineProcess(Protocol):
     def read(self, size: int) -> bytes: ...
     def exited(self) -> bool: ...
-    def stop(self, timeout: float) -> bool: ...
+    def stop(self, timeout: float, *, wait: bool = True) -> bool: ...
     def close(self) -> None: ...
 
 
@@ -276,11 +276,13 @@ class SubprocessPipeline:
             time.sleep(0.01)
         return True
 
-    def _group_member_alive(self):
+    def _group_member_alive(self, deadline):
         """True while a non-leader member of the group is not yet dead.
 
-        Unprovable absence (no readable process table) counts as alive, so
-        cleanup is never reported without evidence.
+        Unprovable absence (no readable process table, or a scan that could
+        not finish before ``deadline``) counts as alive, so cleanup is never
+        reported without evidence and a large ``/proc`` cannot stretch the
+        stop bound.
         """
         pgid = self.process.pid
         try:
@@ -288,6 +290,8 @@ class SubprocessPipeline:
         except OSError:
             return True
         for name in entries:
+            if time.monotonic() >= deadline:
+                return True
             if not name.isdigit() or int(name) == pgid:
                 continue
             try:
@@ -304,28 +308,34 @@ class SubprocessPipeline:
                 return True
         return False
 
-    def _wait_group_gone(self, deadline):
-        while self._group_member_alive():
-            if time.monotonic() >= deadline:
+    def _wait_group_gone(self, deadline, wait_deadline):
+        while self._group_member_alive(deadline):
+            if time.monotonic() >= wait_deadline:
                 return False
             time.sleep(0.01)
         return True
 
-    def stop(self, timeout):
-        """Terminate the whole group within ``timeout``; False means not reaped."""
+    def stop(self, timeout, *, wait=True):
+        """Terminate the whole group within ``timeout``; False means not reaped.
+
+        With ``wait=False`` the group is signalled and checked once without
+        sleeping; ``timeout`` then only bounds that check (the process-table
+        scan), so a later retry can still prove the group gone.
+        """
         if self._reaped:
             return True
         deadline = time.monotonic() + timeout
+        wait_deadline = deadline if wait else time.monotonic()
         if not self.exited():
             self._signal(signal.SIGTERM)
-            self._wait_exit(time.monotonic() + timeout / 2)
+            self._wait_exit(min(wait_deadline, time.monotonic() + timeout / 2))
         # Also removes any surviving group member of an already exited leader.
         self._signal(signal.SIGKILL)
-        if not self._wait_exit(deadline):
+        if not self._wait_exit(wait_deadline):
             return False
         # The unreaped zombie leader keeps the group ID from being reused, so
         # a surviving member is still identified by it on a later retry.
-        if not self._wait_group_gone(deadline):
+        if not self._wait_group_gone(deadline, wait_deadline):
             return False
         try:
             self.process.wait(timeout=max(0.0, deadline - time.monotonic()) or 0.01)
