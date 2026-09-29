@@ -21,7 +21,9 @@ lookup (`getaddrinfo`, `gethostbyname`, `gethostbyname_ex`, `gethostbyaddr`,
 `getnameinfo` in both `socket` and `_socket`) from any thread. A process-wide
 `sys.addaudithook` backstop refuses the CPython `socket.connect` / `sendto` /
 `sendmsg` / resolver audit events, so direct `_socket.socket` use or a resolver
-alias captured before the guard started is refused and recorded too. Egress from
+alias captured before the guard started is refused and recorded too. Because
+`send`/`sendall` raise no audit event, entering the guard fails closed (recorded
+as `preconnected`) when a non-AF_UNIX socket is already connected. Egress from
 child processes or native code that bypasses CPython's `_socket` is outside
 this in-process guard:
 

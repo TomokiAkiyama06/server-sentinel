@@ -153,6 +153,30 @@ class NoTelemetryScenarios(unittest.TestCase):
             self.assertNotIsInstance(raised.exception, OutboundNetworkForbidden)
         self.assertEqual(6, len(guard.attempts))
 
+    def test_guard_fails_closed_on_sockets_connected_before_it_started(self):
+        import _socket
+
+        local_a, local_b = socket.socketpair()
+        self.addCleanup(local_a.close)
+        self.addCleanup(local_b.close)
+        with closing(_socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)) as early:
+            # UDP connect only records the peer; nothing is transmitted.
+            early.connect(("192.0.2.9", 9))
+            guard = NetworkGuard()
+            with self.assertRaises(OutboundNetworkForbidden):
+                guard.__enter__()
+            self.assertEqual([("preconnected", "192.0.2.9")], guard.attempts)
+            # The failed entry left no patch or active guard behind.
+            with self.assertRaises(OSError) as raised:
+                socket.getaddrinfo("telemetry.invalid", 443,
+                                   flags=getattr(socket, "AI_NUMERICHOST", 0))
+            self.assertNotIsInstance(raised.exception, OutboundNetworkForbidden)
+        # Local AF_UNIX pairs are not outbound and do not trip the guard.
+        with NetworkGuard() as guard:
+            local_a.send(b"local")
+        self.assertEqual(b"local", local_b.recv(16))
+        self.assertEqual([], guard.attempts)
+
     def run_main_paths(self):
         # Hardware integrity: startup success, then a failing daily probe.
         probe = SyntheticIntegrityProbe(self.faults)

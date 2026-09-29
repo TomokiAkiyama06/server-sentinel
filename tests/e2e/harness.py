@@ -349,10 +349,51 @@ class NetworkGuard:
                 patcher = patch.object(owner, name, self._refuse(name))
                 patcher.start()
                 self._patches.append(patcher)
+            # send/sendall raise no audit event, so a socket connected before
+            # the guard could still transmit. Scan after activation (a connect
+            # racing the scan is refused by the hook) and fail closed.
+            preconnected = self._preconnected_peers(socket)
+            if preconnected:
+                self.attempts.extend(("preconnected", peer) for peer in preconnected)
+                raise OutboundNetworkForbidden(
+                    f"synthetic network guard found {len(preconnected)} socket(s) "
+                    "connected before the guard started")
         except BaseException:
             self.__exit__(None, None, None)
             raise
         return self
+
+    @staticmethod
+    def _preconnected_peers(socket):
+        """Return peers of non-local sockets already connected in this process."""
+        local = {socket.AF_UNIX, getattr(socket, "AF_NETLINK", socket.AF_UNIX)}
+        try:
+            descriptors = os.listdir("/proc/self/fd")
+        except OSError as error:
+            raise OutboundNetworkForbidden(
+                "synthetic network guard cannot enumerate open sockets") from error
+        peers = []
+        for entry in descriptors:
+            try:
+                if not os.readlink(f"/proc/self/fd/{entry}").startswith("socket:"):
+                    continue
+                duplicate = os.dup(int(entry))
+            except OSError:
+                continue  # closed while scanning, including listdir's own fd
+            try:
+                probe = socket.socket(fileno=duplicate)
+            except OSError:
+                os.close(duplicate)
+                continue
+            with probe:
+                if probe.family in local:
+                    continue
+                try:
+                    peer = probe.getpeername()
+                except OSError:
+                    continue  # not connected; sendto/connect remain refused
+                peers.append(peer[0] if isinstance(peer, tuple) and peer else str(peer))
+        return peers
 
     def __exit__(self, *_):
         while self._patches:
