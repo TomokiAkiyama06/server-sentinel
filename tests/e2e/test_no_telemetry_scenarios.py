@@ -5,7 +5,7 @@ attempt from any thread. Only the explicitly configured Slack integration may
 try to reach its own endpoint, and even that attempt is refused here.
 """
 
-from contextlib import closing
+from contextlib import ExitStack, closing
 import errno
 import io
 import logging
@@ -71,6 +71,20 @@ SCENARIO_MODULES = (
     "tests.e2e.test_no_telemetry_scenarios",
 )
 
+# The processes users run: the Agent CLI and runtime, and the Main launcher,
+# settings and logging. The Main web entry points need the server runtime
+# dependencies (FastAPI), which are checked separately below.
+ENTRY_MODULES = (
+    "media_capture_agent.cli",
+    "media_capture_agent.runtime",
+    "media_capture_agent.config",
+    "media_capture_agent.storage",
+    "app.deployment",
+    "app.settings",
+    "app.logging",
+)
+MAIN_WEB_ENTRY_MODULES = ("app.main", "app.__main__")
+
 # The module-scope imports above run before any NetworkGuard exists, and a
 # socket opened and closed during import leaves nothing for the guard's
 # open-descriptor scan. So imports are replayed in a fresh interpreter whose
@@ -94,36 +108,51 @@ preloaded = sorted(name for name in sys.modules
                    if name.split(".")[0] in {"app", "media_capture_agent", "tests"})
 failed = []
 imported = []
+calls = []
 def report():
     reporting = sorted(set(%(reporting)r) & set(sys.modules))
     print(json.dumps({"attempts": attempts, "failed": failed, "preloaded": preloaded,
-                      "reporting": reporting, "imported": imported}), flush=True)
+                      "reporting": reporting, "imported": imported, "calls": calls}),
+          flush=True)
 atexit.register(report)
 for name in %(modules)r:
     try:
         importlib.import_module(name)
     except BaseException as error:
         failed.append([name, type(error).__name__])
+# Startup/validation entry points run under the same hook as the imports.
+for module, function, arguments in %(calls)r:
+    try:
+        entry = getattr(importlib.import_module(module), function)
+        value = entry() if arguments is None else entry(arguments)
+    except SystemExit as exit:
+        value = exit.code
+    except BaseException as error:
+        value = type(error).__name__
+    calls.append([module, function, value])
 if not %(guard_first)r:
     sys.addaudithook(hook)
 imported.append(True)
 """
 
 
-def guarded_import(modules, *, extra_path=None, guard_first=True):
+def guarded_import(modules, *, extra_path=None, guard_first=True, calls=()):
     import json
     import os
     import subprocess
 
     from tests.e2e.harness import _NETWORK_AUDIT_EVENTS
 
-    environment = dict(os.environ)
+    # No deployment setting from the invoking shell reaches the entry points.
+    environment = {key: value for key, value in os.environ.items()
+                   if not key.startswith("SERVERSENTINEL_")}
     if extra_path is not None:
         environment["PYTHONPATH"] = os.pathsep.join(
             filter(None, (str(extra_path), environment.get("PYTHONPATH"))))
     script = IMPORT_BOOTSTRAP % {
         "events": sorted(_NETWORK_AUDIT_EVENTS), "modules": list(modules),
         "reporting": sorted(REPORTING_MODULES), "guard_first": guard_first,
+        "calls": [list(call) for call in calls],
     }
     completed = subprocess.run(
         [sys.executable, "-c", script], cwd=Path(__file__).resolve().parents[2],
@@ -290,7 +319,7 @@ class NoTelemetryScenarios(unittest.TestCase):
                 pass
         self.assertEqual([], guard.attempts)
 
-    def run_main_paths(self):
+    def run_main_paths(self, lifecycle):
         # Hardware integrity: startup success, then a failing daily probe.
         probe = SyntheticIntegrityProbe(self.faults)
         integrity = IntegrityService(IntegrityMemoryPort(probe.inventory), probe, lambda *_: None,
@@ -303,7 +332,7 @@ class NoTelemetryScenarios(unittest.TestCase):
         # Recording health success and failure with Slack left unset.
         local = []
         notifications = NotificationService(local.append)
-        self.addCleanup(notifications.close)
+        lifecycle.callback(notifications.close)
 
         def record(result, at):
             if result.state != HealthState.OK:
@@ -359,13 +388,13 @@ class NoTelemetryScenarios(unittest.TestCase):
         self.assertIn('"event":"application_startup_failed"', stream.getvalue())
         self.assertNotIn("synthetic startup failure", stream.getvalue())
 
-    def run_agent_paths(self):
+    def run_agent_paths(self, lifecycle):
         settings = agent_settings(self.root / "agent", UUID(int=300))
         store = MediaStore(settings, stable_device=lambda _expected: True)
-        self.addCleanup(store.close)
+        lifecycle.callback(store.close)
         ring = DiskRing(settings, store, ledger_maximum_bytes=16 * 1024 * 1024,
                         authority=AllowRingControls())
-        self.addCleanup(ring.close)
+        lifecycle.callback(ring.close)
         source = UUID(int=400)
         t0 = self.clock.now_us()
         ring.configure(RingConfig("duration", 600),
@@ -390,6 +419,52 @@ class NoTelemetryScenarios(unittest.TestCase):
         self.assertEqual([], result["failed"])
         self.assertEqual([], result["attempts"])
         self.assertEqual([], result["reporting"])
+
+    def test_production_entry_points_make_no_outbound_connection_under_guard(self):
+        import json
+        import os
+
+        from tests.e2e.harness import agent_configuration
+
+        # A protected synthetic Agent configuration outside the checkout, so
+        # the CLI runs its real load/storage validation path.
+        configuration = self.root / "agent.json"
+        configuration.write_text(json.dumps(agent_configuration(self.root / "agent", UUID(int=300))),
+                                 encoding="utf-8")
+        os.chmod(configuration, 0o600)
+        missing = str(self.root / "absent.json")
+        result = guarded_import(ENTRY_MODULES, calls=(
+            ("media_capture_agent.cli", "main", ["--config", missing]),
+            ("media_capture_agent.cli", "main", ["--config", str(configuration), "--check"]),
+            ("app.deployment", "main", ["--config", missing, "--check"]),
+        ))
+        self.assertEqual([], result["preloaded"])
+        self.assertEqual([], result["failed"])
+        self.assertEqual([], result["attempts"])
+        self.assertEqual([], result["reporting"])
+        # Every entry point ran to its own validation result, not an exception.
+        self.assertEqual(3, len(result["calls"]))
+        for module, function, value in result["calls"]:
+            self.assertIn(value, (0, 1), (module, function))
+        self.assertEqual([1, 1], [result["calls"][0][2], result["calls"][2][2]])
+
+    def test_main_web_entry_points_make_no_outbound_connection_under_guard(self):
+        import importlib.util
+
+        result = guarded_import(MAIN_WEB_ENTRY_MODULES,
+                                calls=(("app.__main__", "main", None),))
+        self.assertEqual([], result["attempts"])
+        self.assertEqual([], result["reporting"])
+        if importlib.util.find_spec("fastapi") is not None:
+            # Server runtime dependencies present: the real startup error path
+            # (no data directory configured) runs under the hook.
+            self.assertEqual([], result["failed"])
+            self.assertEqual([["app.__main__", "main", 1]], result["calls"])
+        else:
+            # The dependency-free e2e job cannot load the web stack; the import
+            # still runs under the hook up to the missing dependency only.
+            self.assertEqual({"ModuleNotFoundError"}, {kind for _name, kind in result["failed"]})
+            self.assertEqual([["app.__main__", "main", "ModuleNotFoundError"]], result["calls"])
 
     def test_guarded_import_sees_a_connection_closed_during_import(self):
         # A module that resolves and connects once at import time, closes the
@@ -451,24 +526,50 @@ class NoTelemetryScenarios(unittest.TestCase):
         with self.assertRaises(AssertionError):
             guarded_import(["synthetic_abrupt_exit"], extra_path=package)
 
+    def run_guarded_paths(self):
+        # The lifecycle stack is exited before the guard, so every service's
+        # shutdown (a flush in close()) runs while egress is still refused.
+        with NetworkGuard() as guard, ExitStack() as lifecycle:
+            self.run_main_paths(lifecycle)
+            self.run_agent_paths(lifecycle)
+        return guard
+
+    def test_shutdown_cleanups_run_while_the_guard_is_active(self):
+        from unittest import mock
+
+        for owner in (NotificationService, MediaStore, DiskRing):
+            with self.subTest(owner=owner.__name__):
+                original = owner.close
+
+                def flushing_close(instance, _original=original):
+                    try:
+                        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as beacon:
+                            beacon.connect(("127.0.0.1", 9))
+                    except Exception:
+                        pass  # a flush that swallows the refusal still shows up
+                    _original(instance)
+
+                self.setUp()
+                with mock.patch.object(owner, "close", flushing_close):
+                    guard = self.run_guarded_paths()
+                self.assertIn(("connect", "127.0.0.1"), guard.attempts)
+
     def test_normal_and_error_paths_make_no_outbound_connection(self):
         import atexit
 
         # A shutdown flush registered while the paths run would execute after
         # the guard is gone, so the paths must leave no new exit callback.
         registered = atexit._ncallbacks()
-        with NetworkGuard() as guard:
-            self.run_main_paths()
-            self.run_agent_paths()
+        guard = self.run_guarded_paths()
         self.assertEqual(registered, atexit._ncallbacks())
         self.assertEqual([], guard.attempts)
         self.assertEqual(set(), REPORTING_MODULES & set(sys.modules))
 
     def test_opt_in_slack_is_the_only_destination_and_is_not_telemetry(self):
-        with NetworkGuard() as guard:
+        with NetworkGuard() as guard, ExitStack() as lifecycle:
             local = []
             service = NotificationService(local.append, SlackDelivery(endpoint(), timeout_seconds=1))
-            self.addCleanup(service.close)
+            lifecycle.callback(service.close)
             self.assertEqual(DeliveryResult.PENDING, service.record(
                 NotificationKind.RECORDING_HEALTH_FAILURE, at=self.clock.utcnow()))
             while service.pending_count:

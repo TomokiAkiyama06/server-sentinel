@@ -209,6 +209,11 @@ def storage_reservation():
 
 def agent_settings(root: Path, node_id: UUID) -> Settings:
     """Build protected-path settings from an ephemeral local filesystem."""
+    return Settings.parse(agent_configuration(root, node_id), code_root=root / "code")
+
+
+def agent_configuration(root: Path, node_id: UUID) -> dict:
+    """Agent configuration document for an ephemeral local filesystem."""
     media, runtime = root / "media", root / "state"
     root.mkdir(mode=0o700)
     media.mkdir(mode=0o700)
@@ -219,7 +224,7 @@ def agent_settings(root: Path, node_id: UUID) -> Settings:
         mount = next(item.identity for item in read_mounts() if item.mount_id == mount_id)
     finally:
         os.close(descriptor)
-    return Settings.parse({
+    return {
         "node_id": str(node_id), "media_root": str(media), "runtime_root": str(runtime),
         "expected_mount": {
             "mount_point": str(mount.mount_point), "filesystem": mount.filesystem,
@@ -231,7 +236,7 @@ def agent_settings(root: Path, node_id: UUID) -> Settings:
         "max_segment_bytes": 16384, "heartbeat_seconds": 1,
         "clock_offset_limit_seconds": 2, "clock_uncertainty_limit_seconds": 0.5,
         "clock_step_limit_seconds": 0.1,
-    }, code_root=root / "code")
+    }
 
 
 class SyntheticQuota:

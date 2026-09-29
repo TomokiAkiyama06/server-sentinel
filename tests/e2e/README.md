@@ -27,7 +27,17 @@ as `preconnected`) when a non-AF_UNIX socket is already connected. Module-scope
 imports run before any guard exists, so `test_no_telemetry_scenarios.py` also
 replays every scenario module (and the production modules they load) in a fresh
 interpreter whose first statement installs a refusing, recording audit hook;
-an import-time connect that already closed is caught there. Egress from
+an import-time connect that already closed is caught there. The same replay
+imports the Agent CLI/runtime and Main launcher and runs their startup
+validation and error paths (`media_capture_agent.cli.main`,
+`app.deployment.main`); the report is written from an exit callback registered
+before any import, so import-registered shutdown flushes run under the hook
+first. The Main web entry points (`app.main`, `app.__main__`) need FastAPI,
+which the dependency-free e2e CI job does not install: there they are checked
+only up to the missing dependency, and fully (including the
+`app.__main__.main` startup error path) wherever the server runtime
+dependencies are installed. In-process services are closed while the guard is
+still active, so shutdown flushes in `close()` are covered. Egress from
 child processes or native code that bypasses CPython's `_socket` is outside
 this in-process guard:
 
