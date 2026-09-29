@@ -58,7 +58,10 @@ the Agent retry rather than lose media, idempotent duplicate acknowledgement
 and bounded, coalescing gap events for skips, capture restarts, clock
 regressions and refused units. Known loss keeps a source flow `degraded` and a
 closed or stale session makes it `interrupted`. Session generations are never
-reissued (also after `forget_node` and re-enrollment), and `forget_source`
+reissued (also after `forget_node` and re-enrollment), `forget_node` also
+discards the node's ingest rate window under the tracker lock (so a
+re-enrolled node UUID never inherits the old credential's rate/clock state),
+and `forget_source`
 releases a deactivated source's slot and returns its undrained gaps. The
 node/source lifecycle commits a durable revocation or source deactivation
 inside `authorization_change` (tracker, or queue for direct queue users), so

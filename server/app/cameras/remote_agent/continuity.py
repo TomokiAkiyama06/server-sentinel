@@ -640,8 +640,21 @@ class ContinuityTracker:
             return self._forget_source_locked(source_id)
 
     def forget_node(self, node_id: UUID) -> tuple[GapEvent, ...]:
-        """Drop state after durable revocation/removal; returns undrained gaps."""
+        """Drop state after durable revocation/removal; returns undrained gaps.
+
+        Like a revocation committed through ``authorization_change``, this
+        forgets the node's session grant, every source it owns (with their
+        sequence/epoch/capture-clock watermarks) and the ingest queue's rate
+        window for the node.  The rate window is discarded while this
+        tracker's lock is held (tracker, then queue: the same lock order as
+        ``receive``), so no waiting attempt can observe the forgotten node
+        with its old rate/clock state still present, and a re-enrolled node
+        with the same UUID is never refused ``rate_limit`` or
+        ``clock_regression`` because of the previous credential's window.
+        The authorizer must already refuse the node.
+        """
         if not isinstance(node_id, UUID):
             raise ValueError("invalid agent node identity")
         with self._lock:
+            self._ingest.forget_revoked_node(node_id)
             return self._forget_node_locked(node_id)

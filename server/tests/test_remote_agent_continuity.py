@@ -700,6 +700,63 @@ class ContinuityTrackerTests(unittest.TestCase):
                          tracker.receive(fresh, unit(0), b"v").outcome)
         self.assertEqual(2, ingest.snapshot().queued_messages)
 
+    def test_forget_node_discards_rate_window_for_re_enrolled_node(self):
+        tracker, ingest, _, authorizer = build(rate=1)
+        old = tracker.open_session(NODE)
+        self.assertEqual(DeliveryOutcome.ACCEPTED,
+                         tracker.receive(old, unit(0), b"v").outcome)
+        # The old credential exhausts its rate budget for this window.
+        limited = tracker.receive(old, unit(1), b"v")
+        self.assertEqual((DeliveryOutcome.RATE_LIMITED, "rate_limit"),
+                         (limited.outcome, limited.reason))
+        self.assertEqual(1, ingest.snapshot().tracked_rate_windows)
+        authorizer.revoked.add(NODE)
+        tracker.forget_node(NODE)
+        self.assertEqual(0, ingest.snapshot().tracked_rate_windows)
+        # Re-enrollment of the same UUID with a new credential starts with a
+        # fresh budget instead of inheriting the old window.
+        authorizer.revoked.discard(NODE)
+        fresh = tracker.open_session(NODE)
+        delivery = tracker.receive(fresh, unit(0), b"v")
+        self.assertEqual((DeliveryOutcome.ACCEPTED, None),
+                         (delivery.outcome, delivery.reason))
+
+    def test_forget_node_discards_future_rate_window_start(self):
+        tracker, ingest, clock, authorizer = build()
+        clock.now = 1000
+        old = tracker.open_session(NODE)
+        tracker.receive(old, unit(0), b"v")
+        authorizer.revoked.add(NODE)
+        tracker.forget_node(NODE)
+        # The re-enrolled node's first unit is sampled before the old
+        # window's start; a retained window would refuse it as a regression.
+        clock.now = 500
+        authorizer.revoked.discard(NODE)
+        fresh = tracker.open_session(NODE)
+        delivery = tracker.receive(fresh, unit(0), b"v")
+        self.assertEqual((DeliveryOutcome.ACCEPTED, None),
+                         (delivery.outcome, delivery.reason))
+        self.assertEqual(1, ingest.snapshot().tracked_rate_windows)
+
+    def test_forget_source_keeps_other_node_state_and_resets_source_watermarks(self):
+        tracker, ingest, _, authorizer = build(
+            authorizer=Authorizer(((NODE, SOURCE), (NODE, OTHER_SOURCE))))
+        session = tracker.open_session(NODE)
+        tracker.receive(session, unit(5, at=10 ** 6), b"v")
+        tracker.receive(session, unit(0, source=OTHER_SOURCE), b"v")
+        authorizer.pairs.discard((NODE, SOURCE))
+        tracker.forget_source(SOURCE)
+        authorizer.pairs.add((NODE, SOURCE))
+        # A reactivated source identity starts without the old sequence,
+        # epoch or capture-clock watermark, so an earlier capture time or
+        # lower sequence is neither a duplicate nor a clock regression.
+        delivery = tracker.receive(session, unit(0, at=1), b"v")
+        self.assertEqual((DeliveryOutcome.ACCEPTED, ()),
+                         (delivery.outcome, delivery.gaps))
+        self.assertEqual(0, flow(tracker).last_sequence)
+        self.assertEqual(0, flow(tracker, OTHER_SOURCE).last_sequence)
+        self.assertEqual(1, ingest.snapshot().tracked_rate_windows)
+
     def test_grant_from_another_tracker_lifetime_is_stale(self):
         before_restart, _, _, _ = build()
         old = before_restart.open_session(NODE)
