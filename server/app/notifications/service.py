@@ -111,6 +111,10 @@ class NotificationService:
         self._worker = DeliveryWorker(self._slack, queue_capacity)
         self._capacity = queue_capacity
         self._pending = {}
+        # `record()` events whose delivery is final but whose local write was
+        # refused (full disk, unverified filesystem): retried on every poll,
+        # bounded by the same capacity, so a mandatory alert is not lost.
+        self._unpersisted: dict[UUID, NotificationEvent] = {}
         self._owner = threading.get_ident()
         self.closed = False
         self.last_delivery = DeliveryResult.DISABLED
@@ -120,6 +124,10 @@ class NotificationService:
     @property
     def pending_count(self) -> int:
         return len(self._pending)
+
+    @property
+    def unpersisted_count(self) -> int:
+        return len(self._unpersisted)
 
     def _check(self):
         if threading.get_ident() != self._owner:
@@ -133,7 +141,19 @@ class NotificationService:
             self.local_delivery_failed = True
             return False
 
-    def _enqueue(self, event: NotificationEvent, text: str, on_complete=None) -> DeliveryResult:
+    def _retain(self, event: NotificationEvent) -> None:
+        """Keep a refused local write for retry; a full buffer stays visible."""
+        self.local_delivery_failed = True
+        if event.event_id in self._unpersisted or len(self._unpersisted) < self._capacity:
+            self._unpersisted[event.event_id] = event
+
+    def _flush_unpersisted(self) -> None:
+        for identifier, event in tuple(self._unpersisted.items()):
+            if self._local(event):
+                del self._unpersisted[identifier]
+
+    def _enqueue(self, event: NotificationEvent, text: str, on_complete=None,
+                 retain: bool = False) -> DeliveryResult:
         if event.event_id in self._pending:
             prior = self._pending[event.event_id][0]
             if (event.kind, event.at, event.confirmed) != (prior.kind, prior.at, prior.confirmed):
@@ -149,6 +169,8 @@ class NotificationService:
             result = DeliveryResult.PENDING
         event = replace(event, delivery=result)
         if not self._local(event) and result != DeliveryResult.PENDING:
+            if retain:
+                self._retain(event)
             self.last_delivery = DeliveryResult.FAILED
             return self.last_delivery
         self.last_delivery = result
@@ -166,6 +188,7 @@ class NotificationService:
     def poll(self) -> tuple[NotificationEvent, ...]:
         """Persist completed results without waiting; failed persistence retries locally."""
         self._check()
+        self._flush_unpersisted()
         for identifier, result in self._worker.results():
             self._pending[identifier][2] = result
         completed = []
@@ -199,14 +222,27 @@ class NotificationService:
         if kind == NotificationKind.DAILY_SUMMARY:
             raise ValueError("daily summary requires aggregate data")
         event = NotificationEvent(kind, at, confirmed, event_id=event_id or uuid4())
+        prior = self._unpersisted.get(event.event_id)
+        if prior is not None:
+            # A resubmission of a retained event retries its local write
+            # instead of delivering it a second time.
+            if (kind, at, confirmed) != (prior.kind, prior.at, prior.confirmed):
+                self.delivery_failed = True
+                return DeliveryResult.FAILED
+            if not self._local(prior):
+                return DeliveryResult.FAILED
+            del self._unpersisted[event.event_id]
+            return prior.delivery
         immediate = (kind in {NotificationKind.HARDWARE_INTEGRITY_FAILURE,
                               NotificationKind.RECORDING_HEALTH_FAILURE}
                      or confirmed and kind in {NotificationKind.SERVER_MOVEMENT,
                                                NotificationKind.CAMERA_TAMPER})
         if not immediate:
-            self._local(event)
+            if not self._local(event):
+                self._retain(event)
             return DeliveryResult.SUPPRESSED
-        return self._enqueue(event, f"ServerSentinel critical alert: {kind.value}", on_complete)
+        return self._enqueue(event, f"ServerSentinel critical alert: {kind.value}", on_complete,
+                             retain=True)
 
     def daily(self, summary: DailySummary, *, at: datetime, on_complete=None) -> DeliveryResult:
         self._check()

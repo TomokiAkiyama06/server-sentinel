@@ -695,6 +695,37 @@ class SlackDisabledTests(RuntimeFixture):
         self.assertEqual([], self.transport.requests)
 
 
+class SlackDisabledFilesystemAlertTests(RuntimeFixture):
+    slack = False
+
+    async def test_filesystem_alert_is_persisted_after_the_filesystem_returns(self):
+        application = self.application()
+        async with application.router.lifespan_context(application):
+            runtime = application.state.monitoring
+            await self.settle(runtime)
+            before = [kind for kind, _ in self.events()].count("recording_health_failure")
+            detached = self.recordings.with_name("detached")
+            self.recordings.rename(detached)
+            self.recordings.mkdir(mode=0o700)
+            await runtime.call(runtime.tick)
+            self.assertFalse(runtime.status.recording_filesystem_ok)
+            self.assertTrue(runtime.status.notification_local_failed)
+            # The local write was refused; with Slack disabled it is the only
+            # record of the alert, so it is kept until storage recovers.
+            self.assertEqual(before, [kind for kind, _ in self.events()].count(
+                "recording_health_failure"))
+            self.assertEqual(1, runtime.notifications.unpersisted_count)
+            self.recordings.rmdir()
+            detached.rename(self.recordings)
+            self.clock.advance(timedelta(minutes=1))
+            await runtime.call(runtime.tick)
+            self.assertTrue(runtime.status.recording_filesystem_ok)
+            self.assertEqual(0, runtime.notifications.unpersisted_count)
+            self.assertIn(("recording_health_failure", "disabled"), self.events())
+            self.assertEqual(before + 1, [kind for kind, _ in self.events()].count(
+                "recording_health_failure"))
+
+
 class SlackFailureTests(RuntimeFixture):
     async def test_failed_delivery_keeps_local_fault_and_no_secret_in_logs(self):
         self.transport = Transport(error=RuntimeError("generated private failure"))
