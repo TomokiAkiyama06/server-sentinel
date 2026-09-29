@@ -61,6 +61,14 @@ class RemoteAgentIngestTests(unittest.TestCase):
             AgentMessage(NODE, SOURCE, AgentAction.MEDIA, -1, b"")
         with self.assertRaises(ValueError):
             AgentMessage(NODE, SOURCE, AgentAction.MEDIA, 0, bytearray(b"x"))
+        # The sequence has the envelope's signed 64-bit range for every action.
+        for action in AgentAction:
+            with self.assertRaises(ValueError):
+                AgentMessage(NODE, SOURCE, action, 2 ** 63, b"",
+                             capture_epoch=1, capture_time_ns=0)
+        self.assertEqual(2 ** 63 - 1, AgentMessage(
+            NODE, SOURCE, AgentAction.MEDIA, 2 ** 63 - 1, b"",
+            capture_epoch=1, capture_time_ns=0).sequence)
         for envelope in ({"capture_epoch": -1}, {"capture_time_ns": -1},
                          {"capture_epoch": 2 ** 63}, {"capture_time_ns": True},
                          {"capture_epoch": 1.0}):

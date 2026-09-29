@@ -63,7 +63,10 @@ class AgentMessage:
     different capture epochs and preserve the Agent capture timestamp.  Both
     are required for ``MEDIA`` (a partial or missing envelope is refused) and
     may be absent only for non-media actions; when present they must be
-    nonnegative 63-bit integers.
+    nonnegative 63-bit integers.  ``sequence`` has the same nonnegative
+    63-bit range as ``MediaUnitHeader`` for every action, so a direct queue
+    user cannot enqueue an envelope the continuity API or a signed 64-bit
+    downstream field cannot represent.
     """
 
     node_id: UUID
@@ -78,7 +81,8 @@ class AgentMessage:
         envelope = (self.capture_epoch, self.capture_time_ns)
         if (not isinstance(self.node_id, UUID) or not isinstance(self.source_id, UUID)
                 or not isinstance(self.action, AgentAction)
-                or type(self.sequence) is not int or self.sequence < 0
+                or type(self.sequence) is not int
+                or not 0 <= self.sequence <= _MAXIMUM_COUNTER
                 or type(self.payload) is not bytes
                 or any(value is not None and (type(value) is not int
                                               or not 0 <= value <= _MAXIMUM_COUNTER)
