@@ -39,12 +39,13 @@ with the real lookup, and the missing-configuration calls, must fail closed
 (exit 1). The Main
 web entry points (`app.main`, `app.__main__`) need FastAPI: the required CI job
 installs the hash-pinned `server/requirements.lock`, verifies the resolved pins
-with `license_gate.py`, and sets `E2E_REQUIRE_FULL_ENTRY_POINTS=1`, so there
+with `license_gate.py`, and sets `E2E_REQUIRE_FULL_COVERAGE=1`, so there
 they are checked fully (including the `app.__main__.main` startup error path)
 and a missing web stack or a root (UID 0) run fails instead of being skipped.
 Local runs without those dependencies check the web entry points only up to the
-missing dependency, and a local root run skips the Agent entry-point test
-because the Agent refuses UID 0 by design. In-process services are closed while the guard is
+missing dependency. Because the Agent refuses UID 0 by design, every Agent
+fixture (`agent_configuration()` / `agent_settings()`) skips a local root run
+with an explicit reason and fails it where `E2E_REQUIRE_FULL_COVERAGE=1`. In-process services are closed while the guard is
 still active, so shutdown flushes in `close()` are covered. Egress from
 child processes or native code that bypasses CPython's `_socket` is outside
 this in-process guard:

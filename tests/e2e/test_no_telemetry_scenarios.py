@@ -44,6 +44,7 @@ from tests.e2e.harness import (
     SyntheticIntegrityProbe,
     SyntheticRecorder,
     agent_settings,
+    require_full_coverage,
     storage_reservation,
 )
 from tests.e2e.test_notification_fault_scenarios import endpoint
@@ -84,9 +85,6 @@ ENTRY_MODULES = (
     "app.logging",
 )
 MAIN_WEB_ENTRY_MODULES = ("app.main", "app.__main__")
-# Set by the required CI job, which runs as non-root with the hash-pinned
-# server runtime dependencies installed: no entry point path may be skipped.
-REQUIRE_FULL_ENTRY_POINTS = "E2E_REQUIRE_FULL_ENTRY_POINTS"
 
 # The module-scope imports above run before any NetworkGuard exists, and a
 # socket opened and closed during import leaves nothing for the guard's
@@ -137,13 +135,6 @@ if not %(guard_first)r:
     sys.addaudithook(hook)
 imported.append(True)
 """
-
-
-def require_full_entry_points():
-    """Whether this run must execute every entry point path (set in required CI)."""
-    import os
-
-    return os.environ.get(REQUIRE_FULL_ENTRY_POINTS) == "1"
 
 
 def guarded_import(modules, *, extra_path=None, guard_first=True, calls=()):
@@ -436,14 +427,9 @@ class NoTelemetryScenarios(unittest.TestCase):
 
         from tests.e2e.harness import agent_configuration
 
-        if os.geteuid() == 0:
-            # The Agent refuses root by design (config and runtime), so its
-            # protected --check success path cannot run here; a required run
-            # fails instead of silently covering only the refusal path.
-            reason = "media_capture_agent refuses UID 0; run the E2E suite as a non-root user"
-            if require_full_entry_points():
-                self.fail(reason)
-            self.skipTest(reason)
+        # The Agent refuses root by design, so under UID 0 agent_configuration()
+        # skips locally and fails in required CI rather than letting the
+        # protected --check success path collapse into the refusal path.
         # A protected synthetic Agent configuration outside the checkout, so
         # the CLI runs its real load/storage validation path.
         configuration = self.root / "agent.json"
@@ -490,7 +476,7 @@ class NoTelemetryScenarios(unittest.TestCase):
         else:
             # The required CI job installs server/requirements.lock, so a
             # missing web stack there is a failure, never partial coverage.
-            self.assertFalse(require_full_entry_points(),
+            self.assertFalse(require_full_coverage(),
                              "server runtime dependencies (server/requirements.lock) are required")
             # Without the web stack (a local run) the import still runs under
             # the hook up to the missing dependency only.

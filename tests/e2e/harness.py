@@ -13,6 +13,7 @@ import os
 import sys
 import threading
 from pathlib import Path
+import unittest
 from uuid import UUID
 
 from app.cameras.registry import SourceHealthState, SourceType
@@ -207,6 +208,31 @@ def storage_reservation():
     return nullcontext()
 
 
+# Set by the required CI job, which runs as non-root with the hash-pinned
+# server runtime dependencies installed: no scenario may be skipped there.
+REQUIRE_FULL_COVERAGE = "E2E_REQUIRE_FULL_COVERAGE"
+AGENT_ROOT_REFUSED = ("media_capture_agent refuses UID 0 by design; "
+                      "run the E2E suite as a non-root user")
+
+
+def require_full_coverage() -> bool:
+    """Whether this run must execute every scenario path (set in required CI)."""
+    return os.environ.get(REQUIRE_FULL_COVERAGE) == "1"
+
+
+def skip_unless_full_coverage_required(reason: str):
+    """Skip locally with an explicit reason; fail where full coverage is required."""
+    if require_full_coverage():
+        raise AssertionError(reason)
+    raise unittest.SkipTest(reason)
+
+
+def require_non_root_agent() -> None:
+    """The Agent refuses root, so no Agent fixture can be built under UID 0."""
+    if os.geteuid() == 0:
+        skip_unless_full_coverage_required(AGENT_ROOT_REFUSED)
+
+
 SYNTHETIC_FILESYSTEM_UUID = "synthetic-filesystem-identity"
 
 
@@ -242,7 +268,12 @@ def agent_settings(root: Path, node_id: UUID) -> Settings:
 
 
 def agent_configuration(root: Path, node_id: UUID) -> dict:
-    """Agent configuration document for an ephemeral local filesystem."""
+    """Agent configuration document for an ephemeral local filesystem.
+
+    Every Agent fixture is built here, so a root run skips (or, in required
+    CI, fails) each Agent scenario instead of erroring in its setup.
+    """
+    require_non_root_agent()
     media, runtime = root / "media", root / "state"
     root.mkdir(mode=0o700)
     media.mkdir(mode=0o700)

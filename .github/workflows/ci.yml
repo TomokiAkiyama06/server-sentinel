@@ -64,12 +64,13 @@ jobs:
         env:
           PYTHONDONTWRITEBYTECODE: '1'
           PYTHONPATH: server:agent:.
+          E2E_REQUIRE_FULL_COVERAGE: '1'
         run: python -m unittest tests.e2e.test_mock_core_harness -v
       - name: Hardware-free mock E2E storage, retention, notification and telemetry scenarios
         env:
           PYTHONDONTWRITEBYTECODE: '1'
           PYTHONPATH: server:agent:.
-          E2E_REQUIRE_FULL_ENTRY_POINTS: '1'
+          E2E_REQUIRE_FULL_COVERAGE: '1'
         run: >-
           python -m unittest -v
           tests.e2e.test_agent_ring_scenarios

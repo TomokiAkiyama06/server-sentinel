@@ -44,13 +44,15 @@ class CIWorkflowTests(unittest.TestCase):
         self.assertNotEqual(-1, telemetry)
         self.assertLess(install, verify)
         self.assertLess(verify, telemetry)
-        # The step running the no-telemetry scenarios must forbid skipping any
-        # entry point path (missing web stack, root run).
-        step = repository[repository.rfind("\n      - name:", 0, telemetry):telemetry]
-        self.assertIn("\n          E2E_REQUIRE_FULL_ENTRY_POINTS: '1'\n", step)
-        scenarios = (ROOT / "tests/e2e/test_no_telemetry_scenarios.py").read_text(
-            encoding="utf-8")
-        self.assertIn('REQUIRE_FULL_ENTRY_POINTS = "E2E_REQUIRE_FULL_ENTRY_POINTS"\n', scenarios)
+        # Both E2E steps must forbid skipping any scenario path (missing web
+        # stack, root run) and run after the runtime install.
+        core = repository.find("run: python -m unittest tests.e2e.test_mock_core_harness -v")
+        self.assertLess(verify, core)
+        for anchor in (core, telemetry):
+            step = repository[repository.rfind("\n      - name:", 0, anchor):anchor]
+            self.assertIn("\n          E2E_REQUIRE_FULL_COVERAGE: '1'\n", step)
+        harness = (ROOT / "tests/e2e/harness.py").read_text(encoding="utf-8")
+        self.assertIn('REQUIRE_FULL_COVERAGE = "E2E_REQUIRE_FULL_COVERAGE"\n', harness)
 
 
 if __name__ == "__main__":

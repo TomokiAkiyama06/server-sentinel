@@ -5,6 +5,7 @@ private directory. Segment bytes are generated opaque placeholders, never
 camera media, and every scenario runs with outbound networking refused.
 """
 
+import os
 from pathlib import Path
 import tempfile
 import threading
@@ -21,7 +22,9 @@ from tests.e2e.harness import (
     NetworkGuard,
     SyntheticClock,
     SyntheticQuota,
+    agent_configuration,
     agent_settings,
+    REQUIRE_FULL_COVERAGE,
 )
 
 
@@ -34,6 +37,30 @@ LEDGER_BYTES = 16 * 1024 * 1024
 
 def sources(count):
     return tuple(UUID(int=400 + index) for index in range(count))
+
+
+class AgentFixtureUidTests(unittest.TestCase):
+    """Every Agent fixture refuses UID 0 the same way, before touching disk."""
+
+    def test_root_skips_locally_and_fails_where_full_coverage_is_required(self):
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "agent"
+            for required, raised in (("", unittest.SkipTest), ("1", AssertionError)):
+                with self.subTest(required=required), \
+                        mock.patch.dict("os.environ", {REQUIRE_FULL_COVERAGE: required}), \
+                        mock.patch("os.geteuid", return_value=0):
+                    with self.assertRaises(raised) as caught:
+                        agent_settings(root, NODE)
+                    self.assertIn("UID 0", str(caught.exception))
+                    with self.assertRaises(raised):
+                        agent_configuration(root, NODE)
+                    self.assertFalse(root.exists())
+            # A non-root run still builds the fixture.
+            if os.geteuid() != 0:
+                with mock.patch.dict("os.environ", {REQUIRE_FULL_COVERAGE: "1"}):
+                    self.assertEqual(agent_settings(root, NODE).media_root, root / "media")
 
 
 class RingScenario(unittest.TestCase):
