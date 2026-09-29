@@ -202,6 +202,11 @@ class _BoundedCall:
         self._pending = None
         return call.result()
 
+    def wait(self, timeout):
+        """Wait up to ``timeout`` for a blocked call; True once none is blocked."""
+        pending = self._pending
+        return pending is None or pending.done.wait(timeout)
+
 
 class _Active:
     """One running pipeline plus its reader thread; frames only via the queue."""
@@ -265,6 +270,9 @@ class _Source:
         self.storage_failed = False
         # Descriptors whose close could not even be scheduled (no worker).
         self.pending_close = []
+        # A close worker started but exceeded the bound: the descriptor is
+        # still being released until ``device_call`` stops being blocked.
+        self.closing = False
         # Queue drops already surfaced in a degraded snapshot.
         self.reported_drops = 0
         # Last capture failure while no pipeline runs; cleared by real frames.
@@ -337,8 +345,17 @@ class UvcCapture:
         except _NotStarted:
             return False
         except OSError:
-            pass  # Timed out (still closing in the worker) or failed: not reusable.
+            # Failed (not reusable) or timed out: a close still running in the
+            # worker is not finished cleanup and stays pending until it returns.
+            if source.device_call.blocked:
+                source.closing = True
         return True
+
+    @staticmethod
+    def _cleanup_pending(source):
+        if source.closing and not source.device_call.blocked:
+            source.closing = False
+        return bool(source.stuck or source.pending_close or source.closing)
 
     def _release_descriptor(self, source, descriptor):
         # Closing can reach the driver's release callback: bounded, off-thread.
@@ -520,7 +537,7 @@ class UvcCapture:
         if controller.state == CameraState.MANUAL or controller.requires_approval:
             reason = "identity_ambiguous" if controller.reason in _AMBIGUOUS else "owner_approval_required"
             return SourceHealth(source_id, "manual_intervention_required", reason)
-        if source.stuck or source.pending_close:
+        if self._cleanup_pending(source):
             return SourceHealth(source_id, "offline", "capture_cleanup_failed")
         if source.discovery_blocked:
             return SourceHealth(source_id, "offline", "discovery_failed")
@@ -571,7 +588,7 @@ class UvcCapture:
                 # without consuming the bound, so it cannot starve the others.
                 for source in self._sources.values():
                     controller = source.controller
-                    if (source.active is None and not source.stuck and not source.pending_close
+                    if (source.active is None and not self._cleanup_pending(source)
                             and not source.storage_failed and not source.discovery_blocked
                             and controller.bound is not None
                             and not controller.requires_approval and now >= source.retry_at):
@@ -608,7 +625,7 @@ class UvcCapture:
             source = self._sources[source_id]
             if not isinstance(candidate, DeviceEvidence):
                 raise CaptureRefused("invalid candidate")
-            if source.stuck or source.pending_close or source.storage_failed:
+            if self._cleanup_pending(source) or source.storage_failed:
                 raise CaptureRefused("source requires local recovery")
             scan = self._scan()
             if scan.failures:
@@ -640,10 +657,15 @@ class UvcCapture:
                 self._teardown(source)
                 # Shutdown grants every stuck pipeline one more full bound.
                 source.stuck = [active for active in source.stuck if not self._reap(active)]
+                # A still-blocked open or close (its late descriptor is released
+                # in the worker) gets one more full bound; if it is still
+                # running, shutdown is not clean.
+                source.device_call.wait(self.limits.device_timeout)
                 self._retry_pending_close(source, self.limits.device_timeout)
                 source.queue.close()
                 source.controller.capture_closed()
-                if source.stuck or source.pending_close or source.storage_failed:
+                if (self._cleanup_pending(source) or source.device_call.blocked
+                        or source.storage_failed):
                     # Keep the recovery marker armed: restart requires re-approval.
                     failed = True
                     continue

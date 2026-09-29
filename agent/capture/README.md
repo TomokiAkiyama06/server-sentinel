@@ -92,7 +92,11 @@ descriptor returned late is closed in the worker without being used.
 If no worker can be started at all (thread/PID exhaustion), the descriptor is
 kept for a bounded retry on later polls and the source reports
 `capture_cleanup_failed` (relaunch and re-approval blocked); it is never closed
-on the tick thread and the failure never escapes `poll()`.
+on the tick thread and the failure never escapes `poll()`. A close whose worker
+started but exceeded the bound is likewise `capture_cleanup_failed` until the
+worker returns, and `close()` gives a still-blocked open/close one more
+`device_timeout`, otherwise raising `CaptureCleanupError` with the recovery
+marker left armed.
 
 ## Not yet wired
 

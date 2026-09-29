@@ -673,11 +673,65 @@ class CaptureTests(CaptureCase):
         capture.poll()
         capture.approve(SOURCES[0], device)
         started = time.monotonic()
-        self.assertEqual(self.state(capture), ("degraded", "capture_starting"))
+        # Old behavior: the timed-out close counted as done ("capture_starting").
+        self.assertEqual(self.state(capture), ("offline", "capture_cleanup_failed"))
         self.assertLess(time.monotonic() - started, 1.0)
         self.assertEqual(len(self.launcher.pipelines), 1)
+        self.assertEqual(self.state(capture), ("offline", "capture_cleanup_failed"))
+        with self.assertRaises(CaptureRefused):
+            capture.approve(SOURCES[0], device)
         release.set()
         self.assertTrue(wait_for(lambda: len(closed) == 1))
+        self.assertTrue(wait_for(lambda: self.state(capture) == ("degraded",
+                                                                 "capture_starting")))
+
+    def test_shutdown_during_timed_out_close_keeps_recovery_marker(self):
+        self.short_device_limits(0.2)
+        release = threading.Event()
+        self.addCleanup(release.set)
+
+        def hung_close(descriptor):
+            release.wait(10)
+            os.close(descriptor)
+
+        device = evidence(serial="SYN-CLOSE")
+        discovery = FakeDiscovery(device)
+        capture = self.capture(discovery, close_device=hung_close)
+        capture.poll()
+        capture.approve(SOURCES[0], device)
+        capture.poll()
+        started = time.monotonic()
+        # Old behavior: close() returned cleanly and disarmed the marker.
+        with self.assertRaises(CaptureCleanupError):
+            capture.close()
+        self.assertLess(time.monotonic() - started, 2.0)
+        release.set()
+        restarted = self.capture(discovery)
+        self.assertEqual(self.state(restarted), ("manual_intervention_required",
+                                                 "owner_approval_required"))
+
+    def test_shutdown_during_hung_open_keeps_recovery_marker(self):
+        self.short_device_limits(0.2)
+        release = threading.Event()
+        self.addCleanup(release.set)
+
+        def hung_open(_candidate):
+            release.wait(10)
+            return os.open(os.devnull, os.O_RDONLY | os.O_CLOEXEC)
+
+        device = evidence(serial="SYN-OPEN")
+        discovery = FakeDiscovery(device)
+        capture = self.capture(discovery, open_device=hung_open)
+        capture.poll()
+        capture.approve(SOURCES[0], device)
+        self.assertEqual(self.state(capture), ("offline", "capture_failed"))
+        # The late descriptor would still be released in the worker.
+        with self.assertRaises(CaptureCleanupError):
+            capture.close()
+        release.set()
+        restarted = self.capture(discovery)
+        self.assertEqual(self.state(restarted), ("manual_intervention_required",
+                                                 "owner_approval_required"))
 
     def test_close_worker_exhaustion_is_a_source_cleanup_failure(self):
         closed = []
