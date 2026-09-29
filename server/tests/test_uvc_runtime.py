@@ -35,7 +35,7 @@ from app.deployment import Deployment
 from app.main import create_app
 from app.monitoring.runtime import MonitoringDependencies, RuntimeState
 from app.settings import ConfigurationError, Settings
-from app.storage.database import Database
+from app.storage.database import Database, PinnedDatabase
 from app.storage.migrations import migrate
 from app.storage.schema import APPLICATION_MIGRATIONS
 from tests.asgi import request
@@ -260,6 +260,33 @@ class RuntimeLifecycleTests(RuntimeFixture):
         self.discovery.devices = [replace(self.camera, device_path="/dev/video7")]
         self.assertTrue(self.wait_health(source.id, SourceHealthState.ONLINE))
         self.assertEqual(source.id, self.registry.get_source(source.id).id)
+
+    def test_registry_read_failure_is_current_capture_loss(self):
+        # A read fault while the camera is live closes capture, delivers the
+        # offline transition and degrades the service until polls succeed.
+        source = self.source()
+        events = []
+        runtime = self.runtime(source.id, health_sink=events.append)
+        runtime.start()
+        runtime.reapprove(self.admin, "synthetic-owner", source.id, self.camera)
+        self.assertTrue(self.wait_health(source.id, SourceHealthState.ONLINE))
+        self.assertTrue(wait_for(lambda: self.frame_count(source.id) > 0))
+
+        def failing(source_id):
+            raise RuntimeError("synthetic read fault")
+
+        with patch.object(self.registry, "get_source", side_effect=failing):
+            self.assertTrue(wait_for(
+                lambda: runtime.status().state is LocalUvcRuntimeState.DEGRADED))
+            self.assertIn(CameraState.OFFLINE, [event.state for event in events])
+            self.assertIsNot(runtime.status().sources[0].camera_state, CameraState.ONLINE)
+            self.assertTrue(all(capture.closed for capture in self.captures.instances))
+            count = self.frame_count(source.id)
+            time.sleep(0.2)
+            self.assertEqual(count, self.frame_count(source.id))
+        self.assertTrue(wait_for(
+            lambda: runtime.status().state is LocalUvcRuntimeState.RUNNING))
+        self.assertTrue(self.wait_health(source.id, SourceHealthState.ONLINE))
 
     def test_identical_non_serial_reconnect_requires_manual_intervention(self):
         source = self.source()
@@ -701,6 +728,73 @@ class ApplicationWiringTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(RuntimeError):
             registry.update_source_health(source.id, health_state=SourceHealthState.ONLINE)
         self.assertIs(registry.get_source(source.id).health_state, SourceHealthState.OFFLINE)
+
+    def test_pinned_database_never_creates_or_opens_a_replacement(self):
+        database, _source = self.migrated_source()
+        pinned = PinnedDatabase(database)
+        with self.assertRaises(ValueError):
+            pinned.connect()
+        refusing = ToggleAdmission()
+        refusing.refuse = True
+        with self.assertRaises(RuntimeError):
+            pinned.pin(refusing)
+        self.assertFalse(pinned.pinned)
+        pinned.pin(ToggleAdmission())
+        with closing(pinned.connect()) as connection:
+            connection.execute("SELECT 1 FROM camera_sources").fetchall()
+        path = database.path
+        moved = path.with_name("moved.sqlite")
+        os.rename(path, moved)
+        # A lost mount: the path is missing. Nothing is created there.
+        with self.assertRaises(ValueError):
+            pinned.connect()
+        self.assertFalse(path.exists())
+        # A replaced filesystem/file at the same path is never opened.
+        with closing(Database(path).connect()) as connection:
+            migrate(connection, APPLICATION_MIGRATIONS)
+        with self.assertRaises(ValueError):
+            pinned.connect()
+        os.replace(moved, path)
+        with closing(pinned.connect()) as connection:
+            self.assertEqual(1, len(connection.execute("SELECT id FROM camera_sources").fetchall()))
+
+    async def test_lost_database_file_after_start_is_not_recreated(self):
+        # After startup the verified database disappears (lost mount): the
+        # capture workers' registry reads never create a fallback file, and
+        # the live camera is reported as lost instead of staying ONLINE.
+        database, source = self.migrated_source()
+        application = create_app(
+            self.settings, storage_reservation=synthetic_admission,
+            local_uvc=LocalUvcConfiguration((source.id,), **FAST),
+            local_uvc_dependencies=self.dependencies,
+        )
+        admin = OwnerAdministration(
+            OwnerAuditService(AuditStore(database), PermitOwner()), CameraRegistry(database),
+        )
+        registry = CameraRegistry(database)
+        path = database.path
+        moved = path.with_name("moved.sqlite")
+        async with application.router.lifespan_context(application):
+            runtime = application.state.local_uvc
+            runtime.reapprove(admin, "synthetic-owner", source.id, self.camera)
+            self.assertTrue(wait_for(lambda: registry.get_source(source.id).health_state
+                                     is SourceHealthState.ONLINE))
+            os.rename(path, moved)
+            try:
+                self.assertTrue(wait_for(
+                    lambda: runtime.status().state is LocalUvcRuntimeState.DEGRADED))
+                await asyncio.sleep(0.2)
+                self.assertFalse(path.exists())
+                status = runtime.status()
+                self.assertIsNot(status.sources[0].camera_state, CameraState.ONLINE)
+                self.assertFalse(application.state.local_preview.source(source.id).live)
+                self.assertTrue(all(capture.closed
+                                    for capture in self.dependencies.capture_factory.instances))
+            finally:
+                os.replace(moved, path)
+            self.assertTrue(wait_for(lambda: runtime.status().state
+                                     is LocalUvcRuntimeState.RUNNING))
+        self.assertIs(application.state.local_uvc_state, LocalUvcRuntimeState.STOPPED)
 
     async def test_cancelled_startup_stops_capture_workers(self):
         # A cancelled lifespan startup (embedder shutdown, startup timeout)

@@ -91,6 +91,13 @@ then fails visibly and retries instead of writing past the reserve. The
 in-memory camera transition is still delivered (`recent_health_events()`,
 per-source `camera_state`), `health_persisted` becomes false and the service
 reports `degraded`, because the durable row may still show an earlier state.
+Reads are covered too: the runtime's registry and approval store use a
+`PinnedDatabase` that is pinned (device + inode) under a storage admission at
+start, opens with SQLite `mode=rw` (never creates a file) and refuses a
+missing or replaced file, so a lost mount never yields a fallback database.
+A registry read failure while a camera is live closes that capture and
+delivers the offline transition; any poll that raised marks the worker
+`polling_failed` and the service `degraded` until a poll completes.
 A lifespan startup that fails or is cancelled while the runtime starts still
 stops every worker. A UUID
 that is not a `local_uvc` source is `rejected`, never silently skipped; a worker

@@ -20,7 +20,7 @@ from typing import Callable
 from uuid import UUID
 
 from app.media.live.sessions import LiveAccess
-from app.storage.database import Database
+from app.storage.database import Database, PinnedDatabase
 from .model import AccessValidationError, Permission, PrincipalRole, PrincipalStatus, utc_time
 from .store import AccessStore, _digest, _us
 
@@ -55,7 +55,9 @@ def live_view_validator(database: Database, *,
                         source_allowed: Callable[[UUID], bool] | None = None,
                         clock: Callable[[], datetime] | None = None):
     """Return a ``LiveAccessValidator`` that reads current grants from SQLite."""
-    if not isinstance(database, Database):
+    # A route may pass the admission-pinned database so validation never
+    # opens or creates a database on a lost/replaced filesystem.
+    if not isinstance(database, (Database, PinnedDatabase)):
         raise ValueError("access database is required")
     if source_allowed is not None and not callable(source_allowed):
         raise ValueError("source filter must be callable")

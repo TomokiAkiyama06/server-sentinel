@@ -195,6 +195,11 @@ class LocalUvcRuntime:
                 return self.status()
             self._started = True
             try:
+                pin = getattr(self.registry.database, "pin", None)
+                if callable(pin):
+                    # Pin the admitted database file before any worker opens
+                    # it; later opens refuse a missing or replaced file.
+                    pin(getattr(self.registry, "reservation", None))
                 self.adapter = self._adapter_factory(
                     self.registry, emit_audit=self._health, on_frame=self._on_frame,
                     discovery=self._discovery, capture_factory=self._capture_factory,
@@ -258,6 +263,7 @@ class LocalUvcRuntime:
                         continue
                     status = self._supervisor.status(source_id)
                     if (status is None or not status.running or status.cleanup_failed
+                            or getattr(status, "polling_failed", False)
                             or self._health_unpersisted(source_id)):
                         # A live worker whose health cannot be persisted is
                         # not a healthy service: the registry may be stale.

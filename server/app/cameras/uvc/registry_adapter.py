@@ -230,8 +230,28 @@ class LocalUvcAdapter:
         # transient read cannot turn a durable success into an apparent error.
         self._approved_handoffs[source_id] = candidate
 
+    def _fail_session(self, source_id):
+        """Close a live session and report capture loss; never masks the cause."""
+        session = self.sessions.get(source_id)
+        if session is None:
+            return
+        try:
+            session.close()
+        finally:
+            session.controller.capture_failed()
+
     def poll_source(self, source_id, *, timeout=1.0):
-        source = self._source(source_id)
+        try:
+            source = self._source(source_id)
+        except BaseException:
+            # A registry read failure (lost mount, SQLite fault) while a
+            # camera is live is current capture loss: close it and deliver
+            # the offline transition, exactly like a failed poll.
+            try:
+                self._fail_session(source_id)
+            except BaseException:
+                pass
+            raise
         session = self.sessions.get(source_id)
         if session is None:
             approved = self.store.load(source_id)

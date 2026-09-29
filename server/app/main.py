@@ -24,7 +24,7 @@ from app.media.live.local_preview import LocalPreviewHub
 from app.monitoring.config import MonitoringConfiguration
 from app.monitoring.runtime import MonitoringDependencies, MonitoringRuntime, RuntimeState
 from app.settings import Settings
-from app.storage.database import Database
+from app.storage.database import Database, PinnedDatabase
 from app.storage.migrations import migrate
 from app.storage.schema import APPLICATION_MIGRATIONS
 
@@ -121,7 +121,11 @@ def create_app(settings: Settings, *, database: Database | None = None,
     local_uvc_runtime = (
         LocalUvcRuntime(
             local_uvc,
-            CameraRegistry(store, reservation=storage_reservation or runtime_admission),
+            # Reads, too, open only the database file pinned under admission
+            # and never create one, so a lost or replaced filesystem after
+            # startup cannot make a worker open/create a fallback database.
+            CameraRegistry(PinnedDatabase(store),
+                           reservation=storage_reservation or runtime_admission),
             on_frame=local_preview.on_frame,
             health_sink=local_uvc_health,
             discovery=uvc_dependencies.discovery,
