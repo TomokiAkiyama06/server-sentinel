@@ -201,6 +201,78 @@ class ContinuityTrackerTests(unittest.TestCase):
         self.assertEqual((DeliveryOutcome.ACCEPTED, ()), (result.outcome, result.gaps))
         self.assertEqual(SourceFlow.RECEIVING, flow(tracker).flow)
 
+    def test_queued_unit_preserves_full_continuity_envelope(self):
+        tracker, ingest, _, _ = build()
+        session = tracker.open_session(NODE)
+        tracker.receive(session, unit(0, epoch=1, at=70), b"a")
+        tracker.receive(session, unit(0, epoch=2, at=5), b"b")
+        queued = ingest.drain(10)
+        self.assertEqual([(1, 0, 70, b"a"), (2, 0, 5, b"b")],
+                         [(m.capture_epoch, m.sequence, m.capture_time_ns, m.payload)
+                          for m in queued])
+
+    def test_first_unit_pressure_is_visible_before_any_commit(self):
+        authorizer = Authorizer({(NODE, SOURCE), (NODE, OTHER_SOURCE)})
+        tracker, ingest, _, _ = build(authorizer=authorizer, queued=1)
+        session = tracker.open_session(NODE)
+        tracker.receive(session, unit(0), b"v")
+        result = tracker.receive(session, unit(3, source=OTHER_SOURCE), b"v")
+        self.assertEqual(DeliveryOutcome.BACKPRESSURED, result.outcome)
+        pressured = flow(tracker, OTHER_SOURCE)
+        self.assertEqual((SourceFlow.DEGRADED, True, None, 0),
+                         (pressured.flow, pressured.backpressured,
+                          pressured.last_sequence, pressured.pending_gaps))
+        ingest.drain(1)
+        result = tracker.receive(session, unit(3, source=OTHER_SOURCE), b"v")
+        # Once admitted, the first unit is treated as the start of the flow:
+        # leading loss is reported, not a capture restart.
+        self.assertEqual(DeliveryOutcome.ACCEPTED, result.outcome)
+        self.assertEqual([(GapReason.SEQUENCE_SKIP, 3)],
+                         [(g.reason, g.missing_units) for g in result.gaps])
+        self.assertEqual((3, False), (flow(tracker, OTHER_SOURCE).last_sequence,
+                                      flow(tracker, OTHER_SOURCE).backpressured))
+
+    def test_first_unit_rate_limit_and_transient_refusal_are_visible(self):
+        authorizer = Authorizer({(NODE, SOURCE), (NODE, OTHER_SOURCE)})
+        tracker, _, clock, _ = build(authorizer=authorizer, rate=1)
+        session = tracker.open_session(NODE)
+        tracker.receive(session, unit(0), b"v")
+        self.assertEqual(DeliveryOutcome.RATE_LIMITED,
+                         tracker.receive(session, unit(0, source=OTHER_SOURCE), b"v").outcome)
+        self.assertEqual((SourceFlow.DEGRADED, None),
+                         (flow(tracker, OTHER_SOURCE).flow,
+                          flow(tracker, OTHER_SOURCE).last_sequence))
+        tracker, _, clock, _ = build(authorizer=authorizer)
+        session = tracker.open_session(NODE)
+        clock.now = 50
+        tracker.receive(session, unit(0), b"v")
+        clock.now = 40
+        result = tracker.receive(session, unit(0, source=OTHER_SOURCE), b"v")
+        self.assertEqual((DeliveryOutcome.REJECTED, "clock_regression"),
+                         (result.outcome, result.reason))
+        clock.now = 55
+        self.assertEqual((SourceFlow.DEGRADED, None),
+                         (flow(tracker, OTHER_SOURCE).flow,
+                          flow(tracker, OTHER_SOURCE).last_sequence))
+        clock.now = 60
+        self.assertEqual(DeliveryOutcome.ACCEPTED,
+                         tracker.receive(session, unit(0, source=OTHER_SOURCE), b"v").outcome)
+        self.assertEqual(SourceFlow.RECEIVING, flow(tracker, OTHER_SOURCE).flow)
+
+    def test_uncommitted_sources_stay_within_source_capacity(self):
+        authorizer = Authorizer({(NODE, s) for s in SOURCES})
+        tracker, _, _, _ = build(authorizer=authorizer, queued=1)
+        session = tracker.open_session(NODE)
+        tracker.receive(session, unit(0, source=SOURCES[0]), b"v")
+        for source in SOURCES[1:4]:
+            self.assertEqual(DeliveryOutcome.BACKPRESSURED,
+                             tracker.receive(session, unit(0, source=source), b"v").outcome)
+        self.assertEqual(4, len(tracker.snapshot()))
+        self.assertEqual("source_capacity",
+                         tracker.receive(session, unit(0, source=SOURCES[4]), b"v").reason)
+        self.assertEqual((), tracker.forget_node(NODE))
+        self.assertEqual((), tracker.snapshot())
+
     def test_rate_limited_unit_is_not_committed(self):
         tracker, _, _, _ = build(rate=1)
         session = tracker.open_session(NODE)

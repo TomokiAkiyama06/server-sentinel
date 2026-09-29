@@ -13,6 +13,8 @@ from threading import Lock
 from typing import Callable, Protocol
 from uuid import UUID
 
+_MAXIMUM_COUNTER = 2 ** 63 - 1
+
 
 class AgentAction(str, Enum):
     """The only action categories the transport boundary may submit."""
@@ -54,6 +56,12 @@ class AgentMessage:
     The payload has no filesystem path, codec, URL, or human identity field.
     Frame/container parsing remains a transport/recording concern after
     authenticated bounded admission.
+
+    ``capture_epoch`` and ``capture_time_ns`` carry the Agent continuity
+    envelope (ADR-0007) so a downstream consumer can distinguish units of
+    different capture epochs and preserve the Agent capture timestamp.  They
+    are optional only for callers that predate the envelope; when present they
+    must be nonnegative 63-bit integers.
     """
 
     node_id: UUID
@@ -61,12 +69,18 @@ class AgentMessage:
     action: AgentAction
     sequence: int
     payload: bytes
+    capture_epoch: int | None = None
+    capture_time_ns: int | None = None
 
     def __post_init__(self) -> None:
+        envelope = (self.capture_epoch, self.capture_time_ns)
         if (not isinstance(self.node_id, UUID) or not isinstance(self.source_id, UUID)
                 or not isinstance(self.action, AgentAction)
                 or type(self.sequence) is not int or self.sequence < 0
-                or type(self.payload) is not bytes):
+                or type(self.payload) is not bytes
+                or any(value is not None and (type(value) is not int
+                                              or not 0 <= value <= _MAXIMUM_COUNTER)
+                       for value in envelope)):
             raise ValueError("invalid agent ingest message")
 
 

@@ -37,6 +37,10 @@ explicitly forbidden by the Issue.
    A lossless reconnect therefore yields no gap, a lossy reconnect yields an
    exact missing-unit count, and a capture restart yields a gap of explicitly
    unknown extent. Every candidate is evaluated by the same Main-side assertions.
+   The complete envelope (including `capture_epoch` and `capture_time_ns`)
+   travels with each admitted unit in the ingest queue, so a downstream
+   consumer can distinguish units of different epochs and preserve the Agent
+   capture timestamp (REQUIREMENTS MEDIA-007).
 2. **Main-assigned session generation.** Each authenticated session open gets a
    new generation; a superseded session cannot deliver, heartbeat or close the
    newer one.
@@ -55,7 +59,9 @@ explicitly forbidden by the Issue.
    sends each source in order and keeps loss-window protection independent of
    Main acknowledgements.
 4. **No silent healthy state.** Known loss, clock regression, or backpressure
-   keeps the source flow `degraded`; a closed or stale session makes it
+   keeps the source flow `degraded`, including pressure or a transient refusal
+   on a source's very first unit before anything is committed (reported with
+   no committed sequence); a closed or stale session makes it
    `interrupted`. Pending gap events are hard-bounded per source and coalesce
    into an unknown-extent event rather than being dropped. Flow continuity is
    separate from camera health and from node health (SPECIFICATION §5.8).

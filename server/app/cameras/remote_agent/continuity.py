@@ -142,16 +142,22 @@ class SourceContinuity:
     source_id: UUID
     flow: SourceFlow
     capture_epoch: int
-    last_sequence: int
+    last_sequence: int | None
     pending_gaps: int
     backpressured: bool
 
 
 @dataclass
 class _Source:
+    """Per-source state; ``last_sequence`` None means nothing committed yet.
+
+    An uncommitted entry exists only so that pressure/refusal on a source's
+    first unit is visible as ``degraded``; it occupies a bounded source slot.
+    """
+
     node_id: UUID
     capture_epoch: int
-    last_sequence: int
+    last_sequence: int | None
     last_capture_time_ns: int
     last_seen_ns: int
     backpressured: bool = False
@@ -258,13 +264,25 @@ class ContinuityTracker:
             gap.before_sequence, None,
         ))
 
+    def _pending(self, state: _Source | None, node_id: UUID,
+                 header: MediaUnitHeader, now: int) -> _Source:
+        """Return the source state, creating an uncommitted one if absent.
+
+        Capacity was already checked by the caller, so this stays bounded.
+        """
+        if state is not None:
+            return state
+        state = self._sources[header.source_id] = _Source(
+            node_id, header.capture_epoch, None, header.capture_time_ns, now)
+        return state
+
     def _discontinuities(self, node_id: UUID, state: _Source | None,
                          header: MediaUnitHeader) -> tuple[GapEvent, ...] | str:
         """Pure check; returns gaps to record, or a refusal/duplicate reason."""
         source_id, epoch, sequence = header.source_id, header.capture_epoch, header.sequence
-        if state is None or epoch > state.capture_epoch:
+        if state is None or state.last_sequence is None or epoch > state.capture_epoch:
             gaps = []
-            if state is not None:
+            if state is not None and state.last_sequence is not None:
                 # A new capture epoch means the Agent capture process
                 # restarted; the extent of any loss is not knowable here.
                 gaps.append(GapEvent(node_id, source_id, GapReason.CAPTURE_RESTART, epoch,
@@ -317,10 +335,11 @@ class ContinuityTracker:
             if isinstance(checked, str):
                 return Delivery(DeliveryOutcome.REJECTED, checked)
             admission = self._ingest.submit(AgentMessage(
-                node_id, source_id, AgentAction.MEDIA, header.sequence, payload))
+                node_id, source_id, AgentAction.MEDIA, header.sequence, payload,
+                capture_epoch=header.capture_epoch,
+                capture_time_ns=header.capture_time_ns))
             if admission.outcome in (IngestOutcome.BACKPRESSURED, IngestOutcome.RATE_LIMITED):
-                if state is not None:
-                    state.backpressured = True
+                self._pending(state, node_id, header, now).backpressured = True
                 outcome = (DeliveryOutcome.BACKPRESSURED
                            if admission.outcome is IngestOutcome.BACKPRESSURED
                            else DeliveryOutcome.RATE_LIMITED)
@@ -332,8 +351,7 @@ class ContinuityTracker:
                     and admission.reason not in _PERMANENT_INGEST_REFUSALS):
                 # Transient/unknown refusal: do not commit or claim loss, but
                 # never let the flow look healthy while it persists.
-                if state is not None:
-                    state.refused = True
+                self._pending(state, node_id, header, now).refused = True
                 return Delivery(DeliveryOutcome.REJECTED, admission.reason)
             if state is None:
                 state = self._sources[source_id] = _Source(

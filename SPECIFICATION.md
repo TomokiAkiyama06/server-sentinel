@@ -593,8 +593,10 @@ a retry of a committed unit is an idempotent `duplicate`, a unit refused for
 a reason no retry can satisfy (oversize) is recorded as loss, and any other
 ingest refusal leaves continuity unchanged and the flow `degraded`. A sequence skip reports the exact missing
 count, a new capture epoch reports a gap of unknown extent, and an in-epoch
-capture clock regression is reported. Known loss or backpressure keeps the
-source flow `degraded`; a closed or stale session makes it `interrupted`. Gap
+capture clock regression is reported. The full envelope travels with each
+admitted unit in the ingest queue. Known loss or backpressure keeps the
+source flow `degraded`, including pressure or a transient refusal on a
+source's first unit before anything is committed; a closed or stale session makes it `interrupted`. Gap
 events are bounded per source and coalesce into an unknown-extent event rather
 than being dropped. Flow continuity is not camera health or node health (§5.8).
 Tracked nodes and sources are bounded by the active-source limit (§3.4).

@@ -45,7 +45,8 @@ routes, and provide the revocable authenticated session required by Issue #13.
 `continuity.py` sits in front of `ingest.py` and implements the Proposed
 ADR-0007 contract: Main-assigned session generations for an already
 mTLS-authenticated node, the `(source_id, capture_epoch, sequence,
-capture_time_ns)` media envelope, commit-after-admission so backpressure makes
+capture_time_ns)` media envelope (carried in full on each queued
+`AgentMessage`), commit-after-admission so backpressure makes
 the Agent retry rather than lose media, idempotent duplicate acknowledgement,
 and bounded, coalescing gap events for skips, capture restarts, clock
 regressions and refused units. Known loss keeps a source flow `degraded` and a

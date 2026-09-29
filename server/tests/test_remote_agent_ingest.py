@@ -57,6 +57,11 @@ class RemoteAgentIngestTests(unittest.TestCase):
             AgentMessage(NODE, SOURCE, AgentAction.MEDIA, -1, b"")
         with self.assertRaises(ValueError):
             AgentMessage(NODE, SOURCE, AgentAction.MEDIA, 0, bytearray(b"x"))
+        for envelope in ({"capture_epoch": -1}, {"capture_time_ns": -1},
+                         {"capture_epoch": 2 ** 63}, {"capture_time_ns": True},
+                         {"capture_epoch": 1.0}):
+            with self.assertRaises(ValueError):
+                AgentMessage(NODE, SOURCE, AgentAction.MEDIA, 0, b"", **envelope)
         boundary = queue()
         accepted = boundary.submit(message(payload=b"opaque"))
         self.assertEqual(IngestOutcome.ACCEPTED, accepted.outcome)
