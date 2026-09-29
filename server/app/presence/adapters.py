@@ -331,10 +331,16 @@ class TimelineOutbox:
             if strict:
                 raise
             return False
+        session.unpersisted = self._unpersisted
         with self._lock:
             self._handle = session
             self._session, self._gap = True, gap is not None
         return True
+
+    def _unpersisted(self):
+        """Counted loss not yet in the durable marker; read by Owner status."""
+        with self._lock:
+            return self._unpersisted_refused + self._unpersisted_rejected
 
     def _persist(self, *, lost=0, close=False):
         """Add unpersisted counts to the durable marker, or re-read it."""

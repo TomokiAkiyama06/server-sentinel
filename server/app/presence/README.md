@@ -194,8 +194,9 @@ Only one outbox session per database can be open: `open()` takes an exclusive
 advisory lock beside the database file, which the kernel releases when the
 process dies, and a second outbox is refused while it is held. The lock file is
 created and taken inside the same storage-admitted transaction as the session
-row, so a refused volume gains nothing from an outbox start, and the read-only
-gap check never creates a missing database. A session row
+row, so a refused volume gains nothing from an outbox start. Status, history,
+audit and gap reads take no reservation and use a read-only SQLite open
+(`mode=ro`), so they never create a missing or replaced database. A session row
 found once the lock is free therefore belongs to an outbox that is gone. A
 clock fault while a producer hands a fact over is counted as a refused fact,
 because a one-shot producer callback will not re-emit it. A false positive is
@@ -203,7 +204,12 @@ cleared only by the Owner through the audited
 `clear_timeline_gap()`, a domain operation with no route. `OutboxState.degraded`
 stays true while facts are pending, counts are not yet persisted, the session
 is not open, or the durable marker is set or unreadable; the Owner status
-reports it as `timeline_gap` and `timeline_gap_detail`. Counts are only added,
+reports it as `timeline_gap` and `timeline_gap_detail`. Loss a live outbox has
+counted but not yet written is part of `timeline_gap` too
+(`timeline_gap_unpersisted`), and it refuses `clear_timeline_gap()` until the
+outbox writes it, so a clear never makes Owner status look healthy while known
+loss is pending. That in-memory count is visible through the service instance
+that opened the session. Counts are only added,
 so a retried write that had committed overstates the gap rather than hiding it.
 
 `owner_presence_validity` and `maximum_source_latency` have no default; they

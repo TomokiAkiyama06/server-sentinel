@@ -6,6 +6,8 @@ from datetime import timedelta
 import fcntl
 import json
 import os
+import sqlite3
+import threading
 from uuid import UUID, uuid4
 
 from .access import DenyAccess
@@ -36,6 +38,14 @@ class TimelineSession:
     def __init__(self, token, descriptor):
         self.token = token
         self._descriptor = descriptor
+        # Loss the outbox holding this session has counted but not yet
+        # written to the durable marker. The outbox replaces it with a reader
+        # of its own counts, so Owner status sees that loss before it lands.
+        self.unpersisted = lambda: 0
+
+    @property
+    def live(self):
+        return self._descriptor is not None
 
     def release(self):
         """Release the lock; the kernel does the same when the process dies."""
@@ -67,6 +77,37 @@ class PresenceService:
         # Injected by the reviewed #24 detector supervisor. Absent means unknown
         # detection health here; this module never claims a detector is running.
         self.detection = detection
+        # Outbox sessions this service opened and that are still live.
+        self._sessions = []
+        self._sessions_lock = threading.Lock()
+
+    def _read(self):
+        """A genuinely read-only connection for status and history reads.
+
+        Reads take no storage reservation, so they must never create a
+        database: SQLite's ``mode=ro`` opens an existing file or fails, with
+        no check-then-create window if the file or its mount disappears.
+        """
+        path = self.database.path
+        if not path.is_absolute() or path.is_symlink():
+            raise ValueError("database location is unavailable")
+        connection = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=5, isolation_level=None)
+        connection.row_factory = sqlite3.Row
+        return connection
+
+    def _unpersisted_loss(self):
+        """Timeline loss counted by a live outbox of this process but not yet written."""
+        with self._sessions_lock:
+            self._sessions = [session for session in self._sessions if session.live]
+            sessions = tuple(self._sessions)
+        total = 0
+        for session in sessions:
+            try:
+                total += session.unpersisted()
+            except Exception:
+                # An unreadable count cannot prove there is no loss.
+                total += 1
+        return total
 
     def _admission(self):
         """Obtain one storage reservation context for a single durable write.
@@ -495,6 +536,8 @@ class PresenceService:
             if session is not None:
                 session.release()
             raise
+        with self._sessions_lock:
+            self._sessions.append(session)
         return session, gap
 
     def record_timeline_gap(self, *, now, refused=0, rejected=0, lost=0, close=None):
@@ -526,9 +569,7 @@ class PresenceService:
         A missing database is an unreadable marker, never created here: this
         read takes no storage reservation.
         """
-        if not self.database.path.is_file():
-            raise RuntimeError("timeline gap marker unavailable")
-        with closing(self.database.connect()) as db:
+        with closing(self._read()) as db:
             return self._gap(db)
 
     def clear_timeline_gap(self, context, *, now, clock_trusted):
@@ -537,11 +578,17 @@ class PresenceService:
         The lost facts are not recoverable, so only the Owner can accept the
         gap, for example after an interrupted-restart false positive. Clearing
         is audited with the cleared counts and never happens automatically.
+        Loss a live outbox has counted but not yet written refuses the clear:
+        the Owner cannot accept a gap that is not yet on record, and the
+        outbox's next flush writes it. Owner status reports that loss either
+        way, so a clear never makes status look healthy while it is pending.
         """
         actor = self._owner(context)
         with self._transaction() as db:
             if not self._control_clock(db, now, clock_trusted):
                 raise ValueError("trusted control timestamp required")
+            if self._unpersisted_loss():
+                raise ValueError("unpersisted timeline loss pending")
             gap = self._gap(db)
             if gap is None:
                 raise ValueError("no timeline gap")
@@ -742,7 +789,7 @@ class PresenceService:
         `owner_status()` and must never expose this payload to a `live:view`
         identity or to any unauthenticated surface.
         """
-        with closing(self.database.connect()) as db:
+        with closing(self._read()) as db:
             control_trusted = self._control_trust(db, now, clock_trusted)
             override = db.execute("SELECT * FROM presence_override WHERE singleton=1").fetchone()
         expired = bool(override and override["expires"] and control_trusted
@@ -750,7 +797,7 @@ class PresenceService:
         # An expired override stops applying even when the durable retirement
         # write is refused; the pending flag keeps that difference visible.
         retired, admitted = self._retire_override(now) if expired else (True, True)
-        with closing(self.database.connect()) as db:
+        with closing(self._read()) as db:
             trusted = self._clock_trust(db, now, clock_trusted)
             control_trusted = self._control_trust(db, now, clock_trusted)
             state, basis, expires = self._effective(db, now, trusted, control_trusted)
@@ -771,6 +818,8 @@ class PresenceService:
             # A durable timeline gap stays visible across restarts until the
             # Owner clears it; it is Owner information like the paths below.
             gap = self._gap(db)
+        # Loss a live outbox has counted but not yet written is a gap too.
+        unpersisted = self._unpersisted_loss()
         # The reported state is only as trustworthy as the marker behind its
         # basis: Owner control for an override or hint, observation receipt for
         # an inferred owner observation. A skewed source timestamp must not
@@ -785,8 +834,9 @@ class PresenceService:
                 **self._critical_paths(unresolved, not admitted),
                 "override_expiry_pending": not retired,
                 "pending_critical_actions": failed,
-                "timeline_gap": gap is not None,
-                "timeline_gap_detail": gap}
+                "timeline_gap": gap is not None or unpersisted > 0,
+                "timeline_gap_detail": gap,
+                "timeline_gap_unpersisted": unpersisted}
 
     def owner_status(self, context, *, now, clock_trusted):
         self._owner(context)
@@ -794,7 +844,7 @@ class PresenceService:
 
     def audit(self, context):
         self._owner(context)
-        with closing(self.database.connect()) as db:
+        with closing(self._read()) as db:
             return [dict(row) for row in db.execute("SELECT * FROM presence_audit ORDER BY sequence")]
 
     def expire_audit(self, *, now, limit=1000):
@@ -892,7 +942,7 @@ class PresenceService:
         if cursor is not None:
             page = "AND (received>? OR (received=? AND sequence>?)) "
             window += [cursor[0], cursor[0], cursor[1]]
-        with closing(self.database.connect()) as db:
+        with closing(self._read()) as db:
             rows = db.execute("SELECT sequence,received,payload FROM presence_observations "
                               "WHERE received>=? AND received<? " + page
                               + "ORDER BY received,sequence LIMIT ?", (*window, limit)).fetchall()

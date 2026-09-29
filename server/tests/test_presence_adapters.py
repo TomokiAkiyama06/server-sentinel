@@ -4,10 +4,11 @@ from contextlib import closing, contextmanager
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 import json
+import sqlite3
 from pathlib import Path
 import tempfile
 import threading
-from unittest import TestCase
+from unittest import TestCase, mock
 from uuid import UUID, uuid4
 
 from app.cameras.registry.models import NodeHealthState, SourceHealthState, SourceType
@@ -652,7 +653,7 @@ class TimelineGapDurabilityTests(PresenceFixture, TestCase):
         state = self.outbox.flush()
         self.assertEqual((state.pending, state.unpersisted), (8, 1))
         self.assertTrue(state.degraded)
-        self.assertEqual(self.gap(), (False, None))
+        self.assertEqual(self.gap(), (True, None))  # counted loss is a gap before it lands
         self.refuse = False
         state = self.outbox.flush()
         self.assertEqual((state.pending, state.unpersisted), (0, 0))
@@ -755,10 +756,61 @@ class TimelineGapDurabilityTests(PresenceFixture, TestCase):
     def test_gap_read_never_creates_a_missing_database(self):
         missing = self.database.path.with_name("absent.sqlite3")
         self.presence.database = Database(missing)
-        with self.assertRaises(RuntimeError):
+        with self.assertRaises(sqlite3.OperationalError):
             self.presence.timeline_gap()
         self.assertFalse(missing.exists())
         self.assertIsNone(self.outbox.flush().gap)
+
+    def test_gap_read_opens_without_create_semantics(self):
+        # The database vanishing between any existence check and the open
+        # must not let the read-only check create it: the open itself fails.
+        missing = self.database.path.with_name("vanished.sqlite3")
+        self.presence.database = Database(missing)
+        with mock.patch.object(Path, "is_file", return_value=True):
+            with self.assertRaises(Exception):
+                self.presence.timeline_gap()
+        self.assertFalse(missing.exists())
+
+    def test_status_and_history_reads_never_create_a_missing_database(self):
+        missing = self.database.path.with_name("absent-status.sqlite3")
+        self.presence.database = Database(missing)
+        for read in (lambda: self.presence.snapshot(now=NOW, clock_trusted=True),
+                     lambda: self.presence.audit("owner"), self.history):
+            with self.assertRaises(sqlite3.OperationalError):
+                read()
+            self.assertFalse(missing.exists())
+
+    def test_unpersisted_loss_is_a_gap_and_refuses_the_clear(self):
+        self.outbox.flush()
+        self.restart()  # interrupted: a durable marker the Owner may clear
+        self.refuse = True
+        self.fill_and_refuse()
+        self.assertEqual(self.outbox.flush().unpersisted, 1)
+        self.refuse = False
+        status = self.presence.owner_status("owner", now=NOW, clock_trusted=True)
+        self.assertTrue(status["timeline_gap"])
+        self.assertEqual(status["timeline_gap_unpersisted"], 1)
+        with self.assertRaisesRegex(ValueError, "unpersisted"):
+            self.presence.clear_timeline_gap("owner", now=NOW, clock_trusted=True)
+        self.assertEqual(self.gap()[1]["interrupted"], 1)
+        # Once the outbox writes the loss, the Owner can accept all of it.
+        self.assertEqual(self.outbox.flush().unpersisted, 0)
+        cleared = self.presence.clear_timeline_gap("owner", now=NOW, clock_trusted=True)
+        self.assertEqual((cleared["refused"], cleared["interrupted"]), (1, 1))
+        self.assertEqual(self.gap(), (False, None))
+
+    def test_loss_counted_after_a_clear_keeps_status_degraded(self):
+        self.outbox.flush()
+        self.restart()
+        self.presence.clear_timeline_gap("owner", now=NOW, clock_trusted=True)
+        self.refuse = True
+        self.fill_and_refuse()
+        # The durable write is refused, yet status never reads healthy.
+        status = self.presence.owner_status("owner", now=NOW, clock_trusted=True)
+        self.refuse = False
+        self.assertTrue(status["timeline_gap"])
+        self.assertIsNone(status["timeline_gap_detail"])
+        self.assertEqual(status["timeline_gap_unpersisted"], 1)
 
     def test_a_second_outbox_is_refused_while_the_first_is_open(self):
         second = TimelineOutbox(self.presence, clock=self.clock, capacity=8)
