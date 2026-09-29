@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import textwrap
 import time
 import unittest
@@ -156,11 +157,11 @@ class CaptureCase(unittest.TestCase):
 
     def capture(self, discovery, count=1, **kwargs):
         kwargs.setdefault("launcher", self.launcher)
+        kwargs.setdefault("open_device",
+                          lambda _candidate: os.open(os.devnull, os.O_RDONLY | os.O_CLOEXEC))
         capture = UvcCapture(
             self.settings, [UvcSourceConfig(SOURCES[index], PROFILE) for index in range(count)],
-            discovery=discovery, limits=self.limits, clock=self.clock,
-            open_device=lambda _candidate: os.open(os.devnull, os.O_RDONLY | os.O_CLOEXEC),
-            **kwargs)
+            discovery=discovery, limits=self.limits, clock=self.clock, **kwargs)
         self.addCleanup(self._close, capture)
         return capture
 
@@ -535,6 +536,91 @@ class CaptureTests(CaptureCase):
         self.stream(capture, pipeline)
         self.assertEqual(self.state(capture), ("online", "video_ready"))
 
+    def test_drops_between_slow_polls_are_reported_before_recovery(self):
+        device = evidence()
+        capture, pipeline = self.approved_online(FakeDiscovery(device), device)
+        self.stream(capture, pipeline, count=6)
+        while capture.frames(SOURCES[0]).get(0) is not None:
+            pass
+        # Poll interval longer than stall_timeout: the drop burst is already
+        # outside the time window but was never reported.
+        self.clock.now += 10
+        self.stream(capture, pipeline)
+        self.assertEqual(self.state(capture), ("degraded", "capture_overloaded"))
+        # Reported once; with no new drops the source may recover.
+        self.clock.now += 1
+        self.stream(capture, pipeline)
+        self.assertEqual(self.state(capture), ("online", "video_ready"))
+        self.assertEqual(capture.frames(SOURCES[0]).drop_stats()[0], 3)
+
+    def test_hung_discovery_never_blocks_poll_or_grows_threads(self):
+        device = evidence()
+        discovery = FakeDiscovery(device)
+        self.limits = CaptureLimits(max_frame_bytes=4096, queue_frames=4, startup_timeout=5,
+                                    stall_timeout=2, stop_timeout=1, backoff_initial=1,
+                                    backoff_max=4, device_timeout=0.2)
+        capture, pipeline = self.approved_online(discovery, device)
+        release = threading.Event()
+        original = discovery.scan
+
+        def hung_scan():
+            release.wait(10)  # A V4L2 ioctl blocked by a faulty driver.
+            return original()
+
+        discovery.scan = hung_scan
+        self.addCleanup(release.set)
+        scans = discovery.scans
+        started = time.monotonic()
+        self.assertEqual(self.state(capture), ("offline", "discovery_failed"))
+        # Still blocked: fails at once without starting another worker.
+        self.assertEqual(self.state(capture), ("offline", "discovery_failed"))
+        self.assertLess(time.monotonic() - started, 2.0)
+        self.assertEqual(discovery.scans, scans)
+        self.assertEqual(len([thread for thread in threading.enumerate()
+                              if thread.name == "media-capture-agent-uvc-discovery"]), 1)
+        discovery.scan = original
+        release.set()
+        self.assertTrue(wait_for(lambda: self.state(capture) == ("degraded",
+                                                                 "capture_starting")))
+        self.assertEqual(len(self.launcher.pipelines), 2)
+
+    def test_hung_device_open_fails_source_and_closes_late_descriptor(self):
+        self.limits = CaptureLimits(max_frame_bytes=4096, queue_frames=4, startup_timeout=5,
+                                    stall_timeout=2, stop_timeout=1, backoff_initial=1,
+                                    backoff_max=4, device_timeout=0.2)
+        release = threading.Event()
+        self.addCleanup(release.set)
+        opened, closed = [], []
+
+        def hung_open(_candidate):
+            release.wait(10)
+            descriptor = os.open(os.devnull, os.O_RDONLY | os.O_CLOEXEC)
+            opened.append(descriptor)
+            return descriptor
+
+        def close_device(descriptor):
+            closed.append(descriptor)
+            os.close(descriptor)
+
+        device = evidence()
+        capture = self.capture(FakeDiscovery(device), open_device=hung_open,
+                               close_device=close_device)
+        capture.poll()
+        started = time.monotonic()
+        capture.approve(SOURCES[0], device)
+        self.assertEqual(self.state(capture), ("offline", "capture_failed"))
+        self.assertLess(time.monotonic() - started, 2.0)
+        self.assertEqual(self.launcher.pipelines, [])
+        release.set()
+        # The descriptor that arrives after the bound is closed, never launched.
+        self.assertTrue(wait_for(lambda: opened and closed == opened))
+        self.assertEqual(self.launcher.pipelines, [])
+
+    def test_device_timeout_bound_is_validated(self):
+        for value in (0, -1, 61, "2"):
+            with self.assertRaises(ValueError):
+                CaptureLimits(device_timeout=value)
+
     def test_unreapable_pipeline_blocks_relaunch_and_keeps_recovery_marker(self):
         device = evidence()
         discovery = FakeDiscovery(device)
@@ -561,7 +647,9 @@ class CaptureTests(CaptureCase):
         pipeline.stop_result = False
         discovery.devices = []
         capture.poll()
-        self.assertEqual(pipeline.stop_timeouts, [self.limits.stop_timeout])
+        # The first teardown gets (what remains of) the full per-poll bound.
+        self.assertEqual(len(pipeline.stop_timeouts), 1)
+        self.assertAlmostEqual(pipeline.stop_timeouts[0], self.limits.stop_timeout, delta=0.1)
         started = time.monotonic()
         for _ in range(3):
             self.assertEqual(self.state(capture), ("offline", "capture_cleanup_failed"))
@@ -572,6 +660,39 @@ class CaptureTests(CaptureCase):
             capture.close()
         # Shutdown still grants the stuck pipeline one more full bound.
         self.assertEqual(pipeline.stop_timeouts[-1], self.limits.stop_timeout)
+
+    def test_simultaneous_stuck_teardowns_share_one_stop_bound(self):
+        devices = [evidence(index, serial=f"SYN-{index}") for index in range(4)]
+        discovery = FakeDiscovery(*devices)
+        capture = self.capture(discovery, count=4)
+        for index, device in enumerate(devices):
+            capture.approve(SOURCES[index], device)
+        capture.poll()
+        for index in range(4):
+            self.stream(capture, self.launcher.pipelines[index], index=index)
+        self.assertEqual([item.state for item in capture.poll()], ["online"] * 4)
+
+        def hanging_stop(pipeline):
+            def stop(timeout):
+                pipeline.stop_timeouts.append(timeout)
+                time.sleep(timeout)  # A D-state process never exits.
+                return False
+            return stop
+
+        for pipeline in self.launcher.pipelines:
+            pipeline.stop = hanging_stop(pipeline)
+        discovery.devices = []  # E.g. the shared USB hub disappears.
+        started = time.monotonic()
+        health = capture.poll()
+        elapsed = time.monotonic() - started
+        self.assertEqual([(item.state, item.reason) for item in health],
+                         [("offline", "capture_cleanup_failed")] * 4)
+        # Old behavior: 4 x (stop + join) = 8 x stop_timeout before the heartbeat.
+        self.assertLess(elapsed, 1.8 * self.limits.stop_timeout)
+        for pipeline in self.launcher.pipelines:
+            pipeline.stop_result = True
+            del pipeline.stop
+            pipeline.stop(0)
 
     def test_stuck_pipeline_recovers_when_finally_reaped(self):
         device = evidence()

@@ -726,6 +726,10 @@ Capture:
 - [ ] Stop the stream by suspending the child (`SIGSTOP`): the
   source reports `capture_failed` after the stall timeout, the stopped process
   group is killed and reaped, and relaunch follows bounded backoff.
+- [ ] If a camera/driver fault can be reproduced that blocks V4L2 ioctls or
+  `open()`, confirm the node heartbeat keeps arriving on schedule while the
+  source reports `discovery_failed`/`capture_failed`, and that only one probe
+  thread remains blocked.
 - [ ] Connect a second camera of the same model and serial (or two identical
   non-serial cameras): no automatic binding; `identity_ambiguous` persists across
   a clean Agent restart until the Owner re-approves.

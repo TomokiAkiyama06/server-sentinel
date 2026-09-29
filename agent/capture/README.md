@@ -66,16 +66,25 @@ or pipeline failures.
 
 | State | Reasons |
 | --- | --- |
-| `online` | `video_ready` — frames are arriving and no frame was dropped within the stall window |
+| `online` | `video_ready` — frames are arriving, no frame was dropped within the stall window, and every earlier drop has already been reported once as `capture_overloaded` |
 | `degraded` | `capture_starting` (bound, no frame yet), `capture_overloaded` (consumer is not keeping up) |
 | `offline` | `camera_missing`, `capture_failed` (exit/stall/startup timeout/malformed stream; bounded backoff), `capture_unsupported`, `capture_cleanup_failed` (process not reaped; relaunch blocked), `discovery_failed` |
 | `manual_intervention_required` | `owner_approval_required`, `identity_ambiguous`, `approval_state_unavailable` |
 
 A pipeline that cannot be reaped, or approval state that cannot be written,
 keeps the active-session marker armed so the next start requires re-approval.
-Only the first teardown waits the full stop bound; later polls re-signal the
+All teardowns within one poll share a single stop bound (several cameras
+failing together cannot multiply the delay), and only the first attempt for a
+pipeline waits; later polls re-signal the
 stuck process group and check without waiting, so a process in uninterruptible
 sleep does not delay every heartbeat. `close()` grants it one more full bound.
+
+Discovery scans (sysfs reads and V4L2 `QUERYCAP`/`ENUM_FMT` ioctls) and the
+open of the capture node run in a worker bounded by `device_timeout` (default
+2 s). A call that exceeds it yields `discovery_failed` (scan) or
+`capture_failed` (open) for the affected sources and the heartbeat proceeds;
+while that call is still blocked, new requests fail at once instead of starting
+more threads, and a descriptor returned late is closed without being used.
 
 ## Not yet wired
 

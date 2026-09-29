@@ -208,6 +208,11 @@ class FrameQueue:
         with self._condition:
             return len(self._frames)
 
+    def drop_stats(self):
+        """Consistent ``(dropped, last_drop)`` snapshot for health reporting."""
+        with self._condition:
+            return self.dropped, self.last_drop
+
     def close(self):
         with self._condition:
             self._closed = True

@@ -12,7 +12,11 @@ Fail-closed rules:
 - a source is ``online`` only while frames actually arrive; dropped frames,
   startup/stall timeouts and malformed streams are visible;
 - a pipeline that cannot be reaped blocks relaunch for that source and keeps
-  the restart-recovery marker armed.
+  the restart-recovery marker armed;
+- device probing (V4L2 discovery ioctls, opening the capture node) runs off the
+  Agent tick thread under a bound, so a hung camera/driver becomes a per-source
+  ``discovery_failed``/``capture_failed`` and never stops the node heartbeat;
+- queue drops stay latched until a ``degraded`` snapshot has reported them.
 
 Frames go to a bounded per-source ``FrameQueue``. Transport/ring integration
 (#15/#16) and the Owner approval route (#13/#14) are not wired here.
@@ -60,6 +64,8 @@ class CaptureLimits:
     startup_timeout: float = 10.0
     stall_timeout: float = 5.0
     stop_timeout: float = 3.0
+    # Bound for one discovery scan or capture-node open on the tick thread.
+    device_timeout: float = 2.0
     backoff_initial: float = 1.0
     backoff_max: float = 60.0
 
@@ -71,6 +77,8 @@ class CaptureLimits:
         for value in (self.startup_timeout, self.stall_timeout, self.stop_timeout):
             if not _positive(value, 300):
                 raise ValueError("invalid capture timeout")
+        if not _positive(self.device_timeout, 60):
+            raise ValueError("invalid capture timeout")
         if not _positive(self.backoff_initial, 3600) or not _positive(self.backoff_max, 3600):
             raise ValueError("invalid capture backoff")
         if self.backoff_initial > self.backoff_max:
@@ -103,6 +111,89 @@ def open_video_device(candidate):
         os.close(descriptor)
         raise
     return descriptor
+
+
+class _Call:
+    """One blocking call in a worker; a result arriving after abandon is discarded."""
+
+    def __init__(self, discard):
+        self.done = threading.Event()
+        self._lock = threading.Lock()
+        self._discard = discard
+        self._abandoned = False
+        self._value = None
+        self._error = None
+
+    def execute(self, function):
+        value = error = None
+        try:
+            value = function()
+        except BaseException as exc:  # Re-raised in the caller, never in the worker.
+            error = exc
+        with self._lock:
+            abandoned = self._abandoned
+            if not abandoned:
+                self._value, self._error = value, error
+            self.done.set()
+        if abandoned and error is None:
+            self._release(value)
+
+    def abandon(self):
+        with self._lock:
+            self._abandoned = True
+            late = self.done.is_set() and self._error is None
+            value, self._value = self._value, None
+        if late:
+            # Finished between the timed-out wait and this abandon: still unused.
+            self._release(value)
+
+    def _release(self, value):
+        if self._discard is not None and value is not None:
+            try:
+                self._discard(value)
+            except Exception:
+                pass
+
+    def result(self):
+        if self._error is not None:
+            raise self._error
+        return self._value
+
+
+class _BoundedCall:
+    """Run a potentially blocking device call off the Agent tick thread.
+
+    At most one call is outstanding: while an earlier call is still blocked
+    (e.g. an ioctl on a hung UVC driver) new requests fail at once, so the
+    number of stuck threads never grows. A timed-out call's late result is
+    passed to ``discard`` (e.g. close a descriptor) and never used.
+    """
+
+    def __init__(self, name, discard=None):
+        self._name = name
+        self._discard = discard
+        self._pending = None
+
+    @property
+    def blocked(self):
+        return self._pending is not None and not self._pending.done.is_set()
+
+    def run(self, function, timeout):
+        if self.blocked:
+            raise TimeoutError("device call still blocked")
+        call = _Call(self._discard)
+        thread = threading.Thread(target=call.execute, args=(function,), name=self._name,
+                                  daemon=True)
+        try:
+            thread.start()
+        except RuntimeError:
+            raise TimeoutError("device call could not start") from None
+        if not call.done.wait(timeout):
+            self._pending = call
+            call.abandon()
+            raise TimeoutError("device call exceeded bound")
+        self._pending = None
+        return call.result()
 
 
 class _Active:
@@ -165,6 +256,8 @@ class _Source:
         self.retry_at = 0.0
         self.discovery_blocked = False
         self.storage_failed = False
+        # Queue drops already surfaced in a degraded snapshot.
+        self.reported_drops = 0
         # Last capture failure while no pipeline runs; cleared by real frames.
         self.failure = None
 
@@ -191,6 +284,9 @@ class UvcCapture:
         self.launcher = launcher
         self.discovery = discovery or LinuxDiscovery()
         self.open_device, self.close_device, self.clock = open_device, close_device, clock
+        self._discovery_call = _BoundedCall("media-capture-agent-uvc-discovery")
+        # Inside poll(): one stop bound shared by every teardown of that tick.
+        self._teardown_deadline = None
         self._owns_store = store is None
         self.store = ApprovalStore(settings) if store is None else store
         self._lock = threading.RLock()
@@ -199,16 +295,27 @@ class UvcCapture:
         try:
             for config in sources:
                 controller = ReconnectController(config.source_id, self.store)
-                self._sources[config.source_id] = _Source(config, controller, self.limits, clock)
+                source = _Source(config, controller, self.limits, clock)
+                source.open_call = _BoundedCall("media-capture-agent-uvc-open",
+                                                discard=self._close_quietly)
+                self._sources[config.source_id] = source
         except BaseException:
             if self._owns_store:
                 self.store.close()
             raise
 
     # -- discovery ---------------------------------------------------------
-    def _scan(self):
+    def _close_quietly(self, descriptor):
         try:
-            result = self.discovery.scan()
+            self.close_device(descriptor)
+        except OSError:
+            pass
+
+    def _scan(self):
+        # A timed-out or still-blocked scan (TimeoutError is an OSError) proves
+        # neither absence nor uniqueness: it counts as a failed node.
+        try:
+            result = self._discovery_call.run(self.discovery.scan, self.limits.device_timeout)
         except (OSError, ValueError, ProbeError):
             return DiscoveryResult((), 1)
         if not isinstance(result, DiscoveryResult) or any(
@@ -228,11 +335,20 @@ class UvcCapture:
         if not self._reap(active):
             source.stuck.append(active)
 
+    def _stop_bound(self):
+        if self._teardown_deadline is None:
+            return self.limits.stop_timeout
+        return max(0.0, min(self.limits.stop_timeout,
+                            self._teardown_deadline - time.monotonic()))
+
     def _reap(self, active, timeout=None):
-        timeout = self.limits.stop_timeout if timeout is None else timeout
+        # In poll() all teardowns share one stop bound, so several cameras
+        # failing together (e.g. a USB hub fault) cannot multiply the delay
+        # before the heartbeat; an unfinished one is retried as stuck.
+        timeout = self._stop_bound() if timeout is None else timeout
         stopped = active.process.stop(timeout)
         if active.thread.ident is not None:
-            active.thread.join(timeout)
+            active.thread.join(min(timeout, self._stop_bound()))
         if not stopped or active.thread.is_alive():
             return False
         active.process.close()
@@ -316,7 +432,8 @@ class UvcCapture:
         descriptor = None
         process = None
         try:
-            descriptor = self.open_device(candidate)
+            descriptor = source.open_call.run(lambda: self.open_device(candidate),
+                                              self.limits.device_timeout)
             # Re-verify after opening: the descriptor must belong to the same,
             # still unique physical evidence the controller would bind now.
             fresh = self._scan()
@@ -366,8 +483,12 @@ class UvcCapture:
         if source.discovery_blocked:
             return SourceHealth(source_id, "offline", "discovery_failed")
         if controller.state == CameraState.ONLINE and source.active is not None:
-            drop = source.queue.last_drop
-            if drop is not None and now - drop <= self.limits.stall_timeout:
+            dropped, drop = source.queue.drop_stats()
+            # A drop between polls (or older than the window when polls are
+            # slower than stall_timeout) is still reported once before recovery.
+            if (dropped != source.reported_drops
+                    or drop is not None and now - drop <= self.limits.stall_timeout):
+                source.reported_drops = dropped
                 return SourceHealth(source_id, "degraded", "capture_overloaded")
             return SourceHealth(source_id, "online", "video_ready")
         if controller.state == CameraState.DEGRADED and source.active is not None:
@@ -386,15 +507,20 @@ class UvcCapture:
         with self._lock:
             if self._closed:
                 raise CaptureRefused("capture is closed")
-            now = self.clock()
             scan = self._scan()
-            for source in self._sources.values():
-                self._retry_stuck(source)
-                if not source.storage_failed:
-                    self._reconcile(source, scan)
-            for source in self._sources.values():
-                self._supervise(source, now)
-            self._resolve_conflicts()
+            # Sample after the bounded scan so timeouts use the current time.
+            now = self.clock()
+            self._teardown_deadline = time.monotonic() + self.limits.stop_timeout
+            try:
+                for source in self._sources.values():
+                    self._retry_stuck(source)
+                    if not source.storage_failed:
+                        self._reconcile(source, scan)
+                for source in self._sources.values():
+                    self._supervise(source, now)
+                self._resolve_conflicts()
+            finally:
+                self._teardown_deadline = None
             for source in self._sources.values():
                 controller = source.controller
                 if (source.active is None and not source.stuck and not source.storage_failed

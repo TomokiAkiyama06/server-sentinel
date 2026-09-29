@@ -332,7 +332,14 @@ Per-source health: `manual_intervention_required` (`owner_approval_required`,
 Startup/stall timeouts, malformed streams and pipeline exits retry with bounded
 exponential backoff; a pipeline that cannot be reaped blocks relaunch and keeps
 the recovery marker armed, and later polls retry reaping without waiting the full
-stop bound so heartbeats are not delayed. Node health is unaffected by any source failure.
+stop bound so heartbeats are not delayed; teardowns within one poll share one
+stop bound. Discovery scans and the capture-node
+open run off the tick thread under `device_timeout`; a hung driver call yields
+`discovery_failed`/`capture_failed` instead of stopping the heartbeat, starts no
+additional worker while still blocked, and a late descriptor is closed unused.
+Queue drops are latched until one `capture_overloaded` snapshot has reported
+them, even when polls are slower than the stall window.
+Node health is unaffected by any source failure.
 Wiring into the production CLI, the Owner approval route (#13/#14), ring
 storage (#16) and transport (#15) is separate work.
 
