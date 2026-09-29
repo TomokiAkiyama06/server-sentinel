@@ -175,3 +175,70 @@ class OwnerAdministration:
                 target_logical_id=recording_id,
             )
             raise
+
+
+class AccessAdministration:
+    """Owner-only human-access mutations with their security audit records.
+
+    Each operation runs through ``OwnerAuditService.execute_transactional``:
+    the Owner authorizer runs first, a refused actor gets a bounded ``denied``
+    record and no mutation, and a permitted mutation commits in the same SQLite
+    transaction as its ``succeeded`` record. Only the principal's application
+    logical UUID reaches the audit log; external identities, display names,
+    invitation secrets, credential identifiers and public keys never do.
+    This class registers no route.
+    """
+
+    def __init__(self, service, access_store):
+        if getattr(service.store, "database", None) != access_store.database:
+            raise ValueError("access audit must share the access database")
+        self.service = service
+        self.access = access_store
+
+    def _execute(self, actor_context, action, principal_id, operation):
+        return self.service.execute_transactional(
+            actor_context, action=action, target_kind=TargetKind.PRINCIPAL,
+            target_logical_id=principal_id,
+            operation=lambda connection: operation(connection, self.access.now()),
+        )
+
+    def invite(self, actor_context, external_identity, display_name, permissions):
+        target = uuid4()
+        return self._execute(
+            actor_context, AuditAction.INVITE_PRINCIPAL, target,
+            lambda connection, at: self.access.invite_on(
+                connection, target, external_identity, display_name, permissions, at=at,
+            ),
+        )
+
+    def issue_invitation(self, actor_context, principal_id, secret, expires_at):
+        return self._execute(
+            actor_context, AuditAction.ISSUE_PRINCIPAL_INVITATION, principal_id,
+            lambda connection, at: self.access.issue_enrollment_on(
+                connection, principal_id, secret, expires_at, at=at,
+            ),
+        )
+
+    def set_permissions(self, actor_context, principal_id, permissions):
+        return self._execute(
+            actor_context, AuditAction.CHANGE_PRINCIPAL_PERMISSIONS, principal_id,
+            lambda connection, at: self.access.set_permissions_on(
+                connection, principal_id, permissions, at=at,
+            ),
+        )
+
+    def revoke_principal(self, actor_context, principal_id):
+        return self._execute(
+            actor_context, AuditAction.REVOKE_PRINCIPAL, principal_id,
+            lambda connection, at: self.access.revoke_principal_on(
+                connection, principal_id, at=at,
+            ),
+        )
+
+    def revoke_credential(self, actor_context, principal_id, credential_id):
+        return self._execute(
+            actor_context, AuditAction.REVOKE_PRINCIPAL_CREDENTIAL, principal_id,
+            lambda connection, at: self.access.revoke_credential_on(
+                connection, principal_id, credential_id, at=at,
+            ),
+        )
