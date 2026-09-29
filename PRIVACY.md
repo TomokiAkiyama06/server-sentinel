@@ -95,7 +95,9 @@ Historical timeline/event access is not exposed through `live:view`; it is inclu
 Local UVC live preview keeps at most one latest frame per source in Main Server
 memory, and only while an authorized `live:view` session for that source is
 open; with no viewer the frame is discarded and nothing is written to disk.
-Every preview read re-checks the viewer's current `live:view` grant server-side.
+Every preview read re-checks the viewer's current `live:view` grant and the
+validity of the human access session it was opened from server-side, so revoking
+a lost device's credential also ends that device's live preview.
 
 ## Human viewer credentials
 

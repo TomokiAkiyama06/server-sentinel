@@ -33,11 +33,14 @@ from app.cameras.uvc.runtime import (
 )
 from app.deployment import Deployment
 from app.main import create_app
+from app.monitoring.runtime import MonitoringDependencies, RuntimeState
 from app.settings import ConfigurationError, Settings
 from app.storage.database import Database
 from app.storage.migrations import migrate
 from app.storage.schema import APPLICATION_MIGRATIONS
 from tests.asgi import request
+from tests.test_recording import SyntheticValidator
+from tests.test_monitoring_runtime import RuntimeFixture as MonitoringFixture
 
 
 PROFILE = CaptureProfile(640, 480, 10, "MJPG")
@@ -606,6 +609,50 @@ class ApplicationWiringTests(unittest.IsolatedAsyncioTestCase):
     def test_invalid_configuration_type_is_refused(self):
         with self.assertRaises(TypeError):
             create_app(self.settings, local_uvc={"source_ids": []})
+
+
+class MonitoringAdmissionTests(MonitoringFixture):
+    """UVC capture follows the monitoring runtime's verified storage state."""
+
+    async def test_failed_monitoring_startup_defers_capture_until_recovery(self):
+        from datetime import timedelta
+        database = Database(self.settings.database_path)
+        with closing(database.connect()) as connection:
+            migrate(connection, APPLICATION_MIGRATIONS)
+        source = CameraRegistry(database, unaudited_writes=True).create_source(
+            source_type=SourceType.LOCAL_UVC, name="Synthetic source", enabled=True,
+            desired_capture_profile=PROFILE,
+        )
+        discovery = Discovery([DeviceEvidence("/dev/video0", "synthetic", "model", "serial-a")])
+        # The recording filesystem identity does not match: startup open fails.
+        self.approved_device = self.device + 1
+        application = create_app(
+            self.settings, monitoring=self.configuration(),
+            monitoring_dependencies=MonitoringDependencies(
+                integrity_probe=self.probe, segment_validator=SyntheticValidator(),
+                slack_opener=self.transport, utcnow=self.clock.utcnow,
+                monotonic=lambda: self.clock.monotonic, tick_seconds=0.01,
+            ),
+            local_uvc=LocalUvcConfiguration((source.id,), **FAST),
+            local_uvc_dependencies=LocalUvcDependencies(
+                discovery=discovery, capture_factory=CaptureFactory(discovery),
+            ),
+        )
+        async with application.router.lifespan_context(application):
+            self.assertEqual(RuntimeState.FAILED, application.state.monitoring_state)
+            self.assertIs(application.state.local_uvc_state,
+                          LocalUvcRuntimeState.STORAGE_UNADMITTED)
+            self.assertFalse(application.state.local_uvc.status().sources[0].worker_running)
+            self.approved_device = self.device
+            self.clock.advance(timedelta(minutes=15))
+            for _ in range(500):
+                if application.state.local_uvc_state is LocalUvcRuntimeState.RUNNING:
+                    break
+                await asyncio.sleep(0.01)
+            self.assertEqual(RuntimeState.RUNNING, application.state.monitoring_state)
+            self.assertIs(application.state.local_uvc_state, LocalUvcRuntimeState.RUNNING)
+            self.assertTrue(application.state.local_uvc.status().sources[0].worker_running)
+        self.assertIs(application.state.local_uvc_state, LocalUvcRuntimeState.STOPPED)
 
 
 class ConfigurationParsingTests(unittest.TestCase):

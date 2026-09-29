@@ -151,16 +151,27 @@ def create_app(settings: Settings, *, database: Database | None = None,
             raise RuntimeError("application startup failed") from None
         monitoring_task = None
 
+        uvc_lifecycle = {"deferred": None, "stopping": False}
+
+        def local_uvc_storage_admitted() -> bool:
+            if monitoring_runtime is not None:
+                # A monitoring runtime whose startup open failed (missing or
+                # replaced recording filesystem, unopenable database) has not
+                # migrated or verified storage; its admission refuses writes.
+                return monitoring_runtime.status.state == RuntimeState.RUNNING
+            return storage_reservation is not None
+
         async def start_local_uvc() -> None:
             # Never a silent default: every outcome is an explicit state.
             if local_uvc_runtime is None:
                 application.state.local_uvc_state = LocalUvcRuntimeState.UNCONFIGURED
                 logging.getLogger(__name__).warning(Event.LOCAL_UVC_UNCONFIGURED)
                 return
-            if monitoring_runtime is None and storage_reservation is None:
+            if not local_uvc_storage_admitted():
                 # No schema was migrated and no write is admitted, so the
                 # approval store and source health cannot be trusted. Capture
-                # stays off rather than running against unverified storage.
+                # stays off rather than running against unverified storage;
+                # a later successful monitoring retry starts it.
                 application.state.local_uvc_state = LocalUvcRuntimeState.STORAGE_UNADMITTED
                 logging.getLogger(__name__).error(Event.LOCAL_UVC_STORAGE_UNADMITTED)
                 return
@@ -192,6 +203,14 @@ def create_app(settings: Settings, *, database: Database | None = None,
             application.state.audit_storage_admitted = (
                 storage_reservation is not None or runtime_admission.bound
             )
+            if (local_uvc_runtime is not None and not uvc_lifecycle["stopping"]
+                    and uvc_lifecycle["deferred"] is None
+                    and application.state.local_uvc_state
+                    is LocalUvcRuntimeState.STORAGE_UNADMITTED
+                    and local_uvc_storage_admitted()):
+                # Storage became admitted after a failed startup open: start
+                # capture once. Shutdown awaits this task before stopping.
+                uvc_lifecycle["deferred"] = asyncio.create_task(start_local_uvc())
 
         if monitoring_runtime is None:
             # Explicit fail-closed fault, never a silently healthy default.
@@ -228,6 +247,12 @@ def create_app(settings: Settings, *, database: Database | None = None,
         try:
             yield
         finally:
+            uvc_lifecycle["stopping"] = True
+            if uvc_lifecycle["deferred"] is not None:
+                # start() and stop() serialize on the runtime lock; let a
+                # deferred start finish so stop() sees its workers.
+                with suppress(Exception):
+                    await asyncio.shield(uvc_lifecycle["deferred"])
             await stop_local_uvc()
             cleanup_task.cancel()
             with suppress(asyncio.CancelledError):

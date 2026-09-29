@@ -263,13 +263,16 @@ starts one worker per deployment-configured `local_uvc` source (`local_uvc`
 deployment object, 1 to 4 registry UUIDs, no physical evidence) after storage
 migration/admission and stops them, with bounded joins, before the monitoring
 runtime stops. Missing configuration is the explicit `unconfigured` state;
-configuration without admitted storage is `storage_unadmitted` and never
-captures. Capture-service state is reported separately from each source's
+configuration without admitted storage, including a monitoring runtime whose
+startup storage open failed, is `storage_unadmitted` and never captures until
+a monitoring retry succeeds. Capture-service state is reported separately from each source's
 registry camera health, so an unplugged camera is `offline` while the service
 keeps running. Frames feed a bounded latest-frame preview hub that retains
 nothing without live viewer demand; reading it requires a
-`LiveViewerSessions` session whose validator re-checks the principal's current
-`live:view` grant on every open and read. See `server/app/cameras/uvc/README.md`.
+`LiveViewerSessions` session bound to the caller's human access session, whose
+validator re-checks on every open and read that the human session is still
+valid (not invalidated, expired or on a revoked credential) and that the
+principal still holds `live:view` at the bound revision. See `server/app/cameras/uvc/README.md`.
 
 Identity reconciliation starts only after an active-session marker is durable.
 An unclean session, including a failed ambiguity-latch write, requires Owner

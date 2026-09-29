@@ -81,7 +81,9 @@ validate it) lists 1 to 4 logical registry source UUIDs; physical evidence is
 never configuration. `create_app()` starts the runtime inside the lifespan after
 schema migration/storage admission and stops it before the monitoring runtime.
 Missing configuration is the explicit `unconfigured` state and configuration
-without admitted storage is `storage_unadmitted` (no worker, no scan). A UUID
+without admitted storage is `storage_unadmitted` (no worker, no scan). That
+includes a monitoring runtime whose startup open failed; capture then starts
+once, when a later monitoring retry reaches `running`. A UUID
 that is not a `local_uvc` source is `rejected`, never silently skipped; a worker
 that fails to start is `worker_failed` and its camera is written `offline`.
 Service state (`running` / `degraded` / `failed` / `stopped` / `stop_failed`)

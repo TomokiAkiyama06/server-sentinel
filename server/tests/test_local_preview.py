@@ -10,10 +10,11 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import tempfile
 import unittest
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from app.audit import AuditStore
-from app.auth.live_access import live_view_validator
+from app.auth.live_access import BoundLiveAccess, authorize_live_access, live_view_validator
+from app.auth.model import AccessValidationError
 from app.auth.model import Permission
 from app.auth.store import AccessStore
 from app.cameras.uvc.capture import VideoFrame
@@ -44,24 +45,38 @@ class AccessFixture:
                                  audit=AuditStore(database, clock=lambda: NOW),
                                  unaudited_writes=True)
         self._next = 0
+        self.tokens = {}
+
+    def enroll(self, principal_id, identity):
+        """Enroll one synthetic credential and open a human access session."""
+        self._next += 1
+        secret = bytes([self._next]) * 32
+        credential = f"credential-{self._next}".encode()
+        self.store.issue_enrollment(principal_id, secret, NOW + timedelta(minutes=5))
+        self.store.enroll_credential(secret, identity, credential,
+                                     b"synthetic-public-key", -7, 0)
+        token = bytes([self._next]) * 24
+        self.store.establish_session(principal_id, credential, token)
+        self.tokens[principal_id] = (token, identity, credential)
+        return authorize_live_access(self.store, token, identity)
 
     def principal(self, permissions):
-        self._next += 1
-        identity = f"viewer-{self._next}@example.invalid"
-        secret = bytes([self._next]) * 32
+        identity = f"viewer-{self._next + 1}@example.invalid"
         principal = self.store.invite(identity, "Synthetic viewer", permissions)
-        self.store.issue_enrollment(principal.id, secret, NOW + timedelta(minutes=5))
-        self.store.enroll_credential(secret, identity, f"credential-{self._next}".encode(),
-                                     b"synthetic-public-key", -7, 0)
-        return self.access(principal.id)
+        return self.enroll(principal.id, identity)
 
-    def access(self, principal_id):
+    def owner(self):
+        owner = self.store.bootstrap_owner("owner@example.invalid", "Synthetic owner")
+        return self.enroll(owner.id, "owner@example.invalid")
+
+    def access(self, principal_id, session_id):
+        """A bound access at the principal's current revision (possibly forged)."""
         with closing(self.store.database.connect()) as connection:
             revision = connection.execute(
                 "SELECT authorization_revision FROM access_principals WHERE id=?",
                 (str(principal_id),),
             ).fetchone()[0]
-        return LiveAccess(principal_id, revision)
+        return BoundLiveAccess(principal_id, revision, session_id)
 
 
 class PreviewHubTests(unittest.TestCase):
@@ -102,10 +117,24 @@ class LiveViewEnforcementTests(unittest.TestCase):
         self.source = uuid4()
         self.hub = LocalPreviewHub((self.source,))
         self.preview = AuthorizedLocalPreview(self.hub, LIMITS,
-                                              live_view_validator(self.database))
+                                              live_view_validator(self.database, clock=lambda: NOW))
+
+    def recordings_only(self, fixture=None):
+        """A recordings-only principal cannot authorize live:view; forge the
+        bound access to show the per-read validator refuses it anyway."""
+        fixture = fixture or self.access
+        identity = f"recorder-{fixture._next + 1}@example.invalid"
+        principal = fixture.store.invite(identity, "Synthetic viewer", (Permission.RECORDINGS_VIEW,))
+        with self.assertRaises(AccessValidationError):
+            fixture.enroll(principal.id, identity)
+        with closing(self.database.connect()) as connection:
+            session = connection.execute(
+                "SELECT id FROM access_sessions WHERE principal_id=?", (str(principal.id),),
+            ).fetchone()[0]
+        return fixture.access(principal.id, UUID(session))
 
     def test_recordings_view_alone_cannot_open_live_preview(self):
-        recorder = self.access.principal((Permission.RECORDINGS_VIEW,))
+        recorder = self.recordings_only()
         with self.assertRaises(LiveSessionUnavailable):
             self.preview.open(recorder, self.source)
         self.assertEqual(0, self.hub.status.viewers)
@@ -128,7 +157,7 @@ class LiveViewEnforcementTests(unittest.TestCase):
             self.preview.read(viewer, session.session_id)
         self.assertEqual(0, self.hub.status.viewers)
         self.assertEqual(0, self.hub.status.retained_bytes)
-        current = self.access.access(viewer.principal_id)
+        current = self.access.access(viewer.principal_id, viewer.access_session_id)
         with self.assertRaises(LiveSessionUnavailable):
             self.preview.open(current, self.source)
 
@@ -139,11 +168,16 @@ class LiveViewEnforcementTests(unittest.TestCase):
         # A copied session identifier is not enough for another principal.
         with self.assertRaises(LiveSessionUnavailable):
             self.preview.read(other, session.session_id)
-        stale = LiveAccess(viewer.principal_id, viewer.authorization_revision + 1)
+        stale = BoundLiveAccess(viewer.principal_id, viewer.authorization_revision + 1,
+                                viewer.access_session_id)
         with self.assertRaises(LiveSessionUnavailable):
             self.preview.open(stale, self.source)
         with self.assertRaises(LiveSessionUnavailable):
-            self.preview.open(LiveAccess(uuid4(), 0), self.source)
+            self.preview.open(BoundLiveAccess(uuid4(), 0, uuid4()), self.source)
+        with self.assertRaises(LiveSessionUnavailable):
+            # Not bound to a human access session.
+            self.preview.open(LiveAccess(viewer.principal_id, viewer.authorization_revision),
+                              self.source)
         with self.assertRaises(LiveSessionUnavailable):
             self.preview.open(viewer, uuid4())
         self.access.store.revoke_principal(viewer.principal_id)
@@ -151,9 +185,38 @@ class LiveViewEnforcementTests(unittest.TestCase):
             self.preview.read(viewer, session.session_id)
         self.assertEqual(0, self.preview.sessions.status.active_viewers)
 
+    def test_credential_revocation_and_session_end_stop_live_preview(self):
+        # A lost device: revoking its credential ends that device's human
+        # session without changing the principal revision; live must stop too.
+        viewer = self.access.principal((Permission.LIVE_VIEW,))
+        _token, _identity, credential = self.access.tokens[viewer.principal_id]
+        session = self.preview.open(viewer, self.source)
+        with self.access.store._transaction(write=True) as connection:
+            self.access.store.revoke_credential_on(connection, viewer.principal_id,
+                                                   credential, at=NOW)
+        self.assertEqual(viewer, self.access.access(viewer.principal_id,
+                                                    viewer.access_session_id))
+        with self.assertRaises(LiveSessionUnavailable):
+            self.preview.read(viewer, session.session_id)
+        self.assertEqual(0, self.hub.status.viewers)
+
+        # Idle/absolute expiry of the bound human session also fails closed.
+        other = self.access.principal((Permission.LIVE_VIEW,))
+        later = AuthorizedLocalPreview(
+            self.hub, LIMITS,
+            live_view_validator(self.database, clock=lambda: NOW + timedelta(days=400)),
+        )
+        with self.assertRaises(LiveSessionUnavailable):
+            later.open(other, self.source)
+        # Another principal's session identifier cannot be borrowed.
+        borrowed = BoundLiveAccess(other.principal_id, other.authorization_revision,
+                                   viewer.access_session_id)
+        with self.assertRaises(LiveSessionUnavailable):
+            self.preview.open(borrowed, self.source)
+        self.preview.open(other, self.source)
+
     def test_owner_has_live_view_and_storage_errors_deny(self):
-        owner = self.access.store.bootstrap_owner("owner@example.invalid", "Synthetic owner")
-        access = LiveAccess(owner.id, owner.authorization_revision)
+        access = self.access.owner()
         session = self.preview.open(access, self.source)
         self.preview.close(access, session.session_id)
         self.assertEqual(0, self.hub.status.viewers)
@@ -184,10 +247,7 @@ class RuntimePreviewTests(RuntimeFixture):
         self.assertEqual(0, hub.status.retained_bytes)
 
         access = AccessFixture(self.database)
-        preview = AuthorizedLocalPreview(hub, LIMITS, live_view_validator(self.database))
-        recorder = access.principal((Permission.RECORDINGS_VIEW,))
-        with self.assertRaises(LiveSessionUnavailable):
-            preview.open(recorder, source.id)
+        preview = AuthorizedLocalPreview(hub, LIMITS, live_view_validator(self.database, clock=lambda: NOW))
         viewer = access.principal((Permission.LIVE_VIEW,))
         session = preview.open(viewer, source.id)
         self.assertTrue(wait_for(lambda: preview.read(viewer, session.session_id) is not None))

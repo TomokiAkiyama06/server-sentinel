@@ -32,12 +32,17 @@ threads, is lock-protected and never raises into capture; it keeps at most one
 latest frame per configured source (bounded by `max_frame_bytes`) and only while
 that source has viewer demand, so zero subscribers retain nothing.
 `AuthorizedLocalPreview` wraps `LiveViewerSessions`: every `open` and `read`
-re-runs the validator. `app.auth.live_access.live_view_validator` reads current
-grants from SQLite and admits only an active principal at the exact bound
-authorization revision holding `live:view` (the Owner implicitly);
-`recordings:view` alone, a stale revision, a revoked principal, a copied session
-identifier or a storage error all fail with the same generic refusal and
-release demand. The route that constructs `LiveAccess` must first authorize the
-caller through `AccessStore.authorize(..., Permission.LIVE_VIEW)`. Browser
+re-runs the validator. The route obtains a `BoundLiveAccess` through
+`app.auth.live_access.authorize_live_access`, which runs
+`AccessStore.authorize(..., Permission.LIVE_VIEW)` and binds the result to that
+caller's human access session. `live_view_validator` reads current state from
+SQLite and admits only a bound human session that is not invalidated, expired
+or on a revoked credential, of an active principal at the exact bound
+authorization revision holding `live:view` (the Owner implicitly); an unbound
+`LiveAccess`, `recordings:view` alone, a stale revision, a revoked principal or
+credential, an idle/absolute-expired session, a copied session identifier or a
+storage error all fail with the same generic refusal and release demand. The
+validator does not refresh the idle deadline, so a long-lived transport must
+re-authorize through `authorize_live_access` to keep its session current. Browser
 transport, codec and viewer limits remain #19 decisions; the human surface stays
 closed.
