@@ -173,20 +173,38 @@ class PipelineQualityContinuityTests(unittest.TestCase):
 
     def test_detector_failure_and_stop_do_not_interrupt_live_or_recording(self):
         harness = Harness()
-        harness.step()
-        harness.step()
+
+        def publish_absence():
+            # Every case starts from a published negative, so the assertions
+            # show revocation of `absent`, not an already-unknown leftover.
+            harness.step()  # recovery pending
+            _, result = harness.step()
+            self.assertEqual(Detection(Observation.ABSENT, Reason.EVALUATED), result)
+
+        publish_absence()
         harness.detector.fail = True
         _, result = harness.step()
         self.assertEqual(Detection(Observation.UNKNOWN, Reason.FAILURE), result)
-        self.assertEqual(Detection(Observation.UNKNOWN, Reason.NOT_STARTED),
-                         harness.gate.invalidate(execution=Execution.STOPPED))
+        self.assertNotIn("synthetic detector failure", repr(harness.scheduler.snapshot(SOURCE)))
+        harness.detector.fail = False
+
+        publish_absence()
+        stopped = harness.gate.invalidate(execution=Execution.STOPPED)
+        self.assertEqual(Detection(Observation.UNKNOWN, Reason.NOT_STARTED), stopped)
+        self.assertEqual(stopped, harness.scheduler.snapshot(SOURCE).result)
+
         for execution in (Execution.STOPPED, Execution.FAILED, Execution.UNAVAILABLE,
                           Execution.SKIPPED):
-            decision, result = harness.step(execution=execution)
-            self.assertEqual(Quality.UNKNOWN, decision.quality)
-            self.assertEqual(Observation.UNKNOWN, result.observation)
+            with self.subTest(execution=execution):
+                publish_absence()
+                calls = harness.detector.calls
+                decision, result = harness.step(execution=execution)
+                self.assertEqual(Quality.UNKNOWN, decision.quality)
+                self.assertFalse(decision.allows_conclusion)
+                # The gate alone revokes: no frame is offered to the scheduler.
+                self.assertEqual(Observation.UNKNOWN, result.observation)
+                self.assertEqual(calls, harness.detector.calls)
         harness.assert_media_continuous(self)
-        self.assertEqual(2, harness.detector.calls)
 
     def test_live_viewer_leaving_does_not_stop_recording_while_person_is_unknown(self):
         harness = Harness()
