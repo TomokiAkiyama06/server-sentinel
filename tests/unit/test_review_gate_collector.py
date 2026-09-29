@@ -705,6 +705,32 @@ class CollectorTests(unittest.TestCase):
         self.assertIsNone(self.ledger()["published"])
         self.assertEqual(client.posts[-1]["conclusion"], "failure")
 
+    def test_clean_pass_republishes_after_an_unrecorded_revocation(self):
+        client, credentials = self.publication()
+        self.collector.request_review("codex", self.live, self.source)
+        self.source.add(self.context.head_sha, self.late())
+        self.reconcile(client, credentials)
+        good = self.source.reviews
+        self.source.reviews = "unavailable"
+
+        def read_only_save(store, request):
+            raise collector.CollectorFailure("review request ledger write failed")
+        with mock.patch.object(collector.LedgerStore, "save", read_only_save):
+            with self.assertRaises(collector.CollectorFailure):
+                self.reconcile(client, credentials)
+        self.assertEqual(self.ledger()["published"]["state"], "success")  # stale
+        self.assertEqual(client.posts[-1]["conclusion"], "failure")
+        # The ledger is writable again and the evidence is clean: the stale
+        # record must not be reused while GitHub's latest attempt is failure.
+        self.source.reviews = good
+        self.assertEqual(self.reconcile(client, credentials).status, "pass")
+        self.assertEqual(client.posts[-1]["conclusion"], "success")
+        self.assertEqual(self.ledger()["published"]["state"], "success")
+        # Later polls reuse the new success without further runs.
+        posts = len(client.posts)
+        self.assertEqual(self.reconcile(client, credentials).status, "pass")
+        self.assertEqual(len(client.posts), posts)
+
     def test_overlapping_pass_cannot_revoke_a_newer_success(self):
         client, credentials = self.publication()
         self.collector.request_review("codex", self.live, self.source)

@@ -287,12 +287,16 @@ SHA, Check Run ID (once confirmed) and state (`publishing` / `success` /
 - If the `revoking` state cannot be written (read-only or full `state_dir`),
   the failure attempt is still posted, best effort, and the ledger write error
   is raised (fail closed): an unwritable ledger never leaves the old success
-  as GitHub's latest attempt. The ledger then still names that success, so a
-  later `pass` for the same request treats it as already published while
-  GitHub's latest attempt is the failure; the gate stays blocked (never passes
-  wrongly). Once `state_dir` is writable again, the next non-passing outcome
-  or `revoke_published()` clears the record, after which a `pass` posts a new
-  success.
+  as GitHub's latest attempt. The ledger then still names that success, so
+  the running collector remembers the key in memory and never reuses that
+  record as the current success: once `state_dir` is writable again, the next
+  pass revokes and clears it and, on a clean review, posts a new success.
+  Residual limit: if the publisher restarts before that recovery pass, the
+  memory is lost and a later `pass` for the same request reuses the stale
+  record while GitHub's latest attempt is the failure. The gate then stays
+  blocked (it never passes wrongly); the `review success revocation not
+  recorded` error log identifies the case, and the Owner runs
+  `revoke_published()` (or waits for any non-passing outcome) to clear it.
 - If collection fails **and** the revocation fails, `CollectorFailure` is
   raised with a fixed message; the ledger still holds the standing success (or
   `revoking`) and the next pass retries.

@@ -466,6 +466,10 @@ class ReviewCollector:
         self._store = store
         self._identities = dict(identities)
         self._clock = clock
+        # Ledger keys whose superseding failure attempt may have been posted
+        # without the ledger recording it (the ``revoking`` write failed).
+        # Their standing publication is never reused as the current success.
+        self._unrecorded_revocations: set[tuple[int, int, str]] = set()
 
     def _identity(self, reviewer: str) -> ProviderIdentity:
         identity = self._identities.get(reviewer) if isinstance(reviewer, str) else None
@@ -644,11 +648,26 @@ class ReviewCollector:
         with self._store.lock(context.repository_id, context.pr_number):
             return self._publish_locked(client, credentials, decision)
 
+    def _load_publication_locked(self, repository_id: int, pr_number: int,
+                                 reviewer: str) -> ReviewRequest | None:
+        """Load a record, marking an unrecorded revocation as ``revoking``."""
+        request = self._store.load(repository_id, pr_number, reviewer)
+        key = (repository_id, pr_number, reviewer)
+        if key not in self._unrecorded_revocations:
+            return request
+        standing = None if request is None else request.published
+        if standing is None:
+            self._unrecorded_revocations.discard(key)
+            return request
+        if standing.state == "revoking":
+            return request
+        return replace(request, published=replace(standing, state="revoking"))
+
     def _publish_locked(self, client: GitHubTransport, credentials: AppCredentials,
                         decision: CollectorDecision) -> dict[str, Any]:
         context = self._checked_decision(credentials, decision)
-        request = self._store.load(context.repository_id, context.pr_number,
-                                   decision.reviewer)
+        request = self._load_publication_locked(context.repository_id,
+                                                context.pr_number, decision.reviewer)
         if request is None:
             raise CollectorFailure("review request ledger is missing")
         current = (request.state == "active"
@@ -693,7 +712,7 @@ class ReviewCollector:
     def _revoke_standing_locked(self, client: GitHubTransport,
                                 credentials: AppCredentials, reviewer: str,
                                 repository_id: int, pr_number: int) -> bool:
-        request = self._store.load(repository_id, pr_number, reviewer)
+        request = self._load_publication_locked(repository_id, pr_number, reviewer)
         if request is None or request.published is None:
             return False
         self._revoke_locked(client, credentials, request)
@@ -708,17 +727,22 @@ class ReviewCollector:
         failure attempt is still posted, best effort, before the write error is
         raised: an unwritable ledger must never leave the old success as
         GitHub's latest attempt.  The ledger then still names the standing
-        success; a later non-passing outcome or ``revoke_published`` (once the
-        ledger is writable) clears it, after which a pass posts a new success.
+        success, so this collector remembers the key and never reuses that
+        record as the current success: the next pass (once the ledger is
+        writable) revokes it again, clears it and, on a clean review, posts a
+        new success.  A restart loses that memory; see REVIEW_GATE_SETUP.md.
         """
         standing = request.published
         if standing is None:
             return request
+        key = (request.context.repository_id, request.context.pr_number,
+               request.reviewer)
         if standing.state != "revoking":
             revoking = replace(request, published=replace(standing, state="revoking"))
             try:
                 self._store.save(revoking)
             except CollectorFailure:
+                self._unrecorded_revocations.add(key)
                 try:
                     publish_revocation(client, credentials, standing.test_merge_sha,
                                        request.reviewer)
@@ -733,6 +757,7 @@ class ReviewCollector:
         publish_revocation(client, credentials, standing.test_merge_sha, request.reviewer)
         request = replace(request, published=None)
         self._store.save(request)
+        self._unrecorded_revocations.discard(key)
         LOG.warning("review success superseded reviewer=%s pr=%d request=%s",
                     request.reviewer, request.context.pr_number, standing.request_id)
         return request
