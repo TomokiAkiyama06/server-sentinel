@@ -10,6 +10,8 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import math
 import os
+import sys
+import threading
 from pathlib import Path
 from uuid import UUID
 
@@ -256,13 +258,40 @@ class OutboundNetworkForbidden(AssertionError):
     pass
 
 
+_ACTIVE_NETWORK_GUARDS: list["NetworkGuard"] = []
+_NETWORK_GUARD_LOCK = threading.Lock()
+_NETWORK_AUDIT_HOOK_INSTALLED = False
+# CPython raises these audit events from the ``_socket`` C implementation, so
+# they fire for every Python caller (``socket``, ``_socket`` or a re-imported
+# alias) on every thread. send/sendall carry no event but need a prior connect.
+_NETWORK_AUDIT_EVENTS = {
+    "socket.connect": "connect", "socket.sendto": "sendto", "socket.sendmsg": "sendmsg",
+    "socket.getaddrinfo": "getaddrinfo", "socket.gethostbyname": "gethostbyname",
+    "socket.gethostbyaddr": "gethostbyaddr", "socket.getnameinfo": "getnameinfo",
+}
+
+
+def _network_audit_hook(event, args):
+    # Audit hooks cannot be removed, so the hook is inert unless a guard is active.
+    if not _ACTIVE_NETWORK_GUARDS or event not in _NETWORK_AUDIT_EVENTS:
+        return
+    with _NETWORK_GUARD_LOCK:
+        guard = _ACTIVE_NETWORK_GUARDS[-1] if _ACTIVE_NETWORK_GUARDS else None
+    if guard is not None:
+        name = _NETWORK_AUDIT_EVENTS[event]
+        guard._record_and_raise(name, guard._host(name, args))
+
+
 class NetworkGuard:
     """Refuse and record every outbound socket attempt made by any thread.
 
     Name resolution (every resolver in both ``socket`` and the ``_socket`` C
     module) and connect/send entry points are replaced for the life of the
     context, so telemetry, crash reporting or an unconfigured webhook would
-    surface as a recorded attempt instead of reaching a network.
+    surface as a recorded attempt instead of reaching a network. A process-wide
+    audit hook backs the patches below the Python wrappers, so direct
+    ``_socket.socket`` use or a resolver captured before the guard started is
+    refused and recorded as well.
     """
 
     # Every name/address resolver exposed by the stdlib socket modules.
@@ -272,6 +301,7 @@ class NetworkGuard:
     def __init__(self):
         self.attempts: list[tuple[str, str | None]] = []
         self._patches = []
+        self._active = False
 
     @staticmethod
     def _host(name, args):
@@ -284,13 +314,17 @@ class NetworkGuard:
                 return value
         return None
 
+    def _record_and_raise(self, name, host):
+        self.attempts.append((name, host))
+        raise OutboundNetworkForbidden(f"synthetic network guard refused {name}")
+
     def _refuse(self, name):
         def refused(*args, **_kwargs):
-            self.attempts.append((name, self._host(name, args)))
-            raise OutboundNetworkForbidden(f"synthetic network guard refused {name}")
+            self._record_and_raise(name, self._host(name, args))
         return refused
 
     def __enter__(self):
+        global _NETWORK_AUDIT_HOOK_INSTALLED
         import _socket
         import socket
         from unittest.mock import patch
@@ -301,10 +335,16 @@ class NetworkGuard:
             (socket, "create_connection"),
         ]
         # ``socket`` re-exports the C resolvers from ``_socket``; patch both so
-        # a caller of either module is refused and recorded.
+        # a caller of either module is refused and recorded by its exact name.
         for owner in (socket, _socket):
             targets.extend((owner, name) for name in self.RESOLVERS)
         try:
+            with _NETWORK_GUARD_LOCK:
+                if not _NETWORK_AUDIT_HOOK_INSTALLED:
+                    sys.addaudithook(_network_audit_hook)
+                    _NETWORK_AUDIT_HOOK_INSTALLED = True
+                _ACTIVE_NETWORK_GUARDS.append(self)
+                self._active = True
             for owner, name in targets:
                 patcher = patch.object(owner, name, self._refuse(name))
                 patcher.start()
@@ -317,4 +357,8 @@ class NetworkGuard:
     def __exit__(self, *_):
         while self._patches:
             self._patches.pop().stop()
+        with _NETWORK_GUARD_LOCK:
+            if self._active:
+                _ACTIVE_NETWORK_GUARDS.remove(self)
+                self._active = False
         return False

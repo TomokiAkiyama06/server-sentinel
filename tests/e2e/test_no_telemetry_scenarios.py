@@ -12,6 +12,7 @@ from pathlib import Path
 import socket
 import sys
 import tempfile
+import threading
 import unittest
 from uuid import UUID
 
@@ -111,6 +112,46 @@ class NoTelemetryScenarios(unittest.TestCase):
         # Every patch is reverted on exit.
         for (module, name), original in originals.items():
             self.assertIs(getattr(module, name), original)
+
+    def test_guard_refuses_low_level_socket_and_captured_resolvers(self):
+        import _socket
+        from socket import gethostbyname_ex as captured_before_guard
+
+        with NetworkGuard() as guard:
+            with closing(_socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)) as raw:
+                for attempt in (
+                    lambda: raw.connect(("192.0.2.1", 9)),
+                    lambda: raw.connect_ex(("192.0.2.2", 9)),
+                    lambda: raw.sendto(b"generated", ("192.0.2.3", 9)),
+                    lambda: raw.sendmsg([b"generated"], [], 0, ("192.0.2.4", 9)),
+                ):
+                    with self.assertRaises(OutboundNetworkForbidden):
+                        attempt()
+            with self.assertRaises(OutboundNetworkForbidden):
+                captured_before_guard("telemetry.invalid")
+            errors = []
+
+            def worker():
+                try:
+                    with closing(_socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)) as other:
+                        other.connect(("192.0.2.5", 9))
+                except OutboundNetworkForbidden as error:
+                    errors.append(error)
+            thread = threading.Thread(target=worker)
+            thread.start()
+            thread.join()
+            self.assertEqual(1, len(errors))
+        self.assertEqual(
+            [("connect", "192.0.2.1"), ("connect", "192.0.2.2"), ("sendto", "192.0.2.3"),
+             ("sendmsg", "192.0.2.4"), ("gethostbyname", "telemetry.invalid"),
+             ("connect", "192.0.2.5")],
+            guard.attempts)
+        # The process-wide hook is inert once no guard is active.
+        with closing(_socket.socket(_socket.AF_UNIX, _socket.SOCK_DGRAM)) as local:
+            with self.assertRaises(OSError) as raised:
+                local.connect(str(self.root / "absent.sock"))
+            self.assertNotIsInstance(raised.exception, OutboundNetworkForbidden)
+        self.assertEqual(6, len(guard.attempts))
 
     def run_main_paths(self):
         # Hardware integrity: startup success, then a failing daily probe.
