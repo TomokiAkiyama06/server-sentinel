@@ -797,6 +797,10 @@ class PresenceService:
         # An expired override stops applying even when the durable retirement
         # write is refused; the pending flag keeps that difference visible.
         retired, admitted = self._retire_override(now) if expired else (True, True)
+        # Loss a live outbox has counted but not yet written is a gap too. It
+        # is read before the durable marker: the outbox commits the marker
+        # before it drops its count, so a loss is always seen in one of them.
+        unpersisted = self._unpersisted_loss()
         with closing(self._read()) as db:
             trusted = self._clock_trust(db, now, clock_trusted)
             control_trusted = self._control_trust(db, now, clock_trusted)
@@ -818,8 +822,6 @@ class PresenceService:
             # A durable timeline gap stays visible across restarts until the
             # Owner clears it; it is Owner information like the paths below.
             gap = self._gap(db)
-        # Loss a live outbox has counted but not yet written is a gap too.
-        unpersisted = self._unpersisted_loss()
         # The reported state is only as trustworthy as the marker behind its
         # basis: Owner control for an override or hint, observation receipt for
         # an inferred owner observation. A skewed source timestamp must not

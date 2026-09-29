@@ -348,18 +348,22 @@ class TimelineOutbox:
             refused, rejected = self._unpersisted_refused, self._unpersisted_rejected
         if not (refused or rejected or lost or close):
             try:
-                self._gap = self.service.timeline_gap() is not None
+                gap = self.service.timeline_gap() is not None
             except Exception:
-                self._gap = None
+                gap = None
+            with self._lock:
+                self._gap = gap
             return
         now, _ = _stamp(self.clock)
         gap = self.service.record_timeline_gap(now=now, refused=refused, rejected=rejected,
                                                lost=lost, close=self._handle if close else None)
         with self._lock:
             # Subtract what was written; facts refused meanwhile stay counted.
+            # The durable marker is published in the same critical section,
+            # so `state()` never sees the loss in neither place.
             self._unpersisted_refused -= refused
             self._unpersisted_rejected -= rejected
-        self._gap = gap is not None
+            self._gap = gap is not None
 
     def close(self):
         """End the durable session cleanly, recording still-staged facts as lost.

@@ -812,6 +812,61 @@ class TimelineGapDurabilityTests(PresenceFixture, TestCase):
         self.assertIsNone(status["timeline_gap_detail"])
         self.assertEqual(status["timeline_gap_unpersisted"], 1)
 
+    def count_one_refusal(self):
+        # A clock fault at handoff: counted as refused, nothing staged.
+        self.outbox.flush()
+        self.clock.trusted = None
+        self.assertFalse(self.health.node(NODE, NodeHealthState.OFFLINE))
+        self.clock.trusted = True
+        state = self.outbox.state()
+        self.assertEqual((state.pending, state.unpersisted, state.gap), (0, 1, False))
+
+    def test_outbox_state_never_reads_healthy_while_loss_moves_to_the_marker(self):
+        self.count_one_refusal()
+        outbox, seen = self.outbox, []
+
+        class Observing:
+            # After every release of the outbox lock, poll state() the way a
+            # concurrent status reader could.
+            def __init__(self, inner):
+                self.inner, self.polling = inner, False
+
+            def __enter__(self):
+                return self.inner.__enter__()
+
+            def __exit__(self, *failure):
+                self.inner.__exit__(*failure)
+                if not self.polling:
+                    self.polling = True
+                    try:
+                        seen.append(outbox.state().degraded)
+                    finally:
+                        self.polling = False
+        outbox._lock = Observing(outbox._lock)
+        state = outbox.flush()
+        self.assertTrue(state.degraded)
+        self.assertTrue(state.gap)
+        self.assertTrue(seen)
+        self.assertTrue(all(seen), seen)
+
+    def test_status_never_reads_healthy_while_loss_moves_to_the_marker(self):
+        self.count_one_refusal()
+        original, fired = self.presence._gap, []
+
+        def gap(db):
+            result = original(db)
+            if not fired and result is None:
+                # The outbox persists its count between the two status reads.
+                fired.append(True)
+                self.outbox.flush()
+            return result
+        self.presence._gap = gap
+        status = self.presence.owner_status("owner", now=NOW, clock_trusted=True)
+        self.assertTrue(fired)
+        self.assertTrue(status["timeline_gap"])
+        del self.presence._gap
+        self.assertEqual(self.gap()[1]["refused"], 1)
+
     def test_a_second_outbox_is_refused_while_the_first_is_open(self):
         second = TimelineOutbox(self.presence, clock=self.clock, capacity=8)
         with self.assertRaisesRegex(RuntimeError, "another timeline outbox"):
