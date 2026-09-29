@@ -548,6 +548,30 @@ class CaptureTests(CaptureCase):
         self.assertEqual(self.state(capture), ("degraded", "capture_starting"))
         self.assertEqual(len(self.launcher.pipelines), 2)
 
+    def test_stall_is_judged_after_another_sources_slow_teardown(self):
+        devices = [evidence(index, serial=f"SYN-{index}") for index in range(2)]
+        discovery = FakeDiscovery(*devices)
+        capture = self.capture(discovery, count=2)
+        for index, device in enumerate(devices):
+            capture.approve(SOURCES[index], device)
+        capture.poll()
+        for index in range(2):
+            self.stream(capture, self.launcher.pipelines[index], index=index)
+        self.assertEqual([item.state for item in capture.poll()], ["online"] * 2)
+        first = self.launcher.pipelines[0]
+        original_stop = first.stop
+
+        def slow_stop(timeout):
+            self.clock.now += 1.5  # Camera 0's bounded teardown takes time.
+            return original_stop(timeout)
+
+        first.stop = slow_stop
+        self.clock.now += 1  # Camera 1's last frame is still inside stall_timeout.
+        discovery.devices = devices[1:]
+        health = capture.poll()
+        # Camera 1 produced nothing for 2.5s > stall_timeout by the heartbeat.
+        self.assertEqual((health[1].state, health[1].reason), ("offline", "capture_failed"))
+
     def test_startup_timeout_counts_from_launch_not_before_slow_open(self):
         device = evidence()
 

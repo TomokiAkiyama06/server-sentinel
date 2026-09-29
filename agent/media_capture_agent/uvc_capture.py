@@ -577,16 +577,12 @@ class UvcCapture:
             self._device_deadline = time.monotonic() + self.limits.device_timeout
             try:
                 scan = self._scan()
-                # Sample after the bounded scan so timeouts use the current time.
-                now = self.clock()
                 self._teardown_deadline = time.monotonic() + self.limits.stop_timeout
                 for source in self._sources.values():
                     self._retry_stuck(source)
                     self._retry_pending_close(source)
                     if not source.storage_failed:
                         self._reconcile(source, scan)
-                for source in self._sources.values():
-                    self._supervise(source, now)
                 self._resolve_conflicts()
                 # A source whose device call is still blocked fails at once
                 # without consuming the bound, so it cannot starve the others.
@@ -595,12 +591,19 @@ class UvcCapture:
                     if (source.active is None and not self._cleanup_pending(source)
                             and not source.storage_failed and not source.discovery_blocked
                             and controller.bound is not None
-                            and not controller.requires_approval and now >= source.retry_at):
+                            and not controller.requires_approval
+                            and self.clock() >= source.retry_at):
                         if self._device_bound() <= 0:
                             break  # Deferred to the next tick; not a failure.
                         self._launch(source)
+                # Supervise after every blocking scan/reconcile/open/teardown of
+                # this tick, each source against a fresh clock sample, so another
+                # camera's bounded device or stop work cannot hide a stall.
+                for source in self._sources.values():
+                    self._supervise(source, self.clock())
             finally:
                 self._device_deadline = self._teardown_deadline = None
+            now = self.clock()
             return tuple(self._health(source, now) for source in self._sources.values())
 
     def frames(self, source_id):
