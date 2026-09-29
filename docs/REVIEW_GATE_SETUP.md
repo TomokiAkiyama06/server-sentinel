@@ -259,6 +259,15 @@ SHA, Check Run ID (once confirmed) and state (`publishing` / `success` /
   active request posts one success; if that exact success is already recorded
   the pass is a no-op, so polling and restart recovery do not create further
   runs.
+- The per-PR ledger lock is held for the **whole** pass (collection and the
+  resulting publication or revocation), so a pass only ever publishes or
+  revokes what its own collection observed. Overlapping passes cannot revoke a
+  success published from newer evidence, nor publish from evidence a newer
+  non-passing collection already superseded. A pass that cannot take the lock
+  within the lock timeout fails without changing anything (another pass is
+  running); the next scheduled or event-driven pass retries. Automated
+  reconciliation must use `collect_and_publish`; composing `collect()`,
+  `publish()` and `revoke_published()` separately does not have this property.
 - A `publishing` record is saved **before** the success is sent. If the
   outcome is then ambiguous (API error, lost or malformed response, crash, or
   a failed ledger write after GitHub accepted the post), the success is still
@@ -275,6 +284,15 @@ SHA, Check Run ID (once confirmed) and state (`publishing` / `success` /
 - Before that failure attempt is posted the ledger is set to `revoking`. A
   crash or API error during revocation is retried on the next pass and the
   record is never taken for the current success.
+- If the `revoking` state cannot be written (read-only or full `state_dir`),
+  the failure attempt is still posted, best effort, and the ledger write error
+  is raised (fail closed): an unwritable ledger never leaves the old success
+  as GitHub's latest attempt. The ledger then still names that success, so a
+  later `pass` for the same request treats it as already published while
+  GitHub's latest attempt is the failure; the gate stays blocked (never passes
+  wrongly). Once `state_dir` is writable again, the next non-passing outcome
+  or `revoke_published()` clears the record, after which a `pass` posts a new
+  success.
 - If collection fails **and** the revocation fails, `CollectorFailure` is
   raised with a fixed message; the ledger still holds the standing success (or
   `revoking`) and the next pass retries.

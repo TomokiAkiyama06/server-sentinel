@@ -537,54 +537,94 @@ class ReviewCollector:
         if not isinstance(before, Context):
             raise CollectorFailure("invalid live context")
         with self._store.lock(before.repository_id, before.pr_number):
-            request = self._store.load(before.repository_id, before.pr_number, reviewer)
-            if request is None:
-                decision = CollectorDecision("pending", "no_review_request", reviewer)
-            elif request.state != "active":
-                decision = CollectorDecision("invalidated", "review_request_invalidated",
-                                             reviewer, request.request_id)
-            elif request.context != before:
-                decision = None  # Ordering is unknown; confirm with a fresh read.
-            else:
-                decision = self._evaluate(identity, request, before,
-                                          read_live_context, source)
+            request, decision = self._decide_locked(identity, before,
+                                                    read_live_context, source)
         if decision is None:
-            decision = self._confirm_mismatch(reviewer, request, read_live_context)
+            again = read_live_context()
+            if not isinstance(again, Context):
+                raise CollectorFailure("invalid live context")
+            context = request.context
+            with self._store.lock(context.repository_id, context.pr_number):
+                decision = self._confirm_mismatch_locked(reviewer, request, again)
+        return self._logged(decision, before)
+
+    def _collect_held(self, reviewer: str, read_live_context: Callable[[], Context],
+                      source: ReviewSource) -> CollectorDecision:
+        """``collect`` for a caller that already holds the PR's ledger lock."""
+        identity = self._identity(reviewer)
+        before = read_live_context()
+        if not isinstance(before, Context):
+            raise CollectorFailure("invalid live context")
+        request, decision = self._decide_locked(identity, before,
+                                                read_live_context, source)
+        if decision is None:
+            again = read_live_context()
+            if not isinstance(again, Context):
+                raise CollectorFailure("invalid live context")
+            decision = self._confirm_mismatch_locked(reviewer, request, again)
+        return self._logged(decision, before)
+
+    @staticmethod
+    def _logged(decision: CollectorDecision, before: Context) -> CollectorDecision:
         log = LOG.info if decision.status == "pass" else LOG.warning
         log("review collection reviewer=%s pr=%d status=%s reason=%s untrusted=%d",
-            reviewer, before.pr_number, decision.status, decision.reason,
+            decision.reviewer, before.pr_number, decision.status, decision.reason,
             decision.ignored_untrusted_reviews)
         return decision
 
-    def _confirm_mismatch(self, reviewer: str, seen: ReviewRequest,
-                          read_live_context: Callable[[], Context]) -> CollectorDecision:
+    def _decide_locked(self, identity: ProviderIdentity, before: Context,
+                       read_live_context: Callable[[], Context], source: ReviewSource
+                       ) -> tuple[ReviewRequest | None, CollectorDecision | None]:
+        reviewer = identity.reviewer
+        request = self._store.load(before.repository_id, before.pr_number, reviewer)
+        if request is None:
+            return None, CollectorDecision("pending", "no_review_request", reviewer)
+        if request.state != "active":
+            return request, CollectorDecision("invalidated", "review_request_invalidated",
+                                              reviewer, request.request_id)
+        if request.context != before:
+            return request, None  # Ordering is unknown; confirm with a fresh read.
+        return request, self._evaluate(identity, request, before,
+                                       read_live_context, source)
+
+    def _confirm_mismatch_locked(self, reviewer: str, seen: ReviewRequest,
+                                 again: Context) -> CollectorDecision:
         """Invalidate only on a mismatch that is proven not older than the request.
 
-        The first, unlocked live read may have started before a concurrent
+        The first live read may have started before a concurrent
         ``request_review`` for a newer context recorded ``seen`` -- possibly
         within the same clock second, so timestamps cannot order them.
         ``seen`` was observed under the lock, hence the requester's own live
-        read had already finished; a read started now is not older than the
-        request.  If the request was replaced meanwhile, ordering is again
-        unknown and the decision stays pending.
+        read had already finished; ``again`` was read after that observation
+        and is not older than the request.  If the request was replaced
+        meanwhile, ordering is again unknown and the decision stays pending.
         """
-        again = read_live_context()
-        if not isinstance(again, Context):
-            raise CollectorFailure("invalid live context")
         context = seen.context
-        with self._store.lock(context.repository_id, context.pr_number):
-            request = self._store.load(context.repository_id, context.pr_number, reviewer)
-            if request is None or request.request_id != seen.request_id:
-                return CollectorDecision("pending", "live_context_read_predates_request",
-                                         reviewer,
-                                         None if request is None else request.request_id)
-            if request.state != "active":
-                return CollectorDecision("invalidated", "review_request_invalidated",
-                                         reviewer, request.request_id)
-            if request.context != again:
-                return self._invalidate(request, "context_changed_since_request")
+        request = self._store.load(context.repository_id, context.pr_number, reviewer)
+        if request is None or request.request_id != seen.request_id:
+            return CollectorDecision("pending", "live_context_read_predates_request",
+                                     reviewer,
+                                     None if request is None else request.request_id)
+        if request.state != "active":
+            return CollectorDecision("invalidated", "review_request_invalidated",
+                                     reviewer, request.request_id)
+        if request.context != again:
+            return self._invalidate(request, "context_changed_since_request")
         return CollectorDecision("pending", "live_context_read_predates_request",
                                  reviewer, seen.request_id)
+
+    def _checked_decision(self, credentials: AppCredentials,
+                          decision: CollectorDecision) -> Context:
+        if (not isinstance(decision, CollectorDecision) or decision.status != "pass"
+                or not isinstance(decision.context, Context)
+                or decision.check_run_request
+                != successful_check_run_request(decision.context, decision.reviewer)):
+            raise CollectorFailure("only a passing collector decision can be published")
+        self._identity(decision.reviewer)
+        context = decision.context
+        if context.repository_id != credentials.config.repository_id:
+            raise CollectorFailure("decision targets another repository")
+        return context
 
     def publish(self, client: GitHubTransport, credentials: AppCredentials,
                 decision: CollectorDecision) -> dict[str, Any]:
@@ -600,40 +640,37 @@ class ReviewCollector:
         (error, lost response, crash, failed ledger write) the next outcome
         revokes it, and a later pass revokes it before posting a new success.
         """
-        if (not isinstance(decision, CollectorDecision) or decision.status != "pass"
-                or not isinstance(decision.context, Context)
-                or decision.check_run_request
-                != successful_check_run_request(decision.context, decision.reviewer)):
-            raise CollectorFailure("only a passing collector decision can be published")
-        self._identity(decision.reviewer)
-        context = decision.context
-        if context.repository_id != credentials.config.repository_id:
-            raise CollectorFailure("decision targets another repository")
+        context = self._checked_decision(credentials, decision)
         with self._store.lock(context.repository_id, context.pr_number):
-            request = self._store.load(context.repository_id, context.pr_number,
-                                       decision.reviewer)
-            if request is None:
-                raise CollectorFailure("review request ledger is missing")
-            current = (request.state == "active"
-                       and request.request_id == decision.request_id
-                       and request.context == context)
-            standing = request.published
-            if (current and standing is not None and standing.state == "success"
-                    and standing.request_id == request.request_id
-                    and standing.test_merge_sha == context.test_merge_sha):
-                return {"published": False, "check_run_id": standing.check_run_id}
-            request = self._revoke_locked(client, credentials, request)
-            if not current:
-                return {"published": False, "check_run_id": None}
-            request = replace(request, published=Publication(
-                request.request_id, context.test_merge_sha, None, "publishing"))
-            self._store.save(request)
-            response = publish_success(client, credentials, context, decision.reviewer)
-            run_id = response.get("id")
-            if type(run_id) is not int or run_id <= 0:
-                raise CollectorFailure("GitHub did not identify the published check")
-            self._store.save(replace(request, published=Publication(
-                request.request_id, context.test_merge_sha, run_id, "success")))
+            return self._publish_locked(client, credentials, decision)
+
+    def _publish_locked(self, client: GitHubTransport, credentials: AppCredentials,
+                        decision: CollectorDecision) -> dict[str, Any]:
+        context = self._checked_decision(credentials, decision)
+        request = self._store.load(context.repository_id, context.pr_number,
+                                   decision.reviewer)
+        if request is None:
+            raise CollectorFailure("review request ledger is missing")
+        current = (request.state == "active"
+                   and request.request_id == decision.request_id
+                   and request.context == context)
+        standing = request.published
+        if (current and standing is not None and standing.state == "success"
+                and standing.request_id == request.request_id
+                and standing.test_merge_sha == context.test_merge_sha):
+            return {"published": False, "check_run_id": standing.check_run_id}
+        request = self._revoke_locked(client, credentials, request)
+        if not current:
+            return {"published": False, "check_run_id": None}
+        request = replace(request, published=Publication(
+            request.request_id, context.test_merge_sha, None, "publishing"))
+        self._store.save(request)
+        response = publish_success(client, credentials, context, decision.reviewer)
+        run_id = response.get("id")
+        if type(run_id) is not int or run_id <= 0:
+            raise CollectorFailure("GitHub did not identify the published check")
+        self._store.save(replace(request, published=Publication(
+            request.request_id, context.test_merge_sha, run_id, "success")))
         LOG.info("review success published reviewer=%s pr=%d request=%s",
                  decision.reviewer, context.pr_number, decision.request_id)
         return {"published": True, "check_run_id": run_id}
@@ -642,27 +679,57 @@ class ReviewCollector:
                          reviewer: str, pr_number: int) -> bool:
         """Supersede a standing success with a newer failure attempt.
 
-        Needed for every non-passing outcome, before ``force_new``, and after a
-        collection error left the current evidence unverifiable.  Returns
-        whether a success had to be superseded.
+        Needed before ``force_new`` and after a collection error left the
+        current evidence unverifiable (``collect_and_publish`` already does
+        this for every non-passing outcome).  Returns whether a success had to
+        be superseded.
         """
         self._identity(reviewer)
         repository_id = credentials.config.repository_id
         with self._store.lock(repository_id, pr_number):
-            request = self._store.load(repository_id, pr_number, reviewer)
-            if request is None or request.published is None:
-                return False
-            self._revoke_locked(client, credentials, request)
+            return self._revoke_standing_locked(client, credentials, reviewer,
+                                                repository_id, pr_number)
+
+    def _revoke_standing_locked(self, client: GitHubTransport,
+                                credentials: AppCredentials, reviewer: str,
+                                repository_id: int, pr_number: int) -> bool:
+        request = self._store.load(repository_id, pr_number, reviewer)
+        if request is None or request.published is None:
+            return False
+        self._revoke_locked(client, credentials, request)
         return True
 
     def _revoke_locked(self, client: GitHubTransport, credentials: AppCredentials,
                        request: ReviewRequest) -> ReviewRequest:
+        """Post a failure attempt over the standing success; fail closed.
+
+        ``revoking`` is recorded first so an interrupted revocation is retried.
+        If that ledger write fails (read-only or full state directory) the
+        failure attempt is still posted, best effort, before the write error is
+        raised: an unwritable ledger must never leave the old success as
+        GitHub's latest attempt.  The ledger then still names the standing
+        success; a later non-passing outcome or ``revoke_published`` (once the
+        ledger is writable) clears it, after which a pass posts a new success.
+        """
         standing = request.published
         if standing is None:
             return request
         if standing.state != "revoking":
-            request = replace(request, published=replace(standing, state="revoking"))
-            self._store.save(request)
+            revoking = replace(request, published=replace(standing, state="revoking"))
+            try:
+                self._store.save(revoking)
+            except CollectorFailure:
+                try:
+                    publish_revocation(client, credentials, standing.test_merge_sha,
+                                       request.reviewer)
+                    posted = True
+                except Exception:
+                    posted = False
+                LOG.error("review success revocation not recorded reviewer=%s pr=%d "
+                          "request=%s failure_posted=%s", request.reviewer,
+                          request.context.pr_number, standing.request_id, posted)
+                raise
+            request = revoking
         publish_revocation(client, credentials, standing.test_merge_sha, request.reviewer)
         request = replace(request, published=None)
         self._store.save(request)
@@ -681,6 +748,13 @@ class ReviewCollector:
         standing success, so GitHub's latest attempt never reads successful
         while the collector cannot currently confirm a clean review.
 
+        The PR's ledger lock is held for the whole pass, so its publication or
+        revocation always acts on the ledger state its own collection
+        observed: an overlapping pass can neither revoke a success published
+        from newer evidence nor publish from evidence that a newer
+        non-passing collection has already superseded.  If the lock cannot be
+        taken, another pass is running and nothing is changed.
+
         Collection is bound to ``pr_number`` and the configured repository:
         every live read that names another pull request or repository fails
         before any ledger is read or written, so a miswired reader can never
@@ -688,6 +762,7 @@ class ReviewCollector:
         """
         if type(pr_number) is not int or pr_number <= 0:
             raise CollectorFailure("invalid pull request number")
+        self._identity(reviewer)
         repository_id = credentials.config.repository_id
 
         def bound_read() -> Context:
@@ -696,20 +771,23 @@ class ReviewCollector:
                     or live.repository_id != repository_id):
                 raise CollectorFailure("live context names another pull request")
             return live
-        try:
-            decision = self.collect(reviewer, bound_read, source)
-            if decision.status == "pass":
-                self.publish(client, credentials, decision)
-                return decision
-        except Exception:
+        with self._store.lock(repository_id, pr_number):
             try:
-                self.revoke_published(client, credentials, reviewer, pr_number)
+                decision = self._collect_held(reviewer, bound_read, source)
+                if decision.status == "pass":
+                    self._publish_locked(client, credentials, decision)
+                    return decision
             except Exception:
-                raise CollectorFailure(
-                    "collection failed and the published success could not be revoked"
-                ) from None
-            raise
-        self.revoke_published(client, credentials, reviewer, pr_number)
+                try:
+                    self._revoke_standing_locked(client, credentials, reviewer,
+                                                 repository_id, pr_number)
+                except Exception:
+                    raise CollectorFailure(
+                        "collection failed and the published success could not be "
+                        "revoked") from None
+                raise
+            self._revoke_standing_locked(client, credentials, reviewer,
+                                         repository_id, pr_number)
         return decision
 
     def _evaluate(self, identity: ProviderIdentity, request: ReviewRequest,

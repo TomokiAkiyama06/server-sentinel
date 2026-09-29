@@ -674,6 +674,70 @@ class CollectorTests(unittest.TestCase):
                          [("success", self.context.test_merge_sha),
                           ("failure", self.context.test_merge_sha)])
 
+    def test_unwritable_ledger_still_supersedes_the_standing_success(self):
+        client, credentials = self.publication()
+        self.collector.request_review("codex", self.live, self.source)
+        self.source.add(self.context.head_sha, self.late())
+        self.reconcile(client, credentials)
+        standing = self.ledger()["published"]
+        self.source.add(self.context.head_sha, self.late() + 5, body=BLOCK)
+
+        def read_only_save(store, request):  # read-only or full state directory
+            raise collector.CollectorFailure("review request ledger write failed")
+        for outcome in ("blocked", "collection_error"):
+            with self.subTest(outcome=outcome):
+                posts_before = len(client.posts)
+                good = self.source.reviews
+                if outcome == "collection_error":
+                    self.source.reviews = "unavailable"
+                with mock.patch.object(collector.LedgerStore, "save", read_only_save):
+                    with self.assertRaises(collector.CollectorFailure):
+                        self.reconcile(client, credentials)
+                self.source.reviews = good
+                # The old success is no longer GitHub's latest attempt even
+                # though the revoking state could not be recorded.
+                self.assertEqual([(post["conclusion"], post["head_sha"])
+                                  for post in client.posts[posts_before:]],
+                                 [("failure", self.context.test_merge_sha)])
+                self.assertEqual(self.ledger()["published"], standing)
+        # Once the ledger is writable the stale record is cleared.
+        self.assertEqual(self.reconcile(client, credentials).status, "blocked")
+        self.assertIsNone(self.ledger()["published"])
+        self.assertEqual(client.posts[-1]["conclusion"], "failure")
+
+    def test_overlapping_pass_cannot_revoke_a_newer_success(self):
+        client, credentials = self.publication()
+        self.collector.request_review("codex", self.live, self.source)
+        other = self.make_collector()
+        outcomes = []
+
+        class Overlap(logging.Handler):
+            # Runs a second reconciliation right after the first one has
+            # decided "pending", while its revocation is still to come.
+            def emit(handler, record):
+                if outcomes or "status=pending" not in record.getMessage():
+                    return
+                outcomes.append("started")
+                self.source.add(self.context.head_sha, self.late())
+                try:
+                    outcomes.append(self.reconcile(client, credentials,
+                                                   collector_=other).status)
+                except collector.CollectorFailure:
+                    outcomes.append("busy")
+        handler = Overlap()
+        collector.LOG.addHandler(handler)
+        try:
+            with mock.patch.object(collector, "LOCK_TIMEOUT_SECONDS", 0.1):
+                self.assertEqual(self.reconcile(client, credentials).status, "pending")
+        finally:
+            collector.LOG.removeHandler(handler)
+        self.assertEqual(outcomes, ["started", "busy"])
+        self.assertEqual(self.reconcile(client, credentials, collector_=other).status,
+                         "pass")
+        # No failure attempt ever superseded the success of the newer evidence.
+        self.assertEqual([post["conclusion"] for post in client.posts], ["success"])
+        self.assertEqual(self.ledger()["published"]["state"], "success")
+
     def test_context_change_supersedes_success_on_the_old_test_merge(self):
         client, credentials = self.publication()
         self.collector.request_review("codex", self.live, self.source)
