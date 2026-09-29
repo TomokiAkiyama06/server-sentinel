@@ -862,8 +862,36 @@ visible; completion-persistence retry never resends a message. The persisted dai
 scheduler defaults to 23:00 configured local time and claims one dispatch per
 local date across restart/DST/clock rollback; missed dates are not replayed.
 An uncertain crash remains `pending`, failed delivery is visible, and no implicit
-retry floods the channel. Production timers, durable event-outbox integration,
-human authorization and recording playback remain separate integration work.
+retry floods the channel. Human authorization and recording playback remain
+separate integration work.
+
+Runtime wiring (`server/app/monitoring/`, Issues #21/#23). The application
+lifespan starts a monitoring runtime only when the deployment configuration's
+`monitoring` object supplies all of `storage_limits`, `recording_limits` and
+`recording_filesystem`. Because the startup/daily hardware integrity check and
+daily recording self-test are mandatory, the production launcher (`--check`
+and service start) and `python -m app` refuse to run without them, failing
+closed and visibly instead of running with those checks absent. An embedded
+`create_app()` without them reports the explicit `unconfigured` fault (logged
+at error): storage admission stays unbound, audit and other metadata writes are
+refused and no worker runs; a partial or invalid object is refused at
+deployment validation. When configured, one dedicated worker thread
+owns the SQLite connection, `MainStoragePolicy`, the recorder store (bound as
+the policy's inventory/reclaimer), the storage state-transition audit
+(`storage_state_audit`, 90-day cleanup), notifications, the daily scheduler,
+hardware integrity and recording health. Audit writes from other threads (for
+example 90-day audit retention) are admitted by parking that worker while it
+holds the policy's control reservation through the caller's commit. Each tick
+(default 60 s) polls notification completions, re-verifies the recording
+filesystem, samples storage state (including other-process consumption), expires
+recordings/state audit/fault history, runs the integrity and recording-health
+coordinators and the daily summary. A failed step sets a visible degraded flag
+and retries after 15 minutes; it never stops the other steps. No production
+codec validator exists yet, so the runtime recorder refuses every segment and no
+recording pipeline or human route is started. The daily summary marks monitored
+duration, source, agent and observation counts `unavailable` while no capture
+pipeline reports (service uptime is labeled separately), never presenting zero
+observations or process uptime as verified monitoring coverage.
 
 ## 10. Host hardware integrity and recording self-check
 
@@ -872,11 +900,31 @@ human authorization and recording playback remain separate integration work.
 Implementation foundation: `server/app/integrity/` provides explicit read-only
 Linux probes, a revision-checked Owner-authorized local baseline, sanitized fault
 outbox and startup/24-hour worker coordinator. `server/app/media/health/` provides
-bounded recorder-worker temporary I/O and recovery. The launcher does not enable
-these adapters before authorization, production codec/source configuration and
-notification wiring. Migration factories receive the next unused schema slots
-during integration. Module READMEs document contracts; #23 physical acceptance
-remains open.
+bounded recorder-worker temporary I/O and recovery. With configured monitoring
+storage (§9), the lifespan runtime runs `IntegrityService.startup()` and the
+24-hour tick with the read-only `LinuxProbe`, and `RecordingHealthService`
+startup and daily self-tests. Integrity outbox events reach the durable
+`notification_events` store through a bridge keyed by a deterministic ID per
+outbox row, so redelivery is deduplicated; the outbox row is acknowledged only
+after the local row exists. `CHANGED`/`MISSING`/storage-`UNVERIFIABLE` map to
+the immediate `hardware_integrity_failure`, other warnings to the local-only
+`hardware_integrity_warning`. Recording-health verdicts persist in
+`recording_health_status`; `FAILED` is the immediate `recording_health_failure`
+and `UNAVAILABLE` the local-only `recording_health_warning`. Without an actual
+capture-pipeline adapter the self-test is an explicit `UNAVAILABLE`, not
+healthy. Independently of that adapter, the runtime re-verifies the declared
+recording filesystem (UUID → device, major/minor, mounted mount point, pinned
+root device/inode, private metadata file) on every storage sample; a mismatch
+is `STORAGE_HARD_STOP`, refuses writes without creating a fallback and raises one
+immediate `recording_health_failure` per episode. A mismatch at startup leaves
+the runtime `failed`, refuses writes and still attempts the immediate Slack
+alert; the open is retried every 15 minutes against the same declared identity
+(never another directory), without repeating the alert, and a successful retry
+resumes the startup integrity/health checks and admission. The baseline is never written by the runtime; approval remains the
+Owner-only audited boundary, and without an approved baseline every check
+reports storage `UNVERIFIABLE` (immediate). Slack is optional; local rows and
+runtime status persist whether Slack is disabled or fails. Module READMEs
+document contracts; #23 physical acceptance remains open.
 
 During setup, the Owner approves a baseline inventory for the main ServerSentinel host. Collect the strongest local identifiers available without pretending that unavailable identifiers exist.
 

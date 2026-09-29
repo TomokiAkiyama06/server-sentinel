@@ -98,6 +98,61 @@ Keep actual paths, filesystem identity and UID private. A loopback literal is
 mandatory for the human listener; expose it through the separately configured
 trusted private proxy after application authorization is available.
 
+### Monitoring section (required to run the service)
+
+The `monitoring` object configures the Main Server monitoring runtime
+(storage admission, retention, daily summary, hardware integrity and recording
+health). Values below are internally consistent examples for a filesystem
+of roughly 1 TB, not defaults; size them for the actual deployment:
+
+```json
+"monitoring": {
+  "time_zone": "Asia/Tokyo",
+  "daily_summary_time": "23:00",
+  "slack_webhook_url": "<private incoming webhook, optional>",
+  "storage_limits": {
+    "recording_limit_bytes": 500000000000, "critical_allowance_bytes": 10000000000,
+    "hard_reserve_bytes": 20000000000, "pressure_free_bytes": 40000000000,
+    "recovery_free_bytes": 60000000000, "recovery_allocation_bytes": 450000000000,
+    "write_overhead_bytes": 1048576, "max_request_bytes": 16777216,
+    "cleanup_batch_size": 100
+  },
+  "recording_limits": {
+    "pre_roll_bytes": 67108864, "max_segment_bytes": 8388608, "max_segment_ms": 10000,
+    "max_active_recordings": 4, "max_spool_segments": 64,
+    "max_segments_per_recording": 8640
+  },
+  "recording_filesystem": {
+    "filesystem_uuid": "00000000-1111-2222-3333-444444444444",
+    "device": [8, 1],
+    "mount_point": "/srv/example-filesystem"
+  }
+}
+```
+
+`time_zone` is an IANA name and is required when the object is present;
+`daily_summary_time` defaults to 23:00. Slack stays disabled without
+`slack_webhook_url`; keep that value only in this private file. Every storage
+and recording limit must be sized for the deployment (all positive integers,
+`hard_reserve_bytes < pressure_free_bytes < recovery_free_bytes`,
+`recovery_allocation_bytes < recording_limit_bytes`, `cleanup_batch_size` at
+most 1000, `max_segment_bytes` at most `max_request_bytes`); ServerSentinel does
+not guess them. `recording_filesystem` must describe the filesystem that holds
+`<runtime_root>/recordings`: the UUID must resolve to its device, `device` must
+equal its major/minor numbers, and `mount_point` must be a mounted ancestor on
+the same device other than the operating-system root. The runtime re-checks this
+identity on every storage sample and refuses writes, without a fallback, when
+it no longer holds.
+
+The service must run the startup/daily hardware integrity check and the daily
+recording self-test, which need all three of `storage_limits`,
+`recording_limits` and `recording_filesystem`. Without the object, or without
+those sections, `--check` (the unit's `ExecStartPre`) and the launcher fail
+with the value-free validation message, and `python -m app` logs
+`monitoring_storage_unconfigured` and exits non-zero, so the service never runs
+with the mandatory checks silently absent. Supplying only some of them, or any
+invalid value, also fails `--check`.
+
 ## Install, update, and rollback
 
 Run the separately downloaded installer only after verifying its published
