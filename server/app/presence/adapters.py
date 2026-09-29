@@ -105,11 +105,25 @@ class OutboxState:
     pending: int
     refused: int
     rejected: int
+    # Refused or rejected facts counted in memory but not yet in the durable
+    # timeline gap marker.
+    unpersisted: int = 0
+    # Whether this outbox holds an open durable session.
+    session: bool = False
+    # The durable gap marker as last read: True, False, or None when unknown.
+    gap: bool | None = None
 
     @property
     def degraded(self):
-        """A refused or rejected fact is a visible gap in the timeline."""
-        return bool(self.pending or self.refused or self.rejected)
+        """Any pending, unpersisted, durable or unknown loss is a visible gap.
+
+        The durable marker is the source of truth across restarts: it stays
+        set until the Owner clears it, and an outbox with no open session or an
+        unreadable marker never reports healthy.
+        """
+        # Persisted refused/rejected counts live in the durable marker, so
+        # an Owner clear of that marker is what returns the outbox to healthy.
+        return bool(self.pending or self.unpersisted or not self.session or self.gap is not False)
 
 
 # Builds the observation for one staged fact from the main-host receipt taken
@@ -147,6 +161,16 @@ class TimelineOutbox:
     the staged one; a different fact under that UUID is an identity conflict,
     refused and counted as rejected just as presence would reject it. Both
     counters make the gap visible; neither is silent loss.
+
+    Loss is also durable. The first flush opens a durable outbox session, and
+    every flush adds the refused and rejected counts to the presence timeline
+    gap marker. `close()` records any still-staged facts as lost and ends the
+    session; a process that exits without a successful close leaves the
+    session row behind, so the next start records an interrupted gap. The
+    marker is cleared only by the Owner (`PresenceService.clear_timeline_gap`),
+    and while it is set, or cannot be read, `OutboxState.degraded` stays true.
+    Staged facts themselves are not recovered after a restart. The runtime
+    stops its producers before `close()`; staging after close raises.
     """
 
     def __init__(self, service, *, clock: MainClock, capacity: int):
@@ -162,6 +186,10 @@ class TimelineOutbox:
         self._flushing = threading.Lock()
         self._receipt = threading.RLock()
         self._recorded = self._refused = self._rejected = 0
+        self._unpersisted_refused = self._unpersisted_rejected = 0
+        self._session = False
+        self._closed = False
+        self._gap = None
 
     @contextmanager
     def receipt(self):
@@ -183,15 +211,19 @@ class TimelineOutbox:
             raise ValueError("presence validity applies to owner observations only")
         fact = _fact(observation)
         with self._lock:
+            if self._closed:
+                raise RuntimeError("timeline outbox closed")
             for item, _, staged in self._pending:
                 if item == identifier:
                     if staged == fact:
                         return True
                     # Same UUID, different source fact: never deduplicated.
                     self._rejected += 1
+                    self._unpersisted_rejected += 1
                     return False
             if len(self._pending) >= self.capacity:
                 self._refused += 1
+                self._unpersisted_refused += 1
                 return False
             self._pending.append((identifier, build, fact))
             return True
@@ -201,6 +233,12 @@ class TimelineOutbox:
             raise ValueError("invalid flush limit")
         # One flusher at a time keeps staging order; staging stays available.
         with self._flushing:
+            if self._closed:
+                raise RuntimeError("timeline outbox closed")
+            if not self._open():
+                # Without a durable session a later loss could not be proven
+                # on restart, so nothing is written and every fact stays staged.
+                return self.state()
             for _ in range(limit):
                 with self._lock:
                     if not self._pending:
@@ -224,11 +262,77 @@ class TimelineOutbox:
                         self._recorded += 1
                     else:
                         self._rejected += 1
+                        self._unpersisted_rejected += 1
+            try:
+                self._persist()
+            except Exception:
+                # Counts stay unpersisted and are retried by the next flush;
+                # the open session row keeps a restart from looking clean.
+                pass
         return self.state()
+
+    def _open(self):
+        """Open the durable session once; False (retried later) on any failure."""
+        if self._session:
+            return True
+        try:
+            now, _ = _stamp(self.clock)
+            gap = self.service.open_timeline_session(now=now)
+        except Exception:
+            return False
+        self._session, self._gap = True, gap is not None
+        return True
+
+    def _persist(self, *, lost=0, close=False):
+        """Add unpersisted counts to the durable marker, or re-read it."""
+        with self._lock:
+            refused, rejected = self._unpersisted_refused, self._unpersisted_rejected
+        if not (refused or rejected or lost or close):
+            try:
+                self._gap = self.service.timeline_gap() is not None
+            except Exception:
+                self._gap = None
+            return
+        now, _ = _stamp(self.clock)
+        gap = self.service.record_timeline_gap(now=now, refused=refused, rejected=rejected,
+                                               lost=lost, close=close)
+        with self._lock:
+            # Subtract what was written; facts refused meanwhile stay counted.
+            self._unpersisted_refused -= refused
+            self._unpersisted_rejected -= rejected
+        self._gap = gap is not None
+
+    def close(self):
+        """End the durable session cleanly, recording still-staged facts as lost.
+
+        Raises when the close cannot be persisted. The session row then stays,
+        so the next start records an interrupted gap, and this outbox remains
+        open for a retry.
+        """
+        with self._flushing:
+            with self._lock:
+                if self._closed:
+                    return self.state()
+                # Staging stops before the durable write; a producer staging
+                # after this point gets an error rather than silent loss.
+                self._closed = True
+                lost = len(self._pending)
+            try:
+                if not self._open():
+                    raise RuntimeError("timeline outbox session unavailable")
+                self._persist(lost=lost, close=True)
+            except BaseException:
+                with self._lock:
+                    self._closed = False
+                raise
+            self._session = False
+            return self.state()
 
     def state(self):
         with self._lock:
-            return OutboxState(self._recorded, len(self._pending), self._refused, self._rejected)
+            return OutboxState(self._recorded, len(self._pending), self._refused, self._rejected,
+                               self._unpersisted_refused + self._unpersisted_rejected,
+                               self._session, self._gap)
 
 
 class EntranceObservationAdapter:

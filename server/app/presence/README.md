@@ -177,6 +177,23 @@ route, worker thread or default timing policy:
   conflict and counted as rejected. Both are counted and reported by `OutboxState.degraded`, never
   dropped silently.
 
+Timeline loss is durable (`presence_timeline_gap` migration). The first flush
+opens a durable outbox session (`open_timeline_session()`), and every flush adds
+its refused and rejected counts to a singleton gap marker that holds counts and
+times only, never observation content. `TimelineOutbox.close()` records any
+still-staged fact as lost and ends the session; staging or flushing after close
+raises, so the runtime stops its producers first. A process that exits without
+a successful close leaves its session row behind, and the next start records
+an interrupted gap: a restart is never assumed clean, and staged facts are not
+recovered. A failed close keeps the outbox open and the session row in place.
+A second outbox on the same database is also reported as interrupted; that and
+any other false positive is cleared only by the Owner through the audited
+`clear_timeline_gap()`, a domain operation with no route. `OutboxState.degraded`
+stays true while facts are pending, counts are not yet persisted, the session
+is not open, or the durable marker is set or unreadable; the Owner status
+reports it as `timeline_gap` and `timeline_gap_detail`. Counts are only added,
+so a retried write that had committed overstates the gap rather than hiding it.
+
 `owner_presence_validity` and `maximum_source_latency` have no default; they
 are deployment decisions that need real-room and cross-host clock evaluation.
 

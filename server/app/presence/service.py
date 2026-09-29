@@ -409,6 +409,84 @@ class PresenceService:
                        "VALUES ('critical_event_cleared',?,?,NULL,?)",
                        (actor, timestamp(now), str(identifier)))
 
+    @staticmethod
+    def _gap(db):
+        row = db.execute("SELECT since, latest, refused, rejected, lost, interrupted "
+                         "FROM presence_timeline_gap WHERE singleton=1").fetchone()
+        return None if row is None else dict(row)
+
+    @staticmethod
+    def _add_gap(db, now, *, refused=0, rejected=0, lost=0, interrupted=0):
+        counts = (refused, rejected, lost, interrupted)
+        if any(type(value) is not int or value < 0 for value in counts):
+            raise ValueError("non-negative gap counts required")
+        if not any(counts):
+            return
+        at = timestamp(now)
+        db.execute("INSERT INTO presence_timeline_gap(singleton,since,latest,refused,rejected,lost,interrupted) "
+                   "VALUES (1,?,?,?,?,?,?) ON CONFLICT(singleton) DO UPDATE SET latest=excluded.latest, "
+                   "refused=refused+excluded.refused, rejected=rejected+excluded.rejected, "
+                   "lost=lost+excluded.lost, interrupted=interrupted+excluded.interrupted",
+                   (at, at, *counts))
+
+    def open_timeline_session(self, *, now):
+        """Start the durable outbox session; returns the timeline gap marker or None.
+
+        A session row still present from an earlier process means that process
+        never closed its outbox cleanly, so whatever it had staged may be lost.
+        That is recorded as an interrupted gap: a restart is never assumed to
+        be clean. A false positive, such as a second outbox opened on the same
+        database, is cleared by the Owner (`clear_timeline_gap`), never here.
+        """
+        with self._transaction() as db:
+            if db.execute("SELECT 1 FROM presence_outbox_session WHERE singleton=1").fetchone():
+                self._add_gap(db, now, interrupted=1)
+            db.execute("INSERT OR REPLACE INTO presence_outbox_session(singleton,opened) VALUES (1,?)",
+                       (timestamp(now),))
+            return self._gap(db)
+
+    def record_timeline_gap(self, *, now, refused=0, rejected=0, lost=0, close=False):
+        """Durably add outbox loss counts; ``close`` also ends the session cleanly.
+
+        Counts are only ever added, so a write that committed and then raised
+        and is retried overstates the gap rather than hiding it. Only a
+        successful close removes the session row; a failed close leaves it for
+        the next start to record as interrupted.
+        """
+        if type(close) is not bool:
+            raise ValueError("explicit close required")
+        with self._transaction() as db:
+            self._add_gap(db, now, refused=refused, rejected=rejected, lost=lost)
+            if close:
+                db.execute("DELETE FROM presence_outbox_session WHERE singleton=1")
+            return self._gap(db)
+
+    def timeline_gap(self):
+        """Read-only durable timeline gap marker, or None when there is none."""
+        with closing(self.database.connect()) as db:
+            return self._gap(db)
+
+    def clear_timeline_gap(self, context, *, now, clock_trusted):
+        """Owner-confirmed clearing of the durable timeline gap marker.
+
+        The lost facts are not recoverable, so only the Owner can accept the
+        gap, for example after an interrupted-restart false positive. Clearing
+        is audited with the cleared counts and never happens automatically.
+        """
+        actor = self._owner(context)
+        with self._transaction() as db:
+            if not self._control_clock(db, now, clock_trusted):
+                raise ValueError("trusted control timestamp required")
+            gap = self._gap(db)
+            if gap is None:
+                raise ValueError("no timeline gap")
+            db.execute("DELETE FROM presence_timeline_gap WHERE singleton=1")
+            target = ",".join(f"{key}={gap[key]}" for key in ("refused", "rejected", "lost", "interrupted"))
+            db.execute("INSERT INTO presence_audit(action,actor,at,state,target) "
+                       "VALUES ('timeline_gap_cleared',?,?,NULL,?)",
+                       (actor, timestamp(now), target))
+            return gap
+
     def dispatch_pending(self, *, limit=100):
         if type(limit) is not int or not 1 <= limit <= 500:
             raise ValueError("invalid dispatch limit")
@@ -625,6 +703,9 @@ class PresenceService:
             # the critical action never completed.
             unresolved |= {row[0] for row in db.execute(
                 "SELECT action FROM presence_expired_unresolved")}
+            # A durable timeline gap stays visible across restarts until the
+            # Owner clears it; it is Owner information like the paths below.
+            gap = self._gap(db)
         # The reported state is only as trustworthy as the marker behind its
         # basis: Owner control for an override or hint, observation receipt for
         # an inferred owner observation. A skewed source timestamp must not
@@ -638,7 +719,9 @@ class PresenceService:
                 "suppress_ordinary": state == PresenceState.PRESENT and timing,
                 **self._critical_paths(unresolved, not admitted),
                 "override_expiry_pending": not retired,
-                "pending_critical_actions": failed}
+                "pending_critical_actions": failed,
+                "timeline_gap": gap is not None,
+                "timeline_gap_detail": gap}
 
     def owner_status(self, context, *, now, clock_trusted):
         self._owner(context)

@@ -553,3 +553,131 @@ class HealthTimelineTests(PresenceFixture, TestCase):
         fact.flush()
         self.assertEqual(self.presence.snapshot(now=NOW, clock_trusted=True)["state"],
                          PresenceState.UNKNOWN.value)
+
+
+class TimelineGapDurabilityTests(PresenceFixture, TestCase):
+    """A known or possible timeline loss survives a restart until the Owner clears it."""
+
+    def setUp(self):
+        self.make_presence()
+        self.health = HealthTimeline(self.outbox)
+
+    def restart(self):
+        # A new process: new service and outbox over the same database, and no
+        # in-memory state carried over.
+        self.presence = PresenceService(self.database, access=MockAccess(), evidence=self.presence.evidence,
+                                        notifications=self.presence.notifications,
+                                        reservation=self.presence.reservation,
+                                        detection=lambda: True, storage_status=lambda: True)
+        self.outbox = TimelineOutbox(self.presence, clock=self.clock, capacity=8)
+        self.health = HealthTimeline(self.outbox)
+        return self.outbox.flush()
+
+    def gap(self):
+        status = self.presence.owner_status("owner", now=NOW, clock_trusted=True)
+        return status["timeline_gap"], status["timeline_gap_detail"]
+
+    def fill_and_refuse(self):
+        for _ in range(8):
+            self.assertTrue(self.health.node(NODE, NodeHealthState.OFFLINE))
+        self.assertFalse(self.health.node(NODE, NodeHealthState.ONLINE))
+
+    def test_refused_fact_stays_degraded_after_restart(self):
+        self.fill_and_refuse()
+        self.assertTrue(self.outbox.flush().degraded)
+        self.outbox.close()
+        state = self.restart()
+        self.assertEqual((state.refused, state.rejected, state.pending), (0, 0, 0))
+        self.assertTrue(state.degraded)
+        self.assertTrue(state.gap)
+        present, detail = self.gap()
+        self.assertTrue(present)
+        self.assertEqual((detail["refused"], detail["lost"], detail["interrupted"]), (1, 0, 0))
+
+    def test_restart_without_clean_close_is_an_interrupted_gap(self):
+        self.assertFalse(self.outbox.flush().degraded)
+        self.refuse = True
+        self.assertTrue(self.health.node(NODE, NodeHealthState.OFFLINE))
+        self.assertEqual(self.outbox.flush().pending, 1)
+        self.refuse = False
+        # The process dies: the staged fact is gone with it.
+        state = self.restart()
+        self.assertTrue(state.degraded)
+        self.assertEqual(self.gap()[1]["interrupted"], 1)
+        self.assertEqual(self.history()["items"], [])
+
+    def test_clean_close_without_loss_restarts_healthy(self):
+        self.assertTrue(self.health.node(NODE, NodeHealthState.OFFLINE))
+        self.assertEqual(self.outbox.flush().recorded, 1)
+        self.outbox.close()
+        state = self.restart()
+        self.assertFalse(state.degraded)
+        self.assertEqual(self.gap(), (False, None))
+
+    def test_close_records_still_staged_facts_as_lost_and_refuses_later_staging(self):
+        self.outbox.flush()
+        self.refuse = True
+        self.assertTrue(self.health.node(NODE, NodeHealthState.OFFLINE))
+        self.outbox.flush()
+        self.refuse = False
+        self.outbox.close()
+        with self.assertRaises(RuntimeError):
+            self.health.node(NODE, NodeHealthState.ONLINE)
+        with self.assertRaises(RuntimeError):
+            self.outbox.flush()
+        self.restart()
+        detail = self.gap()[1]
+        self.assertEqual((detail["lost"], detail["interrupted"]), (1, 0))
+
+    def test_failed_close_keeps_the_session_so_restart_is_interrupted(self):
+        self.outbox.flush()
+        self.refuse = True
+        with self.assertRaises(RuntimeError):
+            self.outbox.close()
+        self.refuse = False
+        self.assertTrue(self.restart().degraded)
+        self.assertEqual(self.gap()[1]["interrupted"], 1)
+
+    def test_unpersisted_count_stays_visible_until_written(self):
+        self.outbox.flush()
+        self.refuse = True
+        self.fill_and_refuse()
+        state = self.outbox.flush()
+        self.assertEqual((state.pending, state.unpersisted), (8, 1))
+        self.assertTrue(state.degraded)
+        self.assertEqual(self.gap(), (False, None))
+        self.refuse = False
+        state = self.outbox.flush()
+        self.assertEqual((state.pending, state.unpersisted), (0, 0))
+        self.assertEqual(self.gap()[1]["refused"], 1)
+
+    def test_unopened_session_or_unreadable_marker_is_never_healthy(self):
+        self.refuse = True
+        state = self.outbox.flush()
+        self.assertFalse(state.session)
+        self.assertTrue(state.degraded)
+        self.refuse = False
+        self.assertFalse(self.outbox.flush().degraded)
+        missing = Path(tempfile.gettempdir()) / f"absent-{uuid4()}" / "synthetic.sqlite3"
+        self.presence.database = Database(missing)
+        state = self.outbox.flush()
+        self.assertIsNone(state.gap)
+        self.assertTrue(state.degraded)
+
+    def test_only_the_owner_clears_the_gap_and_the_clear_is_audited(self):
+        self.outbox.flush()
+        self.restart()  # the first outbox never closed: interrupted
+        with self.assertRaises(AccessDenied):
+            self.presence.clear_timeline_gap("recordings", now=NOW, clock_trusted=True)
+        with self.assertRaises(ValueError):
+            self.presence.clear_timeline_gap("owner", now=NOW, clock_trusted=False)
+        self.assertTrue(self.gap()[0])
+        cleared = self.presence.clear_timeline_gap("owner", now=NOW, clock_trusted=True)
+        self.assertEqual(cleared["interrupted"], 1)
+        self.assertEqual(self.gap(), (False, None))
+        self.assertFalse(self.outbox.flush().degraded)
+        entry = self.presence.audit("owner")[-1]
+        self.assertEqual((entry["action"], entry["actor"]), ("timeline_gap_cleared", str(OWNER)))
+        self.assertEqual(entry["target"], "refused=0,rejected=0,lost=0,interrupted=1")
+        with self.assertRaises(ValueError):
+            self.presence.clear_timeline_gap("owner", now=NOW, clock_trusted=True)
