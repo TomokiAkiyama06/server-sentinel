@@ -17,6 +17,10 @@ class NotificationKind(StrEnum):
     CAMERA_TAMPER = "camera_tamper"
     HARDWARE_INTEGRITY_FAILURE = "hardware_integrity_failure"
     RECORDING_HEALTH_FAILURE = "recording_health_failure"
+    # Visible local warnings (NEW_DEVICE/UNVERIFIABLE hardware, unavailable
+    # recording-health verdict). They are never an immediate Slack message.
+    HARDWARE_INTEGRITY_WARNING = "hardware_integrity_warning"
+    RECORDING_HEALTH_WARNING = "recording_health_warning"
     PERSON = "person"
     MOTION = "motion"
     ENTRY = "entry"
@@ -54,21 +58,37 @@ class DailySummary:
     error_count: int
     recording_bytes: int
     storage_state: StorageState
+    # False when no capture/detection pipeline reports into this summary. The
+    # source, agent and observation counts are then shown as unavailable, so a
+    # summary never presents "0 person observations" as a verified absence.
+    pipeline_available: bool = True
 
     def __post_init__(self):
-        if not isinstance(self.storage_state, StorageState) or any(
-            type(value) is not int or not 0 <= value < 2**63
-            for key, value in vars(self).items() if key != "storage_state"
-        ):
+        if (not isinstance(self.storage_state, StorageState)
+                or type(self.pipeline_available) is not bool or any(
+                    type(value) is not int or not 0 <= value < 2**63
+                    for key, value in vars(self).items()
+                    if key not in {"storage_state", "pipeline_available"})):
             raise ValueError("invalid summary aggregate")
 
     def text(self) -> str:
+        if self.pipeline_available:
+            pipeline = (f"Sources online/degraded/offline: {self.sources_online}/"
+                        f"{self.sources_degraded}/{self.sources_offline}\n"
+                        f"Agents online/offline: {self.agents_online}/{self.agents_offline}\n"
+                        f"Person/motion/entry observations: {self.person_count}/"
+                        f"{self.motion_count}/{self.entry_count}\n")
+            monitored = f"Monitored seconds: {self.monitored_seconds}\n"
+        else:
+            # Service uptime is not monitored coverage: with no capture
+            # pipeline nothing was watched, so no duration is claimed.
+            monitored = ("Monitored seconds: unavailable (no capture pipeline reporting; "
+                         f"service uptime seconds: {self.monitored_seconds})\n")
+            pipeline = ("Sources: unavailable (no capture pipeline reporting)\n"
+                        "Agents: unavailable\n"
+                        "Person/motion/entry observations: unavailable\n")
         return ("ServerSentinel daily summary\n"
-                f"Monitored seconds: {self.monitored_seconds}\n"
-                f"Sources online/degraded/offline: {self.sources_online}/"
-                f"{self.sources_degraded}/{self.sources_offline}\n"
-                f"Agents online/offline: {self.agents_online}/{self.agents_offline}\n"
-                f"Person/motion/entry observations: {self.person_count}/{self.motion_count}/{self.entry_count}\n"
+                + monitored + pipeline +
                 f"Critical events: {self.critical_count}; recordings: {self.recording_count}\n"
                 f"Recording bytes: {self.recording_bytes}; storage: {self.storage_state.value}\n"
                 f"Errors: {self.error_count}")
@@ -91,6 +111,10 @@ class NotificationService:
         self._worker = DeliveryWorker(self._slack, queue_capacity)
         self._capacity = queue_capacity
         self._pending = {}
+        # `record()` events whose delivery is final but whose local write was
+        # refused (full disk, unverified filesystem): retried on every poll,
+        # bounded by the same capacity, so a mandatory alert is not lost.
+        self._unpersisted: dict[UUID, NotificationEvent] = {}
         self._owner = threading.get_ident()
         self.closed = False
         self.last_delivery = DeliveryResult.DISABLED
@@ -100,6 +124,10 @@ class NotificationService:
     @property
     def pending_count(self) -> int:
         return len(self._pending)
+
+    @property
+    def unpersisted_count(self) -> int:
+        return len(self._unpersisted)
 
     def _check(self):
         if threading.get_ident() != self._owner:
@@ -113,7 +141,19 @@ class NotificationService:
             self.local_delivery_failed = True
             return False
 
-    def _enqueue(self, event: NotificationEvent, text: str, on_complete=None) -> DeliveryResult:
+    def _retain(self, event: NotificationEvent) -> None:
+        """Keep a refused local write for retry; a full buffer stays visible."""
+        self.local_delivery_failed = True
+        if event.event_id in self._unpersisted or len(self._unpersisted) < self._capacity:
+            self._unpersisted[event.event_id] = event
+
+    def _flush_unpersisted(self) -> None:
+        for identifier, event in tuple(self._unpersisted.items()):
+            if self._local(event):
+                del self._unpersisted[identifier]
+
+    def _enqueue(self, event: NotificationEvent, text: str, on_complete=None,
+                 retain: bool = False) -> DeliveryResult:
         if event.event_id in self._pending:
             prior = self._pending[event.event_id][0]
             if (event.kind, event.at, event.confirmed) != (prior.kind, prior.at, prior.confirmed):
@@ -129,6 +169,8 @@ class NotificationService:
             result = DeliveryResult.PENDING
         event = replace(event, delivery=result)
         if not self._local(event) and result != DeliveryResult.PENDING:
+            if retain:
+                self._retain(event)
             self.last_delivery = DeliveryResult.FAILED
             return self.last_delivery
         self.last_delivery = result
@@ -146,6 +188,7 @@ class NotificationService:
     def poll(self) -> tuple[NotificationEvent, ...]:
         """Persist completed results without waiting; failed persistence retries locally."""
         self._check()
+        self._flush_unpersisted()
         for identifier, result in self._worker.results():
             self._pending[identifier][2] = result
         completed = []
@@ -179,14 +222,27 @@ class NotificationService:
         if kind == NotificationKind.DAILY_SUMMARY:
             raise ValueError("daily summary requires aggregate data")
         event = NotificationEvent(kind, at, confirmed, event_id=event_id or uuid4())
+        prior = self._unpersisted.get(event.event_id)
+        if prior is not None:
+            # A resubmission of a retained event retries its local write
+            # instead of delivering it a second time.
+            if (kind, at, confirmed) != (prior.kind, prior.at, prior.confirmed):
+                self.delivery_failed = True
+                return DeliveryResult.FAILED
+            if not self._local(prior):
+                return DeliveryResult.FAILED
+            del self._unpersisted[event.event_id]
+            return prior.delivery
         immediate = (kind in {NotificationKind.HARDWARE_INTEGRITY_FAILURE,
                               NotificationKind.RECORDING_HEALTH_FAILURE}
                      or confirmed and kind in {NotificationKind.SERVER_MOVEMENT,
                                                NotificationKind.CAMERA_TAMPER})
         if not immediate:
-            self._local(event)
+            if not self._local(event):
+                self._retain(event)
             return DeliveryResult.SUPPRESSED
-        return self._enqueue(event, f"ServerSentinel critical alert: {kind.value}", on_complete)
+        return self._enqueue(event, f"ServerSentinel critical alert: {kind.value}", on_complete,
+                             retain=True)
 
     def daily(self, summary: DailySummary, *, at: datetime, on_complete=None) -> DeliveryResult:
         self._check()

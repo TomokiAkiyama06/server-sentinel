@@ -899,13 +899,38 @@ class DeploymentConfigurationTests(unittest.TestCase):
                 "human_host": "127.0.0.1", "human_port": 8000, "log_level": "INFO",
             }
 
+            # The launcher requires the storage-configured monitoring section:
+            # without it the mandatory hardware integrity check and recording
+            # self-test could not run.
+            monitored = dict(value, monitoring={
+                "time_zone": "UTC",
+                "storage_limits": {
+                    "recording_limit_bytes": 100_000, "critical_allowance_bytes": 10_000,
+                    "hard_reserve_bytes": 4096, "pressure_free_bytes": 8192,
+                    "recovery_free_bytes": 16_384, "recovery_allocation_bytes": 90_000,
+                    "write_overhead_bytes": 4096, "max_request_bytes": 1024,
+                    "cleanup_batch_size": 10,
+                },
+                "recording_limits": {
+                    "pre_roll_bytes": 4096, "max_segment_bytes": 512, "max_segment_ms": 30_000,
+                    "max_active_recordings": 8, "max_spool_segments": 16,
+                    "max_segments_per_recording": 100,
+                },
+                "recording_filesystem": {
+                    "filesystem_uuid": uuid, "device": [os.major(device), os.minor(device)],
+                    "mount_point": str(root),
+                },
+            })
             external = root / "etc/deployment.json"
             external.parent.mkdir(mode=0o755)
+            unmonitored = root / "etc/unmonitored.json"
             internal = install / "deployment.json"
             release_internal = install / "current/deployment.json"
             for config in (external, internal, release_internal):
-                config.write_text(json.dumps(value))
+                config.write_text(json.dumps(monitored))
                 config.chmod(0o600)
+            unmonitored.write_text(json.dumps(value))
+            unmonitored.chmod(0o600)
 
             with patch("app.deployment.__file__", str(module)), patch(
                     "app.deployment.ADMINISTRATOR_UID", os.geteuid()), patch(
@@ -922,11 +947,25 @@ class DeploymentConfigurationTests(unittest.TestCase):
 
                 with patch("app.deployment.os.path.ismount", return_value=True), patch(
                         "app.deployment._operating_system_root_device",
-                        return_value=device + 1), patch(
-                            "sys.stdout", new_callable=io.StringIO) as stdout:
-                    self.assertEqual(
-                        deployment_main(["--config", str(external), "--check"]), 0
-                    )
+                        return_value=device + 1):
+                    # A structurally valid external configuration without the
+                    # monitoring storage sections is refused by --check (the
+                    # unit's ExecStartPre) and by the launcher itself.
+                    for arguments in (["--check"], []):
+                        with self.subTest(arguments=arguments), patch(
+                                "sys.stderr", new_callable=io.StringIO) as stderr, patch(
+                                "app.__main__.run") as run, self.assertRaises(
+                                    SystemExit) as stopped:
+                            deployment_main(["--config", str(unmonitored), *arguments])
+                        self.assertEqual(stopped.exception.code, 1)
+                        self.assertEqual(
+                            stderr.getvalue(), "ServerSentinel deployment validation failed\n"
+                        )
+                        run.assert_not_called()
+                    with patch("sys.stdout", new_callable=io.StringIO) as stdout:
+                        self.assertEqual(
+                            deployment_main(["--config", str(external), "--check"]), 0
+                        )
                 self.assertEqual(
                     stdout.getvalue(), "ServerSentinel deployment validation passed\n"
                 )

@@ -11,6 +11,13 @@ import zipapp
 
 ROOT = Path(__file__).resolve().parent
 REPOSITORY = ROOT.parent
+INSTALLER_MODULES = (
+    "__init__.py", "deployment.py", "settings.py",
+    "monitoring/__init__.py", "monitoring/config.py",
+    "media/recording/__init__.py", "media/recording/model.py", "media/recording/store.py",
+    "notifications/__init__.py", "notifications/slack.py",
+    "storage/__init__.py", "storage/policy.py",
+)
 
 
 def build(destination: Path) -> str:
@@ -19,8 +26,10 @@ def build(destination: Path) -> str:
     with tempfile.TemporaryDirectory(prefix="server-sentinel-installer-") as temporary:
         stage = Path(temporary)
         shutil.copyfile(ROOT / "install.py", stage / "install.py")
-        (stage / "app").mkdir()
-        for name in ("__init__.py", "deployment.py", "settings.py"):
+        # Deployment validation, including the optional monitoring section,
+        # needs only these standard-library modules; no third-party package.
+        for name in INSTALLER_MODULES:
+            (stage / "app" / name).parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(ROOT / "app" / name, stage / "app" / name)
         shutil.copyfile(REPOSITORY / "LICENSE", stage / "LICENSE")
         shutil.copyfile(REPOSITORY / "NOTICE", stage / "NOTICE")

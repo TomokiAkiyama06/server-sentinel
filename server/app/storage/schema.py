@@ -9,9 +9,12 @@ from app.detection.roi.schema import roi_calibration_migration
 from app.integrity.store import integrity_migration
 from app.media.health.artifacts import recording_health_migration
 from app.media.recording.schema import recording_migration
+from app.monitoring.store import monitoring_migration
+from app.notifications.schedule import notification_migration
 from app.presence.schema import presence_gap_migration, presence_migration
 from app.storage.migrations import BUILTIN_MIGRATIONS
 from app.setup_wizard.schema import wizard_state_migration
+from app.storage.retention import storage_audit_migration
 
 APPLICATION_MIGRATIONS = (
     *BUILTIN_MIGRATIONS,
@@ -28,9 +31,13 @@ APPLICATION_MIGRATIONS = (
     PAIRING_MIGRATION,
     access_migration(12),
     wizard_state_migration(13),
-    # Durable presence timeline-gap marker (#25/#26). Open PR #85 reserves
-    # 14-16; the migration runner requires a contiguous sequence, so whichever
-    # of the two merges second renumbers its entries on rebase (this one
-    # becomes 17 after #85).
-    presence_gap_migration(14),
+    # Issues #21/#23 runtime wiring: the storage state-transition audit, the
+    # persisted daily-summary claim and the durable local fault/notification
+    # state that the monitoring runtime owns.
+    storage_audit_migration(14),
+    notification_migration(15),
+    monitoring_migration(16),
+    # Durable presence timeline-gap marker (#25/#26), renumbered after #85
+    # took 14-16 because the migration runner requires a contiguous sequence.
+    presence_gap_migration(17),
 )

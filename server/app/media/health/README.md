@@ -44,5 +44,6 @@ never determines local fault state.
 
 Production codec/source/encoder wiring, verified mount/device mapping, durable
 notification integration and physical acceptance remain open under #18/#21/#23/
-#28. Run `MANUAL_TEST.md` S on the deployment; synthetic storage tests are not
+#28 (`../../monitoring/` now provides the durable result recorder, notification
+bridge and startup/daily scheduling). Run `MANUAL_TEST.md` S on the deployment; synthetic storage tests are not
 actual playable media or hardware acceptance.

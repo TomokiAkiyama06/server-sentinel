@@ -29,3 +29,18 @@ header adapter, cookie, WebAuthn parser, signature verifier, or browser
 ceremony. A future ceremony verifies its input before calling enrollment/session
 methods; every request integration must still validate current state and its
 required permission.
+
+Owner-only mutations — invitation, invitation issue, grant change, single
+credential revocation and principal revocation — are exposed as `*_on`
+methods on a caller-owned transaction and reached at runtime only through
+`app.audit.integration.AccessAdministration`, which authorizes the Owner and
+commits each mutation with its security audit record. The plain wrappers refuse
+with `UnauditedAccessWriteError` unless the store is constructed with
+`unaudited_writes=True` for non-runtime fixtures. Invitation redemption
+(`enroll_credential`) records its own audit row in the redemption transaction
+and therefore requires `audit=`; the log receives only the principal's logical
+UUID. A redemption that matches no valid invitation records nothing and does
+not affect health; when a matched redemption's audit append or commit fails,
+the redemption rolls back and the lost outcome is counted in the store's
+`audit_delivery_failed` / `undelivered_audit_records` health instead of being
+appended separately. See `server/app/audit/README.md`.

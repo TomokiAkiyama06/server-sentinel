@@ -34,7 +34,14 @@ lowered only after the owner has observed that queue empty, so no completion is
 lost or left unsignalled and the delivery thread does not exit on backpressure.
 If a full disk prevents local persistence, critical delivery may still proceed;
 the visible failure remains and completion is retained for local persistence retry
-without resending. Call `poll()` on each worker timer tick, not just at 23:00.
+without resending. A `record()` event whose delivery is already final (Slack
+disabled, full or closed queue) but whose local write was refused is retained in
+a separate buffer bounded by the same capacity and retried on every `poll()` (or
+by resubmitting its `event_id`) until the durable sink accepts it, so a mandatory
+alert raised while the verified filesystem is unavailable is recorded once
+storage recovers; overflow stays the visible `local_delivery_failed`. This buffer
+is in memory only: after a restart the startup checks re-detect a persisting
+fault. Call `poll()` on each worker timer tick, not just at 23:00.
 Critical `record` also accepts an upstream `event_id: UUID` and an optional
 `on_complete(result)` callback. Repeated submissions of that ID coalesce while
 pending; the callback runs on `poll`'s owning thread. The upstream durable outbox
@@ -64,3 +71,8 @@ is recorded once; no automatic network retries can flood the channel. A crash af
 claim leaves `pending` (uncertain delivery), never a false success. Production
 scheduler, health/presence outbox integration and configured Slack acceptance
 remain pending; transport and DST tests use generated fixtures and no network.
+`../monitoring/` now supplies the durable local sink, the owner-thread timer and
+the integrity/recording-health bridges; configured Slack acceptance remains
+pending. `DailySummary(pipeline_available=False)` renders monitored duration,
+source, agent and observation counts as unavailable instead of zero or uptime;
+service uptime is labeled separately.

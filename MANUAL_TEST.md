@@ -506,6 +506,27 @@ mock Slack and DST/rollback scheduling. They do not establish deployed volume,
 real codec, configured Slack, browser playback or human authorization acceptance.
 Keep the following deployment checks open; do not use production data for fills.
 
+The lifespan runtime wiring (`server/app/monitoring/`) is exercised only with
+disposable directories, a test clock, a synthetic inventory probe and an
+intercepted Slack transport. On the deployment, additionally check:
+
+- [ ] without `monitoring.storage_limits` (or the whole `monitoring` object)
+      `--check` fails and the unit does not start, so it never runs without the
+      startup/daily hardware integrity check and recording self-test;
+- [ ] with configured thresholds and `recording_filesystem`, `--check` passes and
+      the service reports `monitoring_started`; a wrong UUID/device/mount point is
+      refused by `--check`;
+- [ ] storage state transitions appear in `storage_state_audit`, and expired
+      unstarred recordings/state-audit rows are removed by the running service;
+- [ ] detaching or substituting the recording mount while running yields one
+      immediate `recording_health_failure`, `STORAGE_HARD_STOP`, and no new file
+      in the substituted directory or on the root filesystem;
+- [ ] a startup-time failure (for example free space below the hard reserve,
+      or a transiently unresolvable filesystem UUID) yields one immediate
+      `recording_health_failure` and refused writes; once the condition clears,
+      the runtime recovers within 15 minutes without a restart and without a
+      second alert.
+
 - [ ] metadata database and media use the expected filesystem, and configured
       journal/temp overhead safely covers recovery, cleanup and migrations;
 - [ ] configured Slack receives one safe immediate critical alert and one daily
@@ -557,9 +578,11 @@ Record separate performance results for 1, 2, 3, and 4 active sources, including
 ## S. Main-host hardware integrity / recording-health self-test
 
 Current Issue #23 automation uses generated inventory and synthetic compressed
-bytes only. Before physical acceptance, wire the approved Owner authorizer,
-local schema/runtime configuration, actual source/encoder/codec callbacks and
-#21 durable notification bridge. Verify optional read-only tools under the
+bytes only. The lifespan runtime now runs startup/daily integrity comparison and
+recording-health checks and bridges faults to durable local notification rows
+and optional Slack (mock-verified only). Before physical acceptance, wire the
+approved Owner authorizer and the actual source/encoder/codec callbacks; until
+then the self-test reports `UNAVAILABLE` and no baseline can be approved. Verify optional read-only tools under the
 dedicated non-root account; unavailable fields must stay unknown. Do not publish
 collected identifiers or self-test bytes.
 

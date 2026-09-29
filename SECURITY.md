@@ -481,6 +481,14 @@ error responses. Credential URLs, remote bodies and raw exceptions never enter
 its result/log surface. Unset configuration constructs no transport. Current
 payloads are fixed categories/validated aggregates, without media or arbitrary
 event details. Tests use generated dummy components and intercepted transports.
+The webhook is read only from the administrator-owned, non-world-readable
+deployment configuration (`monitoring.slack_webhook_url`); it never enters
+repr, validation messages or logs. The monitoring runtime binds the Main
+storage policy only from explicit deployment thresholds and an Owner-declared
+recording filesystem identity; missing thresholds leave writes refused, and a
+missing, reformatted or substituted recording filesystem is refused without a
+fallback directory. The runtime never approves or rewrites the hardware
+baseline and adds no route; the human surface stays closed.
 
 The Agent's normal ring buffer is bounded by Owner-selected duration or capacity mode. Protected communication-loss/critical incidents are separate from normal overwrite and expire 60 days after completion by default. Storage pressure reclaims eligible ordinary ring data first and refuses unsafe writes; it does not silently delete unexpired protected incidents.
 
