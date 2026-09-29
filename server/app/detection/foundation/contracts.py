@@ -44,6 +44,11 @@ class Reason(str, Enum):
     RESOURCE_LIMIT = "frame_resource_limit"
     CLOCK = "local_clock_regression"
     NOT_STARTED = "not_started"
+    # Isolated worker process failures (see isolation.py). Each is unknown,
+    # never an absent/no-person conclusion.
+    WORKER_TIMEOUT = "detector_timeout"
+    WORKER_CRASHED = "detector_crashed"
+    WORKER_UNAVAILABLE = "detector_worker_unavailable"
 
 
 def positive_integer(value: int, name: str) -> None:

@@ -525,6 +525,17 @@ Preferred order:
 
 Do not require a specific GPU vendor for correctness. Hardware acceleration is optimization.
 
+Adapter selection (`server/app/media/profiles/adapters.py`) takes an explicit
+acceleration policy. With `prefer_hardware`, a missing or failing accelerator
+falls back to a listed software adapter and the selection records
+`hardware_unavailable` + `software_fallback`; with `require_hardware`, or when no
+software adapter exists, the path is `adapter_unavailable` (or
+`adapter_start_failed`). Fallback is never silent and never reports the
+accelerated path as active: the selection is recorded per started adapter/path
+(`PathStatus.adapter_state`), not as one selector-wide latest result, so a path
+still on software fallback stays visible after another path starts on
+recovered hardware.
+
 ### 6.3 Room-overview benchmark
 
 For wide room coverage, real-hardware tests should compare at minimum:
@@ -537,6 +548,15 @@ For wide room coverage, real-hardware tests should compare at minimum:
 - ring-buffer disk throughput/capacity at candidate capture profiles.
 
 Final defaults are measured, not guessed.
+
+The high-resolution room-overview capture is an explicit per-source allowlist
+option (`CaptureOption.ROOM_OVERVIEW_HIGH_RESOLUTION`) with explicit minimum
+capture dimensions. Its sets must downscale inference and viewer output below
+the capture resolution without raising FPS; the option is never inferred from a
+role label or source type, and admission requires requesting it explicitly.
+`python -m app.media.profiles.measure` is a synthetic scheduler-overhead
+harness (CPU, RSS, queue depth) that prints no private values; it does not
+replace the real-hardware benchmark above.
 
 The transport-independent implementation in `server/app/media/profiles/` uses
 explicit immutable profiles, conservative exact-descriptor copy eligibility,
@@ -675,7 +695,7 @@ Use a pluggable backend. Requirements: project-compatible license, CPU fallback,
 
 YOLOX is an initial evaluation candidate only.
 
-The Issue #20 foundation in `server/app/detection/foundation` uses transient grayscale frames, one bounded pending frame per source, independent Main-monotonic inference cadence, and an explicit worker entry point. Quality failure, missing models, stale observations, dropped frames, and evaluation failure produce `unknown`; known loss/throttling remains visible in health snapshots. No model is implicitly downloaded or enabled. The CPU motion baseline detects image change only. An optional RT-DETRv2 CPU adapter loads only a separately licensed, locally supplied, digest-pinned ONNX artifact on the audited Linux x86_64/CPython 3.12 runtime; no runtime model download or cloud/provider fallback is exposed. See `server/docs/DETECTOR_FOUNDATION.md` for limits and `server/docs/DETECTOR_MODEL_AUDIT.md` for separate code/weight evidence. Target-host performance and production worker isolation remain acceptance work.
+The Issue #20 foundation in `server/app/detection/foundation` uses transient grayscale frames, one bounded pending frame per source, independent Main-monotonic inference cadence, and an explicit worker entry point. Quality failure, missing models, stale observations, dropped frames, and evaluation failure produce `unknown`; known loss/throttling remains visible in health snapshots. No model is implicitly downloaded or enabled. The CPU motion baseline detects image change only. An optional RT-DETRv2 CPU adapter loads only a separately licensed, locally supplied, digest-pinned ONNX artifact on the audited Linux x86_64/CPython 3.12 runtime; no runtime model download or cloud/provider fallback is exposed. See `server/docs/DETECTOR_FOUNDATION.md` for limits and `server/docs/DETECTOR_MODEL_AUDIT.md` for separate code/weight evidence. Inference runs in a spawned, rlimit-bounded worker process per source binding under a wall-clock watchdog; a hang, crash, start failure or protocol violation yields `unknown` with a worker reason (`detector_timeout` / `detector_crashed` / `detector_worker_unavailable` / `detector_failure`), never `absent`. `InferenceFeed` feeds pipeline inference samples to the scheduler and invalidates on discontinuities, and its `poll()` invalidates at the moment the pipeline closes, loses admission or requires renegotiation even when no further frame arrives; any current-stream frame of non-sufficient quality invalidates to `unknown` whether or not it is sampled, and closing the inference runtime invalidates every binding. The deployment `detection` object must name every detector parameter, cadence and worker limit explicitly; without it no inference runtime starts. Target-host performance and verification of the worker limits remain acceptance work.
 
 ### 7.3 Server movement
 
