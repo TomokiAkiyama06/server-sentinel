@@ -13,7 +13,7 @@ from app.cameras.remote_agent.continuity import (
     MediaUnitHeader, SourceFlow,
 )
 from app.cameras.remote_agent.ingest import (
-    AgentIngestQueue, DenyIngestAuthorizer, IngestLimits,
+    AgentIngestQueue, DenyIngestAuthorizer, IngestLimits, IngestOutcome,
 )
 
 NODES = tuple(UUID(int=n) for n in range(1, 6))
@@ -34,6 +34,33 @@ class Authorizer:
     def require_source(self, node_id, source_id):
         if (node_id, source_id) not in self.pairs:
             raise PermissionError
+
+
+class RevokeDuringCheckAuthorizer(Authorizer):
+    """Revokes between the tracker's own check and the queue's recheck."""
+
+    def __init__(self, *, revoke_node):
+        super().__init__()
+        self.revoke_node = revoke_node
+        self.armed = False
+
+    def require_source(self, node_id, source_id):
+        super().require_source(node_id, source_id)
+        if self.armed:
+            self.armed = False
+            if self.revoke_node:
+                self.revoked.add(node_id)
+            else:
+                self.pairs.discard((node_id, source_id))
+
+
+class TransientRefusalQueue(AgentIngestQueue):
+    refusing = False
+
+    def submit(self, message):
+        if self.refusing:
+            return self._admission(IngestOutcome.REJECTED, "transient_refusal")
+        return super().submit(message)
 
 
 class Clock:
@@ -405,6 +432,71 @@ class ContinuityTrackerTests(unittest.TestCase):
         self.assertEqual("unauthorized",
                          tracker.receive(session, unit(0, source=OTHER_SOURCE), b"v").reason)
         self.assertTrue(tracker.heartbeat(session))
+        self.assertEqual(SourceFlow.RECEIVING, flow(tracker).flow)
+
+    def test_node_revoked_between_checks_invalidates_session(self):
+        authorizer = RevokeDuringCheckAuthorizer(revoke_node=True)
+        tracker, ingest, _, _ = build(authorizer=authorizer)
+        session = tracker.open_session(NODE)
+        tracker.receive(session, unit(0), b"v")
+        authorizer.armed = True
+        self.assertEqual("unauthorized", tracker.receive(session, unit(1), b"v").reason)
+        self.assertEqual(SourceFlow.INTERRUPTED, flow(tracker).flow)
+        authorizer.revoked.discard(NODE)
+        self.assertFalse(tracker.heartbeat(session))
+        self.assertEqual("stale_session", tracker.receive(session, unit(1), b"v").reason)
+        self.assertEqual(1, ingest.snapshot().queued_messages)
+
+    def test_source_revoked_between_checks_keeps_node_session(self):
+        authorizer = RevokeDuringCheckAuthorizer(revoke_node=False)
+        authorizer.pairs.add((NODE, OTHER_SOURCE))
+        tracker, _, _, _ = build(authorizer=authorizer)
+        session = tracker.open_session(NODE)
+        tracker.receive(session, unit(0), b"v")
+        authorizer.armed = True
+        self.assertEqual("unauthorized",
+                         tracker.receive(session, unit(0, source=OTHER_SOURCE), b"v").reason)
+        self.assertTrue(tracker.heartbeat(session))
+        self.assertEqual(DeliveryOutcome.ACCEPTED,
+                         tracker.receive(session, unit(1), b"v").outcome)
+
+    def test_sustained_backpressure_stays_degraded_not_interrupted(self):
+        tracker, _, clock, _ = build(queued=1, stale=10)
+        session = tracker.open_session(NODE)
+        tracker.receive(session, unit(0), b"v")
+        for now in range(5, 45, 5):
+            clock.now = now
+            self.assertEqual(DeliveryOutcome.BACKPRESSURED,
+                             tracker.receive(session, unit(1), b"v").outcome)
+            self.assertTrue(tracker.heartbeat(session))
+        clock.now = 45
+        state = flow(tracker)
+        self.assertEqual((SourceFlow.DEGRADED, True, 0),
+                         (state.flow, state.backpressured, state.last_sequence))
+        # Once attempts stop, staleness still makes the flow interrupted.
+        clock.now = 51
+        self.assertEqual(SourceFlow.INTERRUPTED, flow(tracker).flow)
+
+    def test_sustained_transient_refusal_stays_degraded_not_interrupted(self):
+        authorizer = Authorizer()
+        clock = Clock()
+        ingest = TransientRefusalQueue(IngestLimits(8, 4, 32, 1000, 10 ** 12),
+                                       authorizer, clock_ns=clock)
+        tracker = ContinuityTracker(ContinuityLimits(4, 4, 10), authorizer, ingest,
+                                    clock_ns=clock)
+        session = tracker.open_session(NODE)
+        tracker.receive(session, unit(0), b"v")
+        ingest.refusing = True
+        for now in range(5, 45, 5):
+            clock.now = now
+            self.assertEqual("transient_refusal",
+                             tracker.receive(session, unit(1), b"v").reason)
+        clock.now = 45
+        self.assertEqual((SourceFlow.DEGRADED, 0),
+                         (flow(tracker).flow, flow(tracker).last_sequence))
+        ingest.refusing = False
+        self.assertEqual(DeliveryOutcome.ACCEPTED,
+                         tracker.receive(session, unit(1), b"v").outcome)
         self.assertEqual(SourceFlow.RECEIVING, flow(tracker).flow)
 
     def test_deterministic_impairment_matrix(self):

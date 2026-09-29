@@ -362,19 +362,35 @@ class ContinuityTracker:
                 capture_epoch=header.capture_epoch,
                 capture_time_ns=header.capture_time_ns))
             if admission.outcome in (IngestOutcome.BACKPRESSURED, IngestOutcome.RATE_LIMITED):
-                self._pending(state, node_id, header, now).backpressured = True
+                pending = self._pending(state, node_id, header, now)
+                pending.backpressured = True
+                # The Agent is still delivering: refresh activity (not the
+                # committed sequence) so sustained pressure stays ``degraded``
+                # instead of decaying to ``interrupted``.
+                pending.last_seen_ns = node.last_seen_ns = now
                 outcome = (DeliveryOutcome.BACKPRESSURED
                            if admission.outcome is IngestOutcome.BACKPRESSURED
                            else DeliveryOutcome.RATE_LIMITED)
                 return Delivery(outcome, admission.reason)
             if (admission.outcome is IngestOutcome.REJECTED
                     and admission.reason == "unauthorized"):
+                # The queue re-authorizes node and source.  If the node was
+                # revoked after the check above, the grant must be closed too;
+                # a source-only revocation keeps the node session.  The
+                # authorizer is already called under this lock by the queue.
+                try:
+                    self._authorizer.require_node(node_id)
+                except PermissionError:
+                    node.open = False
                 return Delivery(DeliveryOutcome.REJECTED, "unauthorized")
             if (admission.outcome is IngestOutcome.REJECTED
                     and admission.reason not in _PERMANENT_INGEST_REFUSALS):
                 # Transient/unknown refusal: do not commit or claim loss, but
-                # never let the flow look healthy while it persists.
-                self._pending(state, node_id, header, now).refused = True
+                # never let the flow look healthy while it persists.  Activity
+                # is refreshed so a persisting refusal stays ``degraded``.
+                pending = self._pending(state, node_id, header, now)
+                pending.refused = True
+                pending.last_seen_ns = node.last_seen_ns = now
                 return Delivery(DeliveryOutcome.REJECTED, admission.reason)
             if state is None:
                 state = self._sources[source_id] = _Source(
