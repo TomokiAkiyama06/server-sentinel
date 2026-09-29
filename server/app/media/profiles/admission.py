@@ -15,15 +15,25 @@ from app.cameras.registry.models import SourceType
 from .model import (
     SourceProfiles,
 )
+from .options import CaptureOption, RoomOverviewCriteria, room_overview_violations
 
 
 @dataclass(frozen=True)
 class SourceProfileCapabilities:
-    """Exact profile choices established for one physical/logical source."""
+    """Exact profile choices established for one physical/logical source.
+
+    ``room_overview_sets`` explicitly marks the subset of ``profile_sets`` that
+    form the high-resolution room-overview capture option. Every such set must
+    satisfy the structural room-overview rules against explicitly supplied
+    ``room_overview_criteria``. The remaining sets form the standard option.
+    Nothing is inferred from a role label, source type or resolution.
+    """
 
     source_id: UUID
     source_type: SourceType
     profile_sets: tuple[SourceProfiles, ...]
+    room_overview_sets: tuple[SourceProfiles, ...] = ()
+    room_overview_criteria: RoomOverviewCriteria | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.source_id, UUID) or not isinstance(self.source_type, SourceType):
@@ -39,6 +49,32 @@ class SourceProfileCapabilities:
         )
         if any(not format_.verified or not format_.video_only for format_ in formats):
             raise ValueError("profile capabilities must be verified as video-only")
+        overview = self.room_overview_sets
+        if (not isinstance(overview, tuple)
+                or any(not isinstance(value, SourceProfiles) for value in overview)
+                or len(set(overview)) != len(overview)):
+            raise ValueError("room-overview sets must be a unique tuple")
+        if any(value not in self.profile_sets for value in overview):
+            raise ValueError("room-overview sets must be listed in profile_sets")
+        criteria = self.room_overview_criteria
+        if overview and not isinstance(criteria, RoomOverviewCriteria):
+            raise ValueError("room-overview option requires explicit criteria")
+        if not overview and criteria is not None:
+            raise ValueError("room-overview criteria require a listed option")
+        for value in overview:
+            violations = room_overview_violations(value, criteria)
+            if violations:
+                # Reason codes only: no dimensions or source identity.
+                raise ValueError("room-overview set rejected: " + ",".join(violations))
+
+    def option_sets(self, option: CaptureOption) -> tuple[SourceProfiles, ...]:
+        """Return the complete sets selectable under one explicit option."""
+        if not isinstance(option, CaptureOption):
+            raise ValueError("invalid capture option")
+        if option is CaptureOption.ROOM_OVERVIEW_HIGH_RESOLUTION:
+            return self.room_overview_sets
+        return tuple(value for value in self.profile_sets
+                     if value not in self.room_overview_sets)
 
 
 @dataclass(frozen=True)
@@ -46,6 +82,7 @@ class AdmissionDecision:
     admitted: bool
     reasons: tuple[str, ...]
     lease: "AdmissionLease | None" = None
+    option: CaptureOption | None = None
 
 
 @dataclass(frozen=True)
@@ -56,6 +93,7 @@ class AdmissionLease:
     generation: int
     profile_sets: tuple[SourceProfiles, ...]
     _owner: "SourceProfileAdmissions" = field(repr=False, compare=False)
+    option: CaptureOption = CaptureOption.STANDARD
 
     def permits(self, profiles: SourceProfiles) -> bool:
         return self._owner.permits(self, profiles)
@@ -108,12 +146,29 @@ class SourceProfileAdmissions:
         self._lock = Lock()
 
     def admit(self, capabilities: SourceProfileCapabilities,
-              profiles: SourceProfiles) -> AdmissionDecision:
+              profiles: SourceProfiles,
+              option: CaptureOption = CaptureOption.STANDARD) -> AdmissionDecision:
+        """Admit one complete set under an explicitly requested option.
+
+        The lease allowlist is limited to that option's sets, so later
+        viewer/inference adaptation cannot silently switch a generation
+        between the standard and room-overview options.
+        """
         if not isinstance(capabilities, SourceProfileCapabilities):
             raise ValueError("invalid source capabilities")
         if not isinstance(profiles, SourceProfiles):
             raise ValueError("invalid source profiles")
-        reasons = [] if profiles in capabilities.profile_sets else ["profile_set_unsupported"]
+        if not isinstance(option, CaptureOption):
+            raise ValueError("invalid capture option")
+        option_sets = capabilities.option_sets(option)
+        if profiles in option_sets:
+            reasons = []
+        elif profiles in capabilities.profile_sets:
+            reasons = ["capture_option_mismatch"]
+        elif not option_sets:
+            reasons = ["capture_option_unavailable"]
+        else:
+            reasons = ["profile_set_unsupported"]
         with self._lock:
             known_type = self._source_types.get(capabilities.source_id)
             if known_type is not None and known_type is not capabilities.source_type:
@@ -124,14 +179,14 @@ class SourceProfileAdmissions:
             if self._pipeline_owners.get(capabilities.source_id) is not None:
                 reasons.append("pipeline_active")
             if reasons:
-                return AdmissionDecision(False, tuple(reasons))
+                return AdmissionDecision(False, tuple(reasons), None, option)
             lease = AdmissionLease(capabilities.source_id, self._next_generation,
-                                   capabilities.profile_sets, self)
+                                   option_sets, self, option)
             self._next_generation += 1
             self._profiles[capabilities.source_id] = profiles
             self._source_types[capabilities.source_id] = capabilities.source_type
             self._leases[capabilities.source_id] = lease
-            return AdmissionDecision(True, (), lease)
+            return AdmissionDecision(True, (), lease, option)
 
     def release(self, lease: AdmissionLease) -> bool:
         if not isinstance(lease, AdmissionLease):

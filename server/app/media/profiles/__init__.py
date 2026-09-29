@@ -10,8 +10,16 @@ from .admission import (
 from .pipeline import AdapterUnavailable, PacketAdapter, PipelineStatus, SourcePipeline
 from .planner import EncodeMode, EncodePlan, plan_encoding
 from .sampling import InferenceSampler, SampleDecision
+from .options import CaptureOption, RoomOverviewCriteria, room_overview_violations
+from .adapters import (
+    AccelerationPolicy, AdapterCandidate, AdapterKind, AdapterSelection, AdapterSelector,
+    AdapterStartFailed,
+)
 
 __all__ = [
+    "AccelerationPolicy", "AdapterCandidate", "AdapterKind", "AdapterSelection",
+    "AdapterSelector", "AdapterStartFailed", "CaptureOption", "RoomOverviewCriteria",
+    "room_overview_violations",
     "AdapterUnavailable", "AdmissionDecision", "AdmissionLease", "CaptureProfile",
     "CompressedPacket", "EncodeMode",
     "EncodePlan", "InferenceProfile", "InferenceSampler", "PacketAdapter",
