@@ -646,6 +646,59 @@ class TimelineGapDurabilityTests(PresenceFixture, TestCase):
         self.assertTrue(self.restart().degraded)
         self.assertEqual(self.gap()[1]["interrupted"], 1)
 
+    def test_pending_backlog_degrades_owner_status_without_counting_loss(self):
+        self.assertFalse(self.outbox.flush().degraded)
+        self.refuse = True
+        self.assertTrue(self.health.node(NODE, NodeHealthState.OFFLINE))
+        self.assertTrue(self.health.node(NODE, NodeHealthState.ONLINE))
+        # A transient storage refusal stops the flush with the facts staged.
+        state = self.outbox.flush()
+        self.assertEqual((state.pending, state.unpersisted), (2, 0))
+        self.refuse = False
+        status = self.presence.owner_status("owner", now=NOW, clock_trusted=True)
+        self.assertTrue(status["timeline_pending"])
+        self.assertEqual(status["timeline_pending_count"], 2)
+        # Staged facts are not loss: no gap is reported or recorded for them.
+        self.assertFalse(status["timeline_gap"])
+        self.assertEqual(status["timeline_gap_unpersisted"], 0)
+        self.assertIsNone(status["timeline_gap_detail"])
+        self.assertEqual(self.outbox.flush().recorded, 2)
+        status = self.presence.owner_status("owner", now=NOW, clock_trusted=True)
+        self.assertEqual((status["timeline_pending"], status["timeline_pending_count"]), (False, 0))
+        self.assertFalse(status["timeline_gap"])
+
+    def test_pending_backlog_is_read_with_loss_in_one_step(self):
+        # A staged fact rejected between two separate reads would be seen in
+        # neither count; the backlog reader returns both under one lock.
+        self.outbox.flush()
+        self.refuse = True
+        self.assertTrue(self.health.node(NODE, NodeHealthState.OFFLINE))
+        self.outbox.flush()
+        self.refuse = False
+        session = self.outbox._handle
+        session.unpersisted = mock.Mock(side_effect=AssertionError("read separately"))
+        status = self.presence.owner_status("owner", now=NOW, clock_trusted=True)
+        self.assertEqual((status["timeline_pending_count"], status["timeline_gap_unpersisted"]), (1, 0))
+
+    def test_unreadable_backlog_is_never_reported_empty(self):
+        self.outbox._handle.backlog = mock.Mock(side_effect=RuntimeError("unreadable"))
+        status = self.presence.owner_status("owner", now=NOW, clock_trusted=True)
+        self.assertTrue(status["timeline_pending"])
+        self.assertTrue(status["timeline_gap"])
+
+    def test_pending_backlog_leaves_owner_status_after_a_clean_close(self):
+        self.outbox.flush()
+        self.refuse = True
+        self.assertTrue(self.health.node(NODE, NodeHealthState.OFFLINE))
+        self.outbox.flush()
+        self.refuse = False
+        self.outbox.close()
+        # Close turned the staged fact into recorded loss; it is not also pending.
+        status = self.presence.owner_status("owner", now=NOW, clock_trusted=True)
+        self.assertEqual((status["timeline_pending"], status["timeline_pending_count"]), (False, 0))
+        self.assertTrue(status["timeline_gap"])
+        self.assertEqual(status["timeline_gap_detail"]["lost"], 1)
+
     def test_unpersisted_count_stays_visible_until_written(self):
         self.outbox.flush()
         self.refuse = True

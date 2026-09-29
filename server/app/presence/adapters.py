@@ -332,6 +332,7 @@ class TimelineOutbox:
                 raise
             return False
         session.unpersisted = self._unpersisted
+        session.backlog = self._backlog
         with self._lock:
             self._handle = session
             self._session, self._gap = True, gap is not None
@@ -341,6 +342,11 @@ class TimelineOutbox:
         """Counted loss not yet in the durable marker; read by Owner status."""
         with self._lock:
             return self._unpersisted_refused + self._unpersisted_rejected
+
+    def _backlog(self):
+        """Staged facts and unpersisted loss, read together for Owner status."""
+        with self._lock:
+            return len(self._pending), self._unpersisted_refused + self._unpersisted_rejected
 
     def _persist(self, *, lost=0, close=False):
         """Add unpersisted counts to the durable marker, or re-read it."""

@@ -208,8 +208,15 @@ reports it as `timeline_gap` and `timeline_gap_detail`. Loss a live outbox has
 counted but not yet written is part of `timeline_gap` too
 (`timeline_gap_unpersisted`), and it refuses `clear_timeline_gap()` until the
 outbox writes it, so a clear never makes Owner status look healthy while known
-loss is pending. That in-memory count is visible through the service instance
-that opened the session. Counts are only added,
+loss is pending. Facts still staged because a transient storage, database or
+clock failure stopped the flush are not loss and are not counted in
+`timeline_gap`; Owner status reports them separately as `timeline_pending` and
+`timeline_pending_count`, which stay degraded until those facts are written
+(or, at a clean close, recorded as lost in the gap marker). The outbox reports
+its staged and unpersisted counts in one step, so a fact moving from staged to
+counted loss is never missed, and an unreadable backlog is reported as both
+pending and a gap. These in-memory counts are visible through the service
+instance that opened the session. Counts are only added,
 so a retried write that had committed overstates the gap rather than hiding it.
 
 `owner_presence_validity` and `maximum_source_latency` have no default; they

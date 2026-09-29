@@ -42,6 +42,10 @@ class TimelineSession:
         # written to the durable marker. The outbox replaces it with a reader
         # of its own counts, so Owner status sees that loss before it lands.
         self.unpersisted = lambda: 0
+        # Staged facts awaiting a successful write together with that loss
+        # count, read in one critical section of the outbox so a fact moving
+        # from staged to counted loss is never missed by a status read.
+        self.backlog = lambda: (0, self.unpersisted())
 
     @property
     def live(self):
@@ -95,19 +99,33 @@ class PresenceService:
         connection.row_factory = sqlite3.Row
         return connection
 
-    def _unpersisted_loss(self):
-        """Timeline loss counted by a live outbox of this process but not yet written."""
+    def _live_sessions(self):
         with self._sessions_lock:
             self._sessions = [session for session in self._sessions if session.live]
-            sessions = tuple(self._sessions)
-        total = 0
-        for session in sessions:
+            return tuple(self._sessions)
+
+    def _unpersisted_loss(self):
+        """Timeline loss counted by a live outbox of this process but not yet written."""
+        return self._outbox_backlog()[1]
+
+    def _outbox_backlog(self):
+        """``(pending, unpersisted)`` across the live outboxes of this process.
+
+        Pending facts are staged and await a successful write; they are not
+        loss. Each session reports both counts atomically, so a fact that is
+        rejected between two reads is never seen in neither count.
+        """
+        pending = unpersisted = 0
+        for session in self._live_sessions():
             try:
-                total += session.unpersisted()
+                staged, lost = session.backlog()
             except Exception:
-                # An unreadable count cannot prove there is no loss.
-                total += 1
-        return total
+                # An unreadable backlog proves neither an empty queue nor the
+                # absence of loss.
+                staged, lost = 1, 1
+            pending += staged
+            unpersisted += lost
+        return pending, unpersisted
 
     def _admission(self):
         """Obtain one storage reservation context for a single durable write.
@@ -800,7 +818,10 @@ class PresenceService:
         # Loss a live outbox has counted but not yet written is a gap too. It
         # is read before the durable marker: the outbox commits the marker
         # before it drops its count, so a loss is always seen in one of them.
-        unpersisted = self._unpersisted_loss()
+        # Staged facts are read in the same step: a staged fact leaves the
+        # backlog only after its write committed, so it is either still
+        # pending here or already in the timeline read below.
+        pending, unpersisted = self._outbox_backlog()
         with closing(self._read()) as db:
             trusted = self._clock_trust(db, now, clock_trusted)
             control_trusted = self._control_trust(db, now, clock_trusted)
@@ -838,7 +859,12 @@ class PresenceService:
                 "pending_critical_actions": failed,
                 "timeline_gap": gap is not None or unpersisted > 0,
                 "timeline_gap_detail": gap,
-                "timeline_gap_unpersisted": unpersisted}
+                "timeline_gap_unpersisted": unpersisted,
+                # Staged facts a transient storage, database or clock failure
+                # holds back: not loss, so not part of timeline_gap, but the
+                # timeline is incomplete until they are written.
+                "timeline_pending": pending > 0,
+                "timeline_pending_count": pending}
 
     def owner_status(self, context, *, now, clock_trusted):
         self._owner(context)
