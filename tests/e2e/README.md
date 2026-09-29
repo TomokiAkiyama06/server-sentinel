@@ -23,7 +23,11 @@ lookup (`getaddrinfo`, `gethostbyname`, `gethostbyname_ex`, `gethostbyaddr`,
 `sendmsg` / resolver audit events, so direct `_socket.socket` use or a resolver
 alias captured before the guard started is refused and recorded too. Because
 `send`/`sendall` raise no audit event, entering the guard fails closed (recorded
-as `preconnected`) when a non-AF_UNIX socket is already connected. Egress from
+as `preconnected`) when a non-AF_UNIX socket is already connected. Module-scope
+imports run before any guard exists, so `test_no_telemetry_scenarios.py` also
+replays every scenario module (and the production modules they load) in a fresh
+interpreter whose first statement installs a refusing, recording audit hook;
+an import-time connect that already closed is caught there. Egress from
 child processes or native code that bypasses CPython's `_socket` is outside
 this in-process guard:
 

@@ -59,6 +59,73 @@ REPORTING_MODULES = frozenset({
 })
 
 
+# Every scenario module, and through it every production module it loads at
+# import time (including tests.e2e.harness itself).
+SCENARIO_MODULES = (
+    "tests.e2e.harness",
+    "tests.e2e.test_mock_core_harness",
+    "tests.e2e.test_agent_ring_scenarios",
+    "tests.e2e.test_agent_storage_scenarios",
+    "tests.e2e.test_retention_scenarios",
+    "tests.e2e.test_notification_fault_scenarios",
+    "tests.e2e.test_no_telemetry_scenarios",
+)
+
+# The module-scope imports above run before any NetworkGuard exists, and a
+# socket opened and closed during import leaves nothing for the guard's
+# open-descriptor scan. So imports are replayed in a fresh interpreter whose
+# very first statement installs a refusing, recording audit hook; only the
+# standard library is loaded before it.
+IMPORT_BOOTSTRAP = r"""
+import sys
+EVENTS = %(events)r
+attempts = []
+def hook(event, args):
+    if event in EVENTS:
+        attempts.append(event)
+        raise PermissionError("guarded import refused " + event)
+if %(guard_first)r:
+    sys.addaudithook(hook)
+import importlib, json
+preloaded = sorted(name for name in sys.modules
+                   if name.split(".")[0] in {"app", "media_capture_agent", "tests"})
+failed = []
+for name in %(modules)r:
+    try:
+        importlib.import_module(name)
+    except BaseException as error:
+        failed.append([name, type(error).__name__])
+if not %(guard_first)r:
+    sys.addaudithook(hook)
+reporting = sorted(set(%(reporting)r) & set(sys.modules))
+print(json.dumps({"attempts": attempts, "failed": failed, "preloaded": preloaded,
+                  "reporting": reporting}))
+"""
+
+
+def guarded_import(modules, *, extra_path=None, guard_first=True):
+    import json
+    import os
+    import subprocess
+
+    from tests.e2e.harness import _NETWORK_AUDIT_EVENTS
+
+    environment = dict(os.environ)
+    if extra_path is not None:
+        environment["PYTHONPATH"] = os.pathsep.join(
+            filter(None, (str(extra_path), environment.get("PYTHONPATH"))))
+    script = IMPORT_BOOTSTRAP % {
+        "events": sorted(_NETWORK_AUDIT_EVENTS), "modules": list(modules),
+        "reporting": sorted(REPORTING_MODULES), "guard_first": guard_first,
+    }
+    completed = subprocess.run(
+        [sys.executable, "-c", script], cwd=Path(__file__).resolve().parents[2],
+        env=environment, capture_output=True, text=True, timeout=120, check=False)
+    if completed.returncode != 0:
+        raise AssertionError(f"guarded import bootstrap failed: {completed.stderr}")
+    return json.loads(completed.stdout.splitlines()[-1])
+
+
 class NoTelemetryScenarios(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -161,12 +228,14 @@ class NoTelemetryScenarios(unittest.TestCase):
         self.addCleanup(local_a.close)
         self.addCleanup(local_b.close)
         with closing(_socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)) as early:
-            # UDP connect only records the peer; nothing is transmitted.
-            early.connect(("192.0.2.9", 9))
+            # UDP connect only records the peer; nothing is transmitted. The
+            # peer is loopback so the setup never depends on a default route
+            # and stays deterministic on offline runners.
+            early.connect(("127.0.0.1", 9))
             guard = NetworkGuard()
             with self.assertRaises(OutboundNetworkForbidden):
                 guard.__enter__()
-            self.assertEqual([("preconnected", "192.0.2.9")], guard.attempts)
+            self.assertEqual([("preconnected", "127.0.0.1")], guard.attempts)
             # The failed entry left no patch or active guard behind.
             with self.assertRaises(OSError) as raised:
                 socket.getaddrinfo("telemetry.invalid", 443,
@@ -299,6 +368,40 @@ class NoTelemetryScenarios(unittest.TestCase):
             ring.append(source, t0, t0 + SECOND, b"x", now_us=t0 + SECOND, clock_trusted=True)
         store.mounts = lambda: []
         self.assertEqual("STORAGE_HARD_STOP", ring.status(now_us=t0, clock_trusted=True)["state"])
+
+    def test_production_imports_make_no_outbound_connection_under_guard(self):
+        result = guarded_import(SCENARIO_MODULES)
+        self.assertEqual([], result["preloaded"])
+        self.assertEqual([], result["failed"])
+        self.assertEqual([], result["attempts"])
+        self.assertEqual([], result["reporting"])
+
+    def test_guarded_import_sees_a_connection_closed_during_import(self):
+        # A module that resolves and connects once at import time, closes the
+        # socket and swallows every error: nothing stays open for the in-process
+        # guard's descriptor scan, so only a guard installed first can see it.
+        package = self.root / "import_beacon"
+        package.mkdir()
+        (package / "synthetic_import_beacon.py").write_text(
+            "import socket\n"
+            "try:\n"
+            "    socket.getaddrinfo('127.0.0.1', 9, flags=socket.AI_NUMERICHOST)\n"
+            "except Exception:\n"
+            "    pass\n"
+            "try:\n"
+            "    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as beacon:\n"
+            "        beacon.connect(('127.0.0.1', 9))\n"
+            "except Exception:\n"
+            "    pass\n",
+            encoding="ascii")
+        guarded = guarded_import(["synthetic_import_beacon"], extra_path=package)
+        self.assertEqual(["socket.getaddrinfo", "socket.connect"], guarded["attempts"])
+        self.assertEqual([], guarded["failed"])
+        # Importing first and guarding afterwards, as a module-scope import
+        # before NetworkGuard does, observes nothing.
+        late = guarded_import(["synthetic_import_beacon"], extra_path=package,
+                              guard_first=False)
+        self.assertEqual([], late["attempts"])
 
     def test_normal_and_error_paths_make_no_outbound_connection(self):
         with NetworkGuard() as guard:
