@@ -133,9 +133,17 @@ class DurationModeLifecycleTests(RingScenario):
                          (active["trigger_reason"], active["state"]))
         self.assertEqual((t0 - PRE, t0 + POST), (active["started_at_us"], active["target_end_us"]))
 
-        # Autonomous continuation while Main is unreachable, then reconnect
-        # half-way through T+10. Reconnect neither ends nor duplicates it.
-        self.capture(t0, t0 + 5 * MINUTE)
+        # Autonomous continuation while Main is unreachable. The Agent
+        # restarts mid-window (T+3) and must restore the still-active
+        # incident and keep protecting the rest of T+10.
+        self.capture(t0, t0 + 3 * MINUTE)
+        self.restart()
+        restored = self.ring.incident(incident, now_us=t0 + 3 * MINUTE)
+        self.assertEqual(("active", t0 + POST), (restored["state"], restored["target_end_us"]))
+        self.assertEqual(1, self.count("incidents"))
+        # Then reconnect half-way through T+10. Reconnect neither ends nor
+        # duplicates it.
+        self.capture(t0 + 3 * MINUTE, t0 + 5 * MINUTE)
         self.assertIsNone(self.connect(t0 + 5 * MINUTE))
         self.capture(t0 + 5 * MINUTE, t0 + POST)
         self.assertEqual(1, self.count("incidents"))
