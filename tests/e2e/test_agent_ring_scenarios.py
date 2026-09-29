@@ -60,17 +60,21 @@ class RingScenario(unittest.TestCase):
                                 stable_device=lambda _expected: True)
         self.addCleanup(self.store.close)
         self.ledger_bytes = ledger_bytes
-        self.ring = DiskRing(self.settings, self.store, ledger_maximum_bytes=ledger_bytes,
-                             authority=AllowRingControls())
-        self.addCleanup(lambda: self.ring.close())
+        self.open_ring()
         self.sources = sources(count)
         self.profiles = tuple(SegmentProfile(source, 800, 400, MINUTE, 100)
                               for source in self.sources)
 
-    def restart(self):
-        self.ring.close()
+    def open_ring(self):
+        # Every ring (including rebuilt and restarted ones) closes its own
+        # ledger; a late-bound ``self.ring`` cleanup would leak earlier ones.
         self.ring = DiskRing(self.settings, self.store, ledger_maximum_bytes=self.ledger_bytes,
                              authority=AllowRingControls())
+        self.addCleanup(self.ring.close)
+
+    def restart(self):
+        self.ring.close()
+        self.open_ring()
 
     def configure(self, mode="duration", value=600, *, at=None):
         return self.ring.configure(RingConfig(mode, value), self.profiles,
@@ -306,12 +310,29 @@ class SimultaneousBudgetAdmissionTests(RingScenario):
         self.configure()
         self.capture(t0 - PRE, t0)
         self.connect(t0)
-        self.lose(t0)
+        incident = self.lose(t0)
         self.capture(t0, t0 + POST)
-        self.quota.capacity = self.quota.used() + self.estimate(PRE)
+        protected = self.quota.used()
+        at = t0 + POST + PRE
+        self.assertEqual(protected, self.status(at)["protected_allocated_bytes"])
+        # No ordinary pre-loss remains buffered at ``at``: a new incident
+        # needs the full T-10 + T+10 envelope on top of the protected bytes.
+        needed = self.status(at)["required_additional"] + self.settings.safety_reserve_bytes
+        self.assertEqual(self.estimate(PRE + POST) + self.ring.ledger_headroom
+                         + self.settings.safety_reserve_bytes, needed)
+        # The capacity would admit the envelope if protected bytes were
+        # reclaimable, so a refusal proves they are neither credited nor freed.
+        self.quota.capacity = protected + needed - 1
+        self.assertGreaterEqual(self.quota.capacity, needed)
         with self.assertRaisesRegex(RingRefused, "insufficient_simultaneous_pre_post_budget"):
             self.ring.configure(RingConfig("duration", 600), self.profiles,
-                                now_us=t0 + POST + PRE, clock_trusted=True)
+                                now_us=at, clock_trusted=True)
+        kept = self.ring.incident(incident, now_us=at)
+        self.assertEqual(("complete", False), (kept["state"], kept["has_gaps"]))
+        self.assertEqual(protected, self.quota.used())
+        self.quota.capacity += 1
+        self.ring.configure(RingConfig("duration", 600), self.profiles, now_us=at, clock_trusted=True)
+        self.assertEqual(protected, self.quota.used())
 
     def concurrent_preserves(self):
         barrier = threading.Barrier(2)
@@ -336,8 +357,7 @@ class SimultaneousBudgetAdmissionTests(RingScenario):
     def test_concurrent_preserves_reject_the_one_that_exceeds_the_ledger_budget(self):
         self.ring.close()
         self.ledger_bytes = 450 * 4096
-        self.ring = DiskRing(self.settings, self.store, ledger_maximum_bytes=self.ledger_bytes,
-                             authority=AllowRingControls())
+        self.open_ring()
         self.configure()
         self.capture(self.t0 - PRE, self.t0)
         results = self.concurrent_preserves()
@@ -354,8 +374,7 @@ class SimultaneousBudgetAdmissionTests(RingScenario):
     def test_concurrent_preserves_both_admitted_without_double_counting(self):
         self.ring.close()
         self.ledger_bytes = 512 * 4096
-        self.ring = DiskRing(self.settings, self.store, ledger_maximum_bytes=self.ledger_bytes,
-                             authority=AllowRingControls())
+        self.open_ring()
         self.configure()
         self.capture(self.t0 - PRE, self.t0)
         results = self.concurrent_preserves()

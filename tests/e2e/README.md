@@ -22,12 +22,14 @@ lookup from any thread:
 - `test_agent_ring_scenarios.py` — duration and capacity ring modes, T-10 pin
   and autonomous T+10 continuation across reconnect/restart, partial/gap
   reporting, critical preserve, Owner delete, 60-day expiry, and simultaneous
-  T-10/T+10 budget admission (including concurrent preserve requests) without
-  double counting shared segments;
+  T-10/T+10 budget admission (exact boundaries, including existing protected
+  usage that is never credited as reclaimable, and concurrent preserve
+  requests) without double counting shared segments;
 - `test_agent_storage_scenarios.py` — media-root mount loss, mount/device
   identity substitution and directory/symlink replacement never fall back to
   another directory, ordinary data is reclaimed before any protected incident,
-  and writes stop before the hard reserve;
+  the required T-10 pre-loss window is never reclaimed under pressure (duration
+  and capacity modes), and writes stop before the hard reserve;
 - `test_retention_scenarios.py` — Main 20-day recordings, 90-day audit and Agent
   60-day incidents on independent clocks, starred recordings never reclaimed,
   and `STORAGE_PRESSURE` / `STORAGE_HARD_STOP`;

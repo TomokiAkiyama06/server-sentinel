@@ -109,6 +109,49 @@ class MediaRootRefusalTests(RingScenario):
 class HardReserveTests(RingScenario):
     source_count = 1
 
+    def test_pressure_never_reclaims_required_pre_loss_ordinary_media(self):
+        # Capacity mode has no duration FIFO cutoff, so only the T-10 guard
+        # keeps the required pre-loss window out of pressure reclamation.
+        for mode in ("duration", "capacity"):
+            with self.subTest(mode=mode):
+                self.build(1, name=f"agent-{mode}")
+                self.assert_pre_loss_kept_under_pressure(mode)
+
+    def assert_pre_loss_kept_under_pressure(self, mode):
+        t0 = self.t0
+        self.configure(mode, 600 if mode == "duration" else self.estimate(PRE), at=t0 - PRE)
+        self.capture(t0 - PRE, t0)
+        self.connect(t0)
+        rows = self.ring._rows()
+        self.assertEqual(10, len(rows))
+        now = t0 + MINUTE
+        # Only the oldest segment falls outside T-10 at ``now``; the other
+        # nine are the required pre-loss window for a future incident.
+        required = {row["id"] for row in rows if row["end"] > now - PRE}
+        self.assertEqual(9, len(required))
+        oldest = UUID(rows[0]["id"])
+        reserve = self.settings.safety_reserve_bytes
+        unit = self.store.allocation_unit
+        needed = -(-len(PAYLOAD) // unit) * unit
+        freed = self.store.segment_allocations()[oldest]
+        # Reclaiming the one eligible segment leaves one block short of the
+        # next write plus reserve and ledger headroom.
+        self.quota.other = (self.quota.capacity - (self.quota.used() - freed)
+                            - (reserve + self.ring.ledger_headroom + needed - unit))
+        with self.assertRaisesRegex(RingRefused, "segment_storage_refused"):
+            self.ring.append(self.sources[0], t0, now, PAYLOAD, now_us=now, clock_trusted=True)
+        stored = {row["id"] for row in self.ring._rows() if row["state"] == "stored"}
+        self.assertEqual(required, stored)
+        self.assertEqual(required, {str(item) for item in self.store.list_segments()})
+        status = self.status(now)
+        self.assertNotEqual("healthy", status["state"])
+        self.assertEqual([(t0, now)], status["pre_loss_coverage"][str(self.sources[0])]["gaps_us"])
+        # A loss now still pins every surviving pre-loss segment.
+        incident = self.lose(now)
+        pinned = {row["segment"] for row in self.ring.db.execute(
+            "SELECT segment FROM protection WHERE incident=?", (str(incident),))}
+        self.assertTrue(required <= pinned)
+
     def test_pressure_reclaims_ordinary_first_keeps_protection_and_stops_before_reserve(self):
         t0 = self.t0
         limit = 2 * self.estimate(PRE)
