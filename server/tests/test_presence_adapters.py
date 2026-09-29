@@ -898,6 +898,52 @@ class TimelineGapDurabilityTests(PresenceFixture, TestCase):
         self.assertTrue(state.degraded)
         self.assertEqual(self.gap()[1]["interrupted"], 1)
 
+    def fresh_service(self):
+        return PresenceService(self.database, access=MockAccess(), evidence=self.presence.evidence,
+                               notifications=self.presence.notifications,
+                               reservation=self.presence.reservation,
+                               detection=lambda: True, storage_status=lambda: True)
+
+    def test_stale_session_is_a_gap_before_a_replacement_opens(self):
+        self.assertTrue(self.health.node(NODE, NodeHealthState.OFFLINE))
+        # The process dies without a clean close and the next start cannot
+        # open its replacement session: the stale row is never converted.
+        self.outbox._handle.release()
+        self.presence = self.fresh_service()
+        self.outbox = TimelineOutbox(self.presence, clock=self.clock, capacity=8)
+        self.refuse = True
+        with self.assertRaisesRegex(RuntimeError, "STORAGE_HARD_STOP"):
+            self.outbox.open()
+        status = self.presence.owner_status("owner", now=NOW, clock_trusted=True)
+        self.assertTrue(status["timeline_gap"])
+        self.assertIsNone(status["timeline_gap_detail"])
+        self.assertEqual(status["timeline_gap_orphaned_sessions"], 1)
+        # Once the replacement opens, the row becomes the durable marker.
+        self.refuse = False
+        self.outbox.open()
+        status = self.presence.owner_status("owner", now=NOW, clock_trusted=True)
+        self.assertTrue(status["timeline_gap"])
+        self.assertEqual(status["timeline_gap_orphaned_sessions"], 0)
+        self.assertEqual(status["timeline_gap_detail"]["interrupted"], 1)
+
+    def test_a_live_session_elsewhere_is_not_an_orphan(self):
+        # A status reader without its own session sees the row of the outbox
+        # that holds the session lock; that outbox is live, nothing is lost.
+        status = self.fresh_service().owner_status("owner", now=NOW, clock_trusted=True)
+        self.assertEqual(status["timeline_gap_orphaned_sessions"], 0)
+        self.assertFalse(status["timeline_gap"])
+        # Released without a clean close, the same row is an orphan.
+        self.outbox._handle.release()
+        status = self.fresh_service().owner_status("owner", now=NOW, clock_trusted=True)
+        self.assertEqual(status["timeline_gap_orphaned_sessions"], 1)
+        self.assertTrue(status["timeline_gap"])
+
+    def test_clean_close_leaves_no_orphan_for_a_service_without_a_session(self):
+        self.outbox.close()
+        status = self.fresh_service().owner_status("owner", now=NOW, clock_trusted=True)
+        self.assertEqual(status["timeline_gap_orphaned_sessions"], 0)
+        self.assertFalse(status["timeline_gap"])
+
     def test_repeated_close_returns_without_blocking(self):
         self.outbox.close()
         worker = threading.Thread(target=self.outbox.close, daemon=True)

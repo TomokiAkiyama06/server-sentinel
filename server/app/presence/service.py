@@ -554,6 +554,51 @@ class PresenceService:
             raise
         return descriptor
 
+    def _session_lock_held(self):
+        """Read-only probe: whether any open outbox session holds the lock now.
+
+        The lock file is opened without ``O_CREAT``, so a status read never
+        creates it: a missing file means no session was ever opened there.
+        A probe that cannot be completed proves nothing and returns None.
+        """
+        path = self.database.path
+        try:
+            descriptor = os.open(path.with_name(path.name + ".timeline-session.lock"),
+                                 os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        except FileNotFoundError:
+            return False
+        except OSError:
+            return None
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        except OSError:
+            return None
+        finally:
+            # Closing the descriptor also drops the probe's own shared lock.
+            os.close(descriptor)
+        return False
+
+    def _orphaned_sessions(self, db):
+        """Session rows no live outbox holds: evidence of an interrupted gap.
+
+        `open_timeline_session()` converts such rows into the durable marker,
+        but a restart whose replacement session cannot open (a refused
+        volume, a clock or database fault) never gets there. Status must not
+        report a healthy timeline in the meantime. A row held by a live
+        session of this process is not orphaned. With no such session here,
+        a lock held elsewhere means another process's live outbox owns the
+        rows, since its own open already converted any stale ones; a free,
+        missing or unprobeable lock leaves every row reported as orphaned.
+        """
+        live = {session.token for session in self._live_sessions()}
+        tokens = [row[0] for row in db.execute("SELECT token FROM presence_outbox_sessions")]
+        orphaned = [token for token in tokens if token not in live]
+        if orphaned and not live and self._session_lock_held() is True:
+            return 0
+        return len(orphaned)
+
     def open_timeline_session(self, *, now):
         """Start the durable outbox session; returns ``(session, gap marker or None)``.
 
@@ -881,6 +926,9 @@ class PresenceService:
             # the critical action never completed.
             unresolved |= {row[0] for row in db.execute(
                 "SELECT action FROM presence_expired_unresolved")}
+            # Session rows are read before the marker: an open that converts
+            # them commits both at once, so they are seen in one of the two.
+            orphaned = self._orphaned_sessions(db)
             # A durable timeline gap stays visible across restarts until the
             # Owner clears it; it is Owner information like the paths below.
             gap = self._gap(db)
@@ -898,9 +946,12 @@ class PresenceService:
                 **self._critical_paths(unresolved, not admitted),
                 "override_expiry_pending": not retired,
                 "pending_critical_actions": failed,
-                "timeline_gap": gap is not None or unpersisted > 0,
+                "timeline_gap": gap is not None or unpersisted > 0 or orphaned > 0,
                 "timeline_gap_detail": gap,
                 "timeline_gap_unpersisted": unpersisted,
+                # Sessions that never closed cleanly and that no replacement
+                # has yet converted into the marker: possible, not proven, loss.
+                "timeline_gap_orphaned_sessions": orphaned,
                 # Staged facts a transient storage, database or clock failure
                 # holds back: not loss, so not part of timeline_gap, but the
                 # timeline is incomplete until they are written.
