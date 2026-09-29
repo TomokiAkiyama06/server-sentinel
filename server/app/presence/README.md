@@ -211,7 +211,13 @@ created and taken inside the same storage-admitted transaction as the session
 row, so a refused volume gains nothing from an outbox start. Status, history,
 audit and gap reads take no reservation and use a read-only SQLite open
 (`mode=ro`), so they never create a missing or replaced database. A session row
-found once the lock is free therefore belongs to an outbox that is gone. A
+found once the lock is free therefore belongs to an outbox that is gone. Owner
+status reports such rows as part of `timeline_gap`
+(`timeline_gap_orphaned_sessions`) even before a replacement session opens, so
+a restart whose `open()` is refused (for example `STORAGE_HARD_STOP` or a clock
+fault) never looks healthy. A row held by a live session is not counted; the
+lock probe opens the lock file read-only and never creates it, and a lock that
+is free, missing or cannot be probed leaves the row counted. A
 clock fault while a producer hands a fact over is counted as a refused fact,
 because a one-shot producer callback will not re-emit it. A false positive is
 cleared only by the Owner through the audited
