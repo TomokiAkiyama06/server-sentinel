@@ -145,7 +145,10 @@ class PairingLedger:
     Owner-only call refused by the authorizer runs nothing and records a
     ``denied`` outcome. Redemption attempts that match no pending enrollment
     (unknown identity, wrong code or wrong key) record nothing, so an
-    unauthenticated caller cannot grow the audit table.
+    unauthenticated caller cannot grow the audit table. When a matched
+    redemption's audit append or commit fails, the rolled-back outcome is
+    counted in the bounded ledger health instead of being appended separately,
+    so repeated attempts still cannot grow the table.
     """
 
     def __init__(self, database: Database, verifier: CodeVerifier, *,
@@ -188,8 +191,11 @@ class PairingLedger:
                               target_kind=TargetKind.CAPTURE_NODE,
                               target_logical_id=node, outcome=outcome)
         except Exception:
-            self.audit_delivery_failed = True
-            self.undelivered_audit_records += 1
+            self._mark_undelivered()
+
+    def _mark_undelivered(self) -> None:
+        self.audit_delivery_failed = True
+        self.undelivered_audit_records += 1
 
     def _append_on(self, connection, actor: ActorCategory, action: AuditAction, node: UUID,
                    outcome: AuditOutcome) -> None:
@@ -254,35 +260,48 @@ class PairingLedger:
         action = AuditAction.REDEEM_CAPTURE_NODE_ENROLLMENT
         expired = False
         claim = None
-        with self._transaction(write=True) as connection:
-            row = connection.execute(
-                "SELECT node_id, public_key_digest, code_digest, process_epoch, expires_at, state "
-                "FROM pairing_enrollments WHERE id = ?", (str(enrollment),)
-            ).fetchone()
-            if row is None or row["state"] != "pending":
-                raise PairingError("pairing enrollment is unavailable")
-            node = UUID(row["node_id"])
-            if row["process_epoch"] != str(self.process_epoch) or float(now) >= row["expires_at"]:
-                # A pending enrollment expires at most once, so this record is
-                # bounded by Owner approvals rather than by redemption attempts.
-                connection.execute("UPDATE pairing_enrollments SET state = 'expired' WHERE id = ?", (str(enrollment),))
-                self._append_on(connection, ActorCategory.CAPTURE_NODE, action, node,
-                                AuditOutcome.FAILED)
-                expired = True
-            elif not HmacCodeVerifier.matches(row["code_digest"], candidate):
-                raise PairingError("pairing enrollment is unavailable")
-            elif not hmac.compare_digest(row["public_key_digest"], key_digest):
-                raise PairingError("pairing enrollment is unavailable")
-            else:
-                changed = connection.execute(
-                    "UPDATE pairing_enrollments SET state = 'consumed' "
-                    "WHERE id = ? AND state = 'pending'", (str(enrollment),)
-                ).rowcount
-                if changed != 1:
+        # Only a matched enrollment (expiry or consumption) produces an audit
+        # outcome; ordinary unmatched denials never reach an append.
+        audit_attempted = False
+        try:
+            with self._transaction(write=True) as connection:
+                row = connection.execute(
+                    "SELECT node_id, public_key_digest, code_digest, process_epoch, expires_at, state "
+                    "FROM pairing_enrollments WHERE id = ?", (str(enrollment),)
+                ).fetchone()
+                if row is None or row["state"] != "pending":
                     raise PairingError("pairing enrollment is unavailable")
-                self._append_on(connection, ActorCategory.CAPTURE_NODE, action, node,
-                                AuditOutcome.SUCCEEDED)
-                claim = EnrollmentClaim(enrollment, node, key_digest)
+                node = UUID(row["node_id"])
+                if row["process_epoch"] != str(self.process_epoch) or float(now) >= row["expires_at"]:
+                    # A pending enrollment expires at most once, so this record is
+                    # bounded by Owner approvals rather than by redemption attempts.
+                    connection.execute("UPDATE pairing_enrollments SET state = 'expired' WHERE id = ?", (str(enrollment),))
+                    audit_attempted = True
+                    self._append_on(connection, ActorCategory.CAPTURE_NODE, action, node,
+                                    AuditOutcome.FAILED)
+                    expired = True
+                elif not HmacCodeVerifier.matches(row["code_digest"], candidate):
+                    raise PairingError("pairing enrollment is unavailable")
+                elif not hmac.compare_digest(row["public_key_digest"], key_digest):
+                    raise PairingError("pairing enrollment is unavailable")
+                else:
+                    changed = connection.execute(
+                        "UPDATE pairing_enrollments SET state = 'consumed' "
+                        "WHERE id = ? AND state = 'pending'", (str(enrollment),)
+                    ).rowcount
+                    if changed != 1:
+                        raise PairingError("pairing enrollment is unavailable")
+                    audit_attempted = True
+                    self._append_on(connection, ActorCategory.CAPTURE_NODE, action, node,
+                                    AuditOutcome.SUCCEEDED)
+                    claim = EnrollmentClaim(enrollment, node, key_digest)
+        except Exception:
+            if audit_attempted:
+                # The append or its commit failed and rolled the change back.
+                # Surface the lost outcome in bounded health only: a separate
+                # append would let repeated attempts grow the audit table.
+                self._mark_undelivered()
+            raise
         if expired:
             raise PairingError("pairing enrollment is unavailable")
         if claim is None:

@@ -400,7 +400,36 @@ class PairingAuditTests(_Base):
         self.assertTrue(self.ledger.admits(node_id=claim.node_id, public_key_digest=KEY_DIGEST,
                                            credential_serial_digest=SERIAL_DIGEST))
         self.assertTrue(self.ledger.audit_delivery_failed)
+        # Approval, redemption and revocation each lost one outcome.
+        self.assertEqual(self.ledger.undelivered_audit_records, 3)
+
+    def test_redemption_audit_failure_is_visible_but_unmatched_attempts_are_not(self):
+        approval, code = self.approve()
+        expiring, expiring_code = self.approve()
+        before = len(self.records())
+        _fail_audit_inserts(self.database)
+        for attempt in (
+            dict(enrollment_id=uuid4(), public_key_digest=KEY_DIGEST, code=code.value),
+            dict(enrollment_id=approval.enrollment_id, public_key_digest=OTHER_DIGEST, code=code.value),
+            dict(enrollment_id=approval.enrollment_id, public_key_digest=KEY_DIGEST, code="A" * 26),
+        ):
+            with self.assertRaises(PairingError):
+                self.ledger.redeem(**attempt)
+        self.assertFalse(self.ledger.audit_delivery_failed)
+        self.assertEqual(self.ledger.undelivered_audit_records, 0)
+        with self.assertRaises(PairingStorageError):
+            self.ledger.redeem(enrollment_id=approval.enrollment_id,
+                               public_key_digest=KEY_DIGEST, code=code.value)
+        self.assertTrue(self.ledger.audit_delivery_failed)
+        self.assertEqual(self.ledger.undelivered_audit_records, 1)
+        self.now += 300
+        with self.assertRaises(PairingStorageError):
+            self.ledger.redeem(enrollment_id=expiring.enrollment_id,
+                               public_key_digest=KEY_DIGEST, code=expiring_code.value)
         self.assertEqual(self.ledger.undelivered_audit_records, 2)
+        # Both changes rolled back and no separate audit row was appended.
+        self.assertEqual(self.count("SELECT count(*) FROM pairing_enrollments WHERE state='pending'"), 2)
+        self.assertEqual(len(self.records()), before)
 
     def test_failed_revocation_and_activation_record_bounded_failure(self):
         missing = uuid4()
