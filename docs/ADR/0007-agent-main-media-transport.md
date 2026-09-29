@@ -52,6 +52,12 @@ explicitly forbidden by the Issue.
    evaluated while the lock guarding that state is held, so a call that waited
    across a revocation can neither issue a fresh grant, refresh liveness,
    acknowledge a revoked source, enqueue media, nor recreate a rate window.
+   Because a durable revocation commits in its own database transaction, the
+   node/source lifecycle commits it inside the tracker's (and, for direct
+   queue users, the queue's) `authorization_change` block, which holds those
+   locks for the commit: every check-then-act section runs entirely before or
+   entirely after it, and a grant issued just before the commit is closed and
+   its rate window discarded when the block completes.
 3. **Commit only after bounded admission.** A unit advances continuity only
    after the #14 `AgentIngestQueue` accepts it. Backpressure/rate refusal
    leaves state unchanged so the Agent retries the same sequence from its disk

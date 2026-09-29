@@ -59,7 +59,11 @@ and bounded, coalescing gap events for skips, capture restarts, clock
 regressions and refused units. Known loss keeps a source flow `degraded` and a
 closed or stale session makes it `interrupted`. Session generations are never
 reissued (also after `forget_node` and re-enrollment), and `forget_source`
-releases a deactivated source's slot and returns its undrained gaps. Tracked node
+releases a deactivated source's slot and returns its undrained gaps. The
+node/source lifecycle commits a durable revocation or source deactivation
+inside `authorization_change` (tracker, or queue for direct queue users), so
+it is serialized with every grant, liveness refresh, charge and enqueue; the
+block closes a revoked node's grant and discards its rate window on success. Tracked node
 sessions have their own hard bound, separate from the 1-4 active-source limit;
 this is flow continuity, not
 camera or node health. It opens no listener, selects no protocol and performs

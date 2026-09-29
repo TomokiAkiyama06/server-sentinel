@@ -27,10 +27,11 @@ drains it; it is never reported as a healthy flow.
 """
 
 from collections import deque
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
 from threading import Lock
-from typing import Callable
+from typing import Callable, Iterator
 from uuid import UUID, uuid4
 
 from app.cameras.remote_agent.ingest import (
@@ -202,6 +203,14 @@ class ContinuityTracker:
     before the state it guards is read or changed.  A check made before
     waiting for the lock could otherwise be applied after a concurrent
     revocation (and ``_invalidate``/``forget_node``) that it never observed.
+
+    Holding this lock does not by itself order a check with a revocation that
+    commits elsewhere (``PairingLedger.revoke`` uses its own database
+    transaction).  The node/source lifecycle therefore commits every durable
+    revocation or source deactivation inside ``authorization_change``, which
+    holds this tracker's lock and the ingest queue's lock for the commit, so
+    no grant, liveness refresh, acknowledgement, charge or enqueue can rest on
+    an authorization read before that commit.
     """
 
     def __init__(self, limits: ContinuityLimits, authorizer: IngestAuthorizer,
@@ -229,6 +238,32 @@ class ContinuityTracker:
             raise ValueError("continuity clock must return nonnegative integer nanoseconds")
         return now
 
+    @contextmanager
+    def authorization_change(self, *, revoked_node: UUID | None = None) -> Iterator[None]:
+        """Serialize a durable authorization change with every grant/commit.
+
+        The caller commits the revocation or source deactivation inside the
+        block and must not call back into this tracker or its ingest queue
+        there.  Both locks are held (tracker, then queue: the same order as
+        ``receive``), so every ``open_session``, ``heartbeat``, ``receive`` and
+        direct queue ``submit`` authorizes and acts entirely before or
+        entirely after the commit.  When the block completes, the current
+        grant of ``revoked_node`` is closed (its sources become
+        ``interrupted``) and its rate window is discarded, so a grant issued
+        just before the commit is unusable afterwards.  If the commit raises,
+        nothing is changed.  ``forget_node``/``forget_source`` may follow to
+        release state and collect undrained gaps.
+        """
+        if revoked_node is not None and not isinstance(revoked_node, UUID):
+            raise ValueError("invalid agent node identity")
+        with self._lock:
+            with self._ingest.authorization_change(revoked_node=revoked_node):
+                yield
+            if revoked_node is not None:
+                node = self._nodes.get(revoked_node)
+                if node is not None:
+                    node.open = False
+
     def open_session(self, node_id: UUID) -> AgentSession:
         """Grant a new session to an already mTLS-authenticated node identity.
 
@@ -241,6 +276,9 @@ class ContinuityTracker:
             # Authorized under the lock, right before the grant is issued: a
             # revocation that lands while this call waits for the lock must
             # refuse the grant instead of reopening an invalidated session.
+            # A revocation committed inside ``authorization_change`` cannot
+            # land between this check and the grant; one committed after the
+            # grant closes it when that block completes.
             self._authorizer.require_node(node_id)
             # Liveness time is sampled under the lock so a delayed caller can
             # never apply an older ``now`` after a newer update (see _seen).

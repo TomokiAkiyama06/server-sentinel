@@ -7,10 +7,11 @@ boundary.
 """
 
 from collections import deque
+from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
 from threading import Lock
-from typing import Callable, Protocol
+from typing import Callable, Iterator, Protocol
 from uuid import UUID
 
 _MAXIMUM_COUNTER = 2 ** 63 - 1
@@ -134,8 +135,14 @@ class AgentIngestQueue:
     held, right before rate state or the queue changes, so an attempt that
     waited for the lock across a revocation and ``forget_revoked_node`` can
     neither enqueue media nor recreate the revoked node's rate window.  The
-    injected authorizer must therefore not call back into this queue.  The future listener owns pre-read network byte limits;
-    this domain object bounds what may remain in Main Server memory afterwards.
+    injected authorizer must therefore not call back into this queue.
+
+    A durable node/source revocation must commit inside
+    ``authorization_change`` so it is serialized with every check-then-act
+    section here: no attempt can pass authorization before the commit and
+    enqueue or charge after it.  The future listener owns pre-read network
+    byte limits; this domain object bounds what may remain in Main Server
+    memory afterwards.
     """
 
     def __init__(self, limits: IngestLimits, authorizer: IngestAuthorizer,
@@ -255,6 +262,24 @@ class AgentIngestQueue:
             self._queue.append(message)
             self._queued_bytes += size
             return self._admission(IngestOutcome.ACCEPTED, None)
+
+    @contextmanager
+    def authorization_change(self, *, revoked_node: UUID | None = None) -> Iterator[None]:
+        """Hold this queue's lock while a durable authorization change commits.
+
+        The caller commits the revocation/deactivation (for example
+        ``PairingLedger.revoke``) inside the block and must not call back into
+        this queue there.  Every submit/charge authorizes and acts under the
+        same lock, so each one is ordered entirely before or entirely after
+        the commit.  When the block completes, ``revoked_node``'s rate window
+        is discarded; if the commit raises, nothing is changed.
+        """
+        if revoked_node is not None and not isinstance(revoked_node, UUID):
+            raise ValueError("invalid agent node identity")
+        with self._lock:
+            yield
+            if revoked_node is not None:
+                self._windows.pop(revoked_node, None)
 
     def forget_revoked_node(self, node_id: UUID) -> None:
         """Forget rate state after durable revocation or node removal."""

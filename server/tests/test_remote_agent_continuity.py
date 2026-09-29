@@ -13,7 +13,8 @@ from app.cameras.remote_agent.continuity import (
     MediaUnitHeader, SourceFlow,
 )
 from app.cameras.remote_agent.ingest import (
-    AgentIngestQueue, DenyIngestAuthorizer, IngestLimits, IngestOutcome,
+    AgentAction, AgentIngestQueue, AgentMessage, DenyIngestAuthorizer, IngestLimits,
+    IngestOutcome,
 )
 
 NODES = tuple(UUID(int=n) for n in range(1, 6))
@@ -91,6 +92,48 @@ def revoke_while_waiting(lock, authorizer, call, revoke):
     if thread.is_alive():
         raise AssertionError("call did not finish")
     return result["value"]
+
+
+class GatedAuthorizer(Authorizer):
+    """Pauses once, after a passing node check, until the test releases it."""
+
+    def __init__(self, pairs=((NODE, SOURCE),)):
+        super().__init__(pairs)
+        self.armed = False
+        self.passed = threading.Event()
+        self.release = threading.Event()
+
+    def require_node(self, node_id):
+        super().require_node(node_id)
+        if self.armed:
+            self.armed = False
+            self.passed.set()
+            if not self.release.wait(5):
+                raise AssertionError("gate was never released")
+
+
+def start(target):
+    result = {}
+
+    def run():
+        try:
+            result["value"] = target()
+        except PermissionError as error:
+            result["value"] = error
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    return thread, result
+
+
+def revoke_in_fence(fence, authorizer, *, committed, hold=None, node=NODE):
+    def commit():
+        with fence(revoked_node=node):
+            authorizer.revoked.add(node)
+            committed.set()
+            if hold is not None and not hold.wait(5):
+                raise AssertionError("fence was never released")
+    return commit
 
 
 class TransientRefusalQueue(AgentIngestQueue):
@@ -974,6 +1017,94 @@ class ContinuityTrackerTests(unittest.TestCase):
                          (result.outcome, result.reason))
         self.assertEqual(0, ingest.snapshot().tracked_rate_windows)
         self.assertEqual(SourceFlow.INTERRUPTED, flow(tracker).flow)
+
+
+    def test_revocation_commit_waits_for_an_authorized_session_grant(self):
+        authorizer = GatedAuthorizer()
+        tracker, ingest, _, _ = build(authorizer=authorizer)
+        first = tracker.open_session(NODE)
+        tracker.receive(first, unit(0), b"v")
+        authorizer.armed = True
+        opener, opened = start(lambda: tracker.open_session(NODE))
+        self.assertTrue(authorizer.passed.wait(5))
+        committed = threading.Event()
+        revoker, _ = start(revoke_in_fence(tracker.authorization_change, authorizer,
+                                           committed=committed))
+        # The durable revocation cannot commit between the grant's passing
+        # authorization check and the grant itself.
+        self.assertFalse(committed.wait(0.2))
+        authorizer.release.set()
+        opener.join(5)
+        revoker.join(5)
+        self.assertFalse(opener.is_alive() or revoker.is_alive())
+        self.assertTrue(committed.is_set())
+        granted = opened["value"]
+        self.assertIsInstance(granted, AgentSession)
+        # The grant issued just before the commit was closed by the fence
+        # itself, before any later heartbeat or media recheck.
+        self.assertEqual(SourceFlow.INTERRUPTED, flow(tracker).flow)
+        self.assertIsNone(tracker._current(granted))
+        self.assertEqual(0, ingest.snapshot().tracked_rate_windows)
+        with self.assertRaises(PermissionError):
+            tracker.open_session(NODE)
+        self.assertEqual("unauthorized", tracker.receive(granted, unit(1), b"v").reason)
+
+    def test_session_open_waits_for_an_in_progress_revocation_commit(self):
+        authorizer = SignallingAuthorizer()
+        tracker, _, _, _ = build(authorizer=authorizer)
+        tracker.open_session(NODE)
+        committed, hold = threading.Event(), threading.Event()
+        revoker, _ = start(revoke_in_fence(tracker.authorization_change, authorizer,
+                                           committed=committed, hold=hold))
+        self.assertTrue(committed.wait(5))
+        authorizer.checked.clear()
+        opener, opened = start(lambda: tracker.open_session(NODE))
+        # No authorization is read while the revocation is committing.
+        self.assertFalse(authorizer.checked.wait(0.2))
+        hold.set()
+        revoker.join(5)
+        opener.join(5)
+        self.assertFalse(opener.is_alive() or revoker.is_alive())
+        self.assertIsInstance(opened["value"], PermissionError)
+
+    def test_failed_revocation_commit_changes_no_session_state(self):
+        tracker, ingest, _, _ = build()
+        session = tracker.open_session(NODE)
+        tracker.receive(session, unit(0), b"v")
+        with self.assertRaises(RuntimeError):
+            with tracker.authorization_change(revoked_node=NODE):
+                raise RuntimeError("durable commit failed")
+        self.assertTrue(tracker.heartbeat(session))
+        self.assertEqual(SourceFlow.RECEIVING, flow(tracker).flow)
+        self.assertEqual(1, ingest.snapshot().tracked_rate_windows)
+        with self.assertRaises(ValueError):
+            with tracker.authorization_change(revoked_node="node"):
+                pass
+
+    def test_direct_queue_submit_is_serialized_with_revocation_commit(self):
+        authorizer = GatedAuthorizer()
+        _, ingest, _, _ = build(authorizer=authorizer)
+        authorizer.armed = True
+        message = AgentMessage(NODE, SOURCE, AgentAction.HEARTBEAT, 0, b"")
+        submitter, submitted = start(lambda: ingest.submit(message))
+        self.assertTrue(authorizer.passed.wait(5))
+        committed = threading.Event()
+        revoker, _ = start(revoke_in_fence(ingest.authorization_change, authorizer,
+                                           committed=committed))
+        self.assertFalse(committed.wait(0.2))
+        authorizer.release.set()
+        submitter.join(5)
+        revoker.join(5)
+        self.assertFalse(submitter.is_alive() or revoker.is_alive())
+        # Admitted entirely before the commit; the fence then discarded the
+        # rate window and every later attempt observes the revocation.
+        self.assertEqual(IngestOutcome.ACCEPTED, submitted["value"].outcome)
+        self.assertEqual(0, ingest.snapshot().tracked_rate_windows)
+        self.assertEqual("unauthorized", ingest.submit(message).reason)
+        self.assertEqual("unauthorized", ingest.charge_attempt(NODE).reason)
+        with self.assertRaises(ValueError):
+            with ingest.authorization_change(revoked_node="node"):
+                pass
 
     def test_invalid_inputs_and_limits_are_rejected(self):
         for bad in ((0, 1, 1), (1, 0, 1), (1, 1, 0), (True, 1, 1), (1, 1, 1, 0),
