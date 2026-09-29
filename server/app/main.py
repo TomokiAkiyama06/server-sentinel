@@ -173,6 +173,7 @@ def create_app(settings: Settings, *, database: Database | None = None,
             raise RuntimeError("application startup failed") from None
         monitoring_task = None
         cleanup_task = None
+        uvc_watch_task = None
 
         uvc_lifecycle = {"deferred": None, "stopping": False}
 
@@ -234,14 +235,47 @@ def create_app(settings: Settings, *, database: Database | None = None,
             application.state.audit_storage_admitted = (
                 storage_reservation is not None or runtime_admission.bound
             )
+            retry_local_uvc_start()
+
+        def retry_local_uvc_start() -> None:
+            deferred = uvc_lifecycle["deferred"]
+            if deferred is not None and deferred.done():
+                # A finished attempt that ended STORAGE_UNADMITTED again (the
+                # admission was refused while pinning) must not block later
+                # retries once storage recovers.
+                uvc_lifecycle["deferred"] = deferred = None
             if (local_uvc_runtime is not None and not uvc_lifecycle["stopping"]
-                    and uvc_lifecycle["deferred"] is None
+                    and deferred is None
                     and application.state.local_uvc_state
                     is LocalUvcRuntimeState.STORAGE_UNADMITTED
                     and local_uvc_storage_admitted()):
-                # Storage became admitted after a failed startup open: start
-                # capture once. Shutdown awaits this task before stopping.
+                # Storage became admitted after a failed startup open or a
+                # refused pin: start capture. Shutdown awaits this task
+                # before stopping.
                 uvc_lifecycle["deferred"] = asyncio.create_task(start_local_uvc())
+
+        async def watch_local_uvc() -> None:
+            # The application snapshot follows the live runtime: a worker that
+            # later fails polling, dies or cannot persist health turns RUNNING
+            # into DEGRADED/FAILED here instead of staying RUNNING until
+            # shutdown. It also retries a start refused by storage admission
+            # when no monitoring tick drives the retry.
+            while True:
+                await asyncio.sleep(local_uvc.retry_delay_seconds)
+                if uvc_lifecycle["stopping"]:
+                    return
+                if (application.state.local_uvc_state
+                        in (LocalUvcRuntimeState.RUNNING, LocalUvcRuntimeState.DEGRADED)):
+                    try:
+                        status = await asyncio.to_thread(local_uvc_runtime.status)
+                    except Exception:
+                        status = None
+                    if not uvc_lifecycle["stopping"]:
+                        application.state.local_uvc_state = (
+                            status.state if status is not None
+                            else LocalUvcRuntimeState.DEGRADED
+                        )
+                retry_local_uvc_start()
 
         # Everything below runs under one cleanup guard.
         try:
@@ -274,6 +308,8 @@ def create_app(settings: Settings, *, database: Database | None = None,
                 # retention state stays visible and the scheduled run retries it.
                 logging.getLogger(__name__).error(Event.AUDIT_RETENTION_DEGRADED)
             await start_local_uvc()
+            if local_uvc_runtime is not None:
+                uvc_watch_task = asyncio.create_task(watch_local_uvc())
             application.state.ready = True
             cleanup_task = asyncio.create_task(audit_retention.run())
             logging.getLogger(__name__).info(Event.STARTED)
@@ -283,6 +319,10 @@ def create_app(settings: Settings, *, database: Database | None = None,
             # monitoring worker started, so no capture worker, descriptor,
             # retention task or monitoring worker outlives a failed lifespan.
             uvc_lifecycle["stopping"] = True
+            if uvc_watch_task is not None:
+                uvc_watch_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await uvc_watch_task
             if uvc_lifecycle["deferred"] is not None:
                 # start() and stop() serialize on the runtime lock; let a
                 # deferred start finish so stop() sees its workers.

@@ -716,6 +716,101 @@ class ApplicationWiringTests(unittest.IsolatedAsyncioTestCase):
                                      is SourceHealthState.ONLINE))
         self.assertIs(application.state.local_uvc_state, LocalUvcRuntimeState.STOPPED)
 
+    async def async_wait_for(self, predicate, timeout=5.0):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if predicate():
+                return True
+            await asyncio.sleep(0.01)
+        return predicate()
+
+    async def test_refused_pin_admission_retries_start_after_recovery(self):
+        # A hard stop that refuses the pin during startup leaves nothing
+        # opened: the runtime reports STORAGE_UNADMITTED and stays startable,
+        # and the lifespan starts capture once admission recovers instead of
+        # keeping it FAILED until a process restart.
+        database, source = self.migrated_source()
+        refuse = threading.Event()
+        refuse.set()
+        original_pin = PinnedDatabase.pin
+
+        def pin(database_, admission=None):
+            if refuse.is_set():
+                raise RuntimeError("synthetic STORAGE_HARD_STOP")
+            return original_pin(database_, admission)
+
+        application = create_app(
+            self.settings, storage_reservation=synthetic_admission,
+            local_uvc=LocalUvcConfiguration((source.id,), **FAST),
+            local_uvc_dependencies=self.dependencies,
+        )
+        with patch.object(PinnedDatabase, "pin", pin):
+            async with application.router.lifespan_context(application):
+                runtime = application.state.local_uvc
+                self.assertIs(application.state.local_uvc_state,
+                              LocalUvcRuntimeState.STORAGE_UNADMITTED)
+                self.assertIs(runtime.status().state, LocalUvcRuntimeState.STORAGE_UNADMITTED)
+                self.assertFalse(runtime.status().sources[0].worker_running)
+                await asyncio.sleep(0.2)
+                self.assertEqual([], self.dependencies.capture_factory.instances)
+                refuse.clear()
+                self.assertTrue(await self.async_wait_for(
+                    lambda: application.state.local_uvc_state is LocalUvcRuntimeState.RUNNING))
+                self.assertTrue(runtime.status().sources[0].worker_running)
+                await self.assert_surface_closed(application)
+        self.assertIs(application.state.local_uvc_state, LocalUvcRuntimeState.STOPPED)
+
+    def test_refused_pin_leaves_runtime_startable(self):
+        _database, source = self.migrated_source()
+        admission = ToggleAdmission()
+        admission.refuse = True
+        runtime = LocalUvcRuntime(
+            LocalUvcConfiguration((source.id,), **FAST),
+            CameraRegistry(PinnedDatabase(Database(self.settings.database_path)),
+                           reservation=admission),
+            on_frame=lambda *_: None, discovery=self.discovery,
+            capture_factory=self.dependencies.capture_factory,
+        )
+        self.addCleanup(runtime.stop)
+        with self.assertLogs("app.cameras.uvc.runtime", level="ERROR"):
+            status = runtime.start()
+        self.assertIs(status.state, LocalUvcRuntimeState.STORAGE_UNADMITTED)
+        self.assertFalse(status.sources[0].worker_running)
+        with self.assertRaises(ValueError):
+            runtime.reapprove(None, "synthetic-owner", source.id, self.camera)
+        admission.refuse = False
+        self.assertIs(runtime.start().state, LocalUvcRuntimeState.RUNNING)
+        self.assertTrue(runtime.status().sources[0].worker_running)
+
+    async def test_application_state_follows_runtime_worker_faults(self):
+        # A later capture/storage loss turns the application snapshot from
+        # RUNNING into DEGRADED, and recovery back into RUNNING, instead of
+        # freezing the value computed at startup.
+        database, source = self.migrated_source()
+        admission = ToggleAdmission()
+        application = create_app(
+            self.settings, storage_reservation=admission,
+            local_uvc=LocalUvcConfiguration((source.id,), **FAST),
+            local_uvc_dependencies=self.dependencies,
+        )
+        admin = OwnerAdministration(
+            OwnerAuditService(AuditStore(database), PermitOwner()), CameraRegistry(database),
+        )
+        async with application.router.lifespan_context(application):
+            runtime = application.state.local_uvc
+            await asyncio.to_thread(runtime.reapprove, admin, "synthetic-owner",
+                                    source.id, self.camera)
+            self.assertTrue(await self.async_wait_for(
+                lambda: application.state.local_uvc_state is LocalUvcRuntimeState.RUNNING))
+            admission.refuse = True
+            self.assertTrue(await self.async_wait_for(
+                lambda: application.state.local_uvc_state is LocalUvcRuntimeState.DEGRADED))
+            admission.refuse = False
+            self.assertTrue(await self.async_wait_for(
+                lambda: application.state.local_uvc_state is LocalUvcRuntimeState.RUNNING))
+            await self.assert_surface_closed(application)
+        self.assertIs(application.state.local_uvc_state, LocalUvcRuntimeState.STOPPED)
+
     def test_approval_session_marker_refused_without_admission(self):
         database, source = self.migrated_source()
         admission = ToggleAdmission()

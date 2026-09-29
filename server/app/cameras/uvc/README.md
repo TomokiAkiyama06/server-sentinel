@@ -82,8 +82,13 @@ never configuration. `create_app()` starts the runtime inside the lifespan after
 schema migration/storage admission and stops it before the monitoring runtime.
 Missing configuration is the explicit `unconfigured` state and configuration
 without admitted storage is `storage_unadmitted` (no worker, no scan). That
-includes a monitoring runtime whose startup open failed; capture then starts
-once, when a later monitoring retry reaches `running`. After startup every
+includes a monitoring runtime whose startup open failed, and a storage
+admission refused while the runtime pins the database at start (nothing is
+opened yet, so the runtime stays startable); capture then starts once storage
+is admitted again. The application's `local_uvc_state` snapshot is refreshed
+from `LocalUvcRuntime.status()` every `retry_delay_seconds`, so a later worker
+or storage fault shows as `degraded`/`failed` instead of a frozen `running`.
+After startup every
 capture-driven write (source health, negotiated profile, last-seen timestamp,
 approval session marker) is admitted by the same Main storage policy as audit
 writes, so a hard stop or a missing/replaced filesystem refuses it: capture

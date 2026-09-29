@@ -184,8 +184,10 @@ class LocalUvcRuntime:
     def start(self) -> LocalUvcRuntimeStatus:
         """Validate configured sources and start one worker per valid source.
 
-        Idempotent while running.  A runtime is single-use: after ``stop()`` a
-        new runtime must be constructed so a stale approval handoff or session
+        Idempotent while running.  A refused storage admission while pinning
+        the database returns ``STORAGE_UNADMITTED`` and leaves the runtime
+        startable, because nothing was opened yet.  A runtime is single-use:
+        after ``stop()`` a new runtime must be constructed so a stale approval handoff or session
         marker can never leak into a new lifecycle.
         """
         with self._lock:
@@ -193,13 +195,23 @@ class LocalUvcRuntime:
                 if self._state in (LocalUvcRuntimeState.STOPPED, LocalUvcRuntimeState.STOP_FAILED):
                     raise RuntimeError("local UVC runtime cannot restart")
                 return self.status()
-            self._started = True
-            try:
-                pin = getattr(self.registry.database, "pin", None)
-                if callable(pin):
+            pin = getattr(self.registry.database, "pin", None)
+            if callable(pin):
+                try:
                     # Pin the admitted database file before any worker opens
                     # it; later opens refuse a missing or replaced file.
                     pin(getattr(self.registry, "reservation", None))
+                except Exception:
+                    # Storage admission was refused (a hard stop began, or the
+                    # verified filesystem is gone) before any adapter, worker
+                    # or descriptor exists. That is retryable, not a terminal
+                    # failure: the runtime stays startable so the lifespan
+                    # retries once storage is admitted again.
+                    self._state = LocalUvcRuntimeState.STORAGE_UNADMITTED
+                    logging.getLogger(__name__).error(Event.LOCAL_UVC_STORAGE_UNADMITTED)
+                    return self.status()
+            self._started = True
+            try:
                 self.adapter = self._adapter_factory(
                     self.registry, emit_audit=self._health, on_frame=self._on_frame,
                     discovery=self._discovery, capture_factory=self._capture_factory,
