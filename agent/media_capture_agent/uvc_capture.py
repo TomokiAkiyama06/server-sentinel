@@ -228,17 +228,21 @@ class UvcCapture:
         if not self._reap(active):
             source.stuck.append(active)
 
-    def _reap(self, active):
-        stopped = active.process.stop(self.limits.stop_timeout)
+    def _reap(self, active, timeout=None):
+        timeout = self.limits.stop_timeout if timeout is None else timeout
+        stopped = active.process.stop(timeout)
         if active.thread.ident is not None:
-            active.thread.join(self.limits.stop_timeout)
+            active.thread.join(timeout)
         if not stopped or active.thread.is_alive():
             return False
         active.process.close()
         return True
 
     def _retry_stuck(self, source):
-        source.stuck = [active for active in source.stuck if not self._reap(active)]
+        # Already waited the full bound once at teardown. A process stuck in
+        # uninterruptible sleep must not stall every poll (and so the node
+        # heartbeat); later attempts re-signal and only check without waiting.
+        source.stuck = [active for active in source.stuck if not self._reap(active, 0.0)]
 
     def _storage_failure(self, source):
         self._teardown(source)
@@ -455,7 +459,8 @@ class UvcCapture:
             failed = False
             for source in self._sources.values():
                 self._teardown(source)
-                self._retry_stuck(source)
+                # Shutdown grants every stuck pipeline one more full bound.
+                source.stuck = [active for active in source.stuck if not self._reap(active)]
                 source.queue.close()
                 source.controller.capture_closed()
                 if source.stuck or source.storage_failed:

@@ -80,6 +80,7 @@ class FakePipeline:
         self.dead = False
         self.stop_result = True
         self.stops = 0
+        self.stop_timeouts = []
         self.closed = False
 
     def feed(self, data):
@@ -99,6 +100,7 @@ class FakePipeline:
 
     def stop(self, timeout):
         self.stops += 1
+        self.stop_timeouts.append(timeout)
         if self.stop_result:
             self.dead = True
             self.chunks.put(b"")
@@ -552,6 +554,25 @@ class CaptureTests(CaptureCase):
         self.assertEqual(self.state(restarted), ("manual_intervention_required",
                                                  "owner_approval_required"))
 
+    def test_stuck_pipeline_retry_does_not_stall_every_poll(self):
+        device = evidence()
+        discovery = FakeDiscovery(device)
+        capture, pipeline = self.approved_online(discovery, device)
+        pipeline.stop_result = False
+        discovery.devices = []
+        capture.poll()
+        self.assertEqual(pipeline.stop_timeouts, [self.limits.stop_timeout])
+        started = time.monotonic()
+        for _ in range(3):
+            self.assertEqual(self.state(capture), ("offline", "capture_cleanup_failed"))
+        # Later attempts re-signal without waiting the full bound each poll.
+        self.assertLess(time.monotonic() - started, self.limits.stop_timeout)
+        self.assertEqual(pipeline.stop_timeouts[1:], [0.0] * 3)
+        with self.assertRaises(CaptureCleanupError):
+            capture.close()
+        # Shutdown still grants the stuck pipeline one more full bound.
+        self.assertEqual(pipeline.stop_timeouts[-1], self.limits.stop_timeout)
+
     def test_stuck_pipeline_recovers_when_finally_reaped(self):
         device = evidence()
         discovery = FakeDiscovery(device)
@@ -561,8 +582,10 @@ class CaptureTests(CaptureCase):
         capture.poll()
         pipeline.stop_result = True
         discovery.devices = [device]
-        self.assertEqual(self.state(capture), ("degraded", "capture_starting"))
+        # A non-waiting retry may observe the reader just before it exits.
+        self.assertTrue(wait_for(lambda: self.state(capture) == ("degraded", "capture_starting")))
         self.assertTrue(pipeline.closed)
+        self.assertEqual(len(self.launcher.pipelines), 2)
 
     def test_two_sources_resolving_to_one_camera_require_owner(self):
         device = evidence()

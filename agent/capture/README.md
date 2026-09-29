@@ -73,6 +73,9 @@ or pipeline failures.
 
 A pipeline that cannot be reaped, or approval state that cannot be written,
 keeps the active-session marker armed so the next start requires re-approval.
+Only the first teardown waits the full stop bound; later polls re-signal the
+stuck process group and check without waiting, so a process in uninterruptible
+sleep does not delay every heartbeat. `close()` grants it one more full bound.
 
 ## Not yet wired
 

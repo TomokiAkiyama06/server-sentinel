@@ -331,7 +331,8 @@ Per-source health: `manual_intervention_required` (`owner_approval_required`,
 `online` (`video_ready`) only while frames actually arrive without recent drops.
 Startup/stall timeouts, malformed streams and pipeline exits retry with bounded
 exponential backoff; a pipeline that cannot be reaped blocks relaunch and keeps
-the recovery marker armed. Node health is unaffected by any source failure.
+the recovery marker armed, and later polls retry reaping without waiting the full
+stop bound so heartbeats are not delayed. Node health is unaffected by any source failure.
 Wiring into the production CLI, the Owner approval route (#13/#14), ring
 storage (#16) and transport (#15) is separate work.
 
