@@ -82,7 +82,11 @@ class ClockUnavailable(RuntimeError):
 def _stamp(clock):
     # A clock-port fault is infrastructure, never an observation contract
     # error, so it must not surface as `InvalidObservation` and be dropped.
-    received, trusted = clock()
+    try:
+        received, trusted = clock()
+    except Exception:
+        # A raising or malformed clock port is the same retryable fault.
+        raise ClockUnavailable("main-host clock unavailable") from None
     try:
         utc(received)
     except InvalidObservation:
@@ -164,10 +168,12 @@ class TimelineOutbox:
 
     Loss is also durable. `open()` establishes a durable outbox session at
     startup and `stage()` refuses facts until it has, so no fact is ever held
-    without a session row that a restart would find. Every flush adds the refused and rejected counts to the presence timeline
-    gap marker. `close()` records any still-staged facts as lost and ends the
+    without a session row that a restart would find. Every flush adds the
+    refused and rejected counts to the presence timeline gap marker. `close()` records any still-staged facts as lost and ends the
     session; a process that exits without a successful close leaves the
     session row behind, so the next start records an interrupted gap. The
+    session is exclusive per database (see `open_timeline_session()`), and a
+    clock fault while a fact is handed over is counted as refused. The
     marker is cleared only by the Owner (`PresenceService.clear_timeline_gap`),
     and while it is set, or cannot be read, `OutboxState.degraded` stays true.
     Staged facts themselves are not recovered after a restart. The runtime
@@ -189,6 +195,8 @@ class TimelineOutbox:
         self._recorded = self._refused = self._rejected = 0
         self._unpersisted_refused = self._unpersisted_rejected = 0
         self._session = False
+        # The durable session and its lock, from `open_timeline_session()`.
+        self._handle = None
         self._closed = False
         self._gap = None
 
@@ -202,7 +210,14 @@ class TimelineOutbox:
         """Stage one fact; its contract is checked now against the current clock."""
         if not isinstance(identifier, UUID) or not callable(build):
             raise ValueError("typed staged fact required")
-        observation, valid_until = build(*_stamp(self.clock))
+        self._accepting()
+        try:
+            stamp = _stamp(self.clock)
+        except ClockUnavailable:
+            # The fact cannot be dated or checked now; count it as a refused
+            # handoff so the loss reaches the durable gap marker.
+            return self._refuse()
+        observation, valid_until = build(*stamp)
         if not isinstance(observation, Observation) or observation.identifier != identifier:
             raise ValueError("typed observation required")
         if observation.kind in CRITICAL:
@@ -212,12 +227,7 @@ class TimelineOutbox:
             raise ValueError("presence validity applies to owner observations only")
         fact = _fact(observation)
         with self._lock:
-            if self._closed:
-                raise RuntimeError("timeline outbox closed")
-            if not self._session:
-                # Without a durable session a restart before the first write
-                # would lose this fact with no trace, so nothing is accepted.
-                raise RuntimeError("timeline outbox not open")
+            self._accepting_locked()
             for item, _, staged in self._pending:
                 if item == identifier:
                     if staged == fact:
@@ -276,6 +286,26 @@ class TimelineOutbox:
                 pass
         return self.state()
 
+    def _accepting_locked(self):
+        if self._closed:
+            raise RuntimeError("timeline outbox closed")
+        if not self._session:
+            # Without a durable session a restart before the first write
+            # would lose this fact with no trace, so nothing is accepted.
+            raise RuntimeError("timeline outbox not open")
+
+    def _accepting(self):
+        with self._lock:
+            self._accepting_locked()
+
+    def _refuse(self):
+        """Count a fact that could not be staged as a refused, visible gap."""
+        with self._lock:
+            self._accepting_locked()
+            self._refused += 1
+            self._unpersisted_refused += 1
+        return False
+
     def open(self):
         """Open the durable session at startup, before any producer is wired.
 
@@ -296,12 +326,13 @@ class TimelineOutbox:
             return True
         try:
             now, _ = _stamp(self.clock)
-            gap = self.service.open_timeline_session(now=now)
+            session, gap = self.service.open_timeline_session(now=now)
         except Exception:
             if strict:
                 raise
             return False
         with self._lock:
+            self._handle = session
             self._session, self._gap = True, gap is not None
         return True
 
@@ -317,7 +348,7 @@ class TimelineOutbox:
             return
         now, _ = _stamp(self.clock)
         gap = self.service.record_timeline_gap(now=now, refused=refused, rejected=rejected,
-                                               lost=lost, close=close)
+                                               lost=lost, close=self._handle if close else None)
         with self._lock:
             # Subtract what was written; facts refused meanwhile stay counted.
             self._unpersisted_refused -= refused
@@ -350,7 +381,7 @@ class TimelineOutbox:
                 with self._lock:
                     self._closed = False
                 raise
-            self._session = False
+            self._session, self._handle = False, None
             return self.state()
 
     def state(self):
@@ -482,7 +513,12 @@ class HealthTimeline:
         self.outbox = outbox
 
     def _stage(self, kind, value, **attribution):
-        occurred, occurred_trusted = _stamp(self.outbox.clock)
+        try:
+            occurred, occurred_trusted = _stamp(self.outbox.clock)
+        except ClockUnavailable:
+            # A one-shot producer callback will not re-emit this transition,
+            # so a clock fault here is a counted gap, never silent loss.
+            return self.outbox._refuse()
         identifier = uuid4()
 
         def build(received, trusted):

@@ -190,8 +190,13 @@ no-op. A process that exits without
 a successful close leaves its session row behind, and the next start records
 an interrupted gap: a restart is never assumed clean, and staged facts are not
 recovered. A failed close keeps the outbox open and the session row in place.
-A second outbox on the same database is also reported as interrupted; that and
-any other false positive is cleared only by the Owner through the audited
+Only one outbox session per database can be open: `open()` takes an exclusive
+advisory lock beside the database file, which the kernel releases when the
+process dies, and a second outbox is refused while it is held. A session row
+found once the lock is free therefore belongs to an outbox that is gone. A
+clock fault while a producer hands a fact over is counted as a refused fact,
+because a one-shot producer callback will not re-emit it. A false positive is
+cleared only by the Owner through the audited
 `clear_timeline_gap()`, a domain operation with no route. `OutboxState.degraded`
 stays true while facts are pending, counts are not yet persisted, the session
 is not open, or the durable marker is set or unreadable; the Owner status

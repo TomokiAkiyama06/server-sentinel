@@ -97,6 +97,7 @@ class PresenceFixture:
         self.clock = Clock()
         self.outbox = TimelineOutbox(self.presence, clock=self.clock, capacity=8)
         self.outbox.open()
+        self.addCleanup(lambda: self.outbox._handle and self.outbox._handle.release())
 
     def history(self, context="recordings"):
         return self.presence.history(context, received_from=NOW - timedelta(days=1),
@@ -566,7 +567,10 @@ class TimelineGapDurabilityTests(PresenceFixture, TestCase):
 
     def restart(self):
         # A new process: new service and outbox over the same database, and no
-        # in-memory state carried over.
+        # in-memory state carried over. The old process is gone, so the kernel
+        # released its session lock; its durable rows stay as they were.
+        if self.outbox._handle is not None:
+            self.outbox._handle.release()
         self.presence = PresenceService(self.database, access=MockAccess(), evidence=self.presence.evidence,
                                         notifications=self.presence.notifications,
                                         reservation=self.presence.reservation,
@@ -655,6 +659,7 @@ class TimelineGapDurabilityTests(PresenceFixture, TestCase):
         self.assertEqual(self.gap()[1]["refused"], 1)
 
     def test_staging_is_refused_until_a_durable_session_is_open(self):
+        self.outbox.close()
         outbox = TimelineOutbox(self.presence, clock=self.clock, capacity=8)
         health = HealthTimeline(outbox)
         self.assertFalse(outbox.state().session)
@@ -662,7 +667,7 @@ class TimelineGapDurabilityTests(PresenceFixture, TestCase):
         with self.assertRaises(RuntimeError):
             health.node(NODE, NodeHealthState.OFFLINE)
         self.refuse = True
-        with self.assertRaises(RuntimeError):
+        with self.assertRaisesRegex(RuntimeError, "STORAGE_HARD_STOP"):
             outbox.open()
         with self.assertRaises(RuntimeError):
             health.node(NODE, NodeHealthState.OFFLINE)
@@ -711,3 +716,38 @@ class TimelineGapDurabilityTests(PresenceFixture, TestCase):
         self.assertEqual(entry["target"], "refused=0,rejected=0,lost=0,interrupted=1")
         with self.assertRaises(ValueError):
             self.presence.clear_timeline_gap("owner", now=NOW, clock_trusted=True)
+
+    def test_a_second_outbox_is_refused_while_the_first_is_open(self):
+        second = TimelineOutbox(self.presence, clock=self.clock, capacity=8)
+        with self.assertRaisesRegex(RuntimeError, "another timeline outbox"):
+            second.open()
+        # A refused open neither replaces the live session nor records a gap.
+        self.assertEqual(self.gap(), (False, None))
+        self.outbox.close()
+        second.open()
+        self.assertEqual(self.gap(), (False, None))
+        # The second outbox now crashes; its own session row is still there.
+        self.outbox = second
+        self.assertTrue(self.restart().degraded)
+        self.assertEqual(self.gap()[1]["interrupted"], 1)
+
+    def test_clock_fault_before_staging_is_a_counted_gap(self):
+        adapter = EntranceObservationAdapter(self.outbox, owner_presence_validity=VALIDITY,
+                                             maximum_source_latency=LATENCY)
+
+        def failing():
+            raise OSError("synthetic clock port fault")
+        for fault in ((NOW.replace(tzinfo=None), True), (NOW, None)):
+            self.clock.at, self.clock.trusted = fault
+            self.assertFalse(self.health.camera(HealthEvent(SOURCE, CameraState.OFFLINE, "synthetic")))
+        self.outbox.clock = failing
+        self.assertFalse(adapter.submit(TrackUpdate((), (crossing(CrossingKind.ANONYMOUS_ENTRY),),
+                                                    DetectionQuality.SUFFICIENT)))
+        self.assertFalse(self.health.node(NODE, NodeHealthState.OFFLINE))
+        state = self.outbox.state()
+        self.assertEqual((state.refused, state.unpersisted, state.pending), (4, 4, 0))
+        self.assertTrue(state.degraded)
+        self.outbox.clock = self.clock
+        self.clock.at, self.clock.trusted = NOW, True
+        self.assertTrue(self.outbox.flush().degraded)
+        self.assertEqual(self.gap()[1]["refused"], 4)

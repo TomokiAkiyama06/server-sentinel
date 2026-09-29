@@ -52,8 +52,8 @@ def presence_gap_migration(version: int) -> Migration:
     """Durable timeline-gap marker and the outbox session that proves a clean close.
 
     The marker holds counts and times only, never observation content. A
-    session row left behind by a process that did not close its outbox cleanly
-    is itself evidence of an interrupted gap: staged facts may have been lost.
+    session row left behind by an outbox that did not close cleanly is itself
+    evidence of an interrupted gap: staged facts may have been lost.
     """
     return Migration(version, "presence_timeline_gap", (
         "CREATE TABLE presence_timeline_gap (singleton INTEGER PRIMARY KEY CHECK(singleton=1), "
@@ -62,6 +62,8 @@ def presence_gap_migration(version: int) -> Migration:
         "rejected INTEGER NOT NULL DEFAULT 0 CHECK(rejected>=0), "
         "lost INTEGER NOT NULL DEFAULT 0 CHECK(lost>=0), "
         "interrupted INTEGER NOT NULL DEFAULT 0 CHECK(interrupted>=0))",
-        "CREATE TABLE presence_outbox_session (singleton INTEGER PRIMARY KEY CHECK(singleton=1), "
-        "opened TEXT NOT NULL)",
+        # The open outbox session, removed only by that session's clean close.
+        # A second session is refused by a lock beside the database, so a row
+        # found by a new session belongs to an outbox that is gone.
+        "CREATE TABLE presence_outbox_sessions (token TEXT PRIMARY KEY, opened TEXT NOT NULL)",
     ))

@@ -3,8 +3,10 @@
 from contextlib import ExitStack, closing, contextmanager
 from dataclasses import replace
 from datetime import timedelta
+import fcntl
 import json
-from uuid import UUID
+import os
+from uuid import UUID, uuid4
 
 from .access import DenyAccess
 from .delivery import ActionResult
@@ -26,6 +28,20 @@ SOURCE_CLOCK = frozenset({Kind.PERSON, Kind.MOTION, Kind.OWNER_ENTRY, Kind.OWNER
                           Kind.ANONYMOUS_ENTRY, Kind.ANONYMOUS_EXIT, *CRITICAL})
 # Payload fields a producer stamps at the moment presence receives the fact.
 RECEIPT_FIELDS = ("received_at", "clock_trusted", "confirmed")
+
+
+class TimelineSession:
+    """An open outbox session: its durable token and the lock that proves it live."""
+
+    def __init__(self, token, descriptor):
+        self.token = token
+        self._descriptor = descriptor
+
+    def release(self):
+        """Release the lock; the kernel does the same when the process dies."""
+        descriptor, self._descriptor = self._descriptor, None
+        if descriptor is not None:
+            os.close(descriptor)
 
 
 class PresenceService:
@@ -429,37 +445,72 @@ class PresenceService:
                    "lost=lost+excluded.lost, interrupted=interrupted+excluded.interrupted",
                    (at, at, *counts))
 
-    def open_timeline_session(self, *, now):
-        """Start the durable outbox session; returns the timeline gap marker or None.
+    def _session_lock(self):
+        """Exclusive advisory lock beside the database, held for a session's life.
 
-        A session row still present from an earlier process means that process
-        never closed its outbox cleanly, so whatever it had staged may be lost.
-        That is recorded as an interrupted gap: a restart is never assumed to
-        be clean. A false positive, such as a second outbox opened on the same
-        database, is cleared by the Owner (`clear_timeline_gap`), never here.
+        The kernel releases it when the holding process dies, so a session
+        row found while the lock is free belongs to an outbox that is gone.
         """
-        with self._transaction() as db:
-            if db.execute("SELECT 1 FROM presence_outbox_session WHERE singleton=1").fetchone():
-                self._add_gap(db, now, interrupted=1)
-            db.execute("INSERT OR REPLACE INTO presence_outbox_session(singleton,opened) VALUES (1,?)",
-                       (timestamp(now),))
-            return self._gap(db)
+        path = self.database.path
+        descriptor = os.open(path.with_name(path.name + ".timeline-session.lock"),
+                             os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.close(descriptor)
+            raise RuntimeError("another timeline outbox session is open") from None
+        except BaseException:
+            os.close(descriptor)
+            raise
+        return descriptor
 
-    def record_timeline_gap(self, *, now, refused=0, rejected=0, lost=0, close=False):
-        """Durably add outbox loss counts; ``close`` also ends the session cleanly.
+    def open_timeline_session(self, *, now):
+        """Start the durable outbox session; returns ``(session, gap marker or None)``.
+
+        Only one outbox session per database can be open: a second one is
+        refused while the first holds the session lock. A session row found
+        once the lock is free therefore belongs to an outbox that never closed
+        cleanly, so whatever it had staged may be lost. It is recorded as an
+        interrupted gap: a restart is never assumed to be clean. A false
+        positive is cleared by the Owner (`clear_timeline_gap`), never here.
+        """
+        session = TimelineSession(str(uuid4()), self._session_lock())
+        try:
+            with self._transaction() as db:
+                stale = db.execute("SELECT count(*) FROM presence_outbox_sessions").fetchone()[0]
+                if stale:
+                    self._add_gap(db, now, interrupted=stale)
+                    db.execute("DELETE FROM presence_outbox_sessions")
+                db.execute("INSERT INTO presence_outbox_sessions(token,opened) VALUES (?,?)",
+                           (session.token, timestamp(now)))
+                gap = self._gap(db)
+        except BaseException:
+            session.release()
+            raise
+        return session, gap
+
+    def record_timeline_gap(self, *, now, refused=0, rejected=0, lost=0, close=None):
+        """Durably add outbox loss counts; ``close`` is the session to end cleanly.
 
         Counts are only ever added, so a write that committed and then raised
         and is retried overstates the gap rather than hiding it. Only a
-        successful close removes the session row; a failed close leaves it for
-        the next start to record as interrupted.
+        committed close removes the session row and then releases its lock; a
+        failed close keeps both, and a process that exits after it leaves the
+        row for the next start to record as interrupted. A close whose row is
+        missing cannot prove a clean session and is recorded as interrupted.
         """
-        if type(close) is not bool:
-            raise ValueError("explicit close required")
+        if close is not None and not isinstance(close, TimelineSession):
+            raise ValueError("timeline session required")
         with self._transaction() as db:
             self._add_gap(db, now, refused=refused, rejected=rejected, lost=lost)
-            if close:
-                db.execute("DELETE FROM presence_outbox_session WHERE singleton=1")
-            return self._gap(db)
+            if close is not None:
+                cursor = db.execute("DELETE FROM presence_outbox_sessions WHERE token=?", (close.token,))
+                if not cursor.rowcount:
+                    self._add_gap(db, now, interrupted=1)
+            gap = self._gap(db)
+        if close is not None:
+            close.release()
+        return gap
 
     def timeline_gap(self):
         """Read-only durable timeline gap marker, or None when there is none."""
