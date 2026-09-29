@@ -506,6 +506,63 @@ class CaptureTests(CaptureCase):
         self.assertTrue(wait_for(lambda: capture._sources[SOURCES[0]].active.error))
         self.assertEqual(self.state(capture), ("offline", "capture_failed"))
 
+    def test_retry_backoff_starts_after_slow_failed_open(self):
+        device = evidence()
+        opens = []
+
+        def slow_failing_open(_candidate):
+            opens.append(self.clock.now)
+            self.clock.now += 2  # Driver error after longer than the backoff.
+            raise OSError("synthetic slow open failure")
+
+        capture = self.capture(FakeDiscovery(device), open_device=slow_failing_open)
+        capture.approve(SOURCES[0], device)
+        self.assertEqual(self.state(capture), ("offline", "capture_failed"))
+        self.assertEqual(len(opens), 1)
+        # No clock advance: the 1s backoff counts from the end of the failure.
+        self.assertEqual(self.state(capture), ("offline", "capture_failed"))
+        self.assertEqual(len(opens), 1)
+        self.clock.now += 1
+        capture.poll()
+        self.assertEqual(len(opens), 2)
+        # Doubled backoff (2s) again counts from after the slow failure.
+        self.clock.now += 1.5
+        capture.poll()
+        self.assertEqual(len(opens), 2)
+
+    def test_retry_backoff_starts_after_slow_teardown(self):
+        device = evidence()
+        capture, pipeline = self.approved_online(FakeDiscovery(device), device)
+        original_stop = pipeline.stop
+
+        def slow_stop(timeout):
+            self.clock.now += 2  # Teardown longer than the backoff.
+            return original_stop(timeout)
+
+        pipeline.stop = slow_stop
+        self.clock.now += 3  # Stall beyond stall_timeout.
+        self.assertEqual(self.state(capture), ("offline", "capture_failed"))
+        self.assertEqual(self.state(capture), ("offline", "capture_failed"))
+        self.assertEqual(len(self.launcher.pipelines), 1)
+        self.clock.now += 1
+        self.assertEqual(self.state(capture), ("degraded", "capture_starting"))
+        self.assertEqual(len(self.launcher.pipelines), 2)
+
+    def test_startup_timeout_counts_from_launch_not_before_slow_open(self):
+        device = evidence()
+
+        def slow_open(_candidate):
+            self.clock.now += 6  # Longer than startup_timeout, then succeeds.
+            return os.open(os.devnull, os.O_RDONLY | os.O_CLOEXEC)
+
+        capture = self.capture(FakeDiscovery(device), open_device=slow_open)
+        capture.approve(SOURCES[0], device)
+        self.assertEqual(self.state(capture), ("degraded", "capture_starting"))
+        self.assertEqual(self.state(capture), ("degraded", "capture_starting"))
+        self.assertEqual(len(self.launcher.pipelines), 1)
+        self.clock.now += 5.5
+        self.assertEqual(self.state(capture), ("offline", "capture_failed"))
+
     def test_launch_failure_and_unsupported_format_are_visible(self):
         device = evidence()
         capture = self.capture(FakeDiscovery(device))

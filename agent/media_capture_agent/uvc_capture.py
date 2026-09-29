@@ -386,8 +386,10 @@ class UvcCapture:
         return result
 
     # -- lifecycle ---------------------------------------------------------
-    def _schedule_retry(self, source, now):
-        source.retry_at = now + source.backoff
+    def _schedule_retry(self, source):
+        # Sampled after the failed open/launch/teardown finished: a slow driver
+        # error must not consume the backoff and cause an immediate retry.
+        source.retry_at = self.clock() + source.backoff
         source.backoff = min(self.limits.backoff_max, source.backoff * 2)
 
     def _teardown(self, source):
@@ -461,7 +463,7 @@ class UvcCapture:
             self._teardown(source)
             controller.capture_failed()
             source.failure = "capture_failed"
-            self._schedule_retry(source, now)
+            self._schedule_retry(source)
         elif first is not None and controller.state != CameraState.ONLINE:
             controller.capture_ready(active.candidate)
             source.failure = None
@@ -483,13 +485,13 @@ class UvcCapture:
                 except ApprovalStorageError:
                     self._storage_failure(source)
 
-    def _launch(self, source, now):
+    def _launch(self, source):
         controller = source.controller
         candidate = controller.bound
         if MJPEG not in candidate.formats:
             controller.capture_failed()
             source.failure = "capture_unsupported"
-            self._schedule_retry(source, now)
+            self._schedule_retry(source)
             return
         descriptor = None
         process = None
@@ -510,15 +512,17 @@ class UvcCapture:
             if not controller.requires_approval:
                 controller.capture_failed()
                 source.failure = "capture_failed"
-            self._schedule_retry(source, now)
+            self._schedule_retry(source)
             return
         finally:
             if descriptor is not None:
                 self._release_descriptor(source, descriptor)
         source.generation += 1
         parser = MjpegFrameParser(self.limits.max_frame_bytes)
+        # startup_timeout counts from the launch, not from before the bounded
+        # open/re-scan, so a slow open cannot expire it before any frame.
         active = _Active(candidate, process, parser, source.queue, source.generation,
-                         self.clock, now)
+                         self.clock, self.clock())
         source.active = active
         try:
             active.thread.start()
@@ -526,7 +530,7 @@ class UvcCapture:
             self._teardown(source)
             controller.capture_failed()
             source.failure = "capture_failed"
-            self._schedule_retry(source, now)
+            self._schedule_retry(source)
 
     # -- health --------------------------------------------------------------
     def _health(self, source, now):
@@ -594,7 +598,7 @@ class UvcCapture:
                             and not controller.requires_approval and now >= source.retry_at):
                         if self._device_bound() <= 0:
                             break  # Deferred to the next tick; not a failure.
-                        self._launch(source, now)
+                        self._launch(source)
             finally:
                 self._device_deadline = self._teardown_deadline = None
             return tuple(self._health(source, now) for source in self._sources.values())
