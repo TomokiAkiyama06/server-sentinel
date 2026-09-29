@@ -102,7 +102,8 @@ trusted private proxy after application authorization is available.
 
 The `monitoring` object configures the Main Server monitoring runtime
 (storage admission, retention, daily summary, hardware integrity and recording
-health). Values below are examples, not defaults:
+health). Values below are internally consistent examples for a filesystem
+of roughly 1 TB, not defaults; size them for the actual deployment:
 
 ```json
 "monitoring": {
@@ -110,15 +111,16 @@ health). Values below are examples, not defaults:
   "daily_summary_time": "23:00",
   "slack_webhook_url": "<private incoming webhook, optional>",
   "storage_limits": {
-    "recording_limit_bytes": 0, "critical_allowance_bytes": 0,
-    "hard_reserve_bytes": 0, "pressure_free_bytes": 0,
-    "recovery_free_bytes": 0, "recovery_allocation_bytes": 0,
-    "write_overhead_bytes": 0, "max_request_bytes": 0, "cleanup_batch_size": 0
+    "recording_limit_bytes": 500000000000, "critical_allowance_bytes": 10000000000,
+    "hard_reserve_bytes": 20000000000, "pressure_free_bytes": 40000000000,
+    "recovery_free_bytes": 60000000000, "recovery_allocation_bytes": 450000000000,
+    "write_overhead_bytes": 1048576, "max_request_bytes": 16777216,
+    "cleanup_batch_size": 100
   },
   "recording_limits": {
-    "pre_roll_bytes": 0, "max_segment_bytes": 0, "max_segment_ms": 0,
-    "max_active_recordings": 0, "max_spool_segments": 0,
-    "max_segments_per_recording": 0
+    "pre_roll_bytes": 67108864, "max_segment_bytes": 8388608, "max_segment_ms": 10000,
+    "max_active_recordings": 4, "max_spool_segments": 64,
+    "max_segments_per_recording": 8640
   },
   "recording_filesystem": {
     "filesystem_uuid": "00000000-1111-2222-3333-444444444444",

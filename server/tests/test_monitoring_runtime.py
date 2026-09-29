@@ -513,6 +513,76 @@ class MigrationAdmissionTests(RuntimeFixture):
         self.assertIsNone(application.state.monitoring._executor)
 
 
+class FallbackDatabaseTests(RuntimeFixture):
+    """A database file found while the approved mount is missing is a fallback
+    on the underlying filesystem; it must never be opened, migrated or reused
+    by the retry once the approved filesystem returns."""
+
+    def mount_returns(self):
+        # The approved filesystem is mounted again: the path now names its
+        # (provisioned, empty) database instead of the fallback file.
+        fallback = self.settings.database_path.with_name("fallback.sqlite3")
+        self.settings.database_path.rename(fallback)
+        Database(self.settings.database_path).connect().close()
+        self.approved_device = self.device
+        return fallback
+
+    async def test_fallback_database_is_not_opened_while_the_mount_is_missing(self):
+        Database(self.settings.database_path).connect().close()
+        self.approved_device = self.device + 1
+        application = self.application()
+        async with application.router.lifespan_context(application):
+            runtime = application.state.monitoring
+            self.assertEqual(RuntimeState.FAILED, runtime.status.state)
+            self.assertIsNone(runtime._connection)
+            await self.settle(runtime)
+            self.assertEqual(["ServerSentinel critical alert: recording_health_failure"],
+                             self.slack_texts())
+            fallback = self.mount_returns()
+            self.clock.advance(timedelta(minutes=15))
+            await runtime.call(runtime.tick)
+            self.assertEqual(RuntimeState.RUNNING, runtime.status.state)
+            self.assertEqual(set(), schema_tables(fallback))
+            self.assertIn("schema_migrations", schema_tables(self.settings.database_path))
+
+    async def test_failed_attempt_drops_its_connection_before_the_retry(self):
+        # The identity holds when the database is opened but is gone when the
+        # storage components verify it (the mount vanished in between).
+        Database(self.settings.database_path).connect().close()
+        answers = iter([self.device, self.device + 1])
+        filesystem = RecordingFilesystem(
+            self.recordings, "00000000-1111-2222-3333-444444444444",
+            (os.major(self.device), os.minor(self.device)), self.recordings.parent,
+            lambda uuid: next(answers, self.approved_device), lambda path: True,
+        )
+        self.approved_device = self.device + 1
+        application = self.application(self.configuration(recording_filesystem=filesystem))
+        async with application.router.lifespan_context(application):
+            runtime = application.state.monitoring
+            self.assertEqual(RuntimeState.FAILED, runtime.status.state)
+            self.assertIsNone(runtime._connection)
+            self.assertIsNone(runtime.notification_events)
+            await self.settle(runtime)
+            self.assertEqual(["ServerSentinel critical alert: recording_health_failure"],
+                             self.slack_texts())
+            fallback = self.mount_returns()
+            self.clock.advance(timedelta(minutes=15))
+            await runtime.call(runtime.tick)
+            self.assertEqual(RuntimeState.RUNNING, runtime.status.state)
+            # Schema and metadata went to the database on the verified
+            # filesystem, not to the connection opened by the failed attempt.
+            self.assertEqual(set(), schema_tables(fallback))
+            with closing(sqlite3.connect(self.settings.database_path)) as db:
+                self.assertEqual(len(APPLICATION_MIGRATIONS), db.execute(
+                    "SELECT COUNT(*) FROM schema_migrations").fetchone()[0])
+            await self.settle(runtime)
+            # The alert is not repeated; its local record, refused while the
+            # filesystem was unverified, lands in the verified database.
+            self.assertEqual(1, self.slack_texts().count(
+                "ServerSentinel critical alert: recording_health_failure"))
+            self.assertIn("recording_health_failure", [kind for kind, _ in self.events()])
+
+
 class HardReserveMigrationTests(RuntimeFixture):
     # Free space can never cover this hard reserve plus the write overhead.
     storage_limits = dict(STORAGE_LIMITS, hard_reserve_bytes=2**61,
@@ -696,6 +766,17 @@ class ConfigurationTests(unittest.TestCase):
                 self.parse(value)
             self.assertNotIn("secret-token", str(raised.exception))
             self.assertNotIn("passwd", str(raised.exception))
+
+    def test_documented_monitoring_example_passes_validation(self):
+        text = (Path(__file__).resolve().parents[1] / "docs" / "DEPLOYMENT.md").read_text()
+        section = text.split("### Monitoring section", 1)[1]
+        example = json.loads("{" + section.split("```json", 1)[1].split("```", 1)[0] + "}")
+        value = dict(example["monitoring"])
+        # The placeholders stand for private deployment values.
+        del value["slack_webhook_url"]
+        value["recording_filesystem"] = self.value["recording_filesystem"]
+        configuration = self.parse(value)
+        self.assertTrue(configuration.storage_configured)
 
     def test_recording_filesystem_identity_must_match(self):
         with self.assertRaisesRegex(ConfigurationError, "mismatch"):

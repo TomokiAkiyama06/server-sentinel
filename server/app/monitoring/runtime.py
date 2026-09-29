@@ -279,24 +279,31 @@ class MonitoringRuntime:
             raise RecordingError("NOTIFICATION_STORE_UNAVAILABLE")
         self.notification_events.upsert(event)
 
-    def _admit_database_creation(self) -> None:
-        """Refuse to create an absent database outside verified storage.
+    def _admit_database_open(self) -> None:
+        """Refuse to open or create the database outside verified storage.
 
         `Database.connect()` creates a missing file. Before that is allowed the
         declared recording filesystem identity is verified, the database
         directory must be a private directory on that same filesystem and the
         free space must cover the hard reserve plus the write overhead. An
-        existing file is re-verified by every later policy admission.
+        existing file must be a regular file on the verified filesystem and is
+        re-verified by every later policy admission.
         """
         path = self.database.path
         try:
-            os.lstat(path)
-            return
+            existing = os.lstat(path)
         except FileNotFoundError:
-            pass
+            existing = None
         except OSError:
             raise RecordingError("STORAGE_HARD_STOP") from None
         filesystem = IdentifiedRecordingFilesystem(self.configuration.recording_filesystem, path)
+        if existing is not None:
+            # An existing file is opened only while the declared filesystem is
+            # verified and the file is a regular file on it, so a fallback
+            # database left under a missing mount is never opened.
+            if not stat.S_ISREG(existing.st_mode) or existing.st_dev != filesystem.expected.device:
+                raise RecordingError("STORAGE_HARD_STOP")
+            return
         limits = self.configuration.storage_limits
         try:
             parent = os.stat(path.parent, follow_symlinks=False)
@@ -319,10 +326,13 @@ class MonitoringRuntime:
     def _open(self) -> None:
         """Open the worker's components; also the retry path while `FAILED`.
 
-        The connection and notification service are opened once and reused by
-        a retry, so pending Slack deliveries and their in-memory
-        de-duplication survive. Storage components are rebuilt on each attempt
-        and published only once every one of them was constructed.
+        The notification service is created once and reused by a retry, so
+        pending Slack deliveries and their in-memory de-duplication survive.
+        The database connection is opened only after the declared filesystem
+        was verified and is dropped by a failed attempt, so every retry
+        reopens it on the filesystem approved at that time. Storage components
+        are rebuilt on each attempt and published only once every one of them
+        was constructed.
         """
         self._owner = threading.get_ident()
         if self._started_monotonic is None:
@@ -340,7 +350,7 @@ class MonitoringRuntime:
         if self._connection is None:
             connection = None
             try:
-                self._admit_database_creation()
+                self._admit_database_open()
                 connection = self.database.connect()
                 events = NotificationEventStore(connection, self._owner_reservation)
             except Exception:
@@ -409,7 +419,12 @@ class MonitoringRuntime:
             if recordings is not None:
                 with suppress(Exception):
                     recordings.close()
+            # The alert is persisted locally only if this attempt's verified
+            # policy admits it; afterwards the connection is dropped so the
+            # retry reopens and revalidates the database on the filesystem
+            # that is approved then, never reusing one opened meanwhile.
             self._startup_failed()
+            self._drop_connection()
             return
         self.recordings, self.health_status, self.scheduler = recordings, health_status, scheduler
         self.integrity_store, self.integrity = integrity_store, integrity
@@ -426,6 +441,24 @@ class MonitoringRuntime:
         self._guarded("integrity", self.integrity.startup, "integrity_degraded")
         self._guarded("health", self.recording_health.startup, "recording_health_degraded")
         self._poll()
+
+    def _drop_connection(self) -> None:
+        """Forget the database of a failed attempt; the retry reopens it.
+
+        The notification service is kept, so pending Slack deliveries and
+        their de-duplication survive; their local persistence stays refused
+        (and retried) until a verified reopen.
+        """
+        connection = self._connection
+        self._connection = None
+        self.notification_events = None
+        self.storage_audit = None
+        self._policy = None
+        self.filesystem = None
+        self._migrated = not self._migrations
+        if connection is not None:
+            with suppress(Exception):
+                connection.close()
 
     def _startup_failed(self) -> None:
         """The expected recording target is unusable: refuse, never fall back.
@@ -622,6 +655,7 @@ class MonitoringRuntime:
                 logging.getLogger(__name__).error(Event.MONITORING_DEGRADED)
                 return
             self._set(state=RuntimeState.FAILED)
+            self._drop_connection()
             self._retry_at["startup"] = (self.dependencies.monotonic()
                                          + self.dependencies.retry_seconds)
             logging.getLogger(__name__).error(Event.MONITORING_STARTUP_FAILED)
