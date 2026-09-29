@@ -18,10 +18,39 @@ from app.audit.runtime import AuditRetentionRuntime
 from app.cameras.registry import CameraRegistry
 from app.diagnostics import DiagnosticExportEndpoint
 from app.logging import Event
+from app.monitoring.config import MonitoringConfiguration
+from app.monitoring.runtime import MonitoringDependencies, MonitoringRuntime, RuntimeState
 from app.settings import Settings
 from app.storage.database import Database
 from app.storage.migrations import migrate
 from app.storage.schema import APPLICATION_MIGRATIONS
+
+
+class RuntimeStorageAdmission:
+    """Audit storage admission that follows the monitoring runtime's policy.
+
+    Until a monitoring runtime with configured storage thresholds is running,
+    it behaves exactly like `UnboundStorageAdmission` and refuses audit writes.
+    Once bound, each audit write holds the Main storage policy's reservation on
+    the policy's owning worker through commit.
+    """
+
+    def __init__(self) -> None:
+        self._runtime: MonitoringRuntime | None = None
+
+    @property
+    def bound(self) -> bool:
+        runtime = self._runtime
+        return runtime is not None and runtime.bound
+
+    def bind(self, runtime: MonitoringRuntime | None) -> None:
+        self._runtime = runtime
+
+    def __call__(self) -> ContextManager:
+        runtime = self._runtime
+        if runtime is None or not runtime.bound:
+            return UnboundStorageAdmission()()
+        return runtime.reservation()
 
 
 class ClosedHumanSurface:
@@ -55,14 +84,21 @@ def create_app(settings: Settings, *, database: Database | None = None,
                audit_cleanup_interval_seconds: float = 24 * 60 * 60,
                storage_reservation: Callable[[], ContextManager] | None = None,
                audit_retention_stores: Iterable[object] = (),
-               diagnostic_export_endpoint: DiagnosticExportEndpoint | None = None) -> FastAPI:
+               diagnostic_export_endpoint: DiagnosticExportEndpoint | None = None,
+               monitoring: MonitoringConfiguration | None = None,
+               monitoring_dependencies: MonitoringDependencies | None = None) -> FastAPI:
     store = database or Database(settings.database_path)
-    # The deployment injects the Main Server storage admission reservation once
-    # its storage policy is bound, so audit writes and retention cleanup cannot
-    # spend the hard filesystem reserve. Until then writes are refused rather
-    # than admitted against a reserve this process cannot verify.
-    audit_store = AuditStore(store, reservation=storage_reservation
-                             or UnboundStorageAdmission())
+    # The Main Server storage policy is bound by the monitoring runtime when
+    # the deployment configures storage thresholds, so audit writes and
+    # retention cleanup cannot spend the hard filesystem reserve. Without those
+    # thresholds the admission stays unbound: writes are refused rather than
+    # admitted against a reserve this process cannot verify.
+    runtime_admission = RuntimeStorageAdmission()
+    monitoring_runtime = (
+        MonitoringRuntime(monitoring, store, monitoring_dependencies)
+        if monitoring is not None and monitoring.storage_configured else None
+    )
+    audit_store = AuditStore(store, reservation=storage_reservation or runtime_admission)
     audit_service = OwnerAuditService(audit_store, owner_authorizer or DenyAllOwners())
     owner_administration = OwnerAdministration(audit_service, CameraRegistry(store))
     audit_retention = AuditRetentionRuntime(
@@ -80,6 +116,20 @@ def create_app(settings: Settings, *, database: Database | None = None,
             logging.getLogger(__name__).error(Event.STARTUP_FAILED)
             # Lifespan failures must not pass SQLite/config values to servers.
             raise RuntimeError("application startup failed") from None
+        monitoring_task = None
+        if monitoring_runtime is None:
+            # Explicit fail-closed state, never a silently healthy default.
+            application.state.monitoring_state = RuntimeState.UNCONFIGURED
+            logging.getLogger(__name__).warning(Event.MONITORING_UNCONFIGURED)
+        else:
+            await monitoring_runtime.start()
+            application.state.monitoring_state = monitoring_runtime.status.state
+            if monitoring_runtime.bound:
+                runtime_admission.bind(monitoring_runtime)
+            monitoring_task = asyncio.create_task(monitoring_runtime.run())
+        application.state.audit_storage_admitted = (
+            storage_reservation is not None or runtime_admission.bound
+        )
         try:
             await audit_retention.startup_cleanup()
         except Exception:
@@ -96,6 +146,15 @@ def create_app(settings: Settings, *, database: Database | None = None,
             cleanup_task.cancel()
             with suppress(asyncio.CancelledError):
                 await cleanup_task
+            if monitoring_task is not None:
+                monitoring_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await monitoring_task
+            if monitoring_runtime is not None:
+                runtime_admission.bind(None)
+                application.state.audit_storage_admitted = storage_reservation is not None
+                await monitoring_runtime.stop()
+                application.state.monitoring_state = monitoring_runtime.status.state
             application.state.ready = False
             logging.getLogger(__name__).info(Event.STOPPED)
 
@@ -111,6 +170,11 @@ def create_app(settings: Settings, *, database: Database | None = None,
     # assumption: it is false until the Main Server storage policy is bound.
     application.state.audit_storage_admitted = storage_reservation is not None
     application.state.audit_retention = audit_retention
+    # Internal runtime state only; no route exposes it before #6/#10.
+    application.state.monitoring = monitoring_runtime
+    application.state.monitoring_state = (
+        RuntimeState.STARTING if monitoring_runtime is not None else RuntimeState.UNCONFIGURED
+    )
     application.state.owner_administration = owner_administration
     application.state.diagnostic_export_endpoint = diagnostic_export_endpoint
     # Do not include human routers before approved permission enforcement.

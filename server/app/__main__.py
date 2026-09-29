@@ -7,11 +7,12 @@ from app.main import create_app
 from app.settings import ConfigurationError, Settings
 
 
-def run(settings: Settings) -> int:
+def run(settings: Settings, monitoring=None) -> int:
+    """Serve the closed foundation; `monitoring` comes from the deployment."""
     configure_logging(settings.log_level)
     from app.systemd import build_server
     server = build_server(
-        create_app(settings), host=settings.human_host, port=settings.human_port,
+        create_app(settings, monitoring=monitoring), host=settings.human_host, port=settings.human_port,
         server_header=False, date_header=False, access_log=False, log_config=None,
         proxy_headers=False, forwarded_allow_ips="", ws="none",
     )

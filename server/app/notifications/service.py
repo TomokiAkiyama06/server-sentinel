@@ -17,6 +17,10 @@ class NotificationKind(StrEnum):
     CAMERA_TAMPER = "camera_tamper"
     HARDWARE_INTEGRITY_FAILURE = "hardware_integrity_failure"
     RECORDING_HEALTH_FAILURE = "recording_health_failure"
+    # Visible local warnings (NEW_DEVICE/UNVERIFIABLE hardware, unavailable
+    # recording-health verdict). They are never an immediate Slack message.
+    HARDWARE_INTEGRITY_WARNING = "hardware_integrity_warning"
+    RECORDING_HEALTH_WARNING = "recording_health_warning"
     PERSON = "person"
     MOTION = "motion"
     ENTRY = "entry"
@@ -54,21 +58,33 @@ class DailySummary:
     error_count: int
     recording_bytes: int
     storage_state: StorageState
+    # False when no capture/detection pipeline reports into this summary. The
+    # source, agent and observation counts are then shown as unavailable, so a
+    # summary never presents "0 person observations" as a verified absence.
+    pipeline_available: bool = True
 
     def __post_init__(self):
-        if not isinstance(self.storage_state, StorageState) or any(
-            type(value) is not int or not 0 <= value < 2**63
-            for key, value in vars(self).items() if key != "storage_state"
-        ):
+        if (not isinstance(self.storage_state, StorageState)
+                or type(self.pipeline_available) is not bool or any(
+                    type(value) is not int or not 0 <= value < 2**63
+                    for key, value in vars(self).items()
+                    if key not in {"storage_state", "pipeline_available"})):
             raise ValueError("invalid summary aggregate")
 
     def text(self) -> str:
+        if self.pipeline_available:
+            pipeline = (f"Sources online/degraded/offline: {self.sources_online}/"
+                        f"{self.sources_degraded}/{self.sources_offline}\n"
+                        f"Agents online/offline: {self.agents_online}/{self.agents_offline}\n"
+                        f"Person/motion/entry observations: {self.person_count}/"
+                        f"{self.motion_count}/{self.entry_count}\n")
+        else:
+            pipeline = ("Sources: unavailable (no capture pipeline reporting)\n"
+                        "Agents: unavailable\n"
+                        "Person/motion/entry observations: unavailable\n")
         return ("ServerSentinel daily summary\n"
                 f"Monitored seconds: {self.monitored_seconds}\n"
-                f"Sources online/degraded/offline: {self.sources_online}/"
-                f"{self.sources_degraded}/{self.sources_offline}\n"
-                f"Agents online/offline: {self.agents_online}/{self.agents_offline}\n"
-                f"Person/motion/entry observations: {self.person_count}/{self.motion_count}/{self.entry_count}\n"
+                + pipeline +
                 f"Critical events: {self.critical_count}; recordings: {self.recording_count}\n"
                 f"Recording bytes: {self.recording_bytes}; storage: {self.storage_state.value}\n"
                 f"Errors: {self.error_count}")

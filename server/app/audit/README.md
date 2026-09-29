@@ -97,7 +97,10 @@ Server storage admission, which this subsystem consumes rather than defines: it
 never invents a numeric filesystem reserve of its own. Until the Main Server
 binds that policy, `create_app()` installs `UnboundStorageAdmission`, which
 refuses audit writes instead of admitting them against a reserve this process
-cannot verify — the same default-deny posture as `DenyAllOwners`. That state is
+cannot verify — the same default-deny posture as `DenyAllOwners`. When the
+deployment configures monitoring storage, `RuntimeStorageAdmission` binds to the
+running monitoring runtime (`../monitoring/`), whose worker-owned policy admits
+each audit write through commit. That state is
 explicit in `application.state.audit_storage_admitted`, retention health is
 degraded rather than silently healthy, and Owner-only reading stays available. Owner
 operations that already own an admitted reservation, such as the recording

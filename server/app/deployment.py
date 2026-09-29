@@ -1,6 +1,6 @@
 """Validated stable-deployment configuration and launcher."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import argparse
 import json
 import os
@@ -8,6 +8,7 @@ from pathlib import Path
 import re
 import stat
 
+from app.monitoring.config import MonitoringConfiguration, parse_monitoring
 from app.settings import ConfigurationError, Settings
 
 
@@ -151,6 +152,9 @@ class Deployment:
     settings: Settings
     recordings_directory: Path
     audit_directory: Path
+    # Optional monitoring runtime configuration; absent means the storage
+    # policy stays unbound and writes are refused (explicit unconfigured state).
+    monitoring: MonitoringConfiguration | None = field(default=None, repr=False)
 
     @property
     def state_directory(self) -> Path:
@@ -166,7 +170,8 @@ class Deployment:
             "runtime_filesystem_uuid", "service_uid",
             "human_host", "human_port", "log_level",
         }
-        if set(value) != allowed or type(value.get("service_uid")) is not int:
+        if (not allowed <= set(value) or not set(value) <= allowed | {"monitoring"}
+                or type(value.get("service_uid")) is not int):
             raise ConfigurationError("invalid deployment configuration")
         uid = value["service_uid"]
         if uid <= 0:
@@ -233,7 +238,17 @@ class Deployment:
             human_port=value["human_port"], log_level=value["log_level"],
             source_root=code_root,
         )
-        return cls(runtime_root, uid, settings, directories[1], directories[2])
+        monitoring = None
+        if "monitoring" in value:
+            # Module-level lookups stay patchable, and the same UUID resolver is
+            # re-run by the runtime on every storage sample.
+            monitoring = parse_monitoring(
+                value["monitoring"], recordings_directory=directories[1],
+                resolve_device=lambda uuid: _approved_filesystem_device(uuid),
+                root_device=lambda: _operating_system_root_device(),
+                is_mount=lambda path: os.path.ismount(path),
+            )
+        return cls(runtime_root, uid, settings, directories[1], directories[2], monitoring)
 
 
 def main(arguments: list[str] | None = None) -> int:
@@ -254,7 +269,7 @@ def main(arguments: list[str] | None = None) -> int:
         print("ServerSentinel deployment validation passed")
         return 0
     from app.__main__ import run
-    return run(deployment.settings)
+    return run(deployment.settings, deployment.monitoring)
 
 
 if __name__ == "__main__":

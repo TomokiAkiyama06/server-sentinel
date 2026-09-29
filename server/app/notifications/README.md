@@ -64,3 +64,7 @@ is recorded once; no automatic network retries can flood the channel. A crash af
 claim leaves `pending` (uncertain delivery), never a false success. Production
 scheduler, health/presence outbox integration and configured Slack acceptance
 remain pending; transport and DST tests use generated fixtures and no network.
+`../monitoring/` now supplies the durable local sink, the owner-thread timer and
+the integrity/recording-health bridges; configured Slack acceptance remains
+pending. `DailySummary(pipeline_available=False)` renders source, agent and
+observation counts as unavailable instead of zero.

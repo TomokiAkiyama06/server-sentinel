@@ -98,6 +98,56 @@ Keep actual paths, filesystem identity and UID private. A loopback literal is
 mandatory for the human listener; expose it through the separately configured
 trusted private proxy after application authorization is available.
 
+### Optional monitoring section
+
+An optional `monitoring` object configures the Main Server monitoring runtime
+(storage admission, retention, daily summary, hardware integrity and recording
+health). Values below are examples, not defaults:
+
+```json
+"monitoring": {
+  "time_zone": "Asia/Tokyo",
+  "daily_summary_time": "23:00",
+  "slack_webhook_url": "<private incoming webhook, optional>",
+  "storage_limits": {
+    "recording_limit_bytes": 0, "critical_allowance_bytes": 0,
+    "hard_reserve_bytes": 0, "pressure_free_bytes": 0,
+    "recovery_free_bytes": 0, "recovery_allocation_bytes": 0,
+    "write_overhead_bytes": 0, "max_request_bytes": 0, "cleanup_batch_size": 0
+  },
+  "recording_limits": {
+    "pre_roll_bytes": 0, "max_segment_bytes": 0, "max_segment_ms": 0,
+    "max_active_recordings": 0, "max_spool_segments": 0,
+    "max_segments_per_recording": 0
+  },
+  "recording_filesystem": {
+    "filesystem_uuid": "00000000-1111-2222-3333-444444444444",
+    "device": [8, 1],
+    "mount_point": "/srv/example-filesystem"
+  }
+}
+```
+
+`time_zone` is an IANA name and is required when the object is present;
+`daily_summary_time` defaults to 23:00. Slack stays disabled without
+`slack_webhook_url`; keep that value only in this private file. Every storage
+and recording limit must be sized for the deployment (all positive integers,
+`hard_reserve_bytes < pressure_free_bytes < recovery_free_bytes`,
+`recovery_allocation_bytes < recording_limit_bytes`, `cleanup_batch_size` at
+most 1000, `max_segment_bytes` at most `max_request_bytes`); ServerSentinel does
+not guess them. `recording_filesystem` must describe the filesystem that holds
+`<runtime_root>/recordings`: the UUID must resolve to its device, `device` must
+equal its major/minor numbers, and `mount_point` must be a mounted ancestor on
+the same device other than the operating-system root. The runtime re-checks this
+identity on every storage sample and refuses writes, without a fallback, when
+it no longer holds.
+
+Omit all three of `storage_limits`, `recording_limits` and
+`recording_filesystem` to leave storage unconfigured: the service then logs
+`monitoring_storage_unconfigured`, refuses audit/metadata writes and runs no
+monitoring worker. Supplying only some of them, or any invalid value, fails
+`--check` with a value-free message.
+
 ## Install, update, and rollback
 
 Run the separately downloaded installer only after verifying its published
