@@ -17,6 +17,15 @@ class CIWorkflowTests(unittest.TestCase):
             "run: python -m unittest tests.e2e.test_mock_core_harness -v",
             repository,
         )
+        for module in (
+            "tests.e2e.test_agent_ring_scenarios",
+            "tests.e2e.test_agent_storage_scenarios",
+            "tests.e2e.test_retention_scenarios",
+            "tests.e2e.test_notification_fault_scenarios",
+            "tests.e2e.test_no_telemetry_scenarios",
+        ):
+            self.assertIn(f"\n          {module}\n", repository)
+            self.assertTrue((ROOT / (module.replace(".", "/") + ".py")).is_file(), module)
 
 
 if __name__ == "__main__":

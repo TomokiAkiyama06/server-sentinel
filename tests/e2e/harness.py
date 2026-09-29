@@ -1,7 +1,8 @@
 """Deterministic adapters for mock E2E tests.
 
-The harness owns clocks and faults only. Product state transitions remain in
-the production cores exercised by the scenario tests.
+The harness owns clocks, faults, a synthetic filesystem quota and an outbound
+network guard only. Product state transitions remain in the production cores
+exercised by the scenario tests.
 """
 
 from contextlib import nullcontext
@@ -229,3 +230,78 @@ def agent_settings(root: Path, node_id: UUID) -> Settings:
         "clock_offset_limit_seconds": 2, "clock_uncertainty_limit_seconds": 0.5,
         "clock_step_limit_seconds": 0.1,
     }, code_root=root / "code")
+
+
+class SyntheticQuota:
+    """Filesystem-space port: real statvfs shape with a synthetic free budget.
+
+    ``other`` models unrelated consumers of the same filesystem. Only owned
+    ``*.segment`` allocations under ``root`` count as ring usage.
+    """
+
+    def __init__(self, root: Path, capacity: int = 2 * 1024 * 1024 * 1024):
+        self.root, self.capacity, self.other = Path(root), capacity, 0
+
+    def used(self) -> int:
+        return sum(path.stat().st_blocks * 512 for path in self.root.glob("*.segment"))
+
+    def __call__(self, descriptor):
+        actual = os.fstatvfs(descriptor)
+        values = list(actual)
+        values[4] = max(0, (self.capacity - self.used() - self.other) // actual.f_frsize)
+        return os.statvfs_result(values)
+
+
+class OutboundNetworkForbidden(AssertionError):
+    pass
+
+
+class NetworkGuard:
+    """Refuse and record every outbound socket attempt made by any thread.
+
+    Name resolution and connect/send entry points are replaced for the life of
+    the context, so telemetry, crash reporting or an unconfigured webhook would
+    surface as a recorded attempt instead of reaching a network.
+    """
+
+    def __init__(self):
+        self.attempts: list[tuple[str, str | None]] = []
+        self._patches = []
+
+    @staticmethod
+    def _host(name, args):
+        # Socket methods receive the socket first; module functions do not.
+        values = args[1:] if name in {"connect", "connect_ex", "sendto", "sendmsg"} else args
+        for value in values:
+            if isinstance(value, tuple) and value and isinstance(value[0], str):
+                return value[0]
+            if isinstance(value, str):
+                return value
+        return None
+
+    def _refuse(self, name):
+        def refused(*args, **_kwargs):
+            self.attempts.append((name, self._host(name, args)))
+            raise OutboundNetworkForbidden(f"synthetic network guard refused {name}")
+        return refused
+
+    def __enter__(self):
+        import socket
+        from unittest.mock import patch
+
+        targets = (
+            (socket.socket, "connect"), (socket.socket, "connect_ex"),
+            (socket.socket, "sendto"), (socket.socket, "sendmsg"),
+            (socket, "create_connection"), (socket, "getaddrinfo"),
+            (socket, "gethostbyname"),
+        )
+        for owner, name in targets:
+            patcher = patch.object(owner, name, self._refuse(name))
+            patcher.start()
+            self._patches.append(patcher)
+        return self
+
+    def __exit__(self, *_):
+        while self._patches:
+            self._patches.pop().stop()
+        return False

@@ -56,6 +56,17 @@ jobs:
           PYTHONDONTWRITEBYTECODE: '1'
           PYTHONPATH: server:agent:.
         run: python -m unittest tests.e2e.test_mock_core_harness -v
+      - name: Hardware-free mock E2E storage, retention, notification and telemetry scenarios
+        env:
+          PYTHONDONTWRITEBYTECODE: '1'
+          PYTHONPATH: server:agent:.
+        run: >-
+          python -m unittest -v
+          tests.e2e.test_agent_ring_scenarios
+          tests.e2e.test_agent_storage_scenarios
+          tests.e2e.test_retention_scenarios
+          tests.e2e.test_notification_fault_scenarios
+          tests.e2e.test_no_telemetry_scenarios
       - name: Whitespace validation
         run: git diff --check HEAD^ HEAD
 
