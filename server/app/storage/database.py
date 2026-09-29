@@ -37,11 +37,14 @@ class PinnedDatabase:
     ``Database.connect()`` creates a missing file. A long-running reader that
     keeps opening connections after startup (the local UVC capture workers)
     must not create or open a database on whatever filesystem is at the path
-    once the verified recording filesystem disappears or is replaced. Every
-    connection therefore requires the path to still be the same regular file
-    (device and inode) observed by ``pin()`` inside a storage admission, opens
-    it without create (SQLite ``mode=rw``), and re-checks the identity after
-    the open. Until ``pin()`` succeeds every connection is refused.
+    once the verified recording filesystem disappears or is replaced. ``pin()``
+    therefore opens and holds a read-only descriptor to the admitted regular
+    file. While that descriptor is held the file's inode cannot be freed, so an
+    unlinked-and-recreated replacement can never reuse the pinned (device,
+    inode) pair. Every connection requires the pinned file to still be linked
+    and the path to still name that same file, opens it without create (SQLite
+    ``mode=rw``), and re-checks both after the open. Until ``pin()`` succeeds
+    every connection is refused.
     """
 
     def __init__(self, database: Database) -> None:
@@ -50,6 +53,7 @@ class PinnedDatabase:
         self._database = database
         self._lock = threading.Lock()
         self._pinned: tuple[int, int] | None = None
+        self._descriptor: int | None = None
 
     @property
     def path(self) -> Path:
@@ -60,7 +64,7 @@ class PinnedDatabase:
         with self._lock:
             return self._pinned is not None
 
-    def _identity(self) -> tuple[int, int]:
+    def _path_identity(self) -> tuple[int, int]:
         path = self.path
         try:
             if not path.is_absolute():
@@ -72,30 +76,71 @@ class PinnedDatabase:
             raise ValueError("database location is unavailable")
         return info.st_dev, info.st_ino
 
-    def pin(self, admission=None) -> None:
-        """Record the admitted file identity; ``admission`` verifies storage."""
-        with (admission() if admission is not None else nullcontext()):
-            identity = self._identity()
-        with self._lock:
-            self._pinned = identity
+    @staticmethod
+    def _held_identity(descriptor: int) -> tuple[int, int]:
+        try:
+            info = os.fstat(descriptor)
+        except OSError:
+            raise ValueError("database location is unavailable") from None
+        # An unlinked pinned file (lost or replaced mount/file) is refused even
+        # if the path now names some other file.
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink < 1:
+            raise ValueError("database location is unavailable")
+        return info.st_dev, info.st_ino
 
-    def _require(self) -> tuple[int, int]:
+    def pin(self, admission=None) -> None:
+        """Hold the admitted file open; ``admission`` verifies storage."""
+        with (admission() if admission is not None else nullcontext()):
+            if not self.path.is_absolute():
+                raise ValueError("database location is unavailable")
+            try:
+                descriptor = os.open(
+                    self.path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NOCTTY,
+                )
+            except OSError:
+                raise ValueError("database location is unavailable") from None
+            try:
+                identity = self._held_identity(descriptor)
+                if self._path_identity() != identity:
+                    raise ValueError("database location is unavailable")
+            except BaseException:
+                os.close(descriptor)
+                raise
         with self._lock:
-            pinned = self._pinned
-        if pinned is None or self._identity() != pinned:
+            previous = self._descriptor
+            self._pinned, self._descriptor = identity, descriptor
+        if previous is not None:
+            os.close(previous)
+
+    def release(self) -> None:
+        """Drop the pin; later connections are refused until pinned again."""
+        with self._lock:
+            descriptor = self._descriptor
+            self._pinned = self._descriptor = None
+        if descriptor is not None:
+            os.close(descriptor)
+
+    def _verify(self) -> tuple[int, int]:
+        with self._lock:
+            pinned, descriptor = self._pinned, self._descriptor
+            if pinned is None or descriptor is None:
+                raise ValueError("database location is unavailable")
+            # Checked under the lock so a concurrent release() cannot close
+            # (and the process reuse) the descriptor number mid-check.
+            held = self._held_identity(descriptor)
+        if held != pinned or self._path_identity() != pinned:
             raise ValueError("database location is unavailable")
         return pinned
 
     def connect(self) -> sqlite3.Connection:
-        pinned = self._require()
+        self._verify()
         connection = sqlite3.connect(
             "file:" + quote(str(self.path)) + "?mode=rw", uri=True,
             timeout=5, isolation_level=None,
         )
         try:
             # The path could have been swapped between the check and the open.
-            if self._identity() != pinned:
-                raise ValueError("database location is unavailable")
+            self._verify()
             connection.row_factory = sqlite3.Row
             connection.execute("PRAGMA foreign_keys = ON")
         except BaseException:

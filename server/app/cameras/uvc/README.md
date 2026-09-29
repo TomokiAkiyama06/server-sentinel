@@ -97,9 +97,12 @@ in-memory camera transition is still delivered (`recent_health_events()`,
 per-source `camera_state`), `health_persisted` becomes false and the service
 reports `degraded`, because the durable row may still show an earlier state.
 Reads are covered too: the runtime's registry and approval store use a
-`PinnedDatabase` that is pinned (device + inode) under a storage admission at
-start, opens with SQLite `mode=rw` (never creates a file) and refuses a
-missing or replaced file, so a lost mount never yields a fallback database.
+`PinnedDatabase` that is pinned under a storage admission at start by holding
+a read-only descriptor to the admitted file (so an unlinked-and-recreated
+replacement can never reuse its device + inode pair), opens with SQLite
+`mode=rw` (never creates a file) and refuses an unlinked, missing or replaced
+file, so a lost mount never yields a fallback database. `stop()` releases the
+pin.
 A registry read failure while a camera is live closes that capture and
 delivers the offline transition; any poll that raised marks the worker
 `polling_failed` and the service `degraded` until a poll completes.

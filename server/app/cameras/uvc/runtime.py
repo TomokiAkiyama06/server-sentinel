@@ -328,6 +328,14 @@ class LocalUvcRuntime:
                     self.adapter.close()
                 except Exception:
                     failed = True
+            release = getattr(self.registry.database, "release", None)
+            if callable(release):
+                # Drop the held database pin; a worker that outlived the join
+                # bound then fails closed instead of reading storage.
+                try:
+                    release()
+                except Exception:
+                    failed = True
             for source_id, state in tuple(self._sources.items()):
                 if state is not SourceRuntimeState.REJECTED:
                     self._sources[source_id] = SourceRuntimeState.STOPPED

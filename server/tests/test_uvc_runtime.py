@@ -11,6 +11,7 @@ import json
 import logging
 import os
 from pathlib import Path
+import stat
 import subprocess
 import sys
 import tempfile
@@ -852,6 +853,48 @@ class ApplicationWiringTests(unittest.IsolatedAsyncioTestCase):
         os.replace(moved, path)
         with closing(pinned.connect()) as connection:
             self.assertEqual(1, len(connection.execute("SELECT id FROM camera_sources").fetchall()))
+
+    def test_pinned_database_refuses_replacement_with_reused_inode(self):
+        # An unlinked-and-recreated file can get the same (device, inode) pair
+        # from the allocator. Simulate that reuse deterministically: the path
+        # now reports the pinned identity, but it names a replacement file.
+        database, _source = self.migrated_source()
+        pinned = PinnedDatabase(database)
+        self.addCleanup(pinned.release)
+        pinned.pin(ToggleAdmission())
+        path = database.path
+        original = os.stat(path, follow_symlinks=False)
+        os.unlink(path)
+        with closing(Database(path).connect()) as connection:
+            migrate(connection, APPLICATION_MIGRATIONS)
+        real_stat = os.stat
+
+        def reused_stat(target, *args, **kwargs):
+            info = real_stat(target, *args, **kwargs)
+            if os.fspath(target) != os.fspath(path):
+                return info
+            fields = list(info)
+            fields[stat.ST_INO], fields[stat.ST_DEV] = original.st_ino, original.st_dev
+            return os.stat_result(fields)
+
+        with patch("os.stat", reused_stat):
+            self.assertEqual(original.st_ino, os.stat(path).st_ino)
+            with self.assertRaises(ValueError):
+                pinned.connect()
+        # A renamed-away and restored pinned file is still the same file.
+        repinned = PinnedDatabase(Database(path))
+        self.addCleanup(repinned.release)
+        repinned.pin(ToggleAdmission())
+        moved = path.with_name("moved.sqlite")
+        os.rename(path, moved)
+        with self.assertRaises(ValueError):
+            repinned.connect()
+        os.replace(moved, path)
+        with closing(repinned.connect()) as connection:
+            connection.execute("SELECT 1 FROM camera_sources").fetchall()
+        repinned.release()
+        with self.assertRaises(ValueError):
+            repinned.connect()
 
     async def test_lost_database_file_after_start_is_not_recreated(self):
         # After startup the verified database disappears (lost mount): the
