@@ -36,6 +36,41 @@ human dashboard listener behind the Owner boundary — never by the capture
 ingest listener — so that an invited `live:view` / `recordings:view` principal
 and a capture-node credential cannot read, alter, or delete audit records.
 
+Human-access administration runs through `AccessAdministration`, which wraps
+`OwnerAuditService.execute_transactional()` around the `AccessStore` `*_on`
+mutations: principal invitation (`invite_principal`), invitation issue
+(`issue_principal_invitation`), `live:view` / `recordings:view` grant change
+(`change_principal_permissions`), single-credential revocation
+(`revoke_principal_credential`) and principal revocation (`revoke_principal`).
+Each commits in the same SQLite transaction as its record, a non-Owner
+(including an invited `live:view` / `recordings:view` principal or a
+capture-node credential) is refused with a `denied` record and nothing runs,
+and the plain `AccessStore` wrappers refuse with `UnauditedAccessWriteError`
+outside explicit fixture use. Invitation redemption
+(`redeem_principal_invitation`) is not an Owner operation: `AccessStore`
+appends its record on the redemption transaction itself, admitted through the
+audit store's reservation, so an audit failure leaves the invitation unredeemed.
+A rejected redemption records nothing, so unauthenticated guessing cannot grow
+the audit table. When a matched redemption's audit append or commit fails, the
+rolled-back outcome is counted in `AccessStore`'s own `audit_delivery_failed` /
+`undelivered_audit_records` health rather than appended separately. The target is always the principal's application UUID;
+external identity, display name, invitation secret, credential identifier and
+public key never reach the log.
+
+`PairingLedger` in `app/cameras/remote_agent/pairing.py` requires an
+`AuditStore` on the same database and records
+`approve_capture_node_enrollment`, `redeem_capture_node_enrollment`,
+`activate_capture_node_credential` and `revoke_capture_node_pairing` on the
+same transaction as each ledger change, targeting only the node's logical
+UUID. Owner-only approval and revocation record `denied` for a refused actor
+without running. A redemption that matches no pending enrollment (unknown
+enrollment, wrong code or wrong key) records nothing; an expiry records one
+`failed` outcome because a pending enrollment expires only once. Pairing codes,
+their digests, enrollment identities and key/serial digests are never
+recorded. An outcome that cannot be written outside a committed mutation is
+counted in the ledger's own `audit_delivery_failed` /
+`undelivered_audit_records` health.
+
 Hardware baseline approval runs through
 `OwnerAdministration.approve_integrity_baseline()`, which commits the Issue #23
 integrity store's new baseline and its `approve_hardware_baseline` record on
@@ -97,7 +132,10 @@ Server storage admission, which this subsystem consumes rather than defines: it
 never invents a numeric filesystem reserve of its own. Until the Main Server
 binds that policy, `create_app()` installs `UnboundStorageAdmission`, which
 refuses audit writes instead of admitting them against a reserve this process
-cannot verify — the same default-deny posture as `DenyAllOwners`. That state is
+cannot verify — the same default-deny posture as `DenyAllOwners`. When the
+deployment configures monitoring storage, `RuntimeStorageAdmission` binds to the
+running monitoring runtime (`../monitoring/`), whose worker-owned policy admits
+each audit write through commit. That state is
 explicit in `application.state.audit_storage_admitted`, retention health is
 degraded rather than silently healthy, and Owner-only reading stays available. Owner
 operations that already own an admitted reservation, such as the recording

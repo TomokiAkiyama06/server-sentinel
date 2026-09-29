@@ -91,6 +91,14 @@ checks both positive/negative results, source/profile independence, hysteresis,
 execution failure/stop, late-result rejection, immediate invalidation of an
 already published conclusion on stop/failure/recovery/incomplete batch, and
 scheduler unknown propagation.
+`server/tests/test_media_quality_continuity.py` drives the real
+`SourcePipeline` (with synthetic packets and adapters) together with its
+`InferenceSampler`, this gate and `InferenceScheduler`. While person quality is
+dark, blurred, clipped, occluded, too small, missing context, recovering, or the
+detector fails/stops, every packet still reaches the recording and live-viewer
+adapters with healthy path status, and the person result stays `unknown`,
+never `absent`. This is composition evidence for the core modules; it is not a
+production worker wiring or real codec/camera verification.
 The calibration in tests is only for those synthetic fixtures. Real lighting,
 physical camera/profile thresholds, and their acceptance remain `MANUAL_TEST.md`
 section L and the hardware hardening Issues.

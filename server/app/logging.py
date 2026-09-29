@@ -14,6 +14,10 @@ class Event(StrEnum):
     STOPPED = "application_stopped"
     STARTUP_FAILED = "application_startup_failed"
     AUDIT_RETENTION_DEGRADED = "audit_retention_degraded"
+    MONITORING_STARTED = "monitoring_started"
+    MONITORING_UNCONFIGURED = "monitoring_storage_unconfigured"
+    MONITORING_STARTUP_FAILED = "monitoring_startup_failed"
+    MONITORING_DEGRADED = "monitoring_degraded"
     REQUEST_DENIED = "request_denied"
     UNSTRUCTURED = "unstructured_redacted"
 

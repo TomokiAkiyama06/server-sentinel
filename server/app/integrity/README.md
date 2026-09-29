@@ -85,4 +85,6 @@ that cleanup never changes the approved baseline, current status or fault outbox
 Tests only read generated procfs/sysfs fixtures in temporary directories and
 inject command output. They never inspect the test runner's real inventory.
 Actual probes/permissions/substitution/notifications remain unchecked in
-`MANUAL_TEST.md` S. Recording self-tests belong in `../media/health/`.
+`MANUAL_TEST.md` S. Recording self-tests belong in `../media/health/`. `../monitoring/` runs the
+startup and 24-hour coordinator and the durable #21 bridge in the application
+lifespan when monitoring storage is configured.

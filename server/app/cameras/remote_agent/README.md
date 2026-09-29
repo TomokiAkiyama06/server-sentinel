@@ -13,6 +13,12 @@ issuer, key generation, CSR parser, or credential-file writer. Those adapters
 remain separately reviewed work; code input is never accepted by a command line,
 environment, URL, or this module's logs.
 
+The ledger requires an `AuditStore` on the same database. Approval, redemption,
+activation and revocation commit together with their security audit record,
+which names only the node's logical UUID; a refused Owner-only call records
+`denied` and runs nothing, and unmatched redemption attempts record nothing.
+See `server/app/audit/README.md`.
+
 The deployment injects the verifier key from a protected secret boundary. A
 restart gets a fresh epoch and rejects all old pending approvals rather than
 reusing monotonic-clock state. The ledger's `admits` result is only a narrow

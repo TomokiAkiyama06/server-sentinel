@@ -472,7 +472,9 @@ class PresenceTests(unittest.TestCase):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         settings = Settings(Path(directory.name))
-        application = create_app(settings)
+        # Migrations are metadata writes; a synthetic admission stands in for
+        # the bound Main Server storage policy.
+        application = create_app(settings, storage_reservation=nullcontext)
 
         async def start():
             async with application.router.lifespan_context(application):

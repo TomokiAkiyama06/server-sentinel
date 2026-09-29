@@ -217,7 +217,10 @@ daily counts/duration/storage state, never thumbnails, source names, hardware
 identifiers or arbitrary event text. It is disabled without deployment
 configuration. Person/motion/entry and ordinary camera-offline observations do not
 generate immediate Slack messages by default. Local fault reporting remains
-independent of Slack delivery; production durable event integration is pending.
+independent of Slack delivery: the Main Server runtime stores each fault or
+notification locally as fixed kind/time/delivery-state values only (no message
+text, media or hardware identifiers) and removes that history after the shared
+90-day audit-retention period.
 
 ## Diagnostics
 
