@@ -604,8 +604,9 @@ source flow `degraded`, including pressure or a transient refusal on a
 source's first unit before anything is committed; an observed refused attempt refreshes source activity without advancing continuity, so sustained pressure stays `degraded` rather than `interrupted`. A closed or stale session makes it `interrupted`, and node authorization failing at any check (heartbeat, media, or the ingest queue's own recheck) invalidates the session grant, while a source-only refusal does not. Gap
 events are bounded per source and coalesce into an unknown-extent event rather
 than being dropped. Flow continuity is not camera health or node health (§5.8).
-Tracked nodes and sources are bounded by the active-source limit (§3.4); that
-limit counts active sources, so durable deactivation or replacement of one
+Tracked sources are bounded by the active-source limit (§3.4); tracked node
+sessions are hard-bounded separately, so live source-less node sessions never
+consume the active-source allowance. The active-source limit counts active sources, so durable deactivation or replacement of one
 source releases its slot (returning its undrained gap events to the caller)
 without discarding the node's other flows. A node that owns no tracked source
 and whose session is closed, invalidated or stale does not keep a slot.

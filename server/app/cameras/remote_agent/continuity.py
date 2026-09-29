@@ -73,15 +73,23 @@ class SourceFlow(str, Enum):
 
 @dataclass(frozen=True)
 class ContinuityLimits:
-    """Deployment-selected bounds; this module supplies no network defaults."""
+    """Deployment-selected bounds; this module supplies no network defaults.
+
+    ``maximum_sources`` is the active-source limit (MVP default four) and
+    bounds tracked sources only.  ``maximum_nodes`` separately hard-bounds
+    tracked node sessions (memory only, like the ingest rate-window table),
+    so live source-less node sessions never consume the active-source
+    allowance.
+    """
 
     maximum_sources: int
     maximum_pending_gaps_per_source: int
     stale_after_ns: int
+    maximum_nodes: int = 64
 
     def __post_init__(self) -> None:
         values = (self.maximum_sources, self.maximum_pending_gaps_per_source,
-                  self.stale_after_ns)
+                  self.stale_after_ns, self.maximum_nodes)
         if any(type(value) is not int or value <= 0 for value in values):
             raise ValueError("continuity limits must be positive integers")
 
@@ -182,9 +190,10 @@ class _Node:
 class ContinuityTracker:
     """Bounded per-source continuity in front of an ``AgentIngestQueue``.
 
-    The number of tracked nodes and sources is capped by ``maximum_sources``
-    (the MVP default active-source limit is four), so an authenticated but
-    misbehaving node cannot grow Main Server memory by inventing sources.
+    Tracked sources are capped by ``maximum_sources`` (the MVP default
+    active-source limit is four), so an authenticated but misbehaving node
+    cannot grow Main Server memory by inventing sources; tracked node
+    sessions are separately capped by ``maximum_nodes``.
     The ingest queue is called while this tracker's lock is held; neither the
     queue nor the injected authorizer may call back into the tracker.
     """
@@ -227,9 +236,9 @@ class ContinuityTracker:
         with self._lock:
             node = self._nodes.get(node_id)
             if node is None:
-                if len(self._nodes) >= self.limits.maximum_sources:
+                if len(self._nodes) >= self.limits.maximum_nodes:
                     self._retire_unused_nodes(now)
-                if len(self._nodes) >= self.limits.maximum_sources:
+                if len(self._nodes) >= self.limits.maximum_nodes:
                     raise PermissionError("agent node capacity reached")
                 node = self._nodes[node_id] = _Node(0, False, now)
             self._generation += 1
@@ -242,7 +251,7 @@ class ContinuityTracker:
         """Free node slots held by nodes that own no tracked source.
 
         Only a node without sources whose session is closed, invalidated or
-        stale is retired, so node records cannot exhaust the active-source
+        stale is retired, so node records cannot exhaust the node-session
         bound after sources were deactivated.  A live session (fresh
         heartbeat) keeps its slot.  Generations are tracker-wide and never
         reissued, so a retired node's old grant can never become current.

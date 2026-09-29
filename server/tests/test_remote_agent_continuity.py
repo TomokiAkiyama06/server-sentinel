@@ -72,12 +72,12 @@ class Clock:
 
 
 def build(*, authorizer=None, queued=4, message_bytes=8, sources=4, pending=4,
-          stale=100, rate=1000):
+          stale=100, rate=1000, nodes=64):
     authorizer = authorizer or Authorizer()
     clock = Clock()
     ingest = AgentIngestQueue(IngestLimits(message_bytes, queued, queued * message_bytes,
                                            rate, 10 ** 12), authorizer, clock_ns=clock)
-    tracker = ContinuityTracker(ContinuityLimits(sources, pending, stale), authorizer,
+    tracker = ContinuityTracker(ContinuityLimits(sources, pending, stale, nodes), authorizer,
                                 ingest, clock_ns=clock)
     return tracker, ingest, clock, authorizer
 
@@ -518,8 +518,11 @@ class ContinuityTrackerTests(unittest.TestCase):
                                                  b"v").outcome)
             self.assertEqual(count, len(tracker.snapshot()))
             self.assertEqual(count, ingest.snapshot().queued_messages)
-        with self.assertRaises(PermissionError):
-            tracker.open_session(NODES[4])
+        # A fifth node may hold a session, but not a fifth active source.
+        fifth = tracker.open_session(NODES[4])
+        self.assertEqual("source_capacity",
+                         tracker.receive(fifth, unit(0, source=SOURCES[4]), b"v").reason)
+        self.assertEqual(4, len(tracker.snapshot()))
         authorizer = Authorizer({(NODE, s) for s in SOURCES})
         tracker, _, _, _ = build(authorizer=authorizer, queued=8)
         session = tracker.open_session(NODE)
@@ -554,7 +557,8 @@ class ContinuityTrackerTests(unittest.TestCase):
 
     def test_nodes_without_sources_do_not_exhaust_active_source_capacity(self):
         pairs = {(NODES[i], SOURCES[i]) for i in range(5)}
-        tracker, _, clock, _ = build(authorizer=Authorizer(pairs), queued=8, stale=10)
+        tracker, _, clock, _ = build(authorizer=Authorizer(pairs), queued=8, stale=10,
+                                     nodes=4)
         sessions = [tracker.open_session(NODES[i]) for i in range(4)]
         for i, session in enumerate(sessions[:2]):
             tracker.receive(session, unit(0, source=SOURCES[i]), b"v")
@@ -578,6 +582,22 @@ class ContinuityTrackerTests(unittest.TestCase):
         self.assertTrue(tracker.heartbeat(renewed))
         self.assertEqual({SOURCES[1], SOURCES[4]},
                          {item.source_id for item in tracker.snapshot()})
+
+    def test_live_source_less_sessions_do_not_consume_active_source_capacity(self):
+        pairs = {(NODES[i], SOURCES[i]) for i in range(5)}
+        tracker, _, _, _ = build(authorizer=Authorizer(pairs), queued=8)
+        sessions = [tracker.open_session(NODES[i]) for i in range(4)]
+        self.assertTrue(all(tracker.heartbeat(session) for session in sessions))
+        fifth = tracker.open_session(NODES[4])
+        self.assertEqual(DeliveryOutcome.ACCEPTED,
+                         tracker.receive(fifth, unit(0, source=SOURCES[4]), b"v").outcome)
+        self.assertTrue(all(tracker.heartbeat(session) for session in sessions))
+        # The node-session table is still hard-bounded on its own.
+        capped, _, _, _ = build(authorizer=Authorizer(pairs), nodes=2)
+        capped.open_session(NODES[0])
+        capped.open_session(NODES[1])
+        with self.assertRaises(PermissionError):
+            capped.open_session(NODES[2])
 
     def test_forgotten_node_old_grant_never_becomes_current_again(self):
         tracker, ingest, _, authorizer = build()
@@ -780,7 +800,8 @@ class ContinuityTrackerTests(unittest.TestCase):
         self.assertEqual(32, outcomes.count(DeliveryOutcome.ACCEPTED))
 
     def test_invalid_inputs_and_limits_are_rejected(self):
-        for bad in ((0, 1, 1), (1, 0, 1), (1, 1, 0), (True, 1, 1)):
+        for bad in ((0, 1, 1), (1, 0, 1), (1, 1, 0), (True, 1, 1), (1, 1, 1, 0),
+                    (1, 1, 1, True)):
             with self.assertRaises(ValueError):
                 ContinuityLimits(*bad)
         for bad in ((SOURCE, -1, 0, 0), (SOURCE, 0, 2 ** 63, 0), ("x", 0, 0, 0),
