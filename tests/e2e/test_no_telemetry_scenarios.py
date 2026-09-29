@@ -75,7 +75,10 @@ SCENARIO_MODULES = (
 # socket opened and closed during import leaves nothing for the guard's
 # open-descriptor scan. So imports are replayed in a fresh interpreter whose
 # very first statement installs a refusing, recording audit hook; only the
-# standard library is loaded before it.
+# standard library is loaded before it. The report itself is an exit callback
+# registered before any import: atexit runs callbacks last-in first-out, so
+# every shutdown flush an imported module registers (telemetry, crash reports)
+# has already run under the still-active hook when the report is written.
 IMPORT_BOOTSTRAP = r"""
 import sys
 EVENTS = %(events)r
@@ -86,10 +89,16 @@ def hook(event, args):
         raise PermissionError("guarded import refused " + event)
 if %(guard_first)r:
     sys.addaudithook(hook)
-import importlib, json
+import atexit, importlib, json
 preloaded = sorted(name for name in sys.modules
                    if name.split(".")[0] in {"app", "media_capture_agent", "tests"})
 failed = []
+imported = []
+def report():
+    reporting = sorted(set(%(reporting)r) & set(sys.modules))
+    print(json.dumps({"attempts": attempts, "failed": failed, "preloaded": preloaded,
+                      "reporting": reporting, "imported": imported}), flush=True)
+atexit.register(report)
 for name in %(modules)r:
     try:
         importlib.import_module(name)
@@ -97,9 +106,7 @@ for name in %(modules)r:
         failed.append([name, type(error).__name__])
 if not %(guard_first)r:
     sys.addaudithook(hook)
-reporting = sorted(set(%(reporting)r) & set(sys.modules))
-print(json.dumps({"attempts": attempts, "failed": failed, "preloaded": preloaded,
-                  "reporting": reporting}))
+imported.append(True)
 """
 
 
@@ -123,7 +130,15 @@ def guarded_import(modules, *, extra_path=None, guard_first=True):
         env=environment, capture_output=True, text=True, timeout=120, check=False)
     if completed.returncode != 0:
         raise AssertionError(f"guarded import bootstrap failed: {completed.stderr}")
-    return json.loads(completed.stdout.splitlines()[-1])
+    lines = completed.stdout.splitlines()
+    if not lines:
+        # An exit path that skipped the report (os._exit, a fatal signal in a
+        # callback) is a failure, never an empty-attempt result.
+        raise AssertionError(f"guarded import wrote no report: {completed.stderr}")
+    result = json.loads(lines[-1])
+    if result.pop("imported") != [True]:
+        raise AssertionError(f"guarded import did not finish: {completed.stderr}")
+    return result
 
 
 class NoTelemetryScenarios(unittest.TestCase):
@@ -403,10 +418,49 @@ class NoTelemetryScenarios(unittest.TestCase):
                               guard_first=False)
         self.assertEqual([], late["attempts"])
 
+    def test_guarded_import_sees_a_connection_made_by_an_exit_callback(self):
+        # A module that only registers a shutdown flush at import time: the
+        # connection happens after the import loop, in an atexit callback that
+        # swallows the refusal, so the process still exits successfully.
+        package = self.root / "exit_beacon"
+        package.mkdir()
+        (package / "synthetic_exit_beacon.py").write_text(
+            "import atexit, socket\n"
+            "def flush():\n"
+            "    try:\n"
+            "        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as beacon:\n"
+            "            beacon.connect(('127.0.0.1', 9))\n"
+            "    except Exception:\n"
+            "        pass\n"
+            "atexit.register(flush)\n",
+            encoding="ascii")
+        for guard_first in (True, False):
+            with self.subTest(guard_first=guard_first):
+                guarded = guarded_import(["synthetic_exit_beacon"], extra_path=package,
+                                         guard_first=guard_first)
+                self.assertEqual(["socket.connect"], guarded["attempts"])
+                self.assertEqual([], guarded["failed"])
+
+    def test_guarded_import_fails_when_an_exit_path_skips_the_report(self):
+        package = self.root / "abrupt_exit"
+        package.mkdir()
+        (package / "synthetic_abrupt_exit.py").write_text(
+            "import atexit, os\n"
+            "atexit.register(os._exit, 0)\n",
+            encoding="ascii")
+        with self.assertRaises(AssertionError):
+            guarded_import(["synthetic_abrupt_exit"], extra_path=package)
+
     def test_normal_and_error_paths_make_no_outbound_connection(self):
+        import atexit
+
+        # A shutdown flush registered while the paths run would execute after
+        # the guard is gone, so the paths must leave no new exit callback.
+        registered = atexit._ncallbacks()
         with NetworkGuard() as guard:
             self.run_main_paths()
             self.run_agent_paths()
+        self.assertEqual(registered, atexit._ncallbacks())
         self.assertEqual([], guard.attempts)
         self.assertEqual(set(), REPORTING_MODULES & set(sys.modules))
 
