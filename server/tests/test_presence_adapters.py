@@ -93,8 +93,8 @@ class PresenceFixture:
         self.presence = PresenceService(self.database, access=MockAccess(), evidence=evidence,
                                         notifications=notifications, reservation=reservation,
                                         detection=lambda: True, storage_status=lambda: True)
-        self.outbox = TimelineOutbox(self.presence, capacity=8)
         self.clock = Clock()
+        self.outbox = TimelineOutbox(self.presence, clock=self.clock, capacity=8)
 
     def history(self, context="recordings"):
         return self.presence.history(context, received_from=NOW - timedelta(days=1),
@@ -129,8 +129,12 @@ class EntranceAdapterTests(PresenceFixture, TestCase):
         self.adapter = EntranceObservationAdapter(self.outbox, owner_presence_validity=VALIDITY,
                                                   maximum_source_latency=LATENCY)
 
-    def submit(self, *crossings, quality=DetectionQuality.SUFFICIENT):
+    def submit(self, *crossings, quality=DetectionQuality.SUFFICIENT, flush_at=None):
+        # The main-host receipt is stamped when presence writes the fact.
+        self.clock.at = max(item.received_at for item in crossings)
         self.assertTrue(self.adapter.submit(TrackUpdate((), crossings, quality)))
+        if flush_at is not None:
+            self.clock.at = flush_at
         return self.outbox.flush()
 
     def state(self, now=NOW):
@@ -185,9 +189,9 @@ class EntranceAdapterTests(PresenceFixture, TestCase):
         self.assertNeutral(self.history())
 
     def test_unknown_quality_update_writes_nothing(self):
-        self.assertEqual(self.adapter.observations(TrackUpdate((), (), DetectionQuality.UNKNOWN)), ())
+        self.assertEqual(self.adapter.crossings(TrackUpdate((), (), DetectionQuality.UNKNOWN)), ())
         with self.assertRaises(ValueError):
-            self.adapter.observations(TrackUpdate((), (crossing(CrossingKind.ANONYMOUS_ENTRY),),
+            self.adapter.crossings(TrackUpdate((), (crossing(CrossingKind.ANONYMOUS_ENTRY),),
                                                   DetectionQuality.UNKNOWN))
         self.assertEqual(self.outbox.flush().recorded, 0)
         self.assertEqual(self.history()["items"], [])
@@ -202,6 +206,61 @@ class EntranceAdapterTests(PresenceFixture, TestCase):
         self.assertEqual(self.outbox.flush().pending, 0)
         self.submit(event)
         self.assertEqual(len(self.history()["items"]), 1)
+        self.assertEqual(self.state(), "PRESENT")
+        # A replay stamped later is still the same fact, not an identity conflict.
+        state = self.submit(event, flush_at=NOW + timedelta(minutes=5))
+        self.assertEqual((state.pending, state.rejected), (0, 0))
+        self.assertEqual(len(self.history()["items"]), 1)
+
+    def test_crossing_held_past_latency_bound_cannot_confirm_presence_late(self):
+        self.refuse = True
+        self.submit(crossing(CrossingKind.OWNER_ENTRY))
+        self.refuse = False
+        later = NOW + LATENCY + timedelta(seconds=1)
+        self.clock.at = later
+        self.assertEqual(self.outbox.flush().recorded, 1)
+        self.assertEqual(self.state(later), "UNKNOWN")
+        item, = self.history()["items"]
+        self.assertFalse(item["confirmed"])
+
+    def test_facts_stamped_later_elsewhere_never_make_a_staged_owner_crossing_untrusted(self):
+        # One main clock for 1-4 sources: a camera health fact reported while
+        # the entrance frame was still being processed, and a critical
+        # observation recorded directly, are both written before the crossing.
+        health = HealthTimeline(self.outbox)
+        recorder = CriticalTimelineRecorder(self.outbox, maximum_source_latency=LATENCY)
+        self.clock.at = NOW + timedelta(milliseconds=300)
+        health.camera(HealthEvent(SOURCE, CameraState.DEGRADED, "synthetic"))
+        self.assertEqual(self.outbox.flush().recorded, 1)
+        self.assertTrue(self.adapter.submit(TrackUpdate((), (crossing(CrossingKind.OWNER_ENTRY),),
+                                                        DetectionQuality.SUFFICIENT)))
+        self.clock.at = NOW + timedelta(milliseconds=600)
+        recorder(critical(at=NOW + timedelta(milliseconds=500), source=UUID(int=909)))
+        self.clock.at = NOW + timedelta(milliseconds=900)
+        self.assertEqual(self.outbox.flush().recorded, 2)
+        self.assertEqual(self.state(self.clock.at), "PRESENT")
+        page = self.history()
+        self.assertFalse(page["ordering_degraded"])
+        self.assertTrue(all(item["clock_trusted"] for item in page["items"]))
+
+    def test_unavailable_database_location_keeps_fact_staged(self):
+        missing = Path(tempfile.gettempdir()) / f"absent-{uuid4()}" / "synthetic.sqlite3"
+        self.presence.database = Database(missing)
+        self.submit(crossing(CrossingKind.OWNER_ENTRY))
+        state = self.outbox.state()
+        self.assertEqual((state.pending, state.rejected), (1, 0))
+        self.presence.database = self.database
+        self.assertEqual(self.outbox.flush().recorded, 1)
+        self.assertEqual(self.state(), "PRESENT")
+
+    def test_contract_rejection_is_counted_and_does_not_block_later_facts(self):
+        taken = crossing(CrossingKind.ANONYMOUS_ENTRY)
+        self.submit(taken)
+        conflicting = replace(taken, kind=CrossingKind.ANONYMOUS_EXIT)
+        self.submit(conflicting, crossing(CrossingKind.OWNER_ENTRY))
+        state = self.outbox.state()
+        self.assertEqual((state.pending, state.rejected, state.recorded), (0, 1, 2))
+        self.assertTrue(state.degraded)
         self.assertEqual(self.state(), "PRESENT")
 
 
@@ -253,11 +312,13 @@ class OwnerTrackerEndToEndTests(PresenceFixture, TestCase):
         self.walk()
         self.assertEqual(self.presence.snapshot(now=NOW, clock_trusted=True)["state"], "PRESENT")
         movement_at = NOW + timedelta(seconds=30)
+        self.clock.at = movement_at
         delivery = CriticalDelivery(capacity=2, recorder=CriticalTimelineRecorder(
-            self.presence, clock=Clock(movement_at), maximum_source_latency=LATENCY, capacity=4))
+            self.outbox, maximum_source_latency=LATENCY))
         self.assertTrue(delivery.submit((critical(at=movement_at),)).available)
         offline_at = NOW + timedelta(seconds=45)
-        health = HealthTimeline(self.outbox, clock=Clock(offline_at))
+        self.clock.at = offline_at
+        health = HealthTimeline(self.outbox)
         health.camera(HealthEvent(SOURCE, CameraState.OFFLINE, "device_disconnected"))
         self.outbox.flush()
         # Critical delivery runs while the Owner is PRESENT.
@@ -279,24 +340,51 @@ class OwnerTrackerEndToEndTests(PresenceFixture, TestCase):
 class CriticalRecorderTests(PresenceFixture, TestCase):
     def setUp(self):
         self.make_presence()
-        self.recorder = CriticalTimelineRecorder(self.presence, clock=self.clock,
-                                                 maximum_source_latency=LATENCY, capacity=2)
+        self.recorder = CriticalTimelineRecorder(self.outbox, maximum_source_latency=LATENCY)
 
-    def test_retry_after_refusal_reuses_receipt_and_queues_work_once(self):
+    def test_retry_after_refusal_is_stamped_at_write_and_queues_work_once(self):
         delivery = CriticalDelivery(capacity=2, recorder=self.recorder)
         item = critical(CriticalKind.CAMERA_TAMPER)
         self.refuse = True
         self.assertFalse(delivery.submit((item,)).available)
         self.refuse = False
-        self.clock.at = NOW + timedelta(seconds=5)
+        self.clock.at = NOW + timedelta(seconds=1)
         self.assertEqual(delivery.retry().accepted, (item.identifier,))
         stored, = self.history()["items"]
-        self.assertEqual(stored["received_at"], NOW.isoformat(timespec="microseconds"))
+        # The refused write was rolled back, so presence received it at retry.
+        self.assertEqual(stored["received_at"], self.clock.at.isoformat(timespec="microseconds"))
         self.assertTrue(stored["confirmed"])
-        # A second delivery of the same UUID stays a duplicate.
+        # A second delivery of the same UUID, stamped later, stays a duplicate.
+        self.clock.at = NOW + timedelta(minutes=5)
         self.recorder(item)
         self.presence.dispatch_pending()
         self.assertEqual((len(self.evidence), len(self.notifications)), (1, 1))
+
+    def test_replay_after_restart_or_committed_failure_is_a_duplicate_not_a_stuck_conflict(self):
+        item = critical()
+        presence = self.presence
+
+        class CommitThenFail:
+            """The write commits, then the caller sees a failure (e.g. a lost ack)."""
+            def record(self, observation, **options):
+                presence.record(observation, **options)
+                raise RuntimeError("synthetic failure after commit")
+
+        failing = TimelineOutbox(CommitThenFail(), clock=self.clock, capacity=1)
+        delivery = CriticalDelivery(capacity=2, recorder=CriticalTimelineRecorder(
+            failing, maximum_source_latency=LATENCY))
+        self.assertFalse(delivery.submit((item,)).available)
+        # A restarted process has no in-memory receipt; the durable row decides.
+        self.clock.at = NOW + timedelta(hours=1)
+        restarted = CriticalDelivery(capacity=2, recorder=CriticalTimelineRecorder(
+            self.outbox, maximum_source_latency=LATENCY))
+        self.assertTrue(restarted.submit((item,)).available)
+        self.assertEqual(len(self.history()["items"]), 1)
+        self.presence.dispatch_pending()
+        self.assertEqual((len(self.evidence), len(self.notifications)), (1, 1))
+        # A different fact reusing the UUID is still an identity conflict.
+        with self.assertRaisesRegex(ValueError, "identity conflict"):
+            self.recorder(replace(item, kind=CriticalKind.CAMERA_TAMPER))
 
     def test_untrusted_clock_or_stale_sample_keeps_confirmation_but_marks_timing(self):
         self.clock.trusted = False
@@ -310,23 +398,22 @@ class CriticalRecorderTests(PresenceFixture, TestCase):
         self.presence.dispatch_pending()
         self.assertEqual(len(self.evidence), 2)
 
-    def test_unconfirmed_or_insufficient_quality_is_refused_and_memo_is_bounded(self):
+    def test_unconfirmed_or_insufficient_quality_is_refused_and_storage_refusal_raises(self):
         for item in (critical(confirmed=False), critical(quality=DetectionQuality.DEGRADED)):
             with self.assertRaises(ValueError):
                 self.recorder(item)
         self.refuse = True
-        for _ in range(2):
-            with self.assertRaises(RuntimeError):
-                self.recorder(critical())
-        with self.assertRaises(BufferError):
+        with self.assertRaises(RuntimeError):
             self.recorder(critical())
         self.assertEqual(self.history()["items"], [])
+        with self.assertRaises(ValueError):
+            CriticalTimelineRecorder(self.presence, maximum_source_latency=LATENCY)
 
 
 class HealthTimelineTests(PresenceFixture, TestCase):
     def setUp(self):
         self.make_presence()
-        self.health = HealthTimeline(self.outbox, clock=self.clock)
+        self.health = HealthTimeline(self.outbox)
 
     def test_every_producer_state_maps_to_a_neutral_fact(self):
         other = UUID(int=77)
@@ -384,20 +471,31 @@ class HealthTimelineTests(PresenceFixture, TestCase):
             with self.assertRaises(ValueError):
                 call()
         with self.assertRaises(ValueError):
-            self.outbox.stage(replace(critical(), confirmed=True))
-        self.assertEqual(self.outbox.state().pending, 0)
+            self.outbox.stage(uuid4(), replace(critical(), confirmed=True))
+        # Critical work is recorded synchronously and is never deferred here.
+        recorder = CriticalTimelineRecorder(self.outbox, maximum_source_latency=LATENCY)
+        item = critical()
         with self.assertRaises(ValueError):
-            TimelineOutbox(self.presence, capacity=0)
+            self.outbox.stage(item.identifier, lambda received, trusted: (
+                recorder.observation(item, received, trusted), None))
+        self.assertEqual(self.outbox.state().pending, 0)
+        for options in ({"clock": self.clock, "capacity": 0}, {"capacity": 1}):
+            with self.assertRaises((TypeError, ValueError)):
+                TimelineOutbox(self.presence, **options)
         # A health fact can never carry an Owner presence effect.
         fact = self.outbox
-        node = HealthTimeline(fact, clock=self.clock)
+        node = HealthTimeline(fact)
         node.node(NODE, NodeHealthState.ONLINE)
-        observation = fact._pending[0][0]
+        identifier, build = fact._pending[0]
+        observation, valid_until = build(NOW, True)
+        self.assertIsNone(valid_until)
+        self.assertEqual(observation.identifier, identifier)
         self.assertIs(observation.kind, Kind.NODE_HEALTH)
         self.assertIs(observation.value, Value.ONLINE)
         self.assertIs(observation.quality, Quality.UNKNOWN)
         with self.assertRaises(ValueError):
-            fact.stage(observation, presence_valid_until=NOW + VALIDITY)
+            fact.stage(uuid4(), lambda received, trusted: (
+                replace(observation, identifier=UUID(int=5), received_at=received), received + VALIDITY))
         fact.flush()
         self.assertEqual(self.presence.snapshot(now=NOW, clock_trusted=True)["state"],
                          PresenceState.UNKNOWN.value)

@@ -135,25 +135,38 @@ route, worker thread or default timing policy:
   event UUID, and no presence effect; nothing links crossings across cameras.
 - `CriticalTimelineRecorder` is the #24 `CriticalRecorder` for
   `CriticalDelivery`. It records synchronously and raises on failure so the
-  staging retries the UUID; the main-host receipt time is stamped once per UUID
-  and reused, so a retry is an exact duplicate rather than an identity
-  conflict. It refuses an unconfirmed or insufficient-quality observation.
-  Untrusted receipt clocks or excessive latency mark the timing untrusted but
-  never withdraw confirmation, so evidence and notification work is queued in
-  every presence and clock state.
+  staging retries the UUID. Receipt is stamped at write time from the shared
+  `TimelineOutbox.receipt()`; a replay of an already recorded UUID (a retry
+  after a write that committed and then failed, a repeated delivery, or a
+  replay after a restart) is a duplicate by the durable row, via
+  `record(..., restamped=True)`, never an identity conflict that would stay in
+  the bounded `CriticalDelivery` staging forever. It refuses an unconfirmed or
+  insufficient-quality observation. Untrusted receipt clocks or excessive
+  latency mark the timing untrusted but never withdraw confirmation, so
+  evidence and notification work is queued in every presence and clock state.
 - `HealthTimeline` stages UVC `HealthEvent`s, registry source and node health
   states, `MainStoragePolicy` transitions and `RecordingHealthService` results
   as `camera_health`, `node_health`, `storage` and `recording` facts. It copies
   only attribution and state, never free-form reasons, device evidence or
   storage figures.
-- `TimelineOutbox` is the bounded staging those producers write to. `stage()`
-  never touches the database, so it is safe inside the storage policy's
-  transition audit, which runs while admission is being refused; the Main
-  runtime drives `flush()` from the storage owner's worker, because
-  `MainStoragePolicy.control` only admits writes from that thread. A flush keeps
-  receipt order and stops at the first storage or database failure; a full
-  outbox refuses the new fact, and a fact presence rejects is removed. Both are
-  counted and reported by `OutboxState.degraded`, never dropped silently.
+- `TimelineOutbox` is the bounded staging those producers write to and the
+  single main-host receipt clock. `record()` treats a receipt older than the
+  newest one written as a clock step, which would make an Owner observation
+  `UNKNOWN`, so receipt is stamped at write time under one lock held across
+  the write and shared with `CriticalTimelineRecorder`; a staged crossing is
+  never distrusted merely because another source's fact or a critical
+  observation was written first. An Owner crossing therefore confirms only if
+  it is still within `maximum_source_latency` when presence receives it, and
+  its validity runs from that receipt. `stage()` never touches the database or
+  the receipt lock, so it is safe inside the storage policy's transition
+  audit, which runs while admission is being refused; the Main runtime drives
+  `flush()` from the storage owner's worker, because
+  `MainStoragePolicy.control` only admits writes from that thread. A flush
+  keeps staging order and stops at the first storage, database or clock
+  failure, including an unavailable database location; a full outbox refuses
+  the new fact, and only a fact presence rejects as `InvalidObservation` is
+  removed. Both are counted and reported by `OutboxState.degraded`, never
+  dropped silently.
 
 `owner_presence_validity` and `maximum_source_latency` have no default; they
 are deployment decisions that need real-room and cross-host clock evaluation.
@@ -166,5 +179,8 @@ unavailable. `ordering_degraded` describes the page it is returned with, so a
 caller that concatenates pages treats the window as degraded when any page
 reports it. Each source retains a trusted occurrence-time high-water mark, so
 an out-of-order event cannot later regain trust merely because it is newer than
-another untrusted delayed event. It reports observations and their temporal context only; it never
+another untrusted delayed event. Only source-dated kinds (person, motion,
+entry/exit and critical observations) use that mark; health, storage and
+recording facts are dated by the main host and neither advance nor are checked
+against it. It reports observations and their temporal context only; it never
 infers cause, guilt, or identity.

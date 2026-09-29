@@ -89,7 +89,9 @@ is in view. The core records neutral observation provenance and offers
 least `MAXIMUM_BATCH` observations, because one confirmed sample can carry a
 server movement and a camera tamper together and a batch that never fits could
 not make progress by retrying. `app.presence.adapters.CriticalTimelineRecorder` is the reviewed recorder
-that durably hands each confirmed observation to the presence outbox; a later
+that records each confirmed observation synchronously in presence, whose durable
+evidence/notification queue takes it in every presence state; it is never
+deferred through the timeline staging. A later
 runtime owns recording preservation and configured notifications, which must
 remain armed in every presence state.
 

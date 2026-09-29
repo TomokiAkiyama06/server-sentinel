@@ -7,14 +7,24 @@ from uuid import UUID
 
 from .access import DenyAccess
 from .delivery import ActionResult
-from .models import (CRITICAL, Kind, Observation, PresenceState, Quality, Value,
-                     timestamp, utc)
+from .models import (CRITICAL, InvalidObservation, Kind, Observation, PresenceState, Quality,
+                     Value, timestamp, utc)
 from app.storage.retention import RetentionPeriods
 
 
 ARMED = "armed"
 UNAVAILABLE = "unavailable"
 UNKNOWN = "unknown"
+
+# Kinds whose `occurred_at` is a capture-source timestamp. Health, storage,
+# recording, presence and configuration facts are dated by the main host, so
+# they neither advance nor are checked against a source's clock high-water
+# mark: a main-host health stamp must not make a later-processed source
+# observation from that camera look reordered.
+SOURCE_CLOCK = frozenset({Kind.PERSON, Kind.MOTION, Kind.OWNER_ENTRY, Kind.OWNER_EXIT,
+                          Kind.ANONYMOUS_ENTRY, Kind.ANONYMOUS_EXIT, *CRITICAL})
+# Payload fields a producer stamps at the moment presence receives the fact.
+RECEIPT_FIELDS = ("received_at", "clock_trusted", "confirmed")
 
 
 class PresenceService:
@@ -181,18 +191,31 @@ class PresenceService:
             db.execute("INSERT INTO presence_audit(action,actor,at,state) VALUES ('hint_set',?,?,?)",
                        (actor, timestamp(now), state.value))
 
-    def record(self, observation, *, presence_valid_until=None):
+    def record(self, observation, *, presence_valid_until=None, restamped=False):
+        """Durably record one observation idempotently by its UUID.
+
+        ``restamped=True`` is for producers that stamp the main-host receipt
+        at write time: a replay of an already recorded UUID then carries a new
+        receipt time (and the clock trust and confirmation derived from it),
+        so only the source fact itself must match for it to be a duplicate.
+        Contract errors raise `InvalidObservation`; storage and database
+        failures raise anything else and may be retried.
+        """
         if not isinstance(observation, Observation):
-            raise ValueError("typed observation required")
+            raise InvalidObservation("typed observation required")
         if presence_valid_until is not None and utc(presence_valid_until) <= utc(observation.received_at):
-            raise ValueError("presence validity must be explicit and future")
+            raise InvalidObservation("presence validity must be explicit and future")
         with self._transaction() as db:
             existing = db.execute("SELECT payload FROM presence_observations WHERE id=?",
                                   (str(observation.identifier),)).fetchone()
             if existing:
                 stored = Observation.from_payload(json.loads(existing[0]))
                 if stored.payload() != observation.payload() and stored.payload() != observation.uncertain().payload():
-                    raise ValueError("observation identity conflict")
+                    fact = {key: value for key, value in stored.payload().items() if key not in RECEIPT_FIELDS}
+                    replay = {key: value for key, value in observation.payload().items()
+                              if key not in RECEIPT_FIELDS}
+                    if not restamped or fact != replay:
+                        raise InvalidObservation("observation identity conflict")
                 return stored
             completed = db.execute("SELECT 1 FROM presence_completed_events WHERE id=?",
                                    (str(observation.identifier),)).fetchone()
@@ -203,7 +226,7 @@ class PresenceService:
                 # delayed replay stays a duplicate and its payload stays expired.
                 return observation
             trusted = self._clock(db, observation.received_at, observation.clock_trusted)
-            if observation.source_id:
+            if observation.source_id and observation.kind in SOURCE_CLOCK:
                 source = str(observation.source_id)
                 high_water = db.execute("SELECT latest_occurred FROM presence_source_clock WHERE source=?",
                                         (source,)).fetchone()
@@ -211,7 +234,7 @@ class PresenceService:
                     trusted = False
             if not trusted:
                 observation = observation.uncertain()
-            elif observation.source_id:
+            elif observation.source_id and observation.kind in SOURCE_CLOCK:
                 db.execute("INSERT INTO presence_source_clock(source,latest_occurred) VALUES (?,?) "
                            "ON CONFLICT(source) DO UPDATE SET latest_occurred="
                            "MAX(latest_occurred,excluded.latest_occurred)",
