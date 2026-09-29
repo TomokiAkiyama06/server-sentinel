@@ -27,6 +27,31 @@ class CIWorkflowTests(unittest.TestCase):
             self.assertIn(f"\n          {module}\n", repository)
             self.assertTrue((ROOT / (module.replace(".", "/") + ".py")).is_file(), module)
 
+    def test_guarded_entry_points_run_with_main_runtime_in_required_job(self):
+        workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        repository, separator, _remaining = workflow.partition("\n  components:\n")
+        self.assertTrue(separator, "components job boundary is missing")
+        install = repository.find(
+            "python -m pip install --require-hashes --only-binary=:all: --no-cache-dir \\\n"
+            "            --report \"${RUNNER_TEMP}/server-runtime-report.json\""
+            " -r server/requirements.lock\n")
+        verify = repository.find(
+            "--resolved-python \"${RUNNER_TEMP}/server-runtime-report.json\" \\\n"
+            "            --input server/requirements.lock\n")
+        telemetry = repository.find("\n          tests.e2e.test_no_telemetry_scenarios\n")
+        self.assertNotEqual(-1, install, "server runtime lock is not installed")
+        self.assertNotEqual(-1, verify, "server runtime pins are not verified")
+        self.assertNotEqual(-1, telemetry)
+        self.assertLess(install, verify)
+        self.assertLess(verify, telemetry)
+        # The step running the no-telemetry scenarios must forbid skipping any
+        # entry point path (missing web stack, root run).
+        step = repository[repository.rfind("\n      - name:", 0, telemetry):telemetry]
+        self.assertIn("\n          E2E_REQUIRE_FULL_ENTRY_POINTS: '1'\n", step)
+        scenarios = (ROOT / "tests/e2e/test_no_telemetry_scenarios.py").read_text(
+            encoding="utf-8")
+        self.assertIn('REQUIRE_FULL_ENTRY_POINTS = "E2E_REQUIRE_FULL_ENTRY_POINTS"\n', scenarios)
+
 
 if __name__ == "__main__":
     unittest.main()

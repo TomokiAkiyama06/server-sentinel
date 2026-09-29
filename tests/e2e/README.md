@@ -32,11 +32,19 @@ imports the Agent CLI/runtime and Main launcher and runs their startup
 validation and error paths (`media_capture_agent.cli.main`,
 `app.deployment.main`); the report is written from an exit callback registered
 before any import, so import-registered shutdown flushes run under the hook
-first. The Main web entry points (`app.main`, `app.__main__`) need FastAPI,
-which the dependency-free e2e CI job does not install: there they are checked
-only up to the missing dependency, and fully (including the
-`app.__main__.main` startup error path) wherever the server runtime
-dependencies are installed. In-process services are closed while the guard is
+first. The protected synthetic Agent configuration must pass `--check`
+(exit 0) with only the `/dev/disk/by-uuid` stable-device lookup made synthetic
+(the ephemeral filesystem has no Owner-approved UUID); the same configuration
+with the real lookup, and the missing-configuration calls, must fail closed
+(exit 1). The Main
+web entry points (`app.main`, `app.__main__`) need FastAPI: the required CI job
+installs the hash-pinned `server/requirements.lock`, verifies the resolved pins
+with `license_gate.py`, and sets `E2E_REQUIRE_FULL_ENTRY_POINTS=1`, so there
+they are checked fully (including the `app.__main__.main` startup error path)
+and a missing web stack or a root (UID 0) run fails instead of being skipped.
+Local runs without those dependencies check the web entry points only up to the
+missing dependency, and a local root run skips the Agent entry-point test
+because the Agent refuses UID 0 by design. In-process services are closed while the guard is
 still active, so shutdown flushes in `close()` are covered. Egress from
 child processes or native code that bypasses CPython's `_socket` is outside
 this in-process guard:

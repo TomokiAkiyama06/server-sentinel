@@ -207,6 +207,35 @@ def storage_reservation():
     return nullcontext()
 
 
+SYNTHETIC_FILESYSTEM_UUID = "synthetic-filesystem-identity"
+
+
+def synthetic_stable_device(expected) -> bool:
+    """Stable-device port: accepts only the synthetic approved filesystem UUID.
+
+    The ephemeral test filesystem has no Owner-approved ``/dev/disk/by-uuid``
+    entry, so only this hardware identity lookup is synthetic.
+    """
+    return expected.filesystem_uuid == SYNTHETIC_FILESYSTEM_UUID
+
+
+def agent_cli_with_synthetic_stable_device(argv):
+    """Run the real Agent CLI with only the stable-device lookup synthetic.
+
+    Configuration loading, mount/ownership/space validation, Agent
+    construction, ``--check`` and shutdown remain production code.
+    """
+    from media_capture_agent import cli
+    from media_capture_agent.storage import MediaStore
+
+    original = cli.MediaStore
+    cli.MediaStore = lambda settings: MediaStore(settings, stable_device=synthetic_stable_device)
+    try:
+        return cli.main(argv)
+    finally:
+        cli.MediaStore = original
+
+
 def agent_settings(root: Path, node_id: UUID) -> Settings:
     """Build protected-path settings from an ephemeral local filesystem."""
     return Settings.parse(agent_configuration(root, node_id), code_root=root / "code")
@@ -230,7 +259,7 @@ def agent_configuration(root: Path, node_id: UUID) -> dict:
             "mount_point": str(mount.mount_point), "filesystem": mount.filesystem,
             "source": mount.source, "major": mount.major, "minor": mount.minor,
             "filesystem_root": str(mount.filesystem_root),
-            "filesystem_uuid": "synthetic-filesystem-identity",
+            "filesystem_uuid": SYNTHETIC_FILESYSTEM_UUID,
         },
         "service_uid": os.geteuid(), "safety_reserve_bytes": 4096,
         "max_segment_bytes": 16384, "heartbeat_seconds": 1,

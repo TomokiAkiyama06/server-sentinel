@@ -73,7 +73,7 @@ SCENARIO_MODULES = (
 
 # The processes users run: the Agent CLI and runtime, and the Main launcher,
 # settings and logging. The Main web entry points need the server runtime
-# dependencies (FastAPI), which are checked separately below.
+# dependencies (FastAPI, from server/requirements.lock), checked separately below.
 ENTRY_MODULES = (
     "media_capture_agent.cli",
     "media_capture_agent.runtime",
@@ -84,6 +84,9 @@ ENTRY_MODULES = (
     "app.logging",
 )
 MAIN_WEB_ENTRY_MODULES = ("app.main", "app.__main__")
+# Set by the required CI job, which runs as non-root with the hash-pinned
+# server runtime dependencies installed: no entry point path may be skipped.
+REQUIRE_FULL_ENTRY_POINTS = "E2E_REQUIRE_FULL_ENTRY_POINTS"
 
 # The module-scope imports above run before any NetworkGuard exists, and a
 # socket opened and closed during import leaves nothing for the guard's
@@ -134,6 +137,13 @@ if not %(guard_first)r:
     sys.addaudithook(hook)
 imported.append(True)
 """
+
+
+def require_full_entry_points():
+    """Whether this run must execute every entry point path (set in required CI)."""
+    import os
+
+    return os.environ.get(REQUIRE_FULL_ENTRY_POINTS) == "1"
 
 
 def guarded_import(modules, *, extra_path=None, guard_first=True, calls=()):
@@ -426,6 +436,14 @@ class NoTelemetryScenarios(unittest.TestCase):
 
         from tests.e2e.harness import agent_configuration
 
+        if os.geteuid() == 0:
+            # The Agent refuses root by design (config and runtime), so its
+            # protected --check success path cannot run here; a required run
+            # fails instead of silently covering only the refusal path.
+            reason = "media_capture_agent refuses UID 0; run the E2E suite as a non-root user"
+            if require_full_entry_points():
+                self.fail(reason)
+            self.skipTest(reason)
         # A protected synthetic Agent configuration outside the checkout, so
         # the CLI runs its real load/storage validation path.
         configuration = self.root / "agent.json"
@@ -433,20 +451,29 @@ class NoTelemetryScenarios(unittest.TestCase):
                                  encoding="utf-8")
         os.chmod(configuration, 0o600)
         missing = str(self.root / "absent.json")
+        protected = ["--config", str(configuration), "--check"]
         result = guarded_import(ENTRY_MODULES, calls=(
             ("media_capture_agent.cli", "main", ["--config", missing]),
-            ("media_capture_agent.cli", "main", ["--config", str(configuration), "--check"]),
+            # Only the /dev/disk/by-uuid lookup is synthetic: the ephemeral
+            # filesystem has no Owner-approved stable UUID.
+            ("tests.e2e.harness", "agent_cli_with_synthetic_stable_device", protected),
+            ("media_capture_agent.cli", "main", protected),
             ("app.deployment", "main", ["--config", missing, "--check"]),
         ))
         self.assertEqual([], result["preloaded"])
         self.assertEqual([], result["failed"])
         self.assertEqual([], result["attempts"])
         self.assertEqual([], result["reporting"])
-        # Every entry point ran to its own validation result, not an exception.
-        self.assertEqual(3, len(result["calls"]))
-        for module, function, value in result["calls"]:
-            self.assertIn(value, (0, 1), (module, function))
-        self.assertEqual([1, 1], [result["calls"][0][2], result["calls"][2][2]])
+        # Every entry point ran to its own validation result, not an exception:
+        # missing configurations fail closed, the protected synthetic Agent
+        # configuration passes --check through MediaStore and Agent construction,
+        # and the real stable-device lookup refuses the unapproved synthetic UUID.
+        self.assertEqual([
+            ["media_capture_agent.cli", "main", 1],
+            ["tests.e2e.harness", "agent_cli_with_synthetic_stable_device", 0],
+            ["media_capture_agent.cli", "main", 1],
+            ["app.deployment", "main", 1],
+        ], result["calls"])
 
     def test_main_web_entry_points_make_no_outbound_connection_under_guard(self):
         import importlib.util
@@ -461,8 +488,12 @@ class NoTelemetryScenarios(unittest.TestCase):
             self.assertEqual([], result["failed"])
             self.assertEqual([["app.__main__", "main", 1]], result["calls"])
         else:
-            # The dependency-free e2e job cannot load the web stack; the import
-            # still runs under the hook up to the missing dependency only.
+            # The required CI job installs server/requirements.lock, so a
+            # missing web stack there is a failure, never partial coverage.
+            self.assertFalse(require_full_entry_points(),
+                             "server runtime dependencies (server/requirements.lock) are required")
+            # Without the web stack (a local run) the import still runs under
+            # the hook up to the missing dependency only.
             self.assertEqual({"ModuleNotFoundError"}, {kind for _name, kind in result["failed"]})
             self.assertEqual([["app.__main__", "main", "ModuleNotFoundError"]], result["calls"])
 
