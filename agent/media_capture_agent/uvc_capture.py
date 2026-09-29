@@ -134,18 +134,22 @@ class _Call:
             abandoned = self._abandoned
             if not abandoned:
                 self._value, self._error = value, error
+                self.done.set()
+        if abandoned:
+            # Release (e.g. close a late descriptor) here, in the worker, so a
+            # hung release never runs on the tick thread; stay "blocked" until
+            # it has finished.
+            if error is None:
+                self._release(value)
             self.done.set()
-        if abandoned and error is None:
-            self._release(value)
 
     def abandon(self):
+        """Give up on the call; True if it had in fact already finished."""
         with self._lock:
+            if self.done.is_set():
+                return True
             self._abandoned = True
-            late = self.done.is_set() and self._error is None
-            value, self._value = self._value, None
-        if late:
-            # Finished between the timed-out wait and this abandon: still unused.
-            self._release(value)
+            return False
 
     def _release(self, value):
         if self._discard is not None and value is not None:
@@ -188,9 +192,8 @@ class _BoundedCall:
             thread.start()
         except RuntimeError:
             raise TimeoutError("device call could not start") from None
-        if not call.done.wait(timeout):
+        if not call.done.wait(timeout) and not call.abandon():
             self._pending = call
-            call.abandon()
             raise TimeoutError("device call exceeded bound")
         self._pending = None
         return call.result()
@@ -285,8 +288,10 @@ class UvcCapture:
         self.discovery = discovery or LinuxDiscovery()
         self.open_device, self.close_device, self.clock = open_device, close_device, clock
         self._discovery_call = _BoundedCall("media-capture-agent-uvc-discovery")
-        # Inside poll(): one stop bound shared by every teardown of that tick.
+        # Inside poll(): one stop bound shared by every teardown of that tick
+        # and one device bound shared by every scan/open/close of that tick.
         self._teardown_deadline = None
+        self._device_deadline = None
         self._owns_store = store is None
         self.store = ApprovalStore(settings) if store is None else store
         self._lock = threading.RLock()
@@ -296,8 +301,10 @@ class UvcCapture:
             for config in sources:
                 controller = ReconnectController(config.source_id, self.store)
                 source = _Source(config, controller, self.limits, clock)
-                source.open_call = _BoundedCall("media-capture-agent-uvc-open",
-                                                discard=self._close_quietly)
+                # Open and close of this source's node share one worker, so
+                # a hung driver call blocks only this source, at most once.
+                source.device_call = _BoundedCall("media-capture-agent-uvc-device",
+                                                  discard=self._close_quietly)
                 self._sources[config.source_id] = source
         except BaseException:
             if self._owns_store:
@@ -311,11 +318,32 @@ class UvcCapture:
         except OSError:
             pass
 
+    def _device_bound(self):
+        if self._device_deadline is None:
+            return self.limits.device_timeout
+        return max(0.0, min(self.limits.device_timeout,
+                            self._device_deadline - time.monotonic()))
+
+    def _release_descriptor(self, source, descriptor):
+        # Closing can reach the driver's release callback: bounded, off-thread.
+        try:
+            source.device_call.run(lambda: self.close_device(descriptor), self._device_bound())
+        except TimeoutError:
+            if not source.device_call.blocked:
+                # Worker could not start; still never close on the tick thread.
+                threading.Thread(target=self._close_quietly, args=(descriptor,),
+                                 name="media-capture-agent-uvc-device", daemon=True).start()
+        except OSError:
+            pass
+
     def _scan(self):
         # A timed-out or still-blocked scan (TimeoutError is an OSError) proves
         # neither absence nor uniqueness: it counts as a failed node.
+        timeout = self._device_bound()
+        if timeout <= 0:
+            return DiscoveryResult((), 1)
         try:
-            result = self._discovery_call.run(self.discovery.scan, self.limits.device_timeout)
+            result = self._discovery_call.run(self.discovery.scan, timeout)
         except (OSError, ValueError, ProbeError):
             return DiscoveryResult((), 1)
         if not isinstance(result, DiscoveryResult) or any(
@@ -432,8 +460,8 @@ class UvcCapture:
         descriptor = None
         process = None
         try:
-            descriptor = source.open_call.run(lambda: self.open_device(candidate),
-                                              self.limits.device_timeout)
+            descriptor = source.device_call.run(lambda: self.open_device(candidate),
+                                                self._device_bound())
             # Re-verify after opening: the descriptor must belong to the same,
             # still unique physical evidence the controller would bind now.
             fresh = self._scan()
@@ -452,10 +480,7 @@ class UvcCapture:
             return
         finally:
             if descriptor is not None:
-                try:
-                    self.close_device(descriptor)
-                except OSError:
-                    pass
+                self._release_descriptor(source, descriptor)
         source.generation += 1
         parser = MjpegFrameParser(self.limits.max_frame_bytes)
         active = _Active(candidate, process, parser, source.queue, source.generation,
@@ -507,11 +532,16 @@ class UvcCapture:
         with self._lock:
             if self._closed:
                 raise CaptureRefused("capture is closed")
-            scan = self._scan()
-            # Sample after the bounded scan so timeouts use the current time.
-            now = self.clock()
-            self._teardown_deadline = time.monotonic() + self.limits.stop_timeout
+            # Every device call (scan, open, re-scan, close) of this tick shares
+            # one device_timeout, and every teardown one stop_timeout, so the
+            # heartbeat after poll() is delayed by at most their sum however
+            # many of the 1-4 cameras hang at once.
+            self._device_deadline = time.monotonic() + self.limits.device_timeout
             try:
+                scan = self._scan()
+                # Sample after the bounded scan so timeouts use the current time.
+                now = self.clock()
+                self._teardown_deadline = time.monotonic() + self.limits.stop_timeout
                 for source in self._sources.values():
                     self._retry_stuck(source)
                     if not source.storage_failed:
@@ -519,14 +549,19 @@ class UvcCapture:
                 for source in self._sources.values():
                     self._supervise(source, now)
                 self._resolve_conflicts()
+                # A source whose device call is still blocked fails at once
+                # without consuming the bound, so it cannot starve the others.
+                for source in self._sources.values():
+                    controller = source.controller
+                    if (source.active is None and not source.stuck
+                            and not source.storage_failed and not source.discovery_blocked
+                            and controller.bound is not None
+                            and not controller.requires_approval and now >= source.retry_at):
+                        if self._device_bound() <= 0:
+                            break  # Deferred to the next tick; not a failure.
+                        self._launch(source, now)
             finally:
-                self._teardown_deadline = None
-            for source in self._sources.values():
-                controller = source.controller
-                if (source.active is None and not source.stuck and not source.storage_failed
-                        and not source.discovery_blocked and controller.bound is not None
-                        and not controller.requires_approval and now >= source.retry_at):
-                    self._launch(source, now)
+                self._device_deadline = self._teardown_deadline = None
             return tuple(self._health(source, now) for source in self._sources.values())
 
     def frames(self, source_id):

@@ -334,7 +334,9 @@ exponential backoff; a pipeline that cannot be reaped blocks relaunch and keeps
 the recovery marker armed, and later polls retry reaping without waiting the full
 stop bound so heartbeats are not delayed; teardowns within one poll share one
 stop bound. Discovery scans and the capture-node
-open run off the tick thread under `device_timeout`; a hung driver call yields
+open/close run off the tick thread and share one `device_timeout` per poll, so
+the heartbeat is delayed by at most `device_timeout + stop_timeout` regardless
+of how many sources hang; a hung driver call yields
 `discovery_failed`/`capture_failed` instead of stopping the heartbeat, starts no
 additional worker while still blocked, and a late descriptor is closed unused.
 Queue drops are latched until one `capture_overloaded` snapshot has reported

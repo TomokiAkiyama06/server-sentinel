@@ -80,11 +80,15 @@ stuck process group and check without waiting, so a process in uninterruptible
 sleep does not delay every heartbeat. `close()` grants it one more full bound.
 
 Discovery scans (sysfs reads and V4L2 `QUERYCAP`/`ENUM_FMT` ioctls) and the
-open of the capture node run in a worker bounded by `device_timeout` (default
-2 s). A call that exceeds it yields `discovery_failed` (scan) or
-`capture_failed` (open) for the affected sources and the heartbeat proceeds;
-while that call is still blocked, new requests fail at once instead of starting
-more threads, and a descriptor returned late is closed without being used.
+open and close of the capture node run in workers, never on the tick thread.
+Within one poll all of these calls share a single `device_timeout` (default
+2 s) and all teardowns share a single `stop_timeout`, so the heartbeat after a
+poll is delayed by at most their sum however many of the 1–4 cameras hang. A
+call that exceeds the bound yields `discovery_failed` (scan) or
+`capture_failed` (open) for the affected sources; launches left when the bound
+is used up wait for the next poll. While a source's device call is still
+blocked, its next open fails at once instead of starting more threads, and a
+descriptor returned late is closed in the worker without being used.
 
 ## Not yet wired
 

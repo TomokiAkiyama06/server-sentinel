@@ -17,12 +17,14 @@ import threading
 import textwrap
 import time
 import unittest
+from unittest import mock
 from uuid import UUID
 
 from media_capture_agent.health import SourceHealth
 from media_capture_agent.runtime import Agent
 from media_capture_agent.storage import MediaStore
 from media_capture_agent.uvc_approvals import FILENAME, ApprovalStorageError, ApprovalStore
+from media_capture_agent import uvc_capture
 from media_capture_agent.uvc_capture import (CaptureCleanupError, CaptureLimits, CaptureRefused,
                                              UvcCapture, UvcSourceConfig)
 from media_capture_agent.uvc_discovery import DiscoveryResult, LinuxDiscovery, VideoCapabilities
@@ -615,6 +617,101 @@ class CaptureTests(CaptureCase):
         # The descriptor that arrives after the bound is closed, never launched.
         self.assertTrue(wait_for(lambda: opened and closed == opened))
         self.assertEqual(self.launcher.pipelines, [])
+
+    def short_device_limits(self, device_timeout):
+        self.limits = CaptureLimits(max_frame_bytes=4096, queue_frames=4, startup_timeout=5,
+                                    stall_timeout=2, stop_timeout=1, backoff_initial=1,
+                                    backoff_max=4, device_timeout=device_timeout)
+
+    def four_approved(self, **kwargs):
+        devices = [evidence(index, serial=f"SYN-{index}") for index in range(4)]
+        discovery = FakeDiscovery(*devices)
+        capture = self.capture(discovery, count=4, **kwargs)
+        for index, device in enumerate(devices):
+            capture.approve(SOURCES[index], device)
+        return capture, discovery, devices
+
+    def test_hung_opens_of_several_sources_share_one_device_bound(self):
+        self.short_device_limits(0.5)
+        release = threading.Event()
+        self.addCleanup(release.set)
+
+        def hung_open(_candidate):
+            release.wait(10)
+            return os.open(os.devnull, os.O_RDONLY | os.O_CLOEXEC)
+
+        capture, _discovery, _devices = self.four_approved(open_device=hung_open)
+        started = time.monotonic()
+        health = capture.poll()
+        # Old behavior: 4 x device_timeout before the heartbeat.
+        self.assertLess(time.monotonic() - started, 1.2)
+        self.assertEqual(self.launcher.pipelines, [])
+        self.assertNotIn("online", [item.state for item in health])
+        release.set()
+        self.clock.now += 100
+        # Once the driver recovers, every source launches on later ticks.
+        self.assertTrue(wait_for(lambda: capture.poll() and len(self.launcher.pipelines) == 4))
+
+    def test_hung_descriptor_close_never_blocks_poll(self):
+        self.short_device_limits(0.2)
+        release = threading.Event()
+        self.addCleanup(release.set)
+        closed = []
+
+        def hung_close(descriptor):
+            release.wait(10)  # A driver release callback that never returns.
+            closed.append(descriptor)
+            os.close(descriptor)
+
+        device = evidence()
+        capture = self.capture(FakeDiscovery(device), close_device=hung_close)
+        capture.poll()
+        capture.approve(SOURCES[0], device)
+        started = time.monotonic()
+        self.assertEqual(self.state(capture), ("degraded", "capture_starting"))
+        self.assertLess(time.monotonic() - started, 1.0)
+        self.assertEqual(len(self.launcher.pipelines), 1)
+        release.set()
+        self.assertTrue(wait_for(lambda: len(closed) == 1))
+
+    def test_teardowns_during_launch_share_the_poll_stop_bound(self):
+        capture, _discovery, _devices = self.four_approved()
+
+        def hanging_stop(pipeline):
+            def stop(timeout):
+                pipeline.stop_timeouts.append(timeout)
+                time.sleep(timeout)
+                return False
+            return stop
+
+        original_launch = self.launcher.launch
+
+        def launch(device_fd, profile):
+            pipeline = original_launch(device_fd, profile)
+            pipeline.stop = hanging_stop(pipeline)
+            return pipeline
+
+        self.launcher.launch = launch
+        original_init = uvc_capture._Active.__init__
+
+        def init(active, *args):
+            original_init(active, *args)
+            # Reader thread cannot start (e.g. thread/resource exhaustion).
+            active.thread = mock.Mock(ident=None, **{"start.side_effect": RuntimeError,
+                                                     "is_alive.return_value": False})
+
+        with mock.patch.object(uvc_capture._Active, "__init__", init):
+            started = time.monotonic()
+            health = capture.poll()
+            elapsed = time.monotonic() - started
+        self.assertEqual(len(self.launcher.pipelines), 4)
+        self.assertEqual([item.reason for item in health], ["capture_cleanup_failed"] * 4)
+        # Old behavior: 4 x stop_timeout after the shared deadline was cleared.
+        self.assertLess(elapsed, 1.8 * self.limits.stop_timeout)
+        for pipeline in self.launcher.pipelines:
+            pipeline.stop_result = True
+            del pipeline.stop
+            pipeline.stop(0)
 
     def test_device_timeout_bound_is_validated(self):
         for value in (0, -1, 61, "2"):
