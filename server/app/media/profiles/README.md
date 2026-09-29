@@ -30,6 +30,73 @@ state stays aligned with the sole pipeline owner.
 Teardown releases only the matching generation, so a delayed old teardown cannot
 remove a replacement reservation. Released or superseded leases fail closed.
 
+### Room-overview capture option
+
+`SourceProfileCapabilities.room_overview_sets` explicitly marks the subset of an
+allowlist that forms the high-resolution room-overview option
+(`CaptureOption.ROOM_OVERVIEW_HIGH_RESOLUTION`). Listing it requires explicit
+`RoomOverviewCriteria` (minimum capture width/height from the measured camera
+capabilities; no built-in value). Each listed set must keep the capture at or
+above that minimum, give inference and viewers strictly fewer pixels than the
+capture and no higher FPS, and keep recording within capture size/FPS
+(`room_overview_violations()` returns sanitized reason codes). The option is
+never inferred from a `room_overview` role label, source type or resolution.
+`SourceProfileAdmissions.admit()` defaults to `CaptureOption.STANDARD`; selecting
+an overview set requires the explicit option, and a mismatch is rejected as
+`capture_option_mismatch` (`capture_option_unavailable` when the source lists no
+set for that option). The lease allowlist contains only the selected option's
+sets, so viewer/inference adaptation cannot silently move a generation between
+options.
+
+### Adapter selection without hardware acceleration
+
+`AdapterSelector` is an `AdapterFactory` over explicit `AdapterCandidate`s
+(`hardware` / `software`, each with an integration-supplied bounded probe and
+factory) and an explicit `AccelerationPolicy`:
+
+- `prefer_hardware`: a missing, unsupported, failed-probe or failed-start
+  accelerator falls back to a listed software adapter; the selection records
+  `hardware_unavailable` plus `software_fallback` (state `software_fallback`).
+- `require_hardware`: software is never substituted; no accelerator yields
+  `AdapterUnavailable` (pipeline `adapter_unavailable`), and a start failure
+  yields `AdapterStartFailed` (pipeline `adapter_start_failed`).
+- `software_only`: accelerators are not probed.
+
+The selection is bound to the adapter it started: each returned
+`SelectedAdapter` carries its own `selection`, `SourcePipeline` reports it per
+path as `PathStatus.adapter_state` (`ready` / `software_fallback`, `None` when
+no adapter is held), and `AdapterSelector.active_selections` /
+`fallback_active` cover every adapter not yet closed successfully. A selector
+shared by several paths or sources therefore cannot hide a path still on
+software fallback behind a later hardware start; `last_selection` is only the
+most recent attempt. Tracking is weak, so dropped adapters do not accumulate.
+
+Nothing installed is always `unavailable`. Reason codes are fixed strings; backend
+exception text and device paths are discarded. Selection reruns on every adapter
+start, so a recovered accelerator is used again. The selector does not probe a
+real device itself and no accelerator adapter is included.
+
+### Synthetic resource harness
+
+```sh
+python -m app.media.profiles.measure --sources 2 --packets 3000 \
+    --packet-bytes 4096 --keyframe-interval 30 --viewers 1 \
+    --queue-packets 64 --queue-bytes 1048576 --pump-every 1 \
+    --pump-budget 4 --acceleration prefer_hardware
+```
+
+It runs 1–4 generated packet streams through `SourcePipeline` with discard-only
+software adapters and prints JSON: process CPU seconds, sampled RSS (`null` with
+`rss_observable: false` when unreadable, never `0`), per-path maximum/final
+queue depth, drops, discontinuities, delivered packets, synthetic inference
+sample count, each path's `adapter_state`, and an aggregate of the adapters
+active at the end (`active_paths`, `fallback_paths`, states, kinds, reasons)
+rather than one shared latest selection. It prints no hostname, user, path,
+environment value, source identity or media, and always reports
+`deployment_acceptance: false`. Exit status is `3` when any source is
+unavailable. All arguments are required and bounded; there are no defaults.
+It measures only scheduler overhead, not codecs, cameras, GPUs or LAN.
+
 `plan_encoding()` permits copy only when complete verified descriptors match:
 video-only content, codec/profile, codec initialization digest, container,
 dimensions, frame rate, time base, pixel format, color space and bitrate bound.
@@ -94,7 +161,7 @@ dependent frames. A decoder/resizer adapter is still required for actual images.
 Run synthetic tests from `server/`:
 
 ```sh
-python -m unittest discover -s tests -p 'test_media_profiles.py' -v
+python -m unittest discover -s tests -p 'test_media_profile*.py' -v
 ```
 
 The tests exercise cadence, profile adaptation, 1–4 isolated sources, reference
