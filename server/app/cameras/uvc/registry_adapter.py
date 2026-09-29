@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+import time
 from uuid import UUID
 
 from app.cameras.registry import CaptureProfile, SourceHealthState, SourceType
@@ -43,8 +44,14 @@ class LocalUvcAdapter:
     that serialization.
     """
 
+    # A frame-rate registry write per source would turn 1-4 cameras into a
+    # sustained SQLite write load. Health transitions are written immediately
+    # by the controller; the last-seen timestamp is refreshed at most this often.
+    LAST_SEEN_INTERVAL_SECONDS = 1.0
+
     def __init__(self, registry, *, emit_audit, on_frame,
-                 discovery=None, capture_factory=MmapCapture, clock=None):
+                 discovery=None, capture_factory=MmapCapture, clock=None,
+                 monotonic=time.monotonic):
         self.registry = registry
         self.store = ApprovalStore(registry.database)
         self.emit_audit = emit_audit
@@ -52,6 +59,7 @@ class LocalUvcAdapter:
         self.discovery = discovery or LinuxDiscovery()
         self.capture_factory = capture_factory
         self.clock = clock or (lambda: datetime.now(timezone.utc))
+        self.monotonic = monotonic
         self.sessions = {}
         self._approved_handoffs = {}
         self.closed = False
@@ -89,9 +97,16 @@ class LocalUvcAdapter:
                 ),
             )
 
+        last_seen = {"at": None, "state": None}
+
         def frame_sink(frame):
-            self.registry.update_source_health(source.id, health_state=SourceHealthState(controller.state.value),
-                                               last_seen_at=self.clock())
+            now = self.monotonic()
+            state = SourceHealthState(controller.state.value)
+            if (last_seen["at"] is None or last_seen["state"] is not state
+                    or now - last_seen["at"] >= self.LAST_SEEN_INTERVAL_SECONDS):
+                self.registry.update_source_health(source.id, health_state=state,
+                                                   last_seen_at=self.clock())
+                last_seen["at"], last_seen["state"] = now, state
             self.on_frame(source.id, frame)
 
         session = CaptureSession(
@@ -191,8 +206,14 @@ class LocalUvcAdapter:
             approved = self.store.load(source_id)
             if approved is None:
                 # Registry entries never automatically acquire a physical device.
-                self.registry.update_source_health(source_id, health_state=SourceHealthState.OFFLINE,
-                                                   negotiated_capture_profile=None)
+                # The worker retries this every poll; write only a change so an
+                # unapproved source does not become a steady SQLite write load.
+                if (source.health_state is not SourceHealthState.OFFLINE
+                        or source.negotiated_capture_profile is not None):
+                    self.registry.update_source_health(
+                        source_id, health_state=SourceHealthState.OFFLINE,
+                        negotiated_capture_profile=None,
+                    )
                 return False
             explicit = self._approved_handoffs.get(source_id)
             if explicit is not None and explicit != approved.approved:

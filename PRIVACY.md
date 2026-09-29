@@ -92,6 +92,11 @@ Non-owner recording access is browser playback only in MVP. ServerSentinel does 
 
 Historical timeline/event access is not exposed through `live:view`; it is included with `recordings:view`.
 
+Local UVC live preview keeps at most one latest frame per source in Main Server
+memory, and only while an authorized `live:view` session for that source is
+open; with no viewer the frame is discarded and nothing is written to disk.
+Every preview read re-checks the viewer's current `live:view` grant server-side.
+
 ## Human viewer credentials
 
 The target deployment shares one Tailscale account across the research room, so a Tailscale login identifies the account rather than the person. ServerSentinel therefore issues each invited person its own credential from an owner invitation and verifies it on every human request; verified Tailscale login/device information is at most supplementary context.

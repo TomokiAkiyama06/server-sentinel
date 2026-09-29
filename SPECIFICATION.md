@@ -258,8 +258,18 @@ bounded single-planar V4L2 MMAP on Linux x86_64/aarch64, reports the actual
 negotiated dimensions/FPS/FourCC, and requires an explicit capture profile.
 Unsupported multi-planar capture or codec/bitrate controls fail explicitly.
 Source workers, Owner management and the preview frame sink are internal
-interfaces; physical capture is not auto-started by the backend launcher and no
-unauthenticated preview route is added. See `server/app/cameras/uvc/README.md`.
+interfaces and no unauthenticated preview route is added. The backend lifespan
+starts one worker per deployment-configured `local_uvc` source (`local_uvc`
+deployment object, 1 to 4 registry UUIDs, no physical evidence) after storage
+migration/admission and stops them, with bounded joins, before the monitoring
+runtime stops. Missing configuration is the explicit `unconfigured` state;
+configuration without admitted storage is `storage_unadmitted` and never
+captures. Capture-service state is reported separately from each source's
+registry camera health, so an unplugged camera is `offline` while the service
+keeps running. Frames feed a bounded latest-frame preview hub that retains
+nothing without live viewer demand; reading it requires a
+`LiveViewerSessions` session whose validator re-checks the principal's current
+`live:view` grant on every open and read. See `server/app/cameras/uvc/README.md`.
 
 Identity reconciliation starts only after an active-session marker is durable.
 An unclean session, including a failed ambiguity-latch write, requires Owner

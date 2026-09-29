@@ -13,6 +13,7 @@ ROOT = Path(__file__).resolve().parent
 REPOSITORY = ROOT.parent
 INSTALLER_MODULES = (
     "__init__.py", "deployment.py", "settings.py",
+    "cameras/uvc/config.py",
     "monitoring/__init__.py", "monitoring/config.py",
     "media/recording/__init__.py", "media/recording/model.py", "media/recording/store.py",
     "notifications/__init__.py", "notifications/slack.py",

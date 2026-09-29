@@ -75,9 +75,32 @@ reported to the lifecycle owner; the supervisor never closes a session from a
 second thread while its capture poll may still be running. A source must be
 stopped before the audited Owner reapproval ceremony.
 
-The backend launcher does not start physical capture automatically. No physical
-webcam, actual preview/browser path, Ubuntu permission setup or arm64 host was
-tested for this change. Synthetic ioctl, persistence, unplug, restart, registry
+`LocalUvcRuntime` (`runtime.py`) is the backend lifecycle owner. The deployment
+`local_uvc` object (`config.py`, standard library only so the installer can
+validate it) lists 1 to 4 logical registry source UUIDs; physical evidence is
+never configuration. `create_app()` starts the runtime inside the lifespan after
+schema migration/storage admission and stops it before the monitoring runtime.
+Missing configuration is the explicit `unconfigured` state and configuration
+without admitted storage is `storage_unadmitted` (no worker, no scan). A UUID
+that is not a `local_uvc` source is `rejected`, never silently skipped; a worker
+that fails to start is `worker_failed` and its camera is written `offline`.
+Service state (`running` / `degraded` / `failed` / `stopped` / `stop_failed`)
+is separate from each camera's registry health. A worker that does not stop
+within the join bound makes the stop `stop_failed`; the adapter is then left to
+that worker's own cleanup rather than closed from a second thread, and the
+durable session marker conservatively requires reapproval at next start.
+`LocalUvcRuntime.reapprove()` stops the one source's worker, runs the audited
+`OwnerAdministration.approve_uvc()`, and restarts the worker whether the
+ceremony committed or was refused. Health transitions go to a bounded
+in-memory buffer, an optional injected sink, and a rate-limited value-free log
+event (`local_uvc_source_health_changed`); durable timeline/audit ingestion of
+these camera-health events is a follow-up. The adapter refreshes `last_seen_at`
+at most once per second and does not rewrite an unchanged offline state for an
+unapproved source, so polling does not become a steady SQLite write load.
+Frames go to `app.media.live.local_preview.LocalPreviewHub`.
+
+No physical webcam, actual preview/browser path, Ubuntu permission setup or
+arm64 host was tested for this change. Synthetic ioctl, persistence, unplug, restart, registry
 and independent-source tests run with the server suite. Issue #11 remains open
 until the real-hardware procedure in `MANUAL_TEST.md` is performed.
 

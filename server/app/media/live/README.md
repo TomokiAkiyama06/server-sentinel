@@ -23,3 +23,21 @@ No browser protocol, route, media URL, codec adapter, or deployment default is
 selected here. FastAPI's human surface remains closed. Browser playback,
 reconnect/adaptation measurements, private-network authorization, and phone/Mac/
 desktop acceptance remain required before Issue #19 can close.
+
+## Local UVC preview wiring (Issue #11)
+
+`local_preview.py` connects the local UVC adapter's frame sink to this session
+layer without a route. `LocalPreviewHub.on_frame` runs on capture worker
+threads, is lock-protected and never raises into capture; it keeps at most one
+latest frame per configured source (bounded by `max_frame_bytes`) and only while
+that source has viewer demand, so zero subscribers retain nothing.
+`AuthorizedLocalPreview` wraps `LiveViewerSessions`: every `open` and `read`
+re-runs the validator. `app.auth.live_access.live_view_validator` reads current
+grants from SQLite and admits only an active principal at the exact bound
+authorization revision holding `live:view` (the Owner implicitly);
+`recordings:view` alone, a stale revision, a revoked principal, a copied session
+identifier or a storage error all fail with the same generic refusal and
+release demand. The route that constructs `LiveAccess` must first authorize the
+caller through `AccessStore.authorize(..., Permission.LIVE_VIEW)`. Browser
+transport, codec and viewer limits remain #19 decisions; the human surface stays
+closed.

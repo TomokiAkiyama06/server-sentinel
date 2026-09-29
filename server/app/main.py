@@ -16,8 +16,11 @@ from app.audit import (
 from app.audit.integration import OwnerAdministration
 from app.audit.runtime import AuditRetentionRuntime
 from app.cameras.registry import CameraRegistry
+from app.cameras.uvc.config import LocalUvcConfiguration
+from app.cameras.uvc.runtime import LocalUvcDependencies, LocalUvcRuntime, LocalUvcRuntimeState
 from app.diagnostics import DiagnosticExportEndpoint
 from app.logging import Event
+from app.media.live.local_preview import LocalPreviewHub
 from app.monitoring.config import MonitoringConfiguration
 from app.monitoring.runtime import MonitoringDependencies, MonitoringRuntime, RuntimeState
 from app.settings import Settings
@@ -86,8 +89,25 @@ def create_app(settings: Settings, *, database: Database | None = None,
                audit_retention_stores: Iterable[object] = (),
                diagnostic_export_endpoint: DiagnosticExportEndpoint | None = None,
                monitoring: MonitoringConfiguration | None = None,
-               monitoring_dependencies: MonitoringDependencies | None = None) -> FastAPI:
+               monitoring_dependencies: MonitoringDependencies | None = None,
+               local_uvc: LocalUvcConfiguration | None = None,
+               local_uvc_dependencies: LocalUvcDependencies | None = None) -> FastAPI:
     store = database or Database(settings.database_path)
+    # Local UVC capture is driven only by the deployment's list of approved
+    # logical sources. Frames go to a bounded preview hub that retains nothing
+    # without authorized live viewer demand; no route reads it (#10/#19).
+    if local_uvc is not None and not isinstance(local_uvc, LocalUvcConfiguration):
+        raise TypeError("local UVC configuration is invalid")
+    uvc_dependencies = local_uvc_dependencies or LocalUvcDependencies()
+    local_preview = LocalPreviewHub(local_uvc.source_ids if local_uvc is not None else ())
+    local_uvc_runtime = (
+        LocalUvcRuntime(
+            local_uvc, CameraRegistry(store), on_frame=local_preview.on_frame,
+            health_sink=uvc_dependencies.health_sink,
+            discovery=uvc_dependencies.discovery,
+            capture_factory=uvc_dependencies.capture_factory,
+        ) if local_uvc is not None else None
+    )
     # The Main Server storage policy is bound by the monitoring runtime when
     # the deployment configures storage thresholds, so audit writes and
     # retention cleanup cannot spend the hard filesystem reserve. Without those
@@ -131,6 +151,40 @@ def create_app(settings: Settings, *, database: Database | None = None,
             raise RuntimeError("application startup failed") from None
         monitoring_task = None
 
+        async def start_local_uvc() -> None:
+            # Never a silent default: every outcome is an explicit state.
+            if local_uvc_runtime is None:
+                application.state.local_uvc_state = LocalUvcRuntimeState.UNCONFIGURED
+                logging.getLogger(__name__).warning(Event.LOCAL_UVC_UNCONFIGURED)
+                return
+            if monitoring_runtime is None and storage_reservation is None:
+                # No schema was migrated and no write is admitted, so the
+                # approval store and source health cannot be trusted. Capture
+                # stays off rather than running against unverified storage.
+                application.state.local_uvc_state = LocalUvcRuntimeState.STORAGE_UNADMITTED
+                logging.getLogger(__name__).error(Event.LOCAL_UVC_STORAGE_UNADMITTED)
+                return
+            try:
+                # Registry reads and thread starts must not block the loop.
+                status = await asyncio.to_thread(local_uvc_runtime.start)
+                application.state.local_uvc_state = status.state
+            except Exception:
+                # Camera capture failure must not take audit/monitoring down.
+                application.state.local_uvc_state = LocalUvcRuntimeState.FAILED
+                logging.getLogger(__name__).error(Event.LOCAL_UVC_STARTUP_FAILED)
+
+        async def stop_local_uvc() -> None:
+            if local_uvc_runtime is None:
+                return
+            try:
+                # Bounded joins; physical capture closes before storage stops.
+                status = await asyncio.to_thread(local_uvc_runtime.stop)
+                application.state.local_uvc_state = status.state
+            except Exception:
+                application.state.local_uvc_state = LocalUvcRuntimeState.STOP_FAILED
+                logging.getLogger(__name__).error(Event.LOCAL_UVC_STOP_FAILED)
+            local_preview.clear()
+
         def refresh_monitoring_state() -> None:
             # Snapshots follow the live runtime, e.g. a retried startup open
             # that later succeeds, instead of freezing the first result.
@@ -167,12 +221,14 @@ def create_app(settings: Settings, *, database: Database | None = None,
             # take physical-security monitoring offline. The bounded degraded
             # retention state stays visible and the scheduled run retries it.
             logging.getLogger(__name__).error(Event.AUDIT_RETENTION_DEGRADED)
+        await start_local_uvc()
         application.state.ready = True
         cleanup_task = asyncio.create_task(audit_retention.run())
         logging.getLogger(__name__).info(Event.STARTED)
         try:
             yield
         finally:
+            await stop_local_uvc()
             cleanup_task.cancel()
             with suppress(asyncio.CancelledError):
                 await cleanup_task
@@ -206,6 +262,13 @@ def create_app(settings: Settings, *, database: Database | None = None,
         RuntimeState.STARTING if monitoring_runtime is not None else RuntimeState.UNCONFIGURED
     )
     application.state.owner_administration = owner_administration
+    # Internal only: no route exposes local capture state or preview frames.
+    application.state.local_uvc = local_uvc_runtime
+    application.state.local_uvc_state = (
+        LocalUvcRuntimeState.STARTING if local_uvc_runtime is not None
+        else LocalUvcRuntimeState.UNCONFIGURED
+    )
+    application.state.local_preview = local_preview
     application.state.diagnostic_export_endpoint = diagnostic_export_endpoint
     # Do not include human routers before approved permission enforcement.
     application.add_middleware(ClosedHumanSurface)
