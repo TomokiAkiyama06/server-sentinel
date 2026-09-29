@@ -77,7 +77,7 @@ def live_view_validator(database: Database, *,
                 row = connection.execute(
                     "SELECT p.role, p.status, p.authorization_revision, s.principal_revision,"
                     " s.deployment_generation, s.invalidated_at_us, s.established_at_us,"
-                    " s.idle_expires_at_us, s.absolute_expires_at_us,"
+                    " s.last_seen_at_us, s.idle_expires_at_us, s.absolute_expires_at_us,"
                     " c.revoked_at_us credential_revoked"
                     " FROM access_sessions s JOIN access_principals p ON p.id=s.principal_id"
                     " JOIN access_credentials c ON c.credential_id=s.credential_id"
@@ -102,6 +102,10 @@ def live_view_validator(database: Database, *,
                 or row["invalidated_at_us"] is not None
                 or row["credential_revoked"] is not None
                 or not row["established_at_us"] <= at < row["idle_expires_at_us"]
+                # A clock that moved before the last accepted activity fails
+                # closed exactly like ``AccessStore.authorize`` (AUTH-009), so a
+                # regression can never extend an open preview's lifetime.
+                or not row["last_seen_at_us"] <= at
                 or at >= row["absolute_expires_at_us"]):
             return False
         return row["role"] == PrincipalRole.OWNER.value or granted

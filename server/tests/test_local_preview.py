@@ -215,6 +215,26 @@ class LiveViewEnforcementTests(unittest.TestCase):
             self.preview.open(borrowed, self.source)
         self.preview.open(other, self.source)
 
+    def test_clock_before_last_accepted_activity_fails_closed(self):
+        # AUTH-009: a refreshed session whose last accepted activity is later
+        # than the validator's clock (wall clock moved backward) is refused,
+        # exactly like AccessStore.authorize refuses it.
+        viewer = self.access.principal((Permission.LIVE_VIEW,))
+        token, identity, _credential = self.access.tokens[viewer.principal_id]
+        refreshed = NOW + timedelta(minutes=2)
+        authorize_live_access(self.access.store, token, identity, now=refreshed)
+        regressed = AuthorizedLocalPreview(
+            self.hub, LIMITS,
+            live_view_validator(self.database, clock=lambda: NOW + timedelta(minutes=1)),
+        )
+        with self.assertRaises(LiveSessionUnavailable):
+            regressed.open(viewer, self.source)
+        current = AuthorizedLocalPreview(
+            self.hub, LIMITS, live_view_validator(self.database, clock=lambda: refreshed),
+        )
+        session = current.open(viewer, self.source)
+        current.close(viewer, session.session_id)
+
     def test_owner_has_live_view_and_storage_errors_deny(self):
         access = self.access.owner()
         session = self.preview.open(access, self.source)

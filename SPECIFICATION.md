@@ -265,7 +265,7 @@ migration/admission and stops them, with bounded joins, before the monitoring
 runtime stops. Missing configuration is the explicit `unconfigured` state;
 configuration without admitted storage, including a monitoring runtime whose
 startup storage open failed, is `storage_unadmitted` and never captures until
-a monitoring retry succeeds. Capture-service state is reported separately from each source's
+a monitoring retry succeeds. Every later capture-driven registry/approval write is admitted by the Main storage policy like an audit write; a refused admission stops that capture visibly and retries, never writes past the hard reserve. A cancelled or failed lifespan startup stops started workers. Capture-service state is reported separately from each source's
 registry camera health, so an unplugged camera is `offline` while the service
 keeps running. Frames feed a bounded latest-frame preview hub that retains
 nothing without live viewer demand; reading it requires a

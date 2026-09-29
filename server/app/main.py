@@ -100,20 +100,27 @@ def create_app(settings: Settings, *, database: Database | None = None,
         raise TypeError("local UVC configuration is invalid")
     uvc_dependencies = local_uvc_dependencies or LocalUvcDependencies()
     local_preview = LocalPreviewHub(local_uvc.source_ids if local_uvc is not None else ())
-    local_uvc_runtime = (
-        LocalUvcRuntime(
-            local_uvc, CameraRegistry(store), on_frame=local_preview.on_frame,
-            health_sink=uvc_dependencies.health_sink,
-            discovery=uvc_dependencies.discovery,
-            capture_factory=uvc_dependencies.capture_factory,
-        ) if local_uvc is not None else None
-    )
     # The Main Server storage policy is bound by the monitoring runtime when
     # the deployment configures storage thresholds, so audit writes and
     # retention cleanup cannot spend the hard filesystem reserve. Without those
     # thresholds the admission stays unbound: writes are refused rather than
     # admitted against a reserve this process cannot verify.
     runtime_admission = RuntimeStorageAdmission()
+    # Capture workers write source health, negotiated profiles, last-seen
+    # timestamps and approval session markers continuously. They are admitted
+    # exactly like audit writes, so a hard stop or a missing/replaced recording
+    # filesystem after startup refuses them (capture then fails visibly and
+    # retries) instead of writing past the reserve or to a fallback path.
+    local_uvc_runtime = (
+        LocalUvcRuntime(
+            local_uvc,
+            CameraRegistry(store, reservation=storage_reservation or runtime_admission),
+            on_frame=local_preview.on_frame,
+            health_sink=uvc_dependencies.health_sink,
+            discovery=uvc_dependencies.discovery,
+            capture_factory=uvc_dependencies.capture_factory,
+        ) if local_uvc is not None else None
+    )
     monitoring_runtime = (
         MonitoringRuntime(monitoring, store, monitoring_dependencies,
                           migrations=APPLICATION_MIGRATIONS)
@@ -142,14 +149,19 @@ def create_app(settings: Settings, *, database: Database | None = None,
                 with storage_reservation():
                     with closing(store.connect()) as connection:
                         migrate(connection, APPLICATION_MIGRATIONS)
-        except Exception:
+        except BaseException as error:
+            # A cancelled startup (embedder shutdown or startup timeout) stops
+            # the monitoring worker exactly like a failed one.
             if monitoring_runtime is not None:
                 with suppress(Exception):
                     await monitoring_runtime.stop()
+            if not isinstance(error, Exception):
+                raise
             logging.getLogger(__name__).error(Event.STARTUP_FAILED)
             # Lifespan failures must not pass SQLite/config values to servers.
             raise RuntimeError("application startup failed") from None
         monitoring_task = None
+        cleanup_task = None
 
         uvc_lifecycle = {"deferred": None, "stopping": False}
 
@@ -175,10 +187,18 @@ def create_app(settings: Settings, *, database: Database | None = None,
                 application.state.local_uvc_state = LocalUvcRuntimeState.STORAGE_UNADMITTED
                 logging.getLogger(__name__).error(Event.LOCAL_UVC_STORAGE_UNADMITTED)
                 return
+            # Registry reads and thread starts must not block the loop.
+            starting = asyncio.ensure_future(asyncio.to_thread(local_uvc_runtime.start))
             try:
-                # Registry reads and thread starts must not block the loop.
-                status = await asyncio.to_thread(local_uvc_runtime.start)
+                status = await asyncio.shield(starting)
                 application.state.local_uvc_state = status.state
+            except asyncio.CancelledError:
+                # Cancelling the await never stops the start thread. Let it
+                # finish so the lifespan cleanup's stop() sees, and stops,
+                # every worker and descriptor it opened.
+                with suppress(Exception):
+                    await starting
+                raise
             except Exception:
                 # Camera capture failure must not take audit/monitoring down.
                 application.state.local_uvc_state = LocalUvcRuntimeState.FAILED
@@ -212,41 +232,45 @@ def create_app(settings: Settings, *, database: Database | None = None,
                 # capture once. Shutdown awaits this task before stopping.
                 uvc_lifecycle["deferred"] = asyncio.create_task(start_local_uvc())
 
-        if monitoring_runtime is None:
-            # Explicit fail-closed fault, never a silently healthy default.
-            # The mandatory startup/daily hardware integrity check and daily
-            # recording self-test cannot run here, so the production entry
-            # points (`app.deployment`, `python -m app`) refuse to serve in
-            # this state; it is reachable only by embedding `create_app()`.
-            # No schema migration runs here without an injected reservation.
-            application.state.monitoring_state = RuntimeState.UNCONFIGURED
-            logging.getLogger(__name__).error(Event.MONITORING_UNCONFIGURED)
-        else:
-            # Admission follows the live runtime state: a runtime that failed
-            # startup refuses writes until its retried open succeeds.
-            runtime_admission.bind(monitoring_runtime)
-            monitoring_task = asyncio.create_task(
-                monitoring_runtime.run(after_tick=refresh_monitoring_state)
+        # Everything below runs under one cleanup guard.
+        try:
+            if monitoring_runtime is None:
+                # Explicit fail-closed fault, never a silently healthy default.
+                # The mandatory startup/daily hardware integrity check and daily
+                # recording self-test cannot run here, so the production entry
+                # points (`app.deployment`, `python -m app`) refuse to serve in
+                # this state; it is reachable only by embedding `create_app()`.
+                # No schema migration runs here without an injected reservation.
+                application.state.monitoring_state = RuntimeState.UNCONFIGURED
+                logging.getLogger(__name__).error(Event.MONITORING_UNCONFIGURED)
+            else:
+                # Admission follows the live runtime state: a runtime that failed
+                # startup refuses writes until its retried open succeeds.
+                runtime_admission.bind(monitoring_runtime)
+                monitoring_task = asyncio.create_task(
+                    monitoring_runtime.run(after_tick=refresh_monitoring_state)
+                )
+            application.state.audit_storage_admitted = (
+                storage_reservation is not None or runtime_admission.bound
             )
-        application.state.audit_storage_admitted = (
-            storage_reservation is not None or runtime_admission.bound
-        )
-        if monitoring_runtime is not None:
-            refresh_monitoring_state()
-        try:
-            await audit_retention.startup_cleanup()
-        except Exception:
-            # A refused storage admission or transient database fault must not
-            # take physical-security monitoring offline. The bounded degraded
-            # retention state stays visible and the scheduled run retries it.
-            logging.getLogger(__name__).error(Event.AUDIT_RETENTION_DEGRADED)
-        await start_local_uvc()
-        application.state.ready = True
-        cleanup_task = asyncio.create_task(audit_retention.run())
-        logging.getLogger(__name__).info(Event.STARTED)
-        try:
+            if monitoring_runtime is not None:
+                refresh_monitoring_state()
+            try:
+                await audit_retention.startup_cleanup()
+            except Exception:
+                # A refused storage admission or transient database fault must not
+                # take physical-security monitoring offline. The bounded degraded
+                # retention state stays visible and the scheduled run retries it.
+                logging.getLogger(__name__).error(Event.AUDIT_RETENTION_DEGRADED)
+            await start_local_uvc()
+            application.state.ready = True
+            cleanup_task = asyncio.create_task(audit_retention.run())
+            logging.getLogger(__name__).info(Event.STARTED)
             yield
         finally:
+            # Also reached when startup itself fails or is cancelled after the
+            # monitoring worker started, so no capture worker, descriptor,
+            # retention task or monitoring worker outlives a failed lifespan.
             uvc_lifecycle["stopping"] = True
             if uvc_lifecycle["deferred"] is not None:
                 # start() and stop() serialize on the runtime lock; let a
@@ -254,9 +278,10 @@ def create_app(settings: Settings, *, database: Database | None = None,
                 with suppress(Exception):
                     await asyncio.shield(uvc_lifecycle["deferred"])
             await stop_local_uvc()
-            cleanup_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await cleanup_task
+            if cleanup_task is not None:
+                cleanup_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await cleanup_task
             if monitoring_task is not None:
                 monitoring_task.cancel()
                 with suppress(asyncio.CancelledError):

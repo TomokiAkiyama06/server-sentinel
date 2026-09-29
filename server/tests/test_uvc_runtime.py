@@ -522,6 +522,25 @@ def synthetic_admission():
     yield
 
 
+class ToggleAdmission:
+    """Synthetic storage admission that can later refuse like a hard stop."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.refuse = False
+        self.admitted = 0
+        self.refused = 0
+
+    @contextmanager
+    def __call__(self):
+        with self.lock:
+            if self.refuse:
+                self.refused += 1
+                raise RuntimeError("synthetic STORAGE_HARD_STOP")
+            self.admitted += 1
+        yield
+
+
 class ApplicationWiringTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
@@ -606,6 +625,104 @@ class ApplicationWiringTests(unittest.IsolatedAsyncioTestCase):
                     self.assertIs(application.state.local_uvc_state,
                                   LocalUvcRuntimeState.FAILED)
 
+    def migrated_source(self):
+        database = Database(self.settings.database_path)
+        with closing(database.connect()) as connection:
+            migrate(connection, APPLICATION_MIGRATIONS)
+        source = CameraRegistry(database, unaudited_writes=True).create_source(
+            source_type=SourceType.LOCAL_UVC, name="Synthetic source", enabled=True,
+            desired_capture_profile=PROFILE,
+        )
+        return database, source
+
+    async def test_capture_writes_are_admitted_and_refused_by_storage_policy(self):
+        # Source health, profile, last-seen and session-marker writes from the
+        # capture workers go through the deployment storage admission; after a
+        # later hard stop / lost mount nothing more is written and capture
+        # fails visibly instead of writing past the reserve.
+        database, source = self.migrated_source()
+        admission = ToggleAdmission()
+        application = create_app(
+            self.settings, storage_reservation=admission,
+            local_uvc=LocalUvcConfiguration((source.id,), **FAST),
+            local_uvc_dependencies=self.dependencies,
+        )
+        admin = OwnerAdministration(
+            OwnerAuditService(AuditStore(database), PermitOwner()), CameraRegistry(database),
+        )
+        registry = CameraRegistry(database)
+        async with application.router.lifespan_context(application):
+            runtime = application.state.local_uvc
+            runtime.reapprove(admin, "synthetic-owner", source.id, self.camera)
+            self.assertTrue(wait_for(lambda: registry.get_source(source.id).health_state
+                                     is SourceHealthState.ONLINE))
+            admitted = admission.admitted
+            self.assertTrue(wait_for(lambda: admission.admitted > admitted + 1))
+            admission.refuse = True
+            captures = self.dependencies.capture_factory.instances
+            self.assertTrue(wait_for(lambda: admission.refused > 0
+                                     and runtime.status().sources[0].worker_failures > 0))
+            self.assertTrue(wait_for(lambda: all(capture.closed for capture in captures)
+                                     or len(captures) > 1))
+            before = registry.get_source(source.id)
+            written = admission.admitted
+            await asyncio.sleep(0.3)
+            self.assertEqual(written, admission.admitted)
+            self.assertEqual(before.updated_at, registry.get_source(source.id).updated_at)
+            self.assertEqual(before.last_seen_at, registry.get_source(source.id).last_seen_at)
+            admission.refuse = False
+        self.assertIs(application.state.local_uvc_state, LocalUvcRuntimeState.STOPPED)
+
+    def test_approval_session_marker_refused_without_admission(self):
+        database, source = self.migrated_source()
+        admission = ToggleAdmission()
+        admission.refuse = True
+        store = ApprovalStore(database, reservation=admission)
+        with self.assertRaises(RuntimeError):
+            store.start_session(source.id, self.camera)
+        self.assertIsNone(store.load(source.id))
+        registry = CameraRegistry(database, reservation=admission)
+        with self.assertRaises(RuntimeError):
+            registry.update_source_health(source.id, health_state=SourceHealthState.ONLINE)
+        self.assertIs(registry.get_source(source.id).health_state, SourceHealthState.OFFLINE)
+
+    async def test_cancelled_startup_stops_capture_workers(self):
+        # A cancelled lifespan startup (embedder shutdown, startup timeout)
+        # while the UVC start thread is running must not leave workers or
+        # descriptors active after startup failed.
+        _database, source = self.migrated_source()
+        application = create_app(
+            self.settings, storage_reservation=synthetic_admission,
+            local_uvc=LocalUvcConfiguration((source.id,), **FAST),
+            local_uvc_dependencies=self.dependencies,
+        )
+        entered = threading.Event()
+        original = LocalUvcRuntime.start
+
+        def slow_start(runtime):
+            entered.set()
+            status = original(runtime)
+            time.sleep(0.3)
+            return status
+
+        async def serve():
+            async with application.router.lifespan_context(application):
+                await asyncio.sleep(30)
+
+        with patch.object(LocalUvcRuntime, "start", slow_start):
+            task = asyncio.create_task(serve())
+            self.assertTrue(await asyncio.to_thread(entered.wait, 5))
+            await asyncio.sleep(0.05)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+        runtime = application.state.local_uvc
+        self.assertFalse(application.state.ready)
+        self.assertIs(runtime.status().state, LocalUvcRuntimeState.STOPPED)
+        self.assertFalse(runtime.status().sources[0].worker_running)
+        await asyncio.sleep(0.2)
+        self.assertFalse(runtime.status().sources[0].worker_running)
+
     def test_invalid_configuration_type_is_refused(self):
         with self.assertRaises(TypeError):
             create_app(self.settings, local_uvc={"source_ids": []})
@@ -613,6 +730,41 @@ class ApplicationWiringTests(unittest.IsolatedAsyncioTestCase):
 
 class MonitoringAdmissionTests(MonitoringFixture):
     """UVC capture follows the monitoring runtime's verified storage state."""
+
+    async def test_cancelled_monitoring_startup_stops_monitoring_runtime(self):
+        from app.monitoring.runtime import MonitoringRuntime
+        application = create_app(
+            self.settings, monitoring=self.configuration(),
+            monitoring_dependencies=MonitoringDependencies(
+                integrity_probe=self.probe, segment_validator=SyntheticValidator(),
+                slack_opener=self.transport, utcnow=self.clock.utcnow,
+                monotonic=lambda: self.clock.monotonic, tick_seconds=0.01,
+            ),
+        )
+        entered, stopped = asyncio.Event(), []
+        original_stop = MonitoringRuntime.stop
+
+        async def hanging_start(runtime):
+            entered.set()
+            await asyncio.sleep(30)
+
+        async def recorded_stop(runtime):
+            stopped.append(runtime)
+            await original_stop(runtime)
+
+        async def serve():
+            async with application.router.lifespan_context(application):
+                await asyncio.sleep(30)
+
+        with patch.object(MonitoringRuntime, "start", hanging_start), \
+                patch.object(MonitoringRuntime, "stop", recorded_stop):
+            task = asyncio.create_task(serve())
+            await asyncio.wait_for(entered.wait(), 5)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+        self.assertEqual([application.state.monitoring], stopped)
+        self.assertFalse(application.state.ready)
 
     async def test_failed_monitoring_startup_defers_capture_until_recovery(self):
         from datetime import timedelta

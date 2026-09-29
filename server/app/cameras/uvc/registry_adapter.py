@@ -53,7 +53,10 @@ class LocalUvcAdapter:
                  discovery=None, capture_factory=MmapCapture, clock=None,
                  monotonic=time.monotonic):
         self.registry = registry
-        self.store = ApprovalStore(registry.database)
+        # Session-marker writes share the registry's storage admission, so no
+        # capture-driven write bypasses the Main storage policy.
+        self.store = ApprovalStore(registry.database,
+                                   reservation=getattr(registry, "reservation", None))
         self.emit_audit = emit_audit
         self.on_frame = on_frame
         self.discovery = discovery or LinuxDiscovery()
