@@ -44,6 +44,8 @@ class Value(StrEnum):
     ONLINE = "online"
     OFFLINE = "offline"
     DEGRADED = "degraded"
+    MANUAL_INTERVENTION_REQUIRED = "manual_intervention_required"
+    REVOKED = "revoked"
     READY = "ready"
     FAILED = "failed"
     CREATED = "created"

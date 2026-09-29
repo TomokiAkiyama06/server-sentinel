@@ -88,9 +88,10 @@ is in view. The core records neutral observation provenance and offers
 `CriticalDelivery` for bounded, explicit local handoff; its staging holds at
 least `MAXIMUM_BATCH` observations, because one confirmed sample can carry a
 server movement and a camera tamper together and a batch that never fits could
-not make progress by retrying. A later runtime owns
-durable events, recording preservation, and configured notifications, which
-must remain armed in every presence state.
+not make progress by retrying. `app.presence.adapters.CriticalTimelineRecorder` is the reviewed recorder
+that durably hands each confirmed observation to the presence outbox; a later
+runtime owns recording preservation and configured notifications, which must
+remain armed in every presence state.
 
 `server/tests/test_detector_roi.py` generates all pixel inputs in memory for
 local and remote-agent calibration, relative movement, global camera motion,

@@ -116,6 +116,48 @@ durably disabled delivery, leaves a per-action degradation marker behind, so
 expiry cannot report that path as armed again while the tombstone stops a
 replay from re-queuing the work.
 
+## Producer adapters
+
+`adapters.py` connects the reviewed producers to `record()` without adding any
+route, worker thread or default timing policy:
+
+- `EntranceObservationAdapter` maps #25 `TrackUpdate` crossings. A crossing is
+  written only when the entrance quality gate was sufficient; an `UNKNOWN`
+  update writes nothing, because an empty crossing list is neither presence nor
+  absence. An Owner crossing keeps its verification confidence and is
+  `confirmed` only when the tracker confirmed it and its source latency and
+  clock uncertainty stay within the explicit `maximum_source_latency`. Every
+  Owner crossing carries the explicit `owner_presence_validity`, so an
+  unconfirmed one makes the Owner-observation slot `UNKNOWN` instead of letting
+  an earlier inference keep applying. Low-quality Owner verification reaches
+  the adapter as an anonymous crossing, because the tracker never names it as
+  the Owner. Anonymous crossings carry no confidence, no identifier beyond the
+  event UUID, and no presence effect; nothing links crossings across cameras.
+- `CriticalTimelineRecorder` is the #24 `CriticalRecorder` for
+  `CriticalDelivery`. It records synchronously and raises on failure so the
+  staging retries the UUID; the main-host receipt time is stamped once per UUID
+  and reused, so a retry is an exact duplicate rather than an identity
+  conflict. It refuses an unconfirmed or insufficient-quality observation.
+  Untrusted receipt clocks or excessive latency mark the timing untrusted but
+  never withdraw confirmation, so evidence and notification work is queued in
+  every presence and clock state.
+- `HealthTimeline` stages UVC `HealthEvent`s, registry source and node health
+  states, `MainStoragePolicy` transitions and `RecordingHealthService` results
+  as `camera_health`, `node_health`, `storage` and `recording` facts. It copies
+  only attribution and state, never free-form reasons, device evidence or
+  storage figures.
+- `TimelineOutbox` is the bounded staging those producers write to. `stage()`
+  never touches the database, so it is safe inside the storage policy's
+  transition audit, which runs while admission is being refused; the Main
+  runtime drives `flush()` from the storage owner's worker, because
+  `MainStoragePolicy.control` only admits writes from that thread. A flush keeps
+  receipt order and stops at the first storage or database failure; a full
+  outbox refuses the new fact, and a fact presence rejects is removed. Both are
+  counted and reported by `OutboxState.degraded`, never dropped silently.
+
+`owner_presence_validity` and `maximum_source_latency` have no default; they
+are deployment decisions that need real-room and cross-host clock evaluation.
+
 Timeline ordering uses main-host receipt order, with the durable sequence only
 as a tie-break, as the single key for the SQL page, the cursor and the
 response, so concatenated pages stay complete and in the advertised order. It
