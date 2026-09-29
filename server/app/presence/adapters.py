@@ -27,6 +27,7 @@ from app.media.health.service import HealthResult, HealthState
 from app.storage.policy import StorageState, StorageTransition
 
 from .models import CRITICAL, InvalidObservation, Kind, Observation, Quality, Value, utc
+from .service import RECEIPT_FIELDS
 
 
 # A main-host wall clock port: returns an aware receipt time and whether the
@@ -61,6 +62,11 @@ _DETECTION_QUALITY = {
     DetectionQuality.SUFFICIENT: Quality.SUFFICIENT, DetectionQuality.DEGRADED: Quality.INSUFFICIENT,
     DetectionQuality.INSUFFICIENT: Quality.INSUFFICIENT, DetectionQuality.UNKNOWN: Quality.UNKNOWN,
 }
+
+
+def _fact(observation):
+    """The source fact of an observation, without the fields stamped at receipt."""
+    return {key: value for key, value in observation.payload().items() if key not in RECEIPT_FIELDS}
 
 
 def _positive(value, name):
@@ -136,8 +142,11 @@ class TimelineOutbox:
     A full outbox refuses the new fact and counts it rather than displacing an
     already staged one. Only a fact presence rejects as a contract error
     (`InvalidObservation`) is counted and removed, so it cannot block every
-    later fact; an unavailable database location stays staged. Both counters
-    make the gap visible; neither is silent loss.
+    later fact; an unavailable database location stays staged. Staging a UUID
+    that is already pending is a duplicate only when its source fact matches
+    the staged one; a different fact under that UUID is an identity conflict,
+    refused and counted as rejected just as presence would reject it. Both
+    counters make the gap visible; neither is silent loss.
     """
 
     def __init__(self, service, *, clock: MainClock, capacity: int):
@@ -172,13 +181,19 @@ class TimelineOutbox:
             raise ValueError("critical observations are recorded, not staged")
         if valid_until is not None and observation.kind not in {Kind.OWNER_ENTRY, Kind.OWNER_EXIT}:
             raise ValueError("presence validity applies to owner observations only")
+        fact = _fact(observation)
         with self._lock:
-            if any(item == identifier for item, _ in self._pending):
-                return True
+            for item, _, staged in self._pending:
+                if item == identifier:
+                    if staged == fact:
+                        return True
+                    # Same UUID, different source fact: never deduplicated.
+                    self._rejected += 1
+                    return False
             if len(self._pending) >= self.capacity:
                 self._refused += 1
                 return False
-            self._pending.append((identifier, build))
+            self._pending.append((identifier, build, fact))
             return True
 
     def flush(self, *, limit: int = 100):
@@ -190,7 +205,7 @@ class TimelineOutbox:
                 with self._lock:
                     if not self._pending:
                         break
-                    _, build = self._pending[0]
+                    _, build, _ = self._pending[0]
                 try:
                     with self.receipt() as (received, trusted):
                         observation, valid_until = build(received, trusted)

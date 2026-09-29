@@ -276,6 +276,25 @@ class EntranceAdapterTests(PresenceFixture, TestCase):
         self.assertTrue(state.degraded)
         self.assertEqual(self.state(), "PRESENT")
 
+    def test_conflicting_pending_uuid_is_rejected_not_deduplicated(self):
+        self.refuse = True
+        staged = crossing(CrossingKind.ANONYMOUS_ENTRY)
+        self.assertEqual(self.submit(staged).pending, 1)
+        # The same fact staged again, stamped later, stays one pending duplicate.
+        self.clock.at = NOW + timedelta(seconds=1)
+        self.assertTrue(self.adapter.submit(TrackUpdate((), (staged,), DetectionQuality.SUFFICIENT)))
+        conflicting = replace(staged, kind=CrossingKind.ANONYMOUS_EXIT)
+        self.assertFalse(self.adapter.submit(TrackUpdate((), (conflicting,), DetectionQuality.SUFFICIENT)))
+        state = self.outbox.state()
+        self.assertEqual((state.pending, state.rejected, state.refused), (1, 1, 0))
+        self.refuse = False
+        state = self.outbox.flush()
+        # The gap stays visible after the first fact is written.
+        self.assertEqual((state.recorded, state.pending, state.rejected), (1, 0, 1))
+        self.assertTrue(state.degraded)
+        item, = self.history()["items"]
+        self.assertEqual(item["kind"], "anonymous_entry")
+
 
 class OwnerTrackerEndToEndTests(PresenceFixture, TestCase):
     """Real tracker, quality gate and owner-verification service with synthetic frames."""
@@ -521,7 +540,7 @@ class HealthTimelineTests(PresenceFixture, TestCase):
         fact = self.outbox
         node = HealthTimeline(fact)
         node.node(NODE, NodeHealthState.ONLINE)
-        identifier, build = fact._pending[0]
+        identifier, build, _ = fact._pending[0]
         observation, valid_until = build(NOW, True)
         self.assertIsNone(valid_until)
         self.assertEqual(observation.identifier, identifier)

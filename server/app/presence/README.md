@@ -171,7 +171,10 @@ route, worker thread or default timing policy:
   otherwise unusable receipt time from the clock port (`ClockUnavailable`,
   never `InvalidObservation`); a full outbox refuses
   the new fact, and only a fact presence rejects as `InvalidObservation` is
-  removed. Both are counted and reported by `OutboxState.degraded`, never
+  removed. A UUID staged again while still pending is a duplicate only when
+  its source fact (every field except the receipt fields) matches; a
+  different fact under that UUID is refused at `stage()` as an identity
+  conflict and counted as rejected. Both are counted and reported by `OutboxState.degraded`, never
   dropped silently.
 
 `owner_presence_validity` and `maximum_source_latency` have no default; they
