@@ -680,14 +680,25 @@ class ReviewCollector:
         which means the current evidence cannot be verified -- supersedes a
         standing success, so GitHub's latest attempt never reads successful
         while the collector cannot currently confirm a clean review.
+
+        Collection is bound to ``pr_number`` and the configured repository:
+        every live read that names another pull request or repository fails
+        before any ledger is read or written, so a miswired reader can never
+        produce, for another PR, an outcome whose revocation lands here.
         """
         if type(pr_number) is not int or pr_number <= 0:
             raise CollectorFailure("invalid pull request number")
+        repository_id = credentials.config.repository_id
+
+        def bound_read() -> Context:
+            live = read_live_context()
+            if (not isinstance(live, Context) or live.pr_number != pr_number
+                    or live.repository_id != repository_id):
+                raise CollectorFailure("live context names another pull request")
+            return live
         try:
-            decision = self.collect(reviewer, read_live_context, source)
+            decision = self.collect(reviewer, bound_read, source)
             if decision.status == "pass":
-                if decision.context.pr_number != pr_number:
-                    raise CollectorFailure("live context names another pull request")
                 self.publish(client, credentials, decision)
                 return decision
         except Exception:

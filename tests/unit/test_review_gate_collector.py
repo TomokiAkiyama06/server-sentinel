@@ -649,6 +649,31 @@ class CollectorTests(unittest.TestCase):
                 expected = ["success", "failure"] + (["success"] if later == "pass" else [])
                 self.assertEqual([post["conclusion"] for post in client.posts], expected)
 
+    def test_reconciliation_is_bound_to_the_supplied_pull_request(self):
+        client, credentials = self.publication()
+        other = replace(self.context, pr_number=13, test_merge_sha="9" * 40)
+        # PR 12 has a published success; PR 13 has an active request.
+        self.collector.request_review("codex", self.live, self.source)
+        self.source.add(self.context.head_sha, self.late())
+        self.reconcile(client, credentials)
+        self.collector.request_review("codex", other, self.source)
+        other_before = (self.state / "900002-13-codex.json").read_text()
+        self.source.add(other.head_sha, self.late() + 5, body=BLOCK)  # 13 would block
+        foreign_repository = replace(self.context, repository_id=900009)
+        for wrong in (other, foreign_repository):
+            with self.subTest(pr=wrong.pr_number, repository=wrong.repository_id):
+                with self.assertRaises(collector.CollectorFailure):
+                    self.collector.collect_and_publish(
+                        "codex", 12, lambda wrong=wrong: wrong, self.source,
+                        client, credentials)
+        # Nothing was decided or written for the other PR; PR 12's success,
+        # which this pass could not verify, was superseded.
+        self.assertEqual((self.state / "900002-13-codex.json").read_text(), other_before)
+        self.assertFalse((self.state / "900009-12-codex.json").exists())
+        self.assertEqual([(post["conclusion"], post["head_sha"]) for post in client.posts],
+                         [("success", self.context.test_merge_sha),
+                          ("failure", self.context.test_merge_sha)])
+
     def test_context_change_supersedes_success_on_the_old_test_merge(self):
         client, credentials = self.publication()
         self.collector.request_review("codex", self.live, self.source)

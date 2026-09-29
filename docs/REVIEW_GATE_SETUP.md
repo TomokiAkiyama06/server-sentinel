@@ -252,7 +252,10 @@ SHA, Check Run ID (once confirmed) and state (`publishing` / `success` /
 `revoking`).
 
 - `collect_and_publish(reviewer, pr_number, read_live_context, source, client,
-  credentials)` is one reconciliation pass. A `pass` for the ledger's current
+  credentials)` is one reconciliation pass, bound to `pr_number` and the
+  configured repository: a live read naming another PR or repository fails
+  before any ledger is touched (and supersedes `pr_number`'s standing
+  success, which that pass could not verify). A `pass` for the ledger's current
   active request posts one success; if that exact success is already recorded
   the pass is a no-op, so polling and restart recovery do not create further
   runs.
