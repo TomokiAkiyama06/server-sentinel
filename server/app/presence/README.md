@@ -247,5 +247,9 @@ an out-of-order event cannot later regain trust merely because it is newer than
 another untrusted delayed event. Only source-dated kinds (person, motion,
 entry/exit and critical observations) use that mark; health, storage and
 recording facts are dated by the main host and neither advance nor are checked
-against it. It reports observations and their temporal context only; it never
+against it. Critical observations keep a separate per-source mark, because
+they are recorded synchronously while other source facts wait in the outbox:
+a later-occurring critical fact written first never makes a staged crossing
+from the same camera look reordered, and order within each path is still
+checked. It reports observations and their temporal context only; it never
 infers cause, guilt, or identity.

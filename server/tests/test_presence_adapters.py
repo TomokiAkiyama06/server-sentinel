@@ -292,6 +292,40 @@ class EntranceAdapterTests(PresenceFixture, TestCase):
         self.assertFalse(page["ordering_degraded"])
         self.assertTrue(all(item["clock_trusted"] for item in page["items"]))
 
+    def test_critical_write_from_the_same_source_never_makes_a_staged_crossing_untrusted(self):
+        # The critical path records synchronously while the crossing waits in
+        # the outbox, so a later-occurring critical fact from the same camera
+        # reaches presence first by design.
+        recorder = CriticalTimelineRecorder(self.outbox, maximum_source_latency=LATENCY)
+        self.clock.at = NOW
+        self.assertTrue(self.adapter.submit(TrackUpdate((), (crossing(CrossingKind.OWNER_ENTRY),),
+                                                        DetectionQuality.SUFFICIENT)))
+        self.clock.at = NOW + timedelta(milliseconds=600)
+        recorder(critical(at=NOW + timedelta(milliseconds=500)))
+        self.clock.at = NOW + timedelta(milliseconds=900)
+        self.assertEqual(self.outbox.flush().recorded, 1)
+        self.assertEqual(self.state(self.clock.at), "PRESENT")
+        page = self.history()
+        self.assertFalse(page["ordering_degraded"])
+        self.assertTrue(all(item["clock_trusted"] for item in page["items"]))
+
+    def test_source_order_is_still_checked_within_each_path(self):
+        recorder = CriticalTimelineRecorder(self.outbox, maximum_source_latency=LATENCY)
+        self.clock.at = NOW + timedelta(milliseconds=600)
+        recorder(critical(at=NOW + timedelta(milliseconds=500)))
+        recorder(critical(at=NOW + timedelta(milliseconds=100)))
+        self.submit(crossing(CrossingKind.OWNER_ENTRY, received=NOW + timedelta(milliseconds=700),
+                             occurred=NOW + timedelta(milliseconds=500)))
+        self.submit(crossing(CrossingKind.OWNER_ENTRY, received=NOW + timedelta(milliseconds=800),
+                             occurred=NOW + timedelta(milliseconds=200)))
+        by_kind = {}
+        for item in self.history()["items"]:
+            kind, occurred, value = item["kind"], item["occurred_at"], item["clock_trusted"]
+            by_kind.setdefault(kind, []).append((occurred, value))
+        for kind, items in by_kind.items():
+            # The earlier-occurring fact arrived second on its own path.
+            self.assertEqual([value for _, value in sorted(items)], [False, True], kind)
+
     def test_unavailable_database_location_keeps_fact_staged(self):
         missing = Path(tempfile.gettempdir()) / f"absent-{uuid4()}" / "synthetic.sqlite3"
         self.presence.database = Database(missing)

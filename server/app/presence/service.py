@@ -28,6 +28,13 @@ UNKNOWN = "unknown"
 # observation from that camera look reordered.
 SOURCE_CLOCK = frozenset({Kind.PERSON, Kind.MOTION, Kind.OWNER_ENTRY, Kind.OWNER_EXIT,
                           Kind.ANONYMOUS_ENTRY, Kind.ANONYMOUS_EXIT, *CRITICAL})
+# Critical observations are recorded synchronously while other source facts
+# wait in the bounded `TimelineOutbox`, so the two reach presence out of source
+# order by design. Each keeps its own per-source high-water mark: a critical
+# write never makes an earlier staged crossing look reordered, and ordering
+# within either path is still checked.
+SOURCE_CLOCK_TABLES = {kind: "presence_critical_source_clock" if kind in CRITICAL else "presence_source_clock"
+                       for kind in SOURCE_CLOCK}
 # Payload fields a producer stamps at the moment presence receives the fact.
 RECEIPT_FIELDS = ("received_at", "clock_trusted", "confirmed")
 
@@ -322,16 +329,17 @@ class PresenceService:
                 # delayed replay stays a duplicate and its payload stays expired.
                 return observation
             trusted = self._clock(db, observation.received_at, observation.clock_trusted)
-            if observation.source_id and observation.kind in SOURCE_CLOCK:
+            clock = SOURCE_CLOCK_TABLES.get(observation.kind) if observation.source_id else None
+            if clock:
                 source = str(observation.source_id)
-                high_water = db.execute("SELECT latest_occurred FROM presence_source_clock WHERE source=?",
+                high_water = db.execute(f"SELECT latest_occurred FROM {clock} WHERE source=?",
                                         (source,)).fetchone()
                 if high_water and timestamp(observation.occurred_at) < high_water["latest_occurred"]:
                     trusted = False
             if not trusted:
                 observation = observation.uncertain()
-            elif observation.source_id and observation.kind in SOURCE_CLOCK:
-                db.execute("INSERT INTO presence_source_clock(source,latest_occurred) VALUES (?,?) "
+            elif clock:
+                db.execute(f"INSERT INTO {clock}(source,latest_occurred) VALUES (?,?) "
                            "ON CONFLICT(source) DO UPDATE SET latest_occurred="
                            "MAX(latest_occurred,excluded.latest_occurred)",
                            (str(observation.source_id), timestamp(observation.occurred_at)))

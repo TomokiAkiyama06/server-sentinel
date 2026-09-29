@@ -50,7 +50,8 @@ def presence_migration(version: int) -> Migration:
 
 def presence_gap_migration(version: int) -> Migration:
     """Durable timeline-gap marker, the outbox session that proves a clean close,
-    and the source-fact digests that keep restamped replays comparable.
+    the source-fact digests that keep restamped replays comparable, and the
+    separate source clock of synchronously recorded critical observations.
 
     The marker holds counts and times only, never observation content. A
     session row left behind by an outbox that did not close cleanly is itself
@@ -73,4 +74,8 @@ def presence_gap_migration(version: int) -> Migration:
         # hash only and is removed together with its observation.
         "CREATE TABLE presence_source_facts (id TEXT PRIMARY KEY, "
         "digest TEXT NOT NULL CHECK(length(digest)=64))",
+        # Per-source high-water mark of synchronously recorded critical
+        # observations, kept apart from the staged-fact mark so the intended
+        # reordering between the two paths is never mistaken for a clock fault.
+        "CREATE TABLE presence_critical_source_clock (source TEXT PRIMARY KEY, latest_occurred TEXT NOT NULL)",
     ))
