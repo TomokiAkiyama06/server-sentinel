@@ -226,6 +226,11 @@ class LifespanTests(RuntimeFixture):
             runtime = application.state.monitoring
             self.assertEqual(RuntimeState.FAILED, runtime.status.state)
             self.assertEqual(1, database.calls)
+            # The failed open raises the immediate recording-health alert.
+            await self.settle(runtime)
+            self.assertEqual(HealthState.FAILED, runtime.status.recording_health)
+            self.assertEqual(["ServerSentinel critical alert: recording_health_failure"],
+                             self.slack_texts())
             # The first due retry raises again from connect(); it must push the
             # deadline forward instead of retrying on every following tick.
             self.clock.advance(timedelta(minutes=15))
@@ -240,6 +245,10 @@ class LifespanTests(RuntimeFixture):
             await runtime.call(runtime.tick)
             self.assertEqual(3, database.calls)
             self.assertEqual(RuntimeState.RUNNING, runtime.status.state)
+            # Failed retries in the same episode did not repeat the alert.
+            await self.settle(runtime)
+            self.assertEqual(1, self.slack_texts().count(
+                "ServerSentinel critical alert: recording_health_failure"))
             self.assertEqual(1, self.probe.calls)
 
     async def test_lifespan_state_snapshots_follow_a_recovered_startup(self):

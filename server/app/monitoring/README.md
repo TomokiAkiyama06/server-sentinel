@@ -56,9 +56,9 @@ still updates the in-memory state and attempts the alert, then marks the step
 degraded for retry; while the write keeps failing the same verdict re-alerts at
 most once per day. A recording filesystem mismatch raises one
 immediate `recording_health_failure` per episode. A failed startup open is
-retried every `retry_seconds` from the tick against the same declared identity
-(also when the retry itself raises, e.g. from the database connect);
-only the first failure of the episode alerts, and a successful retry runs the
+retried every `retry_seconds` from the tick against the same declared identity;
+a failed database open (e.g. SQLite I/O error or permission change) takes the
+same alerting startup-failure path. Only the first failure of the episode alerts, and a successful retry runs the
 startup steps and binds admission. Slack remains optional and
 never determines local state.
 

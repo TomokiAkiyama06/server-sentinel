@@ -338,17 +338,20 @@ class MonitoringRuntime:
                 queue_capacity=dependencies.notification_queue_capacity,
             )
         if self._connection is None:
+            connection = None
             try:
                 self._admit_database_creation()
+                connection = self.database.connect()
+                events = NotificationEventStore(connection, self._owner_reservation)
             except Exception:
+                # A refused creation or a failed open (SQLite I/O error,
+                # read-only or permission change) means recording cannot
+                # start: raise the immediate alert and keep the retry.
+                if connection is not None:
+                    with suppress(Exception):
+                        connection.close()
                 self._startup_failed()
                 return
-            connection = self.database.connect()
-            try:
-                events = NotificationEventStore(connection, self._owner_reservation)
-            except BaseException:
-                connection.close()
-                raise
             self._connection, self.notification_events = connection, events
         connection = self._connection
         recordings = None
