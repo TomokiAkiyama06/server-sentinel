@@ -89,6 +89,10 @@ call that exceeds the bound yields `discovery_failed` (scan) or
 is used up wait for the next poll. While a source's device call is still
 blocked, its next open fails at once instead of starting more threads, and a
 descriptor returned late is closed in the worker without being used.
+If no worker can be started at all (thread/PID exhaustion), the descriptor is
+kept for a bounded retry on later polls and the source reports
+`capture_cleanup_failed` (relaunch and re-approval blocked); it is never closed
+on the tick thread and the failure never escapes `poll()`.
 
 ## Not yet wired
 

@@ -164,6 +164,10 @@ class _Call:
         return self._value
 
 
+class _NotStarted(TimeoutError):
+    """The call never ran: a previous call is still blocked or no worker could start."""
+
+
 class _BoundedCall:
     """Run a potentially blocking device call off the Agent tick thread.
 
@@ -184,14 +188,14 @@ class _BoundedCall:
 
     def run(self, function, timeout):
         if self.blocked:
-            raise TimeoutError("device call still blocked")
+            raise _NotStarted("device call still blocked")
         call = _Call(self._discard)
         thread = threading.Thread(target=call.execute, args=(function,), name=self._name,
                                   daemon=True)
         try:
             thread.start()
         except RuntimeError:
-            raise TimeoutError("device call could not start") from None
+            raise _NotStarted("device call could not start") from None
         if not call.done.wait(timeout) and not call.abandon():
             self._pending = call
             raise TimeoutError("device call exceeded bound")
@@ -259,6 +263,8 @@ class _Source:
         self.retry_at = 0.0
         self.discovery_blocked = False
         self.storage_failed = False
+        # Descriptors whose close could not even be scheduled (no worker).
+        self.pending_close = []
         # Queue drops already surfaced in a degraded snapshot.
         self.reported_drops = 0
         # Last capture failure while no pipeline runs; cleared by real frames.
@@ -324,17 +330,28 @@ class UvcCapture:
         return max(0.0, min(self.limits.device_timeout,
                             self._device_deadline - time.monotonic()))
 
+    def _close_off_thread(self, source, descriptor, timeout):
+        """False only if the close could not be scheduled at all."""
+        try:
+            source.device_call.run(lambda: self.close_device(descriptor), timeout)
+        except _NotStarted:
+            return False
+        except OSError:
+            pass  # Timed out (still closing in the worker) or failed: not reusable.
+        return True
+
     def _release_descriptor(self, source, descriptor):
         # Closing can reach the driver's release callback: bounded, off-thread.
-        try:
-            source.device_call.run(lambda: self.close_device(descriptor), self._device_bound())
-        except TimeoutError:
-            if not source.device_call.blocked:
-                # Worker could not start; still never close on the tick thread.
-                threading.Thread(target=self._close_quietly, args=(descriptor,),
-                                 name="media-capture-agent-uvc-device", daemon=True).start()
-        except OSError:
-            pass
+        # Without a worker (thread/PID exhaustion) the descriptor is kept for a
+        # later bounded retry and the source reports a cleanup failure; it is
+        # never closed on the tick thread and nothing escapes poll().
+        if not self._close_off_thread(source, descriptor, self._device_bound()):
+            source.pending_close.append(descriptor)
+
+    def _retry_pending_close(self, source, timeout=None):
+        timeout = self._device_bound() if timeout is None else timeout
+        source.pending_close = [descriptor for descriptor in source.pending_close
+                                if not self._close_off_thread(source, descriptor, timeout)]
 
     def _scan(self):
         # A timed-out or still-blocked scan (TimeoutError is an OSError) proves
@@ -503,7 +520,7 @@ class UvcCapture:
         if controller.state == CameraState.MANUAL or controller.requires_approval:
             reason = "identity_ambiguous" if controller.reason in _AMBIGUOUS else "owner_approval_required"
             return SourceHealth(source_id, "manual_intervention_required", reason)
-        if source.stuck:
+        if source.stuck or source.pending_close:
             return SourceHealth(source_id, "offline", "capture_cleanup_failed")
         if source.discovery_blocked:
             return SourceHealth(source_id, "offline", "discovery_failed")
@@ -544,6 +561,7 @@ class UvcCapture:
                 self._teardown_deadline = time.monotonic() + self.limits.stop_timeout
                 for source in self._sources.values():
                     self._retry_stuck(source)
+                    self._retry_pending_close(source)
                     if not source.storage_failed:
                         self._reconcile(source, scan)
                 for source in self._sources.values():
@@ -553,7 +571,7 @@ class UvcCapture:
                 # without consuming the bound, so it cannot starve the others.
                 for source in self._sources.values():
                     controller = source.controller
-                    if (source.active is None and not source.stuck
+                    if (source.active is None and not source.stuck and not source.pending_close
                             and not source.storage_failed and not source.discovery_blocked
                             and controller.bound is not None
                             and not controller.requires_approval and now >= source.retry_at):
@@ -590,7 +608,7 @@ class UvcCapture:
             source = self._sources[source_id]
             if not isinstance(candidate, DeviceEvidence):
                 raise CaptureRefused("invalid candidate")
-            if source.stuck or source.storage_failed:
+            if source.stuck or source.pending_close or source.storage_failed:
                 raise CaptureRefused("source requires local recovery")
             scan = self._scan()
             if scan.failures:
@@ -622,9 +640,10 @@ class UvcCapture:
                 self._teardown(source)
                 # Shutdown grants every stuck pipeline one more full bound.
                 source.stuck = [active for active in source.stuck if not self._reap(active)]
+                self._retry_pending_close(source, self.limits.device_timeout)
                 source.queue.close()
                 source.controller.capture_closed()
-                if source.stuck or source.storage_failed:
+                if source.stuck or source.pending_close or source.storage_failed:
                     # Keep the recovery marker armed: restart requires re-approval.
                     failed = True
                     continue

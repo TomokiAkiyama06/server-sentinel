@@ -648,9 +648,14 @@ class CaptureTests(CaptureCase):
         self.assertEqual(self.launcher.pipelines, [])
         self.assertNotIn("online", [item.state for item in health])
         release.set()
-        self.clock.now += 100
+
+        def later_tick():
+            self.clock.now += 100  # Past any bounded backoff.
+            capture.poll()
+            return len(self.launcher.pipelines) == 4
+
         # Once the driver recovers, every source launches on later ticks.
-        self.assertTrue(wait_for(lambda: capture.poll() and len(self.launcher.pipelines) == 4))
+        self.assertTrue(wait_for(later_tick))
 
     def test_hung_descriptor_close_never_blocks_poll(self):
         self.short_device_limits(0.2)
@@ -673,6 +678,43 @@ class CaptureTests(CaptureCase):
         self.assertEqual(len(self.launcher.pipelines), 1)
         release.set()
         self.assertTrue(wait_for(lambda: len(closed) == 1))
+
+    def test_close_worker_exhaustion_is_a_source_cleanup_failure(self):
+        closed = []
+
+        def close_device(descriptor):
+            closed.append(descriptor)
+            os.close(descriptor)
+
+        device = evidence()
+        discovery = FakeDiscovery(device)
+        capture = self.capture(discovery, close_device=close_device)
+        capture.poll()
+        capture.approve(SOURCES[0], device)
+        original_start = threading.Thread.start
+        device_starts = []
+        exhausted = [True]
+
+        def start(thread):
+            if thread.name == "media-capture-agent-uvc-device":
+                device_starts.append(thread)
+                # The open worker starts; every close worker hits exhaustion.
+                if len(device_starts) > 1 and exhausted[0]:
+                    raise RuntimeError("can't start new thread")
+            return original_start(thread)
+
+        with mock.patch.object(threading.Thread, "start", start):
+            # Old behavior: the unguarded fallback start raised out of poll().
+            self.assertEqual(self.state(capture), ("offline", "capture_cleanup_failed"))
+            self.assertEqual(closed, [])  # Never closed on the tick thread.
+            with self.assertRaises(CaptureRefused):
+                capture.approve(SOURCES[0], device)
+            self.assertEqual(self.state(capture), ("offline", "capture_cleanup_failed"))
+            exhausted[0] = False
+            capture.poll()
+        # The retained descriptor is closed by a bounded worker once one starts.
+        self.assertTrue(wait_for(lambda: len(closed) == 1))
+        self.assertEqual(closed, self.launcher.descriptors)
 
     def test_teardowns_during_launch_share_the_poll_stop_bound(self):
         capture, _discovery, _devices = self.four_approved()

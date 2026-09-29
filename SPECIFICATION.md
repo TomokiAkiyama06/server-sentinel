@@ -339,6 +339,8 @@ the heartbeat is delayed by at most `device_timeout + stop_timeout` regardless
 of how many sources hang; a hung driver call yields
 `discovery_failed`/`capture_failed` instead of stopping the heartbeat, starts no
 additional worker while still blocked, and a late descriptor is closed unused.
+If no close worker can start, the descriptor is retained for a bounded retry and
+the source reports `capture_cleanup_failed` instead of the failure escaping.
 Queue drops are latched until one `capture_overloaded` snapshot has reported
 them, even when polls are slower than the stall window.
 Node health is unaffected by any source failure.
