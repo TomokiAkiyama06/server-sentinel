@@ -68,6 +68,13 @@ class Rs256Signer(Protocol):
         ...
 
 
+UNCONFIGURED_SIGNER_MESSAGE = "RS256 signer is not configured (Owner decision pending)"
+
+
+class _SignerNotConfigured(TokenFailure):
+    """Marker raised only by ``UnconfiguredRs256Signer``; its text is replaced."""
+
+
 class UnconfiguredRs256Signer:
     """Default signer until the Owner approves an RS256 implementation."""
 
@@ -78,7 +85,7 @@ class UnconfiguredRs256Signer:
         return "UnconfiguredRs256Signer()"
 
     def sign(self, signing_input: bytes) -> bytes:
-        raise TokenFailure("RS256 signer is not configured (Owner decision pending)")
+        raise _SignerNotConfigured(UNCONFIGURED_SIGNER_MESSAGE)
 
 
 class _Secret:
@@ -117,12 +124,18 @@ def build_app_jwt(app_id: int, signer: Rs256Signer, now: int) -> _Secret:
                      + _json_segment({"iat": now - JWT_BACKDATE_SECONDS,
                                       "exp": now + JWT_LIFETIME_SECONDS,
                                       "iss": app_id}))
+    # Every signer error, including a TokenFailure a custom signer raises with
+    # a key-backend diagnostic, is replaced by a fixed message raised outside
+    # the handler, so not even a suppressed ``__context__`` retains it.
+    failure = None
     try:
         signature = signer.sign(signing_input.encode("ascii"))
-    except TokenFailure:
-        raise
+    except _SignerNotConfigured:
+        failure = UNCONFIGURED_SIGNER_MESSAGE
     except Exception:
-        raise TokenFailure("App JWT signing failed") from None
+        failure = "App JWT signing failed"
+    if failure is not None:
+        raise TokenFailure(failure)
     if not isinstance(signature, bytes) or len(signature) not in RSA_SIGNATURE_BYTES:
         raise TokenFailure("App JWT signing failed")
     return _Secret(signing_input + "." + _b64url(signature))
@@ -196,14 +209,19 @@ class InstallationTokenSource:
         jwt = build_app_jwt(config.issuer.app_id, self._signer, now)
         payload = {"repository_ids": [config.repository_id],
                    "permissions": dict(REQUESTED_PERMISSIONS)}
+        failed = False
         try:
             response = self._transport.post_json(
                 f"/app/installations/{config.installation_id}/access_tokens",
                 jwt.reveal(), payload)
         except Exception:  # PublisherFailure or an unexpected transport error.
-            raise TokenFailure("installation token exchange failed") from None
+            # Raised below, outside the handler: a transport error that echoes
+            # the JWT must not survive even as a suppressed __context__.
+            failed = True
         finally:
             del jwt
+        if failed:
+            raise TokenFailure("installation token exchange failed")
         return self._validated(response, now)
 
     def _validated(self, response: Any, now: int) -> tuple[_Secret, int]:
@@ -244,10 +262,13 @@ def open_token_source(config: RuntimeConfig, checkout_root: Path,
         key = load_app_private_key(config, checkout_root)
     except PublisherFailure:
         raise TokenFailure("App private key is unavailable") from None
+    signer = None
     try:
         signer = signer_factory(key)
     except Exception:
-        raise TokenFailure("RS256 signer could not be initialised") from None
+        pass  # Raised below so a key-bearing diagnostic is not kept as context.
     finally:
         del key
+    if signer is None:
+        raise TokenFailure("RS256 signer could not be initialised")
     return InstallationTokenSource(config, signer, transport, clock)

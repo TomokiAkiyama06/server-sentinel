@@ -158,8 +158,9 @@ closed.
 
 The collector converts an authenticated Codex or Claude **GitHub pull-request
 review** into the fixed receipt from `successful_check_run_request`. It never
-executes a provider, never posts the trigger comment, and never publishes;
-`publish_collected()` hands only a `pass` decision to `publish_success`, which
+executes a provider and never posts the trigger comment. Publication goes
+through `ReviewCollector.collect_and_publish()` (see "Publication and
+supersession" below); a success is posted only via `publish_success`, which
 re-reads the live context again before posting.
 
 Provider policy lives in an external private JSON file named by
@@ -196,16 +197,23 @@ Flow and binding:
    `0600` write and directory fsync in `state_dir` (a `0700` directory owned by
    the publisher account, outside every checkout). A repeated call for the same
    active context returns the same request (retrying trigger delivery never
-   creates a second request). `force_new=True` supersedes it.
+   creates a second request). `force_new=True` supersedes it, but is refused
+   while a success this collector published still stands; call
+   `revoke_published()` first so the old success cannot satisfy the required
+   check during the rerun.
 2. `collect(reviewer, read_live_context, source)` re-reads the live context
    before and after reading the complete, paginated reviews and each candidate's
    inline comments. Any HEAD, base, merge-base, diff or test-merge difference
    from the request marks the request `invalidated` durably; it can never pass
    again, even if the old context returns. A new request is required, and the
    same-HEAD review that preceded it is below its watermark. The unlocked first
-   read can be overtaken by a concurrent `request_review` for a newer context;
-   a request recorded after that read started is therefore not invalidated by a
-   mismatch but reported as `pending` (`live_context_read_predates_request`).
+   read can be overtaken by a concurrent `request_review` for a newer context
+   (even within the same clock second, so timestamps cannot order them). A
+   mismatch therefore only notes the request ID seen under the lock and
+   re-reads the live context: only if that fresh read still differs and the
+   same request is still current is the request invalidated. If the request
+   was replaced meanwhile, or the fresh read matches, the decision is
+   `pending` (`live_context_read_predates_request`).
 3. A review counts only if it is from the configured bot, has an ID above the
    watermark, targets the recorded HEAD, and was submitted at least
    `max_review_runtime_seconds` + 300 s (clock skew allowance) after the
@@ -234,10 +242,39 @@ reviews, a corrupt, foreign or non-private ledger record, an unavailable lock
 absent. Logs carry reviewer, PR, request ID, status and reason code only;
 review text is never logged.
 
+### Publication and supersession
+
+GitHub evaluates a required check by the **latest** attempt with that name on
+the test-merge SHA, and nothing removes an earlier success. The collector
+therefore records, in the same private ledger record (schema version 2), the
+success it last posted per reviewer: request ID, test-merge SHA, Check Run ID
+and state (`success` / `revoking`).
+
+- `collect_and_publish(reviewer, pr_number, read_live_context, source, client,
+  credentials)` is one reconciliation pass. A `pass` for the ledger's current
+  active request posts one success; if that exact success is already recorded
+  the pass is a no-op, so polling and restart recovery do not create further
+  runs (a crash between GitHub accepting the success and the ledger write can
+  repeat that single post once).
+- Every other outcome (`blocked`, `pending` after `force_new`, `invalidated`),
+  a `pass` for a request that was superseded in the meantime, and any
+  collection error supersede a standing success with a newer attempt of the
+  same name on its test-merge SHA: `status: completed`, `conclusion: failure`
+  (never `neutral` / `skipped`, which satisfy a required check), fixed output
+  without review text.
+- Before that failure attempt is posted the ledger is set to `revoking`. A
+  crash or API error during revocation is retried on the next pass and the
+  record is never taken for the current success.
+- If collection fails **and** the revocation fails, `CollectorFailure` is
+  raised with a fixed message; the ledger still holds the standing success (or
+  `revoking`) and the next pass retries.
+
 Recovery: a corrupt ledger record is not deleted automatically. The Owner
 inspects and removes `state_dir/<repository_id>-<pr>-<reviewer>.json`, then a
 new request and review are needed. Deleting a record never produces a pass by
-itself.
+itself, but it forgets a standing success: first confirm on GitHub that the
+latest attempt of that check on the current test merge is not `success`, or
+post a failure attempt, before deleting.
 
 Residual limits (need Owner decision and real GitHub acceptance): marker
 strings and the provider runtime bound are Owner policy, not verified provider
@@ -262,9 +299,13 @@ remain, single-flight across threads, and dropped on any failure or
 
 The key, JWT and token are held only in memory: never in files, `os.environ`,
 subprocess arguments, log records, `repr()` or exception text, and failures
-raise `TokenFailure` with fixed messages and a suppressed exception chain.
-Synthetic tests assert this for success, transport failure and a leaking
-signer.
+raise `TokenFailure` with fixed messages and no exception chain at all
+(neither `__cause__` nor `__context__`, so even code that ignores
+`__suppress_context__` cannot reach a transport or key-backend diagnostic).
+Any exception a signer raises, including a `TokenFailure` a custom signer
+builds from a PEM-parser message, is replaced by the fixed message. Synthetic
+tests assert this for success, transport failure, a leaking signer and a
+signer raising `TokenFailure` with key text.
 
 **RS256 is not implemented.** Python's standard library has no RSA signature
 primitive, and no already-pinned dependency in this repository provides one.

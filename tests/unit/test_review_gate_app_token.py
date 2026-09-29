@@ -293,7 +293,8 @@ class AppTokenTests(unittest.TestCase):
         self.assertEqual(len(errors), 2)
         for exc in errors:
             self.assertIsNone(exc.__cause__)
-            self.assertTrue(exc.__suppress_context__)
+            # Not even a suppressed context may retain the JWT or key text.
+            self.assertIsNone(exc.__context__)
             texts += [str(exc), repr(exc),
                       "".join(traceback.format_exception(exc))]
         texts += capture.messages
@@ -308,6 +309,41 @@ class AppTokenTests(unittest.TestCase):
         with self.assertRaises(TypeError):
             import pickle
             pickle.dumps(app_token.build_app_jwt(1, SyntheticSigner(b"k"), NOW))
+
+    def test_token_failure_raised_by_a_custom_signer_is_redacted(self):
+        key_text = self.key_body.decode("ascii")
+
+        class TokenFailureSigner:
+            def sign(self, data):
+                raise app_token.TokenFailure("PEM parse error near " + key_text)
+
+        class ForgedMarkerSigner:
+            def sign(self, data):
+                raise app_token._SignerNotConfigured("backend said " + key_text)
+        capture = _Capture()
+        logger = logging.getLogger("server_sentinel.review_gate.app_token")
+        logger.addHandler(capture)
+        try:
+            for signer, message in ((TokenFailureSigner(), "App JWT signing failed"),
+                                    (ForgedMarkerSigner(),
+                                     app_token.UNCONFIGURED_SIGNER_MESSAGE)):
+                with self.subTest(signer=type(signer).__name__):
+                    source = app_token.InstallationTokenSource(
+                        self.config, signer, self.transport, self.clock)
+                    with self.assertRaises(app_token.TokenFailure) as caught:
+                        source.token()
+                    exc = caught.exception
+                    self.assertEqual(str(exc), message)
+                    self.assertIsNone(exc.__cause__)
+                    self.assertIsNone(exc.__context__)
+                    self.assertNotIn(key_text[:24],
+                                     "".join(traceback.format_exception(exc)))
+        finally:
+            logger.removeHandler(capture)
+        self.assertTrue(capture.messages)
+        for text in capture.messages:
+            self.assertNotIn(key_text[:24], text)
+        self.assertEqual(self.transport.calls, [])
 
     def test_env_token_path_still_works_and_is_redacted(self):
         credentials = publisher.load_app_credentials(

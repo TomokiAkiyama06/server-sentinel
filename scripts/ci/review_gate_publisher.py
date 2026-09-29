@@ -25,7 +25,7 @@ from urllib.request import (HTTPRedirectHandler, HTTPSHandler, ProxyHandler,
                             Request, build_opener)
 import ssl
 
-from scripts.ci.review_gate_policy import (Context, Issuer, PolicyFailure,
+from scripts.ci.review_gate_policy import (CHECK_NAMES, Context, Issuer, PolicyFailure,
                                            successful_check_run_request)
 
 
@@ -443,4 +443,44 @@ def publish_success(client: GitHubTransport, credentials: AppCredentials,
     repo = "/repos/" + "/".join(_path_part(part) for part in credentials.config.repository.split("/"))
     response = client.post_json(f"{repo}/check-runs", credentials.installation_token, request)
     _validate_published_run(response, credentials.config, request)
+    return response
+
+
+def revocation_check_run_request(test_merge_sha: str, reviewer: str) -> dict[str, Any]:
+    """Build the fixed failure attempt that supersedes an earlier success.
+
+    ``failure`` (never ``neutral`` / ``skipped``, which satisfy a required
+    check) keeps the check unsatisfied until a new success is published.  The
+    output carries no review text or reason detail.
+    """
+    name = CHECK_NAMES.get(reviewer) if isinstance(reviewer, str) else None
+    if name is None:
+        raise PublisherFailure("unsupported reviewer")
+    return {
+        "name": name,
+        "head_sha": _sha(test_merge_sha),
+        "status": "completed",
+        "conclusion": "failure",
+        "output": {"title": f"{reviewer} review is not current",
+                   "summary": "superseded"},
+    }
+
+
+def publish_revocation(client: GitHubTransport, credentials: AppCredentials,
+                       test_merge_sha: str, reviewer: str) -> dict[str, Any]:
+    """Post a newer failure attempt for ``reviewer`` on ``test_merge_sha``.
+
+    No live re-read is needed: a failure attempt can only withhold approval.
+    """
+    request = revocation_check_run_request(test_merge_sha, reviewer)
+    repo = "/repos/" + "/".join(_path_part(part) for part in credentials.config.repository.split("/"))
+    response = client.post_json(f"{repo}/check-runs", credentials.installation_token, request)
+    app = response.get("app") if isinstance(response, dict) else None
+    if (not isinstance(app, dict) or app.get("id") != credentials.config.issuer.app_id
+            or app.get("slug") != credentials.config.issuer.app_slug
+            or response.get("name") != request["name"]
+            or response.get("head_sha") != request["head_sha"]
+            or response.get("status") != "completed"
+            or response.get("conclusion") != "failure"):
+        raise PublisherFailure("GitHub did not confirm the superseding check")
     return response

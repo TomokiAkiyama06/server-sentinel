@@ -33,7 +33,7 @@ key material is logged or placed in an exception message.
 from __future__ import annotations
 
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 import fcntl
 import json
@@ -50,12 +50,12 @@ from scripts.ci.review_gate_policy import (CHECK_NAMES, Context, PolicyFailure,
                                            successful_check_run_request)
 from scripts.ci.review_gate_publisher import (AppCredentials, GitHubTransport,
                                               PublisherFailure, _secure_private_bytes,
-                                              publish_success)
+                                              publish_revocation, publish_success)
 
 
 LOG = logging.getLogger("server_sentinel.review_gate.collector")
 COLLECTOR_CONFIG_ENV = "SERVER_SENTINEL_REVIEW_COLLECTOR_CONFIG"
-LEDGER_SCHEMA_VERSION = 1
+LEDGER_SCHEMA_VERSION = 2
 MAX_REVIEWS = 1000
 MAX_REVIEW_COMMENTS = 300
 # Trusted same-HEAD reviews above one watermark; each costs comment API pages.
@@ -78,6 +78,7 @@ _TIMESTAMP = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z")
 _SHA = re.compile(r"[0-9a-f]{40}")
 _REQUEST_ID = re.compile(r"[0-9a-f]{32}")
 _PASS_STATES = frozenset({"COMMENTED", "APPROVED"})
+_PUBLICATION_STATES = frozenset({"success", "revoking"})
 
 
 class CollectorFailure(RuntimeError):
@@ -128,6 +129,31 @@ class ProviderIdentity:
 
 
 @dataclass(frozen=True)
+class Publication:
+    """The success Check Run this collector last posted for one reviewer.
+
+    ``state == "revoking"`` is written *before* a superseding failure attempt
+    is posted, so a crash or ledger write failure during revocation can never
+    leave the ledger claiming that no success stands, or that the standing
+    success is still current.
+    """
+
+    request_id: str
+    test_merge_sha: str
+    check_run_id: int
+    state: str
+
+    def __post_init__(self) -> None:
+        if (not isinstance(self.request_id, str)
+                or not _REQUEST_ID.fullmatch(self.request_id)
+                or not isinstance(self.test_merge_sha, str)
+                or not _SHA.fullmatch(self.test_merge_sha)
+                or type(self.check_run_id) is not int or self.check_run_id <= 0
+                or self.state not in _PUBLICATION_STATES):
+            raise CollectorFailure("invalid publication record")
+
+
+@dataclass(frozen=True)
 class ReviewRequest:
     reviewer: str
     request_id: str
@@ -135,6 +161,8 @@ class ReviewRequest:
     context: Context
     review_watermark: int
     requested_at: int
+    # Carried across superseding requests until the success is revoked.
+    published: Publication | None = None
 
     def __post_init__(self) -> None:
         if (not isinstance(self.reviewer, str) or self.reviewer not in CHECK_NAMES
@@ -143,7 +171,9 @@ class ReviewRequest:
                 or self.state not in {"active", "invalidated"}
                 or not isinstance(self.context, Context)
                 or type(self.review_watermark) is not int or self.review_watermark < 0
-                or type(self.requested_at) is not int or self.requested_at <= 0):
+                or type(self.requested_at) is not int or self.requested_at <= 0
+                or not (self.published is None
+                        or isinstance(self.published, Publication))):
             raise CollectorFailure("invalid review request record")
 
 
@@ -349,16 +379,22 @@ class LedgerStore:
             data = json.loads(raw.decode("utf-8"), object_pairs_hook=_unique_pairs)
             if (not isinstance(data, dict) or set(data) != {
                     "schema_version", "reviewer", "request_id", "state",
-                    "context", "review_watermark", "requested_at"}
+                    "context", "review_watermark", "requested_at", "published"}
                     or data["schema_version"] != LEDGER_SCHEMA_VERSION
                     or type(data["schema_version"]) is not int
                     or not isinstance(data["context"], dict)):
                 raise CollectorFailure("review request ledger is corrupt")
+            published = data["published"]
+            if published is not None:
+                if not isinstance(published, dict) or set(published) != {
+                        "request_id", "test_merge_sha", "check_run_id", "state"}:
+                    raise CollectorFailure("review request ledger is corrupt")
+                published = Publication(**published)
             request = ReviewRequest(
                 reviewer=data["reviewer"], request_id=data["request_id"],
                 state=data["state"], context=Context(**data["context"]),
                 review_watermark=data["review_watermark"],
-                requested_at=data["requested_at"])
+                requested_at=data["requested_at"], published=published)
         except (UnicodeDecodeError, ValueError, TypeError, RecursionError,
                 PolicyFailure, CollectorFailure):
             raise CollectorFailure("review request ledger is corrupt") from None
@@ -377,6 +413,8 @@ class LedgerStore:
             "state": request.state, "context": asdict(request.context),
             "review_watermark": request.review_watermark,
             "requested_at": request.requested_at,
+            "published": (None if request.published is None
+                          else asdict(request.published)),
         }, sort_keys=True, separators=(",", ":")).encode("utf-8")
         if len(payload) > MAX_LEDGER_BYTES:
             raise CollectorFailure("review request record exceeds size limit")
@@ -444,7 +482,10 @@ class ReviewCollector:
         Repeating the call for an unchanged active context returns the same
         request (``created=False``) so a retried trigger delivery does not
         create a second request.  ``force_new`` supersedes it, for example to
-        re-review the same context after a failed provider run.
+        re-review the same context after a failed provider run.  It is refused
+        while a success this collector published still stands, because that
+        success would keep satisfying the required check during the rerun;
+        call ``revoke_published`` first.
         """
         self._identity(reviewer)
         if not isinstance(live, Context):
@@ -454,12 +495,15 @@ class ReviewCollector:
             if (existing is not None and existing.state == "active"
                     and existing.context == live and not force_new):
                 return RequestOutcome(existing, False)
+            if force_new and existing is not None and existing.published is not None:
+                raise CollectorFailure("revoke the published success before a rerun")
             reviews = _checked_reviews(source.list_reviews(live.pr_number))
             watermark = max((review["id"] for review in reviews), default=0)
             if existing is not None and watermark < existing.review_watermark:
                 raise CollectorFailure("provider review listing regressed")
             request = ReviewRequest(reviewer, secrets.token_hex(16), "active", live,
-                                    watermark, self._now())
+                                    watermark, self._now(),
+                                    existing.published if existing is not None else None)
             self._store.save(request)
         LOG.info("review request recorded reviewer=%s pr=%d request=%s superseded=%s",
                  reviewer, live.pr_number, request.request_id,
@@ -467,9 +511,7 @@ class ReviewCollector:
         return RequestOutcome(request, True)
 
     def _invalidate(self, request: ReviewRequest, reason: str) -> CollectorDecision:
-        self._store.save(ReviewRequest(request.reviewer, request.request_id,
-                                       "invalidated", request.context,
-                                       request.review_watermark, request.requested_at))
+        self._store.save(replace(request, state="invalidated"))
         LOG.warning("review request invalidated reviewer=%s pr=%d request=%s reason=%s",
                     request.reviewer, request.context.pr_number,
                     request.request_id, reason)
@@ -487,11 +529,6 @@ class ReviewCollector:
         that could pass.
         """
         identity = self._identity(reviewer)
-        # Taken before the unlocked live read: a request recorded in
-        # a later second may be newer than ``before`` (a concurrent
-        # ``request_review`` for the next context), so a mismatch then proves
-        # only that this read is stale, not that the request's context changed.
-        read_started = self._now()
         before = read_live_context()
         if not isinstance(before, Context):
             raise CollectorFailure("invalid live context")
@@ -502,18 +539,158 @@ class ReviewCollector:
             elif request.state != "active":
                 decision = CollectorDecision("invalidated", "review_request_invalidated",
                                              reviewer, request.request_id)
-            elif request.context != before and request.requested_at > read_started:
-                decision = CollectorDecision("pending", "live_context_read_predates_request",
-                                             reviewer, request.request_id)
             elif request.context != before:
-                decision = self._invalidate(request, "context_changed_since_request")
+                decision = None  # Ordering is unknown; confirm with a fresh read.
             else:
                 decision = self._evaluate(identity, request, before,
                                           read_live_context, source)
+        if decision is None:
+            decision = self._confirm_mismatch(reviewer, request, read_live_context)
         log = LOG.info if decision.status == "pass" else LOG.warning
         log("review collection reviewer=%s pr=%d status=%s reason=%s untrusted=%d",
             reviewer, before.pr_number, decision.status, decision.reason,
             decision.ignored_untrusted_reviews)
+        return decision
+
+    def _confirm_mismatch(self, reviewer: str, seen: ReviewRequest,
+                          read_live_context: Callable[[], Context]) -> CollectorDecision:
+        """Invalidate only on a mismatch that is proven not older than the request.
+
+        The first, unlocked live read may have started before a concurrent
+        ``request_review`` for a newer context recorded ``seen`` -- possibly
+        within the same clock second, so timestamps cannot order them.
+        ``seen`` was observed under the lock, hence the requester's own live
+        read had already finished; a read started now is not older than the
+        request.  If the request was replaced meanwhile, ordering is again
+        unknown and the decision stays pending.
+        """
+        again = read_live_context()
+        if not isinstance(again, Context):
+            raise CollectorFailure("invalid live context")
+        context = seen.context
+        with self._store.lock(context.repository_id, context.pr_number):
+            request = self._store.load(context.repository_id, context.pr_number, reviewer)
+            if request is None or request.request_id != seen.request_id:
+                return CollectorDecision("pending", "live_context_read_predates_request",
+                                         reviewer,
+                                         None if request is None else request.request_id)
+            if request.state != "active":
+                return CollectorDecision("invalidated", "review_request_invalidated",
+                                         reviewer, request.request_id)
+            if request.context != again:
+                return self._invalidate(request, "context_changed_since_request")
+        return CollectorDecision("pending", "live_context_read_predates_request",
+                                 reviewer, seen.request_id)
+
+    def publish(self, client: GitHubTransport, credentials: AppCredentials,
+                decision: CollectorDecision) -> dict[str, Any]:
+        """Post the success for a ``pass`` decision exactly once.
+
+        The success is posted only while the decision's request is still the
+        ledger's active request for the same context.  An already recorded
+        success for that request and test merge is reused, so polling and
+        restart recovery do not create further runs.  Any other standing
+        success (an older request, or one being revoked) is first superseded.
+        The publisher re-reads the live context before posting.  A crash after
+        GitHub accepts the success but before the ledger write can repeat that
+        single post on the next pass; nothing else is re-posted.
+        """
+        if (not isinstance(decision, CollectorDecision) or decision.status != "pass"
+                or not isinstance(decision.context, Context)
+                or decision.check_run_request
+                != successful_check_run_request(decision.context, decision.reviewer)):
+            raise CollectorFailure("only a passing collector decision can be published")
+        self._identity(decision.reviewer)
+        context = decision.context
+        if context.repository_id != credentials.config.repository_id:
+            raise CollectorFailure("decision targets another repository")
+        with self._store.lock(context.repository_id, context.pr_number):
+            request = self._store.load(context.repository_id, context.pr_number,
+                                       decision.reviewer)
+            if request is None:
+                raise CollectorFailure("review request ledger is missing")
+            current = (request.state == "active"
+                       and request.request_id == decision.request_id
+                       and request.context == context)
+            standing = request.published
+            if (current and standing is not None and standing.state == "success"
+                    and standing.request_id == request.request_id
+                    and standing.test_merge_sha == context.test_merge_sha):
+                return {"published": False, "check_run_id": standing.check_run_id}
+            request = self._revoke_locked(client, credentials, request)
+            if not current:
+                return {"published": False, "check_run_id": None}
+            response = publish_success(client, credentials, context, decision.reviewer)
+            run_id = response.get("id")
+            if type(run_id) is not int or run_id <= 0:
+                raise CollectorFailure("GitHub did not identify the published check")
+            self._store.save(replace(request, published=Publication(
+                request.request_id, context.test_merge_sha, run_id, "success")))
+        LOG.info("review success published reviewer=%s pr=%d request=%s",
+                 decision.reviewer, context.pr_number, decision.request_id)
+        return {"published": True, "check_run_id": run_id}
+
+    def revoke_published(self, client: GitHubTransport, credentials: AppCredentials,
+                         reviewer: str, pr_number: int) -> bool:
+        """Supersede a standing success with a newer failure attempt.
+
+        Needed for every non-passing outcome, before ``force_new``, and after a
+        collection error left the current evidence unverifiable.  Returns
+        whether a success had to be superseded.
+        """
+        self._identity(reviewer)
+        repository_id = credentials.config.repository_id
+        with self._store.lock(repository_id, pr_number):
+            request = self._store.load(repository_id, pr_number, reviewer)
+            if request is None or request.published is None:
+                return False
+            self._revoke_locked(client, credentials, request)
+        return True
+
+    def _revoke_locked(self, client: GitHubTransport, credentials: AppCredentials,
+                       request: ReviewRequest) -> ReviewRequest:
+        standing = request.published
+        if standing is None:
+            return request
+        if standing.state != "revoking":
+            request = replace(request, published=replace(standing, state="revoking"))
+            self._store.save(request)
+        publish_revocation(client, credentials, standing.test_merge_sha, request.reviewer)
+        request = replace(request, published=None)
+        self._store.save(request)
+        LOG.warning("review success superseded reviewer=%s pr=%d request=%s",
+                    request.reviewer, request.context.pr_number, standing.request_id)
+        return request
+
+    def collect_and_publish(self, reviewer: str, pr_number: int,
+                            read_live_context: Callable[[], Context],
+                            source: ReviewSource, client: GitHubTransport,
+                            credentials: AppCredentials) -> CollectorDecision:
+        """One reconciliation pass: collect, then publish or supersede.
+
+        Every outcome other than ``pass`` -- including a collection error,
+        which means the current evidence cannot be verified -- supersedes a
+        standing success, so GitHub's latest attempt never reads successful
+        while the collector cannot currently confirm a clean review.
+        """
+        if type(pr_number) is not int or pr_number <= 0:
+            raise CollectorFailure("invalid pull request number")
+        try:
+            decision = self.collect(reviewer, read_live_context, source)
+            if decision.status == "pass":
+                if decision.context.pr_number != pr_number:
+                    raise CollectorFailure("live context names another pull request")
+                self.publish(client, credentials, decision)
+                return decision
+        except Exception:
+            try:
+                self.revoke_published(client, credentials, reviewer, pr_number)
+            except Exception:
+                raise CollectorFailure(
+                    "collection failed and the published success could not be revoked"
+                ) from None
+            raise
+        self.revoke_published(client, credentials, reviewer, pr_number)
         return decision
 
     def _evaluate(self, identity: ProviderIdentity, request: ReviewRequest,
@@ -573,21 +750,6 @@ class ReviewCollector:
             raise CollectorFailure("receipt could not be produced") from None
         return CollectorDecision("pass", "trusted_clean_review", identity.reviewer,
                                  request.request_id, check_run, untrusted, before)
-
-
-def publish_collected(client: GitHubTransport, credentials: AppCredentials,
-                      decision: CollectorDecision) -> dict[str, Any]:
-    """Hand a passing decision to the publisher, which re-reads live context.
-
-    Any other status leaves the required check absent.  The publisher refuses
-    publication if the live context no longer equals the reviewed context.
-    """
-    if (not isinstance(decision, CollectorDecision) or decision.status != "pass"
-            or not isinstance(decision.context, Context)
-            or decision.check_run_request
-            != successful_check_run_request(decision.context, decision.reviewer)):
-        raise CollectorFailure("only a passing collector decision can be published")
-    return publish_success(client, credentials, decision.context, decision.reviewer)
 
 
 class GitHubReviewSource:

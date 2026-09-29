@@ -10,9 +10,11 @@ import os
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 from scripts.ci import review_gate_collector as collector
 from scripts.ci import review_gate_policy as gate
+from scripts.ci import review_gate_publisher as publisher
 
 
 START = 1_900_000_000
@@ -72,6 +74,23 @@ class FakeSource:
         return [dict(comment) for comment in self.comments.get(review_id, [])]
 
 
+class FakeCheckRuns:
+    """Records Check Run posts; GitHub echoes them under the dedicated App."""
+
+    def __init__(self, issuer):
+        self.issuer = issuer
+        self.posts: list[dict] = []
+        self.fail = False
+
+    def post_json(self, path, token, payload):
+        if self.fail:
+            raise publisher.PublisherFailure("GitHub API request failed")
+        assert path == "/repos/owner/repository/check-runs", path
+        self.posts.append(payload)
+        return {**payload, "id": len(self.posts),
+                "app": {"id": self.issuer.app_id, "slug": self.issuer.app_slug}}
+
+
 class CollectorTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -85,6 +104,7 @@ class CollectorTests(unittest.TestCase):
                                     "b" * 40, "c" * 40, "d" * 64, "f" * 40)
         self.live = self.context
         self.source = FakeSource()
+        self.issuer = gate.Issuer(900001, "synthetic-review-gate")
         self.collector = self.make_collector()
 
     def tearDown(self):
@@ -156,26 +176,50 @@ class CollectorTests(unittest.TestCase):
     def test_stale_live_read_does_not_invalidate_a_newer_concurrent_request(self):
         old_context = self.context
         new_context = replace(self.context, base_sha="e" * 40, test_merge_sha="9" * 40)
+        for advance in (1, 0):  # 0: both processes sample the same clock second.
+            with self.subTest(advance=advance):
+                for path in self.state.glob("*.json"):
+                    path.unlink()
+                reads = []
 
-        def stale_read():
-            # The collector's unlocked read returns the old context; meanwhile
-            # another process records a request for the newer context.
-            self.clock.now += 1
-            self.collector.request_review("codex", new_context, self.source)
-            return old_context
-        decision = self.collect(read=stale_read)
+                def stale_read():
+                    # Only the collector's first, unlocked read is stale: while
+                    # it runs, another process records the newer request.
+                    reads.append(1)
+                    if len(reads) == 1:
+                        self.clock.now += advance
+                        self.collector.request_review("codex", new_context, self.source)
+                        return old_context
+                    return new_context
+                decision = self.collect(read=stale_read)
+                self.assertEqual((decision.status, decision.reason),
+                                 ("pending", "live_context_read_predates_request"))
+                self.assertIsNone(decision.check_run_request)
+                # The newer request survives and passes with a late clean review.
+                self.live = new_context
+                self.source.add(new_context.head_sha, self.clock.now + RUNTIME
+                                + collector.CLOCK_SKEW_ALLOWANCE_SECONDS)
+                self.assertEqual(self.collect().status, "pass")
+                # A genuine change after the request is still invalidated.
+                self.live = old_context
+                self.assertEqual(self.collect().reason, "context_changed_since_request")
+
+    def test_mismatch_confirmation_stays_pending_if_request_is_replaced_again(self):
+        first = replace(self.context, base_sha="e" * 40, test_merge_sha="9" * 40)
+        second = replace(self.context, base_sha="7" * 40, test_merge_sha="8" * 40)
+        self.collector.request_review("codex", first, self.source)
+        reads = []
+
+        def racing_read():
+            reads.append(1)
+            if len(reads) == 2:  # the confirmation read races a third request
+                self.collector.request_review("codex", second, self.source)
+            return self.context
+        decision = self.collect(read=racing_read)
         self.assertEqual((decision.status, decision.reason),
                          ("pending", "live_context_read_predates_request"))
-        self.assertIsNone(decision.check_run_request)
-        # The newer request survives and still passes with a late clean review.
-        self.live = new_context
-        self.source.add(new_context.head_sha, self.clock.now + RUNTIME
-                        + collector.CLOCK_SKEW_ALLOWANCE_SECONDS)
-        self.assertEqual(self.collect().status, "pass")
-        # A request older than the live read is still invalidated on mismatch.
-        self.clock.now += 1
-        self.live = old_context
-        self.assertEqual(self.collect().reason, "context_changed_since_request")
+        self.live = second
+        self.assertEqual(self.collect().status, "pending")  # still active
 
     def test_every_context_field_change_during_collection_invalidates(self):
         for field, value in {"head_sha": "e" * 40, "base_sha": "e" * 40,
@@ -418,7 +462,29 @@ class CollectorTests(unittest.TestCase):
         self.assertIn("status=pass", joined)
         self.assertNotIn(secret_text, joined)
 
-    def test_publish_collected_requires_a_passing_decision(self):
+    def publication(self):
+        client = FakeCheckRuns(self.issuer)
+        config = publisher.RuntimeConfig("owner/repository", self.context.repository_id,
+                                         self.issuer, 900003,
+                                         Path(self.temp.name) / "key.pem")
+        credentials = publisher.AppCredentials(config, b"synthetic-key", "t" * 40)
+        patcher = mock.patch.object(publisher, "collect_live_context",
+                                    lambda *args: self.live)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return client, credentials
+
+    def reconcile(self, client, credentials, reviewer="codex", source=None,
+                  collector_=None):
+        return (collector_ or self.collector).collect_and_publish(
+            reviewer, self.context.pr_number, self.read_live, source or self.source,
+            client, credentials)
+
+    def ledger(self, reviewer="codex"):
+        return json.loads((self.state / f"900002-12-{reviewer}.json").read_text())
+
+    def test_publish_requires_a_passing_decision(self):
+        client, credentials = self.publication()
         for decision in (
             collector.CollectorDecision("pending", "x", "codex"),
             collector.CollectorDecision("pass", "x", "codex", "0" * 32,
@@ -429,7 +495,112 @@ class CollectorTests(unittest.TestCase):
         ):
             with self.subTest(status=decision.status), self.assertRaises(
                     collector.CollectorFailure):
-                collector.publish_collected(object(), object(), decision)
+                self.collector.publish(client, credentials, decision)
+        self.assertEqual(client.posts, [])
+
+    def test_pass_is_published_once_across_polls_and_restart(self):
+        client, credentials = self.publication()
+        self.collector.request_review("codex", self.live, self.source)
+        self.source.add(self.context.head_sha, self.late())
+        for _ in range(3):
+            self.assertEqual(self.reconcile(client, credentials).status, "pass")
+        restarted = self.make_collector()
+        self.assertEqual(self.reconcile(client, credentials, collector_=restarted).status,
+                         "pass")
+        self.assertEqual([post["conclusion"] for post in client.posts], ["success"])
+        self.assertEqual(self.ledger()["published"],
+                         {"request_id": self.ledger()["request_id"],
+                          "test_merge_sha": self.context.test_merge_sha,
+                          "check_run_id": 1, "state": "success"})
+
+    def test_superseded_pass_decision_is_never_posted(self):
+        client, credentials = self.publication()
+        self.collector.request_review("codex", self.live, self.source)
+        self.source.add(self.context.head_sha, self.late())
+        stale = self.collect()
+        self.assertEqual(stale.status, "pass")
+        self.collector.request_review("codex", self.live, self.source, force_new=True)
+        self.assertFalse(self.collector.publish(client, credentials, stale)["published"])
+        self.assertEqual(client.posts, [])
+
+    def test_later_blocking_review_supersedes_the_published_success(self):
+        client, credentials = self.publication()
+        self.collector.request_review("codex", self.live, self.source)
+        self.source.add(self.context.head_sha, self.late())
+        self.assertEqual(self.reconcile(client, credentials).status, "pass")
+        self.source.add(self.context.head_sha, self.late() + 5, body=BLOCK)
+        for _ in range(2):
+            self.assertEqual(self.reconcile(client, credentials).status, "blocked")
+        self.assertEqual([(post["conclusion"], post["head_sha"]) for post in client.posts],
+                         [("success", self.context.test_merge_sha),
+                          ("failure", self.context.test_merge_sha)])
+        self.assertIsNone(self.ledger()["published"])
+        self.assertEqual(client.posts[1]["name"], gate.CHECK_NAMES["codex"])
+
+    def test_force_new_rerun_requires_revoking_the_standing_success(self):
+        client, credentials = self.publication()
+        self.collector.request_review("codex", self.live, self.source)
+        self.source.add(self.context.head_sha, self.late())
+        self.reconcile(client, credentials)
+        with self.assertRaises(collector.CollectorFailure):
+            self.collector.request_review("codex", self.live, self.source, force_new=True)
+        self.assertTrue(self.collector.revoke_published(client, credentials, "codex", 12))
+        self.assertFalse(self.collector.revoke_published(client, credentials, "codex", 12))
+        self.clock.now = self.late() + 10
+        self.assertTrue(self.collector.request_review(
+            "codex", self.live, self.source, force_new=True).created)
+        self.assertEqual(self.reconcile(client, credentials).status, "pending")
+        self.source.add(self.context.head_sha, self.clock.now + RUNTIME
+                        + collector.CLOCK_SKEW_ALLOWANCE_SECONDS)
+        self.assertEqual(self.reconcile(client, credentials).status, "pass")
+        self.assertEqual([post["conclusion"] for post in client.posts],
+                         ["success", "failure", "success"])
+
+    def test_collection_error_supersedes_the_published_success(self):
+        client, credentials = self.publication()
+        self.collector.request_review("codex", self.live, self.source)
+        self.source.add(self.context.head_sha, self.late())
+        self.reconcile(client, credentials)
+        good = self.source.reviews
+        self.source.reviews = "unavailable"
+        with self.assertRaises(collector.CollectorFailure):
+            self.reconcile(client, credentials)
+        self.assertEqual([post["conclusion"] for post in client.posts],
+                         ["success", "failure"])
+        self.source.reviews = good
+        self.assertEqual(self.reconcile(client, credentials).status, "pass")
+        self.assertEqual(len(client.posts), 3)
+
+    def test_failed_revocation_is_retried_and_never_reads_as_current(self):
+        client, credentials = self.publication()
+        self.collector.request_review("codex", self.live, self.source)
+        self.source.add(self.context.head_sha, self.late())
+        self.reconcile(client, credentials)
+        client.fail = True
+        with self.assertRaises(publisher.PublisherFailure):
+            self.collector.revoke_published(client, credentials, "codex", 12)
+        self.assertEqual(self.ledger()["published"]["state"], "revoking")
+        client.fail = False
+        # Same request, same test merge: the revoking record must not be
+        # mistaken for the current success; revoke first, then post anew.
+        self.assertEqual(self.reconcile(client, credentials).status, "pass")
+        self.assertEqual([post["conclusion"] for post in client.posts],
+                         ["success", "failure", "success"])
+        self.assertEqual(self.ledger()["published"]["state"], "success")
+
+    def test_context_change_supersedes_success_on_the_old_test_merge(self):
+        client, credentials = self.publication()
+        self.collector.request_review("codex", self.live, self.source)
+        self.source.add(self.context.head_sha, self.late())
+        self.reconcile(client, credentials)
+        self.live = replace(self.context, base_sha="e" * 40, test_merge_sha="9" * 40)
+        self.assertEqual(self.reconcile(client, credentials).status, "invalidated")
+        self.assertEqual(client.posts[-1]["head_sha"], self.context.test_merge_sha)
+        self.assertEqual(client.posts[-1]["conclusion"], "failure")
+        # A new request for the new context carries no stale success forward.
+        self.clock.now = self.late() + 10
+        self.collector.request_review("codex", self.live, self.source)
+        self.assertIsNone(self.ledger()["published"])
 
     def test_external_config_loader(self):
         config = Path(self.temp.name) / "collector.json"
