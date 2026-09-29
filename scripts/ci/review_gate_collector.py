@@ -487,6 +487,11 @@ class ReviewCollector:
         that could pass.
         """
         identity = self._identity(reviewer)
+        # Taken before the unlocked live read: a request recorded in
+        # a later second may be newer than ``before`` (a concurrent
+        # ``request_review`` for the next context), so a mismatch then proves
+        # only that this read is stale, not that the request's context changed.
+        read_started = self._now()
         before = read_live_context()
         if not isinstance(before, Context):
             raise CollectorFailure("invalid live context")
@@ -496,6 +501,9 @@ class ReviewCollector:
                 decision = CollectorDecision("pending", "no_review_request", reviewer)
             elif request.state != "active":
                 decision = CollectorDecision("invalidated", "review_request_invalidated",
+                                             reviewer, request.request_id)
+            elif request.context != before and request.requested_at > read_started:
+                decision = CollectorDecision("pending", "live_context_read_predates_request",
                                              reviewer, request.request_id)
             elif request.context != before:
                 decision = self._invalidate(request, "context_changed_since_request")

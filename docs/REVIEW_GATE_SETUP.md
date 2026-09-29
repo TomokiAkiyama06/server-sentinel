@@ -202,7 +202,10 @@ Flow and binding:
    inline comments. Any HEAD, base, merge-base, diff or test-merge difference
    from the request marks the request `invalidated` durably; it can never pass
    again, even if the old context returns. A new request is required, and the
-   same-HEAD review that preceded it is below its watermark.
+   same-HEAD review that preceded it is below its watermark. The unlocked first
+   read can be overtaken by a concurrent `request_review` for a newer context;
+   a request recorded after that read started is therefore not invalidated by a
+   mismatch but reported as `pending` (`live_context_read_predates_request`).
 3. A review counts only if it is from the configured bot, has an ID above the
    watermark, targets the recorded HEAD, and was submitted at least
    `max_review_runtime_seconds` + 300 s (clock skew allowance) after the
@@ -210,7 +213,13 @@ Flow and binding:
    exclude a review that was started under an older base (automatic review on
    push, a human `@codex review`) and finished after the new request.
    Earlier passing reviews are ignored as ambiguous; earlier *failing* ones
-   still block.
+   still block. Consequently a provider run that finishes inside the bound
+   (the normal case when the bound is set correctly) leaves the decision
+   `pending`: after the bound has elapsed with the context unchanged, post the
+   trigger again **without** `force_new` (the same request is reused) and the
+   new review, submitted after `earliest`, can count. This doubles provider
+   runs per context; a cheaper binding needs provider-side request/base
+   provenance and is an Owner decision.
 4. A counted review passes only with state `COMMENTED` or `APPROVED`, a pass
    marker in the body, no blocking marker, and every inline comment carrying a
    non-blocking marker and no blocking marker. Any other trusted same-HEAD

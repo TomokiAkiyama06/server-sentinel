@@ -153,6 +153,30 @@ class CollectorTests(unittest.TestCase):
         self.assertTrue(self.collector.request_review("codex", self.live, self.source).created)
         self.assertEqual(self.collect().status, "pending")
 
+    def test_stale_live_read_does_not_invalidate_a_newer_concurrent_request(self):
+        old_context = self.context
+        new_context = replace(self.context, base_sha="e" * 40, test_merge_sha="9" * 40)
+
+        def stale_read():
+            # The collector's unlocked read returns the old context; meanwhile
+            # another process records a request for the newer context.
+            self.clock.now += 1
+            self.collector.request_review("codex", new_context, self.source)
+            return old_context
+        decision = self.collect(read=stale_read)
+        self.assertEqual((decision.status, decision.reason),
+                         ("pending", "live_context_read_predates_request"))
+        self.assertIsNone(decision.check_run_request)
+        # The newer request survives and still passes with a late clean review.
+        self.live = new_context
+        self.source.add(new_context.head_sha, self.clock.now + RUNTIME
+                        + collector.CLOCK_SKEW_ALLOWANCE_SECONDS)
+        self.assertEqual(self.collect().status, "pass")
+        # A request older than the live read is still invalidated on mismatch.
+        self.clock.now += 1
+        self.live = old_context
+        self.assertEqual(self.collect().reason, "context_changed_since_request")
+
     def test_every_context_field_change_during_collection_invalidates(self):
         for field, value in {"head_sha": "e" * 40, "base_sha": "e" * 40,
                              "merge_base_sha": "e" * 40, "diff_sha256": "e" * 64,
