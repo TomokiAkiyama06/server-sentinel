@@ -51,7 +51,9 @@ outside explicit fixture use. Invitation redemption
 appends its record on the redemption transaction itself, admitted through the
 audit store's reservation, so an audit failure leaves the invitation unredeemed.
 A rejected redemption records nothing, so unauthenticated guessing cannot grow
-the audit table. The target is always the principal's application UUID;
+the audit table. When a matched redemption's audit append or commit fails, the
+rolled-back outcome is counted in `AccessStore`'s own `audit_delivery_failed` /
+`undelivered_audit_records` health rather than appended separately. The target is always the principal's application UUID;
 external identity, display name, invitation secret, credential identifier and
 public key never reach the log.
 

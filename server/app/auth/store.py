@@ -88,6 +88,15 @@ class AccessStore:
         self.audit = audit
         self.unaudited_writes = unaudited_writes
         self._clock = clock or (lambda: datetime.now(timezone.utc))
+        # Bounded health only: a matched invitation redemption whose audit
+        # append or commit failed is counted here instead of being appended
+        # separately, so unauthenticated attempts cannot grow the audit table.
+        self.audit_delivery_failed = False
+        self.undelivered_audit_records = 0
+
+    def _mark_undelivered(self) -> None:
+        self.audit_delivery_failed = True
+        self.undelivered_audit_records += 1
 
     def _require_unaudited_writes(self) -> None:
         if not self.unaudited_writes:
@@ -202,34 +211,48 @@ class AccessStore:
         """Redeem an invitation and record its audit row in the same transaction.
 
         A rejected redemption writes nothing, so an unauthenticated caller
-        presenting unknown or stale codes cannot grow the audit table.
+        presenting unknown or stale codes cannot grow the audit table. When a
+        matched redemption's audit append or commit fails, the rolled-back
+        outcome is counted in ``audit_delivery_failed`` /
+        ``undelivered_audit_records`` instead of being appended separately.
         """
         digest, identity = _digest(enrollment_secret), _identity(external_identity)
         credential = Credential(credential_id, UUID(int=0), public_key, algorithm, sign_count,
                                 utc_time(self._clock() if now is None else now))
         at = credential.enrolled_at
-        with self._audited_transaction() as connection:
-            row = connection.execute("SELECT i.*, p.external_identity, p.role, p.status, p.authorization_revision FROM access_invitations i JOIN access_principals p ON p.id=i.principal_id WHERE i.secret_digest=?", (digest,)).fetchone()
-            state = connection.execute("SELECT authorization_generation FROM access_deployment_state WHERE singleton=1").fetchone()[0]
-            if (row is None or row["redeemed_at_us"] is not None or row["revoked_at_us"] is not None
-                    or row["status"] == PrincipalStatus.REVOKED.value or row["external_identity"] != identity
-                    or row["principal_revision"] != row["authorization_revision"]
-                    or row["deployment_generation"] != state or not row["issued_at_us"] <= _us(at) < row["expires_at_us"]):
-                raise AccessValidationError("enrollment is unavailable")
-            principal_id = UUID(row["principal_id"])
-            credential = Credential(credential_id, principal_id, public_key, algorithm, sign_count, at)
-            connection.execute("INSERT INTO access_credentials VALUES (?, ?, ?, ?, ?, ?, NULL)",
-                               (credential.credential_id, str(principal_id), credential.public_key, credential.algorithm, credential.sign_count, _us(at)))
-            connection.execute("UPDATE access_invitations SET redeemed_at_us=? WHERE id=?", (_us(at), row["id"]))
-            connection.execute("UPDATE access_principals SET status=? WHERE id=? AND status=?", (PrincipalStatus.ACTIVE.value, str(principal_id), PrincipalStatus.INVITED.value))
-            # Same transaction: an audit write failure rolls the redemption back.
-            # Only the principal's logical UUID is recorded, never the secret,
-            # external identity, credential identifier or public key.
-            actor = ActorCategory.OWNER if row["role"] == PrincipalRole.OWNER.value else ActorCategory.INVITED_USER
-            self.audit.append_on(connection, actor_category=actor,
-                                 action=AuditAction.REDEEM_PRINCIPAL_INVITATION,
-                                 target_kind=TargetKind.PRINCIPAL, target_logical_id=principal_id,
-                                 outcome=AuditOutcome.SUCCEEDED)
+        # Only a matched, valid invitation reaches the append; ordinary
+        # unmatched or stale attempts never touch audit health.
+        audit_attempted = False
+        try:
+            with self._audited_transaction() as connection:
+                row = connection.execute("SELECT i.*, p.external_identity, p.role, p.status, p.authorization_revision FROM access_invitations i JOIN access_principals p ON p.id=i.principal_id WHERE i.secret_digest=?", (digest,)).fetchone()
+                state = connection.execute("SELECT authorization_generation FROM access_deployment_state WHERE singleton=1").fetchone()[0]
+                if (row is None or row["redeemed_at_us"] is not None or row["revoked_at_us"] is not None
+                        or row["status"] == PrincipalStatus.REVOKED.value or row["external_identity"] != identity
+                        or row["principal_revision"] != row["authorization_revision"]
+                        or row["deployment_generation"] != state or not row["issued_at_us"] <= _us(at) < row["expires_at_us"]):
+                    raise AccessValidationError("enrollment is unavailable")
+                principal_id = UUID(row["principal_id"])
+                credential = Credential(credential_id, principal_id, public_key, algorithm, sign_count, at)
+                connection.execute("INSERT INTO access_credentials VALUES (?, ?, ?, ?, ?, ?, NULL)",
+                                   (credential.credential_id, str(principal_id), credential.public_key, credential.algorithm, credential.sign_count, _us(at)))
+                connection.execute("UPDATE access_invitations SET redeemed_at_us=? WHERE id=?", (_us(at), row["id"]))
+                connection.execute("UPDATE access_principals SET status=? WHERE id=? AND status=?", (PrincipalStatus.ACTIVE.value, str(principal_id), PrincipalStatus.INVITED.value))
+                # Same transaction: an audit write failure rolls the redemption back.
+                # Only the principal's logical UUID is recorded, never the secret,
+                # external identity, credential identifier or public key.
+                actor = ActorCategory.OWNER if row["role"] == PrincipalRole.OWNER.value else ActorCategory.INVITED_USER
+                audit_attempted = True
+                self.audit.append_on(connection, actor_category=actor,
+                                     action=AuditAction.REDEEM_PRINCIPAL_INVITATION,
+                                     target_kind=TargetKind.PRINCIPAL, target_logical_id=principal_id,
+                                     outcome=AuditOutcome.SUCCEEDED)
+        except Exception:
+            if audit_attempted:
+                # The append or its commit failed and rolled the redemption
+                # back. Surface the lost outcome in bounded health only.
+                self._mark_undelivered()
+            raise
         return credential
 
     def establish_session(self, principal_id: UUID, credential_id: bytes, token: bytes, *, now: datetime | None = None,

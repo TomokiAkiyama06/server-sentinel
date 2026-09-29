@@ -39,4 +39,8 @@ with `UnauditedAccessWriteError` unless the store is constructed with
 `unaudited_writes=True` for non-runtime fixtures. Invitation redemption
 (`enroll_credential`) records its own audit row in the redemption transaction
 and therefore requires `audit=`; the log receives only the principal's logical
-UUID. See `server/app/audit/README.md`.
+UUID. A redemption that matches no valid invitation records nothing and does
+not affect health; when a matched redemption's audit append or commit fails,
+the redemption rolls back and the lost outcome is counted in the store's
+`audit_delivery_failed` / `undelivered_audit_records` health instead of being
+appended separately. See `server/app/audit/README.md`.

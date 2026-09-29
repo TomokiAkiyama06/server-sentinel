@@ -241,6 +241,38 @@ class AccessAuditTests(_Base):
         self.assertEqual(self.count("SELECT count(*) FROM access_invitations WHERE redeemed_at_us IS NULL"), 1)
         self.assertEqual(self.count("SELECT count(*) FROM access_principals WHERE status='invited'"), 1)
 
+    def test_redemption_audit_failure_is_visible_but_unmatched_attempts_are_not(self):
+        principal = self.admin.invite(OWNER_CONTEXT, IDENTITY, DISPLAY, ())
+        self.admin.issue_invitation(OWNER_CONTEXT, principal.id, SECRET, NOW + timedelta(minutes=5))
+        before = len(self.records())
+        _fail_audit_inserts(self.database)
+        for secret, identity in ((b"u" * 32, IDENTITY), (SECRET, "other@example.invalid")):
+            with self.assertRaises(AccessValidationError):
+                self.access.enroll_credential(secret, identity, CREDENTIAL, PUBLIC_KEY, -7, 0)
+        self.assertFalse(self.access.audit_delivery_failed)
+        self.assertEqual(self.access.undelivered_audit_records, 0)
+        for _ in range(2):
+            with self.assertRaises(AccessStorageError):
+                self.access.enroll_credential(SECRET, IDENTITY, CREDENTIAL, PUBLIC_KEY, -7, 0)
+        self.assertTrue(self.access.audit_delivery_failed)
+        self.assertEqual(self.access.undelivered_audit_records, 2)
+        # The redemption rolled back and no separate audit row was appended.
+        self.assertEqual(self.count("SELECT count(*) FROM access_credentials"), 0)
+        self.assertEqual(self.count("SELECT count(*) FROM access_invitations WHERE redeemed_at_us IS NULL"), 1)
+        self.assertEqual(len(self.records()), before)
+
+    def test_redemption_storage_refusal_before_match_is_not_counted(self):
+        principal = self.admin.invite(OWNER_CONTEXT, IDENTITY, DISPLAY, ())
+        self.admin.issue_invitation(OWNER_CONTEXT, principal.id, SECRET, NOW + timedelta(minutes=5))
+        self.reservation.refuse = True
+        with self.assertRaises(RuntimeError):
+            self.access.enroll_credential(b"u" * 32, IDENTITY, CREDENTIAL, PUBLIC_KEY, -7, 0)
+        self.assertFalse(self.access.audit_delivery_failed)
+        self.reservation.refuse = False
+        self.access.enroll_credential(SECRET, IDENTITY, CREDENTIAL, PUBLIC_KEY, -7, 0)
+        self.assertFalse(self.access.audit_delivery_failed)
+        self.assertEqual(self.access.undelivered_audit_records, 0)
+
     def test_redemption_is_admitted_by_storage_reservation_and_requires_audit(self):
         principal = self.admin.invite(OWNER_CONTEXT, IDENTITY, DISPLAY, ())
         self.admin.issue_invitation(OWNER_CONTEXT, principal.id, SECRET, NOW + timedelta(minutes=5))
