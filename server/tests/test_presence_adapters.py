@@ -253,6 +253,19 @@ class EntranceAdapterTests(PresenceFixture, TestCase):
         self.assertEqual(self.outbox.flush().recorded, 1)
         self.assertEqual(self.state(), "PRESENT")
 
+    def test_invalid_receipt_clock_during_flush_keeps_fact_staged(self):
+        entry = crossing(CrossingKind.OWNER_ENTRY)
+        self.clock.at = entry.received_at
+        self.assertTrue(self.adapter.submit(TrackUpdate((), (entry,), DetectionQuality.SUFFICIENT)))
+        # A transient clock-port fault is not an observation contract error.
+        for fault in ((NOW.replace(tzinfo=None), True), (NOW, None)):
+            self.clock.at, self.clock.trusted = fault
+            state = self.outbox.flush()
+            self.assertEqual((state.pending, state.rejected, state.recorded), (1, 0, 0))
+        self.clock.at, self.clock.trusted = entry.received_at, True
+        self.assertEqual(self.outbox.flush().recorded, 1)
+        self.assertEqual(self.state(), "PRESENT")
+
     def test_contract_rejection_is_counted_and_does_not_block_later_facts(self):
         taken = crossing(CrossingKind.ANONYMOUS_ENTRY)
         self.submit(taken)
@@ -385,6 +398,28 @@ class CriticalRecorderTests(PresenceFixture, TestCase):
         # A different fact reusing the UUID is still an identity conflict.
         with self.assertRaisesRegex(ValueError, "identity conflict"):
             self.recorder(replace(item, kind=CriticalKind.CAMERA_TAMPER))
+
+    def test_confirmed_delivery_of_a_stored_unconfirmed_critical_fact_queues_work_once(self):
+        item = critical(CriticalKind.CAMERA_TAMPER)
+        unconfirmed = self.recorder.observation(item, NOW, True)
+        self.presence.record(replace(unconfirmed, confirmed=False))
+        self.presence.dispatch_pending()
+        self.assertEqual(self.evidence, [])
+        self.clock.at = NOW + timedelta(seconds=1)
+        self.recorder(item)
+        stored, = self.history()["items"]
+        self.assertTrue(stored["confirmed"])
+        # The first receipt is kept; confirmation only adds the critical work.
+        self.assertEqual(stored["received_at"], NOW.isoformat(timespec="microseconds"))
+        self.clock.at = NOW + timedelta(minutes=5)
+        self.recorder(item)
+        self.presence.record(replace(unconfirmed, confirmed=False), restamped=True)
+        self.assertTrue(self.history()["items"][0]["confirmed"])
+        self.presence.dispatch_pending()
+        self.assertEqual((len(self.evidence), len(self.notifications)), (1, 1))
+        # A different fact under the same UUID still conflicts.
+        with self.assertRaisesRegex(ValueError, "identity conflict"):
+            self.recorder(replace(item, kind=CriticalKind.SERVER_MOVEMENT))
 
     def test_untrusted_clock_or_stale_sample_keeps_confirmation_but_marks_timing(self):
         self.clock.trusted = False

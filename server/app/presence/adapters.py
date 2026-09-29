@@ -69,11 +69,20 @@ def _positive(value, name):
     return value
 
 
+class ClockUnavailable(RuntimeError):
+    """The main-host clock port returned no usable receipt; retryable."""
+
+
 def _stamp(clock):
+    # A clock-port fault is infrastructure, never an observation contract
+    # error, so it must not surface as `InvalidObservation` and be dropped.
     received, trusted = clock()
-    utc(received)
+    try:
+        utc(received)
+    except InvalidObservation:
+        raise ClockUnavailable("aware main-host receipt time required") from None
     if type(trusted) is not bool:
-        raise ValueError("explicit clock trust required")
+        raise ClockUnavailable("explicit clock trust required")
     return received, trusted
 
 

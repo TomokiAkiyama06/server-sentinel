@@ -1,6 +1,7 @@
 """Durable precedence, neutral history, and presence-independent critical work."""
 
 from contextlib import ExitStack, closing, contextmanager
+from dataclasses import replace
 from datetime import timedelta
 import json
 from uuid import UUID
@@ -198,6 +199,8 @@ class PresenceService:
         at write time: a replay of an already recorded UUID then carries a new
         receipt time (and the clock trust and confirmation derived from it),
         so only the source fact itself must match for it to be a duplicate.
+        A critical fact first stored unconfirmed and then delivered confirmed
+        is confirmed in place and queues its critical work once.
         Contract errors raise `InvalidObservation`; storage and database
         failures raise anything else and may be retried.
         """
@@ -210,6 +213,8 @@ class PresenceService:
                                   (str(observation.identifier),)).fetchone()
             if existing:
                 stored = Observation.from_payload(json.loads(existing[0]))
+                if self._confirms_critical(stored, observation, restamped=restamped):
+                    return self._confirm_critical(db, stored)
                 if stored.payload() != observation.payload() and stored.payload() != observation.uncertain().payload():
                     fact = {key: value for key, value in stored.payload().items() if key not in RECEIPT_FIELDS}
                     replay = {key: value for key, value in observation.payload().items()
@@ -265,6 +270,38 @@ class PresenceService:
                                "VALUES (?,?,'pending',0)",
                                (str(observation.identifier), action))
         return observation
+
+    @staticmethod
+    def _confirms_critical(stored, observation, *, restamped):
+        """A confirmed delivery of a critical fact stored earlier as unconfirmed.
+
+        Critical confirmation comes from the detector, not from the receipt,
+        so it must not be discarded as a receipt field: the confirmed delivery
+        still has to queue evidence preservation and notification. Only the
+        receipt fields may differ; any other difference stays a conflict.
+        """
+        if observation.kind not in CRITICAL or not observation.confirmed or stored.confirmed:
+            return False
+        ignored = RECEIPT_FIELDS if restamped else ("clock_trusted", "confirmed")
+        fact = {key: value for key, value in stored.payload().items() if key not in ignored}
+        replay = {key: value for key, value in observation.payload().items() if key not in ignored}
+        return fact == replay
+
+    @staticmethod
+    def _confirm_critical(db, stored):
+        """Record the confirmation and queue its critical work exactly once.
+
+        The stored receipt and clock trust are kept; confirmation is never
+        withdrawn again by a later unconfirmed replay of the same identity.
+        """
+        confirmed = replace(stored, confirmed=True)
+        db.execute("UPDATE presence_observations SET payload=? WHERE id=?",
+                   (json.dumps(confirmed.payload(), sort_keys=True, separators=(",", ":")),
+                    str(confirmed.identifier)))
+        for action in ("evidence", "notification"):
+            db.execute("INSERT OR IGNORE INTO presence_deliveries(observation,action,state,attempts) "
+                       "VALUES (?,?,'pending',0)", (str(confirmed.identifier), action))
+        return confirmed
 
     def complete_action(self, identifier, action, result, *, generation=None):
         """Record the outcome of one critical delivery attempt.

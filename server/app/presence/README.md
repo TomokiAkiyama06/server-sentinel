@@ -140,7 +140,11 @@ route, worker thread or default timing policy:
   after a write that committed and then failed, a repeated delivery, or a
   replay after a restart) is a duplicate by the durable row, via
   `record(..., restamped=True)`, never an identity conflict that would stay in
-  the bounded `CriticalDelivery` staging forever. It refuses an unconfirmed or
+  the bounded `CriticalDelivery` staging forever. Critical confirmation comes
+  from the detector rather than the receipt, so a confirmed delivery of a
+  critical UUID first stored unconfirmed is confirmed in place (keeping the
+  first receipt) and queues evidence and notification work exactly once; a
+  later unconfirmed replay never withdraws it. It refuses an unconfirmed or
   insufficient-quality observation. Untrusted receipt clocks or excessive
   latency mark the timing untrusted but never withdraw confirmation, so
   evidence and notification work is queued in every presence and clock state.
@@ -163,7 +167,9 @@ route, worker thread or default timing policy:
   `flush()` from the storage owner's worker, because
   `MainStoragePolicy.control` only admits writes from that thread. A flush
   keeps staging order and stops at the first storage, database or clock
-  failure, including an unavailable database location; a full outbox refuses
+  failure, including an unavailable database location and a naive or
+  otherwise unusable receipt time from the clock port (`ClockUnavailable`,
+  never `InvalidObservation`); a full outbox refuses
   the new fact, and only a fact presence rejects as `InvalidObservation` is
   removed. Both are counted and reported by `OutboxState.degraded`, never
   dropped silently.
