@@ -36,6 +36,11 @@ from app.cameras.remote_agent.ingest import (
 )
 
 _MAXIMUM_COUNTER = 2 ** 63 - 1
+# Only an ingest refusal that no retry of the same unit can ever satisfy is
+# committed past as known loss.  Any other refusal (for example the ingest
+# boundary's fail-closed Main clock regression) is transient: continuity is
+# left unchanged so the Agent can retry from its ring buffer.
+_PERMANENT_INGEST_REFUSALS = frozenset({"message_too_large"})
 
 
 class DeliveryOutcome(str, Enum):
@@ -150,6 +155,7 @@ class _Source:
     last_capture_time_ns: int
     last_seen_ns: int
     backpressured: bool = False
+    refused: bool = False
     gaps: deque = field(default_factory=deque)
 
 
@@ -322,6 +328,13 @@ class ContinuityTracker:
             if (admission.outcome is IngestOutcome.REJECTED
                     and admission.reason == "unauthorized"):
                 return Delivery(DeliveryOutcome.REJECTED, "unauthorized")
+            if (admission.outcome is IngestOutcome.REJECTED
+                    and admission.reason not in _PERMANENT_INGEST_REFUSALS):
+                # Transient/unknown refusal: do not commit or claim loss, but
+                # never let the flow look healthy while it persists.
+                if state is not None:
+                    state.refused = True
+                return Delivery(DeliveryOutcome.REJECTED, admission.reason)
             if state is None:
                 state = self._sources[source_id] = _Source(
                     node_id, header.capture_epoch, header.sequence,
@@ -340,7 +353,7 @@ class ContinuityTracker:
             state.last_sequence = header.sequence
             state.last_capture_time_ns = header.capture_time_ns
             state.last_seen_ns = node.last_seen_ns = now
-            state.backpressured = False
+            state.backpressured = state.refused = False
             if admission.outcome is IngestOutcome.REJECTED:
                 return Delivery(DeliveryOutcome.REJECTED, admission.reason, tuple(gaps))
             return Delivery(DeliveryOutcome.ACCEPTED, None, tuple(gaps))
@@ -354,7 +367,7 @@ class ContinuityTracker:
                 if (not node.open or now < state.last_seen_ns
                         or now - state.last_seen_ns > self.limits.stale_after_ns):
                     flow = SourceFlow.INTERRUPTED
-                elif state.gaps or state.backpressured:
+                elif state.gaps or state.backpressured or state.refused:
                     flow = SourceFlow.DEGRADED
                 else:
                     flow = SourceFlow.RECEIVING

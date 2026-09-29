@@ -224,6 +224,27 @@ class ContinuityTrackerTests(unittest.TestCase):
                          tracker.receive(session, unit(1), b"too large").outcome)
         self.assertEqual(1, ingest.snapshot().queued_messages)
 
+    def test_transient_ingest_refusal_is_not_committed_as_loss(self):
+        tracker, ingest, clock, _ = build()
+        session = tracker.open_session(NODE)
+        clock.now = 50
+        tracker.receive(session, unit(0), b"v")
+        # The ingest boundary fails closed on a Main clock regression; that is
+        # not a property of the unit, so the unit must stay retryable.
+        clock.now = 40
+        result = tracker.receive(session, unit(1), b"v")
+        self.assertEqual((DeliveryOutcome.REJECTED, "clock_regression", ()),
+                         (result.outcome, result.reason, result.gaps))
+        clock.now = 55
+        self.assertEqual(0, flow(tracker).last_sequence)
+        self.assertEqual(SourceFlow.DEGRADED, flow(tracker).flow)
+        self.assertEqual((), tracker.drain_gaps(10))
+        clock.now = 60
+        result = tracker.receive(session, unit(1), b"v")
+        self.assertEqual((DeliveryOutcome.ACCEPTED, ()), (result.outcome, result.gaps))
+        self.assertEqual(SourceFlow.RECEIVING, flow(tracker).flow)
+        self.assertEqual([0, 1], [m.sequence for m in ingest.drain(10)])
+
     def test_pending_gap_events_are_bounded_by_coalescing(self):
         tracker, _, _, _ = build(pending=2, queued=16)
         session = tracker.open_session(NODE)

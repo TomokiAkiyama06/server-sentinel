@@ -44,8 +44,16 @@ explicitly forbidden by the Issue.
    after the #14 `AgentIngestQueue` accepts it. Backpressure/rate refusal
    leaves state unchanged so the Agent retries the same sequence from its disk
    ring buffer; a retry of a committed unit is an idempotent `duplicate`
-   acknowledgement and is never enqueued twice. A permanently refused unit is
-   recorded as known loss.
+   acknowledgement and is never enqueued twice. Only a refusal that no retry
+   of the same unit can satisfy (currently `message_too_large`) is committed
+   past and recorded as known loss; any other ingest refusal (for example the
+   ingest boundary's fail-closed Main clock regression) leaves continuity
+   unchanged, keeps the flow `degraded`, and records no loss claim. A
+   `duplicate` acknowledgement means "at or behind the committed head", not
+   proof that that exact sequence was committed: a late unit behind an
+   already-reported skip is also acknowledged as `duplicate`, so the Agent
+   sends each source in order and keeps loss-window protection independent of
+   Main acknowledgements.
 4. **No silent healthy state.** Known loss, clock regression, or backpressure
    keeps the source flow `degraded`; a closed or stale session makes it
    `interrupted`. Pending gap events are hard-bounded per source and coalesce
