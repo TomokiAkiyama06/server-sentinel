@@ -43,7 +43,10 @@ explicitly forbidden by the Issue.
    capture timestamp (REQUIREMENTS MEDIA-007).
 2. **Main-assigned session generation.** Each authenticated session open gets a
    new generation; a superseded session cannot deliver, heartbeat or close the
-   newer one.
+   newer one. Generations come from one tracker-wide counter that is never
+   reset or reissued (also across node removal and re-enrollment of the same
+   UUID), and each grant is bound to one Main process lifetime, so a revoked
+   or pre-restart grant can never become current again.
 3. **Commit only after bounded admission.** A unit advances continuity only
    after the #14 `AgentIngestQueue` accepts it. Backpressure/rate refusal
    leaves state unchanged so the Agent retries the same sequence from its disk

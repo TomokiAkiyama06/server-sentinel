@@ -375,6 +375,60 @@ class ContinuityTrackerTests(unittest.TestCase):
         self.assertEqual("source_capacity",
                          tracker.receive(session, unit(0, source=SOURCES[4]), b"v").reason)
 
+    def test_deactivated_source_releases_slot_and_keeps_other_flows(self):
+        authorizer = Authorizer({(NODE, s) for s in SOURCES})
+        tracker, _, _, _ = build(authorizer=authorizer, queued=16)
+        session = tracker.open_session(NODE)
+        for source in SOURCES[:4]:
+            tracker.receive(session, unit(0, source=source), b"v")
+        tracker.receive(session, unit(3, source=SOURCES[0]), b"v")
+        authorizer.pairs.discard((NODE, SOURCES[0]))
+        pending = tracker.forget_source(SOURCES[0])
+        # Undrained loss is handed back, never silently dropped.
+        self.assertEqual([(GapReason.SEQUENCE_SKIP, 2)],
+                         [(g.reason, g.missing_units) for g in pending])
+        self.assertEqual((), tracker.forget_source(SOURCES[0]))
+        self.assertEqual(DeliveryOutcome.ACCEPTED,
+                         tracker.receive(session, unit(0, source=SOURCES[4]), b"v").outcome)
+        self.assertEqual(DeliveryOutcome.ACCEPTED,
+                         tracker.receive(session, unit(1, source=SOURCES[1]), b"v").outcome)
+        self.assertEqual(4, len(tracker.snapshot()))
+        self.assertEqual("unauthorized",
+                         tracker.receive(session, unit(4, source=SOURCES[0]), b"v").reason)
+        self.assertTrue(tracker.heartbeat(session))
+        with self.assertRaises(ValueError):
+            tracker.forget_source("x")
+
+    def test_forgotten_node_old_grant_never_becomes_current_again(self):
+        tracker, ingest, _, authorizer = build()
+        old = tracker.open_session(NODE)
+        tracker.receive(old, unit(0), b"v")
+        authorizer.revoked.add(NODE)
+        tracker.forget_node(NODE)
+        # Re-enrollment of the same UUID with a new credential.
+        authorizer.revoked.discard(NODE)
+        fresh = tracker.open_session(NODE)
+        self.assertNotEqual(old.generation, fresh.generation)
+        self.assertEqual("stale_session", tracker.receive(old, unit(0), b"v").reason)
+        self.assertFalse(tracker.heartbeat(old))
+        tracker.close_session(old)
+        self.assertTrue(tracker.heartbeat(fresh))
+        self.assertEqual(DeliveryOutcome.ACCEPTED,
+                         tracker.receive(fresh, unit(0), b"v").outcome)
+        self.assertEqual(2, ingest.snapshot().queued_messages)
+
+    def test_grant_from_another_tracker_lifetime_is_stale(self):
+        before_restart, _, _, _ = build()
+        old = before_restart.open_session(NODE)
+        after_restart, ingest, _, _ = build()
+        fresh = after_restart.open_session(NODE)
+        self.assertEqual(old.generation, fresh.generation)
+        self.assertEqual("stale_session", after_restart.receive(old, unit(0), b"v").reason)
+        self.assertFalse(after_restart.heartbeat(old))
+        after_restart.close_session(old)
+        self.assertTrue(after_restart.heartbeat(fresh))
+        self.assertEqual(0, ingest.snapshot().queued_messages)
+
     def test_stale_flow_and_clock_regression_fail_closed(self):
         tracker, _, clock, _ = build(stale=10)
         session = tracker.open_session(NODE)

@@ -29,7 +29,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from threading import Lock
 from typing import Callable
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from app.cameras.remote_agent.ingest import (
     AgentAction, AgentIngestQueue, AgentMessage, IngestAuthorizer, IngestOutcome,
@@ -88,12 +88,17 @@ class ContinuityLimits:
 class AgentSession:
     """A Main-assigned session grant for one authenticated capture node.
 
-    ``generation`` increases on every ``open_session`` for the node; a newer
+    ``generation`` is drawn from one tracker-wide counter that never resets,
+    so it increases on every ``open_session`` and is never reissued, even
+    after ``forget_node`` and re-enrollment of the same node UUID.  A newer
     grant supersedes older ones, whose in-flight units are then rejected.
+    ``instance`` binds the grant to one tracker lifetime, so a grant from
+    before a Main Server restart can never match a post-restart session.
     """
 
     node_id: UUID
     generation: int
+    instance: UUID | None = None
 
 
 @dataclass(frozen=True)
@@ -196,6 +201,9 @@ class ContinuityTracker:
         self._clock_ns = clock_ns
         self._nodes: dict[UUID, _Node] = {}
         self._sources: dict[UUID, _Source] = {}
+        # Monotonic across forget/re-enrollment; never reused for any node.
+        self._generation = 0
+        self._instance = uuid4()
         self._lock = Lock()
 
     def _now(self) -> int:
@@ -220,14 +228,16 @@ class ContinuityTracker:
                 if len(self._nodes) >= self.limits.maximum_sources:
                     raise PermissionError("agent node capacity reached")
                 node = self._nodes[node_id] = _Node(0, False, now)
-            node.generation += 1
+            self._generation += 1
+            node.generation = self._generation
             node.open = True
             node.last_seen_ns = now
-            return AgentSession(node_id, node.generation)
+            return AgentSession(node_id, node.generation, self._instance)
 
     def _current(self, session: AgentSession) -> _Node | None:
         node = self._nodes.get(session.node_id)
-        if node is None or not node.open or node.generation != session.generation:
+        if (node is None or not node.open or session.instance != self._instance
+                or node.generation != session.generation):
             return None
         return node
 
@@ -443,6 +453,21 @@ class ContinuityTracker:
                 while state.gaps and len(result) < maximum_events:
                     result.append(state.gaps.popleft())
             return tuple(result)
+
+    def forget_source(self, source_id: UUID) -> tuple[GapEvent, ...]:
+        """Release one source slot after durable deactivation/replacement.
+
+        The active-source limit bounds *active* sources, not lifetime source
+        identities, so a deactivated source must free its slot without
+        discarding continuity of the node's other sources.  Undrained gaps
+        are returned so the caller can persist them; nothing is dropped
+        silently.  The authorizer must already refuse the source.
+        """
+        if not isinstance(source_id, UUID):
+            raise ValueError("invalid agent source identity")
+        with self._lock:
+            state = self._sources.pop(source_id, None)
+            return () if state is None else tuple(state.gaps)
 
     def forget_node(self, node_id: UUID) -> tuple[GapEvent, ...]:
         """Drop state after durable revocation/removal; returns undrained gaps."""

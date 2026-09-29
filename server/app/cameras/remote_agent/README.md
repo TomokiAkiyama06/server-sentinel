@@ -50,7 +50,9 @@ capture_time_ns)` media envelope (carried in full on each queued
 the Agent retry rather than lose media, idempotent duplicate acknowledgement,
 and bounded, coalescing gap events for skips, capture restarts, clock
 regressions and refused units. Known loss keeps a source flow `degraded` and a
-closed or stale session makes it `interrupted`; this is flow continuity, not
+closed or stale session makes it `interrupted`. Session generations are never
+reissued (also after `forget_node` and re-enrollment), and `forget_source`
+releases a deactivated source's slot and returns its undrained gaps; this is flow continuity, not
 camera or node health. It opens no listener, selects no protocol and performs
 no cryptography; tests are synthetic only.
 
