@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
 import tempfile
+import threading
 from unittest import TestCase
 from uuid import UUID, uuid4
 
@@ -95,6 +96,7 @@ class PresenceFixture:
                                         detection=lambda: True, storage_status=lambda: True)
         self.clock = Clock()
         self.outbox = TimelineOutbox(self.presence, clock=self.clock, capacity=8)
+        self.outbox.open()
 
     def history(self, context="recordings"):
         return self.presence.history(context, received_from=NOW - timedelta(days=1),
@@ -571,6 +573,7 @@ class TimelineGapDurabilityTests(PresenceFixture, TestCase):
                                         detection=lambda: True, storage_status=lambda: True)
         self.outbox = TimelineOutbox(self.presence, clock=self.clock, capacity=8)
         self.health = HealthTimeline(self.outbox)
+        self.outbox.open()
         return self.outbox.flush()
 
     def gap(self):
@@ -651,12 +654,39 @@ class TimelineGapDurabilityTests(PresenceFixture, TestCase):
         self.assertEqual((state.pending, state.unpersisted), (0, 0))
         self.assertEqual(self.gap()[1]["refused"], 1)
 
-    def test_unopened_session_or_unreadable_marker_is_never_healthy(self):
+    def test_staging_is_refused_until_a_durable_session_is_open(self):
+        outbox = TimelineOutbox(self.presence, clock=self.clock, capacity=8)
+        health = HealthTimeline(outbox)
+        self.assertFalse(outbox.state().session)
+        self.assertTrue(outbox.state().degraded)
+        with self.assertRaises(RuntimeError):
+            health.node(NODE, NodeHealthState.OFFLINE)
         self.refuse = True
-        state = self.outbox.flush()
-        self.assertFalse(state.session)
-        self.assertTrue(state.degraded)
+        with self.assertRaises(RuntimeError):
+            outbox.open()
+        with self.assertRaises(RuntimeError):
+            health.node(NODE, NodeHealthState.OFFLINE)
         self.refuse = False
+        self.assertEqual(outbox.state().pending, 0)
+
+    def test_process_exit_before_the_first_flush_is_an_interrupted_gap(self):
+        # The session is opened at startup, so facts staged and never flushed
+        # are found by the next start even though no write ever happened.
+        self.assertTrue(self.health.node(NODE, NodeHealthState.OFFLINE))
+        state = self.restart()
+        self.assertTrue(state.degraded)
+        self.assertEqual(self.gap()[1]["interrupted"], 1)
+
+    def test_repeated_close_returns_without_blocking(self):
+        self.outbox.close()
+        worker = threading.Thread(target=self.outbox.close, daemon=True)
+        worker.start()
+        worker.join(2)
+        self.assertFalse(worker.is_alive())
+        with self.assertRaises(RuntimeError):
+            self.outbox.open()
+
+    def test_unreadable_marker_is_never_healthy(self):
         self.assertFalse(self.outbox.flush().degraded)
         missing = Path(tempfile.gettempdir()) / f"absent-{uuid4()}" / "synthetic.sqlite3"
         self.presence.database = Database(missing)

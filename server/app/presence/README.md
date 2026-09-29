@@ -177,12 +177,16 @@ route, worker thread or default timing policy:
   conflict and counted as rejected. Both are counted and reported by `OutboxState.degraded`, never
   dropped silently.
 
-Timeline loss is durable (`presence_timeline_gap` migration). The first flush
-opens a durable outbox session (`open_timeline_session()`), and every flush adds
-its refused and rejected counts to a singleton gap marker that holds counts and
+Timeline loss is durable (`presence_timeline_gap` migration). The runtime calls
+`TimelineOutbox.open()` at startup, before it wires any producer, to open a
+durable outbox session (`open_timeline_session()`); `stage()` refuses facts
+until that succeeds, so no fact is held without a session row a restart would
+find, and `open()` raises for the runtime to retry. Every flush adds its
+refused and rejected counts to a singleton gap marker that holds counts and
 times only, never observation content. `TimelineOutbox.close()` records any
 still-staged fact as lost and ends the session; staging or flushing after close
-raises, so the runtime stops its producers first. A process that exits without
+raises, so the runtime stops its producers first; a repeated close is a
+no-op. A process that exits without
 a successful close leaves its session row behind, and the next start records
 an interrupted gap: a restart is never assumed clean, and staged facts are not
 recovered. A failed close keeps the outbox open and the session row in place.

@@ -162,8 +162,9 @@ class TimelineOutbox:
     refused and counted as rejected just as presence would reject it. Both
     counters make the gap visible; neither is silent loss.
 
-    Loss is also durable. The first flush opens a durable outbox session, and
-    every flush adds the refused and rejected counts to the presence timeline
+    Loss is also durable. `open()` establishes a durable outbox session at
+    startup and `stage()` refuses facts until it has, so no fact is ever held
+    without a session row that a restart would find. Every flush adds the refused and rejected counts to the presence timeline
     gap marker. `close()` records any still-staged facts as lost and ends the
     session; a process that exits without a successful close leaves the
     session row behind, so the next start records an interrupted gap. The
@@ -213,6 +214,10 @@ class TimelineOutbox:
         with self._lock:
             if self._closed:
                 raise RuntimeError("timeline outbox closed")
+            if not self._session:
+                # Without a durable session a restart before the first write
+                # would lose this fact with no trace, so nothing is accepted.
+                raise RuntimeError("timeline outbox not open")
             for item, _, staged in self._pending:
                 if item == identifier:
                     if staged == fact:
@@ -271,7 +276,21 @@ class TimelineOutbox:
                 pass
         return self.state()
 
-    def _open(self):
+    def open(self):
+        """Open the durable session at startup, before any producer is wired.
+
+        `stage()` refuses facts until this succeeds, so a fact is never held
+        in memory without a session row that a restart would find. Raises when
+        the session cannot be opened; the runtime retries before wiring
+        producers. Opening an already open outbox is a no-op.
+        """
+        with self._flushing:
+            if self._closed:
+                raise RuntimeError("timeline outbox closed")
+            self._open(strict=True)
+        return self.state()
+
+    def _open(self, *, strict=False):
         """Open the durable session once; False (retried later) on any failure."""
         if self._session:
             return True
@@ -279,8 +298,11 @@ class TimelineOutbox:
             now, _ = _stamp(self.clock)
             gap = self.service.open_timeline_session(now=now)
         except Exception:
+            if strict:
+                raise
             return False
-        self._session, self._gap = True, gap is not None
+        with self._lock:
+            self._session, self._gap = True, gap is not None
         return True
 
     def _persist(self, *, lost=0, close=False):
@@ -311,8 +333,11 @@ class TimelineOutbox:
         """
         with self._flushing:
             with self._lock:
-                if self._closed:
-                    return self.state()
+                closed = self._closed
+            if closed:
+                # Repeated close is idempotent; `state()` takes the lock itself.
+                return self.state()
+            with self._lock:
                 # Staging stops before the durable write; a producer staging
                 # after this point gets an error rather than silent loss.
                 self._closed = True
