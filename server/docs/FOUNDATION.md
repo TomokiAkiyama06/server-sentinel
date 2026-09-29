@@ -41,6 +41,13 @@ Production environments may install `requirements.lock` without the two lint
 tools or the optional detector runtime. Preserve
 `docs/BACKEND_THIRD_PARTY_LICENSE_TEXTS.md` with deployments.
 
+The environment-only `python -m app` path has no monitoring storage
+configuration, so it validates settings and then logs
+`monitoring_storage_unconfigured` and exits non-zero instead of serving without
+the mandatory hardware integrity check and recording self-test. Run the service
+through `python -m app.deployment` with the deployment configuration's
+`monitoring` object (`server/docs/DEPLOYMENT.md`).
+
 Optional settings are `SERVERSENTINEL_HUMAN_HOST` (default `127.0.0.1`, literal
 loopback addresses only), `SERVERSENTINEL_HUMAN_PORT` (default `8000`, 1–65535),
 and `SERVERSENTINEL_LOG_LEVEL` (`INFO`, `WARNING`, `ERROR`). Unknown application

@@ -860,11 +860,15 @@ separate integration work.
 
 Runtime wiring (`server/app/monitoring/`, Issues #21/#23). The application
 lifespan starts a monitoring runtime only when the deployment configuration's
-optional `monitoring` object supplies all of `storage_limits`,
-`recording_limits` and `recording_filesystem`. Without them the runtime state is
-the explicit `unconfigured`: storage admission stays unbound, audit and other
-metadata writes are refused and no worker runs; a partial or invalid object is
-refused at deployment validation. When configured, one dedicated worker thread
+`monitoring` object supplies all of `storage_limits`, `recording_limits` and
+`recording_filesystem`. Because the startup/daily hardware integrity check and
+daily recording self-test are mandatory, the production launcher (`--check`
+and service start) and `python -m app` refuse to run without them, failing
+closed and visibly instead of running with those checks absent. An embedded
+`create_app()` without them reports the explicit `unconfigured` fault (logged
+at error): storage admission stays unbound, audit and other metadata writes are
+refused and no worker runs; a partial or invalid object is refused at
+deployment validation. When configured, one dedicated worker thread
 owns the SQLite connection, `MainStoragePolicy`, the recorder store (bound as
 the policy's inventory/reclaimer), the storage state-transition audit
 (`storage_state_audit`, 90-day cleanup), notifications, the daily scheduler,

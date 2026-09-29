@@ -8,8 +8,16 @@ from app.settings import ConfigurationError, Settings
 
 
 def run(settings: Settings, monitoring=None) -> int:
-    """Serve the closed foundation; `monitoring` comes from the deployment."""
+    """Serve the closed foundation; `monitoring` comes from the deployment.
+
+    Without a storage-configured monitoring section the mandatory startup/daily
+    hardware integrity check and daily recording self-test cannot run, so the
+    service refuses to start (non-zero exit) instead of running without them.
+    """
     configure_logging(settings.log_level)
+    if monitoring is None or not monitoring.storage_configured:
+        logging.getLogger(__name__).error(Event.MONITORING_UNCONFIGURED)
+        return 1
     from app.systemd import build_server
     server = build_server(
         create_app(settings, monitoring=monitoring), host=settings.human_host, port=settings.human_port,

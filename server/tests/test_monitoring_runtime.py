@@ -17,6 +17,7 @@ from uuid import uuid4
 from zoneinfo import ZoneInfo
 import zlib
 
+import app.__main__ as entry
 from app.audit import ActorCategory, AuditAction, AuditOutcome, AuditStorageError, TargetKind
 from app.deployment import Deployment
 from app.integrity.model import Inventory
@@ -26,6 +27,7 @@ from app.media.recording import Segment
 from app.monitoring.config import MonitoringConfiguration, RecordingFilesystem, parse_monitoring
 from app.monitoring.runtime import MonitoringDependencies, RuntimeState
 from app.settings import ConfigurationError, Settings
+from app.storage.database import Database
 from app.storage.policy import StorageLimits, StorageState
 from app.media.recording.model import Limits
 from tests.asgi import request
@@ -165,7 +167,87 @@ class UnconfiguredTests(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(application.state.audit_storage_admitted)
 
 
+class ProductionEntryTests(unittest.TestCase):
+    def test_service_refuses_to_run_without_mandatory_checks(self):
+        # Without the storage sections the startup/daily hardware integrity
+        # check and daily recording self-test cannot run: the service exits
+        # non-zero with a fixed event and never starts a listener.
+        with tempfile.TemporaryDirectory() as directory:
+            settings = Settings(Path(directory))
+            for monitoring in (None, MonitoringConfiguration(ZoneInfo("UTC"))):
+                with self.subTest(monitoring=monitoring), patch(
+                        "app.__main__.configure_logging"), patch(
+                        "app.systemd.build_server") as build_server, self.assertLogs(
+                            "app.__main__", "ERROR") as logs:
+                    self.assertEqual(1, entry.run(settings, monitoring))
+                build_server.assert_not_called()
+                self.assertEqual(["monitoring_storage_unconfigured"],
+                                 [record.getMessage() for record in logs.records])
+
+
+class FlakyDatabase(Database):
+    """Migration connects; the next `failures` connects raise."""
+
+    def __init__(self, path, failures):
+        super().__init__(path)
+        self.calls = 0
+        self.failures = failures
+
+    def connect(self):
+        self.calls += 1
+        if 1 < self.calls <= 1 + self.failures:
+            raise OSError("synthetic database fault")
+        return super().connect()
+
+
 class LifespanTests(RuntimeFixture):
+    async def test_raising_startup_retry_is_rescheduled_not_repeated_each_tick(self):
+        database = FlakyDatabase(self.settings.database_path, failures=2)
+        application = create_app(
+            self.settings, database=database, monitoring=self.configuration(),
+            monitoring_dependencies=MonitoringDependencies(
+                integrity_probe=self.probe, segment_validator=SyntheticValidator(),
+                slack_opener=self.transport, utcnow=self.clock.utcnow,
+                monotonic=lambda: self.clock.monotonic, tick_seconds=3600.0,
+            ),
+        )
+        async with application.router.lifespan_context(application):
+            runtime = application.state.monitoring
+            self.assertEqual(RuntimeState.FAILED, runtime.status.state)
+            self.assertEqual(2, database.calls)
+            # The first due retry raises again from connect(); it must push the
+            # deadline forward instead of retrying on every following tick.
+            self.clock.advance(timedelta(minutes=15))
+            await runtime.call(runtime.tick)
+            self.assertEqual(3, database.calls)
+            self.assertEqual(RuntimeState.FAILED, runtime.status.state)
+            for _ in range(5):
+                self.clock.advance(timedelta(minutes=1))
+                await runtime.call(runtime.tick)
+            self.assertEqual(3, database.calls)
+            self.clock.advance(timedelta(minutes=10))
+            await runtime.call(runtime.tick)
+            self.assertEqual(4, database.calls)
+            self.assertEqual(RuntimeState.RUNNING, runtime.status.state)
+            self.assertEqual(1, self.probe.calls)
+
+    async def test_lifespan_state_snapshots_follow_a_recovered_startup(self):
+        self.approved_device = self.device + 1
+        application = self.application(tick_seconds=0.01)
+        async with application.router.lifespan_context(application):
+            self.assertEqual(RuntimeState.FAILED, application.state.monitoring_state)
+            self.assertFalse(application.state.audit_storage_admitted)
+            self.approved_device = self.device
+            self.clock.advance(timedelta(minutes=15))
+            for _ in range(300):
+                if application.state.monitoring_state == RuntimeState.RUNNING:
+                    break
+                await asyncio.sleep(0.01)
+            self.assertEqual(RuntimeState.RUNNING, application.state.monitoring_state)
+            self.assertTrue(application.state.audit_storage_admitted)
+        self.assertEqual(RuntimeState.STOPPED, application.state.monitoring_state)
+        self.assertFalse(application.state.audit_storage_admitted)
+
     async def test_startup_binds_policy_runs_integrity_and_health_and_alerts(self):
         application = self.application()
         async with application.router.lifespan_context(application):

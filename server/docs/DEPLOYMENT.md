@@ -98,9 +98,9 @@ Keep actual paths, filesystem identity and UID private. A loopback literal is
 mandatory for the human listener; expose it through the separately configured
 trusted private proxy after application authorization is available.
 
-### Optional monitoring section
+### Monitoring section (required to run the service)
 
-An optional `monitoring` object configures the Main Server monitoring runtime
+The `monitoring` object configures the Main Server monitoring runtime
 (storage admission, retention, daily summary, hardware integrity and recording
 health). Values below are examples, not defaults:
 
@@ -142,11 +142,14 @@ the same device other than the operating-system root. The runtime re-checks this
 identity on every storage sample and refuses writes, without a fallback, when
 it no longer holds.
 
-Omit all three of `storage_limits`, `recording_limits` and
-`recording_filesystem` to leave storage unconfigured: the service then logs
-`monitoring_storage_unconfigured`, refuses audit/metadata writes and runs no
-monitoring worker. Supplying only some of them, or any invalid value, fails
-`--check` with a value-free message.
+The service must run the startup/daily hardware integrity check and the daily
+recording self-test, which need all three of `storage_limits`,
+`recording_limits` and `recording_filesystem`. Without the object, or without
+those sections, `--check` (the unit's `ExecStartPre`) and the launcher fail
+with the value-free validation message, and `python -m app` logs
+`monitoring_storage_unconfigured` and exits non-zero, so the service never runs
+with the mandatory checks silently absent. Supplying only some of them, or any
+invalid value, also fails `--check`.
 
 ## Install, update, and rollback
 

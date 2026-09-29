@@ -117,20 +117,36 @@ def create_app(settings: Settings, *, database: Database | None = None,
             # Lifespan failures must not pass SQLite/config values to servers.
             raise RuntimeError("application startup failed") from None
         monitoring_task = None
+
+        def refresh_monitoring_state() -> None:
+            # Snapshots follow the live runtime, e.g. a retried startup open
+            # that later succeeds, instead of freezing the first result.
+            application.state.monitoring_state = monitoring_runtime.status.state
+            application.state.audit_storage_admitted = (
+                storage_reservation is not None or runtime_admission.bound
+            )
+
         if monitoring_runtime is None:
-            # Explicit fail-closed state, never a silently healthy default.
+            # Explicit fail-closed fault, never a silently healthy default.
+            # The mandatory startup/daily hardware integrity check and daily
+            # recording self-test cannot run here, so the production entry
+            # points (`app.deployment`, `python -m app`) refuse to serve in
+            # this state; it is reachable only by embedding `create_app()`.
             application.state.monitoring_state = RuntimeState.UNCONFIGURED
-            logging.getLogger(__name__).warning(Event.MONITORING_UNCONFIGURED)
+            logging.getLogger(__name__).error(Event.MONITORING_UNCONFIGURED)
         else:
             await monitoring_runtime.start()
-            application.state.monitoring_state = monitoring_runtime.status.state
             # Admission follows the live runtime state: a runtime that failed
             # startup refuses writes until its retried open succeeds.
             runtime_admission.bind(monitoring_runtime)
-            monitoring_task = asyncio.create_task(monitoring_runtime.run())
+            monitoring_task = asyncio.create_task(
+                monitoring_runtime.run(after_tick=refresh_monitoring_state)
+            )
         application.state.audit_storage_admitted = (
             storage_reservation is not None or runtime_admission.bound
         )
+        if monitoring_runtime is not None:
+            refresh_monitoring_state()
         try:
             await audit_retention.startup_cleanup()
         except Exception:

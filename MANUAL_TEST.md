@@ -510,8 +510,9 @@ The lifespan runtime wiring (`server/app/monitoring/`) is exercised only with
 disposable directories, a test clock, a synthetic inventory probe and an
 intercepted Slack transport. On the deployment, additionally check:
 
-- [ ] without `monitoring.storage_limits` the service reports the
-      `monitoring_storage_unconfigured` event and refuses audit writes;
+- [ ] without `monitoring.storage_limits` (or the whole `monitoring` object)
+      `--check` fails and the unit does not start, so it never runs without the
+      startup/daily hardware integrity check and recording self-test;
 - [ ] with configured thresholds and `recording_filesystem`, `--check` passes and
       the service reports `monitoring_started`; a wrong UUID/device/mount point is
       refused by `--check`;

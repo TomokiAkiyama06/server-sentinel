@@ -3,12 +3,14 @@
 Issues #21/#23 lifespan wiring. No HTTP route, listener or human surface is
 added; `ClosedHumanSurface` stays installed. Python stdlib only.
 
-`config.parse_monitoring()` validates the deployment configuration's optional
+`config.parse_monitoring()` validates the deployment configuration's
 `monitoring` object (see `server/docs/DEPLOYMENT.md`). It is standard-library
 only so the standalone installer validates it too. `storage_limits`,
-`recording_limits` and `recording_filesystem` are all-or-nothing; without them
-`create_app()` keeps `UnboundStorageAdmission` semantics and reports the
-explicit `unconfigured` runtime state.
+`recording_limits` and `recording_filesystem` are all-or-nothing. The production launcher and
+`python -m app` refuse to run without them, because the mandatory
+startup/daily integrity check and recording self-test would not run; an
+embedded `create_app()` without them keeps `UnboundStorageAdmission` semantics
+and reports the explicit `unconfigured` fault at error level.
 
 `runtime.MonitoringRuntime` creates every thread-owned component on one
 dedicated worker thread: SQLite connection, `MainStoragePolicy` over
@@ -29,6 +31,8 @@ recordings (starred never), `storage_state_audit` and 90-day fault history, run
 the integrity/health `tick()` and the daily summary. A failing step sets its
 status flag and retries after `retry_seconds`; other steps continue. Status is a
 frozen `MonitoringStatus` with fixed values only; logs use fixed `Event` codes.
+The lifespan refreshes `application.state.monitoring_state` and
+`audit_storage_admitted` after every tick, so they follow a recovered startup.
 
 Bridges: integrity outbox rows map to deterministic event IDs, are recorded as
 `hardware_integrity_failure` (immediate) or `hardware_integrity_warning`
@@ -37,7 +41,8 @@ results persist in `recording_health_status` before notification;
 `FAILED` → `recording_health_failure`, `UNAVAILABLE` →
 `recording_health_warning`. A recording filesystem mismatch raises one
 immediate `recording_health_failure` per episode. A failed startup open is
-retried every `retry_seconds` from the tick against the same declared identity;
+retried every `retry_seconds` from the tick against the same declared identity
+(also when the retry itself raises, e.g. from the database connect);
 only the first failure of the episode alerts, and a successful retry runs the
 startup steps and binds admission. Slack remains optional and
 never determines local state.

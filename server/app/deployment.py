@@ -152,8 +152,9 @@ class Deployment:
     settings: Settings
     recordings_directory: Path
     audit_directory: Path
-    # Optional monitoring runtime configuration; absent means the storage
-    # policy stays unbound and writes are refused (explicit unconfigured state).
+    # Monitoring runtime configuration. `load()` parses it structurally; the
+    # launcher (`main`, including `--check`) refuses to run without its
+    # storage sections because the mandatory integrity/self-test checks need it.
     monitoring: MonitoringConfiguration | None = field(default=None, repr=False)
 
     @property
@@ -263,6 +264,12 @@ def main(arguments: list[str] | None = None) -> int:
         )
         if os.geteuid() != deployment.service_uid:
             raise ConfigurationError("launcher must run as the dedicated account")
+        # The service must run the mandatory startup/daily hardware integrity
+        # check and daily recording self-test, which need the monitoring
+        # storage sections. `--check` (the unit's ExecStartPre) and the
+        # launcher refuse, so a deployment never runs with them silently absent.
+        if deployment.monitoring is None or not deployment.monitoring.storage_configured:
+            raise ConfigurationError("monitoring storage configuration is required")
     except ConfigurationError:
         parser.exit(1, "ServerSentinel deployment validation failed\n")
     if args.check:

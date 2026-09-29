@@ -493,7 +493,7 @@ class MonitoringRuntime:
                 self._poll()
             if (self.status.state == RuntimeState.FAILED
                     and self._due("startup", self.dependencies.monotonic())):
-                self._open()
+                self._attempt_open()
             return
         self._poll()
         self._storage_tick()
@@ -514,28 +514,45 @@ class MonitoringRuntime:
 
     # -- lifespan ----------------------------------------------------------
 
-    async def start(self) -> None:
-        self._executor = ThreadPoolExecutor(max_workers=1,
-                                            thread_name_prefix="serversentinel-monitoring")
+    def _attempt_open(self) -> None:
+        """Owner-thread `_open()` whose unexpected raise is still rescheduled.
+
+        `_open()` handles storage failures itself. A raise from database
+        connect or notification setup (before any alert path exists) must not
+        leave the past-due `startup` deadline in place, or every tick would
+        retry and log instead of waiting `retry_seconds`.
+        """
         try:
-            await self.call(self._open)
+            self._open()
         except Exception:
-            # Usually the database could not be opened; the tick retries it.
+            if self.status.state == RuntimeState.RUNNING:
+                # Components were published; a later startup step raised.
+                logging.getLogger(__name__).error(Event.MONITORING_DEGRADED)
+                return
             self._set(state=RuntimeState.FAILED)
             self._retry_at["startup"] = (self.dependencies.monotonic()
                                          + self.dependencies.retry_seconds)
             logging.getLogger(__name__).error(Event.MONITORING_STARTUP_FAILED)
-            return
+
+    async def start(self) -> None:
+        self._executor = ThreadPoolExecutor(max_workers=1,
+                                            thread_name_prefix="serversentinel-monitoring")
+        # Usually a raise means the database could not be opened; the tick
+        # retries it every `retry_seconds`.
+        await self.call(self._attempt_open)
         if self.status.state == RuntimeState.RUNNING:
             logging.getLogger(__name__).info(Event.MONITORING_STARTED)
 
-    async def run(self) -> None:
+    async def run(self, after_tick: Callable[[], None] | None = None) -> None:
+        """Tick forever; `after_tick` refreshes lifespan-held status snapshots."""
         while True:
             await asyncio.sleep(self.dependencies.tick_seconds)
             try:
                 await self.call(self.tick)
             except Exception:
                 logging.getLogger(__name__).error(Event.MONITORING_DEGRADED)
+            if after_tick is not None:
+                after_tick()
 
     async def stop(self) -> None:
         executor = self._executor
