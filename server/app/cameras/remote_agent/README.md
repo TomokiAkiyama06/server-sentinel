@@ -47,7 +47,8 @@ ADR-0007 contract: Main-assigned session generations for an already
 mTLS-authenticated node, the `(source_id, capture_epoch, sequence,
 capture_time_ns)` media envelope (carried in full on each queued
 `AgentMessage`), commit-after-admission so backpressure makes
-the Agent retry rather than lose media, idempotent duplicate acknowledgement,
+the Agent retry rather than lose media, idempotent duplicate acknowledgement
+(duplicates and other early refusals still consume the node's rate budget),
 and bounded, coalescing gap events for skips, capture restarts, clock
 regressions and refused units. Known loss keeps a source flow `degraded` and a
 closed or stale session makes it `interrupted`. Session generations are never

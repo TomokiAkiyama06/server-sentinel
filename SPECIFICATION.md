@@ -591,7 +591,9 @@ never reissued, including after node removal and re-enrollment of the same
 identity, and a grant is bound to one Main process lifetime. A unit is
 committed only after the bounded ingest queue accepts it: backpressure or rate
 refusal does not advance continuity and the Agent retries the same sequence,
-a retry of a committed unit is an idempotent `duplicate`, a unit refused for
+a retry of a committed unit is an idempotent `duplicate`, every media attempt
+of an authorized node (including a duplicate or an early refusal that is never
+enqueued) consumes its per-node ingest rate budget, a unit refused for
 a reason no retry can satisfy (oversize) is recorded as loss, and any other
 ingest refusal leaves continuity unchanged and the flow `degraded`. A sequence skip reports the exact missing
 count, a new capture epoch reports a gap of unknown extent, and an in-epoch

@@ -147,6 +147,25 @@ class RemoteAgentIngestTests(unittest.TestCase):
         )
         self.assertEqual(1, boundary.snapshot().tracked_rate_windows)
 
+    def test_charged_attempt_consumes_rate_budget_without_enqueueing(self):
+        clock = [0]
+        boundary = queue(limits=IngestLimits(8, 8, 64, 2, 100), now=lambda: clock[0])
+        self.assertIsNone(boundary.charge_attempt(NODE))
+        self.assertEqual(IngestOutcome.ACCEPTED, boundary.submit(message()).outcome)
+        refusal = boundary.charge_attempt(NODE)
+        self.assertEqual((IngestOutcome.RATE_LIMITED, "rate_limit", 1),
+                         (refusal.outcome, refusal.reason, refusal.queued_messages))
+        self.assertEqual(IngestOutcome.RATE_LIMITED,
+                         boundary.submit(message(sequence=2)).outcome)
+        self.assertEqual((1, 2), (boundary.snapshot().queued_messages,
+                                  boundary.snapshot().rate_limited))
+        clock[0] = 100
+        self.assertIsNone(boundary.charge_attempt(NODE))
+        clock[0] = 50
+        self.assertEqual("clock_regression", boundary.charge_attempt(NODE).reason)
+        with self.assertRaises(ValueError):
+            boundary.charge_attempt("not-a-node")
+
     def test_revoked_node_lifecycle_can_release_rate_window_state(self):
         boundary = queue(limits=IngestLimits(8, 8, 64, 10, 100, 1))
         self.assertEqual(IngestOutcome.ACCEPTED, boundary.submit(message()).outcome)

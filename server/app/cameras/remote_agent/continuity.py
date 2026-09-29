@@ -19,7 +19,9 @@ a reconnect that lost nothing yields no gap.
 A unit is committed only after the bounded ingest queue accepts it.  A
 backpressure/rate refusal leaves continuity unchanged so the Agent retries the
 same sequence from its disk ring buffer; a retry of an already committed unit
-is reported as ``duplicate`` and never enqueued twice.  Known loss is recorded
+is reported as ``duplicate`` and never enqueued twice.  Every attempt of an
+authorized node, including a duplicate or an early refusal that is never
+enqueued, consumes that node's ingest rate budget.  Known loss is recorded
 as a bounded gap event and keeps the source ``degraded`` until a consumer
 drains it; it is never reported as a healthy flow.
 """
@@ -352,6 +354,26 @@ class ContinuityTracker:
                                  epoch, state.last_sequence, sequence, 0))
         return tuple(gaps)
 
+    def _charged(self, node_id: UUID, outcome: DeliveryOutcome,
+                 reason: str) -> Delivery:
+        """Refuse/acknowledge an authorized node's attempt without enqueueing it.
+
+        ``AgentIngestQueue.submit`` is otherwise the only place the per-node
+        rate window is counted, so every early return for an authorized node
+        (duplicate retry, stale session/epoch, source mismatch or capacity,
+        unauthorized source) is charged here.  Over budget, the attempt is
+        reported as the queue's rate/clock refusal, like ``submit`` reports a
+        rate refusal before its other refusals.  Continuity is never changed.
+        Session control (``open_session``/``heartbeat``) is not media and is
+        not charged here; the future listener bounds connection attempts.
+        """
+        refusal = self._ingest.charge_attempt(node_id)
+        if refusal is None:
+            return Delivery(outcome, reason)
+        if refusal.outcome is IngestOutcome.RATE_LIMITED:
+            return Delivery(DeliveryOutcome.RATE_LIMITED, refusal.reason)
+        return Delivery(DeliveryOutcome.REJECTED, refusal.reason)
+
     def receive(self, session: AgentSession, header: MediaUnitHeader,
                 payload: bytes) -> Delivery:
         if (not isinstance(session, AgentSession) or not isinstance(header, MediaUnitHeader)
@@ -367,25 +389,28 @@ class ContinuityTracker:
         try:
             self._authorizer.require_source(node_id, source_id)
         except PermissionError:
-            return Delivery(DeliveryOutcome.REJECTED, "unauthorized")
+            return self._charged(node_id, DeliveryOutcome.REJECTED, "unauthorized")
         now = self._now()
         with self._lock:
             node = self._current(session)
             if node is None:
-                return Delivery(DeliveryOutcome.REJECTED, "stale_session")
+                return self._charged(node_id, DeliveryOutcome.REJECTED, "stale_session")
             state = self._sources.get(source_id)
             if state is not None and state.node_id != node_id:
                 # Source identity is bound to the node that first delivered it;
                 # the authorizer must also refuse this, but fail closed here.
-                return Delivery(DeliveryOutcome.REJECTED, "source_identity_mismatch")
+                return self._charged(node_id, DeliveryOutcome.REJECTED,
+                                     "source_identity_mismatch")
             if state is None and len(self._sources) >= self.limits.maximum_sources:
-                return Delivery(DeliveryOutcome.REJECTED, "source_capacity")
+                return self._charged(node_id, DeliveryOutcome.REJECTED, "source_capacity")
             checked = self._discontinuities(node_id, state, header)
             if checked == "duplicate":
                 # Idempotent acknowledgement: the Agent may release this unit.
-                return Delivery(DeliveryOutcome.DUPLICATE, "already_committed")
+                # It is never enqueued again but still consumes rate budget.
+                return self._charged(node_id, DeliveryOutcome.DUPLICATE,
+                                     "already_committed")
             if isinstance(checked, str):
-                return Delivery(DeliveryOutcome.REJECTED, checked)
+                return self._charged(node_id, DeliveryOutcome.REJECTED, checked)
             admission = self._ingest.submit(AgentMessage(
                 node_id, source_id, AgentAction.MEDIA, header.sequence, payload,
                 capture_epoch=header.capture_epoch,
@@ -407,11 +432,14 @@ class ContinuityTracker:
                 # revoked after the check above, the grant must be closed too;
                 # a source-only revocation keeps the node session.  The
                 # authorizer is already called under this lock by the queue.
+                # The queue counts no rate for an authorization refusal, so a
+                # still-authorized node is charged like the early source check.
                 try:
                     self._authorizer.require_node(node_id)
                 except PermissionError:
                     node.open = False
-                return Delivery(DeliveryOutcome.REJECTED, "unauthorized")
+                    return Delivery(DeliveryOutcome.REJECTED, "unauthorized")
+                return self._charged(node_id, DeliveryOutcome.REJECTED, "unauthorized")
             if (admission.outcome is IngestOutcome.REJECTED
                     and admission.reason not in _PERMANENT_INGEST_REFUSALS):
                 # Transient/unknown refusal: do not commit or claim loss, but

@@ -308,6 +308,111 @@ class ContinuityTrackerTests(unittest.TestCase):
                          tracker.receive(session, unit(1), b"v").outcome)
         self.assertEqual(0, flow(tracker).last_sequence)
 
+    def test_duplicate_retries_consume_rate_budget_without_enqueueing(self):
+        tracker, ingest, clock, _ = build(rate=3)
+        session = tracker.open_session(NODE)
+        tracker.receive(session, unit(0), b"v")
+        tracker.receive(session, unit(1), b"v")
+        self.assertEqual(DeliveryOutcome.DUPLICATE,
+                         tracker.receive(session, unit(0), b"v").outcome)
+        # The budget is spent: further duplicates and new units are throttled.
+        for header in (unit(0), unit(1), unit(2)):
+            result = tracker.receive(session, header, b"v")
+            self.assertEqual((DeliveryOutcome.RATE_LIMITED, "rate_limit"),
+                             (result.outcome, result.reason))
+        self.assertEqual(3, ingest.snapshot().rate_limited)
+        self.assertEqual([0, 1], [m.sequence for m in ingest.drain(10)])
+        self.assertEqual(1, flow(tracker).last_sequence)
+        # A new window restores the idempotent acknowledgement.
+        clock.now = 10 ** 12
+        self.assertEqual(DeliveryOutcome.DUPLICATE,
+                         tracker.receive(session, unit(1), b"v").outcome)
+        self.assertEqual(DeliveryOutcome.ACCEPTED,
+                         tracker.receive(session, unit(2), b"v").outcome)
+
+    def test_over_budget_duplicate_does_not_change_continuity(self):
+        tracker, _, _, _ = build(rate=1)
+        session = tracker.open_session(NODE)
+        tracker.receive(session, unit(0), b"v")
+        self.assertEqual(DeliveryOutcome.RATE_LIMITED,
+                         tracker.receive(session, unit(0), b"v").outcome)
+        state = flow(tracker)
+        self.assertEqual((SourceFlow.RECEIVING, False, 0, 0),
+                         (state.flow, state.backpressured, state.last_sequence,
+                          state.pending_gaps))
+
+    def test_early_refusals_of_authorized_node_consume_rate_budget(self):
+        def exhausted(tracker, session, header=None):
+            result = tracker.receive(session, header or unit(0), b"v")
+            return (result.outcome, result.reason)
+
+        limited = (DeliveryOutcome.RATE_LIMITED, "rate_limit")
+        with self.subTest("stale_session"):
+            tracker, ingest, _, _ = build(rate=1)
+            old = tracker.open_session(NODE)
+            new = tracker.open_session(NODE)
+            self.assertEqual("stale_session", tracker.receive(old, unit(0), b"v").reason)
+            self.assertEqual(limited, exhausted(tracker, new))
+            self.assertEqual(limited, exhausted(tracker, old))
+            self.assertEqual(0, ingest.snapshot().queued_messages)
+        with self.subTest("stale_capture_epoch"):
+            tracker, _, _, _ = build(rate=3)
+            session = tracker.open_session(NODE)
+            tracker.receive(session, unit(9, epoch=2), b"v")
+            tracker.receive(session, unit(0, epoch=3, at=0), b"v")
+            self.assertEqual("stale_capture_epoch",
+                             tracker.receive(session, unit(10, epoch=2), b"v").reason)
+            self.assertEqual(limited, exhausted(tracker, session, unit(1, epoch=3)))
+        with self.subTest("source_identity_mismatch"):
+            authorizer = Authorizer({(NODE, SOURCE), (OTHER_NODE, SOURCE),
+                                     (OTHER_NODE, OTHER_SOURCE)})
+            tracker, _, _, _ = build(authorizer=authorizer, rate=2)
+            session = tracker.open_session(NODE)
+            other = tracker.open_session(OTHER_NODE)
+            tracker.receive(session, unit(0), b"v")
+            for sequence in (1, 2):
+                self.assertEqual("source_identity_mismatch",
+                                 tracker.receive(other, unit(sequence), b"v").reason)
+            self.assertEqual(limited, exhausted(tracker, other, unit(0, source=OTHER_SOURCE)))
+            # The budget is per node: the source owner is not throttled.
+            self.assertEqual(DeliveryOutcome.ACCEPTED,
+                             tracker.receive(session, unit(1), b"v").outcome)
+        with self.subTest("source_capacity"):
+            authorizer = Authorizer({(NODE, SOURCE), (NODE, OTHER_SOURCE)})
+            tracker, _, _, _ = build(authorizer=authorizer, sources=1, rate=2)
+            session = tracker.open_session(NODE)
+            tracker.receive(session, unit(0), b"v")
+            self.assertEqual("source_capacity",
+                             tracker.receive(session, unit(0, source=OTHER_SOURCE),
+                                             b"v").reason)
+            self.assertEqual(limited, exhausted(tracker, session, unit(1)))
+        with self.subTest("unauthorized_source"):
+            tracker, _, _, _ = build(rate=1)
+            session = tracker.open_session(NODE)
+            self.assertEqual("unauthorized",
+                             tracker.receive(session, unit(0, source=OTHER_SOURCE),
+                                             b"v").reason)
+            self.assertEqual(limited, exhausted(tracker, session))
+            self.assertTrue(tracker.heartbeat(session))
+        with self.subTest("source_revoked_between_checks"):
+            authorizer = RevokeDuringCheckAuthorizer(revoke_node=False)
+            authorizer.pairs.add((NODE, OTHER_SOURCE))
+            tracker, _, _, _ = build(authorizer=authorizer, rate=2)
+            session = tracker.open_session(NODE)
+            tracker.receive(session, unit(0), b"v")
+            authorizer.armed = True
+            self.assertEqual("unauthorized",
+                             tracker.receive(session, unit(0, source=OTHER_SOURCE),
+                                             b"v").reason)
+            self.assertEqual(limited, exhausted(tracker, session, unit(1)))
+
+    def test_revoked_node_attempts_are_not_charged(self):
+        tracker, ingest, _, authorizer = build(rate=1)
+        session = tracker.open_session(NODE)
+        authorizer.revoked.add(NODE)
+        self.assertEqual("unauthorized", tracker.receive(session, unit(0), b"v").reason)
+        self.assertEqual(0, ingest.snapshot().tracked_rate_windows)
+
     def test_permanently_refused_unit_is_reported_loss(self):
         tracker, ingest, _, _ = build(message_bytes=4)
         session = tracker.open_session(NODE)

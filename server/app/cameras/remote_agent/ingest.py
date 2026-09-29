@@ -168,6 +168,58 @@ class AgentIngestQueue:
     def _admission(self, outcome: IngestOutcome, reason: str | None) -> IngestAdmission:
         return IngestAdmission(outcome, reason, len(self._queue), self._queued_bytes)
 
+    def _now(self) -> int:
+        now = self._clock_ns()
+        if type(now) is not int or now < 0:
+            raise ValueError("ingest clock must return nonnegative integer nanoseconds")
+        return now
+
+    def _consume_rate_locked(self, node_id: UUID, now: int) -> IngestAdmission | None:
+        """Charge one authenticated attempt; return its refusal, if any.
+
+        Every authenticated attempt consumes rate budget, including an
+        oversized message, a queue-pressure refusal, or an attempt refused
+        before admission by a caller (see ``charge_attempt``).  This prevents
+        a sender from repeatedly making bounded-admission work forever while
+        preserving the first refusal's specific reason.
+        """
+        window = self._windows.get(node_id)
+        if window is None:
+            if len(self._windows) >= self.limits.maximum_tracked_rate_windows:
+                self._retire_expired_windows(now)
+            if len(self._windows) >= self.limits.maximum_tracked_rate_windows:
+                self._rate_limited += 1
+                return self._admission(IngestOutcome.RATE_LIMITED, "rate_window_capacity")
+            start, count = now, 0
+        else:
+            start, count = window
+        if now < start:
+            self._rejected += 1
+            return self._admission(IngestOutcome.REJECTED, "clock_regression")
+        if now - start >= self.limits.rate_window_ns:
+            start, count = now, 0
+        if count >= self.limits.maximum_messages_per_window:
+            self._windows[node_id] = (start, count)
+            self._rate_limited += 1
+            return self._admission(IngestOutcome.RATE_LIMITED, "rate_limit")
+        self._windows[node_id] = (start, count + 1)
+        return None
+
+    def charge_attempt(self, node_id: UUID) -> IngestAdmission | None:
+        """Count an authenticated attempt that a caller refuses before ``submit``.
+
+        Used for attempts that must not be enqueued (for example an
+        idempotent duplicate retry or a stale session) so they still consume
+        the node's rate budget.  The caller must already have authorized the
+        node.  Returns ``None`` when the attempt fits the budget, otherwise the
+        rate/clock refusal; nothing is ever enqueued.
+        """
+        if not isinstance(node_id, UUID):
+            raise ValueError("invalid agent node identity")
+        now = self._now()
+        with self._lock:
+            return self._consume_rate_locked(node_id, now)
+
     def submit(self, message: AgentMessage) -> IngestAdmission:
         if not isinstance(message, AgentMessage):
             raise ValueError("invalid agent ingest message")
@@ -179,36 +231,12 @@ class AgentIngestQueue:
                 self._rejected += 1
                 return self._admission(IngestOutcome.REJECTED, "unauthorized")
 
-        now = self._clock_ns()
-        if type(now) is not int or now < 0:
-            raise ValueError("ingest clock must return nonnegative integer nanoseconds")
+        now = self._now()
         size = len(message.payload)
         with self._lock:
-            window = self._windows.get(message.node_id)
-            if window is None:
-                if len(self._windows) >= self.limits.maximum_tracked_rate_windows:
-                    self._retire_expired_windows(now)
-                if len(self._windows) >= self.limits.maximum_tracked_rate_windows:
-                    self._rate_limited += 1
-                    return self._admission(IngestOutcome.RATE_LIMITED,
-                                           "rate_window_capacity")
-                start, count = now, 0
-            else:
-                start, count = window
-            if now < start:
-                self._rejected += 1
-                return self._admission(IngestOutcome.REJECTED, "clock_regression")
-            if now - start >= self.limits.rate_window_ns:
-                start, count = now, 0
-            if count >= self.limits.maximum_messages_per_window:
-                self._windows[message.node_id] = (start, count)
-                self._rate_limited += 1
-                return self._admission(IngestOutcome.RATE_LIMITED, "rate_limit")
-            # Every authenticated attempt consumes rate budget, including an
-            # oversized message or a queue-pressure refusal. This prevents a
-            # sender from repeatedly making bounded-admission work forever
-            # while preserving the first refusal's specific reason.
-            self._windows[message.node_id] = (start, count + 1)
+            refusal = self._consume_rate_locked(message.node_id, now)
+            if refusal is not None:
+                return refusal
             if size > self.limits.maximum_message_bytes:
                 self._rejected += 1
                 return self._admission(IngestOutcome.REJECTED, "message_too_large")

@@ -51,7 +51,12 @@ explicitly forbidden by the Issue.
    after the #14 `AgentIngestQueue` accepts it. Backpressure/rate refusal
    leaves state unchanged so the Agent retries the same sequence from its disk
    ring buffer; a retry of a committed unit is an idempotent `duplicate`
-   acknowledgement and is never enqueued twice. Only a refusal that no retry
+   acknowledgement and is never enqueued twice. Every media attempt of an
+   authorized node consumes its per-node ingest rate budget, including a
+   `duplicate` and an early refusal that is never enqueued (stale session or
+   capture epoch, source mismatch/capacity, unauthorized source); once the
+   budget is spent such an attempt is reported `rate_limited` and changes no
+   continuity state. Only a refusal that no retry
    of the same unit can satisfy (currently `message_too_large`) is committed
    past and recorded as known loss; any other ingest refusal (for example the
    ingest boundary's fail-closed Main clock regression) leaves continuity
