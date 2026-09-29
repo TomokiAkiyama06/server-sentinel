@@ -435,6 +435,10 @@ class ContinuityTracker:
             if node is None:
                 return self._charged(session, DeliveryOutcome.REJECTED, "stale_session",
                                      locked=True)
+            # Never seed or refresh activity below the node's liveness
+            # watermark: a regressed clock sample must not make a new source
+            # look older than the session that is delivering it.
+            now = max(now, node.last_seen_ns)
             state = self._sources.get(source_id)
             if state is not None and state.node_id != node_id:
                 # Source identity is bound to the node that first delivered it;

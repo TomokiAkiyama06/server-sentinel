@@ -848,6 +848,32 @@ class ContinuityTrackerTests(unittest.TestCase):
         tracker.open_session(NODES[2])
         self.assertTrue(tracker.heartbeat(live))
 
+    def test_new_source_under_regressed_clock_keeps_node_liveness_watermark(self):
+        authorizer = Authorizer({(NODE, SOURCE), (NODE, OTHER_SOURCE)})
+        # Committed first unit.
+        tracker, _, clock, _ = build(authorizer=authorizer, stale=10)
+        clock.now = 100
+        session = tracker.open_session(NODE)
+        clock.now = 50
+        self.assertEqual(DeliveryOutcome.ACCEPTED,
+                         tracker.receive(session, unit(0), b"v").outcome)
+        # During the regression the flow fails closed ...
+        self.assertEqual(SourceFlow.INTERRUPTED, flow(tracker).flow)
+        # ... and after recovery it is not reported older than its session.
+        clock.now = 105
+        self.assertEqual(SourceFlow.RECEIVING, flow(tracker).flow)
+        # Uncommitted (backpressured) first unit.
+        tracker, _, clock, _ = build(authorizer=authorizer, stale=10, queued=1)
+        session = tracker.open_session(NODE)
+        tracker.receive(session, unit(0), b"v")
+        clock.now = 100
+        self.assertTrue(tracker.heartbeat(session))
+        clock.now = 50
+        self.assertEqual(DeliveryOutcome.BACKPRESSURED,
+                         tracker.receive(session, unit(0, source=OTHER_SOURCE), b"v").outcome)
+        clock.now = 105
+        self.assertEqual(SourceFlow.DEGRADED, flow(tracker, OTHER_SOURCE).flow)
+
     def test_invalid_inputs_and_limits_are_rejected(self):
         for bad in ((0, 1, 1), (1, 0, 1), (1, 1, 0), (True, 1, 1), (1, 1, 1, 0),
                     (1, 1, 1, True)):
