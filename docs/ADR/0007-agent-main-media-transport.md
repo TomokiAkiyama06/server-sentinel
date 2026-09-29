@@ -56,7 +56,9 @@ explicitly forbidden by the Issue.
    `duplicate` and an early refusal that is never enqueued (stale session or
    capture epoch, source mismatch/capacity, unauthorized source); once the
    budget is spent such an attempt is reported `rate_limited` and changes no
-   continuity state. Only a refusal that no retry
+   continuity state. The node is re-authorized before it is charged; a node
+   revoked meanwhile is refused `unauthorized`, is not charged, and loses its
+   session grant. Only a refusal that no retry
    of the same unit can satisfy (currently `message_too_large`) is committed
    past and recorded as known loss; any other ingest refusal (for example the
    ingest boundary's fail-closed Main clock regression) leaves continuity

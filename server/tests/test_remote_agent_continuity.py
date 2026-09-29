@@ -406,6 +406,54 @@ class ContinuityTrackerTests(unittest.TestCase):
                                              b"v").reason)
             self.assertEqual(limited, exhausted(tracker, session, unit(1)))
 
+    def test_node_revoked_during_source_check_invalidates_and_is_not_charged(self):
+        class RevokeInSourceCheck(Authorizer):
+            armed = False
+
+            def require_source(self, node_id, source_id):
+                if self.armed:
+                    self.armed = False
+                    self.revoked.add(node_id)
+                    raise PermissionError
+                super().require_source(node_id, source_id)
+
+        authorizer = RevokeInSourceCheck()
+        tracker, _, _, _ = build(authorizer=authorizer, rate=2)
+        session = tracker.open_session(NODE)
+        tracker.receive(session, unit(0), b"v")
+        authorizer.armed = True
+        result = tracker.receive(session, unit(1), b"v")
+        self.assertEqual((DeliveryOutcome.REJECTED, "unauthorized"),
+                         (result.outcome, result.reason))
+        self.assertEqual(SourceFlow.INTERRUPTED, flow(tracker).flow)
+        # The refusal of the revoked node spent no rate budget: after the
+        # revocation is lifted, one of the two window slots remains.
+        authorizer.revoked.discard(NODE)
+        self.assertFalse(tracker.heartbeat(session))
+        renewed = tracker.open_session(NODE)
+        self.assertEqual(DeliveryOutcome.ACCEPTED,
+                         tracker.receive(renewed, unit(1), b"v").outcome)
+        self.assertEqual(DeliveryOutcome.RATE_LIMITED,
+                         tracker.receive(renewed, unit(2), b"v").outcome)
+
+    def test_node_revoked_before_charged_duplicate_invalidates_and_is_not_charged(self):
+        authorizer = RevokeDuringCheckAuthorizer(revoke_node=True)
+        tracker, ingest, _, _ = build(authorizer=authorizer, rate=2)
+        session = tracker.open_session(NODE)
+        tracker.receive(session, unit(0), b"v")
+        authorizer.armed = True
+        result = tracker.receive(session, unit(0), b"v")
+        self.assertEqual((DeliveryOutcome.REJECTED, "unauthorized"),
+                         (result.outcome, result.reason))
+        self.assertEqual(SourceFlow.INTERRUPTED, flow(tracker).flow)
+        self.assertEqual(0, ingest.snapshot().rate_limited)
+        authorizer.revoked.discard(NODE)
+        renewed = tracker.open_session(NODE)
+        self.assertEqual(DeliveryOutcome.ACCEPTED,
+                         tracker.receive(renewed, unit(1), b"v").outcome)
+        self.assertEqual(DeliveryOutcome.RATE_LIMITED,
+                         tracker.receive(renewed, unit(2), b"v").outcome)
+
     def test_revoked_node_attempts_are_not_charged(self):
         tracker, ingest, _, authorizer = build(rate=1)
         session = tracker.open_session(NODE)
