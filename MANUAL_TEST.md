@@ -806,7 +806,12 @@ synthetic test branches/PRs; no production data or unrelated rule deletion.
 - On the target Main Server, run the generated motion workload for 1–4 sources; measure CPU, resident memory, cadence, drops, evaluation latency and sustained health/recording continuity. Record approved per-source budgets without exporting host identifiers.
 - Before any person model is loaded, verify exact implementation/runtime/weights licenses, immutable versions, local artifact SHA-256 and the complete dependency notices. Confirm no runtime downloads, alternative-model fallback, reporting or unapproved outbound attempts on normal and failure paths.
 - Benchmark the accepted person backend on CPU; GPU is optional and separately measured. External benchmark media stays local under its terms and is never committed or attached to GitHub/CI. No real-model accuracy or target-host performance was verified by synthetic unit tests.
-- Stop/delay inference, inject quality loss, stale frames and a wedged plugin in the isolated worker: result must become unknown, loss/throttling remain visible, and capture/recording/health/storage-safety work must continue. Verify the production watchdog/resource limits separately; the primitive cannot forcibly interrupt a native call.
+- Stop/delay inference, inject quality loss, stale frames and a wedged plugin in the isolated worker: result must become unknown, loss/throttling remain visible, and capture/recording/health/storage-safety work must continue.
+- [ ] On the target Main Server under the production systemd unit, start each configured binding's worker via `maintain()` and record start latency, resident/virtual memory and descriptor use; size `address_space_bytes`/`open_files` so the approved person model loads with margin (native runtimes reserve large virtual ranges) and record the chosen values.
+- [ ] With the real person adapter loaded, `SIGSTOP` the worker and separately `SIGKILL` it mid-evaluation: the published result must become `unknown` (`detector_timeout` / `detector_crashed`) within the configured timeout, never `absent`; the child must be reaped (no zombie), restart only after the backoff, and latch after the configured consecutive failures until `recover()`.
+- [ ] Kill the Main service process while a worker is mid-evaluation and verify the worker exits (parent-death signal) instead of surviving as an orphan.
+- [ ] Confirm the worker inherits the unit's filesystem/network confinement and that its stdio produces no journal output on failure paths.
+- [ ] Deploy with the `detection` object omitted and then with one required key removed: `--check`/startup must not start inference, and every source's detector observation must remain `unknown`.
 
 ## ADR-0003 follow-up: accepted human-access boundary
 
