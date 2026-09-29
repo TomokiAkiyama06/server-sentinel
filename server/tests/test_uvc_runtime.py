@@ -28,6 +28,7 @@ from app.cameras.uvc.capture import CaptureError, NegotiatedVideo, VideoFrame
 from app.cameras.uvc.discovery import DiscoveryResult
 from app.cameras.uvc.identity import CameraState, DeviceEvidence
 from app.cameras.uvc.persistence import ApprovalStore
+from app.cameras.uvc.registry_adapter import LocalUvcAdapter
 from app.cameras.uvc.config import LocalUvcConfiguration, parse_local_uvc
 from app.cameras.uvc.runtime import (
     LocalUvcDependencies, LocalUvcRuntime, LocalUvcRuntimeState, SourceRuntimeState,
@@ -782,6 +783,39 @@ class ApplicationWiringTests(unittest.IsolatedAsyncioTestCase):
         admission.refuse = False
         self.assertIs(runtime.start().state, LocalUvcRuntimeState.RUNNING)
         self.assertTrue(runtime.status().sources[0].worker_running)
+
+    def test_failed_initialization_releases_database_pin_and_adapter(self):
+        # Pinning succeeded but the supervisor constructor raised: the
+        # contained startup failure must not keep the admitted descriptor
+        # (and its filesystem) busy, nor leave the adapter open.
+        _database, source = self.migrated_source()
+        pinned = PinnedDatabase(Database(self.settings.database_path))
+        self.addCleanup(pinned.release)
+        adapters = []
+
+        def adapter_factory(*args, **kwargs):
+            adapter = LocalUvcAdapter(*args, **kwargs)
+            adapters.append(adapter)
+            return adapter
+
+        def failing_supervisor(*_args, **_kwargs):
+            raise RuntimeError("synthetic supervisor failure")
+
+        runtime = LocalUvcRuntime(
+            LocalUvcConfiguration((source.id,), **FAST),
+            CameraRegistry(pinned, reservation=ToggleAdmission()),
+            on_frame=lambda *_: None, discovery=self.discovery,
+            capture_factory=self.dependencies.capture_factory,
+            adapter_factory=adapter_factory, supervisor_factory=failing_supervisor,
+        )
+        with self.assertLogs("app.cameras.uvc.runtime", level="ERROR"):
+            status = runtime.start()
+        self.assertIs(status.state, LocalUvcRuntimeState.FAILED)
+        self.assertFalse(pinned.pinned)
+        self.assertEqual(1, len(adapters))
+        self.assertTrue(adapters[0].closed)
+        self.assertIs(runtime.stop().state, LocalUvcRuntimeState.STOPPED)
+        self.assertFalse(pinned.pinned)
 
     async def test_application_state_follows_runtime_worker_faults(self):
         # A later capture/storage loss turns the application snapshot from

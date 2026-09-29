@@ -79,6 +79,10 @@ class LocalPreviewHub:
         self._sources: dict[UUID, _PreviewSource] = {}
         self._oversized = 0
         self._invalid = 0
+        # Set by ``clear()`` when capture stops: a worker that outlived a
+        # failed stop can neither publish a late frame nor re-enable a source
+        # with a late ``online`` transition.
+        self._closed = False
         for source_id in source_ids:
             if not isinstance(source_id, UUID):
                 raise ValueError("preview source identity is invalid")
@@ -101,7 +105,7 @@ class LocalPreviewHub:
                 self._invalid += 1
             return
         with self._lock:
-            if not source.viewers or not source.live:
+            if self._closed or not source.viewers or not source.live:
                 return
             if len(data) > self._max_frame_bytes:
                 self._oversized += 1
@@ -123,8 +127,8 @@ class LocalPreviewHub:
             return
         online = getattr(getattr(event, "state", None), "value", None) == "online"
         with self._lock:
-            source.live = online
-            if not online:
+            source.live = online and not self._closed
+            if not source.live:
                 source.latest = None
 
     def latest(self, source_id: UUID, after_sequence: int = 0) -> PreviewFrame | None:
@@ -135,9 +139,16 @@ class LocalPreviewHub:
             return frame
 
     def clear(self) -> None:
-        """Drop retained frames, e.g. when capture stops."""
+        """Drop retained frames and stop accepting any more; capture stopped.
+
+        Every source becomes non-live permanently for this hub, so a capture
+        worker still finishing a read after a timed-out stop (``stop_failed``)
+        cannot repopulate a slot that would then be served as live.
+        """
         with self._lock:
+            self._closed = True
             for source in self._sources.values():
+                source.live = False
                 source.latest = None
 
     @property

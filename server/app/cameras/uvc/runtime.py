@@ -222,6 +222,11 @@ class LocalUvcRuntime:
                     join_timeout=self.configuration.join_timeout_seconds,
                 )
             except Exception:
+                # No worker exists yet; release what was acquired so a
+                # contained startup failure never keeps the admitted
+                # database descriptor (and its filesystem) busy for the
+                # process lifetime.
+                self._release_partial_start()
                 self._state = LocalUvcRuntimeState.FAILED
                 logging.getLogger(__name__).error(Event.LOCAL_UVC_STARTUP_FAILED)
                 return self.status()
@@ -233,6 +238,25 @@ class LocalUvcRuntime:
             else:
                 logging.getLogger(__name__).error(Event.LOCAL_UVC_DEGRADED)
             return self.status()
+
+    def _release_database(self) -> bool:
+        release = getattr(self.registry.database, "release", None)
+        if not callable(release):
+            return True
+        try:
+            release()
+        except Exception:
+            return False
+        return True
+
+    def _release_partial_start(self) -> None:
+        adapter, self.adapter, self._supervisor = self.adapter, None, None
+        if adapter is not None:
+            try:
+                adapter.close()
+            except Exception:
+                pass
+        self._release_database()
 
     def _start_source(self, source_id: UUID) -> SourceRuntimeState:
         try:
@@ -307,6 +331,9 @@ class LocalUvcRuntime:
             if self._state in (LocalUvcRuntimeState.STOPPED, LocalUvcRuntimeState.STOP_FAILED):
                 return self.status()
             if not self._started or self._supervisor is None:
+                # Never started, or startup failed before any worker existed:
+                # nothing may keep holding the database pin or an adapter.
+                self._release_partial_start()
                 self._state = LocalUvcRuntimeState.STOPPED
                 self._started = True
                 return self.status()
@@ -328,14 +355,10 @@ class LocalUvcRuntime:
                     self.adapter.close()
                 except Exception:
                     failed = True
-            release = getattr(self.registry.database, "release", None)
-            if callable(release):
-                # Drop the held database pin; a worker that outlived the join
-                # bound then fails closed instead of reading storage.
-                try:
-                    release()
-                except Exception:
-                    failed = True
+            # Drop the held database pin; a worker that outlived the join
+            # bound then fails closed instead of reading storage.
+            if not self._release_database():
+                failed = True
             for source_id, state in tuple(self._sources.items()):
                 if state is not SourceRuntimeState.REJECTED:
                     self._sources[source_id] = SourceRuntimeState.STOPPED

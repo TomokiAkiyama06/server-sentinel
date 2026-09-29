@@ -35,6 +35,9 @@ that source has viewer demand, so zero subscribers retain nothing.
 non-`online` transition (disconnect, capture failure, manual intervention)
 drops the retained frame and refuses new frames until the camera is `online`
 again, so a pre-loss image is never served as current live video.
+`LocalPreviewHub.clear()` runs when capture stops and permanently marks every
+source non-live, so a worker still finishing a read after a timed-out stop
+(`stop_failed`) cannot publish a late frame or re-enable a source.
 `AuthorizedLocalPreview` wraps `LiveViewerSessions`: every `open` and `read`
 re-runs the validator. The route obtains a `BoundLiveAccess` through
 `app.auth.live_access.authorize_live_access`, which runs

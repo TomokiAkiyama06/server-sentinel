@@ -330,5 +330,25 @@ class RuntimePreviewTests(RuntimeFixture):
         hub.on_health(HealthEvent(uuid4(), CameraState.OFFLINE, "synthetic"))
 
 
+    def test_clear_disables_sources_against_late_frames(self):
+        # After a timed-out stop a worker may still finish a read and emit a
+        # late ``online`` transition; neither may repopulate a live slot.
+        from app.cameras.uvc.identity import CameraState, HealthEvent
+        source = uuid4()
+        hub = LocalPreviewHub((source,))
+        hub.source(source).add_viewer(uuid4())
+        hub.on_frame(source, frame())
+        self.assertIsNotNone(hub.latest(source))
+        hub.clear()
+        self.assertFalse(hub.source(source).live)
+        self.assertIsNone(hub.latest(source))
+        hub.on_frame(source, frame())
+        self.assertIsNone(hub.latest(source))
+        hub.on_health(HealthEvent(source, CameraState.ONLINE, "video_capture_ready"))
+        self.assertFalse(hub.source(source).live)
+        hub.on_frame(source, frame())
+        self.assertIsNone(hub.latest(source))
+        self.assertEqual(0, hub.status.retained_bytes)
+
 if __name__ == "__main__":
     unittest.main()
