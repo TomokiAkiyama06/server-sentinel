@@ -191,6 +191,24 @@ class AppTokenTests(unittest.TestCase):
         self.assertEqual(results, [SYNTHETIC_TOKEN] * 4)
         self.assertEqual(len(self.transport.calls), 1)
 
+    def test_response_without_optional_repositories_is_accepted(self):
+        # GitHub's documented 201 response may omit ``repositories``; the
+        # outbound ``repository_ids`` already narrowed the grant.
+        original = self.transport.post_json
+
+        def without_repositories(path, token, payload):
+            response = original(path, token, payload)
+            del response["repositories"]
+            return response
+        self.transport.post_json = without_repositories
+        self.assertEqual(self.source().token(), SYNTHETIC_TOKEN)
+        self.assertEqual(self.transport.calls[0][2]["repository_ids"],
+                         [self.config.repository_id])
+        # Without the array, repository_selection must still be "selected".
+        self.transport.override = {"repository_selection": "all"}
+        with self.assertRaises(app_token.TokenFailure):
+            self.source().token()
+
     def test_invalid_responses_fail_closed_and_drop_cache(self):
         cases = (
             {"token": "not-a-token"}, {"token": None},
@@ -206,6 +224,8 @@ class AppTokenTests(unittest.TestCase):
             {"repositories": [{"id": 900002}, {"id": 900009}]},
             {"repositories": [{"id": 900009}]},
             {"repositories": [{"id": True}]},
+            {"repositories": None},
+            {"repositories": {"id": 900002}},
         )
         for override in cases:
             with self.subTest(override=list(override)):

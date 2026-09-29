@@ -239,9 +239,15 @@ class InstallationTokenSource:
         # or less than the publisher needs, both fail closed.
         if response.get("permissions") != REQUESTED_PERMISSIONS:
             raise TokenFailure("installation token permissions differ from policy")
-        repositories = response.get("repositories")
-        if (response.get("repository_selection") != "selected"
-                or not isinstance(repositories, list) or len(repositories) != 1
+        # ``repositories`` is optional in GitHub's response: the grant is
+        # already narrowed by the outbound ``repository_ids``.  When it is
+        # supplied it must name exactly the configured repository.
+        if response.get("repository_selection") != "selected":
+            raise TokenFailure("installation token is not limited to the repository")
+        if "repositories" not in response:
+            return _Secret(token), expires_at
+        repositories = response["repositories"]
+        if (not isinstance(repositories, list) or len(repositories) != 1
                 or not isinstance(repositories[0], dict)
                 or type(repositories[0].get("id")) is not int
                 or repositories[0]["id"] != config.repository_id):
