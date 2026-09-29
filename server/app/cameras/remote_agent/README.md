@@ -40,6 +40,19 @@ implements neither pairing nor mTLS. The eventual listener must independently
 limit bytes before constructing an `AgentMessage`, remain separate from human
 routes, and provide the revocable authenticated session required by Issue #13.
 
+## Transport-neutral continuity core
+
+`continuity.py` sits in front of `ingest.py` and implements the Proposed
+ADR-0007 contract: Main-assigned session generations for an already
+mTLS-authenticated node, the `(source_id, capture_epoch, sequence,
+capture_time_ns)` media envelope, commit-after-admission so backpressure makes
+the Agent retry rather than lose media, idempotent duplicate acknowledgement,
+and bounded, coalescing gap events for skips, capture restarts, clock
+regressions and refused units. Known loss keeps a source flow `degraded` and a
+closed or stale session makes it `interrupted`; this is flow continuity, not
+camera or node health. It opens no listener, selects no protocol and performs
+no cryptography; tests are synthetic only.
+
 Accept only narrow agent actions with bounded input. Agent credentials grant no
 human/admin API rights; the ingest listener exposes no dashboard routes. Do not
 require SSH access to capture nodes, change Tailscale policy, or route browser

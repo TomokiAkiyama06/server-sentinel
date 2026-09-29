@@ -580,6 +580,26 @@ Required behavior regardless of protocol:
 - no arbitrary filesystem paths;
 - no silent loss while reporting healthy.
 
+Transport-independent continuity contract (ADR-0007, Proposed; protocol still
+unselected). Every media unit carries `(source_id, capture_epoch, sequence,
+capture_time_ns)`: `capture_epoch` is a strictly increasing Agent capture-process
+epoch, `sequence` counts units per source within an epoch and survives transport
+reconnects, and `capture_time_ns` is the Agent monotonic capture clock within
+the epoch. The Main Server assigns a new session generation on every
+authenticated session open; a superseded session is rejected. A unit is
+committed only after the bounded ingest queue accepts it: backpressure or rate
+refusal does not advance continuity and the Agent retries the same sequence,
+a retry of a committed unit is an idempotent `duplicate`, and a permanently
+refused unit is recorded as loss. A sequence skip reports the exact missing
+count, a new capture epoch reports a gap of unknown extent, and an in-epoch
+capture clock regression is reported. Known loss or backpressure keeps the
+source flow `degraded`; a closed or stale session makes it `interrupted`. Gap
+events are bounded per source and coalesce into an unknown-extent event rather
+than being dropped. Flow continuity is not camera health or node health (§5.8).
+Tracked nodes and sources are bounded by the active-source limit (§3.4).
+`server/app/cameras/remote_agent/continuity.py` implements this without a
+listener, protocol, or cryptography.
+
 ### 6.5 Main-to-browser live transport
 
 Phone/Mac/desktop users view live video **through the main host**, never directly from `media-capture-agent`.

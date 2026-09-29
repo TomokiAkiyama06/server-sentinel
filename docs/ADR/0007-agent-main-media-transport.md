@@ -1,0 +1,120 @@
+# ADR-0007: Agent-to-Main media transport selection and continuity contract
+
+Status: Proposed — awaiting Owner decision. The transport protocol is **not
+selected** by this ADR; selection requires the real-LAN measurements below.
+
+Related Issues: #15 (Plan 9), #13/ADR-0006 (capture-node trust), #14 (ingest
+boundary), #16 (Agent ring buffer), #17 (recording).
+
+## Context
+
+Issue #15 requires a PoC comparison of WebRTC, SRT, QUIC and authenticated
+HTTP streaming, ranked by (1) stability, (2) reconnect, (3) accurate gap
+reporting, (4) bounded buffering/backpressure, (5) authenticated encryption,
+(6) resource usage, (7) latency. Authenticated encryption is a mandatory
+invariant for every candidate regardless of its rank. Near-real-time is the
+goal, but stability and reconnect take priority over any particular latency.
+
+No Main Server, capture node or UVC camera has been available to this work.
+Nothing in this ADR has been measured on real hardware or a real LAN, and no
+candidate is claimed verified. Fixing a protocol before measurement is
+explicitly forbidden by the Issue.
+
+## Decision
+
+### Accepted now (subject to Owner approval of this ADR)
+
+1. **Transport-independent media envelope.** Every media unit carries
+   `(source_id, capture_epoch, sequence, capture_time_ns)`, independent of any
+   protocol's internal counters:
+   - `capture_epoch` is an Agent-maintained, strictly increasing capture-process
+     epoch (persisted by the Agent, e.g. with its ring ledger);
+   - `sequence` counts units per source within one epoch and survives transport
+     reconnects;
+   - `capture_time_ns` is the Agent monotonic capture clock within that epoch.
+     The Main Server does not compare it with its own clock; cross-host clock
+     offset stays with SPECIFICATION §5.9 heartbeat timing.
+   A lossless reconnect therefore yields no gap, a lossy reconnect yields an
+   exact missing-unit count, and a capture restart yields a gap of explicitly
+   unknown extent. Every candidate is evaluated by the same Main-side assertions.
+2. **Main-assigned session generation.** Each authenticated session open gets a
+   new generation; a superseded session cannot deliver, heartbeat or close the
+   newer one.
+3. **Commit only after bounded admission.** A unit advances continuity only
+   after the #14 `AgentIngestQueue` accepts it. Backpressure/rate refusal
+   leaves state unchanged so the Agent retries the same sequence from its disk
+   ring buffer; a retry of a committed unit is an idempotent `duplicate`
+   acknowledgement and is never enqueued twice. A permanently refused unit is
+   recorded as known loss.
+4. **No silent healthy state.** Known loss, clock regression, or backpressure
+   keeps the source flow `degraded`; a closed or stale session makes it
+   `interrupted`. Pending gap events are hard-bounded per source and coalesce
+   into an unknown-extent event rather than being dropped. Flow continuity is
+   separate from camera health and from node health (SPECIFICATION §5.8).
+5. **Security invariants for any candidate.** Mutual authentication with the
+   ADR-0006 deployment-scoped mTLS identity before any media is accepted; a
+   dedicated ingest listener separate from the human dashboard listener; the
+   capture credential grants no human/admin API right; no Tailscale
+   requirement on private LAN; no arbitrary paths/URLs from the Agent; bounded
+   pre-read byte limits in the listener.
+
+`server/app/cameras/remote_agent/continuity.py` implements items 1–4 as a
+transport-neutral, listener-free domain object with synthetic tests only.
+
+### Deferred to Owner decision after measurement
+
+The concrete protocol, framing, codec/container carriage, and any new
+dependency. The PoC must run each candidate through the same deterministic
+impairment matrix and record the measurements in the table below.
+
+## Alternatives
+
+| Candidate | Expected strengths (unverified) | Concerns to measure | Dependency/licence notes (must be re-verified at pinning) |
+| --- | --- | --- | --- |
+| WebRTC (media + data channels) | Built-in congestion control, NAT handling not needed on LAN | Complexity, DTLS identity binding to ADR-0006 mTLS, jitter-buffer loss hiding, resource use | e.g. aiortc (reported BSD-3-Clause) or GStreamer webrtcbin (LGPL); verify exact licence and transitive codecs |
+| SRT | Designed for contribution links, ARQ and latency window | Passphrase-based AES is not mutual certificate identity; would need mTLS wrapping or separate control channel | libsrt (reported MPL-2.0); verify obligations |
+| QUIC (streams/datagrams) | TLS 1.3 mutual auth native, multiplexed per-source streams, connection migration | Library maturity, userspace CPU cost | e.g. aioquic (reported BSD-3-Clause); verify |
+| Authenticated HTTP/2 or WebSocket streaming over mTLS | Simplest, reuses TLS 1.3 mTLS, explicit application acknowledgements | Head-of-line blocking over TCP, reconnect latency | Standard library TLS plus a reviewed server library |
+
+Licence entries above are candidate notes, not a completed review. Any
+selected dependency needs the full `docs/THIRD_PARTY_POLICY.md` review.
+
+## Consequences
+
+- The Agent must persist `capture_epoch` and keep per-source sequence across
+  reconnects; the Agent-side sender is follow-up work.
+- Backfill of lost units from the Agent ring buffer after reconnect is not
+  admitted by this contract (older sequences are duplicates). A future
+  backfill path needs its own ADR amendment.
+- The transport adapter stays thin: authenticate, bound bytes, frame the
+  envelope, map outcomes to acknowledgements.
+
+## Validation
+
+Synthetic (done, mock only): `server/tests/test_remote_agent_continuity.py`
+covers deny-by-default, cross-node source spoofing, idempotent retries,
+exact/unknown gaps, stale sessions, bounded backpressure and gap coalescing,
+1–4 sources with a fifth refused, stale/clock-regression fail-closed,
+revocation, concurrency, and a deterministic synthetic impairment run.
+
+Real hardware (not done): MANUAL_TEST.md §G "Agent-to-Main transport PoC".
+Record per candidate, for 1, 2, 3 and 4 sources (state real vs synthetic
+inputs for each):
+
+| Measurement | WebRTC | SRT | QUIC | HTTP/WS |
+| --- | --- | --- | --- | --- |
+| Reconnect time after 1–5 s link loss | | | | |
+| Gap reported vs actual after reconnect | | | | |
+| Max sender / receiver queue depth, slow consumer | | | | |
+| Behaviour under sustained packet loss / added jitter | | | | |
+| LAN glass-to-glass latency (informational) | | | | |
+| CPU / GPU / VRAM, Main and Agent | | | | |
+| Bitrate | | | | |
+| Codec/container and recording-extraction impact | | | | |
+
+## Follow-up
+
+- Owner decision on this ADR and, after measurement, on the selected protocol.
+- Agent-side envelope sender and `capture_epoch` persistence (#12/#16).
+- Dedicated ingest listener with mTLS (ADR-0006 adapters, #13/#14).
+- Durable consumer for drained gap events (timeline / recording health).
