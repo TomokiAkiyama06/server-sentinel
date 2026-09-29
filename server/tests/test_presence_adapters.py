@@ -25,7 +25,7 @@ from app.presence.access import AccessDenied
 from app.presence.adapters import (CriticalTimelineRecorder, EntranceObservationAdapter, HealthTimeline,
                                    TimelineOutbox)
 from app.presence.delivery import ActionResult
-from app.presence.models import Kind, PresenceState, Quality, Value
+from app.presence.models import InvalidObservation, Kind, Observation, PresenceState, Quality, Value
 from app.presence.service import PresenceService
 from app.storage.database import Database
 from app.storage.migrations import migrate
@@ -215,6 +215,51 @@ class EntranceAdapterTests(PresenceFixture, TestCase):
         state = self.submit(event, flush_at=NOW + timedelta(minutes=5))
         self.assertEqual((state.pending, state.rejected), (0, 0))
         self.assertEqual(len(self.history()["items"]), 1)
+
+    def test_replay_with_different_tracker_confirmation_is_an_identity_conflict(self):
+        # confirmed is receipt-derived too, so it is ignored when a restamped
+        # replay is compared; the tracker's own confirmation must not be.
+        for index, (first, second) in enumerate(((False, True), (True, False))):
+            original = crossing(CrossingKind.OWNER_ENTRY, confirmed=first,
+                                received=NOW + timedelta(minutes=10 * index))
+            self.submit(original)
+            before = self.outbox.state().rejected
+            state = self.submit(replace(original, confirmed=second))
+            self.assertEqual(state.rejected, before + 1, (first, second))
+            self.assertTrue(state.degraded)
+            items = [entry for entry in self.history()["items"] if entry["id"] == str(original.identifier)]
+            self.assertEqual(len(items), 1)
+            self.assertEqual(items[0]["confirmed"], first)
+        self.assertEqual(self.state(NOW + timedelta(minutes=10)), "PRESENT")
+        status = self.presence.owner_status("owner", now=NOW + timedelta(minutes=10), clock_trusted=True)
+        self.assertTrue(status["timeline_gap"])
+
+    def test_staged_replay_with_different_tracker_confirmation_is_rejected(self):
+        self.refuse = True
+        staged = crossing(CrossingKind.OWNER_ENTRY, confirmed=False)
+        self.assertEqual(self.submit(staged).pending, 1)
+        self.assertFalse(self.adapter.submit(TrackUpdate((), (replace(staged, confirmed=True),),
+                                                        DetectionQuality.SUFFICIENT)))
+        state = self.outbox.state()
+        self.assertEqual((state.pending, state.rejected), (1, 1))
+        self.refuse = False
+        self.outbox.flush()
+        self.assertEqual(self.state(), "UNKNOWN")
+
+    def test_source_fact_digest_expires_with_its_observation(self):
+        self.submit(crossing(CrossingKind.OWNER_ENTRY))
+        with closing(self.database.connect()) as db:
+            self.assertEqual(db.execute("SELECT count(*) FROM presence_source_facts").fetchone()[0], 1)
+        self.presence.expire_history(now=NOW + timedelta(days=self.presence.periods.recording_days + 1))
+        with closing(self.database.connect()) as db:
+            self.assertEqual(db.execute("SELECT count(*) FROM presence_source_facts").fetchone()[0], 0)
+
+    def test_source_fact_digest_is_only_for_restamped_writes(self):
+        observation = Observation(Kind.ANONYMOUS_ENTRY, NOW, NOW, source_id=SOURCE, quality=Quality.SUFFICIENT)
+        for kwargs in ({"source_fact": "0" * 64}, {"source_fact": "g" * 64, "restamped": True},
+                       {"source_fact": "0" * 63, "restamped": True}):
+            with self.assertRaises(InvalidObservation):
+                self.presence.record(observation, **kwargs)
 
     def test_crossing_held_past_latency_bound_cannot_confirm_presence_late(self):
         self.refuse = True
@@ -544,7 +589,7 @@ class HealthTimelineTests(PresenceFixture, TestCase):
         fact = self.outbox
         node = HealthTimeline(fact)
         node.node(NODE, NodeHealthState.ONLINE)
-        identifier, build, _ = fact._pending[0]
+        identifier, build, _, _ = fact._pending[0]
         observation, valid_until = build(NOW, True)
         self.assertIsNone(valid_until)
         self.assertEqual(observation.identifier, identifier)

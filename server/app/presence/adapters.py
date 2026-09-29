@@ -14,6 +14,8 @@ after real-room and cross-host clock evaluation.
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+import hashlib
+import json
 import threading
 from typing import Callable
 from uuid import UUID, uuid4
@@ -67,6 +69,22 @@ _DETECTION_QUALITY = {
 def _fact(observation):
     """The source fact of an observation, without the fields stamped at receipt."""
     return {key: value for key, value in observation.payload().items() if key not in RECEIPT_FIELDS}
+
+
+def _crossing_fact(crossing):
+    """Digest of a tracker crossing as the tracker reported it.
+
+    The observation's ``confirmed`` also depends on receipt timing, so it is
+    ignored when a restamped replay is compared; this digest keeps the
+    tracker's own confirmation, trust and timing in that comparison.
+    """
+    fact = {"id": str(crossing.identifier), "kind": crossing.kind.value,
+            "source_id": str(crossing.source_id), "occurred_at": crossing.occurred_at.isoformat(),
+            "received_at": crossing.received_at.isoformat(), "confidence": crossing.confidence,
+            "clock_trusted": crossing.clock_trusted, "uncertainty_us": crossing.uncertainty_us,
+            "confirmed": crossing.confirmed}
+    encoded = json.dumps(fact, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    return hashlib.sha256(encoded.encode()).hexdigest()
 
 
 def _positive(value, name):
@@ -206,10 +224,17 @@ class TimelineOutbox:
         with self._receipt:
             yield _stamp(self.clock)
 
-    def stage(self, identifier: UUID, build: Build):
-        """Stage one fact; its contract is checked now against the current clock."""
+    def stage(self, identifier: UUID, build: Build, *, source_fact: str | None = None):
+        """Stage one fact; its contract is checked now against the current clock.
+
+        ``source_fact`` is the producer's digest of its own source fact (see
+        `PresenceService.record`); it takes part in duplicate detection here
+        and is written with the observation.
+        """
         if not isinstance(identifier, UUID) or not callable(build):
             raise ValueError("typed staged fact required")
+        if source_fact is not None and type(source_fact) is not str:
+            raise ValueError("typed source fact digest required")
         self._accepting()
         try:
             stamp = _stamp(self.clock)
@@ -225,10 +250,10 @@ class TimelineOutbox:
             raise ValueError("critical observations are recorded, not staged")
         if valid_until is not None and observation.kind not in {Kind.OWNER_ENTRY, Kind.OWNER_EXIT}:
             raise ValueError("presence validity applies to owner observations only")
-        fact = _fact(observation)
+        fact = (_fact(observation), source_fact)
         with self._lock:
             self._accepting_locked()
-            for item, _, staged in self._pending:
+            for item, _, staged, _ in self._pending:
                 if item == identifier:
                     if staged == fact:
                         return True
@@ -240,7 +265,7 @@ class TimelineOutbox:
                 self._refused += 1
                 self._unpersisted_refused += 1
                 return False
-            self._pending.append((identifier, build, fact))
+            self._pending.append((identifier, build, fact, source_fact))
             return True
 
     def flush(self, *, limit: int = 100):
@@ -258,11 +283,12 @@ class TimelineOutbox:
                 with self._lock:
                     if not self._pending:
                         break
-                    _, build, _ = self._pending[0]
+                    _, build, _, source_fact = self._pending[0]
                 try:
                     with self.receipt() as (received, trusted):
                         observation, valid_until = build(received, trusted)
-                        self.service.record(observation, presence_valid_until=valid_until, restamped=True)
+                        self.service.record(observation, presence_valid_until=valid_until, restamped=True,
+                                            source_fact=source_fact)
                 except InvalidObservation:
                     outcome = "rejected"
                 except Exception:
@@ -463,7 +489,8 @@ class EntranceObservationAdapter:
         """Stage every crossing; returns False if the bounded outbox refused any."""
         staged = [self.outbox.stage(crossing.identifier,
                                     lambda received, trusted, crossing=crossing:
-                                    self.observation(crossing, received, trusted))
+                                    self.observation(crossing, received, trusted),
+                                    source_fact=_crossing_fact(crossing))
                   for crossing in self.crossings(update)]
         return all(staged)
 

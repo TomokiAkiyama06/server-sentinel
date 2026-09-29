@@ -267,7 +267,7 @@ class PresenceService:
             db.execute("INSERT INTO presence_audit(action,actor,at,state) VALUES ('hint_set',?,?,?)",
                        (actor, timestamp(now), state.value))
 
-    def record(self, observation, *, presence_valid_until=None, restamped=False):
+    def record(self, observation, *, presence_valid_until=None, restamped=False, source_fact=None):
         """Durably record one observation idempotently by its UUID.
 
         ``restamped=True`` is for producers that stamp the main-host receipt
@@ -276,6 +276,12 @@ class PresenceService:
         so only the source fact itself must match for it to be a duplicate.
         A critical fact first stored unconfirmed and then delivered confirmed
         is confirmed in place and queues its critical work once.
+        ``source_fact`` is the producer's SHA-256 hex digest of its own source
+        fact, for a fact whose payload holds a receipt-derived field that also
+        depends on the source, such as an Owner crossing's ``confirmed``. It is
+        stored with the observation, and a restamped replay whose digest
+        differs from the stored one is an identity conflict even when the
+        payloads agree once receipt fields are ignored.
         Contract errors raise `InvalidObservation`; storage and database
         failures raise anything else and may be retried.
         """
@@ -283,11 +289,21 @@ class PresenceService:
             raise InvalidObservation("typed observation required")
         if presence_valid_until is not None and utc(presence_valid_until) <= utc(observation.received_at):
             raise InvalidObservation("presence validity must be explicit and future")
+        if source_fact is not None and (not restamped or type(source_fact) is not str
+                                        or len(source_fact) != 64
+                                        or any(c not in "0123456789abcdef" for c in source_fact)):
+            raise InvalidObservation("restamped source fact digest required")
         with self._transaction() as db:
             existing = db.execute("SELECT payload FROM presence_observations WHERE id=?",
                                   (str(observation.identifier),)).fetchone()
             if existing:
                 stored = Observation.from_payload(json.loads(existing[0]))
+                digest = db.execute("SELECT digest FROM presence_source_facts WHERE id=?",
+                                    (str(observation.identifier),)).fetchone()
+                if restamped and (digest[0] if digest else None) != source_fact:
+                    # The receipt-independent source fact differs under the
+                    # same UUID; ignoring receipt fields must not hide it.
+                    raise InvalidObservation("observation identity conflict")
                 if self._confirms_critical(stored, observation, restamped=restamped):
                     return self._confirm_critical(db, stored)
                 if stored.payload() != observation.payload() and stored.payload() != observation.uncertain().payload():
@@ -324,6 +340,9 @@ class PresenceService:
                        (str(observation.identifier), observation.kind.value,
                         str(observation.source_id) if observation.source_id else None,
                         timestamp(observation.received_at), payload))
+            if source_fact is not None:
+                db.execute("INSERT OR REPLACE INTO presence_source_facts(id,digest) VALUES (?,?)",
+                           (str(observation.identifier), source_fact))
             if observation.kind in {Kind.OWNER_ENTRY, Kind.OWNER_EXIT} and presence_valid_until is not None:
                 # Confirmation/high confidence is supplied by the separately
                 # reviewed owner-observation pipeline, never guessed numerically.
@@ -480,6 +499,7 @@ class PresenceService:
                            [(row["action"], timestamp(now)) for row in rows])
             db.execute("DELETE FROM presence_deliveries WHERE observation=?", (str(identifier),))
             db.execute("DELETE FROM presence_observations WHERE id=?", (str(identifier),))
+            db.execute("DELETE FROM presence_source_facts WHERE id=?", (str(identifier),))
             db.execute("INSERT INTO presence_audit(action,actor,at,state,target) "
                        "VALUES ('critical_event_cleared',?,?,NULL,?)",
                        (actor, timestamp(now), str(identifier)))
@@ -939,6 +959,7 @@ class PresenceService:
                            [(timestamp(now), row[0]) for row in rows])
             db.executemany("DELETE FROM presence_deliveries WHERE observation=?", identifiers)
             db.executemany("DELETE FROM presence_observations WHERE id=?", identifiers)
+            db.executemany("DELETE FROM presence_source_facts WHERE id=?", identifiers)
         return len(rows)
 
     @staticmethod

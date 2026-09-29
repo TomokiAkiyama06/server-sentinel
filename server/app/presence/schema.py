@@ -49,7 +49,8 @@ def presence_migration(version: int) -> Migration:
 
 
 def presence_gap_migration(version: int) -> Migration:
-    """Durable timeline-gap marker and the outbox session that proves a clean close.
+    """Durable timeline-gap marker, the outbox session that proves a clean close,
+    and the source-fact digests that keep restamped replays comparable.
 
     The marker holds counts and times only, never observation content. A
     session row left behind by an outbox that did not close cleanly is itself
@@ -66,4 +67,10 @@ def presence_gap_migration(version: int) -> Migration:
         # A second session is refused by a lock beside the database, so a row
         # found by a new session belongs to an outbox that is gone.
         "CREATE TABLE presence_outbox_sessions (token TEXT PRIMARY KEY, opened TEXT NOT NULL)",
+        # Digest of the producer-supplied source fact of a restamped
+        # observation, such as the tracker's own confirmation of a crossing,
+        # which the receipt-derived payload fields cannot preserve. It holds a
+        # hash only and is removed together with its observation.
+        "CREATE TABLE presence_source_facts (id TEXT PRIMARY KEY, "
+        "digest TEXT NOT NULL CHECK(length(digest)=64))",
     ))

@@ -133,6 +133,14 @@ route, worker thread or default timing policy:
   the adapter as an anonymous crossing, because the tracker never names it as
   the Owner. Anonymous crossings carry no confidence, no identifier beyond the
   event UUID, and no presence effect; nothing links crossings across cameras.
+  Because `confirmed` also depends on receipt timing, a restamped replay
+  ignores it when payloads are compared; the adapter therefore passes a
+  SHA-256 digest of the crossing exactly as the tracker reported it
+  (`record(..., source_fact=...)`), kept in `presence_source_facts` and
+  removed with its observation. A replay of the same UUID with a different
+  tracker confirmation, trust or timing, whether still staged or already
+  written, is an identity conflict counted as rejected, never a silent
+  duplicate.
 - `CriticalTimelineRecorder` is the #24 `CriticalRecorder` for
   `CriticalDelivery`. It records synchronously and raises on failure so the
   staging retries the UUID. Receipt is stamped at write time from the shared
@@ -172,12 +180,13 @@ route, worker thread or default timing policy:
   never `InvalidObservation`); a full outbox refuses
   the new fact, and only a fact presence rejects as `InvalidObservation` is
   removed. A UUID staged again while still pending is a duplicate only when
-  its source fact (every field except the receipt fields) matches; a
+  its source fact (every field except the receipt fields, plus any producer
+  source-fact digest) matches; a
   different fact under that UUID is refused at `stage()` as an identity
   conflict and counted as rejected. Both are counted and reported by `OutboxState.degraded`, never
   dropped silently.
 
-Timeline loss is durable (`presence_timeline_gap` migration). The runtime calls
+Timeline loss is durable (`presence_timeline_gap` migration 17). The runtime calls
 `TimelineOutbox.open()` at startup, before it wires any producer, to open a
 durable outbox session (`open_timeline_session()`); `stage()` refuses facts
 until that succeeds, so no fact is held without a session row a restart would
