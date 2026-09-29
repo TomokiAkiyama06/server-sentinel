@@ -6,6 +6,7 @@ try to reach its own endpoint, and even that attempt is refused here.
 """
 
 from contextlib import closing
+import errno
 import io
 import logging
 from pathlib import Path
@@ -175,6 +176,34 @@ class NoTelemetryScenarios(unittest.TestCase):
         with NetworkGuard() as guard:
             local_a.send(b"local")
         self.assertEqual(b"local", local_b.recv(16))
+        self.assertEqual([], guard.attempts)
+
+    def test_guard_fails_closed_on_connects_still_in_progress(self):
+        # A full accept queue drops the SYN, so a non-blocking connect_ex made
+        # before the guard stays in SYN_SENT: getpeername() fails, yet the
+        # handshake could complete later and send() carries no audit event.
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.addCleanup(listener.close)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(0)
+        socket.create_connection(listener.getsockname()).close()
+        pending = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.addCleanup(pending.close)
+        pending.setblocking(False)
+        self.assertIn(pending.connect_ex(listener.getsockname()),
+                      {errno.EINPROGRESS, errno.EAGAIN})
+        with self.assertRaises(OSError):
+            pending.getpeername()
+        guard = NetworkGuard()
+        self.addCleanup(guard.__exit__, None, None, None)  # if entry wrongly succeeds
+        with self.assertRaises(OutboundNetworkForbidden):
+            guard.__enter__()
+        self.assertEqual([("preconnected", "127.0.0.1")], guard.attempts)
+        pending.close()
+        # The idle listener and an unconnected TCP socket do not trip the guard.
+        with closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)):
+            with NetworkGuard() as guard:
+                pass
         self.assertEqual([], guard.attempts)
 
     def run_main_paths(self):

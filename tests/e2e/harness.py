@@ -363,27 +363,72 @@ class NetworkGuard:
             raise
         return self
 
+    # Linux tcp_states.h: an unconnected socket is CLOSE and a listener is
+    # LISTEN; every other state (SYN_SENT, SYN_RECV, ESTABLISHED, ...) can
+    # complete or already has a handshake and would let send() transmit.
+    _TCP_IDLE_STATES = {7, 10}  # TCP_CLOSE, TCP_LISTEN
+
     @staticmethod
-    def _preconnected_peers(socket):
-        """Return peers of non-local sockets already connected in this process."""
+    def _proc_tcp_peers():
+        """Map socket inode to remote address from /proc/net/tcp{,6}."""
+        import ipaddress
+
+        peers = {}
+        for table, width in (("/proc/net/tcp", 4), ("/proc/net/tcp6", 16)):
+            try:
+                with open(table, encoding="ascii") as handle:
+                    rows = handle.read().splitlines()[1:]
+            except OSError:
+                continue
+            for row in rows:
+                fields = row.split()
+                try:
+                    raw = bytes.fromhex(fields[2].split(":")[0])
+                    # The kernel prints each 32-bit word in host byte order.
+                    packed = b"".join(raw[i:i + 4][::-1] for i in range(0, width, 4))
+                    peers[fields[9]] = str(ipaddress.ip_address(packed))
+                except (IndexError, ValueError):
+                    continue
+        return peers
+
+    @classmethod
+    def _preconnected_peers(cls, socket):
+        """Return peers of non-local sockets connected or connecting in this process.
+
+        Any socket that cannot be positively classified as idle is reported, so
+        the scan fails closed instead of skipping it.
+        """
+        import errno
+
         local = {socket.AF_UNIX, getattr(socket, "AF_NETLINK", socket.AF_UNIX)}
+        inet = {socket.AF_INET, getattr(socket, "AF_INET6", socket.AF_INET)}
+        tcp_info = getattr(socket, "TCP_INFO", None)
         try:
             descriptors = os.listdir("/proc/self/fd")
         except OSError as error:
             raise OutboundNetworkForbidden(
                 "synthetic network guard cannot enumerate open sockets") from error
         peers = []
+        proc_peers = None
         for entry in descriptors:
             try:
-                if not os.readlink(f"/proc/self/fd/{entry}").startswith("socket:"):
-                    continue
-                duplicate = os.dup(int(entry))
+                target = os.readlink(f"/proc/self/fd/{entry}")
             except OSError:
                 continue  # closed while scanning, including listdir's own fd
+            if not target.startswith("socket:"):
+                continue
+            try:
+                duplicate = os.dup(int(entry))
+            except OSError as error:
+                if error.errno == errno.EBADF:
+                    continue  # closed after readlink
+                peers.append(f"unclassified:{target}")
+                continue
             try:
                 probe = socket.socket(fileno=duplicate)
             except OSError:
                 os.close(duplicate)
+                peers.append(f"unclassified:{target}")
                 continue
             with probe:
                 if probe.family in local:
@@ -391,8 +436,30 @@ class NetworkGuard:
                 try:
                     peer = probe.getpeername()
                 except OSError:
-                    continue  # not connected; sendto/connect remain refused
-                peers.append(peer[0] if isinstance(peer, tuple) and peer else str(peer))
+                    peer = None
+                if peer is not None:
+                    peers.append(peer[0] if isinstance(peer, tuple) and peer else str(peer))
+                    continue
+                if probe.family not in inet:
+                    peers.append(f"unclassified:{target}")
+                    continue
+                if probe.type != socket.SOCK_STREAM:
+                    continue  # unconnected datagram/raw: sendto/sendmsg are refused
+                try:
+                    if tcp_info is None:
+                        raise OSError("TCP_INFO unavailable")
+                    state = probe.getsockopt(socket.IPPROTO_TCP, tcp_info, 1)[0]
+                except OSError:
+                    peers.append(f"unclassified:{target}")
+                    continue
+                if state in cls._TCP_IDLE_STATES:
+                    continue
+                # Still handshaking (e.g. non-blocking connect_ex in progress):
+                # getpeername() fails, but the handshake may complete later.
+                if proc_peers is None:
+                    proc_peers = cls._proc_tcp_peers()
+                inode = target[len("socket:["):-1]
+                peers.append(proc_peers.get(inode, f"connecting:{target}"))
         return peers
 
     def __exit__(self, *_):
