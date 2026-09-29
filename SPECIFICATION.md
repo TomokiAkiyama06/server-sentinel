@@ -302,6 +302,39 @@ Capture Node acceptance.
 
 MVP agent capture is video-only. Do not open microphone/audio devices. No event/detection logic depends on audio.
 
+### 5.3.1 Agent UVC capture adapter
+
+`agent/media_capture_agent/uvc_capture.py` implements the Agent `Capture`
+interface for 1–4 approved local UVC sources. Identity/discovery rules are a
+standalone port of the Main local adapter (§4): only a unique serial reconnects
+automatically, duplicate serials and every non-serial model match require Owner
+re-approval, and a durable approval/ambiguity latch plus active-session marker
+under the private `runtime_root` makes an unclean exit require re-approval.
+Discovery with any unreadable video node never binds a camera
+(`discovery_failed`). Two sources resolving to one device both require Owner
+re-approval.
+
+Capture runs one bounded subprocess pipeline per bound source behind an
+injectable launcher. The production launcher executes an operator-installed,
+root-controlled `gst-launch-1.0` restricted to `v4l2src ! image/jpeg,<explicit
+profile> ! fdsink fd=1`; the V4L2 descriptor opened and identity-rechecked by the
+Agent is passed to the child (`device=/proc/self/fd/N`) instead of a
+`/dev/videoN` path. The child gets a minimal environment, its own process group,
+no stdin, discarded stderr, and is terminated with SIGTERM then SIGKILL of the
+whole group before reaping. MJPEG output is split structurally into complete
+JPEG frames with a per-frame byte bound and queued in a bounded drop-oldest queue.
+
+Per-source health: `manual_intervention_required` (`owner_approval_required`,
+`identity_ambiguous`, `approval_state_unavailable`); `offline` (`camera_missing`,
+`capture_failed`, `capture_unsupported`, `capture_cleanup_failed`,
+`discovery_failed`); `degraded` (`capture_starting`, `capture_overloaded`);
+`online` (`video_ready`) only while frames actually arrive without recent drops.
+Startup/stall timeouts, malformed streams and pipeline exits retry with bounded
+exponential backoff; a pipeline that cannot be reaped blocks relaunch and keeps
+the recovery marker armed. Node health is unaffected by any source failure.
+Wiring into the production CLI, the Owner approval route (#13/#14), ring
+storage (#16) and transport (#15) is separate work.
+
 ### 5.4 Pairing
 
 Preferred flow:

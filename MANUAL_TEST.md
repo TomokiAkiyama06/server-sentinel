@@ -683,6 +683,65 @@ The synthetic CI tests do not complete these checks. On an isolated Capture Node
 Publish only pass/fail summaries; keep configs, mount identity, host identifiers,
 credentials and captured media private.
 
+### Issue #12 Agent UVC capture adapter (pending physical execution)
+
+CI verifies `UvcCapture` only with synthetic JPEG-shaped bytes, fake sysfs/udev
+trees and fake or synthetic Python subprocess pipelines. None of the following is
+verified. Use an isolated Capture Node, a serial-bearing USB/UVC camera pointed at
+an empty wall or test chart (no people, no private room details), and a small
+local harness that constructs `UvcCapture` + `GStreamerLauncher`; the production
+CLI does not wire it yet. Never upload frames, serials, by-id names, topology or
+device numbers.
+
+Preparation:
+
+- [ ] Install the distribution GStreamer package providing `gst-launch-1.0`,
+  `v4l2src` and `fdsink`; confirm the executable and its parent directories are
+  root-owned and not group/world writable, and record the package versions and
+  licenses for the Owner dependency decision.
+- [ ] Create a dedicated non-root service account that is a member of the
+  `video` group (and not `audio`); confirm it can open the camera's `/dev/videoN`
+  read-write and cannot open `/dev/snd/*`.
+- [ ] Record, privately, that the camera exposes a non-empty USB serial and
+  advertises `MJPG` (`v4l2-ctl --list-formats-ext` as the service account).
+
+Capture:
+
+- [ ] As the service account, a never-approved source reports
+  `manual_intervention_required`/`owner_approval_required` and starts no process.
+- [ ] After `approve()` of the exact current candidate, the source reports
+  `degraded`/`capture_starting` and then `online`/`video_ready` only after frames
+  arrive; check actual frame size/rate against the requested MJPEG profile.
+- [ ] `ps`/`/proc/<pid>/cmdline` of the child show `device=/proc/self/fd/<N>`
+  and no `/dev/videoN`, serial or other private value; its environment contains
+  only the minimal variables; `/proc/<pid>/fd` of the child shows no audio device.
+- [ ] Verify `v4l2src` accepts the inherited descriptor path on this GStreamer
+  version; if it does not, record the failure (`capture_failed`) and stop.
+- [ ] With no consumer draining frames, health shows `capture_overloaded` rather
+  than `video_ready`; with a consumer, drops stop and health returns to online.
+- [ ] Unplug the camera: the source becomes `offline`/`camera_missing` within one
+  heartbeat, the pipeline process group is gone, and node heartbeat stays online.
+  Replug into a different port: the serial camera rebinds automatically and
+  streams again.
+- [ ] Stop the stream by suspending the child (`SIGSTOP`): the
+  source reports `capture_failed` after the stall timeout, the stopped process
+  group is killed and reaped, and relaunch follows bounded backoff.
+- [ ] Connect a second camera of the same model and serial (or two identical
+  non-serial cameras): no automatic binding; `identity_ambiguous` persists across
+  a clean Agent restart until the Owner re-approves.
+- [ ] Kill the Agent with SIGKILL during capture: systemd removes the child with
+  the service cgroup, and the next start requires re-approval
+  (`owner_approval_required`).
+- [ ] Under the generated systemd unit (`DevicePolicy=closed`), confirm every
+  video node of the attached cameras (including UVC metadata nodes) is in the
+  device allowlist; otherwise discovery reports `discovery_failed` and never
+  binds. Record whether re-enumeration to another `/dev/videoN` breaks the
+  allowlist (an Owner decision for the installer device policy).
+- [ ] Confirm `GST_REGISTRY` under the private runtime root works with
+  `ProtectHome=true`, and that no file is created outside the runtime/media roots.
+
+Publish only pass/fail summaries.
+
 ## U. Privacy-safe diagnostic export / support bundle
 
 Run this only on the intended Main Server using synthetic, non-production diagnostic inputs. Do not upload, commit, attach, or paste the generated bundle, its manifest, private deployment data, raw identifiers, monitoring media, credentials, or biometric material into GitHub.
