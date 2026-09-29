@@ -86,7 +86,9 @@ explicitly forbidden by the Issue.
    keeps the source flow `degraded`, including pressure or a transient refusal
    on a source's very first unit before anything is committed (reported with
    no committed sequence); a closed or stale session makes it
-   `interrupted`. Pending gap events are hard-bounded per source and coalesce
+   `interrupted`, and after a reconnect or superseding session each source
+   stays `interrupted` until it delivers media on the new session (node
+   connectivity alone never clears a camera's interruption). Pending gap events are hard-bounded per source and coalesce
    into an unknown-extent event rather than being dropped. Flow continuity is
    separate from camera health and from node health (SPECIFICATION §5.8).
 5. **Security invariants for any candidate.** Mutual authentication with the

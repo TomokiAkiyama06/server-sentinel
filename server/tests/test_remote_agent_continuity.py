@@ -263,6 +263,43 @@ class ContinuityTrackerTests(unittest.TestCase):
                          (gap.reason, gap.after_sequence, gap.before_sequence,
                           gap.missing_units))
 
+    def test_reconnected_node_keeps_each_source_interrupted_until_it_delivers(self):
+        tracker, _, clock, _ = build(
+            stale=100, authorizer=Authorizer(((NODE, SOURCE), (NODE, OTHER_SOURCE))))
+        first = tracker.open_session(NODE)
+        tracker.receive(first, unit(0), b"v")
+        tracker.receive(first, unit(0, source=OTHER_SOURCE), b"v")
+        tracker.close_session(first)
+        # Reconnect well within ``stale_after_ns``: node connectivity alone
+        # must not clear either camera's known interruption.
+        clock.now = 5
+        second = tracker.open_session(NODE)
+        self.assertTrue(tracker.heartbeat(second))
+        self.assertEqual(SourceFlow.INTERRUPTED, flow(tracker).flow)
+        self.assertEqual(SourceFlow.INTERRUPTED, flow(tracker, OTHER_SOURCE).flow)
+        # Only the camera that delivers on the new session recovers.
+        tracker.receive(second, unit(1), b"v")
+        self.assertEqual(SourceFlow.RECEIVING, flow(tracker).flow)
+        self.assertEqual(SourceFlow.INTERRUPTED, flow(tracker, OTHER_SOURCE).flow)
+
+    def test_superseding_session_does_not_mark_undelivered_source_receiving(self):
+        tracker, ingest, clock, _ = build(stale=100, queued=1)
+        old = tracker.open_session(NODE)
+        tracker.receive(old, unit(0), b"v")
+        self.assertEqual(SourceFlow.RECEIVING, flow(tracker).flow)
+        # A superseding session (no close) before staleness keeps the flow
+        # interrupted until media arrives on it; pressure on the new session
+        # counts as delivery activity and reports ``degraded``.
+        clock.now = 5
+        new = tracker.open_session(NODE)
+        self.assertEqual(SourceFlow.INTERRUPTED, flow(tracker).flow)
+        self.assertEqual(DeliveryOutcome.BACKPRESSURED,
+                         tracker.receive(new, unit(1), b"v").outcome)
+        self.assertEqual(SourceFlow.DEGRADED, flow(tracker).flow)
+        ingest.drain(1)
+        tracker.receive(new, unit(1), b"v")
+        self.assertEqual(SourceFlow.RECEIVING, flow(tracker).flow)
+
     def test_superseded_session_cannot_deliver_or_close_newer_session(self):
         tracker, _, _, _ = build()
         old = tracker.open_session(NODE)

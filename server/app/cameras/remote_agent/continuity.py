@@ -176,6 +176,9 @@ class _Source:
 
     An uncommitted entry exists only so that pressure/refusal on a source's
     first unit is visible as ``degraded``; it occupies a bounded source slot.
+    ``session_generation`` is the node session that last delivered this
+    source; a source not yet delivered on the node's current session stays
+    ``interrupted`` even though the node itself reconnected.
     """
 
     node_id: UUID
@@ -186,6 +189,7 @@ class _Source:
     backpressured: bool = False
     refused: bool = False
     gaps: deque = field(default_factory=deque)
+    session_generation: int = 0
 
 
 @dataclass
@@ -288,7 +292,10 @@ class ContinuityTracker:
         """Grant a new session to an already mTLS-authenticated node identity.
 
         Raises ``PermissionError`` for an unauthorized/revoked node or when the
-        bounded node table is full.  Continuity state survives the reconnect.
+        bounded node table is full.  Continuity state survives the reconnect,
+        but each of the node's sources stays ``interrupted`` until it delivers
+        media on the new session: node connectivity alone never clears a
+        camera's known interruption.
         """
         if not isinstance(node_id, UUID):
             raise ValueError("invalid agent node identity")
@@ -531,6 +538,7 @@ class ContinuityTracker:
                 # committed sequence) so sustained pressure stays ``degraded``
                 # instead of decaying to ``interrupted``.
                 self._seen(pending, now)
+                pending.session_generation = node.generation
                 self._seen(node, now)
                 outcome = (DeliveryOutcome.BACKPRESSURED
                            if admission.outcome is IngestOutcome.BACKPRESSURED
@@ -553,6 +561,7 @@ class ContinuityTracker:
                 pending = self._pending(state, node_id, header, now)
                 pending.refused = True
                 self._seen(pending, now)
+                pending.session_generation = node.generation
                 self._seen(node, now)
                 return Delivery(DeliveryOutcome.REJECTED, admission.reason)
             if state is None:
@@ -573,6 +582,7 @@ class ContinuityTracker:
             state.last_sequence = header.sequence
             state.last_capture_time_ns = header.capture_time_ns
             self._seen(state, now)
+            state.session_generation = node.generation
             self._seen(node, now)
             state.backpressured = state.refused = False
             if admission.outcome is IngestOutcome.REJECTED:
@@ -587,7 +597,8 @@ class ContinuityTracker:
             result = []
             for source_id, state in self._sources.items():
                 node = self._nodes[state.node_id]
-                if (not node.open or now < state.last_seen_ns
+                if (not node.open or state.session_generation != node.generation
+                        or now < state.last_seen_ns
                         or now - state.last_seen_ns > self.limits.stale_after_ns):
                     flow = SourceFlow.INTERRUPTED
                 elif state.gaps or state.backpressured or state.refused:
