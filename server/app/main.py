@@ -124,8 +124,9 @@ def create_app(settings: Settings, *, database: Database | None = None,
         else:
             await monitoring_runtime.start()
             application.state.monitoring_state = monitoring_runtime.status.state
-            if monitoring_runtime.bound:
-                runtime_admission.bind(monitoring_runtime)
+            # Admission follows the live runtime state: a runtime that failed
+            # startup refuses writes until its retried open succeeds.
+            runtime_admission.bind(monitoring_runtime)
             monitoring_task = asyncio.create_task(monitoring_runtime.run())
         application.state.audit_storage_admitted = (
             storage_reservation is not None or runtime_admission.bound

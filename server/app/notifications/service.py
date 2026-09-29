@@ -78,13 +78,17 @@ class DailySummary:
                         f"Agents online/offline: {self.agents_online}/{self.agents_offline}\n"
                         f"Person/motion/entry observations: {self.person_count}/"
                         f"{self.motion_count}/{self.entry_count}\n")
+            monitored = f"Monitored seconds: {self.monitored_seconds}\n"
         else:
+            # Service uptime is not monitored coverage: with no capture
+            # pipeline nothing was watched, so no duration is claimed.
+            monitored = ("Monitored seconds: unavailable (no capture pipeline reporting; "
+                         f"service uptime seconds: {self.monitored_seconds})\n")
             pipeline = ("Sources: unavailable (no capture pipeline reporting)\n"
                         "Agents: unavailable\n"
                         "Person/motion/entry observations: unavailable\n")
         return ("ServerSentinel daily summary\n"
-                f"Monitored seconds: {self.monitored_seconds}\n"
-                + pipeline +
+                + monitored + pipeline +
                 f"Critical events: {self.critical_count}; recordings: {self.recording_count}\n"
                 f"Recording bytes: {self.recording_bytes}; storage: {self.storage_state.value}\n"
                 f"Errors: {self.error_count}")

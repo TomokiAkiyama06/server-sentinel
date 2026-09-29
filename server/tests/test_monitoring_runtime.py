@@ -244,6 +244,8 @@ class LifespanTests(RuntimeFixture):
             summaries = [text for text in self.slack_texts() if "daily summary" in text]
             self.assertEqual(1, len(summaries))
             self.assertIn("Person/motion/entry observations: unavailable", summaries[0])
+            # Process uptime is never presented as monitored camera coverage.
+            self.assertIn("Monitored seconds: unavailable", summaries[0])
             self.assertIn("storage: NORMAL", summaries[0])
 
     async def test_run_loop_ticks_on_the_owner_worker(self):
@@ -324,6 +326,51 @@ class LifespanTests(RuntimeFixture):
                              self.slack_texts())
             self.assertEqual(0, self.probe.calls)
             self.assertEqual([], list(self.recordings.iterdir()))
+
+    async def test_failed_startup_is_retried_and_recovers_without_restart(self):
+        self.approved_device = self.device + 1
+        application = self.application()
+        async with application.router.lifespan_context(application):
+            runtime = application.state.monitoring
+            self.assertEqual(RuntimeState.FAILED, runtime.status.state)
+            await self.settle(runtime)
+            # Not yet due: no reopen attempt, writes stay refused.
+            self.clock.advance(timedelta(minutes=5))
+            await runtime.call(runtime.tick)
+            self.assertEqual(RuntimeState.FAILED, runtime.status.state)
+            # A due retry that still fails does not repeat the immediate alert.
+            self.clock.advance(timedelta(minutes=15))
+            await runtime.call(runtime.tick)
+            await self.settle(runtime)
+            self.assertEqual(RuntimeState.FAILED, runtime.status.state)
+            self.assertEqual(0, self.probe.calls)
+            with self.assertRaises(Exception):
+                await asyncio.to_thread(
+                    application.state.audit_store.append,
+                    actor_category=ActorCategory.SYSTEM,
+                    action=AuditAction.CHANGE_ADMIN_SETTING,
+                    target_kind=TargetKind.ADMIN_SETTINGS, target_logical_id=uuid4(),
+                    outcome=AuditOutcome.SUCCEEDED,
+                )
+            # The expected filesystem appears (e.g. a late mount): the next due
+            # retry opens storage and runs the startup integrity/health checks.
+            self.approved_device = self.device
+            self.clock.advance(timedelta(minutes=15))
+            await runtime.call(runtime.tick)
+            await self.settle(runtime)
+            self.assertEqual(RuntimeState.RUNNING, runtime.status.state)
+            self.assertTrue(runtime.status.recording_filesystem_ok)
+            self.assertEqual(1, self.probe.calls)
+            self.assertEqual(HealthState.UNAVAILABLE, runtime.status.recording_health)
+            self.assertEqual(1, self.slack_texts().count(
+                "ServerSentinel critical alert: recording_health_failure"))
+            record = await asyncio.to_thread(
+                application.state.audit_store.append,
+                actor_category=ActorCategory.SYSTEM, action=AuditAction.CHANGE_ADMIN_SETTING,
+                target_kind=TargetKind.ADMIN_SETTINGS, target_logical_id=uuid4(),
+                outcome=AuditOutcome.SUCCEEDED,
+            )
+            self.assertEqual(AuditOutcome.SUCCEEDED, record.outcome)
 
 
 class PressureAuditTests(RuntimeFixture):

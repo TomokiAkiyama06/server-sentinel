@@ -877,9 +877,10 @@ recordings/state audit/fault history, runs the integrity and recording-health
 coordinators and the daily summary. A failed step sets a visible degraded flag
 and retries after 15 minutes; it never stops the other steps. No production
 codec validator exists yet, so the runtime recorder refuses every segment and no
-recording pipeline or human route is started. The daily summary marks source,
-agent and observation counts `unavailable` while no capture pipeline reports,
-never presenting zero observations as a verified absence.
+recording pipeline or human route is started. The daily summary marks monitored
+duration, source, agent and observation counts `unavailable` while no capture
+pipeline reports (service uptime is labeled separately), never presenting zero
+observations or process uptime as verified monitoring coverage.
 
 ## 10. Host hardware integrity and recording self-check
 
@@ -906,7 +907,9 @@ root device/inode, private metadata file) on every storage sample; a mismatch
 is `STORAGE_HARD_STOP`, refuses writes without creating a fallback and raises one
 immediate `recording_health_failure` per episode. A mismatch at startup leaves
 the runtime `failed`, refuses writes and still attempts the immediate Slack
-alert. The baseline is never written by the runtime; approval remains the
+alert; the open is retried every 15 minutes against the same declared identity
+(never another directory), without repeating the alert, and a successful retry
+resumes the startup integrity/health checks and admission. The baseline is never written by the runtime; approval remains the
 Owner-only audited boundary, and without an approved baseline every check
 reports storage `UNVERIFIABLE` (immediate). Slack is optional; local rows and
 runtime status persist whether Slack is disabled or fails. Module READMEs

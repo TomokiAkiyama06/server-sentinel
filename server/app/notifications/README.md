@@ -66,5 +66,6 @@ scheduler, health/presence outbox integration and configured Slack acceptance
 remain pending; transport and DST tests use generated fixtures and no network.
 `../monitoring/` now supplies the durable local sink, the owner-thread timer and
 the integrity/recording-health bridges; configured Slack acceptance remains
-pending. `DailySummary(pipeline_available=False)` renders source, agent and
-observation counts as unavailable instead of zero.
+pending. `DailySummary(pipeline_available=False)` renders monitored duration,
+source, agent and observation counts as unavailable instead of zero or uptime;
+service uptime is labeled separately.

@@ -519,7 +519,12 @@ intercepted Slack transport. On the deployment, additionally check:
       unstarred recordings/state-audit rows are removed by the running service;
 - [ ] detaching or substituting the recording mount while running yields one
       immediate `recording_health_failure`, `STORAGE_HARD_STOP`, and no new file
-      in the substituted directory or on the root filesystem.
+      in the substituted directory or on the root filesystem;
+- [ ] a startup-time failure (for example free space below the hard reserve,
+      or a transiently unresolvable filesystem UUID) yields one immediate
+      `recording_health_failure` and refused writes; once the condition clears,
+      the runtime recovers within 15 minutes without a restart and without a
+      second alert.
 
 - [ ] metadata database and media use the expected filesystem, and configured
       journal/temp overhead safely covers recovery, cleanup and migrations;

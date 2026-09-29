@@ -9,7 +9,7 @@ that worker. No HTTP route, listener or human surface is added here.
 
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from enum import StrEnum
@@ -146,6 +146,7 @@ class MonitoringRuntime:
         self._retry_at: dict[str, float] = {}
         self._filesystem_ok = True
         self._started_monotonic = None
+        self._startup_alerted = False
         self.notifications: NotificationService | None = None
         self.notification_events: NotificationEventStore | None = None
         self.recordings: RecordingStore | None = None
@@ -231,16 +232,19 @@ class MonitoringRuntime:
             finished.set()
             future.result()
 
+    def _due(self, name: str, now: float) -> bool:
+        retry = self._retry_at.get(name)
+        # A backwards/invalid clock never postpones the retry indefinitely.
+        return not (retry is not None and math.isfinite(now)
+                    and retry - self.dependencies.retry_seconds <= now < retry)
+
     def _guarded(self, name: str, function, flag: str) -> None:
         """Run one worker step; a failure is visible and retried later.
 
         Failures record only the fixed flag, never exception text or values.
         """
         now = self.dependencies.monotonic()
-        retry = self._retry_at.get(name)
-        # A backwards/invalid clock never postpones the retry indefinitely.
-        if (retry is not None and math.isfinite(now)
-                and retry - self.dependencies.retry_seconds <= now < retry):
+        if not self._due(name, now):
             return
         try:
             function()
@@ -267,17 +271,33 @@ class MonitoringRuntime:
         self.storage_audit.append(event)
 
     def _open(self) -> None:
+        """Open the worker's components; also the retry path while `FAILED`.
+
+        The connection and notification service are opened once and reused by
+        a retry, so pending Slack deliveries and their in-memory
+        de-duplication survive. Storage components are rebuilt on each attempt
+        and published only once every one of them was constructed.
+        """
         self._owner = threading.get_ident()
-        self._started_monotonic = self.dependencies.monotonic()
+        if self._started_monotonic is None:
+            self._started_monotonic = self.dependencies.monotonic()
         configuration, dependencies = self.configuration, self.dependencies
-        self._connection = connection = self.database.connect()
-        self.notification_events = NotificationEventStore(connection, self._owner_reservation)
-        slack = (SlackDelivery(configuration.slack, opener=dependencies.slack_opener)
-                 if configuration.slack is not None else None)
-        self.notifications = NotificationService(
-            self._persist_notification, slack,
-            queue_capacity=dependencies.notification_queue_capacity,
-        )
+        if self.notifications is None:
+            if self._connection is not None:
+                # An earlier attempt failed between connect and service setup.
+                self._connection.close()
+                self._connection = None
+            self._connection = self.database.connect()
+            self.notification_events = NotificationEventStore(self._connection,
+                                                              self._owner_reservation)
+            slack = (SlackDelivery(configuration.slack, opener=dependencies.slack_opener)
+                     if configuration.slack is not None else None)
+            self.notifications = NotificationService(
+                self._persist_notification, slack,
+                queue_capacity=dependencies.notification_queue_capacity,
+            )
+        connection = self._connection
+        recordings = None
         try:
             self.filesystem = IdentifiedRecordingFilesystem(
                 configuration.recording_filesystem, self.database.path,
@@ -285,40 +305,51 @@ class MonitoringRuntime:
             policy = MainStoragePolicy(configuration.storage_limits, self.filesystem.snapshot,
                                        self._now_ms, self._storage_transition)
             self.storage_audit = StorageAudit(connection, reservation=policy.control)
+            # Every admission re-verifies the filesystem identity, so a local
+            # fault row may use this policy even when a later step fails.
             self._policy = policy
-            self.recordings = RecordingStore(
+            recordings = RecordingStore(
                 connection, configuration.recording_filesystem.root, self.filesystem.expected,
                 configuration.recording_limits, policy,
                 dependencies.segment_validator or RefuseUnvalidatedSegments(),
             )
-            policy.bind(self.recordings, RetentionService(self.recordings))
+            policy.bind(recordings, RetentionService(recordings))
+            health_status = RecordingHealthStatusStore(connection, policy.control)
+            scheduler = DailySummaryScheduler(
+                connection, configuration.time_zone, self.notifications, policy.control,
+                hour=configuration.summary_hour, minute=configuration.summary_minute,
+            )
+            integrity_store = IntegrityStore(
+                connection, dependencies.integrity_approval, reservation=policy.control,
+                max_pending_events=dependencies.integrity_max_pending_events,
+            )
+            probe = dependencies.integrity_probe
+            if probe is None:
+                from app.integrity.probes import LinuxProbe
+                probe = LinuxProbe()
+            integrity = IntegrityService(integrity_store, probe, self._integrity_sink,
+                                         monotonic=dependencies.monotonic,
+                                         utcnow=dependencies.utcnow)
+            adapter = (dependencies.recorder_probe_factory(recordings)
+                       if dependencies.recorder_probe_factory is not None else None)
+            recording_health = RecordingHealthService(
+                adapter, self._record_recording_health,
+                monotonic=dependencies.monotonic, utcnow=dependencies.utcnow,
+            )
         except Exception:
+            if recordings is not None:
+                with suppress(Exception):
+                    recordings.close()
             self._startup_failed()
             return
-        self.health_status = RecordingHealthStatusStore(connection, policy.control)
-        self.scheduler = DailySummaryScheduler(
-            connection, configuration.time_zone, self.notifications, policy.control,
-            hour=configuration.summary_hour, minute=configuration.summary_minute,
-        )
-        self.integrity_store = IntegrityStore(
-            connection, dependencies.integrity_approval, reservation=policy.control,
-            max_pending_events=dependencies.integrity_max_pending_events,
-        )
-        probe = dependencies.integrity_probe
-        if probe is None:
-            from app.integrity.probes import LinuxProbe
-            probe = LinuxProbe()
-        self.integrity = IntegrityService(self.integrity_store, probe, self._integrity_sink,
-                                          monotonic=dependencies.monotonic,
-                                          utcnow=dependencies.utcnow)
-        adapter = (dependencies.recorder_probe_factory(self.recordings)
-                   if dependencies.recorder_probe_factory is not None else None)
-        self.recording_health = RecordingHealthService(
-            adapter, self._record_recording_health,
-            monotonic=dependencies.monotonic, utcnow=dependencies.utcnow,
-        )
+        self.recordings, self.health_status, self.scheduler = recordings, health_status, scheduler
+        self.integrity_store, self.integrity = integrity_store, integrity
+        self.recording_health = recording_health
+        self._startup_alerted = False
+        self._filesystem_ok = True
+        self._retry_at.pop("startup", None)
         self._set(state=RuntimeState.RUNNING, storage_state=policy.state,
-                  recording_filesystem_ok=True)
+                  recording_filesystem_ok=True, recording_health=None)
         # Startup always compares inventory and runs the recording self-test,
         # regardless of when the previous process last did.
         self._storage_tick()
@@ -328,10 +359,22 @@ class MonitoringRuntime:
         self._poll()
 
     def _startup_failed(self) -> None:
-        """The expected recording target is unusable: refuse, never fall back."""
+        """The expected recording target is unusable: refuse, never fall back.
+
+        The tick retries the open every `retry_seconds` against the same
+        declared identity, so a mount that appears late recovers without a
+        restart and integrity/health/summary checks resume. Only the first
+        failure of an episode raises the immediate alert.
+        """
         self._set(state=RuntimeState.FAILED, recording_filesystem_ok=False,
                   storage_state=StorageState.HARD_STOP, recording_health=HealthState.FAILED)
+        self._retry_at["startup"] = (self.dependencies.monotonic()
+                                     + self.dependencies.retry_seconds)
         logging.getLogger(__name__).error(Event.MONITORING_STARTUP_FAILED)
+        if self._startup_alerted:
+            self._poll()
+            return
+        self._startup_alerted = True
         at = self.dependencies.utcnow()
         # Local persistence is refused without a verified policy; Slack, when
         # configured, still receives the fixed-category immediate alert.
@@ -446,7 +489,11 @@ class MonitoringRuntime:
         if threading.get_ident() != self._owner:
             raise RuntimeError("monitoring owner thread required")
         if self.status.state != RuntimeState.RUNNING:
-            self._poll()
+            if self.notifications is not None:
+                self._poll()
+            if (self.status.state == RuntimeState.FAILED
+                    and self._due("startup", self.dependencies.monotonic())):
+                self._open()
             return
         self._poll()
         self._storage_tick()
@@ -473,7 +520,10 @@ class MonitoringRuntime:
         try:
             await self.call(self._open)
         except Exception:
+            # Usually the database could not be opened; the tick retries it.
             self._set(state=RuntimeState.FAILED)
+            self._retry_at["startup"] = (self.dependencies.monotonic()
+                                         + self.dependencies.retry_seconds)
             logging.getLogger(__name__).error(Event.MONITORING_STARTUP_FAILED)
             return
         if self.status.state == RuntimeState.RUNNING:

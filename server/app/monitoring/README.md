@@ -36,7 +36,10 @@ Bridges: integrity outbox rows map to deterministic event IDs, are recorded as
 results persist in `recording_health_status` before notification;
 `FAILED` → `recording_health_failure`, `UNAVAILABLE` →
 `recording_health_warning`. A recording filesystem mismatch raises one
-immediate `recording_health_failure` per episode. Slack remains optional and
+immediate `recording_health_failure` per episode. A failed startup open is
+retried every `retry_seconds` from the tick against the same declared identity;
+only the first failure of the episode alerts, and a successful retry runs the
+startup steps and binds admission. Slack remains optional and
 never determines local state.
 
 `MonitoringDependencies` injects the probe, recorder self-test adapter factory,
