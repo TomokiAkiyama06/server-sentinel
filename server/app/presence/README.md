@@ -215,9 +215,14 @@ found once the lock is free therefore belongs to an outbox that is gone. Owner
 status reports such rows as part of `timeline_gap`
 (`timeline_gap_orphaned_sessions`) even before a replacement session opens, so
 a restart whose `open()` is refused (for example `STORAGE_HARD_STOP` or a clock
-fault) never looks healthy. A row held by a live session is not counted; the
-lock probe opens the lock file read-only and never creates it, and a lock that
-is free, missing or cannot be probed leaves the row counted. A
+fault) never looks healthy. A row held by a live session is not counted. For
+a reader without its own session, that proof is a second, committed-session
+lock, which `open()` takes only after its transaction committed (both lock
+files are created inside that admitted transaction). A replacement whose open
+is still in flight holds only the session mutex and has not yet converted the
+stale rows, so they stay counted, and stay so if that open stalls or rolls
+back. The probe opens the committed lock file read-only and never creates it,
+and a lock that is free, missing or cannot be probed leaves the row counted. A
 clock fault while a producer hands a fact over is counted as a refused fact,
 because a one-shot producer callback will not re-emit it. A false positive is
 cleared only by the Owner through the audited

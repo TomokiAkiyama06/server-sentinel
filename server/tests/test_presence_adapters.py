@@ -938,6 +938,52 @@ class TimelineGapDurabilityTests(PresenceFixture, TestCase):
         self.assertEqual(status["timeline_gap_orphaned_sessions"], 1)
         self.assertTrue(status["timeline_gap"])
 
+    def replacement_open_observed(self, *, fail):
+        """Open a replacement session, reading status from another service mid-open.
+
+        The status read happens inside the open transaction, after the session
+        mutex is taken and the stale rows are converted but before commit.
+        """
+        replacement = self.fresh_service()
+        original, seen = replacement._gap, []
+
+        def gap(db):
+            seen.append(self.fresh_service().owner_status("owner", now=NOW, clock_trusted=True))
+            if fail:
+                raise RuntimeError("synthetic open failure")
+            return original(db)
+        replacement._gap = gap
+        outbox = TimelineOutbox(replacement, clock=self.clock, capacity=8)
+        if fail:
+            with self.assertRaisesRegex(RuntimeError, "synthetic open failure"):
+                outbox.open()
+        else:
+            outbox.open()
+            self.addCleanup(lambda: outbox._handle and outbox._handle.release())
+        self.assertEqual(len(seen), 1)
+        return seen[0]
+
+    def test_an_open_in_flight_elsewhere_does_not_hide_stale_rows(self):
+        self.assertTrue(self.health.node(NODE, NodeHealthState.OFFLINE))
+        self.outbox._handle.release()
+        # A replacement that holds the session mutex but has not committed
+        # has not converted the stale row: it stays reported, and stays so
+        # when that open rolls back.
+        status = self.replacement_open_observed(fail=True)
+        self.assertEqual(status["timeline_gap_orphaned_sessions"], 1)
+        self.assertTrue(status["timeline_gap"])
+        status = self.fresh_service().owner_status("owner", now=NOW, clock_trusted=True)
+        self.assertEqual(status["timeline_gap_orphaned_sessions"], 1)
+        self.assertIsNone(status["timeline_gap_detail"])
+        status = self.replacement_open_observed(fail=False)
+        self.assertEqual(status["timeline_gap_orphaned_sessions"], 1)
+        self.assertTrue(status["timeline_gap"])
+        # Once committed, the live replacement owns its row and the stale one
+        # is in the durable marker.
+        status = self.fresh_service().owner_status("owner", now=NOW, clock_trusted=True)
+        self.assertEqual(status["timeline_gap_orphaned_sessions"], 0)
+        self.assertEqual(status["timeline_gap_detail"]["interrupted"], 1)
+
     def test_clean_close_leaves_no_orphan_for_a_service_without_a_session(self):
         self.outbox.close()
         status = self.fresh_service().owner_status("owner", now=NOW, clock_trusted=True)
@@ -984,17 +1030,21 @@ class TimelineGapDurabilityTests(PresenceFixture, TestCase):
         # even the session lock file that sits beside the database.
         self.outbox.close()
         lock = self.database.path.with_name(self.database.path.name + ".timeline-session.lock")
+        committed = self.database.path.with_name(self.database.path.name + ".timeline-session.committed.lock")
         lock.unlink()
+        committed.unlink()
         outbox = TimelineOutbox(self.presence, clock=self.clock, capacity=8)
         self.refuse = True
         with self.assertRaisesRegex(RuntimeError, "STORAGE_HARD_STOP"):
             outbox.open()
         self.assertFalse(lock.exists())
+        self.assertFalse(committed.exists())
         self.assertFalse(outbox.state().session)
         self.refuse = False
         outbox.open()
         self.addCleanup(lambda: outbox._handle and outbox._handle.release())
         self.assertTrue(lock.exists())
+        self.assertTrue(committed.exists())
         self.assertTrue(outbox.state().session)
 
     def test_lock_file_is_created_while_the_reservation_is_held(self):

@@ -40,11 +40,17 @@ RECEIPT_FIELDS = ("received_at", "clock_trusted", "confirmed")
 
 
 class TimelineSession:
-    """An open outbox session: its durable token and the lock that proves it live."""
+    """An open outbox session: its durable token and the locks that prove it live.
+
+    ``descriptor`` holds the session mutex from the start of the open. The
+    committed lock is taken only once the session row has committed, so a
+    reader that sees it held knows the open converted every stale row.
+    """
 
     def __init__(self, token, descriptor):
         self.token = token
         self._descriptor = descriptor
+        self._committed = None
         # Loss the outbox holding this session has counted but not yet
         # written to the durable marker. The outbox replaces it with a reader
         # of its own counts, so Owner status sees that loss before it lands.
@@ -59,8 +65,11 @@ class TimelineSession:
         return self._descriptor is not None
 
     def release(self):
-        """Release the lock; the kernel does the same when the process dies."""
+        """Release the locks; the kernel does the same when the process dies."""
+        committed, self._committed = self._committed, None
         descriptor, self._descriptor = self._descriptor, None
+        if committed is not None:
+            os.close(committed)
         if descriptor is not None:
             os.close(descriptor)
 
@@ -554,16 +563,31 @@ class PresenceService:
             raise
         return descriptor
 
-    def _session_lock_held(self):
-        """Read-only probe: whether any open outbox session holds the lock now.
+    def _committed_lock_file(self):
+        """Open (creating it if needed) the committed-session lock file, unlocked.
+
+        Created inside the admitted open transaction like the session lock;
+        the lock itself is taken only after that transaction commits.
+        """
+        path = self.database.path
+        return os.open(path.with_name(path.name + ".timeline-session.committed.lock"),
+                       os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+
+    def _committed_session_held(self):
+        """Read-only probe: whether a live outbox holds a committed session now.
+
+        The session mutex alone is not enough: a replacement holds it while
+        its open is still in flight, before the stale rows are converted into
+        the marker, and that open may stall or roll back. Only the committed
+        lock, taken after the open committed, proves the rows are owned.
 
         The lock file is opened without ``O_CREAT``, so a status read never
-        creates it: a missing file means no session was ever opened there.
+        creates it: a missing file means no session was ever committed there.
         A probe that cannot be completed proves nothing and returns None.
         """
         path = self.database.path
         try:
-            descriptor = os.open(path.with_name(path.name + ".timeline-session.lock"),
+            descriptor = os.open(path.with_name(path.name + ".timeline-session.committed.lock"),
                                  os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
         except FileNotFoundError:
             return False
@@ -588,14 +612,17 @@ class PresenceService:
         volume, a clock or database fault) never gets there. Status must not
         report a healthy timeline in the meantime. A row held by a live
         session of this process is not orphaned. With no such session here,
-        a lock held elsewhere means another process's live outbox owns the
-        rows, since its own open already converted any stale ones; a free,
-        missing or unprobeable lock leaves every row reported as orphaned.
+        a committed lock held elsewhere means another process's live outbox
+        owns the rows, since its committed open already converted any stale
+        ones. A lock that is free, missing or unprobeable, or an open still in
+        flight that holds only the session mutex, leaves every row reported
+        as orphaned. Rows are read before the probe, and the marker after it,
+        so a conversion that commits in between is seen in the marker.
         """
         live = {session.token for session in self._live_sessions()}
         tokens = [row[0] for row in db.execute("SELECT token FROM presence_outbox_sessions")]
         orphaned = [token for token in tokens if token not in live]
-        if orphaned and not live and self._session_lock_held() is True:
+        if orphaned and not live and self._committed_session_held() is True:
             return 0
         return len(orphaned)
 
@@ -616,6 +643,7 @@ class PresenceService:
                 # the transaction already holds, so a refused volume never
                 # gains even a directory entry from an outbox start.
                 session = TimelineSession(str(uuid4()), self._session_lock())
+                session._committed = self._committed_lock_file()
                 stale = db.execute("SELECT count(*) FROM presence_outbox_sessions").fetchone()[0]
                 if stale:
                     self._add_gap(db, now, interrupted=stale)
@@ -623,6 +651,11 @@ class PresenceService:
                 db.execute("INSERT INTO presence_outbox_sessions(token,opened) VALUES (?,?)",
                            (session.token, timestamp(now)))
                 gap = self._gap(db)
+            # Only now, with the stale rows converted and the new row durable,
+            # may a reader in another process treat the rows as owned. If this
+            # fails the committed row stays behind, reported as orphaned and
+            # converted into an interrupted gap by the next open.
+            fcntl.flock(session._committed, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BaseException:
             if session is not None:
                 session.release()
