@@ -24,6 +24,31 @@ restart gets a fresh epoch and rejects all old pending approvals rather than
 reusing monotonic-clock state. The ledger's `admits` result is only a narrow
 capture-node authorization primitive: it cannot authorize a human/API route.
 
+## Capture-node CA and mTLS ingest adapter (Issue #13)
+
+`node_ca.py` is the deployment-local issuer (uses the Owner-approved
+`cryptography` dependency, see `server/docs/CRYPTOGRAPHY_AUDIT.md`). It creates or
+loads the EC P-256 deployment CA from an owner-only (0700) directory with
+write-once 0600 files, writes the serverAuth-only Main ingest certificate/key to a
+*different* private directory, exports the public trust bundle with its full
+SHA-256 digest, and issues a capture-only client certificate for a redeemed
+`EnrollmentClaim`. The CSR only proves possession of the approved key; the node
+cannot choose its identity, SANs, key usage or scope. `issue_and_activate` signs
+and then activates the exact certificate digest in the ledger, so a certificate
+whose activation failed stays unusable. Validity is an explicit bounded
+parameter; there is no default validity or renewal policy yet.
+
+`ingest_tls.py` builds the ingest server `ssl.SSLContext` (TLS 1.3 only, client
+certificate required, deployment CA only, strict X.509, no session tickets) and
+turns an accepted TCP connection into an `AuthenticatedCaptureSession` whose
+`CaptureNodeIdentity` carries a node UUID and digests only, never a human role.
+Every connection re-reads the ledger's active record; `still_admitted()` must be
+called before committing queued work and closes the session after revocation.
+`IngestListenerConfig` refuses wildcard binds and the human listener's
+address/port. Nothing starts this listener yet: the ingest core below and #14/#15
+own wiring, per-connection byte limits and connection counts. The bootstrap
+enrollment listener and the local approval CLI are not implemented.
+
 ## Transport-neutral bounded ingest core
 
 `ingest.py` is the in-process admission boundary used after a future dedicated

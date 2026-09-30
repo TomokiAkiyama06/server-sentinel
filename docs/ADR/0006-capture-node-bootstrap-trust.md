@@ -193,3 +193,60 @@ camera, mount, account or network policy is modified by this proposal.
 ## Decision record
 
 Accepted by the repository Owner on 2026-09-21: local-CA public bundle and trusted transfer, local privileged Main approval plus non-root Agent pairing, approved-public-key binding, TLS 1.3, and a 128-bit/five-minute/one-use code. The existing #6 Owner-authentication and #4 GitHub-App decisions remain separate; this ADR neither repeats nor resolves them.
+
+## Follow-up notes (2026-09-30, Issue #13 mTLS adapters)
+
+These notes record implementation progress; they do not change this ADR's
+status or decision.
+
+- **Dependency.** The Owner approved `cryptography` 50.0.1 on 2026-09-30
+  (`docs/decisions/2026-09-30-cryptography-mtls.md`), resolving item 4 of the
+  implementation plan above. The exact release, wheel hashes, statically linked
+  OpenSSL 4.0.2, Rust crate closure and notices are audited in
+  `server/docs/CRYPTOGRAPHY_AUDIT.md`. TLS remains stdlib `ssl`.
+- **Main issuer** (`server/app/cameras/remote_agent/node_ca.py`): EC P-256
+  deployment CA (`pathlen=0`) whose key lives in a 0700 directory with 0600
+  write-once files; a separate directory holds the serverAuth-only Main ingest
+  certificate/key, so the listener never needs the CA key. Node certificates are
+  issued only for a redeemed `EnrollmentClaim`; the CSR is proof of possession of
+  the approved key and its subject/extensions are ignored. The leaf carries
+  `CA=false`, `digitalSignature`, EKU `clientAuth` only, and exactly the SAN URIs
+  `urn:serversentinel:capture-node:<node UUID>` and
+  `urn:serversentinel:deployment:<deployment UUID>`. Validity is an explicit,
+  bounded parameter (at most 397 days for leaves, never beyond the CA); the
+  default validity policy and renewal remain undecided as stated above.
+  Signing happens after ledger consumption; the ledger's
+  `credential_serial_digest` stores the SHA-256 of the exact DER certificate, and
+  activation happens only after signing succeeds.
+- **Trust bundle.** `export_trust_bundle` emits format version, deployment UUID,
+  CA certificate, Main server name and explicit endpoint, with its full SHA-256
+  digest; the Agent refuses a bundle whose digest does not match the value the
+  Owner verified independently.
+- **Ingest adapter** (`server/app/cameras/remote_agent/ingest_tls.py`): TLS 1.3
+  only, client certificate required, deployment CA as the only trust anchor,
+  `VERIFY_X509_STRICT`, no session tickets. Admission re-parses the peer leaf and
+  requires the ledger's current active record for node, key digest and
+  certificate digest on every connection; `still_admitted()` re-checks before
+  queued work commits and closes the session after revocation. Listener
+  configuration refuses wildcard binds and the human listener's address/port.
+  The application does not start this listener; it stays disabled until #14/#15
+  wire it with their byte, connection and rate limits.
+- **Agent** (`agent/media_capture_agent/node_tls.py`): non-root EC P-256 key
+  generation into a write-once 0600 file under a 0700 runtime directory, CSR with
+  an empty subject, trust-bundle parsing, issued-credential validation (own key,
+  deployment CA, capture-only scope) before `NodeCredentialStore.install`, and a
+  TLS 1.3 client context pinned to the deployment CA with hostname verification
+  and no key-log support.
+- **Evidence.** Real loopback TLS tests with temporary CAs cover mutual-auth
+  success; wrong CA (both directions), expired client and server certificates,
+  wrong server name, missing client certificate, plaintext, TLS 1.2 downgrade,
+  orphan (unactivated) certificate, revocation of new and open sessions, role
+  confusion between Main and node certificates, file modes, and absence of key
+  material in logs, argv, environment and key-log files. A cross-process E2E
+  (`tests/e2e/test_capture_mtls_scenarios.py`) runs the Agent side in separate
+  processes.
+- **Still open for #13 acceptance.** The bootstrap enrollment listener and wire
+  protocol, the local Main approval CLI and Agent pairing CLI, crash-boundary
+  fault injection, multi-process concurrent redemption over a real listener, and
+  real LAN interoperability (MANUAL_TEST §B) are not implemented or verified by
+  this change.

@@ -347,6 +347,8 @@ ADR-0006 selects the bootstrap trust mechanism: the Owner transfers a deployment
 
 After pairing, use mutually authenticated encryption. mTLS with a deployment-local CA/issuer is the default target unless an ADR selects an equivalent mechanism.
 
+Certificate profile implemented by the Issue #13 adapters (not yet wired to a running listener): an EC P-256 deployment CA (`pathlen=0`); a Main ingest leaf with EKU `serverAuth` and the bundle's DNS server name; node leaves issued only for a redeemed ledger claim with `CA=false`, EKU `clientAuth` only and exactly two SAN URIs, `urn:serversentinel:capture-node:<node UUID>` and `urn:serversentinel:deployment:<deployment UUID>`. The node's CSR proves key possession only; its requested subject/extensions are ignored. The ledger key digest is SHA-256 of the DER SubjectPublicKeyInfo and the credential digest is SHA-256 of the DER certificate. Ingest requires TLS 1.3, a client certificate chaining to the deployment CA only, and the ledger's current active record on every connection and before committing queued work; a valid certificate alone never admits a node. Leaf validity is an explicit bounded parameter (maximum 397 days, never beyond the CA); the default validity and renewal policy remain an open Owner decision.
+
 Node identity is independent from source identity: one agent may later expose multiple cameras without gaining human/admin dashboard permissions.
 
 ### 5.6 Network direction

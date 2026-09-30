@@ -66,7 +66,7 @@ jobs:
           PYTHONPATH: server:agent:.
           E2E_REQUIRE_FULL_COVERAGE: '1'
         run: python -m unittest tests.e2e.test_mock_core_harness -v
-      - name: Hardware-free mock E2E storage, retention, notification and telemetry scenarios
+      - name: Hardware-free mock E2E storage, retention, notification, telemetry and capture mTLS scenarios
         env:
           PYTHONDONTWRITEBYTECODE: '1'
           PYTHONPATH: server:agent:.
@@ -78,6 +78,7 @@ jobs:
           tests.e2e.test_retention_scenarios
           tests.e2e.test_notification_fault_scenarios
           tests.e2e.test_no_telemetry_scenarios
+          tests.e2e.test_capture_mtls_scenarios
       - name: Whitespace validation
         run: git diff --check HEAD^ HEAD
 

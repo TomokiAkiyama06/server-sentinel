@@ -175,6 +175,52 @@ Pairing/security:
 - [ ] an unpaired LAN host cannot submit media;
 - [ ] capture-node credential cannot access dashboard/admin APIs.
 
+#### Issue #13 real-LAN pairing / mTLS procedure (not yet executed)
+
+Status: **unverified**. The adapters are covered only by loopback tests with
+temporary CAs (`server/tests/test_capture_mtls.py`, `agent/tests/test_node_tls.py`,
+`tests/e2e/test_capture_mtls_scenarios.py`). The bootstrap enrollment listener,
+Main approval CLI and Agent pairing CLI do not exist yet, so the steps marked
+*(needs CLI)* wait for them. Use a disposable deployment CA and synthetic
+server name; never paste keys, codes, certificates, bundle contents, LAN
+addresses or hostnames into Issues, PRs or CI artifacts.
+
+1. On the Main host, as the local administrative account, create the deployment
+   CA in a dedicated private directory outside the checkout and media trees;
+   confirm the directory is 0700 and every file 0600, owned by that account.
+2. Issue the Main ingest certificate into a *separate* private directory for the
+   listener account; confirm that account cannot read the CA key.
+3. Export the trust bundle and note its full SHA-256 on the Main console.
+   Copy the bundle to the capture host over an Owner-trusted channel (for
+   example removable media); on the capture host recompute and compare the full
+   digest by eye before continuing.
+4. On the capture host, as the dedicated non-root `media-capture-agent` account,
+   generate the node key and enrollment request *(needs CLI)*; confirm
+   `<runtime_root>/pending-enrollment` is 0700, the key file 0600, and that no
+   root, GUI, Tailscale or admin credential was required.
+5. Transfer only the public request to the Main; approve it locally and read the
+   code from the controlling terminal only *(needs CLI)*.
+6. Enroll over the private LAN with the capture host **not** joined to
+   Tailscale *(needs bootstrap listener)*. Negative checks before the code is
+   typed: a wrong bundle, a Main certificate for another name, and a plaintext
+   endpoint each abort without prompting for the code.
+7. Confirm the installed credential directory is 0700 with 0600 files and that
+   the pending key was removed.
+8. Start the ingest listener bound to the Main's private-LAN IP and a port
+   distinct from the dashboard listener; confirm the dashboard listener still
+   binds loopback only and the ingest port answers no HTTP route.
+9. Connect from the Agent: expect a TLS 1.3 session admitted as that node.
+   From another LAN host without a node certificate, with a certificate from a
+   different CA, and with an expired certificate: expect refusal before any
+   capture message is accepted.
+10. Revoke the node on the Main: the open session closes on the next admission
+    check, and reconnecting is refused although the certificate has not expired.
+11. Inspect Main and Agent logs, `ps` output, service environment and shell
+    history on both hosts for key, code or certificate text; expect none.
+
+Record the Main/Agent OS, Python, OpenSSL (`cryptography` reports 4.0.2 from its
+wheel) and architecture used, without private deployment values.
+
 Connectivity:
 
 - [ ] agent works over the same private LAN without joining Tailscale;
