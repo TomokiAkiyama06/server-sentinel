@@ -234,8 +234,16 @@ class StorageAdapter(_Adapter):
         else:
             filesystem_state = Health.UNKNOWN if running else Health.UNAVAILABLE
         if not running:
-            return (_field(Name.STORAGE_STATE, Health.UNAVAILABLE),
-                    _field(Name.STORAGE_REASON_CODE, Reason.DEPENDENCY_UNAVAILABLE),
+            state, reason = Health.UNAVAILABLE, Reason.DEPENDENCY_UNAVAILABLE
+            if (status.state is RuntimeState.FAILED
+                    and status.storage_state is not None
+                    and StorageState(status.storage_state) is StorageState.HARD_STOP):
+                # A failed startup records an explicit hard stop (writes stay
+                # refused); keep that actionable verdict visible. A stopped or
+                # starting runtime has no current verdict and stays unavailable.
+                state, reason = _STORAGE_STATES[StorageState.HARD_STOP]
+            return (_field(Name.STORAGE_STATE, state),
+                    _field(Name.STORAGE_REASON_CODE, reason),
                     _field(Name.STORAGE_AUDIT_DELIVERY_STATE, Health.UNAVAILABLE),
                     _field(Name.RECORDING_FILESYSTEM_STATE, filesystem_state))
         if status.storage_state is None:
@@ -306,6 +314,12 @@ _FINDING_REASONS = {
 _FINDING_SEVERITY = (State.MISSING, State.CHANGED, State.UNVERIFIABLE, State.NEW_DEVICE)
 
 
+def _severity(finding: Finding) -> int:
+    """Rank within a kind: lower is more severe; OK ranks last."""
+    return (_FINDING_SEVERITY.index(finding.state) if finding.state in _FINDING_SEVERITY
+            else len(_FINDING_SEVERITY))
+
+
 class IntegrityAdapter(_Adapter):
     """Hardware Integrity verdicts per category; never baseline observations."""
 
@@ -334,11 +348,15 @@ class IntegrityAdapter(_Adapter):
                     _field(Name.INTEGRITY_CHECK_STATE, check_state),
                     _field(Name.INTEGRITY_DELIVERY_STATE, Health.UNKNOWN))
         findings, delivery_blocked = latest
+        # compare() reports one finding per baseline component, so a kind with
+        # several components (DIMMs, disks) repeats: keep its most severe one.
         by_kind: dict[Kind, Finding] = {}
         for finding in findings:
-            if not isinstance(finding, Finding) or finding.kind in by_kind:
+            if not isinstance(finding, Finding):
                 raise DiagnosticSourceUnavailable
-            by_kind[finding.kind] = finding
+            current = by_kind.get(finding.kind)
+            if current is None or _severity(finding) < _severity(current):
+                by_kind[finding.kind] = finding
         # A category the check did not report is unverifiable, not healthy.
         verdicts = {kind: by_kind.get(kind) or Finding(kind, State.UNVERIFIABLE, "NOT_REPORTED")
                     for kind in Kind}

@@ -161,7 +161,11 @@ and contributes no counts. A subsystem that raises reports `unavailable` with
 defaults to "not degraded" before the worker runs, so job states are reported
 `ok` only while the monitoring runtime is `running`; a missing verdict is
 `unknown`, and an integrity category the check did not report is
-`hardware_unverifiable`. No absent or failing subsystem is ever reported `ok`.
+`hardware_unverifiable`. A category with several baseline components (DIMMs,
+disks) reports its most severe component finding. A runtime whose startup
+failed keeps its explicit storage hard stop (`failed` / `storage_hard_stop`);
+a stopped or starting runtime reports storage `unavailable`. No absent or
+failing subsystem is ever reported `ok`.
 
 `RecordingStore` and `IntegrityStore` refuse calls off the monitoring worker, so
 `OwnerWorkerCalls` submits their reads to that worker with a bounded wait and

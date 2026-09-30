@@ -223,6 +223,51 @@ class ProducerMappingTests(unittest.TestCase):
         self.assertEqual(reported["recording_health"]["recording_health.reason_code"],
                          "self_test_failed")
 
+    def test_failed_startup_keeps_its_explicit_storage_hard_stop(self):
+        failed = FakeMonitoring(MonitoringStatus(
+            RuntimeState.FAILED, recording_filesystem_ok=False,
+            storage_state=StorageState.HARD_STOP, recording_health=HealthState.FAILED))
+        storage = values(CompositeDiagnosticSource((StorageAdapter(failed),)).collect())["storage"]
+        self.assertEqual((storage["storage.state"], storage["storage.reason_code"]),
+                         ("failed", "storage_hard_stop"))
+        self.assertEqual(storage["recording_filesystem.state"], "failed")
+        # Audit delivery has no current verdict without a running worker.
+        self.assertEqual(storage["storage.audit_delivery_state"], "unavailable")
+        # A stopped or starting runtime has no current storage verdict.
+        for runtime_state in (RuntimeState.STOPPED, RuntimeState.STARTING):
+            with self.subTest(runtime_state=runtime_state):
+                idle = FakeMonitoring(MonitoringStatus(
+                    runtime_state, storage_state=StorageState.HARD_STOP))
+                storage = values(CompositeDiagnosticSource(
+                    (StorageAdapter(idle),)).collect())["storage"]
+                self.assertEqual((storage["storage.state"], storage["storage.reason_code"]),
+                                 ("unavailable", "dependency_unavailable"))
+
+    def test_repeated_integrity_kinds_aggregate_to_their_most_severe_finding(self):
+        monitoring = FakeMonitoring(MonitoringStatus(RuntimeState.RUNNING))
+        # One finding per baseline component: two DIMMs and two disks.
+        findings = (Finding(Kind.CPU, State.OK, "x"),
+                    Finding(Kind.MEMORY, State.OK, "x"), Finding(Kind.MEMORY, State.MISSING, "x"),
+                    Finding(Kind.STORAGE, State.NEW_DEVICE, "x"),
+                    Finding(Kind.STORAGE, State.OK, "x"),
+                    Finding(Kind.GPU, State.OK, "x"))
+        documents = CompositeDiagnosticSource((IntegrityAdapter(
+            monitoring, StoreFindings((findings, False)).latest),)).collect()
+        integrity = values(documents)["hardware_inventory"]
+        self.assertEqual(integrity["integrity.memory.reason_code"], "hardware_missing")
+        self.assertEqual(integrity["integrity.storage.reason_code"], "hardware_new_device")
+        self.assertEqual((integrity["integrity.state"], integrity["integrity.reason_code"]),
+                         ("failed", "hardware_missing"))
+
+        healthy = (Finding(Kind.CPU, State.OK, "x"), Finding(Kind.MEMORY, State.OK, "x"),
+                   Finding(Kind.MEMORY, State.OK, "x"), Finding(Kind.STORAGE, State.OK, "x"),
+                   Finding(Kind.STORAGE, State.OK, "x"), Finding(Kind.GPU, State.OK, "x"))
+        documents = CompositeDiagnosticSource((IntegrityAdapter(
+            monitoring, StoreFindings((healthy, False)).latest),)).collect()
+        integrity = values(documents)["hardware_inventory"]
+        self.assertEqual((integrity["integrity.state"], integrity["integrity.reason_code"]),
+                         ("ok", "none"))
+
     def test_running_monitoring_maps_storage_and_recording_health_verdicts(self):
         monitoring = FakeMonitoring(MonitoringStatus(
             RuntimeState.RUNNING, storage_state=StorageState.HARD_STOP,
