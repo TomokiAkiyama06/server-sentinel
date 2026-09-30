@@ -69,8 +69,55 @@ run the following on the intended Main Ubuntu host under its dedicated account:
    profile; the manual-intervention state must remain visible. A normal clean
    shutdown/restart of an unambiguous serial device may reconnect automatically.
 
-Results: **NOT RUN — hardware, authorized management and viewer integration
-remain pending. Issue #11 is not closed by synthetic tests.**
+Backend runtime wiring status (2026-09-29): the lifespan now starts/stops
+`LocalUvcRuntime` for the deployment `local_uvc` source list, and frames reach
+the authorization-bound preview session layer. This was verified only with
+synthetic discovery/capture adapters and synthetic frame bytes; no physical
+camera, V4L2 node, udev rule or real frame was used.
+
+#### Real-hardware runtime procedure (serial-bearing UVC cameras)
+
+Use one or more USB UVC cameras that report a USB serial number (for example
+conference-style or speakerphone-integrated webcams from vendors such as EMEET
+or Yamaha; any serial-bearing UVC model is suitable). Record the exact models,
+serials, by-id names and ports only in the private local test record.
+
+1. Create the `local_uvc` registry sources with explicit capture profiles, list
+   their UUIDs in the private deployment `local_uvc` object, and run
+   `--check`. Confirm that an unknown key, a device path in place of a UUID, a
+   duplicate UUID and a fifth UUID each fail validation without echoing values.
+2. Start the service without the `local_uvc` object once and confirm the
+   `local_uvc_unconfigured` log event and that no video node is opened.
+3. Start with the object. Before Owner approval, confirm each source stays
+   `offline` and the service holds no `/dev/video*` descriptor.
+4. Approve one camera through the audited Owner path (stop-worker reapproval).
+   Confirm `degraded` until the first frame, then `online`, the negotiated
+   profile, and an `approve_camera` audit record. Repeat for up to four sources.
+5. Unplug one camera: confirm that source becomes `offline`, the service stays
+   running (process and other sources unaffected, their frames continue), and a
+   `local_uvc_source_health_changed` log line contains no path, serial or UUID.
+6. Replug it into a different port so its video node number changes: it must
+   return `online` automatically as the same source UUID after a new frame.
+7. Connect a second camera of the same model with the same (or no usable)
+   serial, or reproduce that with a controlled mock: the source must become
+   `manual_intervention_required`, deliver no frames, and stay so across a
+   service restart until explicitly reapproved.
+8. Stop the service (`systemctl stop`) while capturing: confirm all video
+   descriptors close within the join bound, the sources are `offline`, and a
+   clean restart reconnects a unique-serial camera automatically. Simulate a
+   hung driver if practical and confirm `local_uvc_stop_failed`; if the process
+   is terminated before that worker exits, the next start must require Owner
+   reapproval.
+9. While capturing, confirm no ALSA/OSS/microphone device of the integrated
+   speakerphone/microphone is opened (inspect `/proc/<pid>/fd` locally; do not
+   publish paths).
+10. With an invited `live:view` principal (once the authorized viewer route
+    exists), confirm preview frames are delivered; with a `recordings:view`-only
+    principal and after revoking `live:view`, confirm refusal and that no frame
+    is retained without viewers.
+
+Results: **NOT RUN — hardware, authorized management route and browser viewer
+integration remain pending. Issue #11 is not closed by synthetic tests.**
 
 For each tested camera:
 
@@ -189,6 +236,9 @@ The synthetic profile core tests do not satisfy the following integration checks
 - [ ] apply recording and viewer queue pressure separately; verify bounded memory, visible loss, and keyframe recovery without claiming continuous evidence;
 - [ ] verify copy eligibility against actual codec configuration, container, timestamps and color metadata; unsupported copy/transcode paths remain unavailable;
 - [ ] record only sanitized aggregate resource measurements; no deployment identifiers, room imagery, media payloads, or exact private network values enter GitHub.
+- [ ] on the Main Server and Capture Node, run `python -m app.media.profiles.measure` for 1, 2, 3 and 4 sources with and without viewers as a synthetic scheduler-overhead baseline; it does not measure codecs/cameras/GPU and its output is not a deployment default;
+- [ ] with the real room-overview camera, list the room-overview profile set with measured `RoomOverviewCriteria`; confirm admission rejects it unless the room-overview option is requested and that inference/viewer stay downscaled;
+- [ ] on a host without the accelerator (or with it disabled), confirm `prefer_hardware` selects software with visible `hardware_unavailable` / `software_fallback`, `require_hardware` reports the path unavailable, and recording never reports the accelerated path as active; re-enable the accelerator and confirm the next adapter start uses it.
 
 ## D. Source registry / mixed topology
 
@@ -807,7 +857,12 @@ synthetic test branches/PRs; no production data or unrelated rule deletion.
 - On the target Main Server, run the generated motion workload for 1–4 sources; measure CPU, resident memory, cadence, drops, evaluation latency and sustained health/recording continuity. Record approved per-source budgets without exporting host identifiers.
 - Before any person model is loaded, verify exact implementation/runtime/weights licenses, immutable versions, local artifact SHA-256 and the complete dependency notices. Confirm no runtime downloads, alternative-model fallback, reporting or unapproved outbound attempts on normal and failure paths.
 - Benchmark the accepted person backend on CPU; GPU is optional and separately measured. External benchmark media stays local under its terms and is never committed or attached to GitHub/CI. No real-model accuracy or target-host performance was verified by synthetic unit tests.
-- Stop/delay inference, inject quality loss, stale frames and a wedged plugin in the isolated worker: result must become unknown, loss/throttling remain visible, and capture/recording/health/storage-safety work must continue. Verify the production watchdog/resource limits separately; the primitive cannot forcibly interrupt a native call.
+- Stop/delay inference, inject quality loss, stale frames and a wedged plugin in the isolated worker: result must become unknown, loss/throttling remain visible, and capture/recording/health/storage-safety work must continue.
+- [ ] On the target Main Server under the production systemd unit, start each configured binding's worker via `maintain()` and record start latency, resident/virtual memory and descriptor use; size `address_space_bytes`/`open_files` so the approved person model loads with margin (native runtimes reserve large virtual ranges) and record the chosen values.
+- [ ] With the real person adapter loaded, `SIGSTOP` the worker and separately `SIGKILL` it mid-evaluation: the published result must become `unknown` (`detector_timeout` / `detector_crashed`) within the configured timeout, never `absent`; the child must be reaped (no zombie), restart only after the backoff, and latch after the configured consecutive failures until `recover()`.
+- [ ] Kill the Main service process while a worker is mid-evaluation and verify the worker exits (parent-death signal) instead of surviving as an orphan.
+- [ ] Confirm the worker inherits the unit's filesystem/network confinement and that its stdio produces no journal output on failure paths.
+- [ ] Deploy with the `detection` object omitted and then with one required key removed: `--check`/startup must not start inference, and every source's detector observation must remain `unknown`.
 
 ## ADR-0003 follow-up: accepted human-access boundary
 

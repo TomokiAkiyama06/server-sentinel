@@ -15,6 +15,10 @@ class WorkerStatus:
     running: bool
     failures: int
     cleanup_failed: bool
+    # The most recent poll raised (storage/registry fault, not an ordinary
+    # camera offline, which polls report by returning False). Cleared by the
+    # next poll that completes.
+    polling_failed: bool = False
 
 
 @dataclass
@@ -23,6 +27,7 @@ class _Worker:
     thread: threading.Thread | None = None
     failures: int = 0
     cleanup_failed: bool = False
+    polling_failed: bool = False
 
 
 class LocalUvcSupervisor:
@@ -91,6 +96,12 @@ class LocalUvcSupervisor:
         with self._lock:
             worker.failures += 1
             worker.cleanup_failed = worker.cleanup_failed or cleanup
+            if not cleanup:
+                worker.polling_failed = True
+
+    def _polled(self, worker):
+        with self._lock:
+            worker.polling_failed = False
 
     def _run(self, source_id, worker):
         try:
@@ -102,6 +113,8 @@ class LocalUvcSupervisor:
                 except Exception:
                     self._failed(worker)
                     delivered = False
+                else:
+                    self._polled(worker)
                 if not delivered:
                     worker.stop.wait(self._retry_delay)
         finally:
@@ -120,7 +133,7 @@ class LocalUvcSupervisor:
                 return None
             return WorkerStatus(
                 worker.thread is not None and worker.thread.is_alive(),
-                worker.failures, worker.cleanup_failed,
+                worker.failures, worker.cleanup_failed, worker.polling_failed,
             )
 
     def stop(self, source_id):

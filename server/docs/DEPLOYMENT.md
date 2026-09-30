@@ -153,6 +153,82 @@ with the value-free validation message, and `python -m app` logs
 with the mandatory checks silently absent. Supplying only some of them, or any
 invalid value, also fails `--check`.
 
+### Local UVC section (optional)
+
+The optional `local_uvc` object names the logical Camera Registry sources
+(1 to 4) whose USB/UVC cameras the Main Server backend supervises:
+
+```json
+"local_uvc": {
+  "source_ids": ["00000000-0000-4000-8000-000000000001"],
+  "poll_timeout_seconds": 1.0,
+  "retry_delay_seconds": 1.0,
+  "join_timeout_seconds": 3.0
+}
+```
+
+`source_ids` are canonical lowercase registry source UUIDs, never device paths,
+`/dev/videoN` numbers, serials or other physical evidence; the physical camera
+for each source is selected only by the audited Owner approval and stays in the
+private approval store. A listed source without that approval stays `offline`
+and never opens a device. The timing keys are optional (bounded; invalid values
+fail `--check`). A UUID that is not a `local_uvc` registry source is rejected at
+startup and reported, never silently skipped. Without the object the backend
+logs `local_uvc_unconfigured` and keeps an explicit `unconfigured` local capture
+state; remote-agent-only deployments need no `local_uvc` object.
+
+### Detection section (optional; inference stays unavailable without it)
+
+The optional `detection` object binds reviewed detectors to sources. Values
+below are placeholders showing the shape, not defaults or recommendations;
+thresholds, cadence and limits must come from the target-host measurements in
+`MANUAL_TEST.md` (Issue #20):
+
+```json
+"detection": {
+  "bindings": [
+    {
+      "source_id": "00000000-0000-0000-0000-000000000001",
+      "detector": {
+        "kind": "motion", "implementation": "server-sentinel-gray-difference",
+        "version": "1", "pixel_delta": "<evaluated>", "changed_fraction": "<evaluated>"
+      },
+      "cadence": {
+        "cadence_ns": "<ns>", "maximum_cadence_ns": "<ns>",
+        "maximum_queue_age_ns": "<ns>", "maximum_evaluation_ns": "<ns>",
+        "maximum_observation_age_ns": "<ns>", "maximum_pixels": "<pixels>"
+      },
+      "worker": {
+        "evaluation_timeout_ns": "<ns>", "start_timeout_ns": "<ns>",
+        "restart_backoff_ns": "<ns>", "maximum_consecutive_failures": "<count>",
+        "address_space_bytes": "<bytes>", "open_files": "<count>"
+      }
+    }
+  ]
+}
+```
+
+Every key is required and numeric values are JSON integers (fractions are
+numbers in (0, 1]); unknown keys are refused. A person binding instead uses
+`"kind": "person"`, `"implementation": "rtdetr-v2-r18vd-onnx-cpu"`, the pinned
+model revision as `version`, an absolute `artifact` path, `artifact_sha256`
+equal to the pinned digest, `score_threshold` in (0, 1) and
+`intra_op_threads` from 1 to 64; see `DETECTOR_FOUNDATION.md`. Any other
+implementation, version or digest is refused rather than substituted. At most
+four distinct sources may be bound, each at most once per detector kind.
+`evaluation_timeout_ns` must be at least `maximum_evaluation_ns`; the worker's
+frame limit is derived as three bytes per `maximum_pixels`. Watchdog timeouts
+must be representable by the poll(2) wait (at most `(2**31 - 1) * 1_000_000`
+ns) and `address_space_bytes` / `open_files` below `2**63`, so an oversized
+value is refused at `--check` instead of failing after a worker is spawned or
+being read as an unlimited rlimit. These are representability ceilings, not
+recommended values.
+
+Without the object, no inference runtime can be constructed and every source's
+detector observation remains `unknown`, never `absent`. An invalid object fails
+`--check` with the value-free validation message. Keep the artifact path in
+this private file only.
+
 ## Install, update, and rollback
 
 Run the separately downloaded installer only after verifying its published
