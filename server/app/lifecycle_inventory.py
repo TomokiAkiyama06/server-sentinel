@@ -3,8 +3,9 @@
 ``record`` captures, from a read-only view of the Main Server runtime tree:
 
 - per-recording content evidence keyed by the recording logical ID: a SHA-256
-  of every linked segment file as stored on disk, the starred flag, and the
-  catalog duration;
+  of every linked segment file as stored on disk with the segment's source and
+  catalog bounds, the starred flag, and the catalog start, target end and
+  ended boundaries (the manifest clips playback to the target end);
 - a per-row and a chained SHA-256 over every retained audit row
   (``security_admin_audit_records`` and ``integrity_audit``), so a rewritten
   middle row is detected even when counts and boundary timestamps match;
@@ -155,7 +156,7 @@ def _recordings(connection, tables, directory: Path) -> dict | None:
         "FROM recordings WHERE status != 'deleting' ORDER BY id").fetchall()
     for row in rows:
         segments = connection.execute(
-            "SELECT s.id, s.start_ms, s.end_ms, s.sha256 FROM recording_segments s "
+            "SELECT s.id, s.source_id, s.start_ms, s.end_ms, s.sha256 FROM recording_segments s "
             "JOIN recording_links l ON l.segment_id = s.id "
             "WHERE l.recording_id = ? AND s.state = 'ready' ORDER BY s.start_ms, s.id",
             (row["id"],)).fetchall()
@@ -165,15 +166,19 @@ def _recordings(connection, tables, directory: Path) -> dict | None:
             items.append({
                 "segment_id": segment["id"], "sha256": digest, "bytes": size,
                 "catalog_match": digest is not None and digest == segment["sha256"],
+                "source_id": segment["source_id"],
+                "start_ms": segment["start_ms"], "end_ms": segment["end_ms"],
                 "media_ms": segment["end_ms"] - segment["start_ms"],
             })
-        end = row["ended_ms"] if row["ended_ms"] is not None else row["target_end_ms"]
         result[row["id"]] = {
             "source_id": row["source_id"],
             "status": row["status"],
             "starred": bool(row["starred"]),
             "start_ms": row["start_ms"],
-            "catalog_duration_ms": end - row["start_ms"],
+            # Both boundaries are kept separately: RecordingStore.manifest()
+            # clips segments and computes gaps against target_end_ms.
+            "target_end_ms": row["target_end_ms"],
+            "ended_ms": row["ended_ms"],
             "segment_media_ms": sum(item["media_ms"] for item in items),
             "segments": items,
             "content_sha256": _digest([[item["segment_id"], item["sha256"]] for item in items]),
@@ -341,19 +346,30 @@ def _valid_growth(base: dict, now: dict) -> bool:
     """Whether a recording active at record time only grew as the store allows.
 
     Source, start and starred flag are immutable; the status may only move to
-    an allowed successor; the catalog end may only stay or move earlier (the
-    store never extends target_end_ms); every recorded segment must be present
-    and identical; and every current segment, old or new, must be readable and
-    match its catalog digest.
+    an allowed successor; the target end may only stay or move earlier (the
+    store never extends target_end_ms); a still-active recording has no ended
+    boundary and a finished one ends after its start and no later than its
+    target; every recorded segment must be present and identical; and every
+    current segment, old or new, must come from the recording's own source,
+    overlap its current target window (the only segments the store links), be
+    readable and match its catalog digest.
     """
     if (base["status"] != "active" or now["status"] not in _ACTIVE_SUCCESSORS
             or not _evidenced(base) or not _evidenced(now)):
         return False
     if any(now.get(key) != base.get(key) for key in ("source_id", "start_ms", "starred")):
         return False
-    if not 0 < now["catalog_duration_ms"] <= base["catalog_duration_ms"]:
+    start, target = now["start_ms"], now["target_end_ms"]
+    if not start < target <= base["target_end_ms"]:
         return False
-    if not all(segment["catalog_match"] for segment in now["segments"]):
+    if now["status"] == "active":
+        if now["ended_ms"] is not None:
+            return False
+    elif now["ended_ms"] is None or not start < now["ended_ms"] <= target:
+        return False
+    if not all(segment["catalog_match"] and segment["source_id"] == now["source_id"]
+               and segment["start_ms"] < target and segment["end_ms"] > start
+               for segment in now["segments"]):
         return False
     now_segments = {item["segment_id"]: item for item in now["segments"]}
     return all(now_segments.get(item["segment_id"]) == item for item in base["segments"])

@@ -324,8 +324,10 @@ the newer release's interpreter under `releases/<version>/venv/bin/python`;
 both only read the runtime tree.
 
 `record` stores, keyed by stable logical ID: each recording's source, status,
-starred flag, catalog start and duration, and the SHA-256 of every linked
-segment file as read from disk; a per-row and a chained SHA-256 over every
+starred flag, catalog start, target end and ended boundaries (recorded
+separately, since playback is clipped to the target end), and for every linked
+segment its source, catalog bounds and the SHA-256 of its file as read from
+disk; a per-row and a chained SHA-256 over every
 retained `security_admin_audit_records` and `integrity_audit` row; registered
 camera source IDs and types; and Owner presence plus each principal's independent
 `live:view` / `recordings:view` grants, invitation redemption and revocation
@@ -336,11 +338,18 @@ permission-bearing URLs, media bytes, or audit row contents.
 `verify` recomputes the same inventory and compares it. A missing or changed
 recording, audit row, source, principal or invitation is `failed` (exit 1);
 rows and recordings that exist only now are listed as `appended` and are never
-counted as preserved. A recording that was still active when recorded may gain
-segments, end no later than its recorded target, and become `complete`,
-`gapped` or `interrupted`; its source, start and starred flag must not change,
-every segment it already had must be identical, and every current segment must
-be readable and match its catalog digest; anything else is `changed`. If a
+counted as preserved. A finished recording must be identical, including its
+target and ended boundaries. A recording that was still active when recorded
+may gain segments, move its target end earlier but never later, and become
+`complete`, `gapped` or `interrupted` with an end after its start and no later
+than its target; its source, start and starred flag must not change, every
+segment it already had must be identical, and every current segment must come
+from the recording's own source, overlap its target window, be readable and
+match its catalog digest; anything else is `changed`. Starring or unstarring
+any recording between `record` and `verify` is also `changed` and stays a
+failure (Owner decision 2026-09-30): do not change stars during the lifecycle
+window; if one changed, investigate it and take a new baseline before the next
+operation rather than accepting the result. If a
 documented migration intentionally rewrites stored bytes, name each affected
 recording in advance with `--declared-rewrite <logical ID>`; those recordings
 are reported separately and must be re-verified manually, and any other digest

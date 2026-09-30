@@ -66,15 +66,22 @@ class Runtime:
         return recording_id
 
     def add_segment(self, recording_id: str, payload: bytes, *, write_file: bool = True,
-                    catalog_payload: bytes | None = None) -> str:
+                    catalog_payload: bytes | None = None, source_id: str | None = None,
+                    start_ms: int = 10000, end_ms: int = 20000) -> str:
+        """Link a ready segment; by default from the recording's own source,
+        as the recording store only links source-matched overlapping media."""
         segment_id = str(uuid4())
+        if source_id is None:
+            with closing(sqlite3.connect(self.database)) as connection:
+                source_id = connection.execute(
+                    "SELECT source_id FROM recordings WHERE id=?", (recording_id,)).fetchone()[0]
         if write_file:
             self.segment_file(segment_id, payload)
         self.execute(
             "INSERT INTO recording_segments (id, source_id, stream_id, sequence, start_ms, "
             "end_ms, codec, container, byte_length, sha256, state, spool) "
-            "VALUES (?, ?, 's', ?, 10000, 20000, 'synthetic', 'deflate', ?, ?, 'ready', 0)",
-            (segment_id, str(uuid4()), self.clock, len(payload),
+            "VALUES (?, ?, 's', ?, ?, ?, 'synthetic', 'deflate', ?, ?, 'ready', 0)",
+            (segment_id, source_id, self.clock, start_ms, end_ms, len(payload),
              hashlib.sha256(catalog_payload if catalog_payload is not None
                             else payload).hexdigest()))
         self.clock += 1
@@ -372,7 +379,8 @@ class LifecycleInventoryTests(unittest.TestCase):
         item = recorded["recordings"][seeded["ordinary"]]
         self.assertEqual(item["decode_verification"], "manual")
         self.assertEqual(item["container_duration"], "manual")
-        self.assertEqual(item["catalog_duration_ms"], 10000)
+        self.assertEqual((item["start_ms"], item["target_end_ms"], item["ended_ms"]),
+                         (0, 10000, 10000))
         self.assertIn("capture_agent_protected_incidents", recorded["not_applicable"])
         _, report, stdout = self.verify(baseline)
         self.assertEqual(report["manual"]["decode_verification"], "manual")
@@ -468,6 +476,84 @@ class LifecycleInventoryTests(unittest.TestCase):
         for recording_id in rejected:
             self.assertIn({"id": recording_id, "reason": "changed"}, section["failed"])
             self.assertNotIn(recording_id, section["preserved"])
+
+
+    def test_finished_recording_target_boundary_change_is_detected(self):
+        # The manifest clips segments and computes gaps against target_end_ms,
+        # so a change to it alone alters the playable recording.
+        seeded = self.runtime.seed()
+        _, baseline = self.record()
+        self.runtime.execute("UPDATE recordings SET target_end_ms=5000 WHERE id=?",
+                             (seeded["ordinary"],))
+        self.runtime.execute("UPDATE recordings SET ended_ms=5000 WHERE id=?",
+                             (seeded["starred"],))
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_FAILED)
+        failed = report["sections"]["recordings"]["failed"]
+        self.assertIn({"id": seeded["ordinary"], "reason": "changed"}, failed)
+        self.assertIn({"id": seeded["starred"], "reason": "changed"}, failed)
+
+    def test_star_change_during_lifecycle_is_a_failure(self):
+        # Owner decision 2026-09-30: starring or unstarring between record and
+        # verify stays a failure; take a new baseline instead.
+        seeded = self.runtime.seed()
+        active = self.runtime.recording(starred=False, payload=b"generated-active-star",
+                                        status="active", target_end_ms=20000)
+        _, baseline = self.record()
+        self.runtime.execute("UPDATE recordings SET starred=1 WHERE id IN (?, ?)",
+                             (seeded["ordinary"], active))
+        self.runtime.execute("UPDATE recordings SET starred=0 WHERE id=?", (seeded["starred"],))
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_FAILED)
+        failed = report["sections"]["recordings"]["failed"]
+        for recording_id in (seeded["ordinary"], seeded["starred"], active):
+            self.assertIn({"id": recording_id, "reason": "changed"}, failed)
+
+    def test_in_progress_growth_rejects_foreign_or_out_of_window_segments(self):
+        self.runtime.seed()
+
+        def active(label: str) -> str:
+            return self.runtime.recording(starred=False, payload=b"generated-" + label.encode(),
+                                          status="active", target_end_ms=20000)
+        grows = active("grows")
+        foreign = active("foreign")
+        outside = active("outside")
+        shrunk = active("shrunk")
+        _, baseline = self.record()
+        self.runtime.add_segment(grows, b"generated-grows-later")
+        # Ready and hash-matching, but from another camera.
+        self.runtime.add_segment(foreign, b"generated-foreign-later", source_id=str(uuid4()))
+        # Same source, but wholly after the recording's target end.
+        self.runtime.add_segment(outside, b"generated-outside-later",
+                                 start_ms=20000, end_ms=30000)
+        # A stop may move the target earlier, but not below linked media.
+        self.runtime.add_segment(shrunk, b"generated-shrunk-later")
+        self.runtime.execute("UPDATE recordings SET target_end_ms=10000, ended_ms=10000, "
+                             "status='complete' WHERE id=?", (shrunk,))
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_FAILED)
+        section = report["sections"]["recordings"]
+        self.assertEqual(section["in_progress_at_record"], [grows])
+        for recording_id in (foreign, outside, shrunk):
+            self.assertIn({"id": recording_id, "reason": "changed"}, section["failed"])
+            self.assertNotIn(recording_id, section["preserved"])
+
+    def test_in_progress_recording_end_must_lie_within_its_target(self):
+        self.runtime.seed()
+        ended_active = self.runtime.recording(starred=False, payload=b"generated-ended-active",
+                                              status="active", target_end_ms=20000)
+        overrun = self.runtime.recording(starred=False, payload=b"generated-overrun",
+                                         status="active", target_end_ms=20000)
+        _, baseline = self.record()
+        # Still active yet already carrying an end, and an end past the target.
+        self.runtime.execute("UPDATE recordings SET ended_ms=15000 WHERE id=?", (ended_active,))
+        self.runtime.execute("UPDATE recordings SET target_end_ms=15000, ended_ms=18000, "
+                             "status='complete' WHERE id=?", (overrun,))
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_FAILED)
+        failed = report["sections"]["recordings"]["failed"]
+        for recording_id in (ended_active, overrun):
+            self.assertIn({"id": recording_id, "reason": "changed"}, failed)
 
 
 if __name__ == "__main__":
