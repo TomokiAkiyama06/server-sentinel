@@ -19,9 +19,29 @@ proof of possession, parsing of the Owner-transferred public trust bundle with a
 independent SHA-256 check, validation that an issued certificate is for this key,
 this deployment's CA and capture-only scope before `NodeCredentialStore.install`,
 and a TLS 1.3 client context pinned to the deployment CA with hostname
-verification and no key-log support. The Agent still opens no listener, and the
-bootstrap enrollment exchange and pairing CLI are not implemented yet. Only this
-module imports `cryptography`; the runtime, CLI and ring buffer stay stdlib-only.
+verification and no key-log support. The Agent still opens no listener. Only
+`node_tls` and the pairing CLI below import `cryptography`; the runtime, service
+CLI and ring buffer stay stdlib-only.
+
+`media_capture_agent.enroll` is the pairing CLI (run as the non-root service
+account; UID 0 is refused):
+
+```bash
+python -m media_capture_agent.enroll request --runtime-root <runtime_root> --output request.json
+python -m media_capture_agent.enroll pair --runtime-root <runtime_root> \
+    --trust-bundle bundle.json --bundle-sha256 <full digest shown on the Main>
+```
+
+`request` writes only public data (CSR and key digest) and prints the digest for
+the Owner to compare with the Main's approval prompt. `pair` refuses a bundle
+whose digest differs before any network traffic. It then authenticates the Main
+(TLS 1.3 pinned to the bundle CA, server name, enrollment ALPN protocol, the
+bundle's deployment URI on the Main certificate) and closes that connection.
+Only after that does it read the code from the non-echoing controlling-terminal
+prompt; hyphen groups and lowercase are accepted. It reconnects with the same
+verification, sends the code and CSR once, and installs the returned certificate
+only after validating it. There is no code argument, environment variable, stdin
+or URL input, and no plaintext or insecure mode.
 
 Automatic renewal (Owner decision 2026-09-30): `RenewalSchedule` starts 30 days
 before the installed certificate expires and backs off from 1 hour to at most

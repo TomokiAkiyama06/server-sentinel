@@ -108,6 +108,16 @@ class CredentialExpiry:
 
 
 @dataclass(frozen=True)
+class PairingSummary:
+    """Listing row for the local Owner CLI; contains no key material or digest."""
+
+    node_id: UUID
+    enrollment_state: str | None
+    credential_state: str | None
+    not_after: float | None
+
+
+@dataclass(frozen=True)
 class EnrollmentClaim:
     """A consumed enrollment awaiting a separately implemented signer."""
 
@@ -538,6 +548,29 @@ class PairingLedger:
                 "not_after = excluded.not_after",
                 (str(node), key, serial, expiry),
             )
+
+    def pairing_summaries(self) -> tuple[PairingSummary, ...]:
+        """Per-node enrollment/credential states for the local Owner CLI listing.
+
+        Only generated node UUIDs, fixed state words and credential expiry;
+        no code, key, serial or certificate digest.
+        """
+        with self._transaction(write=False) as connection:
+            rows = connection.execute(
+                "SELECT n.node_id, "
+                "(SELECT e.state FROM pairing_enrollments e WHERE e.node_id = n.node_id "
+                " ORDER BY e.rowid DESC LIMIT 1) AS enrollment_state, "
+                "c.state AS credential_state, c.not_after "
+                "FROM (SELECT node_id FROM pairing_enrollments UNION "
+                "      SELECT node_id FROM pairing_node_credentials) n "
+                "LEFT JOIN pairing_node_credentials c ON c.node_id = n.node_id "
+                "ORDER BY n.node_id LIMIT ?", (_MAX_EXPIRY_ROWS,),
+            ).fetchall()
+        return tuple(PairingSummary(
+            node_id=UUID(row["node_id"]), enrollment_state=row["enrollment_state"],
+            credential_state=row["credential_state"],
+            not_after=None if row["not_after"] is None else float(row["not_after"]))
+            for row in rows)
 
     def credential_expiries(self) -> tuple[CredentialExpiry, ...]:
         """Active credentials with a recorded expiry, for Owner-visible monitoring."""

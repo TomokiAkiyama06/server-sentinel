@@ -62,8 +62,33 @@ Every connection re-reads the ledger's active record; `still_admitted()` must be
 called before committing queued work and closes the session after revocation.
 `IngestListenerConfig` refuses wildcard binds and the human listener's
 address/port. Nothing starts this listener yet: the ingest core below and #14/#15
-own wiring, per-connection byte limits and connection counts. The bootstrap
-enrollment listener and the local approval CLI are not implemented.
+own wiring, per-connection byte limits and connection counts.
+
+## Bootstrap enrollment listener and local approval CLI (Issue #13)
+
+`enrollment.py` is the separate bootstrap listener of ADR-0006. It binds only an
+explicit private IP literal (no wildcard, multicast or public address, never the
+human or ingest socket address), speaks TLS 1.3 with the Main certificate and
+the ALPN protocol `serversentinel-capture-enroll/1`, and carries exactly one
+length-prefixed JSON request (`version`, `deployment_id`, `code`, `csr`) and one
+response (`issued` with the certificate, or a generic `refused`). It opens only
+for the approvals of the running `approve` command and closes when they
+complete or expire, or after too many refused requests. Explicit
+`EnrollmentLimits` bound frame sizes, concurrent connections, a single
+per-connection deadline and attempts per source address. Logs carry fixed
+reason words only.
+
+`pairing_cli.py` (`python -m app.cameras.remote_agent.pairing_cli`) is the local
+Owner CLI: `init`, `export-bundle`, `approve`, `list`, `revoke`. `approve` shows
+the request's key digest, requires a typed `APPROVE` on the controlling
+terminal, creates the pairing through `PairingLedger.approve`, writes the code
+once to the controlling terminal (never stdout, stderr, logs or files), and
+serves the listener in the same process (the ledger's process epoch makes
+approvals from other processes unusable; the HMAC key is per run and never
+stored). It refuses before any state change when there is no controlling
+terminal. Until #6 lands, Owner authority in this CLI is the local account that
+owns the issuer material and database plus one typed confirmation per
+approve/revoke; see the ADR-0006 follow-up notes.
 
 ## Transport-neutral bounded ingest core
 

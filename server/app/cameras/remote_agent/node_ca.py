@@ -423,6 +423,16 @@ class DeploymentAuthority:
         return self._sign_node(claim.node_id, public, key_digest, validity)
 
     @staticmethod
+    def enrollment_key_digest(csr_pem: bytes) -> str:
+        """Verify an enrollment CSR's proof of possession and return its key digest.
+
+        Used by the local approval CLI (to bind the approval to the requested
+        key) and the bootstrap listener (to find the approval). Subject and
+        extensions are ignored, as for issuance.
+        """
+        return DeploymentAuthority._proof_of_possession(csr_pem)[1]
+
+    @staticmethod
     def _proof_of_possession(csr_pem: bytes, *, strict: bool = False):
         """Return the CSR's EC P-256 public key and digest after verifying its signature.
 
@@ -520,6 +530,45 @@ def _is_ca(certificate: x509.Certificate) -> bool:
         return certificate.extensions.get_extension_for_class(x509.BasicConstraints).value.ca
     except x509.ExtensionNotFound:
         return False
+
+
+def deployment_id_of(directory: PrivateDirectory) -> UUID:
+    """Read the deployment UUID from the CA certificate's deployment SAN URI.
+
+    ``DeploymentAuthority.load`` still checks the key and certificate match.
+    """
+    try:
+        certificate = x509.load_pem_x509_certificate(directory.read(_CA_CERTIFICATE))
+    except CaptureAuthorityError:
+        raise
+    except (ValueError, TypeError):
+        raise CaptureAuthorityError("issuer material is invalid") from None
+    deployments = [uri for uri in _uris(certificate) if uri.startswith(DEPLOYMENT_URI_PREFIX)]
+    try:
+        if len(deployments) != 1:
+            raise ValueError
+        text = deployments[0][len(DEPLOYMENT_URI_PREFIX):]
+        deployment = UUID(text)
+        if str(deployment) != text:
+            raise ValueError
+    except ValueError:
+        raise CaptureAuthorityError("issuer material is invalid") from None
+    return deployment
+
+
+def main_server_name(directory: PrivateDirectory) -> str:
+    """Return the single DNS name of the Main listener certificate in ``directory``."""
+    try:
+        certificate = x509.load_pem_x509_certificate(directory.read(_SERVER_CERTIFICATE))
+        names = certificate.extensions.get_extension_for_class(
+            x509.SubjectAlternativeName).value.get_values_for_type(x509.DNSName)
+    except CaptureAuthorityError:
+        raise
+    except (ValueError, TypeError, x509.ExtensionNotFound):
+        raise CaptureAuthorityError("listener material is invalid") from None
+    if len(names) != 1 or not valid_server_name(names[0]):
+        raise CaptureAuthorityError("listener material is invalid")
+    return names[0]
 
 
 def listener_material(directory: PrivateDirectory) -> MainServerCredential:
