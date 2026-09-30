@@ -492,6 +492,32 @@ class RuntimeLifecycleTests(RuntimeFixture):
         self.assertEqual(19, runtime.status().health_logs_suppressed)
         self.assertEqual(22, len(runtime.recent_health_events()))
 
+    def test_manual_watch_helper_reports_events_after_bounded_buffer_evicts(self):
+        # scripts/manual/uvc_watch.py must keep reporting transitions of a
+        # flapping source after the bounded recent-event deque is full.
+        import importlib.util
+        from app.cameras.uvc.identity import HealthEvent
+        script = Path(__file__).resolve().parents[2] / "scripts" / "manual" / "uvc_watch.py"
+        spec = importlib.util.spec_from_file_location("uvc_watch_under_test", script)
+        watch = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(watch)
+        log = watch.HealthEventLog()
+        source_id = uuid4()
+        runtime = LocalUvcRuntime(
+            LocalUvcConfiguration((source_id,)), self.registry, on_frame=self.on_frame,
+            health_sink=log.sink, max_health_events=4,
+        )
+        logging.disable(logging.CRITICAL)
+        self.addCleanup(logging.disable, logging.NOTSET)
+        for index in range(10):
+            state = CameraState.OFFLINE if index % 2 else CameraState.DEGRADED
+            runtime._health(HealthEvent(source_id, state, f"synthetic-{index}"))
+        self.assertEqual(4, len(runtime.recent_health_events()))
+        self.assertEqual([f"synthetic-{i}" for i in range(10)], [e.reason for e in log.drain()])
+        runtime._health(HealthEvent(source_id, CameraState.ONLINE, "recovered"))
+        self.assertEqual(["recovered"], [e.reason for e in log.drain()])
+        self.assertEqual([], log.drain())
+
     def test_frame_rate_does_not_write_registry_per_frame(self):
         source = self.source()
         runtime = self.runtime(source.id)

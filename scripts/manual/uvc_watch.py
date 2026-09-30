@@ -9,7 +9,8 @@ private SQLite state in --state-dir. Output contains only logical labels
 (src1/src2), health states, reasons, fps and descriptor counts — no serials,
 device paths, by-id names or USB ports.
 
-Usage (normal non-root user in group `video`, from the repository root):
+Usage (normal non-root user in group `video`, from the repository root;
+SERVER_DIR is optional and defaults to this checkout's server directory):
   SERVER_DIR=server python scripts/manual/uvc_watch.py --state-dir DIR [--approve] [--seconds N]
 
 --state-dir must be OUTSIDE the repository; keep it between runs to test
@@ -23,15 +24,17 @@ from contextlib import closing, contextmanager
 import hashlib
 import os
 from pathlib import Path
+import queue
 import sys
 import time
 
-sys.path.insert(0, os.environ["SERVER_DIR"])
+sys.path.insert(0, os.environ.get("SERVER_DIR", str(Path(__file__).resolve().parents[2] / "server")))
 from app.audit import AuditStore, OwnerAuditService  # noqa: E402
 from app.audit.integration import OwnerAdministration  # noqa: E402
 from app.cameras.registry import CameraRegistry, CaptureProfile, SourceType  # noqa: E402
 from app.cameras.uvc.config import LocalUvcConfiguration  # noqa: E402
 from app.cameras.uvc.discovery import LinuxDiscovery  # noqa: E402
+from app.cameras.uvc.runtime import LocalUvcDependencies  # noqa: E402
 from app.main import create_app  # noqa: E402
 from app.settings import Settings  # noqa: E402
 from app.storage.database import Database  # noqa: E402
@@ -48,6 +51,30 @@ class Owner:
 @contextmanager
 def admitted():
     yield
+
+
+class HealthEventLog:
+    """Receives every health transition through the runtime's health sink.
+
+    recent_health_events() is a bounded deque that evicts old entries once
+    full, so its length is not a usable cursor during a long flapping run.
+    The sink sees each event exactly once; drain() returns what arrived since
+    the previous call. The queue is drained every second, so it stays small.
+    """
+
+    def __init__(self):
+        self._queue = queue.SimpleQueue()
+
+    def sink(self, event):
+        self._queue.put(event)
+
+    def drain(self):
+        events = []
+        while True:
+            try:
+                events.append(self._queue.get_nowait())
+            except queue.Empty:
+                return events
 
 
 def fds():
@@ -90,8 +117,10 @@ async def main():
     registry = CameraRegistry(db)
     admin = OwnerAdministration(OwnerAuditService(AuditStore(db), Owner()), CameraRegistry(db))
     counts = {i: 0 for i in ids}
+    log = HealthEventLog()
     app = create_app(settings, storage_reservation=admitted,
-                     local_uvc=LocalUvcConfiguration(tuple(ids), retry_delay_seconds=0.5))
+                     local_uvc=LocalUvcConfiguration(tuple(ids), retry_delay_seconds=0.5),
+                     local_uvc_dependencies=LocalUvcDependencies(health_sink=log.sink))
     async with app.router.lifespan_context(app):
         rt = app.state.local_uvc
         original = rt.adapter.on_frame
@@ -105,15 +134,12 @@ async def main():
                           key=lambda d: hashlib.sha256((d.serial or "").encode()).hexdigest())
             for sid, dev in zip(ids, devs):
                 rt.reapprove(admin, "hw-owner", sid, dev)
-        seen = 0
         end = time.monotonic() + a.seconds
         while time.monotonic() < end:
             before = dict(counts)
             await asyncio.sleep(1.0)
-            events = rt.recent_health_events()
-            for e in events[seen:]:
+            for e in log.drain():
                 print(f"  event src{ids.index(e.source_id) + 1}: {e.state.value} ({e.reason})", flush=True)
-            seen = len(events)
             parts = []
             for n, sid in enumerate(ids, 1):
                 s = registry.get_source(sid)
@@ -124,4 +150,6 @@ async def main():
     print("stopped:", app.state.local_uvc_state.value, "video_fds=%d audio_fds=%d" % fds())
 
 
-asyncio.run(main())
+
+if __name__ == "__main__":
+    asyncio.run(main())

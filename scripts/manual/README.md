@@ -7,4 +7,6 @@ a production runtime root.
 - `uvc_watch.py` — prints per-second health/fps/descriptor counts for two local
   UVC sources while cameras are unplugged, moved between ports or covered
   (`MANUAL_TEST.md` section A). Frames are counted and discarded; state lives in
-  a throwaway directory outside the repository.
+  a throwaway directory outside the repository. Every health transition is printed
+  through the runtime health sink, so none is lost when the bounded
+  recent-event buffer evicts entries during a long flapping run.

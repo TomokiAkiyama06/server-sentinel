@@ -125,15 +125,15 @@ launcher/systemd の各確認は未実施。Issue #11 はこの記録では clos
 ```text
 Date: 2026-09-30
 ServerSentinel version / Git commit: 83d387f (main)
-Main Ubuntu version / hardware: Ubuntu 26.04.1 LTS, kernel 7.0.0-31-generic, x86_64,
-  AMD Ryzen 9 9950X (16C/32T), RAM 約 121 GiB, NVIDIA RTX PRO 6000 Blackwell
-  （desktop session 常駐の開発機。専用 service account ではない）
+Main Ubuntu version / hardware: Ubuntu LTS の x86_64 desktop 機（multi-core CPU、
+  discrete GPU 搭載。desktop session 常駐の開発機で、専用 service account ではない）。
+  正確な OS/kernel・CPU・RAM・GPU は INTEGRITY-007 によりローカル記録のみ
 Capture-node: 未使用（remote_agent は対象外）
-Camera source(s) / model(s): EMEET SmartCam C960 × 2（同一 vendor/product、
-  各個体が一意の USB serial を報告。UVC 内蔵マイク付き）
-  advertised: MJPG 1920x1080/1280x960/1280x720/1024x576/960x720/800x600/640x480/
-  640x360 @30、YUYV 640x480/640x360 @30（4K 非対応）
-USB topology: 2 台とも同一 xHCI の USB 2.0 high-speed ポート（詳細はローカル記録のみ）
+Camera source(s) / model(s): serial 付き同型 USB UVC camera × 2（同一
+  vendor/product、各個体が一意の USB serial を報告。UVC 内蔵マイク付き）。
+  正確な model と advertised mode 一覧はローカル記録のみ。概略: MJPG は最大
+  1920x1080@30、YUYV は 640x480 以下 @30、4K 非対応
+USB topology: 2 台とも USB 2.0 high-speed 接続（controller・port はローカル記録のみ）
 Tester: Claude Code（Owner 指示による自動実行。実行ユーザーは video group の
   非 root ユーザー、sudo/root 不使用）
 ```
@@ -154,7 +154,7 @@ device path・USB port・source UUID は本記録に含めない（INTEGRITY-007
 | A-2 | 同型判定: 2 台の `model_key` は同一、serial-backed `strong_key` は 2 個で相異なる | PASS | 実機確認済み |
 | A-3 | `/dev/videoN` 非依存: A の承認 evidence の node path/番号/by-id/topology を B のものに置換しても `identity_matched` で**実 A** を選び B を選ばない | PASS | 実機 evidence + 論理置換（物理抜線なし） |
 | A-4 | A 不在で同型 B のみ存在（A 抜線相当をメモリ上で再現）: `offline` / `approved_device_absent`、B を bind しない | PASS | 実機 evidence のサブセット（物理抜線なし） |
-| A-5 | 非 serial 同型（serial を除去した evidence）: 2 台でも 1 台でも `manual_intervention_required` / `identity_not_unique`。重複 serial: `duplicate_identity` | PASS | 実機 evidence 由来の mock（C960 は serial 付きのため物理再現不可） |
+| A-5 | 非 serial 同型（serial を除去した evidence）: 2 台でも 1 台でも `manual_intervention_required` / `identity_not_unique`。重複 serial: `duplicate_identity` | PASS | 実機 evidence 由来の mock（使用機は serial 付きのため物理再現不可） |
 | A-6 | `local_uvc` 未構成で起動: `unconfigured`、`local_uvc_unconfigured` log、video/audio descriptor 0 | PASS | 実機確認済み |
 | A-7 | 構成済み・未承認: 2 秒間 両 source `offline`、discovery scan 0 回、video descriptor 0。未承認 idle の process CPU 0.25%（1 core 比） | PASS | 実機確認済み |
 | A-8 | Owner 承認（stand-in authorizer）後 0.60–0.72 秒で `online`、negotiated `1920x1080 30fps MJPG`、`approve_camera` 監査 1 件。非 Owner actor の承認は拒否され source は `offline` のまま | PASS（authorizer は stand-in） | 実機確認済み（部分） |
@@ -206,7 +206,7 @@ device path・USB port・source UUID は本記録に含めない（INTEGRITY-007
 4. **再起動 / 再列挙**: 観測用 state を保持したまま host を再起動（または両方を
    抜いて逆順に挿し直し node 番号を入れ替え）、service 相当を再起動。期待:
    `/dev/videoN` の再利用で別カメラを黙って bind しない。
-5. **非 serial 同型機（手順 7 / Ambiguous identical-device test）**: C960 は serial
+5. **非 serial 同型機（手順 7 / Ambiguous identical-device test）**: 使用機は serial
    付きのため不可。serial を報告しない同型 UVC 2 台を用意できる場合のみ実施し、
    抜き差し・並べ替えで `manual_intervention_required`、restart 後も latch 維持、
    明示再承認後にだけ復帰することを確認する。用意できなければ mock 確認のみのまま。
@@ -331,10 +331,10 @@ Choose defaults from measurements, not assumptions.
 
 #### 実機記録 2026-09-30: Main Server 上の local UVC capture resource（Issue #17）
 
-環境は A 節の 2026-09-30 記録と同じ（EMEET SmartCam C960 × 2、USB 2.0、非 root）。
+環境は A 節の 2026-09-30 記録と同じ（serial 付き同型 UVC × 2、USB 2.0、非 root）。
 実 `LocalUvcRuntime`（V4L2 MMAP、transcode なし、frame はメモリ上で件数のみ数えて
 破棄）を各 profile で 20 秒計測（warm-up 3 秒）。CPU は process 全体の CPU 時間 /
-経過時間（**1 core = 100%**、32 logical CPU 機）、RSS は FastAPI app 込みの process
+経過時間（**1 core = 100%**）、RSS は FastAPI app 込みの process
 全体。2 回目の計測（実配信 30 fps）を採用し、1 回目（露出で 16.65 fps に低下）は
 括弧内に示す。録画・encoder・viewer・推論・GPU 経路はまだ接続されていないため、
 これは **capture 取り込みだけ** の負荷であり、deployment default の根拠にはならない。
@@ -838,7 +838,7 @@ self-test・通知は runtime 未接続のため未実施）。識別子の値�
 | RAM | `dmidecode` は非 root で不可、DMI table は root 専用 0400 → `MEMORY` 全体 `UNVERIFIABLE` / `PROBE_UNAVAILABLE` | 実機確認済み（Owner 判断が必要） |
 | NVMe | serial / WWID と容量・model を取得。再取得との比較 `OK` | 実機確認済み |
 | SATA HDD | 容量・model のみ。`UNIQUE_ID_UNAVAILABLE` | **FAIL（下記 重要-3）** |
-| GPU | NVIDIA dGPU は UUID / serial / PCI を取得して `OK`。CPU 内蔵 GPU は一意 ID なしで `UNVERIFIABLE` | 実機確認済み |
+| GPU | discrete GPU は UUID / serial / PCI を取得して `OK`。CPU 内蔵 GPU は一意 ID なしで `UNVERIFIABLE` | 実機確認済み |
 | SMART / NVMe health | 非 root で `smartctl` 不可 → 2 台とも `UNVERIFIABLE`（正常扱いしない） | 実機確認済み |
 | baseline なし | 全 kind `UNVERIFIABLE` / `BASELINE_REQUIRED` | 実機確認済み |
 | repr | `Component` の repr に location / 識別子を含まない | 実機確認済み |
