@@ -255,7 +255,8 @@ class ReservationAdministration:
     Validation runs after Owner authorization. The persisted set
     (``ListenerExceptionStore.write_on``) and the ``change_security_setting``
     audit record commit in one SQLite transaction; only after that commit is
-    the set applied to the in-memory check, which immediately re-checks. A
+    the set applied to the in-memory check, which immediately re-checks; the
+    check's ``exception_change_lock`` serializes that whole sequence. A
     refused actor gets a bounded ``denied`` record and changes nothing; an
     invalid set or a failed write/append gets a ``failed`` record, rolls back,
     and changes nothing. This class registers no route.
@@ -277,11 +278,14 @@ class ReservationAdministration:
             self.store.write_on(connection, staged.exceptions)
             return staged
 
-        change = self.service.execute_transactional(
-            actor_context, action=AuditAction.CHANGE_SECURITY_SETTING,
-            target_kind=TargetKind.SECURITY_SETTINGS,
-            target_logical_id=RESERVATION_LISTENER_EXCEPTIONS_ID,
-            prepare=lambda: self.check.stage_listener_exceptions(exceptions),
-            operation=persist,
-        )
-        return self.check.apply_audited_listener_exceptions(change)
+        # One change at a time from stage to apply: otherwise an older, wider
+        # set could be applied after a newer, narrower one had committed.
+        with self.check.exception_change_lock:
+            change = self.service.execute_transactional(
+                actor_context, action=AuditAction.CHANGE_SECURITY_SETTING,
+                target_kind=TargetKind.SECURITY_SETTINGS,
+                target_logical_id=RESERVATION_LISTENER_EXCEPTIONS_ID,
+                prepare=lambda: self.check.stage_listener_exceptions(exceptions),
+                operation=persist,
+            )
+            return self.check.apply_audited_listener_exceptions(change)

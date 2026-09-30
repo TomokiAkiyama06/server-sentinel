@@ -49,15 +49,20 @@ appended separately. See `server/app/audit/README.md`.
 
 `reservation.py` verifies, and does not prevent, the dedicated-hostname
 reservation. `HostnameReservationCheck.startup()` and the daily `tick()` run an
-injected listener enumerator (`ProcNetListeners`, parsing `/proc/net/tcp` and
-`/proc/net/tcp6` text from an injected reader) and an injected proxy-route
+injected listener enumerator (`ProcNetListeners`, parsing `/proc/net/tcp`,
+`/proc/net/tcp6`, `/proc/net/udp` and `/proc/net/udp6` text from an injected
+reader) and an injected proxy-route
 enumerator (`ServeStatusRoutes`, parsing Tailscale Serve status JSON from an
 injected source). `access_open` is `False` until a check passes, and any of the
 following closes it:
 
-- a TCP listener other than the recorded proxy sockets on a reserved address,
-  a wildcard (`0.0.0.0` / `::`) listener, or an IPv4-mapped equivalent, on any
-  port, unless it is a wildcard bind covered by an Owner listener exception;
+- a TCP LISTEN or unconnected UDP socket (for example HTTP/3/QUIC) other than
+  the recorded proxy sockets on a reserved address, a wildcard (`0.0.0.0` /
+  `::`) listener, or an IPv4-mapped equivalent, on any port, unless it is a
+  wildcard bind covered by an Owner listener exception. Recorded proxy sockets
+  are TCP at the configured origin port only; a proxy socket on any other port
+  of the reserved name is refused as configuration. Connected UDP client
+  sockets answer only their peer and are not counted;
 - any Serve route other than the single `https://<host>:<port>/` proxy to the
   loopback human listener (other paths, ports, `http`, raw TCP forwards, empty
   TLS listeners, Funnel), or a duplicate of it;
@@ -73,25 +78,30 @@ check is retried every five minutes, re-notifying only when the reasons change,
 and a later passing check reopens access. A process binding the reserved
 address between two checks is not seen until the next check: detection bounds
 the exposure window, and only the Owner-recorded deployment isolation removes
-it. `/proc/net` covers one network namespace and TCP only (UDP/QUIC listeners
-are not enumerated).
+it. `/proc/net` covers one network namespace.
 
-Owner listener exceptions (`ListenerException`: protocol `tcp`, port,
+Owner listener exceptions (`ListenerException`: protocol `tcp` or `udp`, port,
 optional address family, bind scope `wildcard`) let a system service such as
-`sshd` on 22 bind a wildcard address without closing access. The set is empty
+`sshd` on tcp/22 or `tailscaled` on its UDP port bind a wildcard address without
+closing access. An exception covers only its own protocol. `/proc/net` does not
+show `IPV6_V6ONLY` and a `::` socket may also accept IPv4, so a `::` bind is
+treated as dual-stack: only an exception without a family covers it, an `ipv4`
+exception covers `0.0.0.0` only, and an `ipv6`-only exception is rejected. The set is empty
 by default, typed, bounded to 16 entries, and is never read from deployment
 configuration. An exception never matches the dashboard port, the loopback
-human listener port or a recorded proxy socket port, and never matches a bind
+human listener port or a recorded proxy socket port (for either protocol, so
+UDP/443 is never exempt), and never matches a bind
 to a reserved address: `100.64.x.y:22` still closes access when `0.0.0.0:22`
 is allowed. The only runtime path that changes it is
 `app.audit.integration.ReservationAdministration`, which authorizes the Owner,
 writes the set and a `change_security_setting` audit record in one SQLite
 transaction, then applies the set and re-checks immediately so narrowing it
-closes access at once. `reservation_store.ListenerExceptionStore` persists the
+closes access at once. Concurrent changes are serialized from staging through
+apply, so the live set always matches the latest committed one. `reservation_store.ListenerExceptionStore` persists the
 set as versioned JSON under one fixed key of the foundation
 `application_metadata` key/value table (no migration), and `startup()` loads it
 before the first check. A missing row is the empty default; an unreadable,
-corrupt, or no longer valid value (for example one covering the dashboard
+corrupt (including duplicate JSON members), or no longer valid value (for example one covering the dashboard
 port) loads as the empty set and emits a `LISTENER_EXCEPTIONS_UNREADABLE`
 Owner fault, never a wider set. Faults still carry only reasons and counts.
 

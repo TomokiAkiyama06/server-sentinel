@@ -4,8 +4,9 @@ The reserved hostname must serve this deployment alone on every scheme and
 port. That is a deployment obligation met by the Owner-recorded isolation
 (a dedicated network identity, or a single-purpose node enforced by OS/service
 policy outside this application). This module only *verifies what it can
-observe*: at startup and daily it enumerates the actual TCP listening sockets
-that answer on the reserved addresses and the proxy (Tailscale Serve) routes,
+observe*: at startup and daily it enumerates the actual TCP listening and
+unconnected UDP sockets that answer on the reserved addresses and the proxy
+(Tailscale Serve) routes,
 and returns a closed verdict on any other answer, a missing mapping, an
 unstated isolation mode, or an enumeration that fails or times out.
 
@@ -40,6 +41,10 @@ ENUMERATION_TIMEOUT_SECONDS = 10.0
 MAX_PROC_NET_LINES = 1_000_000
 MAX_SERVE_STATUS_BYTES = 1_048_576
 TCP_LISTEN = "0A"
+# An unconnected UDP socket shows the kernel's TCP_CLOSE state; it accepts
+# datagrams from any peer (for example HTTP/3/QUIC). A connected one (01)
+# answers only its peer and gets a concrete local address from connect().
+UDP_UNCONNECTED = "07"
 
 Address = ipaddress.IPv4Address | ipaddress.IPv6Address
 _HOSTNAME = re.compile(r"(?=.{1,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*")
@@ -81,6 +86,7 @@ class CheckKind(StrEnum):
 
 class TransportProtocol(StrEnum):
     TCP = "tcp"
+    UDP = "udp"
 
 
 class AddressFamily(StrEnum):
@@ -101,9 +107,14 @@ MAX_PENDING_FAULTS = 8
 class ListenerException:
     """One Owner-allowed wildcard system listener, for example ``sshd`` on 22.
 
-    It matches only a wildcard (``0.0.0.0`` / ``::``) TCP bind on ``port`` in
-    ``family`` (``None`` for both). A bind of the same port to a reserved
-    address still closes access, as does every port not listed.
+    It matches only a wildcard (``0.0.0.0`` / ``::``) bind of ``protocol`` on
+    ``port`` in ``family`` (``None`` for both). A bind of the same port to a
+    reserved address still closes access, as does every port not listed.
+
+    ``/proc/net/{tcp6,udp6}`` does not show ``IPV6_V6ONLY``, and a ``::``
+    socket also accepts IPv4 unless that option is set, so a ``::`` bind is
+    treated as dual-stack: only an exception without a family covers it. An
+    IPv6-only exception could therefore never be verified and is rejected.
     """
 
     port: int
@@ -115,26 +126,30 @@ class ListenerException:
         if (type(self.port) is not int or not 1 <= self.port <= 65535
                 or not isinstance(self.protocol, TransportProtocol)
                 or (self.family is not None and not isinstance(self.family, AddressFamily))
+                or self.family is AddressFamily.IPV6
                 or not isinstance(self.scope, BindScope)):
             raise ValueError("INVALID_LISTENER_EXCEPTION")
 
     def matches(self, listener: "Listener") -> bool:
         address = listener.address
-        family = AddressFamily.IPV4 if address.version == 4 else AddressFamily.IPV6
-        return (self.protocol is TransportProtocol.TCP and self.scope is BindScope.WILDCARD
+        # A ``::`` bind may be dual-stack, so only an unrestricted exception covers it.
+        family = AddressFamily.IPV4 if address.version == 4 else None
+        return (self.protocol is listener.protocol and self.scope is BindScope.WILDCARD
                 and address.is_unspecified and listener.port == self.port
                 and (self.family is None or self.family is family))
 
 
 @dataclass(frozen=True)
 class Listener:
-    """One TCP socket in LISTEN state within the enumerated network namespace."""
+    """One TCP LISTEN or unconnected UDP socket in the enumerated network namespace."""
 
     address: Address
     port: int
+    protocol: TransportProtocol = TransportProtocol.TCP
 
     def __post_init__(self):
-        if not isinstance(self.address, (ipaddress.IPv4Address, ipaddress.IPv6Address)):
+        if not isinstance(self.address, (ipaddress.IPv4Address, ipaddress.IPv6Address)) \
+                or not isinstance(self.protocol, TransportProtocol):
             raise ValueError("INVALID_LISTENER")
         if type(self.port) is not int or not 0 <= self.port <= 65535:
             raise ValueError("INVALID_LISTENER")
@@ -173,7 +188,7 @@ class ProxyRoute:
 
 class ListenerEnumerator(Protocol):
     def listeners(self) -> Iterable[Listener]:
-        """Return every TCP LISTEN socket; raise when that cannot be established."""
+        """Return every TCP LISTEN and unconnected UDP socket; raise when that cannot be established."""
 
 
 class ProxyRouteEnumerator(Protocol):
@@ -191,7 +206,7 @@ class FaultSink(Protocol):
         """Deliver an Owner fault event; must not block indefinitely."""
 
 
-# -- /proc/net/tcp{,6} -------------------------------------------------------
+# -- /proc/net/{tcp,udp}{,6} -------------------------------------------------
 
 def _decode_address(text: str, *, ipv6: bool, byteorder: str) -> Address:
     width = 32 if ipv6 else 8
@@ -212,6 +227,20 @@ def parse_proc_net_tcp(text: str, *, ipv6: bool, byteorder: str = sys.byteorder)
     Only LISTEN sockets are returned. Anything not understood raises instead of
     being skipped, so a format change closes access rather than hiding a bind.
     """
+    return _parse_proc_net(text, ipv6=ipv6, byteorder=byteorder, protocol=TransportProtocol.TCP)
+
+
+def parse_proc_net_udp(text: str, *, ipv6: bool, byteorder: str = sys.byteorder) -> tuple[Listener, ...]:
+    """Parse ``/proc/net/udp`` (``ipv6=False``) or ``/proc/net/udp6`` text.
+
+    Only unconnected sockets, which accept datagrams from any peer, are
+    returned; the same strictness as ``parse_proc_net_tcp`` applies.
+    """
+    return _parse_proc_net(text, ipv6=ipv6, byteorder=byteorder, protocol=TransportProtocol.UDP)
+
+
+def _parse_proc_net(text: str, *, ipv6: bool, byteorder: str, protocol: TransportProtocol) -> tuple[Listener, ...]:
+    listening = TCP_LISTEN if protocol is TransportProtocol.TCP else UDP_UNCONNECTED
     if not isinstance(text, str):
         raise ReservationEnumerationError("MALFORMED_PROC_NET")
     lines = text.splitlines()
@@ -234,15 +263,16 @@ def parse_proc_net_tcp(text: str, *, ipv6: bool, byteorder: str = sys.byteorder)
         if not re.fullmatch(r"[0-9A-Fa-f]{4}", port):
             raise ReservationEnumerationError("MALFORMED_PROC_NET")
         decoded = _decode_address(address, ipv6=ipv6, byteorder=byteorder)
-        if state == TCP_LISTEN:
-            result.append(Listener(decoded, int(port, 16)))
+        if state == listening:
+            result.append(Listener(decoded, int(port, 16), protocol))
     return tuple(result)
 
 
 class ProcNetListeners:
-    """Enumerate TCP listeners from an injected ``/proc/net`` reader.
+    """Enumerate TCP and UDP listeners from an injected ``/proc/net`` reader.
 
-    ``read`` receives ``"tcp"`` or ``"tcp6"`` and returns that file's text. It
+    ``read`` receives ``"tcp"``, ``"tcp6"``, ``"udp"`` or ``"udp6"`` and
+    returns that file's text. It
     sees only the network namespace it runs in; with a dedicated network
     namespace the check must run inside the namespace holding the reserved
     address.
@@ -256,7 +286,9 @@ class ProcNetListeners:
 
     def listeners(self) -> tuple[Listener, ...]:
         return (parse_proc_net_tcp(self._read("tcp"), ipv6=False, byteorder=self._byteorder)
-                + parse_proc_net_tcp(self._read("tcp6"), ipv6=True, byteorder=self._byteorder))
+                + parse_proc_net_tcp(self._read("tcp6"), ipv6=True, byteorder=self._byteorder)
+                + parse_proc_net_udp(self._read("udp"), ipv6=False, byteorder=self._byteorder)
+                + parse_proc_net_udp(self._read("udp6"), ipv6=True, byteorder=self._byteorder))
 
 
 # -- Tailscale Serve status -------------------------------------------------
@@ -405,10 +437,11 @@ class ReservationConfig:
 
     ``hostname``/``port`` form the configured ``https://<host>[:<port>]``.
     ``reserved_addresses`` are every address the name resolves to on this node
-    (IPv4 and IPv6). ``human_listener`` is the loopback upstream the proxy
-    forwards to. ``proxy_listeners`` are sockets the proxy itself is expected
-    to hold on a reserved address (empty when the proxy intercepts without a
-    visible socket). ``isolation`` stays ``None`` until the Owner states it;
+    (IPv4 and IPv6). ``human_listener`` is the loopback TCP upstream the proxy
+    forwards to. ``proxy_listeners`` are TCP sockets the proxy itself is
+    expected to hold on a reserved address at the configured ``port`` (empty
+    when the proxy intercepts without a visible socket); any other port on the
+    reserved name is another answer for its cookies, so it is never exempted. ``isolation`` stays ``None`` until the Owner states it;
     ``None`` or any non-``IsolationMode`` value keeps access closed.
     """
 
@@ -432,11 +465,12 @@ class ReservationConfig:
             raise ValueError("INVALID_RESERVATION_CONFIG")
         object.__setattr__(self, "reserved_addresses", addresses)
         if (not isinstance(self.human_listener, Listener) or not self.human_listener.address.is_loopback
-                or self.human_listener.port == 0):
+                or self.human_listener.port == 0 or self.human_listener.protocol is not TransportProtocol.TCP):
             # ADR-0003: the upstream binds an explicit loopback address.
             raise ValueError("INVALID_RESERVATION_CONFIG")
         proxies = frozenset(self.proxy_listeners)
-        if any(not isinstance(item, Listener) or item.address not in addresses or item.port == 0
+        if any(not isinstance(item, Listener) or item.address not in addresses or item.port != self.port
+               or item.protocol is not TransportProtocol.TCP
                for item in proxies):
             raise ValueError("INVALID_RESERVATION_CONFIG")
         object.__setattr__(self, "proxy_listeners", proxies)
@@ -507,10 +541,10 @@ def evaluate(config: ReservationConfig, listeners, routes,
         seen_human = False
         for listener in listeners:
             address = _normalize(listener.address)
-            if Listener(address, listener.port) == config.human_listener:
+            normalized = Listener(address, listener.port, listener.protocol)
+            if normalized == config.human_listener:
                 seen_human = True
                 continue
-            normalized = Listener(address, listener.port)
             # A wildcard bind answers on every address, the reserved ones
             # included, unless the Owner explicitly allowed that port.
             if any(item.matches(normalized) for item in exceptions):
@@ -576,6 +610,9 @@ class HostnameReservationCheck:
         self._utcnow = utcnow
         self._lock = threading.Lock()
         self._check_lock = threading.Lock()
+        # Held by ``ReservationAdministration`` across stage, audited commit and
+        # apply, so the applied set always follows the durable commit order.
+        self.exception_change_lock = threading.Lock()
         self._verdict = CLOSED
         self._last_check: float | None = None
         self._last_notified: tuple[Reason, ...] | None = None

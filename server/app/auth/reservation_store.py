@@ -40,11 +40,19 @@ def encode(exceptions) -> str:
     return json.dumps({"version": FORMAT_VERSION, "exceptions": entries}, separators=(",", ":"))
 
 
+def _no_duplicates(pairs):
+    keys = [key for key, _ in pairs]
+    if len(keys) != len(set(keys)):
+        # ``json.loads`` would otherwise keep the last member silently.
+        raise ValueError("duplicate member")
+    return dict(pairs)
+
+
 def decode(text) -> frozenset:
     if not isinstance(text, str) or len(text.encode()) > MAX_STORED_BYTES:
         raise ListenerExceptionStoreError("LISTENER_EXCEPTIONS_UNREADABLE")
     try:
-        document = json.loads(text)
+        document = json.loads(text, object_pairs_hook=_no_duplicates)
         if (not isinstance(document, dict) or set(document) != {"version", "exceptions"}
                 or type(document["version"]) is not int or document["version"] != FORMAT_VERSION
                 or not isinstance(document["exceptions"], list)

@@ -884,7 +884,7 @@ by the Issue #6 synthetic policy model.
   (dedicated network identity, or single-purpose node) actually prevents that
   bind, since the application cannot.
 - Hostname reservation check module (`server/app/auth/reservation.py`, Issue
-  #10 slice S1): its tests use synthetic `/proc/net/tcp`/`tcp6` text and
+  #10 slice S1): its tests use synthetic `/proc/net/{tcp,tcp6,udp,udp6}` text and
   synthetic Serve status JSON only. The real `tailscale serve status --json`
   output format is **unverified**; the parser assumes a `TCP` / `Web` /
   `AllowFunnel` shape and fails closed on anything else. On the installed
@@ -896,7 +896,9 @@ by the Issue #6 synthetic policy model.
   whether reading status needs anything beyond local operator access (it must
   not need ACL/Grants changes or admin credentials).
 - On the target host, compare the parsed `/proc/net/tcp` and `/proc/net/tcp6`
-  listeners with `ss -ltnH` for IPv4, IPv6, wildcard and IPv4-mapped binds,
+  listeners with `ss -ltnH`, and the parsed `/proc/net/udp` and
+  `/proc/net/udp6` unconnected sockets with `ss -lunH`, for IPv4, IPv6,
+  wildcard and IPv4-mapped binds,
   and record whether Tailscale Serve holds a visible socket on the Tailscale
   address (which decides the recorded proxy sockets). Run the check in the
   network namespace that holds the reserved address when the dedicated
@@ -912,8 +914,14 @@ by the Issue #6 synthetic policy model.
   persisted exception is loaded before the first check and access opens;
   corrupt the stored `application_metadata` value on a disposable copy and
   confirm startup uses no exceptions (access closed) and the Owner receives
-  a `LISTENER_EXCEPTIONS_UNREADABLE` fault. UDP/QUIC listeners are not
-  enumerated.
+  a `LISTENER_EXCEPTIONS_UNREADABLE` fault. Record which wildcard UDP sockets
+  the node holds (for example `tailscaled`'s WireGuard port): confirm each
+  closes access until the Owner adds a `udp` exception for that port, that a
+  `tcp` exception on the same port does not cover it, and that a UDP socket
+  bound to the Tailscale address on 443 (for example a test QUIC server)
+  closes access. Confirm on the host whether its `::` listeners are dual-stack
+  (`net.ipv6.bindv6only`, per-socket `IPV6_V6ONLY`); the check assumes they
+  are and needs an exception without a family for them.
 - Once the check is composed into startup and the daily worker, confirm an
   enumeration failure or timeout (for example stopping `tailscaled`, or making
   `/proc/net` unreadable) keeps human access closed and notifies the Owner,

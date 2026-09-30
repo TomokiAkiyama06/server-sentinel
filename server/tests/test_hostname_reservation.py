@@ -18,8 +18,8 @@ from app.audit.integration import RESERVATION_LISTENER_EXCEPTIONS_ID, Reservatio
 from app.auth.reservation import (
     AddressFamily, CheckKind, HostnameReservationCheck, IsolationMode, Listener, ListenerException,
     ProcNetListeners, ProxyRoute, Reason, ReservationConfig, ReservationEnumerationError,
-    ReservationFault, RouteKind, ServeStatusRoutes, evaluate, parse_proc_net_tcp,
-    parse_serve_status,
+    ReservationFault, RouteKind, ServeStatusRoutes, TransportProtocol, evaluate, parse_proc_net_tcp,
+    parse_proc_net_udp, parse_serve_status,
 )
 from app.auth.reservation_store import STORE_KEY, ListenerExceptionStore, decode, encode
 from app.storage.database import Database
@@ -70,9 +70,11 @@ def config(isolation=IsolationMode.SINGLE_PURPOSE_NODE, **overrides):
 
 
 class Files:
-    def __init__(self, tcp=None, tcp6=None):
+    def __init__(self, tcp=None, tcp6=None, udp=None, udp6=None):
         self.files = {"tcp": tcp if tcp is not None else proc(("127.0.0.1", 8080, "0A")),
-                      "tcp6": tcp6 if tcp6 is not None else proc(ipv6=True)}
+                      "tcp6": tcp6 if tcp6 is not None else proc(ipv6=True),
+                      "udp": udp if udp is not None else proc(),
+                      "udp6": udp6 if udp6 is not None else proc(ipv6=True)}
 
     def __call__(self, name):
         value = self.files[name]
@@ -198,14 +200,38 @@ class ConfigTests(TestCase):
                dict(reserved_addresses=frozenset({ipaddress.IPv4Address("127.0.0.1")})),
                dict(reserved_addresses=frozenset({ipaddress.IPv6Address("::ffff:100.64.0.10")})),
                dict(hostname="Not A Host"), dict(port=0),
-               dict(proxy_listeners=frozenset({Listener(ipaddress.IPv4Address("100.64.0.99"), 443)})))
+               dict(proxy_listeners=frozenset({Listener(ipaddress.IPv4Address("100.64.0.99"), 443)})),
+               # A proxy socket is exempt only at the configured origin port.
+               dict(proxy_listeners=frozenset({Listener(V4, 8443)})),
+               dict(proxy_listeners=frozenset({Listener(V6, 80)})),
+               dict(proxy_listeners=frozenset({Listener(V4, 443, TransportProtocol.UDP)})),
+               dict(human_listener=Listener(ipaddress.IPv4Address("127.0.0.1"), 8080, TransportProtocol.UDP)))
         for overrides in bad:
             with self.subTest(overrides=overrides), self.assertRaises(ValueError):
                 config(**overrides)
 
+    def test_proxy_listener_must_be_at_the_configured_port(self):
+        cfg = config(port=8443, proxy_listeners=frozenset({Listener(V4, 8443)}))
+        self.assertEqual(cfg.proxy_listeners, frozenset({Listener(V4, 8443)}))
+        with self.assertRaises(ValueError):
+            config(proxy_listeners=frozenset({Listener(V4, 443), Listener(V4, 8443)}))
+
     def test_ipv6_upstream_url(self):
         cfg = config(human_listener=Listener(ipaddress.IPv6Address("::1"), 8080))
         self.assertEqual(cfg.upstream, "http://[::1]:8080")
+
+
+class ProcNetUdpTests(TestCase):
+    def test_only_unconnected_udp_sockets_are_listeners(self):
+        text = proc(("0.0.0.0", 41641, "07"), ("100.64.0.10", 53000, "01"), ("100.64.0.10", 443, "07"))
+        self.assertEqual(parse_proc_net_udp(text, ipv6=False, byteorder="little"),
+                         (Listener(ipaddress.IPv4Address("0.0.0.0"), 41641, TransportProtocol.UDP),
+                          Listener(V4, 443, TransportProtocol.UDP)))
+        self.assertEqual(parse_proc_net_udp(proc((str(V6), 443, "07"), ipv6=True), ipv6=True,
+                                            byteorder="little"),
+                         (Listener(V6, 443, TransportProtocol.UDP),))
+        with self.assertRaises(ReservationEnumerationError):
+            parse_proc_net_udp("garbage", ipv6=False)
 
 
 class ReservationCheckTests(TestCase):
@@ -303,6 +329,25 @@ class ReservationCheckTests(TestCase):
         reasons, _, extra = evaluate(config(), (HUMAN,), (route, route))
         self.assertEqual(reasons, (Reason.UNEXPECTED_ROUTE,))
         self.assertEqual(extra, 1)
+
+    def test_udp_listener_on_reserved_name_closes(self):
+        cases = {
+            "quic on reserved v4": Files(udp=proc(("100.64.0.10", 443, "07"))),
+            "quic on reserved v6": Files(udp6=proc((str(V6), 443, "07"), ipv6=True)),
+            "wildcard v4": Files(udp=proc(("0.0.0.0", 41641, "07"))),
+            "wildcard v6": Files(udp6=proc(("::", 41641, "07"), ipv6=True)),
+            "v4-mapped v6": Files(udp6=proc(("::ffff:100.64.0.10", 443, "07"), ipv6=True)),
+        }
+        for name, files in cases.items():
+            with self.subTest(name):
+                check, _, _, sink = checker(files=files)
+                check.startup()
+                self.assertClosed(check, Reason.UNEXPECTED_LISTENER)
+                self.assertEqual(sink.events[-1].unexpected_listeners, 1)
+        # Loopback/LAN UDP and connected client sockets do not answer for the name.
+        check, *_ = checker(files=Files(udp=proc(("127.0.0.53", 53, "07"), ("192.168.1.20", 5353, "07"),
+                                                 ("100.64.0.10", 53000, "01"))))
+        self.assertTrue(check.startup().open)
 
     def test_human_listener_absent_closes(self):
         check, *_ = checker(files=Files(tcp=proc()))
@@ -470,7 +515,7 @@ class ExceptionFixture(TestCase):
         self.exception_store = ListenerExceptionStore(self.database)
 
     def admin(self, files):
-        check, _, _, sink = checker(files=Files(files.files["tcp"], files.files["tcp6"]),
+        check, _, _, sink = checker(files=Files(**files.files),
                                     exception_store=self.exception_store)
         return ReservationAdministration(self.service, check), check, sink
 
@@ -515,6 +560,74 @@ class ListenerExceptionTests(ExceptionFixture):
             "synthetic-owner-session", {ListenerException(22, family=AddressFamily.IPV4)})
         self.assertFalse(verdict.open)
         self.assertEqual(verdict.reasons, (Reason.UNEXPECTED_LISTENER,))
+
+    def test_ipv6_wildcard_needs_an_unrestricted_exception(self):
+        # ``::`` may accept IPv4 too (bindv6only=0), so an IPv4-only exception never covers it.
+        admin, check, _ = self.admin(Files(tcp6=proc(("::", 22, "0A"), ipv6=True)))
+        self.assertFalse(admin.set_listener_exceptions(
+            "synthetic-owner-session", {ListenerException(22, family=AddressFamily.IPV4)}).open)
+        self.assertTrue(admin.set_listener_exceptions("synthetic-owner-session", {SSH}).open)
+        self.assertFalse(ListenerException(22, family=AddressFamily.IPV4).matches(
+            Listener(ipaddress.IPv6Address("::"), 22)))
+        self.assertTrue(ListenerException(22, family=AddressFamily.IPV4).matches(
+            Listener(ipaddress.IPv4Address("0.0.0.0"), 22)))
+
+    def test_udp_exception_is_protocol_specific(self):
+        tailscaled = Files(udp=proc(("0.0.0.0", 41641, "07")), udp6=proc(("::", 41641, "07"), ipv6=True))
+        admin, check, _ = self.admin(tailscaled)
+        self.assertFalse(admin.set_listener_exceptions(
+            "synthetic-owner-session", {ListenerException(41641)}).open)
+        udp = ListenerException(41641, TransportProtocol.UDP)
+        self.assertTrue(admin.set_listener_exceptions("synthetic-owner-session", {udp}).open)
+        # A UDP exception never covers the dashboard port (HTTP/3 on the origin).
+        with self.assertRaises(ValueError):
+            admin.set_listener_exceptions("synthetic-owner-session", {ListenerException(443, TransportProtocol.UDP)})
+        # Nor a bind to a reserved address, nor TCP on the same port.
+        admin, check, _ = self.admin(Files(tcp=proc(("127.0.0.1", 8080, "0A"), ("0.0.0.0", 41641, "0A")),
+                                           udp=proc(("100.64.0.10", 41641, "07"))))
+        verdict = admin.set_listener_exceptions("synthetic-owner-session", {udp})
+        self.assertFalse(verdict.open)
+        self.assertEqual(check.verdict.reasons, (Reason.UNEXPECTED_LISTENER,))
+        self.assertEqual(decode(self.stored()), frozenset({udp}))
+
+    def test_concurrent_changes_apply_in_commit_order(self):
+        admin, check, _ = self.admin(WILDCARD_SSH)
+        wide, narrow = {SSH}, set()
+        committed, release = threading.Event(), threading.Event()
+        original = check.apply_audited_listener_exceptions
+        calls = []
+
+        def paused_apply(change):
+            calls.append(change.exceptions)
+            if len(calls) == 1:
+                # The wider change has committed; pause it before it applies.
+                committed.set()
+                release.wait(5)
+            return original(change)
+
+        errors = []
+
+        def run(exceptions):
+            try:
+                admin.set_listener_exceptions("synthetic-owner-session", exceptions)
+            except BaseException as error:  # pragma: no cover - surfaced below
+                errors.append(error)
+
+        with patch.object(check, "apply_audited_listener_exceptions", side_effect=paused_apply):
+            first = threading.Thread(target=run, args=(wide,))
+            first.start()
+            self.assertTrue(committed.wait(5))
+            second = threading.Thread(target=run, args=(narrow,))
+            second.start()
+            second.join(0.5)
+            release.set()
+            first.join(5)
+            second.join(5)
+        self.assertEqual(errors, [])
+        # The durable latest change and the live set agree: the narrowing is not undone.
+        self.assertEqual(decode(self.stored()), frozenset())
+        self.assertEqual(check.listener_exceptions, frozenset())
+        self.assertFalse(check.access_open)
 
     def test_same_port_on_reserved_address_still_closes(self):
         for files in (Files(tcp=proc(("127.0.0.1", 8080, "0A"), ("100.64.0.10", 22, "0A"))),
@@ -567,7 +680,9 @@ class ListenerExceptionTests(ExceptionFixture):
 
     def test_exception_type_is_validated(self):
         for kwargs in (dict(port=0), dict(port=70000), dict(port="22"), dict(port=22, family="ipv4"),
-                       dict(port=22, protocol="udp"), dict(port=True)):
+                       dict(port=22, protocol="udp"), dict(port=True),
+                       # A ``::`` bind may be dual-stack; an IPv6-only exception is unverifiable.
+                       dict(port=22, family=AddressFamily.IPV6)):
             with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
                 ListenerException(**kwargs)
 
@@ -604,7 +719,12 @@ class ListenerExceptionPersistenceTests(ExceptionFixture):
                    '{"version": 2, "exceptions": []}',
                    '{"version": 1, "exceptions": "*"}',
                    '{"version": 1, "exceptions": [{"port": 22}]}',
-                   '{"version": 1, "exceptions": [{"protocol": "udp", "port": 22, "family": null, "scope": "wildcard"}]}',
+                   '{"version": 1, "exceptions": [{"protocol": "sctp", "port": 22, "family": null, "scope": "wildcard"}]}',
+                   '{"version": 1, "exceptions": [{"protocol": "tcp", "port": 22, "family": "ipv6", "scope": "wildcard"}]}',
+                   # Duplicate members must not silently keep the last value.
+                   '{"version": 1, "exceptions": [{"protocol": "tcp", "port": 443, "port": 22,'
+                   ' "family": null, "scope": "wildcard"}]}',
+                   '{"version": 1, "version": 1, "exceptions": []}',
                    '{"version": 1, "exceptions": [{"protocol": "tcp", "port": 0, "family": null, "scope": "wildcard"}]}',
                    '{"version": 1, "exceptions": [{"protocol": "tcp", "port": 22, "family": null, "scope": "any"}]}',
                    '{"version": 1, "exceptions": [{"protocol": "tcp", "port": 22, "family": null, "scope": "wildcard"},'
