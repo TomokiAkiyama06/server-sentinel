@@ -240,6 +240,33 @@ class ModelSmokeWorkerAuditTests(unittest.TestCase):
         with self.assertRaises(detector_model_smoke.SmokeFailure):
             self.check("smoke_adapter_outbound_at_evaluation")
 
+    def test_every_swallowed_dns_entry_point_fails_the_smoke(self):
+        # gethostbyname(_ex)/gethostbyaddr/getnameinfo raise their own audit
+        # events, not socket.getaddrinfo.
+        for lookup in detector_worker_fakes.LOOKUPS:
+            with self.subTest(lookup=lookup), \
+                    self.assertRaises(detector_model_smoke.SmokeFailure):
+                self.check(f"smoke_adapter_{lookup}")
+
+    def test_parent_hook_records_every_dns_entry_point(self):
+        # The parent process uses the same event set; checked in a child so
+        # this test runner's own process never gains an audit hook.
+        tests = Path(__file__).resolve().parent
+        program = (
+            "import sys\n"
+            f"sys.path[:0] = [{str(tests)!r}, {str(tests.parent)!r}]\n"
+            "import detector_model_smoke, detector_worker_fakes\n"
+            "sys.addaudithook(detector_model_smoke.reject_outbound)\n"
+            "for name in detector_worker_fakes.LOOKUPS:\n"
+            "    before = len(detector_model_smoke._attempts)\n"
+            "    detector_worker_fakes._swallowed_lookup(name)\n"
+            "    if len(detector_model_smoke._attempts) == before:\n"
+            "        print(name); sys.exit(3)\n"
+            "sys.exit(0)\n")
+        completed = subprocess.run([sys.executable, "-c", program],
+                                   cwd=tests.parent, capture_output=True, timeout=60)
+        self.assertEqual(completed.returncode, 0, completed.stdout.decode(errors="replace"))
+
     def test_worker_attempt_still_fails_the_smoke_under_python_optimize(self):
         # `python -O` strips `assert`; the failure must not depend on it.
         tests = Path(__file__).resolve().parent

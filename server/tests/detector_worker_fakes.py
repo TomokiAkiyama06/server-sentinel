@@ -73,10 +73,21 @@ def motion(pixel_delta, changed_fraction):
     return MotionBaseline(pixel_delta=pixel_delta, changed_fraction=changed_fraction)
 
 
-def _swallowed_lookup():
-    # Local name only; the refusal is swallowed like a careless library would.
+# Every Python DNS entry point, each with its own audit event name. Local
+# names/addresses only; the audit hook refuses before any resolver runs.
+LOOKUPS = {
+    "getaddrinfo": lambda: socket.getaddrinfo("localhost", None),
+    "gethostbyname": lambda: socket.gethostbyname("localhost"),
+    "gethostbyname_ex": lambda: socket.gethostbyname_ex("localhost"),
+    "gethostbyaddr": lambda: socket.gethostbyaddr("127.0.0.1"),
+    "getnameinfo": lambda: socket.getnameinfo(("127.0.0.1", 0), 0),
+}
+
+
+def _swallowed_lookup(lookup="getaddrinfo"):
+    # The refusal is swallowed like a careless library would.
     try:
-        socket.getaddrinfo("localhost", None)
+        LOOKUPS[lookup]()
     except Exception:
         pass
 
@@ -96,6 +107,18 @@ def smoke_adapter(implementation, **_arguments):
 def smoke_adapter_outbound_at_start(implementation, **_arguments):
     _swallowed_lookup()
     return _smoke_adapter("absent", implementation)
+
+
+def _lookup_at_start(lookup):
+    def factory(implementation, **_arguments):
+        _swallowed_lookup(lookup)
+        return _smoke_adapter("absent", implementation)
+    return factory
+
+
+# One importable factory per DNS entry point, e.g. `smoke_adapter_gethostbyaddr`.
+for _lookup in LOOKUPS:
+    globals()[f"smoke_adapter_{_lookup}"] = _lookup_at_start(_lookup)
 
 
 def smoke_adapter_outbound_at_evaluation(implementation, **_arguments):

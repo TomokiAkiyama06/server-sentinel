@@ -160,27 +160,35 @@ def _outcomes(measurements: list[_Measurement]) -> dict[str, int]:
     return dict(sorted(counts.items()))
 
 
-def _frame(source_index: int, sequence: int, size: int) -> RgbFrame:
+def _pixels(size: int) -> bytes:
+    return bytes(size * size * 3)
+
+
+def _frame(source_index: int, sequence: int, size: int, pixels: bytes) -> RgbFrame:
     return RgbFrame(UUID(int=source_index + 1), UUID(int=source_index + 101),
-                    sequence, size, size, bytes(size * size * 3))
+                    sequence, size, size, pixels)
 
 
 def _measure(config: BenchmarkConfig, detectors: list[Detector],
              timer_ns: Callable[[], int]) -> list[list[_Measurement]]:
     size = ADAPTERS[config.adapter].input_size
+    # One immutable buffer, reused: allocation/zeroing is not inference work.
+    pixels = _pixels(size)
     measurements: list[list[_Measurement]] = [[] for _ in detectors]
     for detector in detectors:
         detector.reset()
     for cycle in range(config.warmup_cycles):
         for source_index, detector in enumerate(detectors):
-            result = detector.evaluate(_frame(source_index, cycle, size))
+            result = detector.evaluate(_frame(source_index, cycle, size, pixels))
             if not isinstance(result, Detection):
                 raise ValueError("detector returned an invalid result")
     for cycle in range(config.measured_cycles):
         sequence = config.warmup_cycles + cycle
         for source_index, detector in enumerate(detectors):
+            # Built before the timer starts so only evaluate() is measured.
+            frame = _frame(source_index, sequence, size, pixels)
             started = timer_ns()
-            result = detector.evaluate(_frame(source_index, sequence, size))
+            result = detector.evaluate(frame)
             finished = timer_ns()
             if not isinstance(result, Detection):
                 raise ValueError("detector returned an invalid result")
@@ -193,6 +201,7 @@ def _measure(config: BenchmarkConfig, detectors: list[Detector],
 def _replay(config: BenchmarkConfig, measurements: list[list[_Measurement]],
             implementation: str, version: str) -> list[SourceSnapshot]:
     size = ADAPTERS[config.adapter].input_size
+    pixels = _pixels(size)
     clock = _SimulationClock()
     scheduler = InferenceScheduler(clock_ns=clock, maximum_sources=config.sources)
     policy = SourcePolicy(
@@ -216,7 +225,7 @@ def _replay(config: BenchmarkConfig, measurements: list[list[_Measurement]],
             captured_ns = capture_tick * config.capture_interval_ns
             clock.advance_to(captured_ns)
             for source_index in range(config.sources):
-                scheduler.offer(_frame(source_index, capture_tick, size),
+                scheduler.offer(_frame(source_index, capture_tick, size, pixels),
                                 quality=Quality.SUFFICIENT)
             capture_tick += 1
         clock.advance_to(finished_ns)
