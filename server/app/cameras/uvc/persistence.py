@@ -1,5 +1,6 @@
 """Private approved device evidence and durable ambiguity latch in SQLite."""
 
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass, field
 import json
 import sqlite3
@@ -44,10 +45,23 @@ class ApprovalStore:
 
     A new controller restores the latch, never a live capture binding. Storage
     errors abort the operation; they must never be replaced by an empty store.
+
+    ``reservation`` is the deployment storage admission: the session marker
+    writes this store commits itself are admitted by the Main storage policy
+    through commit. A refused admission raises the policy's bounded error and
+    nothing is written; the already durable marker then conservatively
+    requires Owner reapproval. The Owner approval itself is written on the
+    audited transaction, which holds its own admission.
     """
 
-    def __init__(self, database):
+    def __init__(self, database, *, reservation=None):
+        if reservation is not None and not callable(reservation):
+            raise ApprovalStorageError("UVC approval storage admission is invalid")
         self.database = database
+        self.reservation = reservation
+
+    def _admission(self):
+        return self.reservation() if self.reservation is not None else nullcontext()
 
     @staticmethod
     def _state(row):
@@ -106,6 +120,10 @@ class ApprovalStore:
             raise ApprovalStorageError("UVC approval state could not be saved") from None
 
     def start_session(self, source_id, initial_approved):
+        with self._admission():
+            return self._start_session(source_id, initial_approved)
+
+    def _start_session(self, source_id, initial_approved):
         """Arm recovery before any discovery/reconciliation decision is trusted.
 
         If a later ambiguity write cannot persist, the already durable active
@@ -151,6 +169,12 @@ class ApprovalStore:
     def save(self, source_id, approved, requires_approval, *, session_token, serial_ambiguous, release=False):
         if session_token is None:
             raise ApprovalStorageError("UVC approval session is not active")
+        with self._admission():
+            self._save(source_id, approved, requires_approval, session_token=session_token,
+                       serial_ambiguous=serial_ambiguous, release=release)
+
+    def _save(self, source_id, approved, requires_approval, *, session_token, serial_ambiguous,
+              release):
         evidence = json.dumps(asdict(approved), allow_nan=False, separators=(",", ":"))
         connection = None
         try:

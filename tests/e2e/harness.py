@@ -1,7 +1,8 @@
 """Deterministic adapters for mock E2E tests.
 
-The harness owns clocks and faults only. Product state transitions remain in
-the production cores exercised by the scenario tests.
+The harness owns clocks, faults, a synthetic filesystem quota and an outbound
+network guard only. Product state transitions remain in the production cores
+exercised by the scenario tests.
 """
 
 from contextlib import nullcontext
@@ -9,7 +10,10 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import math
 import os
+import sys
+import threading
 from pathlib import Path
+import unittest
 from uuid import UUID
 
 from app.cameras.registry import SourceHealthState, SourceType
@@ -204,8 +208,72 @@ def storage_reservation():
     return nullcontext()
 
 
+# Set by the required CI job, which runs as non-root with the hash-pinned
+# server runtime dependencies installed: no scenario may be skipped there.
+REQUIRE_FULL_COVERAGE = "E2E_REQUIRE_FULL_COVERAGE"
+AGENT_ROOT_REFUSED = ("media_capture_agent refuses UID 0 by design; "
+                      "run the E2E suite as a non-root user")
+
+
+def require_full_coverage() -> bool:
+    """Whether this run must execute every scenario path (set in required CI)."""
+    return os.environ.get(REQUIRE_FULL_COVERAGE) == "1"
+
+
+def skip_unless_full_coverage_required(reason: str):
+    """Skip locally with an explicit reason; fail where full coverage is required."""
+    if require_full_coverage():
+        raise AssertionError(reason)
+    raise unittest.SkipTest(reason)
+
+
+def require_non_root_agent() -> None:
+    """The Agent refuses root, so no Agent fixture can be built under UID 0."""
+    if os.geteuid() == 0:
+        skip_unless_full_coverage_required(AGENT_ROOT_REFUSED)
+
+
+SYNTHETIC_FILESYSTEM_UUID = "synthetic-filesystem-identity"
+
+
+def synthetic_stable_device(expected) -> bool:
+    """Stable-device port: accepts only the synthetic approved filesystem UUID.
+
+    The ephemeral test filesystem has no Owner-approved ``/dev/disk/by-uuid``
+    entry, so only this hardware identity lookup is synthetic.
+    """
+    return expected.filesystem_uuid == SYNTHETIC_FILESYSTEM_UUID
+
+
+def agent_cli_with_synthetic_stable_device(argv):
+    """Run the real Agent CLI with only the stable-device lookup synthetic.
+
+    Configuration loading, mount/ownership/space validation, Agent
+    construction, ``--check`` and shutdown remain production code.
+    """
+    from media_capture_agent import cli
+    from media_capture_agent.storage import MediaStore
+
+    original = cli.MediaStore
+    cli.MediaStore = lambda settings: MediaStore(settings, stable_device=synthetic_stable_device)
+    try:
+        return cli.main(argv)
+    finally:
+        cli.MediaStore = original
+
+
 def agent_settings(root: Path, node_id: UUID) -> Settings:
     """Build protected-path settings from an ephemeral local filesystem."""
+    return Settings.parse(agent_configuration(root, node_id), code_root=root / "code")
+
+
+def agent_configuration(root: Path, node_id: UUID) -> dict:
+    """Agent configuration document for an ephemeral local filesystem.
+
+    Every Agent fixture is built here, so a root run skips (or, in required
+    CI, fails) each Agent scenario instead of erroring in its setup.
+    """
+    require_non_root_agent()
     media, runtime = root / "media", root / "state"
     root.mkdir(mode=0o700)
     media.mkdir(mode=0o700)
@@ -216,16 +284,254 @@ def agent_settings(root: Path, node_id: UUID) -> Settings:
         mount = next(item.identity for item in read_mounts() if item.mount_id == mount_id)
     finally:
         os.close(descriptor)
-    return Settings.parse({
+    return {
         "node_id": str(node_id), "media_root": str(media), "runtime_root": str(runtime),
         "expected_mount": {
             "mount_point": str(mount.mount_point), "filesystem": mount.filesystem,
             "source": mount.source, "major": mount.major, "minor": mount.minor,
             "filesystem_root": str(mount.filesystem_root),
-            "filesystem_uuid": "synthetic-filesystem-identity",
+            "filesystem_uuid": SYNTHETIC_FILESYSTEM_UUID,
         },
         "service_uid": os.geteuid(), "safety_reserve_bytes": 4096,
         "max_segment_bytes": 16384, "heartbeat_seconds": 1,
         "clock_offset_limit_seconds": 2, "clock_uncertainty_limit_seconds": 0.5,
         "clock_step_limit_seconds": 0.1,
-    }, code_root=root / "code")
+    }
+
+
+class SyntheticQuota:
+    """Filesystem-space port: real statvfs shape with a synthetic free budget.
+
+    ``other`` models unrelated consumers of the same filesystem. Only owned
+    ``*.segment`` allocations under ``root`` count as ring usage.
+    """
+
+    def __init__(self, root: Path, capacity: int = 2 * 1024 * 1024 * 1024):
+        self.root, self.capacity, self.other = Path(root), capacity, 0
+
+    def used(self) -> int:
+        return sum(path.stat().st_blocks * 512 for path in self.root.glob("*.segment"))
+
+    def __call__(self, descriptor):
+        actual = os.fstatvfs(descriptor)
+        values = list(actual)
+        values[4] = max(0, (self.capacity - self.used() - self.other) // actual.f_frsize)
+        return os.statvfs_result(values)
+
+
+class OutboundNetworkForbidden(AssertionError):
+    pass
+
+
+_ACTIVE_NETWORK_GUARDS: list["NetworkGuard"] = []
+_NETWORK_GUARD_LOCK = threading.Lock()
+_NETWORK_AUDIT_HOOK_INSTALLED = False
+# CPython raises these audit events from the ``_socket`` C implementation, so
+# they fire for every Python caller (``socket``, ``_socket`` or a re-imported
+# alias) on every thread. send/sendall carry no event but need a prior connect.
+_NETWORK_AUDIT_EVENTS = {
+    "socket.connect": "connect", "socket.sendto": "sendto", "socket.sendmsg": "sendmsg",
+    "socket.getaddrinfo": "getaddrinfo", "socket.gethostbyname": "gethostbyname",
+    "socket.gethostbyaddr": "gethostbyaddr", "socket.getnameinfo": "getnameinfo",
+}
+
+
+def _network_audit_hook(event, args):
+    # Audit hooks cannot be removed, so the hook is inert unless a guard is active.
+    if not _ACTIVE_NETWORK_GUARDS or event not in _NETWORK_AUDIT_EVENTS:
+        return
+    with _NETWORK_GUARD_LOCK:
+        guard = _ACTIVE_NETWORK_GUARDS[-1] if _ACTIVE_NETWORK_GUARDS else None
+    if guard is not None:
+        name = _NETWORK_AUDIT_EVENTS[event]
+        guard._record_and_raise(name, guard._host(name, args))
+
+
+class NetworkGuard:
+    """Refuse and record every outbound socket attempt made by any thread.
+
+    Name resolution (every resolver in both ``socket`` and the ``_socket`` C
+    module) and connect/send entry points are replaced for the life of the
+    context, so telemetry, crash reporting or an unconfigured webhook would
+    surface as a recorded attempt instead of reaching a network. A process-wide
+    audit hook backs the patches below the Python wrappers, so direct
+    ``_socket.socket`` use or a resolver captured before the guard started is
+    refused and recorded as well.
+    """
+
+    # Every name/address resolver exposed by the stdlib socket modules.
+    RESOLVERS = ("getaddrinfo", "gethostbyname", "gethostbyname_ex",
+                 "gethostbyaddr", "getnameinfo")
+
+    def __init__(self):
+        self.attempts: list[tuple[str, str | None]] = []
+        self._patches = []
+        self._active = False
+
+    @staticmethod
+    def _host(name, args):
+        # Socket methods receive the socket first; module functions do not.
+        values = args[1:] if name in {"connect", "connect_ex", "sendto", "sendmsg"} else args
+        for value in values:
+            if isinstance(value, tuple) and value and isinstance(value[0], str):
+                return value[0]
+            if isinstance(value, str):
+                return value
+        return None
+
+    def _record_and_raise(self, name, host):
+        self.attempts.append((name, host))
+        raise OutboundNetworkForbidden(f"synthetic network guard refused {name}")
+
+    def _refuse(self, name):
+        def refused(*args, **_kwargs):
+            self._record_and_raise(name, self._host(name, args))
+        return refused
+
+    def __enter__(self):
+        global _NETWORK_AUDIT_HOOK_INSTALLED
+        import _socket
+        import socket
+        from unittest.mock import patch
+
+        targets = [
+            (socket.socket, "connect"), (socket.socket, "connect_ex"),
+            (socket.socket, "sendto"), (socket.socket, "sendmsg"),
+            (socket, "create_connection"),
+        ]
+        # ``socket`` re-exports the C resolvers from ``_socket``; patch both so
+        # a caller of either module is refused and recorded by its exact name.
+        for owner in (socket, _socket):
+            targets.extend((owner, name) for name in self.RESOLVERS)
+        try:
+            with _NETWORK_GUARD_LOCK:
+                if not _NETWORK_AUDIT_HOOK_INSTALLED:
+                    sys.addaudithook(_network_audit_hook)
+                    _NETWORK_AUDIT_HOOK_INSTALLED = True
+                _ACTIVE_NETWORK_GUARDS.append(self)
+                self._active = True
+            for owner, name in targets:
+                patcher = patch.object(owner, name, self._refuse(name))
+                patcher.start()
+                self._patches.append(patcher)
+            # send/sendall raise no audit event, so a socket connected before
+            # the guard could still transmit. Scan after activation (a connect
+            # racing the scan is refused by the hook) and fail closed.
+            preconnected = self._preconnected_peers(socket)
+            if preconnected:
+                self.attempts.extend(("preconnected", peer) for peer in preconnected)
+                raise OutboundNetworkForbidden(
+                    f"synthetic network guard found {len(preconnected)} socket(s) "
+                    "connected before the guard started")
+        except BaseException:
+            self.__exit__(None, None, None)
+            raise
+        return self
+
+    # Linux tcp_states.h: an unconnected socket is CLOSE and a listener is
+    # LISTEN; every other state (SYN_SENT, SYN_RECV, ESTABLISHED, ...) can
+    # complete or already has a handshake and would let send() transmit.
+    _TCP_IDLE_STATES = {7, 10}  # TCP_CLOSE, TCP_LISTEN
+
+    @staticmethod
+    def _proc_tcp_peers():
+        """Map socket inode to remote address from /proc/net/tcp{,6}."""
+        import ipaddress
+
+        peers = {}
+        for table, width in (("/proc/net/tcp", 4), ("/proc/net/tcp6", 16)):
+            try:
+                with open(table, encoding="ascii") as handle:
+                    rows = handle.read().splitlines()[1:]
+            except OSError:
+                continue
+            for row in rows:
+                fields = row.split()
+                try:
+                    raw = bytes.fromhex(fields[2].split(":")[0])
+                    # The kernel prints each 32-bit word in host byte order.
+                    packed = b"".join(raw[i:i + 4][::-1] for i in range(0, width, 4))
+                    peers[fields[9]] = str(ipaddress.ip_address(packed))
+                except (IndexError, ValueError):
+                    continue
+        return peers
+
+    @classmethod
+    def _preconnected_peers(cls, socket):
+        """Return peers of non-local sockets connected or connecting in this process.
+
+        Any socket that cannot be positively classified as idle is reported, so
+        the scan fails closed instead of skipping it.
+        """
+        import errno
+
+        local = {socket.AF_UNIX, getattr(socket, "AF_NETLINK", socket.AF_UNIX)}
+        inet = {socket.AF_INET, getattr(socket, "AF_INET6", socket.AF_INET)}
+        tcp_info = getattr(socket, "TCP_INFO", None)
+        try:
+            descriptors = os.listdir("/proc/self/fd")
+        except OSError as error:
+            raise OutboundNetworkForbidden(
+                "synthetic network guard cannot enumerate open sockets") from error
+        peers = []
+        proc_peers = None
+        for entry in descriptors:
+            try:
+                target = os.readlink(f"/proc/self/fd/{entry}")
+            except OSError:
+                continue  # closed while scanning, including listdir's own fd
+            if not target.startswith("socket:"):
+                continue
+            try:
+                duplicate = os.dup(int(entry))
+            except OSError as error:
+                if error.errno == errno.EBADF:
+                    continue  # closed after readlink
+                peers.append(f"unclassified:{target}")
+                continue
+            try:
+                probe = socket.socket(fileno=duplicate)
+            except OSError:
+                os.close(duplicate)
+                peers.append(f"unclassified:{target}")
+                continue
+            with probe:
+                if probe.family in local:
+                    continue
+                try:
+                    peer = probe.getpeername()
+                except OSError:
+                    peer = None
+                if peer is not None:
+                    peers.append(peer[0] if isinstance(peer, tuple) and peer else str(peer))
+                    continue
+                if probe.family not in inet:
+                    peers.append(f"unclassified:{target}")
+                    continue
+                if probe.type != socket.SOCK_STREAM:
+                    continue  # unconnected datagram/raw: sendto/sendmsg are refused
+                try:
+                    if tcp_info is None:
+                        raise OSError("TCP_INFO unavailable")
+                    state = probe.getsockopt(socket.IPPROTO_TCP, tcp_info, 1)[0]
+                except OSError:
+                    peers.append(f"unclassified:{target}")
+                    continue
+                if state in cls._TCP_IDLE_STATES:
+                    continue
+                # Still handshaking (e.g. non-blocking connect_ex in progress):
+                # getpeername() fails, but the handshake may complete later.
+                if proc_peers is None:
+                    proc_peers = cls._proc_tcp_peers()
+                inode = target[len("socket:["):-1]
+                peers.append(proc_peers.get(inode, f"connecting:{target}"))
+        return peers
+
+    def __exit__(self, *_):
+        while self._patches:
+            self._patches.pop().stop()
+        with _NETWORK_GUARD_LOCK:
+            if self._active:
+                _ACTIVE_NETWORK_GUARDS.remove(self)
+                self._active = False
+        return False

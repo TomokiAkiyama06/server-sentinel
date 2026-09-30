@@ -57,6 +57,10 @@ class PathStatus:
     discontinuities: int
     awaiting_keyframe: bool
     reason: str
+    # Selection state of the adapter this path currently holds (for example
+    # ``ready`` or ``software_fallback``), or None when no selecting adapter is
+    # held. Software fallback is correct output, not a health failure.
+    adapter_state: str | None = None
 
     @property
     def healthy(self) -> bool:
@@ -184,12 +188,22 @@ class _PacketPath:
         if not self._failed:
             self._reason = "closed"
 
+    def _adapter_state(self) -> str | None:
+        if self._adapter is None:
+            return None
+        try:
+            state = getattr(self._adapter, "selection_state", None)
+        except Exception:
+            return None
+        return state if isinstance(state, str) else None
+
     @property
     def status(self) -> PathStatus:
         return PathStatus(not self._closed, self._adapter is not None,
                           self._failed, len(self._queue), self._bytes,
                           self._dropped, self._skipped, self._discontinuities,
-                          self._awaiting_keyframe, self._reason)
+                          self._awaiting_keyframe, self._reason,
+                          self._adapter_state())
 
 
 @dataclass(frozen=True)
