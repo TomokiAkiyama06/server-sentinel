@@ -11,6 +11,7 @@ token exchange (``review_gate_app_token``) are separate adapters.
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import dataclass, field
 import hashlib
 import json
@@ -18,6 +19,7 @@ import os
 from pathlib import Path
 import re
 import stat
+import threading
 from typing import Any, Mapping, Protocol
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote
@@ -41,6 +43,11 @@ _CHECK_RUNS_ROUTE = re.compile(r"/repos/[^/?#%\\]+/[^/?#%\\]+/commits/[0-9a-f]{4
 _CHECK_RUNS_QUERY = re.compile(r"check_name=[A-Za-z0-9._~%-]+&app_id=[1-9][0-9]{0,18}"
                                r"&filter=all&per_page=100&page=[1-9][0-9]?")
 MAX_CHECK_RUN_PAGES = 10
+# Content-addressed Git objects: a response for one of these paths can never change.
+_IMMUTABLE_GIT_OBJECT = re.compile(
+    r"/repos/[^/?#%\\]+/[^/?#%\\]+/git/(?:commits/(?P<commit>[0-9a-f]{40})"
+    r"|trees/(?P<tree>[0-9a-f]{40})\?recursive=1)")
+MAX_CACHED_GIT_OBJECTS = 2 * _MAX_ANCESTRY_COMMITS
 
 
 class PublisherFailure(RuntimeError):
@@ -258,6 +265,86 @@ class UrllibGitHubTransport:
         body = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
         return _json_object(self._request("POST", path, token, body,
                                           "application/vnd.github+json"))
+
+
+class GitObjectCache:
+    """Bounded, thread-safe LRU of immutable Git commit and recursive tree responses.
+
+    Only content-addressed objects are held: a commit or tree SHA names exactly
+    one object, so a verified response can be reused by every later live
+    context read. Pull request, merge-ref and check-run state is mutable and is
+    never cached. Entries are stored serialized so callers cannot mutate them.
+    """
+
+    def __init__(self, max_entries: int = MAX_CACHED_GIT_OBJECTS) -> None:
+        if type(max_entries) is not int or max_entries <= 0:
+            raise PublisherFailure("invalid Git object cache bound")
+        self._max_entries = max_entries
+        self._entries: OrderedDict[str, str] = OrderedDict()
+        self._lock = threading.Lock()
+
+    def get(self, path: str) -> dict[str, Any] | None:
+        with self._lock:
+            raw = self._entries.get(path)
+            if raw is None:
+                return None
+            self._entries.move_to_end(path)
+        return json.loads(raw)
+
+    def put(self, path: str, value: dict[str, Any]) -> None:
+        try:
+            raw = json.dumps(value, separators=(",", ":"))
+        except (TypeError, ValueError, RecursionError):
+            return
+        with self._lock:
+            self._entries[path] = raw
+            self._entries.move_to_end(path)
+            while len(self._entries) > self._max_entries:
+                self._entries.popitem(last=False)
+
+
+def _verified_git_object(match: re.Match[str], value: Any) -> bool:
+    """Cache only a response that names the requested object and is complete."""
+    if not isinstance(value, dict):
+        return False
+    if match.group("commit"):
+        return value.get("sha") == match.group("commit") and isinstance(value.get("parents"), list)
+    return (value.get("sha") in (None, match.group("tree")) and value.get("truncated") is False
+            and isinstance(value.get("tree"), list))
+
+
+class CachingGitHubTransport:
+    """``GitHubTransport`` that reuses immutable Git objects from a ``GitObjectCache``.
+
+    Every other request, including all mutable state, goes to ``client``.
+    """
+
+    def __init__(self, client: GitHubTransport, cache: GitObjectCache) -> None:
+        if not isinstance(cache, GitObjectCache):
+            raise PublisherFailure("invalid Git object cache")
+        self._client = client
+        self._cache = cache
+
+    def get_json(self, path: str, token: str) -> dict[str, Any]:
+        match = _IMMUTABLE_GIT_OBJECT.fullmatch(path) if isinstance(path, str) else None
+        if match is None:
+            return self._client.get_json(path, token)
+        cached = self._cache.get(path)
+        if cached is not None:
+            return cached
+        value = self._client.get_json(path, token)
+        if _verified_git_object(match, value):
+            self._cache.put(path, value)
+        return value
+
+    def get_bytes(self, path: str, token: str, accept: str) -> bytes:
+        return self._client.get_bytes(path, token, accept)
+
+    def get_list(self, path: str, token: str) -> list[Any]:
+        return self._client.get_list(path, token)
+
+    def post_json(self, path: str, token: str, payload: dict[str, Any]) -> dict[str, Any]:
+        return self._client.post_json(path, token, payload)
 
 
 def _json_object(raw: bytes) -> dict[str, Any]:

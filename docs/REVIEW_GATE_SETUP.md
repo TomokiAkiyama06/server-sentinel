@@ -252,7 +252,8 @@ SHA, Check Run ID (once confirmed) and state (`publishing` / `success` /
 `revoking`).
 
 - `collect_and_publish(reviewer, pr_number, read_live_context, source, client,
-  credentials)` is one reconciliation pass, bound to `pr_number` and the
+  credentials)` (pass `read_live_context=None` in production to share the
+  immutable Git object cache described below) is one reconciliation pass, bound to `pr_number` and the
   configured repository: a live read naming another PR or repository fails
   before any ledger is touched (and supersedes `pr_number`'s standing
   success, which that pass could not verify). A `pass` for the ledger's current
@@ -378,6 +379,19 @@ a missing/malformed parent object, no common ancestor, or a criss-cross history
 with multiple best common ancestors fails closed. A deployment whose repository
 history exceeds the bound needs a separately reviewed, trusted graph collector;
 do not weaken or skip this proof.
+
+Because commit and recursive tree objects are content-addressed, the
+collector keeps one bounded LRU `GitObjectCache` (at most 8192 objects) and
+`collect_and_publish()` routes every GitHub read through
+`CachingGitHubTransport`. A commit object is cached only when its `sha`
+matches the requested SHA, and a tree only when it is complete (not
+`truncated`); nothing mutable (the pull request, the test-merge ref, check
+runs) is ever cached. Passing `read_live_context=None` makes the before,
+after and mismatch-confirmation reads and the `publish_success` re-read all
+use `collect_live_context` over that transport, so one passing reconciliation
+walks the ancestry once instead of three times, and later polls reuse it.
+Every live read still re-fetches the PR and merge ref, so a HEAD, base or
+test-merge change is always observed.
 
 Invalidate previous successes before rerunning either review. Handle PR opens,
 updates, retargets, reopenings, review reruns and base pushes; polling must also

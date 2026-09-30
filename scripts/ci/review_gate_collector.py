@@ -48,7 +48,9 @@ from typing import Any, Callable, Iterator, Mapping, Protocol
 
 from scripts.ci.review_gate_policy import (CHECK_NAMES, Context, PolicyFailure,
                                            successful_check_run_request)
-from scripts.ci.review_gate_publisher import (AppCredentials, GitHubTransport,
+from scripts.ci import review_gate_publisher
+from scripts.ci.review_gate_publisher import (AppCredentials, CachingGitHubTransport,
+                                              GitHubTransport, GitObjectCache,
                                               PublisherFailure, _secure_private_bytes,
                                               publish_revocation, publish_success,
                                               success_is_latest_attempt)
@@ -471,6 +473,9 @@ class ReviewCollector:
         # without the ledger recording it (the ``revoking`` write failed).
         # Their standing publication is never reused as the current success.
         self._unrecorded_revocations: set[tuple[int, int, str]] = set()
+        # Immutable commit/tree responses shared by every live-context read
+        # of every reconciliation pass (mutable PR state is always re-read).
+        self._git_objects = GitObjectCache()
 
     def _identity(self, reviewer: str) -> ProviderIdentity:
         identity = self._identities.get(reviewer) if isinstance(reviewer, str) else None
@@ -776,7 +781,7 @@ class ReviewCollector:
         return request
 
     def collect_and_publish(self, reviewer: str, pr_number: int,
-                            read_live_context: Callable[[], Context],
+                            read_live_context: Callable[[], Context] | None,
                             source: ReviewSource, client: GitHubTransport,
                             credentials: AppCredentials) -> CollectorDecision:
         """One reconciliation pass: collect, then publish or supersede.
@@ -797,11 +802,24 @@ class ReviewCollector:
         every live read that names another pull request or repository fails
         before any ledger is read or written, so a miswired reader can never
         produce, for another PR, an outcome whose revocation lands here.
+
+        With ``read_live_context=None`` (the production composition) every
+        live read -- before, after, a mismatch confirmation and the re-read in
+        ``publish_success`` -- is ``collect_live_context`` over ``client``
+        wrapped in this collector's ``GitObjectCache``: immutable commit and
+        tree objects (the complete merge-base ancestry walk) are fetched once
+        and reused across rechecks and later passes, while the PR, merge ref
+        and check runs are read fresh every time.
         """
         if type(pr_number) is not int or pr_number <= 0:
             raise CollectorFailure("invalid pull request number")
         self._identity(reviewer)
         repository_id = credentials.config.repository_id
+        client = CachingGitHubTransport(client, self._git_objects)
+        if read_live_context is None:
+            def read_live_context() -> Context:
+                return review_gate_publisher.collect_live_context(
+                    client, credentials.config, credentials.installation_token, pr_number)
 
         def bound_read() -> Context:
             live = read_live_context()

@@ -957,6 +957,140 @@ class GitHubReviewSourceTests(unittest.TestCase):
                 url(path)
 
 
+class FakeLiveGitHub(FakeCheckRuns):
+    """Serves a synthetic PR, its ancestry and trees, counting every read."""
+
+    def __init__(self, issuer, depth=40):
+        super().__init__(issuer)
+        def sha(n):
+            return f"{n:040x}"
+        self.graph = {sha(1): ()}
+        for n in range(2, depth + 1):  # shared linear history up to the merge base
+            self.graph[sha(n)] = (sha(n - 1),)
+        self.merge_base = sha(depth)
+        self.base = sha(0xB0000 + 1)
+        self.head = sha(0xA0000 + 1)
+        self.graph[self.base] = (self.merge_base,)
+        self.graph[self.head] = (self.merge_base,)
+        self.test_merge = sha(0xF0000 + 1)
+        self.reads: dict[str, int] = {}
+        self.corrupt: set[str] = set()
+        self.trees = {
+            self.base: {"sha": self.base, "truncated": False, "tree": [
+                {"path": "a.txt", "mode": "100644", "type": "blob", "sha": "1" * 40}]},
+            self.head: {"sha": self.head, "truncated": False, "tree": [
+                {"path": "a.txt", "mode": "100644", "type": "blob", "sha": "2" * 40}]},
+        }
+
+    def get_json(self, path, token):
+        self.reads[path] = self.reads.get(path, 0) + 1
+        repo = "/repos/owner/repository"
+        if path in self.corrupt:
+            return {"sha": "8" * 40, "parents": []}
+        if path == f"{repo}/pulls/12":
+            return {"number": 12, "base": {"ref": "main", "sha": self.base,
+                                           "repo": {"id": 900002}},
+                    "head": {"sha": self.head}}
+        if path == f"{repo}/git/ref/pull/12/merge":
+            return {"object": {"sha": self.test_merge}}
+        if path == f"{repo}/git/commits/{self.test_merge}":
+            return {"sha": self.test_merge,
+                    "parents": [{"sha": self.base}, {"sha": self.head}]}
+        if path.startswith(f"{repo}/git/commits/"):
+            sha = path.rsplit("/", 1)[1]
+            return {"sha": sha, "parents": [{"sha": p} for p in self.graph[sha]]}
+        if path.startswith(f"{repo}/git/trees/"):
+            return json.loads(json.dumps(self.trees[path.rsplit("/", 1)[1].split("?")[0]]))
+        return super().get_json(path, token)
+
+    def object_reads(self):
+        return {path: count for path, count in self.reads.items() if "/git/" in path
+                and "/git/ref/" not in path}
+
+
+class LiveContextCacheTests(unittest.TestCase):
+    """Immutable commit/tree objects are read once across live-context rechecks."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        root = Path(self.temp.name)
+        self.checkout = root / "checkout"
+        self.checkout.mkdir()
+        state = root / "state"
+        state.mkdir(mode=0o700)
+        self.clock = Clock()
+        self.issuer = gate.Issuer(900001, "synthetic-review-gate")
+        self.github = FakeLiveGitHub(self.issuer)
+        config = publisher.RuntimeConfig("owner/repository", 900002, self.issuer, 900003,
+                                         root / "key.pem")
+        self.credentials = publisher.AppCredentials(config, b"synthetic-key", "t" * 40)
+        self.collector = collector.ReviewCollector(
+            collector.LedgerStore(state, self.checkout), {"codex": identity()}, self.clock)
+        self.source = FakeSource()
+        self.live = publisher.collect_live_context(FakeLiveGitHub(self.issuer), config,
+                                                   "t" * 40, 12)
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def reconcile(self):
+        return self.collector.collect_and_publish("codex", 12, None, self.source,
+                                                  self.github, self.credentials)
+
+    def test_passing_reconciliation_reads_each_git_object_once(self):
+        self.collector.request_review("codex", self.live, self.source)
+        self.source.add(self.live.head_sha, START + RUNTIME + collector.CLOCK_SKEW_ALLOWANCE_SECONDS)
+        decision = self.reconcile()
+        self.assertEqual(decision.status, "pass")
+        self.assertEqual(decision.context, self.live)
+        self.assertEqual([post["conclusion"] for post in self.github.posts], ["success"])
+        objects = self.github.object_reads()
+        self.assertEqual(len(objects), len(self.github.graph) + 1 + 2)  # + test merge, trees
+        self.assertEqual(set(objects.values()), {1})
+        # Mutable PR and merge-ref state is read fresh for every recheck.
+        self.assertEqual(self.github.reads["/repos/owner/repository/pulls/12"], 3)
+        self.assertEqual(self.github.reads["/repos/owner/repository/git/ref/pull/12/merge"], 3)
+        # A later poll reuses the immutable objects as well.
+        self.assertEqual(self.reconcile().status, "pass")
+        self.assertEqual(set(self.github.object_reads().values()), {1})
+        self.assertEqual(self.github.reads["/repos/owner/repository/pulls/12"], 5)
+
+    def test_changed_mutable_state_is_still_seen(self):
+        self.collector.request_review("codex", self.live, self.source)
+        self.source.add(self.live.head_sha, START + RUNTIME + collector.CLOCK_SKEW_ALLOWANCE_SECONDS)
+        self.assertEqual(self.reconcile().status, "pass")
+        new_head = f"{0xA0000 + 2:040x}"
+        self.github.graph[new_head] = (self.github.head,)
+        self.github.trees[new_head] = self.github.trees[self.github.head]
+        self.github.head = new_head
+        self.github.test_merge = f"{0xF0000 + 2:040x}"
+        decision = self.reconcile()
+        self.assertEqual((decision.status, decision.reason),
+                         ("invalidated", "context_changed_since_request"))
+
+    def test_only_valid_content_addressed_objects_are_cached(self):
+        cache = publisher.GitObjectCache(max_entries=2)
+        transport = publisher.CachingGitHubTransport(self.github, cache)
+        repo = "/repos/owner/repository"
+        wrong = f"{repo}/git/commits/{'9' * 40}"
+        self.github.corrupt.add(wrong)  # answers with another object's identity
+        for _ in range(2):
+            transport.get_json(wrong, "t")
+        self.assertEqual(self.github.reads[wrong], 2)
+        for _ in range(2):
+            transport.get_json(f"{repo}/pulls/12", "t")
+        self.assertEqual(self.github.reads[f"{repo}/pulls/12"], 2)
+        paths = [f"{repo}/git/commits/{f'{n:040x}'}" for n in (1, 2, 3)]
+        for path in paths:
+            transport.get_json(path, "t")
+        value = transport.get_json(paths[2], "t")
+        value["parents"].append({"sha": "7" * 40})  # a caller's mutation never reaches the cache
+        self.assertEqual(transport.get_json(paths[2], "t")["parents"], [{"sha": f"{2:040x}"}])
+        transport.get_json(paths[0], "t")  # evicted by the bound
+        self.assertEqual(self.github.reads[paths[0]], 2)
+        self.assertEqual(self.github.reads[paths[2]], 1)
+
+
 logging.getLogger("server_sentinel").addHandler(logging.NullHandler())
 
 if __name__ == "__main__":
