@@ -214,7 +214,10 @@ code with the reviewed runtime installed. `AGENT_CLI` means
    refused (`root_refused`). Note the printed `public_key_sha256`.
 5. Carry `request.json` (public) to the Main. Run
    `MAIN_CLI approve --database <data_dir>/state.sqlite3 --authority-dir <ca_dir> --listener-dir <listener_dir> --request request.json --listen <ip>:<port>`
-   from an interactive terminal. Compare the displayed public-key SHA-256 with
+   from an interactive terminal (add `--human-host`/`--human-port` when the
+   dashboard does not use the default `127.0.0.1:8000`, for example `::1`, and
+   confirm `--listen` on that exact socket is refused with
+   `enrollment_listener_must_differ_from_other_listeners`). Compare the displayed public-key SHA-256 with
    step 4 and type `APPROVE`. Confirm the code appears only on that terminal,
    not in the command's stdout/stderr (redirect both to files to check), and
    that the same command from a non-interactive session (for example
@@ -238,8 +241,12 @@ code with the reviewed runtime installed. `AGENT_CLI` means
 9. With a fresh runtime root, repeat steps 4–5 and let the five minutes pass
    before typing the code: expect `enrollment closed: reason=expired` on the
    Main and a refused connection on the Agent. Reusing a code after success must
-   also fail (the listener has closed). An already-enrolled key cannot be
-   approved again (`approval_refused`), because a node key is bound to one node.
+   also fail (the listener has closed). A key stays bound to one node for
+   good: re-running `approve` with the same `request.json` after an
+   interrupted, expired or unacknowledged enrollment shows
+   `existing capture node: <uuid>` and re-enrolls that same node (a completed
+   enrollment replaces its current certificate); it never creates a second
+   node. After `revoke`, the key cannot be approved again (`approval_refused`).
 10. Start the ingest listener bound to the Main's private-LAN IP and a port
     distinct from the dashboard and bootstrap listeners; confirm the dashboard
     listener still binds loopback only and the ingest port answers no HTTP

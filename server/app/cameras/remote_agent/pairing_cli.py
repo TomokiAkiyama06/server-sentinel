@@ -290,7 +290,13 @@ def command_approve(args) -> int:
         csr, digest = parse_enrollment_request(
             _read_public_file(args.request, MAX_REQUEST_FILE_BYTES))
         del csr  # the Agent resubmits its CSR over TLS; the ledger stores only the digest
-        reserved = [("127.0.0.1", args.human_port)]
+        try:
+            human_host = ipaddress.ip_address(args.human_host)
+        except ValueError:
+            raise CliRefused("human_listener_must_be_loopback") from None
+        if not human_host.is_loopback:
+            raise CliRefused("human_listener_must_be_loopback")
+        reserved = [(str(human_host), args.human_port)]
         if args.ingest_listen is not None:
             reserved.append(args.ingest_listen)
         host, port = args.listen
@@ -299,6 +305,15 @@ def command_approve(args) -> int:
             config, build_enrollment_server_context(material.certificate_path, material.key_path),
             limits=EnrollmentLimits())
         ledger = _ledger(args.database)
+        # A key stays bound to its node for good, so a retry after an
+        # interrupted, expired or unacknowledged enrollment reuses that node.
+        try:
+            bound = ledger.bound_node(digest)
+        except PairingError:
+            raise CliRefused("approval_refused") from None
+        retry = "" if bound is None else (
+            f"  existing capture node: {bound}\n"
+            "  (retry: completing it replaces that node's current certificate)\n")
         listener.open()
         try:
             owner = LocalConsoleOwner()
@@ -306,11 +321,12 @@ def command_approve(args) -> int:
                 terminal,
                 "Capture-node enrollment request\n"
                 f"  public key SHA-256: {digest}\n"
+                f"{retry}"
                 "Compare it with the digest shown on the capture host.\n"
                 "Type APPROVE to approve this capture node: ",
                 "APPROVE")
             try:
-                approval, code = ledger.approve(owner, grant, node_id=uuid4(),
+                approval, code = ledger.approve(owner, grant, node_id=bound or uuid4(),
                                                 public_key_digest=digest)
             except PairingError:
                 raise CliRefused("approval_refused") from None
@@ -390,7 +406,10 @@ def _parser() -> argparse.ArgumentParser:
     approve.add_argument("--request", type=Path, required=True)
     approve.add_argument("--listen", type=_ip_endpoint, required=True,
                          help="private IP literal HOST:PORT for the bootstrap listener")
-    approve.add_argument("--human-port", type=int, default=8000)
+    approve.add_argument("--human-host", default="127.0.0.1",
+                         help="loopback IP of the human dashboard listener (SERVERSENTINEL_HUMAN_HOST)")
+    approve.add_argument("--human-port", type=int, default=8000,
+                         help="port of the human dashboard listener (SERVERSENTINEL_HUMAN_PORT)")
     approve.add_argument("--ingest-listen", type=_ip_endpoint, default=None)
     approve.set_defaults(handler=command_approve)
 

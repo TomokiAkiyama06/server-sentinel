@@ -549,6 +549,21 @@ class PairingLedger:
                 (str(node), key, serial, expiry),
             )
 
+    def bound_node(self, public_key_digest: str) -> UUID | None:
+        """The node a live (never revoked) key binding names, or ``None``.
+
+        Lets a retried Owner approval reuse the node the key is already bound
+        to (for good, see ``_refuse_foreign_key``) after an interrupted or
+        expired enrollment. A revoked key reports ``None``; approval still
+        refuses it.
+        """
+        key = _digest(public_key_digest, "public key digest")
+        with self._transaction(write=False) as connection:
+            row = connection.execute(
+                "SELECT node_id FROM pairing_key_bindings "
+                "WHERE public_key_digest = ? AND revoked = 0", (key,)).fetchone()
+        return None if row is None else UUID(row["node_id"])
+
     def pairing_summaries(self) -> tuple[PairingSummary, ...]:
         """Per-node enrollment/credential states for the local Owner CLI listing.
 

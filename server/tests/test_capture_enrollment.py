@@ -38,7 +38,7 @@ from app.cameras.remote_agent.node_ca import (
     DeploymentAuthority, PrivateDirectory, deployment_id_of, listener_material,
     main_server_name, public_key_digest,
 )
-from app.cameras.remote_agent.pairing import HmacCodeVerifier, PairingLedger
+from app.cameras.remote_agent.pairing import HmacCodeVerifier, PairingError, PairingLedger
 from app.storage.database import Database
 from app.storage.migrations import migrate
 from app.storage.schema import APPLICATION_MIGRATIONS
@@ -471,6 +471,92 @@ class PairingCliTests(EnrollmentHarness):
         status, _stdout, stderr = self.init(authority, listener, "--server-name", SERVER_NAME)
         self.assertEqual(0, status, stderr)
         self.assertEqual(SERVER_NAME, main_server_name(PrivateDirectory(listener)))
+
+    def test_init_rolls_back_the_ca_key_when_the_ca_certificate_write_fails(self):
+        authority = self.root / f"init-ca-{uuid4()}"
+        listener = self.root / f"init-listener-{uuid4()}"
+        real_write = PrivateDirectory.write_new
+
+        def failing_write(directory, name, value):
+            if name == "ca-certificate.pem":
+                raise pairing_cli.CaptureAuthorityError("issuer material could not be written")
+            return real_write(directory, name, value)
+        with patch.object(PrivateDirectory, "write_new", failing_write):
+            status, _stdout, stderr = self.init(authority, listener, "--server-name", SERVER_NAME)
+        self.assertEqual(2, status)
+        self.assertIn("issuer_material_rejected", stderr)
+        self.assertEqual([], sorted(os.listdir(authority)))
+        self.assertEqual([], sorted(os.listdir(listener)))
+        status, _stdout, stderr = self.init(authority, listener, "--server-name", SERVER_NAME)
+        self.assertEqual(0, status, stderr)
+
+    def test_issuer_file_open_failure_is_a_bounded_refusal(self):
+        directory = PrivateDirectory(self.root / f"open-fail-{uuid4()}")
+        directory.ensure()
+        real_open = os.open
+
+        def refusing_open(path, flags, *args, **kwargs):
+            if path == "ca-key.pem":
+                raise PermissionError(13, "synthetic")
+            return real_open(path, flags, *args, **kwargs)
+        with patch("app.cameras.remote_agent.node_ca.os.open", refusing_open):
+            with self.assertRaises(pairing_cli.CaptureAuthorityError):
+                directory.write_new("ca-key.pem", b"x")
+        self.assertFalse(directory.exists("ca-key.pem"))
+
+    def fake_terminal(self, answer="APPROVE"):
+        written = []
+
+        class Terminal:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def write(self, text):
+                written.append(text)
+
+            def read_line(self):
+                return answer
+
+            def close(self):
+                pass
+        return Terminal, written
+
+    def test_approve_reserves_the_configured_ipv6_loopback_human_listener(self):
+        path, _digest = self.request_file()
+        database = self.root / f"fresh-{uuid4()}.sqlite3"
+        terminal, _written = self.fake_terminal()
+        base = ["approve", "--database", str(database), "--authority-dir", str(self.root / "ca"),
+                "--listener-dir", str(self.root / "listener"), "--request", str(path)]
+        cases = (
+            (["--listen", "[::1]:8000", "--human-host", "::1", "--human-port", "8000"],
+             "enrollment_listener_must_differ_from_other_listeners"),
+            (["--listen", "[::1]:8000", "--human-host", "10.0.0.5", "--human-port", "8000"],
+             "human_listener_must_be_loopback"),
+            (["--listen", "[::1]:8000", "--human-host", "localhost", "--human-port", "8000"],
+             "human_listener_must_be_loopback"),
+        )
+        for extra, reason in cases:
+            with self.subTest(extra=extra):
+                stderr = io.StringIO()
+                with patch.object(pairing_cli, "ControllingTerminal", terminal), \
+                        patch("sys.stderr", stderr):
+                    status = pairing_cli.main(base + extra)
+                self.assertEqual(2, status)
+                self.assertIn(reason, stderr.getvalue())
+                self.assertFalse(database.exists())
+
+    def test_ledger_reports_the_live_node_bound_to_a_key(self):
+        _key, _csr, digest = node_request()
+        self.assertIsNone(self.ledger.bound_node(digest))
+        node = uuid4()
+        self.ledger.approve(Owner(), "owner", node_id=node, public_key_digest=digest)
+        self.assertEqual(node, self.ledger.bound_node(digest))
+        # A retried approval for the same node and key is accepted.
+        self.ledger.approve(Owner(), "owner", node_id=node, public_key_digest=digest)
+        self.ledger.revoke(Owner(), "owner", node_id=node)
+        self.assertIsNone(self.ledger.bound_node(digest))
+        with self.assertRaises(PairingError):
+            self.ledger.bound_node("not-a-digest")
 
     def test_list_shows_states_without_digests(self):
         _key, _csr, approval, _code = self.approve()

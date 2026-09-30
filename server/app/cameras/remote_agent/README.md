@@ -90,7 +90,11 @@ once to the controlling terminal (never stdout, stderr, logs or files), and
 serves the listener in the same process (the ledger's process epoch makes
 approvals from other processes unusable; the HMAC key is per run and never
 stored). It refuses before any state change when there is no controlling
-terminal. Until #6 lands, Owner authority in this CLI is the local account that
+terminal. `--human-host` (loopback IP) and `--human-port` name the dashboard
+listener so the bootstrap listener can never take its socket. A key already
+bound to a live node is re-approved for that same node (shown on the prompt),
+so an interrupted, expired or unacknowledged enrollment can be retried; a
+revoked key is refused. Until #6 lands, Owner authority in this CLI is the local account that
 owns the issuer material and database plus one typed confirmation per
 approve/revoke; see the ADR-0006 follow-up notes.
 

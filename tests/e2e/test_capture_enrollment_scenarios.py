@@ -469,6 +469,46 @@ class CaptureEnrollmentScenario(unittest.TestCase):
         self.assertEqual(1, output.count("node_id="), "a refused approval creates no pairing")
         self.assertNotIn(key_digest, output)
 
+    def test_interrupted_approval_is_retried_for_the_same_bound_node(self):
+        listen_port = free_port()
+        deployment, bundle, bundle_digest = self.initialise_main(listen_port)
+        request, key_digest = self.agent_request()
+        first, _grouped = self.start_approval(request, listen_port, key_digest)
+        first_node = UUID(first.process.stdout.readline().decode().split("node_id=")[1].strip())
+        first.kill()  # interrupted before the Agent redeemed the code
+
+        # The Agent re-exports the same pending key; the retried approval
+        # reuses the node the key is already bound to instead of failing.
+        main = self.main_cli("approve", "--database", self.database,
+                             "--authority-dir", self.authority_dir,
+                             "--listener-dir", self.listener_dir, "--request", request,
+                             "--listen", f"127.0.0.1:{listen_port}",
+                             "--human-port", self.human_port)
+        main.wait_for(b"Type APPROVE")
+        self.assertIn(f"existing capture node: {first_node}".encode(), main.transcript)
+        main.type(b"APPROVE\n")
+        grouped = main.wait_for(GROUPED_CODE).group(1)
+        main.wait_for(b"Type it only")
+        agent = self.agent_cli("pair", "--runtime-root", self.runtime, "--trust-bundle", bundle,
+                               "--bundle-sha256", bundle_digest)
+        agent.wait_for(b"Pairing code: ")
+        agent.type(grouped + b"\n")
+        status, output, error = agent.finish()
+        self.assertEqual(0, status, error)
+        self.assertEqual(f"paired: node_id={first_node}\n", output)
+        status, main_output, main_error = main.finish()
+        self.assertEqual(0, status, main_error)
+        self.assertIn(f"enrollment completed: node_id={first_node}", main_output)
+        session, result = self.ingest_connect(deployment)
+        self.assertEqual("ok", result)
+        self.assertNotIsInstance(session, str, session)
+        self.addCleanup(session.close)
+        self.assertEqual(first_node, session.identity.node_id)
+        listing = self.main_cli("list", "--database", self.database, tty=False)
+        status, output, error = listing.finish()
+        self.assertEqual(0, status, error)
+        self.assertEqual(1, output.count("node_id="), "a retry creates no second pairing")
+
     def test_untrusted_or_plaintext_main_never_receives_a_code(self):
         deployment, bundle, bundle_digest = self.initialise_main(free_port())
         self.agent_request()

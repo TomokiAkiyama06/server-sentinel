@@ -176,6 +176,8 @@ class PrivateDirectory:
                     0o600, dir_fd=directory)
             except FileExistsError:
                 raise CaptureAuthorityError("issuer material already exists") from None
+            except OSError:
+                raise CaptureAuthorityError("issuer material could not be written") from None
             try:
                 remaining = memoryview(value)
                 while remaining:
@@ -345,7 +347,16 @@ class DeploymentAuthority:
             .sign(key, hashes.SHA256())
         )
         directory.write_new(_CA_KEY, _private_pem(key))
-        directory.write_new(_CA_CERTIFICATE, _certificate_pem(certificate))
+        try:
+            directory.write_new(_CA_CERTIFICATE, _certificate_pem(certificate))
+        except BaseException:
+            # The key was created exclusively by this call; never strand it,
+            # or every corrected rerun is refused as existing issuer material.
+            try:
+                directory.discard_created(_CA_KEY)
+            except CaptureAuthorityError:
+                pass
+            raise
         return cls(deployment_id, certificate, key, clock=clock)
 
     @classmethod
