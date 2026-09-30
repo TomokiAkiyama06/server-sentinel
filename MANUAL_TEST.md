@@ -727,6 +727,21 @@ The synthetic CI tests do not complete these checks. On an isolated Capture Node
   pinning and no fallback-directory creation without altering production mounts.
 - [ ] Restart at storage hard stop: inventory and authorized cleanup remain
   possible; new allocations and installer `--check` fail until reserve is restored.
+- [ ] For each refused `--check` case above, confirm exit status 1 and exactly one
+  stderr line ending in the fixed reason code listed in `agent/README.md`
+  (`--check --json`: only `{"ok": false, "reason": ...}` on stdout), and that no
+  UUID, device number, path, mount source, size or username is printed. Expected
+  codes: wrong `filesystem_uuid` → `filesystem_uuid_mismatch`; wrong `major` or
+  `minor` → `mount_device_mismatch`; wrong `source` → `mount_source_mismatch`;
+  approved mount unmounted → `mount_missing` (media root absent) or
+  `media_root_on_root_filesystem` (media root path exists on `/`);
+  `mount_point` set to `/` while the media root is on a separate mount →
+  `mount_point_is_root`; mount replaced during checks → `mount_replaced`; a
+  same-device bind of another directory → `mount_identity_mismatch`; read-only
+  mount → `mount_readonly`; media root not writable by the service account →
+  `not_writable_by_service_account`; reserve above free space (including above
+  filesystem size) → `insufficient_free_space`; malformed/unprotected config →
+  `config_invalid`. A passing `--check` still prints the unchanged success line.
 - [ ] Confirm network observation after authenticated transport integration shows
   only Owner-configured Main communication, including error/reconnect paths.
 
