@@ -201,7 +201,12 @@ kernel log から確認した内容を示す。
 Issue #101 の要再確認項目:
 
 - [x] 手順 0: 識別・両 source `online`・`audio_fds=0`;
-- [x] 手順 1: `src1` のみ `offline`、service 継続、`src2` は取り違えなく自動復帰;
+- [x] 手順 1: 抜いた A の `src1` が `offline`（`approved_device_absent`）、service 継続、
+      同一バスの相互リセットで一時切断した B の `src2` は `identity_matched` で
+      取り違えなく自動復帰（影響を受けたのは `src1` だけではない。B の一時切断中に
+      `src2` が示した状態名は本記録に残しておらず、`src2` の isolation と切断中の
+      表示は下の 2 項目で不合格として扱う。この項目で合格とするのは `src1` の
+      `offline` 化・service 継続・取り違えのない復帰のみ）;
 - [ ] 手順 1: 触れていない `src2` が影響を受けず frame を出し続けること
       （不合格: 同一バスの相互リセットで一時切断。相互リセット自体は既知制約として
       許容。その間の表示は次項）;
