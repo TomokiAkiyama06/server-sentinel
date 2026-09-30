@@ -518,6 +518,49 @@ class RuntimeLifecycleTests(RuntimeFixture):
         self.assertEqual(["recovered"], [e.reason for e in log.drain()])
         self.assertEqual([], log.drain())
 
+    def test_manual_watch_helper_prints_events_raised_during_shutdown(self):
+        # Transitions arriving after the last timed drain and those produced
+        # while the lifespan stops must still be printed, also on error.
+        import contextlib
+        import importlib.util
+        import io
+        from types import SimpleNamespace
+        from app.cameras.uvc.identity import HealthEvent
+        script = Path(__file__).resolve().parents[2] / "scripts" / "manual" / "uvc_watch.py"
+        spec = importlib.util.spec_from_file_location("uvc_watch_under_test", script)
+        watch = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(watch)
+        source_id = uuid4()
+
+        for fail in (False, True):
+            with self.subTest(body_raises=fail):
+                log = watch.HealthEventLog()
+
+                @contextlib.asynccontextmanager
+                async def lifespan(_app):
+                    try:
+                        yield
+                    finally:
+                        log.sink(HealthEvent(source_id, CameraState.OFFLINE, "synthetic-closed"))
+
+                app = SimpleNamespace(router=SimpleNamespace(lifespan_context=lifespan))
+
+                async def body():
+                    log.sink(HealthEvent(source_id, CameraState.ONLINE, "synthetic-late"))
+                    if fail:
+                        raise RuntimeError("synthetic")
+
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    try:
+                        asyncio.run(watch.run_with_final_drain(app, log, [source_id], body))
+                    except RuntimeError:
+                        self.assertTrue(fail)
+                text = out.getvalue()
+                self.assertIn("src1: online (synthetic-late)", text)
+                self.assertIn("src1: offline (synthetic-closed)", text)
+                self.assertEqual([], log.drain())
+
     def test_frame_rate_does_not_write_registry_per_frame(self):
         source = self.source()
         runtime = self.runtime(source.id)

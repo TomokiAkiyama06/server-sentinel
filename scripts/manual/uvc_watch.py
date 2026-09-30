@@ -77,6 +77,25 @@ class HealthEventLog:
                 return events
 
 
+def print_events(log, ids):
+    for e in log.drain():
+        print(f"  event src{ids.index(e.source_id) + 1}: {e.state.value} ({e.reason})", flush=True)
+
+
+async def run_with_final_drain(app, log, ids, body):
+    """Run body inside the app lifespan, then print every remaining transition.
+
+    Transitions that arrive after the last timed drain, and the
+    capture-closed/offline transitions produced while the lifespan stops, are
+    only printed by the drain in the finally path (also on error/interrupt).
+    """
+    try:
+        async with app.router.lifespan_context(app):
+            await body()
+    finally:
+        print_events(log, ids)
+
+
 def fds():
     video = audio = 0
     for e in os.listdir("/proc/self/fd"):
@@ -121,7 +140,7 @@ async def main():
     app = create_app(settings, storage_reservation=admitted,
                      local_uvc=LocalUvcConfiguration(tuple(ids), retry_delay_seconds=0.5),
                      local_uvc_dependencies=LocalUvcDependencies(health_sink=log.sink))
-    async with app.router.lifespan_context(app):
+    async def body():
         rt = app.state.local_uvc
         original = rt.adapter.on_frame
 
@@ -138,8 +157,7 @@ async def main():
         while time.monotonic() < end:
             before = dict(counts)
             await asyncio.sleep(1.0)
-            for e in log.drain():
-                print(f"  event src{ids.index(e.source_id) + 1}: {e.state.value} ({e.reason})", flush=True)
+            print_events(log, ids)
             parts = []
             for n, sid in enumerate(ids, 1):
                 s = registry.get_source(sid)
@@ -147,8 +165,9 @@ async def main():
             v, au = fds()
             print(time.strftime("%H:%M:%S"), " ".join(parts), f"video_fds={v} audio_fds={au}",
                   f"service={rt.status().state.value}", flush=True)
-    print("stopped:", app.state.local_uvc_state.value, "video_fds=%d audio_fds=%d" % fds())
 
+    await run_with_final_drain(app, log, ids, body)
+    print("stopped:", app.state.local_uvc_state.value, "video_fds=%d audio_fds=%d" % fds())
 
 
 if __name__ == "__main__":
