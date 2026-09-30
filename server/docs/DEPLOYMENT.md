@@ -325,9 +325,11 @@ both only read the runtime tree.
 
 `record` stores, keyed by stable logical ID: each recording's source, status,
 starred flag, catalog start, target end and ended boundaries (recorded
-separately, since playback is clipped to the target end), and for every linked
-segment its source, catalog bounds and the SHA-256 of its file as read from
-disk; a per-row and a chained SHA-256 over every
+separately, since playback is clipped to the target end) and critical flag, and
+for every linked segment its source, catalog bounds, the catalog fields that
+control integrity, playback or retention (`byte_length`, `stream_id` /
+`sequence`, `codec`, `container`, capture node and critical flag) and the
+SHA-256 and size of its file as read from disk; a per-row and a chained SHA-256 over every
 retained `security_admin_audit_records` and `integrity_audit` row; registered
 camera source IDs and types; and Owner presence plus each principal's independent
 `live:view` / `recordings:view` grants, invitation redemption and revocation
@@ -342,10 +344,10 @@ counted as preserved. A finished recording must be identical, including its
 target and ended boundaries. A recording that was still active when recorded
 may gain segments, move its target end earlier but never later, and become
 `complete`, `gapped` or `interrupted` with an end after its start and no later
-than its target; its source, start and starred flag must not change, every
-segment it already had must be identical, and every current segment must come
-from the recording's own source, overlap its target window, be readable and
-match its catalog digest; anything else is `changed`. Starring or unstarring
+than its target; its source, start, starred and critical flags must not change,
+every segment it already had must be identical, and every current segment must
+come from the recording's own source, overlap its target window, be readable
+and match its catalog digest and byte length; anything else is `changed`. Starring or unstarring
 any recording between `record` and `verify` is also `changed` and stays a
 failure (Owner decision 2026-09-30): do not change stars during the lifecycle
 window; if one changed, investigate it and take a new baseline before the next
@@ -367,8 +369,10 @@ written if possible, since audit retention cleanup or a new recording between
 `record` and the lifecycle operation otherwise shows up in the comparison.
 
 Output files are created exclusively with mode `0600` and are refused inside
-the runtime root, inside the installed package or its virtual environment, and
-inside any Git checkout. Use an administrator-private directory outside those
+the runtime root, anywhere in the installation destination (every
+`releases/<version>` tree and the `current` / `previous` links, not only the
+running release's package and virtual environment), and inside any Git
+checkout. Use an administrator-private directory outside those
 trees. The console summary carries only statuses and counts; the files contain
 logical IDs and digests and stay deployment-local, never in GitHub.
 

@@ -3,9 +3,12 @@
 ``record`` captures, from a read-only view of the Main Server runtime tree:
 
 - per-recording content evidence keyed by the recording logical ID: a SHA-256
-  of every linked segment file as stored on disk with the segment's source and
-  catalog bounds, the starred flag, and the catalog start, target end and
-  ended boundaries (the manifest clips playback to the target end);
+  and size of every linked segment file as stored on disk with the segment's
+  source, catalog bounds and the catalog fields that control integrity,
+  playback or retention (byte length, stream / sequence, codec, container,
+  capture node, critical flag), the starred and critical flags, and the catalog
+  start, target end and ended boundaries (the manifest clips playback to the
+  target end);
 - a per-row and a chained SHA-256 over every retained audit row
   (``security_admin_audit_records`` and ``integrity_audit``), so a rewritten
   middle row is detected even when counts and boundary timestamps match;
@@ -26,7 +29,9 @@ duration probing and decodable-playback samples need a codec and are left to
 the manual procedure in ``MANUAL_TEST.md`` section V; the output marks them
 ``manual``. The output file is created exclusively with mode 0600 and is
 refused inside the runtime root, the installed package / virtual environment,
-or any Git checkout. Keep it, including its digests and logical IDs,
+the whole installation destination (``<destination>`` of
+``<destination>/releases/<version>/venv``, including ``current``), or any Git
+checkout. Keep it, including its digests and logical IDs,
 deployment-local.
 """
 
@@ -152,11 +157,13 @@ def _recordings(connection, tables, directory: Path) -> dict | None:
         return None
     result = {}
     rows = connection.execute(
-        "SELECT id, source_id, status, starred, start_ms, target_end_ms, ended_ms "
+        "SELECT id, source_id, status, starred, critical, start_ms, target_end_ms, ended_ms "
         "FROM recordings WHERE status != 'deleting' ORDER BY id").fetchall()
     for row in rows:
         segments = connection.execute(
-            "SELECT s.id, s.source_id, s.start_ms, s.end_ms, s.sha256 FROM recording_segments s "
+            "SELECT s.id, s.source_id, s.capture_node_id, s.stream_id, s.sequence, "
+            "s.start_ms, s.end_ms, s.codec, s.container, s.byte_length, s.sha256, s.critical "
+            "FROM recording_segments s "
             "JOIN recording_links l ON l.segment_id = s.id "
             "WHERE l.recording_id = ? AND s.state = 'ready' ORDER BY s.start_ms, s.id",
             (row["id"],)).fetchall()
@@ -165,15 +172,30 @@ def _recordings(connection, tables, directory: Path) -> dict | None:
             digest, size = _file_digest(directory, segment["id"])
             items.append({
                 "segment_id": segment["id"], "sha256": digest, "bytes": size,
-                "catalog_match": digest is not None and digest == segment["sha256"],
+                # RecordingStore._integrity() needs both the digest and the
+                # catalog byte_length to match the file.
+                "catalog_match": (digest is not None and digest == segment["sha256"]
+                                  and size == segment["byte_length"]),
                 "source_id": segment["source_id"],
                 "start_ms": segment["start_ms"], "end_ms": segment["end_ms"],
                 "media_ms": segment["end_ms"] - segment["start_ms"],
+                # Catalog fields that control integrity, playback or retention:
+                # byte_length (integrity), stream_id / sequence (manifest
+                # discontinuities), codec / container (player selection),
+                # capture node provenance and the critical retention flag.
+                "catalog": {
+                    "byte_length": segment["byte_length"],
+                    "stream_id": segment["stream_id"], "sequence": segment["sequence"],
+                    "codec": segment["codec"], "container": segment["container"],
+                    "capture_node_id": segment["capture_node_id"],
+                    "critical": bool(segment["critical"]),
+                },
             })
         result[row["id"]] = {
             "source_id": row["source_id"],
             "status": row["status"],
             "starred": bool(row["starred"]),
+            "critical": bool(row["critical"]),
             "start_ms": row["start_ms"],
             # Both boundaries are kept separately: RecordingStore.manifest()
             # clips segments and computes gaps against target_end_ms.
@@ -345,7 +367,7 @@ _ACTIVE_SUCCESSORS = frozenset({"active", "complete", "gapped", "interrupted"})
 def _valid_growth(base: dict, now: dict) -> bool:
     """Whether a recording active at record time only grew as the store allows.
 
-    Source, start and starred flag are immutable; the status may only move to
+    Source, start, starred and critical flags are immutable; the status may only move to
     an allowed successor; the target end may only stay or move earlier (the
     store never extends target_end_ms); a still-active recording has no ended
     boundary and a finished one ends after its start and no later than its
@@ -357,7 +379,8 @@ def _valid_growth(base: dict, now: dict) -> bool:
     if (base["status"] != "active" or now["status"] not in _ACTIVE_SUCCESSORS
             or not _evidenced(base) or not _evidenced(now)):
         return False
-    if any(now.get(key) != base.get(key) for key in ("source_id", "start_ms", "starred")):
+    if any(now.get(key) != base.get(key)
+           for key in ("source_id", "start_ms", "starred", "critical")):
         return False
     start, target = now["start_ms"], now["target_end_ms"]
     if not start < target <= base["target_end_ms"]:
@@ -492,10 +515,32 @@ def _inside_git_checkout(path: Path) -> bool:
                for parent in (path, *path.parents))
 
 
+def _installation_root(prefix: Path) -> Path | None:
+    """The whole installed tree containing this interpreter's venv, if any.
+
+    The installer lays out ``<destination>/releases/<version>/venv`` with
+    ``<destination>/current`` pointing at a release, so the destination covers
+    every release and the ``current`` / ``previous`` links. Other venvs (e.g.
+    a development one) only refuse themselves, never their parent directory.
+    """
+    release = prefix.parent
+    if prefix.name == "venv" and release.parent.name == "releases":
+        return release.parent.parent
+    return None
+
+
 def _refused_roots(runtime_root: Path) -> tuple[Path, ...]:
     roots = [runtime_root, Path(__file__).resolve().parents[1]]
     if sys.prefix != sys.base_prefix:
-        roots.append(Path(sys.prefix))
+        prefix = Path(sys.prefix)
+        try:
+            prefix = prefix.resolve(strict=False)
+        except (OSError, RuntimeError):
+            pass
+        roots.append(prefix)
+        installation = _installation_root(prefix)
+        if installation is not None:
+            roots.append(installation)
     resolved = []
     for root in roots:
         try:

@@ -359,6 +359,92 @@ class LifecycleInventoryTests(unittest.TestCase):
             self.assertIn("refused", stderr)
             self.assertFalse(target.exists())
 
+    def test_refuses_whole_installed_release_tree(self):
+        # Installed layout: <destination>/releases/<version>/venv with
+        # <destination>/current -> releases/<version>; the tool runs from that
+        # venv, so sys.prefix is the venv and the package is in site-packages.
+        from unittest import mock
+        import sys
+        destination = self.base / "install"
+        release = destination / "releases" / "1.0.0"
+        venv = release / "venv"
+        (venv / "bin").mkdir(parents=True)
+        (destination / "releases" / "0.9.0").mkdir()
+        (destination / "current").symlink_to("releases/1.0.0")
+        targets = (destination / "current" / "inventory.json",
+                   release / "inventory.json",
+                   destination / "inventory.json",
+                   destination / "releases" / "0.9.0" / "inventory.json")
+        with mock.patch.object(sys, "prefix", str(venv)), \
+                mock.patch.object(sys, "base_prefix", "/usr"):
+            for target in targets:
+                code, _, stderr = run("record", "--runtime-root", str(self.runtime.root),
+                                      "--output", str(target))
+                self.assertEqual(code, inventory.EXIT_USAGE, target)
+                self.assertIn("installed release", stderr)
+                self.assertFalse(target.exists())
+            # A private directory beside the installation remains allowed.
+            code, _ = self.record("beside-install.json")
+            self.assertNotEqual(code, inventory.EXIT_USAGE)
+
+    def test_segment_catalog_metadata_change_is_detected(self):
+        # RecordingStore._integrity() reports a segment whose file size differs
+        # from byte_length as corrupt; the manifest derives stream
+        # discontinuities from stream_id/sequence; codec/container select the
+        # player. A migration changing only these must not verify as preserved.
+        seeded = self.runtime.seed()
+        _, baseline = self.record()
+        changes = {
+            "byte_length": "byte_length = byte_length + 1",
+            "codec": "codec = 'other-codec'",
+            "container": "container = 'other-container'",
+            "stream_id": "stream_id = 'other-stream'",
+            "sequence": "sequence = sequence + 1000",
+            "capture_node_id": "capture_node_id = 'other-node'",
+            "critical": "critical = 1",
+        }
+        for column, assignment in changes.items():
+            with self.subTest(column=column):
+                with closing(sqlite3.connect(self.runtime.database)) as connection:
+                    segment_id = connection.execute(
+                        "SELECT segment_id FROM recording_links WHERE recording_id=?",
+                        (seeded["starred"],)).fetchone()[0]
+                    before = connection.execute(
+                        "SELECT * FROM recording_segments WHERE id=?", (segment_id,)).fetchone()
+                self.runtime.execute(
+                    f"UPDATE recording_segments SET {assignment} WHERE id=?", (segment_id,))
+                code, report, _ = self.verify(baseline)
+                self.assertEqual(code, inventory.EXIT_FAILED)
+                self.assertIn({"id": seeded["starred"], "reason": "changed"},
+                              report["sections"]["recordings"]["failed"])
+                with closing(sqlite3.connect(self.runtime.database)) as connection:
+                    columns = [row[1] for row in connection.execute(
+                        "PRAGMA table_info(recording_segments)")]
+                self.runtime.execute(
+                    "UPDATE recording_segments SET "
+                    + ", ".join(f"{name}=?" for name in columns) + " WHERE id=?",
+                    (*before, segment_id))
+        # Recording-level retention protection is also compared.
+        self.runtime.execute("UPDATE recordings SET critical=1 WHERE id=?", (seeded["ordinary"],))
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_FAILED)
+        self.assertIn({"id": seeded["ordinary"], "reason": "changed"},
+                      report["sections"]["recordings"]["failed"])
+
+    def test_in_progress_growth_rejects_byte_length_mismatch(self):
+        self.runtime.seed()
+        active = self.runtime.recording(starred=False, payload=b"generated-active-length",
+                                        status="active", target_end_ms=20000)
+        _, baseline = self.record()
+        later = self.runtime.add_segment(active, b"generated-active-length-later")
+        # Digest matches, catalog length does not: the store reports corrupt.
+        self.runtime.execute("UPDATE recording_segments SET byte_length=byte_length+1 "
+                             "WHERE id=?", (later,))
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_FAILED)
+        self.assertIn({"id": active, "reason": "changed"},
+                      report["sections"]["recordings"]["failed"])
+
     def test_refuses_existing_or_relative_output(self):
         existing = self.notes / "existing.json"
         existing.write_text("keep")
