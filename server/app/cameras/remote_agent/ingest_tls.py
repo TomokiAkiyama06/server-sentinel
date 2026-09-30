@@ -28,6 +28,7 @@ and admission is repeated on every connection regardless.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import datetime
 import hashlib
 import ipaddress
 import logging
@@ -128,6 +129,7 @@ class CaptureNodeIdentity:
     node_id: UUID
     public_key_digest: str
     credential_digest: str
+    not_valid_after: datetime.datetime
 
     def __repr__(self) -> str:
         return "CaptureNodeIdentity(<redacted>)"
@@ -162,10 +164,12 @@ class CaptureNodeAdmission:
             if str(node) != nodes[0][len(NODE_URI_PREFIX):]:
                 raise ValueError
             key_digest = public_key_digest(certificate.public_key())
+            expiry = certificate.not_valid_after_utc
         except (ValueError, TypeError, x509.ExtensionNotFound):
             raise IngestTlsError("capture_node_certificate_invalid") from None
         return CaptureNodeIdentity(node_id=node, public_key_digest=key_digest,
-                                   credential_digest=hashlib.sha256(peer_der).hexdigest())
+                                   credential_digest=hashlib.sha256(peer_der).hexdigest(),
+                                   not_valid_after=expiry)
 
     def is_admitted(self, identity: CaptureNodeIdentity) -> bool:
         """Consult the durable ledger now; any failure denies."""

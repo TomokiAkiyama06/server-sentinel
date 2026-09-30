@@ -48,6 +48,9 @@ MAX_CSR_BYTES = 16 * 1024
 MAX_PEM_BYTES = 64 * 1024
 MAX_CA_VALIDITY = datetime.timedelta(days=3650)
 MAX_LEAF_VALIDITY = datetime.timedelta(days=397)
+# Owner decision 2026-09-30: node leaves default to the 397-day maximum and are
+# renewed automatically (see renewal.py).
+DEFAULT_NODE_VALIDITY = MAX_LEAF_VALIDITY
 _CLOCK_SKEW_ALLOWANCE = datetime.timedelta(minutes=5)
 _CA_KEY = "ca-key.pem"
 _CA_CERTIFICATE = "ca-certificate.pem"
@@ -262,6 +265,7 @@ class IssuedNodeCredential:
     certificate_pem: bytes = field(repr=False)
     public_key_digest: str
     credential_digest: str
+    not_after: datetime.datetime
 
 
 @dataclass(frozen=True)
@@ -408,10 +412,23 @@ class DeploymentAuthority:
         return MainServerCredential(certificate_path=certificate_path, key_path=key_path)
 
     def issue_node_certificate(self, claim: EnrollmentClaim, csr_pem: bytes, *,
-                               validity: datetime.timedelta) -> IssuedNodeCredential:
+                               validity: datetime.timedelta = DEFAULT_NODE_VALIDITY
+                               ) -> IssuedNodeCredential:
         """Sign a capture-only client certificate for a redeemed enrollment claim."""
         if not isinstance(claim, EnrollmentClaim):
             raise CaptureAuthorityError("invalid enrollment claim")
+        public, key_digest = self._proof_of_possession(csr_pem)
+        if not hmac.compare_digest(key_digest, claim.public_key_digest):
+            raise CaptureAuthorityError("enrollment request does not match the approved key")
+        return self._sign_node(claim.node_id, public, key_digest, validity)
+
+    @staticmethod
+    def _proof_of_possession(csr_pem: bytes, *, strict: bool = False):
+        """Return the CSR's EC P-256 public key and digest after verifying its signature.
+
+        ``strict`` (renewal) additionally refuses any requested subject or
+        extension, so a renewal request cannot even ask for another identity.
+        """
         if not isinstance(csr_pem, bytes) or not 0 < len(csr_pem) <= MAX_CSR_BYTES:
             raise CaptureAuthorityError("invalid enrollment request")
         try:
@@ -423,26 +440,44 @@ class DeploymentAuthority:
         if (not proof or not isinstance(public, ec.EllipticCurvePublicKey)
                 or not isinstance(public.curve, ec.SECP256R1)):
             raise CaptureAuthorityError("invalid enrollment request")
-        key_digest = public_key_digest(public)
-        if not hmac.compare_digest(key_digest, claim.public_key_digest):
-            raise CaptureAuthorityError("enrollment request does not match the approved key")
+        if strict and (len(request.subject) or len(request.extensions)):
+            raise CaptureAuthorityError("renewal request may not choose an identity")
+        return public, public_key_digest(public)
+
+    def _sign_node(self, node_id: UUID, public, key_digest: str,
+                   validity: datetime.timedelta) -> IssuedNodeCredential:
         window = self._leaf_window(validity)
         certificate = (
-            self._leaf_builder("capture-node " + str(claim.node_id), public, window)
+            self._leaf_builder("capture-node " + str(node_id), public, window)
             .add_extension(x509.ExtendedKeyUsage([ExtendedKeyUsageOID.CLIENT_AUTH]), critical=False)
             .add_extension(x509.SubjectAlternativeName([
-                x509.UniformResourceIdentifier(node_uri(claim.node_id)),
+                x509.UniformResourceIdentifier(node_uri(node_id)),
                 x509.UniformResourceIdentifier(deployment_uri(self.deployment_id)),
             ]), critical=False)
             .sign(self._private_key, hashes.SHA256())
         )
-        return IssuedNodeCredential(node_id=claim.node_id,
+        return IssuedNodeCredential(node_id=node_id,
                                     certificate_pem=_certificate_pem(certificate),
                                     public_key_digest=key_digest,
-                                    credential_digest=certificate_digest(certificate))
+                                    credential_digest=certificate_digest(certificate),
+                                    not_after=certificate.not_valid_after_utc)
+
+    def issue_renewal_certificate(self, node_id: UUID, csr_pem: bytes, *,
+                                  validity: datetime.timedelta = DEFAULT_NODE_VALIDITY
+                                  ) -> IssuedNodeCredential:
+        """Sign a renewal leaf for ``node_id``; use ``renewal.renew_node_credential``.
+
+        This primitive checks only the CSR. Eligibility (current, admitted,
+        unexpired identity) and ledger staging are enforced by the caller.
+        """
+        if not isinstance(node_id, UUID):
+            raise CaptureAuthorityError("invalid node identity")
+        public, key_digest = self._proof_of_possession(csr_pem, strict=True)
+        return self._sign_node(node_id, public, key_digest, validity)
 
     def issue_and_activate(self, ledger: PairingLedger, claim: EnrollmentClaim, csr_pem: bytes, *,
-                           validity: datetime.timedelta) -> IssuedNodeCredential:
+                           validity: datetime.timedelta = DEFAULT_NODE_VALIDITY
+                           ) -> IssuedNodeCredential:
         """Sign for a consumed claim, then activate that exact certificate in the ledger.
 
         Consumption was committed by ``PairingLedger.redeem`` before signing. If
@@ -451,7 +486,8 @@ class DeploymentAuthority:
         a retry needs a fresh Owner approval.
         """
         issued = self.issue_node_certificate(claim, csr_pem, validity=validity)
-        ledger.activate(claim, credential_serial_digest=issued.credential_digest)
+        ledger.activate(claim, credential_serial_digest=issued.credential_digest,
+                        not_after=issued.not_after.timestamp())
         return issued
 
     def export_trust_bundle(self, *, server_name: str, endpoint_host: str,

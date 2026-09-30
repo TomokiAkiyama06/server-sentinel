@@ -36,7 +36,20 @@ SHA-256 digest, and issues a capture-only client certificate for a redeemed
 cannot choose its identity, SANs, key usage or scope. `issue_and_activate` signs
 and then activates the exact certificate digest in the ledger, so a certificate
 whose activation failed stays unusable. Validity is an explicit bounded
-parameter; there is no default validity or renewal policy yet.
+parameter that defaults to the Owner-decided 397 days.
+
+`renewal.py` implements automatic renewal (Owner decision 2026-09-30).
+`renew_node_credential` issues a certificate only for the presenting session's
+own node. It requires that exact credential to still be the ledger's active,
+unexpired one, and a fresh P-256 key whose CSR requests no subject or extension.
+The result is staged with `PairingLedger.stage_renewal`: one per node, no audit
+growth. The first admission of the renewed certificate promotes it atomically
+and supersedes the old certificate, which stays admitted until then so a lost
+response never locks the Agent out. Revocation discards staged renewals.
+`CaptureCredentialMonitor` raises the local `capture_credential_warning`
+notification through an injected hook in three cases: a credential within
+14 days of expiry, an expired credential, or a refused renewal. The renewal
+exchange is not yet carried by any listener (#14/#15).
 
 `ingest_tls.py` builds the ingest server `ssl.SSLContext` (TLS 1.3 only, client
 certificate required, deployment CA only, strict X.509, no session tickets) and

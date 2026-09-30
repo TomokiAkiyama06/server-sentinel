@@ -33,7 +33,11 @@ from app.cameras.remote_agent.node_ca import (
     CaptureAuthorityError, DeploymentAuthority, PrivateDirectory, listener_material,
     public_key_digest,
 )
-from app.cameras.remote_agent.pairing import HmacCodeVerifier, PairingLedger
+from app.cameras.remote_agent.pairing import HmacCodeVerifier, PairingError, PairingLedger
+from app.cameras.remote_agent.renewal import (
+    CaptureCredentialMonitor, RenewalRefused, renew_node_credential,
+)
+from app.notifications.service import NotificationKind
 from app.storage.database import Database
 from app.storage.migrations import migrate
 from app.storage.schema import APPLICATION_MIGRATIONS
@@ -58,7 +62,9 @@ def fixed_clock(value):
     return lambda: value
 
 
-class CaptureMtlsTests(unittest.TestCase):
+class CaptureTlsHarness(unittest.TestCase):
+    """Shared temporary CA, ledger and listener material; defines no tests."""
+
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory(prefix="capture-mtls-")
         self.addCleanup(self.temporary.cleanup)
@@ -125,6 +131,7 @@ class CaptureMtlsTests(unittest.TestCase):
                 .public_bytes(serialization.Encoding.PEM))
 
     def _paired_node(self, name="a", *, authority=None, activate=True, validity=30 * DAY):
+        """Pair a node; ``validity=None`` uses the Owner-decided 397-day default."""
         key, key_path = self._node_key(name)
         digest = public_key_digest(key.public_key())
         approval, code = self.ledger.approve(Owner(), "owner", node_id=uuid4(),
@@ -132,10 +139,11 @@ class CaptureMtlsTests(unittest.TestCase):
         claim = self.ledger.redeem(enrollment_id=approval.enrollment_id,
                                    public_key_digest=digest, code=code.value)
         issuer = authority or self.authority
+        options = {} if validity is None else {"validity": validity}
         if activate:
-            issued = issuer.issue_and_activate(self.ledger, claim, self._csr(key), validity=validity)
+            issued = issuer.issue_and_activate(self.ledger, claim, self._csr(key), **options)
         else:
-            issued = issuer.issue_node_certificate(claim, self._csr(key), validity=validity)
+            issued = issuer.issue_node_certificate(claim, self._csr(key), **options)
         certificate_path = self._public_file(f"node-{name}.pem", issued.certificate_pem)
         return claim, issued, certificate_path, key_path
 
@@ -178,6 +186,8 @@ class CaptureMtlsTests(unittest.TestCase):
         for secret in self.secrets:
             self.assertNotIn(b"".join(secret.splitlines()[1:-1])[:40].decode(), logs)
 
+
+class CaptureMtlsTests(CaptureTlsHarness):
     # -- positive path -------------------------------------------------------
 
     def test_mutual_tls13_handshake_admits_the_activated_node(self):
@@ -373,6 +383,139 @@ class CaptureMtlsTests(unittest.TestCase):
         for thread in threads:
             thread.join(10)
         self.assertEqual([False] * 4, results)
+
+
+class CaptureRenewalTests(CaptureTlsHarness):
+    """Automatic renewal (Owner decision 2026-09-30) over a real admitted session."""
+
+    def setUp(self):
+        super().setUp()
+        self.notifications = []
+        self.monitor = CaptureCredentialMonitor(
+            self.ledger, lambda kind, at: self.notifications.append((kind, at)))
+
+    @staticmethod
+    def _empty_csr(key, *names):
+        builder = x509.CertificateSigningRequestBuilder().subject_name(x509.Name([]))
+        if names:
+            builder = builder.add_extension(x509.SubjectAlternativeName(
+                [x509.UniformResourceIdentifier(name) for name in names]), critical=False)
+        return builder.sign(key, hashes.SHA256()).public_bytes(serialization.Encoding.PEM)
+
+    def _session(self, certificate, key):
+        session, output = self._exchange(certificate, key)
+        self.assertEqual("ok", output)
+        self.assertNotIsInstance(session, str, session)
+        self.addCleanup(session.close)
+        return session
+
+    def _renew(self, identity, key, **kwargs):
+        return renew_node_credential(self.authority, self.ledger, self.admission, identity,
+                                     self._empty_csr(key), monitor=self.monitor, **kwargs)
+
+    def test_default_node_validity_is_397_days_and_recorded(self):
+        _, issued, _, _ = self._paired_node(validity=None)
+        remaining = issued.not_after - utc_now()
+        self.assertGreater(remaining, 396 * DAY)
+        self.assertLessEqual(remaining, 397 * DAY)
+        (expiry,) = self.ledger.credential_expiries()
+        self.assertAlmostEqual(issued.not_after.timestamp(), expiry.not_after, delta=1)
+
+    def test_renewal_over_admitted_session_supersedes_old_certificate_on_first_use(self):
+        claim, _, old_certificate, old_key = self._paired_node(validity=None)
+        session = self._session(old_certificate, old_key)
+        new_key, new_key_path = self._node_key("renewed")
+        renewed = self._renew(session.identity, new_key)
+        self.assertEqual(claim.node_id, renewed.node_id)
+        self.assertEqual(0o600, stat.S_IMODE(os.lstat(new_key_path).st_mode))
+        certificate = x509.load_pem_x509_certificate(renewed.certificate_pem)
+        names = certificate.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
+        self.assertIn(f"urn:serversentinel:capture-node:{claim.node_id}",
+                      names.get_values_for_type(x509.UniformResourceIdentifier))
+        # Until the new certificate is used, the old one is still admitted.
+        self.assertTrue(session.still_admitted())
+        self._session(old_certificate, old_key)
+        new_certificate = self._public_file("renewed.pem", renewed.certificate_pem)
+        promoted = self._session(new_certificate, new_key_path)
+        self.assertEqual(renewed.credential_digest, promoted.identity.credential_digest)
+        # First use promoted the renewal; the old certificate is superseded.
+        result, _ = self._exchange(old_certificate, old_key)
+        self.assertEqual("capture_node_not_admitted", result)
+        self.assertFalse(session.still_admitted())
+        self.assertEqual([], self.notifications)
+
+    def test_revoked_node_cannot_renew_or_promote_a_staged_renewal(self):
+        claim, _, certificate, key = self._paired_node()
+        session = self._session(certificate, key)
+        new_key, new_key_path = self._node_key("staged")
+        staged = self._renew(session.identity, new_key)
+        self.ledger.revoke(Owner(), "owner", node_id=claim.node_id)
+        with self.assertRaises(RenewalRefused) as raised:
+            self._renew(session.identity, ec.generate_private_key(ec.SECP256R1()))
+        self.assertEqual("renewal_credential_not_admitted", raised.exception.reason)
+        result, _ = self._exchange(self._public_file("staged.pem", staged.certificate_pem),
+                                   new_key_path)
+        self.assertEqual("capture_node_not_admitted", result)
+        self.assertEqual([NotificationKind.CAPTURE_CREDENTIAL_WARNING],
+                         [kind for kind, _ in self.notifications])
+
+    def test_expired_certificate_cannot_renew(self):
+        past = utc_now() - 30 * DAY
+        issuer = DeploymentAuthority.load(PrivateDirectory(self.root / "authority"),
+                                          self.deployment, clock=fixed_clock(past))
+        _, issued, _, _ = self._paired_node("expired", authority=issuer, validity=DAY)
+        der = x509.load_pem_x509_certificate(issued.certificate_pem).public_bytes(
+            serialization.Encoding.DER)
+        identity = self.admission.identify(der)
+        with self.assertRaises(RenewalRefused) as raised:
+            self._renew(identity, ec.generate_private_key(ec.SECP256R1()))
+        self.assertEqual("renewal_credential_expired", raised.exception.reason)
+        self.assertEqual(1, len(self.notifications))
+
+    def test_renewal_request_cannot_change_identity_or_reuse_keys(self):
+        claim, _, certificate, key = self._paired_node("a")
+        _, other_issued, _, _ = self._paired_node("b")
+        session = self._session(certificate, key)
+        current_key = serialization.load_pem_private_key(key.read_bytes(), password=None)
+        other = ec.generate_private_key(ec.SECP256R1())
+        cases = {
+            "renewal_request_invalid": [
+                self._empty_csr(other, f"urn:serversentinel:capture-node:{uuid4()}"),
+                self._csr(other),
+                b"-----BEGIN CERTIFICATE REQUEST-----\n",
+                self._empty_csr(rsa.generate_private_key(public_exponent=65537, key_size=2048)),
+            ],
+            "renewal_not_eligible": [self._empty_csr(current_key)],
+        }
+        for reason, requests in cases.items():
+            for request in requests:
+                with self.subTest(reason), self.assertRaises(RenewalRefused) as raised:
+                    renew_node_credential(self.authority, self.ledger, self.admission,
+                                          session.identity, request)
+                self.assertEqual(reason, raised.exception.reason)
+        # A key already bound to another node cannot be staged for this one.
+        reused = other_issued.public_key_digest
+        self.assertNotEqual(reused, session.identity.public_key_digest)
+        with self.assertRaises(PairingError):
+            self.ledger.stage_renewal(node_id=claim.node_id,
+                                      current_public_key_digest=session.identity.public_key_digest,
+                                      current_credential_digest=session.identity.credential_digest,
+                                      public_key_digest=reused, credential_serial_digest="e" * 64,
+                                      not_after=utc_now().timestamp() + 1000)
+        self.assertTrue(session.still_admitted())
+
+    def test_near_expiry_without_renewal_raises_owner_signal_once(self):
+        self._paired_node("soon", validity=10 * DAY)
+        self._paired_node("later", validity=None)
+        self.assertEqual(["credential_expiring_without_renewal"],
+                         [signal.reason for signal in self.monitor.check()])
+        self.monitor.check()
+        self.assertEqual([NotificationKind.CAPTURE_CREDENTIAL_WARNING],
+                         [kind for kind, _ in self.notifications])
+        expired = CaptureCredentialMonitor(self.ledger, lambda kind, at: self.notifications.append(kind),
+                                           clock=lambda: utc_now() + 20 * DAY)
+        self.assertEqual(["credential_expired"], [signal.reason for signal in expired.check()])
+        self.assertEqual(NotificationKind.CAPTURE_CREDENTIAL_WARNING, self.notifications[-1])
 
 
 if __name__ == "__main__":

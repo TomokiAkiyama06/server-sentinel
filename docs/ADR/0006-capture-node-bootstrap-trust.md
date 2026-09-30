@@ -213,8 +213,8 @@ status or decision.
   `CA=false`, `digitalSignature`, EKU `clientAuth` only, and exactly the SAN URIs
   `urn:serversentinel:capture-node:<node UUID>` and
   `urn:serversentinel:deployment:<deployment UUID>`. Validity is an explicit,
-  bounded parameter (at most 397 days for leaves, never beyond the CA); the
-  default validity policy and renewal remain undecided as stated above.
+  bounded parameter (at most 397 days for leaves, never beyond the CA). The
+  Owner later set the default and renewal policy; see the renewal note below.
   Signing happens after ledger consumption; the ledger's
   `credential_serial_digest` stores the SHA-256 of the exact DER certificate, and
   activation happens only after signing succeeds.
@@ -250,3 +250,43 @@ status or decision.
   fault injection, multi-process concurrent redemption over a real listener, and
   real LAN interoperability (MANUAL_TEST §B) are not implemented or verified by
   this change.
+- **Validity and automatic renewal (Owner decision 2026-09-30).** This answers
+  the "credential validity periods and future unattended renewal" policy that the
+  Atomicity section above required before renewal could ship. Node leaves default to 397 days (still capped at
+  397) and renew automatically; revocation and CA replacement rules above are
+  unchanged. Implementation (`server/app/cameras/remote_agent/renewal.py`,
+  `agent/media_capture_agent/node_tls.py`):
+  - *Window and retries.* The Agent starts renewing 30 days before expiry and
+    retries with exponential backoff from 1 hour, doubling to at most 24 hours.
+    It reuses one fresh renewal key (0600, `pending-renewal/`) across retries.
+  - *Eligibility.* The Main issues a renewal only for the node identity of the
+    presenting mTLS session. That exact credential must still be the ledger's
+    active, unexpired credential. The CSR must be for a new EC P-256 key that is
+    not bound to any node, with an empty subject and no extensions. Revoked,
+    expired or superseded credentials cannot renew; the node must re-pair with a
+    fresh Owner approval.
+  - *Supersession.* The renewed certificate is staged in the ledger (one per
+    node; a retry replaces it; staging writes no audit record, so repeated
+    requests cannot grow the audit table). The old certificate stays admitted
+    until the renewed one is first presented. That admission atomically promotes
+    it and appends an `activate_capture_node_credential` record (actor `system`).
+    From then on only the new certificate is admitted, even though the old one
+    has not expired. This keeps exactly one active credential per node, so
+    revocation and audit stay per node. An Agent that never received or
+    installed the response is not locked out: it keeps its old certificate and
+    retries. Revocation deletes any staged renewal.
+  - *Agent rotation.* `NodeCredentialStore.rotate` atomically replaces the
+    committed generation (rename over `current.json`) for the same node and
+    deployment only, then removes the superseded files.
+  - *Owner signal.* `CaptureCredentialMonitor` raises the local, Owner-visible
+    `capture_credential_warning` notification through the injected notification
+    hook in three cases: an active credential within 14 days of expiry (the
+    Agent has retried for at least 16 days by then), an expired credential, or
+    a refused renewal. Each is reported once per credential (or once per node,
+    reason and day for refusals). It is not an immediate Slack alert; changing
+    that is a separate notification-policy decision.
+  - *Not wired yet.* The renewal request and response travel over the ingest
+    session that #14/#15 will carry. `ingest.py`/`continuity.py` are unchanged,
+    and no scheduler or listener runs the renewal or the monitor yet.
+  - The schema change is migration 17 (`pairing_credential_renewal`), which PR
+    #97 also numbers 17. Whichever merges later renumbers.

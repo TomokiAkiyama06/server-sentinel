@@ -21,6 +21,7 @@ certificate or bundle bytes.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import datetime
 import hashlib
 import hmac
 import ipaddress
@@ -48,6 +49,14 @@ TRUST_BUNDLE_FORMAT = 1
 MAX_TRUST_BUNDLE_BYTES = 32 * 1024
 MAX_CERTIFICATE_BYTES = 16 * 1024
 _PENDING_DIRECTORY = "pending-enrollment"
+_RENEWAL_DIRECTORY = "pending-renewal"
+# Owner decision 2026-09-30: automatic renewal. Start 30 days before expiry,
+# retry with exponential backoff from 1 hour up to 24 hours; the Main warns the
+# Owner if a credential is within 14 days of expiry and still not renewed.
+RENEWAL_WINDOW = datetime.timedelta(days=30)
+RENEWAL_OVERDUE = datetime.timedelta(days=14)
+RENEWAL_FIRST_RETRY = datetime.timedelta(hours=1)
+RENEWAL_MAX_RETRY = datetime.timedelta(hours=24)
 _PENDING_KEY = "node-key.pem"
 _DNS_LABEL = re.compile(r"(?!-)[a-z0-9-]{1,63}(?<!-)")
 
@@ -168,11 +177,19 @@ def _private_pem(private_key) -> bytes:
 
 
 class PendingNodeKeyStore:
-    """Write-once node key awaiting enrollment, below the Agent runtime root."""
+    """Write-once node key awaiting enrollment (or renewal), below the runtime root.
 
-    def __init__(self, runtime_root: Path, *, owner_uid: int | None = None):
+    ``renewal=False`` (enrollment) refuses once an identity is installed;
+    ``renewal=True`` requires an installed identity and keeps its key in a
+    separate ``pending-renewal`` directory so retries reuse one fresh key.
+    """
+
+    def __init__(self, runtime_root: Path, *, owner_uid: int | None = None,
+                 renewal: bool = False):
         self._files = NodeCredentialStore(runtime_root, owner_uid=owner_uid)
         self.runtime_root = Path(runtime_root)
+        self._renewal = renewal
+        self._name = _RENEWAL_DIRECTORY if renewal else _PENDING_DIRECTORY
 
     def _directory(self, *, create: bool) -> tuple[int, int]:
         root_fd = open_directory(self.runtime_root)
@@ -180,11 +197,11 @@ class PendingNodeKeyStore:
             self._files._validate_directory(root_fd, "runtime_root_rejected")
             if create:
                 try:
-                    os.mkdir(_PENDING_DIRECTORY, mode=0o700, dir_fd=root_fd)
+                    os.mkdir(self._name, mode=0o700, dir_fd=root_fd)
                     os.fsync(root_fd)
                 except FileExistsError:
                     pass
-            directory_fd = os.open(_PENDING_DIRECTORY,
+            directory_fd = os.open(self._name,
                                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
                                    dir_fd=root_fd)
         except Exception:
@@ -200,8 +217,9 @@ class PendingNodeKeyStore:
 
     def create(self) -> ec.EllipticCurvePrivateKey:
         """Generate and persist a new key; an existing pending key is never replaced."""
-        if self._files.installed():
-            raise PairingRefused("node_identity_already_exists")
+        if self._files.installed() != self._renewal:
+            raise PairingRefused("node_identity_unavailable" if self._renewal
+                                 else "node_identity_already_exists")
         key = generate_node_key()
         root_fd = directory_fd = None
         try:
@@ -259,25 +277,11 @@ class PendingNodeKeyStore:
 def validate_issued_credential(bundle: TrustBundle, private_key: ec.EllipticCurvePrivateKey,
                                certificate_pem: bytes) -> NodeCredentialMaterial:
     """Accept the Main's response only if it is our key, our deployment, capture-only."""
-    if (not isinstance(bundle, TrustBundle) or not isinstance(private_key, ec.EllipticCurvePrivateKey)
-            or not isinstance(certificate_pem, bytes)
-            or not 0 < len(certificate_pem) <= MAX_CERTIFICATE_BYTES):
+    if not isinstance(bundle, TrustBundle):
         raise PairingRefused("issued_credential_rejected")
     try:
-        certificate = x509.load_pem_x509_certificate(certificate_pem)
-        authority = x509.load_pem_x509_certificate(bundle.ca_certificate_pem)
-        certificate.verify_directly_issued_by(authority)
-        constraints = certificate.extensions.get_extension_for_class(x509.BasicConstraints).value
-        usages = certificate.extensions.get_extension_for_class(x509.ExtendedKeyUsage).value
-        uris = _san_uris(certificate)
-        nodes = [uri for uri in uris if uri.startswith(NODE_URI_PREFIX)]
-        if (constraints.ca or ExtendedKeyUsageOID.CLIENT_AUTH not in usages
-                or ExtendedKeyUsageOID.SERVER_AUTH in usages or len(nodes) != 1
-                or DEPLOYMENT_URI_PREFIX + str(bundle.deployment_id) not in uris
-                or public_key_digest(certificate.public_key())
-                != public_key_digest(private_key.public_key())):
-            raise ValueError
-        node = UUID(nodes[0][len(NODE_URI_PREFIX):])
+        node, _ = _validate_leaf(bundle.ca_certificate_pem, bundle.deployment_id,
+                                 private_key, certificate_pem)
     except (ValueError, TypeError, InvalidSignature, x509.ExtensionNotFound):
         raise PairingRefused("issued_credential_rejected") from None
     return NodeCredentialMaterial(
@@ -332,6 +336,104 @@ def installed_credential(store: NodeCredentialStore) -> InstalledCredential:
         for descriptor in (directory_fd, root_fd):
             if descriptor is not None:
                 os.close(descriptor)
+
+
+def _validate_leaf(ca_certificate_pem: bytes, deployment_id: UUID,
+                   private_key: ec.EllipticCurvePrivateKey, certificate_pem: bytes):
+    if (not isinstance(private_key, ec.EllipticCurvePrivateKey)
+            or not isinstance(certificate_pem, bytes)
+            or not 0 < len(certificate_pem) <= MAX_CERTIFICATE_BYTES):
+        raise ValueError
+    certificate = x509.load_pem_x509_certificate(certificate_pem)
+    authority = x509.load_pem_x509_certificate(ca_certificate_pem)
+    certificate.verify_directly_issued_by(authority)
+    constraints = certificate.extensions.get_extension_for_class(x509.BasicConstraints).value
+    usages = certificate.extensions.get_extension_for_class(x509.ExtendedKeyUsage).value
+    uris = _san_uris(certificate)
+    nodes = [uri for uri in uris if uri.startswith(NODE_URI_PREFIX)]
+    if (constraints.ca or ExtendedKeyUsageOID.CLIENT_AUTH not in usages
+            or ExtendedKeyUsageOID.SERVER_AUTH in usages or len(nodes) != 1
+            or DEPLOYMENT_URI_PREFIX + str(deployment_id) not in uris
+            or public_key_digest(certificate.public_key())
+            != public_key_digest(private_key.public_key())):
+        raise ValueError
+    return UUID(nodes[0][len(NODE_URI_PREFIX):]), certificate
+
+
+class RenewalSchedule:
+    """When the Agent renews: 30 days before expiry, backoff 1 h doubling to 24 h."""
+
+    @staticmethod
+    def status(now: datetime.datetime, not_after: datetime.datetime) -> str:
+        if not_after <= now:
+            return "expired"
+        if not_after - now <= RENEWAL_OVERDUE:
+            return "renewal_overdue"
+        if not_after - now <= RENEWAL_WINDOW:
+            return "renewal_due"
+        return "valid"
+
+    @staticmethod
+    def next_attempt(now: datetime.datetime, not_after: datetime.datetime,
+                     consecutive_failures: int) -> datetime.datetime | None:
+        """``None`` means the credential expired: renewal is impossible, re-pair."""
+        if not_after <= now:
+            return None
+        start = not_after - RENEWAL_WINDOW
+        if now < start:
+            return start
+        if consecutive_failures <= 0:
+            return now
+        delay = min(RENEWAL_FIRST_RETRY * (2 ** min(consecutive_failures - 1, 16)),
+                    RENEWAL_MAX_RETRY)
+        return min(now + delay, not_after)
+
+
+def installed_certificate_expiry(store: NodeCredentialStore) -> datetime.datetime:
+    credential = installed_credential(store)
+    try:
+        content = credential.certificate_path.read_bytes()
+        return x509.load_pem_x509_certificate(content).not_valid_after_utc
+    except (OSError, ValueError):
+        raise PairingRefused("node_identity_unavailable") from None
+
+
+def prepare_renewal(store: NodeCredentialStore) -> EnrollmentRequest:
+    """Return a CSR for a fresh renewal key, reusing it across retries."""
+    pending = PendingNodeKeyStore(store.runtime_root, owner_uid=store.owner_uid, renewal=True)
+    try:
+        key = pending.load()
+    except PairingRefused:
+        key = pending.create()
+    return build_enrollment_request(key)
+
+
+def complete_renewal(store: NodeCredentialStore, certificate_pem: bytes) -> NodeCredentialMaterial:
+    """Validate the renewed certificate and atomically rotate to it.
+
+    It must chain to the installed deployment CA, name the same node and
+    deployment, carry the pending renewal key, and outlive the current
+    certificate. The previous generation is replaced; the Main keeps admitting
+    the old certificate until this new one is first presented.
+    """
+    credential = installed_credential(store)
+    pending = PendingNodeKeyStore(store.runtime_root, owner_uid=store.owner_uid, renewal=True)
+    key = pending.load()
+    current_expiry = installed_certificate_expiry(store)
+    try:
+        node, certificate = _validate_leaf(credential.ca_certificate_pem, credential.deployment_id,
+                                           key, certificate_pem)
+        if node != credential.node_id or certificate.not_valid_after_utc <= current_expiry:
+            raise ValueError
+    except (ValueError, TypeError, InvalidSignature, x509.ExtensionNotFound):
+        raise PairingRefused("renewed_credential_rejected") from None
+    material = NodeCredentialMaterial(
+        deployment_id=credential.deployment_id, node_id=node,
+        server_name=credential.server_name, private_key=_private_pem(key),
+        client_certificate=certificate_pem, ca_certificate=credential.ca_certificate_pem)
+    store.rotate(material)
+    pending.discard()
+    return material
 
 
 def build_capture_client_context(ca_certificate_pem: bytes, *,

@@ -17,14 +17,18 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import ExtendedKeyUsageOID
 
 from media_capture_agent.node_tls import (
-    PendingNodeKeyStore, TrustBundle, build_capture_client_context, build_enrollment_request,
-    connect_to_main, public_key_digest, validate_issued_credential,
+    RENEWAL_MAX_RETRY, PendingNodeKeyStore, RenewalSchedule, TrustBundle,
+    build_capture_client_context, build_enrollment_request, complete_renewal, connect_to_main,
+    installed_certificate_expiry, installed_credential, prepare_renewal, public_key_digest,
+    validate_issued_credential,
 )
 from media_capture_agent.pairing import NodeCredentialStore, PairingRefused
 from tests.tls_support import DAY, SERVER_NAME, MainPeer, SyntheticAuthority, key_pem, now, pem
 
 
-class NodeTlsTests(unittest.TestCase):
+class NodeTlsHarness(unittest.TestCase):
+    """Shared temporary runtime and synthetic Main CA; defines no tests."""
+
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory(prefix="agent-node-tls-")
         self.addCleanup(self.temporary.cleanup)
@@ -62,6 +66,8 @@ class NodeTlsTests(unittest.TestCase):
         return connect_to_main(context, server_name=self.bundle.server_name, host="127.0.0.1",
                                port=peer.port, timeout_seconds=10)
 
+
+class NodeTlsTests(NodeTlsHarness):
     # -- key and request -----------------------------------------------------
 
     def test_pending_key_is_private_write_once_and_matches_request(self):
@@ -223,6 +229,86 @@ class NodeTlsTests(unittest.TestCase):
         self.assertNotIn(body, joined)
         self.assertNotIn("PRIVATE KEY", joined)
         self.assertFalse(any(body in value for value in os.environ.values()))
+
+
+class NodeRenewalTests(NodeTlsHarness):
+    """Agent side of automatic renewal (Owner decision 2026-09-30)."""
+
+    def _installed(self, lifetime=30 * DAY):
+        store = PendingNodeKeyStore(self.runtime)
+        key = store.create()
+        node = uuid4()
+        certificate = pem(self.authority.node_certificate(build_enrollment_request(key).csr_pem,
+                                                          node, lifetime=lifetime))
+        credentials = NodeCredentialStore(self.runtime)
+        credentials.install(validate_issued_credential(self.bundle, key, certificate))
+        store.discard()
+        return credentials, node
+
+    def test_schedule_starts_30_days_before_expiry_with_bounded_backoff(self):
+        start = now()
+        expiry = start + 100 * DAY
+        self.assertEqual("valid", RenewalSchedule.status(start, expiry))
+        self.assertEqual(expiry - 30 * DAY, RenewalSchedule.next_attempt(start, expiry, 0))
+        due = expiry - 20 * DAY
+        self.assertEqual("renewal_due", RenewalSchedule.status(due, expiry))
+        self.assertEqual(due, RenewalSchedule.next_attempt(due, expiry, 0))
+        delays = [RenewalSchedule.next_attempt(due, expiry, failures) - due for failures in (1, 2, 3, 9)]
+        self.assertEqual(delays[:3], sorted(delays[:3]))
+        self.assertEqual(RENEWAL_MAX_RETRY, delays[-1])
+        self.assertEqual("renewal_overdue", RenewalSchedule.status(expiry - 5 * DAY, expiry))
+        self.assertEqual("expired", RenewalSchedule.status(expiry, expiry))
+        self.assertIsNone(RenewalSchedule.next_attempt(expiry, expiry, 3))
+
+    def test_renewal_rotates_to_fresh_key_and_keeps_files_private(self):
+        credentials, node = self._installed()
+        before = installed_credential(credentials)
+        with self.assertRaises(PairingRefused):
+            prepare_renewal(NodeCredentialStore(self.root / "missing"))
+        request = prepare_renewal(credentials)
+        self.assertEqual(request.public_key_digest, prepare_renewal(credentials).public_key_digest,
+                         "retries reuse one pending renewal key")
+        pending = self.runtime / "pending-renewal"
+        self.assertEqual(0o700, stat.S_IMODE(os.lstat(pending).st_mode))
+        self.assertEqual(0o600, stat.S_IMODE(os.lstat(pending / "node-key.pem").st_mode))
+        self.assertEqual(0, len(x509.load_pem_x509_csr(request.csr_pem).subject))
+        renewed = pem(self.authority.node_certificate(request.csr_pem, node, lifetime=397 * DAY))
+        complete_renewal(credentials, renewed)
+        after = installed_credential(credentials)
+        self.assertTrue(credentials.installed())
+        self.assertEqual(before.node_id, after.node_id)
+        self.assertNotEqual(before.key_path, after.key_path)
+        self.assertFalse(before.key_path.exists())
+        self.assertFalse((pending / "node-key.pem").exists())
+        for entry in (self.runtime / "node-credentials").iterdir():
+            self.assertEqual(0o600, stat.S_IMODE(os.lstat(entry).st_mode), entry.name)
+        self.assertGreater(installed_certificate_expiry(credentials), now() + 396 * DAY)
+        server_certificate, server_key = self.authority.server_files(self.root / "main")
+        peer = MainPeer(server_certificate, server_key, pem(self.authority.certificate))
+        context = build_capture_client_context(after.ca_certificate_pem,
+                                               certificate_path=after.certificate_path,
+                                               key_path=after.key_path)
+        with self._connect(context, peer) as connection:
+            connection.sendall(b"ping")
+            self.assertEqual(b"pong", connection.recv(4))
+        peer.join()
+        self.assertEqual(public_key_digest(x509.load_der_x509_certificate(
+            peer.peer_certificate).public_key()), request.public_key_digest)
+
+    def test_renewed_certificate_must_keep_identity_key_ca_and_extend_expiry(self):
+        credentials, node = self._installed()
+        request = prepare_renewal(credentials)
+        foreign = SyntheticAuthority(self.authority.deployment)
+        other_key = build_enrollment_request(ec.generate_private_key(ec.SECP256R1()))
+        for certificate in (
+                pem(self.authority.node_certificate(request.csr_pem, uuid4(), lifetime=397 * DAY)),
+                pem(self.authority.node_certificate(other_key.csr_pem, node, lifetime=397 * DAY)),
+                pem(foreign.node_certificate(request.csr_pem, node, lifetime=397 * DAY)),
+                pem(self.authority.node_certificate(request.csr_pem, node, lifetime=DAY))):
+            with self.assertRaisesRegex(PairingRefused, "renewed_credential_rejected"):
+                complete_renewal(credentials, certificate)
+        self.assertTrue((self.runtime / "pending-renewal" / "node-key.pem").exists())
+        self.assertTrue(credentials.installed())
 
 
 class AgentLockAuditTests(unittest.TestCase):

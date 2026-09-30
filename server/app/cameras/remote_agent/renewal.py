@@ -1,0 +1,171 @@
+"""Automatic capture-node certificate renewal and expiry signals (Issue #13).
+
+Owner decision 2026-09-30: node certificates default to 397 days and renew
+automatically. The Agent starts renewing ``RENEWAL_WINDOW`` (30 days) before
+expiry, generating a fresh key and CSR and sending it over its current,
+ledger-admitted mTLS session. This module is the Main side of that exchange:
+
+* ``renew_node_credential`` issues a certificate only for the node identity of
+  the authenticated session, only while that exact credential is still the
+  ledger's active one and unexpired, and only for a fresh EC P-256 key whose
+  CSR requests no subject or extension. It stages the new certificate in the
+  ledger. Revoked, expired, superseded or unknown credentials cannot renew and
+  must re-pair.
+* Supersession: the old certificate stays admitted until the new one is first
+  presented; that first admission atomically promotes the new credential and
+  the old certificate is no longer admitted, even though it has not expired.
+  This keeps exactly one active credential per node (so revocation and audit
+  stay per node) while never locking out an Agent that failed to receive or
+  install the response: it keeps using the old certificate and retries.
+* ``CaptureCredentialMonitor`` turns ledger expiry state and renewal refusals
+  into Owner-visible local ``capture_credential_warning`` notifications through
+  an injected hook.
+
+No listener or wire protocol is added here; #14/#15 carry the renewal request
+over the ingest session.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass
+import datetime
+from typing import Callable
+from uuid import UUID
+
+from app.notifications.service import NotificationKind
+
+from .ingest_tls import CaptureNodeAdmission, CaptureNodeIdentity
+from .node_ca import (
+    DEFAULT_NODE_VALIDITY, CaptureAuthorityError, DeploymentAuthority, IssuedNodeCredential,
+)
+from .pairing import PairingError, PairingLedger
+
+
+RENEWAL_WINDOW = datetime.timedelta(days=30)
+# Warn the Owner if a credential is this close to expiry and still not renewed:
+# the Agent has then retried for at least 16 days (see agent RenewalSchedule).
+EXPIRY_WARNING_WINDOW = datetime.timedelta(days=14)
+_MAX_REMEMBERED_SIGNALS = 1024
+
+
+class RenewalRefused(RuntimeError):
+    """Fixed refusal reason; never contains key, CSR or certificate bytes."""
+
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
+
+
+def _utc_now() -> datetime.datetime:
+    return datetime.datetime.now(datetime.timezone.utc)
+
+
+def renew_node_credential(authority: DeploymentAuthority, ledger: PairingLedger,
+                          admission: CaptureNodeAdmission, identity: CaptureNodeIdentity,
+                          csr_pem: bytes, *,
+                          validity: datetime.timedelta = DEFAULT_NODE_VALIDITY,
+                          clock: Callable[[], datetime.datetime] = _utc_now,
+                          monitor: "CaptureCredentialMonitor | None" = None
+                          ) -> IssuedNodeCredential:
+    """Issue and stage a renewal for the authenticated session's own node."""
+    try:
+        if not isinstance(identity, CaptureNodeIdentity):
+            raise RenewalRefused("renewal_identity_invalid")
+        now = clock()
+        if identity.not_valid_after <= now:
+            raise RenewalRefused("renewal_credential_expired")
+        if not admission.is_admitted(identity):
+            raise RenewalRefused("renewal_credential_not_admitted")
+        try:
+            issued = authority.issue_renewal_certificate(identity.node_id, csr_pem,
+                                                         validity=validity)
+        except CaptureAuthorityError:
+            raise RenewalRefused("renewal_request_invalid") from None
+        try:
+            ledger.stage_renewal(node_id=identity.node_id,
+                                 current_public_key_digest=identity.public_key_digest,
+                                 current_credential_digest=identity.credential_digest,
+                                 public_key_digest=issued.public_key_digest,
+                                 credential_serial_digest=issued.credential_digest,
+                                 not_after=issued.not_after.timestamp())
+        except (PairingError, ValueError):
+            raise RenewalRefused("renewal_not_eligible") from None
+        return issued
+    except RenewalRefused as refusal:
+        if monitor is not None:
+            monitor.renewal_refused(identity if isinstance(identity, CaptureNodeIdentity) else None,
+                                    refusal.reason)
+        raise
+
+
+@dataclass(frozen=True)
+class CredentialSignal:
+    """What the monitor reported; contains a node UUID and fixed reason only."""
+
+    node_id: UUID | None
+    reason: str
+
+
+class CaptureCredentialMonitor:
+    """Raises Owner-visible local warnings for expiring or unrenewable node credentials.
+
+    ``notify(kind, at)`` is the injected existing notification hook, normally
+    ``NotificationService.record``. Each (node, reason, expiry) is reported
+    once per process; the remembered set is bounded.
+    """
+
+    def __init__(self, ledger: PairingLedger,
+                 notify: Callable[..., object], *,
+                 warning_window: datetime.timedelta = EXPIRY_WARNING_WINDOW,
+                 clock: Callable[[], datetime.datetime] = _utc_now):
+        if not isinstance(ledger, PairingLedger) or not callable(notify):
+            raise ValueError("invalid credential monitor dependency")
+        if not isinstance(warning_window, datetime.timedelta) or warning_window <= datetime.timedelta(0):
+            raise ValueError("invalid credential warning window")
+        self._ledger = ledger
+        self._notify = notify
+        self._window = warning_window
+        self._clock = clock
+        self._reported: set[tuple] = set()
+        self.signals: list[CredentialSignal] = []
+        self.notification_failed = False
+
+    def _signal(self, key: tuple, signal: CredentialSignal, at: datetime.datetime) -> None:
+        if key in self._reported:
+            return
+        if len(self._reported) >= _MAX_REMEMBERED_SIGNALS:
+            self._reported.clear()
+        self._reported.add(key)
+        self.signals = (self.signals + [signal])[-_MAX_REMEMBERED_SIGNALS:]
+        try:
+            self._notify(NotificationKind.CAPTURE_CREDENTIAL_WARNING, at=at)
+        except Exception:
+            self.notification_failed = True
+
+    def check(self) -> tuple[CredentialSignal, ...]:
+        """Report credentials inside the warning window or already expired."""
+        now = self._clock()
+        found = []
+        try:
+            expiries = self._ledger.credential_expiries()
+        except PairingError:
+            signal = CredentialSignal(None, "credential_state_unavailable")
+            self._signal(("unavailable", now.date()), signal, now)
+            return (signal,)
+        for entry in expiries:
+            expires = datetime.datetime.fromtimestamp(entry.not_after, datetime.timezone.utc)
+            if expires <= now:
+                reason = "credential_expired"
+            elif expires - now <= self._window:
+                reason = "credential_expiring_without_renewal"
+            else:
+                continue
+            signal = CredentialSignal(entry.node_id, reason)
+            found.append(signal)
+            self._signal((entry.node_id, reason, entry.not_after), signal, now)
+        return tuple(found)
+
+    def renewal_refused(self, identity: CaptureNodeIdentity | None, reason: str) -> None:
+        now = self._clock()
+        node = identity.node_id if identity is not None else None
+        self._signal((node, "renewal_refused", reason, now.date()),
+                     CredentialSignal(node, "renewal_refused"), now)

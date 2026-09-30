@@ -9,7 +9,8 @@ from pathlib import Path
 
 from media_capture_agent.node_tls import (
     PendingNodeKeyStore, TrustBundle, build_capture_client_context, build_enrollment_request,
-    connect_to_main, installed_credential, validate_issued_credential,
+    complete_renewal, connect_to_main, installed_credential, prepare_renewal,
+    validate_issued_credential,
 )
 from media_capture_agent.pairing import NodeCredentialStore, PairingRefused
 
@@ -27,6 +28,10 @@ def main(argv):
             material = validate_issued_credential(bundle, pending.load(), Path(argv[3]).read_bytes())
             NodeCredentialStore(runtime).install(material)
             pending.discard()
+        elif action == "renew-request":
+            Path(argv[2]).write_bytes(prepare_renewal(NodeCredentialStore(runtime)).csr_pem)
+        elif action == "renew-install":
+            complete_renewal(NodeCredentialStore(runtime), Path(argv[2]).read_bytes())
         elif action == "connect":
             credential = installed_credential(NodeCredentialStore(runtime))
             context = build_capture_client_context(credential.ca_certificate_pem,

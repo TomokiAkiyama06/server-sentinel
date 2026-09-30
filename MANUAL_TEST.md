@@ -218,6 +218,16 @@ addresses or hostnames into Issues, PRs or CI artifacts.
 11. Inspect Main and Agent logs, `ps` output, service environment and shell
     history on both hosts for key, code or certificate text; expect none.
 
+12. Renewal (Owner decision 2026-09-30: 397-day default, automatic renewal):
+    on a disposable deployment, issue a node certificate with a short explicit
+    validity so it enters the 30-day window. Confirm that the Agent renews over
+    its admitted session, that `pending-renewal/` is 0700 with a 0600 key, and
+    that the old certificate keeps working until the renewed one first connects
+    and is refused afterwards. A revoked node's renewal must be refused. After
+    the credential expires, the node must re-pair. Block renewal (for example
+    stop the Main) until the 14-day threshold and confirm the Owner sees a
+    `capture_credential_warning`. *(needs transport wiring and a scheduler)*
+
 Record the Main/Agent OS, Python, OpenSSL (`cryptography` reports 4.0.2 from its
 wheel) and architecture used, without private deployment values.
 

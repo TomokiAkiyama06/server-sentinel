@@ -25,6 +25,7 @@ from app.cameras.remote_agent.ingest_tls import (
 )
 from app.cameras.remote_agent.node_ca import DeploymentAuthority, PrivateDirectory, listener_material
 from app.cameras.remote_agent.pairing import HmacCodeVerifier, PairingLedger
+from app.cameras.remote_agent.renewal import renew_node_credential
 from app.storage.database import Database
 from app.storage.migrations import migrate
 from app.storage.schema import APPLICATION_MIGRATIONS
@@ -65,7 +66,8 @@ class CaptureMtlsScenario(unittest.TestCase):
         material = listener_material(listener_directory)
         context = build_ingest_server_context(self.authority.ca_certificate_pem(),
                                               material.certificate_path, material.key_path)
-        self.acceptor = CaptureIngestAcceptor(context, CaptureNodeAdmission(self.ledger, self.deployment))
+        self.admission = CaptureNodeAdmission(self.ledger, self.deployment)
+        self.acceptor = CaptureIngestAcceptor(context, self.admission)
         self.environment = {
             "PATH": os.environ.get("PATH", ""), "PYTHONDONTWRITEBYTECODE": "1",
             "PYTHONPATH": os.pathsep.join(str(ROOT / part) for part in ("agent", ".")),
@@ -107,8 +109,8 @@ class CaptureMtlsScenario(unittest.TestCase):
                                              public_key_digest=digest_path.read_text())
         claim = self.ledger.redeem(enrollment_id=approval.enrollment_id,
                                    public_key_digest=digest_path.read_text(), code=code.value)
-        issued = self.authority.issue_and_activate(self.ledger, claim, csr_path.read_bytes(),
-                                                   validity=30 * DAY)
+        # Owner decision 2026-09-30: the default node validity is 397 days.
+        issued = self.authority.issue_and_activate(self.ledger, claim, csr_path.read_bytes())
         certificate_path = self.public / "node.pem"
         certificate_path.write_bytes(issued.certificate_pem)
         bundle = self.authority.export_trust_bundle(server_name=SERVER_NAME,
@@ -134,6 +136,23 @@ class CaptureMtlsScenario(unittest.TestCase):
         self.assertNotIsInstance(session, str, session)
         self.addCleanup(session.close)
         self.assertEqual(claim.node_id, session.identity.node_id)
+
+        # Automatic renewal over the admitted session: fresh Agent key, same node.
+        renewal_csr = self.public / "renewal.csr"
+        self.assertEqual(("done", ""), self.agent("renew-request", self.runtime, renewal_csr))
+        renewed = renew_node_credential(self.authority, self.ledger, self.admission,
+                                        session.identity, renewal_csr.read_bytes())
+        renewed_path = self.public / "renewed.pem"
+        renewed_path.write_bytes(renewed.certificate_pem)
+        self.assertEqual(("done", ""), self.agent("renew-install", self.runtime, renewed_path))
+        self.assertTrue(session.still_admitted(), "old certificate is valid until the new one is used")
+        renewed_session, output = self.connect()
+        self.assertEqual("ok", output)
+        self.addCleanup(renewed_session.close)
+        self.assertEqual(renewed.credential_digest, renewed_session.identity.credential_digest)
+        self.assertEqual(claim.node_id, renewed_session.identity.node_id)
+        self.assertFalse(session.still_admitted(), "first use of the renewal supersedes the old one")
+        session = renewed_session
 
         self.ledger.revoke(Owner(), "owner", node_id=claim.node_id)
         self.assertFalse(session.still_admitted())

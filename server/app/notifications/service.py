@@ -21,6 +21,9 @@ class NotificationKind(StrEnum):
     # recording-health verdict). They are never an immediate Slack message.
     HARDWARE_INTEGRITY_WARNING = "hardware_integrity_warning"
     RECORDING_HEALTH_WARNING = "recording_health_warning"
+    # Capture-node certificate approaching expiry without renewal, expired, or
+    # a refused renewal (Issue #13). Local Owner-visible warning only.
+    CAPTURE_CREDENTIAL_WARNING = "capture_credential_warning"
     PERSON = "person"
     MOTION = "motion"
     ENTRY = "entry"

@@ -22,3 +22,14 @@ and a TLS 1.3 client context pinned to the deployment CA with hostname
 verification and no key-log support. The Agent still opens no listener, and the
 bootstrap enrollment exchange and pairing CLI are not implemented yet. Only this
 module imports `cryptography`; the runtime, CLI and ring buffer stay stdlib-only.
+
+Automatic renewal (Owner decision 2026-09-30): `RenewalSchedule` starts 30 days
+before the installed certificate expires and backs off from 1 hour to at most
+24 hours. `prepare_renewal` keeps one fresh key in
+`<runtime_root>/pending-renewal/` (0700/0600) across retries and returns an
+empty-subject CSR for the current mTLS session. `complete_renewal` accepts only a
+certificate for the same node and deployment, issued by the installed CA for the
+pending key and outliving the current certificate. It then calls
+`NodeCredentialStore.rotate`, which atomically renames the new generation over
+`current.json` and removes the old files. An expired credential cannot renew;
+the node must re-pair. No scheduler runs this yet (#15 transport).
