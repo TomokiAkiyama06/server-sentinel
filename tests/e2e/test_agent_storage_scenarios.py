@@ -241,6 +241,74 @@ class HardReserveTests(RingScenario):
         # The refusal side (nothing ages out before the next append) is
         # covered by the refused-capture scenario below.
 
+    def test_staggered_sources_credit_only_media_reclaimed_by_each_next_append(self):
+        # Two sources capture on phases half a cadence apart. Sampled right
+        # after B's append, A's next append is only half a cadence away. The
+        # hard-stop predicate must credit only media that A's real next
+        # append reclaims (its own phase), not B media that expires during
+        # an extra half cadence after a restarted ``now + cadence``.
+        self.build(2, name="agent-staggered")
+        a, b = self.sources
+        half = MINUTE // 2
+        t0 = self.t0
+        self.configure(at=t0 - 2 * PRE)
+        for begin in range(t0 - 2 * PRE, t0, MINUTE):
+            self.ring.append(a, begin, begin + MINUTE, PAYLOAD,
+                             now_us=begin + MINUTE, clock_trusted=True)
+            self.ring.append(b, begin + half, begin + half + MINUTE, PAYLOAD,
+                             now_us=begin + half + MINUTE, clock_trusted=True)
+        now = t0 + half
+        allocations = self.store.segment_allocations()
+        rows = self.ring._rows()
+        oldest_b = next(row for row in rows if row["source"] == str(b) and row["end"] == now - PRE + MINUTE)
+        oldest_a = next(row for row in rows if row["source"] == str(a) and row["end"] == t0 - PRE + MINUTE)
+        # A's next append at t0+60 s reclaims only A's oldest segment; B's
+        # oldest ages out only at B's own next append (t0+90 s).
+        profile = self.profiles[0]
+        reserve = self.settings.safety_reserve_bytes
+        unit = self.store.allocation_unit
+        needed = -(-(profile.segment_bytes() + self.ring.ledger_headroom) // unit) * unit
+        one = allocations[UUID(oldest_a["id"])]
+        self.assertEqual(one, allocations[UUID(oldest_b["id"])])
+        free = reserve + needed - one - 1
+        self.quota.other = self.quota.capacity - self.quota.used() - free
+        status = self.status(now)
+        self.assertEqual(("STORAGE_HARD_STOP", "segment_write_refused_at_reserve"),
+                         (status["state"], status["reason"]))
+        # The real next append of a maximum-size A segment is indeed refused.
+        with self.assertRaisesRegex(RingRefused, "segment_storage_refused"):
+            self.ring.append(a, t0, t0 + MINUTE, b"x" * profile.segment_bytes(),
+                             now_us=t0 + MINUTE, clock_trusted=True)
+
+    def test_overdue_source_credits_nothing_beyond_now(self):
+        # A source whose next segment is already overdue can append at
+        # ``now``: nothing that ages out only later may be credited.
+        self.build(1, name="agent-overdue")
+        t0 = self.t0
+        self.configure(at=t0 - 2 * PRE)
+        self.capture(t0 - 2 * PRE, t0)
+        now = t0 + MINUTE + MINUTE // 2
+        allocations = self.store.segment_allocations()
+        first, second = sorted(self.ring._rows(), key=lambda row: row["end"])[:2]
+        # At ``now`` only the oldest segment (end t0-540 s) is reclaimable
+        # under the 600 s duration; the next one (t0-480 s) would be only at
+        # a restarted now + cadence, which this overdue append never reaches.
+        self.assertLessEqual(first["end"], now - PRE)
+        self.assertGreater(second["end"], now - PRE)
+        self.assertLessEqual(second["end"], now + MINUTE - PRE)
+        profile = self.profiles[0]
+        unit = self.store.allocation_unit
+        needed = -(-(profile.segment_bytes() + self.ring.ledger_headroom) // unit) * unit
+        free = (self.settings.safety_reserve_bytes + needed
+                - allocations[UUID(first["id"])] - 1)
+        self.quota.other = self.quota.capacity - self.quota.used() - free
+        status = self.status(now)
+        self.assertEqual(("STORAGE_HARD_STOP", "segment_write_refused_at_reserve"),
+                         (status["state"], status["reason"]))
+        with self.assertRaisesRegex(RingRefused, "segment_storage_refused"):
+            self.ring.append(self.sources[0], t0, t0 + MINUTE, b"x" * profile.segment_bytes(),
+                             now_us=now, clock_trusted=True)
+
     def test_refused_capture_reports_hard_stop_throughout_and_recovers_with_space(self):
         # Several minutes of capture arrive while the filesystem sits just
         # above the reserve: every write is refused before crossing it, so

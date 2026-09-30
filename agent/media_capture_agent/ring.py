@@ -355,22 +355,34 @@ class DiskRing:
 
         Writes are refused before they would cross the reserve, so free space
         alone never drops below it while capture is being refused. Evaluate
-        each source's next append the way the append path does: at
-        ``now + cadence`` it first reclaims selected-FIFO media that has
-        become eligible by then (trusted time only), then needs the largest
-        bounded segment plus ledger headroom above the reserve. Media that
-        ages out only at that next append is credited; nothing later is.
+        each source's next append the way the append path does: it first
+        reclaims selected-FIFO media that has become eligible by then (trusted
+        time only), then needs the largest bounded segment plus ledger
+        headroom above the reserve.
+
+        The next append is dated by that source's own capture phase, not by a
+        cadence restarted at ``now``: a segment ends at least one cadence after
+        the source's last trusted segment end and is appended no earlier than
+        its end, so the earliest append time is ``max(now, last_end +
+        cadence)``. A source with no trusted segment yet, or an overdue one,
+        may append at ``now``. Only media that ages out by that earliest time
+        is credited, so another source's later expiry is never counted.
         """
         free, reserve = budget["filesystem_free"], budget["safety_reserve"]
         unit = self.store.allocation_unit
-        cadence = max(profile.segment_duration_us for profile in self.profiles.values())
+        next_append = {}
+        for source, profile in self.profiles.items():
+            last = self.db.execute("SELECT max(end) FROM segments WHERE source=? AND clock_trusted=1",
+                                   (str(source),)).fetchone()[0]
+            next_append[source] = now if last is None else max(now, last + profile.segment_duration_us)
         # One membership/row pass at the latest next-append time, filtered
         # per source below, keeps the statement count independent of rows.
-        rows = self._selected_reclaimable(now + cadence, self.config) if clock_trusted else ()
+        latest = max(next_append.values())
+        rows = self._selected_reclaimable(latest, self.config) if clock_trusted else ()
         allocations = self.store.segment_allocations() if rows else {}
         window = self.config.value * SECOND if self.config.mode == "duration" else PRE
-        for profile in self.profiles.values():
-            cutoff = now + profile.segment_duration_us - window
+        for source, profile in self.profiles.items():
+            cutoff = next_append[source] - window
             reclaim = sum(allocations.get(UUID(row["id"]), 0) for row in rows if row["end"] <= cutoff)
             needed = round_up(profile.segment_bytes() + self.ledger_headroom, unit)
             if free + reclaim < reserve + needed:
@@ -819,6 +831,9 @@ class DiskRing:
             if str(exc) != "insufficient_ledger_capacity":
                 raise
             ledger_pressure = True
+            # The size that would admit the next incident, reported exactly
+            # when the configured cap is insufficient.
+            ledger_required = getattr(exc, "required_bytes", None)
         allocated = self.store.segment_allocations()
         rows = self._rows()
         known_ids = {UUID(row["id"]) for row in rows}

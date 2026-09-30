@@ -138,12 +138,16 @@ alone never falls below the reserve while capture is being refused. Status
 therefore also reports `STORAGE_HARD_STOP / segment_write_refused_at_reserve`
 whenever, for any configured source, `free + R_next < reserve +
 round_up(max_segment + L)`. `max_segment` is that source's largest bounded
-segment and `R_next` is the ordinary media its next append (at `now + cadence`)
-would itself reclaim first: selected-FIFO eligible at that time, outside the
-pre-loss window, trusted time only. Evaluating reclaim at `now` would miss the
-segment that ages out exactly at the next append, and a steady full ring that
-keeps accepting writes would be falsely reported as refused; nothing beyond
-the next append is credited. It is
+segment and `R_next` is the ordinary media its next append would itself
+reclaim first: selected-FIFO eligible at that time, outside the pre-loss
+window, trusted time only. The next append is dated by the source's own
+capture phase, `max(now, last_trusted_end + cadence)` (a source with no
+trusted segment yet, or an overdue one, may append at `now`), not by a cadence
+restarted at `now`; otherwise a sample taken mid-interval would credit another
+source's media that expires only after that append. Evaluating reclaim at
+`now` would miss the segment that ages out exactly at the next append, and a
+steady full ring that keeps accepting writes would be falsely reported as
+refused; nothing beyond the next append is credited. It is
 not reported as pressure or healthy while recording is refused, and it clears
 without Owner action as soon as space returns. `safety_reserve_unavailable`
 remains the separate hard stop for another consumer breaching the reserve. Capacity limits use
@@ -268,7 +272,9 @@ required = 4096 * (74 + 6 * (S + F) + 4 * 1 + 4 * F)
 ```
 
 plus existing protected/incident/protection rows. `status()` reports
-`ledger_required_bytes` next to `ledger_maximum_bytes`; the runtime filesystem
+`ledger_required_bytes` next to `ledger_maximum_bytes`, including when the cap
+is insufficient (`STORAGE_PRESSURE / insufficient_ledger_capacity`), so the
+Owner can choose a cap of at least that size; the runtime filesystem
 needs `L_meta` (about 2x the cap) above the safety reserve. Examples computed
 with this code (fresh ring, 4096-byte allocation unit):
 

@@ -160,7 +160,11 @@ class Ledger:
         required = PAGE_BYTES * (74 + 6 * integer(segments) + 4 * integer(incidents)
                                  + 4 * integer(protections))
         if required > self.maximum_bytes:
-            raise RingRefused("insufficient_ledger_capacity")
+            refused = RingRefused("insufficient_ledger_capacity")
+            # Value-free for callers that surface only the code; status()
+            # reports it so the Owner can size a sufficient ledger cap.
+            refused.required_bytes = required
+            raise refused
         return required
 
     def _check_sidecars(self):

@@ -463,6 +463,32 @@ class SimultaneousBudgetAdmissionTests(RingScenario):
         self.assertEqual(20, self.count("segments"))
         self.assertEqual(20, self.count("protection"))
 
+    def test_insufficient_ledger_status_reports_required_bytes(self):
+        # The Owner sizes a larger ledger cap from ledger_required_bytes, so
+        # it must be reported exactly when the cap is insufficient.
+        self.ring.close()
+        self.ledger_bytes = 450 * 4096
+        self.open_ring()
+        self.configure()
+        self.capture(self.t0 - PRE, self.t0)
+        self.connect(self.t0)
+        self.lose(self.t0)
+        self.capture(self.t0, self.t0 + POST)
+        status = self.status(self.t0 + POST)
+        self.assertEqual(("STORAGE_PRESSURE", "insufficient_ledger_capacity"),
+                         (status["state"], status["reason"]))
+        self.assertEqual(self.ledger_bytes, status["ledger_maximum_bytes"])
+        self.assertIsInstance(status["ledger_required_bytes"], int)
+        self.assertGreater(status["ledger_required_bytes"], status["ledger_maximum_bytes"])
+        self.assertEqual(0, status["ledger_required_bytes"] % 4096)
+        # A ledger of exactly the reported size admits the next incident.
+        self.ring.close()
+        self.ledger_bytes = status["ledger_required_bytes"]
+        self.open_ring()
+        ready = self.status(self.t0 + POST)
+        self.assertNotEqual("insufficient_ledger_capacity", ready["reason"])
+        self.assertEqual(status["ledger_required_bytes"], ready["ledger_required_bytes"])
+
     def test_concurrent_preserves_both_admitted_without_double_counting(self):
         self.ring.close()
         self.ledger_bytes = 512 * 4096
