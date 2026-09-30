@@ -406,6 +406,72 @@ class PairingCliTests(EnrollmentHarness):
         self.assertEqual(self.deployment, deployment_id_of(PrivateDirectory(self.root / "ca")))
         self.assertEqual(SERVER_NAME, main_server_name(self.listener_directory))
 
+    def init(self, authority, listener, *extra):
+        stderr, stdout = io.StringIO(), io.StringIO()
+        with patch("sys.stderr", stderr), patch("sys.stdout", stdout):
+            status = pairing_cli.main(["init", "--authority-dir", str(authority),
+                                       "--listener-dir", str(listener), *extra])
+        return status, stdout.getvalue(), stderr.getvalue()
+
+    def test_init_validates_every_input_before_persisting_the_ca(self):
+        occupied = self.root / f"init-occupied-{uuid4()}"
+        occupied.mkdir(mode=0o700)
+        (occupied / "main-server-key.pem").write_bytes(b"x")
+        os.chmod(occupied / "main-server-key.pem", 0o600)
+        shared = self.root / f"init-shared-{uuid4()}"
+        shared.mkdir(mode=0o755)
+        same = object()
+        bad_inputs = (
+            (None, "--server-name", "Not_A-DNS-Name"),
+            (None, "--server-name", "10.0.0.1"),
+            (None, "--server-name", SERVER_NAME, "--server-validity-days", "0"),
+            (None, "--server-name", SERVER_NAME, "--server-validity-days", "398"),
+            (None, "--server-name", SERVER_NAME, "--server-validity-days", str(10 ** 12)),
+            (None, "--server-name", SERVER_NAME, "--ca-validity-days", str(10 ** 12)),
+            (None, "--server-name", SERVER_NAME, "--ca-validity-days", "30"),
+            (occupied, "--server-name", SERVER_NAME),
+            (shared, "--server-name", SERVER_NAME),
+            (same, "--server-name", SERVER_NAME),
+        )
+        for target, *extra in bad_inputs:
+            authority = self.root / f"init-ca-{uuid4()}"
+            listener = self.root / f"init-listener-{uuid4()}"
+            target = listener if target is None else authority if target is same else target
+            with self.subTest(extra=extra, target=target.name):
+                status, stdout, stderr = self.init(authority, target, *extra)
+                self.assertEqual(2, status, stderr)
+                self.assertEqual("", stdout)
+                self.assertIn("refused", stderr)
+                self.assertFalse((authority / "ca-key.pem").exists())
+                self.assertFalse((authority / "ca-certificate.pem").exists())
+                self.assertFalse((listener / "main-server-key.pem").exists())
+                # A corrected rerun on the same directories completes.
+                status, stdout, stderr = self.init(authority, listener, "--server-name", SERVER_NAME)
+                self.assertEqual(0, status, stderr)
+                deployment = deployment_id_of(PrivateDirectory(authority))
+                self.assertEqual(f"deployment_id={deployment}\n", stdout)
+                self.assertEqual(SERVER_NAME, main_server_name(PrivateDirectory(listener)))
+        self.assertEqual(b"x", (occupied / "main-server-key.pem").read_bytes())
+
+    def test_init_rolls_back_the_new_ca_when_listener_issuance_fails(self):
+        authority = self.root / f"init-ca-{uuid4()}"
+        listener = self.root / f"init-listener-{uuid4()}"
+        real_write = PrivateDirectory.write_new
+
+        def failing_write(directory, name, value):
+            if name == "main-server-certificate.pem":
+                raise pairing_cli.CaptureAuthorityError("issuer material could not be written")
+            return real_write(directory, name, value)
+        with patch.object(PrivateDirectory, "write_new", failing_write):
+            status, _stdout, stderr = self.init(authority, listener, "--server-name", SERVER_NAME)
+        self.assertEqual(2, status)
+        self.assertIn("issuer_material_rejected", stderr)
+        self.assertEqual([], sorted(os.listdir(authority)))
+        self.assertEqual([], sorted(os.listdir(listener)))
+        status, _stdout, stderr = self.init(authority, listener, "--server-name", SERVER_NAME)
+        self.assertEqual(0, status, stderr)
+        self.assertEqual(SERVER_NAME, main_server_name(PrivateDirectory(listener)))
+
     def test_list_shows_states_without_digests(self):
         _key, _csr, approval, _code = self.approve()
         stdout = io.StringIO()

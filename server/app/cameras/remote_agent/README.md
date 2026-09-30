@@ -79,7 +79,11 @@ per-connection deadline and attempts per source address. Logs carry fixed
 reason words only.
 
 `pairing_cli.py` (`python -m app.cameras.remote_agent.pairing_cli`) is the local
-Owner CLI: `init`, `export-bundle`, `approve`, `list`, `revoke`. `approve` shows
+Owner CLI: `init`, `export-bundle`, `approve`, `list`, `revoke`. `init` validates
+the server name, both validity periods and both destination directories before
+it writes the write-once CA, and removes what it created if listener issuance
+still fails, so a corrected rerun works without manual secret-file cleanup.
+`approve` shows
 the request's key digest, requires a typed `APPROVE` on the controlling
 terminal, creates the pairing through `PairingLedger.approve`, writes the code
 once to the controlling terminal (never stdout, stderr, logs or files), and

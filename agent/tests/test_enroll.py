@@ -146,8 +146,35 @@ class EnrollClientTests(unittest.TestCase):
         key_file = self.runtime / "pending-enrollment" / "node-key.pem"
         self.assertEqual(0o600, stat.S_IMODE(os.lstat(key_file).st_mode))
         self.assertEqual(0o700, stat.S_IMODE(os.lstat(key_file.parent).st_mode))
-        with self.assertRaisesRegex(PairingRefused, "pending_node_key_exists"):
-            enroll.create_enrollment_request(self.runtime, self.root / "second.json")
+        # Re-running ``request`` re-exports the same pending key; it never makes a second key.
+        second = self.root / "second.json"
+        self.assertEqual(self.digest, enroll.create_enrollment_request(self.runtime, second))
+        again = json.loads(second.read_text())
+        self.assertEqual(set(value), set(again))
+        self.assertEqual(self.digest, again["public_key_digest"])
+        self.assertEqual(
+            x509.load_pem_x509_csr(value["csr"].encode()).public_key(),
+            x509.load_pem_x509_csr(again["csr"].encode()).public_key())
+
+    def test_failed_request_file_leaves_a_retry_path_for_the_same_key(self):
+        runtime = self.root / "state-retry"
+        runtime.mkdir(mode=0o700)
+        taken = self.root / "taken.json"
+        taken.write_text("operator file")
+        with self.assertRaisesRegex(PairingRefused, "output_file_unavailable"):
+            enroll.create_enrollment_request(runtime, taken)
+        self.assertEqual("operator file", taken.read_text(), "existing output is never replaced")
+        key_file = runtime / "pending-enrollment" / "node-key.pem"
+        key_before = key_file.read_bytes()
+        retry = self.root / "retry.json"
+        digest = enroll.create_enrollment_request(runtime, retry)
+        self.assertEqual(key_before, key_file.read_bytes(), "the pending key is reused, not replaced")
+        self.assertEqual(digest, json.loads(retry.read_text())["public_key_digest"])
+        peer = self.peer()
+        enroll.pair(runtime, self.bundle(peer.port), prompt=self.prompt_after(peer))
+        with self.assertRaisesRegex(PairingRefused, "node_identity_already_exists"):
+            enroll.create_enrollment_request(runtime, self.root / "after-pairing.json")
+        self.assertFalse((self.root / "after-pairing.json").exists())
 
     def test_pairs_after_verifying_main_and_installs_private_credential(self):
         peer = self.peer()

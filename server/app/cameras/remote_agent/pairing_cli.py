@@ -55,7 +55,8 @@ from .enrollment import (
     EnrollmentService, build_enrollment_server_context,
 )
 from .node_ca import (
-    MAX_CSR_BYTES, MAX_LEAF_VALIDITY, CaptureAuthorityError, DeploymentAuthority,
+    MAX_CA_VALIDITY, MAX_CSR_BYTES, MAX_LEAF_VALIDITY, CaptureAuthorityError,
+    DeploymentAuthority,
     PrivateDirectory, deployment_id_of, listener_material, main_server_name,
 )
 from .pairing import HmacCodeVerifier, PairingError, PairingLedger
@@ -241,15 +242,24 @@ def _group(code: str) -> str:
     return "-".join(code[index:index + 5] for index in range(0, 20, 5)) + "-" + code[20:]
 
 
+def _days(value: int, maximum: datetime.timedelta) -> datetime.timedelta:
+    if not isinstance(value, int) or not 0 < value <= maximum.days:
+        raise CliRefused("certificate_validity_rejected")
+    return value * _DAY
+
+
 def command_init(args) -> int:
     authority_directory = _directory(args.authority_dir)
     listener_directory = _directory(args.listener_dir)
     if authority_directory.path == listener_directory.path:
         raise CliRefused("listener_directory_must_differ")
-    authority = DeploymentAuthority.create(authority_directory, uuid4(),
-                                           validity=args.ca_validity_days * _DAY)
-    authority.issue_main_server_credential(listener_directory, server_name=args.server_name,
-                                           validity=args.server_validity_days * _DAY)
+    # Everything is validated before the write-once CA exists; a failed run
+    # leaves no issuer material, so the corrected command can simply be rerun.
+    authority = DeploymentAuthority.initialize(
+        authority_directory, listener_directory, uuid4(),
+        validity=_days(args.ca_validity_days, MAX_CA_VALIDITY),
+        server_name=args.server_name,
+        server_validity=_days(args.server_validity_days, MAX_LEAF_VALIDITY))
     print(f"deployment_id={authority.deployment_id}")
     return 0
 

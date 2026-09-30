@@ -224,6 +224,20 @@ class PrivateDirectory:
         finally:
             os.close(directory)
 
+    def discard_created(self, name: str) -> None:
+        """Remove a file this process just created, to roll back an incomplete setup."""
+        directory = self._open_directory()
+        try:
+            try:
+                os.unlink(name, dir_fd=directory)
+            except FileNotFoundError:
+                return
+            except OSError:
+                raise CaptureAuthorityError("issuer material could not be removed") from None
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+
     def private_file(self, name: str) -> Path:
         """Validate a private file and return its path for ``ssl`` path-only loaders."""
         self.read(name)
@@ -333,6 +347,51 @@ class DeploymentAuthority:
         directory.write_new(_CA_KEY, _private_pem(key))
         directory.write_new(_CA_CERTIFICATE, _certificate_pem(certificate))
         return cls(deployment_id, certificate, key, clock=clock)
+
+    @classmethod
+    def initialize(cls, directory: PrivateDirectory, listener: PrivateDirectory,
+                   deployment_id: UUID, *, validity: datetime.timedelta, server_name: str,
+                   server_validity: datetime.timedelta,
+                   clock: Callable[[], datetime.datetime] = _utc_now) -> "DeploymentAuthority":
+        """Create the CA and the Main listener credential together, or neither.
+
+        Every input and both destinations are validated before the write-once
+        CA is persisted, so a typo never strands a CA without a listener
+        credential. If issuance still fails afterwards (I/O, clock), the files
+        this call created are removed and the same command can be rerun.
+        """
+        if not isinstance(deployment_id, UUID):
+            raise CaptureAuthorityError("invalid deployment identity")
+        lifetime = _validity(validity, MAX_CA_VALIDITY)
+        server_lifetime = _validity(server_validity, MAX_LEAF_VALIDITY)
+        if server_lifetime + _CLOCK_SKEW_ALLOWANCE > lifetime:
+            raise CaptureAuthorityError("certificate validity exceeds the deployment CA")
+        if not valid_server_name(server_name):
+            raise CaptureAuthorityError("invalid Main server name")
+        if not isinstance(listener, PrivateDirectory) or listener.path == directory.path:
+            raise CaptureAuthorityError("listener material must not share the CA directory")
+        _checked_now(clock)
+        directory.ensure()
+        listener.ensure()
+        if any(directory.exists(name) for name in (_CA_KEY, _CA_CERTIFICATE)):
+            raise CaptureAuthorityError("issuer material already exists")
+        if any(listener.exists(name)
+               for name in (_CA_KEY, _CA_CERTIFICATE, _SERVER_KEY, _SERVER_CERTIFICATE)):
+            raise CaptureAuthorityError("listener material already exists")
+        authority = cls.create(directory, deployment_id, validity=lifetime, clock=clock)
+        try:
+            authority.issue_main_server_credential(listener, server_name=server_name,
+                                                   validity=server_lifetime)
+        except BaseException:
+            for target, names in ((listener, (_SERVER_CERTIFICATE, _SERVER_KEY)),
+                                  (directory, (_CA_CERTIFICATE, _CA_KEY))):
+                for name in names:
+                    try:
+                        target.discard_created(name)
+                    except CaptureAuthorityError:
+                        pass
+            raise
+        return authority
 
     @classmethod
     def load(cls, directory: PrivateDirectory, deployment_id: UUID, *,

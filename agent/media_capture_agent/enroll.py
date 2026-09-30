@@ -9,7 +9,8 @@ Run as the dedicated non-root ``media-capture-agent`` account::
 ``request`` generates the node key locally (0600 in a 0700 directory below the
 runtime root) and writes the *public* enrollment request (CSR plus key digest)
 that the Owner carries to the Main approval CLI. It prints the key digest so
-the Owner can compare it with the one the Main shows.
+the Owner can compare it with the one the Main shows. Rerunning it before
+pairing re-exports the request for the same pending key (never a new key).
 
 ``pair`` accepts only public selectors: the trust-bundle file, its full SHA-256
 as verified by the Owner, and optionally an endpoint override. Order of work:
@@ -98,8 +99,23 @@ def _read_public_file(path: Path, maximum: int) -> bytes:
 
 
 def create_enrollment_request(runtime_root: Path, output: Path) -> str:
-    """Create the write-once node key and the public request file; return its key digest."""
-    request = build_enrollment_request(PendingNodeKeyStore(runtime_root).create())
+    """Write the public request for the pending node key; return its key digest.
+
+    The node key is write-once: the first run creates it, and a later run
+    re-exports the request for that same key instead of refusing. So when the
+    output file cannot be written (it exists, is unwritable, or fsync fails)
+    after the key is persisted, rerunning with a usable ``--output`` recovers
+    without touching private runtime state. It never replaces the key, never
+    overwrites an existing output file, and refuses once an identity is installed.
+    """
+    pending = PendingNodeKeyStore(runtime_root)
+    try:
+        key = pending.create()
+    except PairingRefused as error:
+        if str(error) != "pending_node_key_exists":
+            raise
+        key = pending.load()
+    request = build_enrollment_request(key)
     content = json.dumps({
         "format_version": REQUEST_FORMAT,
         "csr": request.csr_pem.decode("ascii"),

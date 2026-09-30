@@ -33,7 +33,10 @@ python -m media_capture_agent.enroll pair --runtime-root <runtime_root> \
 ```
 
 `request` writes only public data (CSR and key digest) and prints the digest for
-the Owner to compare with the Main's approval prompt. `pair` refuses a bundle
+the Owner to compare with the Main's approval prompt. Rerunning it before
+pairing re-exports the request for the same pending key (it never creates a
+second key or overwrites an existing output file), so a failed or lost request
+file is recovered by running it again with a new `--output`. `pair` refuses a bundle
 whose digest differs before any network traffic. It then authenticates the Main
 (TLS 1.3 pinned to the bundle CA, server name, enrollment ALPN protocol, the
 bundle's deployment URI on the Main certificate) and closes that connection.
