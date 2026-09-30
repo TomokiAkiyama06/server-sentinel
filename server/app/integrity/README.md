@@ -7,6 +7,23 @@ wiring remain prerequisites; physical acceptance remains open under #23.
 
 `LinuxProbe.collect()` reads CPU signatures/topology from procfs, block-device
 size/model/available serial/WWID from sysfs, and display-controller PCI fields.
+
+Storage identity uses two source families, each in fixed precedence and each
+contributing at most one key named after its source: unit serial from
+`device/serial` (`serial`, e.g. NVMe) else SCSI VPD page 0x80
+(`vpd_pg80_serial`); logical-unit name from block `wwid` (`wwid`, e.g. NVMe)
+else the kernel's SCSI `device/wwid` (`scsi_wwid`) else the best logical-unit
+VPD page 0x83 designator, NAA > EUI-64 > SCSI name string > T10 vendor ID
+(`vpd_pg83_designator`). Vendor-specific and port/group designators are
+ignored. VPD pages are bounds-checked; a wrong page code, disconnected
+qualifier, truncated page or overrunning descriptor makes that page
+unavailable, and empty/placeholder/non-printable values are never identities.
+All sources are world-readable sysfs attributes; no root is needed. Devices
+whose earlier sources exist (NVMe) keep an identical identity. SATA/SCSI disks
+approved before this precedence recorded no identity: they now compare as
+immediate `UNVERIFIABLE` (`IDENTIFIERS_OR_PROPERTIES_INCOMPLETE`) until the
+Owner approves a new baseline; the baseline is never updated automatically.
+USB bridges that expose no conforming serial/designator stay `UNVERIFIABLE`.
 Optional host-provided `dmidecode --type 17` supplies DIMM slot/capacity/part/serial;
 optional `nvidia-smi` supplies exposed GPU UUID/serial. Missing permissions/tools
 or malformed data produce `UNVERIFIABLE`, not invented unique identities or proof

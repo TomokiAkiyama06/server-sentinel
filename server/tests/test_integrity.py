@@ -721,6 +721,167 @@ class LinuxProbeTests(TestCase):
             CommandRunner().run(("sh", "-c", "anything"))
 
 
+def _vpd(page, payload, qualifier=0):
+    return bytes((qualifier << 5, page)) + len(payload).to_bytes(2, "big") + payload
+
+
+def _descriptor(code_set, kind, value, association=0):
+    return bytes((code_set, (association << 4) | kind, 0, len(value))) + value
+
+
+SYNTHETIC_NAA = bytes.fromhex("5000c500deadbeef")
+SYNTHETIC_T10 = b"ATA     Synthetic Model 4TB                         SYNTH0001"
+SATA_PG83 = _vpd(0x83, _descriptor(2, 0, b"SYNTH-VENDOR-SPECIFIC")
+                 + _descriptor(2, 1, SYNTHETIC_T10) + _descriptor(1, 3, SYNTHETIC_NAA))
+
+
+class StorageIdentityProbeTests(TestCase):
+    """Issue #23: SATA/SCSI expose identity only below block/device/."""
+
+    def setUp(self):
+        self.temp = TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.probe = LinuxProbe(self.root, FakeRunner())
+
+    def put(self, path, value):
+        target = self.root / "sys/class/block" / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        (target.write_bytes if isinstance(value, bytes) else target.write_text)(value)
+
+    def disk(self, name, **files):
+        self.put(f"{name}/size", "2048")
+        self.put(f"{name}/device/model", "Synthetic Disk")
+        for key, value in files.items():
+            self.put(f"{name}/{key.replace('__', '/')}", value)
+
+    def identity(self, name):
+        storage = {item.location: item for item in self.probe._storage()}
+        return dict(storage[name].identity)
+
+    def test_nvme_identity_is_unchanged(self):
+        self.disk("nvme0n1", wwid="eui.synthetic0001\n", device__serial="SYNTHNVME0001  \n")
+        self.assertEqual(self.identity("nvme0n1"), {"serial": "SYNTHNVME0001", "wwid": "eui.synthetic0001"})
+
+    def test_existing_sources_take_precedence_over_scsi_sources(self):
+        self.disk("sdz", wwid="synthetic-block-wwid", device__serial="synthetic-serial",
+                  device__wwid="naa.synthetic", device__vpd_pg80=_vpd(0x80, b"OTHER"),
+                  device__vpd_pg83=SATA_PG83)
+        self.assertEqual(self.identity("sdz"), {"serial": "synthetic-serial", "wwid": "synthetic-block-wwid"})
+
+    def test_sata_disk_uses_scsi_wwid_and_vpd_unit_serial(self):
+        self.disk("sda", device__wwid="naa.5000c500deadbeef\n",
+                  device__vpd_pg80=_vpd(0x80, b"        SYNTH0001"), device__vpd_pg83=SATA_PG83)
+        self.assertEqual(self.identity("sda"), {"scsi_wwid": "naa.5000c500deadbeef",
+                                                "vpd_pg80_serial": "SYNTH0001"})
+
+    def test_vpd_pg83_designator_used_when_kernel_wwid_absent(self):
+        self.disk("sda", device__vpd_pg83=SATA_PG83)
+        self.assertEqual(self.identity("sda"), {"vpd_pg83_designator": "naa.5000c500deadbeef"})
+        # Without NAA, the best remaining LU designator is chosen; the
+        # vendor-specific descriptor is never an identity.
+        self.put("sda/device/vpd_pg83", _vpd(0x83, _descriptor(2, 0, b"SYNTH-VENDOR")
+                                             + _descriptor(2, 1, SYNTHETIC_T10)))
+        self.assertEqual(self.identity("sda"), {"vpd_pg83_designator": "t10." + SYNTHETIC_T10.decode()})
+        self.put("sda/device/vpd_pg83", _vpd(0x83, _descriptor(2, 0, b"SYNTH-VENDOR")))
+        self.assertEqual(self.identity("sda"), {})
+
+    def test_scsi_designator_types_and_associations(self):
+        eui = bytes.fromhex("0123456789abcdef")
+        name = b"iqn.2026-01.invalid.synthetic:lun0\x00\x00"
+        cases = (
+            (_descriptor(1, 2, eui), "eui.0123456789abcdef"),
+            (_descriptor(3, 8, name), "name.iqn.2026-01.invalid.synthetic:lun0"),
+            # Target-port association and port designators are not LU names.
+            (_descriptor(1, 3, SYNTHETIC_NAA, association=1) + _descriptor(1, 4, b"\x00\x01\x00\x02"), None),
+            # Nonconforming values: all-zero NAA, reserved NAA field, wrong
+            # code sets, blank T10 vendor-specific part, unaligned name string.
+            (_descriptor(1, 3, bytes(8)), None),
+            (_descriptor(1, 3, bytes.fromhex("1000c500deadbeef")), None),
+            (_descriptor(2, 3, b"5000c500"), None),
+            (_descriptor(1, 1, SYNTHETIC_T10), None),
+            (_descriptor(2, 1, b"ATA             "), None),
+            (_descriptor(3, 8, b"iqn.x"), None),
+        )
+        for payload, expected in cases:
+            with self.subTest(expected=expected, payload=payload.hex()):
+                self.disk("sdb", device__vpd_pg83=_vpd(0x83, payload))
+                self.assertEqual(self.identity("sdb"), {"vpd_pg83_designator": expected} if expected else {})
+
+    def test_usb_bridge_disk_without_ids_is_unique_id_unavailable(self):
+        self.disk("sdc", device__vpd_pg80=_vpd(0x80, b"    "), device__vpd_pg83=_vpd(0x83, b""))
+        self.assertEqual(self.identity("sdc"), {})
+        baseline = Inventory(tuple(self.probe._storage()))
+        self.assertEqual([(item.state, item.reason) for item in compare(baseline, self.probe.collect())
+                          if item.kind == Kind.STORAGE],
+                         [(State.UNVERIFIABLE, "UNIQUE_ID_UNAVAILABLE")])
+
+    def test_malformed_vpd_is_unavailable_not_identity(self):
+        malformed = (
+            b"", b"\x00\x80\x00",                              # short header
+            _vpd(0x83, b"SYNTH0001"),                          # wrong page code
+            _vpd(0x80, b"SYNTH0001", qualifier=1),             # LU not connected
+            _vpd(0x80, b"SYNTH0001")[:-2],                     # truncated page
+            _vpd(0x80, b"SYNTH\x010001"),                      # control byte
+            _vpd(0x80, b"\xffSYNTH"),                          # non-ASCII
+            _vpd(0x80, b"000000"), _vpd(0x80, b"\x00" * 8),     # placeholders
+            _vpd(0x80, b"S" * 1025),                           # over identity bound
+        )
+        for data in malformed:
+            with self.subTest(pg80=data[:12].hex()):
+                self.disk("sdd", device__vpd_pg80=data)
+                self.assertEqual(self.identity("sdd"), {})
+        truncated = _descriptor(1, 3, SYNTHETIC_NAA)
+        pg83 = (
+            _vpd(0x80, truncated),                                        # wrong page code
+            _vpd(0x83, truncated)[:-1],                                   # page truncated
+            _vpd(0x83, truncated[:-1]),                                   # descriptor overruns page
+            _vpd(0x83, truncated + b"\x01\x03"),                          # trailing partial header
+            _vpd(0x83, _descriptor(1, 3, SYNTHETIC_NAA) + bytes((1, 3, 0, 200)) + b"x"),
+        )
+        for data in pg83:
+            with self.subTest(pg83=data.hex()):
+                self.disk("sdd", device__vpd_pg80=b"", device__vpd_pg83=data)
+                self.assertEqual(self.identity("sdd"), {})
+
+    def test_unreadable_sources_are_unavailable(self):
+        self.disk("sde")
+        for name in ("vpd_pg80", "vpd_pg83", "wwid"):
+            (self.root / "sys/class/block/sde/device" / name).mkdir(parents=True)
+        self.assertEqual(self.identity("sde"), {})
+
+    def test_sata_baseline_without_identity_requires_owner_reapproval(self):
+        # A baseline approved before Issue #23 recorded no SATA identity. The
+        # newly exposed identifiers must not silently pass as OK.
+        self.disk("sda", device__wwid="naa.5000c500deadbeef",
+                  device__vpd_pg80=_vpd(0x80, b"SYNTH0001"), device__vpd_pg83=SATA_PG83)
+        current = self.probe.collect()
+        observed = next(item for item in current.components if item.kind == Kind.STORAGE)
+        legacy = Component(Kind.STORAGE, "sda", observed.properties, ())
+        findings = [item for item in compare(Inventory((legacy,)), current) if item.kind == Kind.STORAGE]
+        self.assertEqual([(item.state, item.reason) for item in findings],
+                         [(State.UNVERIFIABLE, "IDENTIFIERS_OR_PROPERTIES_INCOMPLETE")])
+        self.assertTrue(findings[0].immediate)
+        # After the Owner approves the new observation, the disk verifies.
+        findings = [item for item in compare(Inventory((observed,)), self.probe.collect())
+                    if item.kind == Kind.STORAGE]
+        self.assertEqual([item.state for item in findings], [State.OK])
+
+    def test_replaced_sata_disk_is_changed(self):
+        self.disk("sda", device__wwid="naa.5000c500deadbeef", device__vpd_pg80=_vpd(0x80, b"SYNTH0001"))
+        baseline = Inventory(tuple(self.probe._storage()))
+        self.put("sda/device/wwid", "naa.5000c500feedface")
+        self.put("sda/device/vpd_pg80", _vpd(0x80, b"SYNTH0002"))
+        findings = [item for item in compare(baseline, self.probe.collect()) if item.kind == Kind.STORAGE]
+        self.assertEqual([item.state for item in findings], [State.CHANGED])
+
+    def test_identifiers_stay_out_of_repr(self):
+        self.disk("sda", device__wwid="naa.5000c500deadbeef", device__vpd_pg80=_vpd(0x80, b"SYNTH0001"))
+        text = repr(self.probe.collect())
+        self.assertNotIn("SYNTH0001", text)
+        self.assertNotIn("deadbeef", text)
+
+
 class _Stream:
     def __init__(self, descriptor, owner):
         self._descriptor, self._owner = descriptor, owner

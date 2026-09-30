@@ -82,14 +82,21 @@ class CommandRunner:
                     process.stdout.close()
 
 
-def _read(path: Path) -> str:
+def _read_bytes(path: Path) -> bytes:
     try:
         with path.open("rb") as stream:
             data = stream.read(1048577)
-        if len(data) > 1048576:
-            raise ProbeUnavailable()
-        return data.decode("utf-8", errors="strict").strip()
-    except (OSError, UnicodeError):
+    except OSError:
+        raise ProbeUnavailable() from None
+    if len(data) > 1048576:
+        raise ProbeUnavailable()
+    return data
+
+
+def _read(path: Path) -> str:
+    try:
+        return _read_bytes(path).decode("utf-8", errors="strict").strip()
+    except UnicodeError:
         raise ProbeUnavailable() from None
 
 
@@ -109,6 +116,114 @@ def _identity(value: str) -> str:
 
 def _pairs(values: dict[str, str]) -> tuple[tuple[str, str], ...]:
     return tuple(sorted((key, value) for key, value in values.items() if value))
+
+
+# Identity values must fit Component's per-value bound; a longer value is
+# treated as unavailable instead of making the whole STORAGE probe fail.
+_IDENTITY_LIMIT = 1024
+
+
+def _bounded(value: str) -> str:
+    return value if len(value) <= _IDENTITY_LIMIT else ""
+
+
+def _vpd_page(data: bytes, page: int) -> bytes:
+    """Return the payload of one SPC VPD page, or raise on any framing fault.
+
+    Header: peripheral qualifier/type, page code, 16-bit big-endian page
+    length. A truncated page, a different page code or a logical unit that is
+    not connected (non-zero peripheral qualifier) is malformed, never partial.
+    """
+    if len(data) < 4 or data[1] != page or data[0] >> 5 != 0:
+        raise ProbeUnavailable()
+    length = int.from_bytes(data[2:4], "big")
+    if 4 + length > len(data):
+        raise ProbeUnavailable()
+    return data[4:4 + length]
+
+
+def _ascii(value: bytes) -> str:
+    """Printable ASCII with padding (spaces/NULs) removed from both ends."""
+    value = value.strip(b" \x00")
+    if any(byte < 0x20 or byte > 0x7e for byte in value):
+        raise ProbeUnavailable()
+    return value.decode("ascii")
+
+
+def _vpd_unit_serial(data: bytes) -> str:
+    """VPD page 0x80 (Unit Serial Number); empty/placeholder is unavailable."""
+    return _bounded(_identity(_ascii(_vpd_page(data, 0x80))))
+
+
+# VPD page 0x83 designator types accepted as a logical-unit identity, best
+# first. Vendor-specific (0), port/group (4-7) designators are not globally
+# unique logical-unit names and are ignored.
+_DESIGNATOR_RANK = {0x3: "naa", 0x2: "eui", 0x8: "name", 0x1: "t10"}
+
+
+def _designator(code_set: int, kind: int, value: bytes) -> str:
+    """Canonical text for one conforming designator, or "" when unusable."""
+    if kind in (0x2, 0x3):
+        # Binary identifiers: NAA 8/16 bytes with a defined NAA field,
+        # EUI-64 based 8/12/16 bytes. All-zero values identify nothing.
+        if code_set != 0x1 or not any(value):
+            return ""
+        if kind == 0x3 and (len(value) not in (8, 16) or value[0] >> 4 not in (2, 3, 5, 6)):
+            return ""
+        if kind == 0x2 and len(value) not in (8, 12, 16):
+            return ""
+        return value.hex()
+    if kind == 0x8:
+        # SCSI name string: UTF-8, NUL terminated/padded to a multiple of 4.
+        if code_set != 0x3 or len(value) % 4:
+            return ""
+        text = value.rstrip(b"\x00")
+        try:
+            decoded = text.decode("utf-8", errors="strict")
+        except UnicodeError:
+            return ""
+        return decoded if decoded.isprintable() and decoded.strip() else ""
+    # T10 vendor ID: 8-byte vendor field plus a non-blank vendor-specific part.
+    if code_set != 0x2 or len(value) <= 8 or not value[8:].strip(b" \x00"):
+        return ""
+    try:
+        return _ascii(value)
+    except ProbeUnavailable:
+        return ""
+
+
+def _vpd_designator(data: bytes) -> str:
+    """Best logical-unit designator from VPD page 0x83 (Device Identification).
+
+    Every descriptor is bounds-checked against the page length; any framing
+    fault makes the whole page unavailable rather than partially trusted.
+    """
+    payload = _vpd_page(data, 0x83)
+    best = None
+    offset = 0
+    while offset < len(payload):
+        if offset + 4 > len(payload):
+            raise ProbeUnavailable()
+        header, length = payload[offset:offset + 4], payload[offset + 3]
+        end = offset + 4 + length
+        if end > len(payload):
+            raise ProbeUnavailable()
+        code_set, association, kind = header[0] & 0x0F, (header[1] >> 4) & 0x3, header[1] & 0x0F
+        if association == 0 and kind in _DESIGNATOR_RANK:
+            text = _designator(code_set, kind, payload[offset + 4:end])
+            rank = list(_DESIGNATOR_RANK).index(kind)
+            if text and (best is None or rank < best[0]):
+                best = (rank, _DESIGNATOR_RANK[kind] + "." + text)
+        offset = end
+    return _bounded(_identity(best[1])) if best else ""
+
+
+def _optional_vpd(path: Path, parse) -> str:
+    """Absent, unreadable or malformed VPD is unavailable, never an identity."""
+    try:
+        return parse(_read_bytes(path))
+    except ProbeUnavailable:
+        return ""
 
 
 def _pci_slot(value: str) -> str:
@@ -190,10 +305,41 @@ class LinuxProbe:
             # This location is observed but its capacity cannot be verified.
             properties = _pairs({"capacity_bytes": str(sectors * 512) if sectors > 0 else "",
                                  "model": _optional(device / "device/model")})
-            identifiers = _pairs({"serial": _identity(_optional(device / "device/serial")),
-                                  "wwid": _identity(_optional(device / "wwid"))})
+            identifiers = _pairs(self._storage_identity(device))
             components.append(Component(Kind.STORAGE, device.name, properties, identifiers, complete=sectors > 0))
         return tuple(components)
+
+    @staticmethod
+    def _storage_identity(device: Path) -> dict[str, str]:
+        """Per-family identity sources in fixed precedence (Issue #23).
+
+        Each family contributes at most one key, named after its source, so a
+        value from one source is never compared with another source's format:
+
+        - unit serial: ``device/serial`` (NVMe/MMC and others; unchanged key
+          ``serial``), else SCSI/SATA VPD page 0x80 (``vpd_pg80_serial``);
+        - logical-unit name: block ``wwid`` (NVMe; unchanged key ``wwid``),
+          else the kernel's SCSI ``device/wwid`` (``scsi_wwid``), else the
+          best VPD page 0x83 designator (``vpd_pg83_designator``).
+
+        Devices whose existing sources are present keep exactly their prior
+        identity. A device that previously exposed none gains new keys, which
+        compare as UNVERIFIABLE against the old baseline until the Owner
+        approves a new one; nothing is silently accepted. All sources are
+        world-readable sysfs attributes; no source requires root.
+        """
+        serial = _identity(_optional(device / "device/serial"))
+        wwid = _identity(_optional(device / "wwid"))
+        identity = {"serial": serial, "wwid": wwid}
+        if not serial:
+            identity["vpd_pg80_serial"] = _optional_vpd(device / "device/vpd_pg80", _vpd_unit_serial)
+        if not wwid:
+            scsi_wwid = _bounded(_identity(_optional(device / "device/wwid")))
+            if scsi_wwid:
+                identity["scsi_wwid"] = scsi_wwid
+            else:
+                identity["vpd_pg83_designator"] = _optional_vpd(device / "device/vpd_pg83", _vpd_designator)
+        return identity
 
     def _gpu(self):
         components = []
