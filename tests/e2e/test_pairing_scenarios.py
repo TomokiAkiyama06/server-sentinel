@@ -265,14 +265,17 @@ class PairingScenarios(unittest.TestCase):
         # The capture itself works (a canary record reaches it).
         self.assertIn("synthetic canary", captured)
         code_digest = HmacCodeVerifier(self.key).digest(code.value)
+        expired_digest = HmacCodeVerifier(self.key).digest(expired_code.value)
         secrets_ = {
             "pairing code": code.value, "expired code": expired_code.value,
             "verifier key": self.key.hex(), "verifier key bytes": repr(self.key),
-            "code digest": code_digest,
+            "code digest": code_digest, "expired code digest": expired_digest,
         }
+        reprs = "".join(repr(value) for value in (code, agent_code, claim, approval,
+                                                  expired, expired_code))
         for label, value in secrets_.items():
             self.assertNotIn(value, captured, label)
-            self.assertNotIn(value, repr(code) + repr(agent_code) + repr(claim) + repr(approval), label)
+            self.assertNotIn(value, reprs, label)
         # Audit rows carry only bounded categories and the node's logical UUID.
         audit = repr(self.audit_rows())
         self.assertIn(str(node), audit)
@@ -282,9 +285,10 @@ class PairingScenarios(unittest.TestCase):
         # The durable database holds only the keyed HMAC code digest (in
         # pairing_enrollments.code_digest), never a plaintext code or the key.
         with closing(self.database.connect()) as connection:
-            self.assertEqual(code_digest, connection.execute(
-                "SELECT code_digest FROM pairing_enrollments WHERE id = ?",
-                (str(approval.enrollment_id),)).fetchone()[0])
+            for enrollment, digest in ((approval, code_digest), (expired, expired_digest)):
+                self.assertEqual(digest, connection.execute(
+                    "SELECT code_digest FROM pairing_enrollments WHERE id = ?",
+                    (str(enrollment.enrollment_id),)).fetchone()[0])
             connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         stored = b"".join(path.read_bytes() for path in self.root.glob("main.sqlite3*"))
         for value in (code.value, expired_code.value):
