@@ -23,6 +23,16 @@ WIZARD_STEP_TARGETS = {
     for definition in STEP_CATALOG
 }
 
+# The only step the generic Owner transition may mark ``COMPLETED``. Every
+# other step records verified work (Owner bootstrap, storage mount/reserve
+# checks, hardware baseline approval, source and profile setup, ...), so it may
+# be completed only by that feature's own integration path once the integration
+# has verified its result. No such integration exists yet, so those steps
+# cannot be completed at runtime and ``deployment_ready`` cannot become true
+# through this service. The Owner may still defer (``UNAVAILABLE``), skip an
+# optional step, or retry (``PENDING``) through the generic path.
+GENERIC_COMPLETABLE_STEPS = frozenset({WizardStep.WELCOME})
+
 
 class SetupWizardService:
     """Run wizard progress changes through ``OwnerAuditService``.
@@ -34,8 +44,10 @@ class SetupWizardService:
     A permitted transition commits in the same SQLite transaction as its
     ``succeeded`` record, so an audit write failure rolls the transition back.
     A rejected transition (stale revision, skipping a required step, a later
-    step before an earlier one, or downgrading a completed step) rolls back and
-    is recorded as ``failed``. Records carry only the fixed action, the step's
+    step before an earlier one, downgrading a completed step, or completing a
+    step outside ``GENERIC_COMPLETABLE_STEPS``) rolls back and is recorded as
+    ``failed``. A request for the current status at the current revision
+    changes nothing but is still recorded as one ``succeeded`` attempt. Records carry only the fixed action, the step's
     logical UUID and the outcome, never the requested status or any value.
     """
 
@@ -80,7 +92,18 @@ class SetupWizardService:
             actor_context, action=AuditAction.TRANSITION_SETUP_WIZARD_STEP,
             target_kind=TargetKind.SETUP_WIZARD_STEP,
             target_logical_id=WIZARD_STEP_TARGETS[step],
-            operation=lambda connection: self.store.transition_on(
-                connection, step, status, expected_revision=expected_revision,
+            operation=lambda connection: self._generic_transition_on(
+                connection, step, status, expected_revision,
             ),
+        )
+
+    def _generic_transition_on(self, connection, step: WizardStep, status: WizardStatus,
+                               expected_revision: int) -> WizardSnapshot:
+        # Enforced here on the server, not only by the web shell, so a
+        # modified client or direct call cannot record unverified completion.
+        # Raised inside the audited operation so the refusal is ``failed``.
+        if status is WizardStatus.COMPLETED and step not in GENERIC_COMPLETABLE_STEPS:
+            raise WizardValidationError("wizard step completion requires its integration")
+        return self.store.transition_on(
+            connection, step, status, expected_revision=expected_revision,
         )

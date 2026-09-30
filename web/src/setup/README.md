@@ -9,7 +9,9 @@ status only — never setting values, secrets, raw hardware identifiers or
 biometric data — and never shows a pending, unavailable or skipped step as
 completed. Only Welcome is completed by the shell; other steps are completed by
 their own integrations, and until then can be deferred as unavailable (optional
-steps can also be skipped). Owner controls render only with an authorized
+steps can also be skipped). The server enforces the same rule: the generic
+Owner transition refuses `completed` for any step but Welcome
+(`GENERIC_COMPLETABLE_STEPS`), so a modified client cannot record completion. Owner controls render only with an authorized
 transition provider; the server authorizes and audits each transition through
 `server/app/setup_wizard/service.py`. The private-access step keeps Tailnet /
 private-network reachability and the ServerSentinel invitation/permissions as

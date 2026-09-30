@@ -261,7 +261,9 @@ be resumed. Controls render only for an Owner session with an authorized
 `transitionWizard` provider, one transition is in flight at a time, and a
 refused or unconfirmed transition (for example a stale revision) is reported
 and the snapshot is reloaded rather than guessed. The server authorizes, audits
-and may refuse every transition (`SetupWizardService`).
+and may refuse every transition (`SetupWizardService`); it independently refuses
+`completed` for every step except Welcome on the generic Owner path, so the
+Welcome-only rule does not depend on this client.
 
 The private viewer access step lists network-level Tailscale / private-network
 reachability and the ServerSentinel invitation with independent `live:view` /

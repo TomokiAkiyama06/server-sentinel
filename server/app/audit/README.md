@@ -72,6 +72,23 @@ Owner authorizer and writes nothing when refused. The plain
 outside explicit fixture use. Neither the `action` nor the `target_kind` column
 has a CHECK constraint, so the new vocabulary needs no migration.
 
+This generic Owner path may mark only Welcome `completed`
+(`GENERIC_COMPLETABLE_STEPS`); a `completed` request for any other step is
+refused server-side and recorded as `failed`. Those steps record verified work,
+so each may be completed only by its own integration once that integration
+exists and has verified its result; until then they can only be deferred as
+`unavailable`, skipped when optional, or retried, and `deployment_ready` cannot
+become true through this service. A request for the step's current status at
+its current revision changes nothing but still appends one `succeeded` record:
+it is an authorized Owner attempt, so "one record per wizard step change"
+(`MANUAL_TEST.md` W) counts attempts, including such no-ops.
+
+Before a human route to this service is mounted (#10), the route must add
+admission / rate limiting for refused callers: every refused transition
+attempt appends one `denied` record, so an unauthenticated or non-Owner caller
+must not be able to grow the audit table without bound. (Refused reads write
+nothing.)
+
 `PairingLedger` in `app/cameras/remote_agent/pairing.py` requires an
 `AuditStore` on the same database and records
 `approve_capture_node_enrollment`, `redeem_capture_node_enrollment`,

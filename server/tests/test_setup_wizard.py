@@ -14,6 +14,7 @@ from app.audit import (
     OwnerAuthorizationError, TargetKind,
 )
 from app.setup_wizard import (
+    GENERIC_COMPLETABLE_STEPS,
     STEP_CATALOG,
     WIZARD_STEP_TARGETS,
     SetupWizardService,
@@ -59,7 +60,7 @@ class SetupWizardTests(unittest.TestCase):
 
     def test_order_is_enforced_but_unavailable_integration_does_not_block_shell(self):
         with self.assertRaisesRegex(WizardValidationError, "earlier"):
-            self.transition(WizardStep.STORAGE, WizardStatus.COMPLETED)
+            self.transition(WizardStep.STORAGE, WizardStatus.UNAVAILABLE)
 
         for definition in STEP_CATALOG[:5]:
             self.transition(definition.step, WizardStatus.COMPLETED)
@@ -249,6 +250,21 @@ class SetupWizardServiceTests(unittest.TestCase):
         revision = self.store.snapshot().state_for(step).revision
         return self.wizard.transition(actor, step, status, expected_revision=revision)
 
+    def integration_complete(self, step):
+        """Stand-in for a future integration's own verified completion path.
+
+        No integration exists yet; the explicit fixture store marks the step
+        completed so later steps can be exercised. It is not the Owner path.
+        """
+        fixture = WizardStateStore(self.database, unaudited_writes=True)
+        revision = fixture.snapshot().state_for(step).revision
+        return fixture.transition(step, WizardStatus.COMPLETED, expected_revision=revision)
+
+    def complete(self, step):
+        if step in GENERIC_COMPLETABLE_STEPS:
+            return self.transition(step, WizardStatus.COMPLETED)
+        return self.integration_complete(step)
+
     def summary(self):
         return [(record.actor_category, record.action, record.target_kind,
                  record.target_logical_id, record.outcome)
@@ -290,14 +306,14 @@ class SetupWizardServiceTests(unittest.TestCase):
 
     def test_step_order_is_enforced_and_audited_as_failed(self):
         with self.assertRaisesRegex(WizardValidationError, "earlier"):
-            self.transition(WizardStep.STORAGE, WizardStatus.COMPLETED)
+            self.transition(WizardStep.STORAGE, WizardStatus.UNAVAILABLE)
         self.assertTrue(all(status is WizardStatus.PENDING for status in self.statuses()))
         self.assertEqual([self.record(WizardStep.STORAGE, AuditOutcome.FAILED)],
                          self.summary())
         for definition in STEP_CATALOG:
             if definition.skippable:
                 break
-            self.transition(definition.step, WizardStatus.COMPLETED)
+            self.complete(definition.step)
         snapshot = self.wizard.snapshot(OWNER_CONTEXT)
         self.assertTrue(snapshot.deployment_ready)
         self.assertEqual(WizardStep.OWNER_VERIFICATION, snapshot.current_step)
@@ -311,7 +327,7 @@ class SetupWizardServiceTests(unittest.TestCase):
                 with self.assertRaisesRegex(WizardValidationError, "required"):
                     self.transition(definition.step, WizardStatus.SKIPPED)
                 self.assertEqual(before, self.statuses())
-                self.transition(definition.step, WizardStatus.COMPLETED)
+                self.complete(definition.step)
         for definition in STEP_CATALOG:
             if definition.skippable:
                 with self.subTest(step=definition.step):
@@ -324,19 +340,71 @@ class SetupWizardServiceTests(unittest.TestCase):
 
     def test_pending_and_unavailable_are_never_reported_as_completed(self):
         for definition in STEP_CATALOG[:5]:
-            self.transition(definition.step, WizardStatus.COMPLETED)
+            self.complete(definition.step)
         self.transition(WizardStep.CAMERA_SOURCES, WizardStatus.UNAVAILABLE)
         after = self.transition(WizardStep.DETECTION_PROFILES, WizardStatus.UNAVAILABLE)
         self.assertFalse(after.deployment_ready)
         for step in (WizardStep.CAMERA_SOURCES, WizardStep.DETECTION_PROFILES):
             self.assertIs(WizardStatus.UNAVAILABLE, after.state_for(step).status)
             with self.subTest(step=step), self.assertRaisesRegex(
-                    WizardValidationError, "retried"):
+                    WizardValidationError, "integration"):
                 self.transition(step, WizardStatus.COMPLETED)
+            # Even an integration must retry through PENDING first.
+            with self.subTest(step=step), self.assertRaisesRegex(
+                    WizardValidationError, "retried"):
+                self.integration_complete(step)
             self.assertIs(WizardStatus.UNAVAILABLE,
                           self.store.snapshot().state_for(step).status)
         for state in after.states[7:]:
             self.assertIs(WizardStatus.PENDING, state.status)
+
+    def test_generic_owner_path_completes_only_welcome(self):
+        self.assertEqual(frozenset({WizardStep.WELCOME}), GENERIC_COMPLETABLE_STEPS)
+        self.transition(WizardStep.WELCOME, WizardStatus.COMPLETED)
+        expected = [self.record(WizardStep.WELCOME, AuditOutcome.SUCCEEDED)]
+        for definition in STEP_CATALOG[1:]:
+            with self.subTest(step=definition.step):
+                before = self.store.snapshot()
+                with self.assertRaisesRegex(WizardValidationError, "integration"):
+                    self.transition(definition.step, WizardStatus.COMPLETED)
+                self.assertEqual(before, self.store.snapshot())
+                expected.append(self.record(definition.step, AuditOutcome.FAILED))
+                self.assertEqual(expected, self.summary())
+                # Resolve the step the way a future integration would.
+                self.integration_complete(definition.step)
+                # An already completed integration step is not re-completable
+                # through the generic path either.
+                with self.assertRaisesRegex(WizardValidationError, "integration"):
+                    self.transition(definition.step, WizardStatus.COMPLETED)
+                expected.append(self.record(definition.step, AuditOutcome.FAILED))
+
+    def test_generic_owner_transitions_never_make_the_deployment_ready(self):
+        # Try every status on every step, in order, keeping whatever the
+        # generic Owner path accepts; readiness must never be claimed.
+        for definition in STEP_CATALOG:
+            for status in (WizardStatus.COMPLETED, WizardStatus.SKIPPED,
+                           WizardStatus.UNAVAILABLE):
+                try:
+                    after = self.transition(definition.step, status)
+                except WizardValidationError:
+                    continue
+                self.assertFalse(after.deployment_ready)
+                break
+        final = self.wizard.snapshot(OWNER_CONTEXT)
+        self.assertFalse(final.deployment_ready)
+        completed = {state.step for state in final.states
+                     if state.status is WizardStatus.COMPLETED}
+        self.assertEqual({WizardStep.WELCOME}, completed)
+
+    def test_no_op_transition_is_recorded_as_succeeded(self):
+        # Requesting the current status at the current revision changes
+        # nothing but is still one audited Owner attempt (documented in
+        # app/audit/README.md).
+        after = self.transition(WizardStep.WELCOME, WizardStatus.COMPLETED)
+        again = self.transition(WizardStep.WELCOME, WizardStatus.COMPLETED)
+        self.assertEqual(after, again)
+        self.assertEqual([self.record(WizardStep.WELCOME, AuditOutcome.SUCCEEDED)] * 2,
+                         self.summary())
 
     def test_stale_revision_is_rejected_without_changing_state(self):
         first = self.store.snapshot().state_for(WizardStep.WELCOME)
