@@ -46,7 +46,7 @@ class Runtime:
             connection.execute(sql, parameters)
 
     def recording(self, *, starred: bool, payload: bytes, status: str = "completed",
-                  source_id: str | None = None) -> str:
+                  source_id: str | None = None, target_end_ms: int = 10000) -> str:
         recording_id, segment_id = str(uuid4()), str(uuid4())
         source_id = source_id or str(uuid4())
         self.segment_file(segment_id, payload)
@@ -59,23 +59,27 @@ class Runtime:
         self.clock += 1
         self.execute(
             "INSERT INTO recordings (id, source_id, start_ms, target_end_ms, ended_ms, "
-            "status, critical, starred) VALUES (?, ?, 0, 10000, ?, ?, 0, ?)",
-            (recording_id, source_id, None if status == "active" else 10000, status,
-             int(starred)))
+            "status, critical, starred) VALUES (?, ?, 0, ?, ?, ?, 0, ?)",
+            (recording_id, source_id, target_end_ms,
+             None if status == "active" else target_end_ms, status, int(starred)))
         self.execute("INSERT INTO recording_links VALUES (?, ?)", (recording_id, segment_id))
         return recording_id
 
-    def add_segment(self, recording_id: str, payload: bytes) -> None:
+    def add_segment(self, recording_id: str, payload: bytes, *, write_file: bool = True,
+                    catalog_payload: bytes | None = None) -> str:
         segment_id = str(uuid4())
-        self.segment_file(segment_id, payload)
+        if write_file:
+            self.segment_file(segment_id, payload)
         self.execute(
             "INSERT INTO recording_segments (id, source_id, stream_id, sequence, start_ms, "
             "end_ms, codec, container, byte_length, sha256, state, spool) "
             "VALUES (?, ?, 's', ?, 10000, 20000, 'synthetic', 'deflate', ?, ?, 'ready', 0)",
             (segment_id, str(uuid4()), self.clock, len(payload),
-             hashlib.sha256(payload).hexdigest()))
+             hashlib.sha256(catalog_payload if catalog_payload is not None
+                            else payload).hexdigest()))
         self.clock += 1
         self.execute("INSERT INTO recording_links VALUES (?, ?)", (recording_id, segment_id))
+        return segment_id
 
     def segment_file(self, segment_id: str, payload: bytes) -> None:
         path = self.root / "recordings" / (UUID(segment_id).hex + ".seg")
@@ -408,7 +412,7 @@ class LifecycleInventoryTests(unittest.TestCase):
     def test_in_progress_recording_may_grow_but_not_lose_segments(self):
         self.runtime.seed()
         active = self.runtime.recording(starred=False, payload=b"generated-active",
-                                        status="active")
+                                        status="active", target_end_ms=20000)
         _, baseline = self.record()
         self.runtime.add_segment(active, b"generated-active-later")
         self.runtime.execute("UPDATE recordings SET status='interrupted', ended_ms=20000 "
@@ -424,6 +428,46 @@ class LifecycleInventoryTests(unittest.TestCase):
         os.unlink(self.runtime.root / "recordings" / (UUID(first).hex + ".seg"))
         code, report, _ = self.verify(baseline)
         self.assertEqual(code, inventory.EXIT_FAILED)
+
+    def test_in_progress_recording_rejects_anything_but_valid_growth(self):
+        self.runtime.seed()
+
+        def active(label: str) -> str:
+            return self.runtime.recording(starred=False, payload=b"generated-" + label.encode(),
+                                          status="active", target_end_ms=20000)
+        grows = active("grows")
+        source_changed = active("source")
+        start_changed = active("start")
+        extended = active("extended")
+        bad_status = active("status")
+        missing_new = active("missing")
+        mismatched_new = active("mismatch")
+        _, baseline = self.record()
+        self.runtime.add_segment(grows, b"generated-grows-later")
+        self.runtime.execute("UPDATE recordings SET status='complete', ended_ms=20000 "
+                             "WHERE id=?", (grows,))
+        self.runtime.execute("UPDATE recordings SET source_id=? WHERE id=?",
+                             (str(uuid4()), source_changed))
+        # Same catalog duration, shifted start: only the start itself differs.
+        self.runtime.execute("UPDATE recordings SET start_ms=5000, target_end_ms=25000 "
+                             "WHERE id=?", (start_changed,))
+        self.runtime.execute("UPDATE recordings SET target_end_ms=30000 WHERE id=?",
+                             (extended,))
+        self.runtime.execute("UPDATE recordings SET status='deleted' WHERE id=?",
+                             (bad_status,))
+        self.runtime.add_segment(missing_new, b"generated-never-written", write_file=False)
+        self.runtime.add_segment(mismatched_new, b"generated-on-disk",
+                                 catalog_payload=b"generated-in-catalog")
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_FAILED)
+        section = report["sections"]["recordings"]
+        self.assertEqual(section["in_progress_at_record"], [grows])
+        self.assertIn(grows, section["preserved"])
+        rejected = [source_changed, start_changed, extended, bad_status,
+                    missing_new, mismatched_new]
+        for recording_id in rejected:
+            self.assertIn({"id": recording_id, "reason": "changed"}, section["failed"])
+            self.assertNotIn(recording_id, section["preserved"])
 
 
 if __name__ == "__main__":

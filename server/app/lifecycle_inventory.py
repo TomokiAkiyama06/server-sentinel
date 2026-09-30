@@ -172,6 +172,7 @@ def _recordings(connection, tables, directory: Path) -> dict | None:
             "source_id": row["source_id"],
             "status": row["status"],
             "starred": bool(row["starred"]),
+            "start_ms": row["start_ms"],
             "catalog_duration_ms": end - row["start_ms"],
             "segment_media_ms": sum(item["media_ms"] for item in items),
             "segments": items,
@@ -331,6 +332,33 @@ def _evidenced(item: dict) -> bool:
         segment["sha256"] is not None for segment in item["segments"])
 
 
+# Statuses an 'active' recording may reach (store.py: stop / reconcile /
+# interrupted-at-startup); 'deleting' rows are not inventoried.
+_ACTIVE_SUCCESSORS = frozenset({"active", "complete", "gapped", "interrupted"})
+
+
+def _valid_growth(base: dict, now: dict) -> bool:
+    """Whether a recording active at record time only grew as the store allows.
+
+    Source, start and starred flag are immutable; the status may only move to
+    an allowed successor; the catalog end may only stay or move earlier (the
+    store never extends target_end_ms); every recorded segment must be present
+    and identical; and every current segment, old or new, must be readable and
+    match its catalog digest.
+    """
+    if (base["status"] != "active" or now["status"] not in _ACTIVE_SUCCESSORS
+            or not _evidenced(base) or not _evidenced(now)):
+        return False
+    if any(now.get(key) != base.get(key) for key in ("source_id", "start_ms", "starred")):
+        return False
+    if not 0 < now["catalog_duration_ms"] <= base["catalog_duration_ms"]:
+        return False
+    if not all(segment["catalog_match"] for segment in now["segments"]):
+        return False
+    now_segments = {item["segment_id"]: item for item in now["segments"]}
+    return all(now_segments.get(item["segment_id"]) == item for item in base["segments"])
+
+
 def _compare_recordings(baseline: dict | None, current: dict | None, *,
                         declared: frozenset[str]) -> dict:
     result = _compare_keyed(baseline, current, declared=declared)
@@ -349,13 +377,7 @@ def _compare_recordings(baseline: dict | None, current: dict | None, *,
         now = current.get(key)
         if entry["reason"] != "changed" or base["status"] != "active" or now is None:
             continue
-        # A recording that was still active at record time may legitimately
-        # gain segments or become 'interrupted' across a restart; every segment
-        # it already had must still be present and byte-identical.
-        now_segments = {item["segment_id"]: item["sha256"] for item in now["segments"]}
-        if (base["starred"] == now["starred"] and _evidenced(base)
-                and all(now_segments.get(item["segment_id"]) == item["sha256"]
-                        for item in base["segments"])):
+        if _valid_growth(base, now):
             failed.remove(entry)
             preserved.append(key)
             in_progress.append(key)

@@ -323,11 +323,11 @@ When the rolled-back release predates this tool, run the same commands with
 the newer release's interpreter under `releases/<version>/venv/bin/python`;
 both only read the runtime tree.
 
-`record` stores, keyed by stable logical ID: each recording's starred flag,
-catalog duration and the SHA-256 of every linked segment file as read from
-disk; a per-row and a chained SHA-256 over every retained
-`security_admin_audit_records` and `integrity_audit` row; registered camera
-source IDs and types; and Owner presence plus each principal's independent
+`record` stores, keyed by stable logical ID: each recording's source, status,
+starred flag, catalog start and duration, and the SHA-256 of every linked
+segment file as read from disk; a per-row and a chained SHA-256 over every
+retained `security_admin_audit_records` and `integrity_audit` row; registered
+camera source IDs and types; and Owner presence plus each principal's independent
 `live:view` / `recordings:view` grants, invitation redemption and revocation
 state. It never writes principal external identities or display names,
 credential IDs or public keys, invitation or session secret/token digests,
@@ -337,11 +337,14 @@ permission-bearing URLs, media bytes, or audit row contents.
 recording, audit row, source, principal or invitation is `failed` (exit 1);
 rows and recordings that exist only now are listed as `appended` and are never
 counted as preserved. A recording that was still active when recorded may gain
-segments or become `interrupted`, but every segment it already had must be
-byte-identical. If a documented migration intentionally rewrites stored bytes,
-name each affected recording in advance with `--declared-rewrite <logical ID>`;
-those recordings are reported separately and must be re-verified manually, and
-any other digest change is still a failure. The comparison is `empty` (exit 3),
+segments, end no later than its recorded target, and become `complete`,
+`gapped` or `interrupted`; its source, start and starred flag must not change,
+every segment it already had must be identical, and every current segment must
+be readable and match its catalog digest; anything else is `changed`. If a
+documented migration intentionally rewrites stored bytes, name each affected
+recording in advance with `--declared-rewrite <logical ID>`; those recordings
+are reported separately and must be re-verified manually, and any other digest
+change is still a failure. The comparison is `empty` (exit 3),
 never success, while the baseline lacks any of: an ordinary recording, a
 starred recording, a camera source, a security/admin audit row, the Owner, a
 `live:view`-only grant, a `recordings:view`-only grant, or a revoked principal
