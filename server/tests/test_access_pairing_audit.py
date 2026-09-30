@@ -329,9 +329,11 @@ class PairingAuditTests(_Base):
         self.ledger = PairingLedger(self.database, self.verifier, audit=self.audit,
                                     clock=lambda: self.now, process_epoch=uuid4())
         self.authorizer = SyntheticOwnerAuthorizer()
+        # One node per test: a public key is never bound to two nodes.
+        self.node = uuid4()
 
     def approve(self, node=None):
-        return self.ledger.approve(self.authorizer, OWNER_CONTEXT, node_id=node or uuid4(),
+        return self.ledger.approve(self.authorizer, OWNER_CONTEXT, node_id=node or self.node,
                                    public_key_digest=KEY_DIGEST)
 
     def paired(self):

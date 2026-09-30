@@ -40,9 +40,11 @@ class PairingLedgerTests(unittest.TestCase):
                                     clock=lambda: self.now,
                                     process_epoch=uuid4())
         self.owner = Owner()
+        # One node per test: a public key is never bound to two nodes.
+        self.node = uuid4()
 
     def _approval(self):
-        return self.ledger.approve(self.owner, "owner", node_id=uuid4(),
+        return self.ledger.approve(self.owner, "owner", node_id=self.node,
                                    public_key_digest=DIGEST_A)
 
     def test_code_is_ephemeral_and_only_its_keyed_digest_is_persisted(self):
@@ -127,6 +129,40 @@ class PairingLedgerTests(unittest.TestCase):
         self.ledger.activate(claim, credential_serial_digest=SERIAL_A)
         self.assertFalse(self.ledger.admits(node_id=claim.node_id, public_key_digest=DIGEST_B,
                                             credential_serial_digest=SERIAL_A))
+
+
+class PairingKeyBindingMigrationTests(unittest.TestCase):
+    def test_existing_keys_are_backfilled_and_revoked_keys_stay_revoked(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        database = Database(Path(temporary.name) / "synthetic.sqlite3")
+        renewal = APPLICATION_MIGRATIONS.index(next(
+            m for m in APPLICATION_MIGRATIONS if m.name == "pairing_credential_renewal"))
+        active, revoked, pending = uuid4(), uuid4(), uuid4()
+        digest_c = "d" * 64
+        with closing(database.connect()) as connection:
+            migrate(connection, APPLICATION_MIGRATIONS[:renewal])
+            with connection:
+                connection.executemany(
+                    "INSERT INTO pairing_node_credentials VALUES (?, ?, ?, ?)",
+                    [(str(active), DIGEST_A, SERIAL_A, "active"),
+                     (str(revoked), DIGEST_B, SERIAL_A, "revoked")])
+                connection.executemany(
+                    "INSERT INTO pairing_enrollments VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    [(str(uuid4()), str(active), DIGEST_A, "e" * 64, "x", 1.0, "activated"),
+                     (str(uuid4()), str(pending), digest_c, "e" * 64, "x", 1.0, "revoked")])
+            migrate(connection, APPLICATION_MIGRATIONS)
+            rows = {tuple(row) for row in connection.execute(
+                "SELECT public_key_digest, node_id, revoked FROM pairing_key_bindings")}
+        self.assertEqual({(DIGEST_A, str(active), 0), (DIGEST_B, str(revoked), 1),
+                          (digest_c, str(pending), 1)}, rows)
+        ledger = PairingLedger(database, HmacCodeVerifier(b"s" * 32),
+                               audit=AuditStore(database), clock=lambda: 100.0,
+                               process_epoch=uuid4())
+        for digest, node in ((DIGEST_A, uuid4()), (DIGEST_B, revoked), (digest_c, pending)):
+            with self.subTest(digest=digest[:1]), self.assertRaises(PairingError):
+                ledger.approve(Owner(), "owner", node_id=node, public_key_digest=digest)
+        ledger.approve(Owner(), "owner", node_id=active, public_key_digest=DIGEST_A)
 
 
 if __name__ == "__main__":

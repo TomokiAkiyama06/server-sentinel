@@ -275,6 +275,17 @@ status or decision.
     revocation and audit stay per node. An Agent that never received or
     installed the response is not locked out: it keeps its old certificate and
     retries. Revocation deletes any staged renewal.
+  - *Key uniqueness (Owner decision 2026-09-30).* A node public key is bound
+    to at most one node, for good. `pairing_key_bindings` records every key
+    the ledger approves, activates or promotes and is never pruned. Approval,
+    activation, renewal staging and promotion each refuse, in their own write
+    transaction, a key that is bound to (or staged for) another node, whatever
+    that node's credential state. Revocation marks all of the node's keys
+    revoked, and a revoked key is never bound again, even to the same node.
+    Staging only checks and does not bind, so renewal retries with fresh keys
+    do not grow the table; promotion binds. Migration 17 backfills the keys
+    that existing enrollment and credential rows still record. Keys superseded
+    before that migration are not recoverable.
   - *Agent rotation.* `NodeCredentialStore.rotate` atomically replaces the
     committed generation (rename over `current.json`) for the same node and
     deployment only, then removes the superseded files.

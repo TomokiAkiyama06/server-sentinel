@@ -46,6 +46,9 @@ The result is staged with `PairingLedger.stage_renewal`: one per node, no audit
 growth. The first admission of the renewed certificate promotes it atomically
 and supersedes the old certificate, which stays admitted until then so a lost
 response never locks the Agent out. Revocation discards staged renewals.
+A node public key is bound to one node for good (`pairing_key_bindings`,
+Owner decision 2026-09-30). Approval, activation, staging and promotion refuse
+a key bound to or staged for another node, and a revoked key is never reused.
 `CaptureCredentialMonitor` raises the local `capture_credential_warning`
 notification through an injected hook in three cases: a credential within
 14 days of expiry, an expired credential, or a refused renewal. The renewal

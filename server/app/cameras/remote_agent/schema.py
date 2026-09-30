@@ -20,6 +20,12 @@ def pairing_renewal_migration(version: int) -> Migration:
 
     A staged renewal is admitted at most once as a promotion that atomically
     supersedes the active credential; revocation deletes it.
+
+    ``pairing_key_bindings`` permanently records every node public key the
+    ledger has approved, activated or staged (Owner decision 2026-09-30): a
+    key is never rebound to another node, and a revoked key is never reused.
+    Rows are never deleted. Existing rows are backfilled best-effort; keys
+    superseded before this migration are not recoverable.
     """
     return Migration(version, "pairing_credential_renewal", (
         "ALTER TABLE pairing_node_credentials ADD COLUMN not_after REAL",
@@ -27,4 +33,14 @@ def pairing_renewal_migration(version: int) -> Migration:
         "node_id TEXT PRIMARY KEY REFERENCES pairing_node_credentials(node_id), "
         "public_key_digest TEXT NOT NULL, credential_serial_digest TEXT NOT NULL, "
         "not_after REAL NOT NULL)",
+        "CREATE TABLE pairing_key_bindings ("
+        "public_key_digest TEXT PRIMARY KEY, node_id TEXT NOT NULL, "
+        "revoked INTEGER NOT NULL CHECK (revoked IN (0, 1)))",
+        "INSERT OR IGNORE INTO pairing_key_bindings (public_key_digest, node_id, revoked) "
+        "SELECT public_key_digest, node_id, state = 'revoked' FROM pairing_node_credentials",
+        "INSERT OR IGNORE INTO pairing_key_bindings (public_key_digest, node_id, revoked) "
+        "SELECT public_key_digest, node_id, MAX(state = 'revoked') FROM pairing_enrollments "
+        "GROUP BY public_key_digest, node_id",
+        "UPDATE pairing_key_bindings SET revoked = 1 WHERE public_key_digest IN ("
+        "SELECT public_key_digest FROM pairing_enrollments WHERE state = 'revoked')",
     ))

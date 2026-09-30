@@ -530,6 +530,49 @@ class CaptureRenewalTests(CaptureTlsHarness):
                     not_after=utc_now().timestamp() + 1000)
         self.assertTrue(session.still_admitted())
 
+    def test_node_key_is_never_bound_to_a_second_node_or_reused_after_revocation(self):
+        # Owner decision 2026-09-30: a node public key is unique across all
+        # nodes and all credential states; a revoked key is never reused.
+        claim, _, certificate, key = self._paired_node("a")
+        original = public_key_digest(serialization.load_pem_private_key(
+            key.read_bytes(), password=None).public_key())
+        session = self._session(certificate, key)
+        new_key, new_key_path = self._node_key("renewed")
+        renewed_key = public_key_digest(new_key.public_key())
+        renewed = self._renew(session.identity, new_key)
+
+        def approve_elsewhere(digest, node=None):
+            with self.assertRaises(PairingError):
+                self.ledger.approve(Owner(), "owner", node_id=node or uuid4(),
+                                    public_key_digest=digest)
+
+        approve_elsewhere(renewed_key)  # staged for A, not yet promoted
+        self._session(self._public_file("renewed.pem", renewed.certificate_pem), new_key_path)
+        approve_elsewhere(renewed_key)  # promoted: A's active key
+        approve_elsewhere(original)  # superseded key of A
+
+        # Activation re-checks inside its transaction: an enrollment whose key
+        # became bound to A in the meantime (e.g. a pre-migration row) is refused.
+        other = ec.generate_private_key(ec.SECP256R1())
+        other_digest = public_key_digest(other.public_key())
+        approval, code = self.ledger.approve(Owner(), "owner", node_id=uuid4(),
+                                             public_key_digest=other_digest)
+        pending = self.ledger.redeem(enrollment_id=approval.enrollment_id,
+                                     public_key_digest=other_digest, code=code.value)
+        with closing(self.database.connect()) as connection, connection:
+            connection.execute("UPDATE pairing_key_bindings SET node_id = ? "
+                               "WHERE public_key_digest = ?", (str(claim.node_id), other_digest))
+        with self.assertRaises(PairingError):
+            self.authority.issue_and_activate(self.ledger, pending, self._csr(other))
+        self.assertFalse(self.ledger.admits(node_id=pending.node_id, public_key_digest=other_digest,
+                                            credential_serial_digest="e" * 64))
+
+        # After revocation none of A's keys can be bound again, even to A.
+        self.ledger.revoke(Owner(), "owner", node_id=claim.node_id)
+        for digest in (original, renewed_key):
+            approve_elsewhere(digest)
+            approve_elsewhere(digest, claim.node_id)
+
     def test_near_expiry_without_renewal_raises_owner_signal_once(self):
         self._paired_node("soon", validity=10 * DAY)
         self._paired_node("later", validity=None)
