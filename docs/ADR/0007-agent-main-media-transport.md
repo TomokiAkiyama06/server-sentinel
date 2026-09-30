@@ -2,6 +2,8 @@
 
 Status: Proposed — awaiting Owner decision. The transport protocol is **not
 selected** by this ADR; selection requires the real-LAN measurements below.
+Owner decision (2026-09-30): this ADR stays Proposed, and the transport is
+decided only after real-LAN measurement with the capture host.
 
 Related Issues: #15 (Plan 9), #13/ADR-0006 (capture-node trust), #14 (ingest
 boundary), #16 (Agent ring buffer), #17 (recording).
@@ -22,7 +24,7 @@ explicitly forbidden by the Issue.
 
 ## Decision
 
-### Accepted now (subject to Owner approval of this ADR)
+### Proposed continuity contract (not accepted until the Owner approves this ADR)
 
 1. **Transport-independent media envelope.** Every media unit carries
    `(source_id, capture_epoch, sequence, capture_time_ns)`, independent of any
