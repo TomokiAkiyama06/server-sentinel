@@ -267,7 +267,8 @@ class PairingScenarios(unittest.TestCase):
         code_digest = HmacCodeVerifier(self.key).digest(code.value)
         secrets_ = {
             "pairing code": code.value, "expired code": expired_code.value,
-            "verifier key": self.key.hex(), "code digest": code_digest,
+            "verifier key": self.key.hex(), "verifier key bytes": repr(self.key),
+            "code digest": code_digest,
         }
         for label, value in secrets_.items():
             self.assertNotIn(value, captured, label)
@@ -278,8 +279,12 @@ class PairingScenarios(unittest.TestCase):
         for label, value in {**secrets_, "key digest": key, "serial digest": serial,
                              "enrollment id": str(approval.enrollment_id)}.items():
             self.assertNotIn(value, audit, label)
-        # The durable database never holds a plaintext code or the verifier key.
+        # The durable database holds only the keyed HMAC code digest (in
+        # pairing_enrollments.code_digest), never a plaintext code or the key.
         with closing(self.database.connect()) as connection:
+            self.assertEqual(code_digest, connection.execute(
+                "SELECT code_digest FROM pairing_enrollments WHERE id = ?",
+                (str(approval.enrollment_id),)).fetchone()[0])
             connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         stored = b"".join(path.read_bytes() for path in self.root.glob("main.sqlite3*"))
         for value in (code.value, expired_code.value):

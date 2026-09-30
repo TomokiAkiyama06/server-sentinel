@@ -80,9 +80,11 @@ this in-process guard:
 - `test_pairing_scenarios.py` — `PairingLedger` refuses expired codes, codes
   from before a Main restart, reused codes/claims, a code bound to another key,
   and a revoked node until a fresh Owner-approved pairing; the code reaches the
-  Agent only through the non-echoing terminal prompt (never argv/environment),
-  and no code, verifier key or code digest reaches logs, stdout/stderr, audit
-  rows or the database. Main trust verification and the TLS bootstrap are not
+  Agent only through the non-echoing terminal prompt (never argv/environment);
+  no code, verifier key (hex or bytes form) or code digest reaches logs,
+  stdout/stderr or audit rows, and the database holds only the keyed HMAC
+  digest in `pairing_enrollments.code_digest`, never a plaintext code or the
+  verifier key. Main trust verification and the TLS bootstrap are not
   exercised;
 - `test_detection_isolation_scenarios.py` — a failing, malformed or missing
   owner verifier yields `unknown` while motion and the calibrated ROI
