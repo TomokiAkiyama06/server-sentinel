@@ -19,6 +19,12 @@ Any failure exits before ``exec``: the pipeline never runs unconfined. The
 module is stdlib-only and runnable as a script::
 
     python3 -I -S uvc_sandbox.py --device-fd N [--read PATH]... -- EXECUTABLE [ARG]...
+
+From the installed zipapp artifact the same helper is the artifact file itself,
+whose ``__main__`` dispatches ``ARCHIVE_ENTRY`` here before importing any other
+agent module::
+
+    python3 -I -S -B media-capture-agent --uvc-sandbox --device-fd N ... -- EXECUTABLE ...
 """
 
 import ctypes
@@ -50,6 +56,8 @@ _FS_BY_ABI = {1: (1 << 13) - 1, 2: (1 << 14) - 1, 3: (1 << 15) - 1,
               4: (1 << 15) - 1, 5: (1 << 16) - 1}
 _FILE_RIGHTS = FS_EXECUTE | FS_WRITE_FILE | FS_READ_FILE | FS_TRUNCATE | FS_IOCTL_DEV
 EXIT_REFUSED = 126
+# First argument of the installed artifact that selects this helper.
+ARCHIVE_ENTRY = "--uvc-sandbox"
 # The only paths a pipeline child may read; plugin loading itself is restricted
 # separately by the launcher's environment and ``--gst-plugin-load``.
 DEFAULT_READ_PATHS = ("/usr", "/lib", "/lib64", "/etc/ld.so.cache")

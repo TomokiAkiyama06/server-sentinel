@@ -22,6 +22,7 @@ import sys
 import sysconfig
 import threading
 import time
+import zipimport
 from typing import Protocol
 
 from . import uvc_sandbox
@@ -299,7 +300,7 @@ class SubprocessPipeline:
             time.sleep(0.01)
         return True
 
-    def _group_member_alive(self, deadline):
+    def _group_member_alive(self, deadline, *, patient=True):
         """True while a non-leader member of the group is not yet dead.
 
         Unprovable absence (no readable process table, or a scan that could
@@ -308,6 +309,8 @@ class SubprocessPipeline:
         busy or stalled ``/proc`` can block ``listdir``/``open``/``read`` past
         any per-entry check; at most one scan per pipeline is outstanding, so
         a stalled one is awaited again instead of starting more threads.
+        An impatient (retry-only) check only polls an outstanding scan: an
+        unfinished one counts as alive without waiting for ``deadline``.
         """
         while True:
             scan, fresh = self._scan, self._scan is None
@@ -320,7 +323,8 @@ class SubprocessPipeline:
                 except RuntimeError:
                     return True
                 self._scan = scan
-            if not scan.done.wait(max(0.0, deadline - time.monotonic())):
+            budget = max(0.0, deadline - time.monotonic()) if fresh or patient else 0.0
+            if not scan.done.wait(budget):
                 return True
             self._scan = None
             # Absence is stable once proven: the unreaped zombie leader keeps
@@ -355,8 +359,8 @@ class SubprocessPipeline:
                 return True
         return False
 
-    def _wait_group_gone(self, deadline, wait_deadline):
-        while self._group_member_alive(deadline):
+    def _wait_group_gone(self, deadline, wait_deadline, *, patient):
+        while self._group_member_alive(deadline, patient=patient):
             if time.monotonic() >= wait_deadline:
                 return False
             time.sleep(0.01)
@@ -366,8 +370,9 @@ class SubprocessPipeline:
         """Terminate the whole group within ``timeout``; False means not reaped.
 
         With ``wait=False`` the group is signalled and checked once without
-        sleeping; ``timeout`` then only bounds that check (the process-table
-        scan), so a later retry can still prove the group gone.
+        sleeping; ``timeout`` then only bounds a newly started process-table
+        scan, so a later retry can still prove the group gone. A scan still
+        outstanding from an earlier call is only polled, never awaited.
         """
         if self._reaped:
             return True
@@ -382,7 +387,7 @@ class SubprocessPipeline:
             return False
         # The unreaped zombie leader keeps the group ID from being reused, so
         # a surviving member is still identified by it on a later retry.
-        if not self._wait_group_gone(deadline, wait_deadline):
+        if not self._wait_group_gone(deadline, wait_deadline, patient=wait):
             return False
         try:
             self.process.wait(timeout=max(0.0, deadline - time.monotonic()) or 0.01)
@@ -461,18 +466,33 @@ def gstreamer_argv(executable, device_fd, profile, *, plugins=()):
             "!", GSTREAMER_ELEMENTS[1], "fd=1", "sync=false"]
 
 
-SANDBOX_HELPER = Path(uvc_sandbox.__file__).resolve()
+def _sandbox_entry():
+    """The real file that runs ``uvc_sandbox``, and the arguments selecting it.
+
+    From the installed zipapp ``uvc_sandbox.__file__`` is a path inside the
+    archive that cannot be trust-checked or executed, so the helper is the
+    root-installed artifact file itself, whose ``__main__`` dispatches
+    ``uvc_sandbox.ARCHIVE_ENTRY`` to the sandbox before any agent code runs.
+    """
+    loader = getattr(uvc_sandbox, "__loader__", None)
+    if isinstance(loader, zipimport.zipimporter):
+        return Path(loader.archive).resolve(), (uvc_sandbox.ARCHIVE_ENTRY,)
+    return Path(uvc_sandbox.__file__).resolve(), ()
 
 
-def sandbox_argv(python, helper, device_fd, read_paths, command):
+SANDBOX_HELPER, SANDBOX_HELPER_ARGS = _sandbox_entry()
+
+
+def sandbox_argv(python, helper, device_fd, read_paths, command, helper_args=()):
     """Run ``command`` under ``uvc_sandbox``: only the approved device is openable."""
-    python, helper = Path(python), Path(helper)
-    if not python.is_absolute() or not helper.is_absolute():
+    python, helper, helper_args = Path(python), Path(helper), tuple(helper_args)
+    if (not python.is_absolute() or not helper.is_absolute()
+            or helper_args not in ((), (uvc_sandbox.ARCHIVE_ENTRY,))):
         raise PipelineError("video pipeline sandbox is unavailable")
     reads = []
     for path in read_paths:
         reads += ["--read", str(path)]
-    return [str(python), "-I", "-S", "-B", str(helper),
+    return [str(python), "-I", "-S", "-B", str(helper), *helper_args,
             "--device-fd", str(device_fd), *reads, "--", *command]
 
 
@@ -529,7 +549,8 @@ class GStreamerLauncher(SubprocessLauncher):
 
     def __init__(self, executable, *, plugin_dirs=None, trust=require_trusted_executable,
                  trust_file=require_trusted_file, sandbox_abi=uvc_sandbox.abi_version,
-                 python=sys.executable, helper=SANDBOX_HELPER, popen=subprocess.Popen):
+                 python=sys.executable, helper=SANDBOX_HELPER,
+                 helper_args=SANDBOX_HELPER_ARGS, popen=subprocess.Popen):
         self.executable = trust(executable)
         self._trust = trust
         self._trust_file = trust_file
@@ -539,7 +560,7 @@ class GStreamerLauncher(SubprocessLauncher):
                                           else plugin_dirs)
         if not python:
             raise PipelineError("video pipeline sandbox is unavailable")
-        self.python, self.helper = python, helper
+        self.python, self.helper, self.helper_args = python, helper, tuple(helper_args)
         self._trusted_sandbox()
         super().__init__(self._argv, environment=GSTREAMER_ENVIRONMENT, popen=popen)
 
@@ -562,4 +583,4 @@ class GStreamerLauncher(SubprocessLauncher):
                                  plugins=[str(plugin) for plugin in plugins])
         read_paths = (*uvc_sandbox.DEFAULT_READ_PATHS, str(executable),
                       *(str(plugin) for plugin in plugins))
-        return sandbox_argv(python, helper, device_fd, read_paths, command)
+        return sandbox_argv(python, helper, device_fd, read_paths, command, self.helper_args)

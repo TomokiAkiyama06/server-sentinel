@@ -405,8 +405,14 @@ class PipelineCommandTests(unittest.TestCase):
                     "GST_PLUGIN_PATH_1_0", "GST_PLUGIN_PATH"):
             self.assertEqual(kwargs["env"][key], "")
         self.assertEqual(kwargs["env"]["GST_REGISTRY_FORK"], "no")
+        # Compare path components, not substrings: a checkout below e.g.
+        # ``/home/runner`` must not look like ``/run``.
+        paths = [part for item in argv for part in item.replace(",", "=").split("=")
+                 if part.startswith("/")]
+        for path in paths:
+            self.assertNotIn(Path(path).parts[1:2], (("dev",), ("sys",), ("run",)), path)
         text = " ".join(argv)
-        for forbidden in ("/dev/", "/sys", "/run", "alsa", "pulse", "pipewire", "jack"):
+        for forbidden in ("alsa", "pulse", "pipewire", "jack"):
             self.assertNotIn(forbidden, text)
 
     def test_gstreamer_launcher_fails_closed_without_sandbox_or_plugins(self):
@@ -1626,8 +1632,10 @@ class SubprocessPipelineTests(unittest.TestCase):
                     self.assertFalse(pipeline.stop(0.3, wait=wait))
                     self.assertLess(time.monotonic() - started, 1)
                     self.assertIsNone(leader.returncode)  # Group ID stays reserved.
-            # A scan that completes within the bound proves the group gone.
-            self.assertTrue(pipeline.stop(2, wait=False))
+            # A scan that completes within the bound proves the group gone; a
+            # retry-only stop merely polls a still-running earlier scan, so a
+            # later retry is the one that observes the proof.
+            self.assertTrue(wait_for(lambda: pipeline.stop(2, wait=False)))
             self.assertIsNotNone(leader.returncode)
         pipeline.close()
 
@@ -1666,10 +1674,50 @@ class SubprocessPipelineTests(unittest.TestCase):
                     self.assertEqual(sum(thread.name == "media-capture-agent-pgscan"
                                          for thread in threading.enumerate()), 1)
                     release.set()
-                    # Once the stalled scan completes it proves the group gone.
-                    self.assertTrue(pipeline.stop(2, wait=False))
+                    # Once the stalled scan completes it proves the group gone
+                    # (observed by a later retry-only poll).
+                    self.assertTrue(wait_for(lambda: pipeline.stop(2, wait=False)))
                     self.assertIsNotNone(leader.returncode)
             pipeline.close()
+
+    def test_retry_only_stop_does_not_wait_for_an_outstanding_scan(self):
+        # Synthetic stalled /proc: the first bounded stop leaves a scan
+        # outstanding; a retry-only (wait=False) stop polls it without waiting
+        # for its budget, and still treats the unfinished scan as "alive".
+        release = threading.Event()
+        self.addCleanup(release.set)
+        listdir = os.listdir
+
+        def blocking_listdir(path):
+            release.wait(10)
+            return listdir(path)
+
+        leader = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"],
+                                  stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                  stderr=subprocess.DEVNULL, start_new_session=True)
+        self.addCleanup(leader.stdout.close)
+        self.addCleanup(leader.wait, 5)
+        with tempfile.TemporaryDirectory() as proc:
+            pipeline = SubprocessPipeline(leader, proc_root=proc)
+            with mock.patch("media_capture_agent.uvc_pipeline.os.listdir", blocking_listdir):
+                # The leader exits; the scan proving its group gone stalls.
+                self.assertFalse(pipeline.stop(0.3, wait=True))
+                self.assertTrue(pipeline.exited())
+                for _ in range(3):
+                    started = time.monotonic()
+                    self.assertFalse(pipeline.stop(1.0, wait=False))
+                    self.assertLess(time.monotonic() - started, 0.3)
+                    self.assertIsNone(leader.returncode)
+                # A patient stop still waits (bounded) for the same scan.
+                started = time.monotonic()
+                self.assertFalse(pipeline.stop(0.3, wait=True))
+                self.assertGreaterEqual(time.monotonic() - started, 0.25)
+                self.assertEqual(sum(thread.name == "media-capture-agent-pgscan"
+                                     for thread in threading.enumerate()), 1)
+                release.set()
+                self.assertTrue(wait_for(lambda: pipeline.stop(0.5, wait=False)))
+            self.assertIsNotNone(leader.returncode)
+        pipeline.close()
 
     def test_sigterm_ignoring_pipeline_is_killed_within_bound(self):
         process = self.launch("ignore")
