@@ -69,8 +69,55 @@ run the following on the intended Main Ubuntu host under its dedicated account:
    profile; the manual-intervention state must remain visible. A normal clean
    shutdown/restart of an unambiguous serial device may reconnect automatically.
 
-Results: **NOT RUN — hardware, authorized management and viewer integration
-remain pending. Issue #11 is not closed by synthetic tests.**
+Backend runtime wiring status (2026-09-29): the lifespan now starts/stops
+`LocalUvcRuntime` for the deployment `local_uvc` source list, and frames reach
+the authorization-bound preview session layer. This was verified only with
+synthetic discovery/capture adapters and synthetic frame bytes; no physical
+camera, V4L2 node, udev rule or real frame was used.
+
+#### Real-hardware runtime procedure (serial-bearing UVC cameras)
+
+Use one or more USB UVC cameras that report a USB serial number (for example
+conference-style or speakerphone-integrated webcams from vendors such as EMEET
+or Yamaha; any serial-bearing UVC model is suitable). Record the exact models,
+serials, by-id names and ports only in the private local test record.
+
+1. Create the `local_uvc` registry sources with explicit capture profiles, list
+   their UUIDs in the private deployment `local_uvc` object, and run
+   `--check`. Confirm that an unknown key, a device path in place of a UUID, a
+   duplicate UUID and a fifth UUID each fail validation without echoing values.
+2. Start the service without the `local_uvc` object once and confirm the
+   `local_uvc_unconfigured` log event and that no video node is opened.
+3. Start with the object. Before Owner approval, confirm each source stays
+   `offline` and the service holds no `/dev/video*` descriptor.
+4. Approve one camera through the audited Owner path (stop-worker reapproval).
+   Confirm `degraded` until the first frame, then `online`, the negotiated
+   profile, and an `approve_camera` audit record. Repeat for up to four sources.
+5. Unplug one camera: confirm that source becomes `offline`, the service stays
+   running (process and other sources unaffected, their frames continue), and a
+   `local_uvc_source_health_changed` log line contains no path, serial or UUID.
+6. Replug it into a different port so its video node number changes: it must
+   return `online` automatically as the same source UUID after a new frame.
+7. Connect a second camera of the same model with the same (or no usable)
+   serial, or reproduce that with a controlled mock: the source must become
+   `manual_intervention_required`, deliver no frames, and stay so across a
+   service restart until explicitly reapproved.
+8. Stop the service (`systemctl stop`) while capturing: confirm all video
+   descriptors close within the join bound, the sources are `offline`, and a
+   clean restart reconnects a unique-serial camera automatically. Simulate a
+   hung driver if practical and confirm `local_uvc_stop_failed`; if the process
+   is terminated before that worker exits, the next start must require Owner
+   reapproval.
+9. While capturing, confirm no ALSA/OSS/microphone device of the integrated
+   speakerphone/microphone is opened (inspect `/proc/<pid>/fd` locally; do not
+   publish paths).
+10. With an invited `live:view` principal (once the authorized viewer route
+    exists), confirm preview frames are delivered; with a `recordings:view`-only
+    principal and after revoking `live:view`, confirm refusal and that no frame
+    is retained without viewers.
+
+Results: **NOT RUN — hardware, authorized management route and browser viewer
+integration remain pending. Issue #11 is not closed by synthetic tests.**
 
 For each tested camera:
 

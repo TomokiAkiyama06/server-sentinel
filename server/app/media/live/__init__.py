@@ -1,5 +1,11 @@
 """Transport-neutral, authorization-bound live viewer sessions."""
 
+from .local_preview import (
+    AuthorizedLocalPreview,
+    LocalPreviewHub,
+    LocalPreviewStatus,
+    PreviewFrame,
+)
 from .sessions import (
     LiveAccess,
     LiveSession,
@@ -11,6 +17,10 @@ from .sessions import (
 )
 
 __all__ = [
+    "AuthorizedLocalPreview",
+    "LocalPreviewHub",
+    "LocalPreviewStatus",
+    "PreviewFrame",
     "LiveAccess",
     "LiveSession",
     "LiveSessionCapacityExceeded",

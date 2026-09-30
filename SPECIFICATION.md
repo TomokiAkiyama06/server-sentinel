@@ -258,8 +258,21 @@ bounded single-planar V4L2 MMAP on Linux x86_64/aarch64, reports the actual
 negotiated dimensions/FPS/FourCC, and requires an explicit capture profile.
 Unsupported multi-planar capture or codec/bitrate controls fail explicitly.
 Source workers, Owner management and the preview frame sink are internal
-interfaces; physical capture is not auto-started by the backend launcher and no
-unauthenticated preview route is added. See `server/app/cameras/uvc/README.md`.
+interfaces and no unauthenticated preview route is added. The backend lifespan
+starts one worker per deployment-configured `local_uvc` source (`local_uvc`
+deployment object, 1 to 4 registry UUIDs, no physical evidence) after storage
+migration/admission and stops them, with bounded joins, before the monitoring
+runtime stops. Missing configuration is the explicit `unconfigured` state;
+configuration without admitted storage, including a monitoring runtime whose
+startup storage open failed or an admission refused while pinning the database at start, is `storage_unadmitted` (retryable, nothing opened) and never captures until
+storage is admitted again. The application capture-service snapshot follows the live runtime status, so a later worker or storage fault is never left reported as `running`. Every later capture-driven registry/approval write is admitted by the Main storage policy like an audit write; a refused admission stops that capture visibly and retries, never writes past the hard reserve; the camera transition is still recorded in memory and the capture service reports `degraded` while health cannot be persisted. The runtime opens only the database file pinned under that admission (a held descriptor, so inode reuse by a replacement cannot pass the identity check) and never creates one, so a lost or replaced filesystem after startup cannot yield a fallback database; a registry read failure while a camera is live is reported as capture loss and degrades the service until polling succeeds. A cancelled or failed lifespan startup stops started workers; a cancelled shutdown invalidates the preview and still completes the bounded capture stop and remaining cleanup before re-raising. Capture-service state is reported separately from each source's
+registry camera health, so an unplugged camera is `offline` while the service
+keeps running. Frames feed a bounded latest-frame preview hub that retains
+nothing without live viewer demand and drops its retained frame on any non-online camera transition; reading it requires a
+`LiveViewerSessions` session bound to the caller's human access session, whose
+validator re-checks on every open and read that the human session is still
+valid (not invalidated, expired or on a revoked credential) and that the
+principal still holds `live:view` at the bound revision. See `server/app/cameras/uvc/README.md`.
 
 Identity reconciliation starts only after an active-session marker is durable.
 An unclean session, including a failed ambiguity-latch write, requires Owner
