@@ -883,6 +883,30 @@ by the Issue #6 synthetic policy model.
   detected until the next one. Then verify the recorded deployment isolation
   (dedicated network identity, or single-purpose node) actually prevents that
   bind, since the application cannot.
+- Hostname reservation check module (`server/app/auth/reservation.py`, Issue
+  #10 slice S1): its tests use synthetic `/proc/net/tcp`/`tcp6` text and
+  synthetic Serve status JSON only. The real `tailscale serve status --json`
+  output format is **unverified**; the parser assumes a `TCP` / `Web` /
+  `AllowFunnel` shape and fails closed on anything else. On the installed
+  Tailscale version, capture the sanitized output for: no Serve config, the
+  single expected mapping, an extra path, an extra HTTPS port, a plain HTTP
+  mapping, a raw TCP forward, Funnel, and a foreground `tailscale serve`
+  session; confirm each is parsed as expected or fails closed rather than
+  passing. Record whether empty config prints `{}`, nothing, or text, and
+  whether reading status needs anything beyond local operator access (it must
+  not need ACL/Grants changes or admin credentials).
+- On the target host, compare the parsed `/proc/net/tcp` and `/proc/net/tcp6`
+  listeners with `ss -ltnH` for IPv4, IPv6, wildcard and IPv4-mapped binds,
+  and record whether Tailscale Serve holds a visible socket on the Tailscale
+  address (which decides the recorded proxy sockets). Run the check in the
+  network namespace that holds the reserved address when the dedicated
+  network identity isolation is used. Note that a wildcard `sshd` or other
+  service on the node is reported as an unexpected listener; record how the
+  deployment meets that. UDP/QUIC listeners are not enumerated.
+- Once the check is composed into startup and the daily worker, confirm an
+  enumeration failure or timeout (for example stopping `tailscaled`, or making
+  `/proc/net` unreadable) keeps human access closed and notifies the Owner,
+  and that a later violation closes access that was previously open.
 - Verify Owner bootstrap provisions the first credential locally: the command
   creates the Owner and a single-use short-lived enrollment authorization, human
   access stays closed until it is redeemed once from the reserved origin with a

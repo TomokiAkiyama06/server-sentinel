@@ -44,3 +44,39 @@ not affect health; when a matched redemption's audit append or commit fails,
 the redemption rolls back and the lost outcome is counted in the store's
 `audit_delivery_failed` / `undelivered_audit_records` health instead of being
 appended separately. See `server/app/audit/README.md`.
+
+## Hostname reservation check (ADR-0003)
+
+`reservation.py` verifies, and does not prevent, the dedicated-hostname
+reservation. `HostnameReservationCheck.startup()` and the daily `tick()` run an
+injected listener enumerator (`ProcNetListeners`, parsing `/proc/net/tcp` and
+`/proc/net/tcp6` text from an injected reader) and an injected proxy-route
+enumerator (`ServeStatusRoutes`, parsing Tailscale Serve status JSON from an
+injected source). `access_open` is `False` until a check passes, and any of the
+following closes it:
+
+- a TCP listener other than the recorded proxy sockets on a reserved address,
+  a wildcard (`0.0.0.0` / `::`) listener, or an IPv4-mapped equivalent, on any
+  port;
+- any Serve route other than the single `https://<host>:<port>/` proxy to the
+  loopback human listener (other paths, ports, `http`, raw TCP forwards, empty
+  TLS listeners, Funnel), or a duplicate of it;
+- the expected mapping or the loopback human listener being absent;
+- the isolation mode (`IsolationMode`) not being stated;
+- an enumeration that raises, returns unrecognised output, or exceeds its
+  timeout; a hung enumeration is never stacked by a later check.
+
+A failing startup/daily check closes access before emitting an identifier-free
+`ReservationFault` (reasons and counts only) to the injected Owner sink; a
+failed delivery is counted and retried on the next tick. While closed the
+check is retried every five minutes, re-notifying only when the reasons change,
+and a later passing check reopens access. A process binding the reserved
+address between two checks is not seen until the next check: detection bounds
+the exposure window, and only the Owner-recorded deployment isolation removes
+it. `/proc/net` covers one network namespace and TCP only (UDP/QUIC listeners
+are not enumerated).
+
+Nothing here is wired into the application or a route yet, reads the host
+implicitly, runs `tailscale`, changes Tailscale ACLs/Grants, or needs Tailscale
+administrative credentials. The assumed `tailscale serve status --json` shape
+is unverified against an installed Tailscale; unrecognised keys fail closed.
