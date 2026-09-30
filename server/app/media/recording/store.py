@@ -680,31 +680,37 @@ class RecordingStore:
         return {"event_id": str(event_id),
                 "recordings": [self.manifest(UUID(row["id"])) for row in rows]}
 
+    def _published_segment(self, segment_id: UUID):
+        self._check()
+        if not isinstance(segment_id, UUID):
+            raise ValueError("invalid segment identity")
+        row = self.db.execute(
+            "SELECT byte_length,sha256 FROM recording_segments WHERE id=? AND state='ready'",
+            (str(segment_id),)).fetchone()
+        if row is None:
+            raise RecordingError("RECORDING_SEGMENT_NOT_FOUND")
+        return row
+
     def segment_length(self, segment_id: UUID) -> int:
         """Journaled byte length of one published segment; no bytes are read.
 
         Local Owner-only diagnostic selection; callers enforce authorization.
         A pending (unpublished) or unknown segment is refused.
         """
-        self._check()
-        if not isinstance(segment_id, UUID):
-            raise ValueError("invalid segment identity")
-        row = self.db.execute(
-            "SELECT byte_length FROM recording_segments WHERE id=? AND state='ready'",
-            (str(segment_id),)).fetchone()
-        if row is None:
-            raise RecordingError("RECORDING_SEGMENT_NOT_FOUND")
-        return row["byte_length"]
+        return self._published_segment(segment_id)["byte_length"]
 
     def open_segment(self, segment_id: UUID) -> BinaryIO:
         """Open one published segment read-only through the pinned root.
 
         The file is opened relative to the verified root descriptor without
         following symlinks and must be a single-link regular file whose size
-        matches the journal. The caller closes the returned reader. Nothing is
-        written, so no storage reservation is taken.
+        matches the journal, and the opened descriptor's content must match the
+        journaled SHA-256 before it is returned (rewound to the start). The
+        caller closes the returned reader. Nothing is written, so no storage
+        reservation is taken.
         """
-        expected = self.segment_length(segment_id)
+        row = self._published_segment(segment_id)
+        expected = row["byte_length"]
         self._verify_root()
         descriptor = -1
         try:
@@ -713,8 +719,21 @@ class RecordingStore:
                                  dir_fd=self._fd)
             info = os.fstat(descriptor)
             if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
-                    or info.st_size != expected):
+                    or info.st_size != expected
+                    or info.st_size > self.limits.max_segment_bytes):
                 raise RecordingError("RECORDING_SEGMENT_UNAVAILABLE")
+            digest = hashlib.sha256()
+            remaining = info.st_size
+            while remaining:
+                part = os.read(descriptor, min(65_536, remaining))
+                if not part:
+                    raise RecordingError("RECORDING_SEGMENT_UNAVAILABLE")
+                remaining -= len(part)
+                digest.update(part)
+            if (os.read(descriptor, 1) != b""
+                    or digest.hexdigest() != row["sha256"]):
+                raise RecordingError("RECORDING_SEGMENT_UNAVAILABLE")
+            os.lseek(descriptor, 0, os.SEEK_SET)
             reader = os.fdopen(descriptor, "rb", buffering=0)
             descriptor = -1
             return reader

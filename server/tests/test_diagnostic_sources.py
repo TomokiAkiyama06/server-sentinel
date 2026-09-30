@@ -624,6 +624,20 @@ class ComposedExportTests(unittest.IsolatedAsyncioTestCase):
         result = await self.export((segment_media_id(self.segment),))
         self.assertEqual(result.included_media_count, 1)
 
+    async def test_a_same_length_rewritten_segment_is_not_copied(self):
+        stored = self.base / "recordings" / (self.segment.hex + ".seg")
+        original = stored.read_bytes()
+        tampered = bytes(byte ^ 0xFF for byte in original)
+        self.assertEqual(len(tampered), len(original))
+        stored.write_bytes(tampered)
+        self.assertEqual(os.stat(stored).st_nlink, 1)
+        with self.assertRaises(DiagnosticExportError):
+            await self.export((segment_media_id(self.segment),))
+        self.assertEqual(list(self.output.iterdir()), [])
+        stored.write_bytes(original)
+        result = await self.export((segment_media_id(self.segment),))
+        self.assertEqual(result.included_media_count, 1)
+
     async def test_integrity_verdicts_are_read_on_the_owning_worker(self):
         latest = await self.runtime.call(self.runtime.integrity_store.latest)
         self.assertIsNotNone(latest)
