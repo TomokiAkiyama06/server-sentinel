@@ -10,7 +10,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from media_capture_agent import cli
+from media_capture_agent import cli, storage
 from media_capture_agent.cli import CHECK_REASONS, main
 from media_capture_agent.config import ExpectedMount
 from media_capture_agent.storage import MediaStore, Mount, StorageRefused
@@ -188,6 +188,46 @@ class CheckReasonTests(unittest.TestCase):
             raise StorageRefused("mount_inventory_unavailable")
         self.store_options["mounts"] = unavailable
         self.assert_reason("mount_inventory_unavailable")
+
+    def test_mount_inventory_io_error_maps_to_inventory_reason(self):
+        # Real read_mounts/descriptor_mount_id: /proc mountinfo/fdinfo unreadable.
+        self.store_options = {"stable_device": lambda _expected: True}
+        with patch.object(storage, "open", create=True,
+                          side_effect=OSError(13, "synthetic " + str(self.root))):
+            self.assert_reason("mount_inventory_unavailable")
+        # Only mountinfo unreadable while fdinfo still resolves the mount ID.
+        self.store_options = {"stable_device": lambda _expected: True,
+                              "mount_id": lambda _fd: 1}
+        with patch.object(storage, "open", create=True,
+                          side_effect=OSError(5, "synthetic " + str(self.root))):
+            self.assert_reason("mount_inventory_unavailable")
+
+    def test_mount_inventory_io_error_at_startup_root_diagnostic(self):
+        # Media root cannot be opened and the inventory is unreadable: the
+        # startup helper must not report media_root_unavailable instead.
+        self.media.rmdir()
+        self.store_options = {"stable_device": lambda _expected: True}
+        with patch.object(storage, "open", create=True,
+                          side_effect=OSError(13, "synthetic " + str(self.root))):
+            self.assert_reason("mount_inventory_unavailable")
+
+        def unreadable():
+            raise OSError(5, "synthetic " + str(self.root))
+        self.store_options["mounts"] = unreadable
+        self.assert_reason("mount_inventory_unavailable")
+
+    def test_mount_inventory_io_error_keeps_runtime_reason(self):
+        # Heartbeat/ring contract: str(exc) stays storage_unavailable.
+        with patch.object(storage, "open", create=True, side_effect=OSError(5, "synthetic")):
+            with self.assertRaises(StorageRefused) as raised:
+                storage.read_mounts()
+        self.assertEqual((str(raised.exception), raised.exception.diagnostic),
+                         ("storage_unavailable", "mount_inventory_unavailable"))
+        with patch.object(storage, "open", create=True, side_effect=OSError(5, "synthetic")):
+            with self.assertRaises(StorageRefused) as raised:
+                storage.descriptor_mount_id(0)
+        self.assertEqual((str(raised.exception), raised.exception.diagnostic),
+                         ("storage_unavailable", "mount_inventory_unavailable"))
 
     # Media root ownership, permissions and space.
 

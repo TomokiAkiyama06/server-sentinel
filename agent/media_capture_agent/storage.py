@@ -38,16 +38,32 @@ def decode_mount(value):
     return re.sub(r"\\([0-7]{3})", lambda match: chr(int(match[1], 8)), value)
 
 
+def _inventory_unreadable():
+    """/proc mount inventory I/O failure.
+
+    The runtime reason stays ``storage_unavailable`` (heartbeat/ring contract);
+    ``--check`` reports the finer ``mount_inventory_unavailable`` diagnostic.
+    """
+    return StorageRefused("storage_unavailable", diagnostic="mount_inventory_unavailable")
+
+
 def read_mounts():
-    with open("/proc/self/mountinfo", encoding="utf-8") as stream:
-        return parse_mounts(stream.read())
+    try:
+        with open("/proc/self/mountinfo", encoding="utf-8") as stream:
+            text = stream.read()
+    except OSError as exc:
+        raise _inventory_unreadable() from exc
+    return parse_mounts(text)
 
 
 def descriptor_mount_id(descriptor):
-    with open(f"/proc/self/fdinfo/{descriptor}", encoding="utf-8") as stream:
-        for line in stream:
-            if line.startswith("mnt_id:"):
-                return int(line.split(":", 1)[1])
+    try:
+        with open(f"/proc/self/fdinfo/{descriptor}", encoding="utf-8") as stream:
+            for line in stream:
+                if line.startswith("mnt_id:"):
+                    return int(line.split(":", 1)[1])
+    except OSError as exc:
+        raise _inventory_unreadable() from exc
     raise StorageRefused("mount_inventory_unavailable")
 
 
@@ -200,11 +216,13 @@ class MediaStore:
     def _unavailable_root_diagnostic(self):
         """Fixed code when the media root cannot be opened at startup."""
         try:
-            mount_point = self.settings.expected_mount.mount_point
-            if not any(entry.identity.mount_point == mount_point for entry in self.mounts()):
-                return "mount_missing"
+            mounts = self.mounts()
         except (OSError, StorageRefused):
-            pass
+            # The inventory itself could not be read or parsed.
+            return "mount_inventory_unavailable"
+        mount_point = self.settings.expected_mount.mount_point
+        if not any(entry.identity.mount_point == mount_point for entry in mounts):
+            return "mount_missing"
         return "media_root_unavailable"
 
     def _mismatch_diagnostic(self, actual, mounts):
