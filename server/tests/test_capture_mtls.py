@@ -241,6 +241,26 @@ class CaptureMtlsTests(CaptureTlsHarness):
         result, _ = self._exchange(certificate, key)
         self.assertEqual("capture_node_not_admitted", result)
 
+    def test_open_session_is_dropped_once_its_certificate_expires(self):
+        # OpenSSL checks validity only during the handshake; admission must
+        # re-check expiry with the server clock on an already-open session.
+        current = [utc_now()]
+        self.admission = CaptureNodeAdmission(self.ledger, self.deployment,
+                                              clock=lambda: current[0])
+        self.acceptor = CaptureIngestAcceptor(self.context, self.admission,
+                                              handshake_timeout_seconds=10)
+        _, _, certificate, key = self._paired_node(validity=DAY)
+        session, output = self._exchange(certificate, key)
+        self.assertEqual("ok", output)
+        self.addCleanup(session.close)
+        self.assertTrue(session.still_admitted())
+        current[0] = session.identity.not_valid_after
+        self.assertFalse(session.still_admitted())
+        self.assertEqual(-1, session.connection.fileno(), "expired session must be closed")
+        broken = CaptureNodeAdmission(self.ledger, self.deployment,
+                                      clock=lambda: datetime.datetime(2000, 1, 1))
+        self.assertFalse(broken.is_admitted(session.identity), "a naive clock denies")
+
     def test_orphan_certificate_without_activation_is_not_admitted(self):
         _, _, certificate, key = self._paired_node(activate=False)
         result, _ = self._exchange(certificate, key)
@@ -493,15 +513,21 @@ class CaptureRenewalTests(CaptureTlsHarness):
                     renew_node_credential(self.authority, self.ledger, self.admission,
                                           session.identity, request)
                 self.assertEqual(reason, raised.exception.reason)
-        # A key already bound to another node cannot be staged for this one.
-        reused = other_issued.public_key_digest
-        self.assertNotEqual(reused, session.identity.public_key_digest)
-        with self.assertRaises(PairingError):
-            self.ledger.stage_renewal(node_id=claim.node_id,
-                                      current_public_key_digest=session.identity.public_key_digest,
-                                      current_credential_digest=session.identity.credential_digest,
-                                      public_key_digest=reused, credential_serial_digest="e" * 64,
-                                      not_after=utc_now().timestamp() + 1000)
+        # A key already bound to another node cannot be staged for this one,
+        # including a key bound only by another node's not-yet-activated
+        # (consumed or pending) enrollment.
+        _, consumed, _, _ = self._paired_node("c", activate=False)
+        pending = public_key_digest(ec.generate_private_key(ec.SECP256R1()).public_key())
+        self.ledger.approve(Owner(), "owner", node_id=uuid4(), public_key_digest=pending)
+        for reused in (other_issued.public_key_digest, consumed.public_key_digest, pending):
+            self.assertNotEqual(reused, session.identity.public_key_digest)
+            with self.subTest(reused=reused[:8]), self.assertRaises(PairingError):
+                self.ledger.stage_renewal(
+                    node_id=claim.node_id,
+                    current_public_key_digest=session.identity.public_key_digest,
+                    current_credential_digest=session.identity.credential_digest,
+                    public_key_digest=reused, credential_serial_digest="e" * 64,
+                    not_after=utc_now().timestamp() + 1000)
         self.assertTrue(session.still_admitted())
 
     def test_near_expiry_without_renewal_raises_owner_signal_once(self):

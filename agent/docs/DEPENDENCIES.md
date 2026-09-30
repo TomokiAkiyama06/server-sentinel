@@ -15,8 +15,9 @@ except `node_tls`.
 
 Reviewed 2026-09-20. The Agent runtime, installer and artifact builder use the
 Python standard library only. No model, media codec, third-party runtime library,
-SDK, native extension, or implicit package download is introduced. Python 3.12+
-is required; exact CI interpreter is 3.12.14. Project code remains Apache-2.0;
+SDK, native extension, or implicit package download is introduced. CPython 3.12
+or 3.14 is required (3.13 has no reviewed `cffi` wheel in the mTLS adapter lock
+above); exact CI interpreter is 3.12.14. Project code remains Apache-2.0;
 `agent/LICENSE` is a copy of the root license included in the executable zipapp.
 The zipapp contains application source and its license, not an interpreter or
 operating-system image. Deployments supply their separately licensed Python.

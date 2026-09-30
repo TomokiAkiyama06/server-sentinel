@@ -14,7 +14,9 @@ and port that differ from the human listener.
 Admission requires all of:
 
 * a TLS 1.3 handshake with a client certificate chaining only to the
-  deployment CA (validity is enforced by OpenSSL during the handshake);
+  deployment CA (validity is enforced by OpenSSL during the handshake, and
+  expiry again by the server clock on every admission check, because OpenSSL
+  does not re-check a certificate on an already-open connection);
 * a capture-only leaf (CA=false, clientAuth EKU, exactly one node URI and the
   expected deployment URI);
 * the pairing ledger's *current* active record for that node, public key and
@@ -35,6 +37,7 @@ import logging
 import socket
 import ssl
 from pathlib import Path
+from typing import Callable
 from uuid import UUID
 
 from cryptography import x509
@@ -49,6 +52,10 @@ from .pairing import PairingError, PairingLedger
 LOGGER = logging.getLogger("serversentinel.capture_ingest.tls")
 MAX_PEER_CERTIFICATE_BYTES = 16 * 1024
 DEFAULT_HANDSHAKE_TIMEOUT_SECONDS = 10.0
+
+
+def _utc_now() -> datetime.datetime:
+    return datetime.datetime.now(datetime.timezone.utc)
 
 
 class IngestTlsError(RuntimeError):
@@ -138,11 +145,14 @@ class CaptureNodeIdentity:
 class CaptureNodeAdmission:
     """Maps a verified peer certificate to the ledger's current node authorization."""
 
-    def __init__(self, ledger: PairingLedger, deployment_id: UUID):
-        if not isinstance(ledger, PairingLedger) or not isinstance(deployment_id, UUID):
+    def __init__(self, ledger: PairingLedger, deployment_id: UUID, *,
+                 clock: Callable[[], datetime.datetime] = _utc_now):
+        if (not isinstance(ledger, PairingLedger) or not isinstance(deployment_id, UUID)
+                or not callable(clock)):
             raise IngestConfigurationError("ingest_admission_dependency_invalid")
         self._ledger = ledger
         self._deployment = deployment_uri(deployment_id)
+        self._clock = clock
 
     def identify(self, peer_der: bytes) -> CaptureNodeIdentity:
         if not isinstance(peer_der, bytes) or not 0 < len(peer_der) <= MAX_PEER_CERTIFICATE_BYTES:
@@ -172,10 +182,12 @@ class CaptureNodeAdmission:
                                    not_valid_after=expiry)
 
     def is_admitted(self, identity: CaptureNodeIdentity) -> bool:
-        """Consult the durable ledger now; any failure denies."""
+        """Check expiry and consult the durable ledger now; any failure denies."""
         if not isinstance(identity, CaptureNodeIdentity):
             return False
         try:
+            if not identity.not_valid_after > self._clock():
+                return False
             return self._ledger.admits(node_id=identity.node_id,
                                        public_key_digest=identity.public_key_digest,
                                        credential_serial_digest=identity.credential_digest)

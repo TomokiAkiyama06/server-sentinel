@@ -109,8 +109,12 @@ class CaptureMtlsScenario(unittest.TestCase):
                                              public_key_digest=digest_path.read_text())
         claim = self.ledger.redeem(enrollment_id=approval.enrollment_id,
                                    public_key_digest=digest_path.read_text(), code=code.value)
-        # Owner decision 2026-09-30: the default node validity is 397 days.
-        issued = self.authority.issue_and_activate(self.ledger, claim, csr_path.read_bytes())
+        # The renewal below uses the Owner-decided 397-day default. Certificate
+        # times have one-second precision and the Agent requires a renewal to
+        # outlive the current certificate, so this one is a day shorter; in
+        # service renewal starts 30 days before expiry and cannot tie.
+        issued = self.authority.issue_and_activate(self.ledger, claim, csr_path.read_bytes(),
+                                                   validity=396 * DAY)
         certificate_path = self.public / "node.pem"
         certificate_path.write_bytes(issued.certificate_pem)
         bundle = self.authority.export_trust_bundle(server_name=SERVER_NAME,

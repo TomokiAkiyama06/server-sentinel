@@ -389,22 +389,36 @@ class RenewalSchedule:
         return min(now + delay, not_after)
 
 
-def installed_certificate_expiry(store: NodeCredentialStore) -> datetime.datetime:
+def _installed_certificate(store: NodeCredentialStore) -> x509.Certificate:
     credential = installed_credential(store)
     try:
         content = credential.certificate_path.read_bytes()
-        return x509.load_pem_x509_certificate(content).not_valid_after_utc
+        return x509.load_pem_x509_certificate(content)
     except (OSError, ValueError):
         raise PairingRefused("node_identity_unavailable") from None
 
 
+def installed_certificate_expiry(store: NodeCredentialStore) -> datetime.datetime:
+    return _installed_certificate(store).not_valid_after_utc
+
+
 def prepare_renewal(store: NodeCredentialStore) -> EnrollmentRequest:
-    """Return a CSR for a fresh renewal key, reusing it across retries."""
+    """Return a CSR for a fresh renewal key, reusing it across retries.
+
+    A pending key that already is the installed key is stale: the Agent
+    stopped after ``store.rotate()`` committed but before ``pending.discard()``.
+    The Main refuses current-key reuse, so it is discarded and replaced.
+    """
     pending = PendingNodeKeyStore(store.runtime_root, owner_uid=store.owner_uid, renewal=True)
     try:
         key = pending.load()
     except PairingRefused:
         key = pending.create()
+    else:
+        installed = public_key_digest(_installed_certificate(store).public_key())
+        if hmac.compare_digest(public_key_digest(key.public_key()), installed):
+            pending.discard()
+            key = pending.create()
     return build_enrollment_request(key)
 
 

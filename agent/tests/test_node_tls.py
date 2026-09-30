@@ -295,6 +295,22 @@ class NodeRenewalTests(NodeTlsHarness):
         self.assertEqual(public_key_digest(x509.load_der_x509_certificate(
             peer.peer_certificate).public_key()), request.public_key_digest)
 
+    def test_stale_pending_key_after_rotation_is_replaced_by_a_fresh_key(self):
+        credentials, node = self._installed()
+        request = prepare_renewal(credentials)
+        renewed = pem(self.authority.node_certificate(request.csr_pem, node, lifetime=397 * DAY))
+        # The Agent stops after rotate() committed but before discard() ran.
+        with patch.object(PendingNodeKeyStore, "discard"):
+            complete_renewal(credentials, renewed)
+        installed = public_key_digest(x509.load_pem_x509_certificate(
+            installed_credential(credentials).certificate_path.read_bytes()).public_key())
+        self.assertEqual(request.public_key_digest, installed)
+        self.assertTrue((self.runtime / "pending-renewal" / "node-key.pem").exists())
+        recovered = prepare_renewal(credentials)
+        self.assertNotEqual(installed, recovered.public_key_digest)
+        self.assertEqual(recovered.public_key_digest, prepare_renewal(credentials).public_key_digest,
+                         "the replacement key is reused across later retries")
+
     def test_renewed_certificate_must_keep_identity_key_ca_and_extend_expiry(self):
         credentials, node = self._installed()
         request = prepare_renewal(credentials)
@@ -326,6 +342,30 @@ class AgentLockAuditTests(unittest.TestCase):
         for row in rows:
             self.assertTrue(row["license_files"])
             self.assertEqual(set(row["license_files"]), set(row["license_sha256"]))
+
+    def test_declared_python_range_is_covered_by_audited_wheels(self):
+        root = Path(__file__).resolve().parents[1]
+        declared = re.search(r'^requires-python = "([^"]+)"$',
+                             (root / "pyproject.toml").read_text(), re.M).group(1)
+
+        def allowed(minor):
+            for clause in declared.split(","):
+                operator, version = re.fullmatch(r"(>=|<|!=)3\.(\d+)(\.\*)?", clause).group(1, 2)
+                if not {">=": minor >= int(version), "<": minor < int(version),
+                        "!=": minor != int(version)}[operator]:
+                    return False
+            return True
+
+        rows = json.loads((root / "docs/cryptography-wheel-audit.json").read_text())
+        packages = {row["name"] for row in rows}
+        for minor in (minor for minor in range(12, 40) if allowed(minor)):
+            for name in packages:
+                tags = [row["wheel"].split("-")[2:4] for row in rows if row["name"] == name]
+                with self.subTest(python=f"3.{minor}", package=name):
+                    self.assertTrue(any(
+                        python == f"cp3{minor}" or python.startswith("py3")
+                        or (abi == "abi3" and int(python[3:]) <= minor)
+                        for python, abi in tags), "no audited wheel for a declared Python")
 
 
 if __name__ == "__main__":

@@ -460,7 +460,8 @@ class PairingLedger:
         The caller has authenticated the node over mTLS with the credential
         named by the ``current_*`` digests; this re-checks, in the same write
         transaction, that it is still the node's active credential. The new key
-        must differ from the current one. At most one renewal is staged per node
+        must differ from the current one and must not be bound to another node
+        by a credential, staged renewal or enrollment. At most one renewal is staged per node
         (a retry replaces it), so repeated attempts cannot grow the ledger, and
         staging writes no audit record for the same reason; promotion does.
         """
@@ -481,10 +482,14 @@ class PairingLedger:
                     and hmac.compare_digest(row["public_key_digest"], current_key)
                     and hmac.compare_digest(row["credential_serial_digest"], current_serial)):
                 raise PairingError("capture node is not eligible for renewal")
+            # An enrollment (any state) already binds its key to its node, even
+            # before that node activates a credential.
             reused = connection.execute(
                 "SELECT 1 FROM pairing_node_credentials WHERE public_key_digest = ? "
                 "UNION ALL SELECT 1 FROM pairing_node_renewals WHERE public_key_digest = ? "
-                "AND node_id != ?", (key, key, str(node)),
+                "AND node_id != ? "
+                "UNION ALL SELECT 1 FROM pairing_enrollments WHERE public_key_digest = ? "
+                "AND node_id != ?", (key, key, str(node), key, str(node)),
             ).fetchone()
             if reused:
                 raise PairingError("capture node is not eligible for renewal")
