@@ -9,8 +9,8 @@ import unittest
 from uuid import UUID
 
 from app.cameras.remote_agent.continuity import (
-    AgentSession, ContinuityLimits, ContinuityTracker, DeliveryOutcome, GapReason,
-    MediaUnitHeader, SourceFlow,
+    AgentSession, CommittedWatermark, ContinuityLimits, ContinuityTracker, DeliveryOutcome,
+    GapReason, MediaUnitHeader, SourceFlow,
 )
 from app.cameras.remote_agent.ingest import (
     AgentAction, AgentIngestQueue, AgentMessage, DenyIngestAuthorizer, IngestLimits,
@@ -154,14 +154,18 @@ class Clock:
         return self.now
 
 
+def no_watermark(source_id):
+    return None
+
+
 def build(*, authorizer=None, queued=4, message_bytes=8, sources=4, pending=4,
-          stale=100, rate=1000, nodes=64):
+          stale=100, rate=1000, nodes=64, watermark=no_watermark):
     authorizer = authorizer or Authorizer()
     clock = Clock()
     ingest = AgentIngestQueue(IngestLimits(message_bytes, queued, queued * message_bytes,
                                            rate, 10 ** 12), authorizer, clock_ns=clock)
     tracker = ContinuityTracker(ContinuityLimits(sources, pending, stale, nodes), authorizer,
-                                ingest, clock_ns=clock)
+                                ingest, clock_ns=clock, committed_watermark=watermark)
     return tracker, ingest, clock, authorizer
 
 
@@ -413,7 +417,7 @@ class ContinuityTrackerTests(unittest.TestCase):
         ingest = TransientRefusalQueue(IngestLimits(8, 1, 8, 1000, 10 ** 12),
                                        authorizer, clock_ns=clock)
         tracker = ContinuityTracker(ContinuityLimits(4, 4, 100), authorizer, ingest,
-                                    clock_ns=clock)
+                                    clock_ns=clock, committed_watermark=no_watermark)
         session = tracker.open_session(NODE)
         if kind == "backpressure":
             tracker.receive(session, unit(0), b"v")
@@ -482,7 +486,8 @@ class ContinuityTrackerTests(unittest.TestCase):
                                  2 if kind == "rate_limit" else 1000, 50),
                     authorizer, clock_ns=clock)
                 tracker = ContinuityTracker(ContinuityLimits(4, 4, 100), authorizer,
-                                            ingest, clock_ns=clock)
+                                            ingest, clock_ns=clock,
+                                            committed_watermark=no_watermark)
                 session = tracker.open_session(NODE)
                 tracker.receive(session, unit(0, epoch=2), b"v")
                 if kind == "backpressure":
@@ -493,6 +498,8 @@ class ContinuityTrackerTests(unittest.TestCase):
                     ingest.refusing = True
                 refused = tracker.receive(session, unit(0, epoch=3, at=0), b"n")
                 self.assertNotEqual(DeliveryOutcome.ACCEPTED, refused.outcome)
+                self.assertEqual([GapReason.CAPTURE_RESTART],
+                                 [g.reason for g in refused.gaps])
                 ingest.drain(10)
                 ingest.refusing = False
                 clock.now = 60  # past the rate window, before the stale bound
@@ -507,8 +514,101 @@ class ContinuityTrackerTests(unittest.TestCase):
                                             flow(tracker).last_sequence))
                 new = tracker.receive(session, unit(0, epoch=3, at=0), b"n")
                 self.assertEqual(DeliveryOutcome.ACCEPTED, new.outcome)
+                # Reported once, when the refused unit first showed it.
+                self.assertEqual((), new.gaps)
                 self.assertEqual([GapReason.CAPTURE_RESTART],
-                                 [g.reason for g in new.gaps])
+                                 [g.reason for g in tracker.drain_gaps(10)])
+
+    def test_capture_restart_is_recorded_when_first_observed(self):
+        for kind in ("backpressure", "rate_limit", "transient_refusal"):
+            with self.subTest(kind=kind):
+                authorizer = Authorizer()
+                clock = Clock()
+                ingest = TransientRefusalQueue(
+                    IngestLimits(8, 1 if kind == "backpressure" else 8, 64,
+                                 1 if kind == "rate_limit" else 1000, 50),
+                    authorizer, clock_ns=clock)
+                tracker = ContinuityTracker(ContinuityLimits(4, 4, 100), authorizer,
+                                            ingest, clock_ns=clock,
+                                            committed_watermark=no_watermark)
+                session = tracker.open_session(NODE)
+                self.assertEqual(DeliveryOutcome.ACCEPTED,
+                                 tracker.receive(session, unit(4, epoch=2), b"v").outcome)
+                tracker.drain_gaps(10)  # the leading loss of epoch 2
+                ingest.refusing = kind == "transient_refusal"
+                refused = tracker.receive(session, unit(0, epoch=3, at=0), b"n")
+                self.assertNotEqual(DeliveryOutcome.ACCEPTED, refused.outcome)
+                # The Agent never retries (disconnect, deactivation): the
+                # known restart still reaches the durable consumer.
+                (gap,) = tracker.forget_source(SOURCE)
+                self.assertEqual((GapReason.CAPTURE_RESTART, 3, None, 0, None),
+                                 (gap.reason, gap.capture_epoch, gap.after_sequence,
+                                  gap.before_sequence, gap.missing_units))
+
+    def test_retry_after_an_observed_restart_reports_only_new_loss(self):
+        tracker, ingest, _, _ = build(queued=1)
+        session = tracker.open_session(NODE)
+        tracker.receive(session, unit(0, epoch=2), b"v")
+        for _ in range(3):
+            tracker.receive(session, unit(2, epoch=3, at=0), b"n")
+        self.assertEqual(1, flow(tracker).pending_gaps)
+        ingest.drain(1)
+        result = tracker.receive(session, unit(5, epoch=3, at=5), b"n")
+        self.assertEqual(DeliveryOutcome.ACCEPTED, result.outcome)
+        self.assertEqual([(GapReason.SEQUENCE_SKIP, 1, 5, 3)],
+                         [(g.reason, g.after_sequence, g.before_sequence, g.missing_units)
+                          for g in result.gaps])
+        self.assertEqual([GapReason.CAPTURE_RESTART, GapReason.SEQUENCE_SKIP],
+                         [g.reason for g in tracker.drain_gaps(10)])
+        self.assertEqual((3, 5), (flow(tracker).capture_epoch, flow(tracker).last_sequence))
+
+    def test_main_restart_resumes_from_the_durable_watermark(self):
+        marks = {SOURCE: CommittedWatermark(NODE, 1, 4, 40)}
+        tracker, ingest, _, _ = build(watermark=marks.get)
+        session = tracker.open_session(NODE)
+        # The Agent kept capturing across the Main restart: no false loss.
+        result = tracker.receive(session, unit(5), b"v")
+        self.assertEqual((DeliveryOutcome.ACCEPTED, ()), (result.outcome, result.gaps))
+        self.assertEqual(SourceFlow.RECEIVING, flow(tracker).flow)
+        self.assertEqual(1, ingest.snapshot().queued_messages)
+        tracker, ingest, _, _ = build(watermark=marks.get)
+        session = tracker.open_session(NODE)
+        # A durably recorded unit is an idempotent duplicate, never re-enqueued.
+        self.assertEqual(DeliveryOutcome.DUPLICATE,
+                         tracker.receive(session, unit(4), b"v").outcome)
+        self.assertEqual(0, ingest.snapshot().queued_messages)
+        # Units the restart lost after the watermark are exact loss.
+        result = tracker.receive(session, unit(8), b"v")
+        self.assertEqual([(GapReason.SEQUENCE_SKIP, 4, 8, 3)],
+                         [(g.reason, g.after_sequence, g.before_sequence, g.missing_units)
+                          for g in result.gaps])
+        tracker, _, _, _ = build(watermark=marks.get)
+        session = tracker.open_session(NODE)
+        self.assertEqual("stale_capture_epoch",
+                         tracker.receive(session, unit(9, epoch=0), b"v").reason)
+        result = tracker.receive(session, unit(0, epoch=2, at=0), b"v")
+        self.assertEqual([GapReason.CAPTURE_RESTART], [g.reason for g in result.gaps])
+
+    def test_watermark_lookup_failure_or_mismatch_is_refused_not_loss(self):
+        def failing(source_id):
+            raise OSError("durable store unavailable")
+        tracker, ingest, _, _ = build(watermark=failing)
+        session = tracker.open_session(NODE)
+        result = tracker.receive(session, unit(5), b"v")
+        self.assertEqual((DeliveryOutcome.REJECTED, "watermark_unavailable", ()),
+                         (result.outcome, result.reason, result.gaps))
+        self.assertEqual((), tracker.snapshot())
+        self.assertEqual(0, ingest.snapshot().queued_messages)
+        for mark, reason in ((object(), "watermark_unavailable"),
+                             (CommittedWatermark(OTHER_NODE, 1, 4, 40),
+                              "source_identity_mismatch")):
+            with self.subTest(reason=reason):
+                tracker, ingest, _, _ = build(watermark=lambda source_id, mark=mark: mark)
+                session = tracker.open_session(NODE)
+                result = tracker.receive(session, unit(5), b"v")
+                self.assertEqual((DeliveryOutcome.REJECTED, reason),
+                                 (result.outcome, result.reason))
+                self.assertEqual((), tracker.snapshot())
 
     def test_uncommitted_sources_stay_within_source_capacity(self):
         authorizer = Authorizer({(NODE, s) for s in SOURCES})
@@ -1018,7 +1118,7 @@ class ContinuityTrackerTests(unittest.TestCase):
         ingest = TransientRefusalQueue(IngestLimits(8, 4, 32, 1000, 10 ** 12),
                                        authorizer, clock_ns=clock)
         tracker = ContinuityTracker(ContinuityLimits(4, 4, 10), authorizer, ingest,
-                                    clock_ns=clock)
+                                    clock_ns=clock, committed_watermark=no_watermark)
         session = tracker.open_session(NODE)
         tracker.receive(session, unit(0), b"v")
         ingest.refusing = True
@@ -1095,7 +1195,8 @@ class ContinuityTrackerTests(unittest.TestCase):
         ingest = AgentIngestQueue(IngestLimits(8, 4, 32, 1000, 10 ** 12), authorizer,
                                   clock_ns=clock_for("ingest"))
         tracker = ContinuityTracker(ContinuityLimits(4, 4, 100, 64), authorizer, ingest,
-                                    clock_ns=clock_for("tracker"))
+                                    clock_ns=clock_for("tracker"),
+                                    committed_watermark=no_watermark)
         holders.update(tracker=tracker._lock, ingest=ingest._lock)
         session = tracker.open_session(NODE)
         self.assertTrue(tracker.heartbeat(session))
@@ -1362,7 +1463,13 @@ class ContinuityTrackerTests(unittest.TestCase):
             tracker.drain_gaps(0)
         with self.assertRaises(ValueError):
             ContinuityTracker(ContinuityLimits(1, 1, 1), Authorizer(), object(),
-                              clock_ns=Clock())
+                              clock_ns=Clock(), committed_watermark=no_watermark)
+        tracker, ingest, clock, authorizer = build()
+        with self.assertRaises(ValueError):
+            ContinuityTracker(tracker.limits, authorizer, ingest, clock_ns=clock,
+                              committed_watermark=None)
+        with self.assertRaises(ValueError):
+            CommittedWatermark(NODE, 1, -1, 0)
 
 
 if __name__ == "__main__":

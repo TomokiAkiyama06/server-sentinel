@@ -631,8 +631,16 @@ a reason no retry can satisfy (oversize) is recorded as loss, and any other
 ingest refusal leaves continuity unchanged and the flow `degraded`. A sequence skip reports the exact missing
 count, a new capture epoch reports a gap of unknown extent (also when the
 source's earlier-epoch unit was attempted but never committed; an epoch lower
-than one already attempted is refused as stale), and an in-epoch
-capture clock regression is reported. The full envelope travels with each
+than one already attempted is refused as stale; a restart is recorded when a
+refused unit first shows it, so it reaches the durable consumer even if that
+unit is never retried, and its retry does not report it again), and an in-epoch
+capture clock regression is reported. After a Main Server restart, a source's
+continuity resumes from the durable recording layer's committed watermark
+`(node, capture_epoch, sequence, capture_time_ns)` before its first unit is
+checked, so units already recorded by the earlier process are `duplicate`
+rather than leading loss and units lost after that watermark are an exact
+skip; a failed watermark lookup refuses the unit transiently rather than
+reporting loss or healthy flow. The full envelope travels with each
 admitted unit in the ingest queue, and the ingest boundary refuses a media
 unit with a missing or partial envelope. Known loss or backpressure keeps the
 source flow `degraded`, including pressure or a transient refusal on a

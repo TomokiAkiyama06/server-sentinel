@@ -55,8 +55,11 @@ capture_time_ns)` media envelope (carried in full on each queued
 `AgentMessage`), commit-after-admission so backpressure makes
 the Agent retry rather than lose media, idempotent duplicate acknowledgement
 (duplicates and other early refusals still consume the node's rate budget),
-and bounded, coalescing gap events for skips, capture restarts, clock
-regressions and refused units. Known loss keeps a source flow `degraded` and a
+and bounded, coalescing gap events for skips, capture restarts (recorded when
+first observed, even on a refused unit), clock regressions and refused units.
+After a Main Server restart each source resumes from the durable
+`CommittedWatermark` supplied by the deployment, so already recorded units
+are never reported as loss. Known loss keeps a source flow `degraded` and a
 closed or stale session makes it `interrupted`; after a reconnect each source
 stays `interrupted` until it delivers media on the new session. Session generations are never
 reissued (also after `forget_node` and re-enrollment), `forget_node` also
