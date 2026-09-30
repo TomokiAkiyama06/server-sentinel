@@ -206,9 +206,14 @@ Installation/service checkboxes above remain open.
 
 - [x] discovery binds only the video capture node; the UVC metadata node is
       excluded, audio is not enumerated, 0 probe failures;
-- [x] identity is vendor/product/serial/interface: a changed node path, port or
-      device number still matches; a different serial is absent; a duplicate
-      serial requires manual intervention;
+- [x] real hardware: the single camera was discovered as a source keyed by its
+      vendor/product/serial/interface identity (values in the private record),
+      and that source was approved and brought online (see below);
+- [x] synthetic (harness-injected enumeration, not physical): with a changed
+      node path, port or device number injected, the identity still matches;
+      an injected different serial is absent; an injected duplicate serial
+      requires manual intervention. This checks the matching logic on the
+      capture node only; the physical cases are the two pending items below;
 - [x] a never-approved source reports `manual_intervention_required` /
       `owner_approval_required`, starts no process, and performs only read-only
       `QUERYCAP`/`ENUM_FMT` probes;
@@ -234,16 +239,20 @@ Installation/service checkboxes above remain open.
 - [ ] **FAIL:** during v4l2 plugin initialisation the `gst-launch` child opens
       every `/dev/video*` node `O_RDWR`, including non-approved and metadata
       nodes; with a cold registry it also loads ALSA/PulseAudio/PipeWire plugin
-      libraries (no audio device or socket use observed). Fix in progress on
-      PR #88; re-run this trace on the fixed HEAD;
+      libraries (no audio device or socket use observed). Observed at PR #88
+      HEAD `7840f4a`; fix in progress on PR #88. This record must be re-traced
+      and updated on the fixed HEAD after PR #88 merges (it stays FAIL until
+      then);
 - [ ] pending: dedicated service account and systemd unit with a
       `DevicePolicy`/`DeviceAllow` video-node allowlist (check whether the
       over-broad open above then fails with `EPERM` and whether capture still
       starts) — requires root;
-- [ ] pending: USB unplug and replug into another port (source offline while the
-      agent stays up; same source returns online only after a new frame);
-- [ ] pending: second identical camera (duplicate/no-serial ambiguity must
-      require manual intervention on real hardware).
+- [ ] pending (real hardware): USB unplug and replug into another port (source
+      offline while the agent stays up; the same identity matches on the new
+      port/node; same source returns online only after a new frame);
+- [ ] pending (real hardware): a camera with a different serial is not bound
+      to the approved source, and a second identical camera
+      (duplicate/no-serial ambiguity) requires manual intervention.
 
 ## C. Room-overview camera placement
 
@@ -683,7 +692,8 @@ Environment: remote capture node (x86_64 Linux), non-root operator account,
 disposable loop-mounted ext4 volume. Synthetic segments and a synthetic trusted
 clock drove the real `MediaStore`; no camera media was written. Profile: 2
 sources, 10 s segments, 4 Mbps, safety reserve 256 MiB. Mount identity values
-stay in the private local record.
+stay in the private local record. Code: `main` at `83d387f` (the pre-fix base
+of PR #104; `agent/` unchanged on `main` since `bec201b`).
 
 - [x] `--check` passes on the approved mount and refuses a wrong filesystem
       UUID, device minor or mount source, a reserve larger than free space, a
@@ -703,10 +713,12 @@ stay in the private local record.
       `mount_replaced`) and create no fallback file; remounting the approved
       volume recovers the ledger;
 - [ ] **FAIL:** capacity mode is not configurable at realistic sizes (the
-      ledger requirement is ≈ 48 × capacity). Fix in progress;
+      ledger requirement is ≈ 48 × capacity). Fix in PR #104 (Refs #16);
+      re-verify on a real disk after it merges;
 - [ ] **FAIL:** a write refused because of the safety reserve is reported as
       `STORAGE_PRESSURE` / `post_loss_headroom_reduced`, never
-      `STORAGE_HARD_STOP`. Fix in progress.
+      `STORAGE_HARD_STOP`. Fix in PR #104 (Refs #16); re-verify on a real disk
+      after it merges.
 
 The real segmenter/profile, authenticated transport, Owner UI and systemd
 deployment checks in section G and the Issue #16 note in *Test metadata* remain
