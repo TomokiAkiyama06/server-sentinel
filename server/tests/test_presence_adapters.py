@@ -3,7 +3,9 @@
 from contextlib import closing, contextmanager
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
+import fcntl
 import json
+import os
 import sqlite3
 from pathlib import Path
 import tempfile
@@ -1024,6 +1026,33 @@ class TimelineGapDurabilityTests(PresenceFixture, TestCase):
         self.assertEqual(entry["target"], "refused=0,rejected=0,lost=0,interrupted=1")
         with self.assertRaises(ValueError):
             self.presence.clear_timeline_gap("owner", now=NOW, clock_trusted=True)
+
+    def hold_committed_probe(self):
+        # A status read in another process: a shared probe on the committed lock.
+        committed = self.database.path.with_name(self.database.path.name + ".timeline-session.committed.lock")
+        descriptor = os.open(committed, os.O_RDONLY)
+        fcntl.flock(descriptor, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        return descriptor
+
+    def test_concurrent_status_probe_does_not_fail_a_clean_open(self):
+        self.outbox.close()
+        probe = self.hold_committed_probe()
+        timer = threading.Timer(0.05, os.close, (probe,))
+        timer.start()
+        self.addCleanup(timer.join)
+        state = self.restart()
+        self.assertTrue(self.outbox.state().session)
+        self.assertFalse(state.degraded)
+        self.assertEqual(self.gap(), (False, None))
+
+    def test_committed_lock_held_beyond_the_wait_fails_the_open(self):
+        self.outbox.close()
+        probe = self.hold_committed_probe()
+        self.addCleanup(os.close, probe)
+        with mock.patch("app.presence.service.COMMITTED_LOCK_WAIT", 0.05):
+            with self.assertRaisesRegex(RuntimeError, "committed-session lock"):
+                self.restart()
+        self.assertFalse(self.outbox.state().session)
 
     def test_refused_open_creates_no_lock_file(self):
         # Under STORAGE_HARD_STOP an outbox start writes nothing at all, not

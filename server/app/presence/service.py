@@ -8,6 +8,7 @@ import json
 import os
 import sqlite3
 import threading
+import time
 from uuid import UUID, uuid4
 
 from .access import DenyAccess
@@ -37,6 +38,27 @@ SOURCE_CLOCK_TABLES = {kind: "presence_critical_source_clock" if kind in CRITICA
                        for kind in SOURCE_CLOCK}
 # Payload fields a producer stamps at the moment presence receives the fact.
 RECEIPT_FIELDS = ("received_at", "clock_trusted", "confirmed")
+
+
+# How long an outbox open waits for the committed-session lock. Only
+# read-only status probes take it (shared, for an instant) while the session
+# mutex is held, so a short bounded wait covers them; a lock still held after
+# it is not a probe and fails the open.
+COMMITTED_LOCK_WAIT = 2.0
+COMMITTED_LOCK_POLL = 0.005
+
+
+def _lock_committed(descriptor):
+    """Take the committed-session lock exclusively, waiting out status probes."""
+    deadline = time.monotonic() + COMMITTED_LOCK_WAIT
+    while True:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                raise RuntimeError("timeline committed-session lock stayed held") from None
+            time.sleep(COMMITTED_LOCK_POLL)
 
 
 class TimelineSession:
@@ -654,8 +676,10 @@ class PresenceService:
             # Only now, with the stale rows converted and the new row durable,
             # may a reader in another process treat the rows as owned. If this
             # fails the committed row stays behind, reported as orphaned and
-            # converted into an interrupted gap by the next open.
-            fcntl.flock(session._committed, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            # converted into an interrupted gap by the next open. A status read
+            # in another process may hold a shared probe on it for an instant;
+            # that is waited out rather than failing a clean open.
+            _lock_committed(session._committed)
         except BaseException:
             if session is not None:
                 session.release()
