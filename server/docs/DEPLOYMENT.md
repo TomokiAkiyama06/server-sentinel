@@ -153,6 +153,30 @@ with the value-free validation message, and `python -m app` logs
 with the mandatory checks silently absent. Supplying only some of them, or any
 invalid value, also fails `--check`.
 
+### Local UVC section (optional)
+
+The optional `local_uvc` object names the logical Camera Registry sources
+(1 to 4) whose USB/UVC cameras the Main Server backend supervises:
+
+```json
+"local_uvc": {
+  "source_ids": ["00000000-0000-4000-8000-000000000001"],
+  "poll_timeout_seconds": 1.0,
+  "retry_delay_seconds": 1.0,
+  "join_timeout_seconds": 3.0
+}
+```
+
+`source_ids` are canonical lowercase registry source UUIDs, never device paths,
+`/dev/videoN` numbers, serials or other physical evidence; the physical camera
+for each source is selected only by the audited Owner approval and stays in the
+private approval store. A listed source without that approval stays `offline`
+and never opens a device. The timing keys are optional (bounded; invalid values
+fail `--check`). A UUID that is not a `local_uvc` registry source is rejected at
+startup and reported, never silently skipped. Without the object the backend
+logs `local_uvc_unconfigured` and keeps an explicit `unconfigured` local capture
+state; remote-agent-only deployments need no `local_uvc` object.
+
 ### Detection section (optional; inference stays unavailable without it)
 
 The optional `detection` object binds reviewed detectors to sources. Values

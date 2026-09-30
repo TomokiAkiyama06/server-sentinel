@@ -2,6 +2,8 @@
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+import threading
+import time
 from uuid import UUID
 
 from app.cameras.registry import CaptureProfile, SourceHealthState, SourceType
@@ -43,18 +45,33 @@ class LocalUvcAdapter:
     that serialization.
     """
 
+    # A frame-rate registry write per source would turn 1-4 cameras into a
+    # sustained SQLite write load. Health transitions are written immediately
+    # by the controller; the last-seen timestamp is refreshed at most this often.
+    LAST_SEEN_INTERVAL_SECONDS = 1.0
+
     def __init__(self, registry, *, emit_audit, on_frame,
-                 discovery=None, capture_factory=MmapCapture, clock=None):
+                 discovery=None, capture_factory=MmapCapture, clock=None,
+                 monotonic=time.monotonic):
         self.registry = registry
-        self.store = ApprovalStore(registry.database)
+        # Session-marker writes share the registry's storage admission, so no
+        # capture-driven write bypasses the Main storage policy.
+        self.store = ApprovalStore(registry.database,
+                                   reservation=getattr(registry, "reservation", None))
         self.emit_audit = emit_audit
         self.on_frame = on_frame
         self.discovery = discovery or LinuxDiscovery()
         self.capture_factory = capture_factory
         self.clock = clock or (lambda: datetime.now(timezone.utc))
+        self.monotonic = monotonic
         self.sessions = {}
         self._approved_handoffs = {}
         self.closed = False
+        # Sources whose latest health observation could not be persisted
+        # (storage admission refused, database fault). The registry may then
+        # still show an earlier state, so the runtime reports these in memory.
+        self._unpersisted_lock = threading.Lock()
+        self._unpersisted = set()
 
     def _source(self, source_id):
         if self.closed:
@@ -64,24 +81,46 @@ class LocalUvcAdapter:
             raise ValueError("source is not local UVC")
         return source
 
+    def _write_health(self, source_id, **values):
+        """Persist one health observation and track whether it was durable."""
+        try:
+            result = self.registry.update_source_health(source_id, **values)
+        except BaseException:
+            with self._unpersisted_lock:
+                self._unpersisted.add(source_id)
+            raise
+        with self._unpersisted_lock:
+            self._unpersisted.discard(source_id)
+        return result
+
+    def health_unpersisted(self, source_id):
+        """True while this source's latest health write was refused or failed."""
+        with self._unpersisted_lock:
+            return source_id in self._unpersisted
+
     def _event(self, event):
-        self.registry.update_source_health(
-            event.source_id, health_state=SourceHealthState(event.state.value),
-            image_quality_state="unknown",
-            **({"negotiated_capture_profile": None} if event.state != "online" else {}),
-        )
-        self.emit_audit(event)
+        try:
+            self._write_health(
+                event.source_id, health_state=SourceHealthState(event.state.value),
+                image_quality_state="unknown",
+                **({"negotiated_capture_profile": None} if event.state != "online" else {}),
+            )
+        finally:
+            # The in-memory transition (runtime health, preview invalidation)
+            # is delivered even when persistence is refused, so capture loss is
+            # never represented only by a stale durable ONLINE row.
+            self.emit_audit(event)
 
     def _session(self, source, approved, *, explicit_candidate=None):
-        self.registry.update_source_health(source.id, health_state=SourceHealthState.OFFLINE,
-                                           negotiated_capture_profile=None, image_quality_state="unknown")
+        self._write_health(source.id, health_state=SourceHealthState.OFFLINE,
+                           negotiated_capture_profile=None, image_quality_state="unknown")
         controller = ReconnectController(source.id, approved, self._event,
                                          enabled=source.enabled, store=self.store,
                                          explicit_candidate=explicit_candidate)
 
         def profile_sink(negotiated):
             value = negotiated.profile
-            self.registry.update_source_health(
+            self._write_health(
                 source.id, health_state=SourceHealthState(controller.state.value),
                 negotiated_capture_profile=CaptureProfile(
                     width=value.width, height=value.height, fps=value.fps,
@@ -89,9 +128,16 @@ class LocalUvcAdapter:
                 ),
             )
 
+        last_seen = {"at": None, "state": None}
+
         def frame_sink(frame):
-            self.registry.update_source_health(source.id, health_state=SourceHealthState(controller.state.value),
-                                               last_seen_at=self.clock())
+            now = self.monotonic()
+            state = SourceHealthState(controller.state.value)
+            if (last_seen["at"] is None or last_seen["state"] is not state
+                    or now - last_seen["at"] >= self.LAST_SEEN_INTERVAL_SECONDS):
+                self._write_health(source.id, health_state=state,
+                                   last_seen_at=self.clock())
+                last_seen["at"], last_seen["state"] = now, state
             self.on_frame(source.id, frame)
 
         session = CaptureSession(
@@ -184,15 +230,41 @@ class LocalUvcAdapter:
         # transient read cannot turn a durable success into an apparent error.
         self._approved_handoffs[source_id] = candidate
 
+    def _fail_session(self, source_id):
+        """Close a live session and report capture loss; never masks the cause."""
+        session = self.sessions.get(source_id)
+        if session is None:
+            return
+        try:
+            session.close()
+        finally:
+            session.controller.capture_failed()
+
     def poll_source(self, source_id, *, timeout=1.0):
-        source = self._source(source_id)
+        try:
+            source = self._source(source_id)
+        except BaseException:
+            # A registry read failure (lost mount, SQLite fault) while a
+            # camera is live is current capture loss: close it and deliver
+            # the offline transition, exactly like a failed poll.
+            try:
+                self._fail_session(source_id)
+            except BaseException:
+                pass
+            raise
         session = self.sessions.get(source_id)
         if session is None:
             approved = self.store.load(source_id)
             if approved is None:
                 # Registry entries never automatically acquire a physical device.
-                self.registry.update_source_health(source_id, health_state=SourceHealthState.OFFLINE,
-                                                   negotiated_capture_profile=None)
+                # The worker retries this every poll; write only a change so an
+                # unapproved source does not become a steady SQLite write load.
+                if (source.health_state is not SourceHealthState.OFFLINE
+                        or source.negotiated_capture_profile is not None):
+                    self._write_health(
+                        source_id, health_state=SourceHealthState.OFFLINE,
+                        negotiated_capture_profile=None,
+                    )
                 return False
             explicit = self._approved_handoffs.get(source_id)
             if explicit is not None and explicit != approved.approved:
