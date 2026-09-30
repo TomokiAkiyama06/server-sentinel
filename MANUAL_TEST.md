@@ -656,6 +656,26 @@ Establish an Owner-approved baseline, then validate both startup and scheduled d
 
 Use controlled inventory mocks for destructive/expensive substitution cases where physical replacement is impractical. Real hardware swaps are optional and must not damage production equipment.
 
+#### 実機記録 2026-09-30: storage identity の SATA 修正（Issue #23）
+
+Main Server 実機で、非 root の通常ユーザー（sudo なし）のまま `LinuxProbe` の
+storage probe と `compare()` を直接実行した（read-only）。識別子の値は記録していない。
+
+| 対象 | 使われた identity 源 | 再取得との比較 | 区分 |
+|---|---|---|---|
+| NVMe（1 台） | `serial` + `wwid`（修正前と同一の値・key） | `OK` | 実機確認済み |
+| SATA HDD（1 台、libata） | `scsi_wwid`（NAA）+ `vpd_pg80_serial`。修正前は identity なし（`UNIQUE_ID_UNAVAILABLE`） | `OK` | 実機確認済み |
+
+- 同 SATA disk の VPD page 0x83 parser の結果（NAA designator）は kernel の
+  `device/wwid` と一致し、VPD page 0x80 から空でない unit serial を得た。
+- 修正前の probe で作った baseline と修正後の probe を比較すると、NVMe は `OK`、
+  SATA は `UNVERIFIABLE` / `IDENTIFIERS_OR_PROPERTIES_INCOMPLETE`（即時扱い）
+  となり、新しい identity が黙って受け入れられないことを確認した。解消には
+  Owner による新 baseline の承認が必要。
+- 未確認: USB bridge 接続 disk・SAS/SCSI disk の実機、専用 service account での
+  実行、Owner baseline 承認・監査、startup/daily 実行と通知。上の checklist は
+  それらの確認まで未チェックのままとする。
+
 ### Recording-health daily self-test
 
 - [ ] enabled sources have fresh frames or an explicit truthful offline/degraded state;
