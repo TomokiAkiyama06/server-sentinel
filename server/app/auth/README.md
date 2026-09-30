@@ -81,13 +81,23 @@ until the remaining Issue #10 gates pass.
   symlink fails closed rather than being repaired or replaced. The key never
   enters the database, logs, errors, `repr`, pickling or diagnostics, and an
   `AccessStore` without it establishes and accepts no session.
-- Binding mismatch policy (conservative choice pending Owner confirmation):
-  a request whose identity does not reproduce the binding receives the generic
-  denial for that request only. The session is neither revoked nor sent to
-  step-up, and nothing is audited, because in the shared-account deployment a
-  mismatch cannot identify a person and revoking on it would let anyone with a
-  stolen cookie sign its holder out. The binding is therefore a necessary
-  consistency signal, never an authorization input.
+- Binding mismatch policy (Owner decision, 2026-09-30, PR #107): a request
+  whose identity does not reproduce the binding of an otherwise current
+  session receives the generic denial for that request only. The session is
+  neither revoked nor sent to step-up, because in the shared-account
+  deployment a mismatch cannot identify a person and revoking on it would let
+  anyone with a stolen cookie sign its holder out. The mismatch is audited as
+  `detect_session_proxy_identity_mismatch` (actor `system`, outcome `denied`,
+  target the principal's logical UUID; never an identity, binding, token or
+  session id). The record is non-amplifiable: at most one per session per
+  `BINDING_MISMATCH_AUDIT_INTERVAL` (10 minutes), with later mismatches in the
+  window — including after a backward clock step — only incrementing
+  `access_sessions.binding_mismatch_suppressed`. A request without an
+  otherwise current session (unknown, expired or revoked token) records
+  nothing, so no record can be produced without a valid session token. If the
+  append fails the request is still denied and the loss is counted in
+  `audit_delivery_failed` / `undelivered_audit_records`. The binding is
+  therefore a necessary consistency signal, never an authorization input.
 - Audit: sign-in (`authenticate_principal`), step-up
   (`verify_principal_step_up`), an inconsistent credential
   (`mark_principal_credential_inconsistent`) and a counter regression
@@ -99,6 +109,10 @@ Not implemented yet, and required before routes open:
 
 - the HTTP routes and their cookie handling;
 - per-source rate limiting (only the per-code attempt bound exists here);
+- the decision whether any path (for example a strictly local
+  `http://localhost` Owner) may run without a trusted-proxy identity; until
+  the routes are built one is required on every ceremony and session check
+  (Owner decision, 2026-09-30);
 - the runtime composition that loads the session-binding key with
   `SessionBindingKey.load_or_create(Settings.session_binding_key_path)` and
   hands it to `AccessStore` (no human route constructs the store yet);

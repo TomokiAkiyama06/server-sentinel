@@ -27,7 +27,7 @@ from uuid import UUID, uuid4
 from app.auth.model import AccessValidationError, Permission, PrincipalStatus
 from app.auth.passkeys import PasskeyCeremonies
 from app.auth.session_binding import KEY_BYTES, SessionBindingKey, SessionBindingKeyError
-from app.auth.store import AccessStore, _us
+from app.auth.store import BINDING_MISMATCH_AUDIT_INTERVAL, AccessStore, _us
 from app.auth.webauthn import RelyingParty
 from app.audit.store import AuditStore
 from app.diagnostics.export import DiagnosticField
@@ -42,6 +42,7 @@ from tests.webauthn_fakes import ORIGIN, RP_ID, SyntheticAuthenticator
 
 SHARED = "synthetic-lab-shared@example.invalid"
 ELSEWHERE = "synthetic-elsewhere@example.invalid"
+NEW_SESSION_COLUMNS = ("external_identity_binding", "binding_mismatch_audited_at_us", "binding_mismatch_suppressed")
 ALICE_CODE = b"a" * 32
 BOB_CODE = b"b" * 32
 
@@ -200,6 +201,115 @@ class ProxyIdentityCannotAuthorizeTests(CeremonyTestCase):
         self.clock.advance(minutes=31)
         self.sign_in(other_key, SHARED)
         self.assertFalse(bindings()[str(expiring.session_id)])
+
+
+class BindingMismatchAuditTests(CeremonyTestCase):
+    """Owner decision 2026-09-30: deny, audit once per session per window, never revoke."""
+
+    MISMATCH = ("detect_session_proxy_identity_mismatch", "system", "denied")
+
+    def setUp(self):
+        super().setUp()
+        self.principal = self.invite(permissions=(Permission.LIVE_VIEW,))
+        self.key, self.credential = self.register(identity=SHARED)
+        self.grant = self.sign_in(self.key, SHARED)
+        self.baseline = self.audit_actions()
+
+    def mismatches(self):
+        return [item for item in self.audit_actions() if item == self.MISMATCH]
+
+    def suppressed(self):
+        return self.count("SELECT binding_mismatch_suppressed FROM access_sessions WHERE id=?", str(self.grant.session_id))
+
+    def deny(self, identity=ELSEWHERE, token=None):
+        with self.assertRaises(AccessValidationError) as caught:
+            self.store.authorize(self.grant.token if token is None else token, identity, Permission.LIVE_VIEW)
+        self.assertIs(type(caught.exception), AccessValidationError)
+        self.assertEqual(str(caught.exception), GENERIC)
+
+    def test_mismatch_is_denied_and_audited_once_without_identity_values(self):
+        stream = io.StringIO()
+        handler = logging.StreamHandler(stream)
+        root = logging.getLogger()
+        previous = root.level
+        root.addHandler(handler)
+        root.setLevel(logging.DEBUG)
+        self.addCleanup(root.removeHandler, handler)
+        self.addCleanup(root.setLevel, previous)
+        self.deny()
+        self.assertEqual(self.mismatches(), [self.MISMATCH])
+        with closing(self.database.connect()) as connection:
+            record = connection.execute(
+                "SELECT * FROM security_admin_audit_records WHERE action=?", (self.MISMATCH[0],)).fetchone()
+            binding = bytes(connection.execute("SELECT external_identity_binding FROM access_sessions WHERE id=?",
+                                               (str(self.grant.session_id),)).fetchone()[0])
+        self.assertEqual(record["target_kind"], "principal")
+        self.assertEqual(record["target_logical_id"], str(self.principal.id))
+        text = " ".join(str(value) for value in record) + stream.getvalue()
+        for secret in (SHARED, ELSEWHERE, binding.hex(), self.grant.token.hex(), str(self.grant.session_id)):
+            self.assertNotIn(secret, text)
+        # Not a revocation and not a step-up: the holder keeps working.
+        self.assertEqual(self.store.authorize(self.grant.token, SHARED, Permission.LIVE_VIEW).id, self.principal.id)
+        self.assertEqual(self.count("SELECT count(*) FROM access_sessions WHERE invalidated_at_us IS NOT NULL"), 0)
+
+    def test_repeated_mismatches_are_coalesced_per_session_and_window(self):
+        for identity in (ELSEWHERE, None, "", ELSEWHERE, "another@example.invalid"):
+            self.deny(identity)
+        self.assertEqual(len(self.mismatches()), 1)
+        self.assertEqual(self.suppressed(), 4)
+        # Owner-route and step-up paths share the same per-session window.
+        self.assertGenericDenial(lambda: self.ceremonies.authorize_owner_operation(self.grant.token, ELSEWHERE))
+        self.assertGenericDenial(lambda: self.ceremonies.begin_step_up(self.grant.token, ELSEWHERE))
+        self.assertEqual(len(self.mismatches()), 1)
+        self.assertEqual(self.suppressed(), 6)
+        # Later in the window, and after a backward clock step, still coalesced.
+        self.clock.advance(minutes=2)
+        self.deny()
+        self.clock.advance(minutes=-1)
+        self.deny()
+        self.assertEqual(len(self.mismatches()), 1)
+        self.assertEqual(self.suppressed(), 8)
+        # The next window gets exactly one more record.
+        self.clock.advance(minutes=BINDING_MISMATCH_AUDIT_INTERVAL.total_seconds() / 60 - 1)
+        self.deny()
+        self.deny()
+        self.assertEqual(len(self.mismatches()), 2)
+        self.assertEqual(self.suppressed(), 9)
+
+    def test_each_session_has_its_own_window(self):
+        other = self.sign_in(self.key, SHARED)
+        self.deny()
+        self.deny(token=other.token)
+        self.assertEqual(len(self.mismatches()), 2)
+
+    def test_audit_failure_still_denies_and_is_counted(self):
+        with closing(self.database.connect()) as connection:
+            connection.execute(
+                "CREATE TRIGGER synthetic_audit_fault BEFORE INSERT ON security_admin_audit_records "
+                "BEGIN SELECT RAISE(ABORT, 'synthetic audit fault'); END")
+        self.deny()
+        self.assertTrue(self.store.audit_delivery_failed)
+        self.assertEqual(self.store.undelivered_audit_records, 1)
+        self.assertEqual(self.mismatches(), [])
+        # The rolled-back attempt did not consume the window either.
+        self.assertIsNone(self.count("SELECT binding_mismatch_audited_at_us FROM access_sessions WHERE id=?",
+                                     str(self.grant.session_id)))
+        with closing(self.database.connect()) as connection:
+            connection.execute("DROP TRIGGER synthetic_audit_fault")
+        self.assertEqual(self.store.authorize(self.grant.token, SHARED, Permission.LIVE_VIEW).id, self.principal.id)
+
+    def test_nothing_is_recorded_without_an_otherwise_current_session(self):
+        for token in (b"x" * 32, b""):
+            self.deny(token=token)
+        with self.assertRaises(AccessValidationError):
+            self.store.authorize(None, ELSEWHERE, Permission.LIVE_VIEW)
+        self.assertEqual(self.mismatches(), [])
+        self.admin.revoke_credential(OWNER_CONTEXT, self.principal.id, self.credential.credential_id)
+        before = self.audit_actions()
+        for _ in range(3):
+            self.deny()
+        self.assertEqual(self.audit_actions(), before)
+        self.assertEqual(self.mismatches(), [])
 
 
 class SessionBindingKeyTests(unittest.TestCase):
@@ -379,7 +489,7 @@ class SharedIdentityMigrationTests(unittest.TestCase):
         result = {}
         for table in self.TABLES:
             columns = [row[1] for row in connection.execute(f"PRAGMA table_info({table})")
-                       if row[1] != "external_identity_binding"]
+                       if row[1] not in NEW_SESSION_COLUMNS]
             result[table] = sorted(tuple(row) for row in connection.execute(
                 f"SELECT rowid, {', '.join(columns)} FROM {table}"))
         return result

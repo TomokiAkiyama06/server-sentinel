@@ -61,6 +61,8 @@ _INVITATIONS = ("CREATE TABLE access_invitations (id TEXT PRIMARY KEY, secret_di
 _SESSIONS = ("CREATE TABLE access_sessions (id TEXT PRIMARY KEY, token_digest BLOB NOT NULL UNIQUE, principal_id TEXT NOT NULL REFERENCES access_principals(id) ON DELETE CASCADE, credential_id BLOB NOT NULL REFERENCES access_credentials(credential_id), principal_revision INTEGER NOT NULL, deployment_generation INTEGER NOT NULL, established_at_us INTEGER NOT NULL, last_seen_at_us INTEGER NOT NULL, idle_lifetime_us INTEGER NOT NULL CHECK(idle_lifetime_us > 0), idle_expires_at_us INTEGER NOT NULL, absolute_expires_at_us INTEGER NOT NULL, invalidated_at_us INTEGER,"
              " last_user_verification_at_us INTEGER,"
              " external_identity_binding BLOB CHECK(external_identity_binding IS NULL OR length(external_identity_binding) = 32),"
+             " binding_mismatch_audited_at_us INTEGER,"
+             " binding_mismatch_suppressed INTEGER NOT NULL DEFAULT 0 CHECK(binding_mismatch_suppressed >= 0),"
              " CHECK(invalidated_at_us IS NULL OR external_identity_binding IS NULL))")
 _CHALLENGES = ("CREATE TABLE access_webauthn_challenges (challenge_digest BLOB PRIMARY KEY, ceremony TEXT NOT NULL CHECK(ceremony IN ('registration','authentication','step_up')), invitation_id TEXT REFERENCES access_invitations(id) ON DELETE CASCADE, session_id TEXT REFERENCES access_sessions(id) ON DELETE CASCADE, issued_at_us INTEGER NOT NULL, expires_at_us INTEGER NOT NULL, CHECK(expires_at_us > issued_at_us), CHECK((ceremony = 'registration') = (invitation_id IS NOT NULL)), CHECK((ceremony = 'step_up') = (session_id IS NOT NULL)))")
 
@@ -124,8 +126,11 @@ def access_shared_identity_migration(version: int) -> Migration:
     Tailscale account presents the same login. Sessions gain
     ``external_identity_binding``, the HMAC-SHA-256 of that identity under the
     deployment-local key (``app.auth.session_binding``), cleared on
-    invalidation. Sessions created before this migration have no binding and
-    are therefore refused; their holders sign in again.
+    invalidation, plus the coalescing state for binding-mismatch audit records
+    (``binding_mismatch_audited_at_us`` and the ``binding_mismatch_suppressed``
+    count of mismatches not separately audited). Sessions created before this
+    migration have no binding and are therefore refused; their holders sign in
+    again.
 
     SQLite cannot drop a UNIQUE constraint in place, and the runner holds one
     transaction with foreign keys enforced, where ``PRAGMA foreign_keys`` is a

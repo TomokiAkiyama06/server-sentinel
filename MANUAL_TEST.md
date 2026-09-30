@@ -406,6 +406,12 @@ The research-room Tailnet is shared, so run these with two people (or two browse
   they contain only a keyed binding, never the raw login/device; a mismatched
   identity is refused, diagnostics/exports omit the binding, and sign-out,
   expiry and revocation clear it;
+- [ ] present a signed-in session's cookie with a different trusted-proxy
+  identity (for example through a second Tailscale login or a shared-in
+  device): the request gets the generic response, the original holder keeps
+  working, the audit log shows one `detect_session_proxy_identity_mismatch`
+  entry with no login/device value, and repeating the replay within ten
+  minutes adds no further entry;
 - [ ] on the Main Server, confirm the session-binding key file in the data
   directory is a regular file of the service account with mode `0600`, that the
   data directory is not group/other writable, that a changed mode, extra hard

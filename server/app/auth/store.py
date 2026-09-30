@@ -42,6 +42,11 @@ OWNER_STEP_UP_FRESHNESS = timedelta(minutes=5)
 MAX_CHALLENGE_LIFETIME = timedelta(minutes=10)
 MAX_PENDING_CHALLENGES = 1024
 MAX_REDEMPTION_ATTEMPTS = 5
+# Owner decision 2026-09-30 (PR #107): a proxy-identity binding mismatch is
+# audited at most once per session per window; later mismatches in the same
+# window only increment the session's counter, so a replayed stolen cookie
+# cannot flood the audit log.
+BINDING_MISMATCH_AUDIT_INTERVAL = timedelta(minutes=10)
 
 
 @dataclass(frozen=True)
@@ -417,26 +422,73 @@ class AccessStore:
         except AccessValidationError:
             return b"\x00" * 32
 
-    def _current_session_on(self, connection, token: object, proxy_identity: object, at: datetime):
+    def _current_session_on(self, connection, token: object, proxy_identity: object, at: datetime,
+                            mismatch: list | None = None):
         """Return the joined session row when it is currently valid, else ``None``.
 
         The session is found by its token digest alone. The proxy identity
         only has to reproduce the session's keyed binding (constant-time); it
         is never compared with the principal, so a shared login neither
-        selects nor excludes a person.
+        selects nor excludes a person. When the session is otherwise current
+        and only the binding fails, ``(session_id, principal_id)`` is appended
+        to ``mismatch`` so the caller can audit it after its own transaction.
         """
         digest = self._request_digest(token)
         row = connection.execute("SELECT s.*, p.id principal_id, p.external_identity, p.display_name, p.role, p.status, p.authorization_revision, p.created_at_us, p.revoked_at_us, c.revoked_at_us credential_revoked, c.inconsistent_at_us credential_inconsistent FROM access_sessions s JOIN access_principals p ON p.id=s.principal_id JOIN access_credentials c ON c.credential_id=s.credential_id WHERE s.token_digest=?", (digest,)).fetchone()
         state = connection.execute("SELECT authorization_generation FROM access_deployment_state WHERE singleton=1").fetchone()[0]
         bound = (row is not None and self._session_binding is not None
                  and self._session_binding.matches(row["external_identity_binding"], proxy_identity))
-        valid = (bound and row["invalidated_at_us"] is None
-                 and row["status"] == PrincipalStatus.ACTIVE.value and row["credential_revoked"] is None
-                 and row["credential_inconsistent"] is None
-                 and row["principal_revision"] == row["authorization_revision"] and row["deployment_generation"] == state
-                 and row["established_at_us"] <= _us(at) and row["last_seen_at_us"] <= _us(at)
-                 and _us(at) < row["idle_expires_at_us"] and _us(at) < row["absolute_expires_at_us"])
-        return row if valid else None
+        current = (row is not None and row["invalidated_at_us"] is None
+                   and row["status"] == PrincipalStatus.ACTIVE.value and row["credential_revoked"] is None
+                   and row["credential_inconsistent"] is None
+                   and row["principal_revision"] == row["authorization_revision"] and row["deployment_generation"] == state
+                   and row["established_at_us"] <= _us(at) and row["last_seen_at_us"] <= _us(at)
+                   and _us(at) < row["idle_expires_at_us"] and _us(at) < row["absolute_expires_at_us"])
+        if current and not bound and mismatch is not None and self._session_binding is not None:
+            mismatch.append((row["id"], UUID(row["principal_id"])))
+        return row if current and bound else None
+
+    def _record_binding_mismatch(self, mismatch: list, at: datetime) -> None:
+        """Audit a binding mismatch of an otherwise current session, coalesced.
+
+        The request is denied whatever happens here. At most one
+        ``detect_session_proxy_identity_mismatch`` record (actor ``system``,
+        outcome ``denied``, target the principal's logical UUID) is written per
+        session per ``BINDING_MISMATCH_AUDIT_INTERVAL``; further mismatches in
+        that window, including any at an earlier clock reading, only increment
+        ``access_sessions.binding_mismatch_suppressed``. No identity, binding,
+        token or session secret reaches the audit log. The session is neither
+        revoked nor sent to step-up. A failed append is counted in
+        ``audit_delivery_failed`` / ``undelivered_audit_records``.
+        """
+        if not mismatch:
+            return
+        session_id, principal_id = mismatch[0]
+        at_us = _us(utc_time(at))
+        window = _duration_us(BINDING_MISMATCH_AUDIT_INTERVAL)
+
+        def write(connection, mark):
+            row = connection.execute("SELECT binding_mismatch_audited_at_us FROM access_sessions WHERE id=? AND invalidated_at_us IS NULL",
+                                     (session_id,)).fetchone()
+            if row is None:
+                return
+            last = row[0]
+            if last is not None and at_us < last + window:
+                connection.execute("UPDATE access_sessions SET binding_mismatch_suppressed=binding_mismatch_suppressed+1 WHERE id=?", (session_id,))
+                return
+            connection.execute("UPDATE access_sessions SET binding_mismatch_audited_at_us=? WHERE id=?", (at_us, session_id))
+            mark()
+            self.audit.append_on(connection, actor_category=ActorCategory.SYSTEM,
+                                 action=AuditAction.DETECT_SESSION_PROXY_IDENTITY_MISMATCH,
+                                 target_kind=TargetKind.PRINCIPAL, target_logical_id=principal_id,
+                                 outcome=AuditOutcome.DENIED)
+
+        try:
+            self._audited_write(write)
+        except Exception:
+            # Never turns the denial into anything else; a lost record is
+            # counted by ``_audited_write`` when the append was attempted.
+            pass
 
     @staticmethod
     def _touch_session_on(connection, row, at: datetime) -> None:
@@ -453,8 +505,16 @@ class AccessStore:
         if not isinstance(permission, Permission):
             raise AccessValidationError("permission is invalid")
         at = utc_time(self._clock() if now is None else now)
+        mismatch: list = []
+        try:
+            return self._authorize(token, proxy_identity, permission, at, mismatch)
+        except AccessValidationError:
+            self._record_binding_mismatch(mismatch, at)
+            raise
+
+    def _authorize(self, token, proxy_identity, permission, at, mismatch) -> Principal:
         with self._transaction(write=True) as connection:
-            row = self._current_session_on(connection, token, proxy_identity, at)
+            row = self._current_session_on(connection, token, proxy_identity, at, mismatch)
             if row is None:
                 raise AccessValidationError("access is unavailable")
             granted = connection.execute("SELECT 1 FROM access_principal_permissions WHERE principal_id=? AND permission=?", (row["principal_id"], permission.value)).fetchone() is not None
@@ -477,13 +537,18 @@ class AccessStore:
         if not isinstance(freshness, timedelta) or freshness <= timedelta(0):
             raise AccessValidationError("freshness window is invalid")
         at = utc_time(self._clock() if now is None else now)
-        with self._transaction(write=True) as connection:
-            row = self._current_session_on(connection, token, proxy_identity, at)
-            if row is None or row["role"] != PrincipalRole.OWNER.value:
-                raise AccessValidationError("access is unavailable")
-            self._touch_session_on(connection, row, at)
-            principal = self._principal(row)
-            verified = row["last_user_verification_at_us"]
+        mismatch: list = []
+        try:
+            with self._transaction(write=True) as connection:
+                row = self._current_session_on(connection, token, proxy_identity, at, mismatch)
+                if row is None or row["role"] != PrincipalRole.OWNER.value:
+                    raise AccessValidationError("access is unavailable")
+                self._touch_session_on(connection, row, at)
+                principal = self._principal(row)
+                verified = row["last_user_verification_at_us"]
+        except AccessValidationError:
+            self._record_binding_mismatch(mismatch, at)
+            raise
         if (verified is None or not row["established_at_us"] <= verified <= _us(at)
                 or _us(at) - verified >= _duration_us(freshness)):
             raise StepUpRequired()
@@ -643,19 +708,30 @@ class AccessStore:
         list; ``accept_assertion`` refuses an assertion from any other credential.
         """
         at = utc_time(at)
-        with self._transaction(write=True) as connection:
-            row = self._current_session_on(connection, token, proxy_identity, at)
-            if row is None or row["role"] != PrincipalRole.OWNER.value:
-                raise AccessValidationError("access is unavailable")
-            self._insert_challenge_on(connection, digest, "step_up", at, lifetime, session_id=row["id"])
-            return bytes(row["credential_id"])
+        mismatch: list = []
+        try:
+            with self._transaction(write=True) as connection:
+                row = self._current_session_on(connection, token, proxy_identity, at, mismatch)
+                if row is None or row["role"] != PrincipalRole.OWNER.value:
+                    raise AccessValidationError("access is unavailable")
+                self._insert_challenge_on(connection, digest, "step_up", at, lifetime, session_id=row["id"])
+                return bytes(row["credential_id"])
+        except AccessValidationError:
+            self._record_binding_mismatch(mismatch, at)
+            raise
 
     def current_session(self, token: object, proxy_identity: object, *, at: datetime) -> SessionView | None:
-        """Read-only lookup of a currently valid session; records no activity."""
+        """Lookup of a currently valid session; records no activity.
+
+        Only a binding mismatch of an otherwise current session writes, and
+        then only the coalesced audit record of ``_record_binding_mismatch``.
+        """
         at = utc_time(at)
+        mismatch: list = []
         with self._transaction() as connection:
-            row = self._current_session_on(connection, token, proxy_identity, at)
+            row = self._current_session_on(connection, token, proxy_identity, at, mismatch)
         if row is None:
+            self._record_binding_mismatch(mismatch, at)
             return None
         return SessionView(UUID(row["id"]), UUID(row["principal_id"]), bytes(row["credential_id"]))
 

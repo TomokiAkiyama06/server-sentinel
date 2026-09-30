@@ -1181,8 +1181,10 @@ it in constant time; a mismatch is refused. The deployment-local HMAC secret is
 kept outside the database and is unrelated to Tailscale administrative
 credentials. The refusal applies to that request only: the session is not
 revoked or moved to step-up on a mismatch, since under the shared account a
-mismatch cannot identify anyone (implementation choice recorded for Owner
-confirmation in `server/app/auth/README.md`). Invitations carry no proxy
+mismatch cannot identify anyone. The mismatch is audited without any identity
+or binding value, at most once per session per ten minutes with the remainder
+counted on the session, and an audit failure still denies (Owner decision,
+2026-09-30; details in `server/app/auth/README.md`). Invitations carry no proxy
 identity, and `external_identity` is neither unique nor compared with the
 supplied identity: the enrollment code selects the invitation and the
 credential selects the principal, so several people behind one shared login
