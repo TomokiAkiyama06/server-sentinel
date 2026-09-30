@@ -214,7 +214,12 @@ class RingTests(unittest.TestCase):
         with self.assertRaisesRegex(RingRefused, "segment_storage_refused"):
             self.append(T0)
         self.assertEqual(self.quota.used(), before)
-        self.assertEqual(self.ring.status(now_us=T0, clock_trusted=True)["state"], "STORAGE_PRESSURE")
+        # Free space still equals the reserve because the write was refused
+        # before crossing it. Recording is refused, which is a hard stop.
+        status = self.ring.status(now_us=T0, clock_trusted=True)
+        self.assertEqual(status["filesystem_free"], self.settings.safety_reserve_bytes)
+        self.assertEqual((status["state"], status["reason"]),
+                         ("STORAGE_HARD_STOP", "segment_write_refused_at_reserve"))
         self.ring.tick(now_us=T0 + POST, clock_trusted=True)
         result = self.ring.incident(identifier, now_us=T0 + POST)
         self.assertEqual(result["state"], "partial")
@@ -856,15 +861,88 @@ class RingTests(unittest.TestCase):
         self.assertEqual(self.ring._rows(), [])
         self.assertEqual(self.store.list_segments(), {})
 
-    def test_capacity_admission_counts_512_byte_allocations_before_capture(self):
+    def test_capacity_admission_counts_expected_bitrate_horizon_rows_before_capture(self):
         self.ring.close()
-        self.ring = DiskRing(self.settings, self.store, ledger_maximum_bytes=1792 * 1024,
+        self.ring = DiskRing(self.settings, self.store, ledger_maximum_bytes=640 * 4096,
                              authority=AllowControls())
         minimum = self.profile.bytes_for(PRE, self.store.allocation_unit)
+        # A lower expected bitrate lengthens the capacity horizon, so the
+        # same byte limit needs more segment rows than this ledger can hold.
+        sparse = SegmentProfile(SOURCE, 800, 40, 60 * SECOND, 100)
         with self.assertRaisesRegex(RingRefused, "insufficient_ledger_capacity"):
-            self.configure("capacity", minimum)
+            self.configure("capacity", minimum, profiles=(sparse,))
         self.assertIsNone(self.ring.config)
         self.assertEqual(self.store.list_segments(), {})
+        status = self.configure("capacity", minimum)
+        self.assertLessEqual(status["ledger_required_bytes"], status["ledger_maximum_bytes"])
+        self.assertGreaterEqual(status["capacity_horizon_us"], PRE)
+
+    def test_capacity_mode_admits_realistic_capacity_within_a_small_ledger(self):
+        # Two sources, 4 Mbit/s bounded bitrate, 10 s segments: a 700 MiB
+        # capacity is required to fit the bounded ten-minute pre-loss window
+        # plus boundary segments. The former 512-byte row model demanded a
+        # ~33 GiB ledger (and ~33x that as journal headroom) for this.
+        self.ring.close()
+        self.store.close()
+        from dataclasses import replace
+        self.settings = replace(self.settings, max_segment_bytes=8 * 1024 * 1024)
+        self.quota.capacity = 8 * 1024**3
+        self.store = MediaStore(self.settings, space=self.quota, stable_device=lambda _expected: True)
+        self.addCleanup(self.store.close)
+        self.ring = DiskRing(self.settings, self.store, ledger_maximum_bytes=32 * 1024 * 1024,
+                             authority=AllowControls())
+        # Headroom is now about twice the cap, not ~34 times it.
+        self.assertLess(self.ring.ledger.headroom, 2 * 32 * 1024 * 1024 + 512 * 1024)
+        profiles = tuple(SegmentProfile(UUID(int=500 + index), 4_000_000, 4_000_000, 10 * SECOND, 0)
+                         for index in range(2))
+        with self.assertRaisesRegex(RingRefused, "insufficient_pre_loss_capacity"):
+            self.configure("capacity", 500 * 1024 * 1024, profiles=profiles)
+        status = self.configure("capacity", 700 * 1024 * 1024, profiles=profiles)
+        self.assertEqual(status["mode"], "capacity")
+        self.assertGreaterEqual(status["estimated_duration_us"], PRE)
+        self.assertGreaterEqual(status["capacity_horizon_us"], status["estimated_duration_us"])
+        self.assertLessEqual(status["ledger_required_bytes"], 32 * 1024 * 1024)
+        # A new T-10/T+10 incident still has its full metadata reservation.
+        self.assertNotEqual(status["reason"], "insufficient_ledger_capacity")
+
+    def test_capacity_horizon_bounds_rows_when_actual_segments_are_small(self):
+        profile = SegmentProfile(SOURCE, 2000, 1600, 60 * SECOND, 100)
+        limit = profile.bytes_for(PRE, self.store.allocation_unit)
+        status = self.configure("capacity", limit, profiles=(profile,))
+        horizon = status["capacity_horizon_us"]
+        self.assertGreaterEqual(horizon, PRE)
+        # Generated segments are far below the expected size, so the byte
+        # limit alone would keep ~48 one-block segments.
+        for index in range(60):
+            start = T0 + index * 60 * SECOND
+            self.ring.append(SOURCE, start, start + 60 * SECOND, PAYLOAD,
+                             now_us=start + 60 * SECOND, clock_trusted=True)
+        now = T0 + 60 * 60 * SECOND
+        rows = self.ring._rows()
+        self.assertLessEqual(len(rows), DiskRing._segment_count({SOURCE: profile}, horizon))
+        self.assertTrue(all(row["end"] > now - horizon for row in rows))
+        status = self.ring.status(now_us=now, clock_trusted=True)
+        self.assertEqual(status["state"], "healthy")
+        self.assertLessEqual(status["ordinary_allocated_bytes"], limit)
+        self.assertFalse(status["pre_loss_coverage"][str(SOURCE)]["gaps_us"])
+
+    def test_ledger_runs_without_cache_spill_so_the_journal_bound_holds(self):
+        self.assertEqual(self.ring.db.execute("PRAGMA cache_spill").fetchone()[0], 0)
+        with self.ring.ledger.transaction():
+            self.ring.db.executemany("INSERT INTO settings VALUES (?, ?)",
+                                     ((f"generated-{index}", "x" * 1000) for index in range(2000)))
+        pages = self.ring.db.execute("PRAGMA page_count").fetchone()[0]
+        journal = self.settings.runtime_root / "ring.sqlite3-journal"
+        # A tiny page cache would spill (and start new journal headers)
+        # many times while every original page is rewritten.
+        self.ring.db.execute("PRAGMA cache_size = 4")
+        with self.ring.ledger.transaction():
+            self.ring.db.execute("UPDATE settings SET value = replace(value, 'x', 'y') "
+                                 "WHERE key LIKE 'generated-%'")
+            size = journal.stat().st_size
+        self.assertGreater(size, 0)
+        self.assertLessEqual(size, pages * (4096 + 8) + 2 * 65536)
+        self.assertLessEqual(size, self.ring.ledger.journal_bound)
 
     def test_sufficient_ledger_completes_one_second_pre_and_post_through_restart(self):
         self.ring.close()
@@ -1074,10 +1152,10 @@ class RingTests(unittest.TestCase):
             self.ring.db.executemany("INSERT INTO segments VALUES (?,?,?,?,?,0,?,'missing',1)",
                                     ((str(UUID(int=index + 1)), str(SOURCE), index * 60 * SECOND,
                                       (index + 1) * 60 * SECOND, len(PAYLOAD), hashlib.sha256(PAYLOAD).hexdigest())
-                                     for index in range(100)))
+                                     for index in range(300)))
         with self.assertRaisesRegex(RingRefused, "insufficient_ledger_capacity"):
             self.configure("capacity", minimum)
-        self.assertEqual(len(self.ring._rows()), 100)
+        self.assertEqual(len(self.ring._rows()), 300)
 
     def test_zero_allocation_cannot_enter_capacity_accounting_or_healthy_recovery(self):
         self.configure()

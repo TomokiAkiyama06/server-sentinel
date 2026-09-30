@@ -132,7 +132,17 @@ reclamation; expired blocks are not credited before actual deletion.
 Every media write retains `L` in addition to the hard reserve, and uses the store's exclusive
 allocation/write/fsync path. Runtime status recomputes full protection headroom;
 later external disk consumption yields explicit `STORAGE_PRESSURE` or
-`STORAGE_HARD_STOP`, coverage/gaps and refused unsafe writes. Capacity limits use
+`STORAGE_HARD_STOP`, coverage/gaps and refused unsafe writes.
+Because a write is refused *before* it would cross the reserve, free space
+alone never falls below the reserve while capture is being refused. Status
+therefore also reports `STORAGE_HARD_STOP / segment_write_refused_at_reserve`
+whenever `free + R_fifo < reserve + round_up(max_segment + L)`, where
+`max_segment` is the largest bounded segment of any configured source and
+`R_fifo` is the ordinary media the write path itself may reclaim first
+(selected-FIFO eligible, outside the pre-loss window, trusted time only). It is
+not reported as pressure or healthy while recording is refused, and it clears
+without Owner action as soon as space returns. `safety_reserve_unavailable`
+remains the separate hard stop for another consumer breaching the reserve. Capacity limits use
 physical ordinary allocations and exclude shared protected bytes. A provisional
 write exceeding its actual allocation budget is rejected/cleaned before it is
 admitted to the ring. The core never overwrites an unexpired protected segment to
@@ -152,17 +162,32 @@ media. Recovery can require the operator to restore free space first.
 
 The main database uses 4096-byte pages and an enforced `max_page_count` derived
 from `ledger_maximum_bytes`. Oversized/unsupported existing databases and unsafe
-journal/WAL sidecars are rejected before SQLite may perform recovery. The bound
-allows the full maximum database plus every possible original journal page,
-eight record bytes per page, one worst-case sector header and alignment per
-page, a final sector and two filesystem allocation units for directory updates.
-It conservatively retains the full bound even when current metadata already
-occupies blocks; it never credits those occupied blocks as free.
+journal/WAL sidecars are rejected before SQLite may perform recovery. The
+retained headroom is
+
+```text
+pages   = floor(ledger_maximum_bytes / 4096)
+journal = pages * (4096 + 8) + 2 * 65536
+L_meta  = round_up(pages * 4096, u) + round_up(journal, u) + 2u     (u = f_frsize)
+```
+
+i.e. the full maximum database, every possible original page once in the
+rollback journal with its eight record bytes, one worst-case sector header plus
+one further sector, and two allocation units for directory updates — about
+twice the cap. It conservatively retains the full bound even when current
+metadata already occupies blocks; it never credits those occupied blocks as free.
 
 The derivation follows SQLite's [rollback-journal format](https://www.sqlite.org/fileformat2.html#the_rollback_journal)
 (each original page appears at most once, with an eight-byte record overhead)
 and its [pager sector limit](https://github.com/sqlite/sqlite/blob/master/src/pager.c)
-of 65536 bytes. The page-size/cap and DELETE-journal assumptions are enforced;
+of 65536 bytes. A single header per transaction holds because the connection
+sets `PRAGMA cache_spill = OFF` and refuses to open the ledger if the setting
+does not read back as off: a mid-transaction cache spill syncs the journal and
+starts another sector-aligned header, which the former per-page header
+allowance (~33x the cap) existed to cover. With spilling off, dirty pages stay
+in memory until commit; ledger transactions are small and the database itself
+is capped. A hot journal left by an older build that exceeds this bound is
+refused rather than replayed. The page-size/cap and DELETE-journal assumptions are enforced;
 SQLite temporary stores stay in memory. The bound does not purport to reserve
 exclusive disk capacity against unrelated processes or a filesystem failure.
 DB-cap exhaustion is an explicit failure; schema history and incidents are never
@@ -171,12 +196,27 @@ reset to make capacity available. Interrupted transactions roll back even for
 
 Configuration also checks that this page cap can hold the selected ordinary
 ring and a complete new T-10/T+10 incident at every configured segment cadence.
-Duration-mode row counts include boundary segments per source. Capacity-mode
-counts use the [512-byte `st_blocks` unit](https://man7.org/linux/man-pages/man3/stat.3type.html)
-as the minimum positive allocation, independently of the filesystem fragment
-size. New zero-allocation media is refused before admission; such existing media
-is uncertain at inventory/recovery. Maximum bitrate is never treated as a
-minimum payload. Existing protected segments, incident tombstones and every
+Row counts include boundary segments per source over the ordinary horizon `H`:
+duration mode uses the selected duration; capacity mode uses the *capacity
+horizon*, the longest `H >= 600 s` with
+
+```text
+sum over sources (ceil(H / cadence) + 2) * expected_segment_bytes <= capacity
+expected_segment_bytes = ceil(expected_bitrate * cadence / 8) + overhead   (unrounded)
+```
+
+Capacity-mode FIFO enforces that horizon as well as the byte limit: an ordinary
+segment older than `now - H` is trimmed even while ordinary bytes are below the
+capacity. Rows therefore stay bounded by cadence and source count, however small
+actual segments are. Maximum bitrate is never treated as a minimum payload: a
+source recording below its expected bitrate retains `H` of history using less
+than the capacity, never more rows. `H` is never below the ten-minute
+pre-loss window because admission already requires the capacity to hold that
+window at the maximum bitrate. (The former model counted one row per 512-byte
+`st_blocks` unit of capacity, which needed a ledger about 48 times the media
+capacity and made capacity mode unusable at realistic sizes.) New
+zero-allocation media is still refused before admission; such existing media is
+uncertain at inventory/recovery. Existing protected segments, incident tombstones and every
 protection reference consume metadata capacity, including separate references
 when incidents share one media file. Protection membership is keyed by
 segment and indexed by incident, so both the per-segment lookup used for every
@@ -211,7 +251,32 @@ per protection edge (table and primary-key index). Ten root pages and 64 pages
 of transient split headroom are added; 4096-byte pages, no reserved page bytes
 and no auto-vacuum pointer maps are required. This intentionally generous bound
 can reject a cap that happens to fit one insertion order. The Owner must size
-the explicit ledger cap and its filesystem reserve together. Continued incident
+the explicit ledger cap and its filesystem reserve together.
+
+### Sizing the ledger cap
+
+For a fresh ring the admission bound is
+
+```text
+S = sum over sources (ceil(H / cadence) + 2)      ordinary rows
+F = sum over sources (ceil(1200 s / cadence) + 2) rows of one new T-10/T+10 incident
+required = 4096 * (74 + 6 * (S + F) + 4 * 1 + 4 * F)
+```
+
+plus existing protected/incident/protection rows. `status()` reports
+`ledger_required_bytes` next to `ledger_maximum_bytes`; the runtime filesystem
+needs `L_meta` (about 2x the cap) above the safety reserve. Examples computed
+with this code (fresh ring, 4096-byte allocation unit):
+
+| Profile | Capacity | `H` | Ledger cap needed | Runtime headroom |
+| --- | --- | --- | --- | --- |
+| 2 sources, 4 Mbit/s bound = expected, 10 s segments | 700 MiB | 710 s | 13.3 MiB | 26.7 MiB |
+| 1 source 1080p, 8 Mbit/s bound, 4 Mbit/s expected, 2 s segments | 1.8 GB (1 h expected) | 3596 s | 66.0 MiB | 132.3 MiB |
+| same, 1 s segments | 1.8 GB | 3598 s | 131.6 MiB | 263.7 MiB |
+| 4 such sources, 2 s segments | 7.2 GB | 3596 s | 263.1 MiB | 526.9 MiB |
+
+Under the former 512-byte model the first row needed a ~32.8 GiB ledger and
+~1.1 TiB of journal headroom, so capacity mode was always refused. Continued incident
 growth can still exhaust a finite cap; expiry does not silently erase tombstones
 or promise unlimited incident storage.
 
@@ -276,7 +341,9 @@ from this media-expiry core and must follow the application's retention contract
 ## Status DTOs and validation
 
 `status()` provides selected mode/value/unit, projected maximum/expected bytes,
-estimated capacity-mode duration, physical ordinary/protected/orphan usage,
+estimated capacity-mode duration (at the maximum bitrate), the capacity horizon
+`capacity_horizon_us` (at the expected bitrate; `None` in duration mode),
+`ledger_maximum_bytes`/`ledger_required_bytes`, physical ordinary/protected/orphan usage,
 filesystem free, reserve, required future bytes, pressure state and per-source
 pre-loss intervals/gaps. Duration estimates use each profile's allocated segment
 size and cadence; capacity bytes are never treated as elapsed seconds. Search
@@ -292,7 +359,10 @@ quota that accounts for actual allocated files and controlled clock samples.
 They cover one/four-source protection, both modes, pre-only quota rejection,
 existing protected/other usage, actual reclaimed-block verification, shared
 references, missing/corrupt recovery, clock rollback, partial post-loss capture,
-60-day expiry and interrupted deletion. CI normal/error smoke executes actual
+60-day expiry and interrupted deletion, a 700 MiB two-source capacity ring under
+a 32 MiB ledger cap, capacity-horizon row bounding with undersized segments, the
+spill-free journal bound, and hard-stop reporting while writes are refused at
+the reserve and its recovery once space returns. CI normal/error smoke executes actual
 ring/SQLite writes under an accelerated synthetic timeline with no socket or
 subprocess attempts, in a non-root/read-only/network-isolated container.
 

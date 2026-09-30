@@ -200,7 +200,13 @@ class HardReserveTests(RingScenario):
         self.assertTrue(protected_ids <= rows)
         self.assertTrue({str(item) for item in self.store.list_segments()} >= protected_ids)
         self.assertEqual(reserve + unit, self.quota.capacity - self.quota.used() - self.quota.other)
-        self.assertEqual("STORAGE_PRESSURE", self.status(later)["state"])
+        # Free space never fell below the reserve because the write was
+        # refused first; recording is nevertheless refused, which is a hard
+        # stop rather than mere pressure.
+        refused = self.status(later)
+        self.assertEqual(("STORAGE_HARD_STOP", "segment_write_refused_at_reserve"),
+                         (refused["state"], refused["reason"]))
+        self.assertGreaterEqual(refused["filesystem_free"], reserve)
         self.assertEqual("complete", self.ring.incident(incident, now_us=later)["state"])
         # Once another consumer breaches the reserve itself: hard stop.
         self.quota.other += 2 * unit
@@ -210,6 +216,40 @@ class HardReserveTests(RingScenario):
         with self.assertRaisesRegex(StorageRefused, "STORAGE_HARD_STOP"):
             self.store.write_segment(UUID(int=999), PAYLOAD)
         self.assertEqual("complete", self.ring.incident(incident, now_us=later)["state"])
+
+    def test_refused_capture_reports_hard_stop_throughout_and_recovers_with_space(self):
+        # Several minutes of capture arrive while the filesystem sits just
+        # above the reserve: every write is refused before crossing it, so
+        # free space never drops below the reserve. Status must say recording
+        # is refused on every sample, not pressure or healthy.
+        t0 = self.t0
+        # A 20-minute duration ring still filling: no FIFO trim frees space.
+        self.configure(value=1200, at=t0 - PRE)
+        self.capture(t0 - PRE, t0)
+        reserve = self.settings.safety_reserve_bytes
+        unit = self.store.allocation_unit
+        self.quota.other = (self.quota.capacity - self.quota.used() - reserve
+                            - self.ring.ledger_headroom)
+        kept = set(self.store.list_segments())
+        for begin in range(t0, t0 + 5 * MINUTE, MINUTE):
+            now = begin + MINUTE
+            with self.assertRaisesRegex(RingRefused, "segment_storage_refused"):
+                self.ring.append(self.sources[0], begin, now, PAYLOAD, now_us=now, clock_trusted=True)
+            status = self.status(now)
+            self.assertEqual(("STORAGE_HARD_STOP", "segment_write_refused_at_reserve"),
+                             (status["state"], status["reason"]))
+            self.assertGreaterEqual(status["filesystem_free"], reserve)
+        # Nothing required for the pre-loss window was reclaimed to squeeze in.
+        now = t0 + 5 * MINUTE
+        self.assertTrue(set(self.store.list_segments()) <= kept)
+        # Space returns: status leaves hard stop before the next write, and
+        # capture resumes.
+        self.quota.other -= 2 * self.estimate(POST) + unit
+        recovered = self.status(now)
+        self.assertNotEqual("STORAGE_HARD_STOP", recovered["state"])
+        self.ring.append(self.sources[0], now, now + MINUTE, PAYLOAD,
+                         now_us=now + MINUTE, clock_trusted=True)
+        self.assertNotEqual("STORAGE_HARD_STOP", self.status(now + MINUTE)["state"])
 
 if __name__ == "__main__":
     unittest.main()

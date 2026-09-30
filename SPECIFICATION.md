@@ -411,7 +411,7 @@ buffer_limit_mode = duration | capacity
 **Capacity mode**
 - owner selects maximum bytes/GiB usable by the rolling buffer;
 - UI derives/displays estimated effective duration from the configured/negotiated bitrate;
-- FIFO overwrite keeps ordinary ring-buffer data within the selected capacity.
+- FIFO overwrite keeps ordinary ring-buffer data within the selected capacity, and within the capacity's duration horizon at the configured expected bitrate so segment metadata stays bounded; that horizon is never shorter than the 10-minute pre-loss window.
 
 In both modes the UI displays selected mode/value, estimated equivalent duration/capacity, current ring-buffer bytes, protected-incident bytes, filesystem free space, and safety reserve.
 
@@ -484,7 +484,7 @@ If space becomes unsafe:
 - reclaim eligible non-protected ring-buffer segments first;
 - do not auto-delete a protected incident before its 60-day default expiry merely to satisfy ordinary buffer demand;
 - surface `agent_storage_pressure`/equivalent state and an owner-visible warning;
-- stop/refuse unsafe writes before crossing the filesystem safety reserve;
+- stop/refuse unsafe writes before crossing the filesystem safety reserve; while the next bounded segment cannot be admitted without crossing it, report `STORAGE_HARD_STOP` (not pressure or healthy) until space returns;
 - if the full 10-minute pre-loss target or 10-minute post-loss continuation cannot be maintained, report the exact degraded/gap state rather than claiming complete protection.
 
 ### 5.15 Media-root mount safety

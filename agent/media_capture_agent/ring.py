@@ -198,9 +198,12 @@ class DiskRing:
         if self.config.mode == "capacity":
             allocations = self.store.segment_allocations()
             excess = self._ordinary_bytes(allocations, self._protected_segments()) - self.config.value
+            horizon = self._horizon_us(self.config, self.profiles)
             eligible = []
             for row in current:
-                if excess <= 0:
+                # Rows are ordered by end: beyond the current horizon or over
+                # the current byte limit are both already FIFO-eligible.
+                if excess <= 0 and row["end"] > now - horizon:
                     break
                 eligible.append(row)
                 excess -= allocations.get(UUID(row["id"]), 0)
@@ -217,6 +220,43 @@ class DiskRing:
     def _segment_count(profiles, duration):
         return sum((duration + item.segment_duration_us - 1) // item.segment_duration_us + 2
                    for item in profiles.values())
+
+    @staticmethod
+    def _horizon_us(config, profiles):
+        """Ordinary-ring time horizon that bounds retained segment rows.
+
+        Duration mode retains its selected duration. Capacity mode retains at
+        most ``config.value`` physical bytes *and* at most the duration those
+        bytes represent at the Owner-declared expected bitrate (unrounded
+        segment bytes, so the horizon never shrinks with block size). A
+        capacity row cannot be sized by the 512-byte ``st_blocks`` unit: that
+        would demand ledger metadata many times larger than the media itself.
+        Lower-than-expected actual bitrate therefore keeps this horizon rather
+        than more history, which never falls below the required pre-loss
+        window because admission already requires ``value`` to hold it at the
+        maximum bitrate.
+        """
+        if config.mode == "duration":
+            return config.value * SECOND
+        sizes = [(profile.segment_duration_us, profile.segment_bytes(expected=True))
+                 for profile in profiles.values()]
+
+        def fits(duration):
+            return sum(((duration + cadence - 1) // cadence + 2) * size
+                       for cadence, size in sizes) <= config.value
+
+        # Each profile alone bounds the horizon, so this is a valid ceiling.
+        left = PRE
+        right = max(PRE, min(max(0, config.value // size - 2) * cadence for cadence, size in sizes))
+        if not fits(left):
+            return PRE
+        while left < right:
+            middle = (left + right + 1) // 2
+            if fits(middle):
+                left = middle
+            else:
+                right = middle - 1
+        return left
 
     @staticmethod
     def _trusted_profile_row(row, profiles):
@@ -255,8 +295,9 @@ class DiskRing:
             if (row["state"] != "stored" or row["allocated"] < 512
                     or not self._trusted_profile_row(row, profiles)):
                 carryover += 1
-        selected = (self._segment_count(profiles, config.value * SECOND) if config.mode == "duration"
-                    else config.value // 512 + 1)
+        # Both modes bound ordinary rows by a time horizon at every source
+        # cadence; capacity mode FIFO enforces its horizon as well as bytes.
+        selected = self._segment_count(profiles, self._horizon_us(config, profiles))
         segments = protected + carryover + max(len(rows) - protected - carryover, selected) + additional_segments
         incidents = self.db.execute("SELECT count(*) FROM incidents").fetchone()[0]
         protections = self.db.execute("SELECT count(*) FROM protection").fetchone()[0] + additional_protections
@@ -442,12 +483,13 @@ class DiskRing:
         # Reclamation removes only unprotected media, so one membership
         # snapshot stays accurate for the whole pass.
         ordinary = self._ordinary_bytes(allocations, self._protected_segments())
+        horizon = self._horizon_us(self.config, self.profiles)
         for row in self._selected_reclaimable(now, self.config):
-            outside = row["end"] <= now - self.config.value * SECOND
-            if self.config.mode == "duration" and not outside:
-                continue
-            if self.config.mode == "capacity" and ordinary <= self.config.value:
-                break
+            if row["end"] > now - horizon:
+                # Rows are ordered by end. Duration mode only trims outside
+                # its horizon; capacity mode also trims to its byte limit.
+                if self.config.mode == "duration" or ordinary <= self.config.value:
+                    break
             self._remove_segment(row["id"])
             ordinary -= allocations.get(UUID(row["id"]), 0)
 
@@ -548,7 +590,8 @@ class DiskRing:
             except StorageRefused as exc:
                 with self.ledger.transaction():
                     self.db.execute("UPDATE segments SET state='missing' WHERE id=?", (identifier,))
-                self.state, self.reason = "STORAGE_HARD_STOP", str(exc)
+                self.state, self.reason = "STORAGE_HARD_STOP", (
+                    "segment_write_refused_at_reserve" if str(exc) == "STORAGE_HARD_STOP" else str(exc))
                 raise RingRefused("segment_storage_refused") from exc
             with self.ledger.transaction():
                 self.db.execute("UPDATE segments SET state='stored', allocated=? WHERE id=?",
@@ -661,8 +704,7 @@ class DiskRing:
         # than asserting a FIFO cutoff. The next trusted tick applies limits.
         if self.config is None:
             return False
-        return (not trusted or self.config.mode == "capacity"
-                or row["end"] > now - self.config.value * SECOND)
+        return not trusted or row["end"] > now - self._horizon_us(self.config, self.profiles)
 
     def _delete_incident(self, identifier, *, now=None, trusted=False):
         incident = self.db.execute("SELECT * FROM incidents WHERE id=?", (identifier,)).fetchone()
@@ -741,10 +783,11 @@ class DiskRing:
         self.ledger.check_space()
         clock_trusted = self._clock(now, clock_trusted, record=False)
         budget = self._budget(self.profiles, now, clock_trusted=clock_trusted)
-        ledger_pressure = False
+        ledger_pressure, ledger_required = False, None
         try:
             active = self.db.execute("SELECT 1 FROM incidents WHERE state='active' LIMIT 1").fetchone()
-            self._ledger_capacity(self.config, self.profiles, proposal=None if active else (now - PRE, now + POST))
+            ledger_required = self._ledger_capacity(self.config, self.profiles,
+                                                    proposal=None if active else (now - PRE, now + POST))
         except RingRefused as exc:
             if str(exc) != "insufficient_ledger_capacity":
                 raise
@@ -763,8 +806,18 @@ class DiskRing:
                                                   and row["clock_trusted"]],
                                                  now - PRE, now)
             coverage[str(source)] = {"intervals_us": intervals, "gaps_us": gaps}
+        # Writes are refused before they would cross the reserve, so free
+        # space alone never drops below it while capture is being refused.
+        # When the largest bounded next segment of any source cannot be
+        # admitted even after eligible FIFO reclamation, recording is refused:
+        # report that as a hard stop, not as pressure or health.
+        next_write = round_up(max(profile.segment_bytes() for profile in self.profiles.values())
+                              + self.ledger_headroom, self.store.allocation_unit)
         if budget["filesystem_free"] < budget["safety_reserve"]:
             self.state, self.reason = "STORAGE_HARD_STOP", "safety_reserve_unavailable"
+        elif (budget["filesystem_free"] + budget["reclaimable_allocated"]
+              < budget["safety_reserve"] + next_write):
+            self.state, self.reason = "STORAGE_HARD_STOP", "segment_write_refused_at_reserve"
         elif self.config.mode == "capacity" and ordinary > self.config.value:
             self.state, self.reason = "STORAGE_PRESSURE", "ordinary_capacity_exhausted"
         elif ledger_pressure:
@@ -815,6 +868,10 @@ class DiskRing:
             expected_bytes = self._estimate(self.profiles, left, expected=True)
         return {**budget, "mode": self.config.mode, "selected_value": self.config.value,
                 "selected_unit": "seconds" if self.config.mode == "duration" else "bytes",
+                "capacity_horizon_us": (self._horizon_us(self.config, self.profiles)
+                                        if self.config.mode == "capacity" else None),
+                "ledger_maximum_bytes": self.ledger.maximum_bytes,
+                "ledger_required_bytes": ledger_required,
                 "projected_maximum_bytes": max_bytes, "projected_expected_bytes": expected_bytes,
                 "estimated_duration_us": estimated_duration, "ordinary_allocated_bytes": ordinary,
                 "protected_allocated_bytes": protected, "orphan_allocated_bytes": orphan_bytes,

@@ -292,6 +292,20 @@ Remote-agent scenarios:
 - [ ] capture-node restart;
 - [ ] bandwidth throttling/backpressure test in a controlled environment.
 
+Agent ring core on a real disk (capture host, 2026-09-30). The capture-host
+session ran the Issue #16 ring core with a disposable loop-mounted ext4 media
+filesystem, generated (synthetic) segment bytes, an injected clock and the real
+`MediaStore` mount/free-space/reserve checks. No camera, real segmenter,
+authenticated transport or UI was involved, so the product checklist items
+below stay unchecked. Private host details are kept out of the repository.
+
+- [x] duration-mode FIFO kept exactly the selected duration;
+- [x] a Main-loss incident covered T-600 s..T+600 s complete and was retained across further FIFO;
+- [x] 60-day expiry ran only under a trusted clock;
+- [x] lazy unmount, a substituted directory and another filesystem each became `STORAGE_HARD_STOP` (`storage_path_unavailable` / `mount_replaced`) with no fallback write; remounting the same device recovered the ledger;
+- [ ] **capacity mode** — re-verify after the sizing fix: the run found every realistic capacity refused as `insufficient_ledger_capacity` (the former 512-byte row model needed a ledger ~48x the capacity and ~33x that again as journal headroom). Repeat with the same profile shape (two sources, 4 Mbit/s, 10 s segments, 700 MiB, 32 MiB ledger cap): configuration must be admitted, `ledger_required_bytes` must stay within the cap, and T-10/T+10 must complete;
+- [ ] **hard stop while writes are refused** — re-verify after the status fix: the run found 83 `segment_storage_refused` appends near exhaustion while status stayed `STORAGE_PRESSURE / post_loss_headroom_reduced`. Repeat the near-reserve fill: every refused interval must read `STORAGE_HARD_STOP / segment_write_refused_at_reserve`, free space must stay at or above the reserve, and status must leave hard stop once space is released.
+
 Ring-buffer configuration:
 
 - [ ] owner can select **duration mode** and UI shows projected/actual disk usage;

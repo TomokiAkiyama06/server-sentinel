@@ -5,6 +5,7 @@ private directory. Segment bytes are generated opaque placeholders, never
 camera media, and every scenario runs with outbound networking refused.
 """
 
+from dataclasses import replace
 import os
 from pathlib import Path
 import tempfile
@@ -247,6 +248,62 @@ class CapacityModeLifecycleTests(RingScenario):
         self.assertEqual(0, after["protected_allocated_bytes"])
         self.assertLessEqual(after["ordinary_allocated_bytes"], limit)
         self.assertFalse(any(item["gaps_us"] for item in after["pre_loss_coverage"].values()))
+
+
+class RealScaleCapacityModeTests(RingScenario):
+    """Capacity mode at a realistic profile with a small explicit ledger cap.
+
+    Two sources at a 4 Mbit/s bound and 10 s segments need about 620 MB for
+    the bounded ten-minute pre-loss window. Only the byte counters are
+    synthetic; segment payloads stay small generated placeholders.
+    """
+
+    ledger = 32 * 1024 * 1024
+
+    def build(self, count, *, ledger_bytes=None, name="agent"):
+        super().build(count, ledger_bytes=self.ledger, name=name)
+        self.ring.close()
+        self.store.close()
+        self.settings = replace(self.settings, max_segment_bytes=8 * 1024 * 1024)
+        self.quota = SyntheticQuota(self.settings.media_root, capacity=8 * 1024 ** 3)
+        self.store = MediaStore(self.settings, space=self.quota,
+                                stable_device=lambda _expected: True)
+        self.addCleanup(self.store.close)
+        self.open_ring()
+        self.profiles = tuple(SegmentProfile(source, 4_000_000, 4_000_000, 10 * SECOND, 0)
+                              for source in self.sources)
+
+    def capture_every(self, start, end, step=10 * SECOND):
+        for begin in range(start, end, step):
+            for source in self.sources:
+                self.ring.append(source, begin, begin + step, PAYLOAD,
+                                 now_us=begin + step, clock_trusted=True)
+
+    def test_700_mib_capacity_is_admitted_and_protects_t_minus_10_t_plus_10(self):
+        t0 = self.t0
+        # Journal/database headroom stays proportional to the 32 MiB cap.
+        self.assertLess(self.ring.ledger_headroom, 2 * self.ledger + 512 * 1024)
+        with self.assertRaisesRegex(RingRefused, "insufficient_pre_loss_capacity"):
+            self.configure("capacity", 500 * 1024 * 1024, at=t0 - PRE - 2 * MINUTE)
+        ready = self.configure("capacity", 700 * 1024 * 1024, at=t0 - PRE - 2 * MINUTE)
+        self.assertEqual("capacity", ready["mode"])
+        self.assertGreaterEqual(ready["estimated_duration_us"], PRE)
+        self.assertGreaterEqual(ready["capacity_horizon_us"], ready["estimated_duration_us"])
+        self.assertLessEqual(ready["ledger_required_bytes"], self.ledger)
+
+        self.capture_every(t0 - PRE - 2 * MINUTE, t0)
+        status = self.status(t0)
+        self.assertEqual(("healthy", "protection_ready"), (status["state"], status["reason"]))
+        self.connect(t0)
+        incident = self.lose(t0)
+        self.capture_every(t0, t0 + POST)
+        complete = self.ring.incident(incident, now_us=t0 + POST)
+        self.assertEqual(("complete", False), (complete["state"], complete["has_gaps"]))
+        self.assertEqual({str(source): [(t0 - PRE, t0 + POST)] for source in self.sources},
+                         {key: value["intervals_us"] for key, value in complete["coverage"].items()})
+        after = self.status(t0 + POST)
+        self.assertLessEqual(after["ordinary_allocated_bytes"], 700 * 1024 * 1024)
+        self.assertLessEqual(after["ledger_required_bytes"], self.ledger)
 
 
 class PartialGapAndPreserveTests(RingScenario):
