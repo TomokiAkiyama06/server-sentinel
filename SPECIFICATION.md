@@ -345,7 +345,11 @@ disabled, no `gst-plugin-scanner`), so no audio plugin is ever loaded. Without
 Landlock the launcher refuses to run (fail closed). The helper file and the
 Python interpreter that runs it are checked like the executable and plugins
 (root-owned, not group/world writable, including parent directories) at every
-start, and the resolved interpreter path is executed. Residual limits: on
+start, and the resolved interpreter path is executed. From the installed zipapp
+release the helper is the root-installed artifact file itself (its entry point
+dispatches a fixed `--uvc-sandbox` argument to the stdlib-only helper before any
+other agent module is imported), because a path inside the archive can be
+neither trust-checked nor executed. Residual limits: on
 Landlock ABI 4 ioctls on already reachable files are not restricted (ABI 5+
 limits device ioctls to the approved inode), abstract UNIX socket and signal
 scoping needs ABI 6+, and Landlock does not control UDP or connecting to a
@@ -366,7 +370,8 @@ the recovery marker armed, and later polls retry reaping without waiting the ful
 stop bound so heartbeats are not delayed; teardowns within one poll share one
 stop bound. The process-table check that proves the group gone is itself bounded
 by that stop bound (it runs off the tick thread, so a stalled `/proc` listing or
-read cannot overrun it; at most one check per pipeline is outstanding); a check
+read cannot overrun it; at most one check per pipeline is outstanding, and a
+retry-only poll only polls an outstanding check instead of waiting for it); a check
 that cannot finish in time counts as not reaped. Discovery scans and the capture-node
 open/close run off the tick thread and share one `device_timeout` per poll, so
 the heartbeat is delayed by at most `device_timeout + stop_timeout` regardless
