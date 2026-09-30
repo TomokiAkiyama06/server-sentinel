@@ -741,8 +741,21 @@ Capture:
   device allowlist; otherwise discovery reports `discovery_failed` and never
   binds. Record whether re-enumeration to another `/dev/videoN` breaks the
   allowlist (an Owner decision for the installer device policy).
-- [ ] Confirm `GST_REGISTRY` under the private runtime root works with
-  `ProtectHome=true`, and that no file is created outside the runtime/media roots.
+- [ ] Confirm the kernel reports Landlock (`/sys/kernel/security/lsm` contains
+  `landlock`); on a kernel without it `GStreamerLauncher` must refuse to start.
+- [ ] With the camera plus its UVC metadata node (and, if available, a second
+  camera) attached, trace one launch as the service account
+  (`strace -f -e trace=openat,open,execve,connect`, cold and warm): after
+  `landlock_restrict_self` the child opens only `/proc/self/fd/<N>` read-write;
+  `/dev`, `/sys/class`, `/sys/bus` and every other `/dev/video*`/`/dev/snd/*`
+  open fails or is absent; only `libgstcoreelements.so` and
+  `libgstvideo4linux2.so` are loaded (no ALSA/PulseAudio/PipeWire plugin or
+  library), no `gst-plugin-scanner` is executed, and no registry file is read
+  or created. Recheck frame rate/size against the earlier unsandboxed baseline.
+- [ ] Note that a stalled camera (frames stop without the pipeline exiting)
+  keeps reporting `online`/`video_ready` until the stall timeout expires
+  (`CaptureLimits.stall_timeout`, default 5 s), then `capture_failed`; confirm
+  the observed delay.
 
 Publish only pass/fail summaries.
 

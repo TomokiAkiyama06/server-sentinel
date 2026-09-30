@@ -319,9 +319,19 @@ injectable launcher. The production launcher executes an operator-installed,
 root-controlled `gst-launch-1.0` restricted to `v4l2src ! image/jpeg,<explicit
 profile> ! fdsink fd=1`; the V4L2 descriptor opened and identity-rechecked by the
 Agent is passed to the child (`device=/proc/self/fd/N`) instead of a
-`/dev/videoN` path. The child gets a minimal environment, its own process group,
-no stdin, discarded stderr, and is terminated with SIGTERM then SIGKILL of the
-whole group before reaping. MJPEG output is split structurally into complete
+`/dev/videoN` path. Because GStreamer's `video4linux2` plugin opens every
+`/dev/video*` node read-write while it initializes (a device probe no option
+disables), the child is started through an unprivileged Landlock helper
+(`uvc_sandbox.py`) that denies all filesystem access except read/execute of
+system libraries, the executable and the two plugin files, and read/write/ioctl
+of the one approved device inode (plus TCP bind/connect where the kernel's
+Landlock ABI supports it); every other video node, `/dev`, `/sys`, `/run`, home
+and runtime directories are unreachable. Only `coreelements` and `video4linux2`
+are loaded (`--gst-plugin-load`, empty plugin search paths, registry cache
+disabled, no `gst-plugin-scanner`), so no audio plugin is ever loaded. Without
+Landlock the launcher refuses to run (fail closed). The child gets a minimal
+environment, its own process group, no stdin, discarded stderr, and is
+terminated with SIGTERM then SIGKILL of the whole group before reaping. MJPEG output is split structurally into complete
 JPEG frames with a per-frame byte bound and queued in a bounded drop-oldest queue.
 
 Per-source health: `manual_intervention_required` (`owner_approval_required`,

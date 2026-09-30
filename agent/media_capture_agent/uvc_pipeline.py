@@ -5,8 +5,10 @@ The production launcher runs an operator-installed ``gst-launch-1.0`` with only
 file sink can be named. The pipeline receives an already verified V4L2
 descriptor instead of a ``/dev/videoN`` path, runs in its own process group with
 a minimal environment, and its stderr is discarded (never logged) because it can
-contain device details. Tests inject a synthetic launcher; production never
-substitutes one silently.
+contain device details. Only the ``coreelements`` and ``video4linux2`` plugins
+can load, and the child runs under a Landlock sandbox (``uvc_sandbox``) that
+lets it open no device node other than the approved one. Tests inject a
+synthetic launcher; production never substitutes one silently.
 """
 
 from collections import deque
@@ -16,9 +18,13 @@ from pathlib import Path
 import signal
 import stat
 import subprocess
+import sys
+import sysconfig
 import threading
 import time
 from typing import Protocol
+
+from . import uvc_sandbox
 
 
 MAX_FRAME_BYTES = 32 * 1024 * 1024
@@ -430,20 +436,55 @@ class SubprocessLauncher:
 
 
 GSTREAMER_ELEMENTS = ("v4l2src", "fdsink")
+# The only plugins the child may load: ``fdsink`` (core) and ``v4l2src``.
+GSTREAMER_PLUGINS = ("libgstcoreelements.so", "libgstvideo4linux2.so")
+# No plugin directory is scanned (so no audio/GUI/network plugin is ever
+# loaded, not even by the registry scanner), the registry cache is neither read
+# nor written, and no ``gst-plugin-scanner`` helper process is spawned.
+GSTREAMER_ENVIRONMENT = {
+    "GST_PLUGIN_SYSTEM_PATH_1_0": "", "GST_PLUGIN_SYSTEM_PATH": "",
+    "GST_PLUGIN_PATH_1_0": "", "GST_PLUGIN_PATH": "",
+    "GST_REGISTRY_DISABLE": "yes", "GST_REGISTRY_FORK": "no",
+}
 
 
-def gstreamer_argv(executable, device_fd, profile):
+def gstreamer_argv(executable, device_fd, profile, *, plugins=()):
     """``v4l2src ! image/jpeg caps ! fdsink``; nothing else can be expressed."""
     if not isinstance(profile, MjpegProfile):
         raise PipelineError("explicit MJPEG profile is required")
-    return [str(executable), "-q",
+    if any(not isinstance(plugin, str) or "," in plugin for plugin in plugins):
+        raise PipelineError("invalid pipeline plugin")
+    preload = [f"--gst-plugin-load={','.join(plugins)}"] if plugins else []
+    return [str(executable), "-q", *preload,
             GSTREAMER_ELEMENTS[0], f"device=/proc/self/fd/{device_fd}", "do-timestamp=true",
             "!", profile.caps(),
             "!", GSTREAMER_ELEMENTS[1], "fd=1", "sync=false"]
 
 
+def sandbox_argv(python, device_fd, read_paths, command):
+    """Run ``command`` under ``uvc_sandbox``: only the approved device is openable."""
+    python = Path(python)
+    if not python.is_absolute():
+        raise PipelineError("video pipeline sandbox is unavailable")
+    helper = Path(uvc_sandbox.__file__).resolve()
+    reads = []
+    for path in read_paths:
+        reads += ["--read", str(path)]
+    return [str(python), "-I", "-S", "-B", str(helper),
+            "--device-fd", str(device_fd), *reads, "--", *command]
+
+
 def require_trusted_executable(path):
     """Refuse a pipeline binary that the service account (or anyone) could replace."""
+    return _require_root_controlled(path, executable=True)
+
+
+def require_trusted_file(path):
+    """Refuse a plugin file that the service account (or anyone) could replace."""
+    return _require_root_controlled(path, executable=False)
+
+
+def _require_root_controlled(path, *, executable):
     path = Path(path)
     if not path.is_absolute() or ".." in path.parts:
         raise PipelineError("pipeline executable must be an absolute path")
@@ -453,7 +494,7 @@ def require_trusted_executable(path):
             path = path.resolve(strict=True)
             info = os.stat(path, follow_symlinks=False)
         if (not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022
-                or not info.st_mode & 0o111):
+                or (executable and not info.st_mode & 0o111)):
             raise PipelineError("pipeline executable is not root-controlled")
         for parent in path.parents:
             parent_info = os.stat(parent, follow_symlinks=False)
@@ -464,25 +505,48 @@ def require_trusted_executable(path):
     return path
 
 
+def default_plugin_dirs():
+    multiarch = sysconfig.get_config_var("MULTIARCH")
+    dirs = [f"/usr/lib/{multiarch}/gstreamer-1.0"] if multiarch else []
+    return (*dirs, "/usr/lib64/gstreamer-1.0", "/usr/lib/gstreamer-1.0")
+
+
 class GStreamerLauncher(SubprocessLauncher):
     """Operator-installed GStreamer; not bundled, never downloaded, never PATH-searched.
 
-    ``registry`` optionally points GStreamer's plugin cache into the private
-    runtime root, because a hardened unit hides the service account's home.
+    ``gst-launch-1.0`` itself probes every ``/dev/video*`` node read-write when
+    its ``video4linux2`` plugin loads, so the child is started through the
+    Landlock helper (``uvc_sandbox``), which leaves it able to open only the
+    approved descriptor's device. Without Landlock the launcher refuses to run
+    (fail closed) instead of exposing every camera to the pipeline.
     """
 
-    def __init__(self, executable, *, registry=None, trust=require_trusted_executable,
-                 popen=subprocess.Popen):
+    def __init__(self, executable, *, plugin_dirs=None, trust=require_trusted_executable,
+                 trust_file=require_trusted_file, sandbox_abi=uvc_sandbox.abi_version,
+                 python=sys.executable, popen=subprocess.Popen):
         self.executable = trust(executable)
         self._trust = trust
-        environment = {}
-        if registry is not None:
-            registry = Path(registry)
-            if not registry.is_absolute() or ".." in registry.parts:
-                raise ValueError("invalid pipeline registry path")
-            environment["GST_REGISTRY"] = str(registry)
-        super().__init__(self._argv, environment=environment, popen=popen)
+        self._trust_file = trust_file
+        if sandbox_abi() < 1:
+            raise PipelineError("video pipeline sandbox is unavailable")
+        self.plugins = self._find_plugins(default_plugin_dirs() if plugin_dirs is None
+                                          else plugin_dirs)
+        self.python = python
+        super().__init__(self._argv, environment=GSTREAMER_ENVIRONMENT, popen=popen)
+
+    def _find_plugins(self, plugin_dirs):
+        for directory in plugin_dirs:
+            candidates = [Path(directory) / name for name in GSTREAMER_PLUGINS]
+            if all(candidate.exists() for candidate in candidates):
+                return tuple(self._trust_file(candidate) for candidate in candidates)
+        raise PipelineError("required GStreamer plugins are unavailable")
 
     def _argv(self, device_fd, profile):
         # Re-check at every start: a package change must not be trusted blindly.
-        return gstreamer_argv(self._trust(self.executable), device_fd, profile)
+        executable = self._trust(self.executable)
+        plugins = tuple(self._trust_file(plugin) for plugin in self.plugins)
+        command = gstreamer_argv(executable, device_fd, profile,
+                                 plugins=[str(plugin) for plugin in plugins])
+        read_paths = (*uvc_sandbox.DEFAULT_READ_PATHS, str(executable),
+                      *(str(plugin) for plugin in plugins))
+        return sandbox_argv(self.python, device_fd, read_paths, command)

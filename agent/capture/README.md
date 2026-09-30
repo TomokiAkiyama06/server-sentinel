@@ -37,16 +37,39 @@ operator-installed `gst-launch-1.0` (absolute path, root-owned, not group/world
 writable, re-checked at every start, never PATH-searched) as:
 
 ```text
-gst-launch-1.0 -q v4l2src device=/proc/self/fd/<N> do-timestamp=true \
+python3 -I -S -B uvc_sandbox.py --device-fd <N> --read /usr --read /lib --read /lib64 \
+  --read /etc/ld.so.cache --read <gst-launch-1.0> --read <plugin>... -- \
+gst-launch-1.0 -q --gst-plugin-load=<dir>/libgstcoreelements.so,<dir>/libgstvideo4linux2.so \
+  v4l2src device=/proc/self/fd/<N> do-timestamp=true \
   ! image/jpeg,width=<W>,height=<H>,framerate=<N>/<D> ! fdsink fd=1 sync=false
 ```
+
+- Least device access: the `video4linux2` plugin opens every `/dev/video*` node
+  `O_RDWR` during plugin initialization (M2M codec probe, observed with a warm
+  registry on GStreamer 1.24 and 1.28; no variable disables it). The
+  `uvc_sandbox.py` helper therefore applies a Landlock ruleset before `exec`
+  (unprivileged: `no_new_privs`, no root, no user namespace): every filesystem
+  right the kernel's Landlock ABI knows is denied except read/execute beneath
+  the listed paths and read/write/ioctl of the approved device inode itself;
+  TCP bind/connect is denied on ABI >= 4 and abstract UNIX sockets/signals are
+  scoped on ABI >= 6. The probe's `/sys` and `/dev` enumeration fails with
+  `EACCES`, so no other camera or metadata node is opened. Any helper failure
+  exits 126 without executing GStreamer; a kernel without Landlock makes
+  `GStreamerLauncher` refuse to start (fail closed).
+- Restricted plugin set: only `coreelements` (`fdsink`) and `video4linux2`
+  (`v4l2src`) are loaded from the root-controlled system plugin directory
+  (each file re-checked at every start). `GST_PLUGIN_SYSTEM_PATH[_1_0]` and
+  `GST_PLUGIN_PATH[_1_0]` are empty, `GST_REGISTRY_DISABLE=yes` and
+  `GST_REGISTRY_FORK=no`, so neither `gst-launch-1.0` nor a
+  `gst-plugin-scanner` loads ALSA/PulseAudio/PipeWire or any other plugin, and
+  no registry cache is read or written (the sandbox also denies it).
 
 - Video only: no audio, GUI, network or file element can be expressed.
 - The Agent opens `/dev/videoN` itself (`O_NOFOLLOW`, character device, expected
   `st_rdev`), rescans evidence to confirm the same unique candidate, and passes
   that descriptor to the child. The path never appears in the command line.
-- Minimal environment (`PATH`, `LC_ALL`, optional `GST_REGISTRY` in the private
-  runtime root); nothing inherited from the service environment.
+- Minimal environment (`PATH`, `LC_ALL` and the fixed `GST_*` plugin/registry
+  restrictions above); nothing inherited from the service environment.
 - Own process group, no stdin, stderr discarded (it can contain device details
   and is never logged). Teardown sends SIGTERM to the group, then SIGKILL to the
   group while the exited leader is still unreaped, and reaps it only after no

@@ -29,11 +29,13 @@ from media_capture_agent.uvc_capture import (CaptureCleanupError, CaptureLimits,
                                              UvcCapture, UvcSourceConfig)
 from media_capture_agent.uvc_discovery import DiscoveryResult, LinuxDiscovery, VideoCapabilities
 from media_capture_agent.uvc_identity import DeviceEvidence
-from media_capture_agent.uvc_pipeline import (FrameError, FrameQueue, GStreamerLauncher,
+from media_capture_agent import uvc_sandbox
+from media_capture_agent.uvc_pipeline import (GSTREAMER_ENVIRONMENT, GSTREAMER_PLUGINS,
+                                              FrameError, FrameQueue, GStreamerLauncher,
                                               MjpegFrameParser, MjpegProfile, PipelineError,
                                               SubprocessLauncher, SubprocessPipeline,
-                                              gstreamer_argv,
-                                              minimal_environment, require_trusted_executable)
+                                              gstreamer_argv, minimal_environment,
+                                              require_trusted_executable, require_trusted_file)
 from tests.support import MockSession, settings
 
 
@@ -283,6 +285,76 @@ class PipelineCommandTests(unittest.TestCase):
                     require_trusted_executable(candidate)
             with self.assertRaises(PipelineError):
                 GStreamerLauncher(path)
+
+    def test_gstreamer_command_preloads_only_the_named_plugins(self):
+        argv = gstreamer_argv("/usr/bin/gst-launch-1.0", 7, PROFILE,
+                              plugins=["/p/libgstcoreelements.so", "/p/libgstvideo4linux2.so"])
+        self.assertEqual(argv[1:4], [
+            "-q", "--gst-plugin-load=/p/libgstcoreelements.so,/p/libgstvideo4linux2.so",
+            "v4l2src"])
+        with self.assertRaises(PipelineError):
+            gstreamer_argv("/usr/bin/gst-launch-1.0", 7, PROFILE, plugins=["/p/a.so,/p/b.so"])
+
+    def test_untrusted_plugin_files_are_refused(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / GSTREAMER_PLUGINS[0]
+            path.write_bytes(b"synthetic")
+            for candidate in (path, Path(GSTREAMER_PLUGINS[0]), Path(temporary) / "missing"):
+                with self.subTest(candidate=candidate.name), self.assertRaises(PipelineError):
+                    require_trusted_file(candidate)
+
+    def _launcher(self, temporary, *, popen=None, abi=lambda: 4, plugin_dirs=None):
+        directory = Path(temporary) / "plugins"
+        directory.mkdir(exist_ok=True)
+        for name in GSTREAMER_PLUGINS:
+            (directory / name).write_bytes(b"synthetic")
+        return GStreamerLauncher(
+            "/usr/bin/gst-launch-1.0", trust=Path, trust_file=Path, sandbox_abi=abi,
+            plugin_dirs=[Path(temporary) / "empty", directory] if plugin_dirs is None
+            else plugin_dirs,
+            python="/usr/bin/python3", popen=popen or subprocess.Popen)
+
+    def test_gstreamer_child_is_sandboxed_with_a_restricted_plugin_set(self):
+        calls = []
+
+        def record(argv, **kwargs):
+            calls.append((argv, kwargs))
+            raise OSError("synthetic")
+        with tempfile.TemporaryDirectory() as temporary:
+            launcher = self._launcher(temporary, popen=record)
+            plugins = [str(Path(temporary) / "plugins" / name) for name in GSTREAMER_PLUGINS]
+            with self.assertRaises(PipelineError):
+                launcher.launch(7, PROFILE)
+        argv, kwargs = calls[0]
+        helper = str(Path(uvc_sandbox.__file__).resolve())
+        split = argv.index("--")
+        reads = [argv[index + 1] for index in range(split) if argv[index] == "--read"]
+        self.assertEqual(argv[:7], ["/usr/bin/python3", "-I", "-S", "-B", helper,
+                                    "--device-fd", "7"])
+        # The sandbox may read system libraries, the executable and the two
+        # plugins only: never /dev, /sys, /run, a home or the runtime root.
+        self.assertEqual(reads, [*uvc_sandbox.DEFAULT_READ_PATHS, "/usr/bin/gst-launch-1.0",
+                                 *plugins])
+        self.assertEqual(argv[split + 1:], gstreamer_argv(
+            "/usr/bin/gst-launch-1.0", 7, PROFILE, plugins=plugins))
+        self.assertEqual(kwargs["pass_fds"], (7,))
+        self.assertEqual(kwargs["env"], {"PATH": "/usr/bin:/bin", "LC_ALL": "C",
+                                         **GSTREAMER_ENVIRONMENT})
+        for key in ("GST_PLUGIN_SYSTEM_PATH_1_0", "GST_PLUGIN_SYSTEM_PATH",
+                    "GST_PLUGIN_PATH_1_0", "GST_PLUGIN_PATH"):
+            self.assertEqual(kwargs["env"][key], "")
+        self.assertEqual(kwargs["env"]["GST_REGISTRY_FORK"], "no")
+        text = " ".join(argv)
+        for forbidden in ("/dev/", "/sys", "/run", "alsa", "pulse", "pipewire", "jack"):
+            self.assertNotIn(forbidden, text)
+
+    def test_gstreamer_launcher_fails_closed_without_sandbox_or_plugins(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            with self.assertRaises(PipelineError) as raised:
+                self._launcher(temporary, abi=lambda: 0)
+            self.assertEqual(str(raised.exception), "video pipeline sandbox is unavailable")
+            with self.assertRaises(PipelineError):
+                self._launcher(temporary, plugin_dirs=[Path(temporary) / "empty"])
 
     def test_launcher_rejects_invalid_descriptor_and_spawn_errors(self):
         def refuse(*_args, **_kwargs):
@@ -1264,6 +1336,119 @@ class SubprocessPipelineTests(unittest.TestCase):
         process = capture._sources[SOURCES[0]].active.process.process
         capture.close()
         self.assertIsNotNone(process.returncode)
+
+
+FAKE_GST = """#!/usr/bin/python3 -I
+import json, os, socket, sys
+def attempt(path, flags=os.O_RDWR):
+    try:
+        os.close(os.open(path, flags))
+        return "opened"
+    except OSError as error:
+        return error.errno
+fd = int(sys.argv[sys.argv.index("v4l2src") + 1].rsplit("/", 1)[1])
+result = {"argv": sys.argv[1:], "env": dict(os.environ),
+          "approved": attempt(f"/proc/self/fd/{fd}"),
+          "other_device": attempt("/dev/zero"), "dev_listing": attempt("/dev", os.O_RDONLY | os.O_DIRECTORY),
+          "private_file": attempt(sys.argv[0] + ".private")}
+try:
+    socket.create_connection(("127.0.0.1", 9), timeout=1).close()
+    result["tcp"] = "connected"
+except OSError as error:
+    result["tcp"] = error.errno
+sys.stdout.write(json.dumps(result))
+"""
+
+
+class LandlockSandboxTests(unittest.TestCase):
+    """The pipeline child can open only the approved device (Linux Landlock)."""
+
+    def test_command_parsing_is_strict(self):
+        self.assertEqual(uvc_sandbox.parse(["--device-fd", "5", "--", "/bin/true"]),
+                         (5, uvc_sandbox.DEFAULT_READ_PATHS, ["/bin/true"]))
+        self.assertEqual(uvc_sandbox.parse(["--device-fd", "5", "--read", "/usr", "--",
+                                            "/bin/true", "x"]), (5, ("/usr",), ["/bin/true", "x"]))
+        for argv in ([], ["--device-fd", "5", "/bin/true"], ["--device-fd", "2", "--", "/bin/true"],
+                     ["--device-fd", "x", "--", "/bin/true"], ["--device-fd", "5", "--"],
+                     ["--device-fd", "5", "--", "true"], ["--read", "usr", "--device-fd", "5",
+                                                          "--", "/bin/true"],
+                     ["--device-fd", "5", "--device-fd", "6", "--", "/bin/true"],
+                     ["--device-fd", "5", "--other", "/x", "--", "/bin/true"]):
+            with self.subTest(argv), self.assertRaises(uvc_sandbox.SandboxError):
+                uvc_sandbox.parse(argv)
+
+    def test_every_known_filesystem_right_is_denied_by_default(self):
+        with self.assertRaises(uvc_sandbox.SandboxError):
+            uvc_sandbox.handled_rights(0)
+        self.assertEqual(uvc_sandbox.handled_rights(1), ((1 << 13) - 1, 0, 0))
+        self.assertEqual(uvc_sandbox.handled_rights(4)[1],
+                         uvc_sandbox.NET_BIND_TCP | uvc_sandbox.NET_CONNECT_TCP)
+        self.assertEqual(uvc_sandbox.handled_rights(9), (
+            (1 << 16) - 1, uvc_sandbox.NET_BIND_TCP | uvc_sandbox.NET_CONNECT_TCP,
+            uvc_sandbox.SCOPE_ABSTRACT_UNIX_SOCKET | uvc_sandbox.SCOPE_SIGNAL))
+        self.assertEqual(uvc_sandbox.device_rights(3),
+                         uvc_sandbox.FS_READ_FILE | uvc_sandbox.FS_WRITE_FILE)
+        self.assertEqual(uvc_sandbox.device_rights(5) & uvc_sandbox.FS_IOCTL_DEV,
+                         uvc_sandbox.FS_IOCTL_DEV)
+
+    def test_invalid_command_or_unavailable_sandbox_never_executes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            marker = Path(temporary) / "executed"
+            helper = str(Path(uvc_sandbox.__file__).resolve())
+            command = ["/bin/sh", "-c", f"echo > {marker}"]
+            for options in (["--device-fd", "0"], ["--device-fd", "999"]):
+                with self.subTest(options):
+                    result = subprocess.run([sys.executable, "-I", "-S", helper, *options, "--",
+                                             *command], stdin=subprocess.DEVNULL,
+                                            capture_output=True, timeout=30)
+                    self.assertEqual(result.returncode, uvc_sandbox.EXIT_REFUSED)
+                    self.assertEqual((result.stdout, result.stderr), (b"", b""))
+                    self.assertFalse(marker.exists())
+        with mock.patch.object(uvc_sandbox, "abi_version", return_value=0), \
+                self.assertRaises(uvc_sandbox.SandboxError):
+            uvc_sandbox.restrict(0)
+
+    @unittest.skipUnless(uvc_sandbox.abi_version() > 0, "Landlock is unavailable")
+    @unittest.skipUnless(os.path.exists("/usr/bin/python3"), "no system Python")
+    def test_fake_gstreamer_child_gets_only_the_approved_device_and_minimal_environment(self):
+        os.environ["SERVERSENTINEL_SYNTHETIC_SECRET"] = "sentinel-value"
+        self.addCleanup(os.environ.pop, "SERVERSENTINEL_SYNTHETIC_SECRET", None)
+        with tempfile.TemporaryDirectory() as temporary:
+            executable = Path(temporary) / "gst-launch-1.0"
+            executable.write_text(FAKE_GST)
+            executable.chmod(0o700)
+            Path(f"{executable}.private").write_text("synthetic")
+            plugins = Path(temporary) / "plugins"
+            plugins.mkdir()
+            for name in GSTREAMER_PLUGINS:
+                (plugins / name).write_bytes(b"synthetic")
+            launcher = GStreamerLauncher(executable, trust=Path, trust_file=Path,
+                                         plugin_dirs=[plugins])
+            # /dev/null stands in for the verified camera node: any character device.
+            descriptor = os.open("/dev/null", os.O_RDWR | os.O_CLOEXEC)
+            try:
+                process = launcher.launch(descriptor, PROFILE)
+            finally:
+                os.close(descriptor)
+            output = b""
+            while chunk := process.read(65536):
+                output += chunk
+            self.assertTrue(process.stop(10))
+            process.close()
+        result = json.loads(output)
+        self.assertEqual(result["approved"], "opened")
+        self.assertEqual(result["other_device"], 13)  # EACCES
+        self.assertEqual(result["dev_listing"], 13)
+        self.assertEqual(result["private_file"], 13)
+        if uvc_sandbox.abi_version() >= 4:
+            self.assertEqual(result["tcp"], 13)
+        environment = result["env"]
+        environment.pop("LC_CTYPE", None)  # May be coerced by the interpreter itself.
+        self.assertEqual(environment, {"PATH": "/usr/bin:/bin", "LC_ALL": "C",
+                                       **GSTREAMER_ENVIRONMENT})
+        self.assertEqual(result["argv"][:2], [
+            "-q", "--gst-plugin-load=" + ",".join(
+                str(plugins / name) for name in GSTREAMER_PLUGINS)])
 
 
 @unittest.skipUnless(shutil.which("gst-launch-1.0"), "GStreamer is not installed")

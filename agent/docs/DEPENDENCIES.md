@@ -41,7 +41,10 @@ operator-installed `gst-launch-1.0` as a separate process; it does not import,
 link, bundle, download or redistribute GStreamer, and the Agent artifact and CI
 image do not contain it. CI tests use synthetic Python subprocesses; an optional
 local test runs GStreamer's `videotestsrc`/`jpegenc` only when it is installed.
-Only the `v4l2src` (gst-plugins-good) and `fdsink` (core) elements are named.
+Only the `v4l2src` (gst-plugins-good) and `fdsink` (core) elements are named,
+and only their two plugin files (`video4linux2`, `coreelements`) are loaded.
+The child is confined with the kernel's Landlock LSM through the stdlib-only
+`uvc_sandbox.py` helper (Python `ctypes` system calls); no library is added.
 Upstream GStreamer core and gst-plugins-good are LGPL-2.1-or-later
 (https://gitlab.freedesktop.org/gstreamer/gstreamer/-/blob/main/subprojects/gstreamer/COPYING,
 https://gitlab.freedesktop.org/gstreamer/gstreamer/-/blob/main/subprojects/gst-plugins-good/COPYING).
