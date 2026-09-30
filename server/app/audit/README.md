@@ -36,6 +36,15 @@ human dashboard listener behind the Owner boundary — never by the capture
 ingest listener — so that an invited `live:view` / `recordings:view` principal
 and a capture-node credential cannot read, alter, or delete audit records.
 
+Hostname-reservation listener exceptions (ADR-0003) change only through
+`ReservationAdministration.set_listener_exceptions()`, recorded as
+`change_security_setting` on `security_settings` with one fixed logical ID and
+no port, address or service name. The existing action column has no `CHECK`
+constraint and the action already existed, so no migration is involved. The
+record commits before the new set is applied to the in-memory check; a
+non-Owner gets a `denied` record and an invalid set a `failed` record, and
+neither changes anything.
+
 Human-access administration runs through `AccessAdministration`, which wraps
 `OwnerAuditService.execute_transactional()` around the `AccessStore` `*_on`
 mutations: principal invitation (`invite_principal`), invitation issue

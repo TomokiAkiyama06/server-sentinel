@@ -57,7 +57,7 @@ following closes it:
 
 - a TCP listener other than the recorded proxy sockets on a reserved address,
   a wildcard (`0.0.0.0` / `::`) listener, or an IPv4-mapped equivalent, on any
-  port;
+  port, unless it is a wildcard bind covered by an Owner listener exception;
 - any Serve route other than the single `https://<host>:<port>/` proxy to the
   loopback human listener (other paths, ports, `http`, raw TCP forwards, empty
   TLS listeners, Funnel), or a duplicate of it;
@@ -75,6 +75,22 @@ address between two checks is not seen until the next check: detection bounds
 the exposure window, and only the Owner-recorded deployment isolation removes
 it. `/proc/net` covers one network namespace and TCP only (UDP/QUIC listeners
 are not enumerated).
+
+Owner listener exceptions (`ListenerException`: protocol `tcp`, port,
+optional address family, bind scope `wildcard`) let a system service such as
+`sshd` on 22 bind a wildcard address without closing access. The set is empty
+by default, typed, bounded to 16 entries, and is never read from deployment
+configuration. An exception never matches the dashboard port, the loopback
+human listener port or a recorded proxy socket port, and never matches a bind
+to a reserved address: `100.64.x.y:22` still closes access when `0.0.0.0:22`
+is allowed. The only runtime path that changes it is
+`app.audit.integration.ReservationAdministration`, which authorizes the Owner,
+commits a `change_security_setting` audit record, then applies the set and
+re-checks immediately so narrowing it closes access at once. The set is kept
+in memory only in this slice; a restart returns to the empty default (fail
+closed), so the Owner re-applies it through the same audited path, for example
+from a local host-side command, until durable storage is added. Faults still
+carry only reasons and counts.
 
 Nothing here is wired into the application or a route yet, reads the host
 implicitly, runs `tailscale`, changes Tailscale ACLs/Grants, or needs Tailscale

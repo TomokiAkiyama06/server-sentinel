@@ -900,9 +900,17 @@ by the Issue #6 synthetic policy model.
   and record whether Tailscale Serve holds a visible socket on the Tailscale
   address (which decides the recorded proxy sockets). Run the check in the
   network namespace that holds the reserved address when the dedicated
-  network identity isolation is used. Note that a wildcard `sshd` or other
-  service on the node is reported as an unexpected listener; record how the
-  deployment meets that. UDP/QUIC listeners are not enumerated.
+  network identity isolation is used. A wildcard `sshd` or other system
+  service on the node is reported as an unexpected listener unless the Owner
+  adds a listener exception for that port. With a wildcard `sshd` on 22:
+  confirm access closes with no exception; add `tcp/22` through the audited
+  Owner path and confirm access opens and a `change_security_setting` audit
+  record exists; bind a test listener to the Tailscale address on port 22
+  (not wildcard) and confirm access still closes; start a wildcard listener
+  on another port and confirm access closes; attempt the change as a non-Owner
+  and confirm a `denied` record and no change; restart and confirm the
+  exception is gone (in-memory only in this slice) and access is closed until
+  it is re-applied. UDP/QUIC listeners are not enumerated.
 - Once the check is composed into startup and the daily worker, confirm an
   enumeration failure or timeout (for example stopping `tailscaled`, or making
   `/proc/net` unreadable) keeps human access closed and notifies the Owner,

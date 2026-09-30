@@ -1,16 +1,28 @@
 """Synthetic /proc/net and Serve status fixtures only; no host sockets or tailscale."""
 
+from contextlib import closing
 from datetime import datetime, timezone
 import ipaddress
 import json
+from pathlib import Path
+from tempfile import TemporaryDirectory
 import threading
 from unittest import TestCase
 
-from app.auth.reservation import (
-    CheckKind, HostnameReservationCheck, IsolationMode, Listener, ProcNetListeners, ProxyRoute,
-    Reason, ReservationConfig, ReservationEnumerationError, ReservationFault, RouteKind,
-    ServeStatusRoutes, evaluate, parse_proc_net_tcp, parse_serve_status,
+from app.audit import (
+    ActorCategory, AuditAction, AuditOutcome, AuditStore, OwnerAuditService,
+    OwnerAuthorizationError, TargetKind,
 )
+from app.audit.integration import RESERVATION_LISTENER_EXCEPTIONS_ID, ReservationAdministration
+from app.auth.reservation import (
+    AddressFamily, CheckKind, HostnameReservationCheck, IsolationMode, Listener, ListenerException,
+    ProcNetListeners, ProxyRoute, Reason, ReservationConfig, ReservationEnumerationError,
+    ReservationFault, RouteKind, ServeStatusRoutes, evaluate, parse_proc_net_tcp,
+    parse_serve_status,
+)
+from app.storage.database import Database
+from app.storage.migrations import migrate
+from app.storage.schema import APPLICATION_MIGRATIONS
 
 
 NOW = datetime(2026, 1, 1, tzinfo=timezone.utc)
@@ -430,3 +442,120 @@ class ReservationCheckTests(TestCase):
         for value in (0, -1, float("nan"), float("inf"), True):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 checker(timeout=value)
+
+
+class SyntheticOwnerAuthorizer:
+    def require_owner(self, actor_context):
+        if actor_context != "synthetic-owner-session":
+            raise OwnerAuthorizationError(ActorCategory.INVITED_USER)
+
+
+SSH = ListenerException(22)
+WILDCARD_SSH = Files(tcp=proc(("127.0.0.1", 8080, "0A"), ("0.0.0.0", 22, "0A")),
+                     tcp6=proc(("::", 22, "0A"), ipv6=True))
+
+
+class ListenerExceptionTests(TestCase):
+    def setUp(self):
+        self.temporary = TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.database = Database(Path(self.temporary.name) / "synthetic.sqlite3")
+        with closing(self.database.connect()) as connection:
+            migrate(connection, APPLICATION_MIGRATIONS)
+        self.store = AuditStore(self.database, clock=lambda: NOW)
+        self.service = OwnerAuditService(self.store, SyntheticOwnerAuthorizer())
+
+    def admin(self, files):
+        check, _, _, sink = checker(files=Files(files.files["tcp"], files.files["tcp6"]))
+        return ReservationAdministration(self.service, check), check, sink
+
+    def test_default_is_empty_and_wildcard_system_listener_closes(self):
+        _, check, _ = self.admin(WILDCARD_SSH)
+        self.assertEqual(check.listener_exceptions, frozenset())
+        check.startup()
+        self.assertEqual(check.verdict.reasons, (Reason.UNEXPECTED_LISTENER,))
+
+    def test_allowed_wildcard_port_passes_after_audited_owner_change(self):
+        admin, check, sink = self.admin(WILDCARD_SSH)
+        check.startup()
+        verdict = admin.set_listener_exceptions("synthetic-owner-session", {SSH})
+        self.assertTrue(verdict.open)
+        self.assertEqual(verdict.check, CheckKind.CONFIGURATION)
+        self.assertEqual(check.listener_exceptions, frozenset({SSH}))
+        record, = self.store.list_records()
+        self.assertEqual((record.actor_category, record.action, record.target_kind,
+                          record.target_logical_id, record.outcome),
+                         (ActorCategory.OWNER, AuditAction.CHANGE_SECURITY_SETTING,
+                          TargetKind.SECURITY_SETTINGS, RESERVATION_LISTENER_EXCEPTIONS_ID,
+                          AuditOutcome.SUCCEEDED))
+        # The fault from the earlier closed check carries reasons/counts only.
+        self.assertNotIn("22", repr(sink.events[0].reasons))
+
+    def test_family_restricted_exception(self):
+        admin, check, _ = self.admin(WILDCARD_SSH)
+        verdict = admin.set_listener_exceptions(
+            "synthetic-owner-session", {ListenerException(22, family=AddressFamily.IPV4)})
+        self.assertFalse(verdict.open)
+        self.assertEqual(verdict.reasons, (Reason.UNEXPECTED_LISTENER,))
+
+    def test_same_port_on_reserved_address_still_closes(self):
+        for files in (Files(tcp=proc(("127.0.0.1", 8080, "0A"), ("100.64.0.10", 22, "0A"))),
+                      Files(tcp6=proc((str(V6), 22, "0A"), ipv6=True)),
+                      Files(tcp6=proc(("::ffff:100.64.0.10", 22, "0A"), ipv6=True))):
+            with self.subTest(files=files.files):
+                admin, check, _ = self.admin(files)
+                verdict = admin.set_listener_exceptions("synthetic-owner-session", {SSH})
+                self.assertFalse(verdict.open)
+                self.assertEqual(verdict.reasons, (Reason.UNEXPECTED_LISTENER,))
+
+    def test_non_allowed_port_still_closes(self):
+        files = Files(tcp=proc(("127.0.0.1", 8080, "0A"), ("0.0.0.0", 22, "0A"), ("0.0.0.0", 8443, "0A")))
+        admin, check, sink = self.admin(files)
+        verdict = admin.set_listener_exceptions("synthetic-owner-session", {SSH})
+        self.assertFalse(verdict.open)
+        self.assertEqual(sink.events[-1].unexpected_listeners, 1)
+        self.assertEqual(sink.events[-1].check, CheckKind.CONFIGURATION)
+
+    def test_narrowing_closes_immediately(self):
+        admin, check, _ = self.admin(WILDCARD_SSH)
+        self.assertTrue(admin.set_listener_exceptions("synthetic-owner-session", {SSH}).open)
+        self.assertFalse(admin.set_listener_exceptions("synthetic-owner-session", ()).open)
+        self.assertFalse(check.access_open)
+
+    def test_non_owner_is_denied_audited_and_changes_nothing(self):
+        admin, check, _ = self.admin(WILDCARD_SSH)
+        check.startup()
+        for actor in ({"invited": True}, None, "shared-tailnet-login"):
+            with self.subTest(actor=actor), self.assertRaises(OwnerAuthorizationError):
+                admin.set_listener_exceptions(actor, {SSH})
+        self.assertEqual(check.listener_exceptions, frozenset())
+        self.assertFalse(check.access_open)
+        records = self.store.list_records()
+        self.assertEqual(len(records), 3)
+        self.assertTrue(all(record.outcome is AuditOutcome.DENIED
+                            and record.action is AuditAction.CHANGE_SECURITY_SETTING
+                            for record in records))
+
+    def test_exception_never_covers_dashboard_or_human_listener(self):
+        admin, check, _ = self.admin(WILDCARD_SSH)
+        for exceptions in ({ListenerException(443)}, {ListenerException(8080)}, {22},
+                           {ListenerException(port) for port in range(1000, 1017)}):
+            with self.subTest(exceptions=exceptions), self.assertRaises(ValueError):
+                admin.set_listener_exceptions("synthetic-owner-session", exceptions)
+        self.assertEqual(check.listener_exceptions, frozenset())
+        self.assertTrue(all(record.outcome is AuditOutcome.FAILED for record in self.store.list_records()))
+        with self.assertRaises(ValueError):
+            evaluate(config(), (HUMAN,), (config().expected_route,), {ListenerException(443)})
+
+    def test_exception_type_is_validated(self):
+        for kwargs in (dict(port=0), dict(port=70000), dict(port="22"), dict(port=22, family="ipv4"),
+                       dict(port=22, protocol="udp"), dict(port=True)):
+            with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
+                ListenerException(**kwargs)
+
+    def test_unaudited_change_object_from_another_check_is_refused(self):
+        _, check, _ = self.admin(WILDCARD_SSH)
+        other, *_ = checker()
+        with self.assertRaises(ValueError):
+            check.apply_audited_listener_exceptions(other.stage_listener_exceptions({SSH}))
+        self.assertEqual(check.listener_exceptions, frozenset())

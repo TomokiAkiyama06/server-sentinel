@@ -74,6 +74,53 @@ class CheckKind(StrEnum):
     STARTUP = "startup"
     DAILY = "daily"
     RETRY = "retry"
+    CONFIGURATION = "configuration"
+
+
+class TransportProtocol(StrEnum):
+    TCP = "tcp"
+
+
+class AddressFamily(StrEnum):
+    IPV4 = "ipv4"
+    IPV6 = "ipv6"
+
+
+class BindScope(StrEnum):
+    # Only a wildcard bind may be excepted; a bind to a reserved address never is.
+    WILDCARD = "wildcard"
+
+
+MAX_LISTENER_EXCEPTIONS = 16
+
+
+@dataclass(frozen=True)
+class ListenerException:
+    """One Owner-allowed wildcard system listener, for example ``sshd`` on 22.
+
+    It matches only a wildcard (``0.0.0.0`` / ``::``) TCP bind on ``port`` in
+    ``family`` (``None`` for both). A bind of the same port to a reserved
+    address still closes access, as does every port not listed.
+    """
+
+    port: int
+    protocol: TransportProtocol = TransportProtocol.TCP
+    family: AddressFamily | None = None
+    scope: BindScope = BindScope.WILDCARD
+
+    def __post_init__(self):
+        if (type(self.port) is not int or not 1 <= self.port <= 65535
+                or not isinstance(self.protocol, TransportProtocol)
+                or (self.family is not None and not isinstance(self.family, AddressFamily))
+                or not isinstance(self.scope, BindScope)):
+            raise ValueError("INVALID_LISTENER_EXCEPTION")
+
+    def matches(self, listener: "Listener") -> bool:
+        address = listener.address
+        family = AddressFamily.IPV4 if address.version == 4 else AddressFamily.IPV6
+        return (self.protocol is TransportProtocol.TCP and self.scope is BindScope.WILDCARD
+                and address.is_unspecified and listener.port == self.port
+                and (self.family is None or self.family is family))
 
 
 @dataclass(frozen=True)
@@ -423,8 +470,25 @@ class ReservationFault:
 CLOSED = ReservationVerdict(False, (), None, None)
 
 
-def evaluate(config: ReservationConfig, listeners, routes) -> tuple[tuple[Reason, ...], int, int]:
+def validate_listener_exceptions(config: ReservationConfig, exceptions) -> frozenset:
+    """Typed, bounded exceptions that never cover the dashboard or human listener."""
+    try:
+        values = frozenset(exceptions)
+    except TypeError:
+        raise ValueError("INVALID_LISTENER_EXCEPTION") from None
+    if len(values) > MAX_LISTENER_EXCEPTIONS:
+        raise ValueError("INVALID_LISTENER_EXCEPTION")
+    forbidden = {config.port, config.human_listener.port} | {item.port for item in config.proxy_listeners}
+    for item in values:
+        if not isinstance(item, ListenerException) or item.port in forbidden:
+            raise ValueError("INVALID_LISTENER_EXCEPTION")
+    return values
+
+
+def evaluate(config: ReservationConfig, listeners, routes,
+             exceptions: frozenset = frozenset()) -> tuple[tuple[Reason, ...], int, int]:
     """Pure comparison. ``listeners``/``routes`` are sequences or a ``Reason``."""
+    exceptions = validate_listener_exceptions(config, exceptions)
     reasons: list[Reason] = []
     if not isinstance(config.isolation, IsolationMode):
         reasons.append(Reason.ISOLATION_UNSTATED)
@@ -438,9 +502,13 @@ def evaluate(config: ReservationConfig, listeners, routes) -> tuple[tuple[Reason
             if Listener(address, listener.port) == config.human_listener:
                 seen_human = True
                 continue
-            # A wildcard bind answers on every address, the reserved ones included.
+            normalized = Listener(address, listener.port)
+            # A wildcard bind answers on every address, the reserved ones
+            # included, unless the Owner explicitly allowed that port.
+            if any(item.matches(normalized) for item in exceptions):
+                continue
             if (address.is_unspecified or address in config.reserved_addresses) and \
-                    Listener(address, listener.port) not in config.proxy_listeners:
+                    normalized not in config.proxy_listeners:
                 unexpected_listeners += 1
         if unexpected_listeners:
             reasons.append(Reason.UNEXPECTED_LISTENER)
@@ -504,6 +572,9 @@ class HostnameReservationCheck:
         self._last_notified: tuple[Reason, ...] | None = None
         self._pending: ReservationFault | None = None
         self._inflight: dict[str, threading.Thread] = {}
+        # Empty by default and never read from deployment configuration: only
+        # the audited Owner path (``ReservationAdministration``) changes it.
+        self._exceptions: frozenset = frozenset()
         self.undelivered_faults = 0
 
     @property
@@ -514,6 +585,27 @@ class HostnameReservationCheck:
     def access_open(self) -> bool:
         """Precedes identity, session and permission evaluation (ADR-0003)."""
         return self._verdict.open
+
+    @property
+    def listener_exceptions(self) -> frozenset:
+        return self._exceptions
+
+    def stage_listener_exceptions(self, exceptions) -> "ListenerExceptionChange":
+        """Validate a replacement set; changes nothing until applied."""
+        return ListenerExceptionChange(self, validate_listener_exceptions(self.config, exceptions))
+
+    def apply_audited_listener_exceptions(self, change: "ListenerExceptionChange") -> ReservationVerdict:
+        """Apply a change whose Owner audit record has committed, then re-check.
+
+        Reached at runtime only through ``app.audit.integration.ReservationAdministration``.
+        Access closes during the immediate re-check, so narrowing the set takes
+        effect now rather than at the next daily check.
+        """
+        if not isinstance(change, ListenerExceptionChange) or change.check is not self:
+            raise ValueError("INVALID_LISTENER_EXCEPTION")
+        with self._check_lock:
+            self._exceptions = change.exceptions
+            return self._check_locked(CheckKind.CONFIGURATION)
 
     def startup(self) -> ReservationVerdict:
         return self._check(CheckKind.STARTUP)
@@ -576,7 +668,8 @@ class HostnameReservationCheck:
             routes = self._enumerate("routes", lambda: self._routes.routes(),
                                      Reason.ROUTE_ENUMERATION_TIMEOUT,
                                      Reason.ROUTE_ENUMERATION_UNAVAILABLE, ProxyRoute)
-            reasons, extra_listeners, extra_routes = evaluate(self.config, listeners, routes)
+            reasons, extra_listeners, extra_routes = evaluate(self.config, listeners, routes,
+                                                              self._exceptions)
         except Exception:
             reasons, extra_listeners, extra_routes = (Reason.LISTENER_ENUMERATION_UNAVAILABLE,), 0, 0
         try:
@@ -610,3 +703,11 @@ class HostnameReservationCheck:
             return
         if self._pending is fault:
             self._pending = None
+
+
+@dataclass(frozen=True)
+class ListenerExceptionChange:
+    """A validated, not yet applied replacement of the Owner's listener exceptions."""
+
+    check: HostnameReservationCheck = field(repr=False)
+    exceptions: frozenset
