@@ -428,3 +428,16 @@ verification must include real IPv4/IPv6/LAN bypass attempts, exact installed
 Serve behavior, Docker exposure, clock/restart/session cases, and active
 phone/Mac/desktop playback revocation. Until these exist, no production-security
 or hardware/network/browser acceptance is claimed.
+
+Reservation-breach recovery (Owner decision, 2026-09-30, PR #91): a listener or
+route that answered for the reserved name may already hold a session cookie, so
+access that the reservation check closed for an unexpected listener or route
+reopens only after the deployment authorization generation has advanced and
+every human session, the Owner's included, has been invalidated, with that
+change and its `system` audit record committed. Everyone then signs in again
+with their own credential, and an enrollment authorization issued under the
+previous generation must be issued again. The same applies after an enumeration
+error or timeout, since it cannot rule an exposure out. A missing or failing
+revocation keeps access closed and notifies the Owner; a pending revocation
+survives a restart. This is still detection: it bounds how long an exposed
+cookie stays usable, and does not prevent the exposure.

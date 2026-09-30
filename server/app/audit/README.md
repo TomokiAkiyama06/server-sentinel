@@ -36,6 +36,12 @@ human dashboard listener behind the Owner boundary — never by the capture
 ingest listener — so that an invited `live:view` / `recordings:view` principal
 and a capture-node credential cannot read, alter, or delete audit records.
 
+After a reservation close that may have exposed a session cookie, the check
+revokes every human session before reopening and records it as `system`
+`invalidate_human_sessions` on `security_settings` with one fixed logical ID, in
+the same transaction as the generation advance (a new action value; the action
+column has no `CHECK` constraint, so no migration).
+
 Hostname-reservation listener exceptions (ADR-0003) change only through
 `ReservationAdministration.set_listener_exceptions()`, recorded as
 `change_security_setting` on `security_settings` with one fixed logical ID and

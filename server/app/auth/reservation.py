@@ -75,6 +75,20 @@ class Reason(StrEnum):
     MAPPING_MISSING = "MAPPING_MISSING"
     HUMAN_LISTENER_MISSING = "HUMAN_LISTENER_MISSING"
     LISTENER_EXCEPTIONS_UNREADABLE = "LISTENER_EXCEPTIONS_UNREADABLE"
+    SESSION_REVOCATION_UNAVAILABLE = "SESSION_REVOCATION_UNAVAILABLE"
+    SESSION_REVOCATION_FAILED = "SESSION_REVOCATION_FAILED"
+
+
+# Something other than this deployment answered, or may have answered unseen,
+# for the reserved name, so a session cookie may have been exposed. Reopening
+# after any of these first revokes every human session (Owner decision,
+# 2026-09-30). An enumeration error or timeout is treated the same way: nothing
+# shows an exposure, but nothing rules one out either.
+EXPOSURE_REASONS = frozenset({
+    Reason.UNEXPECTED_LISTENER, Reason.UNEXPECTED_ROUTE,
+    Reason.LISTENER_ENUMERATION_UNAVAILABLE, Reason.LISTENER_ENUMERATION_TIMEOUT,
+    Reason.ROUTE_ENUMERATION_UNAVAILABLE, Reason.ROUTE_ENUMERATION_TIMEOUT,
+})
 
 
 class CheckKind(StrEnum):
@@ -199,6 +213,17 @@ class ProxyRouteEnumerator(Protocol):
 class ListenerExceptionSource(Protocol):
     def load(self) -> Iterable["ListenerException"]:
         """Return the persisted Owner exceptions; raise when unreadable or corrupt."""
+
+
+class SessionRevoker(Protocol):
+    def record_exposure(self) -> None:
+        """Durably note that sessions must be revoked before access reopens."""
+
+    def exposure_pending(self) -> bool:
+        """Whether a recorded exposure still awaits revocation; raise when unreadable."""
+
+    def revoke_all_human_sessions(self) -> None:
+        """Invalidate every human session with its audit record committed; raise on failure."""
 
 
 class FaultSink(Protocol):
@@ -584,12 +609,17 @@ class HostnameReservationCheck:
     retried on the next ``tick``. While closed, the check is retried every
     ``retry_seconds`` so a transient enumeration failure does not hold access
     closed for a day; retries re-notify only when the reasons change. A later
-    passing check reopens access (the Owner has already been notified).
+    passing check reopens access (the Owner has already been notified), except
+    after an ``EXPOSURE_REASONS`` close: then it reopens only once the injected
+    ``session_revoker`` has revoked every human session and committed its audit
+    record. Without a revoker, or when revocation fails, access stays closed
+    with a ``SESSION_REVOCATION_*`` fault.
     """
 
     def __init__(self, config: ReservationConfig, listeners: ListenerEnumerator,
                  routes: ProxyRouteEnumerator, sink: FaultSink, *,
                  exception_store: ListenerExceptionSource | None = None,
+                 session_revoker: SessionRevoker | None = None,
                  timeout: float = ENUMERATION_TIMEOUT_SECONDS,
                  retry_seconds: float = RETRY_WHILE_CLOSED_SECONDS,
                  monotonic: Callable[[], float] = time.monotonic,
@@ -623,6 +653,8 @@ class HostnameReservationCheck:
         # persisting it in ``exception_store``, which ``startup`` loads.
         self.exception_store = exception_store
         self._exceptions: frozenset = frozenset()
+        self.session_revoker = session_revoker
+        self._revocation_required = False
         self.undelivered_faults = 0
 
     @property
@@ -664,7 +696,39 @@ class HostnameReservationCheck:
         """
         with self._check_lock:
             self._load_exceptions()
+            self._load_revocation_state()
             return self._check_locked(CheckKind.STARTUP)
+
+    def _load_revocation_state(self) -> None:
+        if self.session_revoker is None:
+            return
+        try:
+            pending = self.session_revoker.exposure_pending() is not False
+        except Exception:
+            # Unknown: revoking is the safe answer.
+            pending = True
+        self._revocation_required = self._revocation_required or pending
+
+    def _after_evaluation(self, reasons: tuple[Reason, ...]) -> tuple[Reason, ...]:
+        if any(reason in EXPOSURE_REASONS for reason in reasons):
+            self._revocation_required = True
+            if self.session_revoker is not None:
+                try:
+                    self.session_revoker.record_exposure()
+                except Exception:
+                    # Still required in memory; a restart could lose it, so tell the Owner.
+                    return reasons + (Reason.SESSION_REVOCATION_FAILED,)
+            return reasons
+        if reasons or not self._revocation_required:
+            return reasons
+        if self.session_revoker is None:
+            return (Reason.SESSION_REVOCATION_UNAVAILABLE,)
+        try:
+            self.session_revoker.revoke_all_human_sessions()
+        except Exception:
+            return (Reason.SESSION_REVOCATION_FAILED,)
+        self._revocation_required = False
+        return ()
 
     def _load_exceptions(self) -> None:
         self._exceptions = frozenset()
@@ -738,6 +802,8 @@ class HostnameReservationCheck:
                                                               self._exceptions)
         except Exception:
             reasons, extra_listeners, extra_routes = (Reason.LISTENER_ENUMERATION_UNAVAILABLE,), 0, 0
+        # Access is still closed here: reopening waits for any required revocation.
+        reasons = self._after_evaluation(reasons)
         at = self._now()
         verdict = ReservationVerdict(not reasons, reasons, at, kind)
         with self._lock:

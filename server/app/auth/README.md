@@ -75,7 +75,25 @@ A failing startup/daily check closes access before emitting an identifier-free
 `ReservationFault` (reasons and counts only) to the injected Owner sink; a
 failed delivery is counted and retried on the next tick. While closed the
 check is retried every five minutes, re-notifying only when the reasons change,
-and a later passing check reopens access. A process binding the reserved
+and a later passing check reopens access. After a close that may have exposed
+a session cookie (an unexpected listener or route, or an enumeration error or
+timeout that cannot rule one out: `EXPOSURE_REASONS`), a passing check reopens
+only after the injected `session_revoker` has revoked every human session
+(Owner decision, 2026-09-30). `reservation_store.ReservationSessionRevocation`
+does that through `AccessStore.invalidate_all_sessions_on`, which advances the
+existing `access_deployment_state.authorization_generation` and invalidates
+every `access_sessions` row (no migration), in one transaction with a `system`
+`invalidate_human_sessions` audit record on a fixed logical ID. Everyone, the
+Owner included, signs in again with their credential, and pending enrollment
+authorizations from the previous generation must be reissued. The exposure is
+recorded as a marker in `application_metadata` first, so a restart before the
+revocation still revokes before opening (an unreadable marker also revokes).
+Without a revoker, or when revocation or its audit append fails (rolled back
+together, with a `failed` record attempted), access stays closed with a
+`SESSION_REVOCATION_UNAVAILABLE` / `SESSION_REVOCATION_FAILED` fault; a failure
+to record the marker is reported the same way. Other closes (missing mapping,
+missing human listener, unstated isolation, unreadable exceptions) show no
+other answer on the name and reopen without revocation. A process binding the reserved
 address between two checks is not seen until the next check: detection bounds
 the exposure window, and only the Owner-recorded deployment isolation removes
 it. `/proc/net` covers one network namespace.

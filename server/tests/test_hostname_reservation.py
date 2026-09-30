@@ -1,7 +1,8 @@
 """Synthetic /proc/net and Serve status fixtures only; no host sockets or tailscale."""
 
 from contextlib import closing
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+import hashlib
 import ipaddress
 import json
 from pathlib import Path
@@ -16,12 +17,17 @@ from app.audit import (
 )
 from app.audit.integration import RESERVATION_LISTENER_EXCEPTIONS_ID, ReservationAdministration
 from app.auth.reservation import (
-    AddressFamily, CheckKind, HostnameReservationCheck, IsolationMode, Listener, ListenerException,
+    DAILY_SECONDS, AddressFamily, CheckKind, HostnameReservationCheck, IsolationMode, Listener, ListenerException,
     ProcNetListeners, ProxyRoute, Reason, ReservationConfig, ReservationEnumerationError,
     ReservationFault, RouteKind, ServeStatusRoutes, TransportProtocol, evaluate, parse_proc_net_tcp,
     parse_proc_net_udp, parse_serve_status,
 )
-from app.auth.reservation_store import STORE_KEY, ListenerExceptionStore, decode, encode
+from app.auth.model import AccessValidationError, Permission
+from app.auth.reservation_store import (
+    HUMAN_SESSIONS_ID, REVOCATION_PENDING_KEY, STORE_KEY, ListenerExceptionStore,
+    ReservationSessionRevocation, decode, encode,
+)
+from app.auth.store import AccessStore
 from app.storage.database import Database
 from app.storage.migrations import migrate
 from app.storage.schema import APPLICATION_MIGRATIONS
@@ -102,6 +108,25 @@ class Sink:
         if self.fail:
             raise OSError("synthetic delivery failure")
         self.events.append(fault)
+
+
+class FakeRevoker:
+    def __init__(self, fail=False):
+        self.fail = fail
+        self.pending = False
+        self.revocations = 0
+
+    def record_exposure(self):
+        self.pending = True
+
+    def exposure_pending(self):
+        return self.pending
+
+    def revoke_all_human_sessions(self):
+        if self.fail:
+            raise OSError("synthetic revocation failure")
+        self.pending = False
+        self.revocations += 1
 
 
 class Clock:
@@ -448,7 +473,9 @@ class ReservationCheckTests(TestCase):
 
     def test_closed_retry_renotifies_only_on_change_and_reopens_on_pass(self):
         clock = Clock()
-        check, files, status, sink = checker(clock=clock, status=Status(OSError("down")))
+        revoker = FakeRevoker()
+        check, files, status, sink = checker(clock=clock, status=Status(OSError("down")),
+                                             session_revoker=revoker)
         check.startup()
         self.assertEqual(len(sink.events), 1)
         clock.value += 300
@@ -463,6 +490,8 @@ class ReservationCheckTests(TestCase):
         clock.value += 300
         self.assertTrue(check.tick().open)
         self.assertTrue(check.access_open)
+        # The earlier enumeration failure could not rule out an exposure.
+        self.assertEqual(revoker.revocations, 1)
 
     def test_backward_monotonic_clock_forces_a_check(self):
         clock = Clock()
@@ -513,11 +542,19 @@ class ExceptionFixture(TestCase):
         self.service = OwnerAuditService(self.store, SyntheticOwnerAuthorizer())
 
         self.exception_store = ListenerExceptionStore(self.database)
+        self.access = AccessStore(self.database, clock=lambda: NOW, audit=self.store,
+                                  unaudited_writes=True)
+        self.revoker = ReservationSessionRevocation(self.access)
 
-    def admin(self, files):
+    def admin(self, files, **kwargs):
+        kwargs.setdefault("session_revoker", self.revoker)
         check, _, _, sink = checker(files=Files(**files.files),
-                                    exception_store=self.exception_store)
+                                    exception_store=self.exception_store, **kwargs)
         return ReservationAdministration(self.service, check), check, sink
+
+    def owner_records(self):
+        return [record for record in self.store.list_records()
+                if record.action is not AuditAction.INVALIDATE_HUMAN_SESSIONS]
 
     def stored(self):
         with closing(self.database.connect()) as connection:
@@ -545,7 +582,7 @@ class ListenerExceptionTests(ExceptionFixture):
         self.assertTrue(verdict.open)
         self.assertEqual(verdict.check, CheckKind.CONFIGURATION)
         self.assertEqual(check.listener_exceptions, frozenset({SSH}))
-        record, = self.store.list_records()
+        record, = self.owner_records()
         self.assertEqual((record.actor_category, record.action, record.target_kind,
                           record.target_logical_id, record.outcome),
                          (ActorCategory.OWNER, AuditAction.CHANGE_SECURITY_SETTING,
@@ -791,3 +828,151 @@ class ListenerExceptionPersistenceTests(ExceptionFixture):
     def test_write_requires_a_transaction(self):
         with closing(self.database.connect()) as connection, self.assertRaises(Exception):
             self.exception_store.write_on(connection, {SSH})
+
+
+class SessionRevocationTests(ExceptionFixture):
+    """Owner decision 2026-09-30: revoke every human session before reopening after an exposure."""
+
+    EXTRA = proc(("127.0.0.1", 8080, "0A"), ("100.64.0.10", 8443, "0A"))
+
+    def session(self, identity, token, *, owner=False):
+        if owner:
+            principal = self.access.bootstrap_owner(identity, "Synthetic owner")
+        else:
+            principal = self.access.invite(identity, "Synthetic viewer", (Permission.LIVE_VIEW,))
+        secret = hashlib.sha256(token).digest()
+        self.access.issue_enrollment(principal.id, secret, NOW + timedelta(minutes=5))
+        credential = self.access.enroll_credential(secret, identity, b"credential-" + token, b"synthetic-key", -7, 0)
+        self.access.establish_session(principal.id, credential.credential_id, token)
+        return principal, credential
+
+    def marker(self):
+        with closing(self.database.connect()) as connection:
+            row = connection.execute("SELECT value FROM application_metadata WHERE key=?",
+                                     (REVOCATION_PENDING_KEY,)).fetchone()
+        return None if row is None else row[0]
+
+    def revocation_records(self):
+        return [record for record in self.store.list_records()
+                if record.action is AuditAction.INVALIDATE_HUMAN_SESSIONS]
+
+    def breached(self, **kwargs):
+        clock = Clock()
+        kwargs.setdefault("session_revoker", self.revoker)
+        check, files, status, sink = checker(clock=clock, exception_store=self.exception_store, **kwargs)
+        self.assertTrue(check.startup().open)
+        files.files["tcp"] = self.EXTRA
+        clock.value += DAILY_SECONDS
+        self.assertFalse(check.tick().open)
+        self.assertEqual(check.verdict.reasons, (Reason.UNEXPECTED_LISTENER,))
+        files.files["tcp"] = proc(("127.0.0.1", 8080, "0A"))
+        clock.value += 300
+        return check, clock, sink
+
+    def test_reopen_after_violation_revokes_every_session_with_audit_first(self):
+        owner, owner_credential = self.session("owner@example.invalid", b"o" * 32, owner=True)
+        self.session("viewer@example.invalid", b"v" * 32)
+        pending = self.access.invite("pending@example.invalid", "Synthetic pending", (Permission.LIVE_VIEW,))
+        self.access.issue_enrollment(pending.id, b"p" * 32, NOW + timedelta(minutes=5))
+        check, clock, sink = self.breached()
+        self.assertEqual(self.marker(), "1")
+        observed = []
+        original = self.revoker.revoke_all_human_sessions
+
+        def revoke():
+            original()
+            # Committed before the verdict opens.
+            observed.append((check.access_open, len(self.revocation_records())))
+
+        with patch.object(self.revoker, "revoke_all_human_sessions", side_effect=revoke):
+            self.assertTrue(check.tick().open)
+        self.assertEqual(observed, [(False, 1)])
+        record, = self.revocation_records()
+        self.assertEqual((record.actor_category, record.target_kind, record.target_logical_id, record.outcome),
+                         (ActorCategory.SYSTEM, TargetKind.SECURITY_SETTINGS, HUMAN_SESSIONS_ID,
+                          AuditOutcome.SUCCEEDED))
+        self.assertIsNone(self.marker())
+        # Every earlier session is denied, the Owner's included.
+        for token, identity in ((b"o" * 32, "owner@example.invalid"), (b"v" * 32, "viewer@example.invalid")):
+            with self.subTest(identity=identity), self.assertRaises(AccessValidationError):
+                self.access.authorize(token, identity, Permission.LIVE_VIEW)
+        # An invitation issued under the previous generation must be issued again.
+        with self.assertRaises(AccessValidationError):
+            self.access.enroll_credential(b"p" * 32, "pending@example.invalid", b"pending", b"k", -7, 0)
+        # Signing in again with the same credential works.
+        self.access.establish_session(owner.id, owner_credential.credential_id, b"n" * 32)
+        self.assertEqual(self.access.authorize(b"n" * 32, "owner@example.invalid", Permission.LIVE_VIEW).id,
+                         owner.id)
+        # A later pass with nothing pending does not revoke again.
+        clock.value += DAILY_SECONDS
+        self.assertTrue(check.tick().open)
+        self.assertEqual(len(self.revocation_records()), 1)
+
+    def test_revocation_failure_keeps_access_closed_and_notifies(self):
+        self.session("viewer@example.invalid", b"v" * 32)
+        check, clock, sink = self.breached()
+        for target, method in ((AccessStore, "invalidate_all_sessions_on"), (AuditStore, "append_on")):
+            with self.subTest(method=method):
+                with patch.object(target, method, side_effect=OSError("synthetic failure")):
+                    self.assertFalse(check.tick().open)
+                clock.value += 300
+                self.assertEqual(check.verdict.reasons, (Reason.SESSION_REVOCATION_FAILED,))
+                # Rolled back: the old session is still valid in the store, the marker remains.
+                self.access.authorize(b"v" * 32, "viewer@example.invalid", Permission.LIVE_VIEW)
+                self.assertEqual(self.marker(), "1")
+        self.assertIn((Reason.SESSION_REVOCATION_FAILED,), [event.reasons for event in sink.events])
+        self.assertTrue(all(record.outcome is AuditOutcome.FAILED for record in self.revocation_records()))
+        self.assertTrue(check.tick().open)
+        with self.assertRaises(AccessValidationError):
+            self.access.authorize(b"v" * 32, "viewer@example.invalid", Permission.LIVE_VIEW)
+
+    def test_missing_revoker_keeps_access_closed_after_violation(self):
+        check, clock, sink = self.breached(session_revoker=None)
+        self.assertFalse(check.tick().open)
+        self.assertEqual(check.verdict.reasons, (Reason.SESSION_REVOCATION_UNAVAILABLE,))
+        self.assertEqual(sink.events[-1].reasons, (Reason.SESSION_REVOCATION_UNAVAILABLE,))
+
+    def test_restart_with_pending_revocation_revokes_before_opening(self):
+        self.session("viewer@example.invalid", b"v" * 32)
+        self.breached()
+        self.assertEqual(self.marker(), "1")
+        # A new process before the revocation happened.
+        restarted, *_ = checker(exception_store=self.exception_store, session_revoker=self.revoker)
+        self.assertTrue(restarted.startup().open)
+        self.assertIsNone(self.marker())
+        with self.assertRaises(AccessValidationError):
+            self.access.authorize(b"v" * 32, "viewer@example.invalid", Permission.LIVE_VIEW)
+
+    def test_unreadable_pending_marker_revokes(self):
+        with closing(self.database.connect()) as connection:
+            connection.execute("INSERT INTO application_metadata VALUES (?, 'corrupt')", (REVOCATION_PENDING_KEY,))
+            connection.commit()
+        check, *_ = checker(exception_store=self.exception_store, session_revoker=self.revoker)
+        self.assertTrue(check.startup().open)
+        self.assertEqual(len(self.revocation_records()), 1)
+        self.assertIsNone(self.marker())
+
+    def test_non_exposure_close_reopens_without_revocation(self):
+        self.session("viewer@example.invalid", b"v" * 32)
+        check, _, status, _ = checker(exception_store=self.exception_store, session_revoker=self.revoker,
+                                      status=Status("{}"))
+        self.assertEqual(check.startup().reasons, (Reason.MAPPING_MISSING,))
+        status.text = serve()
+        self.assertTrue(check._check(CheckKind.RETRY).open)
+        self.assertEqual(self.revocation_records(), [])
+        self.access.authorize(b"v" * 32, "viewer@example.invalid", Permission.LIVE_VIEW)
+
+    def test_exposure_marker_failure_is_reported(self):
+        revoker = FakeRevoker()
+        revoker.record_exposure = lambda: (_ for _ in ()).throw(OSError("synthetic marker failure"))
+        check, files, _, sink = checker(session_revoker=revoker, files=Files(tcp=self.EXTRA))
+        check.startup()
+        self.assertEqual(check.verdict.reasons, (Reason.UNEXPECTED_LISTENER, Reason.SESSION_REVOCATION_FAILED))
+        files.files["tcp"] = proc(("127.0.0.1", 8080, "0A"))
+        self.assertTrue(check._check(CheckKind.RETRY).open)
+        self.assertEqual(revoker.revocations, 1)
+
+    def test_revoker_requires_an_audited_access_store(self):
+        for store in (None, AccessStore(self.database), object()):
+            with self.subTest(store=store), self.assertRaises(ValueError):
+                ReservationSessionRevocation(store)

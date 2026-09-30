@@ -922,6 +922,17 @@ by the Issue #6 synthetic policy model.
   closes access. Confirm on the host whether its `::` listeners are dual-stack
   (`net.ipv6.bindv6only`, per-socket `IPV6_V6ONLY`); the check assumes they
   are and needs an exception without a family for them.
+- Breach recovery (Owner decision 2026-09-30): with an Owner and an invited
+  viewer signed in, bind a test listener to the Tailscale address on another
+  port, wait for the check to close access, then stop it. Confirm access
+  reopens only after a `system` `invalidate_human_sessions` audit record
+  exists, that both earlier sessions are refused and each person must sign in
+  again with their passkey, and that a pending invitation must be reissued.
+  Repeat with the listener removed and the service restarted before the next
+  check: startup must revoke before opening. Make the database read-only on a
+  disposable copy and confirm access stays closed with a
+  `SESSION_REVOCATION_FAILED` Owner fault. Stop `tailscaled` briefly and
+  record that the enumeration failure also forces everyone to sign in again.
 - Once the check is composed into startup and the daily worker, confirm an
   enumeration failure or timeout (for example stopping `tailscaled`, or making
   `/proc/net` unreadable) keeps human access closed and notifies the Owner,

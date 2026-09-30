@@ -1,4 +1,7 @@
-"""Durable Owner listener exceptions in the existing ``application_metadata`` table.
+"""Durable reservation state in the existing ``application_metadata`` table.
+
+Holds the Owner listener exceptions and the pending session-revocation marker
+set after a possible exposure of the reserved name.
 
 The foundation migration's key/value table holds one row under a fixed key, so
 no migration is added. ``write_on`` runs only inside the audited Owner
@@ -11,14 +14,20 @@ closed with an Owner fault instead of guessing.
 from contextlib import closing
 import json
 import sqlite3
+from uuid import UUID
 
+from app.audit.model import ActorCategory, AuditAction, AuditOutcome, TargetKind
 from app.storage.database import Database, PinnedDatabase
+from .store import AccessStore
 from .reservation import (
     AddressFamily, BindScope, ListenerException, MAX_LISTENER_EXCEPTIONS, TransportProtocol,
 )
 
 
 STORE_KEY = "auth.reservation.listener_exceptions"
+REVOCATION_PENDING_KEY = "auth.reservation.session_revocation_pending"
+# Fixed logical ID for "every human session"; the audit record names no person.
+HUMAN_SESSIONS_ID = UUID("0b6f3f64-54a9-4e0f-8f5e-7d2c9a4b1e37")
 FORMAT_VERSION = 1
 MAX_STORED_BYTES = 4096
 
@@ -100,3 +109,63 @@ class ListenerExceptionStore:
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             (STORE_KEY, encode(exceptions)),
         )
+
+
+class ReservationSessionRevocation:
+    """Revoke every human session before access reopens after a possible exposure.
+
+    Owner decision (2026-09-30, PR #91): a listener or route that answered for
+    the reserved name may have received session cookies, so reopening first
+    advances the authorization generation and invalidates every human session,
+    committing that together with a ``system`` ``invalidate_human_sessions``
+    audit record. ``record_exposure`` persists a marker so a restart before the
+    revocation still revokes before opening.
+    """
+
+    def __init__(self, access_store: AccessStore):
+        if not isinstance(access_store, AccessStore) or access_store.audit is None \
+                or access_store.audit.database != access_store.database:
+            raise ValueError("an audited access store is required")
+        self.access_store = access_store
+        self.audit = access_store.audit
+
+    def record_exposure(self) -> None:
+        with self.audit.transaction(write=True) as connection:
+            connection.execute(
+                "INSERT INTO application_metadata(key, value) VALUES (?, '1') "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (REVOCATION_PENDING_KEY,))
+
+    def exposure_pending(self) -> bool:
+        """Raise when unreadable; the caller then treats revocation as required."""
+        try:
+            with closing(self.access_store.database.connect()) as connection:
+                row = connection.execute("SELECT value FROM application_metadata WHERE key=?",
+                                         (REVOCATION_PENDING_KEY,)).fetchone()
+        except sqlite3.Error:
+            raise ListenerExceptionStoreError("REVOCATION_STATE_UNREADABLE") from None
+        if row is None:
+            return False
+        if row[0] != "1":
+            raise ListenerExceptionStoreError("REVOCATION_STATE_UNREADABLE")
+        return True
+
+    def revoke_all_human_sessions(self) -> None:
+        """Commit the revocation, marker removal and audit record together, or raise."""
+        at = self.access_store.now()
+        try:
+            with self.audit.transaction(write=True) as connection:
+                self.access_store.invalidate_all_sessions_on(connection, at=at)
+                connection.execute("DELETE FROM application_metadata WHERE key=?", (REVOCATION_PENDING_KEY,))
+                self.audit.append_on(connection, actor_category=ActorCategory.SYSTEM,
+                                     action=AuditAction.INVALIDATE_HUMAN_SESSIONS,
+                                     target_kind=TargetKind.SECURITY_SETTINGS,
+                                     target_logical_id=HUMAN_SESSIONS_ID, outcome=AuditOutcome.SUCCEEDED)
+        except Exception:
+            try:
+                self.audit.append(actor_category=ActorCategory.SYSTEM,
+                                  action=AuditAction.INVALIDATE_HUMAN_SESSIONS,
+                                  target_kind=TargetKind.SECURITY_SETTINGS,
+                                  target_logical_id=HUMAN_SESSIONS_ID, outcome=AuditOutcome.FAILED)
+            except Exception:
+                pass
+            raise

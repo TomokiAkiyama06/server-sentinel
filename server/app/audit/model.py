@@ -40,6 +40,7 @@ class AuditAction(StrEnum):
     APPROVE_HARDWARE_BASELINE = "approve_hardware_baseline"
     CHANGE_SECURITY_SETTING = "change_security_setting"
     CHANGE_ADMIN_SETTING = "change_admin_setting"
+    INVALIDATE_HUMAN_SESSIONS = "invalidate_human_sessions"
     ENROLL_OWNER_BIOMETRIC = "enroll_owner_biometric"
     REPLACE_OWNER_BIOMETRIC = "replace_owner_biometric"
     DELETE_OWNER_BIOMETRIC = "delete_owner_biometric"
@@ -72,6 +73,7 @@ ACTION_TARGETS = {
     AuditAction.APPROVE_HARDWARE_BASELINE: TargetKind.HARDWARE_BASELINE,
     AuditAction.CHANGE_SECURITY_SETTING: TargetKind.SECURITY_SETTINGS,
     AuditAction.CHANGE_ADMIN_SETTING: TargetKind.ADMIN_SETTINGS,
+    AuditAction.INVALIDATE_HUMAN_SESSIONS: TargetKind.SECURITY_SETTINGS,
     AuditAction.ENROLL_OWNER_BIOMETRIC: TargetKind.OWNER_BIOMETRIC,
     AuditAction.REPLACE_OWNER_BIOMETRIC: TargetKind.OWNER_BIOMETRIC,
     AuditAction.DELETE_OWNER_BIOMETRIC: TargetKind.OWNER_BIOMETRIC,
