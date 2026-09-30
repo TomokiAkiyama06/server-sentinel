@@ -19,15 +19,16 @@ component (`pypi:cryptography@50.0.1`).
 No other new dependency is approved by this decision. In particular a
 WebAuthn/FIDO library (`webauthn`/py_webauthn, `fido2`) is not added.
 
-## Not covered: `cffi` (MIT-0)
+## `cffi` (MIT-0): allowlist extension
 
 `cryptography` requires `cffi` on CPython. `cffi` 2.1.1 ships the MIT No
-Attribution (MIT-0) license, which is also outside the gate's allowlist. The
-owner's approval named `cryptography` only, so no approval record for `cffi` is
-written here. It needs an explicit owner decision — either an approval record
-for `pypi:cffi@2.1.1` or adding `MIT-0` to the gate's permissive allowlist —
-before the license gate can pass. `pycparser` 3.0 (BSD-3-Clause) is within the
-allowlist.
+Attribution (MIT-0) license, which was outside the gate's allowlist. On
+2026-09-30 the repository owner decided to add the exact SPDX id `MIT-0` to the
+permissive allowlist of `scripts/ci/license_gate.py` (and the preferred
+families in `docs/THIRD_PARTY_POLICY.md`), rather than recording a per-package
+approval. The gate matches the exact id only; a variant spelling or an
+expression containing `MIT-0` still needs its own approval. `pycparser` 3.0
+(BSD-3-Clause) was already within the allowlist.
 
 ## Evidence
 
