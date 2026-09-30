@@ -116,9 +116,23 @@ serials, by-id names and ports only in the private local test record.
     principal and after revoking `live:view`, confirm refusal and that no frame
     is retained without viewers.
 
-Results: **PARTIAL — 2026-09-30 の実機記録（下記）で人手不要の項目のみ実施。
-抜線・ポート入替・再起動・非serial同型機・browser viewer・deployment
-launcher/systemd の各確認は未実施。Issue #11 はこの記録では close しない。**
+Results: **PARTIAL — 2026-09-30 に実機確認を一部実施（本節の 2026-09-30
+実機記録を参照。各記録の未実施・不合格項目はそれぞれの記録に記載）。
+非serial同型機・3–4 source・低照度・browser viewer（手順 10）・deployment
+launcher/systemd（手順 1, 2, 8）は未実施。Issue #11 はこれらの記録では close しない。**
+
+For each tested camera:
+
+- [ ] exact manufacturer/model and advertised UVC resolution/FPS/pixel-format/codec capabilities are recorded locally;
+- [ ] device is discovered;
+- [ ] stable identity evidence is shown where available;
+- [ ] owner can enable/disable source;
+- [ ] preview works;
+- [ ] negotiated resolution/FPS/format is reported;
+- [ ] unplug creates `offline` event/state;
+- [ ] reconnect works when identity is unambiguous;
+- [ ] reboot/re-enumeration does not silently bind a different device through `/dev/videoN` reuse;
+- [ ] no unnecessary privileged container is required.
 
 #### 実機記録 2026-09-30（Main Server 候補、serial 付き同型 UVC × 2）
 
@@ -219,19 +233,6 @@ device path・USB port・source UUID は本記録に含めない（INTEGRITY-007
    中の descriptor close、hung driver 時の `local_uvc_stop_failed`。
 8. **3–4 source**: カメラが 2 台のため未実施。追加の UVC を接続して実施。
 9. **authorized preview（手順 10）**: 認可済み viewer route と browser 統合の完成後。
-
-For each tested camera:
-
-- [ ] exact manufacturer/model and advertised UVC resolution/FPS/pixel-format/codec capabilities are recorded locally;
-- [ ] device is discovered;
-- [ ] stable identity evidence is shown where available;
-- [ ] owner can enable/disable source;
-- [ ] preview works;
-- [ ] negotiated resolution/FPS/format is reported;
-- [ ] unplug creates `offline` event/state;
-- [ ] reconnect works when identity is unambiguous;
-- [ ] reboot/re-enumeration does not silently bind a different device through `/dev/videoN` reuse;
-- [ ] no unnecessary privileged container is required.
 
 ### Ambiguous identical-device test
 
