@@ -106,6 +106,9 @@ installed before the adapter is imported, loaded or evaluated
 or evaluation). The worker-side hook was added after the first run and the
 container smoke was re-run with it on 2026-09-30. `--network none` blocks
 delivery; the hooks, not the network namespace, are the attempt evidence.
+The smoke's pass/fail checks raise unconditionally (`SmokeFailure`) rather
+than using `assert`, so `python -O` / `PYTHONOPTIMIZE` cannot turn a worker
+failure into a zero-attempt success (regression-tested with `-O`).
 Native syscalls were not traced.
 
 ## Not established

@@ -5,6 +5,7 @@ import importlib.metadata
 from pathlib import Path
 import platform
 import socket
+import subprocess
 import sys
 import tempfile
 from types import SimpleNamespace
@@ -232,12 +233,29 @@ class ModelSmokeWorkerAuditTests(unittest.TestCase):
         self.assertEqual(result["worker_python_outbound_attempts"], 0)
 
     def test_swallowed_worker_attempt_at_load_fails_the_smoke(self):
-        with self.assertRaises(AssertionError):
+        with self.assertRaises(detector_model_smoke.SmokeFailure):
             self.check("smoke_adapter_outbound_at_start")
 
     def test_swallowed_worker_attempt_at_evaluation_fails_the_smoke(self):
-        with self.assertRaises(AssertionError):
+        with self.assertRaises(detector_model_smoke.SmokeFailure):
             self.check("smoke_adapter_outbound_at_evaluation")
+
+    def test_worker_attempt_still_fails_the_smoke_under_python_optimize(self):
+        # `python -O` strips `assert`; the failure must not depend on it.
+        tests = Path(__file__).resolve().parent
+        program = (
+            "import sys\n"
+            f"sys.path[:0] = [{str(tests)!r}, {str(tests.parent)!r}]\n"
+            "import detector_model_smoke\n"
+            "try:\n"
+            "    detector_model_smoke.isolated_check('yolox-tiny-onnx-cpu', '/unused', 4,\n"
+            "        target='detector_worker_fakes:smoke_adapter_outbound_at_evaluation')\n"
+            "except detector_model_smoke.SmokeFailure:\n"
+            "    sys.exit(0)\n"
+            "sys.exit(3)\n")
+        completed = subprocess.run([sys.executable, "-O", "-c", program],
+                                   cwd=tests.parent, capture_output=True, timeout=120)
+        self.assertEqual(completed.returncode, 0, completed.stderr.decode(errors="replace"))
 
 
 @unittest.skipUnless(reviewed_runtime(), "requires the reviewed Linux CPython 3.12 ORT closure")

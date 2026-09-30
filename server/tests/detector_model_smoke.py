@@ -16,6 +16,16 @@ OUTBOUND_EVENTS = frozenset({"socket.connect", "socket.getaddrinfo", "socket.sen
 _attempts = []
 
 
+class SmokeFailure(RuntimeError):
+    """The smoke check failed; raised unconditionally (unlike `assert`, which
+    `python -O` / PYTHONOPTIMIZE strips), before any result is emitted."""
+
+
+def require(condition, detail):
+    if not condition:
+        raise SmokeFailure(str(detail))
+
+
 def reject_outbound(event, args):
     if event in OUTBOUND_EVENTS:
         # Recorded before refusing, so an attempt whose refusal a library
@@ -89,8 +99,8 @@ def isolated_check(implementation, artifact, size, target=YOLOX_FACTORY):
         started = time.perf_counter_ns()
         result = detector.evaluate(frame)
         elapsed = time.perf_counter_ns() - started
-        assert state == "running", state
-        assert result.observation is not Observation.UNKNOWN, result.reason
+        require(state == "running", state)
+        require(result.observation is not Observation.UNKNOWN, result.reason)
         # Reaching here means the child's hook recorded no attempt.
         return {"worker_state": state, "worker_observation": result.observation.value,
                 "worker_evaluation_ns": elapsed, "worker_python_outbound_attempts": 0}
@@ -127,9 +137,10 @@ def main():
     frame = RgbFrame(UUID(int=1), UUID(int=2), 0, size, size, pixels)
     result = detector.evaluate(frame)
     evaluated = time.perf_counter_ns()
-    assert result.observation is not Observation.UNKNOWN, result.reason
+    require(result.observation is not Observation.UNKNOWN, result.reason)
     invalid = GrayFrame(UUID(int=1), UUID(int=2), 1, 1, 1, bytes([0]))
-    assert detector.evaluate(invalid).observation is Observation.UNKNOWN
+    require(detector.evaluate(invalid).observation is Observation.UNKNOWN,
+            "malformed frame was not unknown")
     print(json.dumps({
         "workload": "generated uniform RGB only; not person accuracy acceptance",
         "adapter": args.adapter,
