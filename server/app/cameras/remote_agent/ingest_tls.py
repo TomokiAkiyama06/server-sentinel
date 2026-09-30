@@ -257,6 +257,10 @@ class CaptureIngestAcceptor:
             if not peer:
                 raise IngestTlsError("capture_node_certificate_missing")
             identity = self._admission.authorize(peer)
+            # The timeout bounds only the handshake and admission. An admitted
+            # session may legitimately pause (camera offline, backpressure);
+            # session liveness is the ingest protocol's concern, not this bound.
+            tls.settimeout(None)
         except IngestTlsError as error:
             _close(tls)
             LOGGER.info("capture ingest refused: reason=%s", error.reason)

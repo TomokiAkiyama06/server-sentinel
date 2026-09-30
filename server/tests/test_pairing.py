@@ -9,7 +9,7 @@ from app.cameras.remote_agent.pairing import (
 )
 from app.audit.store import AuditStore
 from app.storage.database import Database
-from app.storage.migrations import migrate
+from app.storage.migrations import MigrationError, migrate
 from app.storage.schema import APPLICATION_MIGRATIONS
 
 
@@ -163,6 +163,42 @@ class PairingKeyBindingMigrationTests(unittest.TestCase):
             with self.subTest(digest=digest[:1]), self.assertRaises(PairingError):
                 ledger.approve(Owner(), "owner", node_id=node, public_key_digest=digest)
         ledger.approve(Owner(), "owner", node_id=active, public_key_digest=DIGEST_A)
+
+    def test_legacy_key_bound_to_two_nodes_fails_migration_closed(self):
+        cases = {
+            "two_credentials": (
+                [(DIGEST_A, "active"), (DIGEST_A, "active")], []),
+            "credential_and_enrollment": (
+                [(DIGEST_A, "active")], [(DIGEST_A, "pending")]),
+            "two_enrollments": (
+                [], [(DIGEST_A, "revoked"), (DIGEST_A, "pending")]),
+        }
+        for name, (credentials, enrollments) in cases.items():
+            with self.subTest(name):
+                temporary = tempfile.TemporaryDirectory()
+                self.addCleanup(temporary.cleanup)
+                database = Database(Path(temporary.name) / "synthetic.sqlite3")
+                renewal = APPLICATION_MIGRATIONS.index(next(
+                    m for m in APPLICATION_MIGRATIONS if m.name == "pairing_credential_renewal"))
+                with closing(database.connect()) as connection:
+                    migrate(connection, APPLICATION_MIGRATIONS[:renewal])
+                    with connection:
+                        connection.executemany(
+                            "INSERT INTO pairing_node_credentials VALUES (?, ?, ?, ?)",
+                            [(str(uuid4()), digest, SERIAL_A, state)
+                             for digest, state in credentials])
+                        connection.executemany(
+                            "INSERT INTO pairing_enrollments VALUES (?, ?, ?, ?, ?, ?, ?)",
+                            [(str(uuid4()), str(uuid4()), digest, "e" * 64, "x", 1.0, state)
+                             for digest, state in enrollments])
+                    with self.assertRaises(MigrationError):
+                        migrate(connection, APPLICATION_MIGRATIONS)
+                    applied = {row[0] for row in connection.execute(
+                        "SELECT name FROM schema_migrations")}
+                    tables = {row[0] for row in connection.execute(
+                        "SELECT name FROM sqlite_master WHERE type = 'table'")}
+                self.assertNotIn("pairing_credential_renewal", applied)
+                self.assertNotIn("pairing_key_bindings", tables)
 
 
 if __name__ == "__main__":

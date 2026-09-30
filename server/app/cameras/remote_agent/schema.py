@@ -24,8 +24,11 @@ def pairing_renewal_migration(version: int) -> Migration:
     ``pairing_key_bindings`` permanently records every node public key the
     ledger has approved, activated or staged (Owner decision 2026-09-30): a
     key is never rebound to another node, and a revoked key is never reused.
-    Rows are never deleted. Existing rows are backfilled best-effort; keys
-    superseded before this migration are not recoverable.
+    Rows are never deleted. Existing rows are backfilled; keys superseded
+    before this migration are not recoverable. If a legacy database holds one
+    key digest under two node IDs (any states), the migration fails closed and
+    startup is blocked instead of silently picking one binding; the conflicting
+    legacy rows need explicit Owner remediation before the upgrade can proceed.
     """
     return Migration(version, "pairing_credential_renewal", (
         "ALTER TABLE pairing_node_credentials ADD COLUMN not_after REAL",
@@ -36,11 +39,12 @@ def pairing_renewal_migration(version: int) -> Migration:
         "CREATE TABLE pairing_key_bindings ("
         "public_key_digest TEXT PRIMARY KEY, node_id TEXT NOT NULL, "
         "revoked INTEGER NOT NULL CHECK (revoked IN (0, 1)))",
-        "INSERT OR IGNORE INTO pairing_key_bindings (public_key_digest, node_id, revoked) "
-        "SELECT public_key_digest, node_id, state = 'revoked' FROM pairing_node_credentials",
-        "INSERT OR IGNORE INTO pairing_key_bindings (public_key_digest, node_id, revoked) "
-        "SELECT public_key_digest, node_id, MAX(state = 'revoked') FROM pairing_enrollments "
-        "GROUP BY public_key_digest, node_id",
-        "UPDATE pairing_key_bindings SET revoked = 1 WHERE public_key_digest IN ("
-        "SELECT public_key_digest FROM pairing_enrollments WHERE state = 'revoked')",
+        # Deliberately not INSERT OR IGNORE: a legacy key digest held by two
+        # node IDs violates the primary key and fails the migration closed.
+        "INSERT INTO pairing_key_bindings (public_key_digest, node_id, revoked) "
+        "SELECT public_key_digest, node_id, MAX(revoked) FROM ("
+        "SELECT public_key_digest, node_id, state = 'revoked' AS revoked "
+        "FROM pairing_node_credentials UNION ALL "
+        "SELECT public_key_digest, node_id, state = 'revoked' AS revoked "
+        "FROM pairing_enrollments) GROUP BY public_key_digest, node_id",
     ))
