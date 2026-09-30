@@ -423,6 +423,63 @@ class FrameProgressTests(unittest.TestCase):
         self.assertEqual(CameraState.ONLINE, self.controller.state)
 
 
+    def test_watchdog_rechecks_progress_before_reporting_a_stall(self):
+        capture = self.go_online()
+        self.clock.advance(self.session.frame_stall_seconds)
+        original = self.controller.frame_stalled
+
+        def worker_delivers_first(*args, **kwargs):
+            # The watchdog read an expired progress time, then the worker
+            # delivered a frame and went online before the watchdog resumed.
+            self.assertTrue(self.session.step())
+            return original(*args, **kwargs)
+
+        self.controller.frame_stalled = worker_delivers_first
+        self.assertFalse(self.session.check_frame_progress())
+        self.assertEqual(CameraState.ONLINE, self.controller.state)
+        self.assertEqual("video_capture_ready", self.events[-1].reason)
+        self.assertFalse(capture.closed)
+
+    def test_watchdog_enforces_the_reopen_deadline_while_the_worker_is_blocked(self):
+        capture = self.go_online()
+        self.clock.advance(self.session.frame_stall_seconds)
+        self.assertTrue(self.session.check_frame_progress())
+        self.assertEqual("video_frame_stalled", self.events[-1].reason)
+        self.clock.advance(self.session.frame_stall_reopen_seconds)
+        self.assertTrue(self.session.check_frame_progress())
+        self.assertEqual(CameraState.OFFLINE, self.controller.state)
+        self.assertEqual("video_capture_failed", self.events[-1].reason)
+        # The blocked worker owns the descriptor; the watchdog never closes it.
+        self.assertFalse(capture.closed)
+        self.assertFalse(self.session.check_frame_progress())
+        # When the worker returns, it tears down and reopens through the
+        # identity path instead of resuming the old descriptor.
+        self.assertFalse(self.session.step())
+        self.assertTrue(capture.closed)
+        self.assertEqual(CameraState.OFFLINE, self.controller.state)
+        self.assertTrue(self.session.step())
+        self.assertEqual(2, len(self.instances))
+        self.assertEqual(CameraState.ONLINE, self.controller.state)
+
+    def test_frame_returned_after_a_watchdog_reopen_is_not_reported_online(self):
+        capture = self.go_online()
+        read = capture.read_frame
+
+        def blocked_read(timeout):
+            # The watchdog runs while the worker is inside this read.
+            self.clock.advance(self.session.frame_stall_reopen_seconds)
+            self.assertTrue(self.session.check_frame_progress())
+            return read(timeout)
+
+        capture.read_frame = blocked_read
+        self.clock.advance(0.5)
+        self.assertFalse(self.session.step())
+        self.assertTrue(capture.closed)
+        self.assertEqual(CameraState.OFFLINE, self.controller.state)
+        self.assertEqual("video_capture_failed", self.events[-1].reason)
+        self.assertEqual(1, len(self.frames))
+
+
 class PresenceScanTests(unittest.TestCase):
     """Live capture does not open every video node on each frame."""
 

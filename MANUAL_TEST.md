@@ -114,7 +114,10 @@ device scan を `presence_scan_seconds` 間隔へ抑制）は synthetic fake で
    もう片方の frame 継続も記録する。
 2. 同一 USB bus 上でもう片方が再列挙される場合も含め、抜線・再接続を 10 回以上
    繰り返し、停止中に `online` のままの区間がないこと、frame 再開後にだけ
-   `online` へ戻ることを確認する。
+   `online` へ戻ることを確認する。`video_frame_stalled` から復帰した source の
+   negotiated profile が registry に残っていること、停止が
+   `frame_stall_reopen_seconds` を超えた場合は `offline` になり再 open されることも
+   確認する。
 3. レンズを覆う・暗室にするなど低照度で 5 分以上連続取得し、`video_frame_stalled`
    への遷移が 0 回であること（fps 低下で flap しないこと）を確認する。
 4. 30 fps × 2 台で 60 秒取得し、live 中の全 device scan が概ね

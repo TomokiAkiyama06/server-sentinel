@@ -180,8 +180,9 @@ may deliver no frame before its source is reported `degraded`
 (`video_frame_stalled`) instead of `online`; the effective window is never
 shorter than 10 negotiated frame intervals, so a slow profile cannot flap.
 `frame_stall_reopen_seconds` (0.5–300, not less than `frame_stall_seconds`,
-scaled by the same factor) is how long a stall lasts before the capture is
-closed (`offline`) and reopened. `presence_scan_seconds` (0.1–10) bounds how
+scaled by the same factor) is how long a stall lasts before the source is
+reported `offline` and the capture is closed and reopened (also enforced by the
+watchdog while the worker is blocked). `presence_scan_seconds` (0.1–10) bounds how
 often the full device scan runs while a capture is live. A UUID that is not a `local_uvc` registry source is rejected at
 startup and reported, never silently skipped. Without the object the backend
 logs `local_uvc_unconfigured` and keeps an explicit `unconfigured` local capture

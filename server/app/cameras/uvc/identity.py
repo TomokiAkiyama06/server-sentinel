@@ -127,7 +127,7 @@ class ReconnectController:
     """
 
     def __init__(self, source_id, approved, emit, *, enabled=True, store=None,
-                 explicit_candidate=None):
+                 explicit_candidate=None, flush=None):
         if not isinstance(source_id, UUID) or not isinstance(approved, DeviceEvidence):
             raise ValueError("invalid source identity")
         if type(enabled) is not bool:
@@ -158,23 +158,38 @@ class ReconnectController:
         self._profile_hold = None
         self._reason = "not_started"
         self._finished = False
-        # Serializes health transitions (and their emitted registry writes)
-        # between the source worker and the off-worker frame-progress check,
-        # so the last durable write always matches the latest state. All other
-        # controller state is mutated only by the source worker.
+        # Serializes health transitions between the source worker and the
+        # off-worker frame-progress check. It is held only for in-memory work:
+        # ``emit`` runs under it (so events and staged writes keep transition
+        # order) and must not block; ``flush(blocking=...)`` persists what was
+        # staged and runs after the lock is released, so a slow SQLite or
+        # storage write never holds the transition lock. All other controller
+        # state is mutated only by the source worker.
         self.lock = threading.RLock()
+        self.flush = flush
 
     def _persist(self):
         if self.store is not None:
             self.store.save(self.source_id, self.approved, self.requires_approval,
                             session_token=self._session_token, serial_ambiguous=self.serial_ambiguous)
 
+    def _set_state(self, state, reason):
+        """Change the in-memory state; the caller holds ``self.lock``."""
+        changed = (self.state, self._reason) != (state, reason)
+        self.state, self._reason = state, reason
+        if changed:
+            self.emit(HealthEvent(self.source_id, state, reason))
+        return changed
+
+    def _flush(self, blocking=True):
+        if self.flush is not None:
+            self.flush(blocking=blocking)
+
     def _transition(self, state, reason):
         with self.lock:
-            changed = (self.state, self._reason) != (state, reason)
-            self.state, self._reason = state, reason
-            if changed:
-                self.emit(HealthEvent(self.source_id, state, reason))
+            changed = self._set_state(state, reason)
+        if changed:
+            self._flush()
 
     def disconnected(self):
         self.bound = None
@@ -248,7 +263,8 @@ class ReconnectController:
             raise ValueError("capture has no approved binding")
         self._transition(CameraState.ONLINE, "video_capture_ready")
 
-    def frame_stalled(self, candidate, *, only_online=False, blocking=True):
+    def frame_stalled(self, candidate, *, only_online=False, blocking=True,
+                      confirm=None, capture_lost=False):
         """An open capture delivered no frame within its stall window.
 
         Reported ``degraded`` with a fixed reason: a camera that is not
@@ -258,6 +274,11 @@ class ReconnectController:
         binding are never raised to ``degraded`` here. The off-worker check
         passes ``only_online`` and ``blocking=False``: it only lowers an
         ``online`` claim and skips a tick while the worker is transitioning.
+        ``confirm`` is re-evaluated under the transition lock, so frame
+        progress recorded after the caller's snapshot wins. ``capture_lost``
+        reports a stall past the reopen bound as ``offline``
+        (``video_capture_failed``) without touching the descriptor, which the
+        (possibly blocked) worker still owns and closes when it returns.
         Returns True when the stall is (now) the reported state.
         """
         if not self.lock.acquire(blocking=blocking):
@@ -268,10 +289,17 @@ class ReconnectController:
             if (self._finished or candidate is None or self.bound != candidate
                     or self.state not in allowed):
                 return False
-            self._transition(CameraState.DEGRADED, "video_frame_stalled")
-            return True
+            if confirm is not None and not confirm():
+                return False
+            if capture_lost:
+                changed = self._set_state(CameraState.OFFLINE, "video_capture_failed")
+            else:
+                changed = self._set_state(CameraState.DEGRADED, "video_frame_stalled")
         finally:
             self.lock.release()
+        if changed:
+            self._flush(blocking)
+        return True
 
     @property
     def profile_unavailable(self):
@@ -321,11 +349,13 @@ class ReconnectController:
         """Release recovery marker only after capture is closed and state durable."""
         if self.bound is not None:
             raise ValueError("capture binding must close before shutdown")
+        # No transition lock around this storage write: with no binding the
+        # off-worker check cannot report a stall for this controller anyway.
+        if self.store is not None and self._session_token is not None:
+            self.store.save(self.source_id, self.approved, self.requires_approval,
+                            session_token=self._session_token, serial_ambiguous=self.serial_ambiguous, release=True)
+            self._session_token = None
         with self.lock:
-            if self.store is not None and self._session_token is not None:
-                self.store.save(self.source_id, self.approved, self.requires_approval,
-                                session_token=self._session_token, serial_ambiguous=self.serial_ambiguous, release=True)
-                self._session_token = None
             self._finished = True
 
     def supersede_stopped_session(self):

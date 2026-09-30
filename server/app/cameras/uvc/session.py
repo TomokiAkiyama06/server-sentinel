@@ -31,7 +31,9 @@ class CaptureSession:
     next step reopens it through the normal identity path. Any other capture
     error still closes immediately. ``check_frame_progress()`` repeats the
     stall check from a second thread, so a worker blocked inside a kernel or
-    storage call cannot leave an ``online`` claim standing.
+    storage call cannot leave an ``online`` claim standing, and past the
+    reopen bound it reports ``offline`` and requests the reopen, which the
+    worker performs (closing its own descriptor) as soon as it returns.
 
     Presence: while a capture is open, the full discovery scan (which opens
     every video node) runs at most every ``presence_scan_seconds``; a real
@@ -64,14 +66,19 @@ class CaptureSession:
         # Shared with check_frame_progress(): (candidate, stall window, reopen
         # bound) of the open, profile-accepted capture, and the monotonic time
         # of its last frame (or of opening, before the first frame).
+        # Set by the off-worker check past the reopen bound. Frame progress
+        # and this request are read and written under _progress_lock, so a
+        # frame is either recorded before the check sees it or discarded.
         self._progress_lock = threading.Lock()
         self._live = None
         self._last_progress = None
+        self._reopen_requested = False
 
     def close(self):
         with self._progress_lock:
             self._live = None
             self._last_progress = None
+            self._reopen_requested = False
         self._last_scan = None
         try:
             if self.capture is not None:
@@ -147,18 +154,42 @@ class CaptureSession:
         """Off-worker check: lower an ``online`` claim when frames stopped.
 
         Safe to call from a thread other than the source worker. It never
-        closes, opens or rebinds anything; it only reports an open capture
-        whose last frame is older than its stall window as ``degraded``.
-        Returns True when it reported the stall.
+        closes, opens or rebinds anything: an open capture whose last frame
+        is older than its stall window is reported ``degraded``, and one
+        older than its reopen bound ``offline`` (``video_capture_failed``)
+        with a reopen request the worker honours when it next runs. The age
+        is re-checked under the transition lock, so a frame delivered after
+        this snapshot is never overwritten. Returns True when it reported.
         """
         with self._progress_lock:
             live, last = self._live, self._last_progress
         if live is None or last is None:
             return False
-        candidate, window, _reopen = live
-        if self.clock() - last < window:
+        candidate, window, reopen = live
+        age = self.clock() - last
+        if age < window:
             return False
-        return self.controller.frame_stalled(candidate, only_online=True, blocking=False)
+        lost = age >= reopen
+        limit = reopen if lost else window
+
+        def confirm():
+            # Called under the controller's transition lock.
+            with self._progress_lock:
+                if (self._live is not live or self._last_progress is None
+                        or self.clock() - self._last_progress < limit):
+                    return False
+                if lost:
+                    self._reopen_requested = True
+                return True
+
+        return self.controller.frame_stalled(
+            candidate, only_online=not lost, blocking=False, confirm=confirm,
+            capture_lost=lost,
+        )
+
+    def _reopen_pending(self):
+        with self._progress_lock:
+            return self._reopen_requested
 
     def step(self, *, timeout=1.0):
         """Deliver at most one frame, returning False on offline/manual/failure."""
@@ -175,6 +206,12 @@ class CaptureSession:
             self.controller.reconcile(())
             return False
         try:
+            if self._reopen_pending():
+                # The off-worker check found this capture stalled past the
+                # reopen bound while the worker was blocked.
+                self.close()
+                self.controller.capture_failed()
+                return False
             candidate = self._presence()
             if candidate is None:
                 if self.capture is not None or not self.controller.profile_unavailable:
@@ -206,7 +243,15 @@ class CaptureSession:
             except FrameTimeout:
                 return self._stalled(candidate)
             with self._progress_lock:
-                self._last_progress = self.clock()
+                lost = self._reopen_requested
+                if not lost:
+                    self._last_progress = self.clock()
+            if lost:
+                # Already reported offline for a reopen; this late frame does
+                # not resume the old descriptor.
+                self.close()
+                self.controller.capture_failed()
+                return False
             self.controller.capture_ready(candidate)
             self.on_frame(frame)
             return True

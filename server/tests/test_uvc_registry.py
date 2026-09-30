@@ -4,6 +4,7 @@ from itertools import count
 import json
 from pathlib import Path
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
 from uuid import uuid4
@@ -94,7 +95,8 @@ class UvcRegistryTests(UvcRegistryFixture):
                          self.registry.get_source(self.source.id).health_state)
         # Off-worker check: no frame within the stall window.
         self.assertFalse(self.adapter.check_frame_progress(self.source.id))
-        now[0] += 60
+        # Past the stall window, still inside the reopen bound.
+        now[0] += 2
         self.assertTrue(self.adapter.check_frame_progress(self.source.id))
         self.assertEqual(SourceHealthState.DEGRADED,
                          self.registry.get_source(self.source.id).health_state)
@@ -104,6 +106,77 @@ class UvcRegistryTests(UvcRegistryFixture):
         self.assertEqual(SourceHealthState.ONLINE,
                          self.registry.get_source(self.source.id).health_state)
         self.assertFalse(self.adapter.check_frame_progress(uuid4()))
+
+    def _approved_online(self):
+        class PermitOwner:
+            def require_owner(self, actor_context):
+                return None
+
+        admin = OwnerAdministration(
+            OwnerAuditService(AuditStore(self.database), PermitOwner()), self.registry,
+        )
+        now = [1000.0]
+        self.adapter.monotonic = lambda: now[0]
+        admin.approve_uvc("owner", self.adapter, self.source.id, self.camera)
+        self.assertTrue(self.adapter.poll_source(self.source.id))
+        self.assertEqual(SourceHealthState.ONLINE,
+                         self.registry.get_source(self.source.id).health_state)
+        return now
+
+    def test_transient_stall_keeps_the_negotiated_profile_through_recovery(self):
+        now = self._approved_online()
+        negotiated = CaptureProfile(640, 480, 10, "MJPG")
+        self.assertEqual(negotiated,
+                         self.registry.get_source(self.source.id).negotiated_capture_profile)
+        now[0] += 2
+        self.assertTrue(self.adapter.check_frame_progress(self.source.id))
+        stalled = self.registry.get_source(self.source.id)
+        self.assertEqual(SourceHealthState.DEGRADED, stalled.health_state)
+        # The descriptor stays open with the same profile during a stall.
+        self.assertEqual(negotiated, stalled.negotiated_capture_profile)
+        now[0] += 1
+        self.assertTrue(self.adapter.poll_source(self.source.id))
+        recovered = self.registry.get_source(self.source.id)
+        self.assertEqual(SourceHealthState.ONLINE, recovered.health_state)
+        self.assertEqual(negotiated, recovered.negotiated_capture_profile)
+
+    def test_watchdog_reports_a_stall_while_the_worker_is_blocked_in_a_health_write(self):
+        now = self._approved_online()
+        entered, release = threading.Event(), threading.Event()
+        self.addCleanup(release.set)
+        original = self.registry.update_source_health
+
+        def blocking_write(source_id, **values):
+            if "last_seen_at" in values and not release.is_set():
+                # The worker holds a slow SQLite/storage write.
+                entered.set()
+                release.wait(10)
+            return original(source_id, **values)
+
+        self.registry.update_source_health = blocking_write
+        now[0] += 1.5
+        worker = threading.Thread(target=self.adapter.poll_source, args=(self.source.id,))
+        worker.start()
+        self.addCleanup(worker.join, 10)
+        self.assertTrue(entered.wait(5))
+        # No frame arrives while the worker is stuck in the write.
+        now[0] += 2
+        result = []
+        watchdog = threading.Thread(
+            target=lambda: result.append(self.adapter.check_frame_progress(self.source.id)))
+        watchdog.start()
+        watchdog.join(5)
+        self.assertFalse(watchdog.is_alive())
+        self.assertEqual([True], result)
+        self.assertEqual("video_frame_stalled", self.events[-1].reason)
+        # The durable row is behind the in-memory state until the write ends.
+        self.assertTrue(self.adapter.health_unpersisted(self.source.id))
+        release.set()
+        worker.join(10)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(SourceHealthState.DEGRADED,
+                         self.registry.get_source(self.source.id).health_state)
+        self.assertFalse(self.adapter.health_unpersisted(self.source.id))
 
     def test_uvc_approval_rolls_back_when_audit_append_fails(self):
         class PermitOwner:

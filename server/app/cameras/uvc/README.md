@@ -67,10 +67,18 @@ identity path, so a weak binding then needs the Owner again. The same check runs
 from `LocalUvcSupervisor`'s single watchdog thread through
 `LocalUvcAdapter.check_frame_progress()`: a worker blocked inside a kernel or
 SQLite call cannot run its own read timeout, so the watchdog lowers that
-source's `online` claim. It never opens, closes or rebinds a device; it takes
-the controller's transition lock non-blockingly and skips a tick while the
-worker is transitioning, and the frame sink writes `last_seen_at` under the same
-lock so the durable row always follows the latest transition.
+source's `online` claim, and past the reopen bound reports `offline`
+(`video_capture_failed`) with a reopen request that the worker performs (close,
+then reopen through the identity path) as soon as it returns; a frame it
+returns with is discarded. The watchdog never opens, closes or rebinds a device
+itself. It takes the controller's transition lock non-blockingly and re-checks
+the frame age under it, so a frame delivered after its snapshot wins. That lock
+covers in-memory work only: transitions, the negotiated profile and
+`last_seen_at` stage their values in transition order, and a per-source writer
+persists the merged latest values after the lock is released, one write at a
+time. A watchdog report that finds a write in flight leaves its values to that
+writer and marks the source unpersisted until they are durable. A transient
+stall keeps the recorded negotiated profile.
 
 While a capture is open, `LinuxDiscovery.scan()` (which opens every video node)
 runs at most every `presence_scan_seconds` instead of on every frame; an unplug

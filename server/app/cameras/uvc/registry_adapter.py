@@ -32,6 +32,59 @@ def _serial_shared(candidate, devices):
     ) > 1
 
 
+class _HealthWriter:
+    """One source's health persistence, coalesced and serialized.
+
+    Transitions stage their values in memory under the controller's
+    transition lock, so staged values always follow transition order. A
+    flush writes the merged latest values outside that lock; merging is
+    equivalent to applying the partial updates in order. At most one write
+    is in flight: a non-blocking flush that finds one running leaves its
+    values to that writer, which re-reads the staged values after its write,
+    and marks the source unpersisted meanwhile so the runtime reports the
+    in-memory state instead of a stale durable row.
+    """
+
+    def __init__(self, write, mark):
+        self._write = write
+        self._mark = mark
+        self._staged_lock = threading.Lock()
+        self._io = threading.Lock()
+        self._staged = None
+
+    def stage(self, **values):
+        with self._staged_lock:
+            self._staged = {**(self._staged or {}), **values}
+
+    def flush(self, *, blocking=True):
+        while True:
+            if not self._io.acquire(blocking=blocking):
+                with self._staged_lock:
+                    if self._staged is not None:
+                        self._mark(True)
+                return False
+            try:
+                with self._staged_lock:
+                    values, self._staged = self._staged, None
+                if values is None:
+                    return True
+                try:
+                    self._write(**values)
+                except BaseException:
+                    with self._staged_lock:
+                        # Keep the failed values under anything newer, so a
+                        # later flush retries whatever was not superseded.
+                        self._staged = {**values, **(self._staged or {})}
+                        self._mark(True)
+                    raise
+                with self._staged_lock:
+                    if self._staged is None:
+                        self._mark(False)
+                        return True
+            finally:
+                self._io.release()
+
+
 @dataclass(frozen=True)
 class PreparedApproval:
     """One Owner selection already validated against a current device scan."""
@@ -90,6 +143,8 @@ class LocalUvcAdapter:
         # still show an earlier state, so the runtime reports these in memory.
         self._unpersisted_lock = threading.Lock()
         self._unpersisted = set()
+        self._writers = {}
+        self._writers_lock = threading.Lock()
 
     def _source(self, source_id):
         if self.closed:
@@ -99,17 +154,28 @@ class LocalUvcAdapter:
             raise ValueError("source is not local UVC")
         return source
 
+    def _writer(self, source_id):
+        with self._writers_lock:
+            writer = self._writers.get(source_id)
+            if writer is None:
+                def write(**values):
+                    self.registry.update_source_health(source_id, **values)
+
+                def mark(unpersisted):
+                    with self._unpersisted_lock:
+                        if unpersisted:
+                            self._unpersisted.add(source_id)
+                        else:
+                            self._unpersisted.discard(source_id)
+
+                writer = self._writers[source_id] = _HealthWriter(write, mark)
+            return writer
+
     def _write_health(self, source_id, **values):
         """Persist one health observation and track whether it was durable."""
-        try:
-            result = self.registry.update_source_health(source_id, **values)
-        except BaseException:
-            with self._unpersisted_lock:
-                self._unpersisted.add(source_id)
-            raise
-        with self._unpersisted_lock:
-            self._unpersisted.discard(source_id)
-        return result
+        writer = self._writer(source_id)
+        writer.stage(**values)
+        writer.flush()
 
     def health_unpersisted(self, source_id):
         """True while this source's latest health write was refused or failed."""
@@ -117,48 +183,61 @@ class LocalUvcAdapter:
             return source_id in self._unpersisted
 
     def _event(self, event):
-        try:
-            self._write_health(
-                event.source_id, health_state=SourceHealthState(event.state.value),
-                image_quality_state="unknown",
-                **({"negotiated_capture_profile": None} if event.state != "online" else {}),
-            )
-        finally:
-            # The in-memory transition (runtime health, preview invalidation)
-            # is delivered even when persistence is refused, so capture loss is
-            # never represented only by a stale durable ONLINE row.
-            self.emit_audit(event)
+        """Controller callback under its transition lock: in-memory work only.
+
+        The health values are staged here and written by the controller's
+        flush after the lock is released. A transient frame stall keeps the
+        descriptor and its negotiated profile, so only other non-online
+        states clear the profile.
+        """
+        keep_profile = event.state == "online" or event.reason == "video_frame_stalled"
+        self._writer(event.source_id).stage(
+            health_state=SourceHealthState(event.state.value),
+            image_quality_state="unknown",
+            **({} if keep_profile else {"negotiated_capture_profile": None}),
+        )
+        # The in-memory transition (runtime health, preview invalidation) is
+        # delivered even when persistence is refused or still in flight, so
+        # capture loss is never represented only by a stale durable ONLINE row.
+        self.emit_audit(event)
 
     def _session(self, source, approved, *, explicit_candidate=None):
         self._write_health(source.id, health_state=SourceHealthState.OFFLINE,
                            negotiated_capture_profile=None, image_quality_state="unknown")
+        writer = self._writer(source.id)
         controller = ReconnectController(source.id, approved, self._event,
                                          enabled=source.enabled, store=self.store,
-                                         explicit_candidate=explicit_candidate)
+                                         explicit_candidate=explicit_candidate,
+                                         flush=writer.flush)
 
         def profile_sink(negotiated):
             value = negotiated.profile
-            self._write_health(
-                source.id, health_state=SourceHealthState(controller.state.value),
-                negotiated_capture_profile=CaptureProfile(
-                    width=value.width, height=value.height, fps=value.fps,
-                    pixel_format=value.pixel_format,
-                ),
-            )
+            # Stage with the state read under the transition lock (so an
+            # off-worker stall report cannot be overwritten by a stale state);
+            # write after releasing it.
+            with controller.lock:
+                writer.stage(
+                    health_state=SourceHealthState(controller.state.value),
+                    negotiated_capture_profile=CaptureProfile(
+                        width=value.width, height=value.height, fps=value.fps,
+                        pixel_format=value.pixel_format,
+                    ),
+                )
+            writer.flush()
 
         last_seen = {"at": None, "state": None}
 
         def frame_sink(frame):
             now = self.monotonic()
-            # Read the state and write it under the transition lock, so an
-            # off-worker stall report cannot be overwritten by a stale state.
             with controller.lock:
                 state = SourceHealthState(controller.state.value)
-                if (last_seen["at"] is None or last_seen["state"] is not state
-                        or now - last_seen["at"] >= self.LAST_SEEN_INTERVAL_SECONDS):
-                    self._write_health(source.id, health_state=state,
-                                       last_seen_at=self.clock())
-                    last_seen["at"], last_seen["state"] = now, state
+                due = (last_seen["at"] is None or last_seen["state"] is not state
+                       or now - last_seen["at"] >= self.LAST_SEEN_INTERVAL_SECONDS)
+                if due:
+                    writer.stage(health_state=state, last_seen_at=self.clock())
+            if due:
+                writer.flush()
+                last_seen["at"], last_seen["state"] = now, state
             self.on_frame(source.id, frame)
 
         session = CaptureSession(

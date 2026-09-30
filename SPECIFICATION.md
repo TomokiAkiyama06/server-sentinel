@@ -273,8 +273,16 @@ open during that window (a transient stall neither re-enumerates the device nor
 ends a live weak binding); a stall lasting `frame_stall_reopen_seconds` closes
 the capture (`offline`) and reopens it through the normal identity path. The
 same stall check also runs from a supervisor watchdog thread, so a worker
-blocked inside a kernel or storage call cannot keep a stalled source `online`;
-the watchdog only lowers the claim and never opens, closes or rebinds a device.
+blocked inside a kernel or storage call cannot keep a stalled source `online`,
+and past `frame_stall_reopen_seconds` it reports `offline`
+(`video_capture_failed`) with a reopen request; the watchdog never opens,
+closes or rebinds a device itself, and the worker closes and reopens through
+the identity path when it returns (a frame it returns with is discarded). The
+stall age is re-checked under the transition lock, so a frame delivered after
+the watchdog's snapshot is never overwritten. A transient stall keeps the
+recorded negotiated profile. Health writes are coalesced per source and run
+outside the transition lock; while a newer state is not yet durable the source
+is reported unpersisted.
 A stall is capture health, not scene evidence, and is never reported as an
 empty scene. While a capture is live the full device scan runs at most every
 `presence_scan_seconds` (an unplug surfaces through the open descriptor); a
