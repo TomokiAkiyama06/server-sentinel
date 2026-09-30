@@ -25,6 +25,13 @@ def capture_profile(profile):
     return VideoProfile(profile.width, profile.height, profile.fps, profile.pixel_format)
 
 
+def _serial_shared(candidate, devices):
+    """True when another connected camera reports the candidate's serial identity."""
+    return candidate.strong_key is not None and sum(
+        device.strong_key == candidate.strong_key for device in devices
+    ) > 1
+
+
 @dataclass(frozen=True)
 class PreparedApproval:
     """One Owner selection already validated against a current device scan."""
@@ -164,7 +171,9 @@ class LocalUvcAdapter:
         source = self._source(source_id)
         scan = self.discovery.scan()
         if (not source.enabled or scan.failures or scan.devices.count(candidate) != 1
-                or self.store.approved_elsewhere(source.id, candidate)):
+                or self.store.approved_elsewhere(
+                    source.id, candidate,
+                    serial_ambiguous=_serial_shared(candidate, scan.devices))):
             raise ValueError("candidate is unavailable or ambiguous")
         self.registry.update_source(source.id, capabilities={
             **source.capabilities, "uvc_formats": list(candidate.formats), "video_only": True,
@@ -189,16 +198,13 @@ class LocalUvcAdapter:
         source = self._source(source_id)
         scan = self.discovery.scan()
         session = self.sessions.get(source_id)
+        ambiguous = _serial_shared(candidate, scan.devices)
         if ((session is not None and not session.stopped) or not source.enabled
                 or scan.failures or scan.devices.count(candidate) != 1
-                or self.store.approved_elsewhere(source.id, candidate)):
+                or self.store.approved_elsewhere(source.id, candidate,
+                                                 serial_ambiguous=ambiguous)):
             raise ValueError("candidate is unavailable or approval session is active")
-        peers = sum(
-            candidate.strong_key is not None and device.strong_key == candidate.strong_key
-            for device in scan.devices
-        )
-        return PreparedApproval(source.id, candidate,
-                                candidate.strong_key is not None and peers > 1)
+        return PreparedApproval(source.id, candidate, ambiguous)
 
     def approve_source_on(self, connection, prepared):
         """Atomically persist a prepared idle Owner selection with its audit.
@@ -316,7 +322,8 @@ class LocalUvcAdapter:
                 and now - last < self.APPROVAL_CONFLICT_INTERVAL_SECONDS):
             return False
         self._conflict_checked[source.id] = now
-        return self.store.approved_elsewhere(source.id, controller.approved)
+        return self.store.approved_elsewhere(source.id, controller.approved,
+                                             serial_ambiguous=controller.serial_ambiguous)
 
     def stop_source(self, source_id):
         """Stop one source on the same serialized worker that polls it.

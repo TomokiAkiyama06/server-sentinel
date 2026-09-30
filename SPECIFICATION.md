@@ -258,7 +258,9 @@ bounded single-planar V4L2 MMAP on Linux x86_64/aarch64, reports the actual
 negotiated dimensions/FPS/FourCC, and requires an explicit capture profile.
 A negotiated profile that differs from the requested one (driver-adjusted
 size, FourCC or frame rate) is recorded and reported `degraded`, never `online`.
-One physical camera is approved for at most one enabled local source; a
+One physical camera is approved for at most one enabled local source (cameras
+that concurrently share one serial are told apart by exact live-instance
+evidence, so each twin can be mapped to its own source); a
 conflicting approval is refused, and a pre-existing duplicate makes every
 conflicting source `manual_intervention_required` rather than letting startup
 order decide.

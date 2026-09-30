@@ -95,12 +95,16 @@ class ApprovalStore:
         rows = connection.execute(_HELD_APPROVALS, (str(source_id),)).fetchall()
         return tuple(ApprovalStore._state((row[0], 0, None, 0, 0)).approved for row in rows)
 
-    def approved_elsewhere(self, source_id, evidence):
-        """True when another enabled source holds an active approval for this camera."""
+    def approved_elsewhere(self, source_id, evidence, *, serial_ambiguous=False):
+        """True when another enabled source holds an active approval for this camera.
+
+        ``serial_ambiguous`` compares exact live-instance evidence, for a
+        camera whose serial is shared by another concurrently connected one.
+        """
         connection = None
         try:
             connection = self.database.connect()
-            return any(same_physical_camera(evidence, held)
+            return any(same_physical_camera(evidence, held, serial_ambiguous=serial_ambiguous)
                        for held in self._held_on(connection, source_id))
         except (sqlite3.Error, ValueError, TypeError, KeyError):
             raise ApprovalStorageError("UVC approval state is unavailable") from None
@@ -136,7 +140,8 @@ class ApprovalStore:
             raise ApprovalStorageError("UVC approval state could not be saved") from None
         # Checked again inside the write transaction, so two concurrent
         # approvals can never both bind one physical camera.
-        if any(same_physical_camera(approved, other) for other in held):
+        if any(same_physical_camera(approved, other, serial_ambiguous=serial_ambiguous)
+               for other in held):
             raise ApprovalConflictError("camera approval is unavailable")
         try:
             evidence = json.dumps(asdict(approved), allow_nan=False, separators=(",", ":"))

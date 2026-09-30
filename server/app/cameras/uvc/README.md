@@ -66,7 +66,10 @@ selection before its transaction and commits the approval with its
 `approve_camera` audit record; the adapter exposes no unaudited public
 approval, and no HTTP management or preview route. One physical camera (same
 serial-backed identity, or the exact weak evidence) is approved for at most one
-enabled source: approving a camera another enabled source holds an active
+enabled source. When several connected cameras share one serial, that serial
+cannot tell them apart, so each such (serial-ambiguous, exact live-instance)
+selection is compared by its exact evidence instead and every twin can be
+mapped to its own source. Approving a camera another enabled source holds an active
 approval for is refused with the generic reason and audited as failed, checked
 before and again inside the audited transaction. A disabled source or one that
 requires approval holds nothing. A duplicate that predates this check (or an

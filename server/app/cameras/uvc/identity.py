@@ -63,13 +63,20 @@ class DeviceEvidence:
         return self.vendor, self.product, self.interface
 
 
-def same_physical_camera(first, second):
+def same_physical_camera(first, second, *, serial_ambiguous=False):
     """True when two pieces of evidence may name the same physical camera.
 
     A serial-backed identity compares by its strong key, so a changed device
     node or port still names the same camera. Weak (non-serial) evidence can
     only be compared exactly, including its ephemeral instance marker.
+
+    ``serial_ambiguous`` means several connected cameras share the serial of
+    ``first``. The serial then cannot tell them apart, and such an approval is
+    an exact live-instance binding that is never rebound by serial, so only
+    exactly equal evidence names the same camera.
     """
+    if serial_ambiguous:
+        return first == second
     if first.strong_key is not None or second.strong_key is not None:
         return first.strong_key == second.strong_key
     return first == second

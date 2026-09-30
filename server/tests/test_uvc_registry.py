@@ -498,6 +498,46 @@ class DuplicateApprovalTests(UvcRegistryFixture):
             connection.rollback()
         self.assertIsNone(self.adapter.store.load(self.other.id))
 
+    def test_concurrent_duplicate_serial_cameras_map_to_separate_sources(self):
+        # Two physical cameras that report one serial are told apart only by
+        # exact live-instance evidence; each can be explicitly approved once.
+        twin = replace(self.camera, device_path="/dev/video4", device_number=4)
+        self.discovery.devices = [self.camera, twin]
+        self.admin.approve_uvc("owner", self.adapter, self.source.id, self.camera)
+        self.admin.approve_uvc("owner", self.adapter, self.other.id, twin)
+        for source_id, expected in ((self.source.id, self.camera), (self.other.id, twin)):
+            approval = self.adapter.store.load(source_id)
+            self.assertEqual(expected, approval.approved)
+            self.assertTrue(approval.serial_ambiguous)
+        self.adapter.monotonic = lambda: 1e9
+        for _ in range(2):
+            self.assertTrue(self.adapter.poll_source(self.source.id))
+            self.assertTrue(self.adapter.poll_source(self.other.id))
+        for source_id in (self.source.id, self.other.id):
+            self.assertEqual(SourceHealthState.ONLINE,
+                             self.registry.get_source(source_id).health_state)
+        self.assertEqual([AuditOutcome.SUCCEEDED] * 2, self.approvals())
+
+    def test_exact_duplicate_serial_instance_is_still_refused_for_a_second_source(self):
+        twin = replace(self.camera, device_path="/dev/video4", device_number=4)
+        self.discovery.devices = [self.camera, twin]
+        self.admin.approve_uvc("owner", self.adapter, self.source.id, self.camera)
+        with self.assertRaises(ValueError):
+            self.admin.approve_uvc("owner", self.adapter, self.other.id, self.camera)
+        prepared = self.adapter.prepare_approval(self.other.id, twin)
+        with closing(self.database.connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            with self.assertRaises(ApprovalConflictError):
+                self.adapter.approve_source_on(
+                    connection, replace(prepared, candidate=self.camera))
+            connection.rollback()
+        self.assertIsNone(self.adapter.store.load(self.other.id))
+        # Once the twin is gone, the shared serial again names one camera.
+        self.discovery.devices = [replace(self.camera, device_path="/dev/video6")]
+        with self.assertRaises(ValueError):
+            self.admin.approve_uvc("owner", self.adapter, self.other.id,
+                                   self.discovery.devices[0])
+
     def test_disabled_or_latched_source_does_not_hold_the_camera(self):
         self.admin.approve_uvc("owner", self.adapter, self.source.id, self.camera)
         self.registry.update_source(self.source.id, enabled=False)
