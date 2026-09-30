@@ -125,6 +125,10 @@ class _Call:
         self._lock = threading.Lock()
         self._discard = discard
         self._abandoned = False
+        self._finished = False
+        # Releases handed to this abandoned call while it is still blocked
+        # (e.g. the descriptor a hung mode check is using); run in the worker.
+        self._deferred = []
         self._value = None
         self._error = None
 
@@ -135,7 +139,9 @@ class _Call:
         except BaseException as exc:  # Re-raised in the caller, never in the worker.
             error = exc
         with self._lock:
+            self._finished = True
             abandoned = self._abandoned
+            deferred, self._deferred = self._deferred, []
             if not abandoned:
                 self._value, self._error = value, error
                 self.done.set()
@@ -145,7 +151,23 @@ class _Call:
             # it has finished.
             if error is None:
                 self._release(value)
+            for release in deferred:
+                try:
+                    release()
+                except Exception:
+                    pass
             self.done.set()
+
+    def defer(self, release):
+        """Run ``release`` in the worker once this abandoned call returns.
+
+        False if the call has already finished (the caller keeps ownership).
+        """
+        with self._lock:
+            if self._finished or not self._abandoned:
+                return False
+            self._deferred.append(release)
+            return True
 
     def abandon(self):
         """Give up on the call; True if it had in fact already finished."""
@@ -205,6 +227,11 @@ class _BoundedCall:
             raise TimeoutError("device call exceeded bound")
         self._pending = None
         return call.result()
+
+    def defer(self, release):
+        """Hand ``release`` to the still-blocked call; False if none is blocked."""
+        pending = self._pending
+        return pending is not None and pending.defer(release)
 
     def wait(self, timeout):
         """Wait up to ``timeout`` for a blocked call; True once none is blocked."""
@@ -373,8 +400,16 @@ class UvcCapture:
         # Without a worker (thread/PID exhaustion) the descriptor is kept for a
         # later bounded retry and the source reports a cleanup failure; it is
         # never closed on the tick thread and nothing escapes poll().
-        if not self._close_off_thread(source, descriptor, self._device_bound()):
-            source.pending_close.append(descriptor)
+        if self._close_off_thread(source, descriptor, self._device_bound()):
+            return
+        # The shared worker is still blocked (e.g. an abandoned mode check on
+        # this very descriptor): that worker closes it when the call returns,
+        # so the descriptor is released even if close() has already run and
+        # no later poll would retry. Cleanup stays pending until then.
+        if source.device_call.defer(lambda: self._close_quietly(descriptor)):
+            source.closing = True
+            return
+        source.pending_close.append(descriptor)
 
     def _retry_pending_close(self, source, timeout=None):
         timeout = self._device_bound() if timeout is None else timeout

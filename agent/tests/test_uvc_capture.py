@@ -1044,6 +1044,46 @@ class CaptureTests(CaptureCase):
         self.clock.now += 5
         self.assertTrue(wait_for(lambda: self.state(capture)[1] != "capture_cleanup_failed"))
 
+    def test_shutdown_during_hung_mode_check_closes_its_descriptor_when_it_returns(self):
+        self.short_device_limits(0.2)
+        release = threading.Event()
+        self.addCleanup(release.set)
+        opened, closed = [], []
+
+        def open_device(_candidate):
+            descriptor = os.open(os.devnull, os.O_RDONLY | os.O_CLOEXEC)
+            opened.append(descriptor)
+            return descriptor
+
+        def close_device(descriptor):
+            closed.append(descriptor)
+            os.close(descriptor)
+
+        def match_profile(_fd, profile):
+            release.wait(10)
+            return profile
+
+        device = evidence(serial="SYN-MODE")
+        discovery = FakeDiscovery(device)
+        capture = self.capture(discovery, open_device=open_device, close_device=close_device,
+                               match_profile=match_profile)
+        capture.poll()
+        capture.approve(SOURCES[0], device)
+        self.assertEqual(self.state(capture)[0], "offline")
+        self.assertEqual(len(opened), 1)
+        # The mode check outlives shutdown: not a clean stop.
+        with self.assertRaises(CaptureCleanupError):
+            capture.close()
+        self.assertEqual(closed, [])
+        release.set()
+        # Old behavior: no later poll retried pending_close, so the descriptor
+        # leaked for the rest of the process lifetime.
+        self.assertTrue(wait_for(lambda: closed == opened))
+        self.assertEqual(self.launcher.pipelines, [])
+        restarted = self.capture(discovery)
+        self.assertEqual(self.state(restarted), ("manual_intervention_required",
+                                                 "owner_approval_required"))
+
     def test_consumer_backpressure_is_degraded_not_healthy(self):
         device = evidence()
         capture, pipeline = self.approved_online(FakeDiscovery(device), device)
