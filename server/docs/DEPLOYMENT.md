@@ -302,6 +302,64 @@ remains an explicit administrator action. Install the Ubuntu package providing
 `venv` for the selected Python before the first release operation; the installer
 fails closed if it cannot create the per-release environment.
 
+## Preservation inventory across update and rollback
+
+Counts, sizes and first/last timestamps cannot detect a same-size byte
+replacement or a rewritten middle audit row. Before every update and rollback,
+and again after each one, compare a content inventory taken with the installed
+release's own tool. It opens the state database read-only (SQLite `mode=ro`
+with `query_only`), never creates or migrates it, and only reads segment files:
+
+```sh
+sudo /opt/server-sentinel-main/current/venv/bin/python -I -m app.lifecycle_inventory \
+  record --runtime-root <runtime_root> --output <private-notes-dir>/before-update.json
+
+sudo /opt/server-sentinel-main/current/venv/bin/python -I -m app.lifecycle_inventory \
+  verify --runtime-root <runtime_root> --baseline <private-notes-dir>/before-update.json \
+  --report <private-notes-dir>/after-update.json
+```
+
+When the rolled-back release predates this tool, run the same commands with
+the newer release's interpreter under `releases/<version>/venv/bin/python`;
+both only read the runtime tree.
+
+`record` stores, keyed by stable logical ID: each recording's starred flag,
+catalog duration and the SHA-256 of every linked segment file as read from
+disk; a per-row and a chained SHA-256 over every retained
+`security_admin_audit_records` and `integrity_audit` row; registered camera
+source IDs and types; and Owner presence plus each principal's independent
+`live:view` / `recordings:view` grants, invitation redemption and revocation
+state. It never writes principal external identities or display names,
+credential IDs or public keys, invitation or session secret/token digests,
+permission-bearing URLs, media bytes, or audit row contents.
+
+`verify` recomputes the same inventory and compares it. A missing or changed
+recording, audit row, source, principal or invitation is `failed` (exit 1);
+rows and recordings that exist only now are listed as `appended` and are never
+counted as preserved. A recording that was still active when recorded may gain
+segments or become `interrupted`, but every segment it already had must be
+byte-identical. If a documented migration intentionally rewrites stored bytes,
+name each affected recording in advance with `--declared-rewrite <logical ID>`;
+those recordings are reported separately and must be re-verified manually, and
+any other digest change is still a failure. The comparison is `empty` (exit 3),
+never success, while the baseline lacks any of: an ordinary recording, a
+starred recording, a camera source, a security/admin audit row, the Owner, a
+`live:view`-only grant, a `recordings:view`-only grant, or a revoked principal
+or invitation. Capture-agent protected incidents are recorded as not applicable
+here (#16 / #28).
+
+Container duration probing and a decodable-playback sample need a codec and are
+not performed by the tool; the inventory marks them `manual`, and
+`MANUAL_TEST.md` section V covers them. Run `record` while no recording is being
+written if possible, since audit retention cleanup or a new recording between
+`record` and the lifecycle operation otherwise shows up in the comparison.
+
+Output files are created exclusively with mode `0600` and are refused inside
+the runtime root, inside the installed package or its virtual environment, and
+inside any Git checkout. Use an administrator-private directory outside those
+trees. The console summary carries only statuses and counts; the files contain
+logical IDs and digests and stay deployment-local, never in GitHub.
+
 Deployed acceptance of this lifecycle — systemd activation, the trusted-proxy
 boundary, real mount substitution, and the recording/audit content comparison
 across update and rollback — is recorded in `MANUAL_TEST.md` section V for Issue

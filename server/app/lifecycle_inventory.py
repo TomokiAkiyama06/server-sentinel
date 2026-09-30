@@ -1,0 +1,590 @@
+"""Deployment-local preservation inventory for update / rollback (Issue #47).
+
+``record`` captures, from a read-only view of the Main Server runtime tree:
+
+- per-recording content evidence keyed by the recording logical ID: a SHA-256
+  of every linked segment file as stored on disk, the starred flag, and the
+  catalog duration;
+- a per-row and a chained SHA-256 over every retained audit row
+  (``security_admin_audit_records`` and ``integrity_audit``), so a rewritten
+  middle row is detected even when counts and boundary timestamps match;
+- registered camera source logical IDs and types;
+- Owner presence and, per nonidentifying principal / invitation logical ID,
+  the independent ``live:view`` / ``recordings:view`` grants and revocation
+  state.
+
+``verify`` recomputes the same inventory and compares it with a recorded one.
+Rows or recordings that exist only in the current state are listed as
+``appended`` and never counted as preserved. An inventory section that is empty
+reports ``empty`` rather than success, so a comparison cannot pass vacuously.
+
+Never written: principal external identities or display names, credential IDs
+or public keys, invitation / session secret or token digests, permission-bearing
+URLs, media bytes, or audit row contents (only their digests). Container
+duration probing and decodable-playback samples need a codec and are left to
+the manual procedure in ``MANUAL_TEST.md`` section V; the output marks them
+``manual``. The output file is created exclusively with mode 0600 and is
+refused inside the runtime root, the installed package / virtual environment,
+or any Git checkout. Keep it, including its digests and logical IDs,
+deployment-local.
+"""
+
+from __future__ import annotations
+
+import argparse
+from dataclasses import dataclass
+import hashlib
+import json
+import os
+from pathlib import Path
+import sqlite3
+import stat
+import sys
+from urllib.parse import quote
+from uuid import UUID
+
+
+FORMAT = "server-sentinel-lifecycle-inventory"
+FORMAT_VERSION = 1
+CHAIN_SEED = hashlib.sha256(b"server-sentinel-lifecycle-audit-chain-v1").hexdigest()
+_CHUNK = 1024 * 1024
+
+# Coverage items that must be non-empty before a comparison can be a success.
+COVERAGE = (
+    "ordinary_recording", "starred_recording", "camera_source", "audit_record",
+    "owner", "live_view_only_grant", "recordings_view_only_grant", "revocation",
+)
+NOT_APPLICABLE = {
+    # No capture node exists in the Main-only lifecycle environment; the
+    # complete deployment acceptance of Issue #28 verifies these.
+    "capture_agent_protected_incidents": "not_applicable (#16 / #28)",
+}
+MANUAL = {
+    "container_duration": "manual",
+    "decode_verification": "manual",
+}
+
+EXIT_PRESERVED = 0
+EXIT_FAILED = 1
+EXIT_USAGE = 2
+EXIT_EMPTY = 3
+
+
+class InventoryError(RuntimeError):
+    """Refused or failed without echoing deployment paths or stored values."""
+
+
+@dataclass(frozen=True)
+class RuntimeTree:
+    root: Path
+
+    @property
+    def database(self) -> Path:
+        return self.root / "state" / "state.sqlite3"
+
+    @property
+    def recordings(self) -> Path:
+        return self.root / "recordings"
+
+
+def _digest(value: object) -> str:
+    encoded = json.dumps(value, separators=(",", ":"), sort_keys=True, ensure_ascii=True)
+    return hashlib.sha256(encoded.encode()).hexdigest()
+
+
+def _absolute(path: Path, what: str) -> Path:
+    if not isinstance(path, Path) or not path.is_absolute() or ".." in path.parts:
+        raise InventoryError(f"{what} must be an absolute path without '..'")
+    return path
+
+
+def _connect_read_only(database: Path) -> sqlite3.Connection:
+    try:
+        info = os.lstat(database)
+    except OSError:
+        raise InventoryError("state database is unavailable") from None
+    if not stat.S_ISREG(info.st_mode):
+        raise InventoryError("state database is unavailable")
+    try:
+        # mode=ro never creates a database or a fallback file; query_only also
+        # refuses any statement that would write.
+        connection = sqlite3.connect(
+            "file:" + quote(str(database)) + "?mode=ro", uri=True,
+            timeout=5, isolation_level=None,
+        )
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA query_only = ON")
+    except sqlite3.Error:
+        raise InventoryError("state database is unavailable") from None
+    return connection
+
+
+def _file_digest(directory: Path, segment_id: str) -> tuple[str | None, int | None]:
+    try:
+        name = UUID(segment_id).hex + ".seg"
+    except ValueError:
+        return None, None
+    try:
+        descriptor = os.open(directory / name,
+                             os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NOCTTY)
+    except OSError:
+        return None, None
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            return None, None
+        digest, size = hashlib.sha256(), 0
+        while chunk := os.read(descriptor, _CHUNK):
+            digest.update(chunk)
+            size += len(chunk)
+        return digest.hexdigest(), size
+    finally:
+        os.close(descriptor)
+
+
+def _tables(connection: sqlite3.Connection) -> set[str]:
+    return {row[0] for row in connection.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'")}
+
+
+def _recordings(connection, tables, directory: Path) -> dict | None:
+    if not {"recordings", "recording_links", "recording_segments"} <= tables:
+        return None
+    result = {}
+    rows = connection.execute(
+        "SELECT id, source_id, status, starred, start_ms, target_end_ms, ended_ms "
+        "FROM recordings WHERE status != 'deleting' ORDER BY id").fetchall()
+    for row in rows:
+        segments = connection.execute(
+            "SELECT s.id, s.start_ms, s.end_ms, s.sha256 FROM recording_segments s "
+            "JOIN recording_links l ON l.segment_id = s.id "
+            "WHERE l.recording_id = ? AND s.state = 'ready' ORDER BY s.start_ms, s.id",
+            (row["id"],)).fetchall()
+        items = []
+        for segment in segments:
+            digest, size = _file_digest(directory, segment["id"])
+            items.append({
+                "segment_id": segment["id"], "sha256": digest, "bytes": size,
+                "catalog_match": digest is not None and digest == segment["sha256"],
+                "media_ms": segment["end_ms"] - segment["start_ms"],
+            })
+        end = row["ended_ms"] if row["ended_ms"] is not None else row["target_end_ms"]
+        result[row["id"]] = {
+            "source_id": row["source_id"],
+            "status": row["status"],
+            "starred": bool(row["starred"]),
+            "catalog_duration_ms": end - row["start_ms"],
+            "segment_media_ms": sum(item["media_ms"] for item in items),
+            "segments": items,
+            "content_sha256": _digest([[item["segment_id"], item["sha256"]] for item in items]),
+            "container_duration": "manual",
+            "decode_verification": "manual",
+        }
+    return result
+
+
+def _chain(rows: list[tuple[str, str]]) -> str:
+    chain = CHAIN_SEED
+    for row_id, row_digest in rows:
+        chain = hashlib.sha256(f"{chain}:{row_id}:{row_digest}".encode()).hexdigest()
+    return chain
+
+
+def _audit_table(connection, tables, table, columns, order) -> dict | None:
+    if table not in tables:
+        return None
+    rows = connection.execute(
+        f"SELECT {', '.join(columns)} FROM {table} ORDER BY {order}").fetchall()
+    digests = [(str(row[0]), _digest([table, *tuple(row)])) for row in rows]
+    return {"rows": [[row_id, digest] for row_id, digest in digests],
+            "chain_sha256": _chain(digests)}
+
+
+def _audit(connection, tables) -> dict:
+    return {
+        "security_admin": _audit_table(
+            connection, tables, "security_admin_audit_records",
+            ("id", "actor_category", "action", "target_kind", "target_logical_id",
+             "occurred_at_us", "outcome"), "occurred_at_us, id"),
+        "integrity": _audit_table(
+            connection, tables, "integrity_audit", ("id", "at", "actor", "revision"), "id"),
+    }
+
+
+def _sources(connection, tables) -> dict | None:
+    if "camera_sources" not in tables:
+        return None
+    return {row["id"]: {"source_type": row["source_type"]} for row in connection.execute(
+        "SELECT id, source_type FROM camera_sources ORDER BY id")}
+
+
+def _access(connection, tables) -> dict | None:
+    if not {"access_principals", "access_principal_permissions",
+            "access_invitations", "access_credentials"} <= tables:
+        return None
+    principals = {}
+    # Only logical IDs and authorization state: never external_identity,
+    # display_name, credential IDs / keys, or secret / token digests.
+    for row in connection.execute(
+            "SELECT id, role, status, revoked_at_us FROM access_principals ORDER BY id"):
+        permissions = sorted(item[0] for item in connection.execute(
+            "SELECT permission FROM access_principal_permissions WHERE principal_id = ?",
+            (row["id"],)))
+        credentials = connection.execute(
+            "SELECT COUNT(*) FROM access_credentials "
+            "WHERE principal_id = ? AND revoked_at_us IS NULL", (row["id"],)).fetchone()[0]
+        principals[row["id"]] = {
+            "role": row["role"], "status": row["status"],
+            "revoked": row["revoked_at_us"] is not None,
+            "permissions": permissions, "active_credential_count": credentials,
+        }
+    invitations = {row["id"]: {
+        "principal_id": row["principal_id"],
+        "redeemed": row["redeemed_at_us"] is not None,
+        "revoked": row["revoked_at_us"] is not None,
+    } for row in connection.execute(
+        "SELECT id, principal_id, redeemed_at_us, revoked_at_us "
+        "FROM access_invitations ORDER BY id")}
+    return {"principals": principals, "invitations": invitations}
+
+
+def _coverage(inventory: dict) -> dict:
+    recordings = inventory["recordings"] or {}
+    audit = inventory["audit"]["security_admin"] or {"rows": []}
+    access = inventory["access"] or {"principals": {}, "invitations": {}}
+    others = [item for item in access["principals"].values() if item["role"] != "owner"]
+
+    def present(flag: bool) -> str:
+        return "present" if flag else "empty"
+    return {
+        "ordinary_recording": present(any(
+            not r["starred"] and _evidenced(r) for r in recordings.values())),
+        "starred_recording": present(any(
+            r["starred"] and _evidenced(r) for r in recordings.values())),
+        "camera_source": present(bool(inventory["camera_sources"])),
+        "audit_record": present(bool(audit["rows"])),
+        "owner": present(any(item["role"] == "owner" for item in access["principals"].values())),
+        "live_view_only_grant": present(any(
+            item["permissions"] == ["live:view"] for item in others)),
+        "recordings_view_only_grant": present(any(
+            item["permissions"] == ["recordings:view"] for item in others)),
+        "revocation": present(
+            any(item["revoked"] for item in access["principals"].values())
+            or any(item["revoked"] for item in access["invitations"].values())),
+    }
+
+
+def collect(runtime_root: Path) -> dict:
+    """Read the runtime tree without writing to it."""
+    tree = RuntimeTree(_absolute(runtime_root, "runtime root"))
+    connection = _connect_read_only(tree.database)
+    try:
+        # One read transaction gives a consistent catalog snapshot.
+        connection.execute("BEGIN")
+        tables = _tables(connection)
+        schema_version = None
+        if "schema_migrations" in tables:
+            schema_version = connection.execute(
+                "SELECT MAX(version) FROM schema_migrations").fetchone()[0]
+        inventory = {
+            "format": FORMAT, "format_version": FORMAT_VERSION,
+            "schema_version": schema_version,
+            "recordings": _recordings(connection, tables, tree.recordings),
+            "audit": _audit(connection, tables),
+            "camera_sources": _sources(connection, tables),
+            "access": _access(connection, tables),
+        }
+        connection.execute("COMMIT")
+    except sqlite3.Error:
+        raise InventoryError("state database could not be read") from None
+    finally:
+        connection.close()
+    inventory["coverage"] = _coverage(inventory)
+    inventory["not_applicable"] = dict(NOT_APPLICABLE)
+    inventory["manual"] = dict(MANUAL)
+    return inventory
+
+
+def _compare_keyed(baseline: dict | None, current: dict | None, *,
+                   declared: frozenset[str] = frozenset()) -> dict:
+    if not baseline:
+        return {"status": "empty", "preserved": [], "failed": [],
+                "appended": sorted(current or {}), "declared_rewrites": []}
+    current = current or {}
+    preserved, failed, rewrites = [], [], []
+    for key, value in sorted(baseline.items()):
+        if key not in current:
+            failed.append({"id": key, "reason": "missing"})
+        elif current[key] == value:
+            preserved.append(key)
+        elif key in declared:
+            rewrites.append(key)
+        else:
+            failed.append({"id": key, "reason": "changed"})
+    return {"status": "failed" if failed else "preserved",
+            "preserved": preserved, "failed": failed,
+            "appended": sorted(set(current) - set(baseline)),
+            "declared_rewrites": rewrites}
+
+
+def _evidenced(item: dict) -> bool:
+    return bool(item["segments"]) and all(
+        segment["sha256"] is not None for segment in item["segments"])
+
+
+def _compare_recordings(baseline: dict | None, current: dict | None, *,
+                        declared: frozenset[str]) -> dict:
+    result = _compare_keyed(baseline, current, declared=declared)
+    if result["status"] == "empty":
+        return result
+    current = current or {}
+    preserved, failed, in_progress = [], list(result["failed"]), []
+    for key in result["preserved"]:
+        if _evidenced(current[key]):
+            preserved.append(key)
+        else:
+            failed.append({"id": key, "reason": "no_readable_segment_evidence"})
+    for entry in list(failed):
+        key = entry["id"]
+        base = baseline[key]
+        now = current.get(key)
+        if entry["reason"] != "changed" or base["status"] != "active" or now is None:
+            continue
+        # A recording that was still active at record time may legitimately
+        # gain segments or become 'interrupted' across a restart; every segment
+        # it already had must still be present and byte-identical.
+        now_segments = {item["segment_id"]: item["sha256"] for item in now["segments"]}
+        if (base["starred"] == now["starred"] and _evidenced(base)
+                and all(now_segments.get(item["segment_id"]) == item["sha256"]
+                        for item in base["segments"])):
+            failed.remove(entry)
+            preserved.append(key)
+            in_progress.append(key)
+    result.update(status="failed" if failed else "preserved",
+                  preserved=sorted(preserved), failed=failed,
+                  in_progress_at_record=sorted(in_progress))
+    return result
+
+
+def _compare_audit(baseline: dict | None, current: dict | None) -> dict:
+    if not baseline or not baseline["rows"]:
+        return {"status": "empty", "preserved_rows": 0, "failed": [],
+                "appended": [row[0] for row in (current or {"rows": []})["rows"]],
+                "chain_match": None}
+    current_rows = dict((row_id, digest) for row_id, digest in (current or {"rows": []})["rows"])
+    failed, kept = [], []
+    for row_id, digest in baseline["rows"]:
+        if row_id not in current_rows:
+            failed.append({"id": row_id, "reason": "missing"})
+        elif current_rows[row_id] != digest:
+            failed.append({"id": row_id, "reason": "changed"})
+        else:
+            kept.append((row_id, digest))
+    # The chain is recomputed over the baseline row order, so a reordering or
+    # a changed row anywhere in the retained set breaks it.
+    chain_match = not failed and _chain(kept) == baseline["chain_sha256"]
+    if not failed and not chain_match:
+        failed.append({"id": None, "reason": "chain_mismatch"})
+    baseline_ids = {row[0] for row in baseline["rows"]}
+    return {"status": "failed" if failed else "preserved",
+            "preserved_rows": len(kept),
+            "failed": failed,
+            "appended": [row_id for row_id in current_rows if row_id not in baseline_ids],
+            "chain_match": chain_match}
+
+
+def compare(baseline: dict, current: dict, *, declared_rewrites=()) -> dict:
+    if (not isinstance(baseline, dict) or baseline.get("format") != FORMAT
+            or baseline.get("format_version") != FORMAT_VERSION):
+        raise InventoryError("baseline is not a lifecycle inventory")
+    declared = frozenset(str(item) for item in declared_rewrites)
+    unknown = declared - set(baseline.get("recordings") or {})
+    if unknown:
+        raise InventoryError("declared rewrite is not a recorded recording logical ID")
+    access_base = baseline.get("access") or {}
+    access_now = current.get("access") or {}
+    access_owner = any(item["role"] == "owner"
+                       for item in (access_now.get("principals") or {}).values())
+    sections = {
+        "recordings": _compare_recordings(baseline.get("recordings"),
+                                          current.get("recordings"), declared=declared),
+        "audit_security_admin": _compare_audit(
+            baseline["audit"].get("security_admin"), current["audit"].get("security_admin")),
+        "audit_integrity": _compare_audit(
+            baseline["audit"].get("integrity"), current["audit"].get("integrity")),
+        "camera_sources": _compare_keyed(baseline.get("camera_sources"),
+                                         current.get("camera_sources")),
+        "access_principals": _compare_keyed(access_base.get("principals"),
+                                            access_now.get("principals")),
+        "access_invitations": _compare_keyed(access_base.get("invitations"),
+                                             access_now.get("invitations")),
+    }
+    empty_coverage = sorted(key for key, value in baseline["coverage"].items()
+                            if value != "present")
+    failed = any(section["status"] == "failed" for section in sections.values())
+    if baseline["coverage"].get("owner") == "present" and not access_owner:
+        failed = True
+    if failed:
+        status = "failed"
+    elif empty_coverage or any(section["status"] == "empty" and name in {
+            "recordings", "audit_security_admin", "camera_sources",
+            "access_principals", "access_invitations"}
+            for name, section in sections.items()):
+        status = "empty"
+    elif sections["recordings"]["declared_rewrites"]:
+        status = "preserved_except_declared_rewrites"
+    else:
+        status = "preserved"
+    return {
+        "format": FORMAT + "-verification", "format_version": FORMAT_VERSION,
+        "status": status,
+        "schema_version": {"baseline": baseline.get("schema_version"),
+                           "current": current.get("schema_version")},
+        "owner_present": access_owner,
+        "empty_coverage": empty_coverage,
+        "sections": sections,
+        "not_applicable": dict(NOT_APPLICABLE),
+        "manual": dict(MANUAL),
+    }
+
+
+def _inside_git_checkout(path: Path) -> bool:
+    # Same marker rule as the recording store: a worktree's ``.git`` file or a
+    # clone's ``.git/HEAD``.
+    return any((parent / ".git").is_file() or (parent / ".git" / "HEAD").is_file()
+               for parent in (path, *path.parents))
+
+
+def _refused_roots(runtime_root: Path) -> tuple[Path, ...]:
+    roots = [runtime_root, Path(__file__).resolve().parents[1]]
+    if sys.prefix != sys.base_prefix:
+        roots.append(Path(sys.prefix))
+    resolved = []
+    for root in roots:
+        try:
+            resolved.append(root.resolve(strict=False))
+        except (OSError, RuntimeError):
+            resolved.append(root)
+    return tuple(resolved)
+
+
+def safe_output_path(output: Path, runtime_root: Path) -> Path:
+    """Return the destination, refusing runtime, installation and checkout trees."""
+    output = _absolute(output, "output")
+    runtime_root = _absolute(runtime_root, "runtime root")
+    try:
+        parent = output.parent.resolve(strict=True)
+    except (OSError, RuntimeError):
+        raise InventoryError("output directory is unavailable") from None
+    if not parent.is_dir():
+        raise InventoryError("output directory is unavailable")
+    target = parent / output.name
+    for root in _refused_roots(runtime_root):
+        if target == root or root in target.parents:
+            raise InventoryError(
+                "output must be outside the runtime root and the installed release")
+    if _inside_git_checkout(parent):
+        raise InventoryError("output must be outside any repository checkout")
+    return target
+
+
+def write_private(output: Path, runtime_root: Path, document: dict) -> Path:
+    target = safe_output_path(output, runtime_root)
+    payload = (json.dumps(document, indent=2, sort_keys=True) + "\n").encode()
+    try:
+        descriptor = os.open(
+            target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    except FileExistsError:
+        raise InventoryError("output already exists; choose a new file") from None
+    except OSError:
+        raise InventoryError("output could not be created") from None
+    try:
+        os.fchmod(descriptor, 0o600)
+        view = memoryview(payload)
+        while view:
+            view = view[os.write(descriptor, view):]
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    return target
+
+
+def _summary_record(inventory: dict) -> list[str]:
+    recordings = inventory["recordings"] or {}
+    lines = [f"lifecycle inventory recorded: {len(recordings)} recording(s), "
+             f"{len((inventory['audit']['security_admin'] or {'rows': []})['rows'])} "
+             "security/admin audit row(s)"]
+    mismatched = sum(1 for item in recordings.values()
+                     if not all(segment["catalog_match"] for segment in item["segments"]))
+    if mismatched:
+        lines.append(f"warning: {mismatched} recording(s) have segment files that are "
+                     "missing or differ from the catalog digest")
+    for key, value in inventory["coverage"].items():
+        lines.append(f"coverage {key}: {value}")
+    for key, value in {**inventory["not_applicable"], **inventory["manual"]}.items():
+        lines.append(f"{key}: {value}")
+    return lines
+
+
+def _summary_verify(report: dict) -> list[str]:
+    # Value-free: statuses and counts only, never IDs or digests.
+    lines = [f"lifecycle inventory verification: {report['status']}"]
+    for name, section in report["sections"].items():
+        preserved = section.get("preserved_rows", len(section.get("preserved", [])))
+        lines.append(
+            f"{name}: {section['status']} preserved={preserved} "
+            f"failed={len(section['failed'])} appended={len(section['appended'])} "
+            f"declared_rewrites={len(section.get('declared_rewrites', []))}")
+    for key in report["empty_coverage"]:
+        lines.append(f"coverage {key}: empty (not counted as preserved)")
+    for key, value in {**report["not_applicable"], **report["manual"]}.items():
+        lines.append(f"{key}: {value}")
+    return lines
+
+
+def main(arguments: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="python -m app.lifecycle_inventory",
+        description="Record or verify a deployment-local preservation inventory.")
+    commands = parser.add_subparsers(dest="command", required=True)
+    record = commands.add_parser("record")
+    record.add_argument("--runtime-root", type=Path, required=True)
+    record.add_argument("--output", type=Path, required=True)
+    verify = commands.add_parser("verify")
+    verify.add_argument("--runtime-root", type=Path, required=True)
+    verify.add_argument("--baseline", type=Path, required=True)
+    verify.add_argument("--report", type=Path)
+    verify.add_argument("--declared-rewrite", action="append", default=[],
+                        metavar="RECORDING_LOGICAL_ID")
+    args = parser.parse_args(arguments)
+    try:
+        if args.command == "record":
+            # Validate the destination before reading anything.
+            safe_output_path(args.output, args.runtime_root)
+            inventory = collect(args.runtime_root)
+            write_private(args.output, args.runtime_root, inventory)
+            print("\n".join(_summary_record(inventory)))
+            empty = any(value != "present" for value in inventory["coverage"].values())
+            return EXIT_EMPTY if empty else EXIT_PRESERVED
+        if args.report is not None:
+            safe_output_path(args.report, args.runtime_root)
+        try:
+            baseline = json.loads(_absolute(args.baseline, "baseline").read_text())
+        except (OSError, ValueError):
+            raise InventoryError("baseline could not be read") from None
+        report = compare(baseline, collect(args.runtime_root),
+                         declared_rewrites=args.declared_rewrite)
+        if args.report is not None:
+            write_private(args.report, args.runtime_root, report)
+        print("\n".join(_summary_verify(report)))
+        if report["status"] == "failed":
+            return EXIT_FAILED
+        if report["status"] == "empty":
+            return EXIT_EMPTY
+        return EXIT_PRESERVED
+    except InventoryError as exc:
+        print(f"lifecycle inventory refused: {exc}", file=sys.stderr)
+        return EXIT_USAGE
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
