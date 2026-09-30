@@ -699,15 +699,25 @@ class RecordingStore:
         """
         return self._published_segment(segment_id)["byte_length"]
 
+    def segment_sha256(self, segment_id: UUID) -> str:
+        """Journaled SHA-256 (lowercase hex) of one published segment.
+
+        Readers of `open_segment` must hash the bytes they actually consume and
+        compare them with this value; the file may still be rewritten in place
+        by the service account after it is opened.
+        """
+        return self._published_segment(segment_id)["sha256"]
+
     def open_segment(self, segment_id: UUID) -> BinaryIO:
         """Open one published segment read-only through the pinned root.
 
         The file is opened relative to the verified root descriptor without
         following symlinks and must be a single-link regular file whose size
-        matches the journal, and the opened descriptor's content must match the
-        journaled SHA-256 before it is returned (rewound to the start). The
-        caller closes the returned reader. Nothing is written, so no storage
-        reservation is taken.
+        matches the journal. Content is not pre-verified here: a separate
+        digest pass could not authenticate bytes read later from the same
+        mutable file, so the consumer hashes the bytes it copies and checks them
+        against `segment_sha256`. The caller closes the returned reader.
+        Nothing is written, so no storage reservation is taken.
         """
         row = self._published_segment(segment_id)
         expected = row["byte_length"]
@@ -722,18 +732,6 @@ class RecordingStore:
                     or info.st_size != expected
                     or info.st_size > self.limits.max_segment_bytes):
                 raise RecordingError("RECORDING_SEGMENT_UNAVAILABLE")
-            digest = hashlib.sha256()
-            remaining = info.st_size
-            while remaining:
-                part = os.read(descriptor, min(65_536, remaining))
-                if not part:
-                    raise RecordingError("RECORDING_SEGMENT_UNAVAILABLE")
-                remaining -= len(part)
-                digest.update(part)
-            if (os.read(descriptor, 1) != b""
-                    or digest.hexdigest() != row["sha256"]):
-                raise RecordingError("RECORDING_SEGMENT_UNAVAILABLE")
-            os.lseek(descriptor, 0, os.SEEK_SET)
             reader = os.fdopen(descriptor, "rb", buffering=0)
             descriptor = -1
             return reader

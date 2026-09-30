@@ -25,6 +25,7 @@ from app.media.recording.store import RootIdentity
 
 JsonScalar: TypeAlias = str | int | float | bool | None
 _SAFE_NAME = re.compile(r"^[a-z][a-z0-9_.-]{0,63}$")
+_SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
 _MEDIA_CHUNK_BYTES = 64 * 1024
 _MAX_MEDIA_ITEM_BYTES = 512 * 1024 * 1024
 _MAX_DIAGNOSTIC_BUNDLE_BYTES = 1024 * 1024 * 1024
@@ -308,10 +309,15 @@ class DiagnosticDocument:
 
 @dataclass(frozen=True)
 class MediaAsset:
-    """Bounded reader for one individually selected raw media item."""
+    """Bounded reader for one individually selected raw media item.
+
+    When `sha256` is given, the exporter hashes exactly the bytes it copies
+    into the bundle and refuses to publish the bundle unless they match.
+    """
 
     reader: BinaryIO = dataclass_field(repr=False)
     media_type: str = "application/octet-stream"
+    sha256: str | None = None
 
     def __post_init__(self) -> None:
         if not callable(getattr(self.reader, "readinto", None)):
@@ -319,6 +325,9 @@ class MediaAsset:
         if not isinstance(self.media_type, str) or not _SAFE_NAME.fullmatch(
                 self.media_type.replace("/", ".")):
             raise ValueError("media type is invalid")
+        if self.sha256 is not None and (
+                type(self.sha256) is not str or not _SHA256_HEX.fullmatch(self.sha256)):
+            raise ValueError("media digest is invalid")
 
 
 @dataclass(frozen=True)
@@ -656,12 +665,13 @@ class _DiagnosticBundleWriter:
                         with self._media_source.open_selected(media_id) as supplied:
                             if not isinstance(supplied, MediaAsset):
                                 raise TypeError
-                            asset = MediaAsset(supplied.reader, supplied.media_type)
+                            asset = MediaAsset(supplied.reader, supplied.media_type,
+                                               supplied.sha256)
                             if asset.media_type != expected.media_type:
                                 raise ValueError
                             self._write_stream(
                                 archive, f"media/{index:04d}.bin", asset.reader,
-                                expected.size_bytes)
+                                expected.size_bytes, asset.sha256)
                             del asset
                         del supplied
                 # Flush after the central directory is written, so the fsync
@@ -712,12 +722,16 @@ class _DiagnosticBundleWriter:
 
     @staticmethod
     def _write_stream(archive: ZipFile, name: str, reader: BinaryIO,
-                      expected_size: int) -> None:
+                      expected_size: int, expected_sha256: str | None = None) -> None:
+        # The digest covers exactly the bytes written to the entry, so content
+        # changed after any earlier verification cannot reach a published
+        # bundle: a mismatch fails the write before the rename.
         info = ZipInfo(name)
         info.external_attr = 0o600 << 16
         info.compress_type = ZIP_STORED
         info.file_size = expected_size
         buffer = bytearray(_MEDIA_CHUNK_BYTES)
+        digest = hashlib.sha256()
         remaining = expected_size
         with archive.open(info, "w") as target:
             while remaining:
@@ -725,11 +739,15 @@ class _DiagnosticBundleWriter:
                 count = reader.readinto(view)
                 if type(count) is not int or not 0 < count <= len(view):
                     raise ValueError("selected media size changed")
+                digest.update(view[:count])
                 target.write(view[:count])
                 remaining -= count
         extra = bytearray(1)
         if reader.readinto(extra) != 0:
             raise ValueError("selected media size changed")
+        if expected_sha256 is not None and not hmac.compare_digest(
+                digest.hexdigest(), expected_sha256):
+            raise ValueError("selected media content changed")
 
 
 class DiagnosticExportService:

@@ -178,8 +178,10 @@ no other namespace, including Owner biometric template/embedding, face crop or
 self-test artifact, is resolvable, so biometric data can never be selected. The
 segment is opened by `RecordingStore.open_segment` relative to the pinned,
 verified recording root without following symlinks, and must be a single-link
-regular file whose size and SHA-256 match the journal (a same-length rewrite is
-refused, not exported). It is opened only on the owning
+regular file whose size matches the journal. The exporter hashes exactly the
+bytes it copies into the bundle and compares them with the journaled SHA-256
+before publishing, so a same-length rewrite, including one made after the file
+was opened, fails the export and no bundle is published. It is opened only on the owning
 worker, during the export's copy, after the Owner confirmed the selection.
 
 None of these producers opens a socket, schedules work or writes. Tests seed

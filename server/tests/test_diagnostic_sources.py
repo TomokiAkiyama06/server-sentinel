@@ -683,6 +683,32 @@ class ComposedExportTests(unittest.IsolatedAsyncioTestCase):
         result = await self.export((segment_media_id(self.segment),))
         self.assertEqual(result.included_media_count, 1)
 
+    async def test_a_segment_rewritten_after_open_is_not_published(self):
+        """Regression: the digest must cover the bytes copied, not an earlier pass."""
+        stored = self.base / "recordings" / (self.segment.hex + ".seg")
+        original = stored.read_bytes()
+        store = self.runtime.recordings
+        opened = store.open_segment
+
+        def open_then_rewrite(segment_id):
+            reader = opened(segment_id)
+            # Same inode, same length: a service-account in-place rewrite that
+            # lands after the store handed out the (rewound) descriptor.
+            descriptor = os.open(stored, os.O_WRONLY)
+            try:
+                os.pwrite(descriptor, bytes(byte ^ 0xFF for byte in original), 0)
+            finally:
+                os.close(descriptor)
+            return reader
+
+        with patch.object(store, "open_segment", open_then_rewrite):
+            with self.assertRaises(DiagnosticExportError):
+                await self.export((segment_media_id(self.segment),))
+        self.assertEqual(list(self.output.iterdir()), [])
+        stored.write_bytes(original)
+        result = await self.export((segment_media_id(self.segment),))
+        self.assertEqual(result.included_media_count, 1)
+
     async def test_integrity_verdicts_are_read_on_the_owning_worker(self):
         latest = await self.runtime.call(self.runtime.integrity_store.latest)
         self.assertIsNotNone(latest)

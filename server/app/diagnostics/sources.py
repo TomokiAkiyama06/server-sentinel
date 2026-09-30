@@ -539,9 +539,13 @@ class RecordingSegmentMediaSource:
         # thread would hand a descriptor across threads, so it is refused.
         if not self._calls.on_owner():
             raise DiagnosticSourceUnavailable
-        reader = self._store().open_segment(segment)
+        store = self._store()
+        digest = store.segment_sha256(segment)
+        reader = store.open_segment(segment)
         try:
-            yield MediaAsset(reader, SEGMENT_MEDIA_TYPE)
+            # The exporter authenticates the bytes it actually copies against
+            # the journaled digest and refuses to publish on a mismatch.
+            yield MediaAsset(reader, SEGMENT_MEDIA_TYPE, digest)
         finally:
             reader.close()
 
