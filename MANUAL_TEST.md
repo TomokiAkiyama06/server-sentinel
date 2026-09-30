@@ -116,20 +116,24 @@ serials, by-id names and ports only in the private local test record.
     principal and after revoking `live:view`, confirm refusal and that no frame
     is retained without viewers.
 
-Results: **NOT RUN — hardware, authorized management route and browser viewer
-integration remain pending. Issue #11 is not closed by synthetic tests.**
+Results: **PARTIAL — 2026-09-30 に実機確認を一部実施（本節の 2026-09-30
+実機記録を参照。各記録の未実施・不合格項目はそれぞれの記録に記載）。
+非serial同型機・3–4 source・低照度・browser viewer（手順 10）・deployment
+launcher/systemd（手順 1, 2, 8）は未実施。Issue #11 はこれらの記録では close しない。**
 
 For each tested camera:
 
 - [ ] exact manufacturer/model and advertised UVC resolution/FPS/pixel-format/codec capabilities are recorded locally;
-- [ ] device is discovered;
-- [ ] stable identity evidence is shown where available;
+- [x] device is discovered;（2026-09-30 Issue #101 記録、serial 付き同型 2 台）
+- [x] stable identity evidence is shown where available;（同記録: serial 照合で復帰）
 - [ ] owner can enable/disable source;
 - [ ] preview works;
 - [ ] negotiated resolution/FPS/format is reported;
-- [ ] unplug creates `offline` event/state;
-- [ ] reconnect works when identity is unambiguous;
-- [ ] reboot/re-enumeration does not silently bind a different device through `/dev/videoN` reuse;
+- [x] unplug creates `offline` event/state;（同記録 手順 1。ただし触れていない
+      source の健全性表示は不合格。同記録を参照）
+- [x] reconnect works when identity is unambiguous;（同記録 手順 2・3）
+- [x] reboot/re-enumeration does not silently bind a different device through `/dev/videoN` reuse;
+      （同記録 手順 4: 逆順再列挙 + runtime 再起動。host 再起動は未実施）
 - [ ] no unnecessary privileged container is required.
 
 ### Ambiguous identical-device test
@@ -167,9 +171,9 @@ kernel log から確認した内容を示す。
 | 手順 | 操作（人手） | 観測結果（Claude） | 判定 |
 |---|---|---|---|
 | 0 | 片方のレンズを覆って A/B を判別 | 覆ったカメラの source だけ 30 → 約 17 fps、他方は 30 fps のまま。両方 `online` を維持 | PASS |
-| 1 | A だけを抜く | `src1` が `offline`（`approved_device_absent`）、service は継続。kernel log では A の抜線直後に同じ port で短い切断/再列挙の揺れがあり、約 7 秒後に**触れていない B** も切断・再列挙した。`src2` は `identity_matched` で自動復帰し 30 fps に戻った。ただし B の切断が表面化するまでの約 5 秒間、`src2` は **0 fps のまま `online`** を報告した | 分離・service 継続は PASS。0 fps の `online` 表示は **不具合**（下記） |
+| 1 | A だけを抜く | `src1` が `offline`（`approved_device_absent`）、service は継続。kernel log では A の抜線直後に同じ port で短い切断/再列挙の揺れがあり、約 7 秒後に**触れていない B** も切断・再列挙した。`src2` は `identity_matched` で自動復帰し 30 fps に戻った。ただし B の切断が表面化するまでの約 5 秒間、`src2` は **0 fps のまま `online`** を報告した | `src1` の `offline` 化・service 継続・`src2` の自動復帰（取り違えなし）は PASS。**「他 source が影響を受けず frame を出し続ける」は FAIL**: B の一時切断は同一バスの相互リセット（既知制約として許容、下記）だが、その間 0 fps を `online` と表示したのは **不具合**（下記） |
 | 2 | A を別ポートへ挿す | 1 回目は同じ kernel port に列挙されたため再試行。再試行では A が別 port・別 `/dev/video` node に列挙され、`src1` は serial 照合で再承認なしに `online` へ戻った | PASS |
-| 3 | A と B のポートを入れ替え、A を覆う | 両方 `online` に戻り、A を覆うと下がるのは `src1` だけ（割当は port ではなくカメラ個体に追従）。`manual_intervention_required` にならない。入替中に B 側で約 4 秒間 **0 fps のまま `online`** | PASS（0 fps の `online` は手順 1 と同じ不具合） |
+| 3 | A と B のポートを入れ替え、A を覆う | 両方 `online` に戻り、A を覆うと下がるのは `src1` だけ（割当は port ではなくカメラ個体に追従）。`manual_intervention_required` にならない。入替中に B 側で約 4 秒間 **0 fps のまま `online`** | 割当の追従は PASS。入替中の 0 fps `online` 表示は **FAIL**（手順 1 と同じ不具合） |
 | 4 | runtime 停止 → 両方抜いて逆順に挿し直し → `--approve` なしで再起動 → A を覆う | `/dev/video` 番号は承認時と逆順になったが、両方 `identity_matched` で正しい source に戻り、A を覆うと下がるのは `src1` だけ。遮蔽中に A が 1 回 USB 切断し、自動復帰した | PASS |
 | 5 | A のレンズを 30 秒覆う | fps は約 16–17 に低下（MJPEG frame size は約 150 → 220 KiB に増加）、状態は `online` のまま、V4L2 の error flag 付き frame なし、timeout なし。単体診断（1 台 / 2 台同時）と計装した runtime 実行でも同じ | 観測を記録（#22 の材料） |
 | 5 | 部屋の照明を落とす | **未実施**（室内照明を消せなかった） | 未実施 |
@@ -180,30 +184,36 @@ kernel log から確認した内容を示す。
 
 - **不具合（#11）**: frame が届かなくなっても、切断が検出されるまで `online` を
   報告し続ける（frame-stall watchdog なし。手順 1 で約 5 秒、手順 3 で約 4 秒）。
-  既知の loss を healthy と表示しない不変条件に反する。修正 PR 作成中
-  （PR #99 に積む stacked PR。#111）。修正後に手順 1・3 を再確認する。
+  既知の loss を healthy と表示しない不変条件に反する。修正は PR #99 に積む
+  stacked PR #111（stall を `degraded`（`video_frame_stalled`）として表示）。
+  **#111 はまだ実機で検証していない**。#111 の実機確認で手順 1・3 を再実施する。
 - **原因未特定の flapping**: 再起動後の実行で A を覆っている間に、約 1 分間
   `capture_failed` → reopen の反復と A の USB 切断 2 回が発生した。その後の
   3 回の実行では再現しなかった。原因は特定していない。
-- **運用上の注意（要再確認）**: 同じ USB バス上で片方のカメラが列挙されるたびに、
+- **運用上の注意（既知制約）**: 同じ USB バス上で片方のカメラが列挙されるたびに、
   約 1 秒後にもう片方がリセットされる事象を 3 回以上観測した（いずれも
-  software 側は自動復帰）。同一機種のカメラを同じ USB controller に載せると
-  互いに干渉する可能性があるため、別 controller または給電付き hub での
-  構成を推奨し、その構成で再確認する。
+  software 側は取り違えなく自動復帰）。host 側の事象として #112 に記録したが、
+  Owner 判断（2026-09-30）により、取り違えなく自動復帰する限り既知制約として
+  許容し、#112 は not planned で close した。一時切断中の健全性表示が正しいことは
+  #111 側で確認する。別 controller / 給電付き hub での再確認は任意
+  （#101・#11 の close や merge を妨げない）。
 
 Issue #101 の要再確認項目:
 
 - [x] 手順 0: 識別・両 source `online`・`audio_fds=0`;
-- [x] 手順 1: `src1` のみ `offline`、service 継続、`src2` 自動復帰;
+- [x] 手順 1: `src1` のみ `offline`、service 継続、`src2` は取り違えなく自動復帰;
+- [ ] 手順 1: 触れていない `src2` が影響を受けず frame を出し続けること
+      （不合格: 同一バスの相互リセットで一時切断。相互リセット自体は既知制約として
+      許容。その間の表示は次項）;
 - [ ] 手順 1・3: 切断/入替中に 0 fps の source が `online` を表示しないこと
-      （stall watchdog 修正後に再確認）;
+      （不合格。#111 で修正中、#111 の実機確認で再実施）;
 - [x] 手順 2: 別 port・別 node で serial 照合により再承認なしで復帰;
 - [x] 手順 3: port 入替で割当がカメラ個体に追従;
 - [x] 手順 4: 再列挙・逆順 node でも再承認なしで正しい source に復帰;
 - [x] 手順 5: レンズ遮蔽 30 秒の fps・状態を記録;
 - [ ] 手順 5: 室内照明を落とした低照度での fps・状態（未実施）;
 - [ ] 遮蔽中の `capture_failed` / reopen flapping と USB 切断（原因未特定、再現せず）;
-- [ ] 別 USB controller / 給電付き hub 構成での相互リセットの有無。
+- [ ] （任意）別 USB controller / 給電付き hub 構成での相互リセットの有無。
 
 ## B. Remote Linux capture node / `media-capture-agent`
 
