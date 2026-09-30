@@ -101,7 +101,11 @@ gst-launch-1.0 -q --gst-plugin-load=<dir>/libgstcoreelements.so,<dir>/libgstvide
   pipeline requests. A profile the camera does not offer reports a stable
   `capture_unsupported`: no process, no backoff relaunch, and the node is not
   reopened until discovery returns different evidence for the camera (replug)
-  or the Owner re-approves it; a profile change takes effect on restart and is
+  or the Owner re-approves it (the approved binding is held, without any open
+  descriptor or process, only while discovery returns the identical device
+  instance, so a serial-less camera stays `capture_unsupported`; after a
+  replug a serial-less camera needs Owner re-approval as usual); a profile
+  change takes effect on restart and is
   checked then. A failing enumeration ioctl is `capture_failed` with backoff; a
   driver without frame size/interval enumeration (`ENOTTY`), or one that
   advertises a mode it then rejects, is left to pipeline negotiation, which

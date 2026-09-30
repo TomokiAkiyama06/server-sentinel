@@ -557,10 +557,13 @@ class UvcCapture:
 
     @staticmethod
     def _unsupported(source, candidate):
-        # Not a transient failure: no backoff relaunch. Releasing the binding
-        # keeps identity rules unchanged (a weak binding needs an open capture).
+        # Not a transient failure: no backoff relaunch. The binding is kept
+        # while discovery returns this exact evidence (same device instance),
+        # so a serial-less camera stays capture_unsupported instead of turning
+        # into an ambiguous reconnect; it never launches while the verdict
+        # holds, and a replug (new instance) follows the normal identity rules.
         source.unsupported = candidate
-        source.controller.capture_failed()
+        source.controller.capture_unsupported()
         source.failure = "capture_unsupported"
 
     # -- health --------------------------------------------------------------

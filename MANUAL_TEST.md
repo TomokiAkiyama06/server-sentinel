@@ -243,6 +243,7 @@ and discarded; no device values recorded.
 
 Pending: replug and Owner re-approval re-evaluation on hardware; a camera
 advertising stepwise/continuous sizes or fractional (e.g. 30000/1001) intervals;
+a serial-less camera staying `capture_unsupported` across polls (mock-only so far);
 the remote capture node.
 
 ## C. Room-overview camera placement

@@ -360,7 +360,12 @@ frame sizes and intervals the opened approved node advertises (read-only
 discrete/stepwise/continuous; an offered rate within 1 % satisfies the requested
 fps and is then requested exactly, e.g. 30000/1001 for 30). A profile not offered
 is a stable `capture_unsupported` with no pipeline and no backoff relaunch until
-the device evidence changes (e.g. replug) or the Owner re-approves; a driver that
+the device evidence changes (e.g. replug) or the Owner re-approves. While that
+verdict holds, the approved binding is kept only as long as discovery returns the
+identical evidence (same kernel device instance), so a serial-less camera stays
+`capture_unsupported` instead of becoming an ambiguous reconnect; it never
+authorizes a launch, and a replug follows the normal identity rules (a serial-less
+camera then needs Owner re-approval). A driver that
 does not implement the enumeration, or advertises a mode it then refuses, is still
 caught by pipeline negotiation (`capture_failed`). The check is not identity
 evidence.

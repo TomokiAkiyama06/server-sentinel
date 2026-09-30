@@ -925,6 +925,38 @@ class CaptureTests(CaptureCase):
         self.assertEqual(self.launcher.pipelines, [])
         self.assertEqual(self.launcher.descriptors, [])
 
+    def test_serial_less_unsupported_camera_stays_stable_while_continuously_present(self):
+        # The same kernel device instance (identical evidence, including its
+        # instance token) stays present: the verdict is kept without asking
+        # the Owner again, and nothing is reopened or launched.
+        device = evidence(serial=None)
+        capture, discovery, _device, calls = self.unsupported_capture(set(), device=device)
+        capture.approve(SOURCES[0], device)
+        for _tick in range(6):
+            self.assertEqual(self.state(capture), ("offline", "capture_unsupported"))
+            self.clock.now += 70
+        # A discovery failure proves nothing either way; afterwards the same
+        # instance is still the approved one.
+        discovery.failures = 1
+        self.assertEqual(self.state(capture), ("offline", "discovery_failed"))
+        discovery.failures = 0
+        self.assertEqual(self.state(capture), ("offline", "capture_unsupported"))
+        self.assertEqual(calls, {"open": 1, "match": 1})
+        self.assertEqual(self.launcher.pipelines, [])
+        # A replug is a new instance of a serial-less camera: identity rules are
+        # unchanged and only the Owner can bind it again.
+        discovery.devices = [evidence(serial=None, token=(1, 999, 2))]
+        self.assertEqual(self.state(capture),
+                         ("manual_intervention_required", "identity_ambiguous"))
+        discovery.devices = []
+        self.state(capture)
+        discovery.devices = [device]
+        self.assertEqual(self.state(capture),
+                         ("manual_intervention_required", "identity_ambiguous"))
+        self.assertEqual(calls, {"open": 1, "match": 1})
+        self.assertEqual(self.launcher.pipelines, [])
+        capture.close()
+
     def test_replug_or_owner_reapproval_re_evaluates_unsupported_profile(self):
         supported = set()
         capture, discovery, device, calls = self.unsupported_capture(supported)
