@@ -165,9 +165,10 @@ class RuntimeFixture(unittest.TestCase):
         with self.frame_lock:
             return sum(1 for item in self.frames if item[0] == source_id)
 
-    def runtime(self, *source_ids, health_sink=None, **kwargs):
+    def runtime(self, *source_ids, health_sink=None, configuration_timing=None, **kwargs):
         runtime = LocalUvcRuntime(
-            LocalUvcConfiguration(tuple(source_ids), **FAST), self.registry,
+            LocalUvcConfiguration(tuple(source_ids), **FAST, **(configuration_timing or {})),
+            self.registry,
             on_frame=self.on_frame, health_sink=health_sink,
             discovery=self.discovery, capture_factory=self.captures, **kwargs,
         )
@@ -202,6 +203,29 @@ class RuntimeLifecycleTests(RuntimeFixture):
         self.assertEqual([], self.captures.instances)
         self.assertEqual(0, self.frame_count(source.id))
         self.assertIs(self.health(source.id), SourceHealthState.OFFLINE)
+
+    def test_worker_blocked_without_frames_is_not_left_online(self):
+        # Reproduces the hardware finding: the worker is stuck inside a call
+        # and delivers no frame, so its own read timeout never runs. The
+        # supervisor watchdog must still lower the online claim, and only
+        # resumed frames restore it.
+        source = self.source()
+        runtime = self.runtime(source.id, configuration_timing=dict(
+            frame_stall_seconds=0.25, frame_stall_reopen_seconds=30.0))
+        runtime.start()
+        runtime.reapprove(self.admin, "synthetic-owner", source.id, self.camera)
+        self.assertTrue(self.wait_health(source.id, SourceHealthState.ONLINE))
+        block = threading.Event()
+        self.captures.block = block
+        self.addCleanup(block.set)
+        self.assertTrue(self.wait_health(source.id, SourceHealthState.DEGRADED, timeout=3.0))
+        self.assertIs(CameraState.DEGRADED, runtime.status().sources[0].camera_state)
+        # The descriptor was not torn down by the watchdog.
+        self.assertEqual(1, len(self.captures.instances))
+        self.assertFalse(self.captures.instances[0].closed)
+        self.captures.block = None
+        block.set()
+        self.assertTrue(self.wait_health(source.id, SourceHealthState.ONLINE))
 
     def test_start_reapprove_stream_and_stop(self):
         source = self.source()
@@ -1326,6 +1350,20 @@ class ConfigurationParsingTests(unittest.TestCase):
         self.assertEqual(2.0, parsed.retry_delay_seconds)
         self.assertNotIn(identities[0], repr(parsed))
 
+    def test_frame_progress_timing_is_parsed_and_bounded(self):
+        identity = str(uuid4())
+        parsed = parse_local_uvc({"source_ids": [identity]})
+        self.assertEqual(1.0, parsed.frame_stall_seconds)
+        self.assertEqual(5.0, parsed.frame_stall_reopen_seconds)
+        self.assertEqual(1.0, parsed.presence_scan_seconds)
+        parsed = parse_local_uvc({
+            "source_ids": [identity], "frame_stall_seconds": 2,
+            "frame_stall_reopen_seconds": 10, "presence_scan_seconds": 0.5,
+        })
+        self.assertEqual((2.0, 10.0, 0.5), (
+            parsed.frame_stall_seconds, parsed.frame_stall_reopen_seconds,
+            parsed.presence_scan_seconds))
+
     def test_invalid_configuration_is_value_free(self):
         identity = str(uuid4())
         cases = [
@@ -1340,6 +1378,14 @@ class ConfigurationParsingTests(unittest.TestCase):
             {"source_ids": [identity], "retry_delay_seconds": True},
             {"source_ids": [identity], "join_timeout_seconds": float("nan")},
             {"source_ids": [identity], "retry_delay_seconds": 1e9},
+            {"source_ids": [identity], "frame_stall_seconds": 0},
+            {"source_ids": [identity], "frame_stall_seconds": 1e9},
+            {"source_ids": [identity], "frame_stall_reopen_seconds": float("inf")},
+            {"source_ids": [identity], "presence_scan_seconds": 0},
+            {"source_ids": [identity], "presence_scan_seconds": 3600},
+            # Reopen before the stall is even reported would hide the stall.
+            {"source_ids": [identity], "frame_stall_seconds": 5,
+             "frame_stall_reopen_seconds": 2},
             {"source_ids": [7]},
         ]
         for value in cases:

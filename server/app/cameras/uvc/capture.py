@@ -36,6 +36,14 @@ class CaptureError(RuntimeError):
     """Safe capture failure; never attach frame bytes or OS exception values."""
 
 
+class FrameTimeout(CaptureError):
+    """No frame was dequeued within the wait; the stream itself is still open.
+
+    The session decides whether this is a reportable stall or a reason to
+    reopen; every other ``CaptureError`` tears the capture down immediately.
+    """
+
+
 @dataclass(frozen=True)
 class VideoProfile:
     width: int
@@ -205,7 +213,7 @@ class MmapCapture:
             while True:
                 remaining = deadline - self.clock()
                 if remaining <= 0 or not self.wait([self.fd], [], [], remaining)[0]:
-                    raise CaptureError("video frame timed out")
+                    raise FrameTimeout("video frame timed out")
                 buffer = _buffer()
                 try:
                     self.ioctl(self.fd, DQBUF, buffer, True)

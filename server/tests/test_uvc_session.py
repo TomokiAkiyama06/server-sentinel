@@ -2,7 +2,11 @@ from dataclasses import replace
 import unittest
 from uuid import UUID
 
-from app.cameras.uvc.capture import CaptureError, NegotiatedVideo, VideoFrame, VideoProfile
+import threading
+
+from app.cameras.uvc.capture import (
+    CaptureError, FrameTimeout, NegotiatedVideo, VideoFrame, VideoProfile,
+)
 from app.cameras.uvc.discovery import DiscoveryResult
 from app.cameras.uvc.identity import CameraState, DeviceEvidence, ReconnectController
 from app.cameras.uvc.session import CaptureSession
@@ -16,6 +20,17 @@ class Discovery:
         return DiscoveryResult(tuple(self.devices), 0)
 
 
+class FakeClock:
+    def __init__(self):
+        self.now = 1000.0
+
+    def __call__(self):
+        return self.now
+
+    def advance(self, seconds):
+        self.now += seconds
+
+
 class SyntheticCapture:
     instances = []
     # A driver that silently adjusts an unsupported request, like V4L2 S_FMT.
@@ -25,6 +40,9 @@ class SyntheticCapture:
         self.candidate, self.profile, self.verify = candidate, profile, verify_identity
         self.closed = False
         self.failed = False
+        # Synthetic stall: read_frame times out like a V4L2 select() timeout.
+        self.stalled = False
+        self.timeouts = []
         self.instances.append(self)
 
     def open(self):
@@ -36,6 +54,9 @@ class SyntheticCapture:
     def read_frame(self, timeout):
         if self.failed:
             raise CaptureError("synthetic unplug")
+        if self.stalled:
+            self.timeouts.append(timeout)
+            raise FrameTimeout("synthetic frame timeout")
         return VideoFrame(b"synthetic", 0, 1.0)
 
     def close(self):
@@ -49,16 +70,22 @@ class SessionTests(unittest.TestCase):
         self.events, self.frames, self.profiles = [], [], []
         self.controller = ReconnectController(UUID(int=1), self.camera, self.events.append)
         self.profile = VideoProfile(640, 480, 10, "MJPG")
+        self.clock = FakeClock()
         self.session = CaptureSession(
             self.controller, self.discovery, self.profile, on_frame=self.frames.append,
             on_profile=self.profiles.append, capture_factory=SyntheticCapture,
+            clock=self.clock,
         )
+
+    def rescan_due(self):
+        self.clock.advance(self.session.presence_scan_seconds)
 
     def test_unplug_audits_offline_then_serial_reconnect_delivers_video(self):
         self.assertTrue(self.session.step())
         self.assertEqual(self.controller.state, CameraState.ONLINE)
         old_capture = self.session.capture
         self.discovery.devices = []
+        self.rescan_due()
         self.assertFalse(self.session.step())
         self.assertTrue(old_capture.closed)
         self.assertEqual(self.events[-1].reason, "device_disconnected")
@@ -77,6 +104,7 @@ class SessionTests(unittest.TestCase):
     def test_manual_ambiguity_stops_active_capture(self):
         self.session.step()
         self.discovery.devices.append(replace(self.camera, device_path="/dev/video1"))
+        self.rescan_due()
         self.assertFalse(self.session.step())
         self.assertEqual(self.controller.state, CameraState.MANUAL)
         self.assertIsNone(self.session.capture)
@@ -247,6 +275,231 @@ class ProfileNegotiationTests(unittest.TestCase):
         self.assertFalse(self.session.step())
         self.assertEqual(CameraState.MANUAL, self.controller.state)
         self.assertEqual(1, len(self.instances))
+
+
+class FrameProgressTests(unittest.TestCase):
+    """A live capture that stops delivering frames is never reported online."""
+
+    def setUp(self):
+        self.camera = DeviceEvidence("/dev/video0", "synthetic", "model", "serial")
+        self.discovery = CountingDiscovery([self.camera])
+        self.events, self.frames, self.profiles = [], [], []
+        self.controller = ReconnectController(UUID(int=1), self.camera, self.events.append)
+        self.clock = FakeClock()
+        self.instances = []
+        self.session = self.make_session(VideoProfile(1920, 1080, 30, "MJPG"))
+
+    def make_session(self, profile, **timing):
+        def factory(candidate, profile, *, verify_identity):
+            capture = SyntheticCapture(candidate, profile, verify_identity=verify_identity)
+            self.instances.append(capture)
+            return capture
+
+        return CaptureSession(
+            self.controller, self.discovery, profile, on_frame=self.frames.append,
+            on_profile=self.profiles.append, capture_factory=factory, clock=self.clock,
+            **timing,
+        )
+
+    def go_online(self):
+        self.assertTrue(self.session.step())
+        self.assertEqual(CameraState.ONLINE, self.controller.state)
+        return self.session.capture
+
+    def test_stall_degrades_without_teardown_and_recovers_on_next_frame(self):
+        capture = self.go_online()
+        capture.stalled = True
+        self.clock.advance(self.session.frame_stall_seconds)
+        self.assertFalse(self.session.step())
+        self.assertEqual(CameraState.DEGRADED, self.controller.state)
+        self.assertEqual("video_frame_stalled", self.events[-1].reason)
+        # The descriptor (and with it any live weak binding) is kept open.
+        self.assertIs(capture, self.session.capture)
+        self.assertFalse(capture.closed)
+        self.assertEqual(1, len(self.instances))
+        self.assertEqual(1, len(self.frames))
+        capture.stalled = False
+        self.assertTrue(self.session.step())
+        self.assertEqual(CameraState.ONLINE, self.controller.state)
+        self.assertEqual("video_capture_ready", self.events[-1].reason)
+        self.assertEqual(1, len(self.instances))
+
+    def test_read_waits_no_longer_than_the_stall_window(self):
+        self.session = self.make_session(VideoProfile(1920, 1080, 30, "MJPG"),
+                                         frame_stall_seconds=0.5)
+        capture = self.go_online()
+        capture.stalled = True
+        self.assertFalse(self.session.step(timeout=1.0))
+        self.assertLessEqual(capture.timeouts[-1], 0.5)
+
+    def test_timeout_inside_the_window_stays_online(self):
+        capture = self.go_online()
+        capture.stalled = True
+        self.clock.advance(self.session.frame_stall_seconds / 2)
+        self.assertFalse(self.session.step())
+        self.assertEqual(CameraState.ONLINE, self.controller.state)
+        self.assertFalse(capture.closed)
+
+    def test_low_negotiated_frame_rate_widens_the_window(self):
+        # A dark scene or a slow profile legitimately delivers frames far apart;
+        # the window scales with the negotiated frame interval so it cannot flap.
+        self.session = self.make_session(VideoProfile(640, 480, 2, "MJPG"))
+        capture = self.go_online()
+        capture.stalled = True
+        self.clock.advance(3.0)
+        self.assertFalse(self.session.step())
+        self.assertEqual(CameraState.ONLINE, self.controller.state)
+        self.clock.advance(2.0)
+        self.assertFalse(self.session.step())
+        self.assertEqual(CameraState.DEGRADED, self.controller.state)
+        self.assertEqual("video_frame_stalled", self.events[-1].reason)
+
+    def test_prolonged_stall_closes_and_reopens_capture(self):
+        capture = self.go_online()
+        capture.stalled = True
+        self.clock.advance(self.session.frame_stall_seconds)
+        self.assertFalse(self.session.step())
+        self.clock.advance(self.session.frame_stall_reopen_seconds)
+        self.assertFalse(self.session.step())
+        self.assertTrue(capture.closed)
+        self.assertIsNone(self.session.capture)
+        self.assertEqual(CameraState.OFFLINE, self.controller.state)
+        self.assertEqual("video_capture_failed", self.events[-1].reason)
+        self.assertTrue(self.session.step())
+        self.assertEqual(2, len(self.instances))
+        self.assertEqual(CameraState.ONLINE, self.controller.state)
+
+    def test_first_frame_never_arriving_is_reported_stalled_not_online(self):
+        def stalled_factory(candidate, profile, *, verify_identity):
+            capture = SyntheticCapture(candidate, profile, verify_identity=verify_identity)
+            capture.stalled = True
+            self.instances.append(capture)
+            return capture
+
+        self.session.capture_factory = stalled_factory
+        self.clock.advance(0)
+        self.assertFalse(self.session.step())
+        self.assertEqual(CameraState.DEGRADED, self.controller.state)
+        self.clock.advance(self.session.frame_stall_seconds)
+        self.assertFalse(self.session.step())
+        self.assertEqual(CameraState.DEGRADED, self.controller.state)
+        self.assertEqual("video_frame_stalled", self.events[-1].reason)
+        self.assertEqual([], self.frames)
+
+    def test_watchdog_degrades_online_source_while_worker_is_blocked(self):
+        capture = self.go_online()
+        # The worker thread is blocked (e.g. in a kernel call) and cannot run
+        # its own check; a second thread still sees no frame progress.
+        self.assertFalse(self.session.check_frame_progress())
+        self.clock.advance(self.session.frame_stall_seconds)
+        checker = threading.Thread(target=self.session.check_frame_progress)
+        checker.start()
+        checker.join(5)
+        self.assertEqual(CameraState.DEGRADED, self.controller.state)
+        self.assertEqual("video_frame_stalled", self.events[-1].reason)
+        self.assertFalse(capture.closed)
+        self.assertTrue(self.session.step())
+        self.assertEqual(CameraState.ONLINE, self.controller.state)
+
+    def test_watchdog_never_raises_a_closed_or_offline_source(self):
+        self.go_online()
+        self.session.close()
+        self.clock.advance(60)
+        self.assertFalse(self.session.check_frame_progress())
+        self.assertEqual(CameraState.OFFLINE, self.controller.state)
+        self.assertEqual("video_capture_closed", self.events[-1].reason)
+
+    def test_watchdog_skips_when_controller_is_busy(self):
+        self.go_online()
+        self.clock.advance(self.session.frame_stall_seconds)
+        with self.controller.lock:
+            done = threading.Event()
+            result = []
+            thread = threading.Thread(
+                target=lambda: (result.append(self.session.check_frame_progress()), done.set()))
+            thread.start()
+            self.assertTrue(done.wait(5))
+        self.assertEqual([False], result)
+        self.assertEqual(CameraState.ONLINE, self.controller.state)
+
+
+class PresenceScanTests(unittest.TestCase):
+    """Live capture does not open every video node on each frame."""
+
+    def setUp(self):
+        self.camera = DeviceEvidence("/dev/video0", "synthetic", "model", "serial")
+        self.discovery = CountingDiscovery([self.camera])
+        self.events, self.frames = [], []
+        self.controller = ReconnectController(UUID(int=1), self.camera, self.events.append)
+        self.clock = FakeClock()
+        self.session = CaptureSession(
+            self.controller, self.discovery, VideoProfile(640, 480, 30, "MJPG"),
+            on_frame=self.frames.append, on_profile=lambda _: None,
+            capture_factory=SyntheticCapture, clock=self.clock,
+        )
+
+    def test_live_capture_rescans_at_a_bounded_rate(self):
+        self.assertTrue(self.session.step())
+        opened = self.discovery.scans
+        for _ in range(30):
+            self.clock.advance(1 / 30)
+            self.assertTrue(self.session.step())
+        # 30 frames within one presence interval need at most one more scan.
+        self.assertLessEqual(self.discovery.scans - opened, 1)
+        self.clock.advance(self.session.presence_scan_seconds)
+        self.assertTrue(self.session.step())
+        self.assertLessEqual(self.discovery.scans - opened, 2)
+        self.assertEqual(31 + 1, len(self.frames))
+
+    def test_closed_capture_always_rescans_before_binding(self):
+        self.assertTrue(self.session.step())
+        self.session.close()
+        before = self.discovery.scans
+        self.assertTrue(self.session.step())
+        self.assertGreater(self.discovery.scans, before)
+
+    def test_incomplete_scan_does_not_tear_down_live_capture(self):
+        self.assertTrue(self.session.step())
+        capture = self.session.capture
+
+        class FailingProbe:
+            scans = 0
+
+            def scan(self):
+                return DiscoveryResult((), 1)
+
+        self.session.discovery = FailingProbe()
+        self.clock.advance(self.session.presence_scan_seconds)
+        self.assertTrue(self.session.step())
+        self.assertIs(capture, self.session.capture)
+        self.assertEqual(CameraState.ONLINE, self.controller.state)
+        # A complete scan without the device is still a disconnect.
+        self.session.discovery = Discovery([])
+        self.clock.advance(self.session.presence_scan_seconds)
+        self.assertFalse(self.session.step())
+        self.assertTrue(capture.closed)
+        self.assertEqual("device_disconnected", self.events[-1].reason)
+
+    def test_duplicate_serial_appearing_while_live_still_requires_owner(self):
+        self.assertTrue(self.session.step())
+        self.discovery.devices.append(replace(self.camera, device_path="/dev/video1"))
+        self.clock.advance(self.session.presence_scan_seconds)
+        self.assertFalse(self.session.step())
+        self.assertEqual(CameraState.MANUAL, self.controller.state)
+        self.assertIsNone(self.session.capture)
+
+    def test_weak_binding_is_never_rebound_after_a_stall_reopen(self):
+        weak = replace(self.camera, serial=None, instance_token=(1, 2, 3))
+        self.discovery.devices = [weak]
+        self.controller.approve(weak, [weak])
+        self.assertTrue(self.session.step())
+        self.session.capture.stalled = True
+        self.clock.advance(self.session.frame_stall_reopen_seconds)
+        self.assertFalse(self.session.step())
+        self.assertIsNone(self.session.capture)
+        # Losing the descriptor ends the weak live binding: Owner reapproval.
+        self.assertFalse(self.session.step())
+        self.assertEqual(CameraState.MANUAL, self.controller.state)
 
 
 if __name__ == "__main__":

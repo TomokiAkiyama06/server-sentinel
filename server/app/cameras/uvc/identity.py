@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass, field
 from enum import StrEnum
+import threading
 from uuid import UUID
 
 
@@ -157,6 +158,11 @@ class ReconnectController:
         self._profile_hold = None
         self._reason = "not_started"
         self._finished = False
+        # Serializes health transitions (and their emitted registry writes)
+        # between the source worker and the off-worker frame-progress check,
+        # so the last durable write always matches the latest state. All other
+        # controller state is mutated only by the source worker.
+        self.lock = threading.RLock()
 
     def _persist(self):
         if self.store is not None:
@@ -164,10 +170,11 @@ class ReconnectController:
                             session_token=self._session_token, serial_ambiguous=self.serial_ambiguous)
 
     def _transition(self, state, reason):
-        changed = (self.state, self._reason) != (state, reason)
-        self.state, self._reason = state, reason
-        if changed:
-            self.emit(HealthEvent(self.source_id, state, reason))
+        with self.lock:
+            changed = (self.state, self._reason) != (state, reason)
+            self.state, self._reason = state, reason
+            if changed:
+                self.emit(HealthEvent(self.source_id, state, reason))
 
     def disconnected(self):
         self.bound = None
@@ -241,6 +248,31 @@ class ReconnectController:
             raise ValueError("capture has no approved binding")
         self._transition(CameraState.ONLINE, "video_capture_ready")
 
+    def frame_stalled(self, candidate, *, only_online=False, blocking=True):
+        """An open capture delivered no frame within its stall window.
+
+        Reported ``degraded`` with a fixed reason: a camera that is not
+        delivering video is never ``online``, and a stall is never evidence
+        about the scene. Only a later delivered frame (``capture_ready``)
+        returns the source to ``online``. Offline/manual states and a changed
+        binding are never raised to ``degraded`` here. The off-worker check
+        passes ``only_online`` and ``blocking=False``: it only lowers an
+        ``online`` claim and skips a tick while the worker is transitioning.
+        Returns True when the stall is (now) the reported state.
+        """
+        if not self.lock.acquire(blocking=blocking):
+            return False
+        try:
+            allowed = ((CameraState.ONLINE,) if only_online
+                       else (CameraState.ONLINE, CameraState.DEGRADED))
+            if (self._finished or candidate is None or self.bound != candidate
+                    or self.state not in allowed):
+                return False
+            self._transition(CameraState.DEGRADED, "video_frame_stalled")
+            return True
+        finally:
+            self.lock.release()
+
     @property
     def profile_unavailable(self):
         return self._profile_hold is not None and self._reason == "capture_profile_unavailable"
@@ -289,11 +321,12 @@ class ReconnectController:
         """Release recovery marker only after capture is closed and state durable."""
         if self.bound is not None:
             raise ValueError("capture binding must close before shutdown")
-        if self.store is not None and self._session_token is not None:
-            self.store.save(self.source_id, self.approved, self.requires_approval,
-                            session_token=self._session_token, serial_ambiguous=self.serial_ambiguous, release=True)
-            self._session_token = None
-        self._finished = True
+        with self.lock:
+            if self.store is not None and self._session_token is not None:
+                self.store.save(self.source_id, self.approved, self.requires_approval,
+                                session_token=self._session_token, serial_ambiguous=self.serial_ambiguous, release=True)
+                self._session_token = None
+            self._finished = True
 
     def supersede_stopped_session(self):
         """Discard only in-memory state after an audited approval supersedes it."""
@@ -301,8 +334,9 @@ class ReconnectController:
             raise ValueError("capture binding must stop before reapproval")
         # The audited transaction replaces/fences the durable session token.
         # Never save this stale controller during disposal.
-        self._session_token = None
-        self._finished = True
+        with self.lock:
+            self._session_token = None
+            self._finished = True
 
     def set_enabled(self, enabled):
         if self._finished or type(enabled) is not bool:

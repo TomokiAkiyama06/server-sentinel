@@ -205,5 +205,89 @@ class LocalUvcSupervisorTests(unittest.TestCase):
         self.assertTrue(self.supervisor.stop(source))
 
 
+class WatchedAdapter(SyntheticAdapter):
+    """Adapter exposing the off-worker frame-progress check."""
+
+    def __init__(self):
+        super().__init__()
+        self.checked = {}
+        self.check_failures = 0
+        self.checked_event = threading.Event()
+
+    def check_frame_progress(self, source_id):
+        with self.lock:
+            self.checked[source_id] = self.checked.get(source_id, 0) + 1
+            fail = self.check_failures > 0
+            if fail:
+                self.check_failures -= 1
+        self.checked_event.set()
+        if fail:
+            raise RuntimeError("synthetic private detail")
+        return False
+
+
+class FrameProgressWatchdogTests(unittest.TestCase):
+    def setUp(self):
+        self.adapter = WatchedAdapter()
+        self.supervisor = LocalUvcSupervisor(
+            self.adapter, poll_timeout=5.0, retry_delay=0.01, join_timeout=1.0,
+            watchdog_interval=0.01,
+        )
+        self.addCleanup(self._close)
+
+    def _close(self):
+        for release in self.adapter.release.values():
+            release.set()
+        try:
+            self.supervisor.close()
+        except WorkerStopError:
+            pass
+
+    def test_watchdog_checks_a_source_while_its_worker_is_blocked(self):
+        source = uuid4()
+        self.adapter.prepare(source)
+        self.supervisor.start(source)
+        self.assertTrue(self.adapter.entered[source].wait(0.5))
+        # The worker stays inside poll_source (a blocked kernel call); the
+        # frame-progress check still runs from the supervisor watchdog.
+        deadline = time.monotonic() + 2
+        while self.adapter.checked.get(source, 0) < 3 and time.monotonic() < deadline:
+            time.sleep(0.005)
+        self.assertGreaterEqual(self.adapter.checked.get(source, 0), 3)
+        self.assertEqual(1, self.adapter.calls[source])
+
+    def test_watchdog_failure_is_contained_and_counted_without_text(self):
+        source = uuid4()
+        self.adapter.check_failures = 2
+        self.adapter.prepare(source)
+        self.supervisor.start(source)
+        deadline = time.monotonic() + 2
+        while self.adapter.checked.get(source, 0) < 4 and time.monotonic() < deadline:
+            time.sleep(0.005)
+        self.assertGreaterEqual(self.adapter.checked.get(source, 0), 4)
+        self.assertEqual(2, self.supervisor.watchdog_failures)
+        self.assertTrue(self.supervisor.status(source).running)
+
+    def test_close_stops_the_watchdog(self):
+        source = uuid4()
+        self.adapter.prepare(source)
+        self.supervisor.start(source)
+        self.assertTrue(self.adapter.checked_event.wait(1))
+        self.adapter.release[source].set()
+        self.supervisor.close()
+        self.assertFalse(self.supervisor.watchdog_running)
+        count = dict(self.adapter.checked)
+        time.sleep(0.05)
+        self.assertEqual(count, self.adapter.checked)
+
+    def test_adapter_without_check_starts_no_watchdog(self):
+        supervisor = LocalUvcSupervisor(SyntheticAdapter(), watchdog_interval=0.01)
+        source = uuid4()
+        supervisor.start(source)
+        self.assertFalse(supervisor.watchdog_running)
+        supervisor._adapter.release[source].set()
+        supervisor.close()
+
+
 if __name__ == "__main__":
     unittest.main()

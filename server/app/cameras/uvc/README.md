@@ -52,6 +52,34 @@ profile, closes the descriptor and reports `degraded` with the fixed reason
 `capture_profile_unavailable`, never `online`; the same device instance is not
 reopened on every poll, only after the profile, enablement or device instance
 changes.
+`CaptureSession` also watches frame progress. A read that times out raises
+`FrameTimeout` (a `CaptureError` subclass); instead of tearing down, the
+session reports `degraded` (`video_frame_stalled`) once no frame has arrived
+for the stall window, keeps the descriptor (and any live weak binding) open,
+and returns to `online` only on the next delivered frame. The window is
+`frame_stall_seconds` but never less than 10 negotiated frame intervals (the
+reopen bound scales by the same factor), because a dark scene or slow profile
+legitimately lowers the delivered rate; on the real C960s the covered-lens rate
+dropped to about 16–17 fps, far inside a 1 s window. Each read waits at most the
+stall window. A stall lasting `frame_stall_reopen_seconds` closes the capture
+(`offline`, `video_capture_failed`) and the next poll reopens it through the
+identity path, so a weak binding then needs the Owner again. The same check runs
+from `LocalUvcSupervisor`'s single watchdog thread through
+`LocalUvcAdapter.check_frame_progress()`: a worker blocked inside a kernel or
+SQLite call cannot run its own read timeout, so the watchdog lowers that
+source's `online` claim. It never opens, closes or rebinds a device; it takes
+the controller's transition lock non-blockingly and skips a tick while the
+worker is transitioning, and the frame sink writes `last_seen_at` under the same
+lock so the durable row always follows the latest transition.
+
+While a capture is open, `LinuxDiscovery.scan()` (which opens every video node)
+runs at most every `presence_scan_seconds` instead of on every frame; an unplug
+surfaces as a descriptor error. A scan with probe failures that no longer lists
+the bound device is inconclusive and keeps the live descriptor. A duplicate
+serial that appears while capturing is still detected at the next due scan.
+`MmapCapture` requests 4 MMAP buffers (`REQBUFS` count 4, accepting 1 to
+`MAX_BUFFERS` = 8 from the driver), so the driver can fill a buffer while one
+frame is copied.
 The caller supplies width, height, FPS and FourCC; there are no hardware profile
 defaults. Codec/bitrate controls and multi-planar-only capture are unsupported
 and fail explicitly. Camera drivers without a reportable frame rate also fail.

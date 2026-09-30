@@ -63,7 +63,8 @@ class LocalUvcAdapter:
 
     def __init__(self, registry, *, emit_audit, on_frame,
                  discovery=None, capture_factory=MmapCapture, clock=None,
-                 monotonic=time.monotonic):
+                 monotonic=time.monotonic, frame_stall_seconds=1.0,
+                 frame_stall_reopen_seconds=5.0, presence_scan_seconds=1.0):
         self.registry = registry
         # Session-marker writes share the registry's storage admission, so no
         # capture-driven write bypasses the Main storage policy.
@@ -75,6 +76,11 @@ class LocalUvcAdapter:
         self.capture_factory = capture_factory
         self.clock = clock or (lambda: datetime.now(timezone.utc))
         self.monotonic = monotonic
+        self.session_timing = {
+            "frame_stall_seconds": frame_stall_seconds,
+            "frame_stall_reopen_seconds": frame_stall_reopen_seconds,
+            "presence_scan_seconds": presence_scan_seconds,
+        }
         self.sessions = {}
         self._approved_handoffs = {}
         self._conflict_checked = {}
@@ -144,17 +150,21 @@ class LocalUvcAdapter:
 
         def frame_sink(frame):
             now = self.monotonic()
-            state = SourceHealthState(controller.state.value)
-            if (last_seen["at"] is None or last_seen["state"] is not state
-                    or now - last_seen["at"] >= self.LAST_SEEN_INTERVAL_SECONDS):
-                self._write_health(source.id, health_state=state,
-                                   last_seen_at=self.clock())
-                last_seen["at"], last_seen["state"] = now, state
+            # Read the state and write it under the transition lock, so an
+            # off-worker stall report cannot be overwritten by a stale state.
+            with controller.lock:
+                state = SourceHealthState(controller.state.value)
+                if (last_seen["at"] is None or last_seen["state"] is not state
+                        or now - last_seen["at"] >= self.LAST_SEEN_INTERVAL_SECONDS):
+                    self._write_health(source.id, health_state=state,
+                                       last_seen_at=self.clock())
+                    last_seen["at"], last_seen["state"] = now, state
             self.on_frame(source.id, frame)
 
         session = CaptureSession(
             controller, self.discovery, capture_profile(source.desired_capture_profile),
             on_frame=frame_sink, on_profile=profile_sink, capture_factory=self.capture_factory,
+            clock=lambda: self.monotonic(), **self.session_timing,
         )
         self.sessions[source.id] = session
         return session
@@ -304,6 +314,19 @@ class LocalUvcAdapter:
             session.close()
             session.controller.capture_failed()
             raise
+
+    def check_frame_progress(self, source_id):
+        """Off-worker frame-progress check for one source.
+
+        Called by the supervisor watchdog, not the source worker, so a worker
+        blocked in a kernel or storage call cannot keep a stalled source
+        ``online``. It only lowers an ``online`` claim to ``degraded``
+        (``video_frame_stalled``); it never opens, closes or rebinds a device.
+        """
+        session = self.sessions.get(source_id)
+        if session is None or self.closed:
+            return False
+        return session.check_frame_progress()
 
     def _approval_conflict(self, source, session):
         """True when another enabled source holds an approval for this camera.

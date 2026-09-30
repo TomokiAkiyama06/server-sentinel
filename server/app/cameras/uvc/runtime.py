@@ -215,6 +215,9 @@ class LocalUvcRuntime:
                 self.adapter = self._adapter_factory(
                     self.registry, emit_audit=self._health, on_frame=self._on_frame,
                     discovery=self._discovery, capture_factory=self._capture_factory,
+                    frame_stall_seconds=self.configuration.frame_stall_seconds,
+                    frame_stall_reopen_seconds=self.configuration.frame_stall_reopen_seconds,
+                    presence_scan_seconds=self.configuration.presence_scan_seconds,
                 )
                 self._supervisor = self._supervisor_factory(
                     self.adapter, poll_timeout=self.configuration.poll_timeout_seconds,

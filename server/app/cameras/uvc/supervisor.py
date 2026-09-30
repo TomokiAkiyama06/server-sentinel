@@ -41,15 +41,24 @@ class LocalUvcSupervisor:
     Ordinary adapter failures are contained and retried after a bounded delay.
     Status intentionally records only a count, never exception text that might
     contain deployment-private device information.
+
+    When the adapter exposes ``check_frame_progress(source_id)``, one
+    watchdog thread calls it for every running source each
+    ``watchdog_interval``. This is the single deliberate exception to "one
+    thread per source": the check is read-mostly, never opens, closes or
+    rebinds a device, and only lowers an ``online`` claim for a source whose
+    worker has stopped delivering frames (for example while that worker is
+    blocked in a kernel or storage call). Its failures are counted, never
+    logged with text.
     """
 
     def __init__(self, adapter, *, poll_timeout=1.0, retry_delay=0.1,
-                 join_timeout=3.0, clock=time.monotonic):
+                 join_timeout=3.0, clock=time.monotonic, watchdog_interval=0.25):
         if not callable(getattr(adapter, "poll_source", None)):
             raise TypeError("local UVC adapter is required")
         if not callable(getattr(adapter, "stop_source", None)):
             raise TypeError("local UVC adapter cannot stop a source")
-        for value in (poll_timeout, retry_delay, join_timeout):
+        for value in (poll_timeout, retry_delay, join_timeout, watchdog_interval):
             if type(value) not in (int, float) or value <= 0:
                 raise ValueError("worker timing must be positive")
         self._adapter = adapter
@@ -60,6 +69,12 @@ class LocalUvcSupervisor:
         self._lock = threading.Lock()
         self._workers: dict[UUID, _Worker] = {}
         self._closed = False
+        check = getattr(adapter, "check_frame_progress", None)
+        self._check = check if callable(check) else None
+        self._watchdog_interval = float(watchdog_interval)
+        self._watchdog_stop = threading.Event()
+        self._watchdog = None
+        self.watchdog_failures = 0
 
     @staticmethod
     def _identity(source_id):
@@ -90,7 +105,36 @@ class LocalUvcSupervisor:
             except BaseException:
                 del self._workers[source_id]
                 raise
+            self._start_watchdog()
         return True
+
+    def _start_watchdog(self):
+        # Called with self._lock held.
+        if self._check is None or (self._watchdog is not None and self._watchdog.is_alive()):
+            return
+        watchdog = threading.Thread(target=self._watch, name="serversentinel-local-uvc-watchdog",
+                                    daemon=True)
+        watchdog.start()
+        self._watchdog = watchdog
+
+    @property
+    def watchdog_running(self):
+        return self._watchdog is not None and self._watchdog.is_alive()
+
+    def _watch(self):
+        while not self._watchdog_stop.wait(self._watchdog_interval):
+            with self._lock:
+                sources = [source_id for source_id, worker in self._workers.items()
+                           if not worker.stop.is_set()]
+            for source_id in sources:
+                if self._watchdog_stop.is_set():
+                    return
+                try:
+                    self._check(source_id)
+                except Exception:
+                    # Counted only: exception text may carry private details.
+                    with self._lock:
+                        self.watchdog_failures += 1
 
     def _failed(self, worker, *, cleanup=False):
         with self._lock:
@@ -167,10 +211,17 @@ class LocalUvcSupervisor:
             if self._closed and not self._workers:
                 return
             self._closed = True
+            self._watchdog_stop.set()
+            watchdog = self._watchdog
             workers = tuple(self._workers.items())
             for _source_id, worker in workers:
                 worker.stop.set()
         deadline = self._clock() + self._join_timeout
+        if watchdog is not None:
+            # The watchdog only ever lowers a health claim under the source's
+            # transition lock, so a check still finishing a storage write after
+            # this bound cannot race capture cleanup into a wrong state.
+            watchdog.join(max(0.0, deadline - self._clock()))
         for _source_id, worker in workers:
             remaining = max(0.0, deadline - self._clock())
             worker.thread.join(remaining)

@@ -265,6 +265,22 @@ conflicting approval is refused, and a pre-existing duplicate makes every
 conflicting source `manual_intervention_required` rather than letting startup
 order decide.
 Unsupported multi-planar capture or codec/bitrate controls fail explicitly.
+An open capture that delivers no frame for the configured stall window
+(`frame_stall_seconds`, never shorter than 10 negotiated frame intervals) is
+reported `degraded` with the fixed reason `video_frame_stalled`, never
+`online`; only a delivered frame returns it to `online`. The descriptor stays
+open during that window (a transient stall neither re-enumerates the device nor
+ends a live weak binding); a stall lasting `frame_stall_reopen_seconds` closes
+the capture (`offline`) and reopens it through the normal identity path. The
+same stall check also runs from a supervisor watchdog thread, so a worker
+blocked inside a kernel or storage call cannot keep a stalled source `online`;
+the watchdog only lowers the claim and never opens, closes or rebinds a device.
+A stall is capture health, not scene evidence, and is never reported as an
+empty scene. While a capture is live the full device scan runs at most every
+`presence_scan_seconds` (an unplug surfaces through the open descriptor); a
+scan with probe failures that no longer lists the bound device is treated as
+inconclusive, not as an unplug. A closed capture always rescans before binding
+and the post-open identity re-verification is unchanged.
 Source workers, Owner management and the preview frame sink are internal
 interfaces and no unauthenticated preview route is added. The backend lifespan
 starts one worker per deployment-configured `local_uvc` source (`local_uvc`

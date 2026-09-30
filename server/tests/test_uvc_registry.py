@@ -1,10 +1,12 @@
 from contextlib import closing, contextmanager
 from dataclasses import asdict, replace
+from itertools import count
 import json
 from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import patch
+from uuid import uuid4
 
 from app.audit import (
     AuditAction, AuditOutcome, AuditStorageError, AuditStore, OwnerAuditService,
@@ -43,9 +45,15 @@ class UvcRegistryFixture(unittest.TestCase):
         self.addCleanup(self.adapter.close)
 
     def make_adapter(self):
+        # Each clock read advances one second, as if every poll came at least
+        # one presence-scan interval after the previous one: the synthetic
+        # capture does not fail on unplug the way a real descriptor does, so
+        # these fixtures observe device changes through the rescan.
+        ticks = count(1000.0)
         return LocalUvcAdapter(self.registry, emit_audit=self.events.append,
                                on_frame=lambda source_id, frame: self.frames.append((source_id, frame)),
-                               discovery=self.discovery, capture_factory=SyntheticCapture)
+                               discovery=self.discovery, capture_factory=SyntheticCapture,
+                               monotonic=lambda: next(ticks))
 
 
 class UvcRegistryTests(UvcRegistryFixture):
@@ -69,6 +77,33 @@ class UvcRegistryTests(UvcRegistryFixture):
         self.assertEqual(AuditAction.APPROVE_CAMERA, record.action)
         self.assertEqual(AuditOutcome.SUCCEEDED, record.outcome)
         self.assertTrue(self.adapter.poll_source(self.source.id))
+
+    def test_frame_stall_is_persisted_as_not_online_and_recovers(self):
+        class PermitOwner:
+            def require_owner(self, actor_context):
+                return None
+
+        admin = OwnerAdministration(
+            OwnerAuditService(AuditStore(self.database), PermitOwner()), self.registry,
+        )
+        now = [1000.0]
+        self.adapter.monotonic = lambda: now[0]
+        admin.approve_uvc("owner", self.adapter, self.source.id, self.camera)
+        self.assertTrue(self.adapter.poll_source(self.source.id))
+        self.assertEqual(SourceHealthState.ONLINE,
+                         self.registry.get_source(self.source.id).health_state)
+        # Off-worker check: no frame within the stall window.
+        self.assertFalse(self.adapter.check_frame_progress(self.source.id))
+        now[0] += 60
+        self.assertTrue(self.adapter.check_frame_progress(self.source.id))
+        self.assertEqual(SourceHealthState.DEGRADED,
+                         self.registry.get_source(self.source.id).health_state)
+        self.assertEqual("video_frame_stalled", self.events[-1].reason)
+        # Frames resuming is the only way back to online.
+        self.assertTrue(self.adapter.poll_source(self.source.id))
+        self.assertEqual(SourceHealthState.ONLINE,
+                         self.registry.get_source(self.source.id).health_state)
+        self.assertFalse(self.adapter.check_frame_progress(uuid4()))
 
     def test_uvc_approval_rolls_back_when_audit_append_fails(self):
         class PermitOwner:
