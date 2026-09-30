@@ -1,23 +1,23 @@
 # ADR 0004: Shared Tailnet Account and Per-Person Application Credentials
 
-Status: Proposed
+Status: Accepted
 Date: 2026-09-20
+Owner approval recorded: 2026-09-30
 
 ## What this status covers
 
-This record is Proposed and awaits the Owner's decision. Its companion
-[ADR-0003](0003-owner-authentication-and-trusted-proxy.md) for the same Issue #6
-is already Accepted. The repository owner has stated the deployment constraint
-this record is built on — the research room shares one Tailscale account — and
-the direction that application authorization rests on per-person ServerSentinel
-credentials; this record works that into a decision, selects WebAuthn/passkey,
-and states the invariants below. ADR-0003 leaves the authoritative per-person
-application credential to this separate decision.
+The repository owner accepted this record as written on 2026-09-30. Its
+companion [ADR-0003](0003-owner-authentication-and-trusted-proxy.md) for the
+same Issue #6 was accepted on 2026-09-21. The owner stated the deployment
+constraint this record is built on — the research room shares one Tailscale
+account — and the direction that application authorization rests on per-person
+ServerSentinel credentials; this record works that into a decision, selects
+WebAuthn/passkey, and states the invariants below. ADR-0003 leaves the
+authoritative per-person application credential to this decision.
 
-Nothing here opens human access. ADR-0003 is already accepted, so the remaining
-design decision is this ADR; after acceptance, human routes still stay closed
-until Issue #10 implements and tests both records. Issue #6 stays Open until
-those remaining gates are complete.
+Acceptance does not open human access. Human routes stay closed until Issue #10
+implements and tests both records, and Issue #6 stays Open until those
+remaining gates are complete.
 
 This record does not reopen ADR-0003's accepted parameters: session idle and
 absolute lifetimes, the owner step-up freshness window, local bootstrap and
@@ -63,7 +63,7 @@ ServerSentinel issues and verifies its own per-person credential:
 - stored as `principal_credential` bound to one `access_principal` (`SPECIFICATION.md` §11.4);
 - revocable individually, and revoked as a whole with its principal.
 
-**WebAuthn/passkey is the mechanism this record proposes.** Once the Owner accepts it, replacing it takes a superseding Owner-approved ADR.
+**WebAuthn/passkey is the selected mechanism.** Replacing it takes a superseding Owner-approved ADR.
 
 Revocation is credential-scoped, not device-scoped. A synced passkey is a single credential that can exist on several of its owner's devices, so revoking it applies everywhere it synced and losing one device does not by itself isolate a credential. The product describes revocation and labels accordingly.
 
@@ -158,5 +158,5 @@ The origin must be a secure context — HTTPS, or `http://localhost` for a stric
 ## Follow-up
 
 - Issue #10 implements and tests the credential gate; `docs/INITIAL_ISSUES.md` Plan 17 acceptance carries it.
-- WebAuthn library selection follows the dependency-license rules of `AGENTS.md` §13.
+- WebAuthn library selection follows the dependency-license rules of `AGENTS.md` §13. Issue #10 adds no WebAuthn/FIDO library: verification is implemented in `server/app/auth/webauthn.py` over the Owner-approved `cryptography` package (`server/docs/WEBAUTHN_DEPENDENCY_REVIEW.md`).
 - Recovery when an owner loses every authenticator (local owner bootstrap) is specified with Issue #6 implementation and is not decided here.

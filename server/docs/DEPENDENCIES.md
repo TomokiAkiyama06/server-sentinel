@@ -8,18 +8,21 @@ FastAPI 0.141.1 + Uvicorn 0.53.0, both WITHOUT extras. Do not use `fastapi[stand
 FastAPI >= current release requires Pydantic >=2.9; using Pydantic v1 would require deliberately selecting older FastAPI.
 Latest stable package wheels are compatible with Python 3.12; local Python 3.14 x86_64 and Linux Python 3.12 aarch64 pydantic-core wheels were also downloaded and hash verified.
 
-`../requirements.lock` and `../requirements-ci.lock` contain the 13 runtime / 2 development packages with exact SHA256 hashes of downloaded wheels; `../requirements-ci.lock` additionally includes the optional Issue #20 detector lock's 5 packages described at the end of this document. Only the three selected pydantic-core native wheels are permitted by these 15 reviewed base packages. `wheel-audit.json` records their 17 permitted artifacts individually, including each native wheel's filename, SHA256, release metadata URL, download URL, dependencies, and included license-file hashes. The CPython 3.12 aarch64 and CPython 3.14 x86_64 wheels' MIT license bytes match the CPython 3.12 x86_64 wheel; the same source-version Rust dependency audit and accompanying notices apply. An offline CI check requires exact agreement between every permitted lock hash and the 22 artifacts of the 2 audit inventories, `wheel-audit.json` plus `detector-wheel-audit.json`.
+`../requirements.lock` and `../requirements-ci.lock` contain the 16 runtime / 2 development packages with exact SHA256 hashes of downloaded wheels; `../requirements-ci.lock` additionally includes the optional Issue #20 detector lock's 5 packages described at the end of this document. Only the three selected pydantic-core native wheels, the three selected cffi native wheels and the two selected cryptography abi3 wheels are permitted by these 18 reviewed base packages. `wheel-audit.json` records their 23 permitted artifacts individually, including each native wheel's filename, SHA256, release metadata URL, download URL, dependencies, and included license-file hashes. The CPython 3.12 aarch64 and CPython 3.14 x86_64 wheels' MIT license bytes match the CPython 3.12 x86_64 wheel; the same source-version Rust dependency audit and accompanying notices apply. An offline CI check requires exact agreement between every permitted lock hash and the 28 artifacts of the 2 audit inventories, `wheel-audit.json` plus `detector-wheel-audit.json`.
 
 | Package | Exact version | Declared license |
 |---|---|---|
 | annotated-doc | 0.0.5 | MIT |
 | annotated-types | 0.8.0 | MIT |
 | anyio | 4.15.1 | MIT |
+| cffi | 2.1.1 | MIT-0 |
 | click | 8.5.0 | BSD-3-Clause |
+| cryptography | 50.0.1 | Apache-2.0 OR BSD-3-Clause |
 | fastapi | 0.141.1 | MIT |
 | h11 | 0.16.0 | MIT |
 | idna | 3.20 | BSD-3-Clause |
 | pycodestyle | 2.14.0 | MIT |
+| pycparser | 3.0 | BSD-3-Clause |
 | pydantic | 2.13.5 | MIT |
 | pydantic-core | 2.46.5 | MIT |
 | pyflakes | 3.4.0 | MIT |
@@ -41,6 +44,27 @@ Wheel archives, PyPI metadata, included license files and `wheel-audit.json` pro
 - wit-bindgen-rt omitted license files from its crate; MIT/Apache texts were retrieved from the precise crate VCS commit f2393e6e98fa5f9236cac580db8a3fc9de6a4b70 and included conservatively.
 
 Static Python-wheel network review found no telemetry SDK or opaque runtime download code in the selected packages. Starlette TestClient references optional httpx/httpx2, neither is installed. Standard FastAPI CLI/cloud extras are excluded. Runtime egress behavior still needs the component smoke test; a static search is not a network test.
+
+## Issue #10 addition: `cryptography` (2026-09-30)
+
+The Owner approved the Python `cryptography` package on 2026-09-30 (given for Issue #13's mTLS adapters). Issue #10 uses it only for WebAuthn signature verification over COSE public keys (ES256, EdDSA, RS256) in `server/app/auth/webauthn.py`; no WebAuthn/FIDO library (`webauthn`/py_webauthn, `fido2`) is added, see `WEBAUTHN_DEPENDENCY_REVIEW.md`. The #13 branch `feat/issue-13-mtls-adapters` adds the same package, so whichever PR merges second must rebase and reconcile these lock, audit and inventory entries rather than duplicate them.
+
+| Package | Exact version | Artifacts | Declared license |
+|---|---|---|---|
+| cryptography | 50.0.1 | `cp311-abi3-manylinux_2_34` x86_64 + aarch64 (cover CPython 3.12 and 3.14) | Apache-2.0 OR BSD-3-Clause |
+| cffi | 2.1.1 | cp312 x86_64, cp314 x86_64, cp312 aarch64 (`manylinux2014`) | MIT-0 |
+| pycparser | 3.0 | py3-none-any | BSD-3-Clause |
+
+`cryptography` is the direct dependency in `../pyproject.toml`; `cffi` (required on CPython) and `pycparser` (required by cffi) are transitive lock entries. Release dates are on/before the audit date and exact PyPI release metadata reports no known vulnerabilities; this is not an independent CVE audit.
+
+- glibc floor: the pinned cryptography wheels are `manylinux_2_34`, so the Main Server needs glibc 2.34 or newer (Ubuntu 22.04+, Debian bookworm). Older hosts fail the hash-pinned install instead of silently selecting another artifact.
+- cffi 2.0.0 metadata said MIT, but the LICENSE file shipped in both 2.0.0 and 2.1.1 is MIT No Attribution (MIT-0); the latest release was selected and is recorded as MIT-0.
+- Native content: the cryptography wheel statically links OpenSSL 4.0.2 (Apache-2.0; the wheel's own CycloneDX SBOM `cryptography-50.0.1.dist-info/sboms/sbom.json` names `openssl-4.0.2.tar.gz`, SHA-256 `736b467530f916737b7031310ccb21d8218c6229e61e8e160cd1d3458cd543a8`, verified on download) and the Rust crates of its sdist `Cargo.lock`. The cffi wheel statically links libffi 3.4.6 (MIT; cffi's v2.1.1 wheel workflow builds `libffi/archive/v3.4.6.tar.gz`, SHA-256 `9ac790464c1eb2f5ab5809e978a1683e9393131aede72d1b0a0703771d3c6cda` as downloaded) and ships no libffi notice itself. Neither wheel bundles an auditwheel `.libs` directory; the only dynamic dependencies are glibc/libgcc_s.
+- Rust: the cryptography 50.0.1 sdist `Cargo.lock` resolves 32 third-party crates, all of which match the wheel's `cryptography-rust.cyclonedx.json`. `rust-audit.json` records each (checksum-verified `.crate`, license expression, repository, license files) plus a root row for the in-sdist `cryptography-*` workspace crates; heck 0.5.0 was already recorded. `cc`, `find-msvc-tools`, `pkg-config`, `shlex`, `vcpkg`, `target-lexicon` and `pyo3-build-config` are build-time crates, conservatively included.
+- Notice obligations: cryptography is used under its Apache-2.0 alternative (both its Apache-2.0 and BSD-3-Clause texts are preserved); OpenSSL 4.0.2 Apache-2.0 text preserved; MIT is selected for dual MIT/Apache crates; Apache-2.0 is selected for `self_cell` (Apache-2.0 OR GPL-2.0-only), so no GPL term applies; `target-lexicon` is Apache-2.0 WITH LLVM-exception; `unicode-ident` adds Unicode-3.0; `asn1`/`asn1_derive` and pycparser are BSD-3-Clause (no endorsement); cffi is MIT-0 (no attribution required, notice kept anyway); libffi MIT notice preserved. All texts are in `BACKEND_THIRD_PARTY_LICENSE_TEXTS.md` under "Issue #10 additions".
+- License gate status: `Apache-2.0 OR BSD-3-Clause` is outside `scripts/ci/license_gate.py`'s permissive allowlist and is covered by the Owner approval record in `license/owner-approvals.json` (`docs/decisions/2026-09-30-cryptography-dependency.md`). `MIT-0` (cffi) is also outside the allowlist and has **no** approval yet: the gate fails on `pypi:cffi@2.1.1` until the Owner approves it or extends the allowlist.
+
+Static review found no telemetry or network client code in cryptography or cffi; they are local cryptographic/FFI libraries. This is not a network test.
 
 ## Official Python container
 
