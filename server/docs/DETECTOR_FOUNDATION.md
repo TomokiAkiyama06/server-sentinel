@@ -332,8 +332,7 @@ python -m tests.detector_model_smoke --adapter yolox-s-onnx-cpu /absolute/operat
 
 ### Host measurement, 2026-09-30 (this development host, not target acceptance)
 
-Host: 32 logical CPUs, NVIDIA RTX PRO 6000 Blackwell (unused: no approved GPU
-runtime), CPython 3.12.14, ONNX Runtime 1.28.0 `CPUExecutionProvider`,
+Host: 32 logical CPUs, NVIDIA RTX PRO 6000 Blackwell (unused for this table), CPython 3.12.14, ONNX Runtime 1.28.0 `CPUExecutionProvider`,
 generated all-zero S×S RGB frames, 10 warm-up + 200 measured cycles per source,
 sources evaluated serially in one process (one session per source). The host was
 shared with other workloads (1-minute load average ≈ 4–7 during the reported
@@ -359,4 +358,31 @@ saturates once sources × latency approaches 500 ms (RT-DETRv2 at one thread).
 Generated frames make these latency-only numbers: **detection accuracy on real
 room footage, low light, occlusion and the target camera angles was not
 evaluated**. Cross-process contention between several isolated workers, and
-the target Main Server, were not measured. GPU was not measured.
+the target Main Server, were not measured.
+
+### Evaluation-only GPU measurement, 2026-09-30 (this host; production stays CPU-only)
+
+The Owner approved `onnxruntime-gpu` **for evaluation only**. It ran from an
+uncommitted scratch venv (`onnxruntime-gpu==1.28.0` with NVIDIA CUDA 13.4 /
+cuDNN 9.27 wheels under NVIDIA proprietary terms; none of it is in a repository
+lock or the license allowlist). The adapters and harness were unchanged except
+for a CUDA-only session factory with fallback disabled; see
+[YOLOX_EVALUATION_AUDIT.md](YOLOX_EVALUATION_AUDIT.md#gpu-evaluation-runtime-evaluation-only-2026-09-30)
+for versions, NVIDIA license findings and node-placement evidence (YOLOX: all
+203 kernel nodes on CUDA with CPU fallback forbidden; RT-DETRv2: 895 on CUDA and
+134 shape-computation nodes on CPU). GPU: NVIDIA RTX PRO 6000 Blackwell
+Workstation Edition, driver 595.91.07. Same generated frames and replay policy
+as the CPU table, one intra-op thread, 200 measured cycles per source. The host
+CPU was heavily loaded by other workloads (1-minute load ≈ 24–28), which affects
+host-side preprocessing and RT-DETRv2's CPU shape nodes.
+
+| Adapter (CUDA) | sources | p50 ms | p95 ms | max ms | replay |
+| --- | --- | --- | --- | --- | --- |
+| YOLOX-Tiny 416 | 1 / 2 / 3 / 4 | 1.35 / 1.37 / 1.40 / 1.47 | 1.39 / 1.41 / 1.45 / 1.51 | 1.47 / 1.70 / 1.92 / 2.04 | all healthy, 500 ms, 0 drops |
+| YOLOX-S 640 | 1 / 2 / 3 / 4 | 2.10 / 2.25 / 2.31 / 2.35 | 2.26 / 2.36 / 2.39 / 2.52 | 2.92 / 2.68 / 2.99 / 3.44 | all healthy, 500 ms, 0 drops |
+| RT-DETRv2 640 | 1 / 2 / 3 / 4 | 3.50 / 3.69 / 3.60 / 6.23 | 4.28 / 4.26 / 4.25 / 14.85 | 5.16 / 5.22 / 5.16 / 133.99 | all healthy, 500 ms, 0 drops |
+
+Latency includes host-side preprocessing and host↔device copies per call. The
+RT-DETRv2 four-source tail coincided with the host CPU load and was not re-run.
+These are evaluation-only numbers: no production GPU path exists, and the same
+accuracy caveat applies (real room footage was not evaluated).

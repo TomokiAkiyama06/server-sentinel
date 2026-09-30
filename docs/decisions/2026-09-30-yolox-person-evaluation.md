@@ -8,13 +8,18 @@
 
 ## Decision
 
-The repository owner decided in the 2026-09-30 working session (relayed to the
-implementing agent in that session; confirmation on the PR that introduces this
-file is the durable record) that YOLOX is to be **evaluated** as the person
-detector for Issue #20, following `docs/THIRD_PARTY_POLICY.md`.
+The repository owner decided, and confirmed directly in the 2026-09-30 working
+session, that YOLOX is to be **evaluated** as the person detector for Issue #20,
+following `docs/THIRD_PARTY_POLICY.md`, and that **adoption stays on hold**
+because the official weights' license is unclear. Local evaluation continues.
 
 - RT-DETRv2 (the existing digest-pinned adapter) remains a comparison candidate.
 - Owner face verification (#25) stays disabled for the MVP and is not affected.
+- `onnxruntime-gpu` is approved **for evaluation only**, not production. The
+  NVIDIA CUDA/cuDNN runtime components it needs are under NVIDIA's proprietary
+  terms and must not enter the repository's locks or license allowlist. GPU
+  evaluation therefore runs from an uncommitted scratch environment; the
+  production detector remains CPU-only pending a separate approval.
 
 ## What this permits
 
@@ -23,6 +28,8 @@ detector for Issue #20, following `docs/THIRD_PARTY_POLICY.md`.
   constructed isolated worker.
 - Operators/developers obtaining the official Megvii `0.1.1rc0` ONNX release
   assets **outside the repository** for local measurement.
+- Measuring the existing adapters on a GPU through `onnxruntime-gpu` installed in
+  an uncommitted, evaluation-only environment.
 
 ## What this does not permit
 
