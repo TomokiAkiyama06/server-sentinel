@@ -23,7 +23,7 @@
     },
     {
       "path": "web/tests/compile.mjs",
-      "sha256": "sha256:ca41bbfd7ce3350a20f5ab1c0e2f32d0cbbdb79bbdde50340f690bae7084e040"
+      "sha256": "sha256:44b9062f329f67ac567dd7099c7246c426527803ee271b411f0d3449a4a6e555"
     },
     {
       "path": "web/tests/core.test.mjs",
@@ -40,6 +40,10 @@
     {
       "path": "web/tests/presence_views.test.mjs",
       "sha256": "sha256:04f5e442690b0c69d5522ff7f8aa0b2af5213a2792e373f0861f04cb6af5a5cf"
+    },
+    {
+      "path": "web/tests/compile.test.mjs",
+      "sha256": "sha256:2e3b51f5fcc559fafb43abc0bb686eb90e680362882592341fe78a13e4e0085d"
     }
   ],
   "inputs": [
