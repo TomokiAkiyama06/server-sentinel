@@ -8,6 +8,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 import threading
 from unittest import TestCase
+from unittest.mock import patch
 
 from app.audit import (
     ActorCategory, AuditAction, AuditOutcome, AuditStore, OwnerAuditService,
@@ -20,6 +21,7 @@ from app.auth.reservation import (
     ReservationFault, RouteKind, ServeStatusRoutes, evaluate, parse_proc_net_tcp,
     parse_serve_status,
 )
+from app.auth.reservation_store import STORE_KEY, ListenerExceptionStore, decode, encode
 from app.storage.database import Database
 from app.storage.migrations import migrate
 from app.storage.schema import APPLICATION_MIGRATIONS
@@ -455,7 +457,7 @@ WILDCARD_SSH = Files(tcp=proc(("127.0.0.1", 8080, "0A"), ("0.0.0.0", 22, "0A")),
                      tcp6=proc(("::", 22, "0A"), ipv6=True))
 
 
-class ListenerExceptionTests(TestCase):
+class ExceptionFixture(TestCase):
     def setUp(self):
         self.temporary = TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
@@ -465,10 +467,26 @@ class ListenerExceptionTests(TestCase):
         self.store = AuditStore(self.database, clock=lambda: NOW)
         self.service = OwnerAuditService(self.store, SyntheticOwnerAuthorizer())
 
+        self.exception_store = ListenerExceptionStore(self.database)
+
     def admin(self, files):
-        check, _, _, sink = checker(files=Files(files.files["tcp"], files.files["tcp6"]))
+        check, _, _, sink = checker(files=Files(files.files["tcp"], files.files["tcp6"]),
+                                    exception_store=self.exception_store)
         return ReservationAdministration(self.service, check), check, sink
 
+    def stored(self):
+        with closing(self.database.connect()) as connection:
+            row = connection.execute(
+                "SELECT value FROM application_metadata WHERE key=?", (STORE_KEY,)).fetchone()
+        return None if row is None else row[0]
+
+    def store_raw(self, value):
+        with closing(self.database.connect()) as connection:
+            connection.execute("INSERT OR REPLACE INTO application_metadata VALUES (?, ?)", (STORE_KEY, value))
+            connection.commit()
+
+
+class ListenerExceptionTests(ExceptionFixture):
     def test_default_is_empty_and_wildcard_system_listener_closes(self):
         _, check, _ = self.admin(WILDCARD_SSH)
         self.assertEqual(check.listener_exceptions, frozenset())
@@ -559,3 +577,97 @@ class ListenerExceptionTests(TestCase):
         with self.assertRaises(ValueError):
             check.apply_audited_listener_exceptions(other.stage_listener_exceptions({SSH}))
         self.assertEqual(check.listener_exceptions, frozenset())
+
+
+class ListenerExceptionPersistenceTests(ExceptionFixture):
+    """Durable exceptions in the existing application_metadata table."""
+
+    def test_exceptions_survive_restart(self):
+        admin, _, _ = self.admin(WILDCARD_SSH)
+        self.assertTrue(admin.set_listener_exceptions("synthetic-owner-session", {SSH}).open)
+        self.assertEqual(decode(self.stored()), frozenset({SSH}))
+        # A new process: fresh check, same database, loaded before the first check.
+        _, restarted, sink = self.admin(WILDCARD_SSH)
+        self.assertEqual(restarted.listener_exceptions, frozenset())
+        verdict = restarted.startup()
+        self.assertTrue(verdict.open)
+        self.assertEqual(restarted.listener_exceptions, frozenset({SSH}))
+        self.assertEqual(sink.events, [])
+
+    def test_missing_row_is_the_empty_default(self):
+        _, check, sink = self.admin(Files())
+        self.assertTrue(check.startup().open)
+        self.assertEqual(sink.events, [])
+
+    def test_corrupt_or_invalid_stored_value_fails_closed(self):
+        corrupt = ("", "not json", "[]", "null", '{"version": 1}',
+                   '{"version": 2, "exceptions": []}',
+                   '{"version": 1, "exceptions": "*"}',
+                   '{"version": 1, "exceptions": [{"port": 22}]}',
+                   '{"version": 1, "exceptions": [{"protocol": "udp", "port": 22, "family": null, "scope": "wildcard"}]}',
+                   '{"version": 1, "exceptions": [{"protocol": "tcp", "port": 0, "family": null, "scope": "wildcard"}]}',
+                   '{"version": 1, "exceptions": [{"protocol": "tcp", "port": 22, "family": null, "scope": "any"}]}',
+                   '{"version": 1, "exceptions": [{"protocol": "tcp", "port": 22, "family": null, "scope": "wildcard"},'
+                   ' {"protocol": "tcp", "port": 22, "family": null, "scope": "wildcard"}]}',
+                   # Well-formed but covering the dashboard port: invalid for this config.
+                   encode({ListenerException(443), SSH}),
+                   "x" * 5000)
+        for value in corrupt:
+            with self.subTest(value=value[:60]):
+                self.store_raw(value)
+                _, check, sink = self.admin(WILDCARD_SSH)
+                verdict = check.startup()
+                self.assertEqual(check.listener_exceptions, frozenset())
+                self.assertFalse(verdict.open)
+                self.assertEqual([event.reasons for event in sink.events],
+                                 [(Reason.LISTENER_EXCEPTIONS_UNREADABLE,), (Reason.UNEXPECTED_LISTENER,)])
+                self.assertNotIn("22", repr(sink.events[0]))
+
+    def test_unreadable_store_fails_closed(self):
+        class Unreadable:
+            def load(self):
+                raise OSError("synthetic unreadable store")
+
+        check, _, _, sink = checker(files=WILDCARD_SSH, exception_store=Unreadable())
+        self.assertFalse(check.startup().open)
+        self.assertEqual(check.listener_exceptions, frozenset())
+        self.assertEqual(sink.events[0].reasons, (Reason.LISTENER_EXCEPTIONS_UNREADABLE,))
+
+    def test_persist_failure_rolls_back_with_audit(self):
+        admin, check, _ = self.admin(WILDCARD_SSH)
+        admin.set_listener_exceptions("synthetic-owner-session", {SSH})
+        wider = {SSH, ListenerException(8443)}
+        with patch.object(ListenerExceptionStore, "write_on", side_effect=OSError("synthetic write failure")):
+            with self.assertRaises(OSError):
+                admin.set_listener_exceptions("synthetic-owner-session", wider)
+        self.assertEqual(decode(self.stored()), frozenset({SSH}))
+        self.assertEqual(check.listener_exceptions, frozenset({SSH}))
+        self.assertEqual(sorted(record.outcome.value for record in self.store.list_records()),
+                         ["failed", "succeeded"])
+
+    def test_audit_failure_rolls_back_persisted_value(self):
+        admin, check, _ = self.admin(WILDCARD_SSH)
+        with patch.object(AuditStore, "append_on", side_effect=OSError("synthetic audit failure")):
+            with self.assertRaises(OSError):
+                admin.set_listener_exceptions("synthetic-owner-session", {SSH})
+        self.assertIsNone(self.stored())
+        self.assertEqual(check.listener_exceptions, frozenset())
+
+    def test_denied_change_persists_nothing(self):
+        admin, _, _ = self.admin(WILDCARD_SSH)
+        with self.assertRaises(OwnerAuthorizationError):
+            admin.set_listener_exceptions({"invited": True}, {SSH})
+        self.assertIsNone(self.stored())
+
+    def test_facade_requires_a_store_sharing_the_audit_database(self):
+        check, *_ = checker()
+        with self.assertRaises(ValueError):
+            ReservationAdministration(self.service, check)
+        other = Database(Path(self.temporary.name) / "other.sqlite3")
+        check, *_ = checker(exception_store=ListenerExceptionStore(other))
+        with self.assertRaises(ValueError):
+            ReservationAdministration(self.service, check)
+
+    def test_write_requires_a_transaction(self):
+        with closing(self.database.connect()) as connection, self.assertRaises(Exception):
+            self.exception_store.write_on(connection, {SSH})

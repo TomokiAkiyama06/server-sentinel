@@ -85,12 +85,15 @@ human listener port or a recorded proxy socket port, and never matches a bind
 to a reserved address: `100.64.x.y:22` still closes access when `0.0.0.0:22`
 is allowed. The only runtime path that changes it is
 `app.audit.integration.ReservationAdministration`, which authorizes the Owner,
-commits a `change_security_setting` audit record, then applies the set and
-re-checks immediately so narrowing it closes access at once. The set is kept
-in memory only in this slice; a restart returns to the empty default (fail
-closed), so the Owner re-applies it through the same audited path, for example
-from a local host-side command, until durable storage is added. Faults still
-carry only reasons and counts.
+writes the set and a `change_security_setting` audit record in one SQLite
+transaction, then applies the set and re-checks immediately so narrowing it
+closes access at once. `reservation_store.ListenerExceptionStore` persists the
+set as versioned JSON under one fixed key of the foundation
+`application_metadata` key/value table (no migration), and `startup()` loads it
+before the first check. A missing row is the empty default; an unreadable,
+corrupt, or no longer valid value (for example one covering the dashboard
+port) loads as the empty set and emits a `LISTENER_EXCEPTIONS_UNREADABLE`
+Owner fault, never a wider set. Faults still carry only reasons and counts.
 
 Nothing here is wired into the application or a route yet, reads the host
 implicitly, runs `tailscale`, changes Tailscale ACLs/Grants, or needs Tailscale

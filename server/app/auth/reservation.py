@@ -20,6 +20,7 @@ the ``tailscale serve status --json`` shape as understood from upstream
 sources; the real installed output format is unverified (see MANUAL_TEST.md).
 """
 
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import StrEnum
@@ -68,6 +69,7 @@ class Reason(StrEnum):
     UNEXPECTED_ROUTE = "UNEXPECTED_ROUTE"
     MAPPING_MISSING = "MAPPING_MISSING"
     HUMAN_LISTENER_MISSING = "HUMAN_LISTENER_MISSING"
+    LISTENER_EXCEPTIONS_UNREADABLE = "LISTENER_EXCEPTIONS_UNREADABLE"
 
 
 class CheckKind(StrEnum):
@@ -92,6 +94,7 @@ class BindScope(StrEnum):
 
 
 MAX_LISTENER_EXCEPTIONS = 16
+MAX_PENDING_FAULTS = 8
 
 
 @dataclass(frozen=True)
@@ -176,6 +179,11 @@ class ListenerEnumerator(Protocol):
 class ProxyRouteEnumerator(Protocol):
     def routes(self) -> Iterable[ProxyRoute]:
         """Return every proxy route on this node; raise when that cannot be established."""
+
+
+class ListenerExceptionSource(Protocol):
+    def load(self) -> Iterable["ListenerException"]:
+        """Return the persisted Owner exceptions; raise when unreadable or corrupt."""
 
 
 class FaultSink(Protocol):
@@ -547,6 +555,7 @@ class HostnameReservationCheck:
 
     def __init__(self, config: ReservationConfig, listeners: ListenerEnumerator,
                  routes: ProxyRouteEnumerator, sink: FaultSink, *,
+                 exception_store: ListenerExceptionSource | None = None,
                  timeout: float = ENUMERATION_TIMEOUT_SECONDS,
                  retry_seconds: float = RETRY_WHILE_CLOSED_SECONDS,
                  monotonic: Callable[[], float] = time.monotonic,
@@ -570,10 +579,12 @@ class HostnameReservationCheck:
         self._verdict = CLOSED
         self._last_check: float | None = None
         self._last_notified: tuple[Reason, ...] | None = None
-        self._pending: ReservationFault | None = None
+        self._pending: deque[ReservationFault] = deque(maxlen=MAX_PENDING_FAULTS)
         self._inflight: dict[str, threading.Thread] = {}
         # Empty by default and never read from deployment configuration: only
-        # the audited Owner path (``ReservationAdministration``) changes it.
+        # the audited Owner path (``ReservationAdministration``) changes it,
+        # persisting it in ``exception_store``, which ``startup`` loads.
+        self.exception_store = exception_store
         self._exceptions: frozenset = frozenset()
         self.undelivered_faults = 0
 
@@ -608,7 +619,25 @@ class HostnameReservationCheck:
             return self._check_locked(CheckKind.CONFIGURATION)
 
     def startup(self) -> ReservationVerdict:
-        return self._check(CheckKind.STARTUP)
+        """Load the persisted exceptions, then run the first check.
+
+        An unreadable, corrupt or no longer valid stored set fails closed: the
+        check runs with no exceptions and the Owner receives a fault. It is
+        never widened to allow everything.
+        """
+        with self._check_lock:
+            self._load_exceptions()
+            return self._check_locked(CheckKind.STARTUP)
+
+    def _load_exceptions(self) -> None:
+        self._exceptions = frozenset()
+        if self.exception_store is None:
+            return
+        try:
+            self._exceptions = validate_listener_exceptions(self.config, self.exception_store.load())
+        except Exception:
+            self._pending.append(ReservationFault((Reason.LISTENER_EXCEPTIONS_UNREADABLE,),
+                                                  CheckKind.STARTUP, self._now()))
 
     def tick(self) -> ReservationVerdict | None:
         now = self._monotonic()
@@ -672,37 +701,41 @@ class HostnameReservationCheck:
                                                               self._exceptions)
         except Exception:
             reasons, extra_listeners, extra_routes = (Reason.LISTENER_ENUMERATION_UNAVAILABLE,), 0, 0
-        try:
-            at = self._utcnow()
-            if not isinstance(at, datetime) or at.tzinfo is None:
-                raise ValueError
-            at = at.astimezone(timezone.utc)
-        except Exception:
-            at = datetime.now(timezone.utc)
+        at = self._now()
         verdict = ReservationVerdict(not reasons, reasons, at, kind)
         with self._lock:
             self._verdict = verdict
         self._last_check = started if math.isfinite(started) else None
         if reasons:
             if kind != CheckKind.RETRY or reasons != self._last_notified:
-                self._pending = ReservationFault(reasons, kind, at, extra_listeners, extra_routes)
+                self._pending.append(ReservationFault(reasons, kind, at, extra_listeners, extra_routes))
                 self._last_notified = reasons
         else:
             self._last_notified = None
         self._deliver()
         return verdict
 
-    def _deliver(self) -> None:
-        fault = self._pending
-        if fault is None:
-            return
+    def _now(self) -> datetime:
         try:
-            self._sink.emit(fault)
+            at = self._utcnow()
+            if not isinstance(at, datetime) or at.tzinfo is None:
+                raise ValueError
+            return at.astimezone(timezone.utc)
         except Exception:
-            self.undelivered_faults += 1
-            return
-        if self._pending is fault:
-            self._pending = None
+            return datetime.now(timezone.utc)
+
+    def _deliver(self) -> None:
+        # Oldest first; stop at the first failure and retry on the next tick.
+        # The bounded queue drops the oldest undelivered fault when full.
+        while self._pending:
+            fault = self._pending[0]
+            try:
+                self._sink.emit(fault)
+            except Exception:
+                self.undelivered_faults += 1
+                return
+            if self._pending and self._pending[0] is fault:
+                self._pending.popleft()
 
 
 @dataclass(frozen=True)

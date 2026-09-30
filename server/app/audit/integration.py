@@ -3,6 +3,7 @@
 from uuid import UUID, uuid4
 
 from app.auth.reservation import HostnameReservationCheck
+from app.auth.reservation_store import ListenerExceptionStore
 from app.cameras.registry import NodeHealthState
 from .model import AuditAction, TargetKind
 
@@ -251,27 +252,36 @@ class AccessAdministration:
 class ReservationAdministration:
     """Owner-only change of the hostname-reservation listener exceptions.
 
-    Validation runs after Owner authorization; the ``change_security_setting``
-    audit record commits first and only then is the new set applied to the
-    in-memory check, which immediately re-checks. A refused actor gets a
-    bounded ``denied`` record and changes nothing; an invalid set gets a
-    ``failed`` record and changes nothing. The set is not persisted by this
-    class, so a restart starts again from the empty default (closed on any
-    wildcard listener). This class registers no route.
+    Validation runs after Owner authorization. The persisted set
+    (``ListenerExceptionStore.write_on``) and the ``change_security_setting``
+    audit record commit in one SQLite transaction; only after that commit is
+    the set applied to the in-memory check, which immediately re-checks. A
+    refused actor gets a bounded ``denied`` record and changes nothing; an
+    invalid set or a failed write/append gets a ``failed`` record, rolls back,
+    and changes nothing. This class registers no route.
     """
 
     def __init__(self, service, check):
         if not isinstance(check, HostnameReservationCheck):
             raise ValueError("reservation check is required")
+        store = check.exception_store
+        if not isinstance(store, ListenerExceptionStore) or \
+                getattr(service.store, "database", None) != store.database:
+            raise ValueError("listener exceptions must persist with their audit record")
         self.service = service
         self.check = check
+        self.store = store
 
     def set_listener_exceptions(self, actor_context, exceptions):
+        def persist(connection, staged):
+            self.store.write_on(connection, staged.exceptions)
+            return staged
+
         change = self.service.execute_transactional(
             actor_context, action=AuditAction.CHANGE_SECURITY_SETTING,
             target_kind=TargetKind.SECURITY_SETTINGS,
             target_logical_id=RESERVATION_LISTENER_EXCEPTIONS_ID,
             prepare=lambda: self.check.stage_listener_exceptions(exceptions),
-            operation=lambda connection, staged: staged,
+            operation=persist,
         )
         return self.check.apply_audited_listener_exceptions(change)

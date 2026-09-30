@@ -41,9 +41,10 @@ Hostname-reservation listener exceptions (ADR-0003) change only through
 `change_security_setting` on `security_settings` with one fixed logical ID and
 no port, address or service name. The existing action column has no `CHECK`
 constraint and the action already existed, so no migration is involved. The
-record commits before the new set is applied to the in-memory check; a
-non-Owner gets a `denied` record and an invalid set a `failed` record, and
-neither changes anything.
+persisted set (existing `application_metadata` row) commits in the same
+transaction as the record, and only then is it applied to the in-memory check;
+a non-Owner gets a `denied` record, and an invalid set or a failed write or
+append gets a `failed` record and rolls back, changing nothing.
 
 Human-access administration runs through `AccessAdministration`, which wraps
 `OwnerAuditService.execute_transactional()` around the `AccessStore` `*_on`

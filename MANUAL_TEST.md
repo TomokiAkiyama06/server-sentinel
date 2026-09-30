@@ -909,8 +909,11 @@ by the Issue #6 synthetic policy model.
   (not wildcard) and confirm access still closes; start a wildcard listener
   on another port and confirm access closes; attempt the change as a non-Owner
   and confirm a `denied` record and no change; restart and confirm the
-  exception is gone (in-memory only in this slice) and access is closed until
-  it is re-applied. UDP/QUIC listeners are not enumerated.
+  persisted exception is loaded before the first check and access opens;
+  corrupt the stored `application_metadata` value on a disposable copy and
+  confirm startup uses no exceptions (access closed) and the Owner receives
+  a `LISTENER_EXCEPTIONS_UNREADABLE` fault. UDP/QUIC listeners are not
+  enumerated.
 - Once the check is composed into startup and the daily worker, confirm an
   enumeration failure or timeout (for example stopping `tailscaled`, or making
   `/proc/net` unreadable) keeps human access closed and notifies the Owner,
