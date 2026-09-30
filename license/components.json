@@ -23,7 +23,11 @@
     },
     {
       "path": "web/tests/compile.mjs",
-      "sha256": "sha256:ca41bbfd7ce3350a20f5ab1c0e2f32d0cbbdb79bbdde50340f690bae7084e040"
+      "sha256": "sha256:0fb9e61b55956943885fdffe2b4edae44809c7da7231b7a198b712485bbb562e"
+    },
+    {
+      "path": "web/tests/compile.test.mjs",
+      "sha256": "sha256:7b3049d81ef13193a45f1c54eec7cdb4a3b6d2d32a23daf671640e1f62c8d733"
     },
     {
       "path": "web/tests/core.test.mjs",
