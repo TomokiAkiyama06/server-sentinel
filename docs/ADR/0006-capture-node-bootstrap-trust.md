@@ -284,7 +284,10 @@ status or decision.
     revoked, and a revoked key is never bound again, even to the same node.
     Staging only checks and does not bind, so renewal retries with fresh keys
     do not grow the table; promotion binds. Migration 17 backfills the keys
-    that existing enrollment and credential rows still record. Keys superseded
+    that existing enrollment and credential rows still record; if one legacy
+    key digest appears under two node IDs (any state), the migration fails
+    closed and blocks startup rather than silently picking one binding, and
+    the Owner must remediate the conflicting rows first. Keys superseded
     before that migration are not recoverable.
   - *Agent rotation.* `NodeCredentialStore.rotate` atomically replaces the
     committed generation (rename over `current.json`) for the same node and

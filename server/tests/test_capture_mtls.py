@@ -202,6 +202,16 @@ class CaptureMtlsTests(CaptureTlsHarness):
         self.assertNotIn(str(claim.node_id), repr(session))
         self.assertTrue(session.still_admitted())
 
+    def test_admitted_session_does_not_inherit_the_handshake_timeout(self):
+        # A camera/data pause longer than the handshake bound must not surface
+        # as a transport failure on an otherwise healthy session.
+        _, _, certificate, key = self._paired_node()
+        session, output = self._exchange(certificate, key)
+        self.assertEqual("ok", output)
+        self.assertNotIsInstance(session, str, session)
+        self.addCleanup(session.close)
+        self.assertIsNone(session.connection.gettimeout())
+
     # -- negative paths ------------------------------------------------------
 
     def test_missing_client_certificate_is_rejected(self):
