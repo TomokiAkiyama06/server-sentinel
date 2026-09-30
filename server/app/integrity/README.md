@@ -15,8 +15,9 @@ contributing at most one key named after its source: unit serial from
 else the kernel's SCSI `device/wwid` (`scsi_wwid`) else the best logical-unit
 VPD page 0x83 designator, NAA > EUI-64 > SCSI name string > T10 vendor ID
 (`vpd_pg83_designator`). Vendor-specific and port/group designators are
-ignored. VPD pages are bounds-checked; a wrong page code, disconnected
-qualifier, truncated page or overrunning descriptor makes that page
+ignored, as are nonconforming designators (e.g. an NAA whose length does not
+match its NAA field). VPD pages are bounds-checked; a wrong page code,
+disconnected qualifier, truncated page or overrunning descriptor makes that page
 unavailable, and empty/placeholder/non-printable values are never identities.
 All sources are world-readable sysfs attributes; no root is needed. Devices
 whose earlier sources exist (NVMe) keep an identical identity. SATA/SCSI disks

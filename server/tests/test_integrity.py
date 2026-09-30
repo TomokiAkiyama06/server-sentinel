@@ -798,6 +798,15 @@ class StorageIdentityProbeTests(TestCase):
             # code sets, blank T10 vendor-specific part, unaligned name string.
             (_descriptor(1, 3, bytes(8)), None),
             (_descriptor(1, 3, bytes.fromhex("1000c500deadbeef")), None),
+            # NAA length follows the NAA field: 2/3/5 are 8 bytes, 6 is 16.
+            (_descriptor(1, 3, bytes.fromhex("6000c500deadbeef0123456789abcdef")),
+             "naa.6000c500deadbeef0123456789abcdef"),
+            (_descriptor(1, 3, bytes.fromhex("6000c500deadbeef")), None),
+            (_descriptor(1, 3, bytes.fromhex("5000c500deadbeef0123456789abcdef")), None),
+            (_descriptor(1, 3, bytes.fromhex("2000c500deadbeef0123456789abcdef")), None),
+            # A nonconforming NAA never outranks a valid lower designator.
+            (_descriptor(1, 3, bytes.fromhex("6000c500deadbeef")) + _descriptor(1, 2, eui),
+             "eui.0123456789abcdef"),
             (_descriptor(2, 3, b"5000c500"), None),
             (_descriptor(1, 1, SYNTHETIC_T10), None),
             (_descriptor(2, 1, b"ATA             "), None),

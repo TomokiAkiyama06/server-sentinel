@@ -159,16 +159,20 @@ def _vpd_unit_serial(data: bytes) -> str:
 # first. Vendor-specific (0), port/group (4-7) designators are not globally
 # unique logical-unit names and are ignored.
 _DESIGNATOR_RANK = {0x3: "naa", 0x2: "eui", 0x8: "name", 0x1: "t10"}
+# SPC NAA field -> required designator length: IEEE Extended (2), Locally
+# Assigned (3) and IEEE Registered (5) are 8 bytes, IEEE Registered Extended
+# (6) is 16 bytes. Any other NAA field or length is nonconforming.
+_NAA_LENGTH = {0x2: 8, 0x3: 8, 0x5: 8, 0x6: 16}
 
 
 def _designator(code_set: int, kind: int, value: bytes) -> str:
     """Canonical text for one conforming designator, or "" when unusable."""
     if kind in (0x2, 0x3):
-        # Binary identifiers: NAA 8/16 bytes with a defined NAA field,
-        # EUI-64 based 8/12/16 bytes. All-zero values identify nothing.
+        # Binary identifiers: NAA with a defined NAA field and that field's
+        # length, EUI-64 based 8/12/16 bytes. All-zero values identify nothing.
         if code_set != 0x1 or not any(value):
             return ""
-        if kind == 0x3 and (len(value) not in (8, 16) or value[0] >> 4 not in (2, 3, 5, 6)):
+        if kind == 0x3 and _NAA_LENGTH.get(value[0] >> 4) != len(value):
             return ""
         if kind == 0x2 and len(value) not in (8, 12, 16):
             return ""
