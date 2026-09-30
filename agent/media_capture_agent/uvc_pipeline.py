@@ -233,6 +233,22 @@ class PipelineLauncher(Protocol):
     def launch(self, device_fd: int, profile: MjpegProfile) -> PipelineProcess: ...
 
 
+class _GroupScan:
+    """Result of one process-table scan; any failure counts as a live member."""
+
+    def __init__(self):
+        self.done = threading.Event()
+        self.alive = True
+
+    def run(self, scan, deadline):
+        try:
+            self.alive = scan(deadline)
+        except Exception:  # Fail closed; an error is never evidence of absence.
+            self.alive = True
+        finally:
+            self.done.set()
+
+
 class SubprocessPipeline:
     """A child process group whose stdout carries compressed frames.
 
@@ -247,6 +263,7 @@ class SubprocessPipeline:
         self._proc_root = proc_root
         self._stdout = process.stdout
         self._reaped = False
+        self._scan = None
 
     def read(self, size):
         try:
@@ -281,9 +298,33 @@ class SubprocessPipeline:
 
         Unprovable absence (no readable process table, or a scan that could
         not finish before ``deadline``) counts as alive, so cleanup is never
-        reported without evidence and a large ``/proc`` cannot stretch the
-        stop bound.
+        reported without evidence. The scan runs in a worker thread because a
+        busy or stalled ``/proc`` can block ``listdir``/``open``/``read`` past
+        any per-entry check; at most one scan per pipeline is outstanding, so
+        a stalled one is awaited again instead of starting more threads.
         """
+        while True:
+            scan, fresh = self._scan, self._scan is None
+            if fresh:
+                scan = _GroupScan()
+                thread = threading.Thread(target=scan.run, args=(self._scan_group, deadline),
+                                          name="media-capture-agent-pgscan", daemon=True)
+                try:
+                    thread.start()
+                except RuntimeError:
+                    return True
+                self._scan = scan
+            if not scan.done.wait(max(0.0, deadline - time.monotonic())):
+                return True
+            self._scan = None
+            # Absence is stable once proven: the unreaped zombie leader keeps
+            # the group ID reserved, so an earlier scan's "gone" is still valid
+            # evidence; its "alive" (possibly its own expired bound) is not
+            # final, so one fresh scan runs within this deadline.
+            if fresh or not scan.alive:
+                return scan.alive
+
+    def _scan_group(self, deadline):
         pgid = self.process.pid
         try:
             entries = os.listdir(self._proc_root)

@@ -1198,6 +1198,46 @@ class SubprocessPipelineTests(unittest.TestCase):
             self.assertIsNotNone(leader.returncode)
         pipeline.close()
 
+    def test_blocking_process_table_operations_are_bounded(self):
+        # A stalled /proc is synthetic: listdir, or the open of a single
+        # unrelated entry, blocks until released, far past the stop bound.
+        release = threading.Event()
+        self.addCleanup(release.set)
+
+        def blocking(function):
+            def call(*args, **kwargs):
+                release.wait(10)
+                return function(*args, **kwargs)
+            return call
+
+        for target, function in (("media_capture_agent.uvc_pipeline.open", open),
+                                 ("media_capture_agent.uvc_pipeline.os.listdir", os.listdir)):
+            release.clear()
+            leader = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"],
+                                      stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                      stderr=subprocess.DEVNULL, start_new_session=True)
+            self.addCleanup(leader.stdout.close)
+            self.addCleanup(leader.wait, 5)
+            with tempfile.TemporaryDirectory() as proc:
+                (Path(proc) / "900000").mkdir()
+                (Path(proc) / "900000" / "stat").write_bytes(b"900000 (other) S 1 900000 0 0")
+                pipeline = SubprocessPipeline(leader, proc_root=proc)
+                with mock.patch(target, blocking(function), create=True):
+                    for wait in (False, True, False):
+                        started = time.monotonic()
+                        # A scan that cannot finish is not evidence of absence.
+                        self.assertFalse(pipeline.stop(0.1, wait=wait))
+                        self.assertLess(time.monotonic() - started, 0.4)
+                        self.assertIsNone(leader.returncode)  # Group ID stays reserved.
+                    # The stalled scan is awaited again, never duplicated.
+                    self.assertEqual(sum(thread.name == "media-capture-agent-pgscan"
+                                         for thread in threading.enumerate()), 1)
+                    release.set()
+                    # Once the stalled scan completes it proves the group gone.
+                    self.assertTrue(pipeline.stop(2, wait=False))
+                    self.assertIsNotNone(leader.returncode)
+            pipeline.close()
+
     def test_sigterm_ignoring_pipeline_is_killed_within_bound(self):
         process = self.launch("ignore")
         self.assertTrue(process.read(16))

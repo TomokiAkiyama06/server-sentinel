@@ -334,7 +334,9 @@ exponential backoff; a pipeline that cannot be reaped blocks relaunch and keeps
 the recovery marker armed, and later polls retry reaping without waiting the full
 stop bound so heartbeats are not delayed; teardowns within one poll share one
 stop bound. The process-table check that proves the group gone is itself bounded
-by that stop bound; a check that cannot finish in time counts as not reaped. Discovery scans and the capture-node
+by that stop bound (it runs off the tick thread, so a stalled `/proc` listing or
+read cannot overrun it; at most one check per pipeline is outstanding); a check
+that cannot finish in time counts as not reaped. Discovery scans and the capture-node
 open/close run off the tick thread and share one `device_timeout` per poll, so
 the heartbeat is delayed by at most `device_timeout + stop_timeout` regardless
 of how many sources hang; a hung driver call yields
