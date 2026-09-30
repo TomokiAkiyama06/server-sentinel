@@ -69,16 +69,20 @@ from `LocalUvcSupervisor`'s single watchdog thread through
 SQLite call cannot run its own read timeout, so the watchdog lowers that
 source's `online` claim, and past the reopen bound reports `offline`
 (`video_capture_failed`) with a reopen request that the worker performs (close,
-then reopen through the identity path) as soon as it returns; a frame it
-returns with is discarded. The watchdog never opens, closes or rebinds a device
+then reopen through the identity path) as soon as it returns, and re-checks
+after presence discovery before starting another read; a frame it returns with
+is discarded. The watchdog never opens, closes or rebinds a device
 itself. It takes the controller's transition lock non-blockingly and re-checks
 the frame age under it, so a frame delivered after its snapshot wins. That lock
 covers in-memory work only: transitions, the negotiated profile and
-`last_seen_at` stage their values in transition order, and a per-source writer
-persists the merged latest values after the lock is released, one write at a
-time. A watchdog report that finds a write in flight leaves its values to that
-writer and marks the source unpersisted until they are durable. A transient
-stall keeps the recorded negotiated profile.
+`last_seen_at` stage their values in transition order, and the runtime records
+each transition in memory under it; a per-source writer persists the merged
+latest values after the lock is released, one write at a time, and logging and
+the health sink receive the events (in order) after that, also outside the
+lock. The source is marked unpersisted from the start of a write until every
+staged value is durable, so a hung write never reads as persisted; a watchdog
+report that finds a write in flight leaves its values to that writer. A
+transient stall keeps the recorded negotiated profile.
 
 While a capture is open, `LinuxDiscovery.scan()` (which opens every video node)
 runs at most every `presence_scan_seconds` instead of on every frame; an unplug

@@ -178,6 +178,32 @@ class UvcRegistryTests(UvcRegistryFixture):
                          self.registry.get_source(self.source.id).health_state)
         self.assertFalse(self.adapter.health_unpersisted(self.source.id))
 
+    def test_health_is_unpersisted_while_an_uncontended_write_is_in_flight(self):
+        now = self._approved_online()
+        entered, release = threading.Event(), threading.Event()
+        self.addCleanup(release.set)
+        original = self.registry.update_source_health
+
+        def blocking_write(source_id, **values):
+            if "last_seen_at" in values and not release.is_set():
+                entered.set()
+                release.wait(10)
+            return original(source_id, **values)
+
+        self.registry.update_source_health = blocking_write
+        now[0] += 1.5
+        worker = threading.Thread(target=self.adapter.poll_source, args=(self.source.id,))
+        worker.start()
+        self.addCleanup(worker.join, 10)
+        self.assertTrue(entered.wait(5))
+        # No other flush contends: the write in flight alone means the
+        # durable row may still be behind the in-memory state.
+        self.assertTrue(self.adapter.health_unpersisted(self.source.id))
+        release.set()
+        worker.join(10)
+        self.assertFalse(worker.is_alive())
+        self.assertFalse(self.adapter.health_unpersisted(self.source.id))
+
     def test_uvc_approval_rolls_back_when_audit_append_fails(self):
         class PermitOwner:
             def require_owner(self, actor_context):

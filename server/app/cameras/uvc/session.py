@@ -238,6 +238,14 @@ class CaptureSession:
                 self.on_profile(negotiated)
             with self._progress_lock:
                 window = self._live[1] if self._live is not None else self.frame_stall_seconds
+                reopen = self._reopen_requested
+            if reopen:
+                # Requested while the worker was blocked in presence
+                # discovery or other pre-read work: do not start another
+                # read on the stalled descriptor, which may hang as well.
+                self.close()
+                self.controller.capture_failed()
+                return False
             try:
                 frame = self.capture.read_frame(min(timeout, window))
             except FrameTimeout:

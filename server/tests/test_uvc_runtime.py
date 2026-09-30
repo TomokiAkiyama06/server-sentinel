@@ -227,6 +227,33 @@ class RuntimeLifecycleTests(RuntimeFixture):
         block.set()
         self.assertTrue(self.wait_health(source.id, SourceHealthState.ONLINE))
 
+    def test_blocking_health_sink_does_not_hold_the_transition_lock(self):
+        # A downstream sink (logging, preview invalidation, notification) that
+        # blocks while handling ``video_capture_ready`` must not keep the
+        # watchdog from lowering the online claim.
+        source = self.source()
+        entered, release = threading.Event(), threading.Event()
+        self.addCleanup(release.set)
+        armed = threading.Event()
+
+        def blocking_sink(event):
+            if armed.is_set() and event.reason == "video_capture_ready":
+                armed.clear()
+                entered.set()
+                release.wait(10)
+
+        runtime = self.runtime(source.id, health_sink=blocking_sink, configuration_timing=dict(
+            frame_stall_seconds=0.25, frame_stall_reopen_seconds=30.0))
+        runtime.start()
+        armed.set()
+        runtime.reapprove(self.admin, "synthetic-owner", source.id, self.camera)
+        self.assertTrue(entered.wait(5))
+        # The worker is stuck in the sink and delivers no frame.
+        self.assertTrue(self.wait_health(source.id, SourceHealthState.DEGRADED, timeout=3.0))
+        self.assertIs(CameraState.DEGRADED, runtime.status().sources[0].camera_state)
+        release.set()
+        self.assertTrue(self.wait_health(source.id, SourceHealthState.ONLINE))
+
     def test_start_reapprove_stream_and_stop(self):
         source = self.source()
         runtime = self.runtime(source.id)

@@ -148,14 +148,29 @@ class LocalUvcRuntime:
 
     # -- health events -------------------------------------------------
     def _health(self, event: HealthEvent) -> None:
-        """Adapter health callback; never raises into the capture worker."""
-        now = self._monotonic()
+        """Record and publish one event (both halves of the adapter callback)."""
+        self._record_health(event)
+        self._publish_health(event)
+
+    def _record_health(self, event: HealthEvent) -> None:
+        """In-memory half, called under the source's transition lock.
+
+        It only updates bounded in-memory state and never blocks, so the
+        runtime status follows every transition even while a downstream sink
+        is slow.
+        """
         with self._events_lock:
             if len(self._events) == self._events.maxlen:
                 self._events_dropped += 1
             self._events.append(event)
             if event.source_id in self._sources:
                 self._camera[event.source_id] = event.state
+
+    def _publish_health(self, event: HealthEvent) -> None:
+        """Downstream half (logging, health sink), called after the source's
+        transition lock is released; never raises into the capture worker."""
+        now = self._monotonic()
+        with self._events_lock:
             last = self._last_logged.get(event.source_id)
             log = (event.state is CameraState.MANUAL or last is None
                    or now - last >= HEALTH_LOG_INTERVAL_SECONDS)
@@ -213,7 +228,8 @@ class LocalUvcRuntime:
             self._started = True
             try:
                 self.adapter = self._adapter_factory(
-                    self.registry, emit_audit=self._health, on_frame=self._on_frame,
+                    self.registry, emit_audit=self._record_health,
+                    publish=self._publish_health, on_frame=self._on_frame,
                     discovery=self._discovery, capture_factory=self._capture_factory,
                     frame_stall_seconds=self.configuration.frame_stall_seconds,
                     frame_stall_reopen_seconds=self.configuration.frame_stall_reopen_seconds,

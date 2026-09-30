@@ -461,6 +461,28 @@ class FrameProgressTests(unittest.TestCase):
         self.assertEqual(2, len(self.instances))
         self.assertEqual(CameraState.ONLINE, self.controller.state)
 
+    def test_reopen_requested_during_a_blocked_presence_scan_skips_the_next_read(self):
+        capture = self.go_online()
+        reads = []
+        read = capture.read_frame
+        capture.read_frame = lambda timeout: (reads.append(timeout), read(timeout))[1]
+        scan = self.discovery.scan
+
+        def blocked_scan():
+            # The watchdog runs while the worker is stuck in discovery.
+            self.clock.advance(self.session.frame_stall_reopen_seconds)
+            self.assertTrue(self.session.check_frame_progress())
+            return scan()
+
+        self.discovery.scan = blocked_scan
+        self.clock.advance(self.session.presence_scan_seconds)
+        self.assertFalse(self.session.step())
+        self.assertEqual([], reads)
+        self.assertTrue(capture.closed)
+        self.assertIsNone(self.session.capture)
+        self.assertEqual(CameraState.OFFLINE, self.controller.state)
+        self.assertEqual("video_capture_failed", self.events[-1].reason)
+
     def test_frame_returned_after_a_watchdog_reopen_is_not_reported_online(self):
         capture = self.go_online()
         read = capture.read_frame

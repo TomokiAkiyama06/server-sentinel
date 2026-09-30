@@ -40,9 +40,10 @@ class _HealthWriter:
     flush writes the merged latest values outside that lock; merging is
     equivalent to applying the partial updates in order. At most one write
     is in flight: a non-blocking flush that finds one running leaves its
-    values to that writer, which re-reads the staged values after its write,
-    and marks the source unpersisted meanwhile so the runtime reports the
-    in-memory state instead of a stale durable row.
+    values to that writer, which re-reads the staged values after its write.
+    The source is marked unpersisted before any write begins and cleared only
+    once every staged value is durable, so the runtime reports the in-memory
+    state instead of a stale durable row while a write is in flight or hung.
     """
 
     def __init__(self, write, mark):
@@ -66,8 +67,12 @@ class _HealthWriter:
             try:
                 with self._staged_lock:
                     values, self._staged = self._staged, None
-                if values is None:
-                    return True
+                    if values is None:
+                        return True
+                    # Not durable until this write (and anything staged
+                    # meanwhile) completes; a write that blocks indefinitely
+                    # must not leave the source reported as persisted.
+                    self._mark(True)
                 try:
                     self._write(**values)
                 except BaseException:
@@ -114,7 +119,7 @@ class LocalUvcAdapter:
     # often; before any capture opens it is checked on every poll.
     APPROVAL_CONFLICT_INTERVAL_SECONDS = 1.0
 
-    def __init__(self, registry, *, emit_audit, on_frame,
+    def __init__(self, registry, *, emit_audit, on_frame, publish=None,
                  discovery=None, capture_factory=MmapCapture, clock=None,
                  monotonic=time.monotonic, frame_stall_seconds=1.0,
                  frame_stall_reopen_seconds=5.0, presence_scan_seconds=1.0):
@@ -124,6 +129,9 @@ class LocalUvcAdapter:
         self.store = ApprovalStore(registry.database,
                                    reservation=getattr(registry, "reservation", None))
         self.emit_audit = emit_audit
+        # Downstream delivery (logging, external health sinks) that may block;
+        # the controller calls it only after releasing its transition lock.
+        self.publish = publish
         self.on_frame = on_frame
         self.discovery = discovery or LinuxDiscovery()
         self.capture_factory = capture_factory
@@ -196,10 +204,16 @@ class LocalUvcAdapter:
             image_quality_state="unknown",
             **({} if keep_profile else {"negotiated_capture_profile": None}),
         )
-        # The in-memory transition (runtime health, preview invalidation) is
-        # delivered even when persistence is refused or still in flight, so
-        # capture loss is never represented only by a stale durable ONLINE row.
+        # The in-memory transition (runtime health state) is recorded even
+        # when persistence is refused or still in flight, so capture loss is
+        # never represented only by a stale durable ONLINE row. Potentially
+        # blocking downstream delivery goes through ``_publish`` instead.
         self.emit_audit(event)
+
+    def _publish(self, event):
+        """Controller callback after its transition lock is released."""
+        if self.publish is not None:
+            self.publish(event)
 
     def _session(self, source, approved, *, explicit_candidate=None):
         self._write_health(source.id, health_state=SourceHealthState.OFFLINE,
@@ -208,7 +222,7 @@ class LocalUvcAdapter:
         controller = ReconnectController(source.id, approved, self._event,
                                          enabled=source.enabled, store=self.store,
                                          explicit_candidate=explicit_candidate,
-                                         flush=writer.flush)
+                                         flush=writer.flush, notify=self._publish)
 
         def profile_sink(negotiated):
             value = negotiated.profile

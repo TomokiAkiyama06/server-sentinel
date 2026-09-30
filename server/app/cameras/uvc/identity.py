@@ -1,5 +1,6 @@
 """Conservative UVC identity decisions; device paths never identify a camera."""
 
+from collections import deque
 from dataclasses import dataclass, field
 from enum import StrEnum
 import threading
@@ -127,7 +128,7 @@ class ReconnectController:
     """
 
     def __init__(self, source_id, approved, emit, *, enabled=True, store=None,
-                 explicit_candidate=None, flush=None):
+                 explicit_candidate=None, flush=None, notify=None):
         if not isinstance(source_id, UUID) or not isinstance(approved, DeviceEvidence):
             raise ValueError("invalid source identity")
         if type(enabled) is not bool:
@@ -162,11 +163,17 @@ class ReconnectController:
         # off-worker frame-progress check. It is held only for in-memory work:
         # ``emit`` runs under it (so events and staged writes keep transition
         # order) and must not block; ``flush(blocking=...)`` persists what was
-        # staged and runs after the lock is released, so a slow SQLite or
-        # storage write never holds the transition lock. All other controller
-        # state is mutated only by the source worker.
+        # staged and ``notify`` delivers events to potentially blocking
+        # downstream sinks, both after the lock is released, so a slow SQLite
+        # write or health sink never holds the transition lock. All other
+        # controller state is mutated only by the source worker.
         self.lock = threading.RLock()
         self.flush = flush
+        self.notify = notify
+        # Events emitted under the lock, delivered to ``notify`` in the same
+        # order by one thread at a time.
+        self._outbox = deque()
+        self._delivery = threading.Lock()
 
     def _persist(self):
         if self.store is not None:
@@ -178,8 +185,32 @@ class ReconnectController:
         changed = (self.state, self._reason) != (state, reason)
         self.state, self._reason = state, reason
         if changed:
-            self.emit(HealthEvent(self.source_id, state, reason))
+            event = HealthEvent(self.source_id, state, reason)
+            self.emit(event)
+            if self.notify is not None:
+                self._outbox.append(event)
         return changed
+
+    def _deliver(self, blocking=True):
+        """Hand queued events to ``notify`` outside the transition lock.
+
+        A non-blocking caller that finds another delivery running leaves its
+        events to that thread, which drains the queue before returning.
+        """
+        if self.notify is None:
+            return
+        while self._outbox:
+            if not self._delivery.acquire(blocking=blocking):
+                return
+            try:
+                while True:
+                    try:
+                        event = self._outbox.popleft()
+                    except IndexError:
+                        break
+                    self.notify(event)
+            finally:
+                self._delivery.release()
 
     def _flush(self, blocking=True):
         if self.flush is not None:
@@ -188,8 +219,13 @@ class ReconnectController:
     def _transition(self, state, reason):
         with self.lock:
             changed = self._set_state(state, reason)
-        if changed:
-            self._flush()
+        try:
+            if changed:
+                self._flush()
+        finally:
+            # A refused or failed write must not suppress the in-memory
+            # transition reaching downstream sinks (e.g. preview invalidation).
+            self._deliver()
 
     def disconnected(self):
         self.bound = None
@@ -297,8 +333,11 @@ class ReconnectController:
                 changed = self._set_state(CameraState.DEGRADED, "video_frame_stalled")
         finally:
             self.lock.release()
-        if changed:
-            self._flush(blocking)
+        try:
+            if changed:
+                self._flush(blocking)
+        finally:
+            self._deliver(blocking)
         return True
 
     @property
