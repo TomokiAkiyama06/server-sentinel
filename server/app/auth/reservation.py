@@ -564,18 +564,26 @@ def evaluate(config: ReservationConfig, listeners, routes,
         reasons.append(listeners)
     else:
         seen_human = False
+        seen_proxies: set[Listener] = set()
         for listener in listeners:
             address = _normalize(listener.address)
             normalized = Listener(address, listener.port, listener.protocol)
+            # Each expected endpoint is one socket. Independent SO_REUSEPORT
+            # sockets show as identical rows, and every extra copy is another
+            # process sharing the upstream or proxy endpoint (and its cookies).
             if normalized == config.human_listener:
+                if seen_human:
+                    unexpected_listeners += 1
                 seen_human = True
                 continue
             # A wildcard bind answers on every address, the reserved ones
             # included, unless the Owner explicitly allowed that port.
             if any(item.matches(normalized) for item in exceptions):
                 continue
-            if (address.is_unspecified or address in config.reserved_addresses) and \
-                    normalized not in config.proxy_listeners:
+            if address.is_unspecified or address in config.reserved_addresses:
+                if normalized in config.proxy_listeners and normalized not in seen_proxies:
+                    seen_proxies.add(normalized)
+                    continue
                 unexpected_listeners += 1
         if unexpected_listeners:
             reasons.append(Reason.UNEXPECTED_LISTENER)
@@ -653,6 +661,8 @@ class HostnameReservationCheck:
         # persisting it in ``exception_store``, which ``startup`` loads.
         self.exception_store = exception_store
         self._exceptions: frozenset = frozenset()
+        # False until the stored set loads; a check first (re)tries the load.
+        self._exceptions_loaded = False
         self.session_revoker = session_revoker
         self._revocation_required = False
         self.undelivered_faults = 0
@@ -685,17 +695,23 @@ class HostnameReservationCheck:
             raise ValueError("INVALID_LISTENER_EXCEPTION")
         with self._check_lock:
             self._exceptions = change.exceptions
+            # The audited change has just rewritten the stored set.
+            self._exceptions_loaded = True
             return self._check_locked(CheckKind.CONFIGURATION)
 
     def startup(self) -> ReservationVerdict:
         """Load the persisted exceptions, then run the first check.
 
         An unreadable, corrupt or no longer valid stored set fails closed: the
-        check runs with no exceptions and the Owner receives a fault. It is
-        never widened to allow everything.
+        check runs with no exceptions and ``LISTENER_EXCEPTIONS_UNREADABLE``
+        stays in every verdict (so the Owner receives a fault) until the store
+        loads again on a later check or an audited Owner change rewrites it,
+        whether or not any listener needs an exception. It is never widened to
+        allow everything.
         """
         with self._check_lock:
-            self._load_exceptions()
+            self._exceptions = frozenset()
+            self._exceptions_loaded = False
             self._load_revocation_state()
             return self._check_locked(CheckKind.STARTUP)
 
@@ -732,13 +748,12 @@ class HostnameReservationCheck:
 
     def _load_exceptions(self) -> None:
         self._exceptions = frozenset()
-        if self.exception_store is None:
-            return
-        try:
-            self._exceptions = validate_listener_exceptions(self.config, self.exception_store.load())
-        except Exception:
-            self._pending.append(ReservationFault((Reason.LISTENER_EXCEPTIONS_UNREADABLE,),
-                                                  CheckKind.STARTUP, self._now()))
+        if self.exception_store is not None:
+            try:
+                self._exceptions = validate_listener_exceptions(self.config, self.exception_store.load())
+            except Exception:
+                return
+        self._exceptions_loaded = True
 
     def tick(self) -> ReservationVerdict | None:
         now = self._monotonic()
@@ -791,6 +806,9 @@ class HostnameReservationCheck:
         started = self._monotonic()
         # Close first: a check in progress never extends a previous pass.
         self._close()
+        if not self._exceptions_loaded:
+            # Load (or retry) the stored set; until it loads, access stays closed.
+            self._load_exceptions()
         try:
             listeners = self._enumerate("listeners", lambda: self._listeners.listeners(),
                                         Reason.LISTENER_ENUMERATION_TIMEOUT,
@@ -802,6 +820,8 @@ class HostnameReservationCheck:
                                                               self._exceptions)
         except Exception:
             reasons, extra_listeners, extra_routes = (Reason.LISTENER_ENUMERATION_UNAVAILABLE,), 0, 0
+        if not self._exceptions_loaded:
+            reasons = (Reason.LISTENER_EXCEPTIONS_UNREADABLE,) + reasons
         # Access is still closed here: reopening waits for any required revocation.
         reasons = self._after_evaluation(reasons)
         at = self._now()

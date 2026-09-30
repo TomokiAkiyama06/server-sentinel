@@ -18,7 +18,8 @@ from app.audit import (
 from app.audit.integration import RESERVATION_LISTENER_EXCEPTIONS_ID, ReservationAdministration
 from app.auth.reservation import (
     DAILY_SECONDS, AddressFamily, CheckKind, HostnameReservationCheck, IsolationMode, Listener, ListenerException,
-    ProcNetListeners, ProxyRoute, Reason, ReservationConfig, ReservationEnumerationError,
+    RETRY_WHILE_CLOSED_SECONDS, ProcNetListeners, ProxyRoute, Reason, ReservationConfig,
+    ReservationEnumerationError,
     ReservationFault, RouteKind, ServeStatusRoutes, TransportProtocol, evaluate, parse_proc_net_tcp,
     parse_proc_net_udp, parse_serve_status,
 )
@@ -285,6 +286,28 @@ class ReservationCheckTests(TestCase):
         cfg = config(proxy_listeners=frozenset({Listener(V4, 443), Listener(V6, 443)}))
         check, *_ = checker(files=files, cfg=cfg)
         self.assertTrue(check.startup().open)
+
+    def test_duplicate_expected_listener_sockets_close(self):
+        # Independent SO_REUSEPORT sockets show as identical /proc/net rows; a
+        # second process sharing the upstream or proxy endpoint receives
+        # requests and cookies, so only one socket per expected endpoint passes.
+        cfg = config(proxy_listeners=frozenset({Listener(V4, 443), Listener(V6, 443)}))
+        cases = {
+            "human upstream twice": Files(tcp=proc(("127.0.0.1", 8080, "0A"), ("127.0.0.1", 8080, "0A"))),
+            "human upstream via v4-mapped v6": Files(
+                tcp6=proc(("::ffff:127.0.0.1", 8080, "0A"), ipv6=True)),
+            "proxy v4 twice": Files(tcp=proc(("127.0.0.1", 8080, "0A"), ("100.64.0.10", 443, "0A"),
+                                             ("100.64.0.10", 443, "0A")),
+                                    tcp6=proc((str(V6), 443, "0A"), ipv6=True)),
+            "proxy v6 twice": Files(tcp=proc(("127.0.0.1", 8080, "0A"), ("100.64.0.10", 443, "0A")),
+                                    tcp6=proc((str(V6), 443, "0A"), (str(V6), 443, "0A"), ipv6=True)),
+        }
+        for name, files in cases.items():
+            with self.subTest(name):
+                check, _, _, sink = checker(files=files, cfg=cfg)
+                self.assertFalse(check.startup().open)
+                self.assertEqual(check.verdict.reasons, (Reason.UNEXPECTED_LISTENER,))
+                self.assertEqual(sink.events[-1].unexpected_listeners, 1)
 
     def test_unrelated_listeners_elsewhere_do_not_answer_for_the_name(self):
         files = Files(tcp=proc(("127.0.0.1", 8080, "0A"), ("127.0.0.1", 5432, "0A"),
@@ -777,7 +800,7 @@ class ListenerExceptionPersistenceTests(ExceptionFixture):
                 self.assertEqual(check.listener_exceptions, frozenset())
                 self.assertFalse(verdict.open)
                 self.assertEqual([event.reasons for event in sink.events],
-                                 [(Reason.LISTENER_EXCEPTIONS_UNREADABLE,), (Reason.UNEXPECTED_LISTENER,)])
+                                 [(Reason.LISTENER_EXCEPTIONS_UNREADABLE, Reason.UNEXPECTED_LISTENER)])
                 self.assertNotIn("22", repr(sink.events[0]))
 
     def test_unreadable_store_fails_closed(self):
@@ -788,7 +811,47 @@ class ListenerExceptionPersistenceTests(ExceptionFixture):
         check, _, _, sink = checker(files=WILDCARD_SSH, exception_store=Unreadable())
         self.assertFalse(check.startup().open)
         self.assertEqual(check.listener_exceptions, frozenset())
-        self.assertEqual(sink.events[0].reasons, (Reason.LISTENER_EXCEPTIONS_UNREADABLE,))
+        self.assertEqual(sink.events[0].reasons[0], Reason.LISTENER_EXCEPTIONS_UNREADABLE)
+
+    def test_unreadable_store_keeps_startup_closed_without_an_unexpected_listener(self):
+        # The fail-closed verdict must not depend on a wildcard listener being present.
+        for value in ("not json", '{"version": 1, "exceptions": "*"}'):
+            with self.subTest(value=value):
+                self.store_raw(value)
+                _, check, sink = self.admin(Files())
+                verdict = check.startup()
+                self.assertFalse(verdict.open)
+                self.assertEqual(verdict.reasons, (Reason.LISTENER_EXCEPTIONS_UNREADABLE,))
+                self.assertEqual([event.reasons for event in sink.events],
+                                 [(Reason.LISTENER_EXCEPTIONS_UNREADABLE,)])
+
+        class Unreadable:
+            def load(self):
+                raise OSError("synthetic unreadable store")
+
+        clock = Clock()
+        check, _, _, sink = checker(exception_store=Unreadable(), clock=clock)
+        self.assertEqual(check.startup().reasons, (Reason.LISTENER_EXCEPTIONS_UNREADABLE,))
+        # Retries and the daily check stay closed while the store is still unreadable.
+        clock.value += RETRY_WHILE_CLOSED_SECONDS
+        self.assertEqual(check.tick().reasons, (Reason.LISTENER_EXCEPTIONS_UNREADABLE,))
+        clock.value += DAILY_SECONDS
+        self.assertFalse(check.tick().open)
+
+    def test_repaired_store_reopens_on_the_next_check(self):
+        self.store_raw("not json")
+        clock = Clock()
+        _, check, _ = self.admin(Files(), clock=clock)
+        self.assertFalse(check.startup().open)
+        self.store_raw(encode(frozenset()))
+        clock.value += RETRY_WHILE_CLOSED_SECONDS
+        self.assertTrue(check.tick().open)
+
+    def test_audited_owner_change_repairs_an_unreadable_store(self):
+        self.store_raw("not json")
+        admin, check, _ = self.admin(WILDCARD_SSH)
+        self.assertFalse(check.startup().open)
+        self.assertTrue(admin.set_listener_exceptions("synthetic-owner-session", {SSH}).open)
 
     def test_persist_failure_rolls_back_with_audit(self):
         admin, check, _ = self.admin(WILDCARD_SSH)

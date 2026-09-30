@@ -120,8 +120,17 @@ set as versioned JSON under one fixed key of the foundation
 `application_metadata` key/value table (no migration), and `startup()` loads it
 before the first check. A missing row is the empty default; an unreadable,
 corrupt (including duplicate JSON members), or no longer valid value (for example one covering the dashboard
-port) loads as the empty set and emits a `LISTENER_EXCEPTIONS_UNREADABLE`
-Owner fault, never a wider set. Faults still carry only reasons and counts.
+port) loads as the empty set, never a wider set, and
+`LISTENER_EXCEPTIONS_UNREADABLE` stays in every verdict (access closed, Owner
+fault) until the stored value loads again on a later check or an audited Owner
+change rewrites it, whether or not any listener currently needs an exception.
+Faults still carry only reasons and counts.
+
+Each expected endpoint (the loopback human listener and each recorded proxy
+socket) passes as exactly one socket. Independent `SO_REUSEPORT` sockets show
+as identical `/proc/net` rows, and every extra copy is counted as an
+`UNEXPECTED_LISTENER` (an exposure reason): another process sharing the
+endpoint would receive requests and session cookies.
 
 Nothing here is wired into the application or a route yet, reads the host
 implicitly, runs `tailscale`, changes Tailscale ACLs/Grants, or needs Tailscale

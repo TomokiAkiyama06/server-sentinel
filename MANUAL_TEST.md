@@ -934,7 +934,11 @@ by the Issue #6 synthetic policy model.
   persisted exception is loaded before the first check and access opens;
   corrupt the stored `application_metadata` value on a disposable copy and
   confirm startup uses no exceptions (access closed) and the Owner receives
-  a `LISTENER_EXCEPTIONS_UNREADABLE` fault. Record which wildcard UDP sockets
+  a `LISTENER_EXCEPTIONS_UNREADABLE` fault, also when no wildcard listener is
+  present, and that access stays closed until the value is repaired. Start a
+  second `SO_REUSEPORT` listener on the loopback human upstream port and
+  confirm `ss -ltn` shows two rows and access closes with
+  `UNEXPECTED_LISTENER`. Record which wildcard UDP sockets
   the node holds (for example `tailscaled`'s WireGuard port): confirm each
   closes access until the Owner adds a `udp` exception for that port, that a
   `tcp` exception on the same port does not cover it, and that a UDP socket
