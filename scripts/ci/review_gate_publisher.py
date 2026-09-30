@@ -36,6 +36,11 @@ _HEX = re.compile(r"[0-9a-f]{40}")
 _MAX_ANCESTRY_COMMITS = 4096
 _MAX_COMMIT_PARENTS = 64
 _PAGE_QUERY = re.compile(r"per_page=100&page=[1-9][0-9]?")
+# The only other query: one App's runs of one check on one commit, paged.
+_CHECK_RUNS_ROUTE = re.compile(r"/repos/[^/?#%\\]+/[^/?#%\\]+/commits/[0-9a-f]{40}/check-runs")
+_CHECK_RUNS_QUERY = re.compile(r"check_name=[A-Za-z0-9._~%-]+&app_id=[1-9][0-9]{0,18}"
+                               r"&filter=all&per_page=100&page=[1-9][0-9]?")
+MAX_CHECK_RUN_PAGES = 10
 
 
 class PublisherFailure(RuntimeError):
@@ -208,7 +213,9 @@ class UrllibGitHubTransport:
         route, _, query = path.partition("?")
         if ("?" in query or any(character in route for character in "#%\\")
                 or (query and query != "recursive=1"
-                    and not _PAGE_QUERY.fullmatch(query))):
+                    and not _PAGE_QUERY.fullmatch(query)
+                    and not (_CHECK_RUNS_ROUTE.fullmatch(route)
+                             and _CHECK_RUNS_QUERY.fullmatch(query)))):
             raise PublisherFailure("invalid GitHub API path")
         return GITHUB_API + path
 
@@ -444,6 +451,62 @@ def publish_success(client: GitHubTransport, credentials: AppCredentials,
     response = client.post_json(f"{repo}/check-runs", credentials.installation_token, request)
     _validate_published_run(response, credentials.config, request)
     return response
+
+
+def success_is_latest_attempt(client: GitHubTransport, credentials: AppCredentials,
+                              test_merge_sha: str, reviewer: str,
+                              check_run_id: int) -> bool:
+    """Whether ``check_run_id`` is still the App's newest run of ``reviewer``'s check.
+
+    A superseding failure attempt can be posted without the ledger recording
+    it (an unwritable state directory, seen by another worker or across a
+    restart), so a recorded success is reused only while GitHub still lists
+    it as the newest run of that check by the dedicated App on that commit and
+    it reads ``completed`` / ``success``. "Newest" is the highest run ID, as
+    run IDs are assigned in creation order. A listing that is incomplete or
+    changes while paging proves nothing and returns False (the caller then
+    supersedes and republishes); a failed or malformed read raises.
+    """
+    name = CHECK_NAMES.get(reviewer) if isinstance(reviewer, str) else None
+    if name is None:
+        raise PublisherFailure("unsupported reviewer")
+    if type(check_run_id) is not int or check_run_id <= 0:
+        return False
+    sha = _sha(test_merge_sha)
+    app_id = credentials.config.issuer.app_id
+    repo = "/repos/" + "/".join(_path_part(part) for part in credentials.config.repository.split("/"))
+    path = (f"{repo}/commits/{sha}/check-runs?check_name={quote(name, safe='')}"
+            f"&app_id={app_id}&filter=all&per_page=100&page=")
+    runs: list[Any] = []
+    total = None
+    for page in range(1, MAX_CHECK_RUN_PAGES + 1):
+        body = client.get_json(path + str(page), credentials.installation_token)
+        count = body.get("total_count") if isinstance(body, dict) else None
+        items = body.get("check_runs") if isinstance(body, dict) else None
+        if type(count) is not int or count < 0 or not isinstance(items, list):
+            raise PublisherFailure("unexpected GitHub API response")
+        if total is None:
+            total = count
+        elif count != total:
+            return False
+        runs.extend(items)
+        if len(runs) >= total or not items:
+            break
+    if len(runs) != total:
+        return False
+    newest = None
+    for run in runs:
+        if not isinstance(run, dict) or type(run.get("id")) is not int:
+            raise PublisherFailure("unexpected GitHub API response")
+        app = run.get("app")
+        if (not isinstance(app, dict) or app.get("id") != app_id
+                or run.get("name") != name or run.get("head_sha") != sha):
+            continue
+        if newest is None or run["id"] > newest["id"]:
+            newest = run
+    return (newest is not None and newest["id"] == check_run_id
+            and newest.get("status") == "completed"
+            and newest.get("conclusion") == "success")
 
 
 def revocation_check_run_request(test_merge_sha: str, reviewer: str) -> dict[str, Any]:

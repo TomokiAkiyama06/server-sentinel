@@ -11,6 +11,7 @@ from pathlib import Path
 import tempfile
 import unittest
 from unittest import mock
+import urllib.parse
 
 from scripts.ci import review_gate_collector as collector
 from scripts.ci import review_gate_policy as gate
@@ -82,6 +83,9 @@ class FakeCheckRuns:
         self.posts: list[dict] = []
         self.fail = False
         self.after_accept: str | None = None  # GitHub accepted, then ...
+        self.list_fail = False
+        self.list_pages = 0
+        self.hidden_runs = 0  # runs GitHub counts but never returns
 
     def post_json(self, path, token, payload):
         if self.fail:
@@ -98,6 +102,31 @@ class FakeCheckRuns:
                                        "slug": self.issuer.app_slug}}
         return {**payload, "id": len(self.posts),
                 "app": {"id": self.issuer.app_id, "slug": self.issuer.app_slug}}
+
+    def get_json(self, path, token):
+        """List this App's runs of one check on one commit, as GitHub does.
+
+        Every accepted post is a run (id = its position), whether or not its
+        response reached the caller.
+        """
+        if self.fail or self.list_fail:
+            raise publisher.PublisherFailure("GitHub API request failed")
+        route, _, query = path.partition("?")
+        prefix = "/repos/owner/repository/commits/"
+        assert route.startswith(prefix) and route.endswith("/check-runs"), path
+        sha = route[len(prefix):-len("/check-runs")]
+        fields = dict(part.split("=", 1) for part in query.split("&"))
+        assert fields["app_id"] == str(self.issuer.app_id), path
+        assert fields["filter"] == "all" and fields["per_page"] == "100", path
+        name = urllib.parse.unquote(fields["check_name"])
+        runs = [{**post, "id": index + 1,
+                 "app": {"id": self.issuer.app_id, "slug": self.issuer.app_slug}}
+                for index, post in enumerate(self.posts)
+                if post["name"] == name and post["head_sha"] == sha]
+        page = int(fields["page"])
+        self.list_pages += 1
+        return {"total_count": len(runs) + self.hidden_runs,
+                "check_runs": runs[(page - 1) * 100:page * 100]}
 
 
 class CollectorTests(unittest.TestCase):
@@ -731,6 +760,65 @@ class CollectorTests(unittest.TestCase):
         self.assertEqual(self.reconcile(client, credentials).status, "pass")
         self.assertEqual(len(client.posts), posts)
 
+    def test_restarted_or_other_worker_republishes_after_an_unrecorded_revocation(self):
+        # The failure attempt was posted by a worker whose ledger write failed;
+        # a restarted process or another worker has no memory of it and must
+        # still not reuse the stale success record while GitHub's latest
+        # attempt is that failure.
+        for case in ("restart", "other_worker"):
+            with self.subTest(case=case):
+                self.setUp()
+                client, credentials = self.publication()
+                other = self.make_collector()
+                self.collector.request_review("codex", self.live, self.source)
+                self.source.add(self.context.head_sha, self.late())
+                self.reconcile(client, credentials,
+                               collector_=other if case == "other_worker" else None)
+                good = self.source.reviews
+                self.source.reviews = "unavailable"
+
+                def read_only_save(store, request):
+                    raise collector.CollectorFailure("review request ledger write failed")
+                with mock.patch.object(collector.LedgerStore, "save", read_only_save):
+                    with self.assertRaises(collector.CollectorFailure):
+                        self.reconcile(client, credentials)
+                self.assertEqual(self.ledger()["published"]["state"], "success")  # stale
+                self.assertEqual(client.posts[-1]["conclusion"], "failure")
+                self.source.reviews = good
+                recovering = self.make_collector() if case == "restart" else other
+                self.assertEqual(self.reconcile(client, credentials,
+                                                collector_=recovering).status, "pass")
+                self.assertEqual(client.posts[-1]["conclusion"], "success")
+                self.assertEqual(self.ledger()["published"]["check_run_id"],
+                                 len(client.posts))
+                posts = len(client.posts)
+                self.assertEqual(self.reconcile(client, credentials,
+                                                collector_=recovering).status, "pass")
+                self.assertEqual(len(client.posts), posts)
+                self.tearDown()
+
+    def test_unverifiable_latest_attempt_is_never_reused(self):
+        client, credentials = self.publication()
+        self.collector.request_review("codex", self.live, self.source)
+        self.source.add(self.context.head_sha, self.late())
+        self.reconcile(client, credentials)
+        # An incomplete listing proves nothing: supersede and republish.
+        client.hidden_runs = 1
+        self.assertEqual(self.reconcile(client, credentials).status, "pass")
+        self.assertEqual([post["conclusion"] for post in client.posts],
+                         ["success", "failure", "success"])
+        client.hidden_runs = 0
+        # A listing that cannot be read at all fails closed: the standing
+        # success is superseded and the error is raised.
+        client.list_fail = True
+        with self.assertRaises(publisher.PublisherFailure):
+            self.reconcile(client, credentials)
+        self.assertEqual(client.posts[-1]["conclusion"], "failure")
+        self.assertIsNone(self.ledger()["published"])
+        client.list_fail = False
+        self.assertEqual(self.reconcile(client, credentials).status, "pass")
+        self.assertEqual(client.posts[-1]["conclusion"], "success")
+
     def test_overlapping_pass_cannot_revoke_a_newer_success(self):
         client, credentials = self.publication()
         self.collector.request_review("codex", self.live, self.source)
@@ -853,6 +941,15 @@ class GitHubReviewSourceTests(unittest.TestCase):
         self.assertTrue(url("/repos/o/r/pulls/1/reviews?per_page=100&page=10")
                         .endswith("page=10"))
         self.assertTrue(url("/repos/o/r/git/trees/" + "a" * 40 + "?recursive=1"))
+        runs = "/repos/o/r/commits/" + "a" * 40 + "/check-runs"
+        query = "?check_name=ServerSentinel%20Codex%20review&app_id=7&filter=all&per_page=100&page=1"
+        self.assertTrue(url(runs + query).endswith("page=1"))
+        for path in (runs + query.replace("filter=all", "filter=latest"),
+                     runs + query + "&status=completed",
+                     "/repos/o/r/pulls/1/reviews" + query,
+                     runs + "?check_name=a#b&app_id=7&filter=all&per_page=100&page=1"):
+            with self.subTest(path=path), self.assertRaises(PublisherFailure):
+                url(path)
         for path in ("/x?per_page=100&page=0", "/x?per_page=100&page=100",
                      "/x?per_page=50&page=1", "/x?recursive=1&a=b",
                      "/x?per_page=100&page=1?y", "/x%2f?recursive=1", "x", "/x#y"):

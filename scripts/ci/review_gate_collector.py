@@ -50,7 +50,8 @@ from scripts.ci.review_gate_policy import (CHECK_NAMES, Context, PolicyFailure,
                                            successful_check_run_request)
 from scripts.ci.review_gate_publisher import (AppCredentials, GitHubTransport,
                                               PublisherFailure, _secure_private_bytes,
-                                              publish_revocation, publish_success)
+                                              publish_revocation, publish_success,
+                                              success_is_latest_attempt)
 
 
 LOG = logging.getLogger("server_sentinel.review_gate.collector")
@@ -636,8 +637,9 @@ class ReviewCollector:
 
         The success is posted only while the decision's request is still the
         ledger's active request for the same context.  An already recorded
-        success for that request and test merge is reused, so polling and
-        restart recovery do not create further runs.  Any other standing
+        success for that request and test merge is reused while GitHub still
+        lists it as the App's latest attempt, so polling and restart recovery
+        do not create further runs.  Any other standing
         success (an older request, or one being revoked) is first superseded.
         The publisher re-reads the live context before posting.  A
         ``publishing`` record is saved first; if the outcome is then ambiguous
@@ -677,7 +679,16 @@ class ReviewCollector:
         if (current and standing is not None and standing.state == "success"
                 and standing.request_id == request.request_id
                 and standing.test_merge_sha == context.test_merge_sha):
-            return {"published": False, "check_run_id": standing.check_run_id}
+            # A failure attempt may have superseded this success without the
+            # ledger recording it (unwritable state_dir, possibly in another
+            # worker or before a restart): reuse it only while GitHub still
+            # lists it as the latest attempt; otherwise supersede and republish.
+            if success_is_latest_attempt(client, credentials, standing.test_merge_sha,
+                                         decision.reviewer, standing.check_run_id):
+                return {"published": False, "check_run_id": standing.check_run_id}
+            LOG.warning("review success is not the latest attempt reviewer=%s pr=%d "
+                        "request=%s", decision.reviewer, context.pr_number,
+                        standing.request_id)
         request = self._revoke_locked(client, credentials, request)
         if not current:
             return {"published": False, "check_run_id": None}
@@ -730,7 +741,9 @@ class ReviewCollector:
         success, so this collector remembers the key and never reuses that
         record as the current success: the next pass (once the ledger is
         writable) revokes it again, clears it and, on a clean review, posts a
-        new success.  A restart loses that memory; see REVIEW_GATE_SETUP.md.
+        new success.  A restart or another worker lacks that memory; there a
+        clean pass still verifies on GitHub that the recorded success is the
+        latest attempt before reusing it (see ``_publish_locked``).
         """
         standing = request.published
         if standing is None:

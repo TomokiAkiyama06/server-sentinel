@@ -257,8 +257,16 @@ SHA, Check Run ID (once confirmed) and state (`publishing` / `success` /
   before any ledger is touched (and supersedes `pr_number`'s standing
   success, which that pass could not verify). A `pass` for the ledger's current
   active request posts one success; if that exact success is already recorded
-  the pass is a no-op, so polling and restart recovery do not create further
-  runs.
+  **and** GitHub still lists it as the dedicated App's latest attempt of that
+  check on the test-merge SHA, the pass is a no-op, so polling and restart
+  recovery do not create further runs. The verification is one read of
+  `GET /repos/{owner}/{repo}/commits/{test_merge_sha}/check-runs` filtered by
+  `check_name`, `app_id` and `filter=all` (paged, at most 10 pages; covered by
+  the **Checks: read** permission above). The recorded run must have the highest
+  run ID among that App's runs of the check and read `completed` / `success`.
+  An incomplete or changing listing is treated as "not latest" (supersede,
+  then post a new success); a failed read raises and supersedes the standing
+  success (fail closed).
 - The per-PR ledger lock is held for the **whole** pass (collection and the
   resulting publication or revocation), so a pass only ever publishes or
   revokes what its own collection observed. Overlapping passes cannot revoke a
@@ -291,12 +299,14 @@ SHA, Check Run ID (once confirmed) and state (`publishing` / `success` /
   the running collector remembers the key in memory and never reuses that
   record as the current success: once `state_dir` is writable again, the next
   pass revokes and clears it and, on a clean review, posts a new success.
-  Residual limit: if the publisher restarts before that recovery pass, the
-  memory is lost and a later `pass` for the same request reuses the stale
-  record while GitHub's latest attempt is the failure. The gate then stays
-  blocked (it never passes wrongly); the `review success revocation not
-  recorded` error log identifies the case, and the Owner runs
-  `revoke_published()` (or waits for any non-passing outcome) to clear it.
+  A restarted publisher or another worker has no such memory, but a clean
+  pass there still refuses to reuse the stale record because the latest-attempt
+  verification above sees the newer failure; it supersedes the record and
+  posts a new success. The `review success revocation not recorded` error log
+  and the `review success is not the latest attempt` warning identify the case.
+  The run-ID ordering and `filter=all` listing have been exercised only with a
+  synthetic transport; confirm them against GitHub (MANUAL_TEST) before
+  relying on this recovery.
 - If collection fails **and** the revocation fails, `CollectorFailure` is
   raised with a fixed message; the ledger still holds the standing success (or
   `revoking`) and the next pass retries.
