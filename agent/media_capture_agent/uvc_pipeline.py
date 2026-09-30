@@ -461,12 +461,14 @@ def gstreamer_argv(executable, device_fd, profile, *, plugins=()):
             "!", GSTREAMER_ELEMENTS[1], "fd=1", "sync=false"]
 
 
-def sandbox_argv(python, device_fd, read_paths, command):
+SANDBOX_HELPER = Path(uvc_sandbox.__file__).resolve()
+
+
+def sandbox_argv(python, helper, device_fd, read_paths, command):
     """Run ``command`` under ``uvc_sandbox``: only the approved device is openable."""
-    python = Path(python)
-    if not python.is_absolute():
+    python, helper = Path(python), Path(helper)
+    if not python.is_absolute() or not helper.is_absolute():
         raise PipelineError("video pipeline sandbox is unavailable")
-    helper = Path(uvc_sandbox.__file__).resolve()
     reads = []
     for path in read_paths:
         reads += ["--read", str(path)]
@@ -518,12 +520,16 @@ class GStreamerLauncher(SubprocessLauncher):
     its ``video4linux2`` plugin loads, so the child is started through the
     Landlock helper (``uvc_sandbox``), which leaves it able to open only the
     approved descriptor's device. Without Landlock the launcher refuses to run
-    (fail closed) instead of exposing every camera to the pipeline.
+    (fail closed) instead of exposing every camera to the pipeline. The helper
+    and the interpreter that runs it get the same root-controlled check as the
+    executable and plugins at every start, because either one could otherwise
+    skip the confinement; the resolved interpreter path is executed so a
+    replaceable symlink (e.g. in a virtual environment) is never followed later.
     """
 
     def __init__(self, executable, *, plugin_dirs=None, trust=require_trusted_executable,
                  trust_file=require_trusted_file, sandbox_abi=uvc_sandbox.abi_version,
-                 python=sys.executable, popen=subprocess.Popen):
+                 python=sys.executable, helper=SANDBOX_HELPER, popen=subprocess.Popen):
         self.executable = trust(executable)
         self._trust = trust
         self._trust_file = trust_file
@@ -531,7 +537,10 @@ class GStreamerLauncher(SubprocessLauncher):
             raise PipelineError("video pipeline sandbox is unavailable")
         self.plugins = self._find_plugins(default_plugin_dirs() if plugin_dirs is None
                                           else plugin_dirs)
-        self.python = python
+        if not python:
+            raise PipelineError("video pipeline sandbox is unavailable")
+        self.python, self.helper = python, helper
+        self._trusted_sandbox()
         super().__init__(self._argv, environment=GSTREAMER_ENVIRONMENT, popen=popen)
 
     def _find_plugins(self, plugin_dirs):
@@ -541,12 +550,16 @@ class GStreamerLauncher(SubprocessLauncher):
                 return tuple(self._trust_file(candidate) for candidate in candidates)
         raise PipelineError("required GStreamer plugins are unavailable")
 
+    def _trusted_sandbox(self):
+        return self._trust(self.python), self._trust_file(self.helper)
+
     def _argv(self, device_fd, profile):
         # Re-check at every start: a package change must not be trusted blindly.
+        python, helper = self._trusted_sandbox()
         executable = self._trust(self.executable)
         plugins = tuple(self._trust_file(plugin) for plugin in self.plugins)
         command = gstreamer_argv(executable, device_fd, profile,
                                  plugins=[str(plugin) for plugin in plugins])
         read_paths = (*uvc_sandbox.DEFAULT_READ_PATHS, str(executable),
                       *(str(plugin) for plugin in plugins))
-        return sandbox_argv(self.python, device_fd, read_paths, command)
+        return sandbox_argv(python, helper, device_fd, read_paths, command)

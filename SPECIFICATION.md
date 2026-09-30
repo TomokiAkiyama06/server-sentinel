@@ -342,7 +342,15 @@ Landlock ABI supports it); every other video node, `/dev`, `/sys`, `/run`, home
 and runtime directories are unreachable. Only `coreelements` and `video4linux2`
 are loaded (`--gst-plugin-load`, empty plugin search paths, registry cache
 disabled, no `gst-plugin-scanner`), so no audio plugin is ever loaded. Without
-Landlock the launcher refuses to run (fail closed). The child gets a minimal
+Landlock the launcher refuses to run (fail closed). The helper file and the
+Python interpreter that runs it are checked like the executable and plugins
+(root-owned, not group/world writable, including parent directories) at every
+start, and the resolved interpreter path is executed. Residual limits: on
+Landlock ABI 4 ioctls on already reachable files are not restricted (ABI 5+
+limits device ioctls to the approved inode), abstract UNIX socket and signal
+scoping needs ABI 6+, and Landlock does not control UDP or connecting to a
+pathname UNIX socket; plugin selection is enforced by the fixed argv and
+environment, not by the kernel, because `/usr` stays readable. The child gets a minimal
 environment, its own process group, no stdin, discarded stderr, and is
 terminated with SIGTERM then SIGKILL of the whole group before reaping. MJPEG output is split structurally into complete
 JPEG frames with a per-frame byte bound and queued in a bounded drop-oldest queue.

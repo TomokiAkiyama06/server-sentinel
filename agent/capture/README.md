@@ -56,6 +56,19 @@ gst-launch-1.0 -q --gst-plugin-load=<dir>/libgstcoreelements.so,<dir>/libgstvide
   `EACCES`, so no other camera or metadata node is opened. Any helper failure
   exits 126 without executing GStreamer; a kernel without Landlock makes
   `GStreamerLauncher` refuse to start (fail closed).
+- The helper (`uvc_sandbox.py`) and the Python interpreter that runs it pass
+  the same root-controlled check as `gst-launch-1.0` and the plugins (regular
+  file, root-owned, not group/world writable, every parent directory likewise)
+  at construction and every start; otherwise the launcher refuses. The
+  interpreter is executed by its resolved path, so a virtual-environment
+  symlink is not followed after the check. A development checkout owned by the
+  operator is therefore refused unless tests inject the trust checks.
+- Residual limits by Landlock ABI: ABI 4 (e.g. Ubuntu 24.04's 6.8 kernel) does
+  not restrict ioctls (ABI 5+ grants `IOCTL_DEV` only on the approved inode;
+  other video nodes cannot be opened on any ABI); abstract UNIX socket and
+  signal scoping needs ABI 6+; Landlock does not control UDP or `connect()` to
+  a pathname UNIX socket. Plugin selection relies on the fixed argv and
+  environment; `/usr` remains readable.
 - Restricted plugin set: only `coreelements` (`fdsink`) and `video4linux2`
   (`v4l2src`) are loaded from the root-controlled system plugin directory
   (each file re-checked at every start). `GST_PLUGIN_SYSTEM_PATH[_1_0]` and

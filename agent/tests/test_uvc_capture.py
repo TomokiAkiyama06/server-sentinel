@@ -295,6 +295,59 @@ class PipelineCommandTests(unittest.TestCase):
         with self.assertRaises(PipelineError):
             gstreamer_argv("/usr/bin/gst-launch-1.0", 7, PROFILE, plugins=["/p/a.so,/p/b.so"])
 
+    def test_sandbox_helper_and_interpreter_are_trust_checked_at_every_start(self):
+        checked, spawned = [], []
+
+        def trust(path):
+            checked.append(str(path))
+            return Path(path)
+
+        def popen(argv, **_kwargs):
+            spawned.append(argv)
+            raise OSError("synthetic")
+        with tempfile.TemporaryDirectory() as temporary:
+            launcher = self._launcher(temporary, popen=popen)
+            launcher._trust = launcher._trust_file = trust
+            for _ in range(2):
+                with self.assertRaises(PipelineError):
+                    launcher.launch(7, PROFILE)
+            helper = str(Path(uvc_sandbox.__file__).resolve())
+            self.assertEqual(checked.count("/usr/bin/python3"), 2)
+            self.assertEqual(checked.count(helper), 2)
+            self.assertEqual(len(spawned), 2)
+
+            # A helper or interpreter the service account could replace is refused
+            # before anything is spawned, at construction and at every start.
+            def refuse(target):
+                def check(path):
+                    if str(path) == target:
+                        raise PipelineError("pipeline executable is not root-controlled")
+                    return Path(path)
+                return check
+            for target in (helper, "/usr/bin/python3"):
+                with self.subTest(target=target):
+                    with self.assertRaises(PipelineError):
+                        GStreamerLauncher("/usr/bin/gst-launch-1.0", trust=refuse(target),
+                                          trust_file=refuse(target), sandbox_abi=lambda: 4,
+                                          plugin_dirs=[Path(temporary) / "plugins"],
+                                          python="/usr/bin/python3", popen=popen)
+                    launcher._trust = launcher._trust_file = refuse(target)
+                    with self.assertRaises(PipelineError):
+                        launcher.launch(7, PROFILE)
+            self.assertEqual(len(spawned), 2)
+            with self.assertRaises(PipelineError):
+                GStreamerLauncher("/usr/bin/gst-launch-1.0", trust=Path, trust_file=Path,
+                                  sandbox_abi=lambda: 4, python="",
+                                  plugin_dirs=[Path(temporary) / "plugins"])
+
+    def test_default_trust_refuses_a_user_writable_sandbox_helper(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            helper = Path(temporary) / "uvc_sandbox.py"
+            helper.write_text("synthetic")
+            helper.chmod(0o664)
+            with self.assertRaises(PipelineError):
+                require_trusted_file(helper)
+
     def test_untrusted_plugin_files_are_refused(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / GSTREAMER_PLUGINS[0]

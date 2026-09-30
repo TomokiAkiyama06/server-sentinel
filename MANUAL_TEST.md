@@ -194,6 +194,36 @@ Health:
 
 Apply the exact-model, UVC-capability, stable-identity, and reconnect checks in section A to capture-node cameras as well as Main Server cameras.
 
+### Record: Issue #12 sandboxed UVC capture re-run (2026-09-30, PR #88 head `4be6aa9`)
+
+Environment: remote capture node, Landlock ABI 4, GStreamer 1.24, one
+serial-bearing MJPEG UVC camera with a metadata node, non-root operator account
+(development harness, not the generated service unit).
+
+Checked (pass):
+
+- [x] traced launch: the child opens only `/proc/self/fd/<N>` (approved node);
+  `/dev`, `/sys/class`, `/sys/bus` enumeration fails with `EACCES`;
+- [x] the non-approved metadata node, other device nodes, `/etc` and `/proc`
+  outside the allowed paths, writes under `/tmp` and TCP connect fail with
+  `EACCES` inside the sandbox;
+- [x] only `coreelements` and `video4linux2` are loaded; no audio plugin or
+  library, no `gst-plugin-scanner`, no registry file (`GST_REGISTRY_DISABLE`
+  honoured);
+- [x] `v4l2src` streams with `/sys` denied: 1080p30, 720p30 and 360p30 MJPEG at
+  about 30 fps with no missing frames and no queue drops; Agent/GStreamer CPU
+  about 1-2 %; child memory slightly lower than before the sandbox;
+- [x] `close()` in about 0.02 s with no leftover process;
+- [x] `SIGSTOP` of the child: `capture_failed` after about 6.5 s, then relaunch;
+- [x] `SIGKILL` of the Agent: child exits in under 1 s; next start requires
+  re-approval;
+- [x] an unsupported 4K30 profile: `capture_failed` with backoff;
+- [x] an injected Landlock ABI of 0: the launcher refuses to start;
+- [x] lint, Agent unit tests and Agent ring/storage E2E pass on the node.
+
+Pending: dedicated service account; generated systemd unit (`DevicePolicy`
+allowlist, `ProtectHome`); USB unplug/replug; a second identical camera.
+
 ## C. Room-overview camera placement
 
 For the intended wide room view:
@@ -795,13 +825,16 @@ Capture:
   `landlock`); on a kernel without it `GStreamerLauncher` must refuse to start.
 - [ ] With the camera plus its UVC metadata node (and, if available, a second
   camera) attached, trace one launch as the service account
-  (`strace -f -e trace=openat,open,execve,connect`, cold and warm): after
+  (`strace -f -e trace=openat,open,execve,connect`; the registry is disabled,
+  so one launch suffices): after
   `landlock_restrict_self` the child opens only `/proc/self/fd/<N>` read-write;
   `/dev`, `/sys/class`, `/sys/bus` and every other `/dev/video*`/`/dev/snd/*`
   open fails or is absent; only `libgstcoreelements.so` and
   `libgstvideo4linux2.so` are loaded (no ALSA/PulseAudio/PipeWire plugin or
   library), no `gst-plugin-scanner` is executed, and no registry file is read
   or created. Recheck frame rate/size against the earlier unsandboxed baseline.
+- [ ] Confirm the launcher refuses a sandbox helper or Python interpreter that
+  is not root-owned or is group/world writable (e.g. a development checkout).
 - [ ] Note that a stalled camera (frames stop without the pipeline exiting)
   keeps reporting `online`/`video_ready` until the stall timeout expires
   (`CaptureLimits.stall_timeout`, default 5 s), then `capture_failed`; confirm
