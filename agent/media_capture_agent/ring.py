@@ -350,6 +350,33 @@ class DiskRing:
             "safety_reserve": self.settings.safety_reserve_bytes, "ledger_headroom": self.ledger_headroom,
         }
 
+    def _next_write_refused(self, now, budget, *, clock_trusted):
+        """Whether any source's next bounded segment would be refused.
+
+        Writes are refused before they would cross the reserve, so free space
+        alone never drops below it while capture is being refused. Evaluate
+        each source's next append the way the append path does: at
+        ``now + cadence`` it first reclaims selected-FIFO media that has
+        become eligible by then (trusted time only), then needs the largest
+        bounded segment plus ledger headroom above the reserve. Media that
+        ages out only at that next append is credited; nothing later is.
+        """
+        free, reserve = budget["filesystem_free"], budget["safety_reserve"]
+        unit = self.store.allocation_unit
+        cadence = max(profile.segment_duration_us for profile in self.profiles.values())
+        # One membership/row pass at the latest next-append time, filtered
+        # per source below, keeps the statement count independent of rows.
+        rows = self._selected_reclaimable(now + cadence, self.config) if clock_trusted else ()
+        allocations = self.store.segment_allocations() if rows else {}
+        window = self.config.value * SECOND if self.config.mode == "duration" else PRE
+        for profile in self.profiles.values():
+            cutoff = now + profile.segment_duration_us - window
+            reclaim = sum(allocations.get(UUID(row["id"]), 0) for row in rows if row["end"] <= cutoff)
+            needed = round_up(profile.segment_bytes() + self.ledger_headroom, unit)
+            if free + reclaim < reserve + needed:
+                return True
+        return False
+
     def configure(self, config, profiles, *, now_us, clock_trusted):
         self.authority.require_owner("configure_ring")
         integer(now_us)
@@ -806,17 +833,9 @@ class DiskRing:
                                                   and row["clock_trusted"]],
                                                  now - PRE, now)
             coverage[str(source)] = {"intervals_us": intervals, "gaps_us": gaps}
-        # Writes are refused before they would cross the reserve, so free
-        # space alone never drops below it while capture is being refused.
-        # When the largest bounded next segment of any source cannot be
-        # admitted even after eligible FIFO reclamation, recording is refused:
-        # report that as a hard stop, not as pressure or health.
-        next_write = round_up(max(profile.segment_bytes() for profile in self.profiles.values())
-                              + self.ledger_headroom, self.store.allocation_unit)
         if budget["filesystem_free"] < budget["safety_reserve"]:
             self.state, self.reason = "STORAGE_HARD_STOP", "safety_reserve_unavailable"
-        elif (budget["filesystem_free"] + budget["reclaimable_allocated"]
-              < budget["safety_reserve"] + next_write):
+        elif self._next_write_refused(now, budget, clock_trusted=clock_trusted):
             self.state, self.reason = "STORAGE_HARD_STOP", "segment_write_refused_at_reserve"
         elif self.config.mode == "capacity" and ordinary > self.config.value:
             self.state, self.reason = "STORAGE_PRESSURE", "ordinary_capacity_exhausted"

@@ -217,6 +217,30 @@ class HardReserveTests(RingScenario):
             self.store.write_segment(UUID(int=999), PAYLOAD)
         self.assertEqual("complete", self.ring.incident(incident, now_us=later)["state"])
 
+    def test_steady_fifo_near_reserve_accepts_writes_and_is_not_reported_refused(self):
+        # A full duration ring sits one block short of a segment above the
+        # reserve. Each append first trims the segment that just aged out of
+        # the selected duration, so every write succeeds. Status sampled
+        # between appends must not claim recording is refused (the segment
+        # the next append reclaims is not yet FIFO-eligible at ``now``).
+        t0 = self.t0
+        self.configure(at=t0 - PRE)
+        self.capture(t0 - PRE, t0)
+        reserve = self.settings.safety_reserve_bytes
+        unit = self.store.allocation_unit
+        self.quota.other = (self.quota.capacity - self.quota.used() - reserve
+                            - self.ring.ledger_headroom - unit)
+        for begin in range(t0, t0 + 5 * MINUTE, MINUTE):
+            status = self.status(begin)
+            self.assertEqual(("STORAGE_PRESSURE", "post_loss_headroom_reduced"),
+                             (status["state"], status["reason"]))
+            self.ring.append(self.sources[0], begin, begin + MINUTE, PAYLOAD,
+                             now_us=begin + MINUTE, clock_trusted=True)
+            self.assertGreaterEqual(self.quota.capacity - self.quota.used() - self.quota.other, reserve)
+        self.assertEqual(10, len(self.store.list_segments()))
+        # The refusal side (nothing ages out before the next append) is
+        # covered by the refused-capture scenario below.
+
     def test_refused_capture_reports_hard_stop_throughout_and_recovers_with_space(self):
         # Several minutes of capture arrive while the filesystem sits just
         # above the reserve: every write is refused before crossing it, so

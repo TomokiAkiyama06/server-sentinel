@@ -136,10 +136,14 @@ later external disk consumption yields explicit `STORAGE_PRESSURE` or
 Because a write is refused *before* it would cross the reserve, free space
 alone never falls below the reserve while capture is being refused. Status
 therefore also reports `STORAGE_HARD_STOP / segment_write_refused_at_reserve`
-whenever `free + R_fifo < reserve + round_up(max_segment + L)`, where
-`max_segment` is the largest bounded segment of any configured source and
-`R_fifo` is the ordinary media the write path itself may reclaim first
-(selected-FIFO eligible, outside the pre-loss window, trusted time only). It is
+whenever, for any configured source, `free + R_next < reserve +
+round_up(max_segment + L)`. `max_segment` is that source's largest bounded
+segment and `R_next` is the ordinary media its next append (at `now + cadence`)
+would itself reclaim first: selected-FIFO eligible at that time, outside the
+pre-loss window, trusted time only. Evaluating reclaim at `now` would miss the
+segment that ages out exactly at the next append, and a steady full ring that
+keeps accepting writes would be falsely reported as refused; nothing beyond
+the next append is credited. It is
 not reported as pressure or healthy while recording is refused, and it clears
 without Owner action as soon as space returns. `safety_reserve_unavailable`
 remains the separate hard stop for another consumer breaching the reserve. Capacity limits use
