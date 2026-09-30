@@ -43,7 +43,7 @@
     },
     {
       "path": "web/tests/compile.test.mjs",
-      "sha256": "sha256:2e3b51f5fcc559fafb43abc0bb686eb90e680362882592341fe78a13e4e0085d"
+      "sha256": "sha256:99ecd51aa1c9d31726adf6480b308d3e5c8f2def6c9f0b27fb9177df13647792"
     }
   ],
   "inputs": [

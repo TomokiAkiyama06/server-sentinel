@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { link, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { access, link, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { resolve } from 'node:path';
 import { compile } from './compile.mjs';
 
 // `node --test` runs files in parallel and several of them compile the same
@@ -21,7 +22,8 @@ test('compile replaces the bundle atomically instead of rewriting it in place', 
     // A reader holding the previous file still sees it whole; the new bundle is complete.
     assert.equal(await readFile(observer, 'utf8'), previous);
     assert.match(await readFile(outfile, 'utf8'), /\bviews\b/);
-    assert.deepEqual((await readdir('build')).filter(name => name.endsWith('.tmp')), []);
+    // Only this process's temporary file is checked: parallel test files share build/.
+    await assert.rejects(access(`${resolve(outfile)}.${process.pid}.tmp`), { code: 'ENOENT' });
   } finally {
     await rm(outfile, { force: true });
     await rm(observer, { force: true });
