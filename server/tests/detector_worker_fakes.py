@@ -5,6 +5,7 @@ spawned and receives them by reference.
 """
 
 import os
+import socket
 import time
 
 from app.detection.foundation import (Detection, DetectorKind, MotionBaseline,
@@ -41,6 +42,8 @@ class _Fake:
         if self.behaviour == "resets":
             return Detection(Observation.PRESENT if self.resets else Observation.ABSENT,
                              Reason.EVALUATED)
+        if self.behaviour == "outbound_evaluate":
+            _swallowed_lookup()
         if self.behaviour == "crash_after":
             self.argument -= 1
             if self.argument < 0:
@@ -68,3 +71,32 @@ def impostor():
 
 def motion(pixel_delta, changed_fraction):
     return MotionBaseline(pixel_delta=pixel_delta, changed_fraction=changed_fraction)
+
+
+def _swallowed_lookup():
+    # Local name only; the refusal is swallowed like a careless library would.
+    try:
+        socket.getaddrinfo("localhost", None)
+    except Exception:
+        pass
+
+
+def _smoke_adapter(behaviour, implementation):
+    detector = _Fake(behaviour)
+    detector.implementation = implementation
+    detector.version = "0.1.1rc0"
+    return detector
+
+
+def smoke_adapter(implementation, **_arguments):
+    """Stand-in for the YOLOX adapter in model-smoke worker tests."""
+    return _smoke_adapter("absent", implementation)
+
+
+def smoke_adapter_outbound_at_start(implementation, **_arguments):
+    _swallowed_lookup()
+    return _smoke_adapter("absent", implementation)
+
+
+def smoke_adapter_outbound_at_evaluation(implementation, **_arguments):
+    return _smoke_adapter("outbound_evaluate", implementation)

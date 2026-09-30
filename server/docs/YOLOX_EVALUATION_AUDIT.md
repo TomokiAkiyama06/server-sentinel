@@ -99,8 +99,14 @@ artifacts in a `--network none`, read-only, non-root (UID 65534), 1-CPU,
 `requirements-ci.lock`. Enabled providers were `["CPUExecutionProvider"]`; the
 generated frame evaluated in-process and inside the spawned
 `IsolatedDetector` worker (state `running`); malformed input returned
-`unknown`; Python socket/DNS/process audit hooks saw zero attempts (the worker
-is spawned before the hook is installed). Native syscalls were not traced.
+`unknown`. Python socket/DNS/process audit hooks recorded zero attempts in
+the smoke process and, separately, in the spawned worker, whose own hook is
+installed before the adapter is imported, loaded or evaluated
+(`worker_python_outbound_attempts`; a recorded worker attempt fails the start
+or evaluation). The worker-side hook was added after the first run and the
+container smoke was re-run with it on 2026-09-30. `--network none` blocks
+delivery; the hooks, not the network namespace, are the attempt evidence.
+Native syscalls were not traced.
 
 ## Not established
 

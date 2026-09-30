@@ -22,8 +22,10 @@ from app.detection.foundation.config import parse_detection
 from app.settings import ConfigurationError
 
 try:
-    from . import generated_onnx
+    from . import detector_model_smoke, detector_worker_fakes, generated_onnx
 except ImportError:  # discovered as a top-level module
+    import detector_model_smoke
+    import detector_worker_fakes
     import generated_onnx
 
 SOURCE = UUID(int=1)
@@ -213,6 +215,29 @@ class YoloxSessionDoubleTests(unittest.TestCase):
             self.session.run.side_effect = RuntimeError("synthetic failure")
             self.assertEqual(detector.evaluate(rgb(640, 640)).observation, Observation.UNKNOWN)
             network.assert_not_called()
+
+
+class ModelSmokeWorkerAuditTests(unittest.TestCase):
+    """The model smoke's audit hook must run inside the spawned worker."""
+
+    def check(self, factory):
+        target = f"{detector_worker_fakes.__name__}:{factory}"
+        return detector_model_smoke.isolated_check("yolox-tiny-onnx-cpu", "/unused", 4,
+                                                   target=target)
+
+    def test_clean_worker_reports_zero_worker_attempts(self):
+        result = self.check("smoke_adapter")
+        self.assertEqual(result["worker_state"], "running")
+        self.assertEqual(result["worker_observation"], "absent")
+        self.assertEqual(result["worker_python_outbound_attempts"], 0)
+
+    def test_swallowed_worker_attempt_at_load_fails_the_smoke(self):
+        with self.assertRaises(AssertionError):
+            self.check("smoke_adapter_outbound_at_start")
+
+    def test_swallowed_worker_attempt_at_evaluation_fails_the_smoke(self):
+        with self.assertRaises(AssertionError):
+            self.check("smoke_adapter_outbound_at_evaluation")
 
 
 @unittest.skipUnless(reviewed_runtime(), "requires the reviewed Linux CPython 3.12 ORT closure")

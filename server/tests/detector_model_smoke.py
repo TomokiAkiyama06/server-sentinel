@@ -1,6 +1,7 @@
 """Explicit local-artifact synthetic check; not run with weights in CI."""
 
 import argparse
+import importlib
 import json
 from pathlib import Path
 import sys
@@ -8,26 +9,73 @@ import time
 from uuid import UUID
 
 RTDETR = "rtdetr-v2-r18vd-onnx-cpu"
+YOLOX_FACTORY = "app.detection.foundation.yolox:create_yolox_person"
+OUTBOUND_EVENTS = frozenset({"socket.connect", "socket.getaddrinfo", "socket.sendto",
+                             "subprocess.Popen", "os.system", "os.posix_spawn"})
+# Per process: the smoke process and the spawned worker each record their own.
+_attempts = []
 
 
 def reject_outbound(event, args):
-    if event in {"socket.connect", "socket.getaddrinfo", "socket.sendto",
-                 "subprocess.Popen", "os.system", "os.posix_spawn"}:
+    if event in OUTBOUND_EVENTS:
+        # Recorded before refusing, so an attempt whose refusal a library
+        # swallows is still reported.
+        _attempts.append(event)
         raise RuntimeError("unexpected outbound/process attempt")
 
 
-def isolated_check(implementation, artifact, size):
+class _AuditedWorkerDetector:
+    """Worker-side wrapper: any attempt recorded in the child fails the result."""
+
+    def __init__(self, detector):
+        self._detector = detector
+        self.kind = detector.kind
+        self.implementation = detector.implementation
+        self.version = detector.version
+
+    def _check(self):
+        if _attempts:
+            raise RuntimeError("unexpected outbound/process attempt")
+
+    def reset(self):
+        self._detector.reset()
+        self._check()
+
+    def evaluate(self, frame):
+        result = self._detector.evaluate(frame)
+        self._check()
+        return result
+
+
+def audited_worker(target, **arguments):
+    """Worker factory: audit hook first, then import, load and evaluate.
+
+    Runs inside the spawned child, so the child's own artifact loading and
+    evaluation are observed; the parent's hook cannot see another process.
+    """
+    sys.addaudithook(reject_outbound)
+    module, _, name = target.partition(":")
+    detector = getattr(importlib.import_module(module), name)(**arguments)
+    if _attempts:
+        raise RuntimeError("unexpected outbound/process attempt")
+    return _AuditedWorkerDetector(detector)
+
+
+def isolated_check(implementation, artifact, size, target=YOLOX_FACTORY):
     """Run the YOLOX adapter in the watchdog-supervised spawned worker.
 
-    Called before the audit hook is installed, because spawning the worker is
-    itself a process launch. The child applies its own rlimits.
+    Called before this process installs its audit hook, because spawning the
+    worker is itself a process launch. The child applies its own rlimits and
+    installs its own recording audit hook (`audited_worker`) before the adapter
+    is imported; a recorded child attempt fails the start or the evaluation.
     """
     from app.detection.foundation import (DetectorKind, IsolatedDetector,
                                          Observation, RgbFrame, WorkerLimits, WorkerSpec)
-    from app.detection.foundation.yolox import RELEASE, create_yolox_person
-    spec = WorkerSpec(DetectorKind.PERSON, implementation, RELEASE, create_yolox_person,
-                      {"implementation": implementation, "artifact": str(artifact),
-                       "score_threshold": 0.5, "intra_op_threads": 1})
+    from app.detection.foundation.yolox import RELEASE
+    spec = WorkerSpec(DetectorKind.PERSON, implementation, RELEASE, audited_worker,
+                      {"target": target, "implementation": implementation,
+                       "artifact": str(artifact), "score_threshold": 0.5,
+                       "intra_op_threads": 1})
     # Explicit smoke-only limits, never deployment defaults.
     limits = WorkerLimits(evaluation_timeout_ns=5_000_000_000,
                           start_timeout_ns=60_000_000_000, restart_backoff_ns=1,
@@ -43,8 +91,9 @@ def isolated_check(implementation, artifact, size):
         elapsed = time.perf_counter_ns() - started
         assert state == "running", state
         assert result.observation is not Observation.UNKNOWN, result.reason
+        # Reaching here means the child's hook recorded no attempt.
         return {"worker_state": state, "worker_observation": result.observation.value,
-                "worker_evaluation_ns": elapsed}
+                "worker_evaluation_ns": elapsed, "worker_python_outbound_attempts": 0}
     finally:
         detector.close()
 
@@ -93,9 +142,11 @@ def main():
         "synthetic_observation": result.observation.value,
         "synthetic_score": result.measurement,
         "malformed_frame": "unknown",
-        "python_outbound_attempts": 0,
+        "python_outbound_attempts": len(_attempts),
         **worker,
     }, sort_keys=True))
+    if _attempts:
+        sys.exit(1)
 
 
 if __name__ == "__main__":
