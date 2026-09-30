@@ -236,6 +236,44 @@ storage or mutation provider. #21's server-side storage, retention and
 notification core landed with #42; the authorized human provider that would feed
 these screens is still #10's human-access work, so no deployment serves them yet.
 
+## First-run setup wizard shell for #48
+
+`src/setup/wizard.tsx` is the Owner-only **Setup** screen. It lists the ten
+documented steps in the backend order (`server/app/setup_wizard/model.py`):
+Welcome, Deployment Owner, Storage, Hardware baseline / recorder self-check,
+Locale and time, Camera Sources, Detection profiles, and the optional Owner face
+verification, Slack and private viewer access. Each step shows whether it is
+required or optional and its status. `pending`, `unavailable` and `skipped` each
+have their own label and are never drawn as completed, and the readiness line
+reports setup complete only when every required step is actually `completed`.
+
+The screen renders progress only. `parseWizard()` copies the bounded `step`,
+`status` and `revision` fields in the documented order and fails closed on any
+other shape, so no setting value, secret, raw hardware identifier or biometric
+value a provider might return is rendered; the revision is kept only as the
+compare-and-swap token.
+
+Only the current (first pending) step offers forward actions. The shell itself
+completes only Welcome, which is explanatory. Every other step is completed by
+its own integration in a later slice; until then the Owner can defer it as
+`unavailable` (and skip an optional step), and any deferred or skipped step can
+be resumed. Controls render only for an Owner session with an authorized
+`transitionWizard` provider, one transition is in flight at a time, and a
+refused or unconfirmed transition (for example a stale revision) is reported
+and the snapshot is reloaded rather than guessed. The server authorizes, audits
+and may refuse every transition (`SetupWizardService`).
+
+The private viewer access step lists network-level Tailscale / private-network
+reachability and the ServerSentinel invitation with independent `live:view` /
+`recordings:view` permissions as two separate approvals, states that Tailnet
+membership alone never grants access, and states that ServerSentinel never
+changes Tailscale ACLs/Grants or asks for Tailscale administrative credentials.
+
+`canVisit()` keeps `setup` owner-only. No route serves wizard progress yet:
+human routes stay blocked on ADR-0004 / #10, the production entry still uses
+`deniedServices` (no wizard provider), and only the test harness supplies a
+synthetic in-memory provider.
+
 ## Local build and tests
 
 Use Node 24 and the committed lockfile:
@@ -265,10 +303,16 @@ element, starred recordings shown as never auto-deleted, the three separate
 retention periods, storage state display, and Slack disabled until configured.
 Mutation tests cover the one-write-per-recording guard, independent recordings,
 session abort reported as `aborted`, and rejection reported as `failed`.
+Wizard tests cover the documented step order, forward actions only on the
+current step, skip only for optional steps, pending/unavailable/skipped never
+shown as completed, Owner-only controls, separate network and application
+access conditions, and that no provider-supplied value is rendered.
 Chrome CDP tests cover phone/Mac-sized/desktop viewports, zero through four
-synthetic sources, all nine screens, locale switching, session permission
+synthetic sources, all ten screens, locale switching, session permission
 combinations, synthetic recording lists with owner star/delete confirmation,
-timeline/presence behavior, each storage state, and normal/error paths with
+timeline/presence behavior, the Owner wizard shell (complete Welcome, defer a
+required step, never shown as complete) and its absence for viewers, each
+storage state, and normal/error paths with
 hostile opt-in configuration.
 Every page request is intercepted and fulfilled locally or rejected. CSP
 violations and WebSocket attempts fail tests. A dedicated external `.invalid`

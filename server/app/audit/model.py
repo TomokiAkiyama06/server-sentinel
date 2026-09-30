@@ -34,6 +34,7 @@ class TargetKind(StrEnum):
     CAPTURE_NODE = "capture_node"
     PRINCIPAL = "principal"
     RECORDING = "recording"
+    SETUP_WIZARD_STEP = "setup_wizard_step"
 
 
 class AuditAction(StrEnum):
@@ -66,6 +67,7 @@ class AuditAction(StrEnum):
     DELETE_RECORDING = "delete_recording"
     DELETE_RECORDING_CLEANUP = "delete_recording_cleanup"
     UPDATE_RECORDING = "update_recording"
+    TRANSITION_SETUP_WIZARD_STEP = "transition_setup_wizard_step"
 
 
 ACTION_TARGETS = {
@@ -98,6 +100,7 @@ ACTION_TARGETS = {
     AuditAction.DELETE_RECORDING: TargetKind.RECORDING,
     AuditAction.DELETE_RECORDING_CLEANUP: TargetKind.RECORDING,
     AuditAction.UPDATE_RECORDING: TargetKind.RECORDING,
+    AuditAction.TRANSITION_SETUP_WIZARD_STEP: TargetKind.SETUP_WIZARD_STEP,
 }
 
 

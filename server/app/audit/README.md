@@ -57,6 +57,21 @@ rolled-back outcome is counted in `AccessStore`'s own `audit_delivery_failed` /
 external identity, display name, invitation secret, credential identifier and
 public key never reach the log.
 
+First-run wizard progress (Issue #48) changes only through
+`SetupWizardService` in `app/setup_wizard/service.py`, which wraps
+`OwnerAuditService.execute_transactional()` around
+`WizardStateStore.transition_on()`. Each transition commits in the same SQLite
+transaction as its `transition_setup_wizard_step` record, targeting the fixed
+logical UUID of the step (`setup_wizard_step`); the requested status and any
+setting value are never recorded. A non-Owner is refused with a `denied` record
+and nothing runs, a refused transition (stale revision, a skipped required
+step, out-of-order progress) rolls back and records `failed`, and an audit write
+failure rolls the transition back. Reading wizard progress passes the same
+Owner authorizer and writes nothing when refused. The plain
+`WizardStateStore.transition()` wrapper refuses with `UnauditedWizardWriteError`
+outside explicit fixture use. Neither the `action` nor the `target_kind` column
+has a CHECK constraint, so the new vocabulary needs no migration.
+
 `PairingLedger` in `app/cameras/remote_agent/pairing.py` requires an
 `AuditStore` on the same database and records
 `approve_capture_node_enrollment`, `redeem_capture_node_enrollment`,

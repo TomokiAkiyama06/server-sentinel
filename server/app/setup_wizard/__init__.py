@@ -8,10 +8,14 @@ from .model import (
     WizardStep,
     WizardValidationError,
 )
-from .store import WizardStateStore, WizardStorageError
+from .service import WIZARD_STEP_TARGETS, SetupWizardService
+from .store import UnauditedWizardWriteError, WizardStateStore, WizardStorageError
 
 __all__ = (
     "STEP_CATALOG",
+    "SetupWizardService",
+    "UnauditedWizardWriteError",
+    "WIZARD_STEP_TARGETS",
     "WizardSnapshot",
     "WizardState",
     "WizardStateStore",
