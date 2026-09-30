@@ -8,6 +8,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import wraps
 from pathlib import Path
+from typing import BinaryIO
 from uuid import UUID, uuid4
 import fcntl
 import hashlib
@@ -678,6 +679,50 @@ class RecordingStore:
             raise RecordingError("RECORDING_EVENT_NOT_FOUND")
         return {"event_id": str(event_id),
                 "recordings": [self.manifest(UUID(row["id"])) for row in rows]}
+
+    def segment_length(self, segment_id: UUID) -> int:
+        """Journaled byte length of one published segment; no bytes are read.
+
+        Local Owner-only diagnostic selection; callers enforce authorization.
+        A pending (unpublished) or unknown segment is refused.
+        """
+        self._check()
+        if not isinstance(segment_id, UUID):
+            raise ValueError("invalid segment identity")
+        row = self.db.execute(
+            "SELECT byte_length FROM recording_segments WHERE id=? AND state='ready'",
+            (str(segment_id),)).fetchone()
+        if row is None:
+            raise RecordingError("RECORDING_SEGMENT_NOT_FOUND")
+        return row["byte_length"]
+
+    def open_segment(self, segment_id: UUID) -> BinaryIO:
+        """Open one published segment read-only through the pinned root.
+
+        The file is opened relative to the verified root descriptor without
+        following symlinks and must be a single-link regular file whose size
+        matches the journal. The caller closes the returned reader. Nothing is
+        written, so no storage reservation is taken.
+        """
+        expected = self.segment_length(segment_id)
+        self._verify_root()
+        descriptor = -1
+        try:
+            descriptor = os.open(self._name(str(segment_id), ".seg"),
+                                 os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK,
+                                 dir_fd=self._fd)
+            info = os.fstat(descriptor)
+            if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                    or info.st_size != expected):
+                raise RecordingError("RECORDING_SEGMENT_UNAVAILABLE")
+            reader = os.fdopen(descriptor, "rb", buffering=0)
+            descriptor = -1
+            return reader
+        except OSError:
+            raise RecordingError("RECORDING_SEGMENT_UNAVAILABLE") from None
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
 
     @_control_operation
     def set_starred(self, recording_id: UUID, starred: bool) -> None:

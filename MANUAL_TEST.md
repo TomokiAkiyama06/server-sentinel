@@ -748,9 +748,12 @@ Run this only on the intended Main Server using synthetic, non-production diagno
 - [ ] the manifest records no excluded value, media ID, path, or other private deployment identifier, and the bundle stays deployment-local until the Owner separately chooses how to share it;
 - [ ] an export directed at a directory outside the approved storage filesystem, or attempted while the approved mount is missing or substituted, is refused before any space is reserved and never falls back to the root filesystem;
 - [ ] cancelling the Owner request or disconnecting mid-export leaves no bundle, partial file, or held reservation behind; repeat the disconnect and confirm archives do not accumulate;
+- [ ] with the production producers composed on the deployed Main Server, confirm the bundle's `diagnostics/*.json` holds only fixed states, reason codes, counts and the version: no camera name, role label, capture-node name, UVC/hardware serial, device path, pairing code, Slack webhook URL or Owner template bytes appear (search the bundle locally for the synthetic canaries you configured);
+- [ ] stop or leave unconfigured one subsystem at a time (monitoring runtime, camera registry, audit stores) and confirm its fields report `unavailable` with `not_configured` or `dependency_unavailable`, never `ok`, and that no invented counts appear for it;
+- [ ] select one synthetic recording segment by its `segment.<id>` media ID and confirm only that segment is copied; confirm Owner biometric or unknown IDs are refused and leave no bundle;
 - [ ] record only sanitized PASS/FAIL and aggregate results locally; do not retain the test bundle after the local verification policy permits deletion.
 
-Results: **NOT RUN — Owner authorization/UI integration and Main Server network observation remain pending. Synthetic tests do not complete this acceptance.**
+Results: **NOT RUN — Owner authorization/UI integration, production composition of the #49 producers and Main Server network observation remain pending. Synthetic tests do not complete this acceptance.**
 
 ## V. Deployed Main Server install / update / rollback lifecycle
 

@@ -98,6 +98,47 @@ class SafeDiagnosticFieldName(StrEnum):
     REASON_CODE = "reason_code"
     COUNT = "count"
     ENABLED = "enabled"
+    # Production adapter fields (app.diagnostics.sources). Each name is bound
+    # to one reviewed value type below; none can carry a free-form string.
+    MONITORING_STATE = "monitoring.state"
+    MONITORING_REASON_CODE = "monitoring.reason_code"
+    RETENTION_STATE = "retention.state"
+    DAILY_SUMMARY_STATE = "daily_summary.state"
+    NOTIFICATION_LOCAL_STATE = "notification.local_state"
+    NOTIFICATION_DELIVERY_STATE = "notification.delivery_state"
+    STORAGE_STATE = "storage.state"
+    STORAGE_REASON_CODE = "storage.reason_code"
+    STORAGE_AUDIT_DELIVERY_STATE = "storage.audit_delivery_state"
+    RECORDING_FILESYSTEM_STATE = "recording_filesystem.state"
+    RECORDING_HEALTH_STATE = "recording_health.state"
+    RECORDING_HEALTH_REASON_CODE = "recording_health.reason_code"
+    RECORDING_SELF_TEST_STATE = "recording_health.self_test_state"
+    INTEGRITY_STATE = "integrity.state"
+    INTEGRITY_REASON_CODE = "integrity.reason_code"
+    INTEGRITY_CHECK_STATE = "integrity.check_state"
+    INTEGRITY_DELIVERY_STATE = "integrity.delivery_state"
+    INTEGRITY_CPU_REASON_CODE = "integrity.cpu.reason_code"
+    INTEGRITY_MEMORY_REASON_CODE = "integrity.memory.reason_code"
+    INTEGRITY_STORAGE_REASON_CODE = "integrity.storage.reason_code"
+    INTEGRITY_GPU_REASON_CODE = "integrity.gpu.reason_code"
+    CAMERA_REGISTRY_STATE = "camera_registry.state"
+    CAMERA_REGISTRY_REASON_CODE = "camera_registry.reason_code"
+    CAMERA_SOURCES_TOTAL = "camera_sources.total"
+    CAMERA_SOURCES_ENABLED = "camera_sources.enabled"
+    CAMERA_SOURCES_LOCAL_UVC = "camera_sources.local_uvc"
+    CAMERA_SOURCES_REMOTE_AGENT = "camera_sources.remote_agent"
+    CAMERA_SOURCES_ONLINE = "camera_sources.online"
+    CAMERA_SOURCES_DEGRADED = "camera_sources.degraded"
+    CAMERA_SOURCES_OFFLINE = "camera_sources.offline"
+    CAMERA_SOURCES_MANUAL_INTERVENTION = "camera_sources.manual_intervention_required"
+    CAMERA_SOURCES_ACTIVE_LIMIT = "camera_sources.active_limit"
+    AUDIT_OWNER_STATE = "audit.owner.state"
+    AUDIT_OWNER_UNDELIVERED = "audit.owner.undelivered_records"
+    AUDIT_ACCESS_STATE = "audit.access.state"
+    AUDIT_ACCESS_UNDELIVERED = "audit.access.undelivered_records"
+    AUDIT_PAIRING_STATE = "audit.pairing.state"
+    AUDIT_PAIRING_UNDELIVERED = "audit.pairing.undelivered_records"
+    AUDIT_RETENTION_STATE = "audit.retention.state"
 
 
 class SafeDiagnosticState(StrEnum):
@@ -132,9 +173,40 @@ class SafeDiagnosticReasonCode(StrEnum):
     STORAGE_HARD_STOP = "storage_hard_stop"
     MANUAL_INTERVENTION_REQUIRED = "manual_intervention_required"
     SELF_TEST_FAILED = "self_test_failed"
+    HARDWARE_CHANGED = "hardware_changed"
+    HARDWARE_MISSING = "hardware_missing"
+    HARDWARE_NEW_DEVICE = "hardware_new_device"
+    HARDWARE_UNVERIFIABLE = "hardware_unverifiable"
 
 
 _SAFE_FIELD_NAMES = frozenset(item.value for item in SafeDiagnosticFieldName)
+_F = SafeDiagnosticFieldName
+_STATE_FIELDS = frozenset({
+    _F.STATUS, _F.STATE, _F.HEALTH, _F.MONITORING_STATE, _F.RETENTION_STATE,
+    _F.DAILY_SUMMARY_STATE, _F.NOTIFICATION_LOCAL_STATE,
+    _F.NOTIFICATION_DELIVERY_STATE, _F.STORAGE_STATE,
+    _F.STORAGE_AUDIT_DELIVERY_STATE, _F.RECORDING_FILESYSTEM_STATE,
+    _F.RECORDING_HEALTH_STATE, _F.RECORDING_SELF_TEST_STATE, _F.INTEGRITY_STATE,
+    _F.INTEGRITY_CHECK_STATE, _F.INTEGRITY_DELIVERY_STATE,
+    _F.CAMERA_REGISTRY_STATE, _F.AUDIT_OWNER_STATE, _F.AUDIT_ACCESS_STATE,
+    _F.AUDIT_PAIRING_STATE, _F.AUDIT_RETENTION_STATE,
+})
+_REASON_FIELDS = frozenset({
+    _F.REASON_CODE, _F.MONITORING_REASON_CODE, _F.STORAGE_REASON_CODE,
+    _F.RECORDING_HEALTH_REASON_CODE, _F.INTEGRITY_REASON_CODE,
+    _F.INTEGRITY_CPU_REASON_CODE, _F.INTEGRITY_MEMORY_REASON_CODE,
+    _F.INTEGRITY_STORAGE_REASON_CODE, _F.INTEGRITY_GPU_REASON_CODE,
+    _F.CAMERA_REGISTRY_REASON_CODE,
+})
+_COUNT_FIELDS = frozenset({
+    _F.COUNT, _F.CAMERA_SOURCES_TOTAL, _F.CAMERA_SOURCES_ENABLED,
+    _F.CAMERA_SOURCES_LOCAL_UVC, _F.CAMERA_SOURCES_REMOTE_AGENT,
+    _F.CAMERA_SOURCES_ONLINE, _F.CAMERA_SOURCES_DEGRADED,
+    _F.CAMERA_SOURCES_OFFLINE, _F.CAMERA_SOURCES_MANUAL_INTERVENTION,
+    _F.CAMERA_SOURCES_ACTIVE_LIMIT, _F.AUDIT_OWNER_UNDELIVERED,
+    _F.AUDIT_ACCESS_UNDELIVERED, _F.AUDIT_PAIRING_UNDELIVERED,
+})
+del _F
 _SAFE_VERSION = re.compile(
     r"^(?:0|[1-9][0-9]{0,5})\.(?:0|[1-9][0-9]{0,5})\."
     r"(?:0|[1-9][0-9]{0,5})$"
@@ -166,8 +238,7 @@ _CLASSIFIED_FIELD_NAMES = {
 
 
 def _validate_safe_value(name: str, value: object) -> None:
-    if name in {SafeDiagnosticFieldName.STATUS, SafeDiagnosticFieldName.STATE,
-                SafeDiagnosticFieldName.HEALTH}:
+    if name in _STATE_FIELDS:
         if not isinstance(value, SafeDiagnosticState):
             raise TypeError("diagnostic state must use the reviewed enum")
         return
@@ -175,7 +246,7 @@ def _validate_safe_value(name: str, value: object) -> None:
         if not isinstance(value, SafeDiagnosticComponent):
             raise TypeError("diagnostic component must use the reviewed enum")
         return
-    if name == SafeDiagnosticFieldName.REASON_CODE:
+    if name in _REASON_FIELDS:
         if not isinstance(value, SafeDiagnosticReasonCode):
             raise TypeError("diagnostic reason must use the reviewed enum")
         return
@@ -183,7 +254,7 @@ def _validate_safe_value(name: str, value: object) -> None:
         if type(value) is not str or not _SAFE_VERSION.fullmatch(value):
             raise ValueError("diagnostic version is invalid")
         return
-    if name == SafeDiagnosticFieldName.COUNT:
+    if name in _COUNT_FIELDS:
         if type(value) is not int or not 0 <= value <= 1_000_000_000:
             raise ValueError("diagnostic count is invalid")
         return
