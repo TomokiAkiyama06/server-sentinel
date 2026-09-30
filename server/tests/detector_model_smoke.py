@@ -7,6 +7,8 @@ import sys
 import time
 from uuid import UUID
 
+RTDETR = "rtdetr-v2-r18vd-onnx-cpu"
+
 
 def reject_outbound(event, args):
     if event in {"socket.connect", "socket.getaddrinfo", "socket.sendto",
@@ -14,20 +16,66 @@ def reject_outbound(event, args):
         raise RuntimeError("unexpected outbound/process attempt")
 
 
+def isolated_check(implementation, artifact, size):
+    """Run the YOLOX adapter in the watchdog-supervised spawned worker.
+
+    Called before the audit hook is installed, because spawning the worker is
+    itself a process launch. The child applies its own rlimits.
+    """
+    from app.detection.foundation import (DetectorKind, IsolatedDetector,
+                                         Observation, RgbFrame, WorkerLimits, WorkerSpec)
+    from app.detection.foundation.yolox import RELEASE, create_yolox_person
+    spec = WorkerSpec(DetectorKind.PERSON, implementation, RELEASE, create_yolox_person,
+                      {"implementation": implementation, "artifact": str(artifact),
+                       "score_threshold": 0.5, "intra_op_threads": 1})
+    # Explicit smoke-only limits, never deployment defaults.
+    limits = WorkerLimits(evaluation_timeout_ns=5_000_000_000,
+                          start_timeout_ns=60_000_000_000, restart_backoff_ns=1,
+                          maximum_consecutive_failures=1, address_space_bytes=4 << 30,
+                          open_files=256, maximum_frame_bytes=size * size * 3)
+    detector = IsolatedDetector(spec, limits)
+    try:
+        state = detector.maintain().state
+        frame = RgbFrame(UUID(int=1), UUID(int=2), 0, size, size,
+                         bytes([0, 128, 255]) * (size * size))
+        started = time.perf_counter_ns()
+        result = detector.evaluate(frame)
+        elapsed = time.perf_counter_ns() - started
+        assert state == "running", state
+        assert result.observation is not Observation.UNKNOWN, result.reason
+        return {"worker_state": state, "worker_observation": result.observation.value,
+                "worker_evaluation_ns": elapsed}
+    finally:
+        detector.close()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("artifact", type=Path)
+    parser.add_argument("--adapter", default=RTDETR,
+                        choices=[RTDETR, "yolox-s-onnx-cpu", "yolox-tiny-onnx-cpu"])
     args = parser.parse_args()
+    worker = {}
+    if args.adapter == RTDETR:
+        size = 640
+    else:
+        from app.detection.foundation import yolox
+        size = yolox.ARTIFACTS[yolox.ADAPTERS[args.adapter].variant].input_size
+        worker = isolated_check(args.adapter, args.artifact, size)
     sys.addaudithook(reject_outbound)
     from app.detection.foundation import GrayFrame, Observation, RgbFrame
     from app.detection.foundation.person import RtDetrPersonDetector
     import onnxruntime
     started = time.perf_counter_ns()
     # Explicit test-only evaluation settings, never deployment defaults.
-    detector = RtDetrPersonDetector(args.artifact, score_threshold=0.5, intra_op_threads=1)
+    if args.adapter == RTDETR:
+        detector = RtDetrPersonDetector(args.artifact, score_threshold=0.5, intra_op_threads=1)
+    else:
+        detector = yolox.ADAPTERS[args.adapter](args.artifact, score_threshold=0.5,
+                                                intra_op_threads=1)
     loaded = time.perf_counter_ns()
-    pixels = bytes([0, 128, 255]) * (640 * 640)
-    frame = RgbFrame(UUID(int=1), UUID(int=2), 0, 640, 640, pixels)
+    pixels = bytes([0, 128, 255]) * (size * size)
+    frame = RgbFrame(UUID(int=1), UUID(int=2), 0, size, size, pixels)
     result = detector.evaluate(frame)
     evaluated = time.perf_counter_ns()
     assert result.observation is not Observation.UNKNOWN, result.reason
@@ -35,6 +83,7 @@ def main():
     assert detector.evaluate(invalid).observation is Observation.UNKNOWN
     print(json.dumps({
         "workload": "generated uniform RGB only; not person accuracy acceptance",
+        "adapter": args.adapter,
         "runtime": onnxruntime.__version__,
         "build": onnxruntime.get_build_info(),
         "available_providers": onnxruntime.get_available_providers(),
@@ -45,6 +94,7 @@ def main():
         "synthetic_score": result.measurement,
         "malformed_frame": "unknown",
         "python_outbound_attempts": 0,
+        **worker,
     }, sort_keys=True))
 
 

@@ -1,4 +1,7 @@
-"""Local RT-DETRv2 CPU benchmark with synthetic pixels and scheduler replay.
+"""Local person-adapter CPU benchmark with synthetic pixels and scheduler replay.
+
+Adapters: the digest-pinned RT-DETRv2 adapter, and the evaluation-only YOLOX
+adapters (Owner decision 2026-09-30; not approved for deployment).
 
 This operator-run harness never downloads a model or media.  It measures the
 already reviewed local adapter, then replays those timings through the bounded
@@ -21,9 +24,25 @@ from .contracts import (Detection, Detector, DetectorKind, Quality, RgbFrame,
                         positive_integer)
 from .person import MODEL_INPUT_SIZE, MODEL_SHA256, RtDetrPersonDetector
 from .scheduler import InferenceScheduler, SourcePolicy, SourceSnapshot
+from . import yolox
 
 _MAX_CYCLES = 10_000
-_PIXELS = bytes(MODEL_INPUT_SIZE * MODEL_INPUT_SIZE * 3)
+RTDETR = RtDetrPersonDetector.implementation
+
+
+@dataclass(frozen=True)
+class _Adapter:
+    factory: Callable[..., Detector]
+    input_size: int
+    artifact_sha256: str
+
+
+ADAPTERS = {
+    RTDETR: _Adapter(RtDetrPersonDetector, MODEL_INPUT_SIZE, MODEL_SHA256),
+    **{name: _Adapter(adapter, yolox.ARTIFACTS[adapter.variant].input_size,
+                      yolox.ARTIFACTS[adapter.variant].sha256)
+       for name, adapter in yolox.ADAPTERS.items()},
+}
 
 
 @dataclass(frozen=True)
@@ -40,8 +59,11 @@ class BenchmarkConfig:
     evaluation_budget_ns: int
     maximum_queue_age_ns: int
     maximum_observation_age_ns: int
+    adapter: str = RTDETR
 
     def __post_init__(self) -> None:
+        if not isinstance(self.adapter, str) or self.adapter not in ADAPTERS:
+            raise ValueError("adapter must name a reviewed person adapter")
         if not isinstance(self.artifact, Path):
             raise ValueError("artifact must be a path")
         if (isinstance(self.score_threshold, bool)
@@ -138,26 +160,27 @@ def _outcomes(measurements: list[_Measurement]) -> dict[str, int]:
     return dict(sorted(counts.items()))
 
 
-def _frame(source_index: int, sequence: int) -> RgbFrame:
+def _frame(source_index: int, sequence: int, size: int) -> RgbFrame:
     return RgbFrame(UUID(int=source_index + 1), UUID(int=source_index + 101),
-                    sequence, MODEL_INPUT_SIZE, MODEL_INPUT_SIZE, _PIXELS)
+                    sequence, size, size, bytes(size * size * 3))
 
 
 def _measure(config: BenchmarkConfig, detectors: list[Detector],
              timer_ns: Callable[[], int]) -> list[list[_Measurement]]:
+    size = ADAPTERS[config.adapter].input_size
     measurements: list[list[_Measurement]] = [[] for _ in detectors]
     for detector in detectors:
         detector.reset()
     for cycle in range(config.warmup_cycles):
         for source_index, detector in enumerate(detectors):
-            result = detector.evaluate(_frame(source_index, cycle))
+            result = detector.evaluate(_frame(source_index, cycle, size))
             if not isinstance(result, Detection):
                 raise ValueError("detector returned an invalid result")
     for cycle in range(config.measured_cycles):
         sequence = config.warmup_cycles + cycle
         for source_index, detector in enumerate(detectors):
             started = timer_ns()
-            result = detector.evaluate(_frame(source_index, sequence))
+            result = detector.evaluate(_frame(source_index, sequence, size))
             finished = timer_ns()
             if not isinstance(result, Detection):
                 raise ValueError("detector returned an invalid result")
@@ -169,6 +192,7 @@ def _measure(config: BenchmarkConfig, detectors: list[Detector],
 
 def _replay(config: BenchmarkConfig, measurements: list[list[_Measurement]],
             implementation: str, version: str) -> list[SourceSnapshot]:
+    size = ADAPTERS[config.adapter].input_size
     clock = _SimulationClock()
     scheduler = InferenceScheduler(clock_ns=clock, maximum_sources=config.sources)
     policy = SourcePolicy(
@@ -177,7 +201,7 @@ def _replay(config: BenchmarkConfig, measurements: list[list[_Measurement]],
         maximum_queue_age_ns=config.maximum_queue_age_ns,
         maximum_evaluation_ns=config.evaluation_budget_ns,
         maximum_observation_age_ns=config.maximum_observation_age_ns,
-        maximum_pixels=MODEL_INPUT_SIZE * MODEL_INPUT_SIZE,
+        maximum_pixels=size * size,
     )
 
     capture_tick = 0
@@ -192,7 +216,7 @@ def _replay(config: BenchmarkConfig, measurements: list[list[_Measurement]],
             captured_ns = capture_tick * config.capture_interval_ns
             clock.advance_to(captured_ns)
             for source_index in range(config.sources):
-                scheduler.offer(_frame(source_index, capture_tick),
+                scheduler.offer(_frame(source_index, capture_tick, size),
                                 quality=Quality.SUFFICIENT)
             capture_tick += 1
         clock.advance_to(finished_ns)
@@ -227,9 +251,10 @@ def _replay(config: BenchmarkConfig, measurements: list[list[_Measurement]],
 def run_benchmark(config: BenchmarkConfig, *,
                   detector_factory: Callable[[int], Detector] | None = None,
                   timer_ns: Callable[[], int] = time.perf_counter_ns) -> dict[str, object]:
+    adapter = ADAPTERS[config.adapter]
     if detector_factory is None:
         def detector_factory(_index: int) -> Detector:
-            return RtDetrPersonDetector(
+            return adapter.factory(
                 config.artifact,
                 score_threshold=config.score_threshold,
                 intra_op_threads=config.intra_op_threads,
@@ -266,11 +291,12 @@ def run_benchmark(config: BenchmarkConfig, *,
     return {
         "schema_version": 1,
         "deployment_acceptance": False,
-        "workload": "generated uniform 640x640 RGB; repeated local CPU inference",
+        "workload": (f"generated uniform {adapter.input_size}x{adapter.input_size} RGB; "
+                     "repeated local CPU inference"),
         "adapter": {
             "implementation": first.implementation,
             "version": first.version,
-            "artifact_sha256": MODEL_SHA256,
+            "artifact_sha256": adapter.artifact_sha256,
             "execution_provider": "CPUExecutionProvider",
         },
         "host": {
@@ -298,6 +324,7 @@ def run_benchmark(config: BenchmarkConfig, *,
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--adapter", choices=sorted(ADAPTERS), default=RTDETR)
     parser.add_argument("--artifact", type=Path, required=True)
     parser.add_argument("--score-threshold", type=float, required=True)
     parser.add_argument("--intra-op-threads", type=int, required=True)

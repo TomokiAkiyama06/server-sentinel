@@ -133,8 +133,28 @@ class PersonBenchmarkTests(unittest.TestCase):
             "pending": False,
         })
 
+    def test_yolox_adapter_selection_uses_its_pin_and_frame_size(self):
+        from app.detection.foundation import yolox
+        sizes = []
+
+        class SizedDetector(StubDetector):
+            def evaluate(self, frame):
+                sizes.append((frame.width, frame.height))
+                return super().evaluate(frame)
+
+        result = run_benchmark(
+            config(adapter="yolox-tiny-onnx-cpu", evaluation_budget_ns=1_000),
+            detector_factory=lambda _index: SizedDetector(),
+            timer_ns=Timer([10, 20, 30]),
+        )
+        self.assertEqual(result["adapter"]["artifact_sha256"],
+                         yolox.ARTIFACTS["yolox-tiny"].sha256)
+        self.assertIn("416x416", result["workload"])
+        self.assertEqual(set(sizes), {(416, 416)})
+
     def test_invalid_source_count_cycles_and_policy_are_rejected(self):
         for changes in (
+            {"adapter": "unreviewed-model"},
             {"sources": 0}, {"sources": 5}, {"measured_cycles": 0},
             {"warmup_cycles": -1}, {"score_threshold": float("nan")},
             {"maximum_cadence_ns": 99},
