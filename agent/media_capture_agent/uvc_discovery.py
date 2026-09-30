@@ -4,12 +4,14 @@ Standalone port of server/app/cameras/uvc/discovery.py (the Agent artifact
 never imports Main Server code); keep both evidence rules in step.
 
 This reads descriptors; it does not start capture or open ALSA/OSS devices.
-See Linux userspace-api/media/v4l/vidioc-querycap and vidioc-enum-fmt.
+See Linux userspace-api/media/v4l/vidioc-querycap, vidioc-enum-fmt,
+vidioc-enum-framesizes and vidioc-enum-frameintervals.
 """
 
 from dataclasses import dataclass
 import errno
 import fcntl
+from fractions import Fraction
 import os
 from pathlib import Path
 import platform
@@ -18,6 +20,7 @@ import stat
 import struct
 
 from .uvc_identity import DeviceEvidence
+from .uvc_pipeline import MjpegProfile
 
 
 VIDEO_CAPTURE = 0x00000001
@@ -26,6 +29,15 @@ DEVICE_CAPS = 0x80000000
 QUERYCAP = 0x80685600
 ENUM_FMT = 0xC0405602
 MAX_FORMATS = 256
+ENUM_FRAMESIZES = 0xC02C564A  # _IOWR('V', 74, struct v4l2_frmsizeenum), 44 bytes
+ENUM_FRAMEINTERVALS = 0xC034564B  # _IOWR('V', 75, struct v4l2_frmivalenum), 52 bytes
+MAX_FRAME_MODES = 256
+FRMSIZE_DISCRETE, FRMSIZE_CONTINUOUS, FRMSIZE_STEPWISE = 1, 2, 3
+FRMIVAL_DISCRETE, FRMIVAL_CONTINUOUS, FRMIVAL_STEPWISE = 1, 2, 3
+MJPEG_FOURCC = int.from_bytes(b"MJPG", "little")
+# A requested rate is offered when an offered rate is within 1 % of it, so a
+# camera advertising 30000/1001 satisfies a 30 fps profile.
+FPS_TOLERANCE = Fraction(1, 100)
 
 
 class ProbeError(RuntimeError):
@@ -72,11 +84,147 @@ def query_capabilities(fd, ioctl=fcntl.ioctl):
     raise ProbeError("video format enumeration exceeds bound")
 
 
-def probe_video_node(path, expected_device):
+def _require_v4l2_abi():
     # Linux generic ioctl encoding is the same on these supported targets.
     # Refuse other ABIs instead of issuing a guessed ioctl command.
     if platform.system() != "Linux" or platform.machine() not in {"x86_64", "aarch64"}:
         raise ProbeError("unsupported V4L2 ABI")
+
+
+class _NotImplemented(Exception):
+    """The driver does not implement a frame size/interval enumeration ioctl."""
+
+
+def _enumerate(ioctl, fd, request, size, header, fields):
+    """Yield raw entries of one V4L2 enumeration, bounded; stops at ``EINVAL``."""
+    for index in range(MAX_FRAME_MODES):
+        buffer = bytearray(size)
+        struct.pack_into(header, buffer, 0, index, *fields)
+        try:
+            ioctl(fd, request, buffer, True)
+        except OSError as error:
+            if error.errno == errno.EINVAL:
+                return
+            if error.errno == errno.ENOTTY and index == 0:
+                raise _NotImplemented() from None
+            raise
+        yield index, buffer
+    raise ProbeError("video mode enumeration exceeds bound")
+
+
+def _stepwise_values(minimum, maximum, step, *, continuous):
+    if minimum <= 0 or maximum < minimum or (not continuous and step <= 0):
+        raise ProbeError("invalid video mode descriptor")
+    return minimum, maximum, (None if continuous else step)
+
+
+def _in_range(value, minimum, maximum, step):
+    return minimum <= value <= maximum and (step is None or (value - minimum) % step == 0)
+
+
+def _size_offered(fd, ioctl, width, height):
+    offered = False
+    for index, buffer in _enumerate(ioctl, fd, ENUM_FRAMESIZES, 44, "=III", (MJPEG_FOURCC, 0)):
+        kind = struct.unpack_from("=I", buffer, 8)[0]
+        if kind == FRMSIZE_DISCRETE:
+            offered = offered or struct.unpack_from("=II", buffer, 12) == (width, height)
+            continue
+        if kind not in (FRMSIZE_CONTINUOUS, FRMSIZE_STEPWISE) or index != 0:
+            raise ProbeError("invalid video mode descriptor")
+        min_w, max_w, step_w, min_h, max_h, step_h = struct.unpack_from("=6I", buffer, 12)
+        continuous = kind == FRMSIZE_CONTINUOUS
+        widths = _stepwise_values(min_w, max_w, step_w, continuous=continuous)
+        heights = _stepwise_values(min_h, max_h, step_h, continuous=continuous)
+        # A stepwise/continuous range is the only entry of its enumeration.
+        return _in_range(width, *widths) and _in_range(height, *heights)
+    return offered
+
+
+def _fraction(numerator, denominator):
+    if numerator <= 0 or denominator <= 0:
+        return None
+    return Fraction(numerator, denominator)
+
+
+def _rate_within_tolerance(offered, requested):
+    return abs(offered - requested) <= requested * FPS_TOLERANCE
+
+
+def _offered_rate(fd, ioctl, width, height, requested):
+    """The exact offered rate that satisfies ``requested`` (fps), or ``None``.
+
+    V4L2 reports frame *intervals* (seconds per frame); rates are their inverse.
+    An exact offer wins; otherwise the closest offer within the tolerance.
+    """
+    best = None
+    for index, buffer in _enumerate(ioctl, fd, ENUM_FRAMEINTERVALS, 52, "=IIIII",
+                                    (MJPEG_FOURCC, width, height, 0)):
+        kind = struct.unpack_from("=I", buffer, 16)[0]
+        if kind == FRMIVAL_DISCRETE:
+            interval = _fraction(*struct.unpack_from("=II", buffer, 20))
+            if interval is None:
+                continue  # A zero interval can satisfy no profile.
+            candidates = (1 / interval,)
+        elif kind in (FRMIVAL_CONTINUOUS, FRMIVAL_STEPWISE) and index == 0:
+            values = struct.unpack_from("=6I", buffer, 20)
+            minimum, maximum, step = (_fraction(*values[0:2]), _fraction(*values[2:4]),
+                                      _fraction(*values[4:6]))
+            continuous = kind == FRMIVAL_CONTINUOUS
+            if minimum is None or maximum is None or maximum < minimum or (
+                    not continuous and step is None):
+                raise ProbeError("invalid video mode descriptor")
+            # Nearest offered interval to the requested one (clamped, on-step).
+            wanted = min(max(1 / requested, minimum), maximum)
+            if not continuous:
+                steps = min(round((wanted - minimum) / step), (maximum - minimum) // step)
+                wanted = minimum + max(0, steps) * step
+            candidates = (1 / wanted,)
+        else:
+            raise ProbeError("invalid video mode descriptor")
+        for rate in candidates:
+            if rate == requested:
+                return rate
+            if _rate_within_tolerance(rate, requested) and (
+                    best is None or abs(rate - requested) < abs(best - requested)):
+                best = rate
+    return best
+
+
+def match_mjpeg_profile(fd, profile, ioctl=fcntl.ioctl):
+    """Check ``profile`` against the MJPEG modes the opened node advertises.
+
+    Read-only ``VIDIOC_QUERYCAP``/``ENUM_FMT``/``ENUM_FRAMESIZES``/
+    ``ENUM_FRAMEINTERVALS`` on this descriptor only (the approved capture node;
+    no other node is opened). Returns the profile to request from the pipeline
+    (the requested one, or the exact offered rate within ``FPS_TOLERANCE``), or
+    ``None`` when the camera does not offer it. A driver that does not implement
+    frame size/interval enumeration (``ENOTTY``) proves nothing: the requested
+    profile is returned and the pipeline's own negotiation remains the check, as
+    it does for a driver that advertises a mode it then refuses.
+    """
+    _require_v4l2_abi()
+    capabilities = query_capabilities(fd, ioctl)
+    if capabilities is None or "MJPG" not in capabilities.formats:
+        return None
+    requested = Fraction(profile.fps_numerator, profile.fps_denominator)
+    try:
+        if not _size_offered(fd, ioctl, profile.width, profile.height):
+            return None
+        rate = _offered_rate(fd, ioctl, profile.width, profile.height, requested)
+    except _NotImplemented:
+        return profile
+    if rate is None:
+        return None
+    if rate == requested:
+        return profile
+    try:
+        return MjpegProfile(profile.width, profile.height, rate.numerator, rate.denominator)
+    except ValueError:
+        return None
+
+
+def probe_video_node(path, expected_device):
+    _require_v4l2_abi()
     if not re.fullmatch(r"video[0-9]+", path.name):
         raise ProbeError("invalid video node")
     descriptor = None

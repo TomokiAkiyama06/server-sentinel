@@ -5,11 +5,14 @@ byte structures (marker segments around deterministic filler), never images of
 people or rooms. Subprocess tests run the current Python as a synthetic source.
 """
 
+import errno
+from fractions import Fraction
 import json
 import os
 from pathlib import Path
 import queue
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -27,7 +30,9 @@ from media_capture_agent.uvc_approvals import FILENAME, ApprovalStorageError, Ap
 from media_capture_agent import uvc_capture
 from media_capture_agent.uvc_capture import (CaptureCleanupError, CaptureLimits, CaptureRefused,
                                              UvcCapture, UvcSourceConfig)
-from media_capture_agent.uvc_discovery import DiscoveryResult, LinuxDiscovery, VideoCapabilities
+from media_capture_agent import uvc_discovery
+from media_capture_agent.uvc_discovery import (DiscoveryResult, LinuxDiscovery, ProbeError,
+                                               VideoCapabilities, match_mjpeg_profile)
 from media_capture_agent.uvc_identity import DeviceEvidence
 from media_capture_agent import uvc_sandbox
 from media_capture_agent.uvc_pipeline import (GSTREAMER_ENVIRONMENT, GSTREAMER_PLUGINS,
@@ -123,12 +128,14 @@ class FakeLauncher:
         self.pipelines = []
         self.fail = False
         self.descriptors = []
+        self.profiles = []
 
     def launch(self, device_fd, profile):
         if self.fail:
             raise PipelineError("synthetic launch failure")
         os.fstat(device_fd)  # The verified descriptor is still open at launch.
         self.descriptors.append(device_fd)
+        self.profiles.append(profile)
         pipeline = FakePipeline()
         self.pipelines.append(pipeline)
         return pipeline
@@ -162,12 +169,13 @@ class CaptureCase(unittest.TestCase):
                                     stall_timeout=2, stop_timeout=1, backoff_initial=1,
                                     backoff_max=4)
 
-    def capture(self, discovery, count=1, **kwargs):
+    def capture(self, discovery, count=1, *, profile=PROFILE, **kwargs):
         kwargs.setdefault("launcher", self.launcher)
         kwargs.setdefault("open_device",
                           lambda _candidate: os.open(os.devnull, os.O_RDONLY | os.O_CLOEXEC))
+        kwargs.setdefault("match_profile", lambda _fd, profile: profile)
         capture = UvcCapture(
-            self.settings, [UvcSourceConfig(SOURCES[index], PROFILE) for index in range(count)],
+            self.settings, [UvcSourceConfig(SOURCES[index], profile) for index in range(count)],
             discovery=discovery, limits=self.limits, clock=self.clock, **kwargs)
         self.addCleanup(self._close, capture)
         return capture
@@ -418,6 +426,164 @@ class PipelineCommandTests(unittest.TestCase):
         self.assertNotIn("/dev/video", str(raised.exception))
         with self.assertRaises(PipelineError):
             launcher.launch(1, PROFILE)
+
+
+class FakeV4l2:
+    """Synthetic V4L2 ioctl responder for one descriptor; no device is touched.
+
+    ``sizes`` entries: ``(1, w, h)`` discrete, ``(2|3, min_w, max_w, step_w,
+    min_h, max_h, step_h)`` continuous/stepwise. ``intervals`` maps ``(w, h)``
+    (or ``None`` for every size) to entries ``(1, num, den)`` discrete or
+    ``(2|3, (num, den), (num, den), (num, den))`` continuous/stepwise, in
+    seconds per frame as V4L2 reports them.
+    """
+
+    def __init__(self, sizes, intervals, *, formats=("MJPG",), unimplemented=()):
+        self.sizes, self.intervals, self.formats = sizes, intervals, formats
+        self.unimplemented = unimplemented
+        self.descriptors = set()
+        self.requests = []
+
+    @staticmethod
+    def _end():
+        return OSError(errno.EINVAL, "end of enumeration")
+
+    def __call__(self, fd, request, buffer, mutate):
+        self.descriptors.add(fd)
+        self.requests.append(request)
+        if request in self.unimplemented:
+            raise OSError(errno.ENOTTY, "not implemented")
+        if request == uvc_discovery.QUERYCAP:
+            struct.pack_into("=II", buffer, 84, 0x04000001, 0)
+        elif request == uvc_discovery.ENUM_FMT:
+            index = struct.unpack_from("=I", buffer, 0)[0]
+            if index >= len(self.formats):
+                raise self._end()
+            buffer[44:48] = self.formats[index].encode("ascii")
+        elif request == uvc_discovery.ENUM_FRAMESIZES:
+            index, fourcc = struct.unpack_from("=II", buffer, 0)
+            assert fourcc == uvc_discovery.MJPEG_FOURCC
+            if index >= len(self.sizes):
+                raise self._end()
+            kind, *values = self.sizes[index]
+            struct.pack_into(f"={1 + len(values)}I", buffer, 8, kind, *values)
+        elif request == uvc_discovery.ENUM_FRAMEINTERVALS:
+            index, fourcc, width, height = struct.unpack_from("=IIII", buffer, 0)
+            assert fourcc == uvc_discovery.MJPEG_FOURCC
+            entries = self.intervals.get((width, height), self.intervals.get(None, ()))
+            if index >= len(entries):
+                raise self._end()
+            kind, *values = entries[index]
+            flat = [part for value in values
+                    for part in (value if isinstance(value, tuple) else (value,))]
+            struct.pack_into(f"={1 + len(flat)}I", buffer, 16, kind, *flat)
+        else:
+            raise AssertionError("unexpected ioctl")
+
+
+class ModeMatchTests(unittest.TestCase):
+    """``match_mjpeg_profile`` with synthetic ioctl answers only."""
+
+    DISCRETE = FakeV4l2([(1, 1920, 1080), (1, 1280, 720), (1, 640, 480)],
+                        {None: [(1, 1, 30), (1, 1, 15)]})
+
+    def match(self, fake, width, height, fps, denominator=1):
+        profile = MjpegProfile(width, height, fps, denominator)
+        return profile, match_mjpeg_profile(7, profile, ioctl=fake)
+
+    def test_discrete_supported_profile_is_returned_unchanged(self):
+        for size in ((1920, 1080), (1280, 720), (640, 480)):
+            for fps in (30, 15):
+                profile, matched = self.match(self.DISCRETE, *size, fps)
+                self.assertIs(matched, profile)
+        # Only the descriptor handed in is queried; no other node is opened.
+        self.assertEqual(self.DISCRETE.descriptors, {7})
+
+    def test_unsupported_size_or_rate_is_refused(self):
+        self.assertIsNone(self.match(self.DISCRETE, 3840, 2160, 30)[1])  # 4K30
+        self.assertIsNone(self.match(self.DISCRETE, 1920, 1080, 60)[1])  # 1080p60
+        self.assertIsNone(self.match(self.DISCRETE, 1280, 720, 25)[1])   # 720p25
+        self.assertIsNone(self.match(self.DISCRETE, 1920, 1080, 30, 4)[1])  # 7.5 fps
+
+    def test_fractional_intervals_within_one_percent(self):
+        fake = FakeV4l2([(1, 1920, 1080)], {None: [(1, 1001, 30000), (1, 1, 15)]})
+        profile, matched = self.match(fake, 1920, 1080, 30)
+        # The exact offered rate is requested so the pipeline caps intersect.
+        self.assertEqual((matched.width, matched.height), (1920, 1080))
+        self.assertEqual(Fraction(matched.fps_numerator, matched.fps_denominator),
+                         Fraction(30000, 1001))
+        profile, matched = self.match(fake, 1920, 1080, 30000, 1001)
+        self.assertIs(matched, profile)
+        # An exact offer wins over a nearby one; beyond 1 % nothing matches.
+        exact = FakeV4l2([(1, 640, 480)], {None: [(1, 1001, 30000), (1, 1, 30)]})
+        profile, matched = self.match(exact, 640, 480, 30)
+        self.assertIs(matched, profile)
+        self.assertIsNone(self.match(fake, 1920, 1080, 29)[1])
+        self.assertIsNone(self.match(fake, 1920, 1080, 31)[1])
+
+    def test_stepwise_sizes_and_intervals(self):
+        fake = FakeV4l2([(3, 160, 1920, 16, 120, 1080, 8)],
+                        {None: [(3, (1, 30), (1, 1), (1, 30))]})
+        for fps in (30, 15, 10):
+            profile, matched = self.match(fake, 1280, 720, fps)
+            self.assertIs(matched, profile)
+        self.assertIsNone(self.match(fake, 1289, 720, 30)[1])  # Off-step width.
+        self.assertIsNone(self.match(fake, 1280, 1088, 30)[1])     # Above max height.
+        self.assertIsNone(self.match(fake, 1280, 720, 20)[1])      # Between steps.
+        self.assertIsNone(self.match(fake, 1280, 720, 60)[1])      # Above max rate.
+
+    def test_continuous_sizes_and_intervals(self):
+        fake = FakeV4l2([(2, 64, 4096, 1, 64, 2160, 1)],
+                        {None: [(2, (1001, 30000), (1, 1), (1, 1))]})
+        for fps in (24, 7, 1):
+            profile, matched = self.match(fake, 1001, 563, fps)
+            self.assertIs(matched, profile)
+        profile, matched = self.match(fake, 3840, 2160, 30)
+        self.assertEqual(Fraction(matched.fps_numerator, matched.fps_denominator),
+                         Fraction(30000, 1001))  # Clamped to the range within 1 %.
+        self.assertIsNone(self.match(fake, 3840, 2160, 60)[1])
+        self.assertIsNone(self.match(fake, 4097, 2160, 24)[1])
+
+    def test_missing_mjpeg_format_is_unsupported(self):
+        fake = FakeV4l2([(1, 640, 480)], {None: [(1, 1, 15)]}, formats=("YUYV",))
+        self.assertIsNone(self.match(fake, 640, 480, 15)[1])
+        self.assertNotIn(uvc_discovery.ENUM_FRAMESIZES, fake.requests)
+
+    def test_unimplemented_enumeration_defers_to_pipeline_negotiation(self):
+        for request in (uvc_discovery.ENUM_FRAMESIZES, uvc_discovery.ENUM_FRAMEINTERVALS):
+            fake = FakeV4l2([(1, 640, 480)], {None: [(1, 1, 15)]}, unimplemented=(request,))
+            profile, matched = self.match(fake, 640, 480, 15)
+            self.assertIs(matched, profile)
+        # QUERYCAP failing is not "unknown": the node is not a usable V4L2 device.
+        fake = FakeV4l2([], {}, unimplemented=(uvc_discovery.QUERYCAP,))
+        with self.assertRaises(OSError):
+            self.match(fake, 640, 480, 15)
+
+    def test_malformed_or_unbounded_descriptors_fail_closed(self):
+        cases = [
+            FakeV4l2([(9, 640, 480)], {None: [(1, 1, 15)]}),                      # Unknown type.
+            FakeV4l2([(1, 320, 240), (3, 160, 640, 16, 120, 480, 8)], {None: []}),  # Range not first.
+            FakeV4l2([(3, 160, 640, 0, 120, 480, 8)], {None: []}),                  # Zero step.
+            FakeV4l2([(2, 640, 160, 1, 120, 480, 1)], {None: []}),                  # min > max.
+            FakeV4l2([(1, 640, 480)], {None: [(3, (1, 30), (1, 1), (0, 1))]}),      # Zero step.
+            FakeV4l2([(1, 640, 480)], {None: [(2, (1, 1), (1, 30), (1, 1))]}),      # min > max.
+            FakeV4l2([(1, 640, 480)] * (uvc_discovery.MAX_FRAME_MODES + 1), {None: []}),
+            FakeV4l2([(1, 640, 480)], {None: [(1, 1, 60)] * (uvc_discovery.MAX_FRAME_MODES + 1)}),
+        ]
+        for fake in cases:
+            with self.subTest(sizes=fake.sizes[:2]), self.assertRaises(ProbeError):
+                self.match(fake, 640, 480, 15)
+        # A zero discrete interval satisfies nothing but is not an error.
+        fake = FakeV4l2([(1, 640, 480)], {None: [(1, 0, 1), (1, 1, 15)]})
+        profile, matched = self.match(fake, 640, 480, 15)
+        self.assertIs(matched, profile)
+
+    def test_unsupported_abi_issues_no_ioctl(self):
+        fake = FakeV4l2([(1, 640, 480)], {None: [(1, 1, 15)]})
+        with mock.patch.object(uvc_discovery.platform, "machine", return_value="riscv64"):
+            with self.assertRaises(ProbeError):
+                self.match(fake, 640, 480, 15)
+        self.assertEqual(fake.requests, [])
 
 
 class DiscoveryTreeTests(unittest.TestCase):
@@ -731,6 +897,115 @@ class CaptureTests(CaptureCase):
         self.assertEqual(self.state(unsupported), ("offline", "capture_unsupported"))
         self.assertEqual(len(self.launcher.pipelines), 0)
 
+    def unsupported_capture(self, supported, **kwargs):
+        """A capture whose mode check offers only ``supported`` profiles."""
+        calls = {"open": 0, "match": 0}
+
+        def open_device(_candidate):
+            calls["open"] += 1
+            return os.open(os.devnull, os.O_RDONLY | os.O_CLOEXEC)
+
+        def match_profile(_fd, profile):
+            calls["match"] += 1
+            return profile if profile in supported else None
+        device = kwargs.pop("device", evidence())
+        discovery = FakeDiscovery(device)
+        capture = self.capture(discovery, open_device=open_device,
+                               match_profile=match_profile, **kwargs)
+        return capture, discovery, device, calls
+
+    def test_unsupported_profile_is_stable_without_relaunch(self):
+        capture, _discovery, device, calls = self.unsupported_capture(set())
+        capture.approve(SOURCES[0], device)
+        for _tick in range(8):
+            self.assertEqual(self.state(capture), ("offline", "capture_unsupported"))
+            self.clock.now += 70  # Beyond any backoff.
+        # Evaluated once: the node was opened once and no pipeline ever started.
+        self.assertEqual(calls, {"open": 1, "match": 1})
+        self.assertEqual(self.launcher.pipelines, [])
+        self.assertEqual(self.launcher.descriptors, [])
+
+    def test_replug_or_owner_reapproval_re_evaluates_unsupported_profile(self):
+        supported = set()
+        capture, discovery, device, calls = self.unsupported_capture(supported)
+        capture.approve(SOURCES[0], device)
+        self.assertEqual(self.state(capture), ("offline", "capture_unsupported"))
+        # Owner re-approval of the same camera re-evaluates exactly once.
+        capture.approve(SOURCES[0], device)
+        self.assertEqual(self.state(capture), ("offline", "capture_unsupported"))
+        self.assertEqual(self.state(capture), ("offline", "capture_unsupported"))
+        self.assertEqual(calls["match"], 2)
+        discovery.devices = []
+        self.assertEqual(self.state(capture), ("offline", "camera_missing"))
+        # Replugged: same serial identity, new device instance. Identity matching
+        # is unchanged (the serial camera rebinds automatically) and the profile
+        # is checked again against the new instance.
+        supported.add(PROFILE)
+        discovery.devices = [evidence(3, token=(1, 999, 2))]
+        self.assertEqual(self.state(capture), ("degraded", "capture_starting"))
+        self.assertEqual(calls["match"], 3)
+        self.assertEqual(self.launcher.profiles, [PROFILE])
+        self.stream(capture, self.launcher.pipelines[-1])
+        self.assertEqual(self.state(capture), ("online", "video_ready"))
+
+    def test_profile_change_re_evaluates_on_restart(self):
+        wanted = MjpegProfile(1920, 1080, 60)
+        capture, _discovery, device, calls = self.unsupported_capture({PROFILE}, profile=wanted)
+        capture.approve(SOURCES[0], device)
+        self.assertEqual(self.state(capture), ("offline", "capture_unsupported"))
+        capture.close()  # Clean shutdown: a serial camera reconnects on restart.
+        capture, _discovery, device, calls = self.unsupported_capture({PROFILE})
+        self.assertEqual(self.state(capture), ("degraded", "capture_starting"))
+        self.assertEqual(calls, {"open": 1, "match": 1})
+        self.assertEqual(self.launcher.profiles, [PROFILE])
+
+    def test_matched_offered_rate_is_what_the_pipeline_requests(self):
+        offered = MjpegProfile(640, 480, 15000, 1001)
+        device = evidence()
+        capture = self.capture(FakeDiscovery(device),
+                               match_profile=lambda _fd, _profile: offered)
+        capture.approve(SOURCES[0], device)
+        self.assertEqual(self.state(capture), ("degraded", "capture_starting"))
+        self.assertEqual(self.launcher.profiles, [offered])
+
+    def test_mode_check_failure_is_transient_not_unsupported(self):
+        calls = []
+
+        def match_profile(_fd, profile):
+            calls.append(profile)
+            raise ProbeError("synthetic descriptor failure")
+        device = evidence()
+        capture = self.capture(FakeDiscovery(device), match_profile=match_profile)
+        capture.approve(SOURCES[0], device)
+        self.assertEqual(self.state(capture), ("offline", "capture_failed"))
+        self.assertEqual(self.state(capture), ("offline", "capture_failed"))  # Backoff.
+        self.clock.now += 1
+        self.assertEqual(self.state(capture), ("offline", "capture_failed"))
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(self.launcher.pipelines, [])
+
+    def test_hung_mode_check_never_blocks_poll(self):
+        release = threading.Event()
+
+        def match_profile(_fd, profile):
+            release.wait(10)
+            return profile
+        self.limits = CaptureLimits(max_frame_bytes=4096, queue_frames=4, startup_timeout=5,
+                                    stall_timeout=2, stop_timeout=1, device_timeout=0.2,
+                                    backoff_initial=1, backoff_max=4)
+        device = evidence()
+        capture = self.capture(FakeDiscovery(device), match_profile=match_profile)
+        capture.approve(SOURCES[0], device)
+        started = time.monotonic()
+        state = self.state(capture)
+        self.assertLess(time.monotonic() - started, 2)
+        self.assertEqual(state[0], "offline")
+        self.assertEqual(self.launcher.pipelines, [])
+        release.set()
+        # The late match result owns no descriptor; the retained one is closed.
+        self.clock.now += 5
+        self.assertTrue(wait_for(lambda: self.state(capture)[1] != "capture_cleanup_failed"))
+
     def test_consumer_backpressure_is_degraded_not_healthy(self):
         device = evidence()
         capture, pipeline = self.approved_online(FakeDiscovery(device), device)
@@ -961,8 +1236,9 @@ class CaptureTests(CaptureCase):
         def start(thread):
             if thread.name == "media-capture-agent-uvc-device":
                 device_starts.append(thread)
-                # The open worker starts; every close worker hits exhaustion.
-                if len(device_starts) > 1 and exhausted[0]:
+                # The open and mode-check workers start; every close worker
+                # hits exhaustion.
+                if len(device_starts) > 2 and exhausted[0]:
                     raise RuntimeError("can't start new thread")
             return original_start(thread)
 
@@ -1380,7 +1656,8 @@ class SubprocessPipelineTests(unittest.TestCase):
         device = evidence()
         capture = UvcCapture(config, [UvcSourceConfig(SOURCES[0], PROFILE)], launcher=launcher,
                              discovery=FakeDiscovery(device),
-                             open_device=lambda _c: os.open(os.devnull, os.O_RDONLY | os.O_CLOEXEC))
+                             open_device=lambda _c: os.open(os.devnull, os.O_RDONLY | os.O_CLOEXEC),
+                             match_profile=lambda _fd, profile: profile)
         capture.approve(SOURCES[0], device)
         capture.poll()
         frame = capture.frames(SOURCES[0]).get(5)
