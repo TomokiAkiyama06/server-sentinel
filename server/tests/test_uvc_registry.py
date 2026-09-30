@@ -1,5 +1,6 @@
 from contextlib import closing, contextmanager
-from dataclasses import replace
+from dataclasses import asdict, replace
+import json
 from pathlib import Path
 import tempfile
 import unittest
@@ -11,8 +12,9 @@ from app.audit import (
 )
 from app.audit.integration import OwnerAdministration
 from app.cameras.registry import CameraRegistry, CaptureProfile, SourceHealthState, SourceType
+from app.cameras.uvc.capture import VideoProfile as CaptureVideo
 from app.cameras.uvc.identity import DeviceEvidence
-from app.cameras.uvc.persistence import ApprovalStorageError
+from app.cameras.uvc.persistence import ApprovalConflictError, ApprovalStorageError
 from app.cameras.uvc.registry_adapter import LocalUvcAdapter
 from app.storage.database import Database
 from app.storage.migrations import migrate
@@ -20,7 +22,7 @@ from app.storage.schema import APPLICATION_MIGRATIONS
 from tests.test_uvc_session import Discovery, SyntheticCapture
 
 
-class UvcRegistryTests(unittest.TestCase):
+class UvcRegistryFixture(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
@@ -40,6 +42,13 @@ class UvcRegistryTests(unittest.TestCase):
         self.adapter = self.make_adapter()
         self.addCleanup(self.adapter.close)
 
+    def make_adapter(self):
+        return LocalUvcAdapter(self.registry, emit_audit=self.events.append,
+                               on_frame=lambda source_id, frame: self.frames.append((source_id, frame)),
+                               discovery=self.discovery, capture_factory=SyntheticCapture)
+
+
+class UvcRegistryTests(UvcRegistryFixture):
     def test_owner_admin_uvc_approval_is_atomically_audited(self):
         class PermitOwner:
             def require_owner(self, actor_context):
@@ -282,11 +291,6 @@ class UvcRegistryTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.adapter.approve_source_on(object(), self.camera)
 
-    def make_adapter(self):
-        return LocalUvcAdapter(self.registry, emit_audit=self.events.append,
-                               on_frame=lambda source_id, frame: self.frames.append((source_id, frame)),
-                               discovery=self.discovery, capture_factory=SyntheticCapture)
-
     def test_source_does_not_acquire_camera_without_owner_selection(self):
         self.assertFalse(self.adapter.poll_source(self.source.id))
         self.assertEqual(self.registry.get_source(self.source.id).health_state, SourceHealthState.OFFLINE)
@@ -423,6 +427,158 @@ class UvcRegistryTests(unittest.TestCase):
         self.assertEqual(self.frames, [])
         restarted._approve_live_session(self.source.id, self.camera)
         self.assertTrue(restarted.poll_source(self.source.id))
+
+
+class PermitAnyOwner:
+    def require_owner(self, actor_context):
+        return None
+
+
+class DuplicateApprovalTests(UvcRegistryFixture):
+    """One physical camera is never approved for two enabled sources."""
+
+    def setUp(self):
+        super().setUp()
+        self.other = self.registry.create_source(
+            source_type=SourceType.LOCAL_UVC, name="Second synthetic source", enabled=True,
+            desired_capture_profile=CaptureProfile(640, 480, 10, "MJPG"),
+        )
+        self.second_camera = DeviceEvidence("/dev/video2", "synthetic", "model", "serial-2")
+        self.discovery.devices = [self.camera, self.second_camera]
+        self.audit = AuditStore(self.database)
+        self.admin = OwnerAdministration(
+            OwnerAuditService(self.audit, PermitAnyOwner()), self.registry,
+        )
+
+    def approvals(self):
+        return [record.outcome for record in self.audit.list_records()
+                if record.action is AuditAction.APPROVE_CAMERA]
+
+    def persist_duplicate(self, source_id, evidence):
+        """Write an approval row as a build without the check could have."""
+        with closing(self.database.connect()) as connection:
+            connection.execute(
+                "INSERT INTO uvc_approvals (source_id, evidence, requires_approval, "
+                "session_token, serial_ambiguous) VALUES (?, ?, 0, NULL, 0)",
+                (str(source_id), json.dumps(asdict(evidence))),
+            )
+
+    def test_same_camera_cannot_be_approved_for_a_second_source(self):
+        self.admin.approve_uvc("owner", self.adapter, self.source.id, self.camera)
+        self.assertTrue(self.adapter.poll_source(self.source.id))
+        moved = replace(self.camera, device_path="/dev/video7")
+        self.discovery.devices = [moved, self.second_camera]
+        with self.assertRaises(ValueError) as refused:
+            self.admin.approve_uvc("owner", self.adapter, self.other.id, moved)
+        # Generic reason only: no identifier of the other source or camera.
+        self.assertNotIn("serial", str(refused.exception))
+        self.assertIsNone(self.adapter.store.load(self.other.id))
+        self.assertEqual(sorted([AuditOutcome.SUCCEEDED, AuditOutcome.FAILED]),
+                         sorted(self.approvals()))
+        self.assertFalse(self.adapter.poll_source(self.other.id))
+        self.assertEqual(SourceHealthState.OFFLINE, self.registry.get_source(self.other.id).health_state)
+        # The approved source reconnects its camera by serial at its new node.
+        self.assertFalse(self.adapter.poll_source(self.source.id))
+        self.assertTrue(self.adapter.poll_source(self.source.id))
+        # A different camera can still be approved for the second source.
+        self.admin.approve_uvc("owner", self.adapter, self.other.id, self.second_camera)
+        self.assertTrue(self.adapter.poll_source(self.other.id))
+
+    def test_transaction_rechecks_a_concurrent_approval(self):
+        prepared_first = self.adapter.prepare_approval(self.source.id, self.camera)
+        prepared_second = self.adapter.prepare_approval(self.other.id, self.camera)
+        with closing(self.database.connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self.adapter.approve_source_on(connection, prepared_first)
+            connection.commit()
+        with closing(self.database.connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            with self.assertRaises(ApprovalConflictError):
+                self.adapter.approve_source_on(connection, prepared_second)
+            connection.rollback()
+        self.assertIsNone(self.adapter.store.load(self.other.id))
+
+    def test_disabled_or_latched_source_does_not_hold_the_camera(self):
+        self.admin.approve_uvc("owner", self.adapter, self.source.id, self.camera)
+        self.registry.update_source(self.source.id, enabled=False)
+        self.admin.approve_uvc("owner", self.adapter, self.other.id, self.camera)
+        self.assertTrue(self.adapter.poll_source(self.other.id))
+        self.registry.update_source(self.source.id, enabled=True)
+        # Re-enabling the older duplicate never races for the camera: both
+        # conflicting sources require the Owner, whichever polls first.
+        self.assertFalse(self.adapter.poll_source(self.source.id))
+        self.adapter.monotonic = lambda: 1e9
+        self.assertFalse(self.adapter.poll_source(self.other.id))
+        for source_id in (self.source.id, self.other.id):
+            self.assertEqual(SourceHealthState.MANUAL_INTERVENTION_REQUIRED,
+                             self.registry.get_source(source_id).health_state)
+            self.assertIsNone(self.adapter.sessions[source_id].capture)
+        # A latched (approval-required) row holds no camera either.
+        with closing(self.database.connect()) as connection:
+            connection.execute("UPDATE uvc_approvals SET requires_approval=1 WHERE source_id=?",
+                               (str(self.source.id),))
+        self.adapter.stop_source(self.other.id)
+        self.assertTrue(self.adapter.poll_source(self.other.id))
+
+    def test_persisted_duplicate_is_manual_in_either_startup_order(self):
+        for order in ((self.source.id, self.other.id), (self.other.id, self.source.id)):
+            with self.subTest(order=order):
+                with closing(self.database.connect()) as connection:
+                    connection.execute("DELETE FROM uvc_approvals")
+                self.persist_duplicate(self.source.id, self.camera)
+                self.persist_duplicate(self.other.id, self.camera)
+                adapter = self.make_adapter()
+                self.addCleanup(adapter.close)
+                opened = len(SyntheticCapture.instances)
+                for _ in range(3):
+                    for source_id in order:
+                        self.assertFalse(adapter.poll_source(source_id))
+                self.assertEqual(opened, len(SyntheticCapture.instances))
+                for source_id in order:
+                    self.assertEqual(SourceHealthState.MANUAL_INTERVENTION_REQUIRED,
+                                     self.registry.get_source(source_id).health_state)
+                # The durable approvals are unchanged: nothing was rebound.
+                for source_id in order:
+                    self.assertEqual(self.camera, adapter.store.load(source_id).approved)
+                adapter.close()
+
+    def test_owner_resolves_duplicate_by_disabling_one_source(self):
+        self.persist_duplicate(self.source.id, self.camera)
+        self.persist_duplicate(self.other.id, self.camera)
+        self.assertFalse(self.adapter.poll_source(self.source.id))
+        self.assertFalse(self.adapter.poll_source(self.other.id))
+        self.adapter.stop_source(self.source.id)
+        # Reapproving the same camera while the other source still holds it
+        # is refused; the Owner disables (or reapproves) the other source.
+        with self.assertRaises(ValueError):
+            self.admin.approve_uvc("owner", self.adapter, self.source.id, self.camera)
+        self.registry.update_source(self.other.id, enabled=False)
+        self.assertTrue(self.adapter.poll_source(self.source.id))
+        self.assertFalse(self.adapter.poll_source(self.other.id))
+        self.assertEqual(SourceHealthState.OFFLINE, self.registry.get_source(self.other.id).health_state)
+
+    def test_unsupported_profile_is_degraded_with_negotiated_profile_recorded(self):
+        class AdjustingCapture(SyntheticCapture):
+            def open(self):
+                negotiated = super().open()
+                return replace(negotiated, profile=CaptureVideo(1920, 1080, 30, "MJPG"))
+
+        self.registry.update_source(
+            self.source.id, desired_capture_profile=CaptureProfile(3840, 2160, 30, "MJPG"))
+        adapter = LocalUvcAdapter(self.registry, emit_audit=self.events.append,
+                                  on_frame=lambda source_id, frame: self.frames.append(frame),
+                                  discovery=self.discovery, capture_factory=AdjustingCapture)
+        self.addCleanup(adapter.close)
+        self.admin.approve_uvc("owner", adapter, self.source.id, self.camera)
+        for _ in range(3):
+            self.assertFalse(adapter.poll_source(self.source.id))
+        source = self.registry.get_source(self.source.id)
+        self.assertEqual(SourceHealthState.DEGRADED, source.health_state)
+        self.assertEqual((1920, 1080, 30, "MJPG"), (
+            source.negotiated_capture_profile.width, source.negotiated_capture_profile.height,
+            source.negotiated_capture_profile.fps, source.negotiated_capture_profile.pixel_format))
+        self.assertEqual([], self.frames)
+        self.assertEqual("capture_profile_unavailable", self.events[-1].reason)
 
 
 if __name__ == "__main__":

@@ -63,6 +63,18 @@ class DeviceEvidence:
         return self.vendor, self.product, self.interface
 
 
+def same_physical_camera(first, second):
+    """True when two pieces of evidence may name the same physical camera.
+
+    A serial-backed identity compares by its strong key, so a changed device
+    node or port still names the same camera. Weak (non-serial) evidence can
+    only be compared exactly, including its ephemeral instance marker.
+    """
+    if first.strong_key is not None or second.strong_key is not None:
+        return first.strong_key == second.strong_key
+    return first == second
+
+
 @dataclass(frozen=True)
 class IdentityDecision:
     state: CameraState
@@ -131,6 +143,11 @@ class ReconnectController:
         self.bound = explicit_candidate
         self._explicit_binding = explicit_candidate is not None
         self.requires_approval = saved.requires_approval if saved else False
+        # The exact candidate (and whether it was an explicit binding) whose
+        # negotiated profile did not satisfy the requested profile. It keeps
+        # the source visibly degraded without reopening the device on every
+        # poll; it never authorizes capture by itself.
+        self._profile_hold = None
         self._reason = "not_started"
         self._finished = False
 
@@ -161,6 +178,18 @@ class ReconnectController:
             self._transition(CameraState.MANUAL, "owner_approval_required")
             return None
         devices = tuple(devices)
+        if self._profile_hold is not None:
+            held, explicit = self._profile_hold
+            peers = [d for d in devices if d.strong_key == held.strong_key]
+            if devices.count(held) == 1 and (explicit or held.strong_key is None
+                                               or not self.serial_ambiguous and len(peers) == 1):
+                # Same conditions as a live binding below. Nothing is opened
+                # until the profile or enablement changes (set_enabled) or
+                # the device instance changes.
+                self.bound = None
+                self._transition(CameraState.DEGRADED, "capture_profile_unavailable")
+                return None
+            self._profile_hold = None
         # A live open capture descriptor may keep its approved weak binding.
         # Losing that descriptor ends this allowance, including process restart.
         if self.bound is not None and devices.count(self.bound) == 1:
@@ -195,6 +224,7 @@ class ReconnectController:
                             serial_ambiguous=ambiguous)
         self.approved = self.bound = candidate
         self._explicit_binding = True
+        self._profile_hold = None
         self.serial_ambiguous = ambiguous
         self.requires_approval = False
         self._transition(CameraState.DEGRADED, "owner_approved_pending_capture")
@@ -203,6 +233,39 @@ class ReconnectController:
         if not self.enabled or self.requires_approval or self.bound != candidate or candidate is None:
             raise ValueError("capture has no approved binding")
         self._transition(CameraState.ONLINE, "video_capture_ready")
+
+    @property
+    def profile_unavailable(self):
+        return self._profile_hold is not None and self._reason == "capture_profile_unavailable"
+
+    def capture_profile_unavailable(self, candidate):
+        """The driver negotiated a different profile than the requested one.
+
+        The caller has already closed the capture descriptor. The source stays
+        visibly degraded (never online) instead of silently accepting the
+        driver-adjusted profile as if it had been requested.
+        """
+        if self.bound != candidate or candidate is None:
+            raise ValueError("capture has no approved binding")
+        self._profile_hold = (candidate, self._explicit_binding)
+        self.bound = None
+        self._explicit_binding = False
+        self._transition(CameraState.DEGRADED, "capture_profile_unavailable")
+
+    def approval_conflict(self):
+        """Another enabled source holds an active approval for this camera.
+
+        Reported as manual intervention without changing either durable
+        approval, so every conflicting source sees the same state regardless
+        of startup or polling order. The Owner resolves it by disabling or
+        reapproving one of the sources.
+        """
+        if self._finished:
+            raise ValueError("capture controller is closed")
+        self.bound = None
+        self._explicit_binding = False
+        self._profile_hold = None
+        self._transition(CameraState.MANUAL, "approval_conflict")
 
     def capture_failed(self):
         self.bound = None
@@ -239,4 +302,5 @@ class ReconnectController:
             raise ValueError("enabled must be boolean")
         self.enabled = enabled
         self.bound = None
+        self._profile_hold = None
         self._transition(CameraState.OFFLINE, "enabled_pending_capture" if enabled else "disabled")

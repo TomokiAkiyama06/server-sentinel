@@ -75,6 +75,32 @@ the authorization-bound preview session layer. This was verified only with
 synthetic discovery/capture adapters and synthetic frame bytes; no physical
 camera, V4L2 node, udev rule or real frame was used.
 
+#### 実機記録 2026-09-30: 重複承認の拒否と非対応 profile の表示（Issue #11 修正後）
+
+同型 serial 付き UVC 2 台（EMEET SmartCam C960）を接続した Main Server 候補機で、
+修正後のコードを video group の非 root ユーザーが実行した。`create_app()` の
+lifespan、実 `LinuxDiscovery` / `MmapCapture`、`LocalUvcRuntime.reapprove()` →
+`OwnerAdministration.approve_uvc()` の監査付き経路を使用（Owner authorizer のみ
+stand-in）。一時 DB は repository 外に作り実行後に削除した。frame は件数だけを
+数えて破棄し、保存・閲覧していない。serial・device path・by-id・USB port・UUID
+は記録しない。「カメラA/B」「S1/S2」は一時ラベル。
+
+| 確認内容 | 結果 |
+|---|---|
+| S1 にカメラA を承認して `online` の状態で、S2 にも同じカメラA を承認 | 拒否（`ValueError`、汎用 reason）。`approve_camera` 監査は `succeeded`, `failed`。S2 の承認行は作られない |
+| 拒否後 10 秒間 | S1 `online`（300 frame）、S2 `offline`・health event 0・worker failure 0（EBUSY flapping なし）。開いている video node はカメラA だけ |
+| S2 に別のカメラB を承認 | `online` |
+| 修正前に作られうる重複承認（S2 の承認 evidence をカメラA に書き換えた DB）で再起動、config 順 S1→S2 / S2→S1 の両方 | 両 source とも `manual_intervention_required`（`approval_conflict`）、frame 0、video descriptor 0。起動順に依存しない |
+| 上記状態で S1 にカメラA を再承認 | 拒否（S2 が有効なまま保持しているため） |
+| Owner が S2 を無効化 | S1 が自動で `online`、S2 `offline`。開いている video node はカメラA だけ |
+| desired profile 4K MJPG 30 / 1080p MJPG 60 / 1080p MJPG 15 / 1080p H264 30 | `degraded`（`capture_profile_unavailable`）、negotiated `1920x1080@30 MJPG` を記録、frame 0、video descriptor 0、4 秒間の health event 0（再 open の反復なし） |
+| desired profile 1080p YUYV 30 | `degraded`、negotiated `640x480@30 YUYV` を記録、frame 0 |
+| 対応 profile（720p MJPG 30 / 480p YUYV 30）と 1080p MJPG 30 への復帰 | `online`、4 秒で 120 frame |
+| 全工程の audio descriptor / 停止後の video descriptor | 0 / 0 |
+
+未確認: 抜線・ポート入替・再起動を伴う物理操作、非 serial 同型機、3〜4 source、
+実配信 fps の記録（registry は driver の frame interval のみ保持）。
+
 #### Real-hardware runtime procedure (serial-bearing UVC cameras)
 
 Use one or more USB UVC cameras that report a USB serial number (for example

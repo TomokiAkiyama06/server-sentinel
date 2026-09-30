@@ -45,6 +45,13 @@ It opens only a selected `/dev/videoN` with no symlink following, checks the
 character-device number and rescans identity after open, then uses V4L2
 `G/S_FMT`, `G/S_PARM`, `REQBUFS`, `QUERYBUF`, `Q/DQBUF` and `STREAMON/OFF`.
 The driver-adjusted profile is reported separately from the requested profile.
+V4L2 drivers adjust an unsupported request instead of failing, so the session
+compares the negotiated width, height and FourCC exactly and the frame rate
+within 1% (`profile_satisfies()`). On a mismatch it records the negotiated
+profile, closes the descriptor and reports `degraded` with the fixed reason
+`capture_profile_unavailable`, never `online`; the same device instance is not
+reopened on every poll, only after the profile, enablement or device instance
+changes.
 The caller supplies width, height, FPS and FourCC; there are no hardware profile
 defaults. Codec/bitrate controls and multi-planar-only capture are unsupported
 and fail explicitly. Camera drivers without a reportable frame rate also fail.
@@ -57,7 +64,16 @@ approval reaches it only through the audited boundary
 `OwnerAdministration.approve_uvc()`, which validates the exact current
 selection before its transaction and commits the approval with its
 `approve_camera` audit record; the adapter exposes no unaudited public
-approval, and no HTTP management or preview route. A supervisor drives
+approval, and no HTTP management or preview route. One physical camera (same
+serial-backed identity, or the exact weak evidence) is approved for at most one
+enabled source: approving a camera another enabled source holds an active
+approval for is refused with the generic reason and audited as failed, checked
+before and again inside the audited transaction. A disabled source or one that
+requires approval holds nothing. A duplicate that predates this check (or an
+older duplicate re-enabled later) makes every conflicting source
+`manual_intervention_required` (`approval_conflict`) without changing either
+approval, so capture never depends on startup order; the Owner disables or
+reapproves one of them. A supervisor drives
 `poll_source()` in each source's worker and serializes operations on that source.
 The injected frame callback can feed an authorized preview or later media
 pipeline; actual browser viewing remains a downstream task. Discovery and

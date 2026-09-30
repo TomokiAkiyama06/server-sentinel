@@ -1,6 +1,6 @@
 """One source's capture lifecycle, with injected frame and negotiated-profile sinks."""
 
-from .capture import CaptureError, MmapCapture
+from .capture import CaptureError, MmapCapture, profile_satisfies
 from .discovery import ProbeError
 
 
@@ -59,6 +59,11 @@ class CaptureSession:
                 # needs no physical discovery and the transition is deduplicated.
                 self.controller.reconcile(())
             return False
+        if not self.controller.enabled or self.controller.requires_approval:
+            # Neither state depends on physical discovery; skip the rescan.
+            self.close()
+            self.controller.reconcile(())
+            return False
         try:
             scan = self.discovery.scan()
             if self.capture is not None and self.controller.bound not in scan.devices:
@@ -67,11 +72,23 @@ class CaptureSession:
                 return False
             candidate = self.controller.reconcile(scan.devices)
             if candidate is None:
-                self.close()
+                if self.capture is not None or not self.controller.profile_unavailable:
+                    self.close()
                 return False
             if self.capture is None:
                 self.capture = self.capture_factory(candidate, self.profile, verify_identity=self._verify)
                 negotiated = self.capture.open()
+                if not profile_satisfies(self.profile, negotiated.profile):
+                    # The driver silently adjusted an unsupported request.
+                    # Record what it negotiated, but never report the source
+                    # online for a profile the Owner did not configure.
+                    capture, self.capture = self.capture, None
+                    try:
+                        capture.close()
+                    finally:
+                        self.controller.capture_profile_unavailable(candidate)
+                    self.on_profile(negotiated)
+                    return False
                 self.on_profile(negotiated)
             frame = self.capture.read_frame(timeout)
             self.controller.capture_ready(candidate)

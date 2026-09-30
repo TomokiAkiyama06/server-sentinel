@@ -6,7 +6,7 @@ in-memory stand-ins and every frame payload is a fixed synthetic byte string.
 
 import asyncio
 from contextlib import closing, contextmanager
-from dataclasses import replace
+from dataclasses import asdict, replace
 import json
 import logging
 import os
@@ -544,6 +544,58 @@ class RestartDurabilityTests(RuntimeFixture):
         time.sleep(0.2)
         self.assertIs(self.health(source.id), SourceHealthState.MANUAL_INTERVENTION_REQUIRED)
         self.assertEqual(0, sum(1 for capture in self.captures.instances if not capture.closed))
+
+
+class RuntimeDuplicateApprovalTests(RuntimeFixture):
+    """Real-hardware finding (2026-09-30): one camera approved for two sources."""
+
+    def setUp(self):
+        super().setUp()
+        self.second_camera = DeviceEvidence("/dev/video2", "synthetic", "model", "serial-b")
+        self.discovery.devices = [self.camera, self.second_camera]
+
+    def open_captures(self):
+        with self.captures.lock:
+            return sum(1 for capture in self.captures.instances if not capture.closed)
+
+    def test_duplicate_reapproval_is_refused_and_audited(self):
+        first, second = self.source("First"), self.source("Second")
+        runtime = self.runtime(first.id, second.id)
+        runtime.start()
+        runtime.reapprove(self.admin, "synthetic-owner", first.id, self.camera)
+        self.assertTrue(self.wait_health(first.id, SourceHealthState.ONLINE))
+        with self.assertRaises(ValueError):
+            runtime.reapprove(self.admin, "synthetic-owner", second.id, self.camera)
+        outcomes = sorted(record.outcome for record in AuditStore(self.database).list_records()
+                          if record.action is AuditAction.APPROVE_CAMERA)
+        self.assertEqual(sorted([AuditOutcome.SUCCEEDED, AuditOutcome.FAILED]), outcomes)
+        time.sleep(0.3)
+        # No EBUSY-style flapping: the refused source never tries the camera.
+        self.assertIs(self.health(second.id), SourceHealthState.OFFLINE)
+        self.assertIs(self.health(first.id), SourceHealthState.ONLINE)
+        self.assertEqual(1, self.open_captures())
+        self.assertIsNone(ApprovalStore(self.database).load(second.id))
+
+    def test_persisted_duplicate_is_manual_at_startup_in_any_order(self):
+        first, second = self.source("First"), self.source("Second")
+        for source in (first, second):
+            with closing(self.database.connect()) as connection:
+                connection.execute(
+                    "INSERT INTO uvc_approvals (source_id, evidence, requires_approval, "
+                    "session_token, serial_ambiguous) VALUES (?, ?, 0, NULL, 0)",
+                    (str(source.id), json.dumps(asdict(self.camera))),
+                )
+        for order in ((first.id, second.id), (second.id, first.id)):
+            with self.subTest(order=order):
+                runtime = self.runtime(*order)
+                runtime.start()
+                for source_id in order:
+                    self.assertTrue(self.wait_health(
+                        source_id, SourceHealthState.MANUAL_INTERVENTION_REQUIRED))
+                time.sleep(0.2)
+                self.assertEqual(0, self.open_captures())
+                self.assertEqual(0, self.frame_count(first.id) + self.frame_count(second.id))
+                runtime.stop()
 
 
 @contextmanager
