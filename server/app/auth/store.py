@@ -12,6 +12,7 @@ from app.audit.model import ActorCategory, AuditAction, AuditOutcome, TargetKind
 from app.audit.store import AuditStorageError, AuditStore
 from app.storage.database import Database
 from .model import AccessValidationError, Credential, Permission, Principal, PrincipalRole, PrincipalStatus, utc_time
+from .session_binding import SessionBindingKey, canonical_identity
 
 
 class AccessStorageError(RuntimeError):
@@ -85,11 +86,18 @@ def _digest(secret: bytes) -> bytes:
     return hashlib.sha256(secret).digest()
 
 
-def _identity(value: str) -> str:
-    if (not isinstance(value, str) or not 1 <= len(value) <= 256
-            or not value.isascii() or any(ord(char) < 33 or ord(char) > 126 for char in value)):
+def _identity(value: object) -> str:
+    """Validate a supplied trusted-proxy identity.
+
+    A present, well-formed identity is required on every ceremony and session
+    check (ADR-0003 rejects a missing human identity), but it is never
+    compared with a principal: every holder of the shared Tailscale account
+    presents the same value, so it cannot say who is asking.
+    """
+    canonical = canonical_identity(value)
+    if canonical is None:
         raise AccessValidationError("external identity is invalid")
-    return value
+    return canonical
 
 
 def _display(value: str) -> str:
@@ -114,24 +122,41 @@ class AccessStore:
     constructed with ``unaudited_writes=True`` for non-runtime fixtures.
     Invitation redemption is not an Owner operation; it appends its own audit
     record in the same transaction and therefore requires ``audit``.
+
+    Per-person authorization rests on the invitation and on the passkey
+    credential bound to the principal (ADR-0004). The trusted-proxy identity
+    is supplementary: it is required to be present, recorded on the principal
+    as the value last observed at authentication, and bound into each session
+    as ``HMAC(session_binding, identity)``. A later request whose identity
+    does not reproduce that binding is refused; the binding never grants
+    anything, and no principal is ever selected or authorized by it. Without
+    ``session_binding`` no session can be established or used.
     """
 
     def __init__(self, database: Database, *, clock: Callable[[], datetime] | None = None,
-                 audit: AuditStore | None = None, unaudited_writes: bool = False):
+                 audit: AuditStore | None = None, unaudited_writes: bool = False,
+                 session_binding: SessionBindingKey | None = None):
         if type(unaudited_writes) is not bool:
             raise AccessValidationError("unaudited write mode is invalid")
+        if session_binding is not None and not isinstance(session_binding, SessionBindingKey):
+            raise AccessValidationError("session binding key is invalid")
         if audit is not None and (not isinstance(audit, AuditStore) or audit.database != database):
             # The audit row must share the mutation's SQLite database/transaction.
             raise AccessValidationError("audit store is invalid")
         self.database = database
         self.audit = audit
         self.unaudited_writes = unaudited_writes
+        self._session_binding = session_binding
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         # Bounded health only: a matched invitation redemption whose audit
         # append or commit failed is counted here instead of being appended
         # separately, so unauthenticated attempts cannot grow the audit table.
         self.audit_delivery_failed = False
         self.undelivered_audit_records = 0
+
+    @property
+    def session_binding_configured(self) -> bool:
+        return self._session_binding is not None
 
     def _mark_undelivered(self) -> None:
         self.audit_delivery_failed = True
@@ -193,10 +218,10 @@ class AccessStore:
                           backup_state=bool(row["backup_state"]), inconsistent_at=optional("inconsistent_at_us"),
                           label=row["label"], last_used_at=optional("last_used_at_us"))
 
-    def bootstrap_owner(self, external_identity: str, display_name: str, *, now: datetime | None = None) -> Principal:
-        identity, name = _identity(external_identity), _display(display_name)
+    def bootstrap_owner(self, display_name: str, *, now: datetime | None = None) -> Principal:
+        name = _display(display_name)
         at = utc_time(self._clock() if now is None else now)
-        owner = Principal(uuid4(), identity, name, PrincipalRole.OWNER, PrincipalStatus.ACTIVE, 0, at)
+        owner = Principal(uuid4(), None, name, PrincipalRole.OWNER, PrincipalStatus.ACTIVE, 0, at)
         with self._transaction(write=True) as connection:
             if connection.execute("SELECT 1 FROM access_principals WHERE role='owner'").fetchone() is not None:
                 raise AccessValidationError("owner is already configured")
@@ -205,23 +230,27 @@ class AccessStore:
                                 owner.status.value, owner.authorization_revision, _us(owner.created_at)))
         return owner
 
-    def invite(self, external_identity: str, display_name: str, permissions: Iterable[Permission], *, now: datetime | None = None) -> Principal:
+    def invite(self, display_name: str, permissions: Iterable[Permission], *, now: datetime | None = None) -> Principal:
         self._require_unaudited_writes()
         at = utc_time(self._clock() if now is None else now)
         with self._transaction(write=True) as connection:
-            return self.invite_on(connection, uuid4(), external_identity, display_name, permissions, at=at)
+            return self.invite_on(connection, uuid4(), display_name, permissions, at=at)
 
-    def invite_on(self, connection, principal_id: UUID, external_identity: str, display_name: str,
+    def invite_on(self, connection, principal_id: UUID, display_name: str,
                   permissions: Iterable[Permission], *, at: datetime) -> Principal:
-        """Create an invited principal with its grants on a caller-owned transaction."""
+        """Create an invited principal with its grants on a caller-owned transaction.
+
+        The principal is identified by its id and later by its own passkey,
+        never by a Tailscale/proxy login: several invited people may share one.
+        """
         if not isinstance(principal_id, UUID):
             raise AccessValidationError("principal identity is invalid")
-        identity, name = _identity(external_identity), _display(display_name)
+        name = _display(display_name)
         grants = self._permissions(permissions)
         at = utc_time(at)
-        principal = Principal(principal_id, identity, name, PrincipalRole.INVITED_USER, PrincipalStatus.INVITED, 0, at)
-        connection.execute("INSERT INTO access_principals VALUES (?, ?, ?, ?, ?, ?, ?, NULL)",
-                           (str(principal.id), identity, name, principal.role.value, principal.status.value, 0, _us(at)))
+        principal = Principal(principal_id, None, name, PrincipalRole.INVITED_USER, PrincipalStatus.INVITED, 0, at)
+        connection.execute("INSERT INTO access_principals VALUES (?, NULL, ?, ?, ?, ?, ?, NULL)",
+                           (str(principal.id), name, principal.role.value, principal.status.value, 0, _us(at)))
         connection.executemany("INSERT INTO access_principal_permissions VALUES (?, ?)",
                                ((str(principal.id), grant.value) for grant in grants))
         return principal
@@ -250,7 +279,7 @@ class AccessStore:
                            (str(invitation_id), digest, str(principal_id), principal["authorization_revision"], generation, _us(at), _us(expiry)))
         return invitation_id
 
-    def enroll_credential(self, enrollment_secret: bytes, external_identity: str, credential_id: bytes,
+    def enroll_credential(self, enrollment_secret: bytes, proxy_identity: str, credential_id: bytes,
                           public_key: bytes, algorithm: int, sign_count: int, *, now: datetime | None = None,
                           backup_eligible: bool = False, backup_state: bool = False,
                           label: str | None = None, invitation_id: UUID | None = None) -> Credential:
@@ -259,7 +288,9 @@ class AccessStore:
         Callers must have verified the WebAuthn registration first
         (``app.auth.passkeys.PasskeyCeremonies``). When ``invitation_id`` is
         given, the redeemed invitation must be exactly the one the verified
-        registration challenge was bound to.
+        registration challenge was bound to. ``proxy_identity`` must be a
+        present, well-formed trusted-proxy identity but selects nothing: the
+        enrollment secret alone names the invitation and so the person.
 
         A rejected redemption writes nothing, so an unauthenticated caller
         presenting unknown or stale codes cannot grow the audit table. When a
@@ -267,7 +298,8 @@ class AccessStore:
         outcome is counted in ``audit_delivery_failed`` /
         ``undelivered_audit_records`` instead of being appended separately.
         """
-        digest, identity = _digest(enrollment_secret), _identity(external_identity)
+        digest = _digest(enrollment_secret)
+        _identity(proxy_identity)
         if invitation_id is not None and not isinstance(invitation_id, UUID):
             raise AccessValidationError("enrollment is unavailable")
         credential = Credential(credential_id, UUID(int=0), public_key, algorithm, sign_count,
@@ -279,10 +311,10 @@ class AccessStore:
         audit_attempted = False
         try:
             with self._audited_transaction() as connection:
-                row = connection.execute("SELECT i.*, p.external_identity, p.role, p.status, p.authorization_revision FROM access_invitations i JOIN access_principals p ON p.id=i.principal_id WHERE i.secret_digest=?", (digest,)).fetchone()
+                row = connection.execute("SELECT i.*, p.role, p.status, p.authorization_revision FROM access_invitations i JOIN access_principals p ON p.id=i.principal_id WHERE i.secret_digest=?", (digest,)).fetchone()
                 state = connection.execute("SELECT authorization_generation FROM access_deployment_state WHERE singleton=1").fetchone()[0]
                 if (row is None or row["redeemed_at_us"] is not None or row["revoked_at_us"] is not None
-                        or row["status"] == PrincipalStatus.REVOKED.value or row["external_identity"] != identity
+                        or row["status"] == PrincipalStatus.REVOKED.value
                         or row["principal_revision"] != row["authorization_revision"]
                         or row["deployment_generation"] != state or not row["issued_at_us"] <= _us(at) < row["expires_at_us"]
                         or (invitation_id is not None and row["id"] != str(invitation_id))):
@@ -312,7 +344,8 @@ class AccessStore:
             raise
         return credential
 
-    def establish_session(self, principal_id: UUID, credential_id: bytes, token: bytes, *, now: datetime | None = None,
+    def establish_session(self, principal_id: UUID, credential_id: bytes, token: bytes, *, proxy_identity: str,
+                          now: datetime | None = None,
                           idle_lifetime: timedelta = IDLE_LIFETIME, absolute_lifetime: timedelta = ABSOLUTE_LIFETIME) -> UUID:
         """Persist a session for an already verified assertion.
 
@@ -322,21 +355,37 @@ class AccessStore:
         """
         at = utc_time(self._clock() if now is None else now)
         with self._transaction(write=True) as connection:
-            return self.establish_session_on(connection, principal_id, credential_id, token, at=at,
+            return self.establish_session_on(connection, principal_id, credential_id, token,
+                                             proxy_identity=proxy_identity, at=at,
                                              idle_lifetime=idle_lifetime, absolute_lifetime=absolute_lifetime)
 
+    def _binding(self, proxy_identity: object) -> bytes:
+        """Keyed binding of a verified proxy identity; generic denial when unusable."""
+        binding = None if self._session_binding is None else self._session_binding.bind(proxy_identity)
+        if binding is None:
+            raise AccessValidationError("access is unavailable")
+        return binding
+
+    @staticmethod
+    def _clear_ended_bindings_on(connection, at: datetime) -> None:
+        """Drop the binding of sessions whose idle or absolute lifetime has ended."""
+        connection.execute("UPDATE access_sessions SET external_identity_binding=NULL WHERE external_identity_binding IS NOT NULL AND (idle_expires_at_us <= ? OR absolute_expires_at_us <= ?)",
+                           (_us(at), _us(at)))
+
     def establish_session_on(self, connection, principal_id: UUID, credential_id: bytes, token: bytes, *,
-                             at: datetime, verified_at: datetime | None = None,
+                             proxy_identity: str, at: datetime, verified_at: datetime | None = None,
                              idle_lifetime: timedelta = IDLE_LIFETIME,
                              absolute_lifetime: timedelta = ABSOLUTE_LIFETIME) -> UUID:
         """Create an opaque session bound to one principal and one credential.
 
         Lifetimes default to the ADR-0003 accepted values (30 minutes idle,
-        12 hours absolute). Only the token digest is stored.
+        12 hours absolute). Only the token digest is stored, and of the
+        proxy identity only its keyed binding (never the raw value).
         """
         if not isinstance(principal_id, UUID) or not isinstance(credential_id, bytes):
             raise AccessValidationError("session subject is invalid")
         token_digest = _digest(token)
+        binding = self._binding(proxy_identity)
         if not isinstance(idle_lifetime, timedelta) or not isinstance(absolute_lifetime, timedelta) or not timedelta(0) < idle_lifetime <= absolute_lifetime:
             raise AccessValidationError("session lifetime is invalid")
         at, session_id = utc_time(at), uuid4()
@@ -348,9 +397,11 @@ class AccessStore:
                 or row["inconsistent_at_us"] is not None):
             raise AccessValidationError("session subject is unavailable")
         generation = connection.execute("SELECT authorization_generation FROM access_deployment_state WHERE singleton=1").fetchone()[0]
-        connection.execute("INSERT INTO access_sessions (id, token_digest, principal_id, credential_id, principal_revision, deployment_generation, established_at_us, last_seen_at_us, idle_lifetime_us, idle_expires_at_us, absolute_expires_at_us, invalidated_at_us, last_user_verification_at_us) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)",
+        self._clear_ended_bindings_on(connection, at)
+        connection.execute("INSERT INTO access_sessions (id, token_digest, principal_id, credential_id, principal_revision, deployment_generation, established_at_us, last_seen_at_us, idle_lifetime_us, idle_expires_at_us, absolute_expires_at_us, invalidated_at_us, last_user_verification_at_us, external_identity_binding) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)",
                            (str(session_id), token_digest, str(principal_id), credential_id, row["authorization_revision"], generation,
-                            _us(at), _us(at), _duration_us(idle_lifetime), _us(at + idle_lifetime), _us(at + absolute_lifetime), verified))
+                            _us(at), _us(at), _duration_us(idle_lifetime), _us(at + idle_lifetime), _us(at + absolute_lifetime), verified,
+                            binding))
         return session_id
 
     @staticmethod
@@ -366,16 +417,20 @@ class AccessStore:
         except AccessValidationError:
             return b"\x00" * 32
 
-    def _current_session_on(self, connection, token: object, external_identity: object, at: datetime):
-        """Return the joined session row when it is currently valid, else ``None``."""
+    def _current_session_on(self, connection, token: object, proxy_identity: object, at: datetime):
+        """Return the joined session row when it is currently valid, else ``None``.
+
+        The session is found by its token digest alone. The proxy identity
+        only has to reproduce the session's keyed binding (constant-time); it
+        is never compared with the principal, so a shared login neither
+        selects nor excludes a person.
+        """
         digest = self._request_digest(token)
-        try:
-            identity = _identity(external_identity)
-        except AccessValidationError:
-            identity = None
         row = connection.execute("SELECT s.*, p.id principal_id, p.external_identity, p.display_name, p.role, p.status, p.authorization_revision, p.created_at_us, p.revoked_at_us, c.revoked_at_us credential_revoked, c.inconsistent_at_us credential_inconsistent FROM access_sessions s JOIN access_principals p ON p.id=s.principal_id JOIN access_credentials c ON c.credential_id=s.credential_id WHERE s.token_digest=?", (digest,)).fetchone()
         state = connection.execute("SELECT authorization_generation FROM access_deployment_state WHERE singleton=1").fetchone()[0]
-        valid = (identity is not None and row is not None and row["invalidated_at_us"] is None and row["external_identity"] == identity
+        bound = (row is not None and self._session_binding is not None
+                 and self._session_binding.matches(row["external_identity_binding"], proxy_identity))
+        valid = (bound and row["invalidated_at_us"] is None
                  and row["status"] == PrincipalStatus.ACTIVE.value and row["credential_revoked"] is None
                  and row["credential_inconsistent"] is None
                  and row["principal_revision"] == row["authorization_revision"] and row["deployment_generation"] == state
@@ -388,13 +443,18 @@ class AccessStore:
         next_idle = min(_us(at) + row["idle_lifetime_us"], row["absolute_expires_at_us"])
         connection.execute("UPDATE access_sessions SET last_seen_at_us=?, idle_expires_at_us=? WHERE id=?", (_us(at), next_idle, row["id"]))
 
-    def authorize(self, token: bytes, external_identity: str, permission: Permission, *, now: datetime | None = None) -> Principal:
-        """Authorize one request; every refusal is the same generic denial."""
+    def authorize(self, token: bytes, proxy_identity: str, permission: Permission, *, now: datetime | None = None) -> Principal:
+        """Authorize one request; every refusal is the same generic denial.
+
+        A proxy identity that does not reproduce the session binding is
+        refused for this request only; the session itself is left as it is
+        (see the auth README for this Owner-reviewable choice).
+        """
         if not isinstance(permission, Permission):
             raise AccessValidationError("permission is invalid")
         at = utc_time(self._clock() if now is None else now)
         with self._transaction(write=True) as connection:
-            row = self._current_session_on(connection, token, external_identity, at)
+            row = self._current_session_on(connection, token, proxy_identity, at)
             if row is None:
                 raise AccessValidationError("access is unavailable")
             granted = connection.execute("SELECT 1 FROM access_principal_permissions WHERE principal_id=? AND permission=?", (row["principal_id"], permission.value)).fetchone() is not None
@@ -404,7 +464,7 @@ class AccessStore:
             self._touch_session_on(connection, row, at)
             return principal
 
-    def authorize_owner(self, token: bytes, external_identity: str, *, now: datetime | None = None,
+    def authorize_owner(self, token: bytes, proxy_identity: str, *, now: datetime | None = None,
                         freshness: timedelta = OWNER_STEP_UP_FRESHNESS) -> Principal:
         """Authorize an AUTH-008 owner operation with fresh user verification.
 
@@ -418,7 +478,7 @@ class AccessStore:
             raise AccessValidationError("freshness window is invalid")
         at = utc_time(self._clock() if now is None else now)
         with self._transaction(write=True) as connection:
-            row = self._current_session_on(connection, token, external_identity, at)
+            row = self._current_session_on(connection, token, proxy_identity, at)
             if row is None or row["role"] != PrincipalRole.OWNER.value:
                 raise AccessValidationError("access is unavailable")
             self._touch_session_on(connection, row, at)
@@ -463,10 +523,11 @@ class AccessStore:
         row = connection.execute("SELECT status FROM access_principals WHERE id=?", (str(principal_id),)).fetchone()
         if row is None:
             raise AccessValidationError("principal is unavailable")
-        connection.execute("UPDATE access_principals SET status=?, revoked_at_us=?, authorization_revision=authorization_revision+1 WHERE id=?", (PrincipalStatus.REVOKED.value, _us(at), str(principal_id)))
+        # The last observed proxy identity is cleared with the principal (§11.4).
+        connection.execute("UPDATE access_principals SET status=?, revoked_at_us=?, external_identity=NULL, authorization_revision=authorization_revision+1 WHERE id=?", (PrincipalStatus.REVOKED.value, _us(at), str(principal_id)))
         connection.execute("UPDATE access_credentials SET revoked_at_us=? WHERE principal_id=? AND revoked_at_us IS NULL", (_us(at), str(principal_id)))
         connection.execute("UPDATE access_invitations SET revoked_at_us=? WHERE principal_id=? AND redeemed_at_us IS NULL AND revoked_at_us IS NULL", (_us(at), str(principal_id)))
-        connection.execute("UPDATE access_sessions SET invalidated_at_us=? WHERE principal_id=? AND invalidated_at_us IS NULL", (_us(at), str(principal_id)))
+        connection.execute("UPDATE access_sessions SET invalidated_at_us=?, external_identity_binding=NULL WHERE principal_id=? AND invalidated_at_us IS NULL", (_us(at), str(principal_id)))
 
     def revoke_credential_on(self, connection, principal_id: UUID, credential_id: bytes, *, at: datetime) -> None:
         """Revoke one credential of a principal and end the sessions it created.
@@ -483,7 +544,7 @@ class AccessStore:
             (_us(at), credential_id, str(principal_id))).rowcount
         if changed != 1:
             raise AccessValidationError("credential is unavailable")
-        connection.execute("UPDATE access_sessions SET invalidated_at_us=? WHERE credential_id=? AND invalidated_at_us IS NULL", (_us(at), credential_id))
+        connection.execute("UPDATE access_sessions SET invalidated_at_us=?, external_identity_binding=NULL WHERE credential_id=? AND invalidated_at_us IS NULL", (_us(at), credential_id))
 
     # --- WebAuthn ceremony state (Issue #10). Verification lives in app.auth.webauthn;
     # these methods persist only digests, flags and the accepted counter. ---
@@ -522,24 +583,27 @@ class AccessStore:
         with self._transaction(write=True) as connection:
             self._insert_challenge_on(connection, digest, "authentication", at, lifetime)
 
-    def begin_registration(self, enrollment_secret: object, external_identity: object, digest: bytes, *,
+    def begin_registration(self, enrollment_secret: object, proxy_identity: object, digest: bytes, *,
                            at: datetime, lifetime: timedelta) -> RegistrationSubject:
         """Bind a registration challenge to one valid invitation and count the attempt.
 
         The invitation is not redeemed here. An absent, unknown, expired,
         redeemed, revoked, generation-stale or attempt-exhausted code receives
-        the generic denial and writes nothing.
+        the generic denial and writes nothing. The enrollment secret alone
+        selects the invitation; the proxy identity must be present and
+        well-formed but is not compared with anything.
         """
         at = utc_time(at)
         try:
-            secret_digest, identity = _digest(enrollment_secret), _identity(external_identity)
+            secret_digest = _digest(enrollment_secret)
+            _identity(proxy_identity)
         except AccessValidationError:
             raise AccessValidationError("access is unavailable") from None
         with self._transaction(write=True) as connection:
-            row = connection.execute("SELECT i.*, p.external_identity, p.display_name, p.status, p.authorization_revision FROM access_invitations i JOIN access_principals p ON p.id=i.principal_id WHERE i.secret_digest=?", (secret_digest,)).fetchone()
+            row = connection.execute("SELECT i.*, p.display_name, p.status, p.authorization_revision FROM access_invitations i JOIN access_principals p ON p.id=i.principal_id WHERE i.secret_digest=?", (secret_digest,)).fetchone()
             state = connection.execute("SELECT authorization_generation FROM access_deployment_state WHERE singleton=1").fetchone()[0]
             if (row is None or row["redeemed_at_us"] is not None or row["revoked_at_us"] is not None
-                    or row["status"] == PrincipalStatus.REVOKED.value or row["external_identity"] != identity
+                    or row["status"] == PrincipalStatus.REVOKED.value
                     or row["principal_revision"] != row["authorization_revision"]
                     or row["deployment_generation"] != state or not row["issued_at_us"] <= _us(at) < row["expires_at_us"]):
                 raise AccessValidationError("access is unavailable")
@@ -571,7 +635,7 @@ class AccessStore:
         return ConsumedChallenge(None if row["invitation_id"] is None else UUID(row["invitation_id"]),
                                  None if row["session_id"] is None else UUID(row["session_id"]))
 
-    def begin_step_up(self, token: object, external_identity: object, digest: bytes, *,
+    def begin_step_up(self, token: object, proxy_identity: object, digest: bytes, *,
                       at: datetime, lifetime: timedelta) -> bytes:
         """Bind a step-up challenge to a current Owner session and return its credential id.
 
@@ -580,17 +644,17 @@ class AccessStore:
         """
         at = utc_time(at)
         with self._transaction(write=True) as connection:
-            row = self._current_session_on(connection, token, external_identity, at)
+            row = self._current_session_on(connection, token, proxy_identity, at)
             if row is None or row["role"] != PrincipalRole.OWNER.value:
                 raise AccessValidationError("access is unavailable")
             self._insert_challenge_on(connection, digest, "step_up", at, lifetime, session_id=row["id"])
             return bytes(row["credential_id"])
 
-    def current_session(self, token: object, external_identity: object, *, at: datetime) -> SessionView | None:
+    def current_session(self, token: object, proxy_identity: object, *, at: datetime) -> SessionView | None:
         """Read-only lookup of a currently valid session; records no activity."""
         at = utc_time(at)
         with self._transaction() as connection:
-            row = self._current_session_on(connection, token, external_identity, at)
+            row = self._current_session_on(connection, token, proxy_identity, at)
         if row is None:
             return None
         return SessionView(UUID(row["id"]), UUID(row["principal_id"]), bytes(row["credential_id"]))
@@ -617,7 +681,7 @@ class AccessStore:
             rows = connection.execute("SELECT * FROM access_credentials WHERE principal_id=? ORDER BY enrolled_at_us, credential_id", (str(principal_id),)).fetchall()
         return tuple(self._credential(row) for row in rows)
 
-    def accept_assertion(self, credential_id: bytes, principal_id: UUID, external_identity: str, *,
+    def accept_assertion(self, credential_id: bytes, principal_id: UUID, proxy_identity: str, *,
                          expected_sign_count: int, sign_count: int, backup_state: bool, at: datetime,
                          token: bytes | None = None, step_up_session_id: UUID | None = None) -> UUID:
         """Commit a verified assertion: counter, backup state, last use and its session effect.
@@ -628,17 +692,22 @@ class AccessStore:
         credential. The counter update is conditional on the value the
         signature was checked against, so two racing assertions cannot both
         advance it. The audit record commits in the same transaction.
+
+        The credential selected the principal; the proxy identity is only
+        recorded as the principal's last observed value and, for a new
+        session, bound into it. A step-up must present the identity its
+        session is bound to.
         """
         if (token is None) == (step_up_session_id is None):
             raise AccessValidationError("access is unavailable")
         at = utc_time(at)
-        identity = _identity(external_identity)
+        identity = _identity(proxy_identity)
 
         def write(connection, mark):
-            row = connection.execute("SELECT c.sign_count, c.revoked_at_us, c.inconsistent_at_us, c.backup_eligible, p.external_identity, p.role, p.status FROM access_credentials c JOIN access_principals p ON p.id=c.principal_id WHERE c.credential_id=? AND c.principal_id=?",
+            row = connection.execute("SELECT c.sign_count, c.revoked_at_us, c.inconsistent_at_us, c.backup_eligible, p.role, p.status FROM access_credentials c JOIN access_principals p ON p.id=c.principal_id WHERE c.credential_id=? AND c.principal_id=?",
                                      (credential_id, str(principal_id))).fetchone()
             if (row is None or row["status"] != PrincipalStatus.ACTIVE.value or row["revoked_at_us"] is not None
-                    or row["inconsistent_at_us"] is not None or row["external_identity"] != identity
+                    or row["inconsistent_at_us"] is not None
                     or row["sign_count"] != expected_sign_count or (backup_state and not row["backup_eligible"])):
                 raise AccessValidationError("access is unavailable")
             changed = connection.execute("UPDATE access_credentials SET sign_count=?, backup_state=?, last_used_at_us=? WHERE credential_id=? AND sign_count=? AND revoked_at_us IS NULL AND inconsistent_at_us IS NULL",
@@ -647,7 +716,8 @@ class AccessStore:
                 raise AccessValidationError("access is unavailable")
             actor = ActorCategory.OWNER if row["role"] == PrincipalRole.OWNER.value else ActorCategory.INVITED_USER
             if token is not None:
-                session_id = self.establish_session_on(connection, principal_id, credential_id, token, at=at, verified_at=at)
+                session_id = self.establish_session_on(connection, principal_id, credential_id, token,
+                                                       proxy_identity=identity, at=at, verified_at=at)
                 action = AuditAction.AUTHENTICATE_PRINCIPAL
             else:
                 session = connection.execute("SELECT s.*, p.authorization_revision FROM access_sessions s JOIN access_principals p ON p.id=s.principal_id WHERE s.id=?",
@@ -658,12 +728,16 @@ class AccessStore:
                         or session["principal_revision"] != session["authorization_revision"]
                         or session["deployment_generation"] != state
                         or not session["established_at_us"] <= _us(at) or not session["last_seen_at_us"] <= _us(at)
-                        or _us(at) >= session["idle_expires_at_us"] or _us(at) >= session["absolute_expires_at_us"]):
+                        or _us(at) >= session["idle_expires_at_us"] or _us(at) >= session["absolute_expires_at_us"]
+                        or self._session_binding is None
+                        or not self._session_binding.matches(session["external_identity_binding"], identity)):
                     raise AccessValidationError("access is unavailable")
                 connection.execute("UPDATE access_sessions SET last_user_verification_at_us=? WHERE id=?", (_us(at), session["id"]))
                 self._touch_session_on(connection, session, at)
                 session_id = step_up_session_id
                 action = AuditAction.VERIFY_PRINCIPAL_STEP_UP
+            # Owner-visible, overwritten each authentication, never an input.
+            connection.execute("UPDATE access_principals SET external_identity=? WHERE id=?", (identity, str(principal_id)))
             mark()
             self.audit.append_on(connection, actor_category=actor, action=action,
                                  target_kind=TargetKind.PRINCIPAL, target_logical_id=principal_id,
@@ -685,7 +759,7 @@ class AccessStore:
                                          (_us(at), credential_id, str(principal_id))).rowcount
             if changed != 1:
                 return
-            connection.execute("UPDATE access_sessions SET invalidated_at_us=? WHERE credential_id=? AND invalidated_at_us IS NULL", (_us(at), credential_id))
+            connection.execute("UPDATE access_sessions SET invalidated_at_us=?, external_identity_binding=NULL WHERE credential_id=? AND invalidated_at_us IS NULL", (_us(at), credential_id))
             mark()
             self.audit.append_on(connection, actor_category=ActorCategory.SYSTEM,
                                  action=AuditAction.MARK_PRINCIPAL_CREDENTIAL_INCONSISTENT,
@@ -723,4 +797,4 @@ class AccessStore:
         # a failure rolls both back. A real invalidation timestamp avoids a
         # sentinel value that could be misread as a valid Unix epoch session.
         connection.execute("UPDATE access_principals SET authorization_revision=authorization_revision+1 WHERE id=?", (str(principal_id),))
-        connection.execute("UPDATE access_sessions SET invalidated_at_us=? WHERE principal_id=? AND invalidated_at_us IS NULL", (_us(at), str(principal_id)))
+        connection.execute("UPDATE access_sessions SET invalidated_at_us=?, external_identity_binding=NULL WHERE principal_id=? AND invalidated_at_us IS NULL", (_us(at), str(principal_id)))

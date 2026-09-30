@@ -10,7 +10,7 @@ Owns owner invitations/allowlists, independent `live:view` and `recordings:view`
 - Treats revocation as credential-scoped rather than device-scoped, and persists the last accepted signature counter so the clone check has something to compare against. The comparison runs whenever the stored or received counter is non-zero, so a received 0 after a stored non-zero is a regression; only a stored-and-received 0 is exempt.
 - Accepts `none` attestation at registration, verifying the challenge, origin/relying-party id, authenticator data, credential public key and user-verification flag instead; a present-but-invalid attestation statement fails.
 - Records the authenticator's backup-eligibility and backup-state flags with the credential so the owner UI can show whether it syncs, and refuses a backup-eligible registration where the deployment requires device-bound credentials. Eligibility is fixed at registration and a differing value in a later assertion is refused and reported; backup state is refreshed from every verified assertion.
-- Keeps at most the last observed proxy identity on the principal: owner-visible, overwritten each authentication, cleared on revocation or deletion, out of diagnostic exports, and never an authorization input.
+- Keeps at most the last observed proxy identity on the principal: optional and non-unique (every holder of the shared account presents the same login), owner-visible, overwritten each authentication, cleared on revocation or deletion, out of diagnostic exports, and never an authorization input. Sessions keep only its deployment-keyed HMAC binding.
 - Supports revoking a single credential and revoking a whole principal, and binds sessions to the credential that created them.
 - Exposes exactly two pre-credential routes, enrollment-code redemption and authentication; local owner bootstrap is a host-side action that issues an authorization for the same redemption route rather than a third endpoint. They return no application data, redemption is single-use and rate-limited, an absent/unknown/expired/redeemed code gets the uninvited response, and enrollment codes stay out of logs.
 - Generates enrollment codes and bootstrap authorizations from a CSPRNG with at least 128 bits of entropy in the checked value, stores only their hash and compares in constant time; lifetime and rate limits bound guessing but do not replace the entropy.
@@ -58,6 +58,36 @@ until the remaining Issue #10 gates pass.
   `authorize_owner` enforces the ADR-0003 five-minute step-up freshness. A
   session created by the low-level `establish_session` records no verification
   time, so it is never fresh.
+- Shared Tailscale login (ADR-0004 §1, SPECIFICATION §11.4/§11.8): the
+  invitation and the passkey credential are the only per-person key. An
+  invitation carries no proxy identity, the enrollment secret alone selects
+  the invitation, and the discoverable credential alone selects the principal
+  at sign-in, so several invited people behind one Tailscale login each
+  register and sign in with their own passkey. `access_principals.external_identity`
+  is nullable and non-unique (migration 18): it holds only the identity last
+  observed at authentication, is overwritten on every sign-in and step-up, is
+  cleared on principal revocation, and is never compared with anything.
+- Session binding (`session_binding.py`): every ceremony and session check
+  requires a present, well-formed trusted-proxy identity (ADR-0003 rejects a
+  missing human identity). A session stores only
+  `HMAC-SHA-256(key, canonical identity)` in `external_identity_binding`,
+  never the raw value, and each later request recomputes it and compares in
+  constant time. The binding is cleared whenever the session is invalidated
+  (revocation, grant change, inconsistent credential) and, for sessions past
+  their idle or absolute lifetime, at the next session establishment. The
+  deployment-local key is a 32-byte file (`Settings.session_binding_key_path`)
+  created once with mode `0600` in a directory owned by the service account
+  and not group/other writable; a wrong owner, mode, link count, size or a
+  symlink fails closed rather than being repaired or replaced. The key never
+  enters the database, logs, errors, `repr`, pickling or diagnostics, and an
+  `AccessStore` without it establishes and accepts no session.
+- Binding mismatch policy (conservative choice pending Owner confirmation):
+  a request whose identity does not reproduce the binding receives the generic
+  denial for that request only. The session is neither revoked nor sent to
+  step-up, and nothing is audited, because in the shared-account deployment a
+  mismatch cannot identify a person and revoking on it would let anyone with a
+  stolen cookie sign its holder out. The binding is therefore a necessary
+  consistency signal, never an authorization input.
 - Audit: sign-in (`authenticate_principal`), step-up
   (`verify_principal_step_up`), an inconsistent credential
   (`mark_principal_credential_inconsistent`) and a counter regression
@@ -69,14 +99,9 @@ Not implemented yet, and required before routes open:
 
 - the HTTP routes and their cookie handling;
 - per-source rate limiting (only the per-code attempt bound exists here);
-- the HMAC session binding of the proxy identity, and the last-observed login
-  field. Until then `access_principals.external_identity` (inherited from the
-  #6 foundation) is a unique per-principal value that registration, sign-in and
-  every session check compare with the supplied identity. In the
-  shared-account deployment every viewer arrives with the same login, so only
-  one principal could match it; the invitation/passkey must become the only
-  per-person key, with the proxy identity checked as a non-unique
-  supplementary signal, before any route opens (PR #97 review);
+- the runtime composition that loads the session-binding key with
+  `SessionBindingKey.load_or_create(Settings.session_binding_key_path)` and
+  hands it to `AccessStore` (no human route constructs the store yet);
 - delivery of `CredentialFindingSink` to the Owner notification channel;
 - local owner bootstrap and recovery commands;
 - the startup/daily listener and route reservation check.

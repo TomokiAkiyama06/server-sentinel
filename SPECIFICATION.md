@@ -1179,7 +1179,14 @@ session stores only the keyed binding described above. Each later request
 canonicalizes the newly verified identity, recomputes the binding and compares
 it in constant time; a mismatch is refused. The deployment-local HMAC secret is
 kept outside the database and is unrelated to Tailscale administrative
-credentials. Sign-out, idle/absolute expiry and revocation clear the binding and
+credentials. The refusal applies to that request only: the session is not
+revoked or moved to step-up on a mismatch, since under the shared account a
+mismatch cannot identify anyone (implementation choice recorded for Owner
+confirmation in `server/app/auth/README.md`). Invitations carry no proxy
+identity, and `external_identity` is neither unique nor compared with the
+supplied identity: the enrollment code selects the invitation and the
+credential selects the principal, so several people behind one shared login
+each register and sign in with their own passkey. Sign-out, idle/absolute expiry and revocation clear the binding and
 invalidate the record, so a retained cookie or token authorizes nothing
 afterwards; the binding is never shown in the UI or included in diagnostics or
 exports. §11.5
