@@ -73,12 +73,22 @@ until the remaining Issue #10 gates pass.
   `HMAC-SHA-256(key, canonical identity)` in `external_identity_binding`,
   never the raw value, and each later request recomputes it and compares in
   constant time. The binding is cleared whenever the session is invalidated
-  (revocation, grant change, inconsistent credential) and, for sessions past
-  their idle or absolute lifetime, at the next session establishment. The
+  (revocation, grant change, inconsistent credential). A session past its
+  idle or absolute lifetime is invalidated and loses its binding in every
+  authorization, owner-authorization and step-up transaction (committed
+  separately when that request is denied), at every session establishment,
+  and through `AccessStore.end_expired_sessions()`, the bounded sweep that the
+  runtime must schedule when routes are mounted so expired rows are cleared
+  even when no request arrives. The read-only `current_session` lookup does
+  not write. The
   deployment-local key is a 32-byte file (`Settings.session_binding_key_path`)
   created once with mode `0600` in a directory owned by the service account
   and not group/other writable; a wrong owner, mode, link count, size or a
-  symlink fails closed rather than being repaired or replaced. The key never
+  symlink fails closed rather than being repaired or replaced. The only extra
+  link tolerated is a creation staging name (`.<name>.<16 hex>.tmp`) of the
+  same file, left by a concurrent start that has not removed it yet or by one
+  that died between publishing and cleanup; it is removed before the
+  single-link check. The key never
   enters the database, logs, errors, `repr`, pickling or diagnostics, and an
   `AccessStore` without it establishes and accepts no session.
 - Binding mismatch policy (Owner decision, 2026-09-30, PR #107): a request
@@ -95,7 +105,8 @@ until the remaining Issue #10 gates pass.
   `access_sessions.binding_mismatch_suppressed`. A request without an
   otherwise current session (unknown, expired or revoked token) records
   nothing, so no record can be produced without a valid session token. If the
-  append fails the request is still denied and the loss is counted in
+  append fails, or the storage reservation refuses the write before the
+  coalescing decision, the request is still denied and the loss is counted in
   `audit_delivery_failed` / `undelivered_audit_records`. The binding is
   therefore a necessary consistency signal, never an authorization input.
 - Audit: sign-in (`authenticate_principal`), step-up

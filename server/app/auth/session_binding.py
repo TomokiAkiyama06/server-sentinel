@@ -24,6 +24,7 @@ import hashlib
 import hmac
 import os
 from pathlib import Path
+import re
 import secrets
 import stat
 
@@ -111,7 +112,10 @@ class SessionBindingKey:
         exactly ``KEY_BYTES`` bytes; anything else fails closed instead of
         being repaired or replaced, because replacing the key silently would
         invalidate every session and hide tampering. Creation publishes the
-        file atomically, so concurrent starts agree on one key.
+        file atomically, so concurrent starts agree on one key. The one extra
+        link that is tolerated is a creation staging name of the same file
+        (a concurrent start that has not removed it yet, or one that died
+        before it could); it is removed before the single-link check.
         """
         try:
             if not isinstance(path, Path) or not path.is_absolute() or not path.name or path.name in (".", ".."):
@@ -136,10 +140,39 @@ class SessionBindingKey:
             os.close(directory)
 
 
+def _staging_pattern(name: str):
+    return re.compile(re.escape(f".{name}.") + r"[0-9a-f]{16}\.tmp")
+
+
+def _drop_staging_links(name: str, directory: int, info: os.stat_result) -> None:
+    """Remove creation staging names that are hard links of the published key.
+
+    ``_create_key`` publishes with ``link()`` and then unlinks its staging
+    name, so between the two steps -- or forever, when that start died in
+    between -- the key has a second link named ``.<name>.<16 hex>.tmp``. Only
+    such a name that refers to the very same regular file is removed; any other
+    extra link is left in place and the key is still refused.
+    """
+    pattern = _staging_pattern(name)
+    for entry in os.listdir(directory):
+        if not pattern.fullmatch(entry):
+            continue
+        try:
+            other = os.stat(entry, dir_fd=directory, follow_symlinks=False)
+            if stat.S_ISREG(other.st_mode) and (other.st_dev, other.st_ino) == (info.st_dev, info.st_ino):
+                os.unlink(entry, dir_fd=directory)
+        except FileNotFoundError:
+            # The creating start removed its own staging name meanwhile.
+            pass
+
+
 def _read_key(name: str, directory: int) -> bytes:
     descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK, dir_fd=directory)
     try:
         info = os.fstat(descriptor)
+        if stat.S_ISREG(info.st_mode) and info.st_nlink > 1:
+            _drop_staging_links(name, directory, info)
+            info = os.fstat(descriptor)
         if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_nlink != 1
                 or stat.S_IMODE(info.st_mode) != 0o600 or info.st_size != KEY_BYTES):
             raise SessionBindingKeyError()

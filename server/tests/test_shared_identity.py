@@ -10,7 +10,7 @@ process; nothing here is evidence of real browser, proxy or Tailscale
 behavior (see MANUAL_TEST.md).
 """
 
-from contextlib import closing
+from contextlib import closing, contextmanager
 from datetime import timedelta
 import hashlib
 import io
@@ -26,7 +26,7 @@ from uuid import UUID, uuid4
 
 from app.auth.model import AccessValidationError, Permission, PrincipalStatus
 from app.auth.passkeys import PasskeyCeremonies
-from app.auth.session_binding import KEY_BYTES, SessionBindingKey, SessionBindingKeyError
+from app.auth.session_binding import KEY_BYTES, SessionBindingKey, SessionBindingKeyError, _create_key
 from app.auth.store import BINDING_MISMATCH_AUDIT_INTERVAL, AccessStore, _us
 from app.auth.webauthn import RelyingParty
 from app.audit.store import AuditStore
@@ -202,6 +202,51 @@ class ProxyIdentityCannotAuthorizeTests(CeremonyTestCase):
         self.sign_in(other_key, SHARED)
         self.assertFalse(bindings()[str(expiring.session_id)])
 
+    def session_state(self, session_id):
+        with closing(self.database.connect()) as connection:
+            row = connection.execute("SELECT external_identity_binding, invalidated_at_us FROM access_sessions WHERE id=?",
+                                     (str(session_id),)).fetchone()
+        return row[0] is not None, row[1] is not None
+
+    def test_presenting_an_expired_session_clears_its_binding_and_invalidates_it(self):
+        # AUTH-012: expiry clears the binding and invalidates the server-side
+        # record, even when nobody signs in again.
+        self.clock.advance(minutes=31)
+        with self.assertRaises(AccessValidationError) as caught:
+            self.store.authorize(self.grant.token, SHARED, Permission.LIVE_VIEW)
+        self.assertEqual(str(caught.exception), GENERIC)
+        self.assertEqual(self.session_state(self.grant.session_id), (False, True))
+
+    def test_any_authorization_ends_other_expired_sessions(self):
+        other = self.sign_in(self.key, SHARED)
+        self.clock.advance(minutes=20)
+        self.store.authorize(other.token, SHARED, Permission.LIVE_VIEW)
+        self.clock.advance(minutes=15)
+        # self.grant idled out at 30 minutes; ``other`` was touched at 20.
+        self.assertEqual(self.store.authorize(other.token, SHARED, Permission.LIVE_VIEW).id, self.principal.id)
+        self.assertEqual(self.session_state(self.grant.session_id), (False, True))
+        self.assertEqual(self.session_state(other.session_id), (True, False))
+
+    def test_expired_owner_and_step_up_sessions_are_ended_too(self):
+        _, owner_key = self.owner()
+        owner = self.sign_in(owner_key, SHARED)
+        stepped = self.sign_in(owner_key, SHARED)
+        self.clock.advance(hours=13)
+        self.assertGenericDenial(lambda: self.ceremonies.authorize_owner_operation(owner.token, SHARED))
+        self.assertEqual(self.session_state(owner.session_id), (False, True))
+        self.assertGenericDenial(lambda: self.ceremonies.begin_step_up(stepped.token, SHARED))
+        self.assertEqual(self.session_state(stepped.session_id), (False, True))
+
+    def test_maintenance_sweep_ends_expired_sessions_without_a_request(self):
+        live = self.sign_in(self.key, SHARED)
+        self.clock.advance(minutes=29)
+        self.store.authorize(live.token, SHARED, Permission.LIVE_VIEW)
+        self.clock.advance(minutes=2)
+        self.assertEqual(self.store.end_expired_sessions(), 1)
+        self.assertEqual(self.session_state(self.grant.session_id), (False, True))
+        self.assertEqual(self.session_state(live.session_id), (True, False))
+        self.assertEqual(self.store.end_expired_sessions(), 0)
+
 
 class BindingMismatchAuditTests(CeremonyTestCase):
     """Owner decision 2026-09-30: deny, audit once per session per window, never revoke."""
@@ -298,6 +343,24 @@ class BindingMismatchAuditTests(CeremonyTestCase):
             connection.execute("DROP TRIGGER synthetic_audit_fault")
         self.assertEqual(self.store.authorize(self.grant.token, SHARED, Permission.LIVE_VIEW).id, self.principal.id)
 
+    def test_reservation_refusal_is_counted_as_undelivered(self):
+        @contextmanager
+        def refused():
+            raise RuntimeError("synthetic storage hard stop")
+            yield  # pragma: no cover
+
+        self.audit.reservation = refused
+        self.deny()
+        self.assertTrue(self.store.audit_delivery_failed)
+        self.assertEqual(self.store.undelivered_audit_records, 1)
+        self.assertEqual(self.mismatches(), [])
+        # Admission was refused before anything was written, so the window is
+        # still open and the next admitted mismatch is recorded.
+        self.audit.reservation = None
+        self.deny()
+        self.assertEqual(self.mismatches(), [self.MISMATCH])
+        self.assertEqual(self.store.undelivered_audit_records, 1)
+
     def test_nothing_is_recorded_without_an_otherwise_current_session(self):
         for token in (b"x" * 32, b""):
             self.deny(token=token)
@@ -352,6 +415,42 @@ class SessionBindingKeyTests(unittest.TestCase):
         self.path.write_bytes(original)
         self.assertEqual(self.path.read_bytes(), original)
         SessionBindingKey.load_or_create(self.path)
+
+    def staging_link(self):
+        link = self.directory / f".{self.path.name}.{'0' * 16}.tmp"
+        os.link(self.path, link)
+        return link
+
+    def test_a_start_that_crashed_after_publishing_leaves_a_loadable_key(self):
+        key = SessionBindingKey.load_or_create(self.path)
+        link = self.staging_link()
+        again = SessionBindingKey.load_or_create(self.path)
+        self.assertEqual(key.bind(SHARED), again.bind(SHARED))
+        self.assertFalse(link.exists())
+        self.assertEqual(self.path.stat().st_nlink, 1)
+
+    def test_a_concurrent_start_that_lost_the_race_loads_the_winning_key(self):
+        winner = SessionBindingKey.load_or_create(self.path)
+        # The winner has linked its key but not yet removed its staging name.
+        self.staging_link()
+        directory = os.open(self.directory, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            loser = SessionBindingKey(_create_key(self.path.name, directory))
+        finally:
+            os.close(directory)
+        self.assertEqual(winner.bind(SHARED), loser.bind(SHARED))
+        self.assertEqual([item.name for item in self.directory.iterdir()], [self.path.name])
+
+    def test_only_staging_links_of_the_same_file_are_cleaned_up(self):
+        SessionBindingKey.load_or_create(self.path)
+        unrelated = self.directory / f".{self.path.name}.{'1' * 16}.tmp"
+        unrelated.write_bytes(b"u" * KEY_BYTES)
+        other = self.directory / "backup-copy"
+        os.link(self.path, other)
+        self.staging_link()
+        self.assertUnavailable(lambda: SessionBindingKey.load_or_create(self.path))
+        self.assertTrue(unrelated.exists())
+        self.assertTrue(other.exists())
 
     def test_symlinks_and_shared_directories_are_refused(self):
         target = self.directory / "target.key"

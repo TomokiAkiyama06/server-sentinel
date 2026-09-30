@@ -372,10 +372,37 @@ class AccessStore:
         return binding
 
     @staticmethod
-    def _clear_ended_bindings_on(connection, at: datetime) -> None:
-        """Drop the binding of sessions whose idle or absolute lifetime has ended."""
-        connection.execute("UPDATE access_sessions SET external_identity_binding=NULL WHERE external_identity_binding IS NOT NULL AND (idle_expires_at_us <= ? OR absolute_expires_at_us <= ?)",
-                           (_us(at), _us(at)))
+    def _end_expired_sessions_on(connection, at: datetime) -> int:
+        """Invalidate sessions whose idle or absolute lifetime has ended and drop their binding.
+
+        AUTH-012: expiry clears the keyed binding and invalidates the
+        server-side record. This runs inside every authorization transaction
+        that commits, in a separate transaction after a denial, when a session
+        is established, and from ``end_expired_sessions`` for a periodic sweep,
+        so an expired row does not keep its binding merely because nobody
+        signs in again. Returns the number of rows changed.
+        """
+        return connection.execute(
+            "UPDATE access_sessions SET invalidated_at_us=COALESCE(invalidated_at_us, ?), external_identity_binding=NULL "
+            "WHERE (invalidated_at_us IS NULL OR external_identity_binding IS NOT NULL) AND (idle_expires_at_us <= ? OR absolute_expires_at_us <= ?)",
+            (_us(at), _us(at), _us(at))).rowcount
+
+    def end_expired_sessions(self, *, now: datetime | None = None) -> int:
+        """Bounded maintenance sweep of expired sessions (see ``_end_expired_sessions_on``)."""
+        at = utc_time(self._clock() if now is None else now)
+        with self._transaction(write=True) as connection:
+            return self._end_expired_sessions_on(connection, at)
+
+    def _end_expired_sessions_after_denial(self, at: datetime) -> None:
+        """Commit the expiry sweep that a denied request's rolled-back transaction lost.
+
+        Never turns the denial into anything else: a storage failure here only
+        leaves the rows for the next sweep.
+        """
+        try:
+            self.end_expired_sessions(now=at)
+        except AccessStorageError:
+            pass
 
     def establish_session_on(self, connection, principal_id: UUID, credential_id: bytes, token: bytes, *,
                              proxy_identity: str, at: datetime, verified_at: datetime | None = None,
@@ -402,7 +429,7 @@ class AccessStore:
                 or row["inconsistent_at_us"] is not None):
             raise AccessValidationError("session subject is unavailable")
         generation = connection.execute("SELECT authorization_generation FROM access_deployment_state WHERE singleton=1").fetchone()[0]
-        self._clear_ended_bindings_on(connection, at)
+        self._end_expired_sessions_on(connection, at)
         connection.execute("INSERT INTO access_sessions (id, token_digest, principal_id, credential_id, principal_revision, deployment_generation, established_at_us, last_seen_at_us, idle_lifetime_us, idle_expires_at_us, absolute_expires_at_us, invalidated_at_us, last_user_verification_at_us, external_identity_binding) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)",
                            (str(session_id), token_digest, str(principal_id), credential_id, row["authorization_revision"], generation,
                             _us(at), _us(at), _duration_us(idle_lifetime), _us(at + idle_lifetime), _us(at + absolute_lifetime), verified,
@@ -458,8 +485,10 @@ class AccessStore:
         that window, including any at an earlier clock reading, only increment
         ``access_sessions.binding_mismatch_suppressed``. No identity, binding,
         token or session secret reaches the audit log. The session is neither
-        revoked nor sent to step-up. A failed append is counted in
-        ``audit_delivery_failed`` / ``undelivered_audit_records``.
+        revoked nor sent to step-up. A failed append, or a write refused
+        before the coalescing decision (for example by the storage
+        reservation), is counted in ``audit_delivery_failed`` /
+        ``undelivered_audit_records``.
         """
         if not mismatch:
             return
@@ -467,16 +496,21 @@ class AccessStore:
         at_us = _us(utc_time(at))
         window = _duration_us(BINDING_MISMATCH_AUDIT_INTERVAL)
 
+        decided = [False]
+
         def write(connection, mark):
             row = connection.execute("SELECT binding_mismatch_audited_at_us FROM access_sessions WHERE id=? AND invalidated_at_us IS NULL",
                                      (session_id,)).fetchone()
             if row is None:
+                decided[0] = True
                 return
             last = row[0]
             if last is not None and at_us < last + window:
+                decided[0] = True
                 connection.execute("UPDATE access_sessions SET binding_mismatch_suppressed=binding_mismatch_suppressed+1 WHERE id=?", (session_id,))
                 return
             connection.execute("UPDATE access_sessions SET binding_mismatch_audited_at_us=? WHERE id=?", (at_us, session_id))
+            decided[0] = True
             mark()
             self.audit.append_on(connection, actor_category=ActorCategory.SYSTEM,
                                  action=AuditAction.DETECT_SESSION_PROXY_IDENTITY_MISMATCH,
@@ -486,9 +520,13 @@ class AccessStore:
         try:
             self._audited_write(write)
         except Exception:
-            # Never turns the denial into anything else; a lost record is
-            # counted by ``_audited_write`` when the append was attempted.
-            pass
+            # Never turns the denial into anything else. A lost record is
+            # counted by ``_audited_write`` once the append was attempted; a
+            # failure before the coalescing decision -- including a storage
+            # reservation that refuses admission -- is counted here, because
+            # this mismatch may have been due a record.
+            if not decided[0]:
+                self._mark_undelivered()
 
     @staticmethod
     def _touch_session_on(connection, row, at: datetime) -> None:
@@ -509,11 +547,13 @@ class AccessStore:
         try:
             return self._authorize(token, proxy_identity, permission, at, mismatch)
         except AccessValidationError:
+            self._end_expired_sessions_after_denial(at)
             self._record_binding_mismatch(mismatch, at)
             raise
 
     def _authorize(self, token, proxy_identity, permission, at, mismatch) -> Principal:
         with self._transaction(write=True) as connection:
+            self._end_expired_sessions_on(connection, at)
             row = self._current_session_on(connection, token, proxy_identity, at, mismatch)
             if row is None:
                 raise AccessValidationError("access is unavailable")
@@ -540,6 +580,7 @@ class AccessStore:
         mismatch: list = []
         try:
             with self._transaction(write=True) as connection:
+                self._end_expired_sessions_on(connection, at)
                 row = self._current_session_on(connection, token, proxy_identity, at, mismatch)
                 if row is None or row["role"] != PrincipalRole.OWNER.value:
                     raise AccessValidationError("access is unavailable")
@@ -547,6 +588,7 @@ class AccessStore:
                 principal = self._principal(row)
                 verified = row["last_user_verification_at_us"]
         except AccessValidationError:
+            self._end_expired_sessions_after_denial(at)
             self._record_binding_mismatch(mismatch, at)
             raise
         if (verified is None or not row["established_at_us"] <= verified <= _us(at)
@@ -711,12 +753,14 @@ class AccessStore:
         mismatch: list = []
         try:
             with self._transaction(write=True) as connection:
+                self._end_expired_sessions_on(connection, at)
                 row = self._current_session_on(connection, token, proxy_identity, at, mismatch)
                 if row is None or row["role"] != PrincipalRole.OWNER.value:
                     raise AccessValidationError("access is unavailable")
                 self._insert_challenge_on(connection, digest, "step_up", at, lifetime, session_id=row["id"])
                 return bytes(row["credential_id"])
         except AccessValidationError:
+            self._end_expired_sessions_after_denial(at)
             self._record_binding_mismatch(mismatch, at)
             raise
 
