@@ -1,5 +1,18 @@
 # Agent dependency and distribution review
 
+**2026-09-30 update (Issue #13).** The Owner approved `cryptography` 50.0.1 for
+capture-node key, CSR and certificate handling
+(`../../docs/decisions/2026-09-30-cryptography-mtls.md`). `../requirements.lock`
+pins cryptography 50.0.1, cffi 2.1.1 (MIT-0) and pycparser 3.0 with exact wheel
+hashes for CPython 3.12/3.14 on Linux x86_64/aarch64 (glibc); every permitted
+wheel is recorded in `cryptography-wheel-audit.json`, and the full license,
+OpenSSL 4.0.2 and Rust-crate review is `../../server/docs/CRYPTOGRAPHY_AUDIT.md`.
+Only `media_capture_agent.node_tls` imports it. The zipapp still contains only
+application sources: it does not bundle these native wheels, and how an installed
+Agent provisions them for the non-root service account is open installer work.
+The statement below that the runtime is stdlib-only now applies to every module
+except `node_tls`.
+
 Reviewed 2026-09-20. The Agent runtime, installer and artifact builder use the
 Python standard library only. No model, media codec, third-party runtime library,
 SDK, native extension, or implicit package download is introduced. Python 3.12+

@@ -1,4 +1,16 @@
 {
   "schema": 1,
-  "approvals": []
+  "approvals": [
+    {
+      "component_id": "pypi:cryptography@50.0.1",
+      "name": "cryptography",
+      "version": "50.0.1",
+      "kind": "source",
+      "license": "Apache-2.0 OR BSD-3-Clause",
+      "upstream": "https://pypi.org/project/cryptography/50.0.1/",
+      "approved_by": "repository-owner",
+      "approved_on": "2026-09-30",
+      "decision": "docs/decisions/2026-09-30-cryptography-mtls.md"
+    }
+  ]
 }

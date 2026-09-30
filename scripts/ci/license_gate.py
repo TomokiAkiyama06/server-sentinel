@@ -84,7 +84,7 @@ MODEL_SUFFIXES = {
 REQUIRED_SCOPE_REVIEWS = {"transport", "model_code", "model_weight"}
 PERMISSIVE_LICENSES = {
     "0BSD", "Apache-2.0", "Apache-2.0 OR BSD-2-Clause", "BSD-2-Clause",
-    "BSD-3-Clause", "ISC", "MIT", "PSF-2.0", "Python-2.0", "Unicode-3.0",
+    "BSD-3-Clause", "ISC", "MIT", "MIT-0", "PSF-2.0", "Python-2.0", "Unicode-3.0",
     "Unicode-DFS-2016", "Zlib",
 }
 IMAGE_OBLIGATIONS = {

@@ -74,6 +74,87 @@
     }
   },
   {
+    "name": "cffi",
+    "version": "2.1.1",
+    "license": "MIT-0",
+    "requires_python": ">=3.10",
+    "requires_dist": [
+      "pycparser; implementation_name != \"PyPy\""
+    ],
+    "project_urls": [
+      "Changelog, https://cffi.readthedocs.io/en/latest/whatsnew.html",
+      "Contact, https://groups.google.com/forum/#!forum/python-cffi",
+      "Documentation, https://cffi.readthedocs.io/",
+      "Download, https://github.com/python-cffi/cffi/releases",
+      "Issue Tracker, https://github.com/python-cffi/cffi/issues",
+      "Source Code, https://github.com/python-cffi/cffi"
+    ],
+    "wheel": "cffi-2.1.1-cp312-cp312-manylinux2014_aarch64.manylinux_2_17_aarch64.whl",
+    "sha256": "68e62fe11f30d5ca8289242866f0a5291402d8529ca2178ab8afc5c9694ae890",
+    "license_files": [
+      "cffi-2.1.1.dist-info/licenses/LICENSE"
+    ],
+    "download_url": "https://files.pythonhosted.org/packages/44/de/f98430906df1545ffde0d543dd124a7a439bc2cd32b36b9c53f805df7333/cffi-2.1.1-cp312-cp312-manylinux2014_aarch64.manylinux_2_17_aarch64.whl",
+    "release_metadata_url": "https://pypi.org/pypi/cffi/2.1.1/json",
+    "license_sha256": {
+      "cffi-2.1.1.dist-info/licenses/LICENSE": "5ba24ddc57067f9249add644c3afc41a5d6dc37e23433ef759d95df370b0af63"
+    }
+  },
+  {
+    "name": "cffi",
+    "version": "2.1.1",
+    "license": "MIT-0",
+    "requires_python": ">=3.10",
+    "requires_dist": [
+      "pycparser; implementation_name != \"PyPy\""
+    ],
+    "project_urls": [
+      "Changelog, https://cffi.readthedocs.io/en/latest/whatsnew.html",
+      "Contact, https://groups.google.com/forum/#!forum/python-cffi",
+      "Documentation, https://cffi.readthedocs.io/",
+      "Download, https://github.com/python-cffi/cffi/releases",
+      "Issue Tracker, https://github.com/python-cffi/cffi/issues",
+      "Source Code, https://github.com/python-cffi/cffi"
+    ],
+    "wheel": "cffi-2.1.1-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.whl",
+    "sha256": "c1453022f490d2459a11819d83ad1d586e9ff65a12ac3e705ffebd46d3685dcf",
+    "license_files": [
+      "cffi-2.1.1.dist-info/licenses/LICENSE"
+    ],
+    "download_url": "https://files.pythonhosted.org/packages/b1/db/dceb9dd5b231e1da801793f8acc9f3c52a7e1afe40bb1aae37e02b0faad5/cffi-2.1.1-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.whl",
+    "release_metadata_url": "https://pypi.org/pypi/cffi/2.1.1/json",
+    "license_sha256": {
+      "cffi-2.1.1.dist-info/licenses/LICENSE": "5ba24ddc57067f9249add644c3afc41a5d6dc37e23433ef759d95df370b0af63"
+    }
+  },
+  {
+    "name": "cffi",
+    "version": "2.1.1",
+    "license": "MIT-0",
+    "requires_python": ">=3.10",
+    "requires_dist": [
+      "pycparser; implementation_name != \"PyPy\""
+    ],
+    "project_urls": [
+      "Changelog, https://cffi.readthedocs.io/en/latest/whatsnew.html",
+      "Contact, https://groups.google.com/forum/#!forum/python-cffi",
+      "Documentation, https://cffi.readthedocs.io/",
+      "Download, https://github.com/python-cffi/cffi/releases",
+      "Issue Tracker, https://github.com/python-cffi/cffi/issues",
+      "Source Code, https://github.com/python-cffi/cffi"
+    ],
+    "wheel": "cffi-2.1.1-cp314-cp314-manylinux2014_x86_64.manylinux_2_17_x86_64.whl",
+    "sha256": "b0431303acaea1089ad4b3e9ce4e6518193def1118d4073ca848635ee4ea2e96",
+    "license_files": [
+      "cffi-2.1.1.dist-info/licenses/LICENSE"
+    ],
+    "download_url": "https://files.pythonhosted.org/packages/e9/02/4e7d553a7ac4b4238b38b3c1b80d486e9d4436f8d2acbf87a0997fe3f402/cffi-2.1.1-cp314-cp314-manylinux2014_x86_64.manylinux_2_17_x86_64.whl",
+    "release_metadata_url": "https://pypi.org/pypi/cffi/2.1.1/json",
+    "license_sha256": {
+      "cffi-2.1.1.dist-info/licenses/LICENSE": "5ba24ddc57067f9249add644c3afc41a5d6dc37e23433ef759d95df370b0af63"
+    }
+  },
+  {
     "name": "click",
     "version": "8.5.0",
     "license": "BSD-3-Clause",
@@ -95,6 +176,70 @@
     "release_metadata_url": "https://pypi.org/pypi/click/8.5.0/json",
     "license_sha256": {
       "click-8.5.0.dist-info/licenses/LICENSE.txt": "9a8ad106a394e853bfe21f42f4e72d592819a22805d991b5f3275029292b658d"
+    }
+  },
+  {
+    "name": "cryptography",
+    "version": "50.0.1",
+    "license": "Apache-2.0 OR BSD-3-Clause",
+    "requires_python": "!=3.9.0,!=3.9.1,>=3.9",
+    "requires_dist": [
+      "cffi>=2.0.0; platform_python_implementation != \"PyPy\"",
+      "typing-extensions>=4.13.2; python_full_version < \"3.11\"",
+      "bcrypt>=3.1.5; extra == \"ssh\""
+    ],
+    "project_urls": [
+      "changelog, https://cryptography.io/en/latest/changelog/",
+      "documentation, https://cryptography.io/",
+      "homepage, https://github.com/pyca/cryptography",
+      "issues, https://github.com/pyca/cryptography/issues",
+      "source, https://github.com/pyca/cryptography/"
+    ],
+    "wheel": "cryptography-50.0.1-cp311-abi3-manylinux_2_34_aarch64.whl",
+    "sha256": "e2ca8fd1b6b4b82a1c4cb02841d0837e3c12336c2e24b520ab8ab3b969733d8f",
+    "license_files": [
+      "cryptography-50.0.1.dist-info/licenses/LICENSE",
+      "cryptography-50.0.1.dist-info/licenses/LICENSE.APACHE",
+      "cryptography-50.0.1.dist-info/licenses/LICENSE.BSD"
+    ],
+    "download_url": "https://files.pythonhosted.org/packages/39/3b/e96c1ef71edef71057c7e3c3d982ce8fda554e0c52d0cc19c18845cde3eb/cryptography-50.0.1-cp311-abi3-manylinux_2_34_aarch64.whl",
+    "release_metadata_url": "https://pypi.org/pypi/cryptography/50.0.1/json",
+    "license_sha256": {
+      "cryptography-50.0.1.dist-info/licenses/LICENSE": "3e0c7c091a948b82533ba98fd7cbb40432d6f1a9acbf85f5922d2f99a93ae6bb",
+      "cryptography-50.0.1.dist-info/licenses/LICENSE.APACHE": "aac73b3148f6d1d7111dbca32099f68d26c644c6813ae1e4f05f6579aa2663fe",
+      "cryptography-50.0.1.dist-info/licenses/LICENSE.BSD": "602c4c7482de6479dd2e9793cda275e5e63d773dacd1eca689232ab7008fb4fb"
+    }
+  },
+  {
+    "name": "cryptography",
+    "version": "50.0.1",
+    "license": "Apache-2.0 OR BSD-3-Clause",
+    "requires_python": "!=3.9.0,!=3.9.1,>=3.9",
+    "requires_dist": [
+      "cffi>=2.0.0; platform_python_implementation != \"PyPy\"",
+      "typing-extensions>=4.13.2; python_full_version < \"3.11\"",
+      "bcrypt>=3.1.5; extra == \"ssh\""
+    ],
+    "project_urls": [
+      "changelog, https://cryptography.io/en/latest/changelog/",
+      "documentation, https://cryptography.io/",
+      "homepage, https://github.com/pyca/cryptography",
+      "issues, https://github.com/pyca/cryptography/issues",
+      "source, https://github.com/pyca/cryptography/"
+    ],
+    "wheel": "cryptography-50.0.1-cp311-abi3-manylinux_2_34_x86_64.whl",
+    "sha256": "51afcfceb15597cf2635068e4ac9a56b2abde622edde17f37d85fd7b5306497a",
+    "license_files": [
+      "cryptography-50.0.1.dist-info/licenses/LICENSE",
+      "cryptography-50.0.1.dist-info/licenses/LICENSE.APACHE",
+      "cryptography-50.0.1.dist-info/licenses/LICENSE.BSD"
+    ],
+    "download_url": "https://files.pythonhosted.org/packages/85/66/6ccca4722987ddedaa7fc9c3f4708af7431f5535666c174350830888c6b7/cryptography-50.0.1-cp311-abi3-manylinux_2_34_x86_64.whl",
+    "release_metadata_url": "https://pypi.org/pypi/cryptography/50.0.1/json",
+    "license_sha256": {
+      "cryptography-50.0.1.dist-info/licenses/LICENSE": "3e0c7c091a948b82533ba98fd7cbb40432d6f1a9acbf85f5922d2f99a93ae6bb",
+      "cryptography-50.0.1.dist-info/licenses/LICENSE.APACHE": "aac73b3148f6d1d7111dbca32099f68d26c644c6813ae1e4f05f6579aa2663fe",
+      "cryptography-50.0.1.dist-info/licenses/LICENSE.BSD": "602c4c7482de6479dd2e9793cda275e5e63d773dacd1eca689232ab7008fb4fb"
     }
   },
   {
@@ -219,6 +364,26 @@
     "release_metadata_url": "https://pypi.org/pypi/pycodestyle/2.14.0/json",
     "license_sha256": {
       "pycodestyle-2.14.0.dist-info/LICENSE": "f772295e81af3478d34e88e52d076200230ec7dd6a39e123bc5cb35aa66abdae"
+    }
+  },
+  {
+    "name": "pycparser",
+    "version": "3.0",
+    "license": "BSD-3-Clause",
+    "requires_python": ">=3.10",
+    "requires_dist": [],
+    "project_urls": [
+      "Homepage, https://github.com/eliben/pycparser"
+    ],
+    "wheel": "pycparser-3.0-py3-none-any.whl",
+    "sha256": "b727414169a36b7d524c1c3e31839a521725078d7b2ff038656844266160a992",
+    "license_files": [
+      "pycparser-3.0.dist-info/licenses/LICENSE"
+    ],
+    "download_url": "https://files.pythonhosted.org/packages/0c/c3/44f3fbbfa403ea2a7c779186dc20772604442dde72947e7d01069cbe98e3/pycparser-3.0-py3-none-any.whl",
+    "release_metadata_url": "https://pypi.org/pypi/pycparser/3.0/json",
+    "license_sha256": {
+      "pycparser-3.0.dist-info/licenses/LICENSE": "0c846399369ea76ddd7b5c44fe6d16497415fcf015f5cbb508c24bf98b81c5b1"
     }
   },
   {
