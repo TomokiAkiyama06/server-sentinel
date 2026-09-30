@@ -472,6 +472,44 @@ class ContinuityTrackerTests(unittest.TestCase):
         self.assertEqual((DeliveryOutcome.ACCEPTED, ()), (result.outcome, result.gaps))
         self.assertEqual(SourceFlow.RECEIVING, flow(tracker, OTHER_SOURCE).flow)
 
+    def test_refused_higher_epoch_is_not_lost_to_an_older_epoch_retry(self):
+        for kind in ("backpressure", "rate_limit", "transient_refusal"):
+            with self.subTest(kind=kind):
+                authorizer = Authorizer()
+                clock = Clock()
+                ingest = TransientRefusalQueue(
+                    IngestLimits(8, 2 if kind == "backpressure" else 8, 64,
+                                 2 if kind == "rate_limit" else 1000, 50),
+                    authorizer, clock_ns=clock)
+                tracker = ContinuityTracker(ContinuityLimits(4, 4, 100), authorizer,
+                                            ingest, clock_ns=clock)
+                session = tracker.open_session(NODE)
+                tracker.receive(session, unit(0, epoch=2), b"v")
+                if kind == "backpressure":
+                    tracker.receive(session, unit(1, epoch=2), b"v")
+                elif kind == "rate_limit":
+                    tracker.receive(session, unit(1, epoch=2), b"v")
+                else:
+                    ingest.refusing = True
+                refused = tracker.receive(session, unit(0, epoch=3, at=0), b"n")
+                self.assertNotEqual(DeliveryOutcome.ACCEPTED, refused.outcome)
+                ingest.drain(10)
+                ingest.refusing = False
+                clock.now = 60  # past the rate window, before the stale bound
+                # Capacity returned: a retry of the older epoch must not commit,
+                # clear the pressure flag and hide the observed restart.
+                old = tracker.receive(session, unit(2, epoch=2), b"o")
+                self.assertEqual((DeliveryOutcome.REJECTED, "stale_capture_epoch"),
+                                 (old.outcome, old.reason))
+                self.assertEqual((SourceFlow.DEGRADED, 2, 1 if kind != "transient_refusal"
+                                  else 0), (flow(tracker).flow,
+                                            flow(tracker).capture_epoch,
+                                            flow(tracker).last_sequence))
+                new = tracker.receive(session, unit(0, epoch=3, at=0), b"n")
+                self.assertEqual(DeliveryOutcome.ACCEPTED, new.outcome)
+                self.assertEqual([GapReason.CAPTURE_RESTART],
+                                 [g.reason for g in new.gaps])
+
     def test_uncommitted_sources_stay_within_source_capacity(self):
         authorizer = Authorizer({(NODE, s) for s in SOURCES})
         tracker, _, _, _ = build(authorizer=authorizer, queued=1)

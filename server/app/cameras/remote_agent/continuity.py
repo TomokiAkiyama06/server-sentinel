@@ -182,6 +182,9 @@ class _Source:
     ``session_generation`` is the node session that last delivered this
     source; a source not yet delivered on the node's current session stays
     ``interrupted`` even though the node itself reconnected.
+    ``attempted_epoch`` is the highest epoch of a unit refused by pressure or
+    a transient refusal; a lower epoch is stale even before that unit commits,
+    so a restart already observed is never lost to an older-epoch retry.
     """
 
     node_id: UUID
@@ -193,6 +196,7 @@ class _Source:
     refused: bool = False
     gaps: deque = field(default_factory=deque)
     session_generation: int = 0
+    attempted_epoch: int = 0
 
 
 @dataclass
@@ -428,9 +432,10 @@ class ContinuityTracker:
                          header: MediaUnitHeader) -> tuple[GapEvent, ...] | str:
         """Pure check; returns gaps to record, or a refusal/duplicate reason."""
         source_id, epoch, sequence = header.source_id, header.capture_epoch, header.sequence
-        if state is not None and epoch < state.capture_epoch:
-            # Also for an uncommitted state: its epoch was observed on a unit
-            # the Agent attempted, and capture epochs only increase.
+        if state is not None and epoch < max(state.capture_epoch, state.attempted_epoch):
+            # Also for an uncommitted state or an uncommitted higher epoch:
+            # it was observed on a unit the Agent attempted, and capture
+            # epochs only increase.
             return "stale_capture_epoch"
         if state is not None and epoch > state.capture_epoch:
             # A new capture epoch means the Agent capture process restarted;
@@ -542,6 +547,7 @@ class ContinuityTracker:
             if admission.outcome in (IngestOutcome.BACKPRESSURED, IngestOutcome.RATE_LIMITED):
                 pending = self._pending(state, node_id, header, now)
                 pending.backpressured = True
+                pending.attempted_epoch = header.capture_epoch
                 # The Agent is still delivering: refresh activity (not the
                 # committed sequence) so sustained pressure stays ``degraded``
                 # instead of decaying to ``interrupted``.
@@ -568,6 +574,7 @@ class ContinuityTracker:
                 # is refreshed so a persisting refusal stays ``degraded``.
                 pending = self._pending(state, node_id, header, now)
                 pending.refused = True
+                pending.attempted_epoch = header.capture_epoch
                 self._seen(pending, now)
                 pending.session_generation = node.generation
                 self._seen(node, now)
