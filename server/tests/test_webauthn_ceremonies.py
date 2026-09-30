@@ -605,7 +605,11 @@ class RelyingPartyTests(unittest.TestCase):
                 ("Sentinel.example.invalid", "https://Sentinel.example.invalid"),
                 ("192.0.2.1", "http://192.0.2.1"),
                 ("192.0.2.1", "https://192.0.2.1"),
-                ("sentinel.example.invalid", "https://sentinel.example.invalid:99999")):
+                ("sentinel.example.invalid", "https://sentinel.example.invalid:99999"),
+                # Explicit default ports never equal the browser's serialized origin.
+                ("sentinel.example.invalid", "https://sentinel.example.invalid:443"),
+                ("localhost", "https://localhost:443"),
+                ("localhost", "http://localhost:80")):
             with self.subTest(origin=origin), self.assertRaises(ValueError):
                 RelyingParty(rp_id, origin)
 

@@ -201,7 +201,11 @@ class RelyingParty:
         host = parts.hostname
         canonical = f"{parts.scheme}://{host}" + (f":{port}" if port is not None else "")
         secure = parts.scheme == "https" or (parts.scheme == "http" and host == "localhost")
+        # Browsers serialize clientDataJSON.origin without a default port, so an
+        # explicit :443 / :80 could never match exactly; refuse it at startup.
+        default_port = {"https": 443, "http": 80}.get(parts.scheme)
         if (not secure or host is None or host != self.rp_id or canonical != self.origin
+                or port == default_port
                 or parts.username is not None or parts.password is not None
                 or parts.path or parts.query or parts.fragment
                 or not self.rp_id.isascii() or self.rp_id != self.rp_id.lower()

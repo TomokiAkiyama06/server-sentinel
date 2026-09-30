@@ -36,7 +36,10 @@ until the remaining Issue #10 gates pass.
   including `packed` with a certificate chain, are refused rather than accepted
   unverified. CBOR parsing is strict and bounded. `RelyingParty` accepts only
   a secure-context origin (`https://host[:port]` or `http://localhost[:port]`)
-  whose host equals the relying-party id.
+  whose host equals the relying-party id. An explicit default port (`:443`
+  for https, `:80` for http) is refused at construction, because browsers
+  serialize `clientDataJSON.origin` without it and the exact comparison could
+  never match.
 - `passkeys.py` (`PasskeyCeremonies`) composes that verifier with the store:
   invitation redemption (registration), sign-in (authentication) and Owner
   step-up. Every failure before a session exists is one `CeremonyDenied` with
@@ -67,7 +70,13 @@ Not implemented yet, and required before routes open:
 - the HTTP routes and their cookie handling;
 - per-source rate limiting (only the per-code attempt bound exists here);
 - the HMAC session binding of the proxy identity, and the last-observed login
-  field;
+  field. Until then `access_principals.external_identity` (inherited from the
+  #6 foundation) is a unique per-principal value that registration, sign-in and
+  every session check compare with the supplied identity. In the
+  shared-account deployment every viewer arrives with the same login, so only
+  one principal could match it; the invitation/passkey must become the only
+  per-person key, with the proxy identity checked as a non-unique
+  supplementary signal, before any route opens (PR #97 review);
 - delivery of `CredentialFindingSink` to the Owner notification channel;
 - local owner bootstrap and recovery commands;
 - the startup/daily listener and route reservation check.
