@@ -337,8 +337,8 @@ retained `security_admin_audit_records` and `integrity_audit` row; registered
 camera source IDs and types; and Owner presence plus each principal's independent
 `live:view` / `recordings:view` grants, invitation redemption and revocation
 state. It never writes principal external identities or display names,
-credential IDs or public keys, invitation or session secret/token digests,
-permission-bearing URLs, media bytes, or audit row contents.
+credential IDs, public keys or labels, invitation or session secret/token
+digests, session identity bindings, permission-bearing URLs, media bytes, or audit row contents.
 
 `verify` recomputes the same inventory and compares it. A missing or changed
 recording, audit row, source, principal or invitation is `failed` (exit 1);

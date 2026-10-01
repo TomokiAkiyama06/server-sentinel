@@ -27,6 +27,8 @@ NAME_MARKER = "Synthetic Display Name Marker"
 SECRET_DIGEST = bytes(range(32))
 TOKEN_DIGEST = bytes(range(32, 64))
 CREDENTIAL_ID = b"synthetic-credential-id-marker"
+CREDENTIAL_LABEL = "synthetic-credential-label-marker"
+BINDING_DIGEST = bytes(range(64, 96))
 
 
 class Runtime:
@@ -120,7 +122,8 @@ class Runtime:
                   status: str = "active", revoked: bool = False) -> str:
         principal_id = str(uuid4())
         self.execute(
-            "INSERT INTO access_principals VALUES (?, ?, ?, ?, ?, 0, 1, ?)",
+            "INSERT INTO access_principals (id, external_identity, display_name, role, status, "
+            "authorization_revision, created_at_us, revoked_at_us) VALUES (?, ?, ?, ?, ?, 0, 1, ?)",
             (principal_id, f"{IDENTITY_MARKER}-{principal_id}", NAME_MARKER, role, status,
              2 if revoked else None))
         for permission in permissions:
@@ -132,7 +135,9 @@ class Runtime:
         invitation_id = str(uuid4())
         digest = SECRET_DIGEST if revoked else bytes(reversed(SECRET_DIGEST))
         self.execute(
-            "INSERT INTO access_invitations VALUES (?, ?, ?, 0, 0, 1, 2, NULL, ?)",
+            "INSERT INTO access_invitations (id, secret_digest, principal_id, principal_revision, "
+            "deployment_generation, issued_at_us, expires_at_us, redeemed_at_us, revoked_at_us, "
+            "attempt_count) VALUES (?, ?, ?, 0, 0, 1, 2, NULL, ?, 0)",
             (invitation_id, digest, principal_id, 3 if revoked else None))
         return invitation_id
 
@@ -142,11 +147,17 @@ class Runtime:
         recordings = self.principal("invited_user", ("recordings:view",))
         revoked = self.principal("invited_user", ("live:view", "recordings:view"),
                                  status="revoked", revoked=True)
-        self.execute("INSERT INTO access_credentials VALUES (?, ?, X'00', -7, 0, 1, NULL)",
-                     (CREDENTIAL_ID, owner))
         self.execute(
-            "INSERT INTO access_sessions VALUES (?, ?, ?, ?, 0, 0, 1, 1, 10, 11, 20, NULL)",
-            (str(uuid4()), TOKEN_DIGEST, owner, CREDENTIAL_ID))
+            "INSERT INTO access_credentials (credential_id, principal_id, public_key, algorithm, "
+            "sign_count, enrolled_at_us, revoked_at_us, backup_eligible, backup_state, label) "
+            "VALUES (?, ?, X'00', -7, 0, 1, NULL, 0, 0, ?)", (CREDENTIAL_ID, owner, CREDENTIAL_LABEL))
+        self.execute(
+            "INSERT INTO access_sessions (id, token_digest, principal_id, credential_id, "
+            "principal_revision, deployment_generation, established_at_us, last_seen_at_us, "
+            "idle_lifetime_us, idle_expires_at_us, absolute_expires_at_us, invalidated_at_us, "
+            "external_identity_binding, binding_mismatch_suppressed) "
+            "VALUES (?, ?, ?, ?, 0, 0, 1, 1, 10, 11, 20, NULL, ?, 0)",
+            (str(uuid4()), TOKEN_DIGEST, owner, CREDENTIAL_ID, BINDING_DIGEST))
         self.invitation(live, revoked=False)
         self.invitation(revoked, revoked=True)
         source = self.source()
@@ -302,8 +313,9 @@ class LifecycleInventoryTests(unittest.TestCase):
             for marker in (IDENTITY_MARKER, NAME_MARKER, SECRET_DIGEST.hex(),
                            bytes(reversed(SECRET_DIGEST)).hex(), TOKEN_DIGEST.hex(),
                            CREDENTIAL_ID.hex(), CREDENTIAL_ID.decode(),
+                           CREDENTIAL_LABEL, BINDING_DIGEST.hex(),
                            "external_identity", "display_name", "secret_digest",
-                           "token_digest", "public_key"):
+                           "token_digest", "public_key", "label"):
                 self.assertNotIn(marker, text, path.name)
 
     def test_grant_and_revocation_state_is_preserved_by_logical_id(self):

@@ -23,9 +23,9 @@ Rows or recordings that exist only in the current state are listed as
 ``appended`` and never counted as preserved. An inventory section that is empty
 reports ``empty`` rather than success, so a comparison cannot pass vacuously.
 
-Never written: principal external identities or display names, credential IDs
-or public keys, invitation / session secret or token digests, permission-bearing
-URLs, media bytes, or audit row contents (only their digests). Container
+Never written: principal external identities or display names, credential IDs,
+public keys or labels, invitation / session secret or token digests, session
+identity bindings, permission-bearing URLs, media bytes, or audit row contents (only their digests). Container
 duration probing and decodable-playback samples need a codec and are left to
 the manual procedure in ``MANUAL_TEST.md`` section V; the output marks them
 ``manual``. The output file is created exclusively with mode 0600 and is
