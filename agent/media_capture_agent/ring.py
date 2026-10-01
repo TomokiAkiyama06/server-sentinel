@@ -19,6 +19,11 @@ from .ring_models import (DenyControls, MAX_INTEGER, POST, PRE, RETENTION, SECON
 from .storage import StorageRefused
 
 
+# Stored segments per source whose largest real allocation estimates the
+# space each further simulated append consumes in the next-write check.
+RECENT_ALLOCATION_SEGMENTS = 8
+
+
 class DiskRing:
     def __init__(self, settings, store, *, ledger_maximum_bytes, authority=None, ledger_space=os.fstatvfs):
         self.settings, self.store = settings, store
@@ -380,6 +385,11 @@ class DiskRing:
         source whose next segment interval is known (not overdue) is
         credited; otherwise status errs toward pressure or a hard stop.
 
+        Each simulated append must fit at its maximum bound, but the space it
+        consumes (and frees once it ages out) is the largest real allocation
+        among that source's last ``RECENT_ALLOCATION_SEGMENTS`` stored
+        segments, never above the bound; the bound is used without history.
+
         Under untrusted time the trusted phases are not comparable with
         ``now`` (a rollback can leave them far in the future), and nothing is
         credited as reclaimable. Every source's next append is then evaluated
@@ -407,7 +417,20 @@ class DiskRing:
         # per source below, keeps the statement count independent of rows.
         latest = max(next_append.values())
         rows = self._selected_reclaimable(latest, self.config) if clock_trusted else ()
-        allocations = self.store.segment_allocations() if rows else {}
+        allocations = self.store.segment_allocations()
+        # Each simulated append is checked against the maximum bound (its own
+        # size is unknown), but the space it then consumes, and later frees,
+        # is estimated from the source's recent real allocations: charging
+        # every chained append the maximum turns ordinary VBR below the bound
+        # into a permanent false refusal. Without stored history the maximum
+        # is used.
+        recent = {}
+        for source, profile in self.profiles.items():
+            bound = round_up(profile.segment_bytes(), unit)
+            sizes = [allocations.get(UUID(row[0]), bound) for row in self.db.execute(
+                "SELECT id FROM segments WHERE source=? AND state='stored' "
+                "ORDER BY end DESC LIMIT ?", (str(source), RECENT_ALLOCATION_SEGMENTS))]
+            recent[source] = min(bound, max(sizes)) if sizes else bound
         window = self.config.value * SECOND if self.config.mode == "duration" else PRE
         events = []
         for source, profile in self.profiles.items():
@@ -440,7 +463,7 @@ class DiskRing:
             needed = round_up(profile.segment_bytes() + self.ledger_headroom, unit)
             if free + reclaim - consumed < reserve + needed:
                 return True
-            allocation = round_up(profile.segment_bytes(), unit)
+            allocation = recent[profile.source_id]
             consumed += allocation
             source = str(profile.source_id)
             if may_credit and profile.source_id in phased and not any(

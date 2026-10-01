@@ -408,6 +408,44 @@ class RingTests(unittest.TestCase):
         self.assertEqual(result["state"], "partial")
         self.assertTrue(result["clock_uncertain"])
 
+    def _steady_vbr_fifo(self, profiles, minutes):
+        """Sources whose real segments are below the max bound (ordinary VBR)
+        run a steady FIFO near the reserve: every append succeeds, so no
+        status sampled between appends may claim recording is refused."""
+        def due(at):
+            return [profile for profile in profiles if (at - T0) % profile.segment_duration_us == 0]
+
+        self.configure(profiles=profiles)
+        for at in range(T0 - PRE + 60 * SECOND, T0 + SECOND, 60 * SECOND):
+            for profile in due(at):
+                self.ring.append(profile.source_id, at - profile.segment_duration_us, at, PAYLOAD,
+                                 now_us=at, clock_trusted=True)
+        unit, reserve = self.store.allocation_unit, self.settings.safety_reserve_bytes
+        self.assertLess(round_up(len(PAYLOAD), unit), round_up(profiles[0].segment_bytes(), unit))
+        self.quota.other = (self.quota.capacity - self.quota.used() - reserve
+                            - self.ring.ledger_headroom - 1 * unit)
+        appended = 0
+        for at in range(T0 + 60 * SECOND, T0 + (minutes + 1) * 60 * SECOND, 60 * SECOND):
+            status = self.ring.status(now_us=at - 60 * SECOND, clock_trusted=True)
+            self.assertNotEqual("STORAGE_HARD_STOP", status["state"], (at - T0) // SECOND)
+            for profile in due(at):
+                self.ring.append(profile.source_id, at - profile.segment_duration_us, at, PAYLOAD,
+                                 now_us=at, clock_trusted=True)
+                appended += 1
+            status = self.ring.status(now_us=at, clock_trusted=True)
+            self.assertNotEqual("STORAGE_HARD_STOP", status["state"], (at - T0) // SECOND)
+        return appended
+
+    def test_two_same_phase_vbr_sources_steady_fifo_is_not_a_hard_stop(self):
+        profiles = tuple(SegmentProfile(UUID(int=300 + index), 800, 400, 60 * SECOND, 100)
+                         for index in range(2))
+        self.assertEqual(50, self._steady_vbr_fifo(profiles, 25))
+
+    def test_mixed_cadence_vbr_sources_steady_fifo_is_not_a_hard_stop(self):
+        profiles = (SegmentProfile(UUID(int=310), 800, 400, 60 * SECOND, 100),
+                    SegmentProfile(UUID(int=311), 80, 40, PRE, 100))
+        self.assertEqual(27, self._steady_vbr_fifo(profiles, 25))
+
     def _mixed_cadence_ring(self, *, fast_end):
         unit, headroom = self.store.allocation_unit, self.ring.ledger_headroom
         slow = SegmentProfile(SOURCE, 80, 40, PRE, 100)
@@ -416,9 +454,16 @@ class RingTests(unittest.TestCase):
         self.ring.append(SOURCE, T0 - PRE, T0, PAYLOAD, now_us=T0, clock_trusted=True)
         self.ring.append(fast.source_id, fast_end - 60 * SECOND, fast_end, PAYLOAD,
                          now_us=T0, clock_trusted=True)
-        stored = sum(self.store.segment_allocations().values())
-        b = round_up(fast.segment_bytes(), unit)
-        a = round_up(slow.segment_bytes(), unit)
+        allocations = self.store.segment_allocations()
+        stored = sum(allocations.values())
+
+        def recent(source):
+            row = self.ring.db.execute("SELECT id FROM segments WHERE source=?", (str(source),)).fetchone()
+            return allocations[UUID(row[0])]
+
+        # Simulated appends consume (and later free) each source's recent
+        # real allocation, while each must fit at its maximum bound.
+        b, a = recent(fast.source_id), recent(SOURCE)
         # The slow source next appends at T0 + PRE; the fast source appends
         # at T0, T0 + 60 s, ..., T0 + PRE. The budget binds at the fast
         # source's last append exactly when its T0 segment is credited.

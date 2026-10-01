@@ -201,7 +201,10 @@ starts another sector-aligned header, which the former per-page header
 allowance (~33x the cap) existed to cover. With spilling off, dirty pages stay
 in memory until commit; ledger transactions are small and the database itself
 is capped. A hot journal left by an older build that exceeds this bound is
-refused rather than replayed. The page-size/cap and DELETE-journal assumptions are enforced;
+refused rather than replayed (`ledger_sidecar_refused`); to recover, start the
+older build once on the same media root so SQLite rolls that journal back, stop
+it cleanly, then start this build. Never delete the journal by hand: that can
+leave the ledger inconsistent. The page-size/cap and DELETE-journal assumptions are enforced;
 SQLite temporary stores stay in memory. The bound does not purport to reserve
 exclusive disk capacity against unrelated processes or a filesystem failure.
 DB-cap exhaustion is an explicit failure; schema history and incidents are never
