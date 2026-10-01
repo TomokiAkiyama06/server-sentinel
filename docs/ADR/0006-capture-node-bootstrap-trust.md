@@ -331,3 +331,90 @@ status or decision.
   - The schema change is migration 19 (`pairing_credential_renewal`), after
     main's 17 (`human_access_webauthn`, PR #97) and 18
     (`human_access_shared_identity`, PR #107).
+
+## Follow-up notes (2026-09-30, Issue #13 bootstrap enrollment and CLIs)
+
+These notes record implementation progress; they do not change this ADR's
+status or decision. They close the first item of "Still open for #13
+acceptance" above except where listed at the end.
+
+- **Main approval CLI** (`server/app/cameras/remote_agent/pairing_cli.py`,
+  `python -m app.cameras.remote_agent.pairing_cli`): `init` (deployment CA plus
+  the Main listener certificate in a separate private directory), `export-bundle`
+  (public bundle; prints its full SHA-256 on the Main console; the server name
+  is read from the listener certificate), `approve`, `list` and `revoke`.
+  Creating a pairing and approving it are one step, as in the flow above:
+  `approve` validates the Agent's public request file (the CSR must prove the key
+  digest it names), shows that digest on the controlling terminal, requires the
+  Owner to type `APPROVE`, calls `PairingLedger.approve` (new node UUID, key
+  binding, code, audit row), writes the code **once to the controlling terminal
+  only** (hyphen-grouped for reading), and then serves the bootstrap listener in
+  the same process. Without a controlling terminal it refuses before touching any
+  state. No command accepts a code. `revoke` requires typing `REVOKE`; `list`
+  prints node UUIDs and state words only.
+- **Owner authority in the CLI (pending #6).** The CLI's `OwnerAuthorizer` is
+  local: the operating-system account that can open the owner-only issuer
+  material and database, plus one typed confirmation on the controlling terminal
+  per approve/revoke. Each confirmation authorizes exactly one ledger call, which
+  writes the existing audit record. This is a stand-in for the #6
+  Owner-authentication boundary, not a resolution of it.
+- **Process epoch.** Approval and listener share one process because the ledger
+  rejects pending approvals from any other process epoch. The HMAC verifier key is
+  therefore generated in memory for each `approve` run and never stored; an
+  interrupted run leaves only an unusable `pending` row.
+- **Bootstrap listener** (`server/app/cameras/remote_agent/enrollment.py`):
+  separate from the human and ingest listeners (explicit IP literal; wildcard,
+  multicast and non-private addresses refused; must differ from the human
+  listener and an optional ingest address). TLS 1.3 only, Main certificate, no
+  client certificate, no session tickets, ALPN `serversentinel-capture-enroll/1`
+  required. It opens only for the approvals of its own run and closes when they
+  complete, when their five minutes end, after too many refused requests, or on
+  interrupt. Limits (defaults): request frame 20 KiB, response frame 32 KiB,
+  4 concurrent connections, one 10-second deadline per connection covering
+  handshake, request and response, 6 connections per source address per minute,
+  16 refused requests before the listener closes. The last limit is fail-closed:
+  a LAN peer can force the Owner to approve again, but cannot extend a code's
+  lifetime. These are initial values, not measured deployment limits.
+- **Wire protocol v1.** One length-prefixed (4-byte big-endian) JSON frame each
+  way. Request: exactly `version`, `deployment_id`, `code`, `csr`. Response:
+  `{"status":"issued","certificate":PEM}` or the generic `{"status":"refused"}`,
+  whatever the reason. The Main finds the approval by the CSR's proven key among
+  its own run's approvals, then `PairingLedger.redeem` and
+  `DeploymentAuthority.issue_and_activate`. A lost response needs a fresh
+  approval. The TLS handshake necessarily shows any LAN peer the Main
+  certificate (server name and deployment URI); nothing else is returned to an
+  unauthenticated peer.
+- **Agent pairing CLI** (`agent/media_capture_agent/enroll.py`,
+  `python -m media_capture_agent.enroll`): `request` creates the node key (0600
+  under a 0700 directory) and writes the public request file, printing the key
+  digest; `pair` takes only the bundle file, its full SHA-256 and an optional
+  endpoint override, refuses UID 0, and refuses before any network traffic if the
+  digest differs. It then connects with TLS 1.3 pinned to the bundle CA, checks
+  the server name, the ALPN protocol and that the Main certificate carries the
+  bundle's deployment URI, and closes. Only then does it read the code from the
+  non-echoing controlling-terminal prompt. It reconnects with the same full
+  verification and sends one frame. It installs the result only after
+  `validate_issued_credential`. The prompt accepts the grouped form and fixes a
+  defect of the earlier primitive: it could not wrap a real (non-seekable)
+  terminal.
+- **Evidence (loopback, generated identities).** `tests/e2e/test_capture_enrollment_scenarios.py`
+  runs both CLIs as separate processes, each with its own pseudo-terminal:
+  enrollment through a recording relay followed by an admitted mTLS ingest
+  connection; an Agent without a terminal refusing after verification without
+  consuming the approval; the code absent from relay bytes, argv, environment,
+  `/proc/<pid>/cmdline|environ`, stdout/stderr, every written file including the
+  database and audit rows; no key-log file despite `SSLKEYLOGFILE`; revocation,
+  refused ingest and refusal to approve the revoked key again. Impostor CA, a
+  genuine certificate without the enrollment protocol, and a plaintext endpoint
+  each receive zero application bytes and no prompt appears. A wrong bundle digest
+  makes no connection. `server/tests/test_capture_enrollment.py` covers expired,
+  reused, wrong-code, stolen-code/other-key, wrong-deployment and malformed
+  requests, oversized frames, slow and silent peers, connection/source limits,
+  the refusal cap, expiry, six concurrent redemptions yielding one credential,
+  and bind validation. `agent/tests/test_enroll.py` covers the client against
+  synthetic peers.
+- **Still open.** Crash-boundary fault injection and concurrent redemption from
+  separate processes (the concurrency test uses threads against the real
+  listener); real LAN interoperability (MANUAL_TEST §B, unverified); a narrower
+  issuance capability than the CLI process holding the CA key while it serves;
+  Main listener-certificate renewal; the #6 Owner-authentication boundary.
