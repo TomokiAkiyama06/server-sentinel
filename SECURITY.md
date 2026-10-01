@@ -305,9 +305,10 @@ obligation — a dedicated network identity for ServerSentinel, or a
 single-purpose node enforced outside the application — because a local process
 can bind another port on that address without appearing in any proxy
 configuration. Startup and daily checks enumerate actual listeners and proxy
-routes for the whole name and close human access on any other answer, which
-bounds rather than removes that exposure; the application cannot prevent a
-local process from binding.
+routes for the whole name and close human access on any other answer they can
+see, which bounds rather than removes that exposure. The check sees only sockets in `/proc/net` and Serve status. Traffic the kernel redirects before it reaches a listening socket on the reserved address — nftables/iptables DNAT or REDIRECT (for example Docker with `userland-proxy=false`), TPROXY, eBPF `sk_lookup` or IPVS — is not visible to it, so it cannot claim that nothing else answers; the deployment isolation must exclude such forwarding, and the Owner verifies it manually. Even for
+sockets it sees, the check bounds the exposure rather than preventing it: the
+application cannot prevent a local process from binding.
 
 The current contract for that check (Owner decisions 2026-09-30 and
 2026-10-01; details in `server/app/auth/README.md` and ADR-0003):

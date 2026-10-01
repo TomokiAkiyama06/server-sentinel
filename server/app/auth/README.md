@@ -235,7 +235,7 @@ again with exactly the configured set, access reopens with existing sessions
 intact, unless an exposure was seen meanwhile. A process binding the reserved
 address between two checks is not seen until the next check: detection bounds
 the exposure window, and only the Owner-recorded deployment isolation removes
-it. `/proc/net` covers one network namespace.
+it. `/proc/net` covers one network namespace. The check sees only sockets in `/proc/net` and Serve status. Traffic the kernel redirects before it reaches a listening socket on the reserved address — nftables/iptables DNAT or REDIRECT (for example Docker with `userland-proxy=false`), TPROXY, eBPF `sk_lookup` or IPVS — is not visible to it, so it cannot claim that nothing else answers; the deployment isolation must exclude such forwarding, and the Owner verifies it manually.
 
 Owner listener exceptions (`ListenerException`: protocol `tcp` or `udp`, port,
 optional address family, bind scope `wildcard`, and the owning process) let a
@@ -244,8 +244,10 @@ wildcard address without closing access. An exception covers only its own
 protocol. A port alone never exempts a socket (Owner decision, 2026-10-01): each
 exception names its owner by exactly one of `executable` (the absolute,
 normalized path `/proc/<pid>/exe` resolves to, for example `/usr/sbin/sshd`) or
-`unit` (the systemd unit named in the process's cgroup v2 path, for example
-`ssh.service`), and a port-only, doubly identified or malformed entry is
+`unit` (a system unit: the process's cgroup v2 path must be exactly
+`/system.slice/<unit>`, for example `ssh.service`; a `user.slice` path, whose
+user manager can create a unit of any name, a sub-cgroup or another slice names
+no unit and does not match), and a port-only, doubly identified or malformed entry is
 rejected. Each check reads the socket inode from `/proc/net` and the injected
 `socket_owners` (`ProcSocketOwners`, walking `/proc/<pid>/fd`) maps it to every
 process holding it; the socket is excepted only when every holder matches.
@@ -311,9 +313,9 @@ as identical `/proc/net` rows, and every extra copy is counted as an
 endpoint would receive requests and session cookies. The same applies to a
 wildcard endpoint covered by a listener exception: one exception allows one
 socket per distinct endpoint it covers (for example `0.0.0.0:22` and `:::22`),
-and each identical extra row is unexpected. Exceptions stay port-only; a
-service that opens several `SO_REUSEPORT` sockets on an excepted port keeps
-access closed.
+and each identical extra row is unexpected. An exception allows one socket per
+endpoint even for its own process, so a service that opens several
+`SO_REUSEPORT` sockets on an excepted port keeps access closed.
 
 Nothing here is wired into the application or a route yet, reads the host
 implicitly, runs `tailscale`, changes Tailscale ACLs/Grants, or needs Tailscale

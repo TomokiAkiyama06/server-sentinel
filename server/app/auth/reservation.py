@@ -180,8 +180,8 @@ class ListenerException:
     The port alone never exempts a socket (Owner decision, 2026-10-01): the
     exception names the owning process by exactly one of ``executable`` (the
     absolute path ``/proc/<pid>/exe`` resolves to, for example
-    ``/usr/sbin/sshd``) or ``unit`` (the systemd unit in the process's cgroup,
-    for example ``ssh.service``). Each check verifies that every process
+    ``/usr/sbin/sshd``) or ``unit`` (a system unit: the process's cgroup v2
+    path is exactly ``/system.slice/<unit>``, for example ``ssh.service``). Each check verifies that every process
     holding the socket matches; another process, or ownership that cannot be
     verified, closes access as a possible exposure.
 
@@ -406,12 +406,20 @@ class ProcNetListeners:
 
 
 def _unit_from_cgroup(text: str) -> str | None:
-    """The systemd unit named by a cgroup v2 ``0::/...`` line, if any."""
+    """The system unit of a cgroup v2 ``0::/system.slice/<unit>`` line, else None.
+
+    Only a process directly in a system unit's cgroup names a unit. A path
+    under ``user.slice`` is controlled by that user's own service manager,
+    which can create a unit of any name (``.../user@1000.service/app.slice/
+    ssh.service``), and a sub-cgroup or another slice is not the unit itself,
+    so none of them names one; an exception or proxy identity by unit then
+    does not match and access closes.
+    """
     for line in text.splitlines():
         if line.startswith("0::"):
-            for component in reversed(line[3:].split("/")):
-                if _UNIT.fullmatch(component):
-                    return component
+            match = re.fullmatch(r"/system\.slice/([^/]+)", line[3:])
+            if match and _UNIT.fullmatch(match.group(1)):
+                return match.group(1)
             return None
     return None
 
@@ -954,7 +962,7 @@ class HostnameReservationCheck:
         # Startup/daily/retry checks also hold it (always acquired before
         # ``_check_lock``), so no verdict computed from a superseded set can be
         # published after a change has durably committed.
-        self.exception_change_lock = threading.Lock()
+        self.exception_change_lock = threading.RLock()
         self._verdict = CLOSED
         self._last_check: float | None = None
         self._last_notified: tuple[Reason, ...] | None = None
@@ -1005,11 +1013,13 @@ class HostnameReservationCheck:
 
         Reached at runtime only through ``app.audit.integration.ReservationAdministration``.
         Access closes during the immediate re-check, so narrowing the set takes
-        effect now rather than at the next daily check.
+        effect now rather than at the next daily check. It takes the
+        (reentrant) ``exception_change_lock`` itself, so a direct caller is
+        serialized with other changes and checks as well.
         """
         if not isinstance(change, ListenerExceptionChange) or change.check is not self:
             raise ValueError("INVALID_LISTENER_EXCEPTION")
-        with self._check_lock:
+        with self.exception_change_lock, self._check_lock:
             self._exceptions = change.exceptions
             # The audited change has just rewritten the stored set.
             self._exceptions_loaded = True

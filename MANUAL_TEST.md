@@ -1716,6 +1716,16 @@ by the Issue #6 synthetic policy model.
   disposable copy holding a version 1 (port-only) stored exception, confirm
   startup reports `LISTENER_EXCEPTIONS_OUTDATED` and access stays closed until
   the Owner re-enters the exception with its owner.
+- Kernel forwarding (not covered by the check): on the Main Server, run
+  `sudo nft list ruleset` and `sudo iptables-save -t nat` (and `-t mangle`),
+  and confirm no DNAT, REDIRECT or TPROXY rule targets the reserved addresses
+  or their ports; record Docker's `userland-proxy` setting, any `sk_lookup`
+  BPF programs (`sudo bpftool prog show`) and IPVS services
+  (`sudo ipvsadm -Ln`, if installed). Any such forwarding is outside what the
+  check can see and must be removed or excluded by the deployment isolation.
+- Unit identity: confirm `cat /proc/<sshd pid>/cgroup` is exactly
+  `0::/system.slice/ssh.service`, and that a user-session process whose cgroup
+  ends in `ssh.service` under `user.slice` does not satisfy a unit exception.
 - Human upstream ownership (mock-only so far): with the check composed in the
   running service, confirm access opens and that the upstream's inode in
   `ss -ltne 'sport = :8080'` appears in `/proc/<service pid>/fd`. On a

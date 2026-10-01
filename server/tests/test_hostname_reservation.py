@@ -871,6 +871,18 @@ class ListenerExceptionTests(ExceptionFixture):
             with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
                 ListenerException(**kwargs)
 
+    def test_direct_apply_waits_for_the_change_lock(self):
+        _, check, _ = self.admin(WILDCARD_SSH)
+        change = check.stage_listener_exceptions({SSH})
+        done = threading.Event()
+        with check.exception_change_lock:
+            worker = threading.Thread(target=lambda: (check.apply_audited_listener_exceptions(change), done.set()))
+            worker.start()
+            self.assertFalse(done.wait(0.1))
+        worker.join(5)
+        self.assertTrue(done.is_set())
+        self.assertEqual(check.listener_exceptions, frozenset({SSH}))
+
     def test_unaudited_change_object_from_another_check_is_refused(self):
         _, check, _ = self.admin(WILDCARD_SSH)
         other, *_ = checker()
@@ -1477,9 +1489,10 @@ class ProcSocketOwnersTests(TestCase):
         (self.root / "self").mkdir()
         owners = ProcSocketOwners(str(self.root)).owners(frozenset({1000, 2000, 4000}))
         self.assertEqual(owners, {
+            # A user-session scope is not a system unit, so it names none.
             1000: frozenset({SocketOwner("/usr/sbin/sshd", "ssh.service"),
-                             SocketOwner("/usr/bin/python3.12", "x.scope")}),
-            2000: frozenset({SocketOwner("/usr/bin/python3.12", "x.scope")}),
+                             SocketOwner("/usr/bin/python3.12", None)}),
+            2000: frozenset({SocketOwner("/usr/bin/python3.12", None)}),
         })
 
     def unreadable(self, base):
@@ -1519,6 +1532,31 @@ class ProcSocketOwnersTests(TestCase):
     def test_root_must_be_absolute(self):
         with self.assertRaises(ValueError):
             ProcSocketOwners("proc")
+
+    def test_only_a_direct_system_slice_unit_is_reported(self):
+        cases = {
+            # A non-root user can create ssh.service in their own user@ manager.
+            "0::/user.slice/user-1000.slice/user@1000.service/app.slice/ssh.service\n": None,
+            "0::/user.slice/user-1000.slice/user@1000.service\n": None,
+            "0::/system.slice/ssh.service/child\n": None,
+            "0::/machine.slice/ssh.service\n": None,
+            "0::/init.scope\n": None,
+            "0::/system.slice/ssh.service\n": "ssh.service",
+            "0::/system.slice/getty@tty1.service\n": "getty@tty1.service",
+        }
+        for number, (cgroup, unit) in enumerate(cases.items()):
+            with self.subTest(cgroup=cgroup):
+                pid = 100 + number
+                self.process(pid, "/usr/sbin/sshd", [f"socket:[{5000 + number}]"], cgroup=cgroup)
+                owners = ProcSocketOwners(str(self.root)).owners(frozenset({5000 + number}))
+                self.assertEqual(owners[5000 + number], frozenset({SocketOwner("/usr/sbin/sshd", unit)}))
+
+    def test_user_manager_impersonating_a_unit_does_not_match(self):
+        self.process(100, "/usr/bin/python3.12", ["socket:[1001]"],
+                     cgroup="0::/user.slice/user-1000.slice/user@1000.service/app.slice/ssh.service\n")
+        owners = ProcSocketOwners(str(self.root)).owners(frozenset({1001}))
+        exception = ListenerException(22, unit="ssh.service")
+        self.assertFalse(any(exception.owned_by(owner) for owner in owners[1001]))
 
 
 class ProcNetInodeTests(TestCase):
