@@ -1,7 +1,9 @@
 """Conservative UVC identity decisions; device paths never identify a camera."""
 
+from collections import deque
 from dataclasses import dataclass, field
 from enum import StrEnum
+import threading
 from uuid import UUID
 
 
@@ -137,7 +139,7 @@ class ReconnectController:
     """
 
     def __init__(self, source_id, approved, emit, *, enabled=True, store=None,
-                 explicit_candidate=None):
+                 explicit_candidate=None, flush=None, notify=None):
         if not isinstance(source_id, UUID) or not isinstance(approved, DeviceEvidence):
             raise ValueError("invalid source identity")
         if type(enabled) is not bool:
@@ -168,17 +170,120 @@ class ReconnectController:
         self._profile_hold = None
         self._reason = "not_started"
         self._finished = False
+        # Serializes health transitions between the source worker and the
+        # off-worker frame-progress check. It is held only for in-memory work:
+        # ``emit`` runs under it (so events and staged writes keep transition
+        # order) and must not block; ``flush(blocking=...)`` persists what was
+        # staged and ``notify`` delivers events to potentially blocking
+        # downstream sinks, both after the lock is released, so a slow SQLite
+        # write or health sink never holds the transition lock. All other
+        # controller state is mutated only by the source worker.
+        self.lock = threading.RLock()
+        self.flush = flush
+        self.notify = notify
+        # Events emitted under the lock, delivered to ``notify`` in the same
+        # order by one thread at a time.
+        self._outbox = deque()
+        self._delivery = threading.Lock()
+        # A non-blocking caller (the supervisor watchdog) never runs
+        # ``notify`` itself: a downstream sink may block indefinitely, and the
+        # single watchdog thread must keep enforcing reopen deadlines and
+        # checking other sources. At most one handoff thread per controller
+        # drains the outbox for it.
+        self._handoff_lock = threading.Lock()
+        self._handoff_running = False
+        self._handoff_pending = False
+        self.delivery_failures = 0
 
     def _persist(self):
         if self.store is not None:
             self.store.save(self.source_id, self.approved, self.requires_approval,
                             session_token=self._session_token, serial_ambiguous=self.serial_ambiguous)
 
-    def _transition(self, state, reason):
+    def _set_state(self, state, reason):
+        """Change the in-memory state; the caller holds ``self.lock``."""
         changed = (self.state, self._reason) != (state, reason)
         self.state, self._reason = state, reason
         if changed:
-            self.emit(HealthEvent(self.source_id, state, reason))
+            event = HealthEvent(self.source_id, state, reason)
+            self.emit(event)
+            if self.notify is not None:
+                self._outbox.append(event)
+        return changed
+
+    def _deliver(self, blocking=True):
+        """Hand queued events to ``notify`` outside the transition lock.
+
+        A blocking caller delivers in its own thread, in queue order. A
+        non-blocking caller never calls ``notify``: it hands the queue to a
+        background delivery thread, so a blocking sink cannot hold it.
+        """
+        if self.notify is None:
+            return
+        if not blocking:
+            self._handoff()
+            return
+        while self._outbox:
+            if not self._delivery.acquire(blocking=blocking):
+                return
+            try:
+                while True:
+                    try:
+                        event = self._outbox.popleft()
+                    except IndexError:
+                        break
+                    self.notify(event)
+            finally:
+                self._delivery.release()
+
+    def _handoff(self):
+        with self._handoff_lock:
+            if self._handoff_running:
+                # The running thread re-checks the queue before it exits.
+                self._handoff_pending = True
+                return
+            if not self._outbox:
+                return
+            self._handoff_running = True
+            self._handoff_pending = False
+        thread = threading.Thread(target=self._drain_handoff, daemon=True,
+                                  name="serversentinel-local-uvc-health-delivery")
+        try:
+            thread.start()
+        except BaseException:
+            with self._handoff_lock:
+                self._handoff_running = False
+            raise
+
+    def _drain_handoff(self):
+        while True:
+            while self._outbox:
+                try:
+                    self._deliver()
+                except Exception:
+                    # Counted only: exception text may carry private details.
+                    # Each failed attempt consumed one event, so this ends.
+                    self.delivery_failures += 1
+            with self._handoff_lock:
+                if not self._handoff_pending and not self._outbox:
+                    self._handoff_running = False
+                    return
+                self._handoff_pending = False
+
+    def _flush(self, blocking=True):
+        if self.flush is not None:
+            self.flush(blocking=blocking)
+
+    def _transition(self, state, reason):
+        with self.lock:
+            changed = self._set_state(state, reason)
+        try:
+            if changed:
+                self._flush()
+        finally:
+            # A refused or failed write must not suppress the in-memory
+            # transition reaching downstream sinks (e.g. preview invalidation).
+            self._deliver()
 
     def disconnected(self):
         self.bound = None
@@ -252,6 +357,48 @@ class ReconnectController:
             raise ValueError("capture has no approved binding")
         self._transition(CameraState.ONLINE, "video_capture_ready")
 
+    def frame_stalled(self, candidate, *, only_online=False, blocking=True,
+                      confirm=None, capture_lost=False):
+        """An open capture delivered no frame within its stall window.
+
+        Reported ``degraded`` with a fixed reason: a camera that is not
+        delivering video is never ``online``, and a stall is never evidence
+        about the scene. Only a later delivered frame (``capture_ready``)
+        returns the source to ``online``. Offline/manual states and a changed
+        binding are never raised to ``degraded`` here. The off-worker check
+        passes ``only_online`` and ``blocking=False``: it only lowers an
+        ``online`` claim, skips a tick while the worker is transitioning, and
+        leaves event delivery to a background thread (see ``_deliver``).
+        ``confirm`` is re-evaluated under the transition lock, so frame
+        progress recorded after the caller's snapshot wins. ``capture_lost``
+        reports a stall past the reopen bound as ``offline``
+        (``video_capture_failed``) without touching the descriptor, which the
+        (possibly blocked) worker still owns and closes when it returns.
+        Returns True when the stall is (now) the reported state.
+        """
+        if not self.lock.acquire(blocking=blocking):
+            return False
+        try:
+            allowed = ((CameraState.ONLINE,) if only_online
+                       else (CameraState.ONLINE, CameraState.DEGRADED))
+            if (self._finished or candidate is None or self.bound != candidate
+                    or self.state not in allowed):
+                return False
+            if confirm is not None and not confirm():
+                return False
+            if capture_lost:
+                changed = self._set_state(CameraState.OFFLINE, "video_capture_failed")
+            else:
+                changed = self._set_state(CameraState.DEGRADED, "video_frame_stalled")
+        finally:
+            self.lock.release()
+        try:
+            if changed:
+                self._flush(blocking)
+        finally:
+            self._deliver(blocking)
+        return True
+
     @property
     def profile_unavailable(self):
         return self._profile_hold is not None and self._reason == "capture_profile_unavailable"
@@ -289,22 +436,57 @@ class ReconnectController:
         self.bound = None
         self._transition(CameraState.OFFLINE, "video_capture_failed")
 
-    def capture_closed(self):
-        # Only a continuously open capture descriptor can retain a weak live
-        # binding. Invalidate it even when a subsequent approval operation fails.
+    def capture_closing(self):
+        """Close transition before the kernel teardown, without blocking.
+
+        Only a continuously open capture descriptor can retain a weak live
+        binding, so it is invalidated here (even when a subsequent approval
+        operation fails), and an ``online``/``degraded`` source is lowered to
+        ``offline`` in memory. The teardown that follows may hang, so the
+        transition's I/O is handed off now rather than after it: the
+        non-blocking flush marks the source unpersisted at once (in memory)
+        and leaves the registry write to the background health writer, and
+        the notification (live-preview invalidation first) goes to the
+        background delivery thread. Neither can block the teardown.
+        """
         self.bound = None
-        if self.state in (CameraState.DEGRADED, CameraState.ONLINE):
-            self._transition(CameraState.OFFLINE, "video_capture_closed")
+        with self.lock:
+            changed = (self.state in (CameraState.DEGRADED, CameraState.ONLINE)
+                       and self._set_state(CameraState.OFFLINE, "video_capture_closed"))
+        try:
+            if changed:
+                self._flush(blocking=False)
+        finally:
+            self._deliver(blocking=False)
+
+    def capture_closed(self):
+        """After the descriptor is closed; never blocks on health I/O.
+
+        Normally ``capture_closing`` already reported the transition. A close
+        reached without it is reported the same non-blocking way.
+        """
+        self.bound = None
+        with self.lock:
+            changed = (self.state in (CameraState.DEGRADED, CameraState.ONLINE)
+                       and self._set_state(CameraState.OFFLINE, "video_capture_closed"))
+        try:
+            if changed:
+                self._flush(blocking=False)
+        finally:
+            self._deliver(blocking=False)
 
     def shutdown(self):
         """Release recovery marker only after capture is closed and state durable."""
         if self.bound is not None:
             raise ValueError("capture binding must close before shutdown")
+        # No transition lock around this storage write: with no binding the
+        # off-worker check cannot report a stall for this controller anyway.
         if self.store is not None and self._session_token is not None:
             self.store.save(self.source_id, self.approved, self.requires_approval,
                             session_token=self._session_token, serial_ambiguous=self.serial_ambiguous, release=True)
             self._session_token = None
-        self._finished = True
+        with self.lock:
+            self._finished = True
 
     def supersede_stopped_session(self):
         """Discard only in-memory state after an audited approval supersedes it."""
@@ -312,8 +494,9 @@ class ReconnectController:
             raise ValueError("capture binding must stop before reapproval")
         # The audited transaction replaces/fences the durable session token.
         # Never save this stale controller during disposal.
-        self._session_token = None
-        self._finished = True
+        with self.lock:
+            self._session_token = None
+            self._finished = True
 
     def set_enabled(self, enabled):
         if self._finished or type(enabled) is not bool:

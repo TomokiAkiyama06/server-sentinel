@@ -54,6 +54,64 @@ reopened on every poll, only after the profile, enablement or device instance
 changes. A camera without a serial is bound only while its descriptor is open,
 so after `capture_profile_unavailable` a profile change cannot rebind it: the
 source reports `identity_not_unique` and requires Owner reapproval.
+`CaptureSession` also watches frame progress. A read that times out raises
+`FrameTimeout` (a `CaptureError` subclass); instead of tearing down, the
+session reports `degraded` (`video_frame_stalled`) once no frame has arrived
+for the stall window, keeps the descriptor (and any live weak binding) open,
+and returns to `online` only on the next delivered frame. The window is
+`frame_stall_seconds` but never less than 10 negotiated frame intervals (the
+reopen bound scales by the same factor), because a dark scene or slow profile
+legitimately lowers the delivered rate; on the real C960s the covered-lens rate
+dropped to about 16–17 fps, far inside a 1 s window. Each read waits at most the
+stall window. A read that only times out keeps the worker reading at once, without the
+supervisor's retry backoff, so a short `poll_timeout_seconds` or a dark scene
+whose frame interval exceeds it cannot leave the stall window elapsing with no
+read in flight (which would flap `video_frame_stalled` and `online`). A stall lasting `frame_stall_reopen_seconds` closes the capture
+(`offline`, `video_capture_failed`) and the next poll reopens it through the
+identity path, so a weak binding then needs the Owner again. The same check runs
+from `LocalUvcSupervisor`'s single watchdog thread through
+`LocalUvcAdapter.check_frame_progress()`: a worker blocked inside a kernel or
+SQLite call cannot run its own read timeout, so the watchdog lowers that
+source's `online` claim, and past the reopen bound reports `offline`
+(`video_capture_failed`) with a reopen request that the worker performs (close,
+then reopen through the identity path) as soon as it returns, and re-checks
+after presence discovery before starting another read; a frame it returns with
+is discarded. The watchdog never opens, closes or rebinds a device
+itself. A requested stop does not end its checks: a worker still blocked after
+a timed-out stop (for example when a reapproval is refused because the worker
+could not stop) stays checked until its thread actually exits. It takes the controller's transition lock non-blockingly and re-checks
+the frame age under it, so a frame delivered after its snapshot wins. That lock
+covers in-memory work only: transitions, the negotiated profile and
+`last_seen_at` stage their values in transition order, and the runtime records
+each transition in memory under it; a per-source writer persists the merged
+latest values after the lock is released, one write at a time, and logging and
+the health sink receive the events (in order) after that, also outside the
+lock. The source is marked unpersisted from the start of a write until every
+staged value is durable, so a hung write never reads as persisted. A watchdog
+report never writes the registry itself: it marks the source unpersisted and
+hands the write to at most one background writer thread per source, so a hung
+SQLite or storage write cannot stop the watchdog from enforcing reopen
+deadlines or checking other sources. A
+transient stall keeps the recorded negotiated profile. Closing a capture lowers the source to `offline`
+(`video_capture_closed`) in memory before the potentially blocking
+`STREAMOFF`/unmap/close, so a hung kernel teardown never leaves it `online`;
+the registry write and health notification (live-preview invalidation) are
+handed to background threads at that point, before the teardown, so neither
+waits for a hanging close, the source is reported unpersisted until the
+offline row is durable, and hung storage or a hung health sink never keeps
+the descriptor open. Stopping a source then waits at most
+`HEALTH_SETTLE_SECONDS` (1 s, inside the supervisor join bound) for that
+write, so a clean shutdown normally leaves the row durable; a write still
+hung leaves the source reported unpersisted.
+
+While a capture is open, `LinuxDiscovery.scan()` (which opens every video node)
+runs at most every `presence_scan_seconds` instead of on every frame; an unplug
+surfaces as a descriptor error. A scan with probe failures that no longer lists
+the bound device is inconclusive and keeps the live descriptor. A duplicate
+serial that appears while capturing is still detected at the next due scan.
+`MmapCapture` requests 4 MMAP buffers (`REQBUFS` count 4, accepting 1 to
+`MAX_BUFFERS` = 8 from the driver), so the driver can fill a buffer while one
+frame is copied.
 The caller supplies width, height, FPS and FourCC; there are no hardware profile
 defaults. Codec/bitrate controls and multi-planar-only capture are unsupported
 and fail explicitly. Camera drivers without a reportable frame rate also fail.

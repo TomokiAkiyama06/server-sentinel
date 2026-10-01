@@ -32,6 +32,137 @@ def _serial_shared(candidate, devices):
     ) > 1
 
 
+class _HealthWriter:
+    """One source's health persistence, coalesced and serialized.
+
+    Transitions stage their values in memory under the controller's
+    transition lock, so staged values always follow transition order. A
+    flush writes the merged latest values outside that lock; merging is
+    equivalent to applying the partial updates in order. At most one write
+    is in flight, and that writer re-reads the staged values after its write.
+    The source is marked unpersisted before a material write begins (one
+    that changes anything but the routine ``last_seen_at`` refresh relative
+    to the last durable values) and cleared only once every staged value is
+    durable, so the runtime reports the in-memory state instead of a stale
+    durable health row while such a write is in flight or hung. A routine
+    refresh in flight leaves the reported health untouched; any failed write
+    marks the source unpersisted (storage is refusing writes).
+
+    A non-blocking flush (the supervisor watchdog) never writes itself: even
+    an uncontended registry write can hang in SQLite or storage, and the
+    single watchdog thread must keep enforcing reopen deadlines and checking
+    other sources. It marks the source unpersisted and hands the write to at
+    most one background thread per source, which flushes until nothing new
+    is staged or a write fails (the failed values stay staged for the next
+    flush).
+    """
+
+    def __init__(self, write, mark):
+        self._write = write
+        self._mark = mark
+        self._staged_lock = threading.Lock()
+        self._io = threading.Lock()
+        self._staged = None
+        # Values last made durable, to tell a material write from a routine
+        # last_seen_at refresh.
+        self._durable = {}
+        self._handoff_lock = threading.Lock()
+        self._handoff_running = False
+        self._handoff_pending = False
+        # Set while no background write is running.
+        self._idle = threading.Event()
+        self._idle.set()
+
+    def stage(self, **values):
+        with self._staged_lock:
+            self._staged = {**(self._staged or {}), **values}
+
+    def _material(self, values):
+        # Called with _staged_lock held.
+        return any(key != "last_seen_at" and (key not in self._durable or self._durable[key] != value)
+                   for key, value in values.items())
+
+    def _handoff(self):
+        with self._handoff_lock:
+            if self._handoff_running:
+                # The running thread re-checks before it exits.
+                self._handoff_pending = True
+                return
+            self._handoff_running = True
+            self._handoff_pending = False
+            self._idle.clear()
+        thread = threading.Thread(target=self._drain_handoff, daemon=True,
+                                  name="serversentinel-local-uvc-health-write")
+        try:
+            thread.start()
+        except BaseException:
+            with self._handoff_lock:
+                self._handoff_running = False
+                self._idle.set()
+            raise
+
+    def settle(self, timeout):
+        """Wait at most ``timeout`` for a handed-off write; True when idle.
+
+        A write still hung afterwards leaves the source marked unpersisted.
+        """
+        return self._idle.wait(timeout)
+
+    def _drain_handoff(self):
+        while True:
+            try:
+                self.flush()
+            except Exception:
+                # Values stay staged and the source unpersisted; the next
+                # flush retries. Exception text is never logged here.
+                pass
+            with self._handoff_lock:
+                if not self._handoff_pending:
+                    self._handoff_running = False
+                    self._idle.set()
+                    return
+                self._handoff_pending = False
+
+    def flush(self, *, blocking=True):
+        if not blocking:
+            with self._staged_lock:
+                if self._staged is None:
+                    return True
+                if self._material(self._staged):
+                    self._mark(True)
+            self._handoff()
+            return False
+        while True:
+            self._io.acquire()
+            try:
+                with self._staged_lock:
+                    values, self._staged = self._staged, None
+                    if values is None:
+                        return True
+                    # Not durable until this write (and anything staged
+                    # meanwhile) completes; a material write that blocks
+                    # indefinitely must not leave the source reported as
+                    # persisted.
+                    if self._material(values):
+                        self._mark(True)
+                try:
+                    self._write(**values)
+                except BaseException:
+                    with self._staged_lock:
+                        # Keep the failed values under anything newer, so a
+                        # later flush retries whatever was not superseded.
+                        self._staged = {**values, **(self._staged or {})}
+                        self._mark(True)
+                    raise
+                with self._staged_lock:
+                    self._durable.update(values)
+                    if self._staged is None:
+                        self._mark(False)
+                        return True
+            finally:
+                self._io.release()
+
+
 @dataclass(frozen=True)
 class PreparedApproval:
     """One Owner selection already validated against a current device scan."""
@@ -60,21 +191,35 @@ class LocalUvcAdapter:
     # (a pre-existing duplicate re-enabled later) is rechecked at most this
     # often; before any capture opens it is checked on every poll.
     APPROVAL_CONFLICT_INTERVAL_SECONDS = 1.0
+    # Closing a capture hands its health write to a background writer, so a
+    # hung registry write cannot keep the descriptor open. A stop then waits
+    # at most this long for that write, inside the supervisor's join bound,
+    # so a clean shutdown normally leaves the row durable.
+    HEALTH_SETTLE_SECONDS = 1.0
 
-    def __init__(self, registry, *, emit_audit, on_frame,
+    def __init__(self, registry, *, emit_audit, on_frame, publish=None,
                  discovery=None, capture_factory=MmapCapture, clock=None,
-                 monotonic=time.monotonic):
+                 monotonic=time.monotonic, frame_stall_seconds=1.0,
+                 frame_stall_reopen_seconds=5.0, presence_scan_seconds=1.0):
         self.registry = registry
         # Session-marker writes share the registry's storage admission, so no
         # capture-driven write bypasses the Main storage policy.
         self.store = ApprovalStore(registry.database,
                                    reservation=getattr(registry, "reservation", None))
         self.emit_audit = emit_audit
+        # Downstream delivery (logging, external health sinks) that may block;
+        # the controller calls it only after releasing its transition lock.
+        self.publish = publish
         self.on_frame = on_frame
         self.discovery = discovery or LinuxDiscovery()
         self.capture_factory = capture_factory
         self.clock = clock or (lambda: datetime.now(timezone.utc))
         self.monotonic = monotonic
+        self.session_timing = {
+            "frame_stall_seconds": frame_stall_seconds,
+            "frame_stall_reopen_seconds": frame_stall_reopen_seconds,
+            "presence_scan_seconds": presence_scan_seconds,
+        }
         self.sessions = {}
         self._approved_handoffs = {}
         self._conflict_checked = {}
@@ -84,6 +229,8 @@ class LocalUvcAdapter:
         # still show an earlier state, so the runtime reports these in memory.
         self._unpersisted_lock = threading.Lock()
         self._unpersisted = set()
+        self._writers = {}
+        self._writers_lock = threading.Lock()
 
     def _source(self, source_id):
         if self.closed:
@@ -93,68 +240,108 @@ class LocalUvcAdapter:
             raise ValueError("source is not local UVC")
         return source
 
+    def _writer(self, source_id):
+        with self._writers_lock:
+            writer = self._writers.get(source_id)
+            if writer is None:
+                def write(**values):
+                    self.registry.update_source_health(source_id, **values)
+
+                def mark(unpersisted):
+                    with self._unpersisted_lock:
+                        if unpersisted:
+                            self._unpersisted.add(source_id)
+                        else:
+                            self._unpersisted.discard(source_id)
+
+                writer = self._writers[source_id] = _HealthWriter(write, mark)
+            return writer
+
     def _write_health(self, source_id, **values):
         """Persist one health observation and track whether it was durable."""
-        try:
-            result = self.registry.update_source_health(source_id, **values)
-        except BaseException:
-            with self._unpersisted_lock:
-                self._unpersisted.add(source_id)
-            raise
-        with self._unpersisted_lock:
-            self._unpersisted.discard(source_id)
-        return result
+        writer = self._writer(source_id)
+        writer.stage(**values)
+        writer.flush()
 
     def health_unpersisted(self, source_id):
-        """True while this source's latest health write was refused or failed."""
+        """True while the durable health row may be behind the in-memory state.
+
+        That is while a material health write (a state, profile or quality
+        change) is in flight or hung, or after any write was refused or
+        failed, until a later write succeeds. A routine ``last_seen_at``
+        refresh in flight does not count.
+        """
         with self._unpersisted_lock:
             return source_id in self._unpersisted
 
     def _event(self, event):
-        try:
-            self._write_health(
-                event.source_id, health_state=SourceHealthState(event.state.value),
-                image_quality_state="unknown",
-                **({"negotiated_capture_profile": None} if event.state != "online" else {}),
-            )
-        finally:
-            # The in-memory transition (runtime health, preview invalidation)
-            # is delivered even when persistence is refused, so capture loss is
-            # never represented only by a stale durable ONLINE row.
-            self.emit_audit(event)
+        """Controller callback under its transition lock: in-memory work only.
+
+        The health values are staged here and written by the controller's
+        flush after the lock is released. A transient frame stall keeps the
+        descriptor and its negotiated profile, so only other non-online
+        states clear the profile.
+        """
+        keep_profile = event.state == "online" or event.reason == "video_frame_stalled"
+        self._writer(event.source_id).stage(
+            health_state=SourceHealthState(event.state.value),
+            image_quality_state="unknown",
+            **({} if keep_profile else {"negotiated_capture_profile": None}),
+        )
+        # The in-memory transition (runtime health state) is recorded even
+        # when persistence is refused or still in flight, so capture loss is
+        # never represented only by a stale durable ONLINE row. Potentially
+        # blocking downstream delivery goes through ``_publish`` instead.
+        self.emit_audit(event)
+
+    def _publish(self, event):
+        """Controller callback after its transition lock is released."""
+        if self.publish is not None:
+            self.publish(event)
 
     def _session(self, source, approved, *, explicit_candidate=None):
         self._write_health(source.id, health_state=SourceHealthState.OFFLINE,
                            negotiated_capture_profile=None, image_quality_state="unknown")
+        writer = self._writer(source.id)
         controller = ReconnectController(source.id, approved, self._event,
                                          enabled=source.enabled, store=self.store,
-                                         explicit_candidate=explicit_candidate)
+                                         explicit_candidate=explicit_candidate,
+                                         flush=writer.flush, notify=self._publish)
 
         def profile_sink(negotiated):
             value = negotiated.profile
-            self._write_health(
-                source.id, health_state=SourceHealthState(controller.state.value),
-                negotiated_capture_profile=CaptureProfile(
-                    width=value.width, height=value.height, fps=value.fps,
-                    pixel_format=value.pixel_format,
-                ),
-            )
+            # Stage with the state read under the transition lock (so an
+            # off-worker stall report cannot be overwritten by a stale state);
+            # write after releasing it.
+            with controller.lock:
+                writer.stage(
+                    health_state=SourceHealthState(controller.state.value),
+                    negotiated_capture_profile=CaptureProfile(
+                        width=value.width, height=value.height, fps=value.fps,
+                        pixel_format=value.pixel_format,
+                    ),
+                )
+            writer.flush()
 
         last_seen = {"at": None, "state": None}
 
         def frame_sink(frame):
             now = self.monotonic()
-            state = SourceHealthState(controller.state.value)
-            if (last_seen["at"] is None or last_seen["state"] is not state
-                    or now - last_seen["at"] >= self.LAST_SEEN_INTERVAL_SECONDS):
-                self._write_health(source.id, health_state=state,
-                                   last_seen_at=self.clock())
+            with controller.lock:
+                state = SourceHealthState(controller.state.value)
+                due = (last_seen["at"] is None or last_seen["state"] is not state
+                       or now - last_seen["at"] >= self.LAST_SEEN_INTERVAL_SECONDS)
+                if due:
+                    writer.stage(health_state=state, last_seen_at=self.clock())
+            if due:
+                writer.flush()
                 last_seen["at"], last_seen["state"] = now, state
             self.on_frame(source.id, frame)
 
         session = CaptureSession(
             controller, self.discovery, capture_profile(source.desired_capture_profile),
             on_frame=frame_sink, on_profile=profile_sink, capture_factory=self.capture_factory,
+            clock=lambda: self.monotonic(), **self.session_timing,
         )
         self.sessions[source.id] = session
         return session
@@ -305,6 +492,19 @@ class LocalUvcAdapter:
             session.controller.capture_failed()
             raise
 
+    def check_frame_progress(self, source_id):
+        """Off-worker frame-progress check for one source.
+
+        Called by the supervisor watchdog, not the source worker, so a worker
+        blocked in a kernel or storage call cannot keep a stalled source
+        ``online``. It only lowers an ``online`` claim to ``degraded``
+        (``video_frame_stalled``); it never opens, closes or rebinds a device.
+        """
+        session = self.sessions.get(source_id)
+        if session is None or self.closed:
+            return False
+        return session.check_frame_progress()
+
     def _approval_conflict(self, source, session):
         """True when another enabled source holds an approval for this camera.
 
@@ -350,6 +550,10 @@ class LocalUvcAdapter:
             # A failed release deliberately leaves the recovery marker durable.
             failures.append(error)
         self._approved_handoffs.pop(source_id, None)
+        with self._writers_lock:
+            writer = self._writers.get(source_id)
+        if writer is not None:
+            writer.settle(self.HEALTH_SETTLE_SECONDS)
         if failures:
             raise failures[0]
         return True

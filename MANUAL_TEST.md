@@ -101,6 +101,36 @@ stand-in）。一時 DB は repository 外に作り実行後に削除した。fr
 未確認: 抜線・ポート入替・再起動を伴う物理操作、非 serial 同型機、3〜4 source、
 実配信 fps の記録（registry は driver の frame interval のみ保持）。
 
+#### フレーム停止 watchdog / presence scan 抑制の実機再確認（未実施）
+
+2026-09-30 の Main Server 候補機（C960 2 台）の抜き差し試験で、source が 0 fps の
+まま約 4〜5 秒 `online` と表示された。修正（frame-progress watchdog、live 中の全
+device scan を `presence_scan_seconds` 間隔へ抑制）は synthetic fake でのみ確認
+済み。次を実機で再確認するまで未検証とする。
+
+1. 2 台を `online` にし、片方を抜線する。抜線から `online` 以外（`degraded`
+   `video_frame_stalled` または `offline`）になるまでの時間を記録する。既定値
+   （`frame_stall_seconds` 1.0、watchdog 0.25 秒間隔）で概ね 1.5 秒以内を期待。
+   もう片方の frame 継続も記録する。
+2. 同一 USB bus 上でもう片方が再列挙される場合も含め、抜線・再接続を 10 回以上
+   繰り返し、停止中に `online` のままの区間がないこと、frame 再開後にだけ
+   `online` へ戻ることを確認する。`video_frame_stalled` から復帰した source の
+   negotiated profile が registry に残っていること、停止が
+   `frame_stall_reopen_seconds` を超えた場合は `offline` になり再 open されることも
+   確認する。
+3. レンズを覆う・暗室にするなど低照度で 5 分以上連続取得し、`video_frame_stalled`
+   への遷移が 0 回であること（fps 低下で flap しないこと）を確認する。
+4. 30 fps × 2 台で 60 秒取得し、live 中の全 device scan が概ね
+   `presence_scan_seconds` ごと（既定 1 秒）に抑えられていること、frame 欠落・
+   `capture_failed` が増えていないことを確認する（件数のみ記録）。
+5. 抜線時に `STREAMOFF`/unmap/close が戻るまでの時間が長い場合でも、teardown
+   開始時点で `offline`（`video_capture_closed`）になり、teardown 中に `online`
+   と表示されないことを確認する（teardown の所要時間も記録する）。teardown 中の
+   遷移は synthetic fake（close が戻らない capture）でのみ確認済み。
+6. 記録には serial・device path・by-id・USB port・UUID を含めない。
+
+PR #111 は、上記を実機 C960 で再確認してからマージする。
+
 #### Real-hardware runtime procedure (serial-bearing UVC cameras)
 
 Use one or more USB UVC cameras that report a USB serial number (for example
