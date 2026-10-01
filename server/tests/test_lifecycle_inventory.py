@@ -1655,14 +1655,20 @@ class LifecycleInventoryTests(unittest.TestCase):
                              (str(approval.enrollment_id),))
         code, report, _ = self.verify(baseline)
         self.assertEqual(code, inventory.EXIT_FAILED)
-        self.assertEqual(report["sections"]["security_state"]["failed"],
-                         [{"id": f"pairing_renewals:{node}", "reason": "enrollment_key"}])
+        self.assertEqual(sorted(report["sections"]["security_state"]["failed"],
+                                key=lambda item: item["id"]),
+                         [{"id": f"pairing_enrollments:{approval.enrollment_id}",
+                           "reason": "enrollment_key"},
+                          {"id": f"pairing_renewals:{node}", "reason": "enrollment_key"}])
         # The same without the restored enrollment state: still refused.
         self.runtime.execute("UPDATE pairing_enrollments SET state='consumed' WHERE id=?",
                              (str(approval.enrollment_id),))
         code, report, _ = self.verify(baseline)
-        self.assertEqual(report["sections"]["security_state"]["failed"],
-                         [{"id": f"pairing_renewals:{node}", "reason": "enrollment_key"}])
+        self.assertEqual(sorted(report["sections"]["security_state"]["failed"],
+                                key=lambda item: item["id"]),
+                         [{"id": f"pairing_enrollments:{approval.enrollment_id}",
+                           "reason": "enrollment_key"},
+                          {"id": f"pairing_renewals:{node}", "reason": "enrollment_key"}])
 
     def test_recorded_enrollments_only_move_forward(self):
         # Codex P1: PairingLedger never deletes an enrollment; redeem() moves
@@ -1763,6 +1769,42 @@ class LifecycleInventoryTests(unittest.TestCase):
             complete(after, label, "d" * 64)
         code, report, _ = self.verify(baseline)
         self.assertEqual(code, inventory.EXIT_PRESERVED, report["sections"]["security_state"])
+
+    def test_a_retry_never_approves_a_staged_renewal_key(self):
+        # Codex P1: the staged key is live for the node, so command_approve()
+        # would retry it; approving and activating it deletes the renewal and
+        # replaces the credential. That composition fails closed.
+        self.runtime.seed()
+        database = Database(self.runtime.database)
+        ledger = PairingLedger(database, HmacCodeVerifier(b"s" * 32),
+                               audit=AuditStore(database), clock=lambda: 100.0,
+                               process_epoch=uuid4())
+
+        class Owner:
+            def require_owner(self, actor_context):
+                if actor_context != "owner":
+                    raise PermissionError("synthetic denial")
+        owner, node, staged = Owner(), uuid4(), "c" * 64
+
+        def complete(key, serial):
+            approval, code = ledger.approve(owner, "owner", node_id=node, public_key_digest=key)
+            claim = ledger.redeem(enrollment_id=approval.enrollment_id,
+                                  public_key_digest=key, code=code.value)
+            ledger.activate(claim, credential_serial_digest=serial, not_after=50.0)
+            return approval
+        complete("a" * 64, "b" * 64)
+        ledger.stage_renewal(node_id=node, current_public_key_digest="a" * 64,
+                             current_credential_digest="b" * 64, public_key_digest=staged,
+                             credential_serial_digest="d" * 64, not_after=90.0)
+        _, baseline = self.record()
+        self.assertEqual(ledger.bound_node(staged), node)
+        approval = complete(staged, "e" * 64)
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_FAILED)
+        failed = report["sections"]["security_state"]["failed"]
+        self.assertIn({"id": f"pairing_enrollments:{approval.enrollment_id}",
+                       "reason": "enrollment_key"}, failed)
+        self.assertIn({"id": f"pairing_credentials:{node}", "reason": "changed"}, failed)
 
     def test_a_staged_renewal_is_never_restaged_onto_a_superseded_key(self):
         # Codex P1: stage_renewal() accepts a key already bound to the node

@@ -755,7 +755,11 @@ def _compare_pairing(baseline: dict, current: dict) -> list:
       or current, in any state (so no activated enrollment's key is staged:
       activate() deletes the renewal and that key can never be staged
       again). Approving a currently staged key would also break this; it is
-      reachable through approve() but refused here (fail closed);
+      reachable through approve() (and command_approve() would offer it as a
+      retry) but refused here (fail closed): no enrollment created since the
+      record may name a key staged at record time or now, so neither the
+      retry path nor any other accepts it. A key both staged and approved
+      inside the window, its renewal then gone, leaves no trace and passes;
     - an open (pending / consumed) enrollment's key is live for its node; an
       activated enrollment's key is bound (perhaps revoked) to its node.
 
@@ -786,7 +790,8 @@ def _compare_pairing(baseline: dict, current: dict) -> list:
       staged renewal (promotion) or an identity a post-record activation
       installed (an enrollment open at record time, or a new one for a key
       newly bound or, as command_approve() retries, already live for the
-      node at record time); a staged row stays exactly, is retried with its own key
+      node at record time and still, but never one staged at record time or
+      now); a staged row stays exactly, is retried with its own key
       while the credential is unchanged, is replaced by a key newly bound
       since the record, or leaves by promotion, revocation or a fresh
       pairing; a credential first seen now needs a post-record activation of
@@ -835,6 +840,17 @@ def _compare_pairing(baseline: dict, current: dict) -> list:
     for node, renewal in sorted(renewals.items()):
         if renewal["key_ref"] in enrollment_keys:
             fail("pairing_renewals", node, "enrollment_key")
+    # Likewise an enrollment created since the record never names a key
+    # staged at record time or now (approve() would accept one, but that
+    # composition is refused here: fail closed).
+    staged_keys = ({renewal["key_ref"] for renewal in staged.values()}
+                   | {renewal["key_ref"] for renewal in renewals.values()})
+    recorded_enrollments = baseline.get("pairing_enrollments")
+    enrollments_now = current.get("pairing_enrollments") or {}
+    for enrollment, item in sorted(enrollments_now.items()):
+        if (item["key_ref"] in staged_keys and isinstance(recorded_enrollments, dict)
+                and enrollment not in recorded_enrollments):
+            fail("pairing_enrollments", enrollment, "enrollment_key")
     if _by_enrollment(open_now) and _by_enrollment(activations_now):
         for enrollment, node, key_ref in open_now:
             if not live(node, key_ref):
@@ -844,8 +860,6 @@ def _compare_pairing(baseline: dict, current: dict) -> list:
                 fail("pairing_enrollments", enrollment, "unbound")
 
     # -- enrollments: never deleted, node / key fixed, states move forward --
-    recorded_enrollments = baseline.get("pairing_enrollments")
-    enrollments_now = current.get("pairing_enrollments") or {}
     if isinstance(recorded_enrollments, dict):
         for enrollment, before in sorted(recorded_enrollments.items()):
             after = enrollments_now.get(enrollment)
@@ -875,9 +889,12 @@ def _compare_pairing(baseline: dict, current: dict) -> list:
             # enrollment is new since the record (every recorded one must
             # persist, so an old one cannot be re-labelled) and its key was
             # already live for the same node at record time and still is.
+            # A key staged as a renewal (at record time or now) is never one:
+            # approving it is the fail-closed case below.
             recorded = recorded_bindings.get(key_ref) or {}
             return (isinstance(recorded_enrollments, dict)
                     and enrollment not in recorded_enrollments
+                    and key_ref not in staged_keys
                     and recorded.get("node_id") == node and recorded.get("revoked") is False
                     and live(node, key_ref))
         for enrollment, node, key_ref in activations_now:

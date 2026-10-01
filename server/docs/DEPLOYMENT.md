@@ -450,8 +450,10 @@ promotion, revocation or a fresh pairing; a credential first seen now needs a
 fresh pairing of its key. Three ledger-reachable cases fail closed: a renewal
 both staged and promoted inside the window (its material cannot be shown),
 re-pairing a node that was already revoked at record time (reported as a
-reversed revocation), and the Owner approving a key that is currently staged
-as that node's renewal; verify before the next automatic renewal, or
+reversed revocation), and the Owner approving (including retrying through
+the approve command) a key that was staged as a renewal at record time or is
+staged now (a key both staged and approved inside the window leaves no
+evidence and is not detected); verify before the next automatic renewal, or
 investigate and re-record. An invalidated human session never becomes
 valid again, and the authorization generation never decreases; for each
 registered camera source its type, keyed digests of
