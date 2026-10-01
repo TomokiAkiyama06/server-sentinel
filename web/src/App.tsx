@@ -1,9 +1,10 @@
 import { Component, useEffect, useState, type ReactNode } from 'react';
 import { flushSync } from 'react-dom';
-import { canVisit, deniedServices, views, type CameraSourceSummary, type DashboardServices, type RecordingSummary, type Session, type StorageSummary, type View } from './domain';
+import { canVisit, deniedServices, parseWizard, views, type CameraSourceSummary, type DashboardServices, type RecordingSummary, type Session, type StorageSummary, type View, type WizardSnapshot, type WizardStatus, type WizardStepState } from './domain';
 import { messages, type Locale } from './i18n';
 import { RecordingsView } from './recordings/view';
 import { StorageView } from './setup/storage';
+import { WizardView } from './setup/wizard';
 import { MutationQueue } from './shared/mutations';
 import { PresenceScreen } from './views/presence';
 import { TimelineScreen } from './views/timeline';
@@ -24,6 +25,9 @@ type WriteFailure = { id: string };
 const stale = <T extends { state: string }>(current: T) =>
   current.state === 'ready' ? { state: 'loading' as const } : current;
 type Storage = { state: 'loading' | 'failed' | 'pending' } | { state: 'ready'; item: StorageSummary };
+type Wizard = { state: 'loading' | 'failed' | 'pending' } | { state: 'ready'; item: WizardSnapshot };
+/** Mutation subject for wizard transitions: one in flight at a time. */
+const WIZARD_MUTATION = 'setup-wizard';
 
 /** Deliberately no external reporter, error details, or automatic retry loop. */
 class LocalBoundary extends Component<{ children: ReactNode; message: string }, { failed: boolean }> {
@@ -40,6 +44,9 @@ export function App({ services = deniedServices }: { services?: DashboardService
   const [sources, setSources] = useState<Sources>({ state: 'pending' });
   const [recordings, setRecordings] = useState<Recordings>({ state: 'pending' });
   const [storage, setStorage] = useState<Storage>({ state: 'pending' });
+  const [wizard, setWizard] = useState<Wizard>({ state: 'pending' });
+  const [wizardBusy, setWizardBusy] = useState(false);
+  const [wizardFailed, setWizardFailed] = useState(false);
   const [view, setView] = useState<View>('overview');
   const [attempt, setAttempt] = useState(0);
   const [refresh, setRefresh] = useState(0);
@@ -59,6 +66,9 @@ export function App({ services = deniedServices }: { services?: DashboardService
     setSources({ state: 'pending' });
     setRecordings({ state: 'pending' });
     setStorage({ state: 'pending' });
+    setWizard({ state: 'pending' });
+    setWizardBusy(false);
+    setWizardFailed(false);
     setView('overview');
     setBusy([]);
     setFailures([]);
@@ -71,6 +81,7 @@ export function App({ services = deniedServices }: { services?: DashboardService
     setOpenedView(view);
     if (view === 'recordings') setRecordings(stale);
     if (view === 'storage') setStorage(stale);
+    if (view === 'setup') setWizard(stale);
   }
 
   useEffect(() => { document.documentElement.lang = locale; }, [locale]);
@@ -80,6 +91,7 @@ export function App({ services = deniedServices }: { services?: DashboardService
     setSources({ state: 'pending' });
     setRecordings({ state: 'pending' });
     setStorage({ state: 'pending' });
+    setWizard({ state: 'pending' });
     setView('overview');
     void (async () => {
       try {
@@ -146,6 +158,25 @@ export function App({ services = deniedServices }: { services?: DashboardService
   }, [services, access, refresh, view]);
 
   useEffect(() => {
+    // Wizard progress is Owner-only and loaded fresh whenever Setup opens, so a
+    // resumed wizard shows the committed server state, not an earlier snapshot.
+    if (!services.loadWizard || access.state !== 'allowed' || access.role !== 'owner' || view !== 'setup') return;
+    const controller = new AbortController();
+    setWizard({ state: 'loading' });
+    void (async () => {
+      try {
+        const item = parseWizard(await services.loadWizard!(controller.signal));
+        if (!controller.signal.aborted) setWizard({ state: 'ready', item });
+      } catch {
+        if (!controller.signal.aborted) setWizard({ state: 'failed' });
+      }
+    })();
+    return () => controller.abort();
+  }, [services, access, refresh, view]);
+
+  useEffect(() => {
+    setWizardBusy(false);
+    setWizardFailed(false);
     setBusy(current => current.length ? [] : current);
     setFailures(current => current.length ? [] : current);
     return () => mutations.abortAll();
@@ -183,6 +214,31 @@ export function App({ services = deniedServices }: { services?: DashboardService
       mutate(recording.id, signal => star(recording.id, !recording.starred, signal)),
     remove: (recording: RecordingSummary) => mutate(recording.id, signal => remove(recording.id, signal)),
   } : undefined;
+
+  // Owner-only; rendered only when the authorized transition provider exists.
+  // The server authorizes, audits and may refuse every transition. A refused
+  // or unconfirmed write may still have been applied (or the revision was
+  // stale), so the snapshot is reloaded rather than guessed.
+  const wizardAction = session.state === 'allowed' && session.role === 'owner' && services.transitionWizard
+    ? (state: WizardStepState, status: WizardStatus) => {
+        let result: WizardSnapshot | undefined;
+        const started = mutations.start(WIZARD_MUTATION, async signal => {
+          result = parseWizard(await services.transitionWizard!(state.step, status, state.revision, signal));
+        }, outcome => {
+          setWizardBusy(mutations.has(WIZARD_MUTATION));
+          if (outcome === 'done' && result) {
+            const item = result;
+            setWizardFailed(false);
+            setWizard({ state: 'ready', item });
+          } else if (outcome === 'failed') {
+            setWizardFailed(true);
+            setWizard(stale);
+            setRefresh(value => value + 1);
+          }
+        });
+        if (started) setWizardBusy(true);
+      }
+    : undefined;
 
   return <div className="shell">
     <a className="skip-link" href="#main">{t.skip}</a>
@@ -228,6 +284,13 @@ export function App({ services = deniedServices }: { services?: DashboardService
                     {failures.length > 0 && <p data-write-failed="true">{t.actionFailed}</p>}
                     <button className="primary" onClick={() => setRefresh(value => value + 1)}>{t.retry}</button></section>
                   : selected === 'recordings' && recordings.state === 'loading' ? <p role="status">{t.checking}</p>
+                    : selected === 'setup' && access.role === 'owner' && wizard.state === 'ready'
+                      ? <WizardView t={t} snapshot={wizard.item} onTransition={wizardAction} busy={wizardBusy} failed={wizardFailed} />
+                    : selected === 'setup' && wizard.state === 'failed'
+                      ? <section className="notice" role="alert"><p>{t.wizardUnavailable}</p>
+                        {wizardFailed && <p data-wizard-failed="true">{t.wizardActionFailed}</p>}
+                        <button className="primary" onClick={() => setRefresh(value => value + 1)}>{t.retry}</button></section>
+                    : selected === 'setup' && wizard.state === 'loading' ? <p role="status">{t.checking}</p>
                     : selected === 'storage' && access.role === 'owner' && storage.state === 'ready'
                       ? <StorageView t={t} storage={storage.item} onRefresh={() => {
                           flushSync(() => setStorage(stale));

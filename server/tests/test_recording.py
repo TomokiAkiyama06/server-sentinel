@@ -76,7 +76,8 @@ class RecordingTests(unittest.TestCase):
              (12, "human_access_foundation"),
              (13, "setup_wizard_state"), (14, "storage_audit"),
              (15, "notification_schedule"), (16, "monitoring_runtime"),
-             (17, "human_access_webauthn"), (20, "presence_timeline_gap")],
+             (17, "human_access_webauthn"), (18, "human_access_shared_identity"),
+             (20, "presence_timeline_gap")],
         )
         self.policy = Reservation()
         self.validator = SyntheticValidator()
