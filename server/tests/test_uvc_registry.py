@@ -534,6 +534,8 @@ class UvcRegistryTests(UvcRegistryFixture):
                 self.adapter._approve_live_session(self.source.id, weak)
         self.assertTrue(closed_capture.closed)
         self.assertIsNone(self.adapter.sessions[self.source.id].controller.bound)
+        # Closing hands the registry write to the background health writer.
+        self._wait_persisted()
         self.assertEqual(self.registry.get_source(self.source.id).health_state, SourceHealthState.OFFLINE)
         self.assertFalse(self.adapter.poll_source(self.source.id))
         self.assertEqual(len(self.frames), 1)

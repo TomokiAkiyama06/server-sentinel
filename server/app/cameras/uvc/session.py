@@ -80,18 +80,22 @@ class CaptureSession:
             self._last_progress = None
             self._reopen_requested = False
         self._last_scan = None
-        # Lower health before the kernel teardown: STREAMOFF/unmap/close can
-        # block, and with progress tracking already cleared the off-worker
-        # check could no longer lower an ``online`` claim. Dropping the weak
-        # binding before the descriptor closes is only stricter.
+        # Lower health in memory before the kernel teardown: STREAMOFF/unmap/
+        # close can block, and with progress tracking already cleared the
+        # off-worker check could no longer lower an ``online`` claim. Dropping
+        # the weak binding before the descriptor closes is only stricter. The
+        # potentially blocking registry write and health notification are
+        # handed off only after the descriptor is closed, so hung storage or
+        # a hung sink never keeps it open.
         try:
-            self.controller.capture_closed()
+            self.controller.capture_closing()
         finally:
             try:
                 if self.capture is not None:
                     self.capture.close()
             finally:
                 self.capture = None
+                self.controller.capture_closed()
 
     @property
     def stopped(self):

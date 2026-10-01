@@ -603,6 +603,46 @@ class RuntimeLifecycleTests(RuntimeFixture):
         self.assertTrue(wait_for(lambda: self.health(source.id) is not SourceHealthState.ONLINE))
         self.captures.block = None
 
+    def test_teardown_closes_the_descriptor_despite_hung_health_io(self):
+        source = self.source()
+        armed, release = threading.Event(), threading.Event()
+        self.addCleanup(release.set)
+        sink_entered, write_entered = threading.Event(), threading.Event()
+
+        def hanging_sink(event):
+            if armed.is_set():
+                sink_entered.set()
+                release.wait(30)
+
+        runtime = self.runtime(source.id, health_sink=hanging_sink)
+        original = self.registry.update_source_health
+
+        def hanging_write(source_id, **values):
+            if armed.is_set() and values.get("health_state") is SourceHealthState.OFFLINE:
+                write_entered.set()
+                release.wait(30)
+            return original(source_id, **values)
+
+        runtime.start()
+        runtime.reapprove(self.admin, "synthetic-owner", source.id, self.camera)
+        self.assertTrue(self.wait_health(source.id, SourceHealthState.ONLINE))
+        # SQLite/storage and the downstream health sink both hang.
+        self.registry.update_source_health = hanging_write
+        armed.set()
+        result = []
+        stopper = threading.Thread(target=lambda: result.append(runtime.stop()))
+        stopper.start()
+        stopper.join(10)
+        self.assertFalse(stopper.is_alive())
+        self.assertIs(result[0].state, LocalUvcRuntimeState.STOPPED)
+        self.assertTrue(all(capture.closed for capture in self.captures.instances))
+        # The transition itself still happened; only its I/O is pending.
+        self.assertIs(result[0].sources[0].camera_state, CameraState.OFFLINE)
+        self.assertTrue(write_entered.wait(5))
+        self.assertTrue(sink_entered.wait(5))
+        release.set()
+        self.assertTrue(self.wait_health(source.id, SourceHealthState.OFFLINE))
+
     def test_health_sink_failure_and_event_bound_do_not_stop_capture(self):
         source = self.source()
 

@@ -89,10 +89,15 @@ report never writes the registry itself: it marks the source unpersisted and
 hands the write to at most one background writer thread per source, so a hung
 SQLite or storage write cannot stop the watchdog from enforcing reopen
 deadlines or checking other sources. A
-transient stall keeps the recorded negotiated profile. Closing a capture reports
-`offline` (`video_capture_closed`) before the potentially blocking
-`STREAMOFF`/unmap/close, so a hung kernel teardown never leaves the source
-`online`.
+transient stall keeps the recorded negotiated profile. Closing a capture lowers the source to `offline`
+(`video_capture_closed`) in memory before the potentially blocking
+`STREAMOFF`/unmap/close, so a hung kernel teardown never leaves it `online`;
+the registry write and health notification are handed to background threads
+only after the descriptor is closed, so hung storage or a hung health sink
+never keeps it open. Stopping a source then waits at most
+`HEALTH_SETTLE_SECONDS` (1 s, inside the supervisor join bound) for that
+write, so a clean shutdown normally leaves the row durable; a write still
+hung leaves the source reported unpersisted.
 
 While a capture is open, `LinuxDiscovery.scan()` (which opens every video node)
 runs at most every `presence_scan_seconds` instead of on every frame; an unplug

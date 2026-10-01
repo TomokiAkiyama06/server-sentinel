@@ -62,6 +62,9 @@ class _HealthWriter:
         self._handoff_lock = threading.Lock()
         self._handoff_running = False
         self._handoff_pending = False
+        # Set while no background write is running.
+        self._idle = threading.Event()
+        self._idle.set()
 
     def stage(self, **values):
         with self._staged_lock:
@@ -75,6 +78,7 @@ class _HealthWriter:
                 return
             self._handoff_running = True
             self._handoff_pending = False
+            self._idle.clear()
         thread = threading.Thread(target=self._drain_handoff, daemon=True,
                                   name="serversentinel-local-uvc-health-write")
         try:
@@ -82,7 +86,15 @@ class _HealthWriter:
         except BaseException:
             with self._handoff_lock:
                 self._handoff_running = False
+                self._idle.set()
             raise
+
+    def settle(self, timeout):
+        """Wait at most ``timeout`` for a handed-off write; True when idle.
+
+        A write still hung afterwards leaves the source marked unpersisted.
+        """
+        return self._idle.wait(timeout)
 
     def _drain_handoff(self):
         while True:
@@ -95,6 +107,7 @@ class _HealthWriter:
             with self._handoff_lock:
                 if not self._handoff_pending:
                     self._handoff_running = False
+                    self._idle.set()
                     return
                 self._handoff_pending = False
 
@@ -162,6 +175,11 @@ class LocalUvcAdapter:
     # (a pre-existing duplicate re-enabled later) is rechecked at most this
     # often; before any capture opens it is checked on every poll.
     APPROVAL_CONFLICT_INTERVAL_SECONDS = 1.0
+    # Closing a capture hands its health write to a background writer, so a
+    # hung registry write cannot keep the descriptor open. A stop then waits
+    # at most this long for that write, inside the supervisor's join bound,
+    # so a clean shutdown normally leaves the row durable.
+    HEALTH_SETTLE_SECONDS = 1.0
 
     def __init__(self, registry, *, emit_audit, on_frame, publish=None,
                  discovery=None, capture_factory=MmapCapture, clock=None,
@@ -510,6 +528,10 @@ class LocalUvcAdapter:
             # A failed release deliberately leaves the recovery marker durable.
             failures.append(error)
         self._approved_handoffs.pop(source_id, None)
+        with self._writers_lock:
+            writer = self._writers.get(source_id)
+        if writer is not None:
+            writer.settle(self.HEALTH_SETTLE_SECONDS)
         if failures:
             raise failures[0]
         return True
