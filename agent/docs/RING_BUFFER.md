@@ -151,15 +151,16 @@ refused; nothing beyond the next append is credited. Sources do not get
 independent budgets: appends are simulated chronologically up to the latest
 source's next append (same-instant appends of synchronized sources, and
 repeated appends of a shorter-cadence source, included). Each simulated
-append must fit at `round_up(max_segment + L)`, but the space it consumes,
-and frees once it ages out, is that source's recent real allocation `e`: the
-largest allocation among its last eight stored segments, never above
-`round_up(max_segment)`, and `round_up(max_segment)` without history. Charging
+append is charged, and frees once it ages out, that source's recent real
+allocation `e`: the largest allocation among its last eight stored segments,
+never above `round_up(max_segment)`, and `round_up(max_segment)` without
+history. Appends at the same instant form one batch that must fit as a
+whole, `free + R(t) - consumed_before(t) >= reserve + round_up(sum(e) + L)`,
+so the result never depends on profile order. Charging
 every chained append the bound would make two or more sources writing
 ordinary VBR below the bound read as refused in a steady FIFO that accepts
-every write. Each reclaimable segment is credited only once, so the check is
-`free + R(t) - consumed_before(t) < reserve + round_up(max_segment + L)` at
-every simulated append time `t`, with `consumed_before(t)` summing `e`. A
+every write. Each reclaimable segment is credited only once, and
+`consumed_before(t)` sums `e` over earlier batches. A
 simulated segment is credited only for a source whose next interval is known
 (not overdue) and outside any retained incident. `STORAGE_HARD_STOP` thus
 means writes are refused at the recent real bitrate; a chain that would fail

@@ -454,6 +454,57 @@ class RingTests(unittest.TestCase):
         self.assertEqual(27, self._steady_vbr_fifo(profiles, 25))
         self.assertTrue(self.at_risk)
 
+    def _same_instant_vbr(self, *, large_first):
+        large = SegmentProfile(UUID(int=320), 1600, 800, 60 * SECOND, 100)
+        small = SegmentProfile(UUID(int=321), 1600, 800, 60 * SECOND, 100)
+        profiles = (large, small) if large_first else (small, large)
+        self.configure(profiles=profiles)
+        big = b"x" * 12000
+        self.ring.append(large.source_id, T0 - 60 * SECOND, T0, big, now_us=T0, clock_trusted=True)
+        self.ring.append(small.source_id, T0 - 60 * SECOND, T0, PAYLOAD, now_us=T0, clock_trusted=True)
+        unit, reserve = self.store.allocation_unit, self.settings.safety_reserve_bytes
+        allocations = self.store.segment_allocations()
+        recent = sorted(allocations.values())
+        self.assertLess(recent[0], recent[1])
+        # Both next appends land at T0 + 60 s; at the recent real sizes the
+        # batch needs exactly this, whichever source is evaluated first.
+        target = reserve + round_up(sum(recent) + self.ring.ledger_headroom, unit)
+        free = self.ring._budget(self.ring.profiles, T0, clock_trusted=True)["filesystem_free"]
+        self.quota.other += free - target
+        fits = self.ring.status(now_us=T0, clock_trusted=True)
+        budget = self.ring._budget(self.ring.profiles, T0, clock_trusted=True)
+        at_risk = self.ring._next_write_refused(T0, budget, clock_trusted=True, at_bound=True)
+        self.quota.other += unit
+        refused = self.ring.status(now_us=T0, clock_trusted=True)
+        return (fits["state"], fits["reason"]), at_risk, (refused["state"], refused["reason"])
+
+    def test_same_instant_vbr_batch_is_independent_of_profile_order(self):
+        results = []
+        for large_first in (True, False):
+            with self.subTest(large_first=large_first):
+                self.tearDown_ring()
+                results.append(self._same_instant_vbr(large_first=large_first))
+                fits, at_risk, refused = results[-1]
+                self.assertNotEqual("STORAGE_HARD_STOP", fits[0])
+                # A jump of both to the bound would be refused: warning tier.
+                self.assertTrue(at_risk)
+                self.assertEqual(("STORAGE_HARD_STOP", "segment_write_refused_at_reserve"), refused)
+        self.assertEqual(results[0], results[1])
+
+    def tearDown_ring(self):
+        """Fresh media root, quota and ring, so one test can compare setups."""
+        self.ring.close()
+        self.store.close()
+        for path in self.settings.media_root.glob("*.segment"):
+            path.unlink()
+        for path in self.settings.runtime_root.glob("ring.sqlite3*"):
+            path.unlink()
+        self.quota = Quota(self.settings.media_root)
+        self.store = MediaStore(self.settings, space=self.quota, stable_device=lambda _expected: True)
+        self.addCleanup(self.store.close)
+        self.ring = DiskRing(self.settings, self.store, ledger_maximum_bytes=LEDGER_BYTES,
+                             authority=AllowControls())
+
     def _mixed_cadence_ring(self, *, fast_end):
         unit, headroom = self.store.allocation_unit, self.ring.ledger_headroom
         slow = SegmentProfile(SOURCE, 80, 40, PRE, 100)
@@ -469,14 +520,18 @@ class RingTests(unittest.TestCase):
             row = self.ring.db.execute("SELECT id FROM segments WHERE source=?", (str(source),)).fetchone()
             return allocations[UUID(row[0])]
 
-        # Simulated appends consume (and later free) each source's recent
-        # real allocation, while each must fit at its maximum bound.
+        # Simulated appends are charged (and later free) each source's recent
+        # real allocation; the slow source's single stored segment is that
+        # source's allocation, so stored = a + b.
         b, a = recent(fast.source_id), recent(SOURCE)
-        # The slow source next appends at T0 + PRE; the fast source appends
-        # at T0, T0 + 60 s, ..., T0 + PRE. The budget binds at the fast
-        # source's last append exactly when its T0 segment is credited.
-        target = (self.settings.safety_reserve_bytes + round_up(fast.segment_bytes() + headroom, unit)
-                  + 9 * b + a - stored)
+        self.assertEqual(stored, a + b)
+        # The slow source next appends at T0 + PRE together with the fast
+        # source, which appends alone at T0, T0 + 60 s, ... before. At the
+        # T0 + PRE batch everything stored has aged out, so it needs
+        # reserve + round_up(a + b + L) <= free + a + b + credit - 10 b,
+        # i.e. free >= reserve + round_up(L) + 9 b exactly when the fast
+        # source's T0 segment is credited (10 b otherwise).
+        target = self.settings.safety_reserve_bytes + round_up(headroom, unit) + 9 * b
         free = self.ring._budget(self.ring.profiles, T0, clock_trusted=True)["filesystem_free"]
         self.quota.other += free - target
         self.assertEqual(target, self.ring._budget(self.ring.profiles, T0, clock_trusted=True)["filesystem_free"])

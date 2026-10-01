@@ -362,8 +362,8 @@ class DiskRing:
         alone never drops below it while capture is being refused. Evaluate
         each source's next append the way the append path does: it first
         reclaims selected-FIFO media that has become eligible by then (trusted
-        time only), then needs the largest bounded segment plus ledger
-        headroom above the reserve.
+        time only), then needs its segment plus ledger headroom above the
+        reserve.
 
         The next append is dated by that source's own capture phase, not by a
         cadence restarted at ``now``: a segment ends at least one cadence after
@@ -385,12 +385,14 @@ class DiskRing:
         source whose next segment interval is known (not overdue) is
         credited; otherwise status errs toward pressure or a hard stop.
 
-        Each simulated append must fit at its maximum bound, but the space it
-        consumes (and frees once it ages out) is the largest real allocation
-        among that source's last ``RECENT_ALLOCATION_SEGMENTS`` stored
-        segments, never above the bound; the bound is used without history.
+        Each simulated append is charged the largest real allocation among
+        that source's last ``RECENT_ALLOCATION_SEGMENTS`` stored segments,
+        never above its bound (the bound without history): a refusal here
+        means writes are refused at the recent real bitrate. Appends at the
+        same instant form one batch that must fit, with one ledger headroom,
+        as a whole, so the result does not depend on profile order.
 
-        With ``at_bound`` every simulated append consumes its maximum bound
+        With ``at_bound`` every simulated append is charged its maximum bound
         instead: status uses that worst case only to warn (pressure) that a
         rise to the maximum bitrate would be refused.
 
@@ -428,13 +430,13 @@ class DiskRing:
         # every chained append the maximum turns ordinary VBR below the bound
         # into a permanent false refusal. Without stored history the maximum
         # is used.
-        recent = {}
+        charge = {}
         for source, profile in self.profiles.items():
             bound = round_up(profile.segment_bytes(), unit)
             sizes = [allocations.get(UUID(row[0]), bound) for row in self.db.execute(
                 "SELECT id FROM segments WHERE source=? AND state='stored' "
                 "ORDER BY end DESC LIMIT ?", (str(source), RECENT_ALLOCATION_SEGMENTS))]
-            recent[source] = min(bound, max(sizes)) if sizes and not at_bound else bound
+            charge[source] = min(bound, max(sizes)) if sizes and not at_bound else bound
         window = self.config.value * SECOND if self.config.mode == "duration" else PRE
         events = []
         for source, profile in self.profiles.items():
@@ -453,10 +455,15 @@ class DiskRing:
         simulated = []
         consumed = reclaim = 0
         credited_existing = credited_simulated = 0
-        # Equal timestamps share one reclaim credit; their order within the
-        # instant does not matter because consumption is cumulative. Both
-        # credit lists are in end order, so each entry is credited once.
-        for at, profile in sorted(events, key=lambda item: item[0]):
+        # Appends at the same instant form one batch evaluated as a whole, so
+        # the result never depends on profile order: whichever of them is
+        # written last needs the batch's charges plus one ledger headroom
+        # above the reserve. Both credit lists are in end order, so each
+        # entry is credited once.
+        batches = {}
+        for at, profile in events:
+            batches.setdefault(at, []).append(profile)
+        for at in sorted(batches):
             cutoff = at - window
             while credited_existing < len(existing) and existing[credited_existing][0] <= cutoff:
                 reclaim += existing[credited_existing][1]
@@ -464,16 +471,16 @@ class DiskRing:
             while credited_simulated < len(simulated) and simulated[credited_simulated][0] <= cutoff:
                 reclaim += simulated[credited_simulated][1]
                 credited_simulated += 1
-            needed = round_up(profile.segment_bytes() + self.ledger_headroom, unit)
-            if free + reclaim - consumed < reserve + needed:
+            charges = sum(charge[profile.source_id] for profile in batches[at])
+            if free + reclaim - consumed < reserve + round_up(charges + self.ledger_headroom, unit):
                 return True
-            allocation = recent[profile.source_id]
-            consumed += allocation
-            source = str(profile.source_id)
-            if may_credit and profile.source_id in phased and not any(
-                    source in sources and start < at and end > at - profile.segment_duration_us
-                    for start, end, sources in protecting):
-                simulated.append((at, allocation))
+            consumed += charges
+            for profile in batches[at]:
+                source = str(profile.source_id)
+                if may_credit and profile.source_id in phased and not any(
+                        source in sources and start < at and end > at - profile.segment_duration_us
+                        for start, end, sources in protecting):
+                    simulated.append((at, charge[profile.source_id]))
         return False
 
     def configure(self, config, profiles, *, now_us, clock_trusted):
