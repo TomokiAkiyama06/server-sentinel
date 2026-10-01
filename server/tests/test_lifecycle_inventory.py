@@ -1667,6 +1667,43 @@ class LifecycleInventoryTests(unittest.TestCase):
         self.assertIn({"id": f"source_facts:{ids['expired']}", "reason": "retained"}, failed)
         self.assertIn({"id": f"source_facts:{ghost}", "reason": "orphaned"}, failed)
 
+    def test_an_observation_created_and_released_inside_the_window(self):
+        # Claude review: an observation recorded after the baseline and then
+        # released by the real clear_unresolved_critical_event() is accepted
+        # and listed; its events are bounded (at least one per release, at
+        # most one per action), since its jobs were never recorded.
+        from contextlib import nullcontext
+        seeded = self.runtime.seed()
+        _, baseline = self.record()
+        late = uuid4()
+        self.runtime.execute(
+            "INSERT INTO presence_observations (id, kind, source, received, payload) "
+            "VALUES (?, 'crossing', 'synthetic-source', ?, '{}')",
+            (str(late), self.now.isoformat(timespec="microseconds")))
+        for action, state in (("evidence", "delivered"), ("notification", "pending")):
+            self.runtime.execute("INSERT INTO presence_deliveries (observation, action, state, "
+                                 "attempts) VALUES (?, ?, ?, 0)", (str(late), action, state))
+
+        class Owner:
+            def require_owner(self, context):
+                return UUID(seeded["owner"])
+        PresenceService(Database(self.runtime.database), access=Owner(),
+                        reservation=nullcontext).clear_unresolved_critical_event(
+            "owner", late, now=self.now, clock_trusted=True)
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_PRESERVED, report["sections"]["presence"])
+        self.assertEqual(report["sections"]["presence"]["released"], [str(late)])
+        # More events than its actions allow, or none at all, is not a release.
+        self.runtime.execute("UPDATE presence_expired_unresolved SET events=events+1 "
+                             "WHERE action='notification'")
+        code, report, _ = self.verify(baseline)
+        self.assertIn({"id": "expired_unresolved:notification", "reason": "unexplained"},
+                      report["sections"]["presence"]["failed"])
+        self.runtime.execute("DELETE FROM presence_expired_unresolved")
+        code, report, _ = self.verify(baseline)
+        self.assertIn({"id": "expired_unresolved", "reason": "unexplained"},
+                      report["sections"]["presence"]["failed"])
+
     def test_presence_clocks_sessions_and_override_follow_service_transitions(self):
         self.runtime.seed()
         self.runtime.execute("INSERT INTO presence_clock VALUES (1, "

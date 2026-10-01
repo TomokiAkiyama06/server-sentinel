@@ -695,10 +695,25 @@ def _compare_presence(baseline: dict | None, current: dict | None,
             path[key] = "released"
             continue
         fail("observations", key, "missing")
+    # An observation recorded after the baseline and released inside the
+    # window: the same single valid clear row, tombstone and clock; its jobs
+    # were never recorded, so only bounds apply to its events below.
+    recorded_observations = baseline.get("observations") or {}
+    late_released = 0
+    for key, rows in sorted(cleared_now.items()):
+        if (key in recorded_observations or key in observations or key in cleared_before
+                or len(rows) != 1 or rows[0][1] is not None or rows[0][2] not in owners
+                or not isinstance(control, str) or control < rows[0][0]
+                or completed.get(key) != rows[0][0]):
+            continue
+        path[key] = "released"
+        late_released += 1
     deliveries = current.get("deliveries") or {}
     # The Owner release adds one expired-unresolved event per removed job
-    # neither delivered nor disabled, in the transaction that writes the
-    # tombstone; a removed job must be covered by that increase.
+    # neither delivered nor disabled at clear time, in the transaction that
+    # writes the tombstone. Those states are judged as recorded: a job of a
+    # released observation delivered inside the window before the clear
+    # leaves fewer events than counted here and fails closed.
     # A job leaves only with its released observation (the release deletes
     # every job of it, delivered ones included).
     needed: Counter = Counter()
@@ -723,14 +738,21 @@ def _compare_presence(baseline: dict | None, current: dict | None,
     for key in sorted(set(completed) - set(baseline.get("completed_events") or {})):
         if key not in path:
             fail("completed_events", key, "unexplained")
+    # Each observation created since the record and released adds at least
+    # one event (its release needs an unfinished job) and at most one per
+    # action (one job per action: evidence, notification).
     recorded = baseline.get("expired_unresolved") or {}
+    extra_total = 0
     for action in sorted(set(recorded) | set(expired) | set(needed)):
         added = ((expired.get(action) or {}).get("events", 0)
                  - (recorded.get(action) or {}).get("events", 0))
         if action in recorded and action not in expired:
             continue  # reported missing above
-        if added != needed[action]:
+        if not needed[action] <= added <= needed[action] + late_released:
             fail("expired_unresolved", action, "unexplained")
+        extra_total += max(0, added - needed[action])
+    if extra_total < late_released:
+        failed.append({"id": "expired_unresolved", "reason": "unexplained"})
     # A source fact is written with its observation and deleted with it.
     facts = current.get("source_facts") or {}
     for key, value in (baseline.get("source_facts") or {}).items():
@@ -2389,6 +2411,9 @@ def _schema_drift(connection, migrations: list | None) -> dict:
     prefix is replayed into an in-memory database, and every table, index
     and trigger it creates must exist here with the same definition (SQLite
     keeps the CREATE text, ALTERs included). Extra objects are ignored.
+    A future migration using ALTER TABLE ... RENAME (or other DDL whose
+    stored text depends on the SQLite version or legacy_alter_table) must
+    re-validate this comparison.
     """
     code = [[migration.version, migration.name, migration.checksum]
             for migration in APPLICATION_MIGRATIONS]

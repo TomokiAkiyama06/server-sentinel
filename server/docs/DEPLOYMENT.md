@@ -401,7 +401,13 @@ behind it now); each release is listed under the presence section's
 `released` and counted in the console summary, never silently; the
 observation leaves only together with its completed tombstone, and its jobs
 only with one expired-unresolved event per job neither delivered nor
-disabled; any other removal, however old the observation, is `missing`,
+disabled, judged by the recorded job states (a job of a released
+observation that was delivered inside the window before the release leaves
+one event fewer and fails closed); an observation created after the record
+and released inside the window is accepted on the same audit row, tombstone
+and clock evidence, its events bounded to at least one per such release and
+at most one per action (evidence, notification), since its jobs were never
+recorded; any other removal, however old the observation, is `missing`,
 a job or source fact left behind for a released observation is `retained`,
 and a job or source fact whose observation is gone is `orphaned`);
 a job's state, attempts and generation may only move forward: a claim, a
@@ -557,7 +563,9 @@ It recomputes the same inventory and compares it. Every table, index and
 trigger that the applied migrations create must exist with the definition
 they give it, whether or not the tool inventories its rows: the tool replays
 the applied part of its own migration catalog into an in-memory database and
-compares. At `record` a missing or different object (or a history that is
+compares (a future migration using `ALTER TABLE ... RENAME`, or other DDL
+whose stored text depends on the SQLite version or `legacy_alter_table`,
+must re-validate this comparison). At `record` a missing or different object (or a history that is
 not a prefix of the catalog) refuses to write a baseline (exit 2); at
 `verify` it is `table_missing` or `schema_changed` in the `tables` section.
 Every Main table the inventory reads that existed at record time must still
