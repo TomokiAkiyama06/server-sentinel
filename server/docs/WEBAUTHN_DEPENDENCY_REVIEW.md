@@ -1,34 +1,41 @@
 # WebAuthn dependency decision — Issue #10
 
-Status: **recommended, not yet added**. This review does not authorize a
-credential ceremony or a dependency change. The current access foundation stores
-only opaque credential bytes and never parses a WebAuthn response.
+Status: **decided 2026-09-30.** No WebAuthn/FIDO library is added.
 
-## Candidate
+## Decision
 
-Use `webauthn` (Duo Labs / `py_webauthn`) when the separate ceremony PR is ready.
-The official project page states Python 3.10+ support and exposes the four
-server-side operations needed by an RP: registration options/verification and
-authentication options/verification. It is therefore a closer fit than a
-client/authenticator-oriented FIDO library for this FastAPI RP.
+The relying-party ceremony (registration and assertion verification) is
+implemented in-repo in `server/app/auth/webauthn.py`. The only new runtime
+dependency is the Python `cryptography` package, which the Owner approved on
+2026-09-30, plus its required transitive packages `cffi` and `pycparser`. It is
+used solely to verify signatures over COSE public keys:
 
-- Official package page: <https://pypi.org/project/webauthn/>
-- Official source license: <https://github.com/duo-labs/py_webauthn/blob/master/LICENSE>
-- License: BSD-3-Clause. Redistribution must retain the copyright notice,
-  conditions, and disclaimer; the authors/contributors' names cannot endorse a
-  derivative without permission. This is compatible with the project's
-  permissive-license policy, provided notices are shipped.
+- ES256 (COSE alg -7, ECDSA P-256 / SHA-256);
+- EdDSA (COSE alg -8, Ed25519);
+- RS256 (COSE alg -257, RSASSA-PKCS1-v1_5 / SHA-256).
 
-`fido2` from Yubico is a viable BSD-2-Clause alternative:
-<https://github.com/Yubico/python-fido2/blob/main/COPYING>. It has the same
-notice/disclaimer retention obligation, but `webauthn` is recommended because
-its documented public interface directly maps to browser WebAuthn RP ceremonies.
+The exact pins, wheel hashes, statically linked native content (OpenSSL,
+libffi), Rust crate inventory and notice obligations are in
+[`DEPENDENCIES.md`](DEPENDENCIES.md) ("Issue #10 addition"),
+`wheel-audit.json`, `rust-audit.json` and
+`BACKEND_THIRD_PARTY_LICENSE_TEXTS.md`.
 
-## Before adding it
+## Not adopted
 
-Pin one reviewed release in `server/requirements.lock` and
-`server/requirements-ci.lock`, collect hashes, inspect the exact release's
-runtime/transitive dependency graph and licenses, add all required notices to
-`server/docs/BACKEND_THIRD_PARTY_LICENSE_TEXTS.md`, and test registration and
-assertion failure paths. The exact release must be rechecked at that time; this
-document intentionally does not bless a floating version.
+- `webauthn` (Duo Labs / py_webauthn, BSD-3-Clause) and `fido2` (Yubico,
+  BSD-2-Clause) were earlier candidates. Both would be new dependencies beyond
+  the Owner-approved `cryptography`, and new dependencies are not approved for
+  this issue, so neither is added. Revisiting this requires a separate Owner
+  decision and the full lock/license review described in `DEPENDENCIES.md`.
+
+## Consequences
+
+- The in-repo verifier carries the parsing burden (CBOR/COSE subset,
+  authenticator data, client data) and is covered by synthetic authenticator
+  tests generated in the test suite; no real credential or authenticator
+  output is committed.
+- Real browser/authenticator interoperability is not established by those
+  tests; `MANUAL_TEST.md` holds the unverified real-device steps.
+- The `cryptography` addition overlaps with the Issue #13 branch that adds the
+  same package; the later of the two PRs rebases onto the other's lock and
+  inventory entries.

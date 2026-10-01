@@ -1,7 +1,8 @@
-"""Durable, ceremony-neutral human-access schema.
+"""Durable human-access schema.
 
-The WebAuthn verifier will own credential parsing and signature verification.  This
-schema only persists opaque credential material and authorization state.
+``app.auth.webauthn`` owns credential parsing and signature verification. This
+schema persists only public credential material, the verification outputs that
+ADR-0004 allows to persist, and authorization state.
 """
 
 from app.storage.migrations import Migration
@@ -20,4 +21,29 @@ def access_migration(version: int) -> Migration:
         "CREATE INDEX access_invitations_principal ON access_invitations(principal_id)",
         "CREATE TABLE access_sessions (id TEXT PRIMARY KEY, token_digest BLOB NOT NULL UNIQUE, principal_id TEXT NOT NULL REFERENCES access_principals(id) ON DELETE CASCADE, credential_id BLOB NOT NULL REFERENCES access_credentials(credential_id), principal_revision INTEGER NOT NULL, deployment_generation INTEGER NOT NULL, established_at_us INTEGER NOT NULL, last_seen_at_us INTEGER NOT NULL, idle_lifetime_us INTEGER NOT NULL CHECK(idle_lifetime_us > 0), idle_expires_at_us INTEGER NOT NULL, absolute_expires_at_us INTEGER NOT NULL, invalidated_at_us INTEGER)",
         "CREATE INDEX access_sessions_principal ON access_sessions(principal_id)",
+    ))
+
+
+def access_webauthn_migration(version: int) -> Migration:
+    """Per-person WebAuthn credential state for Issue #10 (ADR-0004).
+
+    Adds only what ADR-0004 allows to persist: the backup-eligibility and
+    backup-state flags, the inconsistent-credential marker, an owner-visible
+    label and last-use time, the session's user-verification time for owner
+    step-up freshness, the invitation attempt counter, and pending ceremony
+    challenges. A challenge is stored as its SHA-256 digest only, is bound to
+    one ceremony (and to its invitation or session where the ceremony has
+    one), and is deleted when it is consumed or expires.
+    """
+    return Migration(version, "human_access_webauthn", (
+        "ALTER TABLE access_credentials ADD COLUMN backup_eligible INTEGER NOT NULL DEFAULT 0 CHECK(backup_eligible IN (0,1))",
+        "ALTER TABLE access_credentials ADD COLUMN backup_state INTEGER NOT NULL DEFAULT 0 CHECK(backup_state IN (0,1))",
+        "ALTER TABLE access_credentials ADD COLUMN inconsistency_reason TEXT CHECK(inconsistency_reason IS NULL OR inconsistency_reason = 'backup_eligibility_changed')",
+        "ALTER TABLE access_credentials ADD COLUMN inconsistent_at_us INTEGER",
+        "ALTER TABLE access_credentials ADD COLUMN label TEXT",
+        "ALTER TABLE access_credentials ADD COLUMN last_used_at_us INTEGER",
+        "ALTER TABLE access_sessions ADD COLUMN last_user_verification_at_us INTEGER",
+        "ALTER TABLE access_invitations ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0 CHECK(attempt_count >= 0)",
+        "CREATE TABLE access_webauthn_challenges (challenge_digest BLOB PRIMARY KEY, ceremony TEXT NOT NULL CHECK(ceremony IN ('registration','authentication','step_up')), invitation_id TEXT REFERENCES access_invitations(id) ON DELETE CASCADE, session_id TEXT REFERENCES access_sessions(id) ON DELETE CASCADE, issued_at_us INTEGER NOT NULL, expires_at_us INTEGER NOT NULL, CHECK(expires_at_us > issued_at_us), CHECK((ceremony = 'registration') = (invitation_id IS NOT NULL)), CHECK((ceremony = 'step_up') = (session_id IS NOT NULL)))",
+        "CREATE INDEX access_webauthn_challenges_expiry ON access_webauthn_challenges(expires_at_us)",
     ))
