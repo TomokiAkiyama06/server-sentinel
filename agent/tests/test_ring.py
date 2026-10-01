@@ -425,9 +425,15 @@ class RingTests(unittest.TestCase):
         self.quota.other = (self.quota.capacity - self.quota.used() - reserve
                             - self.ring.ledger_headroom - 1 * unit)
         appended = 0
+        self.at_risk = False
         for at in range(T0 + 60 * SECOND, T0 + (minutes + 1) * 60 * SECOND, 60 * SECOND):
             status = self.ring.status(now_us=at - 60 * SECOND, clock_trusted=True)
             self.assertNotEqual("STORAGE_HARD_STOP", status["state"], (at - T0) // SECOND)
+            budget = self.ring._budget(self.ring.profiles, at - 60 * SECOND, clock_trusted=True)
+            # Charging every chained append the bound is still the warning
+            # tier: a jump to the maximum bitrate would be refused.
+            self.at_risk |= self.ring._next_write_refused(at - 60 * SECOND, budget, clock_trusted=True,
+                                                          at_bound=True)
             for profile in due(at):
                 self.ring.append(profile.source_id, at - profile.segment_duration_us, at, PAYLOAD,
                                  now_us=at, clock_trusted=True)
@@ -440,11 +446,13 @@ class RingTests(unittest.TestCase):
         profiles = tuple(SegmentProfile(UUID(int=300 + index), 800, 400, 60 * SECOND, 100)
                          for index in range(2))
         self.assertEqual(50, self._steady_vbr_fifo(profiles, 25))
+        self.assertTrue(self.at_risk)
 
     def test_mixed_cadence_vbr_sources_steady_fifo_is_not_a_hard_stop(self):
         profiles = (SegmentProfile(UUID(int=310), 800, 400, 60 * SECOND, 100),
                     SegmentProfile(UUID(int=311), 80, 40, PRE, 100))
         self.assertEqual(27, self._steady_vbr_fifo(profiles, 25))
+        self.assertTrue(self.at_risk)
 
     def _mixed_cadence_ring(self, *, fast_end):
         unit, headroom = self.store.allocation_unit, self.ring.ledger_headroom

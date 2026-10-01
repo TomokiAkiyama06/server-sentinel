@@ -345,10 +345,14 @@ class HardReserveTests(RingScenario):
         self.assertGreater(2 * -(-fast.segment_bytes() // unit) * unit,
                            reclaim(t0 + MINUTE) - reclaim(t0 + half) + needed[a] - needed[b])
         self.quota.other = self.quota.capacity - self.quota.used() - free
+        # The buffered history is far below A's bound, so at the recent real
+        # bitrate the chained writes fit: not a hard stop. A sequence that
+        # fails only if every write jumps to the bound is reported as
+        # pressure, never as healthy.
         status = self.status(t0)
-        self.assertEqual(("STORAGE_HARD_STOP", "segment_write_refused_at_reserve"),
+        self.assertEqual(("STORAGE_PRESSURE", "post_loss_headroom_reduced"),
                          (status["state"], status["reason"]))
-        # The real chronological sequence of bounded writes is indeed refused
+        # The real chronological sequence of maximum-size writes is refused
         # before B's next append completes.
         maximum = b"x" * fast.segment_bytes()
         sequence = ((a, t0, t0 + half, maximum, t0 + half),

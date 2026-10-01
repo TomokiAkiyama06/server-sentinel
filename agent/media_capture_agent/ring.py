@@ -355,7 +355,7 @@ class DiskRing:
             "safety_reserve": self.settings.safety_reserve_bytes, "ledger_headroom": self.ledger_headroom,
         }
 
-    def _next_write_refused(self, now, budget, *, clock_trusted):
+    def _next_write_refused(self, now, budget, *, clock_trusted, at_bound=False):
         """Whether any source's next bounded segment would be refused.
 
         Writes are refused before they would cross the reserve, so free space
@@ -389,6 +389,10 @@ class DiskRing:
         consumes (and frees once it ages out) is the largest real allocation
         among that source's last ``RECENT_ALLOCATION_SEGMENTS`` stored
         segments, never above the bound; the bound is used without history.
+
+        With ``at_bound`` every simulated append consumes its maximum bound
+        instead: status uses that worst case only to warn (pressure) that a
+        rise to the maximum bitrate would be refused.
 
         Under untrusted time the trusted phases are not comparable with
         ``now`` (a rollback can leave them far in the future), and nothing is
@@ -430,7 +434,7 @@ class DiskRing:
             sizes = [allocations.get(UUID(row[0]), bound) for row in self.db.execute(
                 "SELECT id FROM segments WHERE source=? AND state='stored' "
                 "ORDER BY end DESC LIMIT ?", (str(source), RECENT_ALLOCATION_SEGMENTS))]
-            recent[source] = min(bound, max(sizes)) if sizes else bound
+            recent[source] = min(bound, max(sizes)) if sizes and not at_bound else bound
         window = self.config.value * SECOND if self.config.mode == "duration" else PRE
         events = []
         for source, profile in self.profiles.items():
@@ -941,6 +945,8 @@ class DiskRing:
             self.state, self.reason = "STORAGE_PRESSURE", "insufficient_ledger_capacity"
         elif budget["filesystem_free"] + budget["reclaimable_allocated"] < budget["required_additional"] + budget["safety_reserve"]:
             self.state, self.reason = "STORAGE_PRESSURE", "post_loss_headroom_reduced"
+        elif self._next_write_refused(now, budget, clock_trusted=clock_trusted, at_bound=True):
+            self.state, self.reason = "STORAGE_PRESSURE", "segment_write_at_risk_at_maximum_bitrate"
         elif self._pending_loss():
             self.state, self.reason = "degraded", "loss_time_anchor_unavailable"
         elif not clock_trusted or self.db.execute(

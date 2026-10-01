@@ -150,12 +150,26 @@ steady full ring that keeps accepting writes would be falsely reported as
 refused; nothing beyond the next append is credited. Sources do not get
 independent budgets: appends are simulated chronologically up to the latest
 source's next append (same-instant appends of synchronized sources, and
-repeated appends of a shorter-cadence source, included), each earlier append
-consuming `round_up(max_segment)` and each reclaimable segment credited only
-once, so the check is `free + R(t) - consumed_before(t) < reserve +
-round_up(max_segment + L)` at every simulated append time `t`. It is
-not reported as pressure or healthy while recording is refused, and it clears
-without Owner action as soon as space returns. `safety_reserve_unavailable`
+repeated appends of a shorter-cadence source, included). Each simulated
+append must fit at `round_up(max_segment + L)`, but the space it consumes,
+and frees once it ages out, is that source's recent real allocation `e`: the
+largest allocation among its last eight stored segments, never above
+`round_up(max_segment)`, and `round_up(max_segment)` without history. Charging
+every chained append the bound would make two or more sources writing
+ordinary VBR below the bound read as refused in a steady FIFO that accepts
+every write. Each reclaimable segment is credited only once, so the check is
+`free + R(t) - consumed_before(t) < reserve + round_up(max_segment + L)` at
+every simulated append time `t`, with `consumed_before(t)` summing `e`. A
+simulated segment is credited only for a source whose next interval is known
+(not overdue) and outside any retained incident. `STORAGE_HARD_STOP` thus
+means writes are refused at the recent real bitrate; a chain that would fail
+only if every write jumped to the bound is not a hard stop: the same
+simulation with every append consuming its bound reports
+`STORAGE_PRESSURE / segment_write_at_risk_at_maximum_bitrate` (unless an
+earlier pressure reason such as `post_loss_headroom_reduced` already applies),
+never healthy. It is not reported as pressure or healthy while recording is refused
+at the recent bitrate, and it clears without Owner action as soon as space
+returns. `safety_reserve_unavailable`
 remains the separate hard stop for another consumer breaching the reserve. Capacity limits use
 physical ordinary allocations and exclude shared protected bytes. A provisional
 write exceeding its actual allocation budget is rejected/cleaned before it is
