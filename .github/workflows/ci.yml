@@ -66,7 +66,7 @@ jobs:
           PYTHONPATH: server:agent:.
           E2E_REQUIRE_FULL_COVERAGE: '1'
         run: python -m unittest tests.e2e.test_mock_core_harness -v
-      - name: Hardware-free mock E2E storage, retention, notification, telemetry and capture mTLS scenarios
+      - name: Hardware-free mock E2E storage, retention, notification, access, pairing, detection isolation, telemetry and capture mTLS scenarios
         env:
           PYTHONDONTWRITEBYTECODE: '1'
           PYTHONPATH: server:agent:.
@@ -77,6 +77,9 @@ jobs:
           tests.e2e.test_agent_storage_scenarios
           tests.e2e.test_retention_scenarios
           tests.e2e.test_notification_fault_scenarios
+          tests.e2e.test_access_matrix_scenarios
+          tests.e2e.test_pairing_scenarios
+          tests.e2e.test_detection_isolation_scenarios
           tests.e2e.test_no_telemetry_scenarios
           tests.e2e.test_capture_mtls_scenarios
       - name: Whitespace validation

@@ -66,17 +66,47 @@ this in-process guard:
   and `STORAGE_PRESSURE` / `STORAGE_HARD_STOP`;
 - `test_notification_fault_scenarios.py` — Slack unset or failing keeps the
   local Dashboard/Audit fault and never reports delivery;
+- `test_access_matrix_scenarios.py` — uninvited, `live:view`-only,
+  `recordings:view`-only, both, revoked, paired capture-node (agent) credential
+  and spoofed Tailscale/proxy identity header callers: the composed Main app
+  answers every human, admin and media path identically (generic `404`,
+  WebSocket `1008`) without consulting even a permissive injected authorizer,
+  and the server-side grant state (`AccessStore.authorize`, the `live:view`
+  validator, and the historical timeline through a test adapter onto
+  `AccessStore.authorize(recordings:view)`) enforces the matrix with one
+  generic denial. A copied live session identifier and an agent credential
+  presented as a human session are refused. The FastAPI part needs the
+  hash-pinned `server/requirements.lock` (required CI); locally it skips;
+- `test_pairing_scenarios.py` — `PairingLedger` refuses expired codes, codes
+  from before a Main restart, reused codes/claims, a code bound to another key,
+  and a revoked node until a fresh Owner-approved pairing; the code reaches the
+  Agent only through the non-echoing terminal prompt (never argv/environment);
+  no code, verifier key (hex or bytes form) or code digest reaches logs,
+  stdout/stderr or audit rows, and the database holds only the keyed HMAC
+  digest in `pairing_enrollments.code_digest`, never a plaintext code or the
+  verifier key. Main trust verification and the TLS bootstrap are not
+  exercised;
+- `test_detection_isolation_scenarios.py` — a failing, malformed or missing
+  owner verifier yields `unknown` while motion and the calibrated ROI
+  `server_movement` output (through `CriticalDelivery`) continue; a raising,
+  malformed, missing, crashed or hung (isolated worker process) person
+  detector and a low-light frame yield `unknown`, revoke a published `absent`,
+  and are never reported as "no person". The per-frame loop is test
+  composition, not the future Main inference runtime;
 - `test_no_telemetry_scenarios.py` — normal and error paths make no outbound
   connection; only an explicitly configured Slack endpoint is ever attempted.
 
-These pass with generated placeholder bytes and synthetic mounts/quotas only;
-they are not hardware, real-filesystem-substitution or network acceptance.
+These pass with generated placeholder bytes, generated shapes/textures and
+synthetic mounts/quotas/credentials only; they are not hardware,
+real-filesystem-substitution, browser/WebAuthn, Tailscale/proxy, TLS or network
+acceptance.
 
 ```bash
 PYTHONPATH=server:agent:. python3 -m unittest \
   tests.e2e.test_agent_ring_scenarios tests.e2e.test_agent_storage_scenarios \
   tests.e2e.test_retention_scenarios tests.e2e.test_notification_fault_scenarios \
-  tests.e2e.test_no_telemetry_scenarios
+  tests.e2e.test_access_matrix_scenarios tests.e2e.test_pairing_scenarios \
+  tests.e2e.test_detection_isolation_scenarios tests.e2e.test_no_telemetry_scenarios
 ```
 
 `test_capture_mtls_scenarios.py` (Issue #13) runs the real Main capture-node CA,

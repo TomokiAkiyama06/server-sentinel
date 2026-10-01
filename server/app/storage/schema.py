@@ -1,7 +1,7 @@
 """Ordered application schema; feature modules never import this catalog."""
 
 from app.audit.schema import audit_migration
-from app.auth.schema import access_migration
+from app.auth.schema import access_migration, access_webauthn_migration
 from app.cameras.remote_agent.schema import PAIRING_MIGRATION, pairing_renewal_migration
 from app.cameras.registry.schema import REGISTRY_MIGRATION
 from app.cameras.uvc.schema import UVC_MIGRATION, uvc_explicit_binding_migration
@@ -37,8 +37,12 @@ APPLICATION_MIGRATIONS = (
     storage_audit_migration(14),
     notification_migration(15),
     monitoring_migration(16),
-    # Issue #13 capture-node certificate renewal. PR #97 (and PR #83) also
-    # claim 17; whichever merges later renumbers, since the runner requires a
+    # Issue #10 per-person WebAuthn credential state. PR #83 also claims 17;
+    # whichever merges second renumbers, since the runner requires a
     # contiguous sequence.
-    pairing_renewal_migration(17),
+    access_webauthn_migration(17),
+    # Issue #13 capture-node certificate renewal. PR #107 also claims 18;
+    # whichever merges second renumbers, since the runner requires a
+    # contiguous sequence.
+    pairing_renewal_migration(18),
 )

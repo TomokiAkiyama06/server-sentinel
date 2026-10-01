@@ -10,7 +10,7 @@
       "upstream": "https://pypi.org/project/cryptography/50.0.1/",
       "approved_by": "repository-owner",
       "approved_on": "2026-09-30",
-      "decision": "docs/decisions/2026-09-30-cryptography-mtls.md"
+      "decision": "docs/decisions/2026-09-30-cryptography-dependency.md"
     }
   ]
 }

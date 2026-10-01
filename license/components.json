@@ -243,19 +243,17 @@
       "license": "MIT-0",
       "license_evidence": [
         "https://pypi.org/pypi/cffi/2.1.1/json",
-        "server/docs/CRYPTOGRAPHY_AUDIT.md",
-        "server/docs/wheel-audit.json"
+        "server/docs/DEPENDENCIES.md"
       ],
       "transitive_evidence": [
-        "server/docs/CRYPTOGRAPHY_AUDIT.md",
-        "server/docs/cryptography-rust-audit.json",
+        "server/docs/wheel-audit.json",
         "agent/docs/cryptography-wheel-audit.json"
       ],
       "obligations": [
         "preserve-license-and-copyright"
       ],
       "notice_files": [
-        "server/docs/CRYPTOGRAPHY_THIRD_PARTY_LICENSE_TEXTS.md"
+        "server/docs/BACKEND_THIRD_PARTY_LICENSE_TEXTS.md"
       ],
       "locations": [
         {
@@ -331,12 +329,11 @@
       "license": "Apache-2.0 OR BSD-3-Clause",
       "license_evidence": [
         "https://pypi.org/pypi/cryptography/50.0.1/json",
-        "server/docs/CRYPTOGRAPHY_AUDIT.md",
-        "server/docs/wheel-audit.json"
+        "server/docs/DEPENDENCIES.md"
       ],
       "transitive_evidence": [
-        "server/docs/CRYPTOGRAPHY_AUDIT.md",
-        "server/docs/cryptography-rust-audit.json",
+        "server/docs/wheel-audit.json",
+        "server/docs/rust-audit.json",
         "agent/docs/cryptography-wheel-audit.json"
       ],
       "obligations": [
@@ -344,7 +341,7 @@
         "preserve-notice"
       ],
       "notice_files": [
-        "server/docs/CRYPTOGRAPHY_THIRD_PARTY_LICENSE_TEXTS.md"
+        "server/docs/BACKEND_THIRD_PARTY_LICENSE_TEXTS.md"
       ],
       "locations": [
         {
@@ -516,19 +513,17 @@
       "license": "BSD-3-Clause",
       "license_evidence": [
         "https://pypi.org/pypi/pycparser/3.0/json",
-        "server/docs/CRYPTOGRAPHY_AUDIT.md",
-        "server/docs/wheel-audit.json"
+        "server/docs/DEPENDENCIES.md"
       ],
       "transitive_evidence": [
-        "server/docs/CRYPTOGRAPHY_AUDIT.md",
-        "server/docs/cryptography-rust-audit.json",
+        "server/docs/wheel-audit.json",
         "agent/docs/cryptography-wheel-audit.json"
       ],
       "obligations": [
         "preserve-license-and-copyright"
       ],
       "notice_files": [
-        "server/docs/CRYPTOGRAPHY_THIRD_PARTY_LICENSE_TEXTS.md"
+        "server/docs/BACKEND_THIRD_PARTY_LICENSE_TEXTS.md"
       ],
       "locations": [
         {

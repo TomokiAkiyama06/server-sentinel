@@ -1,12 +1,22 @@
 # Agent dependency and distribution review
 
 **2026-09-30 update (Issue #13).** The Owner approved `cryptography` 50.0.1 for
-capture-node key, CSR and certificate handling
-(`../../docs/decisions/2026-09-30-cryptography-mtls.md`). `../requirements.lock`
+capture-node key, CSR and certificate handling; it is the single approval
+shared with the Main Server's WebAuthn use
+(`../../docs/decisions/2026-09-30-cryptography-dependency.md`). `../requirements.lock`
 pins cryptography 50.0.1, cffi 2.1.1 (MIT-0) and pycparser 3.0 with exact wheel
 hashes for CPython 3.12/3.14 on Linux x86_64/aarch64 (glibc); every permitted
-wheel is recorded in `cryptography-wheel-audit.json`, and the full license,
-OpenSSL 4.0.2 and Rust-crate review is `../../server/docs/CRYPTOGRAPHY_AUDIT.md`.
+wheel (filename, SHA-256, download URL, license-file hashes) is recorded in
+`cryptography-wheel-audit.json`. The Agent lock is wider than the Main lock
+because capture hosts are more often aarch64 single-board computers on varied
+distributions: cryptography `cp311-abi3` `manylinux_2_34` and `manylinux_2_28`
+(glibc 2.28-2.33 fallback), each x86_64 and aarch64; cffi `cp312` and `cp314`,
+each x86_64 and aarch64; pycparser `py3-none-any`. musl, free-threaded CPython,
+PyPy, 32-bit ARM and non-Linux wheels are not permitted. Every permitted
+cryptography wheel statically links the same OpenSSL 4.0.2 and is built from the
+same 50.0.1 sdist `Cargo.lock`, so the license, OpenSSL, libffi and Rust-crate
+review in `../../server/docs/DEPENDENCIES.md`, `../../server/docs/rust-audit.json`
+and `../../server/docs/BACKEND_THIRD_PARTY_LICENSE_TEXTS.md` applies unchanged.
 Only `media_capture_agent.node_tls` imports it. The zipapp still contains only
 application sources: it does not bundle these native wheels, and how an installed
 Agent provisions them for the non-root service account is open installer work.

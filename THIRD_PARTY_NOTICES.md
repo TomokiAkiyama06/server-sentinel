@@ -2,7 +2,9 @@
 
 Main Server runtime additions and the CI-only base image are reviewed separately
 in [`server/docs/DEPENDENCIES.md`](server/docs/DEPENDENCIES.md). That inventory
-includes all pinned Python wheels, Pydantic Core's Rust closure, image digests
+includes all pinned Python wheels, Pydantic Core's and cryptography's Rust
+closures, the OpenSSL and libffi code statically linked into the cryptography
+and cffi wheels, image digests
 and notice/source obligations. Preserve the bundled
 [`server/docs/BACKEND_THIRD_PARTY_LICENSE_TEXTS.md`](server/docs/BACKEND_THIRD_PARTY_LICENSE_TEXTS.md)
 with application deployments and redistributions.
@@ -73,4 +75,4 @@ RT-DETRv2 original implementation and original/converted model cards separately 
 
 ## Capture-node mTLS cryptography (Issue #13)
 
-The Owner approved `cryptography` 50.0.1 (Apache-2.0 OR BSD-3-Clause, used under Apache-2.0) on 2026-09-30 for capture-node CA, CSR and certificate handling on the Main Server and in `media-capture-agent`. Its closure pins cffi 2.1.1 (MIT-0) and pycparser 3.0 (BSD-3-Clause); every cryptography wheel statically links OpenSSL 4.0.2 (Apache-2.0) and Rust crates under permissive terms. See the [exact audit](server/docs/CRYPTOGRAPHY_AUDIT.md), the [Owner decision](docs/decisions/2026-09-30-cryptography-mtls.md) and the [preserved license texts](server/docs/CRYPTOGRAPHY_THIRD_PARTY_LICENSE_TEXTS.md). ServerSentinel does not vendor these wheels; a redistribution that ships them must include those texts.
+The Owner approved `cryptography` 50.0.1 (Apache-2.0 OR BSD-3-Clause, used under Apache-2.0) on 2026-09-30 for capture-node CA, CSR and certificate handling on the Main Server and in `media-capture-agent`. Its closure pins cffi 2.1.1 (MIT-0) and pycparser 3.0 (BSD-3-Clause); every cryptography wheel statically links OpenSSL 4.0.2 (Apache-2.0) and Rust crates under permissive terms. It is the same single approval and the same exact pins that the Main Server uses for WebAuthn verification (Issue #10). See the [backend audit](server/docs/DEPENDENCIES.md), the [Agent lock review](agent/docs/DEPENDENCIES.md), the [Owner decision](docs/decisions/2026-09-30-cryptography-dependency.md) and the [preserved license texts](server/docs/BACKEND_THIRD_PARTY_LICENSE_TEXTS.md). ServerSentinel does not vendor these wheels; a redistribution that ships them must include those texts.
