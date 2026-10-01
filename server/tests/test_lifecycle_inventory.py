@@ -1120,6 +1120,8 @@ class LifecycleInventoryTests(unittest.TestCase):
     def test_presence_observations_leave_only_through_a_tombstone(self):
         self.runtime.seed()
         ids = self.presence_rows()
+        # Verified past expire_history()'s 90-day horizon for these receipts.
+        self.now = datetime(2026, 6, 1, tzinfo=timezone.utc)
         _, baseline = self.record()
         # The retention path: observation, jobs and fact go, the tombstone
         # appears and the undelivered job adds an expired-unresolved event.
@@ -1161,6 +1163,8 @@ class LifecycleInventoryTests(unittest.TestCase):
         ids = self.presence_rows()
         self.runtime.execute("UPDATE presence_deliveries SET state='failed', attempts=1, "
                              "generation=1 WHERE observation=?", (ids["lost"],))
+        # Verified past expire_history()'s 90-day horizon for these receipts.
+        self.now = datetime(2026, 6, 1, tzinfo=timezone.utc)
         _, baseline = self.record()
         for table, column in (("presence_deliveries", "observation"),
                               ("presence_observations", "id"), ("presence_source_facts", "id")):
@@ -1175,6 +1179,56 @@ class LifecycleInventoryTests(unittest.TestCase):
                              "'2026-02-01T00:00:00.000000+00:00')")
         code, report, _ = self.verify(baseline)
         self.assertEqual(code, inventory.EXIT_PRESERVED, report["sections"]["presence"])
+
+    def test_observation_removal_needs_expiry_or_an_owner_clear(self):
+        # Codex P1: PresenceService removes an observation (with its jobs and
+        # source fact) only in expire_history() once expired, or in the
+        # audited clear_unresolved_critical_event(); a fresh unresolved one
+        # removed with a forged tombstone and marker is not either.
+        self.runtime.seed()
+        now = self.now
+        fresh = (now - timedelta(days=1)).isoformat(timespec="microseconds")
+        old = (now - timedelta(days=21)).isoformat(timespec="microseconds")
+        cases = {"forged": (fresh, "failed"), "cleared": (fresh, "failed"),
+                 "expired-resolved": (old, "delivered"), "expired-unresolved": (old, "failed"),
+                 "expired-plain": (old, None)}
+        ids = {}
+        for label, (received, state) in cases.items():
+            ids[label] = str(uuid4())
+            self.runtime.execute(
+                "INSERT INTO presence_observations (id, kind, source, received, payload) "
+                "VALUES (?, 'crossing', 'synthetic-source', ?, ?)",
+                (ids[label], received, json.dumps({"marker": "synthetic-" + label})))
+            self.runtime.execute("INSERT INTO presence_source_facts (id, digest) VALUES (?, ?)",
+                                 (ids[label], hashlib.sha256(label.encode()).hexdigest()))
+            if state is not None:
+                self.runtime.execute(
+                    "INSERT INTO presence_deliveries (observation, action, state, attempts, "
+                    "generation) VALUES (?, 'notification', ?, 1, 1)", (ids[label], state))
+        _, baseline = self.record()
+        at = now.isoformat(timespec="microseconds")
+        unresolved = 0
+        for label, (_, state) in cases.items():
+            for table, column in (("presence_deliveries", "observation"),
+                                  ("presence_observations", "id"),
+                                  ("presence_source_facts", "id")):
+                self.runtime.execute(f"DELETE FROM {table} WHERE {column}=?", (ids[label],))
+            if state is not None:
+                self.runtime.execute("INSERT INTO presence_completed_events VALUES (?, ?)",
+                                     (ids[label], at))
+                unresolved += state != "delivered"
+        self.runtime.execute("INSERT INTO presence_expired_unresolved VALUES ('notification', ?, ?)",
+                             (unresolved, at))
+        self.runtime.execute("INSERT INTO presence_audit (action, actor, at, state, target) "
+                             "VALUES ('critical_event_cleared', 'owner', ?, NULL, ?)",
+                             (at, ids["cleared"]))
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_FAILED)
+        failed = report["sections"]["presence"]["failed"]
+        for label in ("forged", "expired-unresolved"):
+            self.assertIn({"id": f"observations:{ids[label]}", "reason": "missing"}, failed)
+        for label in ("cleared", "expired-resolved", "expired-plain"):
+            self.assertNotIn({"id": f"observations:{ids[label]}", "reason": "missing"}, failed)
 
     def test_presence_clocks_sessions_and_override_follow_service_transitions(self):
         self.runtime.seed()
@@ -3170,6 +3224,27 @@ class LifecycleInventoryTests(unittest.TestCase):
         self.assertEqual(section["in_progress_at_record"], [ids["valid"]])
         for label in list(cases)[1:]:
             self.assertIn({"id": ids[label], "reason": "changed"}, section["failed"], label)
+
+    def test_unchanged_recordings_need_segments_the_store_would_link(self):
+        # Codex P1: the segment checks apply to every accepted recording, not
+        # only to growth: an unchanged one whose segment the store would have
+        # refused, or that belongs to another source, is not preserved.
+        seeded = self.runtime.seed()
+        with closing(sqlite3.connect(self.runtime.database)) as connection:
+            segments = {key: connection.execute(
+                "SELECT segment_id FROM recording_links WHERE recording_id=?",
+                (seeded[key],)).fetchone()[0] for key in ("ordinary", "starred")}
+        self.runtime.execute("UPDATE recording_segments SET codec='Bad Codec' WHERE id=?",
+                             (segments["ordinary"],))
+        self.runtime.execute("UPDATE recording_segments SET source_id=? WHERE id=?",
+                             (str(uuid4()), segments["starred"]))
+        _, baseline = self.record()
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_FAILED)
+        section = report["sections"]["recordings"]
+        for key in ("ordinary", "starred"):
+            self.assertIn({"id": seeded[key], "reason": "invalid_segment"}, section["failed"])
+            self.assertNotIn(seeded[key], section["preserved"])
 
     def test_extra_hard_link_to_a_segment_is_detected(self):
         # RecordingStore._integrity() treats st_nlink != 1 as corrupt.

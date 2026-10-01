@@ -390,10 +390,14 @@ presence state whose loss would replay, duplicate or hide critical work, each
 allowed only the transitions the presence service performs: completed-event
 tombstones and expired-unresolved markers (kept; marker counts may only rise),
 retained observations as keyed digests (never their content) with their
-delivery jobs and source-fact digests (they may leave only together with a
-completed tombstone, and a job that was not delivered only with the
-expired-unresolved event that retention and the Owner's release both add, so
-do not run timeline retention during the window;
+receipt times, delivery jobs and source-fact digests (an observation may leave
+only through timeline retention once expired — received more than 20 days
+before verify with no unfinished critical job, or more than 90 days before
+regardless — or through the Owner's audited release of unresolved critical
+work, which appends a `critical_event_cleared` audit row naming it; one that
+carried critical jobs leaves only together with its completed tombstone, and
+a job that was not delivered only with the expired-unresolved event both
+paths add;
 a job's state, attempts and generation may only move forward: a claim, a
 recorded outcome, or the audited Owner requeue back to pending, and a
 delivered job stays delivered; attempts rise only with a claim, which also
@@ -549,9 +553,11 @@ Presence and Owner-template audit rows have no automatic retention in Main
 and must all remain. A finished recording must be identical, including its
 target and ended boundaries (a segment's retention `spool` flag and its cached
 `integrity` label, which playback recomputes from the file, are not compared),
-and every segment must be readable and match its
-catalog digest and byte length with a single hard link even if it was already
-broken at record time (reported as `catalog_mismatch`; `record` prints a
+and every recorded and current segment of any accepted recording must come
+from the recording's own source, overlap its target window and pass the
+store's `Segment.validate()` (`invalid_segment` otherwise), and be readable
+and match its catalog digest and byte length with a single hard link even if
+it was already broken at record time (reported as `catalog_mismatch`; `record` prints a
 warning for such recordings). This gate applies to every accepted change,
 including a recording active at record time whose broken segment a later
 stop drops, and a declared rewrite. A recording that was still active when recorded

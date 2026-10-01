@@ -59,7 +59,7 @@ from __future__ import annotations
 import argparse
 from collections import Counter
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 import hmac
 import json
@@ -80,6 +80,7 @@ from app.integrity.model import Finding, Kind, State
 from app.media.recording.model import Limits as RecordingLimits, Segment
 from app.monitoring.runtime import EVENT_NAMESPACE
 from app.presence.delivery import ActionResult
+from app.presence.models import timestamp as presence_timestamp
 from app.presence.service import PresenceService
 from app.storage.retention import DAY_MS, RetentionPeriods
 from app.storage.schema import APPLICATION_MIGRATIONS
@@ -535,6 +536,15 @@ def _presence(connection, tables, salt: str, live_outbox: bool | None) -> dict:
             "SELECT id, kind, source, received, payload FROM presence_observations",
             lambda row: row[0],
             lambda row: _keyed(salt, ["presence-observation-v1", *tuple(row)[1:]])),
+        # Receipt times expire_history() compares (no content).
+        "observation_received": keyed_rows(
+            "presence_observations", "SELECT id, received FROM presence_observations",
+            lambda row: row[0], lambda row: row[1]),
+        # Observations the Owner released (clear_unresolved_critical_event()
+        # appends this audit row in the same transaction).
+        "cleared_events": None if "presence_audit" not in tables else sorted(
+            row[0] for row in connection.execute(
+                "SELECT target FROM presence_audit WHERE action='critical_event_cleared'")),
         "deliveries": keyed_rows(
             "presence_deliveries",
             "SELECT observation, action, state, attempts, generation, requeued "
@@ -605,7 +615,8 @@ def _delivery_advanced(before: dict, after: dict) -> bool:
 
 
 def _compare_presence(baseline: dict | None, current: dict | None,
-                      gap_before: dict | None, gap_now: dict | None) -> dict:
+                      gap_before: dict | None, gap_now: dict | None,
+                      rules: dict | None = None) -> dict:
     """Allow only the transitions PresenceService itself performs."""
     baseline, current = baseline or {}, current or {}
     failed = []
@@ -623,14 +634,31 @@ def _compare_presence(baseline: dict | None, current: dict | None,
             fail("expired_unresolved", key, "missing")
         elif now["since"] != value["since"] or now["events"] < value["events"]:
             fail("expired_unresolved", key)
-    # Retention and Owner release remove an observation (with its jobs and
-    # source fact) only while writing its completed tombstone.
+    # An observation (with its jobs and source fact) leaves only through
+    # PresenceService.expire_history() once expired, or the Owner's audited
+    # clear_unresolved_critical_event(); both write the completed tombstone
+    # of an observation that carried critical jobs.
     observations = current.get("observations") or {}
+    received = baseline.get("observation_received") or {}
+    recorded_jobs: dict = {}
+    for job in (baseline.get("deliveries") or {}).values():
+        recorded_jobs.setdefault(job["observation"], []).append(job["state"])
+    cleared = set(current.get("cleared_events") or ()) - set(baseline.get("cleared_events") or ())
+    rules = rules or {}
     for key, value in (baseline.get("observations") or {}).items():
         if key in observations:
             if observations[key] != value:
                 fail("observations", key)
-        elif key not in completed:
+            continue
+        at, jobs = received.get(key), recorded_jobs.get(key, [])
+        # expire_history(): past the timeline cutoff with no unfinished
+        # critical job, or past the audit-retention horizon regardless.
+        expired_out = (isinstance(at, str) and "presence_cutoff" in rules
+                       and (at < rules["presence_horizon"]
+                            or (at < rules["presence_cutoff"]
+                                and all(state in ("delivered", "disabled") for state in jobs))))
+        released = key in cleared and bool(jobs)
+        if not (expired_out or released) or (jobs and key not in completed):
             fail("observations", key, "missing")
     deliveries = current.get("deliveries") or {}
     # Retention and the Owner's clear_unresolved_critical_event() both add
@@ -1769,6 +1797,15 @@ def _service_valid_segment(segment: dict) -> bool:
     return type(catalog["byte_length"]) is int and catalog["byte_length"] > 0
 
 
+def _segments_consistent(item: dict) -> bool:
+    """Every linked segment is one the store would have linked to ``item``."""
+    return all(segment["source_id"] == item["source_id"]
+               and segment["start_ms"] < item["target_end_ms"]
+               and segment["end_ms"] > item["start_ms"]
+               and _service_valid_segment(segment)
+               for segment in item["segments"])
+
+
 def _expected_ended(now: dict) -> int | None:
     """The ended boundary the store writes for each status an active row reaches.
 
@@ -1876,15 +1913,24 @@ def _compare_recordings(baseline: dict | None, current: dict | None, *,
     # record held must itself have matched its catalog digest, byte length
     # and single hard link then. One RecordingStore._integrity() already
     # reported corrupt is never evidence, even if a later change drops it.
+    # The same gate checks every recorded and current segment of an accepted
+    # recording against the store's own rules: Segment.validate(), its own
+    # source, and an overlap with its target window (the only segments the
+    # store links and finish() keeps).
     rewrites = list(result["declared_rewrites"])
     for key, item in sorted(baseline.items()):
-        if all(segment["catalog_match"] for segment in item["segments"]):
+        if key not in preserved and key not in rewrites:
             continue
-        if key in preserved or key in rewrites:
-            preserved = [other for other in preserved if other != key]
-            in_progress = [other for other in in_progress if other != key]
-            rewrites = [other for other in rewrites if other != key]
-            failed.append({"id": key, "reason": "catalog_mismatch"})
+        if not all(segment["catalog_match"] for segment in item["segments"]):
+            reason = "catalog_mismatch"
+        elif not (_segments_consistent(item) and _segments_consistent(current[key])):
+            reason = "invalid_segment"
+        else:
+            continue
+        preserved = [other for other in preserved if other != key]
+        in_progress = [other for other in in_progress if other != key]
+        rewrites = [other for other in rewrites if other != key]
+        failed.append({"id": key, "reason": reason})
     result.update(status="failed" if failed else "preserved",
                   preserved=sorted(preserved), failed=failed,
                   declared_rewrites=rewrites,
@@ -1970,6 +2016,10 @@ def _retention_rules(now: datetime) -> dict:
         "integrity": lambda value: isinstance(value, str) and value < cutoff.isoformat(),
         "storage_state": lambda value: isinstance(value, int) and value < audit_ms,
         "recording_cutoff_ms": now_ms - periods.recording_days * DAY_MS,
+        # PresenceService.expire_history(): timeline cutoff and the audit
+        # horizon, in its own receipt-time text.
+        "presence_cutoff": presence_timestamp(now - timedelta(days=periods.recording_days)),
+        "presence_horizon": presence_timestamp(now - timedelta(days=periods.audit_days)),
     }
 
 
@@ -2059,7 +2109,8 @@ def compare(baseline: dict, current: dict, *, declared_rewrites=(), now=None) ->
             baseline.get("presence_timeline_gap"), current.get("presence_timeline_gap")),
         "presence": _compare_presence(
             baseline.get("presence"), current.get("presence"),
-            baseline.get("presence_timeline_gap"), current.get("presence_timeline_gap")),
+            baseline.get("presence_timeline_gap"), current.get("presence_timeline_gap"),
+            rules),
         "integrity_baseline": _compare_keyed(
             {"baseline": baseline["integrity_baseline"]}
             if baseline.get("integrity_baseline") is not None else None,
