@@ -4,7 +4,8 @@ A future human route resolves the caller with ``authorize_live_access`` (which
 runs ``AccessStore.authorize`` with ``Permission.LIVE_VIEW``) and receives a
 ``BoundLiveAccess`` tied to that caller's human access session.  This validator
 is what ``LiveViewerSessions`` re-runs on every open and every media read, so a
-grant change, principal revocation, credential revocation (a lost device),
+grant change, principal revocation, credential revocation (credential-scoped:
+a synced passkey is revoked wherever it exists, not on one device),
 session invalidation or expiry, or copied session identifier cannot keep a live
 stream open: the bound human access session must still be current, the
 principal must still be active at the exact authorization revision the session
@@ -80,7 +81,7 @@ def live_view_validator(database: Database, *,
                     "SELECT p.role, p.status, p.authorization_revision, s.principal_revision,"
                     " s.deployment_generation, s.invalidated_at_us, s.established_at_us,"
                     " s.last_seen_at_us, s.idle_expires_at_us, s.absolute_expires_at_us,"
-                    " c.revoked_at_us credential_revoked"
+                    " c.revoked_at_us credential_revoked, c.inconsistent_at_us credential_inconsistent"
                     " FROM access_sessions s JOIN access_principals p ON p.id=s.principal_id"
                     " JOIN access_credentials c ON c.credential_id=s.credential_id"
                     " WHERE s.id=? AND s.principal_id=?",
@@ -103,6 +104,7 @@ def live_view_validator(database: Database, *,
                 or row["deployment_generation"] != generation[0]
                 or row["invalidated_at_us"] is not None
                 or row["credential_revoked"] is not None
+                or row["credential_inconsistent"] is not None
                 or not row["established_at_us"] <= at < row["idle_expires_at_us"]
                 # A clock that moved before the last accepted activity fails
                 # closed exactly like ``AccessStore.authorize`` (AUTH-009), so a

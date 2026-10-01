@@ -69,9 +69,18 @@ audit store's reservation, so an audit failure leaves the invitation unredeemed.
 A rejected redemption records nothing, so unauthenticated guessing cannot grow
 the audit table. When a matched redemption's audit append or commit fails, the
 rolled-back outcome is counted in `AccessStore`'s own `audit_delivery_failed` /
-`undelivered_audit_records` health rather than appended separately. The target is always the principal's application UUID;
-external identity, display name, invitation secret, credential identifier and
-public key never reach the log.
+`undelivered_audit_records` health rather than appended separately. The WebAuthn
+ceremony (`app/auth/passkeys.py`) follows the same rule. A successful sign-in
+(`authenticate_principal`) and Owner step-up (`verify_principal_step_up`) commit
+their records with the session effect. A verified assertion whose backup
+eligibility changed records `mark_principal_credential_inconsistent` (actor
+`system`) with the credential marking and session revocation. A counter
+regression records `detect_principal_credential_sign_count_regression` (actor
+`system`, outcome `failed`). An assertion that matches no active credential, or
+fails verification, records nothing. The target is always the principal's
+application UUID; external identity, display name, invitation secret,
+credential identifier, public key, challenges, client data and signatures never
+reach the log.
 
 `PairingLedger` in `app/cameras/remote_agent/pairing.py` requires an
 `AuditStore` on the same database and records
