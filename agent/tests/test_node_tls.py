@@ -157,6 +157,10 @@ class NodeTlsTests(NodeTlsHarness):
         with patch.dict(os.environ, {"SSLKEYLOGFILE": str(self.root / "keylog")}):
             with self._connect(context, peer) as connection:
                 self.assertEqual("TLSv1.3", connection.version())
+                # The connect/handshake timeout must not outlive the verified
+                # handshake: a long-lived session would otherwise fail on the
+                # first send/recv that waits longer than it.
+                self.assertIsNone(connection.gettimeout())
                 connection.sendall(b"ping")
                 self.assertEqual(b"pong", connection.recv(4))
         peer.join()

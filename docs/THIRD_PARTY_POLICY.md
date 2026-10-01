@@ -24,6 +24,8 @@ Generally acceptable after normal review:
 - MIT
 - BSD-2-Clause
 - BSD-3-Clause
+- MIT-0 (MIT No Attribution; Owner decision 2026-09-30, see
+  [`decisions/2026-09-30-cryptography-dependency.md`](decisions/2026-09-30-cryptography-dependency.md))
 
 Other licenses require explicit evaluation.
 

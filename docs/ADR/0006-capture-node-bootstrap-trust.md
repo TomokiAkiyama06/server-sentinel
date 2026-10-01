@@ -200,10 +200,11 @@ These notes record implementation progress; they do not change this ADR's
 status or decision.
 
 - **Dependency.** The Owner approved `cryptography` 50.0.1 on 2026-09-30
-  (`docs/decisions/2026-09-30-cryptography-mtls.md`), resolving item 4 of the
-  implementation plan above. The exact release, wheel hashes, statically linked
-  OpenSSL 4.0.2, Rust crate closure and notices are audited in
-  `server/docs/CRYPTOGRAPHY_AUDIT.md`. TLS remains stdlib `ssl`.
+  (`docs/decisions/2026-09-30-cryptography-dependency.md`, the single approval
+  shared with Issue #10), resolving item 4 of the implementation plan above. The
+  exact release, wheel hashes, statically linked OpenSSL 4.0.2, Rust crate
+  closure and notices are audited in `server/docs/DEPENDENCIES.md` (Main) and
+  `agent/docs/DEPENDENCIES.md` (Agent lock). TLS remains stdlib `ssl`.
 - **Main issuer** (`server/app/cameras/remote_agent/node_ca.py`): EC P-256
   deployment CA (`pathlen=0`) whose key lives in a 0700 directory with 0600
   write-once files; a separate directory holds the serverAuth-only Main ingest
@@ -283,7 +284,7 @@ status or decision.
     that node's credential state. Revocation marks all of the node's keys
     revoked, and a revoked key is never bound again, even to the same node.
     Staging only checks and does not bind, so renewal retries with fresh keys
-    do not grow the table; promotion binds. Migration 17 backfills the keys
+    do not grow the table; promotion binds. Migration 19 backfills the keys
     that existing enrollment and credential rows still record; if one legacy
     key digest appears under two node IDs (any state), the migration fails
     closed and blocks startup rather than silently picking one binding, and
@@ -302,8 +303,9 @@ status or decision.
   - *Not wired yet.* The renewal request and response travel over the ingest
     session that #14/#15 will carry. `ingest.py`/`continuity.py` are unchanged,
     and no scheduler or listener runs the renewal or the monitor yet.
-  - The schema change is migration 17 (`pairing_credential_renewal`), which PR
-    #97 also numbers 17. Whichever merges later renumbers.
+  - The schema change is migration 19 (`pairing_credential_renewal`), after
+    main's 17 (`human_access_webauthn`, PR #97) and 18
+    (`human_access_shared_identity`, PR #107).
 
 ## Follow-up notes (2026-09-30, Issue #13 bootstrap enrollment and CLIs)
 

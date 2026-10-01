@@ -14,6 +14,14 @@ its production capture/transport/Owner-UI integration is still pending. See
 [`docs/RING_BUFFER.md`](docs/RING_BUFFER.md) for bounds, safe admission, coverage,
 expiry, recovery and validation limits.
 
+Issue #12 also adds the Agent-side UVC capture adapter (`uvc_identity.py`,
+`uvc_discovery.py`, `uvc_approvals.py`, `uvc_pipeline.py`, `uvc_capture.py`):
+stable identity/ambiguity rules ported from the Main local adapter, a durable
+approval latch, and one bounded video-only subprocess pipeline per source
+(operator-installed GStreamer `v4l2src` MJPEG) with separate per-source health.
+It is not yet wired into the production CLI, Owner approval route or transport;
+see [`capture/README.md`](capture/README.md).
+
 Implemented runtime modules live in `media_capture_agent/`: `config.py`,
 `storage.py`, `health.py`, `runtime.py`, and `cli.py`. Existing responsibility
 folders describe subsequent capture/pairing/transport work. Synthetic adapters
@@ -33,6 +41,44 @@ account; configuration is a regular file with mode 0600, owned by that account.
 Agent and installer reject FIFOs/special files without waiting for a writer.
 Both read at most 65,537 bytes before parsing, enforce the 64 KiB configuration
 limit and reject metadata changes during the read.
+
+### `--check` reason codes
+
+On failure `--check` exits with status 1 and prints exactly one line,
+`media-capture-agent: local deployment validation failed: <reason>`, to stderr.
+With `--check --json` it instead prints only `{"ok": false, "reason": "<reason>"}`
+to stdout (success: `{"ok": true}`); `--json` without `--check` is a usage error.
+The success line without `--json` is unchanged. The reason is a fixed word from
+the table below: filesystem UUIDs, device numbers, paths, mount sources, sizes,
+usernames and exception text are never printed. The Owner compares the code with
+their private configuration locally. Normal service startup reports the same
+codes. Validation stops at the first failing check, so only that check's code
+is reported; fix it and rerun to reveal any later failure.
+
+| Reason | Failing check |
+| --- | --- |
+| `config_invalid` | Configuration missing, unreadable, not a protected 0600 file owned by the running account, not JSON, unknown/missing key, or an invalid value/path (including a media root of `/` or overlapping roots) |
+| `mount_missing` | The approved mount is absent: the media root cannot be opened and the approved `mount_point` is not in the mount inventory, the pinned directory's mount is not listed, or a service bind exists without its approved parent mount |
+| `media_root_unavailable` | The media root cannot be opened (missing, not a directory, symlink component, not traversable) although the approved mount point is mounted |
+| `mount_replaced` | The mount or media directory changed between checks, or the directory is not on the device mountinfo reports (stacked/replaced mount) |
+| `media_root_owner_mismatch` | The media root is not owned by `service_uid` |
+| `media_root_permissions_too_open` | The media root is group- or world-writable |
+| `not_writable_by_service_account` | The owner lacks write or search permission on the media root |
+| `mount_inventory_unavailable` | `/proc/self/mountinfo` or fdinfo could not be read or parsed |
+| `media_root_on_root_filesystem` | The approved mount is not `/`, but the media root currently resolves to the root filesystem |
+| `mount_point_is_root` | `expected_mount.mount_point` is `/`, but the media root lives on a separate mount |
+| `mount_source_mismatch` | The mount `source` differs from the approved value |
+| `mount_device_mismatch` | The mount's device `major`/`minor` differs from the approved values |
+| `mount_identity_mismatch` | Any other approved-mount difference: filesystem type, `filesystem_root`, a different mount point, or a bind of another backing directory |
+| `mount_readonly` | The approved mount or filesystem is read-only |
+| `filesystem_uuid_mismatch` | `filesystem_uuid` does not resolve through `/dev/disk/by-uuid/` to the approved block-device major/minor |
+| `insufficient_free_space` | Free space is below `safety_reserve_bytes` (including a reserve larger than the filesystem) |
+| `storage_unavailable` | A filesystem query on the pinned media directory failed |
+| `service_account_mismatch` | Running as root, or not as `service_uid` |
+| `runtime_root_unavailable` | The runtime root cannot be opened |
+| `runtime_root_permissions_unsafe` | The runtime root is not owned by `service_uid` or grants any group/world access |
+| `runtime_root_not_writable` | The owner lacks write or search permission on the runtime root |
+| `check_failed` | Any other internal error; exception text is suppressed |
 
 The deployment-local JSON configuration requires every field below. No private
 path, device identity, disk reserve, segment limit or clock threshold is a public

@@ -53,9 +53,56 @@ audit store's reservation, so an audit failure leaves the invitation unredeemed.
 A rejected redemption records nothing, so unauthenticated guessing cannot grow
 the audit table. When a matched redemption's audit append or commit fails, the
 rolled-back outcome is counted in `AccessStore`'s own `audit_delivery_failed` /
-`undelivered_audit_records` health rather than appended separately. The target is always the principal's application UUID;
-external identity, display name, invitation secret, credential identifier and
-public key never reach the log.
+`undelivered_audit_records` health rather than appended separately. The WebAuthn
+ceremony (`app/auth/passkeys.py`) follows the same rule. A successful sign-in
+(`authenticate_principal`) and Owner step-up (`verify_principal_step_up`) commit
+their records with the session effect. A verified assertion whose backup
+eligibility changed records `mark_principal_credential_inconsistent` (actor
+`system`) with the credential marking and session revocation. A counter
+regression records `detect_principal_credential_sign_count_regression` (actor
+`system`, outcome `failed`). A session whose trusted-proxy identity binding
+does not match records `detect_session_proxy_identity_mismatch` (actor
+`system`, outcome `denied`) in its own transaction after the request is denied,
+at most once per session per ten minutes; further mismatches only increment the
+session's `binding_mismatch_suppressed` counter, and a failed append still
+denies the request and is counted in the store's undelivered-audit health. An
+assertion that matches no active credential, or fails verification, records
+nothing. The target is always the principal's
+application UUID; external identity, display name, invitation secret,
+credential identifier, public key, challenges, client data and signatures never
+reach the log.
+
+First-run wizard progress (Issue #48) changes only through
+`SetupWizardService` in `app/setup_wizard/service.py`, which wraps
+`OwnerAuditService.execute_transactional()` around
+`WizardStateStore.transition_on()`. Each transition commits in the same SQLite
+transaction as its `transition_setup_wizard_step` record, targeting the fixed
+logical UUID of the step (`setup_wizard_step`); the requested status and any
+setting value are never recorded. A non-Owner is refused with a `denied` record
+and nothing runs, a refused transition (stale revision, a skipped required
+step, out-of-order progress) rolls back and records `failed`, and an audit write
+failure rolls the transition back. Reading wizard progress passes the same
+Owner authorizer and writes nothing when refused. The plain
+`WizardStateStore.transition()` wrapper refuses with `UnauditedWizardWriteError`
+outside explicit fixture use. Neither the `action` nor the `target_kind` column
+has a CHECK constraint, so the new vocabulary needs no migration.
+
+This generic Owner path may mark only Welcome `completed`
+(`GENERIC_COMPLETABLE_STEPS`); a `completed` request for any other step is
+refused server-side and recorded as `failed`. Those steps record verified work,
+so each may be completed only by its own integration once that integration
+exists and has verified its result; until then they can only be deferred as
+`unavailable`, skipped when optional, or retried, and `deployment_ready` cannot
+become true through this service. A request for the step's current status at
+its current revision changes nothing but still appends one `succeeded` record:
+it is an authorized Owner attempt, so "one record per wizard step change"
+(`MANUAL_TEST.md` W) counts attempts, including such no-ops.
+
+Before a human route to this service is mounted (#10), the route must add
+admission / rate limiting for refused callers: every refused transition
+attempt appends one `denied` record, so an unauthenticated or non-Owner caller
+must not be able to grow the audit table without bound. (Refused reads write
+nothing.)
 
 `PairingLedger` in `app/cameras/remote_agent/pairing.py` requires an
 `AuditStore` on the same database and records

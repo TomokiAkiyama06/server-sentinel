@@ -1,7 +1,7 @@
 # media-capture-agent runtime lock for the ADR-0006 pairing/mTLS adapter only.
 # Python 3.12 / 3.14, Linux x86_64 / aarch64 (glibc manylinux wheels).
 # Exact verified wheel hashes; install --require-hashes --only-binary=:all:.
-# Owner decision: docs/decisions/2026-09-30-cryptography-mtls.md
+# Owner decision: docs/decisions/2026-09-30-cryptography-dependency.md
 cffi==2.1.1 \
     --hash=sha256:68e62fe11f30d5ca8289242866f0a5291402d8529ca2178ab8afc5c9694ae890 \
     --hash=sha256:c1453022f490d2459a11819d83ad1d586e9ff65a12ac3e705ffebd46d3685dcf \

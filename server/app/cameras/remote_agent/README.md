@@ -27,7 +27,7 @@ capture-node authorization primitive: it cannot authorize a human/API route.
 ## Capture-node CA and mTLS ingest adapter (Issue #13)
 
 `node_ca.py` is the deployment-local issuer (uses the Owner-approved
-`cryptography` dependency, see `server/docs/CRYPTOGRAPHY_AUDIT.md`). It creates or
+`cryptography` dependency, see `server/docs/DEPENDENCIES.md`). It creates or
 loads the EC P-256 deployment CA from an owner-only (0700) directory with
 write-once 0600 files, writes the serverAuth-only Main ingest certificate/key to a
 *different* private directory, exports the public trust bundle with its full
