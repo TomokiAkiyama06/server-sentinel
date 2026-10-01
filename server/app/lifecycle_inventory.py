@@ -683,6 +683,11 @@ def _security_state(connection, tables, salt: str) -> dict:
         "pairing_enrollments_open": None if enrollments is None else sorted(
             [row["id"], row["node_id"], _keyed(salt, ["pairing-key-v1", row["public_key_digest"]])]
             for row in enrollments if row["state"] in ("pending", "consumed")),
+        # Every enrollment (any state) with its state, to check transitions.
+        "pairing_enrollments": None if enrollments is None else {
+            row["id"]: {"node_id": row["node_id"], "state": row["state"],
+                        "key_ref": _keyed(salt, ["pairing-key-v1", row["public_key_digest"]])}
+            for row in enrollments},
         # Every key an enrollment (any state) names: approve() bound them,
         # while stage_renewal() binds keys no enrollment names.
         "pairing_enrollment_keys": None if enrollments is None else sorted(
@@ -702,6 +707,19 @@ def _by_enrollment(items) -> bool:
     return items is not None and all(isinstance(item, list) and len(item) == 3 for item in items)
 
 
+# PairingLedger enrollment states reachable from each recorded state, as
+# compositions of redeem() (pending -> consumed, or -> expired when its
+# process epoch or expiry has passed), activate() (consumed -> activated)
+# and revoke() (pending / consumed -> revoked); the rest are final.
+_ENROLLMENT_SUCCESSORS = {
+    "pending": frozenset({"pending", "consumed", "expired", "activated", "revoked"}),
+    "consumed": frozenset({"consumed", "activated", "revoked"}),
+    "expired": frozenset({"expired"}),
+    "activated": frozenset({"activated"}),
+    "revoked": frozenset({"revoked"}),
+}
+
+
 def _compare_pairing(baseline: dict, current: dict) -> list:
     """The capture-node pairing ledger, checked against PairingLedger itself.
 
@@ -711,7 +729,8 @@ def _compare_pairing(baseline: dict, current: dict) -> list:
     - approve(node, key): a new pending enrollment; binds the key live
       (_bind_key() refuses a key bound elsewhere or revoked, but accepts one
       already live for the same node, even a currently staged key).
-    - redeem(): pending -> consumed, or pending -> expired.
+    - redeem(): pending -> consumed, or pending -> expired (a previous
+      process epoch or a passed expiry; nothing else expires enrollments).
     - activate(claim): consumed -> activated; binds its key live; the node's
       credential becomes (key, serial, not_after) and active (inserted or
       overwritten); any staged renewal is deleted.
@@ -741,7 +760,9 @@ def _compare_pairing(baseline: dict, current: dict) -> list:
       activated enrollment's key is bound (perhaps revoked) to its node.
 
     And per node, record -> verify is a composition of those operations:
-    activated enrollments stay; a recorded binding keeps its node and never
+    every recorded enrollment stays with its node and key, a pending one
+    may become consumed, expired, activated or revoked, a consumed one
+    activated or revoked, and the other states are final; a recorded binding keeps its node and never
     un-revokes, and once any of a node's recorded live bindings, or a binding
     first seen now, is revoked (only revoke() does that) all of the node's
     recorded bindings are; a revoked credential stays
@@ -805,16 +826,19 @@ def _compare_pairing(baseline: dict, current: dict) -> list:
             if (bindings.get(key_ref) or {}).get("node_id") != node:
                 fail("pairing_enrollments", enrollment, "unbound")
 
-    # -- enrollments: recorded activations stay; which ones are fresh ------
-    if _by_enrollment(recorded_activations) and _by_enrollment(activations_now):
-        now_by_id = {item[0]: tuple(item[1:]) for item in activations_now}
-        for item in recorded_activations:
-            if item[0] not in now_by_id:
-                fail("pairing_activations", item[0], "missing")
-            elif now_by_id[item[0]] != tuple(item[1:]):
-                fail("pairing_activations", item[0], "changed")
-    elif recorded_activations:
-        failed.append({"id": "pairing_activations", "reason": "unverifiable"})
+    # -- enrollments: never deleted, node / key fixed, states move forward --
+    recorded_enrollments = baseline.get("pairing_enrollments")
+    enrollments_now = current.get("pairing_enrollments") or {}
+    if isinstance(recorded_enrollments, dict):
+        for enrollment, before in sorted(recorded_enrollments.items()):
+            after = enrollments_now.get(enrollment)
+            if after is None:
+                fail("pairing_enrollments", enrollment, "missing")
+            elif ((after["node_id"], after["key_ref"]) != (before["node_id"], before["key_ref"])
+                  or after["state"] not in _ENROLLMENT_SUCCESSORS.get(before["state"], ())):
+                fail("pairing_enrollments", enrollment, "changed")
+    elif recorded_activations or recorded_open:
+        failed.append({"id": "pairing_enrollments", "reason": "unverifiable"})
     # Only an enrollment activated after the record explains a new identity:
     # one open at record time, unchanged, or one created since, whose key
     # approve() newly bound (a key already recorded as bound or activated is
@@ -1565,8 +1589,23 @@ def _compare_recordings(baseline: dict | None, current: dict | None, *,
             failed.remove(entry)
             preserved.append(key)
             in_progress.append(key)
+    # The single gate every accepted transition passes (unchanged, valid
+    # growth incl. an early stop's trim, declared rewrite): each segment the
+    # record held must itself have matched its catalog digest, byte length
+    # and single hard link then. One RecordingStore._integrity() already
+    # reported corrupt is never evidence, even if a later change drops it.
+    rewrites = list(result["declared_rewrites"])
+    for key, item in sorted(baseline.items()):
+        if all(segment["catalog_match"] for segment in item["segments"]):
+            continue
+        if key in preserved or key in rewrites:
+            preserved = [other for other in preserved if other != key]
+            in_progress = [other for other in in_progress if other != key]
+            rewrites = [other for other in rewrites if other != key]
+            failed.append({"id": key, "reason": "catalog_mismatch"})
     result.update(status="failed" if failed else "preserved",
                   preserved=sorted(preserved), failed=failed,
+                  declared_rewrites=rewrites,
                   in_progress_at_record=sorted(in_progress))
     return result
 

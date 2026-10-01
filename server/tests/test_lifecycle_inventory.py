@@ -1381,8 +1381,8 @@ class LifecycleInventoryTests(unittest.TestCase):
         self.assertEqual(code, inventory.EXIT_FAILED)
         self.assertEqual(sorted(report["sections"]["security_state"]["failed"],
                                 key=lambda item: item["id"]),
-                         [{"id": f"pairing_activations:{recorded}", "reason": "missing"},
-                          {"id": f"pairing_credentials:{node}", "reason": "changed"}])
+                         [{"id": f"pairing_credentials:{node}", "reason": "changed"},
+                          {"id": f"pairing_enrollments:{recorded}", "reason": "missing"}])
         # The recorded activation restored: the reinserted copy still reuses
         # a key bound at record time, so it is no fresh pairing.
         self.runtime.execute(
@@ -1638,6 +1638,42 @@ class LifecycleInventoryTests(unittest.TestCase):
         code, report, _ = self.verify(baseline)
         self.assertEqual(report["sections"]["security_state"]["failed"],
                          [{"id": f"pairing_renewals:{node}", "reason": "enrollment_key"}])
+
+    def test_recorded_enrollments_only_move_forward(self):
+        # Codex P1: PairingLedger never deletes an enrollment; redeem() moves
+        # pending -> consumed / expired, activate() consumed -> activated,
+        # revoke() pending / consumed -> revoked; the rest are final.
+        self.runtime.seed()
+        node = self._paired_node("a" * 64, "c" * 64)
+        self.runtime.execute("INSERT INTO pairing_key_bindings VALUES (?, ?, 0)", ("a" * 64, node))
+        states = {"deleted": "pending", "rewound": "consumed", "revived": "expired",
+                  "expires": "pending", "revoked": "consumed", "completes": "pending"}
+        ids = {}
+        for index, (label, state) in enumerate(states.items()):
+            key = f"{index}e".ljust(64, "0")
+            ids[label] = str(uuid4())
+            self.runtime.execute("INSERT INTO pairing_key_bindings VALUES (?, ?, 0)", (key, node))
+            self.runtime.execute(
+                "INSERT INTO pairing_enrollments VALUES (?, ?, ?, 'f', 'epoch', 0, ?)",
+                (ids[label], node, key, state))
+        _, baseline = self.record()
+        self.runtime.execute("DELETE FROM pairing_enrollments WHERE id=?", (ids["deleted"],))
+        update = "UPDATE pairing_enrollments SET state=? WHERE id=?"
+        self.runtime.execute(update, ("pending", ids["rewound"]))
+        self.runtime.execute(update, ("activated", ids["revived"]))
+        self.runtime.execute(update, ("expired", ids["expires"]))
+        self.runtime.execute(update, ("revoked", ids["revoked"]))
+        self.runtime.execute(update, ("activated", ids["completes"]))
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_FAILED)
+        self.assertEqual(sorted(report["sections"]["security_state"]["failed"],
+                                key=lambda item: item["id"]),
+                         sorted([{"id": f"pairing_enrollments:{ids['deleted']}",
+                                  "reason": "missing"},
+                                 {"id": f"pairing_enrollments:{ids['rewound']}",
+                                  "reason": "changed"},
+                                 {"id": f"pairing_enrollments:{ids['revived']}",
+                                  "reason": "changed"}], key=lambda item: item["id"]))
 
     def test_a_staged_renewal_is_never_restaged_onto_a_superseded_key(self):
         # Codex P1: stage_renewal() accepts a key already bound to the node
@@ -2301,6 +2337,30 @@ class LifecycleInventoryTests(unittest.TestCase):
         for key in ("ordinary", "starred"):
             self.assertIn({"id": seeded[key], "reason": "catalog_mismatch"}, section["failed"])
             self.assertNotIn(seeded[key], section["preserved"])
+
+    def test_a_stop_never_launders_a_segment_corrupt_at_record(self):
+        # Codex P1: the active-recording path must also refuse a recording
+        # whose recorded segment already failed its catalog check, even when
+        # a legitimate early stop then drops that segment.
+        self.runtime.seed()
+        active = self.runtime.recording(starred=False, payload=b"generated-active-corrupt",
+                                        status="active", target_end_ms=30000)
+        tail = self.runtime.add_segment(active, b"generated-tail-corrupt",
+                                        start_ms=12000, end_ms=20000)
+        path = self.runtime.root / "recordings" / (UUID(tail).hex + ".seg")
+        path.write_bytes(b"generated-tail-altered")
+        _, baseline = self.record()
+        self.runtime.execute("UPDATE recordings SET status='complete', target_end_ms=11000, "
+                             "ended_ms=11000 WHERE id=?", (active,))
+        self.runtime.execute("DELETE FROM recording_links WHERE segment_id=?", (tail,))
+        self.runtime.execute("DELETE FROM recording_segments WHERE id=?", (tail,))
+        path.unlink()
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_FAILED)
+        section = report["sections"]["recordings"]
+        self.assertIn({"id": active, "reason": "catalog_mismatch"}, section["failed"])
+        self.assertNotIn(active, section["preserved"])
+        self.assertEqual(section["in_progress_at_record"], [])
 
     def test_extra_hard_link_to_a_segment_is_detected(self):
         # RecordingStore._integrity() treats st_nlink != 1 as corrupt.

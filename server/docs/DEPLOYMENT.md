@@ -420,8 +420,10 @@ an activated enrollment's key is bound to its node, and a staged renewal's
 key is never the key of any enrollment, recorded or current, in any state
 (stage renewal binds keys no enrollment names). From record to
 verify, each node may only change by a composition of those operations:
-enrollments activated at record time stay activated with the same node and
-key; a revoked credential stays revoked with the same material; an active one
+every enrollment recorded (any state) stays with the same node and key and
+only moves forward: pending to consumed, expired, activated or revoked,
+consumed to activated or revoked, the other states final (a vanished one is
+`missing`); a revoked credential stays revoked with the same material; an active one
 stays, becomes the renewal staged at record time (promotion) or the identity
 a fresh pairing installed (an enrollment pending or consumed at record time
 with the same node and key, or a new one whose key was neither bound nor
@@ -488,7 +490,9 @@ counted as preserved. A finished recording must be identical, including its
 target and ended boundaries, and every segment must be readable and match its
 catalog digest and byte length with a single hard link even if it was already
 broken at record time (reported as `catalog_mismatch`; `record` prints a
-warning for such recordings). A recording that was still active when recorded
+warning for such recordings). This gate applies to every accepted change,
+including a recording active at record time whose broken segment a later
+stop drops, and a declared rewrite. A recording that was still active when recorded
 may gain segments, move its target end earlier but never later, and stay
 `active` with no end or become `complete` or `gapped` ending exactly at its
 (possibly earlier) target, or `interrupted` ending exactly at the earlier of
