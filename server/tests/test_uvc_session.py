@@ -401,6 +401,37 @@ class FrameProgressTests(unittest.TestCase):
         self.assertTrue(self.session.step())
         self.assertEqual(CameraState.ONLINE, self.controller.state)
 
+    def test_hung_capture_teardown_never_leaves_the_source_online(self):
+        capture = self.go_online()
+        entered, release = threading.Event(), threading.Event()
+
+        def blocking_close():
+            # STREAMOFF/unmap/close hung in the kernel.
+            entered.set()
+            release.wait(5)
+            capture.closed = True
+
+        capture.close = blocking_close
+        self.discovery.devices = []
+        self.clock.advance(self.session.presence_scan_seconds)
+        worker = threading.Thread(target=self.session.step)
+        worker.start()
+        try:
+            self.assertTrue(entered.wait(5))
+            self.assertEqual(CameraState.OFFLINE, self.controller.state)
+            self.assertEqual("video_capture_closed", self.events[-1].reason)
+            self.assertIsNone(self.controller.bound)
+            self.assertFalse(self.session.stopped)
+            self.clock.advance(60)
+            self.assertFalse(self.session.check_frame_progress())
+            self.assertEqual(CameraState.OFFLINE, self.controller.state)
+        finally:
+            release.set()
+            worker.join(5)
+        self.assertTrue(capture.closed)
+        self.assertTrue(self.session.stopped)
+        self.assertEqual("device_disconnected", self.events[-1].reason)
+
     def test_watchdog_never_raises_a_closed_or_offline_source(self):
         self.go_online()
         self.session.close()
