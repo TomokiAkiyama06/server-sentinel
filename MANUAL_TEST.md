@@ -296,6 +296,66 @@ Health:
 
 Apply the exact-model, UVC-capability, stable-identity, and reconnect checks in section A to capture-node cameras as well as Main Server cameras.
 
+### Capture-node verification record (2026-09-30, Issue #12)
+
+Environment (coarse by design; exact models, versions, serials, paths and host
+identifiers stay in the private local test record): remote capture node
+(x86_64 Linux), one serial-bearing UVC camera (MJPEG), non-root operator account.
+Code: PR #88 HEAD `7840f4a`, driven by a local harness around `UvcCapture` and
+`GStreamerLauncher`. Frames were counted and discarded in memory; nothing was
+stored or viewed. No systemd unit or dedicated service account was used, so the
+Installation/service checkboxes above remain open.
+
+- [x] discovery binds only the video capture node; the UVC metadata node is
+      excluded, audio is not enumerated, 0 probe failures;
+- [x] real hardware: the single camera was discovered as a source keyed by its
+      vendor/product/serial/interface identity (values in the private record),
+      and that source was approved and brought online (see below);
+- [x] synthetic (harness-injected enumeration, not physical): with a changed
+      node path, port or device number injected, the identity still matches;
+      an injected different serial is absent; an injected duplicate serial
+      requires manual intervention. This checks the matching logic on the
+      capture node only; the physical cases are the two pending items below;
+- [x] a never-approved source reports `manual_intervention_required` /
+      `owner_approval_required`, starts no process, and performs only read-only
+      `QUERYCAP`/`ENUM_FMT` probes;
+- [x] after approval the source is online in ~1.0 s; steady-state MJPEG
+      1080p30/720p30/360p30 measured 30.02/30.01/29.90 fps with 0 missing
+      frames and 0 queue drops, JPEG SOF dimensions matching the request;
+      agent+GStreamer CPU ≤ 2.9 %, RSS ≤ 33 MiB (agent) + 10 MiB (child);
+      camera warm-up is ~35 frames at ~13.5 fps followed by a pause of up to
+      336 ms before steady 30 fps;
+- [x] the child argv references video only through `/proc/self/fd/N`; its
+      environment is limited to `GST_REGISTRY`, `LC_ALL`, `PATH`; it runs in
+      its own process group;
+- [x] unsupported profiles (4K30, 1080p60, 720p25) never become online and
+      report `capture_failed` with 1/2/4/8 s backoff (not `capture_unsupported`);
+- [x] `close()` completes in 0.02 s leaving no child, no process-group member
+      and no video descriptor;
+- [x] `SIGSTOP` of the child yields `capture_failed` after the stall timeout
+      (~6.5 s); the child is reaped and relaunched to online;
+- [x] `SIGKILL` of the agent (no systemd): the child exits in < 1 s and the next
+      start requires re-approval;
+- [x] `/dev/snd` is never opened (strace over the full lifecycle, cold and warm
+      GStreamer registry);
+- [ ] **FAIL:** during v4l2 plugin initialisation the `gst-launch` child opens
+      every `/dev/video*` node `O_RDWR`, including non-approved and metadata
+      nodes; with a cold registry it also loads ALSA/PulseAudio/PipeWire plugin
+      libraries (no audio device or socket use observed). Observed at PR #88
+      HEAD `7840f4a`; fix in progress on PR #88. This record must be re-traced
+      and updated on the fixed HEAD after PR #88 merges (it stays FAIL until
+      then);
+- [ ] pending: dedicated service account and systemd unit with a
+      `DevicePolicy`/`DeviceAllow` video-node allowlist (check whether the
+      over-broad open above then fails with `EPERM` and whether capture still
+      starts) — requires root;
+- [ ] pending (real hardware): USB unplug and replug into another port (source
+      offline while the agent stays up; the same identity matches on the new
+      port/node; same source returns online only after a new frame);
+- [ ] pending (real hardware): a camera with a different serial is not bound
+      to the approved source, and a second identical camera
+      (duplicate/no-serial ambiguity) requires manual intervention.
+
 ## C. Room-overview camera placement
 
 For the intended wide room view:
@@ -475,6 +535,31 @@ Record:
 - audit event;
 - manual-intervention requirement if automatic recovery is unsafe.
 
+### LAN baseline measurement (2026-09-30, Issue #15; no transport candidate yet)
+
+This is a baseline of the private LAN path from the remote capture node to the
+Main Server, not a transport evaluation. It was a short measurement on an idle
+LAN; the transport comparison and the impairment matrix above remain pending.
+No checkbox above is completed by it.
+
+- RTT (200 ICMP echoes): p50/p95/p99/max 2.61/3.17/3.50/5.63 ms, 0 % loss;
+- TCP one-way throughput (10 s, two runs): 940.7 / 939.4 Mbps;
+- UDP constant rate, 1200-byte payload, 20 s each: 30/40/60/100 Mbps all 0 %
+  loss; reordered datagrams 0/0/19/1; RFC 3550 interarrival jitter
+  0.370/0.350/0.297/0.125 ms;
+- observed camera MJPEG bitrate: ≈ 60 Mbps (1080p30), ≈ 30 Mbps (720p30),
+  ≈ 26 Mbps (360p30).
+
+Pending once a transport exists (human/root steps; prefer a dedicated NIC or
+VLAN for `netem` so unrelated traffic is not impaired):
+
+- [ ] LAN cable pull for ~1 s, ~5 s and ~2 min;
+- [ ] switch/AP restart;
+- [ ] `netem` loss, delay and rate limits (including rates below the observed
+      MJPEG bitrate) to exercise backpressure;
+- [ ] Main ServerSentinel service restart;
+- [ ] capture-node reboot.
+
 ## H. Clock synchronization
 
 - [ ] main/capture node normally synchronize through NTP/chrony or equivalent;
@@ -482,6 +567,9 @@ Record:
 - [ ] controlled excessive skew causes degraded state/warning;
 - [ ] timeline does not silently present unreliable remote timestamps as exact;
 - [ ] recovery clears degraded state appropriately.
+
+Pending (2026-09-30): controlled clock skew on the capture node via
+`timedatectl` requires root and was not performed in the capture-host session.
 
 ## I. Live view from phone, Mac, and desktop
 
@@ -735,6 +823,44 @@ intercepted Slack transport. On the deployment, additionally check:
 - [ ] recovery uses hysteresis.
 
 Never intentionally fill a production filesystem to zero free bytes.
+
+### Agent storage/ring verification record (2026-09-30, Issue #16)
+
+Environment: remote capture node (x86_64 Linux), non-root operator account,
+disposable loop-mounted ext4 volume. Synthetic segments and a synthetic trusted
+clock drove the real `MediaStore`; no camera media was written. Profile: 2
+sources, 10 s segments, 4 Mbps, safety reserve 256 MiB. Mount identity values
+stay in the private local record. Code: `main` at `83d387f` (the pre-fix base
+of PR #104; `agent/` unchanged on `main` since `bec201b`).
+
+- [x] `--check` passes on the approved mount and refuses a wrong filesystem
+      UUID, device minor or mount source, a reserve larger than free space, a
+      media root on the root filesystem and mount point `/` (no files created);
+- [x] duration mode 900 s keeps exactly 900 s per source (FIFO) after 30 min
+      written;
+- [x] unexpected loss produces a complete incident covering T−600..T+600 s per
+      source with no gaps, retained through a further 30 min of FIFO writes;
+      `STORAGE_PRESSURE` / `post_loss_headroom_reduced` is reported when the
+      next incident cannot fit; expiry is set to end + 60 days and is not
+      applied under an untrusted clock;
+- [x] oversized configurations (capacity 4 GiB, duration 3600 s) are refused
+      with `insufficient_simultaneous_pre_post_budget`;
+- [x] lazy unmount while running, an empty same-name directory on the root
+      filesystem, and a different filesystem at the mount path each refuse
+      writes with `STORAGE_HARD_STOP` (`storage_path_unavailable` /
+      `mount_replaced`) and create no fallback file; remounting the approved
+      volume recovers the ledger;
+- [ ] **FAIL:** capacity mode is not configurable at realistic sizes (the
+      ledger requirement is ≈ 48 × capacity). Fix in PR #104 (Refs #16);
+      re-verify on a real disk after it merges;
+- [ ] **FAIL:** a write refused because of the safety reserve is reported as
+      `STORAGE_PRESSURE` / `post_loss_headroom_reduced`, never
+      `STORAGE_HARD_STOP`. Fix in PR #104 (Refs #16); re-verify on a real disk
+      after it merges.
+
+The real segmenter/profile, authenticated transport, Owner UI and systemd
+deployment checks in section G and the Issue #16 note in *Test metadata* remain
+open.
 
 ## R. Long-duration / performance
 
