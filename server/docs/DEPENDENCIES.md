@@ -47,7 +47,7 @@ Static Python-wheel network review found no telemetry SDK or opaque runtime down
 
 ## Issue #10 addition: `cryptography` (2026-09-30)
 
-The Owner approved the Python `cryptography` package on 2026-09-30 (given for Issue #13's mTLS adapters). Issue #10 uses it only for WebAuthn signature verification over COSE public keys (ES256, EdDSA, RS256) in `server/app/auth/webauthn.py`; no WebAuthn/FIDO library (`webauthn`/py_webauthn, `fido2`) is added, see `WEBAUTHN_DEPENDENCY_REVIEW.md`. The #13 branch `feat/issue-13-mtls-adapters` adds the same package, so whichever PR merges second must rebase and reconcile these lock, audit and inventory entries rather than duplicate them.
+The Owner approved the Python `cryptography` package on 2026-09-30 (given for Issue #13's mTLS adapters). Issue #10 uses it only for WebAuthn signature verification over COSE public keys (ES256, EdDSA, RS256) in `server/app/auth/webauthn.py`; no WebAuthn/FIDO library (`webauthn`/py_webauthn, `fido2`) is added, see `WEBAUTHN_DEPENDENCY_REVIEW.md`. Issue #13's capture-node mTLS adapters use the same exact pins under the same single approval; the `media-capture-agent` lock and its wider wheel set are reviewed in `../../agent/docs/DEPENDENCIES.md` and `../../agent/docs/cryptography-wheel-audit.json`, and the license texts, Rust audit and native-library review below cover both.
 
 | Package | Exact version | Artifacts | Declared license |
 |---|---|---|---|

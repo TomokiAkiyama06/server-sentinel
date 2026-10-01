@@ -112,7 +112,10 @@ same transaction as each ledger change, targeting only the node's logical
 UUID. Owner-only approval and revocation record `denied` for a refused actor
 without running. A redemption that matches no pending enrollment (unknown
 enrollment, wrong code or wrong key) records nothing; an expiry records one
-`failed` outcome because a pending enrollment expires only once. Pairing codes,
+`failed` outcome because a pending enrollment expires only once. Promoting a
+staged certificate renewal on its first admission records
+`activate_capture_node_credential` with actor `system`; staging a renewal
+records nothing, so repeated node requests cannot grow the table. Pairing codes,
 their digests, enrollment identities and key/serial digests are never
 recorded. An outcome that cannot be written outside a committed mutation is
 counted in the ledger's own `audit_delivery_failed` /

@@ -15,6 +15,10 @@ confirmed=False)` first delivers a fixed-category local event. Confirmed server
 movement/camera tamper and hardware-integrity/recording-health failures also enqueue
 an immediate fixed-category Slack message, independently of presence. Ordinary
 person/motion/entry/camera-offline observations stay local until the summary.
+Such a local-only event returns `suppressed` when it was written or retained for
+the `poll()` retry, and `failed` when the write was refused with the retry
+buffer full (the event is dropped), so callers can retry with the same
+`event_id`.
 `local_delivery_failed`, `delivery_failed` and `last_delivery` expose failures
 without sensitive exception content. Production must supply a durable local sink
 that upserts `NotificationEvent` by its generated `event_id`. Initial `pending`

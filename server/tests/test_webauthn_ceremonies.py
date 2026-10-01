@@ -459,7 +459,8 @@ class AuthenticationTests(CeremonyTestCase):
         agent_public = agent_key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
         node_id = "00000000-0000-4000-8000-00000000abcd"
         with closing(self.database.connect()) as connection:
-            connection.execute("INSERT INTO pairing_node_credentials VALUES (?, ?, ?, 'active')",
+            connection.execute("INSERT INTO pairing_node_credentials (node_id, public_key_digest, "
+                               "credential_serial_digest, state) VALUES (?, ?, ?, 'active')",
                                (node_id, hashlib.sha256(agent_public).hexdigest(), "c" * 64))
         for credential_id in (agent_public, node_id.encode(), hashlib.sha256(agent_public).digest()):
             with self.subTest(credential_id=credential_id):
