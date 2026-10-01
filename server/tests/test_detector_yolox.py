@@ -248,7 +248,14 @@ class ModelSmokeWorkerAuditTests(unittest.TestCase):
                     self.assertRaises(detector_model_smoke.SmokeFailure):
                 self.check(f"smoke_adapter_{lookup}")
 
-    def test_parent_hook_records_every_dns_entry_point(self):
+    def test_every_swallowed_datagram_send_fails_the_smoke(self):
+        # An unconnected UDP sendmsg raises socket.sendmsg, not socket.sendto.
+        for send in detector_worker_fakes.DATAGRAMS:
+            with self.subTest(send=send), \
+                    self.assertRaises(detector_model_smoke.SmokeFailure):
+                self.check(f"smoke_adapter_{send}")
+
+    def test_parent_hook_records_every_dns_and_datagram_entry_point(self):
         # The parent process uses the same event set; checked in a child so
         # this test runner's own process never gains an audit hook.
         tests = Path(__file__).resolve().parent
@@ -257,7 +264,7 @@ class ModelSmokeWorkerAuditTests(unittest.TestCase):
             f"sys.path[:0] = [{str(tests)!r}, {str(tests.parent)!r}]\n"
             "import detector_model_smoke, detector_worker_fakes\n"
             "sys.addaudithook(detector_model_smoke.reject_outbound)\n"
-            "for name in detector_worker_fakes.LOOKUPS:\n"
+            "for name in detector_worker_fakes.OUTBOUND_CALLS:\n"
             "    before = len(detector_model_smoke._attempts)\n"
             "    detector_worker_fakes._swallowed_lookup(name)\n"
             "    if len(detector_model_smoke._attempts) == before:\n"

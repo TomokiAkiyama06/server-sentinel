@@ -12,9 +12,10 @@ RTDETR = "rtdetr-v2-r18vd-onnx-cpu"
 YOLOX_FACTORY = "app.detection.foundation.yolox:create_yolox_person"
 # Every DNS entry point has its own audit event: gethostbyname(_ex) raise
 # socket.gethostbyname, reverse lookup socket.gethostbyaddr / getnameinfo.
+# An unconnected datagram send raises socket.sendto or socket.sendmsg.
 OUTBOUND_EVENTS = frozenset({"socket.connect", "socket.getaddrinfo",
                              "socket.gethostbyname", "socket.gethostbyaddr",
-                             "socket.getnameinfo", "socket.sendto",
+                             "socket.getnameinfo", "socket.sendto", "socket.sendmsg",
                              "subprocess.Popen", "os.system", "os.posix_spawn"})
 # Per process: the smoke process and the spawned worker each record their own.
 _attempts = []

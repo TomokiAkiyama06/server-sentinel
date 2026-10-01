@@ -84,10 +84,26 @@ LOOKUPS = {
 }
 
 
+def _datagram(send):
+    # Unconnected UDP to the loopback discard port; the audit hook refuses
+    # before the send, so nothing leaves the process when the hook is armed.
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as udp:
+        send(udp, b"x", ("127.0.0.1", 9))
+
+
+# Unconnected datagram sends, each with its own audit event name:
+# socket.sendto and socket.sendmsg (sendmsg is not reported as sendto).
+DATAGRAMS = {
+    "sendto": lambda: _datagram(lambda udp, data, address: udp.sendto(data, address)),
+    "sendmsg": lambda: _datagram(lambda udp, data, address: udp.sendmsg([data], [], 0, address)),
+}
+OUTBOUND_CALLS = {**LOOKUPS, **DATAGRAMS}
+
+
 def _swallowed_lookup(lookup="getaddrinfo"):
     # The refusal is swallowed like a careless library would.
     try:
-        LOOKUPS[lookup]()
+        OUTBOUND_CALLS[lookup]()
     except Exception:
         pass
 
@@ -116,8 +132,9 @@ def _lookup_at_start(lookup):
     return factory
 
 
-# One importable factory per DNS entry point, e.g. `smoke_adapter_gethostbyaddr`.
-for _lookup in LOOKUPS:
+# One importable factory per DNS entry point / datagram send, e.g.
+# `smoke_adapter_gethostbyaddr`, `smoke_adapter_sendmsg`.
+for _lookup in OUTBOUND_CALLS:
     globals()[f"smoke_adapter_{_lookup}"] = _lookup_at_start(_lookup)
 
 
