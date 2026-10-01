@@ -2,13 +2,14 @@
 
 ``record`` captures, from a read-only view of the Main Server runtime tree:
 
-- per-recording content evidence keyed by the recording logical ID: a SHA-256
-  and size of every linked segment file as stored on disk with the segment's
+- per-recording content evidence keyed by the recording logical ID: a SHA-256,
+  size and hard-link count of every linked segment file as stored on disk
+  (the recording store serves only single-link files) with the segment's
   source, catalog bounds and the catalog fields that control integrity,
   playback or retention (byte length, stream / sequence, codec, container,
   capture node, critical flag), the starred and critical flags, and the catalog
   start, target end and ended boundaries (the manifest clips playback to the
-  target end);
+  target end), the event link and the explicit discontinuity markers;
 - a per-row and a chained SHA-256 over every retained audit row
   (``security_admin_audit_records`` and ``integrity_audit``), so a rewritten
   middle row is detected even when counts and boundary timestamps match;
@@ -38,6 +39,7 @@ deployment-local.
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 from dataclasses import dataclass
 import hashlib
 import json
@@ -125,24 +127,26 @@ def _connect_read_only(database: Path) -> sqlite3.Connection:
     return connection
 
 
-def _file_digest(directory: Path, segment_id: str) -> tuple[str | None, int | None]:
+def _file_digest(directory: Path, segment_id: str) -> tuple[str | None, int | None, int | None]:
+    """SHA-256, size and hard-link count of a segment file as stored."""
     try:
         name = UUID(segment_id).hex + ".seg"
     except ValueError:
-        return None, None
+        return None, None, None
     try:
         descriptor = os.open(directory / name,
                              os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NOCTTY)
     except OSError:
-        return None, None
+        return None, None, None
     try:
-        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
-            return None, None
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode):
+            return None, None, None
         digest, size = hashlib.sha256(), 0
         while chunk := os.read(descriptor, _CHUNK):
             digest.update(chunk)
             size += len(chunk)
-        return digest.hexdigest(), size
+        return digest.hexdigest(), size, info.st_nlink
     finally:
         os.close(descriptor)
 
@@ -157,8 +161,8 @@ def _recordings(connection, tables, directory: Path) -> dict | None:
         return None
     result = {}
     rows = connection.execute(
-        "SELECT id, source_id, status, starred, critical, start_ms, target_end_ms, ended_ms "
-        "FROM recordings WHERE status != 'deleting' ORDER BY id").fetchall()
+        "SELECT id, source_id, event_id, status, starred, critical, start_ms, target_end_ms, "
+        "ended_ms FROM recordings WHERE status != 'deleting' ORDER BY id").fetchall()
     for row in rows:
         segments = connection.execute(
             "SELECT s.id, s.source_id, s.capture_node_id, s.stream_id, s.sequence, "
@@ -169,13 +173,14 @@ def _recordings(connection, tables, directory: Path) -> dict | None:
             (row["id"],)).fetchall()
         items = []
         for segment in segments:
-            digest, size = _file_digest(directory, segment["id"])
+            digest, size, links = _file_digest(directory, segment["id"])
             items.append({
                 "segment_id": segment["id"], "sha256": digest, "bytes": size,
-                # RecordingStore._integrity() needs both the digest and the
-                # catalog byte_length to match the file.
+                "link_count": links,
+                # RecordingStore._integrity() needs the digest and the catalog
+                # byte_length to match a file with exactly one hard link.
                 "catalog_match": (digest is not None and digest == segment["sha256"]
-                                  and size == segment["byte_length"]),
+                                  and size == segment["byte_length"] and links == 1),
                 "source_id": segment["source_id"],
                 "start_ms": segment["start_ms"], "end_ms": segment["end_ms"],
                 "media_ms": segment["end_ms"] - segment["start_ms"],
@@ -191,8 +196,16 @@ def _recordings(connection, tables, directory: Path) -> dict | None:
                     "critical": bool(segment["critical"]),
                 },
             })
+        # Explicit gap markers returned by RecordingStore.manifest(); the
+        # table has no key, so they are kept as a sorted multiset.
+        discontinuities = sorted([item["start_ms"], item["end_ms"], item["reason"]]
+                                 for item in connection.execute(
+            "SELECT start_ms, end_ms, reason FROM recording_discontinuities "
+            "WHERE recording_id = ?", (row["id"],)))
         result[row["id"]] = {
             "source_id": row["source_id"],
+            # RecordingStore.event_manifest() groups recordings by event_id.
+            "event_id": row["event_id"],
             "status": row["status"],
             "starred": bool(row["starred"]),
             "critical": bool(row["critical"]),
@@ -203,6 +216,7 @@ def _recordings(connection, tables, directory: Path) -> dict | None:
             "ended_ms": row["ended_ms"],
             "segment_media_ms": sum(item["media_ms"] for item in items),
             "segments": items,
+            "discontinuities": discontinuities,
             "content_sha256": _digest([[item["segment_id"], item["sha256"]] for item in items]),
             "container_duration": "manual",
             "decode_verification": "manual",
@@ -333,7 +347,7 @@ def collect(runtime_root: Path) -> dict:
 
 
 def _compare_keyed(baseline: dict | None, current: dict | None, *,
-                   declared: frozenset[str] = frozenset()) -> dict:
+                   declared: frozenset[str] = frozenset(), rewrite_only=None) -> dict:
     if not baseline:
         return {"status": "empty", "preserved": [], "failed": [],
                 "appended": sorted(current or {}), "declared_rewrites": []}
@@ -344,7 +358,7 @@ def _compare_keyed(baseline: dict | None, current: dict | None, *,
             failed.append({"id": key, "reason": "missing"})
         elif current[key] == value:
             preserved.append(key)
-        elif key in declared:
+        elif key in declared and rewrite_only is not None and rewrite_only(value, current[key]):
             rewrites.append(key)
         else:
             failed.append({"id": key, "reason": "changed"})
@@ -352,6 +366,35 @@ def _compare_keyed(baseline: dict | None, current: dict | None, *,
             "preserved": preserved, "failed": failed,
             "appended": sorted(set(current) - set(baseline)),
             "declared_rewrites": rewrites}
+
+
+_REWRITTEN_SEGMENT_FIELDS = ("sha256", "bytes")
+
+
+def _without_media_bytes(item: dict) -> dict:
+    """A recording with only the evidence a declared byte rewrite may change.
+
+    A documented rewrite of stored bytes changes each file's digest and size
+    and the catalog byte length that must match it; it never changes the
+    star / critical flags, boundaries, event link, discontinuities, segment
+    set, sources, stream / sequence, codec, container or capture node.
+    """
+    segments = []
+    for segment in item["segments"]:
+        kept = {key: value for key, value in segment.items()
+                if key not in _REWRITTEN_SEGMENT_FIELDS}
+        kept["catalog"] = {key: value for key, value in segment["catalog"].items()
+                           if key != "byte_length"}
+        segments.append(kept)
+    return {**{key: value for key, value in item.items() if key != "content_sha256"},
+            "segments": segments}
+
+
+def _declared_rewrite_only(base: dict, now: dict) -> bool:
+    # The rewritten result must itself be servable: readable and matching its
+    # catalog digest, byte length and single-link invariant.
+    return (_evidenced(now) and all(segment["catalog_match"] for segment in now["segments"])
+            and _without_media_bytes(base) == _without_media_bytes(now))
 
 
 def _evidenced(item: dict) -> bool:
@@ -380,7 +423,7 @@ def _valid_growth(base: dict, now: dict) -> bool:
             or not _evidenced(base) or not _evidenced(now)):
         return False
     if any(now.get(key) != base.get(key)
-           for key in ("source_id", "start_ms", "starred", "critical")):
+           for key in ("source_id", "event_id", "start_ms", "starred", "critical")):
         return False
     start, target = now["start_ms"], now["target_end_ms"]
     if not start < target <= base["target_end_ms"]:
@@ -394,13 +437,25 @@ def _valid_growth(base: dict, now: dict) -> bool:
                and segment["start_ms"] < target and segment["end_ms"] > start
                for segment in now["segments"]):
         return False
+    # The store adds markers while publishing and, on stop, drops only those
+    # wholly outside the new target window; every recorded marker the current
+    # window still overlaps must remain.
+    remaining = Counter(tuple(item) for item in now["discontinuities"])
+    for marker_start, marker_end, reason in base["discontinuities"]:
+        if marker_start >= target or marker_end <= start:
+            continue
+        key = (marker_start, marker_end, reason)
+        if not remaining[key]:
+            return False
+        remaining[key] -= 1
     now_segments = {item["segment_id"]: item for item in now["segments"]}
     return all(now_segments.get(item["segment_id"]) == item for item in base["segments"])
 
 
 def _compare_recordings(baseline: dict | None, current: dict | None, *,
                         declared: frozenset[str]) -> dict:
-    result = _compare_keyed(baseline, current, declared=declared)
+    result = _compare_keyed(baseline, current, declared=declared,
+                            rewrite_only=_declared_rewrite_only)
     if result["status"] == "empty":
         return result
     current = current or {}

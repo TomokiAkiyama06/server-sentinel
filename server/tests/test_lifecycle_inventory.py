@@ -493,7 +493,17 @@ class LifecycleInventoryTests(unittest.TestCase):
         seeded = self.runtime.seed()
         _, baseline = self.record()
         path = self.runtime.segment_path(seeded["ordinary"])
-        path.write_bytes(bytes(reversed(path.read_bytes())))
+        rewritten = bytes(reversed(path.read_bytes()))
+        path.write_bytes(rewritten)
+        # Bytes rewritten without the catalog digest following them are not
+        # servable, so even a declared rewrite is then a failure.
+        code, report, _ = self.verify(baseline, "--declared-rewrite", seeded["ordinary"])
+        self.assertEqual(code, inventory.EXIT_FAILED)
+        self.assertEqual(report["sections"]["recordings"]["declared_rewrites"], [])
+        self.runtime.execute(
+            "UPDATE recording_segments SET sha256=? WHERE id IN "
+            "(SELECT segment_id FROM recording_links WHERE recording_id=?)",
+            (hashlib.sha256(rewritten).hexdigest(), seeded["ordinary"]))
         code, report, _ = self.verify(baseline, "--declared-rewrite", seeded["ordinary"])
         self.assertEqual(code, inventory.EXIT_PRESERVED)
         self.assertEqual(report["status"], "preserved_except_declared_rewrites")
@@ -640,6 +650,118 @@ class LifecycleInventoryTests(unittest.TestCase):
         failed = report["sections"]["recordings"]["failed"]
         for recording_id in (ended_active, overrun):
             self.assertIn({"id": recording_id, "reason": "changed"}, failed)
+
+
+    def test_declared_rewrite_exempts_only_the_media_bytes(self):
+        # A declared rewrite covers the intended byte rewrite, never a star
+        # change (Owner decision 2026-09-30) or other catalog metadata.
+        seeded = self.runtime.seed()
+        _, baseline = self.record()
+        path = self.runtime.segment_path(seeded["ordinary"])
+        path.write_bytes(bytes(reversed(path.read_bytes())))
+        self.runtime.execute("UPDATE recordings SET starred=1 WHERE id=?", (seeded["ordinary"],))
+        path = self.runtime.segment_path(seeded["starred"])
+        path.write_bytes(bytes(reversed(path.read_bytes())))
+        self.runtime.execute("UPDATE recordings SET critical=1 WHERE id=?", (seeded["starred"],))
+        code, report, _ = self.verify(baseline, "--declared-rewrite", seeded["ordinary"],
+                                      "--declared-rewrite", seeded["starred"])
+        self.assertEqual(code, inventory.EXIT_FAILED)
+        section = report["sections"]["recordings"]
+        self.assertEqual(section["declared_rewrites"], [])
+        for recording_id in (seeded["ordinary"], seeded["starred"]):
+            self.assertIn({"id": recording_id, "reason": "changed"}, section["failed"])
+
+    def test_declared_rewrite_with_catalog_update_and_unchanged_metadata_passes(self):
+        # A migration that rewrites bytes and updates the catalog digest and
+        # byte length to match is the declared case; the result must still be
+        # servable (catalog match).
+        seeded = self.runtime.seed()
+        _, baseline = self.record()
+        path = self.runtime.segment_path(seeded["ordinary"])
+        rewritten = b"generated-rewritten-ordinary-bytes"
+        path.write_bytes(rewritten)
+        self.runtime.execute(
+            "UPDATE recording_segments SET sha256=?, byte_length=? WHERE id IN "
+            "(SELECT segment_id FROM recording_links WHERE recording_id=?)",
+            (hashlib.sha256(rewritten).hexdigest(), len(rewritten), seeded["ordinary"]))
+        code, report, _ = self.verify(baseline, "--declared-rewrite", seeded["ordinary"])
+        self.assertEqual(code, inventory.EXIT_PRESERVED)
+        self.assertEqual(report["sections"]["recordings"]["declared_rewrites"],
+                         [seeded["ordinary"]])
+
+    def test_event_link_and_discontinuity_changes_are_detected(self):
+        seeded = self.runtime.seed()
+        event = str(uuid4())
+        self.runtime.execute("UPDATE recordings SET event_id=? WHERE id=?",
+                             (event, seeded["ordinary"]))
+        self.runtime.execute("INSERT INTO recording_discontinuities VALUES (?, 2000, 3000, "
+                             "'stream_discontinuity')", (seeded["starred"],))
+        _, baseline = self.record()
+        self.runtime.execute("UPDATE recordings SET event_id=? WHERE id=?",
+                             (str(uuid4()), seeded["ordinary"]))
+        self.runtime.execute("DELETE FROM recording_discontinuities WHERE recording_id=?",
+                             (seeded["starred"],))
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_FAILED)
+        failed = report["sections"]["recordings"]["failed"]
+        for recording_id in (seeded["ordinary"], seeded["starred"]):
+            self.assertIn({"id": recording_id, "reason": "changed"}, failed)
+
+    def test_in_progress_discontinuities_may_grow_or_be_trimmed_outside_the_target(self):
+        self.runtime.seed()
+
+        def active(label: str) -> str:
+            recording_id = self.runtime.recording(
+                starred=False, payload=b"generated-" + label.encode(),
+                status="active", target_end_ms=20000)
+            self.runtime.execute(
+                "INSERT INTO recording_discontinuities VALUES (?, 4000, 5000, 'stream_discontinuity')",
+                (recording_id,))
+            self.runtime.execute(
+                "INSERT INTO recording_discontinuities VALUES (?, 16000, 17000, 'stream_discontinuity')",
+                (recording_id,))
+            return recording_id
+        trimmed = active("trimmed")
+        lost = active("lost")
+        relinked = active("relinked")
+        self.runtime.execute("UPDATE recordings SET event_id=? WHERE id=?", (str(uuid4()), relinked))
+        _, baseline = self.record()
+        # The store's stop path drops markers wholly outside the new target
+        # and publishing may add new ones: valid growth.
+        self.runtime.execute("UPDATE recordings SET target_end_ms=15000, ended_ms=15000, "
+                             "status='complete' WHERE id=?", (trimmed,))
+        self.runtime.execute("DELETE FROM recording_discontinuities WHERE recording_id=? "
+                             "AND start_ms>=15000", (trimmed,))
+        self.runtime.execute(
+            "INSERT INTO recording_discontinuities VALUES (?, 9000, 9500, 'stream_discontinuity')",
+            (trimmed,))
+        # A marker inside the window disappearing, or the event link moving,
+        # is not growth.
+        self.runtime.execute("DELETE FROM recording_discontinuities WHERE recording_id=? "
+                             "AND start_ms=4000", (lost,))
+        self.runtime.execute("UPDATE recordings SET event_id=? WHERE id=?", (str(uuid4()), relinked))
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_FAILED)
+        section = report["sections"]["recordings"]
+        self.assertEqual(section["in_progress_at_record"], [trimmed])
+        for recording_id in (lost, relinked):
+            self.assertIn({"id": recording_id, "reason": "changed"}, section["failed"])
+
+    def test_extra_hard_link_to_a_segment_is_detected(self):
+        # RecordingStore._integrity() treats st_nlink != 1 as corrupt.
+        seeded = self.runtime.seed()
+        active = self.runtime.recording(starred=False, payload=b"generated-active-link",
+                                        status="active", target_end_ms=20000)
+        _, baseline = self.record()
+        os.link(self.runtime.segment_path(seeded["ordinary"]), self.notes / "extra-link")
+        later = self.runtime.add_segment(active, b"generated-active-linked-later")
+        os.link(self.runtime.root / "recordings" / (UUID(later).hex + ".seg"),
+                self.notes / "extra-link-later")
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_FAILED)
+        section = report["sections"]["recordings"]
+        for recording_id in (seeded["ordinary"], active):
+            self.assertIn({"id": recording_id, "reason": "changed"}, section["failed"])
 
 
 if __name__ == "__main__":
