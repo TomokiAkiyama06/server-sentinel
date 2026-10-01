@@ -1,6 +1,7 @@
 """Explicit local-artifact synthetic check; not run with weights in CI."""
 
 import argparse
+from contextlib import contextmanager
 import importlib
 import json
 from pathlib import Path
@@ -16,9 +17,16 @@ YOLOX_FACTORY = "app.detection.foundation.yolox:create_yolox_person"
 OUTBOUND_EVENTS = frozenset({"socket.connect", "socket.getaddrinfo",
                              "socket.gethostbyname", "socket.gethostbyaddr",
                              "socket.getnameinfo", "socket.sendto", "socket.sendmsg",
-                             "subprocess.Popen", "os.system", "os.posix_spawn"})
+                             "subprocess.Popen", "os.system", "os.posix_spawn",
+                             "_posixsubprocess.fork_exec"})
+# The multiprocessing "spawn" start of the IsolatedDetector worker raises only
+# this event (CPython 3.13+; 3.12 raises none for it); it is permitted solely
+# inside `permit_worker_launch()`.
+WORKER_LAUNCH_EVENTS = frozenset({"_posixsubprocess.fork_exec"})
 # Per process: the smoke process and the spawned worker each record their own.
 _attempts = []
+_permitted_launches = []
+_worker_launch_open = False
 
 
 class SmokeFailure(RuntimeError):
@@ -31,7 +39,21 @@ def require(condition, detail):
         raise SmokeFailure(str(detail))
 
 
+@contextmanager
+def permit_worker_launch():
+    """Permit (and count) only the expected worker spawn while the block runs."""
+    global _worker_launch_open
+    _worker_launch_open = True
+    try:
+        yield
+    finally:
+        _worker_launch_open = False
+
+
 def reject_outbound(event, args):
+    if _worker_launch_open and event in WORKER_LAUNCH_EVENTS:
+        _permitted_launches.append(event)
+        return
     if event in OUTBOUND_EVENTS:
         # Recorded before refusing, so an attempt whose refusal a library
         # swallows is still reported.
@@ -79,10 +101,12 @@ def audited_worker(target, **arguments):
 def isolated_check(implementation, artifact, size, target=YOLOX_FACTORY):
     """Run the YOLOX adapter in the watchdog-supervised spawned worker.
 
-    Called before this process installs its audit hook, because spawning the
-    worker is itself a process launch. The child applies its own rlimits and
-    installs its own recording audit hook (`audited_worker`) before the adapter
-    is imported; a recorded child attempt fails the start or the evaluation.
+    `main` installs this process's audit hook first, so parent-side YOLOX
+    import and setup are observed too; only the worker spawn during start is
+    explicitly permitted (`permit_worker_launch`) and counted. The child
+    applies its own rlimits and installs its own recording audit hook
+    (`audited_worker`) before the adapter is imported; a recorded child
+    attempt fails the start or the evaluation.
     """
     from app.detection.foundation import (DetectorKind, IsolatedDetector,
                                          Observation, RgbFrame, WorkerLimits, WorkerSpec)
@@ -98,7 +122,8 @@ def isolated_check(implementation, artifact, size, target=YOLOX_FACTORY):
                           open_files=256, maximum_frame_bytes=size * size * 3)
     detector = IsolatedDetector(spec, limits)
     try:
-        state = detector.maintain().state
+        with permit_worker_launch():
+            state = detector.maintain().state
         frame = RgbFrame(UUID(int=1), UUID(int=2), 0, size, size,
                          bytes([0, 128, 255]) * (size * size))
         started = time.perf_counter_ns()
@@ -106,14 +131,18 @@ def isolated_check(implementation, artifact, size, target=YOLOX_FACTORY):
         elapsed = time.perf_counter_ns() - started
         require(state == "running", state)
         require(result.observation is not Observation.UNKNOWN, result.reason)
+        require(not _attempts, "unexpected outbound/process attempt in the smoke process")
         # Reaching here means the child's hook recorded no attempt.
         return {"worker_state": state, "worker_observation": result.observation.value,
-                "worker_evaluation_ns": elapsed, "worker_python_outbound_attempts": 0}
+                "worker_evaluation_ns": elapsed, "worker_python_outbound_attempts": 0,
+                "permitted_worker_launches": len(_permitted_launches)}
     finally:
         detector.close()
 
 
 def main():
+    # First, so parent-side YOLOX import and setup are audited as well.
+    sys.addaudithook(reject_outbound)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("artifact", type=Path)
     parser.add_argument("--adapter", default=RTDETR,
@@ -126,7 +155,6 @@ def main():
         from app.detection.foundation import yolox
         size = yolox.ARTIFACTS[yolox.ADAPTERS[args.adapter].variant].input_size
         worker = isolated_check(args.adapter, args.artifact, size)
-    sys.addaudithook(reject_outbound)
     from app.detection.foundation import GrayFrame, Observation, RgbFrame
     from app.detection.foundation.person import RtDetrPersonDetector
     import onnxruntime

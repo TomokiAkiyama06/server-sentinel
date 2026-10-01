@@ -274,6 +274,40 @@ class ModelSmokeWorkerAuditTests(unittest.TestCase):
                                    cwd=tests.parent, capture_output=True, timeout=60)
         self.assertEqual(completed.returncode, 0, completed.stdout.decode(errors="replace"))
 
+    def test_parent_hook_audits_yolox_setup_and_permits_only_the_worker_spawn(self):
+        # The smoke process installs its hook before any YOLOX import; the
+        # worker spawn is the only permitted launch, and only during start.
+        # CPython 3.12 raises no audit event for the multiprocessing spawn
+        # (newer versions raise _posixsubprocess.fork_exec), so 0 or 1.
+        tests = Path(__file__).resolve().parent
+        program = (
+            "import subprocess, sys\n"
+            f"sys.path[:0] = [{str(tests)!r}, {str(tests.parent)!r}]\n"
+            "import detector_model_smoke as smoke\n"
+            "install = sys.addaudithook\n"
+            "def ordered(hook):\n"
+            "    if 'app.detection.foundation.yolox' in sys.modules: sys.exit(4)\n"
+            "    install(hook)\n"
+            "sys.addaudithook = ordered\n"
+            "def stop(*args, **kwargs): raise SystemExit(0)\n"
+            "smoke.isolated_check, real_check = stop, smoke.isolated_check\n"
+            "sys.argv = ['smoke', '/unused', '--adapter', 'yolox-tiny-onnx-cpu']\n"
+            "try:\n"
+            "    smoke.main()\n"
+            "except SystemExit as stopped:\n"
+            "    if stopped.code: raise\n"
+            "result = real_check('yolox-tiny-onnx-cpu', '/unused', 4,\n"
+            "    target='detector_worker_fakes:smoke_adapter')\n"
+            "if smoke._attempts or result['permitted_worker_launches'] > 1: sys.exit(5)\n"
+            "try:\n"
+            "    subprocess.run(['true'])\n"
+            "except RuntimeError:\n"
+            "    pass\n"
+            "sys.exit(0 if smoke._attempts else 6)\n")
+        completed = subprocess.run([sys.executable, "-c", program],
+                                   cwd=tests.parent, capture_output=True, timeout=120)
+        self.assertEqual(completed.returncode, 0, completed.stderr.decode(errors="replace"))
+
     def test_worker_attempt_still_fails_the_smoke_under_python_optimize(self):
         # `python -O` strips `assert`; the failure must not depend on it.
         tests = Path(__file__).resolve().parent

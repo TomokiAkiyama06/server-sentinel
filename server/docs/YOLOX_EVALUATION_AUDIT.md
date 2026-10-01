@@ -104,7 +104,11 @@ the smoke process and, separately, in the spawned worker, whose own hook is
 installed before the adapter is imported, loaded or evaluated
 (`worker_python_outbound_attempts`; a recorded worker attempt fails the start
 or evaluation). The worker-side hook was added after the first run and the
-container smoke was re-run with it on 2026-09-30. `--network none` blocks
+container smoke was re-run with it on 2026-09-30. Since 2026-10-01 the smoke
+process installs its hook before any YOLOX import or setup, permitting only
+the worker spawn during start (`permitted_worker_launches`; CPython 3.12 raises
+no audit event for that spawn); the container smoke has not been re-run since
+this ordering change. `--network none` blocks
 delivery; the hooks, not the network namespace, are the attempt evidence.
 The smoke's pass/fail checks raise unconditionally (`SmokeFailure`) rather
 than using `assert`, so `python -O` / `PYTHONOPTIMIZE` cannot turn a worker
