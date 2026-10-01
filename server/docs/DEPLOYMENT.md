@@ -413,8 +413,11 @@ once revoked stay revoked, the active capture-node credential material
 (keyed digests of the public key and credential serial digests, and its
 expiry) changes only by promotion of the renewal staged at record time (whose
 key must then be bound to that node) or by a fresh pairing activation (an
-enrollment activated after the record, identified by its enrollment ID; an
-enrollment already activated at record time never counts), and
+enrollment activated after the record, identified by its enrollment ID:
+either one pending or consumed at record time with the same node and key, or
+a new one whose key was neither bound nor activated at record time; an
+enrollment already activated at record time never counts, and every such
+enrollment must remain activated with the same node and key), and
 each staged renewal leaves only by that promotion, the node's revocation or a
 fresh pairing, or is re-staged only as a retry of the same staged key or with
 a key newly bound to the node since the record (never a superseded or
@@ -481,7 +484,10 @@ stream and sequence (from that segment's end to the new segment's start, one
 per such publication, none missing), every newly linked segment must pass the
 store's timeline guard (start no earlier than the previous segment's end, no
 repeated or rewound sequence on the same stream), every segment it already had must be
-identical, and every current segment must
+identical except that a stop which closes the recording as `complete` or
+`gapped` at an earlier target may drop the segments starting at or after that
+target, as `RecordingStore.finish()` does (never for a starred or critical
+recording, which then fails closed), and every current segment must
 come from the recording's own source, overlap its target window, be readable
 and match its catalog digest and byte length with a single hard link; anything
 else is `changed`. Starring or unstarring

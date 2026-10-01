@@ -1345,6 +1345,58 @@ class LifecycleInventoryTests(unittest.TestCase):
         self.assertIn({"id": f"pairing_credentials:{node}", "reason": "changed"},
                       report["sections"]["security_state"]["failed"])
 
+    def test_recorded_activations_persist_and_fresh_pairings_bind_new_keys(self):
+        # Codex P1: a migration deletes the recorded 'activated' enrollment
+        # and reinserts the same node / key under a new ID to reinstate the
+        # superseded key "a". PairingLedger never deletes an enrollment or
+        # moves it out of 'activated', and a fresh pairing binds a new key.
+        self.runtime.seed()
+        first, current = "a" * 64, "b" * 64
+        node = self._paired_node(current, "c" * 64)
+        for key in (first, current):
+            self.runtime.execute("INSERT INTO pairing_key_bindings VALUES (?, ?, 0)", (key, node))
+        recorded = str(uuid4())
+        self.runtime.execute(
+            "INSERT INTO pairing_enrollments VALUES (?, ?, ?, 'f', 'epoch', 0, 'activated')",
+            (recorded, node, first))
+        # Approved (key bound) but not yet activated at record time.
+        opened, pending_key = str(uuid4()), "d" * 64
+        self.runtime.execute("INSERT INTO pairing_key_bindings VALUES (?, ?, 0)",
+                             (pending_key, node))
+        self.runtime.execute(
+            "INSERT INTO pairing_enrollments VALUES (?, ?, ?, 'f', 'epoch', 0, 'consumed')",
+            (opened, node, pending_key))
+        _, baseline = self.record()
+        self.assertNotIn(pending_key, baseline.read_text())
+        self.runtime.execute("DELETE FROM pairing_enrollments WHERE id=?", (recorded,))
+        self._activated(node, first)
+        self.runtime.execute("UPDATE pairing_node_credentials SET public_key_digest=?, "
+                             "credential_serial_digest=? WHERE node_id=?",
+                             (first, "e" * 64, node))
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_FAILED)
+        self.assertEqual(sorted(report["sections"]["security_state"]["failed"],
+                                key=lambda item: item["id"]),
+                         [{"id": f"pairing_activations:{recorded}", "reason": "missing"},
+                          {"id": f"pairing_credentials:{node}", "reason": "changed"}])
+        # The recorded activation restored: the reinserted copy still reuses
+        # a key bound at record time, so it is no fresh pairing.
+        self.runtime.execute(
+            "INSERT INTO pairing_enrollments VALUES (?, ?, ?, 'f', 'epoch', 0, 'activated')",
+            (recorded, node, first))
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(report["sections"]["security_state"]["failed"],
+                         [{"id": f"pairing_credentials:{node}", "reason": "changed"}])
+        # The enrollment open at record time completing is a fresh pairing.
+        self.runtime.execute("DELETE FROM pairing_enrollments WHERE state='activated' AND id!=?",
+                             (recorded,))
+        self.runtime.execute("UPDATE pairing_enrollments SET state='activated' WHERE id=?",
+                             (opened,))
+        self.runtime.execute("UPDATE pairing_node_credentials SET public_key_digest=? "
+                             "WHERE node_id=?", (pending_key, node))
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_PRESERVED, report["sections"]["security_state"])
+
     def test_a_staged_renewal_is_never_restaged_onto_a_superseded_key(self):
         # Codex P1: stage_renewal() accepts a key already bound to the node
         # only as a retry of the currently staged key.
@@ -1955,6 +2007,40 @@ class LifecycleInventoryTests(unittest.TestCase):
         self.assertEqual(section["in_progress_at_record"], sorted([stopped, gapped, recovered]))
         for recording_id in (early_complete, early_gapped, recovered_early, recovered_late):
             self.assertIn({"id": recording_id, "reason": "changed"}, section["failed"])
+
+    def test_in_progress_segments_beyond_an_early_stop_may_be_trimmed(self):
+        # Codex P1: RecordingStore.finish() closing an early stop deletes the
+        # links to segments wholly outside the stopped window (and _trim()
+        # then their unlinked rows and files); overlapping ones must remain.
+        self.runtime.seed()
+        labels = ("stopped", "overlapping", "still-active", "starred", "critical",
+                  "not-shortened")
+        ids, tails = {}, {}
+        for label in labels:
+            ids[label] = self.runtime.recording(
+                starred=label == "starred", payload=b"generated-" + label.encode(),
+                status="active", target_end_ms=30000)
+            tails[label] = self.runtime.add_segment(
+                ids[label], b"generated-tail-" + label.encode(), start_ms=12000, end_ms=20000)
+        self.runtime.execute("UPDATE recordings SET critical=1 WHERE id=?", (ids["critical"],))
+        _, baseline = self.record()
+        stop = {"stopped": ("complete", 11000), "overlapping": ("complete", 15000),
+                "still-active": ("active", 11000), "starred": ("complete", 11000),
+                "critical": ("gapped", 11000), "not-shortened": ("complete", 30000)}
+        for label, (status, end) in stop.items():
+            self.runtime.execute(
+                "UPDATE recordings SET status=?, target_end_ms=?, ended_ms=? WHERE id=?",
+                (status, end, None if status == "active" else end, ids[label]))
+            self.runtime.execute("DELETE FROM recording_links WHERE recording_id=? "
+                                 "AND segment_id=?", (ids[label], tails[label]))
+            self.runtime.execute("DELETE FROM recording_segments WHERE id=?", (tails[label],))
+            (self.runtime.root / "recordings" / (UUID(tails[label]).hex + ".seg")).unlink()
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_FAILED)
+        section = report["sections"]["recordings"]
+        self.assertEqual(section["in_progress_at_record"], [ids["stopped"]])
+        for label in labels[1:]:
+            self.assertIn({"id": ids[label], "reason": "changed"}, section["failed"])
 
     def test_extra_hard_link_to_a_segment_is_detected(self):
         # RecordingStore._integrity() treats st_nlink != 1 as corrupt.

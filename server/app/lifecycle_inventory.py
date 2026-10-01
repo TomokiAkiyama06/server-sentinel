@@ -649,9 +649,9 @@ def _security_state(connection, tables, salt: str) -> dict:
     credentials = query("pairing_node_credentials",
                         "SELECT node_id, state, public_key_digest, credential_serial_digest, "
                         f"{not_after} FROM pairing_node_credentials")
-    activated = query("pairing_enrollments",
-                      "SELECT id, node_id, public_key_digest FROM pairing_enrollments "
-                      "WHERE state = 'activated'")
+    enrollments = query("pairing_enrollments",
+                        "SELECT id, node_id, public_key_digest, state FROM pairing_enrollments "
+                        "WHERE state IN ('activated', 'pending', 'consumed')")
     renewals = query("pairing_node_renewals",
                      "SELECT node_id, public_key_digest, credential_serial_digest, not_after "
                      "FROM pairing_node_renewals")
@@ -675,10 +675,15 @@ def _security_state(connection, tables, salt: str) -> dict:
             for row in credentials},
         "pairing_renewals": None if renewals is None else {
             row["node_id"]: material(row) for row in renewals},
-        # Activated enrollments: id, node and key binding reference.
-        "pairing_activations": None if activated is None else sorted(
+        # Activated enrollments (a final state: PairingLedger never deletes
+        # or changes them) and open ones (pending / consumed, the only states
+        # activate() can still complete): id, node and key binding reference.
+        "pairing_activations": None if enrollments is None else sorted(
             [row["id"], row["node_id"], _keyed(salt, ["pairing-key-v1", row["public_key_digest"]])]
-            for row in activated),
+            for row in enrollments if row["state"] == "activated"),
+        "pairing_enrollments_open": None if enrollments is None else sorted(
+            [row["id"], row["node_id"], _keyed(salt, ["pairing-key-v1", row["public_key_digest"]])]
+            for row in enrollments if row["state"] != "activated"),
         "pairing_key_bindings": None if bindings is None else {
             _keyed(salt, ["pairing-key-v1", row[0]]): {"node_id": row[1], "revoked": bool(row[2])}
             for row in bindings},
@@ -707,20 +712,41 @@ def _compare_security_state(baseline: dict | None, current: dict | None) -> dict
     # as newly bound since the record (fail closed).
     recorded_bindings = baseline.get("pairing_key_bindings")
     recorded_activations = baseline.get("pairing_activations")
+    recorded_open = baseline.get("pairing_enrollments_open")
     activations_now = current.get("pairing_activations") or ()
 
     def by_enrollment(items):
-        return all(isinstance(item, list) and len(item) == 3 for item in items)
-    # Only enrollments activated after the record explain a new identity. A
-    # baseline without enrollment IDs cannot tell old activations from new
-    # ones, so it accepts none (fail closed).
-    if (recorded_activations is None or not by_enrollment(recorded_activations)
-            or not by_enrollment(activations_now)):
-        activations = set()
-    else:
+        return items is not None and all(
+            isinstance(item, list) and len(item) == 3 for item in items)
+    activations = set()
+    # PairingLedger never deletes an enrollment or moves it out of
+    # 'activated', so each recorded activation stays exactly as it was.
+    if by_enrollment(recorded_activations) and by_enrollment(activations_now):
+        now_by_id = {item[0]: tuple(item[1:]) for item in activations_now}
+        for item in recorded_activations:
+            if item[0] not in now_by_id:
+                failed.append({"id": f"pairing_activations:{item[0]}", "reason": "missing"})
+            elif now_by_id[item[0]] != tuple(item[1:]):
+                failed.append({"id": f"pairing_activations:{item[0]}", "reason": "changed"})
+    elif recorded_activations:
+        failed.append({"id": "pairing_activations", "reason": "unverifiable"})
+    # Only an enrollment activated after the record explains a new identity:
+    # one open (pending / consumed) at record time, unchanged, or one created
+    # since, whose key approve() newly bound (a key already recorded as bound
+    # or activated is a historical identity, not a fresh pairing). A baseline
+    # without these lists cannot date activations and accepts none.
+    if (by_enrollment(recorded_activations) and by_enrollment(recorded_open)
+            and by_enrollment(activations_now) and recorded_bindings is not None):
         recorded_ids = {item[0] for item in recorded_activations}
-        activations = {(item[1], item[2]) for item in activations_now
-                       if item[0] not in recorded_ids}
+        opened = {item[0]: tuple(item[1:]) for item in recorded_open}
+        historical = {tuple(item[1:]) for item in recorded_activations}
+        for item in activations_now:
+            pair = tuple(item[1:])
+            if item[0] in recorded_ids:
+                continue
+            if (opened.get(item[0]) == pair if item[0] in opened
+                    else pair not in historical and pair[1] not in recorded_bindings):
+                activations.add(pair)
 
     def bound_here(node, key_ref):
         return (bindings.get(key_ref) or {}).get("node_id") == node
@@ -1276,11 +1302,12 @@ def _valid_growth(base: dict, now: dict) -> bool:
     store never extends target_end_ms); a still-active recording has no ended
     boundary; a stopped (complete / gapped) one ends exactly at its target and
     an interrupted one exactly where startup recovery puts it; every recorded
-    segment must be present and identical; every current segment, old or new,
-    must come from the recording's own source, overlap its current target
-    window (the only segments the store links), be readable and match its
-    catalog digest; and the markers not in the record must be exactly those the
-    store adds while publishing the newly linked segments.
+    segment must be present and identical unless a closing early stop trimmed
+    it (_trimmed_by_stop()); every current segment, old or new, must come
+    from the recording's own source, overlap its current target window (the
+    only segments the store links), be readable and match its catalog digest;
+    and the markers not in the record must be exactly those the store adds
+    while publishing the newly linked segments.
     """
     if (base["status"] != "active" or now["status"] not in _ACTIVE_SUCCESSORS
             or not _evidenced(base) or not _evidenced(now)):
@@ -1308,9 +1335,32 @@ def _valid_growth(base: dict, now: dict) -> bool:
         elif not (marker_start >= target or marker_end <= start):
             return False
     now_segments = {item["segment_id"]: item for item in now["segments"]}
-    if not all(now_segments.get(item["segment_id"]) == item for item in base["segments"]):
+    dropped = [item for item in base["segments"] if item["segment_id"] not in now_segments]
+    if not all(now_segments[item["segment_id"]] == item for item in base["segments"]
+               if item["segment_id"] in now_segments):
+        return False
+    if dropped and not _trimmed_by_stop(base, now, dropped):
         return False
     return _appended_publications_valid(base, now, remaining)
+
+
+def _trimmed_by_stop(base: dict, now: dict, dropped: list) -> bool:
+    """Whether recorded segment links left only by a closing early stop.
+
+    RecordingStore.finish() closing a stop (status 'complete', possibly
+    re-labelled 'gapped') deletes exactly the links to segments wholly
+    outside the stopped window (start_ms >= stop or end_ms <= start); the
+    store only ever linked segments overlapping the recorded window, so these
+    are segments starting at or after the earlier stop. A starred or critical
+    (protected) recording is never accepted this way: no shipped caller stops
+    early, and such a drop is indistinguishable from hiding protected media,
+    so verification fails closed.
+    """
+    if (now["status"] not in ("complete", "gapped") or base["starred"] or base["critical"]
+            or not now["target_end_ms"] < base["target_end_ms"]):
+        return False
+    return all(item["start_ms"] >= now["target_end_ms"] or item["end_ms"] <= now["start_ms"]
+               for item in dropped)
 
 
 def _expected_ended(now: dict) -> int | None:
