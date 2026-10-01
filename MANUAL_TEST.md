@@ -943,7 +943,7 @@ The research-room Tailnet is shared, so run these with two people (or two browse
   export;
 - [ ] record that reachability is expected for every holder of the shared account and is not treated as a finding;
 - [ ] the dashboard origin is reserved for ServerSentinel and is a secure context (HTTPS, or `http://localhost` for a strictly local browser); confirm WebAuthn registration and sign-in actually work there, and record that an ordinary-HTTP non-loopback origin makes them impossible;
-- [ ] the startup and daily reservation check enumerates the real listeners and every proxy route for the whole name across all schemes and ports, and closes human access and notifies the Owner on any other answer; record that this bounds rather than prevents, so a process binding between checks can collect credentials until the next check;
+- [ ] the startup and daily reservation check enumerates the real listeners and every proxy route for the whole name across all schemes and ports, and closes human access and notifies the Owner on any other answer it can see; confirm separately (kernel forwarding step) that no DNAT/REDIRECT/TPROXY/`sk_lookup`/IPVS forwarding reaches the reserved address, and record that this bounds rather than prevents, so a process binding between checks can collect credentials until the next check;
 - [ ] the first owner redeems a console-displayed single-use authorization once from a browser at the reserved origin, and it cannot be redeemed again;
 - [ ] record the configured entropy of enrollment codes and bootstrap authorizations and confirm it meets the stated minimum; guessing attempts against a wrong code are rate-limited and give the same generic response;
 - [ ] a first-time invitee redeems an enrollment code and registers a credential without already holding one, and the same code cannot be redeemed twice;
@@ -1672,6 +1672,134 @@ by the Issue #6 synthetic policy model.
   detected until the next one. Then verify the recorded deployment isolation
   (dedicated network identity, or single-purpose node) actually prevents that
   bind, since the application cannot.
+- Hostname reservation check module (`server/app/auth/reservation.py`, Issue
+  #10 slice S1): its tests use synthetic `/proc/net/{tcp,tcp6,udp,udp6}` text and
+  synthetic Serve status JSON only. The real `tailscale serve status --json`
+  output format is **unverified**; the parser assumes a `TCP` / `Web` /
+  `AllowFunnel` shape and fails closed on anything else. On the installed
+  Tailscale version, capture the sanitized output for: no Serve config, the
+  single expected mapping, an extra path, an extra HTTPS port, a plain HTTP
+  mapping, a raw TCP forward, Funnel, and a foreground `tailscale serve`
+  session; confirm each is parsed as expected or fails closed rather than
+  passing. Record whether empty config prints `{}`, nothing, or text, and
+  whether reading status needs anything beyond local operator access (it must
+  not need ACL/Grants changes or admin credentials).
+- On the target host, compare the parsed `/proc/net/tcp` and `/proc/net/tcp6`
+  listeners with `ss -ltnH`, and the parsed `/proc/net/udp` and
+  `/proc/net/udp6` unconnected sockets with `ss -lunH`, for IPv4, IPv6,
+  wildcard and IPv4-mapped binds,
+  and record whether Tailscale Serve holds a visible socket on the Tailscale
+  address (which decides the recorded proxy sockets). Run the check in the
+  network namespace that holds the reserved address when the dedicated
+  network identity isolation is used. A wildcard `sshd` or other system
+  service on the node is reported as an unexpected listener unless the Owner
+  adds a listener exception for that port. With a wildcard `sshd` on 22:
+  confirm access closes with no exception; add `tcp/22` owned by
+  `/usr/sbin/sshd` (or unit `ssh.service`) through the audited
+  Owner path and confirm access opens and a `change_security_setting` audit
+  record exists; bind a test listener to the Tailscale address on port 22
+  (not wildcard) and confirm access still closes; start a wildcard listener
+  on another port and confirm access closes; attempt the change as a non-Owner
+  and confirm a `denied` record and no change; restart and confirm the
+  persisted exception is loaded before the first check and access opens;
+  corrupt the stored `application_metadata` value on a disposable copy and
+  confirm startup uses no exceptions (access closed) and the Owner receives
+  a `LISTENER_EXCEPTIONS_UNREADABLE` fault, also when no wildcard listener is
+  present, and that access stays closed until the value is repaired. Start a
+  second `SO_REUSEPORT` listener on the loopback human upstream port and
+  confirm `ss -ltn` shows two rows and access closes with
+  `UNEXPECTED_LISTENER`; likewise start a second `SO_REUSEPORT` wildcard
+  listener on the excepted port 22 and confirm access closes. Record which wildcard UDP sockets
+  the node holds (for example `tailscaled`'s WireGuard port): confirm each
+  closes access until the Owner adds a `udp` exception for that port, that a
+  `tcp` exception on the same port does not cover it, and that a UDP socket
+  bound to the Tailscale address on 443 (for example a test QUIC server)
+  closes access. Confirm on the host whether its `::` listeners are dual-stack
+  (`net.ipv6.bindv6only`, per-socket `IPV6_V6ONLY`); the check assumes they
+  are and needs an exception without a family for them.
+- Breach recovery (Owner decision 2026-09-30): with an Owner and an invited
+  viewer signed in, bind a test listener to the Tailscale address on another
+  port, wait for the check to close access, then stop it. Confirm access
+  reopens only after a `system` `invalidate_human_sessions` audit record
+  exists, that both earlier sessions are refused and each person must sign in
+  again with their passkey, and that a pending invitation must be reissued.
+  Repeat with the listener removed and the service restarted before the next
+  check: startup must revoke before opening. Make the database read-only on a
+  disposable copy and confirm access stays closed with a
+  `SESSION_REVOCATION_FAILED` Owner fault. Stop `tailscaled` briefly and
+  record that the enumeration failure also forces everyone to sign in again.
+  Make only the marker write fail (for example a disposable copy whose
+  `application_metadata` row is locked by another writer) while the test
+  listener is up: confirm the `invalidate_human_sessions` record is committed
+  at once, so a restart after removing the listener cannot reopen with an
+  earlier session.
+- Listener exception ownership (Owner decision 2026-10-01; mock-only so far):
+  first follow the `server/docs/DEPLOYMENT.md` SSH steps (`ssh.socket`
+  disabled, `ssh.service` enabled) and record `systemctl is-enabled ssh.socket
+  ssh.service`, `ss -ltnp 'sport = :22'` and `readlink /proc/<sshd pid>/exe`.
+  Before Issue #126 (privileged owner helper) lands, confirm the non-root
+  service reports `LISTENER_OWNER_UNVERIFIED` for the excepted `sshd` and
+  human access stays closed. Once #126 is composed as `socket_owners`,
+  confirm the helper's answer matches `readlink` and access opens with `sshd`
+  on 22. With #126 composed, stop `sshd`, start another process on the
+  excepted port (for example `sudo python3 -m http.server 22`), and confirm
+  access closes with `UNEXPECTED_LISTENER` and that reopening revokes every
+  human session. Record whether the host uses `ssh.socket` (socket
+  activation: PID 1 holds the listener, so access stays closed until `sshd`
+  listens itself), and that after upgrading `openssh-server` without
+  restarting `sshd` the `(deleted)` executable keeps access closed. On a
+  disposable copy holding a version 1 (port-only) stored exception, confirm
+  startup reports `LISTENER_EXCEPTIONS_OUTDATED` and access stays closed until
+  the Owner re-enters the exception with its owner.
+- Kernel forwarding (not covered by the check): on the Main Server, run
+  `sudo nft list ruleset` and `sudo iptables-save -t nat` (and `-t mangle`),
+  and confirm no DNAT, REDIRECT or TPROXY rule targets the reserved addresses
+  or their ports; record Docker's `userland-proxy` setting, any `sk_lookup`
+  BPF programs (`sudo bpftool prog show`) and IPVS services
+  (`sudo ipvsadm -Ln`, if installed). Any such forwarding is outside what the
+  check can see and must be removed or excluded by the deployment isolation.
+- Unit identity: confirm `cat /proc/<sshd pid>/cgroup` is exactly
+  `0::/system.slice/ssh.service`, and that a user-session process whose cgroup
+  ends in `ssh.service` under `user.slice` does not satisfy a unit exception.
+- Human upstream ownership (mock-only so far): with the check composed in the
+  running service, confirm access opens and that the upstream's inode in
+  `ss -ltne 'sport = :8080'` appears in `/proc/<service pid>/fd`. On a
+  disposable node, stop the upstream only (keep the check running), bind
+  another process to the same loopback address and port (one socket, no
+  `SO_REUSEPORT`), and confirm `UNEXPECTED_LISTENER` closes access and that
+  reopening revokes every human session.
+- Proxy socket ownership (mock-only so far): record whether `tailscaled`
+  holds a visible socket on the Tailscale address at the origin port (`sudo ss
+  -ltnp`); if it does, record its executable and unit (`readlink
+  /proc/<pid>/exe`, `/proc/<pid>/cgroup`) as `proxy_owner`. Before Issue #126,
+  confirm access stays closed with `LISTENER_OWNER_UNVERIFIED`. Once #126 is
+  composed, confirm access opens, then (on a disposable node) stop the proxy,
+  bind another process to the same address and port while Serve status still
+  lists the route, and confirm `UNEXPECTED_LISTENER` closes access and that
+  reopening revokes every human session. Stop the proxy without a replacement
+  and confirm `PROXY_LISTENER_MISSING` closes access and that it reopens
+  without revocation once the proxy is back.
+- Hostname resolution (mock-only so far): with the production
+  `GetaddrinfoResolver` composed, confirm on the host that it returns exactly
+  the reserved name's Tailscale IPv4 and IPv6 addresses (compare with
+  `getent ahosts <reserved-host>`) and that access opens. Record whether
+  MagicDNS answers both families. Stop `tailscaled` (or point the resolver at a
+  non-answering server) and confirm access closes with
+  `HOSTNAME_RESOLUTION_UNAVAILABLE`/`_TIMEOUT`, and that once resolution
+  recovers access reopens with no `invalidate_human_sessions` record and
+  existing sessions still accepted (Owner decision 2026-10-01: a resolution
+  failure is not an exposure). If `tailscaled` stopping also makes the listener
+  or route enumeration fail, that failure still revokes; record which reasons
+  the host actually produced. Omit one configured address and confirm
+  `RESERVED_ADDRESSES_CHANGED` closes access until the configuration matches
+  and that reopening then revokes every human session;
+  on a disposable node whose name gains an extra address (for example a test
+  `/etc/hosts` entry when the resolver honors it), bind a listener to that
+  address and confirm it is reported as `UNEXPECTED_LISTENER`.
+- Once the check is composed into startup and the daily worker, confirm an
+  enumeration failure or timeout (for example stopping `tailscaled`, or making
+  `/proc/net` unreadable) keeps human access closed and notifies the Owner,
+  and that a later violation closes access that was previously open.
 - Verify Owner bootstrap provisions the first credential locally: the command
   creates the Owner and a single-use short-lived enrollment authorization, human
   access stays closed until it is redeemed once from the reserved origin with a
