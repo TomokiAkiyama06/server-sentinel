@@ -400,8 +400,12 @@ class ProcSocketOwners:
 
     ``proc`` is the ``/proc`` root (a synthetic tree in tests). Reading another
     account's ``fd``/``exe`` needs privilege (for example root or
-    ``CAP_DAC_READ_SEARCH`` + ``CAP_SYS_PTRACE``); a process that cannot be
-    read leaves its sockets without a verified owner, which closes access.
+    ``CAP_DAC_READ_SEARCH`` + ``CAP_SYS_PTRACE``). Any fd table that cannot be
+    read, for a reason other than the process or descriptor having gone away,
+    makes the scan incomplete: it may hide another holder of an excepted
+    socket, so the lookup raises and every excepted listener stays unverified,
+    even one whose readable holders all match. A non-root service therefore
+    needs the privileged helper of Issue #126.
     """
 
     def __init__(self, proc: str = "/proc"):
@@ -412,22 +416,28 @@ class ProcSocketOwners:
     def owners(self, inodes: frozenset) -> dict:
         wanted = {f"socket:[{inode}]": inode for inode in inodes}
         found: dict[int, set[SocketOwner]] = {}
-        for pid in os.listdir(self._proc):
-            if not pid.isdigit():
-                continue
+        try:
+            pids = [pid for pid in os.listdir(self._proc) if pid.isdigit()]
+        except OSError:
+            raise ReservationEnumerationError("SOCKET_OWNERS_UNAVAILABLE") from None
+        for pid in pids:
             base = os.path.join(self._proc, pid)
             held = set()
             try:
-                for fd in os.listdir(os.path.join(base, "fd")):
-                    try:
-                        target = os.readlink(os.path.join(base, "fd", fd))
-                    except OSError:
-                        continue
-                    if target in wanted:
-                        held.add(wanted[target])
+                descriptors = os.listdir(os.path.join(base, "fd"))
+            except (FileNotFoundError, ProcessLookupError):
+                continue  # exited during the scan
             except OSError:
-                # Unreadable or exited: its sockets stay unverified.
-                continue
+                raise ReservationEnumerationError("SOCKET_OWNERS_INCOMPLETE") from None
+            for fd in descriptors:
+                try:
+                    target = os.readlink(os.path.join(base, "fd", fd))
+                except (FileNotFoundError, ProcessLookupError):
+                    continue  # closed during the scan
+                except OSError:
+                    raise ReservationEnumerationError("SOCKET_OWNERS_INCOMPLETE") from None
+                if target in wanted:
+                    held.add(wanted[target])
             if not held:
                 continue
             try:

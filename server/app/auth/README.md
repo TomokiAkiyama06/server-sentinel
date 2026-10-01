@@ -233,9 +233,13 @@ rejected. Each check reads the socket inode from `/proc/net` and the injected
 `socket_owners` (`ProcSocketOwners`, walking `/proc/<pid>/fd`) maps it to every
 process holding it; the socket is excepted only when every holder matches.
 Another process holding it (alone or alongside the named one) counts as
-`UNEXPECTED_LISTENER`; a socket with no inode, no readable holder, an
+`UNEXPECTED_LISTENER`; a socket with no inode or no holder found, an
 unreadable executable/unit, or an owner lookup that fails or times out counts
-as `LISTENER_OWNER_UNVERIFIED`; both are exposure reasons. Reading another
+as `LISTENER_OWNER_UNVERIFIED`; both are exposure reasons. The scan is all or
+nothing: any process whose fd table or descriptor cannot be read (other than
+one that exited or closed it during the scan) could hide another holder, so the
+lookup fails and every excepted listener stays unverified, even one whose
+readable holders all match. Reading another
 account's `/proc/<pid>/fd` and `exe` needs privilege the non-root service may
 not hold (root, or `CAP_DAC_READ_SEARCH` + `CAP_SYS_PTRACE`); without it an
 excepted root-owned `sshd` stays unverified and access stays closed. Owner

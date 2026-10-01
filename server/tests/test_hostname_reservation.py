@@ -1478,13 +1478,33 @@ class ProcSocketOwnersTests(TestCase):
             2000: frozenset({SocketOwner("/usr/bin/python3.12", "x.scope")}),
         })
 
-    def test_unreadable_process_leaves_sockets_unverified(self):
-        base = self.process(100, "/usr/sbin/sshd", ["socket:[1000]"])
+    def unreadable(self, base):
         (base / "fd").chmod(0)
         self.addCleanup((base / "fd").chmod, 0o700)
         if os.access(base / "fd", os.R_OK):
             self.skipTest("running with privilege that bypasses directory permissions")
-        self.assertEqual(ProcSocketOwners(str(self.root)).owners(frozenset({1000})), {})
+
+    def test_unreadable_process_makes_the_scan_incomplete(self):
+        self.unreadable(self.process(100, "/usr/sbin/sshd", ["socket:[1000]"]))
+        with self.assertRaises(ReservationEnumerationError):
+            ProcSocketOwners(str(self.root)).owners(frozenset({1000}))
+
+    def test_unreadable_holder_beside_a_matching_one_closes_access(self):
+        # An unreadable fd table may hide another holder of the excepted socket.
+        self.process(100, "/usr/sbin/sshd", ["socket:[1000]", "socket:[1001]"])
+        self.unreadable(self.process(200, "/usr/bin/python3.12", ["socket:[1000]"]))
+        with self.assertRaises(ReservationEnumerationError):
+            ProcSocketOwners(str(self.root)).owners(frozenset({1000, 1001}))
+        check, _, _, _ = checker(files=WILDCARD_SSH, socket_owners=ProcSocketOwners(str(self.root)))
+        check._exceptions, check._exceptions_loaded = frozenset({SSH}), True
+        verdict = check._check(CheckKind.RETRY)
+        self.assertEqual(verdict.reasons, (Reason.LISTENER_OWNER_UNVERIFIED,))
+
+    def test_process_that_exited_during_the_scan_is_skipped(self):
+        self.process(100, "/usr/sbin/sshd", ["socket:[1000]"])
+        (self.root / "200").mkdir()  # no fd directory: gone before it was read
+        self.assertEqual(ProcSocketOwners(str(self.root)).owners(frozenset({1000})),
+                         {1000: frozenset({SocketOwner("/usr/sbin/sshd", "ssh.service")})})
 
     def test_missing_exe_or_cgroup_unit(self):
         base = self.process(100, "/usr/sbin/sshd", ["socket:[1000]"], cgroup="0::/\n")

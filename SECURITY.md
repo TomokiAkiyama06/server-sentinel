@@ -309,6 +309,32 @@ routes for the whole name and close human access on any other answer, which
 bounds rather than removes that exposure; the application cannot prevent a
 local process from binding.
 
+The current contract for that check (Owner decisions 2026-09-30 and
+2026-10-01; details in `server/app/auth/README.md` and ADR-0003):
+
+- Each check re-resolves the reserved name. A resolved address set that
+  differs from the recorded one is treated as an exposure. A missing resolver
+  or a resolution that fails or times out keeps human access closed but is not
+  an exposure: access reopens without revocation once the name resolves to the
+  recorded set again, unless an exposure was seen meanwhile.
+- After any exposure (another listener or route, a changed address set, an
+  excepted listener with an unverifiable owner, or a listener/route
+  enumeration that fails or times out) access reopens only after every human
+  session, the Owner's included, has been revoked by advancing the
+  authorization generation, with its `system` audit record committed. The
+  requirement is persisted as a marker before reopening; if the marker cannot
+  be written, every human session is revoked at once instead. A check without
+  a durable revoker never opens human access.
+- An Owner listener exception names a port together with its owning
+  executable or systemd unit, never a port alone, and every check verifies the
+  socket's owning processes. Another process, or ownership that cannot be read
+  completely, closes access as an exposure. ServerSentinel stays non-root;
+  reading root-owned sockets is left to a separate privileged helper service
+  (Issue #126), and until it exists an excepted root-owned `sshd` keeps human
+  access closed. The Main Server runs `sshd` as `ssh.service` without
+  `ssh.socket`, with the exception `tcp/22` owned by `/usr/sbin/sshd`
+  (`server/docs/DEPLOYMENT.md`).
+
 ## Shared Tailnet account
 
 The research-room Tailnet uses one shared Tailscale account, so a verified identity header names the shared login rather than the person behind the request. Application authorization therefore rests on a ServerSentinel-issued per-person credential (WebAuthn/passkey, accepted in ADR-0004) created from an owner invitation and individually revocable.
