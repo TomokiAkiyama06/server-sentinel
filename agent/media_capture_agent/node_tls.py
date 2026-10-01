@@ -479,7 +479,11 @@ def connect_to_main(context: ssl.SSLContext, *, server_name: str, host: str, por
 
     ``server_name`` comes from the trust bundle or the installed credential, never
     from the network. Verification failures and downgrades raise
-    ``PairingRefused`` before any application byte is sent.
+    ``PairingRefused`` before any application byte is sent. ``timeout_seconds``
+    bounds only the TCP connect and TLS handshake; the returned socket is
+    blocking with no timeout, like the Main acceptor's admitted session, so a
+    long backpressure or response wait does not tear the session down. Any
+    session-level timeout belongs to the protocol layer above.
     """
     if not isinstance(context, ssl.SSLContext) or not context.check_hostname:
         raise PairingRefused("client_tls_context_rejected")
@@ -501,4 +505,5 @@ def connect_to_main(context: ssl.SSLContext, *, server_name: str, host: str, por
     if connection.version() != "TLSv1.3":
         connection.close()
         raise PairingRefused("main_handshake_failed")
+    connection.settimeout(None)
     return connection
