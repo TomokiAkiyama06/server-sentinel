@@ -36,10 +36,29 @@ PRAGMA user_version = 1;
 """
 
 
-# SQLite pager.c caps assumed sectors at 64 KiB. Budget one header and
-# alignment padding per original page, even though real journals are smaller.
+# SQLite pager.c caps assumed sectors at 64 KiB. With cache spilling disabled
+# a rollback journal has exactly one sector-aligned header per transaction and
+# then each original page at most once as a (page + 8)-byte record.
 PAGE_BYTES = 4096
 MAX_SECTOR_BYTES = 65536
+
+
+def journal_bound(maximum_pages):
+    """Largest DELETE-mode rollback journal for a database of this page cap.
+
+    One header (at most one maximum sector), every original page once with its
+    eight record bytes, and one further maximum sector of slack. This holds
+    only because the connection refuses to run unless ``cache_spill`` is off:
+    each mid-transaction spill would start another sector-aligned header.
+    """
+    return maximum_pages * (PAGE_BYTES + 8) + 2 * MAX_SECTOR_BYTES
+
+
+def ledger_headroom(maximum_bytes, allocation):
+    """Runtime-filesystem bytes retained for a ledger of this explicit cap."""
+    maximum = maximum_bytes // PAGE_BYTES * PAGE_BYTES
+    return (round_up(maximum, allocation) + round_up(journal_bound(maximum // PAGE_BYTES), allocation)
+            + 2 * allocation)
 
 
 class Ledger:
@@ -58,10 +77,8 @@ class Ledger:
             # Lifetime lock: independent agents must not write one ring ledger.
             fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             allocation = self.space(self.fd).f_frsize
-            self.journal_bound = (self.maximum_pages * (PAGE_BYTES + 8 + 2 * MAX_SECTOR_BYTES)
-                                  + MAX_SECTOR_BYTES)
-            self.headroom = (round_up(self.maximum_bytes, allocation)
-                             + round_up(self.journal_bound, allocation) + 2 * allocation)
+            self.journal_bound = journal_bound(self.maximum_pages)
+            self.headroom = ledger_headroom(self.maximum_bytes, allocation)
             # Before file creation, PRAGMAs or hot-journal recovery can write.
             self.check_space()
             self._check_sidecars()
@@ -85,6 +102,12 @@ class Ledger:
             self.connection = sqlite3.connect(f"/proc/self/fd/{self.fd}/ring.sqlite3",
                                               isolation_level=None, check_same_thread=False)
             self.connection.row_factory = sqlite3.Row
+            # The journal bound assumes one header per transaction. A cache
+            # spill would sync and start another sector-aligned header, so a
+            # build that cannot disable spilling is refused, not trusted.
+            self.connection.execute("PRAGMA cache_spill = OFF")
+            if self.connection.execute("PRAGMA cache_spill").fetchone()[0] != 0:
+                raise RingRefused("unsupported_ledger_format")
             self.connection.execute("PRAGMA page_size = 4096")
             if self.connection.execute("PRAGMA auto_vacuum").fetchone()[0] != 0 or (header and header[20] != 0):
                 raise RingRefused("unsupported_ledger_format")
@@ -137,7 +160,11 @@ class Ledger:
         required = PAGE_BYTES * (74 + 6 * integer(segments) + 4 * integer(incidents)
                                  + 4 * integer(protections))
         if required > self.maximum_bytes:
-            raise RingRefused("insufficient_ledger_capacity")
+            refused = RingRefused("insufficient_ledger_capacity")
+            # Value-free for callers that surface only the code; status()
+            # reports it so the Owner can size a sufficient ledger cap.
+            refused.required_bytes = required
+            raise refused
         return required
 
     def _check_sidecars(self):
