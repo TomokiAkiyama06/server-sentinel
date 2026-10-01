@@ -75,6 +75,7 @@ from types import SimpleNamespace
 from uuid import UUID, uuid5
 
 from app.audit.store import DEFAULT_RETENTION as AUDIT_RETENTION, AuditStore
+from app.cameras.remote_agent.pairing import _MAX_KEY_BINDINGS_PER_NODE
 from app.cameras.uvc.persistence import ApprovalStore
 from app.detection.owner import store as owner_store
 from app.integrity.model import Finding, Kind, State
@@ -1138,21 +1139,6 @@ def _compare_pairing(baseline: dict, current: dict) -> list:
         # by revoke() of its node since the record.
         revoked_nodes.update(binding["node_id"] for key_ref, binding in bindings.items()
                              if binding["revoked"] and key_ref not in recorded_bindings)
-        # A live binding added since the record comes from approve() (its
-        # enrollment stays, in some state), from stage_renewal() (the node's
-        # staged row), or is the credential key that renewal became. A key
-        # staged and then superseded (re-staged, or its renewal dropped by an
-        # activation) stays bound with nothing left to show it was staged:
-        # that is indistinguishable from a stray binding and fails closed.
-        enrollment_pairs = {(item["node_id"], item["key_ref"]) for item in enrollments_now.values()}
-        for key_ref, binding in sorted(bindings.items()):
-            node = binding["node_id"]
-            if key_ref in recorded_bindings or binding["revoked"]:
-                continue
-            if not ((node, key_ref) in enrollment_pairs
-                    or (renewals.get(node) or {}).get("key_ref") == key_ref
-                    or (credentials.get(node) or {}).get("key_ref") == key_ref):
-                fail("pairing_key_bindings", key_ref, "unexplained")
 
     # -- enrollment transitions and the operation that made them -----------
     recorded_states = {enrollment: item["state"]
@@ -1248,6 +1234,40 @@ def _compare_pairing(baseline: dict, current: dict) -> list:
             fail("pairing_revocation", node, "incomplete")
         else:
             revoked_completely.add(node)
+
+    # -- every binding added since the record, live or revoked, by its key -
+    # approve() binds an enrollment's key (the enrollment stays, in some
+    # state); stage_renewal() binds the node's staged key, which promotion
+    # makes the credential key. A staged key whose renewal a revoke() then
+    # deleted stays bound, revoked, with no other trace: accepted only for a
+    # node completely revoked in the window that had an active credential
+    # in it (at the record, or from an activation before the revocation).
+    # A key staged and then superseded while live (re-staged, or its
+    # renewal dropped by an activation) has no trace either and fails closed.
+    if recorded_bindings is not None:
+        enrollment_pairs = {(item["node_id"], item["key_ref"])
+                            for item in enrollments_now.values()}
+        for key_ref, binding in sorted(bindings.items()):
+            node = binding["node_id"]
+            if key_ref in recorded_bindings:
+                continue
+            explained = ((node, key_ref) in enrollment_pairs
+                         or (renewals.get(node) or {}).get("key_ref") == key_ref
+                         or (credentials.get(node) or {}).get("key_ref") == key_ref)
+            if not explained and binding["revoked"]:
+                before = recorded_credentials.get(node)
+                explained = node in revoked_completely and (
+                    (before is not None and not before["revoked"])
+                    or any(item["node_id"] == node for item in activated_since.values()))
+            if not explained:
+                fail("pairing_key_bindings", key_ref, "unexplained")
+    # stage_renewal() binds a new key only while the node holds fewer than
+    # PairingLedger's cap; approve() is not capped, one binding each.
+    held: Counter = Counter(binding["node_id"] for binding in bindings.values())
+    approvals: Counter = Counter(item["node_id"] for item in enrollments_now.values())
+    for node, count in sorted(held.items()):
+        if count > _MAX_KEY_BINDINGS_PER_NODE + approvals[node]:
+            fail("pairing_key_bindings", node, "over_capacity")
 
     # Only an enrollment activated after the record explains a new identity:
     # one open at record time, unchanged, or one created since, whose key

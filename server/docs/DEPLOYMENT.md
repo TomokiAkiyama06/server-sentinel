@@ -491,9 +491,13 @@ never deleted, rebound or un-revoked; a
 staged renewal stays, is retried with its own key while the credential is
 unchanged, is replaced by a key newly bound since the record, or leaves by
 promotion, revocation or a fresh pairing; a credential first seen now needs a
-fresh pairing of its key; a live binding added since the record must be
-explained by an enrollment of that node and key, the node's staged renewal,
-or its current credential key (`unexplained` otherwise). Four ledger-reachable
+fresh pairing of its key; every binding added since the record, live or
+revoked, must be explained by its own key: an enrollment of that node and
+key, the node's staged renewal, its current credential key, or, for a
+revoked one only, a key staged before the revocation of a node completely
+revoked in the window that had an active credential in it (`unexplained`
+otherwise); and no node holds more bindings than the ledger's staging cap
+plus one per enrollment (`over_capacity`). Four ledger-reachable
 cases fail closed: a renewal both staged and promoted inside the window (its
 material cannot be shown), a key staged inside the window and then
 superseded by another staging or by an activation that drops its renewal

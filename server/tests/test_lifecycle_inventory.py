@@ -3247,6 +3247,51 @@ class LifecycleInventoryTests(unittest.TestCase):
         self.assertIn({"id": f"pairing_credentials:{node}", "reason": "revocation_incomplete"},
                       report["sections"]["security_state"]["failed"])
 
+    def test_every_new_binding_is_explained_by_its_own_key(self):
+        # Codex P1: a binding added since the record, revoked or live, is an
+        # enrollment's key, the staged or credential key, or (revoked only) a
+        # key staged before a revocation of a node that had an active
+        # credential in the window. A node revoked with only an open
+        # enrollment never staged anything.
+        self.runtime.seed()
+        database = Database(self.runtime.database)
+        ledger = PairingLedger(database, HmacCodeVerifier(b"s" * 32),
+                               audit=AuditStore(database), clock=lambda: 100.0,
+                               process_epoch=uuid4())
+
+        class Owner:
+            def require_owner(self, actor_context):
+                if actor_context != "owner":
+                    raise PermissionError("synthetic denial")
+        owner, node = Owner(), uuid4()
+        ledger.approve(owner, "owner", node_id=node, public_key_digest="a" * 64)
+        _, baseline = self.record()
+        ledger.revoke(owner, "owner", node_id=node)
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(report["sections"]["security_state"]["failed"], [])
+        self.runtime.execute("INSERT INTO pairing_key_bindings VALUES (?, ?, 1)",
+                             ("e" * 64, str(node)))
+        code, report, _ = self.verify(baseline)
+        failed = report["sections"]["security_state"]["failed"]
+        self.assertEqual([item["reason"] for item in failed
+                          if item["id"].startswith("pairing_key_bindings:")], ["unexplained"])
+
+    def test_bindings_stay_within_the_ledger_capacity(self):
+        # stage_renewal() binds a new key only below PairingLedger's per-node
+        # cap; approve() adds at most one binding per enrollment.
+        from app.cameras.remote_agent.pairing import _MAX_KEY_BINDINGS_PER_NODE
+        self.runtime.seed()
+        node = self._paired_node("a" * 64, "c" * 64)
+        with closing(sqlite3.connect(self.runtime.database, isolation_level=None)) as db:
+            db.execute("INSERT INTO pairing_key_bindings VALUES (?, ?, 0)", ("a" * 64, node))
+            db.executemany("INSERT INTO pairing_key_bindings VALUES (?, ?, 1)",
+                           [(f"{index:064x}", node)
+                            for index in range(1, _MAX_KEY_BINDINGS_PER_NODE + 2)])
+        _, baseline = self.record()
+        code, report, _ = self.verify(baseline)
+        self.assertIn({"id": f"pairing_key_bindings:{node}", "reason": "over_capacity"},
+                      report["sections"]["security_state"]["failed"])
+
     def test_a_staged_renewal_is_never_restaged_onto_a_superseded_key(self):
         # Codex P1: stage_renewal() accepts a key already bound to the node
         # only as a retry of the currently staged key.
