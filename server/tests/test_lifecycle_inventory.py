@@ -1250,15 +1250,123 @@ class LifecycleInventoryTests(unittest.TestCase):
         code, report, _ = self.verify(baseline)
         self.assertEqual(code, inventory.EXIT_FAILED)
         self.assertEqual(len(report["sections"]["integrity_delivery"]["failed"]), 2)
-        # The real promotions: one row per slot; one still pending, one
-        # delivered with the slot's time and the failure kind CHANGED implies.
+        # The real promotions: one row per slot. The still-pending one proves
+        # its slot; the delivered one leaves only (failure kind, time), which
+        # cannot name MEMORY / CHANGED, so that slot is unverifiable.
         outbox([{"kind": "CPU", "state": "CHANGED", "detail": "COALESCED_PENDING_WARNING"}], when)
         outbox([{"kind": "MEMORY", "state": "CHANGED",
                  "detail": "COALESCED_PENDING_WARNING"}], when)
         deliver(3, "hardware_integrity_failure", when)
         code, report, _ = self.verify(baseline)
-        self.assertEqual(code, inventory.EXIT_PRESERVED,
-                         report["sections"]["integrity_delivery"])
+        self.assertEqual(code, inventory.EXIT_FAILED)
+        self.assertEqual(report["sections"]["integrity_delivery"]["failed"],
+                         [{"id": "overflow:MEMORY:CHANGED", "reason": "unverifiable"}])
+
+    def test_delivered_unrelated_row_never_stands_in_for_a_lost_slot(self):
+        # Codex P1: a CPU / CHANGED slot is lost while an unrelated GPU /
+        # CHANGED row of the same failure kind and time is delivered.
+        self.runtime.seed()
+        when = "2026-01-01T00:00:00+00:00"
+        self.runtime.execute("INSERT INTO integrity_overflow VALUES ('CPU', 'CHANGED', ?)",
+                             (when,))
+        _, baseline = self.record()
+        self.runtime.execute("DELETE FROM integrity_overflow")
+        self.runtime.execute(
+            "INSERT INTO integrity_outbox(at, immediate, findings) VALUES (?, 1, ?)",
+            (when, json.dumps([{"kind": "GPU", "state": "CHANGED", "detail": "x"}])))
+        self.runtime.execute("DELETE FROM integrity_outbox WHERE id=1")
+        self.runtime.execute(
+            "INSERT INTO notification_events VALUES (?, 'hardware_integrity_failure', ?, 1, 'sent')",
+            (str(uuid5(EVENT_NAMESPACE, "integrity-outbox:1")), when))
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_FAILED)
+        self.assertEqual(report["sections"]["integrity_delivery"],
+                         {"status": "failed",
+                          "failed": [{"id": "overflow:CPU:CHANGED", "reason": "unverifiable"}]})
+
+    def _paired_node(self, key: str, serial: str) -> str:
+        node = str(uuid4())
+        self.runtime.execute(
+            "INSERT INTO capture_nodes VALUES (?, 'synthetic', 'online', NULL, "
+            "'2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00')", (node,))
+        self.runtime.execute(
+            "INSERT INTO pairing_node_credentials (node_id, public_key_digest, "
+            "credential_serial_digest, state, not_after) VALUES (?, ?, ?, 'active', 10.0)",
+            (node, key, serial))
+        return node
+
+    def _activated(self, node: str, key: str) -> None:
+        self.runtime.execute(
+            "INSERT INTO pairing_enrollments VALUES (?, ?, ?, 'f', 'epoch', 0, 'activated')",
+            (str(uuid4()), node, key))
+
+    def test_an_old_activated_enrollment_never_explains_a_new_identity(self):
+        # Codex P1: the node first paired with key "a", then promoted a
+        # renewal to key "b" before the record. Reinstating "a" (still bound,
+        # its enrollment still 'activated') is not a fresh pairing.
+        self.runtime.seed()
+        first, current = "a" * 64, "b" * 64
+        node = self._paired_node(current, "c" * 64)
+        for key in (first, current):
+            self.runtime.execute("INSERT INTO pairing_key_bindings VALUES (?, ?, 0)", (key, node))
+        self._activated(node, first)
+        staged = "d" * 64
+        self.runtime.execute("INSERT INTO pairing_key_bindings VALUES (?, ?, 0)", (staged, node))
+        self.runtime.execute("INSERT INTO pairing_node_renewals VALUES (?, ?, ?, 20.0)",
+                             (node, staged, "e" * 64))
+        _, baseline = self.record()
+        self.runtime.execute("UPDATE pairing_node_credentials SET public_key_digest=?, "
+                             "credential_serial_digest=? WHERE node_id=?",
+                             (first, "f" * 64, node))
+        self.runtime.execute("DELETE FROM pairing_node_renewals")
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_FAILED)
+        self.assertEqual(sorted(report["sections"]["security_state"]["failed"],
+                                key=lambda item: item["id"]),
+                         [{"id": f"pairing_credentials:{node}", "reason": "changed"},
+                          {"id": f"pairing_renewals:{node}", "reason": "missing"}])
+        # A pairing activated after the record does explain it.
+        fresh = "9" * 64
+        self.runtime.execute("INSERT INTO pairing_key_bindings VALUES (?, ?, 0)", (fresh, node))
+        self._activated(node, fresh)
+        self.runtime.execute("UPDATE pairing_node_credentials SET public_key_digest=? "
+                             "WHERE node_id=?", (fresh, node))
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_PRESERVED, report["sections"]["security_state"])
+        # A baseline without enrollment IDs cannot date activations: none count.
+        recorded = json.loads(baseline.read_text())
+        state = recorded["security_state"]
+        state["pairing_activations"] = [item[1:] for item in state["pairing_activations"]]
+        legacy = self.notes / "legacy.json"
+        legacy.write_text(json.dumps(recorded))
+        os.chmod(legacy, 0o600)
+        code, report, _ = self.verify(legacy)
+        self.assertEqual(code, inventory.EXIT_FAILED)
+        self.assertIn({"id": f"pairing_credentials:{node}", "reason": "changed"},
+                      report["sections"]["security_state"]["failed"])
+
+    def test_a_staged_renewal_is_never_restaged_onto_a_superseded_key(self):
+        # Codex P1: stage_renewal() accepts a key already bound to the node
+        # only as a retry of the currently staged key.
+        self.runtime.seed()
+        node = self._paired_node("a" * 64, "c" * 64)
+        superseded, staged = "b" * 64, "d" * 64
+        for key in ("a" * 64, superseded, staged):
+            self.runtime.execute("INSERT INTO pairing_key_bindings VALUES (?, ?, 0)", (key, node))
+        self.runtime.execute("INSERT INTO pairing_node_renewals VALUES (?, ?, ?, 20.0)",
+                             (node, staged, "e" * 64))
+        _, baseline = self.record()
+        # A retry of the staged key with a reissued certificate is allowed.
+        self.runtime.execute("UPDATE pairing_node_renewals SET credential_serial_digest=?, "
+                             "not_after=30.0 WHERE node_id=?", ("f" * 64, node))
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_PRESERVED, report["sections"]["security_state"])
+        self.runtime.execute("UPDATE pairing_node_renewals SET public_key_digest=? "
+                             "WHERE node_id=?", (superseded, node))
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_FAILED)
+        self.assertEqual(report["sections"]["security_state"]["failed"],
+                         [{"id": f"pairing_renewals:{node}", "reason": "changed"}])
 
     def test_uncovered_durable_tables_are_listed_as_not_inventoried(self):
         self.runtime.seed()

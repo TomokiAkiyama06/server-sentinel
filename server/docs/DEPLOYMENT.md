@@ -400,15 +400,25 @@ identifiers); pending hardware-integrity notifications (outbox rows as keyed
 digests, overflow slots by category and state): a pending row may leave only
 once its notification event (`uuid5(EVENT_NAMESPACE, "integrity-outbox:<id>")`)
 is durably recorded, and each overflow slot only by its own promotion: a
-distinct new outbox row with the slot's time and single category / state,
-still pending or delivered with its notification event (the slot's time and
-the failure / warning kind its category implies); one-way security state: pairing credentials and capture nodes
+distinct new outbox row, still pending, with the slot's time and single
+category / state. Once that row is delivered it is deleted and only its
+notification event (time and failure / warning kind, no category or state)
+remains, which an unrelated row could match as well, so such a slot is
+reported `unverifiable` (a failure), never preserved: when overflow slots
+exist at record time, verify before the service delivers their promotions
+(e.g. while it is still stopped for the update), or after an `unverifiable`
+result check the Owner's hardware-integrity notifications for that window by
+hand and re-record the baseline; one-way security state: pairing credentials and capture nodes
 once revoked stay revoked, the active capture-node credential material
 (keyed digests of the public key and credential serial digests, and its
 expiry) changes only by promotion of the renewal staged at record time (whose
-key must then be bound to that node) or by a fresh pairing activation, and
+key must then be bound to that node) or by a fresh pairing activation (an
+enrollment activated after the record, identified by its enrollment ID; an
+enrollment already activated at record time never counts), and
 each staged renewal leaves only by that promotion, the node's revocation or a
-fresh pairing, or is re-staged only with a key bound to the node, pairing key bindings (as keyed digests) are never
+fresh pairing, or is re-staged only as a retry of the same staged key or with
+a key newly bound to the node since the record (never a superseded or
+earlier key), pairing key bindings (as keyed digests) are never
 deleted, rebound or un-revoked, an invalidated human session never becomes
 valid again, and the authorization generation never decreases; for each
 registered camera source its type, keyed digests of

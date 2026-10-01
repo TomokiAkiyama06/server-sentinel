@@ -650,7 +650,7 @@ def _security_state(connection, tables, salt: str) -> dict:
                         "SELECT node_id, state, public_key_digest, credential_serial_digest, "
                         f"{not_after} FROM pairing_node_credentials")
     activated = query("pairing_enrollments",
-                      "SELECT node_id, public_key_digest FROM pairing_enrollments "
+                      "SELECT id, node_id, public_key_digest FROM pairing_enrollments "
                       "WHERE state = 'activated'")
     renewals = query("pairing_node_renewals",
                      "SELECT node_id, public_key_digest, credential_serial_digest, not_after "
@@ -675,9 +675,9 @@ def _security_state(connection, tables, salt: str) -> dict:
             for row in credentials},
         "pairing_renewals": None if renewals is None else {
             row["node_id"]: material(row) for row in renewals},
-        # Keys a fresh pairing activated, per node, as binding references.
+        # Activated enrollments: id, node and key binding reference.
         "pairing_activations": None if activated is None else sorted(
-            [row["node_id"], _keyed(salt, ["pairing-key-v1", row["public_key_digest"]])]
+            [row["id"], row["node_id"], _keyed(salt, ["pairing-key-v1", row["public_key_digest"]])]
             for row in activated),
         "pairing_key_bindings": None if bindings is None else {
             _keyed(salt, ["pairing-key-v1", row[0]]): {"node_id": row[1], "revoked": bool(row[2])}
@@ -703,7 +703,24 @@ def _compare_security_state(baseline: dict | None, current: dict | None) -> dict
     credentials = current.get("pairing_credentials") or {}
     staged = baseline.get("pairing_renewals") or {}
     renewals_now = current.get("pairing_renewals") or {}
-    activations = {tuple(item) for item in current.get("pairing_activations") or ()}
+    # None when the baseline could not see the bindings: then no key counts
+    # as newly bound since the record (fail closed).
+    recorded_bindings = baseline.get("pairing_key_bindings")
+    recorded_activations = baseline.get("pairing_activations")
+    activations_now = current.get("pairing_activations") or ()
+
+    def by_enrollment(items):
+        return all(isinstance(item, list) and len(item) == 3 for item in items)
+    # Only enrollments activated after the record explain a new identity. A
+    # baseline without enrollment IDs cannot tell old activations from new
+    # ones, so it accepts none (fail closed).
+    if (recorded_activations is None or not by_enrollment(recorded_activations)
+            or not by_enrollment(activations_now)):
+        activations = set()
+    else:
+        recorded_ids = {item[0] for item in recorded_activations}
+        activations = {(item[1], item[2]) for item in activations_now
+                       if item[0] not in recorded_ids}
 
     def bound_here(node, key_ref):
         return (bindings.get(key_ref) or {}).get("node_id") == node
@@ -711,15 +728,20 @@ def _compare_security_state(baseline: dict | None, current: dict | None) -> dict
     def reactivated(node, after):
         # PairingLedger.activate(): a fresh pairing installs a new identity
         # whose key it bound to the node and whose enrollment it marked
-        # activated.
+        # activated, after the record.
         return ((node, after["key_ref"]) in activations and bound_here(node, after["key_ref"])
                 and not after["revoked"])
     for node, renewal in staged.items():
         after = credentials.get(node)
         if node in renewals_now:
-            # Re-staging replaces the row only with a key bound to the node.
-            if (renewals_now[node] != renewal
-                    and not bound_here(node, renewals_now[node]["key_ref"])):
+            # PairingLedger.stage_renewal(): a retry keeps the staged key; a
+            # new key is bound to the node in the same transaction, so it is
+            # a binding added since the record, never a superseded one.
+            now_key = renewals_now[node]["key_ref"]
+            newly_bound = (recorded_bindings is not None and now_key not in recorded_bindings
+                           and bound_here(node, now_key))
+            if (renewals_now[node] != renewal and now_key != renewal["key_ref"]
+                    and not newly_bound):
                 failed.append({"id": f"pairing_renewals:{node}", "reason": "changed"})
         # Consumed by promotion, discarded by revocation or a fresh pairing.
         elif not (after is not None and (after["revoked"]
@@ -815,28 +837,30 @@ def _integrity_event_id(row_id: int) -> str:
     return str(uuid5(EVENT_NAMESPACE, f"integrity-outbox:{int(row_id)}"))
 
 
-def _promotion_evidence(slot: tuple, row_id: int, current: dict) -> bool:
-    """Whether new outbox row ``row_id`` is the promotion of overflow ``slot``.
-
-    _promote_overflow() writes one row per slot with the slot's time and a
-    single finding of its category and state. Still pending, the row shows
-    exactly that; delivered, its deterministic notification event carries
-    the slot's time and the failure / warning kind its category implies.
-    """
+def _notification_class(slot: tuple) -> tuple | None:
+    """The (notification kind, time) a promoted slot's delivered event carries."""
     kind, state, at = slot
-    key = str(row_id)
-    if key in current["pending"]:
-        return (current["pending_at"].get(key) == at
-                and current["pending_findings"].get(key) == [[kind, state]])
-    event = current["notification_events"].get(_integrity_event_id(row_id))
-    if event is None:
-        return False
     try:
         immediate = Finding(Kind(kind), State(state), "COALESCED_PENDING_WARNING").immediate
     except ValueError:
-        return False
-    expected = _INTEGRITY_KINDS[0] if immediate else _INTEGRITY_KINDS[1]
-    return event == [expected, at]
+        return None
+    return (_INTEGRITY_KINDS[0] if immediate else _INTEGRITY_KINDS[1], at)
+
+
+def _promotion_evidence(slot: tuple, row_id: int, current: dict) -> bool:
+    """Whether new outbox row ``row_id`` proves the promotion of ``slot``.
+
+    _promote_overflow() writes one row per slot with the slot's time and a
+    single finding of its category and state; only a still-pending row shows
+    that. Once delivered the row is deleted and leaves only its notification
+    event (time and failure / warning kind, no category or state), which an
+    unrelated row of the same kind and time would match as well, so it is no
+    proof.
+    """
+    kind, state, at = slot
+    key = str(row_id)
+    return (key in current["pending"] and current["pending_at"].get(key) == at
+            and current["pending_findings"].get(key) == [[kind, state]])
 
 
 def _compare_integrity_delivery(baseline: dict | None, current: dict | None) -> dict:
@@ -853,14 +877,19 @@ def _compare_integrity_delivery(baseline: dict | None, current: dict | None) -> 
                 failed.append({"id": f"pending:{row_id}", "reason": "changed"})
         elif _integrity_event_id(int(row_id)) not in accepted:
             failed.append({"id": f"pending:{row_id}", "reason": "missing"})
-    # Each removed slot needs its own new outbox row (created after the
-    # recorded AUTOINCREMENT sequence), every row consumed at most once:
-    # a maximum bipartite matching between slots and evidencing rows.
+    # Each removed slot needs its own new, still-pending outbox row (created
+    # after the recorded AUTOINCREMENT sequence), every row consumed at most
+    # once: a maximum bipartite matching between slots and evidencing rows.
     remaining = {tuple(item) for item in current["overflow"]}
     removed = [tuple(item) for item in baseline["overflow"] if tuple(item) not in remaining]
     new_ids = range(baseline["sequence"] + 1, current["sequence"] + 1)
     candidates = [[row_id for row_id in new_ids if _promotion_evidence(slot, row_id, current)]
                   for slot in removed]
+    # Delivered new rows leave only (kind, time): such a row may be the
+    # slot's promotion but cannot prove it, so that slot is unverifiable.
+    delivered = {tuple(accepted[_integrity_event_id(row_id)]) for row_id in new_ids
+                 if str(row_id) not in current["pending"]
+                 and _integrity_event_id(row_id) in accepted}
     owner = {}
 
     def assign(index, seen):
@@ -872,9 +901,11 @@ def _compare_integrity_delivery(baseline: dict | None, current: dict | None) -> 
                 owner[row_id] = index
                 return True
         return False
-    for index, (kind, state, _) in enumerate(removed):
+    for index, slot in enumerate(removed):
         if not assign(index, set()):
-            failed.append({"id": f"overflow:{kind}:{state}", "reason": "missing"})
+            kind, state, _ = slot
+            reason = "unverifiable" if _notification_class(slot) in delivered else "missing"
+            failed.append({"id": f"overflow:{kind}:{state}", "reason": reason})
     return {"status": "failed" if failed else "preserved", "failed": failed}
 
 
