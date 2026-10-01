@@ -2,9 +2,12 @@
 
 Issue [#4](https://github.com/TomokiAkiyama06/server-sentinel/issues/4) remains
 **open**. The checked-in implementation provides an offline receipt validator,
-a disabled candidate ruleset generator, and synthetic policy tests. There is no
-App publisher, trusted evidence collector, installed enforcement, or completed
-GitHub test-PR acceptance. Continue the current manual current-HEAD/current-base review
+a disabled candidate ruleset generator, a self-hosted delivery adapter, a
+provider review collector, an App-JWT installation-token exchange adapter whose
+RS256 signer is deliberately **not** implemented (Owner decision below), and
+synthetic tests for all of them. There is no registered App, deployed
+publisher, installed enforcement, or completed GitHub test-PR acceptance.
+Everything here is verified only against mocks. Continue the current manual current-HEAD/current-base review
 procedure in [CLAUDE_REVIEW_SETUP.md](CLAUDE_REVIEW_SETUP.md); that document also records the temporary suspension of Claude review automation.
 
 ## Capability assessment
@@ -128,9 +131,11 @@ The configuration contains only routing identity:
 Keep it outside the repository, mode `0600`. Set the short-lived installation
 token only in the publisher service environment as
 `SERVER_SENTINEL_REVIEW_GATE_INSTALLATION_TOKEN`; do not write it into this
-file. A future separately reviewed App-JWT exchange component may use the
-validated external key to refresh that environment value. This foundation does
-not create a key, token, App, installation, check source, or ruleset.
+file. Alternatively `review_gate_app_token.py` (below) exchanges an App JWT for
+the token in memory and passes it as `installation_token=` to
+`load_app_credentials`; the environment variable is then unused. The
+`AppCredentials` repr omits the key and token. This foundation does not create
+a key, token, App, installation, check source, or ruleset.
 
 The publisher must execute reviewed, pinned code and load policy from its trusted
 deployment, never from the PR. Neither same-repository nor fork code may run with
@@ -143,11 +148,250 @@ attestation. Its secret must also be isolated before trusting additional writers
 Collect both reviewers from authenticated reviewer APIs or execute the reviewers
 in the isolated trusted process. Verify the actual issuer, exact request/run ID,
 successful complete response, and no unresolved important/critical findings.
-Codex's `Reviewed commit` alone lacks a base binding and is insufficient. Record
-the exact review request context before invoking either engine. Reactions, an
+Codex's `Reviewed commit` alone lacks a base binding and is insufficient; the
+collector below uses it only together with a recorded request, its watermark
+and the runtime delay. Record the exact review request context before invoking
+either engine. Reactions, an
 author display name, or a subsequent request comment do not establish that the
 review was performed against that context. Missing provider provenance fails
-closed. The provider adapters and their hostile-input tests remain required work.
+closed.
+
+### Provider review collector (`review_gate_collector.py`)
+
+The collector converts an authenticated Codex or Claude **GitHub pull-request
+review**, or the provider's **"no findings" issue comment**, into the fixed
+receipt from `successful_check_run_request`. Codex posts findings as a review,
+but when it finds nothing it posts only an issue comment (for example
+`Codex Review: Didn't find any major issues.` followed by
+``**Reviewed commit:** `0123456789` ``, a 10-digit short SHA); without reading
+those comments a clean Codex result would stay `pending` forever. It never
+executes a provider and never posts the trigger comment. Publication goes
+through `ReviewCollector.collect_and_publish()` (see "Publication and
+supersession" below); a success is posted only via `publish_success`, which
+re-reads the live context again before posting.
+
+Provider policy lives in an external private JSON file named by
+`SERVER_SENTINEL_REVIEW_COLLECTOR_CONFIG` (same `0600` / outside-checkout /
+no-symlink rules as the publisher configuration):
+
+```json
+{"state_dir": "/var/lib/server-sentinel-review-gate",
+ "providers": {"codex": {"user_id": 123, "user_login": "<provider-app>[bot]",
+   "max_review_runtime_seconds": 1800,
+   "pass_markers": ["<exact no-findings phrase>"],
+   "blocking_markers": ["<P0 marker>", "<P1 marker>"],
+   "non_blocking_markers": ["<suggestion-only marker>"]}}}
+```
+
+`user_id` is the numeric account ID of the provider App's bot user; the login
+must also match and GitHub must report `type: "Bot"`. The shared GitHub Actions
+bot (`github-actions[bot]`, user ID `41898282`), anything performed via the
+Actions App (`15368`) and `dependabot[bot]` are refused as configuration and
+ignored as evidence. This is what makes a review posted by a PR workflow's
+`GITHUB_TOKEN` worthless: it can copy every word, but not the bot identity.
+Lookalike logins and a matching login with another ID are counted in the
+decision as `ignored_untrusted_reviews`, never as a pass. Codex and Claude must
+have distinct identities. The current same-repository Claude workflow posts as
+the Actions bot and therefore cannot satisfy this collector; a trusted Claude
+path needs its own App identity or an isolated trusted process (Owner decision).
+
+Flow and binding:
+
+1. Before posting any trigger (for example `@codex review`), call
+   `request_review(reviewer, live_context, source)`. It durably records the
+   complete `Context`, the highest review ID and the highest issue comment ID
+   currently listed on the PR (watermarks) and the request time, under a per-PR lock, with an atomic
+   `0600` write and directory fsync in `state_dir` (a `0700` directory owned by
+   the publisher account, outside every checkout). A repeated call for the same
+   active context returns the same request (retrying trigger delivery never
+   creates a second request). `force_new=True` supersedes it, but is refused
+   while a success this collector published still stands; call
+   `revoke_published()` first so the old success cannot satisfy the required
+   check during the rerun.
+2. `collect(reviewer, read_live_context, source)` re-reads the live context
+   before and after reading the complete, paginated reviews and each candidate's
+   inline comments. Any HEAD, base, merge-base, diff or test-merge difference
+   from the request marks the request `invalidated` durably; it can never pass
+   again, even if the old context returns. A new request is required, and the
+   same-HEAD review that preceded it is below its watermark. The unlocked first
+   read can be overtaken by a concurrent `request_review` for a newer context
+   (even within the same clock second, so timestamps cannot order them). A
+   mismatch therefore only notes the request ID seen under the lock and
+   re-reads the live context: only if that fresh read still differs and the
+   same request is still current is the request invalidated. If the request
+   was replaced meanwhile, or the fresh read matches, the decision is
+   `pending` (`live_context_read_predates_request`).
+3. A review counts only if it is from the configured bot, has an ID above the
+   watermark, targets the recorded HEAD, and was submitted at least
+   `max_review_runtime_seconds` + 300 s (clock skew allowance) after the
+   request. GitHub reviews carry only `commit_id`; this delay is the only way to
+   exclude a review that was started under an older base (automatic review on
+   push, a human `@codex review`) and finished after the new request.
+   Earlier passing reviews are ignored as ambiguous; earlier *failing* ones
+   still block. Consequently a provider run that finishes inside the bound
+   (the normal case when the bound is set correctly) leaves the decision
+   `pending`: after the bound has elapsed with the context unchanged, post the
+   trigger again **without** `force_new` (the same request is reused) and the
+   new review, submitted after `earliest`, can count. This doubles provider
+   runs per context; a cheaper binding needs provider-side request/base
+   provenance and is an Owner decision.
+4. A counted review passes only with state `COMMENTED` or `APPROVED`, a pass
+   marker in the body, no blocking marker, and every inline comment carrying a
+   non-blocking marker and no blocking marker. Any other trusted same-HEAD
+   review above the watermark blocks. No clean review yet is `pending`.
+5. Issue comments follow the same author trust (bot ID, login, `type: "Bot"`,
+   not via the Actions App), the comment watermark and the same
+   `created_at` ≥ request + bound rule. A trusted comment without a pass
+   marker (status summary, usage-limit notice) is ignored. A trusted comment
+   with a pass marker is a *result comment*; it must contain exactly one
+   `Reviewed commit` binding spelled as 7–40 lowercase hex digits, no blocking
+   marker, and must never have been edited (`updated_at` = `created_at`; a
+   maintainer can edit a bot's comment). Otherwise it blocks. A result whose
+   short SHA is not a prefix of the recorded HEAD is for another commit and is
+   ignored. A matching short SHA is resolved through
+   `GET /repos/{owner}/{repo}/commits/{short_sha}`: GitHub refuses an
+   ambiguous short SHA, which raises (fail closed), and a resolution to any
+   commit other than the exact HEAD blocks. So a short SHA never attributes a
+   result to another commit, even one crafted to share the prefix. The PR's
+   issue comment listing and the commit lookup are covered by the **Pull
+   requests: read** and **Contents: read** permissions above.
+
+Decisions are `pass`, `pending`, `blocked` or `invalidated` with a fixed reason
+code; only `pass` carries a check-run request. Malformed or oversized evidence,
+a truncated listing (the watermark review must still be listed), a listing that
+regressed, more than 1000 reviews / 1000 issue comments / 300 comments per
+review / 20 candidate reviews and result comments, a corrupt, foreign or non-private ledger record, an unavailable lock
+(30 s bound) and every API error raise `CollectorFailure`, leaving the check
+absent. Logs carry reviewer, PR, request ID, status and reason code only;
+review text is never logged.
+
+### Publication and supersession
+
+GitHub evaluates a required check by the **latest** attempt with that name on
+the test-merge SHA, and nothing removes an earlier success. The collector
+therefore records, in the same private ledger record (schema version 3, which
+adds the issue comment watermark; a version 2 record fails closed as corrupt), the
+success it posted, or may have posted, per reviewer: request ID, test-merge
+SHA, Check Run ID (once confirmed) and state (`publishing` / `success` /
+`revoking`).
+
+- `collect_and_publish(reviewer, pr_number, read_live_context, source, client,
+  credentials)` (pass `read_live_context=None` in production to share the
+  immutable Git object cache described below) is one reconciliation pass, bound to `pr_number` and the
+  configured repository: a live read naming another PR or repository fails
+  before any ledger is touched (and supersedes `pr_number`'s standing
+  success, which that pass could not verify). A `pass` for the ledger's current
+  active request posts one success; if that exact success is already recorded
+  **and** GitHub still lists it as the dedicated App's latest attempt of that
+  check on the test-merge SHA, the pass is a no-op, so polling and restart
+  recovery do not create further runs. The verification is one read of
+  `GET /repos/{owner}/{repo}/commits/{test_merge_sha}/check-runs` filtered by
+  `check_name`, `app_id` and `filter=all` (paged, at most 10 pages; covered by
+  the **Checks: read** permission above). The recorded run must have the highest
+  run ID among that App's runs of the check and read `completed` / `success`.
+  An incomplete or changing listing is treated as "not latest" (supersede,
+  then post a new success); a failed read raises and supersedes the standing
+  success (fail closed). Before any new success is posted, the App's attempt
+  count of that check on the test-merge SHA is read; at 1000 attempts (the most
+  the listing can verify) no further success is posted and the pass raises, so
+  an unverifiable latest attempt cannot cause a supersede-and-republish on
+  every poll. The check then stays failed until the test merge changes.
+- The review `source` must name the configured repository (case-insensitive);
+  a source for another repository is a collection error that supersedes the
+  standing success, and `publish()` refuses a pass collected from such a
+  source. `GitHubReviewSource.for_credentials()` builds the source from the
+  configured repository and App token.
+- The per-PR ledger lock is held for the **whole** pass (collection and the
+  resulting publication or revocation), so a pass only ever publishes or
+  revokes what its own collection observed. Overlapping passes cannot revoke a
+  success published from newer evidence, nor publish from evidence a newer
+  non-passing collection already superseded. A pass that cannot take the lock
+  within the lock timeout fails without changing anything (another pass is
+  running); the next scheduled or event-driven pass retries. Automated
+  reconciliation must use `collect_and_publish`; composing `collect()`,
+  `publish()` and `revoke_published()` separately does not have this property.
+- A `publishing` record is saved **before** the success is sent. If the
+  outcome is then ambiguous (API error, lost or malformed response, crash, or
+  a failed ledger write after GitHub accepted the post), the success is still
+  tracked: the error path supersedes it immediately, and otherwise the next
+  outcome supersedes it (a later `pass` first posts a failure attempt, then a
+  new success). An untracked success therefore cannot remain the latest
+  attempt.
+- Every other outcome (`blocked`, `pending` after `force_new`, `invalidated`),
+  a `pass` for a request that was superseded in the meantime, and any
+  collection error supersede a standing success with a newer attempt of the
+  same name on its test-merge SHA: `status: completed`, `conclusion: failure`
+  (never `neutral` / `skipped`, which satisfy a required check), fixed output
+  without review text.
+- Before that failure attempt is posted the ledger is set to `revoking`. A
+  crash or API error during revocation is retried on the next pass and the
+  record is never taken for the current success.
+- If the `revoking` state cannot be written (read-only or full `state_dir`),
+  the failure attempt is still posted, best effort, and the ledger write error
+  is raised (fail closed): an unwritable ledger never leaves the old success
+  as GitHub's latest attempt. The ledger then still names that success, so
+  the running collector remembers the key in memory and never reuses that
+  record as the current success: once `state_dir` is writable again, the next
+  pass revokes and clears it and, on a clean review, posts a new success.
+  A restarted publisher or another worker has no such memory, but a clean
+  pass there still refuses to reuse the stale record because the latest-attempt
+  verification above sees the newer failure; it supersedes the record and
+  posts a new success. The `review success revocation not recorded` error log
+  and the `review success is not the latest attempt` warning identify the case.
+  The run-ID ordering and `filter=all` listing have been exercised only with a
+  synthetic transport; confirm them against GitHub (MANUAL_TEST) before
+  relying on this recovery.
+- If collection fails **and** the revocation fails, `CollectorFailure` is
+  raised with a fixed message; the ledger still holds the standing success (or
+  `revoking`) and the next pass retries.
+
+Recovery: a corrupt ledger record is not deleted automatically. The Owner
+inspects and removes `state_dir/<repository_id>-<pr>-<reviewer>.json`, then a
+new request and review are needed. Deleting a record never produces a pass by
+itself, but it forgets a standing success: first confirm on GitHub that the
+latest attempt of that check on the current test merge is not `success`, or
+post a failure attempt, before deleting.
+
+Residual limits (need Owner decision and real GitHub acceptance): marker
+strings and the provider runtime bound are Owner policy, not verified provider
+formats; a provider that reviews longer than the bound can still be
+misattributed; a prompt-injected provider can emit a pass marker; the watermark
+assumes GitHub review IDs increase over time.
+
+### App-JWT installation token exchange (`review_gate_app_token.py`)
+
+`open_token_source(config, checkout_root, transport, signer_factory)` loads the
+external key with the publisher's descriptor checks and hands it only to the
+signer. `InstallationTokenSource.token()` builds an App JWT (`alg: RS256`,
+`iat` = now - 60 s, `exp` = now + 540 s, `iss` = App ID) and POSTs to
+`/app/installations/<id>/access_tokens` requesting `repository_ids: [<repo>]`
+and exactly `checks: write`, `contents: read`, `metadata: read`,
+`pull_requests: read`. The answer must echo exactly those permissions,
+`repository_selection: "selected"`, only the configured repository, a
+`ghs_`-form token and an expiry between 5 minutes and 1 hour (+5 minutes skew)
+away. The token is cached in memory, refreshed once fewer than 5 minutes
+remain, single-flight across threads, and dropped on any failure or
+`invalidate()`. There is no retry loop; the caller retries on its next pass.
+
+The key, JWT and token are held only in memory: never in files, `os.environ`,
+subprocess arguments, log records, `repr()` or exception text, and failures
+raise `TokenFailure` with fixed messages and no exception chain at all
+(neither `__cause__` nor `__context__`, so even code that ignores
+`__suppress_context__` cannot reach a transport or key-backend diagnostic).
+Any exception a signer raises, including a `TokenFailure` a custom signer
+builds from a PEM-parser message, is replaced by the fixed message. Synthetic
+tests assert this for success, transport failure, a leaking signer and a
+signer raising `TokenFailure` with key text.
+
+**RS256 is not implemented.** Python's standard library has no RSA signature
+primitive, and no already-pinned dependency in this repository provides one.
+The default `UnconfiguredRs256Signer` refuses to sign, so exchange fails closed.
+Choosing between adding a reviewed crypto dependency (for example the
+Apache-2.0/BSD `cryptography` package, pinned with hashes), signing through a
+system `openssl` binary (key path only, never key bytes, in argv), or a
+hand-written standard-library RSA implementation is an Owner / license decision
+(AGENTS.md sections 13 and 18). Until then, keep using the environment-token
+path or leave the publisher disabled.
 
 Construct a `Context` from the authenticated target repository ID, PR number,
 `refs/heads/main`, current head/base commit IDs, a unique merge-base commit ID,
@@ -168,6 +412,22 @@ a missing/malformed parent object, no common ancestor, or a criss-cross history
 with multiple best common ancestors fails closed. A deployment whose repository
 history exceeds the bound needs a separately reviewed, trusted graph collector;
 do not weaken or skip this proof.
+
+Because commit and recursive tree objects are content-addressed, the
+collector keeps one bounded LRU `GitObjectCache` (at most 8192 objects) and
+`collect_and_publish()` routes every GitHub read through
+`CachingGitHubTransport`. A commit object is cached only when its `sha`
+matches the requested SHA. Trees are requested by commit SHA, so a tree is
+cached only when it is complete (not `truncated`) and its `sha` equals the
+`tree.sha` of that commit's already cached, verified object; a tree read
+before its commit, or one with a missing or different `sha`, is used once but
+never cached, so a later read can still detect the mismatch. Nothing mutable (the pull request, the test-merge ref, check
+runs) is ever cached. Passing `read_live_context=None` makes the before,
+after and mismatch-confirmation reads and the `publish_success` re-read all
+use `collect_live_context` over that transport, so one passing reconciliation
+walks the ancestry once instead of three times, and later polls reuse it.
+Every live read still re-fetches the PR and merge ref, so a HEAD, base or
+test-merge change is always observed.
 
 Invalidate previous successes before rerunning either review. Handle PR opens,
 updates, retargets, reopenings, review reruns and base pushes; polling must also
