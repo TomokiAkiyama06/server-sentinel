@@ -175,7 +175,8 @@ class ReconnectController:
             if self.state != CameraState.MANUAL:
                 self._transition(CameraState.MANUAL, "owner_approval_required")
             return None
-        # Only a continuously open capture keeps an approved weak binding.
+        # Only a continuously open capture (or a held unsupported verdict on
+        # the identical device instance) keeps an approved weak binding.
         if self.bound is not None and devices.count(self.bound) == 1:
             peers = [d for d in devices if d.strong_key == self.bound.strong_key]
             if (self._explicit_binding or self.bound.strong_key is None
@@ -234,6 +235,19 @@ class ReconnectController:
         self.bound = None
         self._explicit_binding = False
         self._transition(CameraState.OFFLINE, "video_capture_failed")
+
+    def capture_unsupported(self):
+        """The bound camera does not offer the profile: stable, status-only.
+
+        The binding is kept only while discovery keeps returning exactly this
+        evidence (the same kernel device instance, see ``reconcile``), so a
+        serial-less camera is not turned into an ambiguous reconnect just
+        because nothing is streaming. It never authorizes a capture: the
+        caller must not launch while its unsupported verdict holds.
+        """
+        if self.requires_approval or self.bound is None:
+            raise ValueError("capture has no approved binding")
+        self._transition(CameraState.OFFLINE, "video_capture_unsupported")
 
     def capture_closed(self, reason="video_capture_closed"):
         self.bound = None

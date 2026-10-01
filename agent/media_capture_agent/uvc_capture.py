@@ -16,7 +16,11 @@ Fail-closed rules:
 - device probing (V4L2 discovery ioctls, opening the capture node) runs off the
   Agent tick thread under a bound, so a hung camera/driver becomes a per-source
   ``discovery_failed``/``capture_failed`` and never stops the node heartbeat;
-- queue drops stay latched until a ``degraded`` snapshot has reported them.
+- queue drops stay latched until a ``degraded`` snapshot has reported them;
+- before a pipeline starts, the MJPEG sizes/intervals the opened approved node
+  advertises are checked against the profile; a profile the camera does not
+  offer is a stable ``capture_unsupported`` (no pipeline, no retry churn) until
+  the device evidence (e.g. a replug) or the Owner approval changes.
 
 Frames go to a bounded per-source ``FrameQueue``. Transport/ring integration
 (#15/#16) and the Owner approval route (#13/#14) are not wired here.
@@ -33,7 +37,7 @@ from uuid import UUID
 
 from .health import SourceHealth
 from .uvc_approvals import ApprovalStorageError, ApprovalStore
-from .uvc_discovery import DiscoveryResult, LinuxDiscovery, ProbeError
+from .uvc_discovery import DiscoveryResult, LinuxDiscovery, ProbeError, match_mjpeg_profile
 from .uvc_identity import CameraState, DeviceEvidence, ReconnectController
 from .uvc_pipeline import (MAX_FRAME_BYTES, MAX_QUEUE_FRAMES, READ_CHUNK_BYTES, Frame,
                            FrameError, FrameQueue, MjpegFrameParser, MjpegProfile,
@@ -121,6 +125,10 @@ class _Call:
         self._lock = threading.Lock()
         self._discard = discard
         self._abandoned = False
+        self._finished = False
+        # Releases handed to this abandoned call while it is still blocked
+        # (e.g. the descriptor a hung mode check is using); run in the worker.
+        self._deferred = []
         self._value = None
         self._error = None
 
@@ -131,7 +139,9 @@ class _Call:
         except BaseException as exc:  # Re-raised in the caller, never in the worker.
             error = exc
         with self._lock:
+            self._finished = True
             abandoned = self._abandoned
+            deferred, self._deferred = self._deferred, []
             if not abandoned:
                 self._value, self._error = value, error
                 self.done.set()
@@ -141,7 +151,23 @@ class _Call:
             # it has finished.
             if error is None:
                 self._release(value)
+            for release in deferred:
+                try:
+                    release()
+                except Exception:
+                    pass
             self.done.set()
+
+    def defer(self, release):
+        """Run ``release`` in the worker once this abandoned call returns.
+
+        False if the call has already finished (the caller keeps ownership).
+        """
+        with self._lock:
+            if self._finished or not self._abandoned:
+                return False
+            self._deferred.append(release)
+            return True
 
     def abandon(self):
         """Give up on the call; True if it had in fact already finished."""
@@ -201,6 +227,11 @@ class _BoundedCall:
             raise TimeoutError("device call exceeded bound")
         self._pending = None
         return call.result()
+
+    def defer(self, release):
+        """Hand ``release`` to the still-blocked call; False if none is blocked."""
+        pending = self._pending
+        return pending is not None and pending.defer(release)
 
     def wait(self, timeout):
         """Wait up to ``timeout`` for a blocked call; True once none is blocked."""
@@ -277,6 +308,10 @@ class _Source:
         self.reported_drops = 0
         # Last capture failure while no pipeline runs; cleared by real frames.
         self.failure = None
+        # The exact device evidence found not to offer this source's profile.
+        # While discovery keeps returning that same evidence the verdict holds
+        # and the node is not reopened; a replug yields new evidence.
+        self.unsupported = None
 
 
 class UvcCapture:
@@ -284,7 +319,7 @@ class UvcCapture:
 
     def __init__(self, settings, sources, *, launcher, store=None, discovery=None,
                  limits=None, open_device=open_video_device, close_device=os.close,
-                 clock=time.monotonic, geteuid=os.geteuid):
+                 match_profile=match_mjpeg_profile, clock=time.monotonic, geteuid=os.geteuid):
         if geteuid() == 0:
             raise CaptureRefused("dedicated_nonroot_account_required")
         sources = tuple(sources)
@@ -301,6 +336,7 @@ class UvcCapture:
         self.launcher = launcher
         self.discovery = discovery or LinuxDiscovery()
         self.open_device, self.close_device, self.clock = open_device, close_device, clock
+        self.match_profile = match_profile
         self._discovery_call = _BoundedCall("media-capture-agent-uvc-discovery")
         # Inside poll(): one stop bound shared by every teardown of that tick
         # and one device bound shared by every scan/open/close of that tick.
@@ -327,6 +363,8 @@ class UvcCapture:
 
     # -- discovery ---------------------------------------------------------
     def _close_quietly(self, descriptor):
+        if type(descriptor) is not int:
+            return  # A late mode-check result owns no descriptor.
         try:
             self.close_device(descriptor)
         except OSError:
@@ -362,8 +400,16 @@ class UvcCapture:
         # Without a worker (thread/PID exhaustion) the descriptor is kept for a
         # later bounded retry and the source reports a cleanup failure; it is
         # never closed on the tick thread and nothing escapes poll().
-        if not self._close_off_thread(source, descriptor, self._device_bound()):
-            source.pending_close.append(descriptor)
+        if self._close_off_thread(source, descriptor, self._device_bound()):
+            return
+        # The shared worker is still blocked (e.g. an abandoned mode check on
+        # this very descriptor): that worker closes it when the call returns,
+        # so the descriptor is released even if close() has already run and
+        # no later poll would retry. Cleanup stays pending until then.
+        if source.device_call.defer(lambda: self._close_quietly(descriptor)):
+            source.closing = True
+            return
+        source.pending_close.append(descriptor)
 
     def _retry_pending_close(self, source, timeout=None):
         timeout = self._device_bound() if timeout is None else timeout
@@ -491,10 +537,8 @@ class UvcCapture:
     def _launch(self, source):
         controller = source.controller
         candidate = controller.bound
-        if MJPEG not in candidate.formats:
-            controller.capture_failed()
-            source.failure = "capture_unsupported"
-            self._schedule_retry(source)
+        if MJPEG not in candidate.formats or source.unsupported == candidate:
+            self._unsupported(source, candidate)
             return
         descriptor = None
         process = None
@@ -507,11 +551,22 @@ class UvcCapture:
             if (fresh.failures or fresh.devices.count(candidate) != 1
                     or controller.reconcile(fresh.devices) != candidate):
                 raise CaptureRefused("video capture identity changed")
-            process = self.launcher.launch(descriptor, source.config.profile)
+            # Read-only mode enumeration on this approved descriptor only,
+            # bounded like the open. A driver that advertises a mode it then
+            # refuses is still caught by the pipeline's own negotiation.
+            profile = source.device_call.run(
+                lambda: self.match_profile(descriptor, source.config.profile),
+                self._device_bound())
+            if profile is None:
+                self._unsupported(source, candidate)
+                return
+            if not isinstance(profile, MjpegProfile):
+                raise PipelineError("invalid capture profile match")
+            process = self.launcher.launch(descriptor, profile)
         except ApprovalStorageError:
             self._storage_failure(source)
             return
-        except (CaptureRefused, PipelineError, OSError, ValueError):
+        except (CaptureRefused, PipelineError, ProbeError, OSError, ValueError):
             if not controller.requires_approval:
                 controller.capture_failed()
                 source.failure = "capture_failed"
@@ -534,6 +589,17 @@ class UvcCapture:
             controller.capture_failed()
             source.failure = "capture_failed"
             self._schedule_retry(source)
+
+    @staticmethod
+    def _unsupported(source, candidate):
+        # Not a transient failure: no backoff relaunch. The binding is kept
+        # while discovery returns this exact evidence (same device instance),
+        # so a serial-less camera stays capture_unsupported instead of turning
+        # into an ambiguous reconnect; it never launches while the verdict
+        # holds, and a replug (new instance) follows the normal identity rules.
+        source.unsupported = candidate
+        source.controller.capture_unsupported()
+        source.failure = "capture_unsupported"
 
     # -- health --------------------------------------------------------------
     def _health(self, source, now):
@@ -655,6 +721,7 @@ class UvcCapture:
                 raise CaptureRefused("approval_state_unavailable") from None
             source.retry_at = 0.0
             source.failure = None
+            source.unsupported = None  # An explicit Owner decision re-evaluates once.
             source.backoff = self.limits.backoff_initial
 
     def close(self):

@@ -326,6 +326,28 @@ Checked (pass):
 Pending: dedicated service account; generated systemd unit (`DevicePolicy`
 allowlist, `ProtectHome`); USB unplug/replug; a second identical camera.
 
+### Record: Issue #12 pre-launch MJPEG profile check (2026-09-30, Main host)
+
+Environment: Main development host (not a deployed service), Landlock present,
+distribution GStreamer, one of two serial-bearing MJPEG UVC cameras of the same
+model, operator account in `video`, scratch harness with the production
+`LinuxDiscovery`, `open_video_device`, `match_mjpeg_profile` and
+`GStreamerLauncher` (only the sandbox helper file's root-ownership check was
+bypassed because the development checkout is user-writable). Frames were counted
+and discarded; no device values recorded.
+
+- [x] 3840x2160@30, 1920x1080@60 and 1280x720@25: one mode check, then
+  `offline`/`capture_unsupported` on every one of 24 polls over 12 s with zero
+  GStreamer launches;
+- [x] 1920x1080@30: mode check returns the requested profile, one launch,
+  `degraded`/`capture_starting` then `online`/`video_ready` after about 1 s,
+  about 30 fps with a draining consumer.
+
+Pending: replug and Owner re-approval re-evaluation on hardware; a camera
+advertising stepwise/continuous sizes or fractional (e.g. 30000/1001) intervals;
+a serial-less camera staying `capture_unsupported` across polls (mock-only so far);
+the remote capture node.
+
 ### Capture-node verification record (2026-09-30, Issue #12)
 
 Environment (coarse by design; exact models, versions, serials, paths and host
@@ -1177,6 +1199,12 @@ Capture:
   only the minimal variables; `/proc/<pid>/fd` of the child shows no audio device.
 - [ ] Verify `v4l2src` accepts the inherited descriptor path on this GStreamer
   version; if it does not, record the failure (`capture_failed`) and stop.
+- [ ] Configure a profile the camera does not list in
+  `v4l2-ctl --list-formats-ext` (size and, separately, frame rate): the source
+  reports `offline`/`capture_unsupported` on every poll with no `gst-launch-1.0`
+  process ever started; unplug/replug (or Owner re-approval) re-evaluates once.
+  If the camera lists a fractional rate such as 29.97, a 30 fps profile starts at
+  that rate.
 - [ ] With no consumer draining frames, health shows `capture_overloaded` rather
   than `video_ready`; with a consumer, drops stop and health returns to online.
 - [ ] Unplug the camera: the source becomes `offline`/`camera_missing` within one

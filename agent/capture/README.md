@@ -91,8 +91,26 @@ gst-launch-1.0 -q --gst-plugin-load=<dir>/libgstcoreelements.so,<dir>/libgstvide
   `capture_cleanup_failed`). A member that leaves the group with `setsid` is
   not tracked without cgroups.
 - The explicit profile requires the camera to advertise `MJPG`; otherwise the
-  source reports `capture_unsupported` without starting a process. A profile the
-  driver rejects makes the pipeline exit and reports `capture_failed`.
+  source reports `capture_unsupported` without starting a process.
+- Before launch, the profile is checked against the MJPEG modes of the opened,
+  identity-rechecked descriptor (`VIDIOC_QUERYCAP`, `ENUM_FMT`,
+  `ENUM_FRAMESIZES`, `ENUM_FRAMEINTERVALS`; read-only, bounded by
+  `device_timeout`, no other node is opened). Discrete, stepwise and continuous
+  sizes/intervals are handled; an offered rate within 1 % of the requested fps
+  satisfies it and the exact offered rate (e.g. `30000/1001`) is what the
+  pipeline requests. A profile the camera does not offer reports a stable
+  `capture_unsupported`: no process, no backoff relaunch, and the node is not
+  reopened until discovery returns different evidence for the camera (replug)
+  or the Owner re-approves it (the approved binding is held, without any open
+  descriptor or process, only while discovery returns the identical device
+  instance, so a serial-less camera stays `capture_unsupported`; after a
+  replug a serial-less camera needs Owner re-approval as usual); a profile
+  change takes effect on restart and is
+  checked then. A failing enumeration ioctl is `capture_failed` with backoff; a
+  driver without frame size/interval enumeration (`ENOTTY`), or one that
+  advertises a mode it then rejects, is left to pipeline negotiation, which
+  exits and reports `capture_failed`. The mode check is not identity evidence
+  and never changes approval records.
 
 MJPEG output is split structurally into complete JPEG frames (per-frame byte
 bound, bounded inter-frame padding, malformed stream = failure) and placed in a
@@ -108,7 +126,7 @@ or pipeline failures.
 | --- | --- |
 | `online` | `video_ready` — frames are arriving, no frame was dropped within the stall window, and every earlier drop has already been reported once as `capture_overloaded` |
 | `degraded` | `capture_starting` (bound, no frame yet), `capture_overloaded` (consumer is not keeping up) |
-| `offline` | `camera_missing`, `capture_failed` (exit/stall/startup timeout/malformed stream; bounded backoff), `capture_unsupported`, `capture_cleanup_failed` (process not reaped; relaunch blocked), `discovery_failed` |
+| `offline` | `camera_missing`, `capture_failed` (exit/stall/startup timeout/malformed stream; bounded backoff), `capture_unsupported` (no MJPEG or profile not offered; stable, no relaunch), `capture_cleanup_failed` (process not reaped; relaunch blocked), `discovery_failed` |
 | `manual_intervention_required` | `owner_approval_required`, `identity_ambiguous`, `approval_state_unavailable` |
 
 A pipeline that cannot be reaped, or approval state that cannot be written,

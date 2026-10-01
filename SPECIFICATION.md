@@ -358,6 +358,21 @@ environment, not by the kernel, because `/usr` stays readable. The child gets a 
 environment, its own process group, no stdin, discarded stderr, and is
 terminated with SIGTERM then SIGKILL of the whole group before reaping. MJPEG output is split structurally into complete
 JPEG frames with a per-frame byte bound and queued in a bounded drop-oldest queue.
+Before starting a pipeline the Agent checks the explicit profile against the MJPEG
+frame sizes and intervals the opened approved node advertises (read-only
+`VIDIOC_ENUM_FMT`/`ENUM_FRAMESIZES`/`ENUM_FRAMEINTERVALS` on that descriptor only,
+discrete/stepwise/continuous; an offered rate within 1 % satisfies the requested
+fps and is then requested exactly, e.g. 30000/1001 for 30). A profile not offered
+is a stable `capture_unsupported` with no pipeline and no backoff relaunch until
+the device evidence changes (e.g. replug) or the Owner re-approves. While that
+verdict holds, the approved binding is kept only as long as discovery returns the
+identical evidence (same kernel device instance), so a serial-less camera stays
+`capture_unsupported` instead of becoming an ambiguous reconnect; it never
+authorizes a launch, and a replug follows the normal identity rules (a serial-less
+camera then needs Owner re-approval). A driver that
+does not implement the enumeration, or advertises a mode it then refuses, is still
+caught by pipeline negotiation (`capture_failed`). The check is not identity
+evidence.
 
 Per-source health: `manual_intervention_required` (`owner_approval_required`,
 `identity_ambiguous`, `approval_state_unavailable`); `offline` (`camera_missing`,
