@@ -1,5 +1,13 @@
 # Issue #20: YOLOX candidate audit (2026-09-20)
 
+> **Update 2026-09-30:** the Owner approved *evaluation* of YOLOX
+> ([decision](../../docs/decisions/2026-09-30-yolox-person-evaluation.md)).
+> The official `0.1.1rc0` ONNX assets were then downloaded outside the
+> repository, SHA-256 pinned, and evaluated through the existing ONNX Runtime
+> closure; see [YOLOX_EVALUATION_AUDIT.md](YOLOX_EVALUATION_AUDIT.md). The
+> weights license remains unresolved, so the statements below about weights
+> still hold: no weight is approved for bundling, redistribution or deployment.
+
 Decision for this implementation: **evaluation candidate only; no YOLOX package,
 pretrained weights, exported ONNX model, or automatic download is approved or
 installed by this audit.** Motion baseline and a fail-closed person-detector
