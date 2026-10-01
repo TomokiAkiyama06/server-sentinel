@@ -35,5 +35,27 @@ expression containing `MIT-0` still needs its own approval. `pycparser` 3.0
 - Exact pins, wheel hashes and notices: `server/requirements.lock`,
   `server/docs/wheel-audit.json`, `server/docs/rust-audit.json`,
   `server/docs/DEPENDENCIES.md` ("Issue #10 addition").
-- Overlap: the Issue #13 branch adds the same package; whichever pull request
-  merges second rebases onto the other's lock, audit and approval entries.
+- Agent lock (Issue #13): `agent/requirements.lock`,
+  `agent/docs/cryptography-wheel-audit.json`, `agent/docs/DEPENDENCIES.md`.
+- This is the only approval record for `pypi:cryptography@50.0.1`; Issue #10
+  and Issue #13 share it, the same lock pins and the same notices.
+
+## Issue #13 scope (capture-node mTLS)
+
+The approval given for Issue #13 covers, on the conditions above (one exact
+version, SHA-256 hashes for every permitted wheel, offline license gate, single
+approval record):
+
+- Main Server: deployment-local capture-node CA, node client certificate
+  issuance bound to the pairing ledger, Main ingest server certificate, and the
+  ingest-listener `ssl.SSLContext` and peer-certificate admission adapter.
+- `media-capture-agent`: node key generation, CSR (proof of possession),
+  deployment trust-bundle parsing, issued-credential validation and the client
+  `ssl.SSLContext`. Only `media_capture_agent.node_tls` imports it. The Agent
+  continues to run as a dedicated non-root account and gains no network
+  listener, GUI, Tailscale or administrative requirement.
+- TLS itself remains the Python standard library `ssl` module; `cryptography`
+  is not used for the record layer.
+
+Media transport selection (Issue #15) or any other new use of `cryptography`
+needs its own review.
