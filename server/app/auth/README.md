@@ -22,13 +22,64 @@ Owns owner invitations/allowlists, independent `live:view` and `recordings:view`
 
 ## Current foundation
 
-`store.py` persists application principals, independent viewer permissions,
-opaque credential records, single-use enrollment authorization digests, and
-opaque server-side session digests. It deliberately has no HTTP route, proxy
-header adapter, cookie, WebAuthn parser, signature verifier, or browser
-ceremony. A future ceremony verifies its input before calling enrollment/session
-methods; every request integration must still validate current state and its
-required permission.
+ADR-0004 (per-person WebAuthn/passkey credentials) was accepted on 2026-09-30,
+alongside ADR-0003. No human route is mounted yet: route mounting stays closed
+until the remaining Issue #10 gates pass.
+
+- `webauthn.py` is pure relying-party verification over the Owner-approved
+  `cryptography` package, with no WebAuthn/FIDO library. It checks the
+  `clientDataJSON` type, challenge, exact origin and cross-origin markers; the
+  relying-party id hash; the UP and UV flags; the BE/BS flags (BS without BE is
+  malformed); the COSE key (ES256/P-256, EdDSA/Ed25519, RS256 with at least
+  2048 bits); `none` attestation, or `packed` self attestation with its
+  signature verified; and the assertion signature. Other attestation formats,
+  including `packed` with a certificate chain, are refused rather than accepted
+  unverified. CBOR parsing is strict and bounded. `RelyingParty` accepts only
+  a secure-context origin (`https://host[:port]` or `http://localhost[:port]`)
+  whose host equals the relying-party id. An explicit default port (`:443`
+  for https, `:80` for http) is refused at construction, because browsers
+  serialize `clientDataJSON.origin` without it and the exact comparison could
+  never match.
+- `passkeys.py` (`PasskeyCeremonies`) composes that verifier with the store:
+  invitation redemption (registration), sign-in (authentication) and Owner
+  step-up. Every failure before a session exists is one `CeremonyDenied` with
+  a fixed message and no chained cause. There are only two distinct outcomes:
+  `StepUpRequired`, returned only to a valid but stale Owner session, and
+  `DeviceBoundCredentialRequired`, returned only after a verified ceremony
+  with a valid invitation, where the deployment requires device-bound
+  credentials.
+- `store.py` persists challenge digests only. Each challenge is single-use,
+  bound to its ceremony, and to its invitation or session where the ceremony
+  has one. It is deleted on use or expiry, and a backward clock step refuses
+  it. The store also enforces the counter rule, marks a credential whose BE
+  changed as inconsistent and revokes that credential's sessions in the same
+  transaction, and establishes sessions with the ADR-0003 lifetimes (30 minutes
+  idle, 12 hours absolute). A session records its user-verification time, and
+  `authorize_owner` enforces the ADR-0003 five-minute step-up freshness. A
+  session created by the low-level `establish_session` records no verification
+  time, so it is never fresh.
+- Audit: sign-in (`authenticate_principal`), step-up
+  (`verify_principal_step_up`), an inconsistent credential
+  (`mark_principal_credential_inconsistent`) and a counter regression
+  (`detect_principal_credential_sign_count_regression`) commit their records
+  in the same transaction as their effect. As with redemption, an attempt that
+  matches no credential writes nothing.
+
+Not implemented yet, and required before routes open:
+
+- the HTTP routes and their cookie handling;
+- per-source rate limiting (only the per-code attempt bound exists here);
+- the HMAC session binding of the proxy identity, and the last-observed login
+  field. Until then `access_principals.external_identity` (inherited from the
+  #6 foundation) is a unique per-principal value that registration, sign-in and
+  every session check compare with the supplied identity. In the
+  shared-account deployment every viewer arrives with the same login, so only
+  one principal could match it; the invitation/passkey must become the only
+  per-person key, with the proxy identity checked as a non-unique
+  supplementary signal, before any route opens (PR #97 review);
+- delivery of `CredentialFindingSink` to the Owner notification channel;
+- local owner bootstrap and recovery commands;
+- the startup/daily listener and route reservation check.
 
 Owner-only mutations — invitation, invitation issue, grant change, single
 credential revocation and principal revocation — are exposed as `*_on`

@@ -186,7 +186,7 @@ route, worker thread or default timing policy:
   conflict and counted as rejected. Both are counted and reported by `OutboxState.degraded`, never
   dropped silently.
 
-Timeline loss is durable (`presence_timeline_gap` migration 17). The runtime calls
+Timeline loss is durable (`presence_timeline_gap` migration 20). The runtime calls
 `TimelineOutbox.open()` at startup, before it wires any producer, to open a
 durable outbox session (`open_timeline_session()`); `stage()` refuses facts
 until that succeeds, so no fact is held without a session row a restart would
