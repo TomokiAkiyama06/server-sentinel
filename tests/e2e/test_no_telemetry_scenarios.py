@@ -69,6 +69,9 @@ SCENARIO_MODULES = (
     "tests.e2e.test_agent_storage_scenarios",
     "tests.e2e.test_retention_scenarios",
     "tests.e2e.test_notification_fault_scenarios",
+    "tests.e2e.test_access_matrix_scenarios",
+    "tests.e2e.test_pairing_scenarios",
+    "tests.e2e.test_detection_isolation_scenarios",
     "tests.e2e.test_no_telemetry_scenarios",
 )
 
