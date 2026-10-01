@@ -3112,6 +3112,41 @@ class LifecycleInventoryTests(unittest.TestCase):
                                         "activate_capture_node_credential", "reason": "unaudited"}],
                                 key=lambda item: item["id"]))
 
+    def test_pairing_audit_evidence_must_be_a_ledger_row(self):
+        # Codex P1: an audit row counts only if it loads through AuditStore's
+        # own record validation and carries what the ledger writes: the
+        # action's actor category, a capture-node target and this node's ID.
+        cases = {"wrong-actor": ("invited_user", "capture_node", None),
+                 "wrong-target-kind": ("owner", "principal", None),
+                 "wrong-target-id": ("owner", "capture_node", "other"),
+                 "ledger-shaped": ("owner", "capture_node", None)}
+        for index, (label, (actor, target_kind, target)) in enumerate(cases.items()):
+            with self.subTest(label):
+                runtime = Runtime(self.base / f"evidence-{index}")
+                saved, self.runtime = self.runtime, runtime
+                try:
+                    runtime.seed()
+                    node = self._paired_node("a" * 64, "c" * 64)
+                    runtime.execute("INSERT INTO pairing_key_bindings VALUES (?, ?, 0)",
+                                    ("a" * 64, node))
+                    _, baseline = self.record(f"evidence-{index}.json")
+                    runtime.execute("UPDATE pairing_node_credentials SET state='revoked'")
+                    runtime.execute("UPDATE pairing_key_bindings SET revoked=1")
+                    runtime.execute(
+                        "INSERT INTO security_admin_audit_records VALUES (?, ?, "
+                        "'revoke_capture_node_pairing', ?, ?, ?, 'succeeded')",
+                        (str(uuid4()), actor, target_kind,
+                         str(uuid4()) if target == "other" else node, runtime.clock))
+                    _, report, _ = self.verify(baseline)
+                finally:
+                    self.runtime = saved
+                unaudited = {"id": f"pairing_audit:{node}:revoke_capture_node_pairing",
+                             "reason": "unaudited"}
+                if label == "ledger-shaped":
+                    self.assertNotIn(unaudited, report["sections"]["security_state"]["failed"])
+                else:
+                    self.assertIn(unaudited, report["sections"]["security_state"]["failed"])
+
     def test_a_staged_renewal_is_never_restaged_onto_a_superseded_key(self):
         # Codex P1: stage_renewal() accepts a key already bound to the node
         # only as a retry of the currently staged key.

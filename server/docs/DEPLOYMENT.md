@@ -445,7 +445,12 @@ verify, each node may only change by a composition of those operations,
 and each accepted operation must be matched by the security/admin audit row
 the ledger writes in the same transaction, appended since the record
 (approval, redemption or its expiry, activation or promotion, revocation;
-staging a renewal writes none), otherwise `unaudited`:
+staging a renewal writes none), otherwise `unaudited`; a row counts only if
+it loads through the audit store's own record validation and carries the
+actor category the ledger uses for that action, a `capture_node` target and
+that node's ID (the audit table has no hash chain or MAC of its own: the
+inventory's chain covers the rows present at record time, and rows appended
+since are judged by these field checks only):
 every enrollment recorded (any state) stays with the same node and key and
 only moves forward: pending to consumed, expired, activated or revoked,
 consumed to activated or revoked, the other states final (a vanished one is

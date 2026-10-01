@@ -73,7 +73,7 @@ from urllib.parse import quote
 from types import SimpleNamespace
 from uuid import UUID, uuid5
 
-from app.audit.store import DEFAULT_RETENTION as AUDIT_RETENTION
+from app.audit.store import DEFAULT_RETENTION as AUDIT_RETENTION, AuditStore
 from app.cameras.uvc.persistence import ApprovalStore
 from app.detection.owner import store as owner_store
 from app.integrity.model import Finding, Kind, State
@@ -541,7 +541,7 @@ def _presence(connection, tables, salt: str, live_outbox: bool | None) -> dict:
             [row[0], row[1], row[2], _keyed(salt, ["presence-actor-v1", row[3]])]
             for row in connection.execute(
                 "SELECT target, at, state, actor FROM presence_audit "
-                "WHERE action='critical_event_cleared'")),
+                "WHERE action='critical_event_cleared'") if _presence_clear_row(row)),
         # Owner principals (keyed), the identities PresenceService._owner()
         # audits for an Owner-only action.
         "owner_actors": None if "access_principals" not in tables else sorted(
@@ -566,6 +566,22 @@ def _presence(connection, tables, salt: str, live_outbox: bool | None) -> dict:
         "outbox_live": live_outbox,
         "override": None if not override else dict(override[0]),
     }
+
+
+def _presence_clear_row(row) -> bool:
+    """Whether a clear audit row has the shape the service writes.
+
+    PresenceService writes presence_audit itself (no separate record type):
+    target is str(identifier) of a UUID, at is timestamp(now) (aware ISO
+    time), actor is the Owner UUID string from _owner().
+    """
+    target, at, _, actor = tuple(row)
+    try:
+        moment = datetime.fromisoformat(at)
+        return (str(UUID(target)) == target and str(UUID(actor)) == actor
+                and moment.tzinfo is not None)
+    except (TypeError, ValueError, AttributeError):
+        return False
 
 
 def _outbox_live(database: Path) -> bool | None:
@@ -752,6 +768,33 @@ def _compare_presence(baseline: dict | None, current: dict | None,
     return {"status": status, "failed": failed, "released": sorted(path)}
 
 
+# The actor PairingLedger records for each of its audit actions.
+_LEDGER_AUDIT_ACTORS = {
+    "approve_capture_node_enrollment": "owner",
+    "redeem_capture_node_enrollment": "capture_node",
+    "activate_capture_node_credential": "system",
+    "revoke_capture_node_pairing": "owner",
+}
+
+
+def _ledger_audit_row(row) -> bool:
+    """Whether a stored audit row is one PairingLedger wrote.
+
+    The row must load through AuditStore's own record validation (UUID
+    identities, known actor / action / outcome, the action's target kind,
+    an aware timestamp) and carry the actor category the ledger uses for
+    that action, against a capture node.
+    """
+    try:
+        record = AuditStore._record(row)
+    except (ValueError, TypeError, KeyError, OverflowError):
+        return False
+    return (record.actor_category.value == _LEDGER_AUDIT_ACTORS.get(record.action.value)
+            and record.target_kind.value == "capture_node"
+            and str(record.target_logical_id) == row["target_logical_id"]
+            and str(record.id) == row["id"])
+
+
 def _security_state(connection, tables, salt: str) -> dict:
     """Revocation and invalidation state that must only ever move one way.
 
@@ -789,10 +832,12 @@ def _security_state(connection, tables, salt: str) -> dict:
     # evidence between them (node logical IDs and times, no key material).
     pairing_audit = query(
         "security_admin_audit_records",
-        "SELECT id, action, target_logical_id, occurred_at_us, outcome "
-        "FROM security_admin_audit_records WHERE action IN "
+        "SELECT id, actor_category, action, target_kind, target_logical_id, occurred_at_us, "
+        "outcome FROM security_admin_audit_records WHERE action IN "
         "('approve_capture_node_enrollment', 'redeem_capture_node_enrollment', "
         "'activate_capture_node_credential', 'revoke_capture_node_pairing')")
+    if pairing_audit is not None:
+        pairing_audit = [row for row in pairing_audit if _ledger_audit_row(row)]
     sessions = query("access_sessions", "SELECT id, invalidated_at_us FROM access_sessions")
     generation = query("access_deployment_state",
                        "SELECT authorization_generation FROM access_deployment_state")
@@ -824,7 +869,8 @@ def _security_state(connection, tables, salt: str) -> dict:
             _keyed(salt, ["pairing-key-v1", row[0]]): {"node_id": row[1], "revoked": bool(row[2])}
             for row in bindings},
         "pairing_audit": None if pairing_audit is None else sorted(
-            [row[0], row[1], row[2], row[3], row[4]] for row in pairing_audit),
+            [row["id"], row["action"], row["target_logical_id"], row["occurred_at_us"],
+             row["outcome"]] for row in pairing_audit),
         "capture_nodes_revoked": None if nodes is None else {
             row[0]: row[1] == "revoked" for row in nodes},
         "sessions_invalidated": None if sessions is None else {
