@@ -996,6 +996,49 @@ class ApplicationWiringTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(registry.get_source(source.id).health_state, SourceHealthState.OFFLINE)
         self.assertEqual(0, application.state.local_preview.status.retained_bytes)
 
+    async def test_blocked_optional_sink_never_delays_preview_invalidation(self):
+        database = Database(self.settings.database_path)
+        with closing(database.connect()) as connection:
+            migrate(connection, APPLICATION_MIGRATIONS)
+        source = CameraRegistry(database, unaudited_writes=True).create_source(
+            source_type=SourceType.LOCAL_UVC, name="Synthetic source", enabled=True,
+            desired_capture_profile=PROFILE,
+        )
+        release, ready_entered = threading.Event(), threading.Event()
+        self.addCleanup(release.set)
+
+        def blocking_sink(event):
+            # An optional downstream sink hangs while handling video ready.
+            if event.reason == "video_capture_ready":
+                ready_entered.set()
+                release.wait(30)
+
+        self.dependencies = replace(self.dependencies, health_sink=blocking_sink)
+        application = create_app(
+            self.settings, storage_reservation=synthetic_admission,
+            local_uvc=LocalUvcConfiguration((source.id,), **FAST),
+            local_uvc_dependencies=self.dependencies,
+        )
+        admin = OwnerAdministration(
+            OwnerAuditService(AuditStore(database), PermitOwner()), CameraRegistry(database),
+        )
+        block = threading.Event()
+        self.addCleanup(block.set)
+        async with application.router.lifespan_context(application):
+            runtime = application.state.local_uvc
+            preview = application.state.local_preview
+            runtime.reapprove(admin, "synthetic-owner", source.id, self.camera)
+            self.assertTrue(wait_for(ready_entered.is_set))
+            self.assertTrue(preview.source(source.id).live)
+            # Frames stop; the stall must invalidate the preview although the
+            # optional sink is still stuck on the earlier ready event.
+            self.dependencies.capture_factory.block = block
+            self.assertTrue(wait_for(lambda: not preview.source(source.id).live, 8))
+            self.assertIsNone(preview.latest(source.id))
+            self.dependencies.capture_factory.block = None
+            block.set()
+            release.set()
+
     async def test_runtime_start_failure_does_not_abort_application(self):
         application = create_app(
             self.settings, storage_reservation=synthetic_admission,
