@@ -1,5 +1,6 @@
 """Synthetic coverage for the transport-neutral remote-agent ingest boundary."""
 
+import threading
 import unittest
 from uuid import UUID
 
@@ -29,6 +30,9 @@ class Authorizer:
 
 
 def message(*, node=NODE, source=SOURCE, sequence=0, payload=b"video", action=AgentAction.MEDIA):
+    if action is AgentAction.MEDIA:
+        return AgentMessage(node, source, action, sequence, payload,
+                            capture_epoch=1, capture_time_ns=sequence * 10)
     return AgentMessage(node, source, action, sequence, payload)
 
 
@@ -57,6 +61,25 @@ class RemoteAgentIngestTests(unittest.TestCase):
             AgentMessage(NODE, SOURCE, AgentAction.MEDIA, -1, b"")
         with self.assertRaises(ValueError):
             AgentMessage(NODE, SOURCE, AgentAction.MEDIA, 0, bytearray(b"x"))
+        # The sequence has the envelope's signed 64-bit range for every action.
+        for action in AgentAction:
+            with self.assertRaises(ValueError):
+                AgentMessage(NODE, SOURCE, action, 2 ** 63, b"",
+                             capture_epoch=1, capture_time_ns=0)
+        self.assertEqual(2 ** 63 - 1, AgentMessage(
+            NODE, SOURCE, AgentAction.MEDIA, 2 ** 63 - 1, b"",
+            capture_epoch=1, capture_time_ns=0).sequence)
+        for envelope in ({"capture_epoch": -1}, {"capture_time_ns": -1},
+                         {"capture_epoch": 2 ** 63}, {"capture_time_ns": True},
+                         {"capture_epoch": 1.0}):
+            with self.assertRaises(ValueError):
+                AgentMessage(NODE, SOURCE, AgentAction.MEDIA, 0, b"", **envelope)
+        # Media must carry the complete continuity envelope (ADR-0007).
+        for envelope in ({}, {"capture_epoch": 1}, {"capture_time_ns": 1}):
+            with self.assertRaises(ValueError):
+                AgentMessage(NODE, SOURCE, AgentAction.MEDIA, 0, b"", **envelope)
+        heartbeat = AgentMessage(NODE, SOURCE, AgentAction.HEARTBEAT, 0, b"")
+        self.assertEqual((None, None), (heartbeat.capture_epoch, heartbeat.capture_time_ns))
         boundary = queue()
         accepted = boundary.submit(message(payload=b"opaque"))
         self.assertEqual(IngestOutcome.ACCEPTED, accepted.outcome)
@@ -133,6 +156,45 @@ class RemoteAgentIngestTests(unittest.TestCase):
         )
         self.assertEqual(1, boundary.snapshot().tracked_rate_windows)
 
+    def test_charged_attempt_consumes_rate_budget_without_enqueueing(self):
+        clock = [0]
+        boundary = queue(limits=IngestLimits(8, 8, 64, 2, 100), now=lambda: clock[0])
+        self.assertIsNone(boundary.charge_attempt(NODE))
+        self.assertEqual(IngestOutcome.ACCEPTED, boundary.submit(message()).outcome)
+        refusal = boundary.charge_attempt(NODE)
+        self.assertEqual((IngestOutcome.RATE_LIMITED, "rate_limit", 1),
+                         (refusal.outcome, refusal.reason, refusal.queued_messages))
+        self.assertEqual(IngestOutcome.RATE_LIMITED,
+                         boundary.submit(message(sequence=2)).outcome)
+        self.assertEqual((1, 2), (boundary.snapshot().queued_messages,
+                                  boundary.snapshot().rate_limited))
+        clock[0] = 100
+        self.assertIsNone(boundary.charge_attempt(NODE))
+        clock[0] = 50
+        self.assertEqual("clock_regression", boundary.charge_attempt(NODE).reason)
+        with self.assertRaises(ValueError):
+            boundary.charge_attempt("not-a-node")
+
+    def test_checked_attempt_refuses_like_a_charge_without_consuming_budget(self):
+        clock = [0]
+        boundary = queue(limits=IngestLimits(8, 8, 64, 1, 100), now=lambda: clock[0])
+        for _ in range(3):
+            self.assertIsNone(boundary.check_attempt(NODE))
+        self.assertIsNone(boundary.charge_attempt(NODE))
+        refusal = boundary.check_attempt(NODE)
+        self.assertEqual((IngestOutcome.RATE_LIMITED, "rate_limit"),
+                         (refusal.outcome, refusal.reason))
+        self.assertEqual(IngestOutcome.RATE_LIMITED, boundary.submit(message()).outcome)
+        self.assertEqual("unauthorized", boundary.check_attempt(OTHER_NODE).reason)
+        clock[0] = 100
+        self.assertIsNone(boundary.check_attempt(NODE))
+        self.assertEqual(IngestOutcome.ACCEPTED, boundary.submit(message()).outcome)
+        clock[0] = 50
+        self.assertEqual("clock_regression", boundary.check_attempt(NODE).reason)
+        self.assertEqual(0, boundary.snapshot().queued_messages - 1)
+        with self.assertRaises(ValueError):
+            boundary.check_attempt("not-a-node")
+
     def test_revoked_node_lifecycle_can_release_rate_window_state(self):
         boundary = queue(limits=IngestLimits(8, 8, 64, 10, 100, 1))
         self.assertEqual(IngestOutcome.ACCEPTED, boundary.submit(message()).outcome)
@@ -142,6 +204,34 @@ class RemoteAgentIngestTests(unittest.TestCase):
         boundary.forget_revoked_node(NODE)
         with self.assertRaises(ValueError):
             boundary.forget_revoked_node("not-a-node")
+
+    def test_revocation_while_waiting_for_the_queue_lock_is_observed(self):
+        checked = threading.Event()
+
+        class Signalling(Authorizer):
+            def require_node(self, node_id):
+                checked.set()
+                super().require_node(node_id)
+
+        authorizer = Signalling()
+        boundary = queue(limits=IngestLimits(8, 8, 64, 10, 100), authorizer=authorizer)
+        for call in (lambda: boundary.submit(message()),
+                     lambda: boundary.charge_attempt(NODE)):
+            authorizer.nodes.add(NODE)
+            checked.clear()
+            result = {}
+            with boundary._lock:
+                thread = threading.Thread(target=lambda: result.update(value=call()))
+                thread.start()
+                checked.wait(0.2)
+                authorizer.nodes.discard(NODE)
+            thread.join(5)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual((IngestOutcome.REJECTED, "unauthorized"),
+                             (result["value"].outcome, result["value"].reason))
+            # Neither media nor a rate window of the revoked node remains.
+            self.assertEqual((0, 0), (boundary.snapshot().queued_messages,
+                                      boundary.snapshot().tracked_rate_windows))
 
     def test_invalid_limits_dependencies_and_drain_are_rejected_without_network_or_health_claims(self):
         for limits in (IngestLimits(1, 1, 1, 1, 1),):
