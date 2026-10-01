@@ -793,6 +793,134 @@ class LifecycleInventoryTests(unittest.TestCase):
         self.assertEqual(report["sections"]["presence_timeline_gap"]["failed"],
                          [{"id": "gap", "reason": "missing"}])
 
+    def presence_rows(self) -> dict:
+        """Synthetic durable presence state; payloads are generated markers."""
+        ids = {name: str(uuid4()) for name in ("kept", "expired", "lost", "edited", "done")}
+        for name in ("kept", "expired", "lost", "edited"):
+            self.runtime.execute(
+                "INSERT INTO presence_observations (id, kind, source, received, payload) "
+                "VALUES (?, 'crossing', 'synthetic-source', '2026-01-01T00:00:00.000000+00:00', ?)",
+                (ids[name], json.dumps({"marker": "synthetic-presence-payload-" + name})))
+            self.runtime.execute(
+                "INSERT INTO presence_deliveries (observation, action, state, attempts) "
+                "VALUES (?, 'notification', 'pending', 0)", (ids[name],))
+            self.runtime.execute("INSERT INTO presence_source_facts (id, digest) VALUES (?, ?)",
+                                 (ids[name], hashlib.sha256(name.encode()).hexdigest()))
+        self.runtime.execute("INSERT INTO presence_completed_events VALUES (?, "
+                             "'2026-01-01T00:00:00.000000+00:00')", (ids["done"],))
+        self.runtime.execute("INSERT INTO presence_expired_unresolved VALUES ('evidence', 2, "
+                             "'2026-01-01T00:00:00.000000+00:00')")
+        return ids
+
+    def test_presence_tombstones_and_unresolved_markers_are_preserved(self):
+        # Completed tombstones stop delayed critical replays; expired markers
+        # keep evidence / notification reported unavailable.
+        self.runtime.seed()
+        ids = self.presence_rows()
+        _, baseline = self.record()
+        self.runtime.execute("UPDATE presence_expired_unresolved SET events=3")
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_PRESERVED, report["sections"]["presence"])
+        self.runtime.execute("DELETE FROM presence_completed_events WHERE id=?", (ids["done"],))
+        self.runtime.execute("UPDATE presence_expired_unresolved SET events=1")
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_FAILED)
+        failed = report["sections"]["presence"]["failed"]
+        self.assertIn({"id": "completed_events:" + ids["done"], "reason": "missing"}, failed)
+        self.assertIn({"id": "expired_unresolved:evidence", "reason": "changed"}, failed)
+        self.runtime.execute("DELETE FROM presence_expired_unresolved")
+        code, report, _ = self.verify(baseline)
+        self.assertIn({"id": "expired_unresolved:evidence", "reason": "missing"},
+                      report["sections"]["presence"]["failed"])
+
+    def test_presence_observations_leave_only_through_a_tombstone(self):
+        self.runtime.seed()
+        ids = self.presence_rows()
+        _, baseline = self.record()
+        # The retention path: observation, jobs and fact go, tombstone appears.
+        for table, column in (("presence_deliveries", "observation"),
+                              ("presence_observations", "id"), ("presence_source_facts", "id")):
+            self.runtime.execute(f"DELETE FROM {table} WHERE {column}=?", (ids["expired"],))
+        self.runtime.execute("INSERT INTO presence_completed_events VALUES (?, "
+                             "'2026-02-01T00:00:00.000000+00:00')", (ids["expired"],))
+        self.runtime.execute("UPDATE presence_deliveries SET state='delivered', attempts=1 "
+                             "WHERE observation=?", (ids["kept"],))
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_PRESERVED, report["sections"]["presence"])
+        # A lost job, a changed payload and a dropped fact are changes.
+        for table, column in (("presence_deliveries", "observation"),
+                              ("presence_observations", "id")):
+            self.runtime.execute(f"DELETE FROM {table} WHERE {column}=?", (ids["lost"],))
+        self.runtime.execute("UPDATE presence_observations SET payload='{}' WHERE id=?",
+                             (ids["edited"],))
+        self.runtime.execute("DELETE FROM presence_source_facts WHERE id=?", (ids["kept"],))
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_FAILED)
+        failed = report["sections"]["presence"]["failed"]
+        for item in ({"id": "observations:" + ids["lost"], "reason": "missing"},
+                     {"id": f"deliveries:{ids['lost']}:notification", "reason": "missing"},
+                     {"id": "observations:" + ids["edited"], "reason": "changed"},
+                     {"id": "source_facts:" + ids["kept"], "reason": "missing"}):
+            self.assertIn(item, failed)
+        for path in self.notes.iterdir():
+            self.assertNotIn("synthetic-presence-payload", path.read_text(), path.name)
+
+    def test_presence_clocks_sessions_and_override_follow_service_transitions(self):
+        self.runtime.seed()
+        self.runtime.execute("INSERT INTO presence_clock VALUES (1, "
+                             "'2026-01-01T00:00:00.000000+00:00')")
+        self.runtime.execute("INSERT INTO presence_critical_source_clock VALUES "
+                             "('synthetic-source', '2026-01-01T00:00:00.000000+00:00')")
+        self.runtime.execute("INSERT INTO presence_outbox_sessions VALUES "
+                             "('synthetic-token', '2026-01-01T00:00:00.000000+00:00')")
+        self.runtime.execute("INSERT INTO presence_override VALUES (1, 'away', 'owner', "
+                             "'2026-01-01T00:00:00.000000+00:00', "
+                             "'2026-01-02T00:00:00.000000+00:00')")
+        _, baseline = self.record()
+        # Clocks advance, the stale session becomes an interrupted gap and
+        # the override expires.
+        self.runtime.execute("UPDATE presence_clock SET latest='2026-01-03T00:00:00.000000+00:00'")
+        self.runtime.execute("DELETE FROM presence_outbox_sessions")
+        self.runtime.execute(
+            "INSERT INTO presence_timeline_gap (singleton, since, latest, interrupted) VALUES "
+            "(1, '2026-01-03T00:00:00.000000+00:00', '2026-01-03T00:00:00.000000+00:00', 1)")
+        self.runtime.execute("DELETE FROM presence_override")
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_PRESERVED, report["sections"]["presence"])
+        # A rolled-back clock, a session dropped without its gap and an
+        # unexpired override removed are changes.
+        self.runtime.execute("UPDATE presence_critical_source_clock "
+                             "SET latest_occurred='2025-12-31T00:00:00.000000+00:00'")
+        self.runtime.execute("DELETE FROM presence_timeline_gap")
+        self.runtime.execute("UPDATE presence_clock SET latest='2026-01-01T12:00:00.000000+00:00'")
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_FAILED)
+        failed = report["sections"]["presence"]["failed"]
+        for item in ({"id": "clocks:critical_source:synthetic-source", "reason": "changed"},
+                     {"id": "outbox_sessions:1", "reason": "missing"},
+                     {"id": "override:owner", "reason": "changed"}):
+            self.assertIn(item, failed)
+
+    def test_integrity_baseline_is_preserved_by_keyed_digest(self):
+        self.runtime.seed()
+        hardware = "synthetic-hardware-identifier-marker"
+        self.runtime.execute("INSERT INTO integrity_baseline VALUES (1, 3, ?)",
+                             (json.dumps({"cpu": hardware}),))
+        _, baseline = self.record()
+        code, _, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_PRESERVED)
+        self.runtime.execute("UPDATE integrity_baseline SET inventory=?",
+                             (json.dumps({"cpu": "synthetic-replaced"}),))
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_FAILED)
+        self.assertEqual(report["sections"]["integrity_baseline"]["failed"],
+                         [{"id": "baseline", "reason": "changed"}])
+        self.runtime.execute("DELETE FROM integrity_baseline")
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_FAILED)
+        for path in self.notes.iterdir():
+            self.assertNotIn(hardware, path.read_text(), path.name)
+
     def test_grant_and_revocation_state_is_preserved_by_logical_id(self):
         seeded = self.runtime.seed()
         _, baseline = self.record()

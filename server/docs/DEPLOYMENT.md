@@ -349,9 +349,20 @@ store treats a file with more than one link as corrupt); a per-row and a chained
 retained `security_admin_audit_records`, `integrity_audit`, `presence_audit`
 and `storage_state_audit` row; the open presence timeline gap, if any (its
 start, latest time and loss counts; it is cleared only by an audited Owner
-action, so verification fails if it disappears or shrinks; the presence outbox
-tables are a transient dispatch queue, not retained history, and are not
-inventoried); for each registered camera source its type, keyed digests of
+action, so verification fails if it disappears or shrinks); the durable
+presence state whose loss would replay, duplicate or hide critical work, each
+allowed only the transitions the presence service performs: completed-event
+tombstones and expired-unresolved markers (kept; marker counts may only rise),
+retained observations as keyed digests (never their content) with their
+delivery jobs and source-fact digests (they may leave only together with a
+completed tombstone, so do not run timeline retention during the window), the
+high-water clocks (may only advance), open outbox session rows (consumed only
+into an interrupted gap) and the Owner override (dropped only once expired);
+`presence_inputs` (live inputs with their own validity windows) and
+`presence_delivery_fairness` (a round-robin cursor) replay nothing and hide no
+failure, so they are not inventoried; the Owner-approved hardware baseline as
+its revision and a keyed digest of its inventory (never the hardware
+identifiers); for each registered camera source its type, keyed digests of
 its Owner-entered name and role label, a digest of its capabilities, its
 `enabled` flag, capture node, a digest of its desired capture profile and of
 its detection bindings, and a keyed digest of its durable UVC approval (the

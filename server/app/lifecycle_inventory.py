@@ -14,7 +14,11 @@
   (``security_admin_audit_records``, ``integrity_audit``, ``presence_audit``
   and ``storage_state_audit``), so a rewritten middle row is detected even
   when counts and boundary timestamps match;
-- the open presence timeline gap, which may only grow;
+- the open presence timeline gap, which may only grow, and the durable
+  presence state (tombstones, unresolved markers, retained observations as
+  keyed digests, delivery jobs, source facts, clocks, outbox sessions, the
+  Owner override) under the transitions the presence service performs;
+- the Owner-approved hardware baseline revision and a keyed inventory digest;
 - per registered camera source: type, keyed digests of the Owner-entered
   name and role label, capabilities digest, enabled flag, capture node, digests of
   the desired capture profile and detection bindings, and a keyed digest of
@@ -373,10 +377,8 @@ def _timeline_gap(connection, tables) -> dict | None:
     """The durable presence timeline-loss record (no observation content).
 
     PresenceService keeps one open gap until the Owner clears it (audited);
-    it never clears automatically. The presence outbox tables
-    (observations, deliveries, source facts, sessions, completed / expired
-    events) are a transient dispatch queue drained by design, not retained
-    history, and are not inventoried; presence_audit is.
+    it never clears automatically. The other durable presence state is in
+    _presence().
     """
     if "presence_timeline_gap" not in tables:
         return None
@@ -401,6 +403,151 @@ def _compare_timeline_gap(baseline: dict | None, current: dict | None) -> dict:
         failed = []
     return {"status": "failed" if failed else "preserved", "failed": failed,
             "preserved": [] if failed else ["gap"]}
+
+
+def _presence(connection, tables, salt: str) -> dict:
+    """Durable presence state whose loss replays, duplicates or hides work.
+
+    - completed-event tombstones (a delayed replay of a completed critical
+      event stays a duplicate) and expired-unresolved markers (evidence /
+      notification stays unavailable after its payload expired);
+    - retained observations (keyed digest of kind, source, receipt time and
+      payload; never the content), their delivery jobs and source-fact
+      digests (a restamped replay is checked against them);
+    - the high-water clocks (losing one would accept stale or replayed
+      observations as trusted);
+    - open outbox session rows (a stale one becomes an interrupted gap);
+    - the Owner override.
+
+    Not inventoried: presence_inputs (live inputs with their own validity
+    windows) and presence_delivery_fairness (the round-robin cursor between
+    delivery classes); losing them replays nothing and hides no failure.
+    """
+    def rows(table, sql):
+        return connection.execute(sql).fetchall() if table in tables else None
+
+    def keyed_rows(table, sql, key, value):
+        found = rows(table, sql)
+        return None if found is None else {key(row): value(row) for row in found}
+    clocks = {}
+    for table, prefix in (("presence_clock", "observation"), ("presence_control_clock", "control")):
+        found = rows(table, f"SELECT latest FROM {table}")
+        if found:
+            clocks[prefix] = found[0][0]
+    for table, prefix in (("presence_source_clock", "source"),
+                          ("presence_critical_source_clock", "critical_source")):
+        for row in rows(table, f"SELECT source, latest_occurred FROM {table}") or ():
+            clocks[f"{prefix}:{row[0]}"] = row[1]
+    override = rows("presence_override",
+                    "SELECT state, actor, started, expires FROM presence_override")
+    return {
+        "completed_events": keyed_rows(
+            "presence_completed_events", "SELECT id, expired_at FROM presence_completed_events",
+            lambda row: row[0], lambda row: row[1]),
+        "expired_unresolved": keyed_rows(
+            "presence_expired_unresolved",
+            "SELECT action, events, since FROM presence_expired_unresolved",
+            lambda row: row[0], lambda row: {"events": row[1], "since": row[2]}),
+        "observations": keyed_rows(
+            "presence_observations",
+            "SELECT id, kind, source, received, payload FROM presence_observations",
+            lambda row: row[0],
+            lambda row: _keyed(salt, ["presence-observation-v1", *tuple(row)[1:]])),
+        "deliveries": keyed_rows(
+            "presence_deliveries", "SELECT observation, action FROM presence_deliveries",
+            lambda row: f"{row[0]}:{row[1]}", lambda row: row[0]),
+        "source_facts": keyed_rows(
+            "presence_source_facts", "SELECT id, digest FROM presence_source_facts",
+            lambda row: row[0], lambda row: _keyed(salt, ["presence-source-fact-v1", row[1]])),
+        "clocks": clocks,
+        "outbox_sessions": None if "presence_outbox_sessions" not in tables else sorted(
+            _keyed(salt, ["presence-outbox-session-v1", row[0]])
+            for row in rows("presence_outbox_sessions",
+                            "SELECT token FROM presence_outbox_sessions")),
+        "override": None if not override else dict(override[0]),
+    }
+
+
+def _compare_presence(baseline: dict | None, current: dict | None,
+                      gap_before: dict | None, gap_now: dict | None) -> dict:
+    """Allow only the transitions PresenceService itself performs."""
+    baseline, current = baseline or {}, current or {}
+    failed = []
+
+    def fail(name, key, reason="changed"):
+        failed.append({"id": f"{name}:{key}", "reason": reason})
+    completed = current.get("completed_events") or {}
+    for key, value in (baseline.get("completed_events") or {}).items():
+        if completed.get(key) != value:
+            fail("completed_events", key, "missing" if key not in completed else "changed")
+    expired = current.get("expired_unresolved") or {}
+    for key, value in (baseline.get("expired_unresolved") or {}).items():
+        now = expired.get(key)
+        if now is None:
+            fail("expired_unresolved", key, "missing")
+        elif now["since"] != value["since"] or now["events"] < value["events"]:
+            fail("expired_unresolved", key)
+    # Retention and Owner release remove an observation (with its jobs and
+    # source fact) only while writing its completed tombstone.
+    observations = current.get("observations") or {}
+    for key, value in (baseline.get("observations") or {}).items():
+        if key in observations:
+            if observations[key] != value:
+                fail("observations", key)
+        elif key not in completed:
+            fail("observations", key, "missing")
+    deliveries = current.get("deliveries") or {}
+    for key, observation in (baseline.get("deliveries") or {}).items():
+        if key not in deliveries and observation not in completed:
+            fail("deliveries", key, "missing")
+    facts = current.get("source_facts") or {}
+    for key, value in (baseline.get("source_facts") or {}).items():
+        if key in facts:
+            if facts[key] != value:
+                fail("source_facts", key)
+        elif key in observations:
+            fail("source_facts", key, "missing")
+    clocks = current.get("clocks") or {}
+    for key, value in (baseline.get("clocks") or {}).items():
+        if key not in clocks or clocks[key] < value:
+            fail("clocks", key, "missing" if key not in clocks else "changed")
+    # A stale outbox session row is consumed only by converting it into an
+    # interrupted timeline gap.
+    removed = set(baseline.get("outbox_sessions") or ()) - set(current.get("outbox_sessions") or ())
+    if removed:
+        before = (gap_before or {}).get("interrupted", 0) if (gap_before or {}).get("open") else 0
+        after = (gap_now or {}).get("interrupted", 0) if (gap_now or {}).get("open") else 0
+        if after - before < len(removed):
+            fail("outbox_sessions", len(removed), "missing")
+    # The service drops an Owner override only once it has expired.
+    override = baseline.get("override")
+    if override and current.get("override") != override:
+        latest = max((clocks.get(key, "") for key in ("observation", "control")), default="")
+        expired_out = (current.get("override") is None and override["expires"] is not None
+                       and override["expires"] <= latest)
+        if not expired_out:
+            fail("override", "owner")
+    has_rows = any(baseline.get(name) for name in (
+        "completed_events", "expired_unresolved", "observations", "deliveries",
+        "source_facts", "clocks", "outbox_sessions", "override"))
+    status = "failed" if failed else ("preserved" if has_rows else "empty")
+    return {"status": status, "failed": failed}
+
+
+def _integrity_baseline(connection, tables, salt: str) -> dict | None:
+    """The Owner-approved hardware baseline as its revision and a keyed digest.
+
+    The inventory text holds hardware identifiers, so only a keyed digest of
+    it is kept.
+    """
+    if "integrity_baseline" not in tables:
+        return None
+    row = connection.execute(
+        "SELECT revision, inventory FROM integrity_baseline WHERE singleton = 1").fetchone()
+    if row is None:
+        return {"approved": False}
+    return {"approved": True, "revision": row["revision"],
+            "inventory_digest": _keyed(salt, ["integrity-baseline-v1", row["inventory"]])}
 
 
 def _registry_settings(connection, tables) -> dict | None:
@@ -659,6 +806,8 @@ def collect(runtime_root: Path, *, salt: str | None = None,
             "access": _access(connection, tables, salt),
             "camera_registry_settings": _registry_settings(connection, tables),
             "presence_timeline_gap": _timeline_gap(connection, tables),
+            "presence": _presence(connection, tables, salt),
+            "integrity_baseline": _integrity_baseline(connection, tables, salt),
         }
         connection.execute("COMMIT")
     except sqlite3.Error:
@@ -918,6 +1067,14 @@ def compare(baseline: dict, current: dict, *, declared_rewrites=()) -> dict:
             baseline.get("camera_registry_settings"), current.get("camera_registry_settings")),
         "presence_timeline_gap": _compare_timeline_gap(
             baseline.get("presence_timeline_gap"), current.get("presence_timeline_gap")),
+        "presence": _compare_presence(
+            baseline.get("presence"), current.get("presence"),
+            baseline.get("presence_timeline_gap"), current.get("presence_timeline_gap")),
+        "integrity_baseline": _compare_keyed(
+            {"baseline": baseline["integrity_baseline"]}
+            if baseline.get("integrity_baseline") is not None else None,
+            {"baseline": current["integrity_baseline"]}
+            if current.get("integrity_baseline") is not None else None),
         "owner_template": _compare_owner_template(baseline.get("owner_template"),
                                                   current.get("owner_template")),
         "access_principals": _compare_principals(access_base.get("principals"),
