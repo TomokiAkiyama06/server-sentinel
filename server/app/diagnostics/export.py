@@ -25,6 +25,7 @@ from app.media.recording.store import RootIdentity
 
 JsonScalar: TypeAlias = str | int | float | bool | None
 _SAFE_NAME = re.compile(r"^[a-z][a-z0-9_.-]{0,63}$")
+_SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
 _MEDIA_CHUNK_BYTES = 64 * 1024
 _MAX_MEDIA_ITEM_BYTES = 512 * 1024 * 1024
 _MAX_DIAGNOSTIC_BUNDLE_BYTES = 1024 * 1024 * 1024
@@ -98,6 +99,47 @@ class SafeDiagnosticFieldName(StrEnum):
     REASON_CODE = "reason_code"
     COUNT = "count"
     ENABLED = "enabled"
+    # Production adapter fields (app.diagnostics.sources). Each name is bound
+    # to one reviewed value type below; none can carry a free-form string.
+    MONITORING_STATE = "monitoring.state"
+    MONITORING_REASON_CODE = "monitoring.reason_code"
+    RETENTION_STATE = "retention.state"
+    DAILY_SUMMARY_STATE = "daily_summary.state"
+    NOTIFICATION_LOCAL_STATE = "notification.local_state"
+    NOTIFICATION_DELIVERY_STATE = "notification.delivery_state"
+    STORAGE_STATE = "storage.state"
+    STORAGE_REASON_CODE = "storage.reason_code"
+    STORAGE_AUDIT_DELIVERY_STATE = "storage.audit_delivery_state"
+    RECORDING_FILESYSTEM_STATE = "recording_filesystem.state"
+    RECORDING_HEALTH_STATE = "recording_health.state"
+    RECORDING_HEALTH_REASON_CODE = "recording_health.reason_code"
+    RECORDING_SELF_TEST_STATE = "recording_health.self_test_state"
+    INTEGRITY_STATE = "integrity.state"
+    INTEGRITY_REASON_CODE = "integrity.reason_code"
+    INTEGRITY_CHECK_STATE = "integrity.check_state"
+    INTEGRITY_DELIVERY_STATE = "integrity.delivery_state"
+    INTEGRITY_CPU_REASON_CODE = "integrity.cpu.reason_code"
+    INTEGRITY_MEMORY_REASON_CODE = "integrity.memory.reason_code"
+    INTEGRITY_STORAGE_REASON_CODE = "integrity.storage.reason_code"
+    INTEGRITY_GPU_REASON_CODE = "integrity.gpu.reason_code"
+    CAMERA_REGISTRY_STATE = "camera_registry.state"
+    CAMERA_REGISTRY_REASON_CODE = "camera_registry.reason_code"
+    CAMERA_SOURCES_TOTAL = "camera_sources.total"
+    CAMERA_SOURCES_ENABLED = "camera_sources.enabled"
+    CAMERA_SOURCES_LOCAL_UVC = "camera_sources.local_uvc"
+    CAMERA_SOURCES_REMOTE_AGENT = "camera_sources.remote_agent"
+    CAMERA_SOURCES_ONLINE = "camera_sources.online"
+    CAMERA_SOURCES_DEGRADED = "camera_sources.degraded"
+    CAMERA_SOURCES_OFFLINE = "camera_sources.offline"
+    CAMERA_SOURCES_MANUAL_INTERVENTION = "camera_sources.manual_intervention_required"
+    CAMERA_SOURCES_ACTIVE_LIMIT = "camera_sources.active_limit"
+    AUDIT_OWNER_STATE = "audit.owner.state"
+    AUDIT_OWNER_UNDELIVERED = "audit.owner.undelivered_records"
+    AUDIT_ACCESS_STATE = "audit.access.state"
+    AUDIT_ACCESS_UNDELIVERED = "audit.access.undelivered_records"
+    AUDIT_PAIRING_STATE = "audit.pairing.state"
+    AUDIT_PAIRING_UNDELIVERED = "audit.pairing.undelivered_records"
+    AUDIT_RETENTION_STATE = "audit.retention.state"
 
 
 class SafeDiagnosticState(StrEnum):
@@ -132,9 +174,40 @@ class SafeDiagnosticReasonCode(StrEnum):
     STORAGE_HARD_STOP = "storage_hard_stop"
     MANUAL_INTERVENTION_REQUIRED = "manual_intervention_required"
     SELF_TEST_FAILED = "self_test_failed"
+    HARDWARE_CHANGED = "hardware_changed"
+    HARDWARE_MISSING = "hardware_missing"
+    HARDWARE_NEW_DEVICE = "hardware_new_device"
+    HARDWARE_UNVERIFIABLE = "hardware_unverifiable"
 
 
 _SAFE_FIELD_NAMES = frozenset(item.value for item in SafeDiagnosticFieldName)
+_F = SafeDiagnosticFieldName
+_STATE_FIELDS = frozenset({
+    _F.STATUS, _F.STATE, _F.HEALTH, _F.MONITORING_STATE, _F.RETENTION_STATE,
+    _F.DAILY_SUMMARY_STATE, _F.NOTIFICATION_LOCAL_STATE,
+    _F.NOTIFICATION_DELIVERY_STATE, _F.STORAGE_STATE,
+    _F.STORAGE_AUDIT_DELIVERY_STATE, _F.RECORDING_FILESYSTEM_STATE,
+    _F.RECORDING_HEALTH_STATE, _F.RECORDING_SELF_TEST_STATE, _F.INTEGRITY_STATE,
+    _F.INTEGRITY_CHECK_STATE, _F.INTEGRITY_DELIVERY_STATE,
+    _F.CAMERA_REGISTRY_STATE, _F.AUDIT_OWNER_STATE, _F.AUDIT_ACCESS_STATE,
+    _F.AUDIT_PAIRING_STATE, _F.AUDIT_RETENTION_STATE,
+})
+_REASON_FIELDS = frozenset({
+    _F.REASON_CODE, _F.MONITORING_REASON_CODE, _F.STORAGE_REASON_CODE,
+    _F.RECORDING_HEALTH_REASON_CODE, _F.INTEGRITY_REASON_CODE,
+    _F.INTEGRITY_CPU_REASON_CODE, _F.INTEGRITY_MEMORY_REASON_CODE,
+    _F.INTEGRITY_STORAGE_REASON_CODE, _F.INTEGRITY_GPU_REASON_CODE,
+    _F.CAMERA_REGISTRY_REASON_CODE,
+})
+_COUNT_FIELDS = frozenset({
+    _F.COUNT, _F.CAMERA_SOURCES_TOTAL, _F.CAMERA_SOURCES_ENABLED,
+    _F.CAMERA_SOURCES_LOCAL_UVC, _F.CAMERA_SOURCES_REMOTE_AGENT,
+    _F.CAMERA_SOURCES_ONLINE, _F.CAMERA_SOURCES_DEGRADED,
+    _F.CAMERA_SOURCES_OFFLINE, _F.CAMERA_SOURCES_MANUAL_INTERVENTION,
+    _F.CAMERA_SOURCES_ACTIVE_LIMIT, _F.AUDIT_OWNER_UNDELIVERED,
+    _F.AUDIT_ACCESS_UNDELIVERED, _F.AUDIT_PAIRING_UNDELIVERED,
+})
+del _F
 _SAFE_VERSION = re.compile(
     r"^(?:0|[1-9][0-9]{0,5})\.(?:0|[1-9][0-9]{0,5})\."
     r"(?:0|[1-9][0-9]{0,5})$"
@@ -166,8 +239,7 @@ _CLASSIFIED_FIELD_NAMES = {
 
 
 def _validate_safe_value(name: str, value: object) -> None:
-    if name in {SafeDiagnosticFieldName.STATUS, SafeDiagnosticFieldName.STATE,
-                SafeDiagnosticFieldName.HEALTH}:
+    if name in _STATE_FIELDS:
         if not isinstance(value, SafeDiagnosticState):
             raise TypeError("diagnostic state must use the reviewed enum")
         return
@@ -175,7 +247,7 @@ def _validate_safe_value(name: str, value: object) -> None:
         if not isinstance(value, SafeDiagnosticComponent):
             raise TypeError("diagnostic component must use the reviewed enum")
         return
-    if name == SafeDiagnosticFieldName.REASON_CODE:
+    if name in _REASON_FIELDS:
         if not isinstance(value, SafeDiagnosticReasonCode):
             raise TypeError("diagnostic reason must use the reviewed enum")
         return
@@ -183,7 +255,7 @@ def _validate_safe_value(name: str, value: object) -> None:
         if type(value) is not str or not _SAFE_VERSION.fullmatch(value):
             raise ValueError("diagnostic version is invalid")
         return
-    if name == SafeDiagnosticFieldName.COUNT:
+    if name in _COUNT_FIELDS:
         if type(value) is not int or not 0 <= value <= 1_000_000_000:
             raise ValueError("diagnostic count is invalid")
         return
@@ -237,10 +309,15 @@ class DiagnosticDocument:
 
 @dataclass(frozen=True)
 class MediaAsset:
-    """Bounded reader for one individually selected raw media item."""
+    """Bounded reader for one individually selected raw media item.
+
+    When `sha256` is given, the exporter hashes exactly the bytes it copies
+    into the bundle and refuses to publish the bundle unless they match.
+    """
 
     reader: BinaryIO = dataclass_field(repr=False)
     media_type: str = "application/octet-stream"
+    sha256: str | None = None
 
     def __post_init__(self) -> None:
         if not callable(getattr(self.reader, "readinto", None)):
@@ -248,6 +325,9 @@ class MediaAsset:
         if not isinstance(self.media_type, str) or not _SAFE_NAME.fullmatch(
                 self.media_type.replace("/", ".")):
             raise ValueError("media type is invalid")
+        if self.sha256 is not None and (
+                type(self.sha256) is not str or not _SHA256_HEX.fullmatch(self.sha256)):
+            raise ValueError("media digest is invalid")
 
 
 @dataclass(frozen=True)
@@ -585,12 +665,13 @@ class _DiagnosticBundleWriter:
                         with self._media_source.open_selected(media_id) as supplied:
                             if not isinstance(supplied, MediaAsset):
                                 raise TypeError
-                            asset = MediaAsset(supplied.reader, supplied.media_type)
+                            asset = MediaAsset(supplied.reader, supplied.media_type,
+                                               supplied.sha256)
                             if asset.media_type != expected.media_type:
                                 raise ValueError
                             self._write_stream(
                                 archive, f"media/{index:04d}.bin", asset.reader,
-                                expected.size_bytes)
+                                expected.size_bytes, asset.sha256)
                             del asset
                         del supplied
                 # Flush after the central directory is written, so the fsync
@@ -641,12 +722,16 @@ class _DiagnosticBundleWriter:
 
     @staticmethod
     def _write_stream(archive: ZipFile, name: str, reader: BinaryIO,
-                      expected_size: int) -> None:
+                      expected_size: int, expected_sha256: str | None = None) -> None:
+        # The digest covers exactly the bytes written to the entry, so content
+        # changed after any earlier verification cannot reach a published
+        # bundle: a mismatch fails the write before the rename.
         info = ZipInfo(name)
         info.external_attr = 0o600 << 16
         info.compress_type = ZIP_STORED
         info.file_size = expected_size
         buffer = bytearray(_MEDIA_CHUNK_BYTES)
+        digest = hashlib.sha256()
         remaining = expected_size
         with archive.open(info, "w") as target:
             while remaining:
@@ -654,11 +739,15 @@ class _DiagnosticBundleWriter:
                 count = reader.readinto(view)
                 if type(count) is not int or not 0 < count <= len(view):
                     raise ValueError("selected media size changed")
+                digest.update(view[:count])
                 target.write(view[:count])
                 remaining -= count
         extra = bytearray(1)
         if reader.readinto(extra) != 0:
             raise ValueError("selected media size changed")
+        if expected_sha256 is not None and not hmac.compare_digest(
+                digest.hexdigest(), expected_sha256):
+            raise ValueError("selected media content changed")
 
 
 class DiagnosticExportService:

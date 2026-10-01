@@ -6,9 +6,10 @@ pair agents or authenticate people. Issue #6's Owner-approved authorization ADR
 and Issue #10's enforcement are prerequisites to opening human routes. Half of
 that ADR work is written up in `docs/ADR/0004-shared-tailnet-account-authorization.md`
 (shared Tailscale account, per-person credentials) and the other half in
-`docs/ADR/0003-owner-authentication-and-trusted-proxy.md`. ADR-0003 is Accepted;
-ADR-0004 remains Proposed. Human routes stay closed until the Owner accepts
-ADR-0004 and Issue #10 implements and tests both records.
+`docs/ADR/0003-owner-authentication-and-trusted-proxy.md`. Both are Accepted
+(ADR-0003 on 2026-09-21, ADR-0004 on 2026-09-30). Human routes stay closed until
+Issue #10 implements and tests both records; `app/auth/passkeys.py` is the
+unmounted WebAuthn ceremony core for that work.
 
 ## Running locally
 

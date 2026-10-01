@@ -15,7 +15,7 @@
     },
     {
       "path": "web/tests/browser.mjs",
-      "sha256": "sha256:2e96f2d673c34f5d60f3943637cc456ab3a8d6e02644c68b933037a0e4b57eea"
+      "sha256": "sha256:6aaf0116f2934d826de28fb35e9931af6d795a21b73dc78a00a95724ca48c8fa"
     },
     {
       "path": "web/tests/chrome.mjs",
@@ -23,11 +23,15 @@
     },
     {
       "path": "web/tests/compile.mjs",
-      "sha256": "sha256:ca41bbfd7ce3350a20f5ab1c0e2f32d0cbbdb79bbdde50340f690bae7084e040"
+      "sha256": "sha256:0fb9e61b55956943885fdffe2b4edae44809c7da7231b7a198b712485bbb562e"
+    },
+    {
+      "path": "web/tests/compile.test.mjs",
+      "sha256": "sha256:7b3049d81ef13193a45f1c54eec7cdb4a3b6d2d32a23daf671640e1f62c8d733"
     },
     {
       "path": "web/tests/core.test.mjs",
-      "sha256": "sha256:c6f6bb1b8603dfe55f238efdaa33488d1cc6e75df9274eb972034033b5ce908f"
+      "sha256": "sha256:60b8248a2303aefc8b96cdeb7ec82066896e1fd5dcef78c13e6a57f18b62e353"
     },
     {
       "path": "web/tests/smoke.mjs",
@@ -40,6 +44,10 @@
     {
       "path": "web/tests/presence_views.test.mjs",
       "sha256": "sha256:04f5e442690b0c69d5522ff7f8aa0b2af5213a2792e373f0861f04cb6af5a5cf"
+    },
+    {
+      "path": "web/tests/wizard.test.mjs",
+      "sha256": "sha256:7cdbaa39325c7c74fc8f6abbf9a1467c1d2baefc463587e85d8dbaad88e290cf"
     }
   ],
   "inputs": [
@@ -238,6 +246,42 @@
       ]
     },
     {
+      "id": "pypi:cffi@2.1.1",
+      "name": "cffi",
+      "version": "2.1.1",
+      "kind": "source",
+      "upstream": "https://pypi.org/project/cffi/2.1.1/",
+      "license": "MIT-0",
+      "license_evidence": [
+        "https://pypi.org/pypi/cffi/2.1.1/json",
+        "server/docs/DEPENDENCIES.md"
+      ],
+      "transitive_evidence": [
+        "server/docs/wheel-audit.json"
+      ],
+      "obligations": [
+        "preserve-license-and-copyright"
+      ],
+      "notice_files": [
+        "server/docs/BACKEND_THIRD_PARTY_LICENSE_TEXTS.md"
+      ],
+      "locations": [
+        {
+          "path": "server/requirements.lock",
+          "ecosystem": "python-requirements",
+          "scope": "backend",
+          "pin": {
+            "type": "lockfile-entry",
+            "digests": [
+              "sha256:68e62fe11f30d5ca8289242866f0a5291402d8529ca2178ab8afc5c9694ae890",
+              "sha256:b0431303acaea1089ad4b3e9ce4e6518193def1118d4073ca848635ee4ea2e96",
+              "sha256:c1453022f490d2459a11819d83ad1d586e9ff65a12ac3e705ffebd46d3685dcf"
+            ]
+          }
+        }
+      ]
+    },
+    {
       "id": "pypi:click@8.5.0",
       "name": "click",
       "version": "8.5.0",
@@ -267,6 +311,52 @@
             "type": "lockfile-entry",
             "digests": [
               "sha256:255bc9599cf7748b4b1a446ccc735421bd08a2ae529a8b88597d3de5664ee360"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "pypi:cryptography@50.0.1",
+      "name": "cryptography",
+      "version": "50.0.1",
+      "kind": "source",
+      "upstream": "https://pypi.org/project/cryptography/50.0.1/",
+      "license": "Apache-2.0 OR BSD-3-Clause",
+      "license_evidence": [
+        "https://pypi.org/pypi/cryptography/50.0.1/json",
+        "server/docs/DEPENDENCIES.md"
+      ],
+      "transitive_evidence": [
+        "server/docs/wheel-audit.json",
+        "server/docs/rust-audit.json"
+      ],
+      "obligations": [
+        "preserve-license-and-copyright",
+        "preserve-notice"
+      ],
+      "notice_files": [
+        "server/docs/BACKEND_THIRD_PARTY_LICENSE_TEXTS.md"
+      ],
+      "locations": [
+        {
+          "path": "server/pyproject.toml",
+          "ecosystem": "python-project",
+          "scope": "backend",
+          "pin": {
+            "type": "lock-correspondence",
+            "lock": "server/requirements.lock"
+          }
+        },
+        {
+          "path": "server/requirements.lock",
+          "ecosystem": "python-requirements",
+          "scope": "backend",
+          "pin": {
+            "type": "lockfile-entry",
+            "digests": [
+              "sha256:51afcfceb15597cf2635068e4ac9a56b2abde622edde17f37d85fd7b5306497a",
+              "sha256:e2ca8fd1b6b4b82a1c4cb02841d0837e3c12336c2e24b520ab8ab3b969733d8f"
             ]
           }
         }
@@ -381,6 +471,40 @@
             "type": "lockfile-entry",
             "digests": [
               "sha256:ab7ae7122974553370f0bdb919e1a960b2cd1bc1ef0276416d896db81c14582c"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "pypi:pycparser@3.0",
+      "name": "pycparser",
+      "version": "3.0",
+      "kind": "source",
+      "upstream": "https://pypi.org/project/pycparser/3.0/",
+      "license": "BSD-3-Clause",
+      "license_evidence": [
+        "https://pypi.org/pypi/pycparser/3.0/json",
+        "server/docs/DEPENDENCIES.md"
+      ],
+      "transitive_evidence": [
+        "server/docs/wheel-audit.json"
+      ],
+      "obligations": [
+        "preserve-license-and-copyright"
+      ],
+      "notice_files": [
+        "server/docs/BACKEND_THIRD_PARTY_LICENSE_TEXTS.md"
+      ],
+      "locations": [
+        {
+          "path": "server/requirements.lock",
+          "ecosystem": "python-requirements",
+          "scope": "backend",
+          "pin": {
+            "type": "lockfile-entry",
+            "digests": [
+              "sha256:b727414169a36b7d524c1c3e31839a521725078d7b2ff038656844266160a992"
             ]
           }
         }

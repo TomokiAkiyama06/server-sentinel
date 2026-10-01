@@ -6,6 +6,7 @@ import unittest
 
 from app.auth.model import AccessValidationError, Permission, PrincipalRole, PrincipalStatus
 from app.audit.store import AuditStore
+from app.auth.session_binding import SessionBindingKey
 from app.auth.store import AccessStore
 from app.storage.database import Database
 from app.storage.migrations import migrate
@@ -30,43 +31,44 @@ class AccessStoreTests(unittest.TestCase):
             migrate(connection, APPLICATION_MIGRATIONS)
         self.store = AccessStore(self.database, clock=lambda: NOW,
                                  audit=AuditStore(self.database, clock=lambda: NOW),
-                                 unaudited_writes=True)
+                                 unaudited_writes=True,
+                                 session_binding=SessionBindingKey.generate())
 
     def enroll(self, permissions=(Permission.LIVE_VIEW,)):
-        principal = self.store.invite(IDENTITY, "Synthetic viewer", permissions)
+        principal = self.store.invite("Synthetic viewer", permissions)
         self.store.issue_enrollment(principal.id, SECRET, NOW + timedelta(minutes=5))
         credential = self.store.enroll_credential(SECRET, IDENTITY, CREDENTIAL, PUBLIC_KEY, -7, 0)
         return principal, credential
 
     def test_independent_permissions_do_not_imply_each_other(self):
         live, live_credential = self.enroll((Permission.LIVE_VIEW,))
-        self.store.establish_session(live.id, live_credential.credential_id, b"l" * 32)
+        self.store.establish_session(live.id, live_credential.credential_id, b"l" * 32, proxy_identity=IDENTITY)
         self.assertEqual(self.store.authorize(b"l" * 32, IDENTITY, Permission.LIVE_VIEW).id, live.id)
         with self.assertRaises(AccessValidationError):
             self.store.authorize(b"l" * 32, IDENTITY, Permission.RECORDINGS_VIEW)
 
-        principal = self.store.invite("recording@example.invalid", "Synthetic recorder", (Permission.RECORDINGS_VIEW,))
+        principal = self.store.invite("Synthetic recorder", (Permission.RECORDINGS_VIEW,))
         self.store.issue_enrollment(principal.id, b"r" * 32, NOW + timedelta(minutes=5))
-        recorder = self.store.enroll_credential(b"r" * 32, principal.external_identity, b"recording-credential", PUBLIC_KEY, -7, 0)
-        self.store.establish_session(principal.id, recorder.credential_id, b"s" * 32)
-        self.assertEqual(self.store.authorize(b"s" * 32, principal.external_identity, Permission.RECORDINGS_VIEW).id, principal.id)
+        recorder = self.store.enroll_credential(b"r" * 32, IDENTITY, b"recording-credential", PUBLIC_KEY, -7, 0)
+        self.store.establish_session(principal.id, recorder.credential_id, b"s" * 32, proxy_identity=IDENTITY)
+        self.assertEqual(self.store.authorize(b"s" * 32, IDENTITY, Permission.RECORDINGS_VIEW).id, principal.id)
         with self.assertRaises(AccessValidationError):
-            self.store.authorize(b"s" * 32, principal.external_identity, Permission.LIVE_VIEW)
+            self.store.authorize(b"s" * 32, IDENTITY, Permission.LIVE_VIEW)
 
     def test_revocation_invalidates_current_and_future_sessions(self):
         principal, credential = self.enroll((Permission.LIVE_VIEW,))
-        self.store.establish_session(principal.id, credential.credential_id, TOKEN)
+        self.store.establish_session(principal.id, credential.credential_id, TOKEN, proxy_identity=IDENTITY)
         self.assertEqual(self.store.authorize(TOKEN, IDENTITY, Permission.LIVE_VIEW).status, PrincipalStatus.ACTIVE)
         self.store.revoke_principal(principal.id)
         with self.assertRaises(AccessValidationError):
             self.store.authorize(TOKEN, IDENTITY, Permission.LIVE_VIEW)
         with self.assertRaises(AccessValidationError):
-            self.store.establish_session(principal.id, credential.credential_id, b"n" * 32)
+            self.store.establish_session(principal.id, credential.credential_id, b"n" * 32, proxy_identity=IDENTITY)
 
     def test_permission_change_invalidates_existing_session_and_requires_new_one(self):
         principal, credential = self.enroll((Permission.LIVE_VIEW, Permission.RECORDINGS_VIEW))
-        self.store.establish_session(principal.id, credential.credential_id, TOKEN)
-        self.store.establish_session(principal.id, credential.credential_id, b"m" * 32)
+        self.store.establish_session(principal.id, credential.credential_id, TOKEN, proxy_identity=IDENTITY)
+        self.store.establish_session(principal.id, credential.credential_id, b"m" * 32, proxy_identity=IDENTITY)
         self.store.set_permissions(principal.id, (Permission.RECORDINGS_VIEW,))
         for token in (TOKEN, b"m" * 32):
             with self.subTest(token=token), self.assertRaises(AccessValidationError):
@@ -74,23 +76,24 @@ class AccessStoreTests(unittest.TestCase):
         with closing(self.database.connect()) as connection:
             invalidated = connection.execute("SELECT count(*) FROM access_sessions WHERE principal_id=? AND invalidated_at_us IS NOT NULL", (str(principal.id),)).fetchone()[0]
         self.assertEqual(invalidated, 2)
-        self.store.establish_session(principal.id, credential.credential_id, b"n" * 32)
+        self.store.establish_session(principal.id, credential.credential_id, b"n" * 32, proxy_identity=IDENTITY)
         self.assertEqual(self.store.authorize(b"n" * 32, IDENTITY, Permission.RECORDINGS_VIEW).id, principal.id)
         with self.assertRaises(AccessValidationError):
             self.store.authorize(b"n" * 32, IDENTITY, Permission.LIVE_VIEW)
 
-    def test_enrollment_is_single_use_identity_bound_and_generation_bound(self):
-        principal = self.store.invite(IDENTITY, "Synthetic viewer", ())
+    def test_enrollment_is_single_use_and_needs_a_present_proxy_identity(self):
+        principal = self.store.invite("Synthetic viewer", ())
         self.store.issue_enrollment(principal.id, SECRET, NOW + timedelta(minutes=5))
-        with self.assertRaises(AccessValidationError):
-            self.store.enroll_credential(SECRET, "other@example.invalid", CREDENTIAL, PUBLIC_KEY, -7, 0)
+        for absent in (None, "", "not an identity"):
+            with self.subTest(identity=absent), self.assertRaises(AccessValidationError):
+                self.store.enroll_credential(SECRET, absent, CREDENTIAL, PUBLIC_KEY, -7, 0)
         credential = self.store.enroll_credential(SECRET, IDENTITY, CREDENTIAL, PUBLIC_KEY, -7, 0)
         self.assertEqual(credential.principal_id, principal.id)
         with self.assertRaises(AccessValidationError):
             self.store.enroll_credential(SECRET, IDENTITY, b"other-credential", PUBLIC_KEY, -7, 0)
 
     def test_enrollment_rejects_redemption_at_exact_expiry(self):
-        principal = self.store.invite(IDENTITY, "Synthetic viewer", ())
+        principal = self.store.invite("Synthetic viewer", ())
         expires_at = NOW + timedelta(minutes=5)
         self.store.issue_enrollment(principal.id, SECRET, expires_at)
 
@@ -101,19 +104,19 @@ class AccessStoreTests(unittest.TestCase):
             )
 
     def test_owner_has_authorization_without_viewer_permission_but_needs_credential_session(self):
-        owner = self.store.bootstrap_owner(OWNER, "Synthetic owner")
+        owner = self.store.bootstrap_owner("Synthetic owner")
         self.assertEqual(owner.role, PrincipalRole.OWNER)
         with self.assertRaises(AccessValidationError):
-            self.store.bootstrap_owner("second@example.invalid", "Second owner")
+            self.store.bootstrap_owner("Second owner")
         self.store.issue_enrollment(owner.id, b"o" * 32, NOW + timedelta(minutes=5))
         credential = self.store.enroll_credential(b"o" * 32, OWNER, b"owner-credential", PUBLIC_KEY, -7, 0)
-        self.store.establish_session(owner.id, credential.credential_id, b"a" * 32)
+        self.store.establish_session(owner.id, credential.credential_id, b"a" * 32, proxy_identity=OWNER)
         self.assertEqual(self.store.authorize(b"a" * 32, OWNER, Permission.LIVE_VIEW).role, PrincipalRole.OWNER)
         self.assertEqual(self.store.authorize(b"a" * 32, OWNER, Permission.RECORDINGS_VIEW).role, PrincipalRole.OWNER)
 
-    def test_expired_idle_session_and_wrong_identity_fail_closed(self):
+    def test_expired_idle_session_and_unbound_identity_fail_closed(self):
         principal, credential = self.enroll()
-        self.store.establish_session(principal.id, credential.credential_id, TOKEN, idle_lifetime=timedelta(seconds=1), absolute_lifetime=timedelta(seconds=2))
+        self.store.establish_session(principal.id, credential.credential_id, TOKEN, proxy_identity=IDENTITY, idle_lifetime=timedelta(seconds=1), absolute_lifetime=timedelta(seconds=2))
         with self.assertRaises(AccessValidationError):
             self.store.authorize(TOKEN, "other@example.invalid", Permission.LIVE_VIEW)
         with self.assertRaises(AccessValidationError):
@@ -121,7 +124,7 @@ class AccessStoreTests(unittest.TestCase):
 
     def test_session_rejects_clock_regression_and_keeps_its_configured_idle_lifetime(self):
         principal, credential = self.enroll()
-        self.store.establish_session(principal.id, credential.credential_id, TOKEN,
+        self.store.establish_session(principal.id, credential.credential_id, TOKEN, proxy_identity=IDENTITY,
                                      idle_lifetime=timedelta(seconds=90),
                                      absolute_lifetime=timedelta(minutes=5))
         with self.assertRaises(AccessValidationError):
@@ -137,7 +140,7 @@ class AccessStoreTests(unittest.TestCase):
 
     def test_no_raw_secret_is_persisted(self):
         principal, credential = self.enroll()
-        self.store.establish_session(principal.id, credential.credential_id, TOKEN)
+        self.store.establish_session(principal.id, credential.credential_id, TOKEN, proxy_identity=IDENTITY)
         with closing(self.database.connect()) as connection:
             text = " ".join(str(value) for row in connection.execute("SELECT * FROM access_invitations").fetchall() for value in row)
             text += " ".join(str(value) for row in connection.execute("SELECT * FROM access_sessions").fetchall() for value in row)
