@@ -759,21 +759,36 @@ def _compare_pairing(baseline: dict, current: dict) -> list:
     - an open (pending / consumed) enrollment's key is live for its node; an
       activated enrollment's key is bound (perhaps revoked) to its node.
 
-    And per node, record -> verify is a composition of those operations:
-    every recorded enrollment stays with its node and key, a pending one
-    may become consumed, expired, activated or revoked, a consumed one
-    activated or revoked, and the other states are final; a recorded binding keeps its node and never
-    un-revokes, and once any of a node's recorded live bindings, or a binding
-    first seen now, is revoked (only revoke() does that) all of the node's
-    recorded bindings are; a revoked credential stays
-    revoked with the same material; an active one stays, becomes the staged
-    renewal (promotion) or an identity a post-record activation installed,
-    and may then be revoked, in which case its recorded bindings and its key
-    are revoked and nothing is staged; a staged row stays exactly, is retried
-    with its own key while the credential is unchanged, is replaced by a key
-    newly bound since the record, or leaves by promotion, revocation or a
-    fresh pairing. A credential first seen now needs a post-record activation
-    of its key.
+    And per node, record -> verify is a composition of those operations,
+    each enrollment transition tied to the operation that produces it:
+
+    - every recorded enrollment stays with its node and key; pending may
+      become consumed or expired (redeem(); nothing else changes), consumed
+      activated (activate()), pending / consumed revoked (revoke()), and the
+      other states are final;
+    - an enrollment activated since the record means activate() ran: the
+      node's credential now holds the key of an enrollment activated since
+      the record (only another activation or revoke(), which keeps the key,
+      changes it afterwards; a promotion of a renewal staged after it cannot
+      show its material and fails closed), and the renewal staged at record
+      time is gone;
+    - revoke() ran for a node if a recorded open enrollment became revoked
+      (only revoke() sets that state), a recorded live binding or a binding
+      first seen now is revoked, or its active credential became revoked;
+      then every recorded binding of the node and every key of its newly
+      revoked enrollments are revoked, none of its recorded open
+      enrollments is still open, and its credential is revoked (its key's
+      binding too) or holds the key of an activation since the record (a
+      re-pairing after the revoke);
+    - a recorded binding keeps its node and never un-revokes; a revoked
+      credential stays revoked with the same material (re-pairing a node
+      revoked at record time fails closed); an active one stays, becomes the
+      staged renewal (promotion) or an identity a post-record activation
+      installed; a staged row stays exactly, is retried with its own key
+      while the credential is unchanged, is replaced by a key newly bound
+      since the record, or leaves by promotion, revocation or a fresh
+      pairing; a credential first seen now needs a post-record activation of
+      its key.
     """
     failed = []
 
@@ -857,7 +872,7 @@ def _compare_pairing(baseline: dict, current: dict) -> list:
                     else pair not in historical and newly_bound(key_ref)):
                 fresh.add(pair)
 
-    # -- bindings: never deleted, rebound or un-revoked; revoked per node --
+    # -- bindings: never deleted, rebound or un-revoked --------------------
     revoked_nodes = set()
     for key_ref, binding in (recorded_bindings or {}).items():
         now = bindings.get(key_ref)
@@ -872,11 +887,67 @@ def _compare_pairing(baseline: dict, current: dict) -> list:
         # by revoke() of its node since the record.
         revoked_nodes.update(binding["node_id"] for key_ref, binding in bindings.items()
                              if binding["revoked"] and key_ref not in recorded_bindings)
+
+    # -- enrollment transitions and the operation that made them -----------
+    recorded_states = {enrollment: item["state"]
+                       for enrollment, item in (recorded_enrollments or {}).items()}
+    # Enrollments activate() completed since the record (recorded open ones
+    # or ones created since), per node.
+    activated_since = {enrollment: item for enrollment, item in enrollments_now.items()
+                       if item["state"] == "activated"
+                       and recorded_states.get(enrollment) != "activated"}
+    activated_keys: dict = {}
+    for item in activated_since.values():
+        activated_keys.setdefault(item["node_id"], set()).add(item["key_ref"])
+    for enrollment, item in sorted(activated_since.items()):
+        node = item["node_id"]
+        after = credentials.get(node)
+        # activate() made its key the node's credential and dropped the staged
+        # renewal; later only another activation (or revoke(), which keeps
+        # the key) changes that credential. A promotion of a renewal staged
+        # after it cannot show its material and fails closed.
+        if after is None or after["key_ref"] not in activated_keys[node]:
+            fail("pairing_enrollments", enrollment, "activation_unapplied")
+        if (node in staged and node in renewals
+                and renewals[node]["key_ref"] == staged[node]["key_ref"]):
+            fail("pairing_renewals", node, "changed")
+    for enrollment, item in sorted((recorded_enrollments or {}).items()):
+        after = enrollments_now.get(enrollment)
+        if (after is not None and after["state"] == "revoked"
+                and item["state"] in ("pending", "consumed")):
+            # Only revoke() sets 'revoked', revoking the node as a whole.
+            revoked_nodes.add(item["node_id"])
+    for node, before in recorded_credentials.items():
+        after = credentials.get(node)
+        if not before["revoked"] and after is not None and after["revoked"]:
+            revoked_nodes.add(node)
+
+    # -- revoke(): all of it, for any node revoked since the record --------
     for node in sorted(revoked_nodes):
-        # revoke() revokes every binding the node then held at once.
-        if any(binding["node_id"] == node and not (bindings.get(key_ref) or {}).get("revoked")
-               for key_ref, binding in recorded_bindings.items()):
-            fail("pairing_key_bindings", node, "partially_revoked")
+        # revoke() revokes every binding the node held (recorded ones and
+        # those of its enrollments), every open enrollment, the active
+        # credential, and deletes the staged row; afterwards only a fresh
+        # approve() / activate() gives the node a live identity again.
+        held = [key_ref for key_ref, binding in (recorded_bindings or {}).items()
+                if binding["node_id"] == node]
+        held += [item["key_ref"] for enrollment, item in (recorded_enrollments or {}).items()
+                 if item["node_id"] == node
+                 and (enrollments_now.get(enrollment) or {}).get("state") == "revoked"]
+        still_open = any(item["node_id"] == node and item["state"] in ("pending", "consumed")
+                         and (enrollments_now.get(enrollment) or {}).get("state")
+                         in ("pending", "consumed")
+                         for enrollment, item in (recorded_enrollments or {}).items())
+        after = credentials.get(node)
+        if after is None:
+            credential_ok = True
+        elif after["revoked"]:
+            held.append(after["key_ref"])
+            credential_ok = True
+        else:
+            credential_ok = after["key_ref"] in activated_keys.get(node, ())
+        if (recorded_bindings is None or still_open or not credential_ok
+                or not all((bindings.get(key_ref) or {}).get("revoked") for key_ref in held)):
+            fail("pairing_revocation", node, "incomplete")
 
     # -- credentials ------------------------------------------------------
     def installed(node, after):
@@ -900,13 +971,6 @@ def _compare_pairing(baseline: dict, current: dict) -> list:
             continue
         if not installed(node, after):
             fail("pairing_credentials", node, "changed")
-        if after["revoked"] and recorded_bindings is not None:
-            # revoke(): every binding the node held then is revoked, the
-            # credential's own key included, and the staged row is gone.
-            held = [key_ref for key_ref, binding in recorded_bindings.items()
-                    if binding["node_id"] == node] + [after["key_ref"]]
-            if not all((bindings.get(key_ref) or {}).get("revoked") for key_ref in held):
-                fail("pairing_credentials", node, "revocation_incomplete")
     for node in sorted(set(recorded_credentials) - set(credentials)):
         fail("pairing_credentials", node, "missing")
 
@@ -992,6 +1056,10 @@ def _integrity_delivery(connection, tables, salt: str) -> dict | None:
         "pending_findings": {str(row["id"]): _finding_categories(row["findings"])
                              for row in pending},
         "pending_at": {str(row["id"]): row["at"] for row in pending},
+        # The notification kind and time its delivery records, per row.
+        "pending_class": {str(row["id"]): [_INTEGRITY_KINDS[0] if row["immediate"]
+                                           else _INTEGRITY_KINDS[1], row["at"]]
+                          for row in pending},
         "overflow": sorted([row[0], row[1], row[2]] for row in connection.execute(
             "SELECT kind, state, at FROM integrity_overflow")),
         "sequence": 0 if sequence is None else sequence[0],
@@ -1044,12 +1112,19 @@ def _compare_integrity_delivery(baseline: dict | None, current: dict | None) -> 
                           "overflow": [], "sequence": 0, "notification_events": {}}
     accepted = current["notification_events"]
     failed = []
+    expected = baseline.get("pending_class") or {}
     for row_id, digest in baseline["pending"].items():
         if row_id in current["pending"]:
             if current["pending"][row_id] != digest:
                 failed.append({"id": f"pending:{row_id}", "reason": "changed"})
         elif _integrity_event_id(int(row_id)) not in accepted:
             failed.append({"id": f"pending:{row_id}", "reason": "missing"})
+        elif row_id not in expected:
+            failed.append({"id": f"pending:{row_id}", "reason": "unverifiable"})
+        elif accepted[_integrity_event_id(int(row_id))] != expected[row_id]:
+            # _integrity_sink() records the row's failure / warning kind
+            # (from its immediate flag) at the row's own time.
+            failed.append({"id": f"pending:{row_id}", "reason": "changed"})
     # Each removed slot needs its own new, still-pending outbox row (created
     # after the recorded AUTOINCREMENT sequence), every row consumed at most
     # once: a maximum bipartite matching between slots and evidencing rows.

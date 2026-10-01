@@ -664,6 +664,11 @@ class LifecycleInventoryTests(unittest.TestCase):
                              {"configured": True, "state": "unsafe"}, label)
         os.chmod(database, 0o644)
         unsafe_verify("readable-database")
+        # Codex P2: run as root, the inventory could read a file the service
+        # account cannot open read-write; only exactly 0600 is the store's.
+        for mode in (0o400, 0o200, 0o000):
+            os.chmod(database, mode)
+            unsafe_verify(f"owner-mode-{mode:o}")
         os.chmod(database, 0o600)
         os.chmod(root, 0o750)
         unsafe_verify("group-root")
@@ -1130,6 +1135,31 @@ class LifecycleInventoryTests(unittest.TestCase):
                           {"id": "pending:2", "reason": "missing"},
                           {"id": "pending:3", "reason": "changed"}])
 
+    def test_accepted_integrity_event_matches_the_pending_row(self):
+        # Codex P1: _integrity_sink() records the row's failure / warning
+        # kind (its immediate flag) at the row's own time under the
+        # deterministic event ID; another kind or time is not that event.
+        self.runtime.seed()
+        when = "2026-01-01T00:00:00+00:00"
+        findings = json.dumps([{"kind": "GPU", "state": "CHANGED", "detail": "x"}])
+        for immediate in (1, 1, 0):
+            self.runtime.execute("INSERT INTO integrity_outbox(at, immediate, findings) "
+                                 "VALUES (?, ?, ?)", (when, immediate, findings))
+        _, baseline = self.record()
+        events = {1: ("hardware_integrity_warning", when),            # wrong kind
+                  2: ("hardware_integrity_failure", "2026-01-02T00:00:00+00:00"),  # wrong time
+                  3: ("hardware_integrity_warning", when)}             # matches
+        for row_id, (kind, at) in events.items():
+            self.runtime.execute("DELETE FROM integrity_outbox WHERE id=?", (row_id,))
+            self.runtime.execute(
+                "INSERT INTO notification_events VALUES (?, ?, ?, 1, 'sent')",
+                (str(uuid5(EVENT_NAMESPACE, f"integrity-outbox:{row_id}")), kind, at))
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_FAILED)
+        self.assertEqual(report["sections"]["integrity_delivery"]["failed"],
+                         [{"id": "pending:1", "reason": "changed"},
+                          {"id": "pending:2", "reason": "changed"}])
+
     def test_active_pairing_material_changes_only_by_staged_promotion(self):
         self.runtime.seed()
         promoted, replaced = str(uuid4()), str(uuid4())
@@ -1456,13 +1486,10 @@ class LifecycleInventoryTests(unittest.TestCase):
                                   "reason": "unbound"},
                                  {"id": f"pairing_credentials:{nodes['unchanged']}",
                                   "reason": "unbound"},
-                                 # Only revoke() revokes a binding, and all of the node's.
-                                 {"id": f"pairing_key_bindings:{nodes['promoted']}",
-                                  "reason": "partially_revoked"},
-                                 {"id": f"pairing_key_bindings:{nodes['repaired']}",
-                                  "reason": "partially_revoked"},
-                                 {"id": f"pairing_key_bindings:{nodes['restaged']}",
-                                  "reason": "partially_revoked"}],
+                                 # Only revoke() revokes a binding, together with
+                                 # every binding, open enrollment and the credential.
+                                 *({"id": f"pairing_revocation:{node}",
+                                    "reason": "incomplete"} for node in nodes.values())],
                                 key=lambda item: (item["id"], item["reason"])))
 
     def test_pairing_state_follows_the_ledger_invariants(self):
@@ -1505,14 +1532,11 @@ class LifecycleInventoryTests(unittest.TestCase):
         for expected in (
                 {"id": f"pairing_credentials:{unbound}", "reason": "unbound"},
                 {"id": f"pairing_credentials:{foreign}", "reason": "unbound"},
-                {"id": f"pairing_credentials:{nodes['revoked-alone']}",
-                 "reason": "revocation_incomplete"},
-                {"id": f"pairing_credentials:{nodes['revoked-staged']}",
-                 "reason": "revocation_incomplete"},
+                {"id": f"pairing_revocation:{nodes['revoked-alone']}", "reason": "incomplete"},
+                {"id": f"pairing_revocation:{nodes['revoked-staged']}", "reason": "incomplete"},
                 {"id": f"pairing_renewals:{nodes['revoked-staged']}", "reason": "unbound"},
                 {"id": f"pairing_renewals:{nodes['staged-flip']}", "reason": "unbound"},
-                {"id": f"pairing_key_bindings:{nodes['staged-flip']}",
-                 "reason": "partially_revoked"}):
+                {"id": f"pairing_revocation:{nodes['staged-flip']}", "reason": "incomplete"}):
             self.assertIn(expected, failed)
 
     def test_ledger_operation_compositions_are_preserved(self):
@@ -1667,13 +1691,23 @@ class LifecycleInventoryTests(unittest.TestCase):
         code, report, _ = self.verify(baseline)
         self.assertEqual(code, inventory.EXIT_FAILED)
         self.assertEqual(sorted(report["sections"]["security_state"]["failed"],
-                                key=lambda item: item["id"]),
+                                key=lambda item: (item["id"], item["reason"])),
                          sorted([{"id": f"pairing_enrollments:{ids['deleted']}",
                                   "reason": "missing"},
                                  {"id": f"pairing_enrollments:{ids['rewound']}",
                                   "reason": "changed"},
                                  {"id": f"pairing_enrollments:{ids['revived']}",
-                                  "reason": "changed"}], key=lambda item: item["id"]))
+                                  "reason": "changed"},
+                                 {"id": f"pairing_enrollments:{ids['revived']}",
+                                  "reason": "activation_unapplied"},
+                                 # Codex P1: flipped to activated alone; activate()
+                                 # also installs its key as the node's credential.
+                                 {"id": f"pairing_enrollments:{ids['completes']}",
+                                  "reason": "activation_unapplied"},
+                                 # Codex P1: flipped to revoked alone; only revoke()
+                                 # sets it, revoking the whole node.
+                                 {"id": f"pairing_revocation:{node}", "reason": "incomplete"}],
+                                key=lambda item: (item["id"], item["reason"])))
 
     def test_a_staged_renewal_is_never_restaged_onto_a_superseded_key(self):
         # Codex P1: stage_renewal() accepts a key already bound to the node

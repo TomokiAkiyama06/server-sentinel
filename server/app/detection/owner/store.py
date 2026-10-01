@@ -79,8 +79,11 @@ def _private_root(info, owner) -> bool:
 
 
 def _private_file(info, owner) -> bool:
+    # Exactly 0600: no group / other access, and the owner can read and
+    # write it (a root inspector could read a 0400 / 0200 / 0000 file the
+    # service itself cannot open read-write).
     return (stat.S_ISREG(info.st_mode) and info.st_nlink == 1
-            and info.st_uid == owner and not info.st_mode & 0o077)
+            and info.st_uid == owner and stat.S_IMODE(info.st_mode) == 0o600)
 
 
 def open_private_root(root: Path, *, owner: int):
@@ -89,8 +92,8 @@ def open_private_root(root: Path, *, owner: int):
     For a read-only inspector (the lifecycle inventory) running as another
     user: every path component is unsubstitutable, the root is owned by
     ``owner`` with no group/other access, and an existing database is a
-    single-link regular file (never a symlink) owned by ``owner`` with no
-    group/other access. Returns the verified directory descriptor and whether
+    single-link regular file (never a symlink) owned by ``owner`` with mode
+    exactly 0600. Returns the verified directory descriptor and whether
     the database exists; raises OwnerError otherwise.
     """
     descriptor = _directory(root, owner)

@@ -353,7 +353,9 @@ recorded with it fails a verification run without it (and the reverse), and
 the store database appearing or disappearing is a change. The tool accepts the
 store only under the layout the store itself enforces (every path component
 unsubstitutable, a root with no group/other access and a single-link regular
-`0600` database, never a symlink, both owned by the service account that owns
+database of mode exactly `0600` (so `0400`, `0200` or `0000`, which a root
+inspector could still read but the service cannot open read-write, are
+refused too), never a symlink, both owned by the service account that owns
 the state database); any other layout is recorded as `unsafe`, is not read and
 always fails verification. Likewise a camera source whose stored UVC approval
 evidence the service could not load always fails as
@@ -399,7 +401,8 @@ its revision and a keyed digest of its inventory (never the hardware
 identifiers); pending hardware-integrity notifications (outbox rows as keyed
 digests, overflow slots by category and state): a pending row may leave only
 once its notification event (`uuid5(EVENT_NAMESPACE, "integrity-outbox:<id>")`)
-is durably recorded, and each overflow slot only by its own promotion: a
+is durably recorded with the row's own failure / warning kind (from its
+immediate flag) and time, and each overflow slot only by its own promotion: a
 distinct new outbox row, still pending, with the slot's time and single
 category / state. Once that row is delivered it is deleted and only its
 notification event (time and failure / warning kind, no category or state)
@@ -423,14 +426,21 @@ verify, each node may only change by a composition of those operations:
 every enrollment recorded (any state) stays with the same node and key and
 only moves forward: pending to consumed, expired, activated or revoked,
 consumed to activated or revoked, the other states final (a vanished one is
-`missing`); a revoked credential stays revoked with the same material; an active one
-stays, becomes the renewal staged at record time (promotion) or the identity
-a fresh pairing installed (an enrollment pending or consumed at record time
-with the same node and key, or a new one whose key was neither bound nor
-activated at record time), and if it is then revoked, every binding the node
-held and its own key are revoked and nothing stays staged; a binding is never
-deleted, rebound or un-revoked, and when one of a node's bindings becomes
-revoked all of its recorded bindings are (revoke() revokes them together); a
+`missing`), and each transition must come with the rest of the operation that
+makes it: an enrollment activated since the record needs the node's
+credential to hold the key of an activation since the record and the renewal
+staged at record time to be gone; a node is treated as revoked since the
+record when one of its recorded open enrollments became revoked, one of its
+bindings became revoked, or its active credential became revoked, and then
+all of its recorded bindings and the keys of its newly revoked enrollments
+must be revoked, none of its recorded open enrollments may still be open,
+and its credential must be revoked (its key too) or hold the key of a
+re-pairing since the record; a revoked credential stays revoked with the
+same material; an active one stays, becomes the renewal staged at record
+time (promotion) or the identity a fresh pairing installed (an enrollment
+pending or consumed at record time with the same node and key, or a new one
+whose key was neither bound nor activated at record time); a binding is
+never deleted, rebound or un-revoked; a
 staged renewal stays, is retried with its own key while the credential is
 unchanged, is replaced by a key newly bound since the record, or leaves by
 promotion, revocation or a fresh pairing; a credential first seen now needs a
