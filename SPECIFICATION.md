@@ -735,6 +735,59 @@ Required behavior regardless of protocol:
 - no arbitrary filesystem paths;
 - no silent loss while reporting healthy.
 
+Transport-independent continuity contract (ADR-0007, Proposed; protocol still
+unselected). Every media unit carries `(source_id, capture_epoch, sequence,
+capture_time_ns)`: `capture_epoch` is a strictly increasing Agent capture-process
+epoch, `sequence` counts units per source within an epoch and survives transport
+reconnects, and `capture_time_ns` is the Agent monotonic capture clock within
+the epoch. The Main Server assigns a new session generation on every
+authenticated session open; a superseded session is rejected. Generations are
+never reissued, including after node removal and re-enrollment of the same
+identity, and a grant is bound to one Main process lifetime. A unit is
+committed only after the bounded ingest queue accepts it: backpressure or rate
+refusal does not advance continuity and the Agent retries the same sequence,
+a retry of a committed unit is an idempotent `duplicate`, every media attempt
+of an authorized node (including a duplicate or an early refusal that is never
+enqueued) consumes its per-node ingest rate budget, a unit refused for
+a reason no retry can satisfy (oversize) is recorded as loss, and any other
+ingest refusal leaves continuity unchanged and the flow `degraded`. A sequence skip reports the exact missing
+count, a new capture epoch reports a gap of unknown extent (also when the
+source's earlier-epoch unit was attempted but never committed; an epoch lower
+than one already attempted is refused as stale; a restart is recorded when a
+refused unit first shows it, so it reaches the durable consumer even if that
+unit is never retried, and its retry does not report it again), and an in-epoch
+capture clock regression is reported. After a Main Server restart, a source's
+continuity resumes from the durable recording layer's committed watermark
+`(node, capture_epoch, sequence, capture_time_ns)` before its first unit is
+checked, so units already recorded by the earlier process are `duplicate`
+rather than leading loss and units lost after that watermark are an exact
+skip; a failed watermark lookup refuses the unit transiently rather than
+reporting loss or healthy flow, and until a lookup succeeds the source is kept
+as a bounded, slot-limited entry reported `degraded` without advancing
+continuity. The full envelope travels with each
+admitted unit in the ingest queue, and the ingest boundary refuses a media
+unit with a missing or partial envelope. Known loss or backpressure keeps the
+source flow `degraded`, including pressure or a transient refusal on a
+source's first unit before anything is committed; an observed refused attempt refreshes source activity without advancing continuity, so sustained pressure stays `degraded` rather than `interrupted`. A closed or stale session makes it `interrupted`, and node authorization failing at any check (heartbeat, media, or the ingest queue's own recheck) invalidates the session grant, while a source-only refusal does not. These authorization checks run while the tracker/queue lock guarding the affected state is held, so a revocation that lands while a session open, heartbeat, or media attempt waits for the lock is always observed (no fresh grant, liveness refresh, `duplicate` acknowledgement, enqueue, or rate window after revocation). A durable node revocation or source deactivation commits inside the tracker/queue `authorization_change` block, which holds those locks for the commit, so no check can pass before the commit and act after it; before the block releases the tracker lock, a revoked node is forgotten with its sources (so a grant issued just before the commit is unusable) and its rate window is discarded, and a deactivated source releases its active-source slot, with undrained gaps handed back to the caller for persistence; a failed commit changes nothing. Gap
+events are bounded per source and coalesce into an unknown-extent event rather
+than being dropped. Flow continuity is not camera health or node health (§5.8).
+Tracked sources are bounded by the active-source limit (§3.4); tracked node
+sessions are hard-bounded separately, so live source-less node sessions never
+consume the active-source allowance. The active-source limit counts active sources, so durable deactivation or replacement of one
+source releases its slot (returning its undrained gap events to the caller)
+without discarding the node's other flows. While accepted units of a released
+source are still in the ingest queue, its committed position is kept outside
+the slot limit, so a retry after reactivation is a `duplicate` and is never
+enqueued twice; once they are drained, the durable watermark applies. A node that owns no tracked source
+and whose session is closed, invalidated or stale does not keep a slot.
+Liveness time is sampled while the tracker state is locked and never moves
+backwards, so a delayed or regressed clock sample cannot make an active flow
+look stale or retire a live session (the new session is refused instead); a
+source first seen under a regressed clock is seeded from its node's liveness
+watermark rather than the older sample.
+`server/app/cameras/remote_agent/continuity.py` implements this without a
+listener, protocol, or cryptography.
+
 ### 6.5 Main-to-browser live transport
 
 Phone/Mac/desktop users view live video **through the main host**, never directly from `media-capture-agent`.
