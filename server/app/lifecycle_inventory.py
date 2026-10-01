@@ -650,8 +650,7 @@ def _security_state(connection, tables, salt: str) -> dict:
                         "SELECT node_id, state, public_key_digest, credential_serial_digest, "
                         f"{not_after} FROM pairing_node_credentials")
     enrollments = query("pairing_enrollments",
-                        "SELECT id, node_id, public_key_digest, state FROM pairing_enrollments "
-                        "WHERE state IN ('activated', 'pending', 'consumed')")
+                        "SELECT id, node_id, public_key_digest, state FROM pairing_enrollments")
     renewals = query("pairing_node_renewals",
                      "SELECT node_id, public_key_digest, credential_serial_digest, not_after "
                      "FROM pairing_node_renewals")
@@ -683,7 +682,11 @@ def _security_state(connection, tables, salt: str) -> dict:
             for row in enrollments if row["state"] == "activated"),
         "pairing_enrollments_open": None if enrollments is None else sorted(
             [row["id"], row["node_id"], _keyed(salt, ["pairing-key-v1", row["public_key_digest"]])]
-            for row in enrollments if row["state"] != "activated"),
+            for row in enrollments if row["state"] in ("pending", "consumed")),
+        # Every key an enrollment (any state) names: approve() bound them,
+        # while stage_renewal() binds keys no enrollment names.
+        "pairing_enrollment_keys": None if enrollments is None else sorted(
+            {_keyed(salt, ["pairing-key-v1", row["public_key_digest"]]) for row in enrollments}),
         "pairing_key_bindings": None if bindings is None else {
             _keyed(salt, ["pairing-key-v1", row[0]]): {"node_id": row[1], "revoked": bool(row[2])}
             for row in bindings},
@@ -706,14 +709,18 @@ def _compare_pairing(baseline: dict, current: dict) -> list:
     keyed digests here; ``live`` means bound to the node and not revoked):
 
     - approve(node, key): a new pending enrollment; binds the key live
-      (_bind_key() refuses a key bound elsewhere or revoked).
+      (_bind_key() refuses a key bound elsewhere or revoked, but accepts one
+      already live for the same node, even a currently staged key).
     - redeem(): pending -> consumed, or pending -> expired.
     - activate(claim): consumed -> activated; binds its key live; the node's
       credential becomes (key, serial, not_after) and active (inserted or
       overwritten); any staged renewal is deleted.
     - stage_renewal(node, key): needs an active credential and a key other
-      than its own; binds a new key live, or retries the currently staged
-      key; writes the single staged row.
+      than its own; refuses a key any credential, another node's renewal or
+      enrollment names; binds a new key live, or retries the currently
+      staged key (a key bound by an enrollment of this node is refused, so
+      it never stages an enrollment's key); writes the single staged row and
+      no enrollment.
     - promotion in admits(): the credential becomes the staged material and
       expiry, the staged key stays live, the staged row is deleted.
     - revoke(node): the active credential -> revoked, pending / consumed
@@ -725,7 +732,11 @@ def _compare_pairing(baseline: dict, current: dict) -> list:
 
     - each active credential's key is live for its node;
     - a staged renewal belongs to an active credential, uses another key,
-      and that key is live for its node;
+      and that key is live for its node and named by no enrollment, recorded
+      or current, in any state (so no activated enrollment's key is staged:
+      activate() deletes the renewal and that key can never be staged
+      again). Approving a currently staged key would also break this; it is
+      reachable through approve() but refused here (fail closed);
     - an open (pending / consumed) enrollment's key is live for its node; an
       activated enrollment's key is bound (perhaps revoked) to its node.
 
@@ -776,6 +787,16 @@ def _compare_pairing(baseline: dict, current: dict) -> list:
         if (owner is None or owner["revoked"] or owner["key_ref"] == renewal["key_ref"]
                 or not live(node, renewal["key_ref"])):
             fail("pairing_renewals", node, "unbound")
+    # A staged key is never an enrollment's key (recorded or current, any
+    # state); this also keeps an activated enrollment's key from being staged.
+    recorded_keys = baseline.get("pairing_enrollment_keys")
+    if renewals and (recorded_keys is None and recorded_activations is not None
+                     or current.get("pairing_enrollment_keys") is None):
+        failed.append({"id": "pairing_enrollment_keys", "reason": "unverifiable"})
+    enrollment_keys = set(recorded_keys or ()) | set(current.get("pairing_enrollment_keys") or ())
+    for node, renewal in sorted(renewals.items()):
+        if renewal["key_ref"] in enrollment_keys:
+            fail("pairing_renewals", node, "enrollment_key")
     if _by_enrollment(open_now) and _by_enrollment(activations_now):
         for enrollment, node, key_ref in open_now:
             if not live(node, key_ref):
@@ -1524,10 +1545,16 @@ def _compare_recordings(baseline: dict | None, current: dict | None, *,
     current = current or {}
     preserved, failed, in_progress = [], list(result["failed"]), []
     for key in result["preserved"]:
-        if _evidenced(current[key]):
-            preserved.append(key)
-        else:
+        if not _evidenced(current[key]):
             failed.append({"id": key, "reason": "no_readable_segment_evidence"})
+        elif not all(segment["catalog_match"] for segment in current[key]["segments"]):
+            # Unchanged is not enough: a segment already missing its catalog
+            # digest, byte length or single hard link at record time is one
+            # RecordingStore._integrity() reports corrupt, so it never
+            # verifies as preserved (record warns about it).
+            failed.append({"id": key, "reason": "catalog_mismatch"})
+        else:
+            preserved.append(key)
     for entry in list(failed):
         key = entry["id"]
         base = baseline[key]

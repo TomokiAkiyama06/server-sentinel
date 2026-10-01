@@ -1596,6 +1596,49 @@ class LifecycleInventoryTests(unittest.TestCase):
                          [{"id": f"pairing_credentials:{nodes['revoke']}",
                            "reason": "revocation_reversed"}])
 
+    def test_a_staged_key_is_never_an_enrollment_key(self):
+        # Codex P1: stage K, consume an approval for K, activate another fresh
+        # key J (which deletes the K renewal); a migration then restores the
+        # K renewal and marks K's enrollment activated. Both keys are newly
+        # bound, but stage_renewal() never stages an enrollment's key.
+        self.runtime.seed()
+        ledger = PairingLedger(Database(self.runtime.database), HmacCodeVerifier(b"s" * 32),
+                               audit=AuditStore(Database(self.runtime.database)),
+                               clock=lambda: 100.0, process_epoch=uuid4())
+
+        class Owner:
+            def require_owner(self, actor_context):
+                if actor_context != "owner":
+                    raise PermissionError("synthetic denial")
+        owner, node = Owner(), uuid4()
+
+        def claim(key):
+            approval, code = ledger.approve(owner, "owner", node_id=node, public_key_digest=key)
+            return approval, ledger.redeem(enrollment_id=approval.enrollment_id,
+                                           public_key_digest=key, code=code.value)
+        ledger.activate(claim("a" * 64)[1], credential_serial_digest="b" * 64, not_after=50.0)
+        _, baseline = self.record()
+        staged, serial = "c" * 64, "d" * 64
+        ledger.stage_renewal(node_id=node, current_public_key_digest="a" * 64,
+                             current_credential_digest="b" * 64, public_key_digest=staged,
+                             credential_serial_digest=serial, not_after=90.0)
+        approval, _ = claim(staged)
+        ledger.activate(claim("e" * 64)[1], credential_serial_digest="f" * 64, not_after=50.0)
+        self.runtime.execute("INSERT INTO pairing_node_renewals VALUES (?, ?, ?, 90.0)",
+                             (str(node), staged, serial))
+        self.runtime.execute("UPDATE pairing_enrollments SET state='activated' WHERE id=?",
+                             (str(approval.enrollment_id),))
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_FAILED)
+        self.assertEqual(report["sections"]["security_state"]["failed"],
+                         [{"id": f"pairing_renewals:{node}", "reason": "enrollment_key"}])
+        # The same without the restored enrollment state: still refused.
+        self.runtime.execute("UPDATE pairing_enrollments SET state='consumed' WHERE id=?",
+                             (str(approval.enrollment_id),))
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(report["sections"]["security_state"]["failed"],
+                         [{"id": f"pairing_renewals:{node}", "reason": "enrollment_key"}])
+
     def test_a_staged_renewal_is_never_restaged_onto_a_superseded_key(self):
         # Codex P1: stage_renewal() accepts a key already bound to the node
         # only as a retry of the currently staged key.
@@ -2240,6 +2283,24 @@ class LifecycleInventoryTests(unittest.TestCase):
         self.assertEqual(section["in_progress_at_record"], [ids["stopped"]])
         for label in labels[1:]:
             self.assertIn({"id": ids[label], "reason": "changed"}, section["failed"])
+
+    def test_segments_already_corrupt_at_record_never_verify(self):
+        # Codex P1: an unchanged recording whose segment already failed
+        # RecordingStore._integrity() at record time (bytes or length differ
+        # from the catalog, or an extra hard link) must not verify.
+        seeded = self.runtime.seed()
+        self.runtime.segment_path(seeded["ordinary"]).write_bytes(b"generated-altered-bytes!")
+        os.link(self.runtime.segment_path(seeded["starred"]), self.notes / "extra-link")
+        code, baseline = self.record()
+        recorded = json.loads(baseline.read_text())["recordings"]
+        for key in ("ordinary", "starred"):
+            self.assertFalse(recorded[seeded[key]]["segments"][0]["catalog_match"])
+        code, report, stdout = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_FAILED)
+        section = report["sections"]["recordings"]
+        for key in ("ordinary", "starred"):
+            self.assertIn({"id": seeded[key], "reason": "catalog_mismatch"}, section["failed"])
+            self.assertNotIn(seeded[key], section["preserved"])
 
     def test_extra_hard_link_to_a_segment_is_detected(self):
         # RecordingStore._integrity() treats st_nlink != 1 as corrupt.

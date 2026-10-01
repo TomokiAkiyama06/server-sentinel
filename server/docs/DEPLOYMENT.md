@@ -416,7 +416,9 @@ promotion, revoke). Every current state must satisfy the ledger's
 invariants: an active credential's key, a staged renewal's key (which differs
 from the credential's and belongs to an active credential) and an open
 enrollment's key are each bound to that node by a live, unrevoked binding,
-and an activated enrollment's key is bound to its node. From record to
+an activated enrollment's key is bound to its node, and a staged renewal's
+key is never the key of any enrollment, recorded or current, in any state
+(stage renewal binds keys no enrollment names). From record to
 verify, each node may only change by a composition of those operations:
 enrollments activated at record time stay activated with the same node and
 key; a revoked credential stays revoked with the same material; an active one
@@ -430,10 +432,11 @@ revoked all of its recorded bindings are (revoke() revokes them together); a
 staged renewal stays, is retried with its own key while the credential is
 unchanged, is replaced by a key newly bound since the record, or leaves by
 promotion, revocation or a fresh pairing; a credential first seen now needs a
-fresh pairing of its key. Two ledger-reachable cases fail closed: a renewal
+fresh pairing of its key. Three ledger-reachable cases fail closed: a renewal
 both staged and promoted inside the window (its material cannot be shown),
-and re-pairing a node that was already revoked at record time (reported as a
-reversed revocation); verify before the next automatic renewal, or
+re-pairing a node that was already revoked at record time (reported as a
+reversed revocation), and the Owner approving a key that is currently staged
+as that node's renewal; verify before the next automatic renewal, or
 investigate and re-record. An invalidated human session never becomes
 valid again, and the authorization generation never decreases; for each
 registered camera source its type, keyed digests of
@@ -482,7 +485,10 @@ It recomputes the same inventory and compares it. A missing or changed
 recording, audit row, source, principal or invitation is `failed` (exit 1);
 rows and recordings that exist only now are listed as `appended` and are never
 counted as preserved. A finished recording must be identical, including its
-target and ended boundaries. A recording that was still active when recorded
+target and ended boundaries, and every segment must be readable and match its
+catalog digest and byte length with a single hard link even if it was already
+broken at record time (reported as `catalog_mismatch`; `record` prints a
+warning for such recordings). A recording that was still active when recorded
 may gain segments, move its target end earlier but never later, and stay
 `active` with no end or become `complete` or `gapped` ending exactly at its
 (possibly earlier) target, or `interrupted` ending exactly at the earlier of
