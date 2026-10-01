@@ -534,6 +534,31 @@ class RuntimeLifecycleTests(RuntimeFixture):
                                              for capture in self.captures.instances)))
         self.assertTrue(wait_for(lambda: self.health(source.id) is SourceHealthState.OFFLINE))
 
+    def test_worker_blocked_through_a_refused_reapproval_stays_watched(self):
+        source = self.source()
+        runtime = LocalUvcRuntime(
+            LocalUvcConfiguration((source.id,), poll_timeout_seconds=0.05,
+                                  retry_delay_seconds=0.05, join_timeout_seconds=0.1),
+            self.registry, on_frame=self.on_frame, discovery=self.discovery,
+            capture_factory=self.captures,
+        )
+        self.addCleanup(runtime.stop)
+        runtime.start()
+        runtime.reapprove(self.admin, "synthetic-owner", source.id, self.camera)
+        self.assertTrue(self.wait_health(source.id, SourceHealthState.ONLINE))
+        block = threading.Event()
+        self.addCleanup(block.set)
+        self.captures.block = block
+        time.sleep(0.05)
+        # The worker is blocked in a kernel call, so the stop for the
+        # approval times out and the approval is refused; the source is
+        # still RUNNING and its worker still registered with stop requested.
+        with self.assertRaisesRegex(ValueError, "could not stop"):
+            runtime.reapprove(self.admin, "synthetic-owner", source.id, self.camera)
+        self.assertIs(runtime.status().sources[0].state, SourceRuntimeState.RUNNING)
+        self.assertTrue(wait_for(lambda: self.health(source.id) is not SourceHealthState.ONLINE))
+        self.captures.block = None
+
     def test_health_sink_failure_and_event_bound_do_not_stop_capture(self):
         source = self.source()
 

@@ -43,7 +43,8 @@ class LocalUvcSupervisor:
     contain deployment-private device information.
 
     When the adapter exposes ``check_frame_progress(source_id)``, one
-    watchdog thread calls it for every running source each
+    watchdog thread calls it for every registered source whose worker thread
+    is still alive (including one whose stop timed out) each
     ``watchdog_interval``. This is the single deliberate exception to "one
     thread per source": the check is read-mostly, never opens, closes or
     rebinds a device, and only lowers an ``online`` claim for a source whose
@@ -123,12 +124,20 @@ class LocalUvcSupervisor:
 
     def _watch(self):
         while not self._watchdog_stop.wait(self._watchdog_interval):
+            # A requested stop is not an exit: a worker blocked in a kernel
+            # call past a timed-out stop() stays registered, and its source
+            # is still reported by that worker's last state. Keep checking
+            # it until the thread has actually exited or was removed.
             with self._lock:
-                sources = [source_id for source_id, worker in self._workers.items()
-                           if not worker.stop.is_set()]
-            for source_id in sources:
+                sources = [(source_id, worker) for source_id, worker in self._workers.items()
+                           if worker.thread is not None and worker.thread.is_alive()]
+            for source_id, worker in sources:
                 if self._watchdog_stop.is_set():
                     return
+                with self._lock:
+                    if (self._workers.get(source_id) is not worker
+                            or not worker.thread.is_alive()):
+                        continue
                 try:
                     self._check(source_id)
                 except Exception:
