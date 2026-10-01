@@ -29,9 +29,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 import datetime
 from typing import Callable
-from uuid import UUID
+from uuid import UUID, uuid5
 
 from app.notifications.service import NotificationKind
+from app.notifications.slack import DeliveryResult
 
 from .ingest_tls import CaptureNodeAdmission, CaptureNodeIdentity
 from .node_ca import (
@@ -45,6 +46,12 @@ RENEWAL_WINDOW = datetime.timedelta(days=30)
 # the Agent has then retried for at least 16 days (see agent RenewalSchedule).
 EXPIRY_WARNING_WINDOW = datetime.timedelta(days=14)
 _MAX_REMEMBERED_SIGNALS = 1024
+# Hook results that confirm the warning was recorded locally (or retained by
+# NotificationService for its own retry). FAILED, any other value, or an
+# exception means it was not, and the warning stays unreported.
+_CONFIRMED = frozenset({DeliveryResult.SUPPRESSED, DeliveryResult.PENDING,
+                        DeliveryResult.SENT, DeliveryResult.DISABLED})
+_WARNING_NAMESPACE = UUID("6f1d2c1e-5b8a-4d55-9a57-0c9b0e3f7a21")
 
 
 class RenewalRefused(RuntimeError):
@@ -108,11 +115,15 @@ class CredentialSignal:
 class CaptureCredentialMonitor:
     """Raises Owner-visible local warnings for expiring or unrenewable node credentials.
 
-    ``notify(kind, at)`` is the injected existing notification hook, normally
-    ``NotificationService.record``. Each (node, reason, expiry) is reported
-    once per process, counted only once the hook succeeds, so a failed
-    notification is retried on the next check or refusal; the remembered set
-    is bounded.
+    ``notify(kind, at=..., event_id=...)`` is the injected existing
+    notification hook, normally ``NotificationService.record``. It must return
+    a ``DeliveryResult``; only SUPPRESSED, PENDING, SENT or DISABLED confirm
+    that the warning was recorded locally (or retained by the service for its
+    own retry). FAILED, any other value, or an exception leaves the warning
+    unreported, and the next check or refusal retries it with the same
+    deterministic ``event_id`` so the local sink upserts instead of
+    duplicating. Each (node, reason, expiry) is reported once per process
+    once confirmed; the remembered set is bounded.
     """
 
     def __init__(self, ledger: PairingLedger,
@@ -134,10 +145,15 @@ class CaptureCredentialMonitor:
     def _signal(self, key: tuple, signal: CredentialSignal, at: datetime.datetime) -> None:
         if key in self._reported:
             return
+        event_id = uuid5(_WARNING_NAMESPACE, repr(key))
         try:
-            self._notify(NotificationKind.CAPTURE_CREDENTIAL_WARNING, at=at)
+            result = self._notify(NotificationKind.CAPTURE_CREDENTIAL_WARNING, at=at,
+                                  event_id=event_id)
         except Exception:
-            # Not marked reported: the next check or refusal retries it.
+            result = None
+        if result not in _CONFIRMED:
+            # Not marked reported: the next check or refusal retries it, with
+            # the same event_id so a retry upserts rather than duplicates.
             self.notification_failed = True
             return
         if len(self._reported) >= _MAX_REMEMBERED_SIGNALS:
