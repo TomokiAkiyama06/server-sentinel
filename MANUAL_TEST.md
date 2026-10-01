@@ -1549,9 +1549,14 @@ by the Issue #6 synthetic policy model.
   `getent ahosts <reserved-host>`) and that access opens. Record whether
   MagicDNS answers both families. Stop `tailscaled` (or point the resolver at a
   non-answering server) and confirm access closes with
-  `HOSTNAME_RESOLUTION_UNAVAILABLE`/`_TIMEOUT` and that reopening revokes every
-  human session. Omit one configured address and confirm
-  `RESERVED_ADDRESSES_CHANGED` closes access until the configuration matches;
+  `HOSTNAME_RESOLUTION_UNAVAILABLE`/`_TIMEOUT`, and that once resolution
+  recovers access reopens with no `invalidate_human_sessions` record and
+  existing sessions still accepted (Owner decision 2026-10-01: a resolution
+  failure is not an exposure). If `tailscaled` stopping also makes the listener
+  or route enumeration fail, that failure still revokes; record which reasons
+  the host actually produced. Omit one configured address and confirm
+  `RESERVED_ADDRESSES_CHANGED` closes access until the configuration matches
+  and that reopening then revokes every human session;
   on a disposable node whose name gains an extra address (for example a test
   `/etc/hosts` entry when the resolver honors it), bind a listener to that
   address and confirm it is reported as `UNEXPECTED_LISTENER`.

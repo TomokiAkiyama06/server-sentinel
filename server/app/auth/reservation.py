@@ -87,14 +87,17 @@ class Reason(StrEnum):
 # for the reserved name, so a session cookie may have been exposed. Reopening
 # after any of these first revokes every human session (Owner decision,
 # 2026-09-30). An enumeration error or timeout is treated the same way: nothing
-# shows an exposure, but nothing rules one out either. That includes a failed
-# hostname resolution, since an address the name gained but the configuration
-# lacks would then go unchecked.
+# shows an exposure, but nothing rules one out either. A resolved address set
+# that differs from the configuration counts too: the name answered on an
+# address the check did not cover until now. A failed or missing hostname
+# resolution only keeps access closed (Owner decision, 2026-10-01): it reopens
+# without revocation once the answer matches again, unless an exposure was
+# seen meanwhile.
 EXPOSURE_REASONS = frozenset({
     Reason.UNEXPECTED_LISTENER, Reason.UNEXPECTED_ROUTE,
     Reason.LISTENER_ENUMERATION_UNAVAILABLE, Reason.LISTENER_ENUMERATION_TIMEOUT,
     Reason.ROUTE_ENUMERATION_UNAVAILABLE, Reason.ROUTE_ENUMERATION_TIMEOUT,
-    Reason.HOSTNAME_RESOLUTION_UNAVAILABLE, Reason.HOSTNAME_RESOLUTION_TIMEOUT,
+    Reason.RESERVED_ADDRESSES_CHANGED,
 })
 
 
@@ -685,8 +688,9 @@ class HostnameReservationCheck:
     restarts, only the delivered Owner fault records the requirement.
 
     Every check also re-resolves the hostname through ``resolver``; a missing
-    resolver, a failed or timed-out resolution (an exposure reason) or an
-    answer that differs from ``reserved_addresses`` keeps access closed.
+    resolver or a failed or timed-out resolution keeps access closed without
+    requiring revocation; an answer that differs from ``reserved_addresses``
+    keeps it closed as an exposure reason.
     """
 
     def __init__(self, config: ReservationConfig, listeners: ListenerEnumerator,

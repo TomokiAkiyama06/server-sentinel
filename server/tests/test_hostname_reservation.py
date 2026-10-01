@@ -1165,6 +1165,31 @@ class SessionRevocationTests(ExceptionFixture):
         self.assertTrue(check._check(CheckKind.RETRY).open)
         self.assertEqual(revoker.revocations, 1)
 
+    def test_resolution_failure_keeps_sessions_and_generation(self):
+        self.session("viewer@example.invalid", b"v" * 32)
+        resolver = Resolver(OSError("synthetic resolver failure"))
+        check, _, _, _ = checker(exception_store=self.exception_store, session_revoker=self.revoker,
+                                 resolver=resolver)
+        self.assertEqual(check.startup().reasons, (Reason.HOSTNAME_RESOLUTION_UNAVAILABLE,))
+        self.assertIsNone(self.marker())
+        resolver.answer = (V4, V6)
+        self.assertTrue(check._check(CheckKind.RETRY).open)
+        self.assertEqual(self.revocation_records(), [])
+        self.access.authorize(b"v" * 32, "viewer@example.invalid", Permission.LIVE_VIEW)
+
+    def test_address_change_revokes_before_reopening(self):
+        self.session("viewer@example.invalid", b"v" * 32)
+        resolver = Resolver((V4,))
+        check, _, _, _ = checker(exception_store=self.exception_store, session_revoker=self.revoker,
+                                 resolver=resolver)
+        self.assertEqual(check.startup().reasons, (Reason.RESERVED_ADDRESSES_CHANGED,))
+        self.assertEqual(self.marker(), "1")
+        resolver.answer = (V4, V6)
+        self.assertTrue(check._check(CheckKind.RETRY).open)
+        self.assertEqual(len(self.revocation_records()), 1)
+        with self.assertRaises(AccessValidationError):
+            self.access.authorize(b"v" * 32, "viewer@example.invalid", Permission.LIVE_VIEW)
+
     def test_revoker_requires_an_audited_access_store(self):
         for store in (None, AccessStore(self.database), object()):
             with self.subTest(store=store), self.assertRaises(ValueError):
@@ -1195,27 +1220,42 @@ class HostnameResolutionTests(TestCase):
         self.assertEqual(sink.events[-1].unexpected_listeners, 1)
         self.assertNotIn("100.64.0.11", repr(sink.events[-1]))
 
-    def test_changed_resolution_closes_without_revocation(self):
+    def test_changed_resolution_is_an_exposure(self):
         resolver = Resolver((V4,))
         revoker = FakeRevoker()
         check, _, _, _ = checker(resolver=resolver, session_revoker=revoker)
         self.assertEqual(check.startup().reasons, (Reason.RESERVED_ADDRESSES_CHANGED,))
-        self.assertFalse(revoker.pending)
+        self.assertTrue(revoker.pending)
         resolver.answer = (V4, V6)
         self.assertTrue(check._check(CheckKind.RETRY).open)
-        self.assertEqual(revoker.revocations, 0)
+        self.assertEqual(revoker.revocations, 1)
 
-    def test_failed_or_missing_resolution_fails_closed_as_exposure(self):
-        for resolver, reason in ((Resolver(OSError("synthetic resolver failure")),
-                                  Reason.HOSTNAME_RESOLUTION_UNAVAILABLE),
-                                 (Resolver(()), Reason.HOSTNAME_RESOLUTION_UNAVAILABLE),
-                                 (Resolver(("100.64.0.10",)), Reason.HOSTNAME_RESOLUTION_UNAVAILABLE),
-                                 (None, Reason.HOSTNAME_RESOLUTION_UNAVAILABLE)):
+    def test_failed_or_missing_resolution_fails_closed_without_revocation(self):
+        for resolver in (Resolver(OSError("synthetic resolver failure")), Resolver(()),
+                         Resolver(("100.64.0.10",)), None):
             with self.subTest(resolver=resolver):
                 revoker = FakeRevoker()
                 check, _, _, _ = checker(resolver=resolver, session_revoker=revoker)
-                self.assertEqual(check.startup().reasons, (reason,))
-                self.assertTrue(revoker.pending)
+                self.assertEqual(check.startup().reasons, (Reason.HOSTNAME_RESOLUTION_UNAVAILABLE,))
+                self.assertFalse(revoker.pending)
+                if resolver is not None:
+                    resolver.answer = (V4, V6)
+                    self.assertTrue(check._check(CheckKind.RETRY).open)
+                    self.assertEqual(revoker.revocations, 0)
+
+    def test_exposure_during_resolution_failure_still_revokes(self):
+        resolver = Resolver(OSError("synthetic resolver failure"))
+        revoker = FakeRevoker()
+        files = Files(tcp=proc(("127.0.0.1", 8080, "0A"), ("100.64.0.10", 8443, "0A")))
+        check, _, _, _ = checker(resolver=resolver, session_revoker=revoker, files=files)
+        self.assertEqual(check.startup().reasons,
+                         (Reason.HOSTNAME_RESOLUTION_UNAVAILABLE, Reason.UNEXPECTED_LISTENER))
+        files.files["tcp"] = proc(("127.0.0.1", 8080, "0A"))
+        self.assertEqual(check._check(CheckKind.RETRY).reasons, (Reason.HOSTNAME_RESOLUTION_UNAVAILABLE,))
+        self.assertEqual(revoker.revocations, 0)
+        resolver.answer = (V4, V6)
+        self.assertTrue(check._check(CheckKind.RETRY).open)
+        self.assertEqual(revoker.revocations, 1)
 
     def test_hung_resolution_times_out(self):
         release = threading.Event()
