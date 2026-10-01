@@ -7,11 +7,14 @@ boundary.
 """
 
 from collections import deque
+from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
 from threading import Lock
-from typing import Callable, Protocol
+from typing import Callable, Iterator, Protocol
 from uuid import UUID
+
+_MAXIMUM_COUNTER = 2 ** 63 - 1
 
 
 class AgentAction(str, Enum):
@@ -54,6 +57,16 @@ class AgentMessage:
     The payload has no filesystem path, codec, URL, or human identity field.
     Frame/container parsing remains a transport/recording concern after
     authenticated bounded admission.
+
+    ``capture_epoch`` and ``capture_time_ns`` carry the Agent continuity
+    envelope (ADR-0007) so a downstream consumer can distinguish units of
+    different capture epochs and preserve the Agent capture timestamp.  Both
+    are required for ``MEDIA`` (a partial or missing envelope is refused) and
+    may be absent only for non-media actions; when present they must be
+    nonnegative 63-bit integers.  ``sequence`` has the same nonnegative
+    63-bit range as ``MediaUnitHeader`` for every action, so a direct queue
+    user cannot enqueue an envelope the continuity API or a signed 64-bit
+    downstream field cannot represent.
     """
 
     node_id: UUID
@@ -61,12 +74,20 @@ class AgentMessage:
     action: AgentAction
     sequence: int
     payload: bytes
+    capture_epoch: int | None = None
+    capture_time_ns: int | None = None
 
     def __post_init__(self) -> None:
+        envelope = (self.capture_epoch, self.capture_time_ns)
         if (not isinstance(self.node_id, UUID) or not isinstance(self.source_id, UUID)
                 or not isinstance(self.action, AgentAction)
-                or type(self.sequence) is not int or self.sequence < 0
-                or type(self.payload) is not bytes):
+                or type(self.sequence) is not int
+                or not 0 <= self.sequence <= _MAXIMUM_COUNTER
+                or type(self.payload) is not bytes
+                or any(value is not None and (type(value) is not int
+                                              or not 0 <= value <= _MAXIMUM_COUNTER)
+                       for value in envelope)
+                or (self.action is AgentAction.MEDIA and None in envelope)):
             raise ValueError("invalid agent ingest message")
 
 
@@ -114,8 +135,18 @@ class AgentIngestQueue:
     """Thread-safe bounded queue after injected node/source authorization.
 
     A refusal never evicts accepted media, silently reports success, or changes
-    source/node health.  The future listener owns pre-read network byte limits;
-    this domain object bounds what may remain in Main Server memory afterwards.
+    source/node health.  Authorization is evaluated while this queue's lock is
+    held, right before rate state or the queue changes, so an attempt that
+    waited for the lock across a revocation and ``forget_revoked_node`` can
+    neither enqueue media nor recreate the revoked node's rate window.  The
+    injected authorizer must therefore not call back into this queue.
+
+    A durable node/source revocation must commit inside
+    ``authorization_change`` so it is serialized with every check-then-act
+    section here: no attempt can pass authorization before the commit and
+    enqueue or charge after it.  The future listener owns pre-read network
+    byte limits; this domain object bounds what may remain in Main Server
+    memory afterwards.
     """
 
     def __init__(self, limits: IngestLimits, authorizer: IngestAuthorizer,
@@ -152,47 +183,102 @@ class AgentIngestQueue:
     def _admission(self, outcome: IngestOutcome, reason: str | None) -> IngestAdmission:
         return IngestAdmission(outcome, reason, len(self._queue), self._queued_bytes)
 
-    def submit(self, message: AgentMessage) -> IngestAdmission:
-        if not isinstance(message, AgentMessage):
-            raise ValueError("invalid agent ingest message")
-        try:
-            self._authorizer.require_node(message.node_id)
-            self._authorizer.require_source(message.node_id, message.source_id)
-        except PermissionError:
-            with self._lock:
-                self._rejected += 1
-                return self._admission(IngestOutcome.REJECTED, "unauthorized")
-
+    def _now(self) -> int:
         now = self._clock_ns()
         if type(now) is not int or now < 0:
             raise ValueError("ingest clock must return nonnegative integer nanoseconds")
+        return now
+
+    def _consume_rate_locked(self, node_id: UUID, now: int, *,
+                             commit: bool = True) -> IngestAdmission | None:
+        """Charge one authenticated attempt; return its refusal, if any.
+
+        With ``commit`` false a fitting attempt is not counted (see
+        ``check_attempt``); a refusal is reported and counted either way.
+
+        Every authenticated attempt consumes rate budget, including an
+        oversized message, a queue-pressure refusal, or an attempt refused
+        before admission by a caller (see ``charge_attempt``).  This prevents
+        a sender from repeatedly making bounded-admission work forever while
+        preserving the first refusal's specific reason.
+        """
+        window = self._windows.get(node_id)
+        if window is None:
+            if len(self._windows) >= self.limits.maximum_tracked_rate_windows:
+                self._retire_expired_windows(now)
+            if len(self._windows) >= self.limits.maximum_tracked_rate_windows:
+                self._rate_limited += 1
+                return self._admission(IngestOutcome.RATE_LIMITED, "rate_window_capacity")
+            start, count = now, 0
+        else:
+            start, count = window
+        if now < start:
+            self._rejected += 1
+            return self._admission(IngestOutcome.REJECTED, "clock_regression")
+        if now - start >= self.limits.rate_window_ns:
+            start, count = now, 0
+        if count >= self.limits.maximum_messages_per_window:
+            self._windows[node_id] = (start, count)
+            self._rate_limited += 1
+            return self._admission(IngestOutcome.RATE_LIMITED, "rate_limit")
+        if commit:
+            self._windows[node_id] = (start, count + 1)
+        return None
+
+    def charge_attempt(self, node_id: UUID) -> IngestAdmission | None:
+        """Count an authenticated attempt that a caller refuses before ``submit``.
+
+        Used for attempts that must not be enqueued (for example an
+        idempotent duplicate retry or a stale session) so they still consume
+        the node's rate budget.  The node is re-authorized under this queue's
+        lock: a revoked node is refused as ``unauthorized`` and never charged.
+        Returns ``None`` when the attempt fits the budget, otherwise the
+        refusal; nothing is ever enqueued.
+        """
+        if not isinstance(node_id, UUID):
+            raise ValueError("invalid agent node identity")
+        with self._lock:
+            try:
+                self._authorizer.require_node(node_id)
+            except PermissionError:
+                self._rejected += 1
+                return self._admission(IngestOutcome.REJECTED, "unauthorized")
+            return self._consume_rate_locked(node_id, self._now())
+
+    def check_attempt(self, node_id: UUID) -> IngestAdmission | None:
+        """Refuse an attempt that ``charge_attempt`` would refuse, without charging.
+
+        Lets a caller refuse an over-budget (or revoked) node before doing
+        expensive work for the attempt, such as a durable-store lookup, while
+        the attempt is still charged exactly once later by ``charge_attempt``
+        or ``submit``.  Returns ``None`` when the attempt currently fits.
+        """
+        if not isinstance(node_id, UUID):
+            raise ValueError("invalid agent node identity")
+        with self._lock:
+            try:
+                self._authorizer.require_node(node_id)
+            except PermissionError:
+                self._rejected += 1
+                return self._admission(IngestOutcome.REJECTED, "unauthorized")
+            return self._consume_rate_locked(node_id, self._now(), commit=False)
+
+    def submit(self, message: AgentMessage) -> IngestAdmission:
+        if not isinstance(message, AgentMessage):
+            raise ValueError("invalid agent ingest message")
         size = len(message.payload)
         with self._lock:
-            window = self._windows.get(message.node_id)
-            if window is None:
-                if len(self._windows) >= self.limits.maximum_tracked_rate_windows:
-                    self._retire_expired_windows(now)
-                if len(self._windows) >= self.limits.maximum_tracked_rate_windows:
-                    self._rate_limited += 1
-                    return self._admission(IngestOutcome.RATE_LIMITED,
-                                           "rate_window_capacity")
-                start, count = now, 0
-            else:
-                start, count = window
-            if now < start:
+            try:
+                self._authorizer.require_node(message.node_id)
+                self._authorizer.require_source(message.node_id, message.source_id)
+            except PermissionError:
                 self._rejected += 1
-                return self._admission(IngestOutcome.REJECTED, "clock_regression")
-            if now - start >= self.limits.rate_window_ns:
-                start, count = now, 0
-            if count >= self.limits.maximum_messages_per_window:
-                self._windows[message.node_id] = (start, count)
-                self._rate_limited += 1
-                return self._admission(IngestOutcome.RATE_LIMITED, "rate_limit")
-            # Every authenticated attempt consumes rate budget, including an
-            # oversized message or a queue-pressure refusal. This prevents a
-            # sender from repeatedly making bounded-admission work forever
-            # while preserving the first refusal's specific reason.
-            self._windows[message.node_id] = (start, count + 1)
+                return self._admission(IngestOutcome.REJECTED, "unauthorized")
+            # Sampled under the lock: a delayed caller's older sample must not
+            # read as clock regression against a concurrently opened window.
+            refusal = self._consume_rate_locked(message.node_id, self._now())
+            if refusal is not None:
+                return refusal
             if size > self.limits.maximum_message_bytes:
                 self._rejected += 1
                 return self._admission(IngestOutcome.REJECTED, "message_too_large")
@@ -204,12 +290,36 @@ class AgentIngestQueue:
             self._queued_bytes += size
             return self._admission(IngestOutcome.ACCEPTED, None)
 
+    @contextmanager
+    def authorization_change(self, *, revoked_node: UUID | None = None) -> Iterator[None]:
+        """Hold this queue's lock while a durable authorization change commits.
+
+        The caller commits the revocation/deactivation (for example
+        ``PairingLedger.revoke``) inside the block and must not call back into
+        this queue there.  Every submit/charge authorizes and acts under the
+        same lock, so each one is ordered entirely before or entirely after
+        the commit.  When the block completes, ``revoked_node``'s rate window
+        is discarded; if the commit raises, nothing is changed.
+        """
+        if revoked_node is not None and not isinstance(revoked_node, UUID):
+            raise ValueError("invalid agent node identity")
+        with self._lock:
+            yield
+            if revoked_node is not None:
+                self._windows.pop(revoked_node, None)
+
     def forget_revoked_node(self, node_id: UUID) -> None:
         """Forget rate state after durable revocation or node removal."""
         if not isinstance(node_id, UUID):
             raise ValueError("invalid agent node identity")
         with self._lock:
             self._windows.pop(node_id, None)
+
+    def holds(self, node_id: UUID, source_id: UUID) -> bool:
+        """Whether accepted media of this node/source still awaits ``drain``."""
+        with self._lock:
+            return any(item.node_id == node_id and item.source_id == source_id
+                       for item in self._queue)
 
     def drain(self, maximum_messages: int) -> tuple[AgentMessage, ...]:
         """Remove a bounded batch for one downstream consumer attempt."""
