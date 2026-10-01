@@ -6,7 +6,7 @@ import json
 import sqlite3
 from uuid import uuid4
 
-from .identity import DeviceEvidence
+from .identity import DeviceEvidence, same_physical_camera
 
 
 # Included by the append-only application migration after the registry schema.
@@ -29,6 +29,20 @@ EXPLICIT_BINDING_SCHEMA = (
 
 class ApprovalStorageError(RuntimeError):
     """A fixed safe error, without physical identifiers or database contents."""
+
+
+class ApprovalConflictError(ValueError):
+    """The camera is approved for another enabled source; fixed safe message."""
+
+
+# Active Owner approvals of other enabled local UVC sources. A row that
+# requires approval (manual latch or never approved) holds no camera.
+_HELD_APPROVALS = (
+    "SELECT a.evidence, a.serial_ambiguous FROM uvc_approvals AS a "
+    "JOIN camera_sources AS s ON s.id = a.source_id "
+    "WHERE a.requires_approval = 0 AND s.enabled = 1 "
+    "AND s.source_type = 'local_uvc' AND a.source_id != ?"
+)
 
 
 @dataclass(frozen=True)
@@ -76,6 +90,44 @@ class ApprovalStore:
             DeviceEvidence(**evidence), bool(row[1]), row[2], bool(row[3]), bool(row[4]),
         )
 
+    @staticmethod
+    def _held_on(connection, source_id):
+        rows = connection.execute(_HELD_APPROVALS, (str(source_id),)).fetchall()
+        return tuple(ApprovalStore._state((row[0], 0, None, row[1], 0)) for row in rows)
+
+    @staticmethod
+    def _conflicts(evidence, serial_ambiguous, held):
+        """True when either side's own comparison names the same camera.
+
+        Each source checks for conflicts with its own recorded comparison
+        mode, so a holder approved before a same-serial twin appeared still
+        compares by serial. Checking both directions keeps the approval-time
+        refusal consistent with what every holder's runtime check reports.
+        """
+        return any(
+            same_physical_camera(evidence, other.approved, serial_ambiguous=serial_ambiguous)
+            or same_physical_camera(other.approved, evidence,
+                                    serial_ambiguous=other.serial_ambiguous)
+            for other in held
+        )
+
+    def approved_elsewhere(self, source_id, evidence, *, serial_ambiguous=False):
+        """True when another enabled source holds an active approval for this camera.
+
+        ``serial_ambiguous`` compares exact live-instance evidence, for a
+        camera whose serial is shared by another concurrently connected one.
+        """
+        connection = None
+        try:
+            connection = self.database.connect()
+            return self._conflicts(evidence, serial_ambiguous,
+                                   self._held_on(connection, source_id))
+        except (sqlite3.Error, ValueError, TypeError, KeyError):
+            raise ApprovalStorageError("UVC approval state is unavailable") from None
+        finally:
+            if connection is not None:
+                connection.close()
+
     def load(self, source_id):
         connection = None
         try:
@@ -98,6 +150,14 @@ class ApprovalStore:
         """Persist Owner selection inside a caller-owned audit transaction."""
         if not connection.in_transaction:
             raise ApprovalStorageError("UVC approval transaction is unavailable")
+        try:
+            held = ApprovalStore._held_on(connection, source_id)
+        except (sqlite3.Error, ValueError, TypeError, KeyError):
+            raise ApprovalStorageError("UVC approval state could not be saved") from None
+        # Checked again inside the write transaction, so two concurrent
+        # approvals can never both bind one physical camera.
+        if ApprovalStore._conflicts(approved, serial_ambiguous, held):
+            raise ApprovalConflictError("camera approval is unavailable")
         try:
             evidence = json.dumps(asdict(approved), allow_nan=False, separators=(",", ":"))
             row = connection.execute(
