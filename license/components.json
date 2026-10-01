@@ -72,6 +72,11 @@
       "scope": "tooling"
     },
     {
+      "path": "agent/requirements.lock",
+      "ecosystem": "python-requirements",
+      "scope": "transport"
+    },
+    {
       "path": "server/Dockerfile.ci",
       "ecosystem": "container-image",
       "scope": "tooling"
@@ -113,14 +118,6 @@
     }
   ],
   "scope_reviews": [
-    {
-      "scope": "transport",
-      "status": "reviewed-empty",
-      "evidence": [
-        "agent/transport/README.md",
-        "docs/THIRD_PARTY_POLICY.md"
-      ]
-    },
     {
       "scope": "model_weight",
       "status": "reviewed-empty",
@@ -257,7 +254,8 @@
         "server/docs/DEPENDENCIES.md"
       ],
       "transitive_evidence": [
-        "server/docs/wheel-audit.json"
+        "server/docs/wheel-audit.json",
+        "agent/docs/cryptography-wheel-audit.json"
       ],
       "obligations": [
         "preserve-license-and-copyright"
@@ -266,6 +264,20 @@
         "server/docs/BACKEND_THIRD_PARTY_LICENSE_TEXTS.md"
       ],
       "locations": [
+        {
+          "path": "agent/requirements.lock",
+          "ecosystem": "python-requirements",
+          "scope": "transport",
+          "pin": {
+            "type": "lockfile-entry",
+            "digests": [
+              "sha256:58acb8ab8e295e6c5ea12f888cbb13cf21511ef2a3303a23f4325c29d17fe5c1",
+              "sha256:68e62fe11f30d5ca8289242866f0a5291402d8529ca2178ab8afc5c9694ae890",
+              "sha256:b0431303acaea1089ad4b3e9ce4e6518193def1118d4073ca848635ee4ea2e96",
+              "sha256:c1453022f490d2459a11819d83ad1d586e9ff65a12ac3e705ffebd46d3685dcf"
+            ]
+          }
+        },
         {
           "path": "server/requirements.lock",
           "ecosystem": "python-requirements",
@@ -329,7 +341,8 @@
       ],
       "transitive_evidence": [
         "server/docs/wheel-audit.json",
-        "server/docs/rust-audit.json"
+        "server/docs/rust-audit.json",
+        "agent/docs/cryptography-wheel-audit.json"
       ],
       "obligations": [
         "preserve-license-and-copyright",
@@ -339,6 +352,29 @@
         "server/docs/BACKEND_THIRD_PARTY_LICENSE_TEXTS.md"
       ],
       "locations": [
+        {
+          "path": "agent/pyproject.toml",
+          "ecosystem": "python-project",
+          "scope": "transport",
+          "pin": {
+            "type": "lock-correspondence",
+            "lock": "agent/requirements.lock"
+          }
+        },
+        {
+          "path": "agent/requirements.lock",
+          "ecosystem": "python-requirements",
+          "scope": "transport",
+          "pin": {
+            "type": "lockfile-entry",
+            "digests": [
+              "sha256:51593d180cf6d179bde5c5d065bed81386b1f381656ae7d042b7ffc87a9895ad",
+              "sha256:51afcfceb15597cf2635068e4ac9a56b2abde622edde17f37d85fd7b5306497a",
+              "sha256:e2ca8fd1b6b4b82a1c4cb02841d0837e3c12336c2e24b520ab8ab3b969733d8f",
+              "sha256:e74591e283fe6eb956416c929eb58262a719fe0311fd9054c62c3350ed8760d8"
+            ]
+          }
+        },
         {
           "path": "server/pyproject.toml",
           "ecosystem": "python-project",
@@ -488,7 +524,8 @@
         "server/docs/DEPENDENCIES.md"
       ],
       "transitive_evidence": [
-        "server/docs/wheel-audit.json"
+        "server/docs/wheel-audit.json",
+        "agent/docs/cryptography-wheel-audit.json"
       ],
       "obligations": [
         "preserve-license-and-copyright"
@@ -497,6 +534,17 @@
         "server/docs/BACKEND_THIRD_PARTY_LICENSE_TEXTS.md"
       ],
       "locations": [
+        {
+          "path": "agent/requirements.lock",
+          "ecosystem": "python-requirements",
+          "scope": "transport",
+          "pin": {
+            "type": "lockfile-entry",
+            "digests": [
+              "sha256:b727414169a36b7d524c1c3e31839a521725078d7b2ff038656844266160a992"
+            ]
+          }
+        },
         {
           "path": "server/requirements.lock",
           "ecosystem": "python-requirements",

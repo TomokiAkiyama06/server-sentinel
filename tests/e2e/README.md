@@ -108,3 +108,11 @@ PYTHONPATH=server:agent:. python3 -m unittest \
   tests.e2e.test_access_matrix_scenarios tests.e2e.test_pairing_scenarios \
   tests.e2e.test_detection_isolation_scenarios tests.e2e.test_no_telemetry_scenarios
 ```
+
+`test_capture_mtls_scenarios.py` (Issue #13) runs the real Main capture-node CA,
+pairing ledger and TLS 1.3 ingest acceptor in the test process and the real
+`media_capture_agent.node_tls` code in separate processes (key/CSR, bundle and
+credential install, mutual-TLS connect, reconnect after revocation). Everything
+is generated under a temporary directory over loopback; it is not LAN or
+real-host evidence, and the pairing code is redeemed in-process because the
+bootstrap listener does not exist yet.

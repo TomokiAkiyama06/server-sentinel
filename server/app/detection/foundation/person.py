@@ -27,20 +27,65 @@ class ModelUnavailable(RuntimeError):
         super().__init__("approved local person detector is unavailable")
 
 
-def _read_approved_artifact(path: Path) -> bytes:
+def _read_pinned_artifact(path: Path, size: int, sha256: str) -> bytes:
     """Hash the same bounded regular-file bytes that the runtime will consume."""
     try:
         descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
         with os.fdopen(descriptor, "rb") as stream:
             metadata = os.fstat(stream.fileno())
-            if not stat.S_ISREG(metadata.st_mode) or metadata.st_size != MODEL_BYTES:
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_size != size:
                 raise ModelUnavailable()
-            content = stream.read(MODEL_BYTES + 1)
-        if len(content) != MODEL_BYTES or hashlib.sha256(content).hexdigest() != MODEL_SHA256:
+            content = stream.read(size + 1)
+        if len(content) != size or hashlib.sha256(content).hexdigest() != sha256:
             raise ModelUnavailable()
         return content
     except (OSError, ValueError):
         raise ModelUnavailable() from None
+
+
+def _read_approved_artifact(path: Path) -> bytes:
+    return _read_pinned_artifact(path, MODEL_BYTES, MODEL_SHA256)
+
+
+def require_reviewed_runtime() -> None:
+    """Only the reviewed Linux runtime closure is supported.
+
+    Installing a newer runtime never silently enables different reporting
+    behavior; any mismatch is `ModelUnavailable` before a model is read.
+    """
+    if (platform.system() != "Linux" or platform.machine() != "x86_64"
+            or sys.implementation.name != "cpython" or sys.version_info[:2] != (3, 12)):
+        raise ModelUnavailable()
+    if importlib.metadata.version("onnxruntime") != RUNTIME_VERSION:
+        raise ModelUnavailable()
+    if importlib.metadata.version("numpy") != NUMPY_VERSION:
+        raise ModelUnavailable()
+
+
+def cpu_session(content: bytes, intra_op_threads: int):
+    """One CPU-only session; constructor and run-time provider fallback disabled."""
+    import onnxruntime
+    options = onnxruntime.SessionOptions()
+    options.intra_op_num_threads = intra_op_threads
+    options.inter_op_num_threads = 1
+    options.execution_mode = onnxruntime.ExecutionMode.ORT_SEQUENTIAL
+    options.log_severity_level = 4
+    session = onnxruntime.InferenceSession(
+        content, sess_options=options, providers=["CPUExecutionProvider"], enable_fallback=False)
+    session.disable_fallback()
+    if session.get_providers() != ["CPUExecutionProvider"]:
+        raise ModelUnavailable()
+    return session
+
+
+def validate_adapter_arguments(score_threshold: float, intra_op_threads: int) -> None:
+    if isinstance(score_threshold, bool) or not isinstance(score_threshold, (float, int)):
+        raise ValueError("score threshold must be a finite fraction")
+    if not math.isfinite(score_threshold) or not 0 < score_threshold < 1:
+        raise ValueError("score threshold must be in (0,1)")
+    positive_integer(intra_op_threads, "intra_op_threads")
+    if intra_op_threads > 64:
+        raise ValueError("intra_op_threads exceeds the adapter ceiling")
 
 
 class RtDetrPersonDetector:
@@ -57,38 +102,14 @@ class RtDetrPersonDetector:
 
     def __init__(self, artifact: Path, *, score_threshold: float,
                  intra_op_threads: int) -> None:
-        if isinstance(score_threshold, bool) or not isinstance(score_threshold, (float, int)):
-            raise ValueError("score threshold must be a finite fraction")
-        if not math.isfinite(score_threshold) or not 0 < score_threshold < 1:
-            raise ValueError("score threshold must be in (0,1)")
-        positive_integer(intra_op_threads, "intra_op_threads")
-        if intra_op_threads > 64:
-            raise ValueError("intra_op_threads exceeds the adapter ceiling")
+        validate_adapter_arguments(score_threshold, intra_op_threads)
         self.threshold = score_threshold
         try:
-            # Only the reviewed Linux runtime closure is supported. Installing a
-            # newer runtime never silently enables different reporting behavior.
-            if (platform.system() != "Linux" or platform.machine() != "x86_64"
-                    or sys.implementation.name != "cpython" or sys.version_info[:2] != (3, 12)):
-                raise ModelUnavailable()
-            if importlib.metadata.version("onnxruntime") != RUNTIME_VERSION:
-                raise ModelUnavailable()
-            if importlib.metadata.version("numpy") != NUMPY_VERSION:
-                raise ModelUnavailable()
+            require_reviewed_runtime()
             import numpy
-            import onnxruntime
             content = _read_approved_artifact(Path(artifact))
-            options = onnxruntime.SessionOptions()
-            options.intra_op_num_threads = intra_op_threads
-            options.inter_op_num_threads = 1
-            options.execution_mode = onnxruntime.ExecutionMode.ORT_SEQUENTIAL
-            options.log_severity_level = 4
-            self._session = onnxruntime.InferenceSession(
-                content, sess_options=options, providers=["CPUExecutionProvider"], enable_fallback=False)
+            self._session = cpu_session(content, intra_op_threads)
             del content
-            self._session.disable_fallback()
-            if self._session.get_providers() != ["CPUExecutionProvider"]:
-                raise ModelUnavailable()
             inputs = self._session.get_inputs()
             if len(inputs) != 1 or inputs[0].name != "pixel_values" or inputs[0].type != "tensor(float)":
                 raise ModelUnavailable()

@@ -24,6 +24,13 @@ from app.storage.database import Database
 _CODE_BYTES = 16
 _CODE_LIFETIME_SECONDS = 5 * 60
 _DIGEST_LENGTH = 64
+_MAX_EXPIRY_ROWS = 256
+# Permanent key bindings one node may accumulate. Every staged renewal binds
+# its key for good, so this bounds ledger growth from repeated renewal
+# attempts; the Agent retries at most ~40 times per 30-day renewal window, so
+# a legitimate node stays far below it for decades. Beyond it renewal is
+# refused (Owner-visible warning) and the node must re-pair.
+_MAX_KEY_BINDINGS_PER_NODE = 1024
 
 
 class PairingError(RuntimeError):
@@ -98,6 +105,15 @@ class EnrollmentApproval:
 
 
 @dataclass(frozen=True)
+class CredentialExpiry:
+    """Expiry of a node's active credential (UTC epoch seconds); no key material."""
+
+    node_id: UUID
+    not_after: float
+    renewal_staged: bool
+
+
+@dataclass(frozen=True)
 class EnrollmentClaim:
     """A consumed enrollment awaiting a separately implemented signer."""
 
@@ -118,10 +134,45 @@ def _digest(value: object, field: str) -> str:
     return value
 
 
+def _expiry(value: object, *, optional: bool) -> float | None:
+    if value is None and optional:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not value > 0:
+        raise PairingValidationError("invalid credential expiry")
+    return float(value)
+
+
 def _identity(value: object, field: str) -> UUID:
     if not isinstance(value, UUID):
         raise PairingValidationError(f"invalid {field}")
     return value
+
+
+def _refuse_foreign_key(connection, node: UUID, key: str) -> bool:
+    """Refuse ``key`` if another node holds it or it was ever revoked; return whether bound.
+
+    Owner decision 2026-09-30: a node public key is unique across all nodes
+    and all credential states, and a revoked key is never reused. Runs inside
+    the caller's write transaction.
+    """
+    row = connection.execute(
+        "SELECT node_id, revoked FROM pairing_key_bindings WHERE public_key_digest = ?", (key,)
+    ).fetchone()
+    staged = connection.execute(
+        "SELECT 1 FROM pairing_node_renewals WHERE public_key_digest = ? AND node_id != ?",
+        (key, str(node)),
+    ).fetchone()
+    if staged or (row is not None and (row["node_id"] != str(node) or row["revoked"])):
+        raise PairingError("public key is bound to another capture node identity")
+    return row is not None
+
+
+def _bind_key(connection, node: UUID, key: str) -> None:
+    """Permanently bind ``key`` to ``node``; re-binding the same live node is a no-op."""
+    if not _refuse_foreign_key(connection, node, key):
+        connection.execute(
+            "INSERT INTO pairing_key_bindings (public_key_digest, node_id, revoked) "
+            "VALUES (?, ?, 0)", (key, str(node)))
 
 
 def _new_code() -> PairingCode:
@@ -234,6 +285,7 @@ class PairingLedger:
             expires = float(now) + _CODE_LIFETIME_SECONDS
             approval = EnrollmentApproval(uuid4(), node, key_digest, expires)
             with self._transaction(write=True) as connection:
+                _bind_key(connection, node, key_digest)
                 connection.execute(
                     "INSERT INTO pairing_enrollments "
                     "(id, node_id, public_key_digest, code_digest, process_epoch, expires_at, state) "
@@ -308,7 +360,8 @@ class PairingLedger:
             raise PairingStorageError("pairing enrollment state is unavailable")
         return claim
 
-    def activate(self, claim: EnrollmentClaim, *, credential_serial_digest: str) -> None:
+    def activate(self, claim: EnrollmentClaim, *, credential_serial_digest: str,
+                 not_after: float | None = None) -> None:
         """Activate a signer-produced credential reference after successful issuance.
 
         The signer/certificate bytes are intentionally outside this dependency-free
@@ -320,6 +373,7 @@ class PairingLedger:
         action = AuditAction.ACTIVATE_CAPTURE_NODE_CREDENTIAL
         try:
             serial = _digest(credential_serial_digest, "credential serial digest")
+            expiry = _expiry(not_after, optional=True)
             with self._transaction(write=True) as connection:
                 row = connection.execute(
                     "SELECT node_id, public_key_digest, state FROM pairing_enrollments WHERE id = ?",
@@ -328,13 +382,18 @@ class PairingLedger:
                 if (row is None or row["state"] != "consumed" or row["node_id"] != str(node)
                         or not hmac.compare_digest(row["public_key_digest"], claim.public_key_digest)):
                     raise PairingError("pairing enrollment cannot be activated")
+                _bind_key(connection, node, claim.public_key_digest)
                 connection.execute(
                     "INSERT INTO pairing_node_credentials "
-                    "(node_id, public_key_digest, credential_serial_digest, state) VALUES (?, ?, ?, 'active') "
+                    "(node_id, public_key_digest, credential_serial_digest, state, not_after) "
+                    "VALUES (?, ?, ?, 'active', ?) "
                     "ON CONFLICT(node_id) DO UPDATE SET public_key_digest = excluded.public_key_digest, "
-                    "credential_serial_digest = excluded.credential_serial_digest, state = 'active'",
-                    (str(node), claim.public_key_digest, serial),
+                    "credential_serial_digest = excluded.credential_serial_digest, state = 'active', "
+                    "not_after = excluded.not_after",
+                    (str(node), claim.public_key_digest, serial, expiry),
                 )
+                # A fresh pairing discards any renewal staged for an older identity.
+                connection.execute("DELETE FROM pairing_node_renewals WHERE node_id = ?", (str(node),))
                 connection.execute("UPDATE pairing_enrollments SET state = 'activated' WHERE id = ?", (str(claim.enrollment_id),))
                 self._append_on(connection, ActorCategory.SYSTEM, action, node,
                                 AuditOutcome.SUCCEEDED)
@@ -356,8 +415,13 @@ class PairingLedger:
                     "UPDATE pairing_enrollments SET state = 'revoked' "
                     "WHERE node_id = ? AND state IN ('pending', 'consumed')", (str(node),),
                 ).rowcount
+                # A revoked node can never promote a renewal it staged earlier.
+                connection.execute("DELETE FROM pairing_node_renewals WHERE node_id = ?", (str(node),))
                 if credentials + enrollments == 0:
                     raise PairingError("capture node is unavailable")
+                # No key this node ever held can be bound again, by any node.
+                connection.execute("UPDATE pairing_key_bindings SET revoked = 1 WHERE node_id = ?",
+                                   (str(node),))
                 self._append_on(connection, ActorCategory.OWNER, action, node,
                                 AuditOutcome.SUCCEEDED)
         except Exception:
@@ -366,7 +430,14 @@ class PairingLedger:
 
     def admits(self, *, node_id: UUID, public_key_digest: str,
                credential_serial_digest: str) -> bool:
-        """Return true only for the current active capture-node credential."""
+        """Return true only for the current active capture-node credential.
+
+        A credential staged by ``stage_renewal`` is admitted exactly by being
+        promoted: in one write transaction it replaces the active credential
+        (superseding the old certificate) and records an activation audit
+        entry. Promotion re-checks that the node is still active, so a
+        revocation committed before it wins.
+        """
         node = _identity(node_id, "node identity")
         key = _digest(public_key_digest, "public key digest")
         serial = _digest(credential_serial_digest, "credential serial digest")
@@ -375,6 +446,133 @@ class PairingLedger:
                 "SELECT public_key_digest, credential_serial_digest, state "
                 "FROM pairing_node_credentials WHERE node_id = ?", (str(node),)
             ).fetchone()
-        return bool(row and row["state"] == "active"
-                    and hmac.compare_digest(row["public_key_digest"], key)
-                    and hmac.compare_digest(row["credential_serial_digest"], serial))
+            staged = connection.execute(
+                "SELECT public_key_digest, credential_serial_digest FROM pairing_node_renewals "
+                "WHERE node_id = ?", (str(node),)
+            ).fetchone()
+        if not row or row["state"] != "active":
+            return False
+        if (hmac.compare_digest(row["public_key_digest"], key)
+                and hmac.compare_digest(row["credential_serial_digest"], serial)):
+            return True
+        if not (staged and hmac.compare_digest(staged["public_key_digest"], key)
+                and hmac.compare_digest(staged["credential_serial_digest"], serial)):
+            return False
+        return self._promote_renewal(node, key, serial)
+
+    def _promote_renewal(self, node: UUID, key: str, serial: str) -> bool:
+        try:
+            return self._promote_renewal_once(node, key, serial)
+        except PairingError:
+            raise
+        except Exception:
+            # The promotion and its audit record rolled back together; deny.
+            raise PairingStorageError("pairing ledger operation failed") from None
+
+    def _promote_renewal_once(self, node: UUID, key: str, serial: str) -> bool:
+        action = AuditAction.ACTIVATE_CAPTURE_NODE_CREDENTIAL
+        with self._transaction(write=True) as connection:
+            staged = connection.execute(
+                "SELECT r.public_key_digest, r.credential_serial_digest, r.not_after "
+                "FROM pairing_node_renewals r JOIN pairing_node_credentials c "
+                "ON c.node_id = r.node_id WHERE r.node_id = ? AND c.state = 'active'",
+                (str(node),),
+            ).fetchone()
+            if not (staged and hmac.compare_digest(staged["public_key_digest"], key)
+                    and hmac.compare_digest(staged["credential_serial_digest"], serial)):
+                return False
+            _bind_key(connection, node, key)
+            connection.execute(
+                "UPDATE pairing_node_credentials SET public_key_digest = ?, "
+                "credential_serial_digest = ?, not_after = ? WHERE node_id = ? AND state = 'active'",
+                (key, serial, staged["not_after"], str(node)),
+            )
+            connection.execute("DELETE FROM pairing_node_renewals WHERE node_id = ?", (str(node),))
+            self._append_on(connection, ActorCategory.SYSTEM, action, node, AuditOutcome.SUCCEEDED)
+        return True
+
+    def stage_renewal(self, *, node_id: UUID, current_public_key_digest: str,
+                      current_credential_digest: str, public_key_digest: str,
+                      credential_serial_digest: str, not_after: float) -> None:
+        """Stage a renewed credential for a node whose presented credential is current.
+
+        The caller has authenticated the node over mTLS with the credential
+        named by the ``current_*`` digests; this re-checks, in the same write
+        transaction, that it is still the node's active credential. The new key
+        must differ from the current one and must not be bound to another node
+        by a credential, staged renewal or enrollment, nor be a revoked key.
+        At most one renewal is staged per node (a retry replaces it). The
+        staged key is bound to the node permanently before the row is written,
+        so neither a retry with a fresh key nor revocation frees it; bindings
+        per node are capped so repeated attempts cannot grow the ledger without
+        bound. A key already bound to this node is accepted only as a retry of
+        the currently staged key, never a superseded or earlier staged one.
+        Staging writes no audit record for the same reason; promotion does.
+        """
+        node = _identity(node_id, "node identity")
+        current_key = _digest(current_public_key_digest, "public key digest")
+        current_serial = _digest(current_credential_digest, "credential serial digest")
+        key = _digest(public_key_digest, "public key digest")
+        serial = _digest(credential_serial_digest, "credential serial digest")
+        expiry = _expiry(not_after, optional=False)
+        if hmac.compare_digest(key, current_key):
+            raise PairingValidationError("renewal requires a fresh key")
+        with self._transaction(write=True) as connection:
+            row = connection.execute(
+                "SELECT public_key_digest, credential_serial_digest, state "
+                "FROM pairing_node_credentials WHERE node_id = ?", (str(node),)
+            ).fetchone()
+            if not (row and row["state"] == "active"
+                    and hmac.compare_digest(row["public_key_digest"], current_key)
+                    and hmac.compare_digest(row["credential_serial_digest"], current_serial)):
+                raise PairingError("capture node is not eligible for renewal")
+            # An enrollment (any state) already binds its key to its node, even
+            # before that node activates a credential.
+            reused = connection.execute(
+                "SELECT 1 FROM pairing_node_credentials WHERE public_key_digest = ? "
+                "UNION ALL SELECT 1 FROM pairing_node_renewals WHERE public_key_digest = ? "
+                "AND node_id != ? "
+                "UNION ALL SELECT 1 FROM pairing_enrollments WHERE public_key_digest = ? "
+                "AND node_id != ?", (key, key, str(node), key, str(node)),
+            ).fetchone()
+            if reused:
+                raise PairingError("capture node is not eligible for renewal")
+            # Main issues the certificate before staging, so the key is bound
+            # to this node for good now: replacing this staged row with a retry,
+            # or revoking the node, must not free it for another node.
+            if _refuse_foreign_key(connection, node, key):
+                # A key already bound to this node is accepted only as a retry
+                # of the currently staged renewal: a superseded key is never
+                # re-staged, and an earlier staged key cannot replace a newer one.
+                current = connection.execute(
+                    "SELECT public_key_digest FROM pairing_node_renewals WHERE node_id = ?",
+                    (str(node),)).fetchone()
+                if not (current and hmac.compare_digest(current["public_key_digest"], key)):
+                    raise PairingError("capture node is not eligible for renewal")
+            else:
+                held = connection.execute(
+                    "SELECT COUNT(*) FROM pairing_key_bindings WHERE node_id = ?", (str(node),)
+                ).fetchone()[0]
+                if held >= _MAX_KEY_BINDINGS_PER_NODE:
+                    raise PairingError("capture node is not eligible for renewal")
+                _bind_key(connection, node, key)
+            connection.execute(
+                "INSERT INTO pairing_node_renewals "
+                "(node_id, public_key_digest, credential_serial_digest, not_after) VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(node_id) DO UPDATE SET public_key_digest = excluded.public_key_digest, "
+                "credential_serial_digest = excluded.credential_serial_digest, "
+                "not_after = excluded.not_after",
+                (str(node), key, serial, expiry),
+            )
+
+    def credential_expiries(self) -> tuple[CredentialExpiry, ...]:
+        """Active credentials with a recorded expiry, for Owner-visible monitoring."""
+        with self._transaction(write=False) as connection:
+            rows = connection.execute(
+                "SELECT c.node_id, c.not_after, r.node_id IS NOT NULL AS staged "
+                "FROM pairing_node_credentials c LEFT JOIN pairing_node_renewals r "
+                "ON r.node_id = c.node_id WHERE c.state = 'active' AND c.not_after IS NOT NULL "
+                "ORDER BY c.not_after LIMIT ?", (_MAX_EXPIRY_ROWS,),
+            ).fetchall()
+        return tuple(CredentialExpiry(UUID(row["node_id"]), float(row["not_after"]),
+                                      bool(row["staged"])) for row in rows)

@@ -5,6 +5,7 @@ spawned and receives them by reference.
 """
 
 import os
+import socket
 import time
 
 from app.detection.foundation import (Detection, DetectorKind, MotionBaseline,
@@ -41,6 +42,8 @@ class _Fake:
         if self.behaviour == "resets":
             return Detection(Observation.PRESENT if self.resets else Observation.ABSENT,
                              Reason.EVALUATED)
+        if self.behaviour == "outbound_evaluate":
+            _swallowed_lookup()
         if self.behaviour == "crash_after":
             self.argument -= 1
             if self.argument < 0:
@@ -68,3 +71,72 @@ def impostor():
 
 def motion(pixel_delta, changed_fraction):
     return MotionBaseline(pixel_delta=pixel_delta, changed_fraction=changed_fraction)
+
+
+# Every Python DNS entry point, each with its own audit event name. Local
+# names/addresses only; the audit hook refuses before any resolver runs.
+LOOKUPS = {
+    "getaddrinfo": lambda: socket.getaddrinfo("localhost", None),
+    "gethostbyname": lambda: socket.gethostbyname("localhost"),
+    "gethostbyname_ex": lambda: socket.gethostbyname_ex("localhost"),
+    "gethostbyaddr": lambda: socket.gethostbyaddr("127.0.0.1"),
+    "getnameinfo": lambda: socket.getnameinfo(("127.0.0.1", 0), 0),
+}
+
+
+def _datagram(send):
+    # Unconnected UDP to the loopback discard port; the audit hook refuses
+    # before the send, so nothing leaves the process when the hook is armed.
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as udp:
+        send(udp, b"x", ("127.0.0.1", 9))
+
+
+# Unconnected datagram sends, each with its own audit event name:
+# socket.sendto and socket.sendmsg (sendmsg is not reported as sendto).
+DATAGRAMS = {
+    "sendto": lambda: _datagram(lambda udp, data, address: udp.sendto(data, address)),
+    "sendmsg": lambda: _datagram(lambda udp, data, address: udp.sendmsg([data], [], 0, address)),
+}
+OUTBOUND_CALLS = {**LOOKUPS, **DATAGRAMS}
+
+
+def _swallowed_lookup(lookup="getaddrinfo"):
+    # The refusal is swallowed like a careless library would.
+    try:
+        OUTBOUND_CALLS[lookup]()
+    except Exception:
+        pass
+
+
+def _smoke_adapter(behaviour, implementation):
+    detector = _Fake(behaviour)
+    detector.implementation = implementation
+    detector.version = "0.1.1rc0"
+    return detector
+
+
+def smoke_adapter(implementation, **_arguments):
+    """Stand-in for the YOLOX adapter in model-smoke worker tests."""
+    return _smoke_adapter("absent", implementation)
+
+
+def smoke_adapter_outbound_at_start(implementation, **_arguments):
+    _swallowed_lookup()
+    return _smoke_adapter("absent", implementation)
+
+
+def _lookup_at_start(lookup):
+    def factory(implementation, **_arguments):
+        _swallowed_lookup(lookup)
+        return _smoke_adapter("absent", implementation)
+    return factory
+
+
+# One importable factory per DNS entry point / datagram send, e.g.
+# `smoke_adapter_gethostbyaddr`, `smoke_adapter_sendmsg`.
+for _lookup in OUTBOUND_CALLS:
+    globals()[f"smoke_adapter_{_lookup}"] = _lookup_at_start(_lookup)
+
+
+def smoke_adapter_outbound_at_evaluation(implementation, **_arguments):
+    return _smoke_adapter("outbound_evaluate", implementation)
