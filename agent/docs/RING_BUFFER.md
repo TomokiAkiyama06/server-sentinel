@@ -135,42 +135,48 @@ later external disk consumption yields explicit `STORAGE_PRESSURE` or
 `STORAGE_HARD_STOP`, coverage/gaps and refused unsafe writes.
 Because a write is refused *before* it would cross the reserve, free space
 alone never falls below the reserve while capture is being refused. Status
-therefore also reports `STORAGE_HARD_STOP / segment_write_refused_at_reserve`
-whenever, for any configured source, `free + R_next < reserve +
-round_up(max_segment + L)`. `max_segment` is that source's largest bounded
-segment and `R_next` is the ordinary media its next append would itself
-reclaim first: selected-FIFO eligible at that time, outside the pre-loss
-window, trusted time only. The next append is dated by the source's own
-capture phase, `max(now, last_trusted_end + cadence)` (a source with no
-trusted segment yet, or an overdue one, may append at `now`), not by a cadence
-restarted at `now`; otherwise a sample taken mid-interval would credit another
-source's media that expires only after that append. Evaluating reclaim at
-`now` would miss the segment that ages out exactly at the next append, and a
-steady full ring that keeps accepting writes would be falsely reported as
-refused; nothing beyond the next append is credited. Sources do not get
-independent budgets: appends are simulated chronologically up to the latest
-source's next append (same-instant appends of synchronized sources, and
-repeated appends of a shorter-cadence source, included). Each simulated
-append is charged, and frees once it ages out, that source's recent real
-allocation `e`: the largest allocation among its last eight stored segments,
-never above `round_up(max_segment)`, and `round_up(max_segment)` without
-history. Appends at the same instant form one batch that must fit as a
-whole, `free + R(t) - consumed_before(t) >= reserve + round_up(sum(e) + L)`,
-so the result never depends on profile order. Charging
-every chained append the bound would make two or more sources writing
-ordinary VBR below the bound read as refused in a steady FIFO that accepts
-every write. Each reclaimable segment is credited only once, and
-`consumed_before(t)` sums `e` over earlier batches. A
-simulated segment is credited only for a source whose next interval is known
-(not overdue) and outside any retained incident. `STORAGE_HARD_STOP` thus
-means writes are refused at the recent real bitrate; a chain that would fail
-only if every write jumped to the bound is not a hard stop: the same
-simulation with every append consuming its bound reports
-`STORAGE_PRESSURE / segment_write_at_risk_at_maximum_bitrate` (unless an
-earlier pressure reason such as `post_loss_headroom_reduced` already applies),
-never healthy. It is not reported as pressure or healthy while recording is refused
-at the recent bitrate, and it clears without Owner action as soon as space
-returns. `safety_reserve_unavailable`
+therefore predicts refusal by simulating the sources' next appends.
+
+- **Next appends.** Each source's next append is dated by its own capture
+  phase, `max(now, last_trusted_end + cadence)` (a source with no trusted
+  segment yet, or an overdue one, may append at `now`), not by a cadence
+  restarted at `now`; otherwise a sample taken mid-interval would credit
+  another source's media that expires only after that append. Sources do not
+  get independent budgets: appends are simulated chronologically up to the
+  latest source's next append, including same-instant appends of synchronized
+  sources and repeated appends of a shorter-cadence source.
+- **Reclaim credit `R(t)`.** Ordinary media each append would itself reclaim
+  first: selected-FIFO eligible at that time `t`, outside the pre-loss window,
+  trusted time only, each segment credited once. Evaluating reclaim at `now`
+  would miss the segment that ages out exactly at the next append and report
+  a steady full ring that keeps accepting writes as refused. A simulated
+  segment is credited once it ages out only for a source whose next interval
+  is known (not overdue) and outside any retained incident.
+- **Charge `e`.** Each simulated append is charged, and frees once it ages
+  out, that source's recent real allocation: the largest allocation among its
+  last eight stored segments, never above `round_up(max_segment)`, and
+  `round_up(max_segment)` without history. `max_segment` is the source's
+  largest bounded segment.
+- **`STORAGE_HARD_STOP / segment_write_refused_at_reserve`** (writes refused
+  at the recent real bitrate). Appends at the same instant form one batch that
+  must fit as a whole, so the result never depends on profile order. Status
+  reports this hard stop when, at any simulated batch time `t`,
+  `free + R(t) - consumed_before(t) < reserve + round_up(sum(e) + L)`, where
+  `consumed_before(t)` sums `e` over earlier batches. Charging every chained
+  append the bound here would make two or more sources writing ordinary VBR
+  below the bound read as refused in a steady FIFO that accepts every write.
+  It is never reported as pressure or healthy while recording is refused at
+  the recent bitrate, and it clears without Owner action as soon as space
+  returns.
+- **`STORAGE_PRESSURE / segment_write_at_risk_at_maximum_bitrate`** (writes
+  would be refused only if the bitrate rose to the bound). The same
+  simulation with every `e` replaced by `round_up(max_segment)`, that is
+  `free + R(t) - consumed_before(t) < reserve + round_up(sum(round_up(max_segment)) + L)`,
+  is not a hard stop. It is reported as this pressure reason unless an
+  earlier pressure reason such as `post_loss_headroom_reduced` already
+  applies, and never as healthy.
+
+`safety_reserve_unavailable`
 remains the separate hard stop for another consumer breaching the reserve. Capacity limits use
 physical ordinary allocations and exclude shared protected bytes. A provisional
 write exceeding its actual allocation budget is rejected/cleaned before it is
