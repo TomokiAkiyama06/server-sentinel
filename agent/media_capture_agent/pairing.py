@@ -204,6 +204,106 @@ class NodeCredentialStore:
             if root_fd is not None:
                 os.close(root_fd)
 
+    def rotate(self, material: NodeCredentialMaterial) -> None:
+        """Atomically replace the committed generation with a renewed one.
+
+        Only the same deployment/node identity may rotate; a different identity
+        needs a fresh pairing. The new generation is written and fsynced, linked
+        as ``.current-next.json`` and renamed over ``current.json`` (an atomic
+        replace), then the superseded generation is removed best-effort. A crash
+        at any point leaves either the old or the new generation committed.
+        """
+        if not isinstance(material, NodeCredentialMaterial):
+            raise PairingRefused("invalid_credential_material")
+        if not self.installed():
+            raise PairingRefused("node_identity_unavailable")
+        root_fd = credentials_fd = lock_fd = None
+        created: list[str] = []
+        committed = False
+        previous: list[str] = []
+        try:
+            root_fd = open_directory(self.runtime_root)
+            self._validate_directory(root_fd, "runtime_root_rejected")
+            credentials_fd = self._open_credentials_directory(root_fd)
+            lock_fd = self._open_lock(credentials_fd)
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            current = json.loads(self._read_file(credentials_fd, _CURRENT_MANIFEST,
+                                                 maximum=_MAX_MANIFEST_BYTES,
+                                                 expected_links=2).decode("utf-8"))
+            if (current["deployment_id"] != str(material.deployment_id)
+                    or current["node_id"] != str(material.node_id)):
+                raise PairingRefused("renewal_identity_mismatch")
+            previous = [entry["name"] for entry in current["files"].values()]
+            previous.append("manifest-" + previous[0].rsplit("-", 1)[1].replace(".pem", ".json"))
+            try:
+                os.unlink(".current-next.json", dir_fd=credentials_fd)
+            except FileNotFoundError:
+                pass
+            generation, manifest = self._write_generation(credentials_fd, material, created)
+            os.link(manifest, ".current-next.json", src_dir_fd=credentials_fd,
+                    dst_dir_fd=credentials_fd, follow_symlinks=False)
+            created.append(".current-next.json")
+            os.rename(".current-next.json", _CURRENT_MANIFEST,
+                      src_dir_fd=credentials_fd, dst_dir_fd=credentials_fd)
+            committed = True
+            os.fsync(credentials_fd)
+            for name in previous:
+                try:
+                    os.unlink(name, dir_fd=credentials_fd)
+                except OSError:
+                    pass
+            os.fsync(credentials_fd)
+        except PairingRefused:
+            raise
+        except (OSError, StorageRefused, ValueError, TypeError, KeyError, IndexError):
+            raise PairingRefused("credential_storage_unavailable") from None
+        finally:
+            if credentials_fd is not None and not committed:
+                for name in reversed(created):
+                    try:
+                        os.unlink(name, dir_fd=credentials_fd)
+                    except OSError:
+                        pass
+            if lock_fd is not None:
+                try:
+                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                finally:
+                    os.close(lock_fd)
+            if credentials_fd is not None:
+                os.close(credentials_fd)
+            if root_fd is not None:
+                os.close(root_fd)
+
+    def _write_generation(self, credentials_fd: int, material: NodeCredentialMaterial,
+                          created: list[str]) -> tuple[str, str]:
+        generation = uuid4().hex
+        values = {
+            "private_key": material.private_key,
+            "client_certificate": material.client_certificate,
+            "ca_certificate": material.ca_certificate,
+        }
+        manifest_files: dict[str, dict[str, str | int]] = {}
+        for kind, value in values.items():
+            name = f"{_FILES[kind]}-{generation}.pem"
+            self._write_file(credentials_fd, name, value)
+            created.append(name)
+            manifest_files[kind] = {
+                "name": name,
+                "size": len(value),
+                "sha256": hashlib.sha256(value).hexdigest(),
+            }
+        manifest = json.dumps({
+            "format_version": 1,
+            "deployment_id": str(material.deployment_id),
+            "node_id": str(material.node_id),
+            "server_name": material.server_name,
+            "files": manifest_files,
+        }, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        manifest_name = f"manifest-{generation}.json"
+        self._write_file(credentials_fd, manifest_name, manifest)
+        created.append(manifest_name)
+        return generation, manifest_name
+
     def installed(self) -> bool:
         root_fd = credentials_fd = None
         try:
