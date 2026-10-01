@@ -75,6 +75,32 @@ the authorization-bound preview session layer. This was verified only with
 synthetic discovery/capture adapters and synthetic frame bytes; no physical
 camera, V4L2 node, udev rule or real frame was used.
 
+#### 実機記録 2026-09-30: 重複承認の拒否と非対応 profile の表示（Issue #11 修正後）
+
+serial 付き同型 USB UVC camera 2 台（正確な model はローカル記録のみ）を接続した Main Server 候補機で、
+修正後のコードを video group の非 root ユーザーが実行した。`create_app()` の
+lifespan、実 `LinuxDiscovery` / `MmapCapture`、`LocalUvcRuntime.reapprove()` →
+`OwnerAdministration.approve_uvc()` の監査付き経路を使用（Owner authorizer のみ
+stand-in）。一時 DB は repository 外に作り実行後に削除した。frame は件数だけを
+数えて破棄し、保存・閲覧していない。serial・device path・by-id・USB port・UUID
+は記録しない。「カメラA/B」「S1/S2」は一時ラベル。
+
+| 確認内容 | 結果 |
+|---|---|
+| S1 にカメラA を承認して `online` の状態で、S2 にも同じカメラA を承認 | 拒否（`ValueError`、汎用 reason）。`approve_camera` 監査は `succeeded`, `failed`。S2 の承認行は作られない |
+| 拒否後 10 秒間 | S1 `online`（300 frame）、S2 `offline`・health event 0・worker failure 0（EBUSY flapping なし）。開いている video node はカメラA だけ |
+| S2 に別のカメラB を承認 | `online` |
+| 修正前に作られうる重複承認（S2 の承認 evidence をカメラA に書き換えた DB）で再起動、config 順 S1→S2 / S2→S1 の両方 | 両 source とも `manual_intervention_required`（`approval_conflict`）、frame 0、video descriptor 0。起動順に依存しない |
+| 上記状態で S1 にカメラA を再承認 | 拒否（S2 が有効なまま保持しているため） |
+| Owner が S2 を無効化 | S1 が自動で `online`、S2 `offline`。開いている video node はカメラA だけ |
+| desired profile 4K MJPG 30 / 1080p MJPG 60 / 1080p MJPG 15 / 1080p H264 30 | `degraded`（`capture_profile_unavailable`）、negotiated `1920x1080@30 MJPG` を記録、frame 0、video descriptor 0、4 秒間の health event 0（再 open の反復なし） |
+| desired profile 1080p YUYV 30 | `degraded`、negotiated `640x480@30 YUYV` を記録、frame 0 |
+| 対応 profile（720p MJPG 30 / 480p YUYV 30）と 1080p MJPG 30 への復帰 | `online`、4 秒で 120 frame |
+| 全工程の audio descriptor / 停止後の video descriptor | 0 / 0 |
+
+未確認: 抜線・ポート入替・再起動を伴う物理操作、非 serial 同型機、3〜4 source、
+実配信 fps の記録（registry は driver の frame interval のみ保持）。
+
 #### Real-hardware runtime procedure (serial-bearing UVC cameras)
 
 Use one or more USB UVC cameras that report a USB serial number (for example
@@ -352,6 +378,62 @@ Pairing/security:
 - [ ] revoked agent cannot reconnect;
 - [ ] an unpaired LAN host cannot submit media;
 - [ ] capture-node credential cannot access dashboard/admin APIs.
+
+#### Issue #13 real-LAN pairing / mTLS procedure (not yet executed)
+
+Status: **unverified**. The adapters are covered only by loopback tests with
+temporary CAs (`server/tests/test_capture_mtls.py`, `agent/tests/test_node_tls.py`,
+`tests/e2e/test_capture_mtls_scenarios.py`). The bootstrap enrollment listener,
+Main approval CLI and Agent pairing CLI do not exist yet, so the steps marked
+*(needs CLI)* wait for them. Use a disposable deployment CA and synthetic
+server name; never paste keys, codes, certificates, bundle contents, LAN
+addresses or hostnames into Issues, PRs or CI artifacts.
+
+1. On the Main host, as the local administrative account, create the deployment
+   CA in a dedicated private directory outside the checkout and media trees;
+   confirm the directory is 0700 and every file 0600, owned by that account.
+2. Issue the Main ingest certificate into a *separate* private directory for the
+   listener account; confirm that account cannot read the CA key.
+3. Export the trust bundle and note its full SHA-256 on the Main console.
+   Copy the bundle to the capture host over an Owner-trusted channel (for
+   example removable media); on the capture host recompute and compare the full
+   digest by eye before continuing.
+4. On the capture host, as the dedicated non-root `media-capture-agent` account,
+   generate the node key and enrollment request *(needs CLI)*; confirm
+   `<runtime_root>/pending-enrollment` is 0700, the key file 0600, and that no
+   root, GUI, Tailscale or admin credential was required.
+5. Transfer only the public request to the Main; approve it locally and read the
+   code from the controlling terminal only *(needs CLI)*.
+6. Enroll over the private LAN with the capture host **not** joined to
+   Tailscale *(needs bootstrap listener)*. Negative checks before the code is
+   typed: a wrong bundle, a Main certificate for another name, and a plaintext
+   endpoint each abort without prompting for the code.
+7. Confirm the installed credential directory is 0700 with 0600 files and that
+   the pending key was removed.
+8. Start the ingest listener bound to the Main's private-LAN IP and a port
+   distinct from the dashboard listener; confirm the dashboard listener still
+   binds loopback only and the ingest port answers no HTTP route.
+9. Connect from the Agent: expect a TLS 1.3 session admitted as that node.
+   From another LAN host without a node certificate, with a certificate from a
+   different CA, and with an expired certificate: expect refusal before any
+   capture message is accepted.
+10. Revoke the node on the Main: the open session closes on the next admission
+    check, and reconnecting is refused although the certificate has not expired.
+11. Inspect Main and Agent logs, `ps` output, service environment and shell
+    history on both hosts for key, code or certificate text; expect none.
+
+12. Renewal (Owner decision 2026-09-30: 397-day default, automatic renewal):
+    on a disposable deployment, issue a node certificate with a short explicit
+    validity so it enters the 30-day window. Confirm that the Agent renews over
+    its admitted session, that `pending-renewal/` is 0700 with a 0600 key, and
+    that the old certificate keeps working until the renewed one first connects
+    and is refused afterwards. A revoked node's renewal must be refused. After
+    the credential expires, the node must re-pair. Block renewal (for example
+    stop the Main) until the 14-day threshold and confirm the Owner sees a
+    `capture_credential_warning`. *(needs transport wiring and a scheduler)*
+
+Record the Main/Agent OS, Python, OpenSSL (`cryptography` reports 4.0.2 from its
+wheel) and architecture used, without private deployment values.
 
 Connectivity:
 
@@ -662,6 +744,28 @@ Record:
 - protected incident bytes/expiry;
 - audit event;
 - manual-intervention requirement if automatic recovery is unsafe.
+
+### Agent-to-Main transport PoC (Issue #15, ADR-0007 — pending physical execution)
+
+Synthetic continuity tests do not verify any transport. For each candidate
+(WebRTC, SRT, QUIC, authenticated HTTP/WebSocket streaming) on the real Main
+Server, capture node and UVC camera over the private LAN, and for 1, 2, 3 and 4
+sources (record which sources are real cameras and which are synthetic input):
+
+- [ ] the session is mutually authenticated with the ADR-0006 mTLS identity; an unpaired, revoked or wrong-deployment certificate delivers no media;
+- [ ] the ingest listener is not the human dashboard listener and serves no human/admin route; the capture credential cannot call a human/admin API;
+- [ ] deterministic impairment matrix: 1 s, 5 s and ~2 min link loss; sustained packet loss; added jitter; a deliberately slow Main consumer;
+- [ ] after each impairment, reported gaps match the units actually missing (exact count when the capture epoch continued, unknown extent after a capture restart); a lossless reconnect reports no gap;
+- [ ] no interval with known loss is presented as healthy; flow shows degraded/interrupted during and after loss until the gap is recorded;
+- [ ] a retry after a lost acknowledgement never duplicates media in the recording;
+- [ ] sender and receiver queue depth and memory stay bounded under slow consumer and link loss;
+- [ ] a fifth source is refused by the active-source limit.
+
+Record per run: reconnect time, reported vs actual gap, maximum queue depth,
+CPU/GPU/VRAM on Main and Agent, bitrate, informational LAN latency,
+codec/container and recording-extraction impact, and the exact dependency
+versions/licences. Enter the results in the ADR-0007 validation table; do not
+attach private addresses, credentials or real footage.
 
 ### LAN baseline measurement (2026-09-30, Issue #15; no transport candidate yet)
 
@@ -1437,6 +1541,10 @@ explicitly. Do not alter production protection to make a negative test pass.
 - [ ] a PR retarget, base change during either review, missing API page, provider/API error, malformed receipt and unavailable publisher each fail closed;
 - [ ] inspect the App's selected-repository grant and verify the publisher cannot alter source, workflows, branch protection, collaborators or repository administration;
 - [ ] demonstrate recovery from a stopped publisher without disabling protection, changing expected issuers or adding bypass actors;
+- [ ] collector: confirm the real Codex (and, if enabled, Claude) bot user ID/login/type on a synthetic test PR; confirm the configured pass/blocking/suggestion markers against real review bodies and inline comments; measure provider review duration against `max_review_runtime_seconds`; confirm review IDs increase over time;
+- [ ] collector: a same-repository workflow posting a PR review with the identical body through `GITHUB_TOKEN` is ignored as untrusted; a base update after the request invalidates it; a review finished before the runtime bound after a base update is not counted;
+- [ ] collector recovery: on a synthetic test PR, post a success then a superseding failure for the same check on the test-merge SHA and confirm `GET .../commits/{sha}/check-runs?check_name=...&app_id=...&filter=all` lists both, that the later run has the higher ID, and that a restarted publisher with a stale `success` ledger record posts a new success instead of reusing it;
+- [ ] token exchange (only after the Owner RS256 decision): the exchanged token is limited to this repository and the four fixed permissions, refreshes before expiry, and never appears in the publisher's journal, process environment or process arguments (`/proc/<pid>/environ`, `/proc/<pid>/cmdline`);
 - [ ] record public test PR/run/check IDs, non-secret context digests, rule snapshots and observed GitHub merge refusals, then re-read the production rule after activation.
 
 Never use a real secret as a fixture or publish an App key/token, reviewer token,

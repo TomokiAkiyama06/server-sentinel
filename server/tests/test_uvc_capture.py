@@ -11,6 +11,7 @@ import unittest
 from app.cameras.uvc.capture import (
     CaptureError, DQBUF, G_FMT, G_PARM, MmapCapture, QBUF, QUERYBUF,
     REQBUFS, S_FMT, S_PARM, STREAMING, STREAMOFF, STREAMON, VideoProfile,
+    profile_satisfies,
 )
 from app.cameras.uvc.discovery import ENUM_FMT, QUERYCAP, VIDEO_CAPTURE
 from app.cameras.uvc.identity import DeviceEvidence
@@ -180,6 +181,22 @@ class CaptureTests(unittest.TestCase):
             self.capture.open()
         self.assertNotIn(S_PARM, self.calls)
         self.assertEqual(self.closed, [8])
+
+
+class ProfileSatisfiesTests(unittest.TestCase):
+    def test_driver_adjusted_profiles_do_not_satisfy_the_request(self):
+        desired = VideoProfile(1920, 1080, 30, "MJPG")
+        self.assertTrue(profile_satisfies(desired, desired))
+        self.assertTrue(profile_satisfies(desired, VideoProfile(1920, 1080, 30000 / 1001, "MJPG")))
+        for negotiated in (
+            VideoProfile(1280, 720, 30, "MJPG"),
+            VideoProfile(1920, 1088, 30, "MJPG"),
+            VideoProfile(1920, 1080, 15, "MJPG"),
+            VideoProfile(1920, 1080, 60, "MJPG"),
+            VideoProfile(1920, 1080, 30, "YUYV"),
+        ):
+            with self.subTest(negotiated=negotiated):
+                self.assertFalse(profile_satisfies(desired, negotiated))
 
 
 if __name__ == "__main__":

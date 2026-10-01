@@ -2,7 +2,7 @@
 
 from app.audit.schema import audit_migration
 from app.auth.schema import access_migration, access_shared_identity_migration, access_webauthn_migration
-from app.cameras.remote_agent.schema import PAIRING_MIGRATION
+from app.cameras.remote_agent.schema import PAIRING_MIGRATION, pairing_renewal_migration
 from app.cameras.registry.schema import REGISTRY_MIGRATION
 from app.cameras.uvc.schema import UVC_MIGRATION, uvc_explicit_binding_migration
 from app.detection.roi.schema import roi_calibration_migration
@@ -45,8 +45,10 @@ APPLICATION_MIGRATIONS = (
     # and passkey become the only per-person key. PRs #83 and #100 also claim
     # 17, so this number is reconciled with them at merge time.
     access_shared_identity_migration(18),
-    # Durable presence timeline-gap marker (#25/#26). Renumbered to 20 after
-    # #97 took 17 and #107 took 18 on main; 19 is reserved by open PR #100
-    # and must land first because the runner requires a contiguous sequence.
+    # Issue #13 capture-node certificate renewal, after main's 17 and 18
+    # (PR #83 also claims 17 and renumbers if it merges later).
+    pairing_renewal_migration(19),
+    # Durable presence timeline-gap marker (#25/#26), after #97 (17), #107 (18)
+    # and #100 (19); the runner requires a contiguous sequence.
     presence_gap_migration(20),
 )
