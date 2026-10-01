@@ -367,6 +367,12 @@ class DiskRing:
         cadence)``. A source with no trusted segment yet, or an overdue one,
         may append at ``now``. Only media that ages out by that earliest time
         is credited, so another source's later expiry is never counted.
+
+        Appends are simulated chronologically up to the latest source's next
+        append, including repeated appends of shorter-cadence sources and
+        same-instant appends of synchronized sources. Free space and each
+        reclaimed segment are shared: every earlier simulated append consumes
+        its bounded allocation, and reclaimable media is credited only once.
         """
         free, reserve = budget["filesystem_free"], budget["safety_reserve"]
         unit = self.store.allocation_unit
@@ -381,12 +387,22 @@ class DiskRing:
         rows = self._selected_reclaimable(latest, self.config) if clock_trusted else ()
         allocations = self.store.segment_allocations() if rows else {}
         window = self.config.value * SECOND if self.config.mode == "duration" else PRE
+        events = []
         for source, profile in self.profiles.items():
-            cutoff = next_append[source] - window
+            at = next_append[source]
+            while at <= latest:
+                events.append((at, profile))
+                at += profile.segment_duration_us
+        consumed = 0
+        # Equal timestamps share one reclaim credit; their order within the
+        # instant does not matter because consumption is cumulative.
+        for at, profile in sorted(events, key=lambda item: item[0]):
+            cutoff = at - window
             reclaim = sum(allocations.get(UUID(row["id"]), 0) for row in rows if row["end"] <= cutoff)
             needed = round_up(profile.segment_bytes() + self.ledger_headroom, unit)
-            if free + reclaim < reserve + needed:
+            if free + reclaim - consumed < reserve + needed:
                 return True
+            consumed += round_up(profile.segment_bytes(), unit)
         return False
 
     def configure(self, config, profiles, *, now_us, clock_trusted):

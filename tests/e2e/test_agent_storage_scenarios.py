@@ -10,7 +10,7 @@ import os
 import unittest
 from uuid import UUID
 
-from media_capture_agent.ring_models import POST, PRE, RingRefused
+from media_capture_agent.ring_models import POST, PRE, RingRefused, SegmentProfile
 from media_capture_agent.storage import StorageRefused, read_mounts
 
 from tests.e2e.test_agent_ring_scenarios import MINUTE, PAYLOAD, RingScenario
@@ -279,6 +279,84 @@ class HardReserveTests(RingScenario):
         with self.assertRaisesRegex(RingRefused, "segment_storage_refused"):
             self.ring.append(a, t0, t0 + MINUTE, b"x" * profile.segment_bytes(),
                              now_us=t0 + MINUTE, clock_trusted=True)
+
+    def test_same_phase_sources_share_free_space_and_reclaimed_media_once(self):
+        # Two synchronized sources append at the same instant. Their small old
+        # segments can be reclaimed only once, and the first append consumes
+        # space the second can no longer use. The predicate must simulate the
+        # appends in order rather than give each source the same budget.
+        self.build(2, name="agent-same-phase")
+        a, b = self.sources
+        t0 = self.t0
+        self.configure(at=t0 - 2 * PRE)
+        for begin in range(t0 - 2 * PRE, t0, MINUTE):
+            for source in (a, b):
+                self.ring.append(source, begin, begin + MINUTE, PAYLOAD,
+                                 now_us=begin + MINUTE, clock_trusted=True)
+        allocations = self.store.segment_allocations()
+        oldest = [row for row in self.ring._rows() if row["end"] == t0 - PRE + MINUTE]
+        self.assertEqual(2, len(oldest))
+        reclaim = sum(allocations[UUID(row["id"])] for row in oldest)
+        profile = self.profiles[0]
+        unit = self.store.allocation_unit
+        needed = -(-(profile.segment_bytes() + self.ring.ledger_headroom) // unit) * unit
+        # Either append alone fits after both old segments are reclaimed.
+        free = self.settings.safety_reserve_bytes + needed - reclaim
+        self.quota.other = self.quota.capacity - self.quota.used() - free
+        status = self.status(t0)
+        self.assertEqual(("STORAGE_HARD_STOP", "segment_write_refused_at_reserve"),
+                         (status["state"], status["reason"]))
+        # The chronological sequence indeed refuses the second same-phase write.
+        maximum = b"x" * profile.segment_bytes()
+        self.ring.append(a, t0, t0 + MINUTE, maximum, now_us=t0 + MINUTE, clock_trusted=True)
+        with self.assertRaisesRegex(RingRefused, "segment_storage_refused"):
+            self.ring.append(b, t0, t0 + MINUTE, maximum, now_us=t0 + MINUTE, clock_trusted=True)
+
+    def test_faster_source_appends_before_slower_source_consume_its_budget(self):
+        # A short-cadence source may append several times before a slower
+        # source's next append; each of those writes consumes space too.
+        self.build(2, name="agent-mixed-cadence")
+        a, b = self.sources
+        t0 = self.t0
+        half = MINUTE // 2
+        # A's bounded segment spans several allocation units, while the
+        # buffered history it would reclaim is a single unit per segment.
+        fast = SegmentProfile(a, 4000, 400, half, 100)
+        self.profiles = (fast, self.profiles[1])
+        self.configure(at=t0 - 2 * PRE)
+        small = b"x" * 100
+        for begin in range(t0 - 2 * PRE, t0, MINUTE):
+            self.ring.append(a, begin, begin + half, small, now_us=begin + half, clock_trusted=True)
+            self.ring.append(a, begin + half, begin + MINUTE, small, now_us=begin + MINUTE, clock_trusted=True)
+            self.ring.append(b, begin, begin + MINUTE, small, now_us=begin + MINUTE, clock_trusted=True)
+        unit = self.store.allocation_unit
+        reserve = self.settings.safety_reserve_bytes
+        needed = {item.source_id: -(-(item.segment_bytes() + self.ring.ledger_headroom) // unit) * unit
+                  for item in self.profiles}
+        allocations = self.store.segment_allocations()
+
+        def reclaim(at):
+            return sum(allocations[UUID(row["id"])] for row in self.ring._rows() if row["end"] <= at - PRE)
+
+        # Judged one at a time, A's next append (t0+30 s) and B's (t0+60 s)
+        # each fit. A's appends at t0+30 s and t0+60 s precede or tie B's and
+        # consume far more than the history aging out in between.
+        free = max(reserve + needed[a] - reclaim(t0 + half), reserve + needed[b] - reclaim(t0 + MINUTE))
+        self.assertGreater(2 * -(-fast.segment_bytes() // unit) * unit,
+                           reclaim(t0 + MINUTE) - reclaim(t0 + half) + needed[a] - needed[b])
+        self.quota.other = self.quota.capacity - self.quota.used() - free
+        status = self.status(t0)
+        self.assertEqual(("STORAGE_HARD_STOP", "segment_write_refused_at_reserve"),
+                         (status["state"], status["reason"]))
+        # The real chronological sequence of bounded writes is indeed refused
+        # before B's next append completes.
+        maximum = b"x" * fast.segment_bytes()
+        sequence = ((a, t0, t0 + half, maximum, t0 + half),
+                    (a, t0 + half, t0 + MINUTE, maximum, t0 + MINUTE),
+                    (b, t0, t0 + MINUTE, b"x" * self.profiles[1].segment_bytes(), t0 + MINUTE))
+        with self.assertRaisesRegex(RingRefused, "segment_storage_refused"):
+            for source, start, end, data, at in sequence:
+                self.ring.append(source, start, end, data, now_us=at, clock_trusted=True)
 
     def test_overdue_source_credits_nothing_beyond_now(self):
         # A source whose next segment is already overdue can append at

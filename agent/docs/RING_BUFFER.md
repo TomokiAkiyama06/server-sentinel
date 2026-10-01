@@ -147,7 +147,13 @@ restarted at `now`; otherwise a sample taken mid-interval would credit another
 source's media that expires only after that append. Evaluating reclaim at
 `now` would miss the segment that ages out exactly at the next append, and a
 steady full ring that keeps accepting writes would be falsely reported as
-refused; nothing beyond the next append is credited. It is
+refused; nothing beyond the next append is credited. Sources do not get
+independent budgets: appends are simulated chronologically up to the latest
+source's next append (same-instant appends of synchronized sources, and
+repeated appends of a shorter-cadence source, included), each earlier append
+consuming `round_up(max_segment)` and each reclaimable segment credited only
+once, so the check is `free + R(t) - consumed_before(t) < reserve +
+round_up(max_segment + L)` at every simulated append time `t`. It is
 not reported as pressure or healthy while recording is refused, and it clears
 without Owner action as soon as space returns. `safety_reserve_unavailable`
 remains the separate hard stop for another consumer breaching the reserve. Capacity limits use
