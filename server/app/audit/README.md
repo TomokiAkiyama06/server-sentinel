@@ -60,8 +60,14 @@ their records with the session effect. A verified assertion whose backup
 eligibility changed records `mark_principal_credential_inconsistent` (actor
 `system`) with the credential marking and session revocation. A counter
 regression records `detect_principal_credential_sign_count_regression` (actor
-`system`, outcome `failed`). An assertion that matches no active credential, or
-fails verification, records nothing. The target is always the principal's
+`system`, outcome `failed`). A session whose trusted-proxy identity binding
+does not match records `detect_session_proxy_identity_mismatch` (actor
+`system`, outcome `denied`) in its own transaction after the request is denied,
+at most once per session per ten minutes; further mismatches only increment the
+session's `binding_mismatch_suppressed` counter, and a failed append still
+denies the request and is counted in the store's undelivered-audit health. An
+assertion that matches no active credential, or fails verification, records
+nothing. The target is always the principal's
 application UUID; external identity, display name, invitation secret,
 credential identifier, public key, challenges, client data and signatures never
 reach the log.

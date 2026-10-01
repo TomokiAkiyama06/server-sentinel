@@ -638,6 +638,7 @@ Use test identities/accounts appropriate for the deployment. ServerSentinel does
 The research-room Tailnet is shared, so run these with two people (or two browser profiles) using the **same** Tailscale login.
 
 - [ ] an invited person with a registered ServerSentinel credential passes authentication, and the authenticator asks for user verification each time;
+- [ ] invite two people, have both register and sign in with their own passkeys under the **same** Tailscale login, and confirm each lands in their own principal with their own permissions (for example one `live:view`-only, one `recordings:view`-only); then revoke one of them and confirm the other keeps working;
 - [ ] each credential is registered on an authenticator the invited person controls; confirm no credential is left in a shared OS profile or behind a shared device unlock;
 - [ ] with the invited person signed out, an uninvited person on the same Tailscale login and the same device is refused;
 - [ ] a session ends after its idle/absolute lifetime, and the explicit sign-out control works on a shared machine;
@@ -661,6 +662,18 @@ The research-room Tailnet is shared, so run these with two people (or two browse
   they contain only a keyed binding, never the raw login/device; a mismatched
   identity is refused, diagnostics/exports omit the binding, and sign-out,
   expiry and revocation clear it;
+- [ ] present a signed-in session's cookie with a different trusted-proxy
+  identity (for example through a second Tailscale login or a shared-in
+  device): the request gets the generic response, the original holder keeps
+  working, the audit log shows one `detect_session_proxy_identity_mismatch`
+  entry with no login/device value, and repeating the replay within ten
+  minutes adds no further entry;
+- [ ] on the Main Server, confirm the session-binding key file in the data
+  directory is a regular file of the service account with mode `0600`, that the
+  data directory is not group/other writable, that a changed mode, extra hard
+  link, symlink or wrong size makes startup refuse the key instead of replacing
+  it, and that the key does not appear in logs, the database or a diagnostic
+  export;
 - [ ] record that reachability is expected for every holder of the shared account and is not treated as a finding;
 - [ ] the dashboard origin is reserved for ServerSentinel and is a secure context (HTTPS, or `http://localhost` for a strictly local browser); confirm WebAuthn registration and sign-in actually work there, and record that an ordinary-HTTP non-loopback origin makes them impossible;
 - [ ] the startup and daily reservation check enumerates the real listeners and every proxy route for the whole name across all schemes and ports, and closes human access and notifies the Owner on any other answer; record that this bounds rather than prevents, so a process binding between checks can collect credentials until the next check;
