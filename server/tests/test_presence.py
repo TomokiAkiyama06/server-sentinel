@@ -5,6 +5,8 @@ from contextlib import closing, contextmanager, nullcontext
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+import os
+import shutil
 import tempfile
 
 from fastapi import FastAPI, Request
@@ -20,7 +22,7 @@ from app.presence.delivery import ActionResult, NotificationAdapter
 from app.presence.models import (InvalidObservation, Kind, Observation, PresenceState,
                                  Quality, Value, timestamp)
 from app.presence.service import PresenceService
-from app.storage.database import Database
+from app.storage.database import Database, PinnedDatabase
 from app.storage.migrations import migrate
 from app.storage.policy import FilesystemSpace, MainStoragePolicy, StorageLimits
 from app.storage.retention import RetentionPeriods
@@ -930,3 +932,25 @@ class PresenceTests(unittest.TestCase):
         response = asyncio.run(request(production, "/api/timeline"))
         self.assertEqual(response[0]["status"], 404)
         self.assertEqual(response[1]["body"], b'{"detail":"Not Found"}')
+
+    def test_read_only_opens_keep_pinned_database_checks(self):
+        pinned = PinnedDatabase(self.database)
+        pinned.pin()
+        self.addCleanup(pinned.release)
+        self.service = self.make_service()
+        self.service.database = pinned
+        self.assertIsNone(self.service.timeline_gap())
+        self.assertEqual(self.history()["items"], [])
+        # Replace the pinned file at its path with a different, valid SQLite
+        # database (as an unlinked file or a replaced mount would look).
+        path = self.database.path
+        os.rename(path, path.with_name("pinned-original.sqlite3"))
+        shutil.copyfile(path.with_name("pinned-original.sqlite3"), path)
+        with self.assertRaisesRegex(ValueError, "database location is unavailable"):
+            self.service.timeline_gap()
+        with self.assertRaisesRegex(ValueError, "database location is unavailable"):
+            self.history()
+        # A released pin refuses read-only opens as well.
+        pinned.release()
+        with self.assertRaisesRegex(ValueError, "database location is unavailable"):
+            self.service.timeline_gap()

@@ -30,8 +30,9 @@ not human authentication.
 
 `Crossing` exposes UUID event/source IDs, kind, aware timestamps, confidence,
 clock trust/uncertainty and confirmed state, without any track/session/biometric
-payload. The pending #26 adapter maps these factual observations to its typed
-timeline, retains quality and validates time freshness; it must not invent guilt
-or causal attribution. No timeline route, UI, presence suppression or inference
+payload. `app.presence.adapters.EntranceObservationAdapter` maps these factual
+observations to the typed #26 timeline, retains quality and validates source
+latency against an explicit bound; it does not invent guilt or causal
+attribution (see `server/app/presence/README.md`). No timeline route, UI, presence suppression or inference
 worker is enabled here. Synthetic geometry tests do not establish real-camera
 identity, occlusion handling or room coverage.

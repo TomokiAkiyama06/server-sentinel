@@ -1,10 +1,10 @@
 import { build } from 'esbuild';
-import { mkdir, rename, writeFile } from 'node:fs/promises';
+import { mkdir, rename, rm, writeFile } from 'node:fs/promises';
 
-// Test files run in parallel processes and share build outputs, so each output
-// is written to a private temporary file and renamed into place: a concurrent
-// import sees either the previous complete module or the new one, never an
-// empty, truncated file.
+// `node --test` runs test files in parallel processes and several of them
+// compile the same entry to the same outfile. Writing in place lets a
+// concurrent importer load a truncated module (every export undefined), so each
+// output is written to a process-unique file and atomically renamed into place.
 export async function compile(entry, outfile, platform = 'node') {
   await mkdir('build', { recursive: true });
   const result = await build({
@@ -12,9 +12,13 @@ export async function compile(entry, outfile, platform = 'node') {
     target: 'es2022', ...(platform === 'node' ? { packages: 'external' } : {}),
     define: { 'process.env.NODE_ENV': '"production"' },
   });
-  for (const file of result.outputFiles) {
-    const temporary = `${file.path}.${process.pid}.tmp`;
-    await writeFile(temporary, file.contents);
-    await rename(temporary, file.path);
+  for (const output of result.outputFiles) {
+    const temporary = `${output.path}.${process.pid}.tmp`;
+    try {
+      await writeFile(temporary, output.contents);
+      await rename(temporary, output.path);
+    } finally {
+      await rm(temporary, { force: true });
+    }
   }
 }
