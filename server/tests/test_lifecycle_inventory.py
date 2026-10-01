@@ -47,13 +47,13 @@ def stream(label: str) -> str:
 class Runtime:
     """A disposable runtime tree: state/state.sqlite3 plus recordings/."""
 
-    def __init__(self, base: Path):
+    def __init__(self, base: Path, migrations=APPLICATION_MIGRATIONS):
         self.root = base / "runtime"
         for name in ("state", "recordings", "audit"):
             (self.root / name).mkdir(parents=True, mode=0o700)
         self.database = self.root / "state" / "state.sqlite3"
         with closing(Database(self.database).connect()) as connection:
-            migrate(connection, APPLICATION_MIGRATIONS)
+            migrate(connection, migrations)
         self.clock = 1_700_000_000_000_000
 
     def execute(self, sql: str, parameters=()):
@@ -678,14 +678,14 @@ class LifecycleInventoryTests(unittest.TestCase):
     def test_applied_migration_history_only_grows_by_known_migrations(self):
         # Codex P1: migrate() re-checks every applied row on startup, so the
         # history must persist; a dropped table would replay every migration.
+        # Recorded one release earlier, before the last migration existed;
+        # the update's startup then applies it.
+        self.runtime = Runtime(self.base / "one-release-earlier", APPLICATION_MIGRATIONS[:-1])
         self.runtime.seed()
-        with closing(sqlite3.connect(self.runtime.database)) as connection:
-            last = connection.execute("SELECT version, name, checksum FROM schema_migrations "
-                                      "ORDER BY version DESC LIMIT 1").fetchone()
-        # Recorded one release earlier: the last migration not yet applied.
-        self.runtime.execute("DELETE FROM schema_migrations WHERE version=?", (last[0],))
         _, baseline = self.record()
-        self.runtime.execute("INSERT INTO schema_migrations VALUES (?, ?, ?)", tuple(last))
+        with closing(Database(self.runtime.database).connect()) as connection:
+            migrate(connection, APPLICATION_MIGRATIONS)
+        last = [APPLICATION_MIGRATIONS[-1].version]
         code, report, _ = self.verify(baseline)
         self.assertEqual(code, inventory.EXIT_PRESERVED, report["sections"]["schema_migrations"])
         self.assertEqual(report["sections"]["schema_migrations"]["appended"], [last[0]])
@@ -710,18 +710,13 @@ class LifecycleInventoryTests(unittest.TestCase):
         }
         for index, (label, (statements, expected)) in enumerate(tampers.items()):
             with self.subTest(label):
-                runtime = Runtime(self.base / f"migrations-{index}")
+                runtime = Runtime(self.base / f"migrations-{index}", APPLICATION_MIGRATIONS[:-2])
                 saved, self.runtime = self.runtime, runtime
                 try:
                     runtime.seed()
-                    with closing(sqlite3.connect(runtime.database)) as connection:
-                        tail = connection.execute(
-                            "SELECT version, name, checksum FROM schema_migrations "
-                            "ORDER BY version DESC LIMIT 2").fetchall()[::-1]
-                    values = {"v1": tail[0][0], "n1": tail[0][1], "c1": tail[0][2],
-                              "v2": tail[1][0], "n2": tail[1][1], "c2": tail[1][2]}
-                    runtime.execute("DELETE FROM schema_migrations WHERE version >= ?",
-                                    (tail[0][0],))
+                    tail = APPLICATION_MIGRATIONS[-2:]
+                    values = {"v1": tail[0].version, "n1": tail[0].name, "c1": tail[0].checksum,
+                              "v2": tail[1].version, "n2": tail[1].name, "c2": tail[1].checksum}
                     _, recorded = self.record(f"migrations-{index}.json")
                     with closing(sqlite3.connect(runtime.database,
                                                  isolation_level=None)) as connection:
@@ -744,6 +739,36 @@ class LifecycleInventoryTests(unittest.TestCase):
                      | {name for name in inventory.NOT_INVENTORIED if "." not in name})
         self.assertEqual(created - accounted, set())
         self.assertEqual(set(inventory.INVENTORIED_TABLES) - created, set())
+
+    def test_schema_must_match_the_applied_migrations(self):
+        # Codex P1: every object the applied catalog creates must exist with
+        # its definition, inventoried or not (the service needs them all). A
+        # mismatch at record writes no baseline; at verify it is a failure.
+        for index, statement in enumerate((
+                "DROP TABLE access_sessions",                  # inventoried
+                "DROP TABLE presence_inputs",                  # transient
+                "DROP INDEX recording_event_id",               # an index
+                "ALTER TABLE camera_sources ADD COLUMN drift TEXT")):  # drift
+            with self.subTest(statement):
+                runtime = Runtime(self.base / f"schema-{index}")
+                saved, self.runtime = self.runtime, runtime
+                try:
+                    runtime.seed()
+                    _, baseline = self.record(f"schema-good-{index}.json")
+                    runtime.execute(statement)
+                    target = self.notes / f"schema-bad-{index}.json"
+                    code, _, stderr = run("record", "--runtime-root", str(runtime.root),
+                                          "--output", str(target))
+                    self.assertEqual(code, inventory.EXIT_USAGE)
+                    self.assertIn("schema does not match", stderr)
+                    self.assertFalse(target.exists())
+                    code, report, _ = self.verify(baseline)
+                finally:
+                    self.runtime = saved
+                self.assertEqual(code, inventory.EXIT_FAILED)
+                self.assertEqual(report["sections"]["tables"]["status"], "failed")
+                self.assertTrue(any(item["reason"] in ("table_missing", "schema_changed")
+                                    for item in report["sections"]["tables"]["failed"]))
 
     def test_presence_and_storage_audit_rows_are_preserved(self):
         self.runtime.seed()

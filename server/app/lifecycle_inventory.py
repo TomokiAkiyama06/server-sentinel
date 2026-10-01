@@ -57,6 +57,7 @@ deployment-local.
 from __future__ import annotations
 
 import argparse
+import functools
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -82,6 +83,7 @@ from app.monitoring.runtime import EVENT_NAMESPACE
 from app.presence.delivery import ActionResult
 from app.presence.service import PresenceService
 from app.storage.retention import DAY_MS, RetentionPeriods
+from app.storage.migrations import migrate
 from app.storage.schema import APPLICATION_MIGRATIONS
 
 
@@ -1793,6 +1795,10 @@ def collect(runtime_root: Path, *, salt: str | None = None,
             "schema_version": schema_version,
             "schema_migrations": migrations,
             "tables": sorted(name for name in INVENTORIED_TABLES if name in tables),
+            # Schema objects the applied migration catalog creates that are
+            # missing or differ here (any table the service needs, including
+            # ones this tool does not inventory).
+            "schema": _schema_drift(connection, migrations),
             "recordings": _recordings(connection, tables),
             "audit": _audit(connection, tables),
             "camera_sources": _sources(connection, tables, salt),
@@ -2285,6 +2291,44 @@ def _retention_rules(now: datetime) -> dict:
     }
 
 
+def _schema_objects(connection) -> dict:
+    return {(row[0], row[1]): row[2] for row in connection.execute(
+        "SELECT type, name, sql FROM sqlite_master "
+        "WHERE type IN ('table', 'index', 'trigger') AND name NOT LIKE 'sqlite_%'")}
+
+
+@functools.lru_cache(maxsize=8)
+def _catalog_schema(count: int) -> tuple:
+    """The schema objects the first ``count`` catalog migrations create."""
+    expected_db = sqlite3.connect(":memory:")
+    try:
+        migrate(expected_db, APPLICATION_MIGRATIONS[:count])
+        return tuple(sorted(_schema_objects(expected_db).items()))
+    finally:
+        expected_db.close()
+
+
+def _schema_drift(connection, migrations: list | None) -> dict:
+    """Compare the database's schema with what its applied migrations create.
+
+    The applied history must be a prefix of this release's catalog; that
+    prefix is replayed into an in-memory database, and every table, index
+    and trigger it creates must exist here with the same definition (SQLite
+    keeps the CREATE text, ALTERs included). Extra objects are ignored.
+    """
+    code = [[migration.version, migration.name, migration.checksum]
+            for migration in APPLICATION_MIGRATIONS]
+    if migrations is None or migrations != code[:len(migrations)]:
+        return {"history_matches": False, "missing": [], "changed": []}
+    expected = dict(_catalog_schema(len(migrations)))
+    actual = _schema_objects(connection)
+    return {"history_matches": True,
+            "missing": sorted(f"{kind}:{name}" for kind, name in expected
+                              if (kind, name) not in actual),
+            "changed": sorted(f"{kind}:{name}" for (kind, name), sql in expected.items()
+                              if (kind, name) in actual and actual[(kind, name)] != sql)}
+
+
 def _compare_migrations(baseline: list | None, current: list | None) -> dict:
     """The applied migration history the next startup would still accept.
 
@@ -2345,6 +2389,14 @@ def compare(baseline: dict, current: dict, *, declared_rewrites=(), now=None) ->
     table_failures = ([{"id": None, "reason": "unverifiable"}] if recorded_tables is None else
                       [{"id": name, "reason": "table_missing"}
                        for name in recorded_tables if name not in present])
+    # Every object the applied catalog creates, inventoried or not.
+    schema = current.get("schema") or {}
+    if schema.get("history_matches"):
+        table_failures += [{"id": item, "reason": "table_missing"}
+                           for item in schema.get("missing", ())
+                           if item.split(":", 1)[1] not in (recorded_tables or ())]
+        table_failures += [{"id": item, "reason": "schema_changed"}
+                           for item in schema.get("changed", ())]
     sections = {
         "schema_migrations": _compare_migrations(baseline.get("schema_migrations"),
                                                  current.get("schema_migrations")),
@@ -2596,6 +2648,15 @@ def main(arguments: list[str] | None = None) -> int:
             # Validate the destination before reading anything.
             safe_output_path(args.output, args.runtime_root)
             inventory = collect(args.runtime_root, owner_template_root=args.owner_template_root)
+            schema = inventory.get("schema") or {}
+            if not schema.get("history_matches") or schema.get("missing") or schema.get("changed"):
+                # A baseline of a database the service cannot run on would
+                # hide what is already lost; nothing is written.
+                raise InventoryError(
+                    "runtime database schema does not match the applied migrations "
+                    f"(missing {len(schema.get('missing') or ())}, "
+                    f"changed {len(schema.get('changed') or ())}, "
+                    f"history {'ok' if schema.get('history_matches') else 'mismatch'})")
             write_private(args.output, args.runtime_root, inventory)
             print("\n".join(_summary_record(inventory)))
             empty = any(value != "present" for value in inventory["coverage"].values())

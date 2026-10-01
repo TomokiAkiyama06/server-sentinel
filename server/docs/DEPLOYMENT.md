@@ -538,9 +538,15 @@ covering them.
 
 `verify` reads the baseline only if it is still a private `0600` regular file
 (not a symlink) owned by the invoking user or root, and refuses otherwise.
-It recomputes the same inventory and compares it. Every Main table the
-inventory reads that existed at record time must still exist, even if it was
-empty then (a dropped one is `table_missing` in the `tables` section), and
+It recomputes the same inventory and compares it. Every table, index and
+trigger that the applied migrations create must exist with the definition
+they give it, whether or not the tool inventories its rows: the tool replays
+the applied part of its own migration catalog into an in-memory database and
+compares. At `record` a missing or different object (or a history that is
+not a prefix of the catalog) refuses to write a baseline (exit 2); at
+`verify` it is `table_missing` or `schema_changed` in the `tables` section.
+Every Main table the inventory reads that existed at record time must still
+exist, even if it was empty then, and
 the applied migration history (`schema_migrations` version, name and
 checksum, which startup re-checks row by row) must keep every recorded row
 unchanged, and the whole history must be exactly this release's own
