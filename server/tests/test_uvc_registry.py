@@ -692,6 +692,43 @@ class DuplicateApprovalTests(UvcRegistryFixture):
             connection.rollback()
         self.assertIsNone(self.adapter.store.load(self.other.id))
 
+    def test_twin_of_a_serial_held_camera_is_refused_until_holder_is_reapproved(self):
+        # S1 was approved before a same-serial twin appeared, so its own
+        # runtime check still compares by serial. Approving the twin for S2
+        # would make S1 report a conflict, so the approval is refused instead.
+        self.discovery.devices = [self.camera]
+        self.admin.approve_uvc("owner", self.adapter, self.source.id, self.camera)
+        self.assertTrue(self.adapter.poll_source(self.source.id))
+        self.assertFalse(self.adapter.store.load(self.source.id).serial_ambiguous)
+        twin = replace(self.camera, device_path="/dev/video4", device_number=4)
+        self.discovery.devices = [self.camera, twin]
+        with self.assertRaises(ValueError):
+            self.admin.approve_uvc("owner", self.adapter, self.other.id, twin)
+        with closing(self.database.connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            with self.assertRaises(ApprovalConflictError):
+                self.adapter.store.approve_on(connection, self.other.id, twin,
+                                              serial_ambiguous=True)
+            connection.rollback()
+        self.assertIsNone(self.adapter.store.load(self.other.id))
+        self.assertCountEqual([AuditOutcome.SUCCEEDED, AuditOutcome.FAILED], self.approvals())
+        self.adapter.monotonic = lambda: 1e9
+        self.assertTrue(self.adapter.poll_source(self.source.id))
+        self.assertEqual(SourceHealthState.ONLINE,
+                         self.registry.get_source(self.source.id).health_state)
+        # Reapproving S1 while the twin is connected records an exact
+        # live-instance binding; the twin can then be approved for S2.
+        self.adapter.stop_source(self.source.id)
+        self.admin.approve_uvc("owner", self.adapter, self.source.id, self.camera)
+        self.assertTrue(self.adapter.store.load(self.source.id).serial_ambiguous)
+        self.admin.approve_uvc("owner", self.adapter, self.other.id, twin)
+        for _ in range(2):
+            self.assertTrue(self.adapter.poll_source(self.source.id))
+            self.assertTrue(self.adapter.poll_source(self.other.id))
+        for source_id in (self.source.id, self.other.id):
+            self.assertEqual(SourceHealthState.ONLINE,
+                             self.registry.get_source(source_id).health_state)
+
     def test_disabled_or_latched_source_does_not_hold_the_camera(self):
         self.admin.approve_uvc("owner", self.adapter, self.source.id, self.camera)
         self.registry.update_source(self.source.id, enabled=False)
@@ -774,6 +811,37 @@ class DuplicateApprovalTests(UvcRegistryFixture):
         self.assertEqual([], self.frames)
         self.assertEqual("capture_profile_unavailable", self.events[-1].reason)
 
+
+    def test_weak_camera_profile_fix_requires_owner_reapproval(self):
+        # A non-serial binding lasts only while its descriptor is open. After
+        # capture_profile_unavailable closes it, changing the profile cannot
+        # rebind the camera by its weak evidence: the Owner reapproves it.
+        class AdjustingCapture(SyntheticCapture):
+            def open(self):
+                negotiated = super().open()
+                return replace(negotiated, profile=CaptureVideo(1920, 1080, 30, "MJPG"))
+
+        weak = replace(self.camera, serial=None, instance_token=(1, 2, 3))
+        self.discovery.devices = [weak, self.second_camera]
+        self.registry.update_source(
+            self.source.id, desired_capture_profile=CaptureProfile(3840, 2160, 30, "MJPG"))
+        adapter = LocalUvcAdapter(self.registry, emit_audit=self.events.append,
+                                  on_frame=lambda source_id, frame: self.frames.append(frame),
+                                  discovery=self.discovery, capture_factory=AdjustingCapture)
+        self.addCleanup(adapter.close)
+        self.admin.approve_uvc("owner", adapter, self.source.id, weak)
+        self.assertFalse(adapter.poll_source(self.source.id))
+        self.assertEqual(SourceHealthState.DEGRADED,
+                         self.registry.get_source(self.source.id).health_state)
+        self.registry.update_source(
+            self.source.id, desired_capture_profile=CaptureProfile(1920, 1080, 30, "MJPG"))
+        for _ in range(2):
+            self.assertFalse(adapter.poll_source(self.source.id))
+        self.assertEqual(SourceHealthState.MANUAL_INTERVENTION_REQUIRED,
+                         self.registry.get_source(self.source.id).health_state)
+        self.assertTrue(adapter.store.load(self.source.id).requires_approval)
+        self.assertIn("identity_not_unique", [event.reason for event in self.events])
+        self.assertEqual([], self.frames)
 
 if __name__ == "__main__":
     unittest.main()

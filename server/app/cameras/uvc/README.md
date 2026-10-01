@@ -51,7 +51,9 @@ within 1% (`profile_satisfies()`). On a mismatch it records the negotiated
 profile, closes the descriptor and reports `degraded` with the fixed reason
 `capture_profile_unavailable`, never `online`; the same device instance is not
 reopened on every poll, only after the profile, enablement or device instance
-changes.
+changes. A camera without a serial is bound only while its descriptor is open,
+so after `capture_profile_unavailable` a profile change cannot rebind it: the
+source reports `identity_not_unique` and requires Owner reapproval.
 `CaptureSession` also watches frame progress. A read that times out raises
 `FrameTimeout` (a `CaptureError` subclass); instead of tearing down, the
 session reports `degraded` (`video_frame_stalled`) once no frame has arrived
@@ -82,7 +84,10 @@ the health sink receive the events (in order) after that, also outside the
 lock. The source is marked unpersisted from the start of a write until every
 staged value is durable, so a hung write never reads as persisted; a watchdog
 report that finds a write in flight leaves its values to that writer. A
-transient stall keeps the recorded negotiated profile.
+transient stall keeps the recorded negotiated profile. Closing a capture reports
+`offline` (`video_capture_closed`) before the potentially blocking
+`STREAMOFF`/unmap/close, so a hung kernel teardown never leaves the source
+`online`.
 
 While a capture is open, `LinuxDiscovery.scan()` (which opens every video node)
 runs at most every `presence_scan_seconds` instead of on every frame; an unplug
@@ -109,7 +114,10 @@ serial-backed identity, or the exact weak evidence) is approved for at most one
 enabled source. When several connected cameras share one serial, that serial
 cannot tell them apart, so each such (serial-ambiguous, exact live-instance)
 selection is compared by its exact evidence instead and every twin can be
-mapped to its own source. Approving a camera another enabled source holds an active
+mapped to its own source. The check applies both sides' comparison modes, so a
+source approved by serial before a twin appeared keeps its camera: approving
+the twin elsewhere is refused until the Owner reapproves the holder while both
+are connected. Approving a camera another enabled source holds an active
 approval for is refused with the generic reason and audited as failed, checked
 before and again inside the audited transaction. A disabled source or one that
 requires approval holds nothing. A duplicate that predates this check (or an
