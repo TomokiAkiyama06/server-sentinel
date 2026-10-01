@@ -355,9 +355,13 @@ allowed only the transitions the presence service performs: completed-event
 tombstones and expired-unresolved markers (kept; marker counts may only rise),
 retained observations as keyed digests (never their content) with their
 delivery jobs and source-fact digests (they may leave only together with a
-completed tombstone, so do not run timeline retention during the window), the
-high-water clocks (may only advance), open outbox session rows (consumed only
-into an interrupted gap) and the Owner override (dropped only once expired);
+completed tombstone, so do not run timeline retention during the window;
+a job's state, attempts and generation may only move forward: a claim, a
+recorded outcome, or the audited Owner requeue back to pending, and a
+delivered job stays delivered), the high-water clocks (may only advance), open
+outbox session rows (a row a live outbox held at record time may end in its
+clean close; a stale one only in an interrupted gap) and the Owner override
+(dropped only once the control clock has reached its expiry);
 `presence_inputs` (live inputs with their own validity windows) and
 `presence_delivery_fairness` (a round-robin cursor) replay nothing and hide no
 failure, so they are not inventoried; the Owner-approved hardware baseline as

@@ -4,7 +4,8 @@ All rows, identities, secrets and segment bytes are generated placeholders;
 no real person, deployment value or playable media is involved.
 """
 
-from contextlib import closing, redirect_stderr, redirect_stdout
+from contextlib import closing, contextmanager, redirect_stderr, redirect_stdout
+from datetime import datetime, timezone
 import hashlib
 import io
 import json
@@ -18,6 +19,7 @@ from uuid import UUID, uuid4
 
 from app import lifecycle_inventory as inventory
 from app.detection.owner import store as owner_store
+from app.presence.service import PresenceService
 from app.storage.database import Database
 from app.storage.migrations import migrate
 from app.storage.schema import APPLICATION_MIGRATIONS
@@ -411,7 +413,7 @@ class LifecycleInventoryTests(unittest.TestCase):
 
         def evidence(serial_value: str, path: str = device, token=None) -> str:
             return json.dumps({
-                "device_path": path, "vendor": "1d6b", "product": "0102",
+                "device_path": path, "vendor": "synthetic-vendor-marker", "product": "0102",
                 "serial": serial_value, "interface": "0",
                 "by_id": ["usb-synthetic-by-id-marker"], "topology": "synthetic-topology-marker",
                 "formats": ["MJPG"], "device_number": 3, "instance_token": token})
@@ -453,7 +455,7 @@ class LifecycleInventoryTests(unittest.TestCase):
         for path in self.notes.iterdir():
             text = path.read_text()
             for marker in (serial, device, "synthetic-by-id-marker", "synthetic-topology-marker",
-                           "synthetic-session-", "1d6b"):
+                           "synthetic-session-", "synthetic-vendor-marker"):
                 self.assertNotIn(marker, text, path.name)
 
     def test_presence_and_storage_audit_rows_are_preserved(self):
@@ -869,6 +871,8 @@ class LifecycleInventoryTests(unittest.TestCase):
         self.runtime.seed()
         self.runtime.execute("INSERT INTO presence_clock VALUES (1, "
                              "'2026-01-01T00:00:00.000000+00:00')")
+        self.runtime.execute("INSERT INTO presence_control_clock VALUES (1, "
+                             "'2026-01-01T00:00:00.000000+00:00')")
         self.runtime.execute("INSERT INTO presence_critical_source_clock VALUES "
                              "('synthetic-source', '2026-01-01T00:00:00.000000+00:00')")
         self.runtime.execute("INSERT INTO presence_outbox_sessions VALUES "
@@ -876,10 +880,13 @@ class LifecycleInventoryTests(unittest.TestCase):
         self.runtime.execute("INSERT INTO presence_override VALUES (1, 'away', 'owner', "
                              "'2026-01-01T00:00:00.000000+00:00', "
                              "'2026-01-02T00:00:00.000000+00:00')")
+        # No live outbox holds the committed lock: the session row is stale.
         _, baseline = self.record()
         # Clocks advance, the stale session becomes an interrupted gap and
-        # the override expires.
+        # _retire_override() drops the override once the control clock passes it.
         self.runtime.execute("UPDATE presence_clock SET latest='2026-01-03T00:00:00.000000+00:00'")
+        self.runtime.execute("UPDATE presence_control_clock "
+                             "SET latest='2026-01-03T00:00:00.000000+00:00'")
         self.runtime.execute("DELETE FROM presence_outbox_sessions")
         self.runtime.execute(
             "INSERT INTO presence_timeline_gap (singleton, since, latest, interrupted) VALUES "
@@ -887,12 +894,14 @@ class LifecycleInventoryTests(unittest.TestCase):
         self.runtime.execute("DELETE FROM presence_override")
         code, report, _ = self.verify(baseline)
         self.assertEqual(code, inventory.EXIT_PRESERVED, report["sections"]["presence"])
-        # A rolled-back clock, a session dropped without its gap and an
-        # unexpired override removed are changes.
+        # A rolled-back clock, a stale session dropped without its gap and an
+        # override removed before the control clock reached its expiry (the
+        # observation clock does not retire overrides) are changes.
         self.runtime.execute("UPDATE presence_critical_source_clock "
                              "SET latest_occurred='2025-12-31T00:00:00.000000+00:00'")
         self.runtime.execute("DELETE FROM presence_timeline_gap")
-        self.runtime.execute("UPDATE presence_clock SET latest='2026-01-01T12:00:00.000000+00:00'")
+        self.runtime.execute("UPDATE presence_control_clock "
+                             "SET latest='2026-01-01T12:00:00.000000+00:00'")
         code, report, _ = self.verify(baseline)
         self.assertEqual(code, inventory.EXIT_FAILED)
         failed = report["sections"]["presence"]["failed"]
@@ -900,6 +909,60 @@ class LifecycleInventoryTests(unittest.TestCase):
                      {"id": "outbox_sessions:1", "reason": "missing"},
                      {"id": "override:owner", "reason": "changed"}):
             self.assertIn(item, failed)
+
+    def test_live_outbox_session_may_close_cleanly(self):
+        # The service's own path: open_timeline_session() holds the committed
+        # lock; record_timeline_gap(close=...) deletes the row without adding
+        # an interrupted count.
+        self.runtime.seed()
+        @contextmanager
+        def reservation():
+            yield
+        service = PresenceService(Database(self.runtime.database), reservation=reservation)
+        now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        session, _ = service.open_timeline_session(now=now)
+        try:
+            _, live = self.record("live.json")
+        finally:
+            service.record_timeline_gap(now=now, close=session)
+        self.assertTrue(json.loads(live.read_text())["presence"]["outbox_live"])
+        code, report, _ = self.verify(live)
+        self.assertEqual(code, inventory.EXIT_PRESERVED, report["sections"]["presence"])
+        # The same removal of a row nobody held is an unexplained loss.
+        session, _ = service.open_timeline_session(now=now)
+        session.release()
+        _, stale = self.record("stale.json")
+        self.assertFalse(json.loads(stale.read_text())["presence"]["outbox_live"])
+        self.runtime.execute("DELETE FROM presence_outbox_sessions")
+        code, report, _ = self.verify(stale)
+        self.assertEqual(code, inventory.EXIT_FAILED)
+
+    def test_presence_delivery_jobs_only_move_forward(self):
+        self.runtime.seed()
+        ids = self.presence_rows()
+        update = ("UPDATE presence_deliveries SET state=?, attempts=?, generation=?, requeued=? "
+                  "WHERE observation=?")
+        self.runtime.execute(update, ("uncertain", 1, 1, 0, ids["edited"]))
+        self.runtime.execute(update, ("delivered", 1, 1, 0, ids["lost"]))
+        _, baseline = self.record()
+        # Claim, an outcome, and the audited Owner requeue of an uncertain job.
+        self.runtime.execute(update, ("submitting", 1, 1, 0, ids["kept"]))
+        self.runtime.execute(update, ("failed", 1, 1, 0, ids["expired"]))
+        self.runtime.execute(update, ("pending", 1, 2, 1, ids["edited"]))
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_PRESERVED, report["sections"]["presence"])
+        # Not service transitions: a pending job whose generation moved without
+        # a claim or requeue, a delivered job reopening, a job returning to
+        # pending without a requeue.
+        self.runtime.execute(update, ("pending", 0, 1, 0, ids["kept"]))
+        self.runtime.execute(update, ("pending", 1, 1, 0, ids["lost"]))
+        self.runtime.execute(update, ("pending", 1, 1, 0, ids["edited"]))
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_FAILED)
+        failed = report["sections"]["presence"]["failed"]
+        for name in ("kept", "lost", "edited"):
+            self.assertIn({"id": f"deliveries:{ids[name]}:notification", "reason": "changed"},
+                          failed)
 
     def test_integrity_baseline_is_preserved_by_keyed_digest(self):
         self.runtime.seed()

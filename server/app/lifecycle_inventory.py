@@ -69,10 +69,13 @@ import sqlite3
 import stat
 import sys
 from urllib.parse import quote
+from types import SimpleNamespace
 from uuid import UUID
 
 from app.cameras.uvc.persistence import ApprovalStore
 from app.detection.owner import store as owner_store
+from app.presence.delivery import ActionResult
+from app.presence.service import PresenceService
 
 
 FORMAT = "server-sentinel-lifecycle-inventory"
@@ -405,7 +408,7 @@ def _compare_timeline_gap(baseline: dict | None, current: dict | None) -> dict:
             "preserved": [] if failed else ["gap"]}
 
 
-def _presence(connection, tables, salt: str) -> dict:
+def _presence(connection, tables, salt: str, live_outbox: bool | None) -> dict:
     """Durable presence state whose loss replays, duplicates or hides work.
 
     - completed-event tombstones (a delayed replay of a completed critical
@@ -416,7 +419,9 @@ def _presence(connection, tables, salt: str) -> dict:
       digests (a restamped replay is checked against them);
     - the high-water clocks (losing one would accept stale or replayed
       observations as trusted);
-    - open outbox session rows (a stale one becomes an interrupted gap);
+    - open outbox session rows and whether a live outbox held them at record
+      time (``live_outbox``, the service's own committed-lock probe): a held
+      row may end in a clean close, a stale one only in an interrupted gap;
     - the Owner override.
 
     Not inventoried: presence_inputs (live inputs with their own validity
@@ -454,8 +459,12 @@ def _presence(connection, tables, salt: str) -> dict:
             lambda row: row[0],
             lambda row: _keyed(salt, ["presence-observation-v1", *tuple(row)[1:]])),
         "deliveries": keyed_rows(
-            "presence_deliveries", "SELECT observation, action FROM presence_deliveries",
-            lambda row: f"{row[0]}:{row[1]}", lambda row: row[0]),
+            "presence_deliveries",
+            "SELECT observation, action, state, attempts, generation, requeued "
+            "FROM presence_deliveries",
+            lambda row: f"{row[0]}:{row[1]}",
+            lambda row: {"observation": row[0], "state": row[2], "attempts": row[3],
+                         "generation": row[4], "requeued": bool(row[5])}),
         "source_facts": keyed_rows(
             "presence_source_facts", "SELECT id, digest FROM presence_source_facts",
             lambda row: row[0], lambda row: _keyed(salt, ["presence-source-fact-v1", row[1]])),
@@ -464,8 +473,48 @@ def _presence(connection, tables, salt: str) -> dict:
             _keyed(salt, ["presence-outbox-session-v1", row[0]])
             for row in rows("presence_outbox_sessions",
                             "SELECT token FROM presence_outbox_sessions")),
+        "outbox_live": live_outbox,
         "override": None if not override else dict(override[0]),
     }
+
+
+def _outbox_live(database: Path) -> bool | None:
+    """PresenceService's read-only committed-session probe for this database.
+
+    True when a live outbox holds a committed session; False or None (no
+    proof) otherwise. It opens the lock file read-only and never creates it.
+    """
+    probe = SimpleNamespace(database=SimpleNamespace(path=database))
+    return PresenceService._committed_session_held(probe)
+
+
+_DELIVERY_RESULTS = frozenset(item.value for item in ActionResult)
+
+
+def _delivery_advanced(before: dict, after: dict) -> bool:
+    """Whether a delivery job moved only as PresenceService moves it.
+
+    'delivered' is final; attempts and generation never fall and an Owner
+    requeue mark never clears. A claim ('submitting') increments both; a
+    return to 'pending' from any other state is only the audited Owner
+    requeue, which sets the mark and advances the generation; any other
+    state is a recorded outcome of an attempt.
+    """
+    if after == before:
+        return True
+    if (before["state"] == "delivered" or after["observation"] != before["observation"]
+            or after["attempts"] < before["attempts"]
+            or after["generation"] < before["generation"]
+            or before["requeued"] > after["requeued"]):
+        return False
+    if after["state"] == "submitting":
+        return (after["attempts"] > before["attempts"]
+                and after["generation"] > before["generation"])
+    if after["state"] == "pending":
+        # Unchanged rows returned above; a pending job that moved must have
+        # passed through the audited Owner requeue.
+        return after["requeued"] and after["generation"] > before["generation"]
+    return after["state"] in _DELIVERY_RESULTS
 
 
 def _compare_presence(baseline: dict | None, current: dict | None,
@@ -497,9 +546,12 @@ def _compare_presence(baseline: dict | None, current: dict | None,
         elif key not in completed:
             fail("observations", key, "missing")
     deliveries = current.get("deliveries") or {}
-    for key, observation in (baseline.get("deliveries") or {}).items():
-        if key not in deliveries and observation not in completed:
-            fail("deliveries", key, "missing")
+    for key, job in (baseline.get("deliveries") or {}).items():
+        if key not in deliveries:
+            if job["observation"] not in completed:
+                fail("deliveries", key, "missing")
+        elif not _delivery_advanced(job, deliveries[key]):
+            fail("deliveries", key)
     facts = current.get("source_facts") or {}
     for key, value in (baseline.get("source_facts") or {}).items():
         if key in facts:
@@ -511,20 +563,20 @@ def _compare_presence(baseline: dict | None, current: dict | None,
     for key, value in (baseline.get("clocks") or {}).items():
         if key not in clocks or clocks[key] < value:
             fail("clocks", key, "missing" if key not in clocks else "changed")
-    # A stale outbox session row is consumed only by converting it into an
-    # interrupted timeline gap.
+    # A row a live outbox held may end in its clean close; a stale row is
+    # consumed only by converting it into an interrupted timeline gap.
     removed = set(baseline.get("outbox_sessions") or ()) - set(current.get("outbox_sessions") or ())
-    if removed:
+    if removed and baseline.get("outbox_live") is not True:
         before = (gap_before or {}).get("interrupted", 0) if (gap_before or {}).get("open") else 0
         after = (gap_now or {}).get("interrupted", 0) if (gap_now or {}).get("open") else 0
         if after - before < len(removed):
             fail("outbox_sessions", len(removed), "missing")
-    # The service drops an Owner override only once it has expired.
+    # _retire_override() drops an Owner override only once the control clock
+    # (advanced in the same transaction) has reached its expiry.
     override = baseline.get("override")
     if override and current.get("override") != override:
-        latest = max((clocks.get(key, "") for key in ("observation", "control")), default="")
         expired_out = (current.get("override") is None and override["expires"] is not None
-                       and override["expires"] <= latest)
+                       and override["expires"] <= clocks.get("control", ""))
         if not expired_out:
             fail("override", "owner")
     has_rows = any(baseline.get(name) for name in (
@@ -806,7 +858,7 @@ def collect(runtime_root: Path, *, salt: str | None = None,
             "access": _access(connection, tables, salt),
             "camera_registry_settings": _registry_settings(connection, tables),
             "presence_timeline_gap": _timeline_gap(connection, tables),
-            "presence": _presence(connection, tables, salt),
+            "presence": _presence(connection, tables, salt, _outbox_live(tree.database)),
             "integrity_baseline": _integrity_baseline(connection, tables, salt),
         }
         connection.execute("COMMIT")
