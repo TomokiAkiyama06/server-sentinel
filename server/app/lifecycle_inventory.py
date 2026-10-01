@@ -470,31 +470,25 @@ def _expected_ended(now: dict) -> int | None:
 def _appended_markers_valid(base: dict, now: dict, remaining: Counter) -> bool:
     """Whether every marker absent from the record matches a store publication.
 
-    RecordingStore._publish() adds at most one marker per linked recording
-    while publishing a segment that does not continue the source cursor:
-    ('stream_discontinuity', prior cursor end, new segment start), where the
-    prior cursor ends no earlier than any segment published before it and no
-    later than the new segment starts. Such a marker ends after a recorded
-    segment and starts before a linked segment does, so it always overlaps
-    the target window and a stop never drops it.
+    RecordingStore._publish() adds one marker per linked recording while
+    publishing a segment that does not continue the source cursor (another
+    stream_id, or a sequence other than the cursor's plus one):
+    ('stream_discontinuity', cursor end, new segment start). The recording
+    already linked a recorded segment, so that cursor is the linked segment
+    published just before the new one. Such a marker always overlaps the
+    target window, so a stop never drops it.
     """
     recorded = {item["segment_id"] for item in base["segments"]}
-    appended = Counter(item["start_ms"] for item in now["segments"]
-                       if item["segment_id"] not in recorded)
-    used: Counter = Counter()
-    for (marker_start, marker_end, reason), count in remaining.items():
-        if count <= 0:
+    ordered = sorted(now["segments"], key=lambda item: (item["start_ms"], item["end_ms"]))
+    allowed: Counter = Counter()
+    for prior, segment in zip(ordered, ordered[1:]):
+        if segment["segment_id"] in recorded:
             continue
-        if reason != "stream_discontinuity" or marker_end not in appended:
-            return False
-        earlier_end = max((item["end_ms"] for item in now["segments"]
-                           if item["start_ms"] < marker_end), default=None)
-        if marker_start > marker_end or (earlier_end is not None and marker_start < earlier_end):
-            return False
-        used[marker_end] += count
-        if used[marker_end] > appended[marker_end]:
-            return False
-    return True
+        contiguous = (segment["catalog"]["stream_id"] == prior["catalog"]["stream_id"]
+                      and segment["catalog"]["sequence"] == prior["catalog"]["sequence"] + 1)
+        if not contiguous:
+            allowed[(prior["end_ms"], segment["start_ms"], "stream_discontinuity")] += 1
+    return all(count <= allowed[key] for key, count in remaining.items())
 
 
 def _compare_recordings(baseline: dict | None, current: dict | None, *,

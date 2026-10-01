@@ -69,7 +69,8 @@ class Runtime:
 
     def add_segment(self, recording_id: str, payload: bytes, *, write_file: bool = True,
                     catalog_payload: bytes | None = None, source_id: str | None = None,
-                    start_ms: int = 10000, end_ms: int = 20000) -> str:
+                    start_ms: int = 10000, end_ms: int = 20000, stream_id: str = "s",
+                    sequence: int | None = None) -> str:
         """Link a ready segment; by default from the recording's own source,
         as the recording store only links source-matched overlapping media."""
         segment_id = str(uuid4())
@@ -82,8 +83,9 @@ class Runtime:
         self.execute(
             "INSERT INTO recording_segments (id, source_id, stream_id, sequence, start_ms, "
             "end_ms, codec, container, byte_length, sha256, state, spool) "
-            "VALUES (?, ?, 's', ?, ?, ?, 'synthetic', 'deflate', ?, ?, 'ready', 0)",
-            (segment_id, source_id, self.clock, start_ms, end_ms, len(payload),
+            "VALUES (?, ?, ?, ?, ?, ?, 'synthetic', 'deflate', ?, ?, 'ready', 0)",
+            (segment_id, source_id, stream_id, self.clock if sequence is None else sequence,
+             start_ms, end_ms, len(payload),
              hashlib.sha256(catalog_payload if catalog_payload is not None
                             else payload).hexdigest()))
         self.clock += 1
@@ -746,7 +748,8 @@ class LifecycleInventoryTests(unittest.TestCase):
                              "AND start_ms>=15000", (trimmed,))
         # Publishing a segment that does not continue the cursor adds
         # (prior cursor end, new segment start) for every linked recording.
-        self.runtime.add_segment(trimmed, b"generated-trimmed-later", start_ms=11000, end_ms=15000)
+        self.runtime.add_segment(trimmed, b"generated-trimmed-later", start_ms=11000,
+                                 end_ms=15000, stream_id="s-restarted")
         self.runtime.execute(
             "INSERT INTO recording_discontinuities VALUES (?, 10000, 11000, 'stream_discontinuity')",
             (trimmed,))
@@ -763,53 +766,53 @@ class LifecycleInventoryTests(unittest.TestCase):
             self.assertIn({"id": recording_id, "reason": "changed"}, section["failed"])
 
     def test_in_progress_appended_markers_must_match_a_published_segment(self):
-        # RecordingStore._publish() only adds ('stream_discontinuity', prior
-        # cursor end, new segment start) while linking a newly published segment.
+        # RecordingStore._publish() only adds ('stream_discontinuity', cursor
+        # end, new segment start) while linking a newly published segment that
+        # does not continue the cursor's stream and sequence.
         self.runtime.seed()
-
-        def active(label: str) -> str:
-            recording_id = self.runtime.recording(
+        labels = ("published", "sequence-gap", "unanchored", "old-anchor", "reason",
+                  "not-prior-end", "inverted", "duplicated", "contiguous")
+        ids = {}
+        for label in labels:
+            ids[label] = self.runtime.recording(
                 starred=False, payload=b"generated-" + label.encode(),
                 status="active", target_end_ms=30000)
-            self.runtime.add_segment(recording_id, b"generated-later-" + label.encode(),
-                                     start_ms=12000, end_ms=20000)
-            return recording_id
-        published = active("published")
-        unanchored = active("unanchored")
-        old_anchor = active("old-anchor")
-        wrong_reason = active("reason")
-        before_prior = active("before-prior")
-        inverted = active("inverted")
-        duplicated = active("duplicated")
+            self.runtime.add_segment(ids[label], b"generated-later-" + label.encode(),
+                                     start_ms=12000, end_ms=20000, stream_id="t", sequence=7)
         with closing(sqlite3.connect(self.runtime.database)) as connection:
             recorded_start = connection.execute(
                 "SELECT MAX(s.start_ms) FROM recording_segments s JOIN recording_links l "
-                "ON l.segment_id=s.id WHERE l.recording_id=?", (old_anchor,)).fetchone()[0]
+                "ON l.segment_id=s.id WHERE l.recording_id=?", (ids["old-anchor"],)).fetchone()[0]
         _, baseline = self.record()
-        for recording_id in (published, unanchored, old_anchor, wrong_reason, before_prior,
-                             inverted, duplicated):
-            self.runtime.add_segment(recording_id, b"generated-new-" + recording_id.encode(),
-                                     start_ms=22000, end_ms=26000)
+        for label, recording_id in ids.items():
+            # A new stream unless the case is about sequence continuity.
+            stream, sequence = {"sequence-gap": ("t", 9), "contiguous": ("t", 8)}.get(
+                label, ("u", 0))
+            self.runtime.add_segment(recording_id, b"generated-new-" + label.encode(),
+                                     start_ms=22000, end_ms=26000, stream_id=stream,
+                                     sequence=sequence)
 
-        def marker(recording_id: str, start: int, end: int,
+        def marker(label: str, start: int, end: int,
                    reason: str = "stream_discontinuity") -> None:
             self.runtime.execute("INSERT INTO recording_discontinuities VALUES (?, ?, ?, ?)",
-                                 (recording_id, start, end, reason))
-        marker(published, 20000, 22000)
-        marker(unanchored, 20000, 21000)              # no segment starts at 21000
-        marker(old_anchor, 10000, recorded_start)     # anchors a recorded segment
-        marker(wrong_reason, 20000, 22000, "operator_note")
-        marker(before_prior, 15000, 22000)            # before an earlier segment's end
-        marker(inverted, 23000, 22000)
-        marker(duplicated, 20000, 22000)
-        marker(duplicated, 20000, 22000)              # one publication, one marker
+                                 (ids[label], start, end, reason))
+        marker("published", 20000, 22000)
+        marker("sequence-gap", 20000, 22000)
+        marker("unanchored", 20000, 21000)              # no segment starts at 21000
+        marker("old-anchor", 10000, recorded_start)     # anchors a recorded segment
+        marker("reason", 20000, 22000, "operator_note")
+        marker("not-prior-end", 15000, 22000)           # the cursor ended at 20000
+        marker("inverted", 23000, 22000)
+        marker("duplicated", 20000, 22000)
+        marker("duplicated", 20000, 22000)              # one publication, one marker
+        marker("contiguous", 20000, 22000)              # same stream, sequence + 1
         code, report, _ = self.verify(baseline)
         self.assertEqual(code, inventory.EXIT_FAILED)
         section = report["sections"]["recordings"]
-        self.assertEqual(section["in_progress_at_record"], [published])
-        for recording_id in (unanchored, old_anchor, wrong_reason, before_prior,
-                             inverted, duplicated):
-            self.assertIn({"id": recording_id, "reason": "changed"}, section["failed"])
+        self.assertEqual(section["in_progress_at_record"],
+                         sorted([ids["published"], ids["sequence-gap"]]))
+        for label in labels[2:]:
+            self.assertIn({"id": ids[label], "reason": "changed"}, section["failed"])
 
     def test_in_progress_ended_boundary_is_status_specific(self):
         # finish() always ends complete / gapped rows at target_end_ms; only

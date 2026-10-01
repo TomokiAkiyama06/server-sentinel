@@ -345,12 +345,17 @@ recording, audit row, source, principal or invitation is `failed` (exit 1);
 rows and recordings that exist only now are listed as `appended` and are never
 counted as preserved. A finished recording must be identical, including its
 target and ended boundaries. A recording that was still active when recorded
-may gain segments, move its target end earlier but never later, and become
-`complete`, `gapped` or `interrupted` with an end after its start and no later
-than its target; its source, event link, start, starred and critical flags must
-not change, every recorded discontinuity marker that still overlaps its target
-window must remain (the store adds markers while publishing and drops only
-those wholly outside a new stop boundary), every segment it already had must be
+may gain segments, move its target end earlier but never later, and stay
+`active` with no end or become `complete` or `gapped` ending exactly at its
+(possibly earlier) target, or `interrupted` ending exactly at the earlier of
+its target and its latest linked segment end (startup recovery); its source,
+event link, start, starred and critical flags must not change, every recorded
+discontinuity marker that still overlaps its target window must remain (a stop
+drops only those wholly outside the new boundary), every new marker must be
+the `stream_discontinuity` the store adds when it links a newly published
+segment that does not continue the previous linked segment's stream and
+sequence (from that segment's end to the new segment's start, one per
+publication), every segment it already had must be
 identical, and every current segment must
 come from the recording's own source, overlap its target window, be readable
 and match its catalog digest and byte length with a single hard link; anything
