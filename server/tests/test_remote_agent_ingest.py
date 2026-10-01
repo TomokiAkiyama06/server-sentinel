@@ -175,6 +175,26 @@ class RemoteAgentIngestTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             boundary.charge_attempt("not-a-node")
 
+    def test_checked_attempt_refuses_like_a_charge_without_consuming_budget(self):
+        clock = [0]
+        boundary = queue(limits=IngestLimits(8, 8, 64, 1, 100), now=lambda: clock[0])
+        for _ in range(3):
+            self.assertIsNone(boundary.check_attempt(NODE))
+        self.assertIsNone(boundary.charge_attempt(NODE))
+        refusal = boundary.check_attempt(NODE)
+        self.assertEqual((IngestOutcome.RATE_LIMITED, "rate_limit"),
+                         (refusal.outcome, refusal.reason))
+        self.assertEqual(IngestOutcome.RATE_LIMITED, boundary.submit(message()).outcome)
+        self.assertEqual("unauthorized", boundary.check_attempt(OTHER_NODE).reason)
+        clock[0] = 100
+        self.assertIsNone(boundary.check_attempt(NODE))
+        self.assertEqual(IngestOutcome.ACCEPTED, boundary.submit(message()).outcome)
+        clock[0] = 50
+        self.assertEqual("clock_regression", boundary.check_attempt(NODE).reason)
+        self.assertEqual(0, boundary.snapshot().queued_messages - 1)
+        with self.assertRaises(ValueError):
+            boundary.check_attempt("not-a-node")
+
     def test_revoked_node_lifecycle_can_release_rate_window_state(self):
         boundary = queue(limits=IngestLimits(8, 8, 64, 10, 100, 1))
         self.assertEqual(IngestOutcome.ACCEPTED, boundary.submit(message()).outcome)

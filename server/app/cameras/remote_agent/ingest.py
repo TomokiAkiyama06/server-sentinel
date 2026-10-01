@@ -189,8 +189,12 @@ class AgentIngestQueue:
             raise ValueError("ingest clock must return nonnegative integer nanoseconds")
         return now
 
-    def _consume_rate_locked(self, node_id: UUID, now: int) -> IngestAdmission | None:
+    def _consume_rate_locked(self, node_id: UUID, now: int, *,
+                             commit: bool = True) -> IngestAdmission | None:
         """Charge one authenticated attempt; return its refusal, if any.
+
+        With ``commit`` false a fitting attempt is not counted (see
+        ``check_attempt``); a refusal is reported and counted either way.
 
         Every authenticated attempt consumes rate budget, including an
         oversized message, a queue-pressure refusal, or an attempt refused
@@ -217,7 +221,8 @@ class AgentIngestQueue:
             self._windows[node_id] = (start, count)
             self._rate_limited += 1
             return self._admission(IngestOutcome.RATE_LIMITED, "rate_limit")
-        self._windows[node_id] = (start, count + 1)
+        if commit:
+            self._windows[node_id] = (start, count + 1)
         return None
 
     def charge_attempt(self, node_id: UUID) -> IngestAdmission | None:
@@ -239,6 +244,24 @@ class AgentIngestQueue:
                 self._rejected += 1
                 return self._admission(IngestOutcome.REJECTED, "unauthorized")
             return self._consume_rate_locked(node_id, self._now())
+
+    def check_attempt(self, node_id: UUID) -> IngestAdmission | None:
+        """Refuse an attempt that ``charge_attempt`` would refuse, without charging.
+
+        Lets a caller refuse an over-budget (or revoked) node before doing
+        expensive work for the attempt, such as a durable-store lookup, while
+        the attempt is still charged exactly once later by ``charge_attempt``
+        or ``submit``.  Returns ``None`` when the attempt currently fits.
+        """
+        if not isinstance(node_id, UUID):
+            raise ValueError("invalid agent node identity")
+        with self._lock:
+            try:
+                self._authorizer.require_node(node_id)
+            except PermissionError:
+                self._rejected += 1
+                return self._admission(IngestOutcome.REJECTED, "unauthorized")
+            return self._consume_rate_locked(node_id, self._now(), commit=False)
 
     def submit(self, message: AgentMessage) -> IngestAdmission:
         if not isinstance(message, AgentMessage):

@@ -369,17 +369,19 @@ class ContinuityTrackerTests(unittest.TestCase):
         tracker.receive(session, unit(0), b"v")
         result = tracker.receive(session, unit(3, source=OTHER_SOURCE), b"v")
         self.assertEqual(DeliveryOutcome.BACKPRESSURED, result.outcome)
+        # The first unit is the start of the flow: its leading loss is known
+        # (not a capture restart) and recorded already on the refused attempt.
+        self.assertEqual([(GapReason.SEQUENCE_SKIP, 3)],
+                         [(g.reason, g.missing_units) for g in result.gaps])
         pressured = flow(tracker, OTHER_SOURCE)
-        self.assertEqual((SourceFlow.DEGRADED, True, None, 0),
+        self.assertEqual((SourceFlow.DEGRADED, True, None, 1),
                          (pressured.flow, pressured.backpressured,
                           pressured.last_sequence, pressured.pending_gaps))
         ingest.drain(1)
         result = tracker.receive(session, unit(3, source=OTHER_SOURCE), b"v")
-        # Once admitted, the first unit is treated as the start of the flow:
-        # leading loss is reported, not a capture restart.
-        self.assertEqual(DeliveryOutcome.ACCEPTED, result.outcome)
-        self.assertEqual([(GapReason.SEQUENCE_SKIP, 3)],
-                         [(g.reason, g.missing_units) for g in result.gaps])
+        # The admitted retry never reports the same leading loss twice.
+        self.assertEqual((DeliveryOutcome.ACCEPTED, ()), (result.outcome, result.gaps))
+        self.assertEqual(1, flow(tracker, OTHER_SOURCE).pending_gaps)
         self.assertEqual((3, False), (flow(tracker, OTHER_SOURCE).last_sequence,
                                       flow(tracker, OTHER_SOURCE).backpressured))
 
@@ -1546,6 +1548,126 @@ class ContinuityTrackerTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             CommittedWatermark(NODE, 1, -1, 0)
 
+    def _refusing_tracker(self, *, watermark=no_watermark, rate=1000):
+        clock = Clock()
+        ingest = TransientRefusalQueue(IngestLimits(8, 1, 8, rate, 10 ** 12),
+                                       Authorizer(), clock_ns=clock)
+        tracker = ContinuityTracker(ContinuityLimits(4, 4, 100), Authorizer(), ingest,
+                                    clock_ns=clock, committed_watermark=watermark)
+        return tracker, ingest, tracker.open_session(NODE)
+
+    def _refuse(self, tracker, ingest, session, header, kind):
+        """Deliver ``header`` while the queue is full or transiently refusing."""
+        if kind == "backpressure":
+            # Fill the one-message queue directly, bypassing continuity.
+            self.assertEqual(IngestOutcome.ACCEPTED, ingest.submit(AgentMessage(
+                NODE, SOURCE, AgentAction.MEDIA, 0, b"f",
+                capture_epoch=1, capture_time_ns=0)).outcome)
+        else:
+            ingest.refusing = True
+        result = tracker.receive(session, header, b"v")
+        ingest.drain(10)
+        ingest.refusing = False
+        return result
+
+    def test_sequence_skip_first_seen_on_refused_unit_is_kept_once(self):
+        for kind in ("backpressure", "transient_refusal"):
+            with self.subTest(kind=kind):
+                tracker, ingest, session = self._refusing_tracker()
+                self.assertEqual(DeliveryOutcome.ACCEPTED,
+                                 tracker.receive(session, unit(0), b"v").outcome)
+                ingest.drain(10)
+                result = self._refuse(tracker, ingest, session, unit(5), kind)
+                self.assertNotEqual(DeliveryOutcome.ACCEPTED, result.outcome)
+                # Units 1-4 are known loss as soon as unit 5 is first seen.
+                self.assertEqual([(GapReason.SEQUENCE_SKIP, 0, 5, 4)],
+                                 [(g.reason, g.after_sequence, g.before_sequence,
+                                   g.missing_units) for g in result.gaps])
+                self.assertEqual((SourceFlow.DEGRADED, 0, 1),
+                                 (flow(tracker).flow, flow(tracker).last_sequence,
+                                  flow(tracker).pending_gaps))
+                # A retry of the same unit, and a refused retry, add nothing.
+                again = self._refuse(tracker, ingest, session, unit(5), kind)
+                self.assertEqual((), again.gaps)
+                accepted = tracker.receive(session, unit(5), b"v")
+                self.assertEqual((DeliveryOutcome.ACCEPTED, ()),
+                                 (accepted.outcome, accepted.gaps))
+                self.assertEqual(1, flow(tracker).pending_gaps)
+                # After committing past it, continuity is ordinary again.
+                later = tracker.receive(session, unit(8), b"v")
+                self.assertEqual([(GapReason.SEQUENCE_SKIP, 5, 8, 2)],
+                                 [(g.reason, g.after_sequence, g.before_sequence,
+                                   g.missing_units) for g in later.gaps])
+
+    def test_refused_retry_past_noted_loss_reports_only_new_units(self):
+        tracker, ingest, session = self._refusing_tracker()
+        tracker.receive(session, unit(0), b"v")
+        ingest.drain(10)
+        self._refuse(tracker, ingest, session, unit(5), "transient_refusal")
+        # The Agent skipped unit 5 too; only units 5 and 6 are new loss.
+        result = tracker.receive(session, unit(7), b"v")
+        self.assertEqual([(GapReason.SEQUENCE_SKIP, 4, 7, 2)],
+                         [(g.reason, g.after_sequence, g.before_sequence, g.missing_units)
+                          for g in result.gaps])
+        self.assertEqual(4 + 2, sum(g.missing_units for g in tracker.drain_gaps(10)))
+        # An older committed unit is still a duplicate.
+        self.assertEqual(DeliveryOutcome.DUPLICATE,
+                         tracker.receive(session, unit(0), b"v").outcome)
+
+    def test_skip_seen_only_on_refused_unit_survives_deactivation(self):
+        for leading in (False, True):
+            with self.subTest(leading=leading):
+                tracker, ingest, session = self._refusing_tracker()
+                if not leading:
+                    tracker.receive(session, unit(0), b"v")
+                    ingest.drain(10)
+                self._refuse(tracker, ingest, session, unit(5), "transient_refusal")
+                # The Agent never retries: the known loss is handed back.
+                released = tracker.forget_source(SOURCE)
+                self.assertEqual([(GapReason.SEQUENCE_SKIP, 5 if leading else 4)],
+                                 [(g.reason, g.missing_units) for g in released])
+
+    def test_rate_limit_is_checked_before_watermark_lookup(self):
+        lookups = []
+
+        def failing(source_id):
+            lookups.append(source_id)
+            raise OSError("durable store unavailable")
+        tracker, ingest, clock, _ = build(watermark=failing, rate=2)
+        session = tracker.open_session(NODE)
+        for _ in range(2):
+            self.assertEqual("watermark_unavailable",
+                             tracker.receive(session, unit(5), b"v").reason)
+        # The window is spent: further retries do no durable-store work.
+        for _ in range(3):
+            result = tracker.receive(session, unit(5), b"v")
+            self.assertEqual((DeliveryOutcome.RATE_LIMITED, "rate_limit"),
+                             (result.outcome, result.reason))
+        self.assertEqual(2, len(lookups))
+        self.assertEqual(SourceFlow.DEGRADED, flow(tracker).flow)
+        clock.now = 10 ** 12
+        self.assertEqual("watermark_unavailable",
+                         tracker.receive(session, unit(5), b"v").reason)
+        self.assertEqual(3, len(lookups))
+
+    def test_resolved_first_unit_is_charged_once(self):
+        lookups = []
+
+        def lookup(source_id):
+            lookups.append(source_id)
+            return None
+        authorizer = Authorizer({(NODE, SOURCE), (NODE, OTHER_SOURCE)})
+        tracker, ingest, _, _ = build(authorizer=authorizer, watermark=lookup, rate=1)
+        session = tracker.open_session(NODE)
+        # One attempt, one charge: the pre-lookup check consumes nothing.
+        self.assertEqual(DeliveryOutcome.ACCEPTED,
+                         tracker.receive(session, unit(0), b"v").outcome)
+        result = tracker.receive(session, unit(0, source=OTHER_SOURCE), b"v")
+        self.assertEqual((DeliveryOutcome.RATE_LIMITED, "rate_limit"),
+                         (result.outcome, result.reason))
+        self.assertEqual([SOURCE], lookups)
+        self.assertEqual((1, 1), (ingest.snapshot().queued_messages,
+                                  ingest.snapshot().rate_limited))
 
 if __name__ == "__main__":
     unittest.main()

@@ -55,8 +55,9 @@ capture_time_ns)` media envelope (carried in full on each queued
 `AgentMessage`), commit-after-admission so backpressure makes
 the Agent retry rather than lose media, idempotent duplicate acknowledgement
 (duplicates and other early refusals still consume the node's rate budget),
-and bounded, coalescing gap events for skips, capture restarts (recorded when
-first observed, even on a refused unit), clock regressions and refused units.
+and bounded, coalescing gap events for skips and capture restarts (both
+recorded when first observed, even on a refused unit, and never twice), clock
+regressions and refused units.
 After a Main Server restart each source resumes from the durable
 `CommittedWatermark` supplied by the deployment, so already recorded units
 are never reported as loss; while that lookup fails the source is reported

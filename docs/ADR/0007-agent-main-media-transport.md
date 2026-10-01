@@ -40,10 +40,13 @@ explicitly forbidden by the Issue.
    exact missing-unit count, and a capture restart yields a gap of explicitly
    unknown extent, even when the source's earlier-epoch unit was attempted but
    never committed (a lower epoch than one already attempted is refused as
-   stale). A restart is recorded when a refused unit first shows it, so it is
-   not lost if that unit is never retried. After a Main Server restart a
+   stale). A restart or skipped sequences are recorded when a refused unit
+   first shows them, so that loss is not lost if the unit is never retried,
+   and a retry never reports it twice. After a Main Server restart a
    source resumes from the durable recording layer's committed watermark, so
    units recorded by the earlier Main process are never reported as loss.
+   That durable lookup happens only for an attempt that fits the node's rate
+   budget, so an over-budget node cannot drive unbounded durable-store work.
    Every candidate is evaluated by the same Main-side assertions.
    The complete envelope (including `capture_epoch` and `capture_time_ns`)
    travels with each admitted unit in the ingest queue, so a downstream

@@ -214,11 +214,12 @@ class _Source:
     ``attempted_epoch`` is the highest epoch of a unit refused by pressure or
     a transient refusal; a lower epoch is stale even before that unit commits,
     so a restart already observed is never lost to an older-epoch retry.
-    ``restart_epoch``/``restart_before`` record a capture restart (a higher
-    epoch than ``capture_epoch``) that was already reported when a refused
-    unit first showed it, so its retry never reports the restart twice; a
-    retry that starts later than ``restart_before`` reports only the units
-    in between.
+    ``noted_epoch``/``noted_before`` record known loss (a capture restart or
+    skipped sequences) that was already reported when a refused unit of that
+    epoch first showed it: every uncommitted unit of ``noted_epoch`` before
+    sequence ``noted_before`` is already reported, so a retry never reports
+    that loss twice; a retry that starts later than ``noted_before`` reports
+    only the units in between.  ``noted_before`` None means nothing noted.
     ``unresolved`` marks an entry kept only because the durable watermark
     lookup failed for the source's first unit: it holds the source slot and
     reports ``degraded``, but carries no continuity, so the next attempt looks
@@ -235,8 +236,8 @@ class _Source:
     gaps: deque = field(default_factory=deque)
     session_generation: int = 0
     attempted_epoch: int = 0
-    restart_epoch: int = 0
-    restart_before: int = 0
+    noted_epoch: int = 0
+    noted_before: int | None = None
     unresolved: bool = False
 
 
@@ -275,7 +276,10 @@ class ContinuityTracker:
     ``CommittedWatermark`` or None when nothing was ever recorded.  It is
     consulted, under this tracker's lock, before the first unit of a source
     this tracker does not yet track, and must not call back into the tracker
-    or its ingest queue.  A lookup that fails refuses the unit transiently
+    or its ingest queue.  An attempt that the node's rate budget (or its
+    authorization) already refuses is refused before the lookup, so retries
+    cannot drive unbounded durable-store work; the attempt is still charged
+    exactly once.  A lookup that fails refuses the unit transiently
     (nothing is committed, so the Agent retries); it never falls back to
     reporting the durably recorded units as loss.  Until a lookup succeeds the
     source is kept as a bounded unresolved entry reported ``degraded``.
@@ -500,14 +504,26 @@ class ContinuityTracker:
             # it was observed on a unit the Agent attempted, and capture
             # epochs only increase.
             return "stale_capture_epoch"
-        if state is not None and epoch > state.capture_epoch and epoch == state.restart_epoch:
-            # This restart was already reported when a refused unit first
-            # showed it; only units skipped past that first unit are new loss.
-            if sequence > state.restart_before:
-                return (GapEvent(node_id, source_id, GapReason.SEQUENCE_SKIP, epoch,
-                                 state.restart_before - 1 if state.restart_before else None,
-                                 sequence, sequence - state.restart_before),)
-            return ()
+        if (state is not None and state.noted_before is not None
+                and epoch == state.noted_epoch
+                and (epoch > state.capture_epoch or state.last_sequence is None
+                     or state.noted_before > state.last_sequence)):
+            # Loss before ``noted_before`` was already reported when a refused
+            # unit first showed it (a restart, or skipped sequences); only
+            # units skipped past that first unit are new loss.
+            if epoch == state.capture_epoch and state.last_sequence is not None \
+                    and sequence <= state.last_sequence:
+                return "duplicate"
+            gaps = []
+            if sequence > state.noted_before:
+                gaps.append(GapEvent(node_id, source_id, GapReason.SEQUENCE_SKIP, epoch,
+                                     state.noted_before - 1 if state.noted_before else None,
+                                     sequence, sequence - state.noted_before))
+            if (epoch == state.capture_epoch and state.last_sequence is not None
+                    and header.capture_time_ns < state.last_capture_time_ns):
+                gaps.append(GapEvent(node_id, source_id, GapReason.CAPTURE_CLOCK_REGRESSION,
+                                     epoch, state.last_sequence, sequence, 0))
+            return tuple(gaps)
         if state is not None and epoch > state.capture_epoch:
             # A new capture epoch means the Agent capture process restarted;
             # the extent of any loss is not knowable here.  This holds for an
@@ -534,23 +550,26 @@ class ContinuityTracker:
                                  epoch, state.last_sequence, sequence, 0))
         return tuple(gaps)
 
-    def _observe_restart(self, state: _Source, checked: tuple[GapEvent, ...],
-                         header: MediaUnitHeader) -> tuple[GapEvent, ...]:
-        """Record a capture restart when a refused unit first shows it.
+    def _observe_loss(self, state: _Source, checked: tuple[GapEvent, ...],
+                      header: MediaUnitHeader) -> tuple[GapEvent, ...]:
+        """Record known loss (restart or skipped units) a refused unit first shows.
 
-        The unit is not committed, but the restart is already known loss: if
-        the Agent never retries it (it disconnects for good, or the source is
-        deactivated) the restart must still reach the durable consumer.  The
-        restart is remembered so the retry never reports it a second time.
+        The unit is not committed, but the units before it are already known
+        loss: if the Agent never retries it (it disconnects for good, or the
+        source is deactivated) that loss must still reach the durable
+        consumer.  The loss is remembered so a retry never reports it a second
+        time.  A capture-clock regression is not loss and is reported only
+        when the unit commits.
         """
-        restarts = tuple(gap for gap in checked if gap.reason is GapReason.CAPTURE_RESTART)
-        if not restarts:
+        losses = tuple(gap for gap in checked
+                       if gap.reason in (GapReason.CAPTURE_RESTART, GapReason.SEQUENCE_SKIP))
+        if not losses:
             return ()
-        for gap in restarts:
+        for gap in losses:
             self._record(state, gap)
-        state.restart_epoch = header.capture_epoch
-        state.restart_before = header.sequence
-        return restarts
+        state.noted_epoch = header.capture_epoch
+        state.noted_before = header.sequence
+        return losses
 
     def _charged(self, session: AgentSession, outcome: DeliveryOutcome,
                  reason: str) -> Delivery:
@@ -573,6 +592,10 @@ class ContinuityTracker:
         refusal = self._ingest.charge_attempt(session.node_id)
         if refusal is None:
             return Delivery(outcome, reason)
+        return self._refused(session, refusal)
+
+    def _refused(self, session: AgentSession, refusal) -> Delivery:
+        """Report a queue rate/clock/authorization refusal of an attempt."""
         if refusal.reason == "unauthorized":
             self._invalidate_locked(session)
             return Delivery(DeliveryOutcome.REJECTED, "unauthorized")
@@ -632,6 +655,18 @@ class ContinuityTracker:
                 # First unit this tracker sees (for example after a Main
                 # Server restart): resume from the durable watermark so units
                 # already recorded by an earlier process are not loss.
+                # An over-budget or revoked node is refused before the lookup,
+                # so retries can never drive unbounded durable-store work under
+                # this lock; a fitting attempt is charged once, later.
+                refusal = self._ingest.check_attempt(node_id)
+                if refusal is not None:
+                    delivery = self._refused(session, refusal)
+                    if refusal.reason != "unauthorized":
+                        # Still delivering: keep the refusal visible.
+                        self._hold_unresolved(
+                            session, node, state, header, now,
+                            pressured=refusal.outcome is IngestOutcome.RATE_LIMITED)
+                    return delivery
                 try:
                     mark = self._committed_watermark(source_id)
                 except Exception:
@@ -666,7 +701,7 @@ class ContinuityTracker:
                 pending = self._pending(state, node_id, header, now)
                 pending.backpressured = True
                 pending.attempted_epoch = header.capture_epoch
-                observed = self._observe_restart(pending, checked, header)
+                observed = self._observe_loss(pending, checked, header)
                 # The Agent is still delivering: refresh activity (not the
                 # committed sequence) so sustained pressure stays ``degraded``
                 # instead of decaying to ``interrupted``.
@@ -694,7 +729,7 @@ class ContinuityTracker:
                 pending = self._pending(state, node_id, header, now)
                 pending.refused = True
                 pending.attempted_epoch = header.capture_epoch
-                observed = self._observe_restart(pending, checked, header)
+                observed = self._observe_loss(pending, checked, header)
                 self._seen(pending, now)
                 pending.session_generation = node.generation
                 self._seen(node, now)
@@ -720,7 +755,11 @@ class ContinuityTracker:
             state.session_generation = node.generation
             self._seen(node, now)
             state.backpressured = state.refused = False
-            state.restart_epoch = state.restart_before = 0
+            if not (state.noted_before is not None
+                    and state.noted_epoch == header.capture_epoch
+                    and header.sequence < state.noted_before):
+                # Committed at or past the noted loss: nothing noted remains.
+                state.noted_epoch, state.noted_before = 0, None
             if admission.outcome is IngestOutcome.REJECTED:
                 return Delivery(DeliveryOutcome.REJECTED, admission.reason, tuple(gaps))
             return Delivery(DeliveryOutcome.ACCEPTED, None, tuple(gaps))
@@ -737,14 +776,27 @@ class ContinuityTracker:
         delivery = self._charged(session, DeliveryOutcome.REJECTED, "watermark_unavailable")
         if delivery.reason != "watermark_unavailable":
             return delivery
+        self._hold_unresolved(session, node, state, header, now, pressured=False)
+        return delivery
+
+    def _hold_unresolved(self, session: AgentSession, node: _Node, state: _Source | None,
+                         header: MediaUnitHeader, now: int, *, pressured: bool) -> None:
+        """Keep a bounded continuity-less entry so a refused source reads ``degraded``.
+
+        Used for a source whose watermark is not resolved yet (``state`` is
+        None or unresolved); capacity was already checked by the caller.
+        """
         if state is None:
             state = self._sources[header.source_id] = _Source(
                 session.node_id, header.capture_epoch, None, header.capture_time_ns, now,
-                refused=True, unresolved=True)
+                unresolved=True)
+        if pressured:
+            state.backpressured = True
+        else:
+            state.refused = True
         self._seen(state, now)
         state.session_generation = node.generation
         self._seen(node, now)
-        return delivery
 
     def snapshot(self) -> tuple[SourceContinuity, ...]:
         with self._lock:
@@ -799,7 +851,8 @@ class ContinuityTracker:
             # retry after reactivation cannot enqueue a queued unit again.
             self._released[source_id] = _Source(
                 state.node_id, state.capture_epoch, state.last_sequence,
-                state.last_capture_time_ns, state.last_seen_ns)
+                state.last_capture_time_ns, state.last_seen_ns,
+                noted_epoch=state.noted_epoch, noted_before=state.noted_before)
         return gaps
 
     def _forget_node_locked(self, node_id: UUID) -> tuple[GapEvent, ...]:
