@@ -1108,6 +1108,107 @@ class LifecycleInventoryTests(unittest.TestCase):
                 section = report["sections"]["audit_storage_state"]
                 self.assertEqual(section["status"] == "preserved", accepted, section)
 
+    def test_real_service_retention_and_release_verify_as_preserved(self):
+        # Guards the mirrored rules against drift: the real service functions
+        # run with the verify time, then verify lists exactly what they
+        # removed and keeps what they left (rows at or just inside a cutoff).
+        from contextlib import nullcontext
+        import zlib
+        from app.media.recording import RecordingStore, RootIdentity, Segment
+        from app.media.recording.model import Limits
+        from app.storage.retention import RetentionService, StorageAudit
+        from tests.test_recording import Reservation, SyntheticValidator
+        seeded = self.runtime.seed()
+        now = self.now
+        now_ms = int(now.timestamp() * 1000)
+        day_ms = 86_400_000
+        # Recordings: ended well past 20 days, exactly at the cutoff (deleted:
+        # ended_ms <= cutoff) and one millisecond inside it (kept).
+        media = self.runtime.root / "recordings"
+        info = media.stat()
+        connection = sqlite3.connect(self.runtime.database, isolation_level=None)
+        store = RecordingStore(connection, media, RootIdentity(info.st_dev, info.st_ino),
+                               Limits(pre_roll_bytes=4096, max_segment_bytes=512,
+                                      max_segment_ms=30_000, max_active_recordings=8,
+                                      max_spool_segments=16, max_segments_per_recording=100),
+                               Reservation(), SyntheticValidator())
+        made = {}
+        for label, ended in (("old", now_ms - 30 * day_ms), ("at-cutoff", now_ms - 20 * day_ms),
+                             ("inside", now_ms - 20 * day_ms + 1)):
+            source = uuid4()
+            recording = store.start_manual(source, ended - 1000, duration_ms=1000)
+            store.append(Segment(source, uuid4(), 0, ended - 1000, ended, "synthetic", "deflate",
+                                 zlib.compress(b"generated geometric test payload" * 4)))
+            store.finish(recording)
+            store.release_source(source)
+            made[label] = str(recording)
+        # Audit rows: past the 90-day cutoff, exactly at it (kept: '<'), inside.
+        audit_cutoff = now - timedelta(days=90)
+        cutoff_us = int(audit_cutoff.timestamp()) * 1_000_000 + audit_cutoff.microsecond
+        admin = {}
+        for label, occurred in (("old", cutoff_us - 1), ("at-cutoff", cutoff_us)):
+            admin[label] = str(uuid4())
+            self.runtime.execute(
+                "INSERT INTO security_admin_audit_records VALUES (?, 'owner', "
+                "'camera_source.update', 'camera_source', ?, ?, 'succeeded')",
+                (admin[label], str(uuid4()), occurred))
+        for at in ((audit_cutoff - timedelta(seconds=1)).isoformat(), audit_cutoff.isoformat()):
+            self.runtime.execute("INSERT INTO integrity_audit(at, actor, revision) "
+                                 "VALUES (?, 'owner', 1)", (at,))
+        for at_ms in (now_ms - 90 * day_ms - 1, now_ms - 90 * day_ms):
+            self.runtime.execute("INSERT INTO storage_state_audit (at_ms, previous_state, "
+                                 "current_state) VALUES (?, 'normal', 'pressure')", (at_ms,))
+        root = self.owner_template_root(template=b"synthetic-owner-template-marker")
+        with closing(sqlite3.connect(root / "owner-template.sqlite3",
+                                     isolation_level=None)) as template_db:
+            template_db.execute("DELETE FROM owner_template_audit")
+            for at in ((audit_cutoff - timedelta(seconds=1)).isoformat(),
+                       audit_cutoff.isoformat()):
+                template_db.execute("INSERT INTO owner_template_audit(at, actor, operation, "
+                                    "generation) VALUES (?, 'owner', 'enroll', 1)", (at,))
+        # An unresolved critical observation the Owner releases.
+        released = uuid4()
+        self.runtime.execute(
+            "INSERT INTO presence_observations (id, kind, source, received, payload) "
+            "VALUES (?, 'crossing', 'synthetic-source', ?, '{}')",
+            (str(released), (now - timedelta(days=1)).isoformat(timespec="microseconds")))
+        self.runtime.execute("INSERT INTO presence_deliveries (observation, action, state, "
+                             "attempts) VALUES (?, 'notification', 'pending', 0)",
+                             (str(released),))
+        option = ("--owner-template-root", str(root))
+        _, baseline = self.record("real.json", *option)
+        # The real service paths, at the verify time.
+        self.assertEqual(RetentionService(store).expired(now_ms, 100), 2)
+        store.close()
+        connection.close()
+        AuditStore(Database(self.runtime.database)).cleanup_expired(now=now)
+        with closing(sqlite3.connect(self.runtime.database, isolation_level=None)) as db:
+            StorageAudit(db, reservation=nullcontext).expire(now_ms)
+        template = owner_store.OwnerTemplateStore(root, max_template_bytes=1024,
+                                                  reservation=nullcontext)
+        try:
+            template.cleanup_expired_batch(now=now)
+        finally:
+            template.close()
+
+        class Owner:
+            def require_owner(self, context):
+                return UUID(seeded["owner"])
+        PresenceService(Database(self.runtime.database), access=Owner(),
+                        reservation=nullcontext).clear_unresolved_critical_event(
+            "owner", released, now=now, clock_trusted=True)
+        code, report, _ = self.verify(baseline, *option)
+        sections = report["sections"]
+        self.assertEqual(code, inventory.EXIT_PRESERVED, json.dumps(sections, indent=1)[:2000])
+        self.assertEqual(sections["recordings"]["retention_expired"],
+                         sorted([made["old"], made["at-cutoff"]]))
+        self.assertIn(made["inside"], sections["recordings"]["preserved"])
+        self.assertEqual(sections["audit_security_admin"]["retention_expired"], [admin["old"]])
+        for name in ("audit_integrity", "audit_storage_state"):
+            self.assertEqual(len(sections[name]["retention_expired"]), 1, name)
+        self.assertEqual(len(sections["owner_template"]["audit"]["retention_expired"]), 1)
+        self.assertEqual(sections["presence"]["released"], [str(released)])
+
     def test_credential_sign_count_may_only_advance(self):
         # A lower counter rolls back the authenticator clone-detection floor.
         seeded = self.runtime.seed()
@@ -1266,27 +1367,37 @@ class LifecycleInventoryTests(unittest.TestCase):
         self.assertIn({"id": "expired_unresolved:evidence", "reason": "missing"},
                       report["sections"]["presence"]["failed"])
 
+    def owner_clear(self, owner: str, identifier: str, at: str) -> None:
+        """The rows clear_unresolved_critical_event() writes besides deletions."""
+        self.runtime.execute("INSERT INTO presence_audit (action, actor, at, state, target) "
+                             "VALUES ('critical_event_cleared', ?, ?, NULL, ?)",
+                             (owner, at, identifier))
+        self.runtime.execute("INSERT INTO presence_control_clock VALUES (1, ?) ON CONFLICT"
+                             "(singleton) DO UPDATE SET latest=excluded.latest", (at,))
+
     def test_presence_observations_leave_only_through_a_tombstone(self):
-        self.runtime.seed()
+        seeded = self.runtime.seed()
         ids = self.presence_rows()
-        # Verified past expire_history()'s 90-day horizon for these receipts.
-        self.now = datetime(2026, 6, 1, tzinfo=timezone.utc)
         _, baseline = self.record()
-        # The retention path: observation, jobs and fact go, the tombstone
+        # The Owner release: observation, jobs and fact go, the tombstone
         # appears and the undelivered job adds an expired-unresolved event.
+        at = "2026-02-01T00:00:00.000000+00:00"
         for table, column in (("presence_deliveries", "observation"),
                               ("presence_observations", "id"), ("presence_source_facts", "id")):
             self.runtime.execute(f"DELETE FROM {table} WHERE {column}=?", (ids["expired"],))
-        self.runtime.execute("INSERT INTO presence_completed_events VALUES (?, "
-                             "'2026-02-01T00:00:00.000000+00:00')", (ids["expired"],))
+        self.runtime.execute("INSERT INTO presence_completed_events VALUES (?, ?)",
+                             (ids["expired"], at))
         self.runtime.execute("INSERT INTO presence_expired_unresolved VALUES ('notification', 1, "
-                             "'2026-02-01T00:00:00.000000+00:00')")
+                             "?)", (at,))
+        self.owner_clear(seeded["owner"], ids["expired"], at)
         # A claim (one attempt, one generation) and its delivered outcome.
         self.runtime.execute("UPDATE presence_deliveries SET state='delivered', "
                              "attempts=attempts+1, generation=generation+1 "
                              "WHERE observation=?", (ids["kept"],))
-        code, report, _ = self.verify(baseline)
+        code, report, stdout = self.verify(baseline)
         self.assertEqual(code, inventory.EXIT_PRESERVED, report["sections"]["presence"])
+        self.assertEqual(report["sections"]["presence"]["released"], [ids["expired"]])
+        self.assertIn("released=1", stdout)
         # A lost job, a changed payload and a dropped fact are changes.
         for table, column in (("presence_deliveries", "observation"),
                               ("presence_observations", "id")):
@@ -1308,18 +1419,17 @@ class LifecycleInventoryTests(unittest.TestCase):
     def test_unresolved_job_removed_with_only_a_tombstone_is_detected(self):
         # A tombstone alone would hide an undelivered critical action: both
         # service paths also add its expired-unresolved event.
-        self.runtime.seed()
+        seeded = self.runtime.seed()
         ids = self.presence_rows()
         self.runtime.execute("UPDATE presence_deliveries SET state='failed', attempts=1, "
                              "generation=1 WHERE observation=?", (ids["lost"],))
-        # Verified past expire_history()'s 90-day horizon for these receipts.
-        self.now = datetime(2026, 6, 1, tzinfo=timezone.utc)
         _, baseline = self.record()
         for table, column in (("presence_deliveries", "observation"),
                               ("presence_observations", "id"), ("presence_source_facts", "id")):
             self.runtime.execute(f"DELETE FROM {table} WHERE {column}=?", (ids["lost"],))
         self.runtime.execute("INSERT INTO presence_completed_events VALUES (?, "
                              "'2026-02-01T00:00:00.000000+00:00')", (ids["lost"],))
+        self.owner_clear(seeded["owner"], ids["lost"], "2026-02-01T00:00:00.000000+00:00")
         code, report, _ = self.verify(baseline)
         self.assertEqual(code, inventory.EXIT_FAILED)
         self.assertIn({"id": f"deliveries:{ids['lost']}:notification", "reason": "missing"},
@@ -1329,11 +1439,11 @@ class LifecycleInventoryTests(unittest.TestCase):
         code, report, _ = self.verify(baseline)
         self.assertEqual(code, inventory.EXIT_PRESERVED, report["sections"]["presence"])
 
-    def test_observation_removal_needs_expiry_or_an_owner_clear(self):
-        # Codex P1: PresenceService removes an observation (with its jobs and
-        # source fact) only in expire_history() once expired, or in the
-        # audited clear_unresolved_critical_event(); a fresh unresolved one
-        # removed with a forged tombstone and marker is not either.
+    def test_observation_removal_needs_an_owner_clear(self):
+        # Main removes an observation (with its jobs and source fact) only in
+        # the audited clear_unresolved_critical_event(); expire_history() is
+        # not run by Main, so even an old, resolved observation removed as it
+        # would remove it is a loss, as is a forged tombstone and marker.
         seeded = self.runtime.seed()
         now = self.now
         fresh = (now - timedelta(days=1)).isoformat(timespec="microseconds")
@@ -1376,10 +1486,10 @@ class LifecycleInventoryTests(unittest.TestCase):
         code, report, _ = self.verify(baseline)
         self.assertEqual(code, inventory.EXIT_FAILED)
         failed = report["sections"]["presence"]["failed"]
-        for label in ("forged", "expired-unresolved"):
+        for label in ("forged", "expired-unresolved", "expired-resolved", "expired-plain"):
             self.assertIn({"id": f"observations:{ids[label]}", "reason": "missing"}, failed)
-        for label in ("cleared", "expired-resolved", "expired-plain"):
-            self.assertNotIn({"id": f"observations:{ids[label]}", "reason": "missing"}, failed)
+        self.assertNotIn({"id": f"observations:{ids['cleared']}", "reason": "missing"}, failed)
+        self.assertEqual(report["sections"]["presence"]["released"], [ids["cleared"]])
 
     def test_owner_clear_mirrors_the_service_exactly(self):
         # clear_unresolved_critical_event(): needs a job neither delivered nor

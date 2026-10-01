@@ -390,17 +390,17 @@ presence state whose loss would replay, duplicate or hide critical work, each
 allowed only the transitions the presence service performs: completed-event
 tombstones and expired-unresolved markers (kept; marker counts may only rise),
 retained observations as keyed digests (never their content) with their
-receipt times, delivery jobs and source-fact digests (an observation may leave
-only through timeline retention once expired — received more than 20 days
-before verify with no unfinished critical job, or more than 90 days before
-regardless — or through the Owner's audited release of unresolved critical
-work, which needs a recorded job neither delivered nor disabled and appends
-one `critical_event_cleared` audit row naming it (no state, the actor an
-Owner principal, keyed) at the same time as its tombstone and advances the
-control clock to that time (which must not be behind it now); one that carried critical jobs leaves only together with
-its completed tombstone, and its jobs only with the expired-unresolved events
-the path adds (retention: one per job not delivered; Owner release: one per
-job neither delivered nor disabled);
+delivery jobs and source-fact digests (Main does not run timeline expiry, so
+an observation may leave only through the Owner's audited release of
+unresolved critical work, which needs a recorded job neither delivered nor
+disabled and appends one `critical_event_cleared` audit row naming it (no
+state, the actor an Owner principal, keyed) at the same time as its
+tombstone and advances the control clock to that time (which must not be
+behind it now); each release is listed under the presence section's
+`released` and counted in the console summary, never silently; the
+observation leaves only together with its completed tombstone, and its jobs
+only with one expired-unresolved event per job neither delivered nor
+disabled; any other removal, however old the observation, is `missing`);
 a job's state, attempts and generation may only move forward: a claim, a
 recorded outcome, or the audited Owner requeue back to pending, and a
 delivered job stays delivered; attempts rise only with a claim, which also
@@ -559,8 +559,13 @@ table or a recording catalog table is gone or unreadable, nothing in it counts
 as retention-expired and the section fails as `table_missing`. Anything one
 second short of those periods, starred,
 still active, or removed by capacity-pressure deletion of the oldest
-recordings (`RetentionService.oldest()`), stays `missing`: if storage
-pressure deleted recordings during the window, investigate and re-record.
+recordings (`RetentionService.oldest()`) before it reached that age, stays
+`missing`. The judgement uses only the row's own time and the verify time,
+so a recording that capacity pressure deleted shortly before its 20 days
+were up, or that the Owner deleted after them, reads as `retention_expired`
+once verify runs past that age; run `verify` promptly after the update, and
+if storage pressure or an Owner deletion happened during the window,
+investigate and re-record.
 Owner-template audit rows older than the store's own 90-day audit retention
 may likewise be gone (listed under the section's `retention_expired`), since
 the store's cleanup runs at startup when it is registered for audit

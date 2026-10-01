@@ -59,7 +59,7 @@ from __future__ import annotations
 import argparse
 from collections import Counter
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 import hashlib
 import hmac
 import json
@@ -80,7 +80,6 @@ from app.integrity.model import Finding, Kind, State
 from app.media.recording.model import Limits as RecordingLimits, Segment
 from app.monitoring.runtime import EVENT_NAMESPACE
 from app.presence.delivery import ActionResult
-from app.presence.models import timestamp as presence_timestamp
 from app.presence.service import PresenceService
 from app.storage.retention import DAY_MS, RetentionPeriods
 from app.storage.schema import APPLICATION_MIGRATIONS
@@ -536,10 +535,6 @@ def _presence(connection, tables, salt: str, live_outbox: bool | None) -> dict:
             "SELECT id, kind, source, received, payload FROM presence_observations",
             lambda row: row[0],
             lambda row: _keyed(salt, ["presence-observation-v1", *tuple(row)[1:]])),
-        # Receipt times expire_history() compares (no content).
-        "observation_received": keyed_rows(
-            "presence_observations", "SELECT id, received FROM presence_observations",
-            lambda row: row[0], lambda row: row[1]),
         # Observations the Owner released (clear_unresolved_critical_event()
         # appends this audit row in the same transaction).
         "cleared_events": None if "presence_audit" not in tables else sorted(
@@ -623,8 +618,7 @@ def _delivery_advanced(before: dict, after: dict) -> bool:
 
 
 def _compare_presence(baseline: dict | None, current: dict | None,
-                      gap_before: dict | None, gap_now: dict | None,
-                      rules: dict | None = None) -> dict:
+                      gap_before: dict | None, gap_now: dict | None) -> dict:
     """Allow only the transitions PresenceService itself performs."""
     baseline, current = baseline or {}, current or {}
     failed = []
@@ -642,12 +636,12 @@ def _compare_presence(baseline: dict | None, current: dict | None,
             fail("expired_unresolved", key, "missing")
         elif now["since"] != value["since"] or now["events"] < value["events"]:
             fail("expired_unresolved", key)
-    # An observation (with its jobs and source fact) leaves only through
-    # PresenceService.expire_history() once expired, or the Owner's audited
-    # clear_unresolved_critical_event(); both write the completed tombstone
-    # of an observation that carried critical jobs.
+    # An observation (with its jobs and source fact) leaves only through the
+    # Owner's audited clear_unresolved_critical_event(), listed as released.
+    # PresenceService.expire_history() is not run by Main, so a removal it
+    # would make is still a loss here; if Main ever schedules it, this rule
+    # must be revisited.
     observations = current.get("observations") or {}
-    received = baseline.get("observation_received") or {}
     recorded_jobs: dict = {}
     for job in (baseline.get("deliveries") or {}).values():
         recorded_jobs.setdefault(job["observation"], []).append(job["state"])
@@ -665,14 +659,13 @@ def _compare_presence(baseline: dict | None, current: dict | None,
     # control clock the clear advanced to its time has not moved back.
     owners = set(baseline.get("owner_actors") or ()) | set(current.get("owner_actors") or ())
     control = (current.get("clocks") or {}).get("control")
-    rules = rules or {}
     path = {}
     for key, value in (baseline.get("observations") or {}).items():
         if key in observations:
             if observations[key] != value:
                 fail("observations", key)
             continue
-        at, jobs = received.get(key), recorded_jobs.get(key, [])
+        jobs = recorded_jobs.get(key, [])
         unfinished = [state for state in jobs if state not in ("delivered", "disabled")]
         # Owner release: at least one unfinished job (its precondition), a
         # single new clear row naming it, and the tombstone it wrote then.
@@ -682,25 +675,11 @@ def _compare_presence(baseline: dict | None, current: dict | None,
                 and unfinished and completed.get(key) == rows[0][0]):
             path[key] = "released"
             continue
-        # expire_history(): past the timeline cutoff with no unfinished
-        # critical job, or past the audit-retention horizon regardless; it
-        # tombstones only an observation that had critical jobs.
-        expired_out = (isinstance(at, str) and "presence_cutoff" in rules
-                       and (at < rules["presence_horizon"]
-                            or (at < rules["presence_cutoff"] and not unfinished)))
-        if expired_out and not (jobs and key not in completed):
-            path[key] = "expired"
-            continue
         fail("observations", key, "missing")
     deliveries = current.get("deliveries") or {}
-    # Retention and the Owner's clear_unresolved_critical_event() both add
-    # one expired-unresolved event per removed job that was not delivered,
-    # in the same transaction as the tombstone. A job recorded unresolved
-    # that is gone must be covered by that increase (one delivered and then
-    # expired inside the window is also reported; do not run retention then).
-    # The paths count differently: expire_history() adds one event per job
-    # not delivered (disabled included); the Owner release one per job
-    # neither delivered nor disabled.
+    # The Owner release adds one expired-unresolved event per removed job
+    # neither delivered nor disabled, in the transaction that writes the
+    # tombstone; a removed job must be covered by that increase.
     needed = {}
     for key, job in (baseline.get("deliveries") or {}).items():
         if key not in deliveries:
@@ -751,7 +730,7 @@ def _compare_presence(baseline: dict | None, current: dict | None,
         "completed_events", "expired_unresolved", "observations", "deliveries",
         "source_facts", "clocks", "outbox_sessions", "override"))
     status = "failed" if failed else ("preserved" if has_rows else "empty")
-    return {"status": status, "failed": failed}
+    return {"status": status, "failed": failed, "released": sorted(path)}
 
 
 def _security_state(connection, tables, salt: str) -> dict:
@@ -1627,6 +1606,9 @@ def collect(runtime_root: Path, *, salt: str | None = None,
     """
     salt = secrets.token_hex(32) if salt is None else salt
     tree = RuntimeTree(_absolute(runtime_root, "runtime root"))
+    # Taken before the snapshot, so a row written in between counts as
+    # written after the record.
+    recorded_at = _utcnow().isoformat()
     connection = _connect_read_only(tree.database)
     try:
         # One short read transaction gives a consistent snapshot of every
@@ -1643,7 +1625,7 @@ def collect(runtime_root: Path, *, salt: str | None = None,
         inventory = {
             "format": FORMAT, "format_version": FORMAT_VERSION,
             # When this snapshot was taken, to tell rows written after it.
-            "recorded_at": _utcnow().isoformat(),
+            "recorded_at": recorded_at,
             "schema_version": schema_version,
             "schema_migrations": migrations,
             "tables": sorted(name for name in INVENTORIED_TABLES if name in tables),
@@ -2117,8 +2099,11 @@ def _retention_rules(now: datetime) -> dict:
     storage_state_audit rows with at_ms below now - 90 days;
     RetentionService.expired() deletes unstarred complete / gapped /
     interrupted recordings whose ended_ms is at most now - 20 days.
-    Presence and Owner-template audit retention does not run in Main, and
-    capacity-pressure deletion (RetentionService.oldest()) is never accepted.
+    OwnerTemplateStore.cleanup_expired_batch() deletes Owner-template audit
+    rows older than the store's own retention when the store is registered
+    for audit retention. Presence audit retention and timeline expiry
+    (PresenceService.expire_audit() / expire_history()) are not run by Main
+    and so accept nothing.
     """
     periods = RetentionPeriods()
     cutoff = now - AUDIT_RETENTION
@@ -2133,10 +2118,6 @@ def _retention_rules(now: datetime) -> dict:
         # OwnerTemplateStore's own default (Main constructs it with it).
         "owner_template": lambda value: isinstance(value, str) and value < (
             now - owner_store.DEFAULT_AUDIT_RETENTION).astimezone(timezone.utc).isoformat(),
-        # PresenceService.expire_history(): timeline cutoff and the audit
-        # horizon, in its own receipt-time text.
-        "presence_cutoff": presence_timestamp(now - timedelta(days=periods.recording_days)),
-        "presence_horizon": presence_timestamp(now - timedelta(days=periods.audit_days)),
     }
 
 
@@ -2227,8 +2208,7 @@ def compare(baseline: dict, current: dict, *, declared_rewrites=(), now=None) ->
             baseline.get("presence_timeline_gap"), current.get("presence_timeline_gap")),
         "presence": _compare_presence(
             baseline.get("presence"), current.get("presence"),
-            baseline.get("presence_timeline_gap"), current.get("presence_timeline_gap"),
-            rules),
+            baseline.get("presence_timeline_gap"), current.get("presence_timeline_gap")),
         "integrity_baseline": _compare_keyed(
             {"baseline": baseline["integrity_baseline"]}
             if baseline.get("integrity_baseline") is not None else None,
@@ -2386,7 +2366,8 @@ def _summary_verify(report: dict) -> list[str]:
             f"{name}: {section['status']} preserved={preserved} "
             f"failed={len(section['failed'])} appended={len(section.get('appended', []))} "
             f"declared_rewrites={len(section.get('declared_rewrites', []))} "
-            f"retention_expired={len(section.get('retention_expired', []))}")
+            f"retention_expired={len(section.get('retention_expired', []) or (section.get('audit') or {}).get('retention_expired', []))} "
+            f"released={len(section.get('released', []))}")
     for key in report["empty_coverage"]:
         lines.append(f"coverage {key}: empty (not counted as preserved)")
     for key, value in {**report["not_applicable"], **report["not_inventoried"],
