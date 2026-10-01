@@ -52,7 +52,9 @@ a key bound to or staged for another node, and a revoked key is never reused.
 Staging binds the key permanently before the staged row is written, so a key
 whose certificate Main issued stays bound even if a retry replaces the staged
 row or the node is revoked first. Bindings per node are capped (1024); beyond
-that renewal is refused and the node must re-pair.
+that renewal is refused and the node must re-pair. A key already bound to the
+node is accepted only as a retry of the currently staged key; a superseded or
+out-of-order earlier staged key is refused.
 `CaptureCredentialMonitor` raises the local `capture_credential_warning`
 notification through an injected hook in three cases: a credential within
 14 days of expiry, an expired credential, or a refused renewal. The renewal

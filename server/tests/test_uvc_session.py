@@ -18,6 +18,8 @@ class Discovery:
 
 class SyntheticCapture:
     instances = []
+    # A driver that silently adjusts an unsupported request, like V4L2 S_FMT.
+    negotiate = None
 
     def __init__(self, candidate, profile, *, verify_identity):
         self.candidate, self.profile, self.verify = candidate, profile, verify_identity
@@ -28,7 +30,8 @@ class SyntheticCapture:
     def open(self):
         if not self.verify(self.candidate):
             raise CaptureError("synthetic identity changed")
-        return NegotiatedVideo(self.profile, 0, 1024)
+        adjusted = self.negotiate(self.profile) if self.negotiate else self.profile
+        return NegotiatedVideo(adjusted, 0, 1024)
 
     def read_frame(self, timeout):
         if self.failed:
@@ -118,6 +121,132 @@ class SessionTests(unittest.TestCase):
         self.session.close()
         self.assertFalse(self.session.step())
         self.assertEqual(self.controller.state, CameraState.MANUAL)
+
+
+class CountingDiscovery(Discovery):
+    def __init__(self, devices):
+        super().__init__(devices)
+        self.scans = 0
+
+    def scan(self):
+        self.scans += 1
+        return super().scan()
+
+
+class ProfileNegotiationTests(unittest.TestCase):
+    """Driver-adjusted profiles are recorded but never reported online."""
+
+    def setUp(self):
+        self.camera = DeviceEvidence("/dev/video0", "synthetic", "model", "serial")
+        self.discovery = CountingDiscovery([self.camera])
+        self.events, self.frames, self.profiles = [], [], []
+        self.controller = ReconnectController(UUID(int=1), self.camera, self.events.append)
+        self.instances = []
+        self.adjust = None
+        self.profile = VideoProfile(1920, 1080, 30, "MJPG")
+        self.session = self.make_session(self.profile)
+
+    def make_session(self, profile):
+        def factory(candidate, profile, *, verify_identity):
+            capture = SyntheticCapture(candidate, profile, verify_identity=verify_identity)
+            capture.negotiate = self.adjust
+            self.instances.append(capture)
+            return capture
+
+        return CaptureSession(
+            self.controller, self.discovery, profile, on_frame=self.frames.append,
+            on_profile=self.profiles.append, capture_factory=factory,
+        )
+
+    def assert_unavailable(self, requested, negotiated):
+        self.adjust = lambda profile: negotiated
+        self.session.configure(enabled=True, profile=requested)
+        delivered = len(self.frames)
+        self.assertFalse(self.session.step())
+        self.assertEqual(CameraState.DEGRADED, self.controller.state)
+        self.assertEqual("capture_profile_unavailable", self.events[-1].reason)
+        self.assertEqual(negotiated, self.profiles[-1].profile)
+        self.assertIsNone(self.session.capture)
+        self.assertTrue(self.instances[-1].closed)
+        self.assertEqual(delivered, len(self.frames))
+
+    def test_unsupported_resolution_is_not_online(self):
+        self.assert_unavailable(VideoProfile(3840, 2160, 30, "MJPG"),
+                                VideoProfile(1920, 1080, 30, "MJPG"))
+
+    def test_unsupported_frame_rate_is_not_online(self):
+        self.assert_unavailable(VideoProfile(1920, 1080, 60, "MJPG"),
+                                VideoProfile(1920, 1080, 30, "MJPG"))
+        self.assert_unavailable(VideoProfile(1920, 1080, 15, "MJPG"),
+                                VideoProfile(1920, 1080, 30, "MJPG"))
+
+    def test_unsupported_pixel_format_is_not_online(self):
+        self.assert_unavailable(VideoProfile(1920, 1080, 30, "H264"),
+                                VideoProfile(1920, 1080, 30, "MJPG"))
+        self.assert_unavailable(VideoProfile(1920, 1080, 30, "YUYV"),
+                                VideoProfile(640, 480, 30, "YUYV"))
+
+    def test_unavailable_profile_is_not_reopened_every_poll(self):
+        self.assert_unavailable(VideoProfile(3840, 2160, 30, "MJPG"),
+                                VideoProfile(1920, 1080, 30, "MJPG"))
+        opened, events, profiles = len(self.instances), len(self.events), len(self.profiles)
+        for _ in range(3):
+            self.assertFalse(self.session.step())
+        self.assertEqual(opened, len(self.instances))
+        self.assertEqual(events, len(self.events))
+        self.assertEqual(profiles, len(self.profiles))
+        self.assertEqual(CameraState.DEGRADED, self.controller.state)
+
+    def test_supported_profile_change_recovers_and_unplug_clears_hold(self):
+        self.assert_unavailable(VideoProfile(3840, 2160, 30, "MJPG"),
+                                VideoProfile(1920, 1080, 30, "MJPG"))
+        self.adjust = None
+        self.session.configure(enabled=True, profile=self.profile)
+        self.assertTrue(self.session.step())
+        self.assertEqual(CameraState.ONLINE, self.controller.state)
+        self.assert_unavailable(VideoProfile(1920, 1080, 60, "MJPG"),
+                                VideoProfile(1920, 1080, 30, "MJPG"))
+        self.discovery.devices = []
+        self.assertFalse(self.session.step())
+        self.assertEqual(CameraState.OFFLINE, self.controller.state)
+        opened = len(self.instances)
+        self.discovery.devices = [replace(self.camera, device_path="/dev/video4")]
+        self.assertFalse(self.session.step())
+        # A re-enumerated device is negotiated again, and still refused.
+        self.assertEqual(opened + 1, len(self.instances))
+        self.assertEqual("capture_profile_unavailable", self.events[-1].reason)
+
+    def test_driver_rounded_ntsc_rate_satisfies_request(self):
+        self.adjust = lambda profile: VideoProfile(1920, 1080, 30000 / 1001, "MJPG")
+        self.assertTrue(self.session.step())
+        self.assertEqual(CameraState.ONLINE, self.controller.state)
+
+    def test_disabled_or_latched_source_does_not_rescan_devices(self):
+        self.session.configure(enabled=False, profile=self.profile)
+        self.assertFalse(self.session.step())
+        self.assertEqual(0, self.discovery.scans)
+        self.session.configure(enabled=True, profile=self.profile)
+        self.controller.requires_approval = True
+        self.assertFalse(self.session.step())
+        self.assertEqual(CameraState.MANUAL, self.controller.state)
+        self.assertEqual(0, self.discovery.scans)
+
+    def test_weak_explicit_binding_stays_degraded_without_reopening(self):
+        weak = replace(self.camera, serial=None, instance_token=(1, 2, 3))
+        self.discovery.devices = [weak]
+        self.adjust = lambda profile: VideoProfile(1920, 1080, 30, "MJPG")
+        self.session = self.make_session(VideoProfile(1920, 1080, 60, "MJPG"))
+        self.controller.approve(weak, [weak])
+        for _ in range(3):
+            self.assertFalse(self.session.step())
+        self.assertEqual(CameraState.DEGRADED, self.controller.state)
+        self.assertEqual("capture_profile_unavailable", self.events[-1].reason)
+        self.assertEqual(1, len(self.instances))
+        # A replaced device instance is never treated as the held binding.
+        self.discovery.devices = [replace(weak, instance_token=(4, 5, 6))]
+        self.assertFalse(self.session.step())
+        self.assertEqual(CameraState.MANUAL, self.controller.state)
+        self.assertEqual(1, len(self.instances))
 
 
 if __name__ == "__main__":

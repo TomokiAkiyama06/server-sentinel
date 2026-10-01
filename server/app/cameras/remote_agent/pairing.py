@@ -515,7 +515,9 @@ class PairingLedger:
         staged key is bound to the node permanently before the row is written,
         so neither a retry with a fresh key nor revocation frees it; bindings
         per node are capped so repeated attempts cannot grow the ledger without
-        bound. Staging writes no audit record for the same reason; promotion does.
+        bound. A key already bound to this node is accepted only as a retry of
+        the currently staged key, never a superseded or earlier staged one.
+        Staging writes no audit record for the same reason; promotion does.
         """
         node = _identity(node_id, "node identity")
         current_key = _digest(current_public_key_digest, "public key digest")
@@ -548,7 +550,16 @@ class PairingLedger:
             # Main issues the certificate before staging, so the key is bound
             # to this node for good now: replacing this staged row with a retry,
             # or revoking the node, must not free it for another node.
-            if not _refuse_foreign_key(connection, node, key):
+            if _refuse_foreign_key(connection, node, key):
+                # A key already bound to this node is accepted only as a retry
+                # of the currently staged renewal: a superseded key is never
+                # re-staged, and an earlier staged key cannot replace a newer one.
+                current = connection.execute(
+                    "SELECT public_key_digest FROM pairing_node_renewals WHERE node_id = ?",
+                    (str(node),)).fetchone()
+                if not (current and hmac.compare_digest(current["public_key_digest"], key)):
+                    raise PairingError("capture node is not eligible for renewal")
+            else:
                 held = connection.execute(
                     "SELECT COUNT(*) FROM pairing_key_bindings WHERE node_id = ?", (str(node),)
                 ).fetchone()[0]
