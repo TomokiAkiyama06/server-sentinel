@@ -64,6 +64,9 @@ import sys
 from urllib.parse import quote
 from uuid import UUID
 
+from app.cameras.uvc.persistence import ApprovalStore
+from app.detection.owner import store as owner_store
+
 
 FORMAT = "server-sentinel-lifecycle-inventory"
 FORMAT_VERSION = 1
@@ -288,31 +291,32 @@ def _keyed(salt: str, value: object) -> str:
     return hmac.new(bytes.fromhex(salt), message.encode(), hashlib.sha256).hexdigest()
 
 
-_STRONG_IDENTITY = ("vendor", "product", "serial", "interface")
-# identity.DeviceEvidence.live_instance_key: the only identity of a camera
-# without a serial, or of one whose serial several connected cameras share.
-_LIVE_INSTANCE_IDENTITY = ("vendor", "product", "serial", "interface", "topology",
-                           "device_path", "device_number", "instance_token")
+UNREADABLE_APPROVAL = "unreadable"
 
 
 def _approval_digest(row, salt: str) -> str:
     """A keyed digest of the durable UVC approval, never the device facts.
 
-    It covers the identity identity.same_physical_camera() compares and the
-    durable latch flags. A unique serial binds by its strong key (vendor,
-    product, serial, interface), so a new device node or port is the same
-    camera. Without a serial, or when the serial is ambiguous, only the live
-    instance names the camera, so its node, topology, device number and
-    instance marker are covered too and a swap to another same-model camera
-    is a change. By-id aliases, advertised formats and the session token are
-    mutable or per-session and excluded.
+    The stored evidence is parsed exactly as ApprovalStore._state() restores
+    it (every required key, DeviceEvidence validation), so evidence the
+    service could not load raises instead of hashing. The digest covers the
+    identity identity.same_physical_camera() compares and the durable latch
+    flags: a unique serial binds by its strong key (vendor, product, serial,
+    interface), so a new device node or port is the same camera; without a
+    serial, or when the serial is ambiguous, only the live instance names the
+    camera, so its node, topology, device number and instance marker are
+    covered and a swap to another same-model camera is a change. By-id
+    aliases, advertised formats and the session token are mutable or
+    per-session and excluded.
     """
-    evidence = json.loads(row["evidence"])
-    ambiguous = bool(row["serial_ambiguous"])
-    strong = bool(evidence.get("serial") and evidence.get("vendor") and evidence.get("product"))
-    fields = _STRONG_IDENTITY if strong and not ambiguous else _LIVE_INSTANCE_IDENTITY
-    return _keyed(salt, ["uvc-approval-v2", [evidence.get(key) for key in fields],
-                         bool(row["requires_approval"]), ambiguous])
+    state = ApprovalStore._state(
+        (row["evidence"], row["requires_approval"], None, row["serial_ambiguous"], 0))
+    evidence = state.approved
+    identity = (evidence.strong_key
+                if evidence.strong_key is not None and not state.serial_ambiguous
+                else evidence.live_instance_key)
+    return _keyed(salt, ["uvc-approval-v3", list(identity), state.requires_approval,
+                         state.serial_ambiguous])
 
 
 def _sources(connection, tables, salt: str) -> dict | None:
@@ -326,8 +330,9 @@ def _sources(connection, tables, salt: str) -> dict | None:
                 "FROM uvc_approvals"):
             try:
                 approvals[row["source_id"]] = _approval_digest(row, salt)
-            except (ValueError, TypeError, AttributeError):
-                approvals[row["source_id"]] = "unreadable"
+            except (ValueError, TypeError, KeyError, AttributeError):
+                # Never comparable as preserved; see compare().
+                approvals[row["source_id"]] = UNREADABLE_APPROVAL
     bindings = {}
     if "detection_bindings" in tables:
         for row in connection.execute(
@@ -356,7 +361,7 @@ def _registry_settings(connection, tables) -> dict | None:
     return {"max_active_video_sources": None if row is None else row[0]}
 
 
-def _owner_template(root: Path | None, salt: str) -> dict:
+def _owner_template(root: Path | None, salt: str, owner: int) -> dict:
     """The separate private Owner-template store, as digests only.
 
     Records whether the store was configured for this run and whether its
@@ -364,16 +369,33 @@ def _owner_template(root: Path | None, salt: str) -> dict:
     enrollment generation and enrolled flag; keyed digests of the template
     and its model provenance (never the template bytes or any embedding);
     and per-row / chained evidence over owner_template_audit.
+
+    The store is accepted only under the filesystem invariants
+    OwnerTemplateStore enforces, checked by the store's own
+    open_private_root() against ``owner`` (the service account owning the
+    state database; this tool usually runs as root). A layout that would
+    expose the biometric template is recorded as ``unsafe`` and never read.
     """
     if root is None:
         return {"configured": False}
-    database = _absolute(root, "owner template root") / "owner-template.sqlite3"
-    if not os.path.lexists(database):
-        return {"configured": True, "state": "absent"}
+    root = _absolute(root, "owner template root")
     try:
-        connection = _connect_read_only(database)
+        descriptor, exists = owner_store.open_private_root(root, owner=owner)
+    except FileNotFoundError:
+        return {"configured": True, "state": "absent"}
+    except (OSError, owner_store.OwnerError):
+        return {"configured": True, "state": "unsafe"}
+    try:
+        if not exists:
+            return {"configured": True, "state": "absent"}
+        # Bound to the verified directory, so no component can be swapped
+        # between the check and the open.
+        connection = _connect_read_only(
+            Path(f"/proc/self/fd/{descriptor}/owner-template.sqlite3"))
     except InventoryError:
         raise InventoryError("owner template database is unavailable") from None
+    finally:
+        os.close(descriptor)
     try:
         connection.execute("BEGIN")
         tables = _tables(connection)
@@ -401,12 +423,28 @@ def _owner_template(root: Path | None, salt: str) -> dict:
         connection.close()
 
 
+def _compare_sources(baseline: dict | None, current: dict | None) -> dict:
+    """Keyed comparison; approval evidence the service cannot load never passes."""
+    result = _compare_keyed(baseline, current)
+    current = current or {}
+    for key in list(result["preserved"]):
+        if current[key].get("uvc_approval_sha256") == UNREADABLE_APPROVAL:
+            result["preserved"].remove(key)
+            result["failed"].append({"id": key, "reason": "unreadable_approval_evidence"})
+    if result["status"] != "empty":
+        result["status"] = "failed" if result["failed"] else "preserved"
+    return result
+
+
 def _compare_owner_template(baseline: dict | None, current: dict | None) -> dict:
     baseline = baseline or {"configured": False}
     current = current or {"configured": False}
     if not baseline["configured"] and not current["configured"]:
         return {"status": "not_configured", "failed": []}
-    failed = [{"id": key, "reason": "changed"}
+    # An unsafe layout exposes the template: never preserved, even unchanged.
+    unsafe = "unsafe" in (baseline.get("state"), current.get("state"))
+    failed = [{"id": "state", "reason": "unsafe"}] if unsafe else []
+    failed += [{"id": key, "reason": "changed"}
               for key in ("configured", "state", "generation", "enrolled",
                           "template_digest", "provenance_digest")
               if baseline.get(key) != current.get(key)]
@@ -540,7 +578,8 @@ def collect(runtime_root: Path, *, salt: str | None = None,
         raise InventoryError("state database could not be read") from None
     finally:
         connection.close()
-    inventory["owner_template"] = _owner_template(owner_template_root, salt)
+    inventory["owner_template"] = _owner_template(
+        owner_template_root, salt, os.lstat(tree.database).st_uid)
     inventory["inventory_salt"] = salt
     inventory["coverage"] = _coverage(inventory)
     inventory["not_applicable"] = dict(NOT_APPLICABLE)
@@ -783,8 +822,8 @@ def compare(baseline: dict, current: dict, *, declared_rewrites=()) -> dict:
             baseline["audit"].get("presence"), current["audit"].get("presence")),
         "audit_storage_state": _compare_audit(
             baseline["audit"].get("storage_state"), current["audit"].get("storage_state")),
-        "camera_sources": _compare_keyed(baseline.get("camera_sources"),
-                                         current.get("camera_sources")),
+        "camera_sources": _compare_sources(baseline.get("camera_sources"),
+                                           current.get("camera_sources")),
         "camera_registry_settings": _compare_keyed(
             baseline.get("camera_registry_settings"), current.get("camera_registry_settings")),
         "owner_template": _compare_owner_template(baseline.get("owner_template"),

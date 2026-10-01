@@ -220,6 +220,8 @@ class LifecycleInventoryTests(unittest.TestCase):
                     connection.execute(
                         "INSERT INTO owner_template_audit(at, actor, operation, generation) "
                         "VALUES ('2026-01-01T00:00:00+00:00', 'owner', ?, 1)", (operation,))
+        # OwnerTemplateStore creates the database 0600 in a 0700 root.
+        os.chmod(root / "owner-template.sqlite3", 0o600)
         return root
 
     def verify(self, baseline: Path, *extra: str) -> tuple[int, dict, str]:
@@ -599,6 +601,79 @@ class LifecycleInventoryTests(unittest.TestCase):
         code, report, _ = self.verify(unconfigured)
         self.assertEqual(code, inventory.EXIT_PRESERVED)
         self.assertEqual(report["sections"]["owner_template"]["status"], "not_configured")
+
+    def test_unloadable_uvc_approval_evidence_is_never_preserved(self):
+        # ApprovalStore._state() refuses evidence without by_id / formats, with
+        # unknown keys or invalid values; the service cannot restore such an
+        # approval, so the inventory must not call it preserved.
+        self.runtime.seed()
+        valid = {"device_path": "/dev/synthetic-node", "vendor": "1d6b", "product": "0102",
+                 "serial": "synthetic-serial", "interface": "0", "by_id": [],
+                 "topology": None, "formats": ["MJPG"], "device_number": 3,
+                 "instance_token": None}
+        broken = {
+            "no-by-id": {key: value for key, value in valid.items() if key != "by_id"},
+            "no-formats": {key: value for key, value in valid.items() if key != "formats"},
+            "unknown-key": {**valid, "extra": 1},
+            "empty-vendor": {**valid, "vendor": ""},
+        }
+        ids = {}
+        for label, evidence in {"valid": valid, **broken}.items():
+            ids[label] = self.runtime.source()
+            self.runtime.execute(
+                "INSERT INTO uvc_approvals (source_id, evidence, requires_approval, "
+                "session_token, serial_ambiguous, explicit_binding) VALUES (?, ?, 0, NULL, 0, 0)",
+                (ids[label], json.dumps(evidence)))
+        ids["not-json"] = self.runtime.source()
+        self.runtime.execute(
+            "INSERT INTO uvc_approvals (source_id, evidence, requires_approval, session_token, "
+            "serial_ambiguous, explicit_binding) VALUES (?, '{', 0, NULL, 0, 0)",
+            (ids["not-json"],))
+        _, baseline = self.record()
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_FAILED)
+        section = report["sections"]["camera_sources"]
+        self.assertIn(ids["valid"], section["preserved"])
+        for label in (*broken, "not-json"):
+            self.assertIn({"id": ids[label], "reason": "unreadable_approval_evidence"},
+                          section["failed"])
+            self.assertNotIn(ids[label], section["preserved"])
+
+    def test_owner_template_store_with_unsafe_layout_is_never_preserved(self):
+        # The store's own invariants: private root, 0600 single-link regular
+        # database owned by the service account, never a symlink.
+        self.runtime.seed()
+        option = ("--owner-template-root", str(self.base / "owner-template"))
+        root = self.owner_template_root(template=b"synthetic-owner-template-marker")
+        database = root / "owner-template.sqlite3"
+
+        def unsafe_verify(label):
+            _, baseline = self.record(f"{label}.json", *option)
+            code, report, _ = self.verify(baseline, *option)
+            self.assertEqual(code, inventory.EXIT_FAILED, label)
+            self.assertIn({"id": "state", "reason": "unsafe"},
+                          report["sections"]["owner_template"]["failed"], label)
+            recorded = json.loads((self.notes / f"{label}.json").read_text())
+            self.assertEqual(recorded["owner_template"],
+                             {"configured": True, "state": "unsafe"}, label)
+        os.chmod(database, 0o644)
+        unsafe_verify("readable-database")
+        os.chmod(database, 0o600)
+        os.chmod(root, 0o750)
+        unsafe_verify("group-root")
+        os.chmod(root, 0o700)
+        os.link(database, self.base / "second-link")
+        unsafe_verify("hard-link")
+        (self.base / "second-link").unlink()
+        moved = self.base / "elsewhere.sqlite3"
+        database.rename(moved)
+        database.symlink_to(moved)
+        unsafe_verify("symlink")
+        database.unlink()
+        moved.rename(database)
+        _, baseline = self.record("safe.json", *option)
+        code, _, _ = self.verify(baseline, *option)
+        self.assertEqual(code, inventory.EXIT_PRESERVED)
 
     def test_grant_and_revocation_state_is_preserved_by_logical_id(self):
         seeded = self.runtime.seed()

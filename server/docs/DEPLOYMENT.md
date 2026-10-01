@@ -322,7 +322,14 @@ sudo /opt/server-sentinel-main/current/venv/bin/python -I -m app.lifecycle_inven
 When the deployment configures the separate private Owner-template store, add
 `--owner-template-root <owner-template-root>` to both commands. A baseline
 recorded with it fails a verification run without it (and the reverse), and
-the store database appearing or disappearing is a change.
+the store database appearing or disappearing is a change. The tool accepts the
+store only under the layout the store itself enforces (every path component
+unsubstitutable, a root with no group/other access and a single-link regular
+`0600` database, never a symlink, both owned by the service account that owns
+the state database); any other layout is recorded as `unsafe`, is not read and
+always fails verification. Likewise a camera source whose stored UVC approval
+evidence the service could not load always fails as
+`unreadable_approval_evidence`.
 
 When the rolled-back release predates this tool, run the same commands with
 the newer release's interpreter under `releases/<version>/venv/bin/python`;
