@@ -475,6 +475,34 @@ class ProcSocketOwners:
         return {inode: frozenset(owners) for inode, owners in found.items()}
 
 
+class OwnSocketInodes:
+    """Socket inodes this process holds, from ``/proc/self/fd``.
+
+    A process can always read its own fd table, so the human upstream check
+    needs no privilege (unlike ``ProcSocketOwners`` for other accounts). A
+    socket on the upstream endpoint that is not among these is another
+    process's, whoever owns it; this process's own sockets are not inherited by
+    children (Python creates non-inheritable descriptors).
+    """
+
+    def __init__(self, proc_self: str = "/proc/self"):
+        if not isinstance(proc_self, str) or not proc_self.startswith("/"):
+            raise ValueError("INVALID_PROC_ROOT")
+        self._fd = os.path.join(proc_self, "fd")
+
+    def __call__(self) -> frozenset:
+        inodes = set()
+        for fd in os.listdir(self._fd):
+            try:
+                target = os.readlink(os.path.join(self._fd, fd))
+            except FileNotFoundError:
+                continue  # closed since the listing (including the listing's own)
+            match = re.fullmatch(r"socket:\[(\d{1,20})\]", target)
+            if match:
+                inodes.add(int(match.group(1)))
+        return frozenset(inodes)
+
+
 # -- Tailscale Serve status -------------------------------------------------
 
 def _no_duplicates(pairs):
@@ -759,12 +787,15 @@ def excepted_inodes(config: ReservationConfig, listeners, exceptions: frozenset)
 
 def evaluate(config: ReservationConfig, listeners, routes,
              exceptions: frozenset = frozenset(),
-             resolved=None, owners=None) -> tuple[tuple[Reason, ...], int, int]:
+             resolved=None, owners=None, own_inodes=None) -> tuple[tuple[Reason, ...], int, int]:
     """Pure comparison. ``listeners``/``routes``/``resolved``/``owners`` are values or a ``Reason``.
 
     ``owners`` maps socket inodes to their ``SocketOwner``s; an excepted
     endpoint passes only when its socket has a known inode and every owner
     matches the exception (``None`` or a ``Reason``: none verified).
+    ``own_inodes`` are the sockets this process holds: the human upstream
+    passes only as one of them (a ``Reason``: unverifiable; ``None`` skips the
+    ownership comparison, for pure endpoint evaluation only).
 
     ``resolved`` is the hostname's current address set (``None``: the
     configured set). Listeners are checked against the union with the
@@ -800,6 +831,12 @@ def evaluate(config: ReservationConfig, listeners, routes,
             if normalized == config.human_listener:
                 if seen_human:
                     unexpected_listeners += 1
+                elif own_inodes is not None:
+                    if isinstance(own_inodes, Reason) or not listener.inode:
+                        unverified += 1
+                    elif listener.inode not in own_inodes:
+                        # A single replacement: another process's socket on the upstream.
+                        unexpected_listeners += 1
                 seen_human = True
                 continue
             # A wildcard bind answers on every address, the reserved ones
@@ -891,6 +928,7 @@ class HostnameReservationCheck:
                  session_revoker: SessionRevoker | None = None,
                  resolver: AddressResolver | None = None,
                  socket_owners: SocketOwnerResolver | None = None,
+                 own_sockets: Callable[[], frozenset] | None = OwnSocketInodes(),
                  timeout: float = ENUMERATION_TIMEOUT_SECONDS,
                  retry_seconds: float = RETRY_WHILE_CLOSED_SECONDS,
                  monotonic: Callable[[], float] = time.monotonic,
@@ -936,6 +974,8 @@ class HostnameReservationCheck:
         # Without it no excepted listener's owner can be verified, so any
         # listener an exception would cover closes access.
         self._socket_owners = socket_owners
+        # Without it the human upstream's owner is unverifiable and access stays closed.
+        self._own_sockets = own_sockets
         self._exceptions_reason = Reason.LISTENER_EXCEPTIONS_UNREADABLE
         self._revocation_required = False
         # True once the requirement is durable: the marker was written, or the
@@ -1098,6 +1138,13 @@ class HostnameReservationCheck:
             return error_reason
         return value
 
+    def _enumerate_own(self):
+        if not callable(self._own_sockets):
+            return Reason.LISTENER_OWNER_UNVERIFIED
+        value = self._enumerate("own-sockets", lambda: tuple(self._own_sockets()),
+                                Reason.LISTENER_OWNER_UNVERIFIED, Reason.LISTENER_OWNER_UNVERIFIED, int)
+        return value if isinstance(value, Reason) else frozenset(value)
+
     def _enumerate_owners(self, inodes: frozenset):
         previous = self._inflight.get("owners")
         if previous is not None and previous.is_alive():
@@ -1154,8 +1201,9 @@ class HostnameReservationCheck:
             inodes = excepted_inodes(self.config, listeners, self._exceptions)
             if inodes and self._socket_owners is not None:
                 owners = self._enumerate_owners(inodes)
+            own = self._enumerate_own()
             reasons, extra_listeners, extra_routes = evaluate(self.config, listeners, routes,
-                                                              self._exceptions, resolved, owners)
+                                                              self._exceptions, resolved, owners, own)
         except Exception:
             reasons, extra_listeners, extra_routes = (Reason.LISTENER_ENUMERATION_UNAVAILABLE,), 0, 0
         if not self._exceptions_loaded:

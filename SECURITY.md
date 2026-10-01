@@ -339,6 +339,9 @@ The current contract for that check (Owner decisions 2026-09-30 and
   Another or unverifiable holder is an exposure; a missing recorded socket
   closes access without revocation until it returns. Until #126 lands, a
   root-owned proxy's sockets keep human access closed.
+- The loopback human upstream must be a socket the ServerSentinel process
+  itself holds (checked in its own `/proc/self/fd`, without privilege); a
+  replacement bound by another process is an exposure.
 
 ## Shared Tailnet account
 

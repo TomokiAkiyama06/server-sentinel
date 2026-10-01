@@ -18,7 +18,7 @@ from app.audit import (
 )
 from app.audit.integration import RESERVATION_LISTENER_EXCEPTIONS_ID, ReservationAdministration
 from app.auth.reservation import (
-    DAILY_SECONDS, AddressFamily, CheckKind, GetaddrinfoResolver, ProcSocketOwners, ProcessIdentity, SocketOwner, HostnameReservationCheck, IsolationMode, Listener, ListenerException,
+    DAILY_SECONDS, AddressFamily, CheckKind, GetaddrinfoResolver, OwnSocketInodes, ProcSocketOwners, ProcessIdentity, SocketOwner, HostnameReservationCheck, IsolationMode, Listener, ListenerException,
     RETRY_WHILE_CLOSED_SECONDS, ProcNetListeners, ProxyRoute, Reason, ReservationConfig,
     ReservationEnumerationError,
     ReservationFault, RouteKind, ServeStatusRoutes, TransportProtocol, evaluate, parse_proc_net_tcp,
@@ -193,6 +193,8 @@ def checker(files=None, status=None, sink=None, cfg=None, clock=None, **kwargs):
     sink = sink if sink is not None else Sink()
     kwargs.setdefault("resolver", Resolver())
     kwargs.setdefault("socket_owners", Owners())
+    # Synthetic rows number their inodes from 1000; this process holds the upstream.
+    kwargs.setdefault("own_sockets", lambda: frozenset(range(1000, 1100)))
     kwargs.setdefault("session_revoker", FakeRevoker())
     check = HostnameReservationCheck(
         cfg or config(), ProcNetListeners(files, byteorder="little"), ServeStatusRoutes(status), sink,
@@ -1585,3 +1587,56 @@ class ProxyListenerOwnershipTests(TestCase):
                      proxy_owner=ProcessIdentity(executable="/usr/sbin/tailscaled"))
         check, *_ = checker(files=self.files(v6=False), cfg=cfg, socket_owners=Owners(TAILSCALED_OWNER))
         self.assertTrue(check.startup().open)
+
+
+class HumanListenerOwnershipTests(TestCase):
+    """The loopback upstream must be a socket this ServerSentinel process holds."""
+
+    def test_own_socket_opens(self):
+        check, *_ = checker(own_sockets=lambda: frozenset({1000}))
+        self.assertTrue(check.startup().open)
+
+    def test_single_replacement_is_an_exposure(self):
+        # One row only (no SO_REUSEPORT duplicate), but not this process's socket.
+        revoker = FakeRevoker()
+        check, _, _, sink = checker(own_sockets=lambda: frozenset({4242}), session_revoker=revoker)
+        self.assertEqual(check.startup().reasons, (Reason.UNEXPECTED_LISTENER,))
+        self.assertEqual(sink.events[-1].unexpected_listeners, 1)
+        self.assertTrue(revoker.pending)
+
+    def test_unverifiable_own_sockets_are_an_exposure(self):
+        release = threading.Event()
+        self.addCleanup(release.set)
+
+        def hung():
+            release.wait(5)
+            return frozenset({1000})
+
+        def fails():
+            raise OSError("synthetic /proc/self/fd failure")
+
+        for name, kwargs in {"fails": dict(own_sockets=fails), "hangs": dict(own_sockets=hung, timeout=0.05),
+                             "bad value": dict(own_sockets=lambda: {"1000"}),
+                             "none": dict(own_sockets=None)}.items():
+            with self.subTest(name):
+                revoker = FakeRevoker()
+                check, *_ = checker(session_revoker=revoker, **kwargs)
+                self.assertEqual(check.startup().reasons, (Reason.LISTENER_OWNER_UNVERIFIED,))
+                self.assertTrue(revoker.pending)
+
+    def test_unknown_inode_is_unverified(self):
+        reasons, count, _ = evaluate(config(), (Listener(HUMAN.address, HUMAN.port, inode=0),),
+                                     (config().expected_route,), own_inodes=frozenset({0}))
+        self.assertEqual(reasons, (Reason.LISTENER_OWNER_UNVERIFIED,))
+        self.assertEqual(count, 1)
+
+    def test_proc_self_fd_reader(self):
+        with TemporaryDirectory() as directory:
+            fd = Path(directory) / "fd"
+            fd.mkdir()
+            (fd / "3").symlink_to("socket:[1234]")
+            (fd / "4").symlink_to("/dev/null")
+            (fd / "5").symlink_to("socket:[99]")
+            self.assertEqual(OwnSocketInodes(directory)(), frozenset({1234, 99}))
+            with self.assertRaises(OSError):
+                OwnSocketInodes(directory + "/missing")()

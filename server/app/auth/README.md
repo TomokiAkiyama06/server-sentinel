@@ -171,6 +171,14 @@ following closes it:
   `UNEXPECTED_LISTENER` and an unverifiable one as `LISTENER_OWNER_UNVERIFIED`
   (both exposures). Connected UDP client sockets answer only their peer and are
   not counted;
+- a loopback human upstream that is not a socket of this ServerSentinel
+  process: each check reads its own `/proc/self/fd` (`OwnSocketInodes`, the
+  injected `own_sockets`), which needs no privilege and no #126 helper. A
+  single replacement bound by another process after the upstream released the
+  endpoint (no `SO_REUSEPORT` duplicate row) counts as `UNEXPECTED_LISTENER`;
+  an unreadable own fd table, a socket without an inode, or no `own_sockets`
+  counts as `LISTENER_OWNER_UNVERIFIED`; both are exposures. Python creates
+  non-inheritable descriptors, so a child process does not share the socket;
 - a recorded proxy socket that is absent (`PROXY_LISTENER_MISSING`). This is
   proxy drift or failure with nothing else seen answering, so, like a
   resolution failure, it closes access without revocation and reopens once

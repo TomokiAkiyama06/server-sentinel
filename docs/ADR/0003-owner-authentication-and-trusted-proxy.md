@@ -470,5 +470,9 @@ socket is verified the same way: it must be present and held only by the
 recorded proxy process (for example `tailscaled.service`); another holder or
 an unverifiable one is an exposure, while a missing recorded socket only
 keeps access closed, without revocation, until it returns. Until #126 exists,
-a root-owned proxy's sockets cannot be verified and keep access closed. This is still detection: it bounds how long an exposed
+a root-owned proxy's sockets cannot be verified and keep access closed. The
+loopback human upstream is checked against the ServerSentinel process's own
+descriptors, which it can always read: a replacement bound by another process
+is an exposure. The missing-proxy-socket handling was accepted by the Owner
+on 2026-10-01. This is still detection: it bounds how long an exposed
 cookie stays usable, and does not prevent the exposure.

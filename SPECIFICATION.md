@@ -1417,8 +1417,14 @@ An Owner listener exception covers a wildcard system listener only by port
 plus owning executable or systemd unit, verified on every check through the
 socket's owning processes; another or unverifiable owner is an exposure
 reason, and stored port-only exceptions fail closed until re-entered (Owner
-decision, 2026-10-01). A check without a durable session revoker never opens
-access.
+decision, 2026-10-01). Each recorded proxy socket requires a recorded proxy
+process identity (`proxy_owner`) and must be present and held by that process
+alone: a missing recorded socket keeps access closed without revocation, and
+another or unverifiable holder is an exposure (Owner decision, 2026-10-01).
+The loopback human upstream passes only as a socket in the ServerSentinel
+process's own `/proc/self/fd`; a single replacement bound by any other
+process is an exposure, and an unreadable own fd table keeps access closed as
+an exposure. A check without a durable session revoker never opens access.
 That bounds the exposure window rather
 than preventing the bind: a process that binds between two checks receives
 credentials and cookies for that origin until the next check.

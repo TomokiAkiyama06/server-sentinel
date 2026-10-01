@@ -1716,6 +1716,13 @@ by the Issue #6 synthetic policy model.
   disposable copy holding a version 1 (port-only) stored exception, confirm
   startup reports `LISTENER_EXCEPTIONS_OUTDATED` and access stays closed until
   the Owner re-enters the exception with its owner.
+- Human upstream ownership (mock-only so far): with the check composed in the
+  running service, confirm access opens and that the upstream's inode in
+  `ss -ltne 'sport = :8080'` appears in `/proc/<service pid>/fd`. On a
+  disposable node, stop the upstream only (keep the check running), bind
+  another process to the same loopback address and port (one socket, no
+  `SO_REUSEPORT`), and confirm `UNEXPECTED_LISTENER` closes access and that
+  reopening revokes every human session.
 - Proxy socket ownership (mock-only so far): record whether `tailscaled`
   holds a visible socket on the Tailscale address at the origin port (`sudo ss
   -ltnp`); if it does, record its executable and unit (`readlink
