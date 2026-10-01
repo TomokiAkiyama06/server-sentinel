@@ -412,7 +412,9 @@ hand and re-record the baseline; one-way security state: pairing credentials and
 once revoked stay revoked, the active capture-node credential material
 (keyed digests of the public key and credential serial digests, and its
 expiry) changes only by promotion of the renewal staged at record time (whose
-key must then be bound to that node) or by a fresh pairing activation (an
+key must then be bound to that node by a live, unrevoked binding, as for a
+fresh pairing or a re-staged key; an active credential whose key binding is
+revoked always fails) or by a fresh pairing activation (an
 enrollment activated after the record, identified by its enrollment ID:
 either one pending or consumed at record time with the same node and key, or
 a new one whose key was neither bound nor activated at record time; an

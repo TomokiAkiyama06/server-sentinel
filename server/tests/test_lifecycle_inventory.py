@@ -1397,6 +1397,67 @@ class LifecycleInventoryTests(unittest.TestCase):
         code, report, _ = self.verify(baseline)
         self.assertEqual(code, inventory.EXIT_PRESERVED, report["sections"]["security_state"])
 
+    def test_credential_changes_require_a_live_key_binding(self):
+        # Codex P1: _bind_key() refuses a revoked binding and revoke() revokes
+        # bindings and credential together, so an active credential over a
+        # revoked binding (allowed 0 -> 1 on its own) is never a ledger state.
+        self.runtime.seed()
+        nodes = {}
+        for index, label in enumerate(("promoted", "repaired", "restaged", "unchanged")):
+            key = f"{index}a".ljust(64, "0")
+            nodes[label] = node = self._paired_node(key, "c" * 64)
+            self.runtime.execute("INSERT INTO pairing_key_bindings VALUES (?, ?, 0)", (key, node))
+        for label in ("promoted", "restaged"):
+            staged = f"{label}".encode().hex().ljust(64, "0")
+            self.runtime.execute("INSERT INTO pairing_key_bindings VALUES (?, ?, 0)",
+                                 (staged, nodes[label]))
+            self.runtime.execute("INSERT INTO pairing_node_renewals VALUES (?, ?, ?, 20.0)",
+                                 (nodes[label], staged, "d" * 64))
+        _, baseline = self.record()
+        # Promotion of the staged renewal, but its binding is revoked.
+        self.runtime.execute(
+            "UPDATE pairing_node_credentials SET public_key_digest=(SELECT public_key_digest "
+            "FROM pairing_node_renewals WHERE node_id=?), credential_serial_digest=?, "
+            "not_after=20.0 WHERE node_id=?", (nodes["promoted"], "d" * 64, nodes["promoted"]))
+        self.runtime.execute(
+            "UPDATE pairing_key_bindings SET revoked=1 WHERE public_key_digest=(SELECT "
+            "public_key_digest FROM pairing_node_renewals WHERE node_id=?)", (nodes["promoted"],))
+        self.runtime.execute("DELETE FROM pairing_node_renewals WHERE node_id=?",
+                             (nodes["promoted"],))
+        # A fresh pairing whose new key binding is revoked.
+        fresh = "e" * 64
+        self.runtime.execute("INSERT INTO pairing_key_bindings VALUES (?, ?, 1)",
+                             (fresh, nodes["repaired"]))
+        self._activated(nodes["repaired"], fresh)
+        self.runtime.execute("UPDATE pairing_node_credentials SET public_key_digest=? "
+                             "WHERE node_id=?", (fresh, nodes["repaired"]))
+        # Re-staged onto a newly bound but revoked key.
+        restaged = "9" * 64
+        self.runtime.execute("INSERT INTO pairing_key_bindings VALUES (?, ?, 1)",
+                             (restaged, nodes["restaged"]))
+        self.runtime.execute("UPDATE pairing_node_renewals SET public_key_digest=? "
+                             "WHERE node_id=?", (restaged, nodes["restaged"]))
+        # The active credential's own binding revoked without revoking it.
+        self.runtime.execute("UPDATE pairing_key_bindings SET revoked=1 WHERE public_key_digest=?",
+                             ("3a".ljust(64, "0"),))
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_FAILED)
+        self.assertEqual(sorted(report["sections"]["security_state"]["failed"],
+                                key=lambda item: (item["id"], item["reason"])),
+                         sorted([{"id": f"pairing_credentials:{nodes['promoted']}",
+                                  "reason": "changed"},
+                                 {"id": f"pairing_credentials:{nodes['promoted']}",
+                                  "reason": "binding_revoked"},
+                                 {"id": f"pairing_credentials:{nodes['repaired']}",
+                                  "reason": "changed"},
+                                 {"id": f"pairing_credentials:{nodes['repaired']}",
+                                  "reason": "binding_revoked"},
+                                 {"id": f"pairing_renewals:{nodes['restaged']}",
+                                  "reason": "changed"},
+                                 {"id": f"pairing_credentials:{nodes['unchanged']}",
+                                  "reason": "binding_revoked"}],
+                                key=lambda item: (item["id"], item["reason"])))
+
     def test_a_staged_renewal_is_never_restaged_onto_a_superseded_key(self):
         # Codex P1: stage_renewal() accepts a key already bound to the node
         # only as a retry of the currently staged key.

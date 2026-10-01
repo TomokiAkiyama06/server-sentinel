@@ -749,7 +749,12 @@ def _compare_security_state(baseline: dict | None, current: dict | None) -> dict
                 activations.add(pair)
 
     def bound_here(node, key_ref):
-        return (bindings.get(key_ref) or {}).get("node_id") == node
+        # _bind_key() refuses a revoked binding, and PairingLedger.revoke()
+        # revokes the bindings together with the credential and drops any
+        # staged renewal, so only a live binding to this node justifies a
+        # promotion, a fresh pairing or a re-staged key.
+        binding = bindings.get(key_ref) or {}
+        return binding.get("node_id") == node and binding.get("revoked") is False
 
     def reactivated(node, after):
         # PairingLedger.activate(): a fresh pairing installs a new identity
@@ -793,6 +798,11 @@ def _compare_security_state(baseline: dict | None, current: dict | None) -> dict
                         and bound_here(key, renewal["key_ref"]))
             if not (promoted or reactivated(key, after)):
                 failed.append({"id": f"pairing_credentials:{key}", "reason": "changed"})
+    # Consistency: the service never leaves an active credential over a
+    # revoked key binding (revoke() changes both in one transaction).
+    for key, after in sorted(credentials.items()):
+        if not after["revoked"] and (bindings.get(after["key_ref"]) or {}).get("revoked"):
+            failed.append({"id": f"pairing_credentials:{key}", "reason": "binding_revoked"})
     now = bindings
     for key, binding in (baseline.get("pairing_key_bindings") or {}).items():
         if key not in now:
