@@ -449,7 +449,7 @@ def _valid_growth(base: dict, now: dict) -> bool:
     now_segments = {item["segment_id"]: item for item in now["segments"]}
     if not all(now_segments.get(item["segment_id"]) == item for item in base["segments"]):
         return False
-    return _appended_markers_valid(base, now, remaining)
+    return _appended_publications_valid(base, now, remaining)
 
 
 def _expected_ended(now: dict) -> int | None:
@@ -467,12 +467,15 @@ def _expected_ended(now: dict) -> int | None:
     return min(now["target_end_ms"], max(item["end_ms"] for item in now["segments"]))
 
 
-def _appended_markers_valid(base: dict, now: dict, remaining: Counter) -> bool:
-    """Whether every marker absent from the record matches a store publication.
+def _appended_publications_valid(base: dict, now: dict, remaining: Counter) -> bool:
+    """Whether newly linked segments and markers match store publications.
 
-    RecordingStore._publish() adds one marker per linked recording while
-    publishing a segment that does not continue the source cursor (another
-    stream_id, or a sequence other than the cursor's plus one):
+    RecordingStore.append() refuses a segment that starts before the source
+    cursor ends or repeats / rewinds the cursor's sequence on the same stream
+    (RECORDING_TIMELINE_REGRESSION), so every new segment follows every
+    recorded one. RecordingStore._publish() adds one marker per linked
+    recording while publishing a segment that does not continue the source
+    cursor (another stream_id, or a sequence other than the cursor's plus one):
     ('stream_discontinuity', cursor end, new segment start). The recording
     already linked a recorded segment, so that cursor is the linked segment
     published just before the new one. Such a marker always overlaps the
@@ -480,11 +483,17 @@ def _appended_markers_valid(base: dict, now: dict, remaining: Counter) -> bool:
     """
     recorded = {item["segment_id"] for item in base["segments"]}
     ordered = sorted(now["segments"], key=lambda item: (item["start_ms"], item["end_ms"]))
+    first_new = next((index for index, item in enumerate(ordered)
+                      if item["segment_id"] not in recorded), len(ordered))
+    if first_new == 0 or any(item["segment_id"] in recorded for item in ordered[first_new:]):
+        return False
     allowed: Counter = Counter()
-    for prior, segment in zip(ordered, ordered[1:]):
-        if segment["segment_id"] in recorded:
-            continue
-        contiguous = (segment["catalog"]["stream_id"] == prior["catalog"]["stream_id"]
+    for prior, segment in zip(ordered[first_new - 1:], ordered[first_new:]):
+        same_stream = segment["catalog"]["stream_id"] == prior["catalog"]["stream_id"]
+        if segment["start_ms"] < prior["end_ms"] or (
+                same_stream and segment["catalog"]["sequence"] <= prior["catalog"]["sequence"]):
+            return False
+        contiguous = (same_stream
                       and segment["catalog"]["sequence"] == prior["catalog"]["sequence"] + 1)
         if not contiguous:
             allowed[(prior["end_ms"], segment["start_ms"], "stream_discontinuity")] += 1

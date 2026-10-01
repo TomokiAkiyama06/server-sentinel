@@ -814,6 +814,38 @@ class LifecycleInventoryTests(unittest.TestCase):
         for label in labels[2:]:
             self.assertIn({"id": ids[label], "reason": "changed"}, section["failed"])
 
+    def test_in_progress_growth_rejects_timeline_regressions(self):
+        # RecordingStore.append() refuses RECORDING_TIMELINE_REGRESSION: a
+        # segment starting before the cursor ends, or repeating / rewinding
+        # the cursor's sequence on the same stream. Such growth is not valid,
+        # with or without a marker.
+        self.runtime.seed()
+        # (An exact repeat is already refused by UNIQUE(source, stream, sequence).)
+        labels = ("advances", "rewound", "rewound-marked", "overlaps", "earlier")
+        ids = {}
+        for label in labels:
+            ids[label] = self.runtime.recording(
+                starred=False, payload=b"generated-" + label.encode(),
+                status="active", target_end_ms=30000)
+            self.runtime.add_segment(ids[label], b"generated-later-" + label.encode(),
+                                     start_ms=12000, end_ms=20000, stream_id="t", sequence=7)
+        _, baseline = self.record()
+        appended = {"advances": (22000, 26000, 8), "rewound": (20000, 26000, 6), "rewound-marked": (22000, 26000, 3),
+                    "overlaps": (19000, 26000, 8), "earlier": (10000, 11000, 8)}
+        for label, (start, end, sequence) in appended.items():
+            self.runtime.add_segment(ids[label], b"generated-new-" + label.encode(),
+                                     start_ms=start, end_ms=end, stream_id="t",
+                                     sequence=sequence)
+        self.runtime.execute(
+            "INSERT INTO recording_discontinuities VALUES (?, 20000, 22000, "
+            "'stream_discontinuity')", (ids["rewound-marked"],))
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_FAILED)
+        section = report["sections"]["recordings"]
+        self.assertEqual(section["in_progress_at_record"], [ids["advances"]])
+        for label in labels[1:]:
+            self.assertIn({"id": ids[label], "reason": "changed"}, section["failed"])
+
     def test_in_progress_ended_boundary_is_status_specific(self):
         # finish() always ends complete / gapped rows at target_end_ms; only
         # startup recovery ends 'interrupted' rows at the latest linked media.
