@@ -401,7 +401,9 @@ behind it now); each release is listed under the presence section's
 `released` and counted in the console summary, never silently; the
 observation leaves only together with its completed tombstone, and its jobs
 only with one expired-unresolved event per job neither delivered nor
-disabled; any other removal, however old the observation, is `missing`);
+disabled; any other removal, however old the observation, is `missing`,
+a job left behind for a released observation is `retained`, and a job whose
+observation is gone is `orphaned`);
 a job's state, attempts and generation may only move forward: a claim, a
 recorded outcome, or the audited Owner requeue back to pending, and a
 delivered job stays delivered; attempts rise only with a claim, which also
@@ -453,7 +455,13 @@ bindings became revoked, or its active credential became revoked, and then
 every binding of the node (recorded or added since) must be revoked, no
 enrollment of it may be pending or consumed, and its credential must stay
 revoked (a revoked node is re-paired as a new node with a new key, Owner
-decision 2026-10-01, which is what the approve command does); because revoke() refuses a node with nothing to
+decision 2026-10-01, which is what the approve command does); any
+activation since the record on such a node must, by the security/admin
+audit rows the ledger writes in the same transactions, precede its first
+revocation in the window (an activation after it re-opened the node on its
+own ID, `reopened`, even if a later revocation closed it again; ordering
+relies on the audit clock, so a clock stepped backwards in between can
+mis-order them); because revoke() refuses a node with nothing to
 revoke, the node must also have had an active credential or an open
 enrollment for it to revoke; a revoked credential stays revoked with the
 same material; an active one stays, becomes the renewal staged at record

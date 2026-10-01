@@ -689,8 +689,15 @@ def _compare_presence(baseline: dict | None, current: dict | None,
                 fail("deliveries", key, "missing")
             elif job["state"] not in ("delivered", "disabled"):
                 needed[key.rsplit(":", 1)[1]] += 1
+        elif job["observation"] in path:
+            # The release deletes all jobs of the observation atomically.
+            fail("deliveries", key, "retained")
         elif not _delivery_advanced(job, deliveries[key]):
             fail("deliveries", key)
+    # No job, recorded or new, may point at an observation that is gone.
+    for key, job in sorted(deliveries.items()):
+        if job["observation"] not in observations:
+            fail("deliveries", key, "orphaned")
     # Tombstones and expired-unresolved events appear only through releases:
     # no tombstone for anything else, and each action's events rise by
     # exactly the released jobs neither delivered nor disabled.
@@ -771,6 +778,14 @@ def _security_state(connection, tables, salt: str) -> dict:
     bindings = query("pairing_key_bindings",
                      "SELECT public_key_digest, node_id, revoked FROM pairing_key_bindings")
     nodes = query("capture_nodes", "SELECT id, health_state FROM capture_nodes")
+    # PairingLedger audits each activation / promotion and each revocation
+    # in the same transaction, with the audit clock: the only ordering
+    # evidence between them (node logical IDs and times, no key material).
+    pairing_audit = query(
+        "security_admin_audit_records",
+        "SELECT id, action, target_logical_id, occurred_at_us FROM security_admin_audit_records "
+        "WHERE outcome = 'succeeded' AND action IN "
+        "('activate_capture_node_credential', 'revoke_capture_node_pairing')")
     sessions = query("access_sessions", "SELECT id, invalidated_at_us FROM access_sessions")
     generation = query("access_deployment_state",
                        "SELECT authorization_generation FROM access_deployment_state")
@@ -801,6 +816,8 @@ def _security_state(connection, tables, salt: str) -> dict:
         "pairing_key_bindings": None if bindings is None else {
             _keyed(salt, ["pairing-key-v1", row[0]]): {"node_id": row[1], "revoked": bool(row[2])}
             for row in bindings},
+        "pairing_audit": None if pairing_audit is None else sorted(
+            [row[0], row[1], row[2], row[3]] for row in pairing_audit),
         "capture_nodes_revoked": None if nodes is None else {
             row[0]: row[1] == "revoked" for row in nodes},
         "sessions_invalidated": None if sessions is None else {
@@ -824,6 +841,30 @@ _ENROLLMENT_SUCCESSORS = {
     "activated": frozenset({"activated"}),
     "revoked": frozenset({"revoked"}),
 }
+
+
+def _audited_before_revocation(node: str, baseline: dict, current: dict,
+                               activations: int) -> bool:
+    """Whether the node's post-record activations all precede its revocation.
+
+    Uses the succeeded activate / revoke audit rows appended since the
+    record. Without a revoke row, or with fewer activation rows than
+    activations, the order is unknown and the check fails closed.
+    """
+    if not activations:
+        return True
+    recorded = {row[0] for row in (baseline.get("pairing_audit") or ())}
+    if current.get("pairing_audit") is None:
+        return False
+    events = [row for row in current["pairing_audit"]
+              if row[0] not in recorded and row[2] == node]
+    revocations = [row[3] for row in events if row[1] == "revoke_capture_node_pairing"]
+    activations_audited = [row[3] for row in events
+                           if row[1] == "activate_capture_node_credential"]
+    if not revocations or len(activations_audited) < activations:
+        return False
+    first = min(revocations)
+    return all(at < first for at in activations_audited)
 
 
 def _compare_pairing(baseline: dict, current: dict) -> list:
@@ -1070,6 +1111,14 @@ def _compare_pairing(baseline: dict, current: dict) -> list:
                    for enrollment, item in enrollments_now.items())
             or (credentials.get(node) or {}).get("revoked") is True
             and credentials[node]["key_ref"] in activated_keys.get(node, ()))
+        # Ordering from the audit: an activation since the record on a node
+        # revoked in the window must have happened before its first
+        # revocation (otherwise it re-opened the node on the same ID), and
+        # every such activation and the revocation must be audited.
+        if not _audited_before_revocation(node, baseline, current,
+                                          sum(1 for item in activated_since.values()
+                                              if item["node_id"] == node)):
+            fail("pairing_revocation", node, "reopened")
         after = credentials.get(node)
         if not revocable:
             credential_ok = False
