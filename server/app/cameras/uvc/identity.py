@@ -62,24 +62,35 @@ class DeviceEvidence:
     def model_key(self):
         return self.vendor, self.product, self.interface
 
+    @property
+    def live_instance_key(self):
+        # Fields fixed for one connected device node. by-id aliases and the
+        # advertised format list are mutable metadata a rescan may refresh
+        # (e.g. a udev alias appearing later), so they never name an instance.
+        return (self.vendor, self.product, self.serial, self.interface, self.topology,
+                self.device_path, self.device_number, self.instance_token)
+
 
 def same_physical_camera(first, second, *, serial_ambiguous=False):
     """True when two pieces of evidence may name the same physical camera.
 
     A serial-backed identity compares by its strong key, so a changed device
     node or port still names the same camera. Weak (non-serial) evidence can
-    only be compared exactly, including its ephemeral instance marker.
+    only be compared by its live-instance fields, including its ephemeral
+    instance marker.
 
     ``serial_ambiguous`` means several connected cameras share the serial of
     ``first``. The serial then cannot tell them apart, and such an approval is
     an exact live-instance binding that is never rebound by serial, so only
-    exactly equal evidence names the same camera.
+    the same live instance names the same camera. Mutable metadata (by-id
+    aliases, advertised formats) is ignored so a rescan cannot free a held
+    camera for another source.
     """
     if serial_ambiguous:
-        return first == second
+        return first.live_instance_key == second.live_instance_key
     if first.strong_key is not None or second.strong_key is not None:
         return first.strong_key == second.strong_key
-    return first == second
+    return first.live_instance_key == second.live_instance_key
 
 
 @dataclass(frozen=True)

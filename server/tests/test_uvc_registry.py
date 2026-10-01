@@ -538,6 +538,26 @@ class DuplicateApprovalTests(UvcRegistryFixture):
             self.admin.approve_uvc("owner", self.adapter, self.other.id,
                                    self.discovery.devices[0])
 
+    def test_refreshed_alias_metadata_does_not_free_a_duplicate_serial_instance(self):
+        # The same live duplicate-serial camera may gain a by-id alias or a
+        # different advertised format list between scans; only mutable
+        # metadata changed, so it is still held by the first source.
+        twin = replace(self.camera, device_path="/dev/video4", device_number=4)
+        self.discovery.devices = [self.camera, twin]
+        self.admin.approve_uvc("owner", self.adapter, self.source.id, self.camera)
+        refreshed = replace(self.camera, by_id=("synthetic-alias",), formats=("YUYV",))
+        self.discovery.devices = [refreshed, twin]
+        with self.assertRaises(ValueError):
+            self.admin.approve_uvc("owner", self.adapter, self.other.id, refreshed)
+        prepared = self.adapter.prepare_approval(self.other.id, twin)
+        with closing(self.database.connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            with self.assertRaises(ApprovalConflictError):
+                self.adapter.approve_source_on(
+                    connection, replace(prepared, candidate=refreshed))
+            connection.rollback()
+        self.assertIsNone(self.adapter.store.load(self.other.id))
+
     def test_disabled_or_latched_source_does_not_hold_the_camera(self):
         self.admin.approve_uvc("owner", self.adapter, self.source.id, self.camera)
         self.registry.update_source(self.source.id, enabled=False)
