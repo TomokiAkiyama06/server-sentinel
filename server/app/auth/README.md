@@ -186,8 +186,9 @@ failed delivery is counted and retried on the next tick. While closed the
 check is retried every five minutes, re-notifying only when the reasons change,
 and a later passing check reopens access. After a close that may have exposed
 a session cookie (an unexpected listener or route, a resolved address set that
-differs from the configuration, or a listener/route enumeration error or
-timeout that cannot rule one out: `EXPOSURE_REASONS`), a passing check reopens
+differs from the configuration, an excepted listener whose owner cannot be
+verified, or a listener/route enumeration error or timeout that cannot rule
+one out: `EXPOSURE_REASONS`), a passing check reopens
 only after the injected `session_revoker` has revoked every human session
 (Owner decision, 2026-09-30). `reservation_store.ReservationSessionRevocation`
 does that through `AccessStore.invalidate_all_sessions_on`, which advances the
@@ -202,10 +203,13 @@ When the marker cannot be written, every human session is revoked at once
 instead (access is already closed, so none is issued until reopening revokes
 again); until one of the two commits, each check retries and keeps
 `SESSION_REVOCATION_FAILED` (Owner decision, 2026-10-01).
-Without a revoker, or when revocation or its audit append fails (rolled back
-together, with a `failed` record attempted), access stays closed with a
-`SESSION_REVOCATION_UNAVAILABLE` / `SESSION_REVOCATION_FAILED` fault; a failure
-to record the marker is reported the same way. Other closes (missing mapping,
+A check without a revoker never opens access, before or after any exposure,
+and keeps `SESSION_REVOCATION_UNAVAILABLE`: nothing durable could carry a
+revocation requirement across a restart, so a restart after an exposure must
+not reopen with the earlier sessions still valid. When revocation or its audit
+append fails (rolled back together, with a `failed` record attempted), access
+stays closed with a `SESSION_REVOCATION_FAILED` fault; a failure to record the
+marker is reported the same way. Other closes (missing mapping,
 missing human listener, unstated isolation, unreadable exceptions, and a
 missing, failed or timed-out hostname resolution) show no other answer on the
 name and reopen without revocation. A resolution failure keeps access closed
@@ -217,9 +221,31 @@ the exposure window, and only the Owner-recorded deployment isolation removes
 it. `/proc/net` covers one network namespace.
 
 Owner listener exceptions (`ListenerException`: protocol `tcp` or `udp`, port,
-optional address family, bind scope `wildcard`) let a system service such as
-`sshd` on tcp/22 or `tailscaled` on its UDP port bind a wildcard address without
-closing access. An exception covers only its own protocol. `/proc/net` does not
+optional address family, bind scope `wildcard`, and the owning process) let a
+system service such as `sshd` on tcp/22 or `tailscaled` on its UDP port bind a
+wildcard address without closing access. An exception covers only its own
+protocol. A port alone never exempts a socket (Owner decision, 2026-10-01): each
+exception names its owner by exactly one of `executable` (the absolute,
+normalized path `/proc/<pid>/exe` resolves to, for example `/usr/sbin/sshd`) or
+`unit` (the systemd unit named in the process's cgroup v2 path, for example
+`ssh.service`), and a port-only, doubly identified or malformed entry is
+rejected. Each check reads the socket inode from `/proc/net` and the injected
+`socket_owners` (`ProcSocketOwners`, walking `/proc/<pid>/fd`) maps it to every
+process holding it; the socket is excepted only when every holder matches.
+Another process holding it (alone or alongside the named one) counts as
+`UNEXPECTED_LISTENER`; a socket with no inode, no readable holder, an
+unreadable executable/unit, or an owner lookup that fails or times out counts
+as `LISTENER_OWNER_UNVERIFIED`; both are exposure reasons. Reading another
+account's `/proc/<pid>/fd` and `exe` needs privilege the non-root service may
+not hold (root, or `CAP_DAC_READ_SEARCH` + `CAP_SYS_PTRACE`); without it an
+excepted root-owned `sshd` stays unverified and access stays closed. A
+deleted executable (`… (deleted)` after a package upgrade until the service
+restarts) does not match either. With socket activation (for example
+Ubuntu's `ssh.socket`) the listening socket is held by the service manager
+(PID 1, cgroup `init.scope`), which no exception identifies narrowly: naming
+`/usr/lib/systemd/systemd` would cover every socket unit. Such a service stays
+closed until it listens itself (for example `ssh.service` without
+`ssh.socket`); whether to support socket activation is an open Owner decision. `/proc/net` does not
 show `IPV6_V6ONLY` and a `::` socket may also accept IPv4, so a `::` bind is
 treated as dual-stack: only an exception without a family covers it, an `ipv4`
 exception covers `0.0.0.0` only, and an `ipv6`-only exception is rejected. The set is empty
@@ -238,7 +264,11 @@ and retry checks take the same lock, so a check still evaluating a superseded
 set cannot publish its verdict after a change has committed. `reservation_store.ListenerExceptionStore` persists the
 set as versioned JSON under one fixed key of the foundation
 `application_metadata` key/value table (no migration), and `startup()` loads it
-before the first check. A missing row is the empty default; an unreadable,
+before the first check. Format version 2 stores the owner; a version 1
+(port-only) value is not migrated, since its owner cannot be inferred, and
+loads as the empty set with `LISTENER_EXCEPTIONS_OUTDATED` in every verdict
+(access closed, Owner fault) until the Owner enters the exceptions again
+through the audited path. A missing row is the empty default; an unreadable,
 corrupt (including duplicate JSON members), or no longer valid value (for example one covering the dashboard
 port) loads as the empty set, never a wider set, and
 `LISTENER_EXCEPTIONS_UNREADABLE` stays in every verdict (access closed, Owner

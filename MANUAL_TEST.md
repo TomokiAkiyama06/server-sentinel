@@ -1553,7 +1553,8 @@ by the Issue #6 synthetic policy model.
   network identity isolation is used. A wildcard `sshd` or other system
   service on the node is reported as an unexpected listener unless the Owner
   adds a listener exception for that port. With a wildcard `sshd` on 22:
-  confirm access closes with no exception; add `tcp/22` through the audited
+  confirm access closes with no exception; add `tcp/22` owned by
+  `/usr/sbin/sshd` (or unit `ssh.service`) through the audited
   Owner path and confirm access opens and a `change_security_setting` audit
   record exists; bind a test listener to the Tailscale address on port 22
   (not wildcard) and confirm access still closes; start a wildcard listener
@@ -1591,6 +1592,22 @@ by the Issue #6 synthetic policy model.
   listener is up: confirm the `invalidate_human_sessions` record is committed
   at once, so a restart after removing the listener cannot reopen with an
   earlier session.
+- Listener exception ownership (Owner decision 2026-10-01; mock-only so far):
+  with `ProcSocketOwners` composed and the check running with the privilege it
+  needs to read `/proc/<pid>/fd` and `exe` of `sshd` (record which: root, or
+  `CAP_DAC_READ_SEARCH` + `CAP_SYS_PTRACE`), confirm `readlink /proc/<sshd
+  pid>/exe` matches the configured executable and access opens with `sshd`
+  on 22. Without that privilege, confirm access stays closed with
+  `LISTENER_OWNER_UNVERIFIED`. Stop `sshd`, start another process on the
+  excepted port (for example `sudo python3 -m http.server 22`), and confirm
+  access closes with `UNEXPECTED_LISTENER` and that reopening revokes every
+  human session. Record whether the host uses `ssh.socket` (socket
+  activation: PID 1 holds the listener, so access stays closed until `sshd`
+  listens itself), and that after upgrading `openssh-server` without
+  restarting `sshd` the `(deleted)` executable keeps access closed. On a
+  disposable copy holding a version 1 (port-only) stored exception, confirm
+  startup reports `LISTENER_EXCEPTIONS_OUTDATED` and access stays closed until
+  the Owner re-enters the exception with its owner.
 - Hostname resolution (mock-only so far): with the production
   `GetaddrinfoResolver` composed, confirm on the host that it returns exactly
   the reserved name's Tailscale IPv4 and IPv6 addresses (compare with

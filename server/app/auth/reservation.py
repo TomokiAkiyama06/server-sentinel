@@ -28,6 +28,7 @@ from enum import StrEnum
 import ipaddress
 import json
 import math
+import os
 import re
 import socket
 import sys
@@ -76,6 +77,8 @@ class Reason(StrEnum):
     MAPPING_MISSING = "MAPPING_MISSING"
     HUMAN_LISTENER_MISSING = "HUMAN_LISTENER_MISSING"
     LISTENER_EXCEPTIONS_UNREADABLE = "LISTENER_EXCEPTIONS_UNREADABLE"
+    LISTENER_EXCEPTIONS_OUTDATED = "LISTENER_EXCEPTIONS_OUTDATED"
+    LISTENER_OWNER_UNVERIFIED = "LISTENER_OWNER_UNVERIFIED"
     SESSION_REVOCATION_UNAVAILABLE = "SESSION_REVOCATION_UNAVAILABLE"
     SESSION_REVOCATION_FAILED = "SESSION_REVOCATION_FAILED"
     HOSTNAME_RESOLUTION_UNAVAILABLE = "HOSTNAME_RESOLUTION_UNAVAILABLE"
@@ -97,7 +100,7 @@ EXPOSURE_REASONS = frozenset({
     Reason.UNEXPECTED_LISTENER, Reason.UNEXPECTED_ROUTE,
     Reason.LISTENER_ENUMERATION_UNAVAILABLE, Reason.LISTENER_ENUMERATION_TIMEOUT,
     Reason.ROUTE_ENUMERATION_UNAVAILABLE, Reason.ROUTE_ENUMERATION_TIMEOUT,
-    Reason.RESERVED_ADDRESSES_CHANGED,
+    Reason.RESERVED_ADDRESSES_CHANGED, Reason.LISTENER_OWNER_UNVERIFIED,
 })
 
 
@@ -125,6 +128,16 @@ class BindScope(StrEnum):
 
 MAX_LISTENER_EXCEPTIONS = 16
 MAX_PENDING_FAULTS = 8
+MAX_EXECUTABLE_PATH = 1024
+_UNIT = re.compile(r"[A-Za-z0-9:_.\\@-]{1,250}\.(service|socket|scope)")
+
+
+@dataclass(frozen=True)
+class SocketOwner:
+    """One process holding a socket: its executable path and systemd unit, when known."""
+
+    executable: str | None
+    unit: str | None
 
 
 @dataclass(frozen=True)
@@ -134,6 +147,14 @@ class ListenerException:
     It matches only a wildcard (``0.0.0.0`` / ``::``) bind of ``protocol`` on
     ``port`` in ``family`` (``None`` for both). A bind of the same port to a
     reserved address still closes access, as does every port not listed.
+
+    The port alone never exempts a socket (Owner decision, 2026-10-01): the
+    exception names the owning process by exactly one of ``executable`` (the
+    absolute path ``/proc/<pid>/exe`` resolves to, for example
+    ``/usr/sbin/sshd``) or ``unit`` (the systemd unit in the process's cgroup,
+    for example ``ssh.service``). Each check verifies that every process
+    holding the socket matches; another process, or ownership that cannot be
+    verified, closes access as a possible exposure.
 
     ``/proc/net/{tcp6,udp6}`` does not show ``IPV6_V6ONLY``, and a ``::``
     socket also accepts IPv4 unless that option is set, so a ``::`` bind is
@@ -145,6 +166,8 @@ class ListenerException:
     protocol: TransportProtocol = TransportProtocol.TCP
     family: AddressFamily | None = None
     scope: BindScope = BindScope.WILDCARD
+    executable: str | None = None
+    unit: str | None = None
 
     def __post_init__(self):
         if (type(self.port) is not int or not 1 <= self.port <= 65535
@@ -153,6 +176,22 @@ class ListenerException:
                 or self.family is AddressFamily.IPV6
                 or not isinstance(self.scope, BindScope)):
             raise ValueError("INVALID_LISTENER_EXCEPTION")
+        if (self.executable is None) == (self.unit is None):
+            # Exactly one owner identity; a port-only exception is refused.
+            raise ValueError("INVALID_LISTENER_EXCEPTION")
+        if self.executable is not None and (
+                not isinstance(self.executable, str) or not self.executable.startswith("/")
+                or len(self.executable) > MAX_EXECUTABLE_PATH or "\0" in self.executable
+                or os.path.normpath(self.executable) != self.executable
+                or self.executable.endswith(" (deleted)")):
+            raise ValueError("INVALID_LISTENER_EXCEPTION")
+        if self.unit is not None and (not isinstance(self.unit, str) or not _UNIT.fullmatch(self.unit)):
+            raise ValueError("INVALID_LISTENER_EXCEPTION")
+
+    def owned_by(self, owner: SocketOwner) -> bool:
+        if self.executable is not None:
+            return owner.executable == self.executable
+        return owner.unit == self.unit
 
     def matches(self, listener: "Listener") -> bool:
         address = listener.address
@@ -170,12 +209,17 @@ class Listener:
     address: Address
     port: int
     protocol: TransportProtocol = TransportProtocol.TCP
+    # The socket inode from ``/proc/net`` (0 or None: unknown); it identifies
+    # the owning processes and is not part of the endpoint's identity.
+    inode: int | None = field(default=None, compare=False)
 
     def __post_init__(self):
         if not isinstance(self.address, (ipaddress.IPv4Address, ipaddress.IPv6Address)) \
                 or not isinstance(self.protocol, TransportProtocol):
             raise ValueError("INVALID_LISTENER")
         if type(self.port) is not int or not 0 <= self.port <= 65535:
+            raise ValueError("INVALID_LISTENER")
+        if self.inode is not None and (type(self.inode) is not int or self.inode < 0):
             raise ValueError("INVALID_LISTENER")
 
 
@@ -225,9 +269,18 @@ class AddressResolver(Protocol):
         """Return every address ``hostname`` resolves to on this node; raise when unknown."""
 
 
+class SocketOwnerResolver(Protocol):
+    def owners(self, inodes: frozenset) -> dict:
+        """Map each socket inode to the ``SocketOwner``s holding it; raise when unknown."""
+
+
 class ListenerExceptionSource(Protocol):
     def load(self) -> Iterable["ListenerException"]:
         """Return the persisted Owner exceptions; raise when unreadable or corrupt."""
+
+
+class ListenerExceptionsOutdated(Exception):
+    """The stored exceptions predate owner binding (port-only); the Owner must re-enter them."""
 
 
 class SessionRevoker(Protocol):
@@ -294,7 +347,7 @@ def _parse_proc_net(text: str, *, ipv6: bool, byteorder: str, protocol: Transpor
         if not line.strip():
             continue
         fields = line.split()
-        if len(fields) < 4 or not re.fullmatch(r"\d+:", fields[0]):
+        if len(fields) < 10 or not re.fullmatch(r"\d+:", fields[0]) or not re.fullmatch(r"\d{1,20}", fields[9]):
             raise ReservationEnumerationError("MALFORMED_PROC_NET")
         local, state = fields[1], fields[3].upper()
         if not re.fullmatch(r"[0-9A-F]{2}", state) or local.count(":") != 1:
@@ -304,7 +357,7 @@ def _parse_proc_net(text: str, *, ipv6: bool, byteorder: str, protocol: Transpor
             raise ReservationEnumerationError("MALFORMED_PROC_NET")
         decoded = _decode_address(address, ipv6=ipv6, byteorder=byteorder)
         if state == listening:
-            result.append(Listener(decoded, int(port, 16), protocol))
+            result.append(Listener(decoded, int(port, 16), protocol, int(fields[9])))
     return tuple(result)
 
 
@@ -329,6 +382,66 @@ class ProcNetListeners:
                 + parse_proc_net_tcp(self._read("tcp6"), ipv6=True, byteorder=self._byteorder)
                 + parse_proc_net_udp(self._read("udp"), ipv6=False, byteorder=self._byteorder)
                 + parse_proc_net_udp(self._read("udp6"), ipv6=True, byteorder=self._byteorder))
+
+
+def _unit_from_cgroup(text: str) -> str | None:
+    """The systemd unit named by a cgroup v2 ``0::/...`` line, if any."""
+    for line in text.splitlines():
+        if line.startswith("0::"):
+            for component in reversed(line[3:].split("/")):
+                if _UNIT.fullmatch(component):
+                    return component
+            return None
+    return None
+
+
+class ProcSocketOwners:
+    """Find the processes holding socket inodes by walking ``/proc/<pid>/fd``.
+
+    ``proc`` is the ``/proc`` root (a synthetic tree in tests). Reading another
+    account's ``fd``/``exe`` needs privilege (for example root or
+    ``CAP_DAC_READ_SEARCH`` + ``CAP_SYS_PTRACE``); a process that cannot be
+    read leaves its sockets without a verified owner, which closes access.
+    """
+
+    def __init__(self, proc: str = "/proc"):
+        if not isinstance(proc, str) or not proc.startswith("/"):
+            raise ValueError("INVALID_PROC_ROOT")
+        self._proc = proc
+
+    def owners(self, inodes: frozenset) -> dict:
+        wanted = {f"socket:[{inode}]": inode for inode in inodes}
+        found: dict[int, set[SocketOwner]] = {}
+        for pid in os.listdir(self._proc):
+            if not pid.isdigit():
+                continue
+            base = os.path.join(self._proc, pid)
+            held = set()
+            try:
+                for fd in os.listdir(os.path.join(base, "fd")):
+                    try:
+                        target = os.readlink(os.path.join(base, "fd", fd))
+                    except OSError:
+                        continue
+                    if target in wanted:
+                        held.add(wanted[target])
+            except OSError:
+                # Unreadable or exited: its sockets stay unverified.
+                continue
+            if not held:
+                continue
+            try:
+                executable = os.readlink(os.path.join(base, "exe"))
+            except OSError:
+                executable = None
+            try:
+                with open(os.path.join(base, "cgroup"), encoding="utf-8") as handle:
+                    unit = _unit_from_cgroup(handle.read(65536))
+            except (OSError, ValueError):
+                unit = None
+            for inode in held:
+                found.setdefault(inode, set()).add(SocketOwner(executable, unit))
+        return {inode: frozenset(owners) for inode, owners in found.items()}
 
 
 # -- Tailscale Serve status -------------------------------------------------
@@ -591,10 +704,24 @@ def validate_listener_exceptions(config: ReservationConfig, exceptions) -> froze
     return values
 
 
+def excepted_inodes(config: ReservationConfig, listeners, exceptions: frozenset) -> frozenset:
+    """Inodes of listeners whose endpoint an exception covers (ownership still unverified)."""
+    if isinstance(listeners, Reason):
+        return frozenset()
+    return frozenset(
+        listener.inode for listener in listeners
+        if listener.inode and any(item.matches(Listener(_normalize(listener.address), listener.port,
+                                                        listener.protocol)) for item in exceptions))
+
+
 def evaluate(config: ReservationConfig, listeners, routes,
              exceptions: frozenset = frozenset(),
-             resolved=None) -> tuple[tuple[Reason, ...], int, int]:
-    """Pure comparison. ``listeners``/``routes``/``resolved`` are sequences or a ``Reason``.
+             resolved=None, owners=None) -> tuple[tuple[Reason, ...], int, int]:
+    """Pure comparison. ``listeners``/``routes``/``resolved``/``owners`` are values or a ``Reason``.
+
+    ``owners`` maps socket inodes to their ``SocketOwner``s; an excepted
+    endpoint passes only when its socket has a known inode and every owner
+    matches the exception (``None`` or a ``Reason``: none verified).
 
     ``resolved`` is the hostname's current address set (``None``: the
     configured set). Listeners are checked against the union with the
@@ -619,6 +746,8 @@ def evaluate(config: ReservationConfig, listeners, routes,
         seen_human = False
         seen_proxies: set[Listener] = set()
         seen_excepted: set[Listener] = set()
+        unverified = 0
+        known = owners if isinstance(owners, dict) else {}
         for listener in listeners:
             address = _normalize(listener.address)
             normalized = Listener(address, listener.port, listener.protocol)
@@ -635,7 +764,16 @@ def evaluate(config: ReservationConfig, listeners, routes,
             # exception allows one socket per covered endpoint (for example
             # both ``0.0.0.0`` and ``::``); an identical extra row is another
             # SO_REUSEPORT socket sharing the port and is unexpected.
-            if any(item.matches(normalized) for item in exceptions):
+            covering = [item for item in exceptions if item.matches(normalized)]
+            if covering:
+                holders = known.get(listener.inode) if listener.inode else None
+                if not holders:
+                    # No verified owner: it may be any process answering here.
+                    unverified += 1
+                    continue
+                if not any(all(item.owned_by(owner) for owner in holders) for item in covering):
+                    unexpected_listeners += 1
+                    continue
                 if normalized in seen_excepted:
                     unexpected_listeners += 1
                 seen_excepted.add(normalized)
@@ -647,6 +785,9 @@ def evaluate(config: ReservationConfig, listeners, routes,
                 unexpected_listeners += 1
         if unexpected_listeners:
             reasons.append(Reason.UNEXPECTED_LISTENER)
+        if unverified:
+            reasons.append(Reason.LISTENER_OWNER_UNVERIFIED)
+            unexpected_listeners += unverified
         if not seen_human:
             reasons.append(Reason.HUMAN_LISTENER_MISSING)
     if isinstance(routes, Reason):
@@ -698,6 +839,7 @@ class HostnameReservationCheck:
                  exception_store: ListenerExceptionSource | None = None,
                  session_revoker: SessionRevoker | None = None,
                  resolver: AddressResolver | None = None,
+                 socket_owners: SocketOwnerResolver | None = None,
                  timeout: float = ENUMERATION_TIMEOUT_SECONDS,
                  retry_seconds: float = RETRY_WHILE_CLOSED_SECONDS,
                  monotonic: Callable[[], float] = time.monotonic,
@@ -740,6 +882,10 @@ class HostnameReservationCheck:
         # Without a resolver every check fails closed: the frozen configured
         # set alone cannot show an address the name gained.
         self._resolver = resolver
+        # Without it no excepted listener's owner can be verified, so any
+        # listener an exception would cover closes access.
+        self._socket_owners = socket_owners
+        self._exceptions_reason = Reason.LISTENER_EXCEPTIONS_UNREADABLE
         self._revocation_required = False
         # True once the requirement is durable: the marker was written, or the
         # revocation already committed while access was closed.
@@ -811,8 +957,6 @@ class HostnameReservationCheck:
         so no session is issued until reopening revokes again). Retried on every
         check until one of them commits.
         """
-        if self.session_revoker is None:
-            return True
         try:
             self.session_revoker.record_exposure()
             return True
@@ -825,6 +969,10 @@ class HostnameReservationCheck:
             return False
 
     def _after_evaluation(self, reasons: tuple[Reason, ...]) -> tuple[Reason, ...]:
+        if self.session_revoker is None:
+            # Nothing durable could carry a revocation requirement across a
+            # restart, so access never opens without a revoker.
+            return reasons + (Reason.SESSION_REVOCATION_UNAVAILABLE,)
         if any(reason in EXPOSURE_REASONS for reason in reasons):
             self._revocation_required = True
             self._revocation_durable = self._make_durable()
@@ -835,8 +983,6 @@ class HostnameReservationCheck:
             return reasons + (Reason.SESSION_REVOCATION_FAILED,)
         if reasons or not self._revocation_required:
             return reasons
-        if self.session_revoker is None:
-            return (Reason.SESSION_REVOCATION_UNAVAILABLE,)
         try:
             self.session_revoker.revoke_all_human_sessions()
         except Exception:
@@ -850,7 +996,11 @@ class HostnameReservationCheck:
         if self.exception_store is not None:
             try:
                 self._exceptions = validate_listener_exceptions(self.config, self.exception_store.load())
+            except ListenerExceptionsOutdated:
+                self._exceptions_reason = Reason.LISTENER_EXCEPTIONS_OUTDATED
+                return
             except Exception:
+                self._exceptions_reason = Reason.LISTENER_EXCEPTIONS_UNREADABLE
                 return
         self._exceptions_loaded = True
 
@@ -897,6 +1047,31 @@ class HostnameReservationCheck:
             return error_reason
         return value
 
+    def _enumerate_owners(self, inodes: frozenset):
+        previous = self._inflight.get("owners")
+        if previous is not None and previous.is_alive():
+            return None
+        box: dict[str, object] = {}
+
+        def run():
+            try:
+                box["value"] = self._socket_owners.owners(inodes)
+            except BaseException:
+                box["error"] = True
+
+        worker = threading.Thread(target=run, name="reservation-owners", daemon=True)
+        self._inflight["owners"] = worker
+        worker.start()
+        worker.join(self._timeout)
+        value = box.get("value")
+        if worker.is_alive() or "error" in box or not isinstance(value, dict) or any(
+                type(inode) is not int or not isinstance(holders, frozenset)
+                or any(not isinstance(owner, SocketOwner) for owner in holders)
+                for inode, holders in value.items()):
+            # Unknown ownership: every excepted listener stays unverified.
+            return None
+        return value
+
     def _check(self, kind: CheckKind) -> ReservationVerdict:
         with self.exception_change_lock, self._check_lock:
             return self._check_locked(kind)
@@ -924,12 +1099,16 @@ class HostnameReservationCheck:
             routes = self._enumerate("routes", lambda: self._routes.routes(),
                                      Reason.ROUTE_ENUMERATION_TIMEOUT,
                                      Reason.ROUTE_ENUMERATION_UNAVAILABLE, ProxyRoute)
+            owners = None
+            inodes = excepted_inodes(self.config, listeners, self._exceptions)
+            if inodes and self._socket_owners is not None:
+                owners = self._enumerate_owners(inodes)
             reasons, extra_listeners, extra_routes = evaluate(self.config, listeners, routes,
-                                                              self._exceptions, resolved)
+                                                              self._exceptions, resolved, owners)
         except Exception:
             reasons, extra_listeners, extra_routes = (Reason.LISTENER_ENUMERATION_UNAVAILABLE,), 0, 0
         if not self._exceptions_loaded:
-            reasons = (Reason.LISTENER_EXCEPTIONS_UNREADABLE,) + reasons
+            reasons = (self._exceptions_reason,) + reasons
         # Access is still closed here: reopening waits for any required revocation.
         reasons = self._after_evaluation(reasons)
         at = self._now()

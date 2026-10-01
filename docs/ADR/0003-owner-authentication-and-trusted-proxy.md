@@ -448,5 +448,16 @@ Owner decision, 2026-10-01 (PR #91): each check re-resolves the reserved name.
 A missing resolver, or a resolution that fails or times out, keeps access
 closed but is not treated as an exposure: it shows no other answer on the
 name, so access reopens without revocation once the name resolves to exactly
-the recorded addresses again, unless an exposure was seen in the meantime. This is still detection: it bounds how long an exposed
+the recorded addresses again, unless an exposure was seen in the meantime.
+
+Owner decision, 2026-10-01 (PR #91): a port number alone never exempts a
+listener, because browsers send the host-scoped session cookie to every HTTPS
+port of the reserved name and any service could take an excepted port. An
+Owner listener exception names the port together with its owning executable
+(for example `/usr/sbin/sshd`) or systemd unit, and each check verifies the
+socket's owning processes; a different process, or ownership that cannot be
+verified, is treated as an exposure. Port-only exceptions stored earlier are
+not migrated and keep access closed until the Owner enters them again.
+Without a durable revocation path the check never opens access, so a restart
+cannot reopen with sessions that an exposure may have leaked. This is still detection: it bounds how long an exposed
 cookie stays usable, and does not prevent the exposure.

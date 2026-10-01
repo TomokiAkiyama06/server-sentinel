@@ -1409,6 +1409,12 @@ route, a changed address set, a listener/route enumeration failure) first
 revokes every human session; a hostname resolution failure alone keeps access
 closed and reopens without revocation once the name resolves to the recorded
 set again (Owner decision, 2026-10-01; details in `server/app/auth/README.md`).
+An Owner listener exception covers a wildcard system listener only by port
+plus owning executable or systemd unit, verified on every check through the
+socket's owning processes; another or unverifiable owner is an exposure
+reason, and stored port-only exceptions fail closed until re-entered (Owner
+decision, 2026-10-01). A check without a durable session revoker never opens
+access.
 That bounds the exposure window rather
 than preventing the bind: a process that binds between two checks receives
 credentials and cookies for that origin until the next check.

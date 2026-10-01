@@ -3,6 +3,7 @@
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
 import hashlib
+import os
 import ipaddress
 import json
 from pathlib import Path
@@ -17,7 +18,7 @@ from app.audit import (
 )
 from app.audit.integration import RESERVATION_LISTENER_EXCEPTIONS_ID, ReservationAdministration
 from app.auth.reservation import (
-    DAILY_SECONDS, AddressFamily, CheckKind, GetaddrinfoResolver, HostnameReservationCheck, IsolationMode, Listener, ListenerException,
+    DAILY_SECONDS, AddressFamily, CheckKind, GetaddrinfoResolver, ProcSocketOwners, SocketOwner, HostnameReservationCheck, IsolationMode, Listener, ListenerException,
     RETRY_WHILE_CLOSED_SECONDS, ProcNetListeners, ProxyRoute, Reason, ReservationConfig,
     ReservationEnumerationError,
     ReservationFault, RouteKind, ServeStatusRoutes, TransportProtocol, evaluate, parse_proc_net_tcp,
@@ -145,6 +146,37 @@ class Resolver:
         return self.answer
 
 
+SSHD = "/usr/sbin/sshd"
+SSHD_OWNER = SocketOwner(SSHD, "ssh.service")
+
+
+def exc(*args, **kwargs):
+    """A listener exception owned by the synthetic sshd unless stated otherwise."""
+    if "unit" not in kwargs:
+        kwargs.setdefault("executable", SSHD)
+    return ListenerException(*args, **kwargs)
+
+
+class Owners:
+    """Synthetic socket ownership: every inode is held by ``default`` unless overridden."""
+
+    def __init__(self, default=SSHD_OWNER, overrides=None):
+        self.default = default
+        self.overrides = dict(overrides or {})
+        self.calls = []
+
+    def owners(self, inodes):
+        self.calls.append(inodes)
+        if isinstance(self.default, BaseException):
+            raise self.default
+        result = {}
+        for inode in inodes:
+            holders = self.overrides.get(inode, self.default)
+            if holders is not None:
+                result[inode] = holders if isinstance(holders, frozenset) else frozenset({holders})
+        return result
+
+
 class Clock:
     def __init__(self):
         self.value = 1000.0
@@ -158,6 +190,8 @@ def checker(files=None, status=None, sink=None, cfg=None, clock=None, **kwargs):
     status = status or Status()
     sink = sink if sink is not None else Sink()
     kwargs.setdefault("resolver", Resolver())
+    kwargs.setdefault("socket_owners", Owners())
+    kwargs.setdefault("session_revoker", FakeRevoker())
     check = HostnameReservationCheck(
         cfg or config(), ProcNetListeners(files, byteorder="little"), ServeStatusRoutes(status), sink,
         monotonic=clock or Clock(), utcnow=lambda: NOW, **kwargs)
@@ -565,7 +599,7 @@ class SyntheticOwnerAuthorizer:
             raise OwnerAuthorizationError(ActorCategory.INVITED_USER)
 
 
-SSH = ListenerException(22)
+SSH = exc(22)
 WILDCARD_SSH = Files(tcp=proc(("127.0.0.1", 8080, "0A"), ("0.0.0.0", 22, "0A")),
                      tcp6=proc(("::", 22, "0A"), ipv6=True))
 
@@ -633,7 +667,7 @@ class ListenerExceptionTests(ExceptionFixture):
     def test_family_restricted_exception(self):
         admin, check, _ = self.admin(WILDCARD_SSH)
         verdict = admin.set_listener_exceptions(
-            "synthetic-owner-session", {ListenerException(22, family=AddressFamily.IPV4)})
+            "synthetic-owner-session", {exc(22, family=AddressFamily.IPV4)})
         self.assertFalse(verdict.open)
         self.assertEqual(verdict.reasons, (Reason.UNEXPECTED_LISTENER,))
 
@@ -641,23 +675,23 @@ class ListenerExceptionTests(ExceptionFixture):
         # ``::`` may accept IPv4 too (bindv6only=0), so an IPv4-only exception never covers it.
         admin, check, _ = self.admin(Files(tcp6=proc(("::", 22, "0A"), ipv6=True)))
         self.assertFalse(admin.set_listener_exceptions(
-            "synthetic-owner-session", {ListenerException(22, family=AddressFamily.IPV4)}).open)
+            "synthetic-owner-session", {exc(22, family=AddressFamily.IPV4)}).open)
         self.assertTrue(admin.set_listener_exceptions("synthetic-owner-session", {SSH}).open)
-        self.assertFalse(ListenerException(22, family=AddressFamily.IPV4).matches(
+        self.assertFalse(exc(22, family=AddressFamily.IPV4).matches(
             Listener(ipaddress.IPv6Address("::"), 22)))
-        self.assertTrue(ListenerException(22, family=AddressFamily.IPV4).matches(
+        self.assertTrue(exc(22, family=AddressFamily.IPV4).matches(
             Listener(ipaddress.IPv4Address("0.0.0.0"), 22)))
 
     def test_udp_exception_is_protocol_specific(self):
         tailscaled = Files(udp=proc(("0.0.0.0", 41641, "07")), udp6=proc(("::", 41641, "07"), ipv6=True))
         admin, check, _ = self.admin(tailscaled)
         self.assertFalse(admin.set_listener_exceptions(
-            "synthetic-owner-session", {ListenerException(41641)}).open)
-        udp = ListenerException(41641, TransportProtocol.UDP)
+            "synthetic-owner-session", {exc(41641)}).open)
+        udp = exc(41641, TransportProtocol.UDP)
         self.assertTrue(admin.set_listener_exceptions("synthetic-owner-session", {udp}).open)
         # A UDP exception never covers the dashboard port (HTTP/3 on the origin).
         with self.assertRaises(ValueError):
-            admin.set_listener_exceptions("synthetic-owner-session", {ListenerException(443, TransportProtocol.UDP)})
+            admin.set_listener_exceptions("synthetic-owner-session", {exc(443, TransportProtocol.UDP)})
         # Nor a bind to a reserved address, nor TCP on the same port.
         admin, check, _ = self.admin(Files(tcp=proc(("127.0.0.1", 8080, "0A"), ("0.0.0.0", 41641, "0A")),
                                            udp=proc(("100.64.0.10", 41641, "07"))))
@@ -755,7 +789,7 @@ class ListenerExceptionTests(ExceptionFixture):
     def test_duplicate_sockets_on_an_excepted_endpoint_close(self):
         # An exception allows one socket per wildcard endpoint it covers; an
         # identical SO_REUSEPORT copy is another process sharing that port.
-        udp = ListenerException(41641, TransportProtocol.UDP)
+        udp = exc(41641, TransportProtocol.UDP)
         cases = {
             "v4 wildcard twice": (Files(tcp=proc(("127.0.0.1", 8080, "0A"), ("0.0.0.0", 22, "0A"),
                                                  ("0.0.0.0", 22, "0A"))), {SSH}),
@@ -816,14 +850,14 @@ class ListenerExceptionTests(ExceptionFixture):
 
     def test_exception_never_covers_dashboard_or_human_listener(self):
         admin, check, _ = self.admin(WILDCARD_SSH)
-        for exceptions in ({ListenerException(443)}, {ListenerException(8080)}, {22},
-                           {ListenerException(port) for port in range(1000, 1017)}):
+        for exceptions in ({exc(443)}, {exc(8080)}, {22},
+                           {exc(port) for port in range(1000, 1017)}):
             with self.subTest(exceptions=exceptions), self.assertRaises(ValueError):
                 admin.set_listener_exceptions("synthetic-owner-session", exceptions)
         self.assertEqual(check.listener_exceptions, frozenset())
         self.assertTrue(all(record.outcome is AuditOutcome.FAILED for record in self.store.list_records()))
         with self.assertRaises(ValueError):
-            evaluate(config(), (HUMAN,), (config().expected_route,), {ListenerException(443)})
+            evaluate(config(), (HUMAN,), (config().expected_route,), {exc(443)})
 
     def test_exception_type_is_validated(self):
         for kwargs in (dict(port=0), dict(port=70000), dict(port="22"), dict(port=22, family="ipv4"),
@@ -862,22 +896,31 @@ class ListenerExceptionPersistenceTests(ExceptionFixture):
         self.assertEqual(sink.events, [])
 
     def test_corrupt_or_invalid_stored_value_fails_closed(self):
-        corrupt = ("", "not json", "[]", "null", '{"version": 1}',
-                   '{"version": 2, "exceptions": []}',
-                   '{"version": 1, "exceptions": "*"}',
-                   '{"version": 1, "exceptions": [{"port": 22}]}',
-                   '{"version": 1, "exceptions": [{"protocol": "sctp", "port": 22, "family": null, "scope": "wildcard"}]}',
-                   '{"version": 1, "exceptions": [{"protocol": "tcp", "port": 22, "family": "ipv6", "scope": "wildcard"}]}',
+        corrupt = ("", "not json", "[]", "null", '{"version": 2}',
+                   '{"version": 3, "exceptions": []}',
+                   # Both owner identities, neither, or a relative/unnormalized path.
+                   '{"version": 2, "exceptions": [{"protocol": "tcp", "port": 22, "family": null, "scope": "wildcard",'
+                   ' "executable": "/usr/sbin/sshd", "unit": "ssh.service"}]}',
+                   '{"version": 2, "exceptions": [{"protocol": "tcp", "port": 22, "family": null, "scope": "wildcard",'
+                   ' "executable": null, "unit": null}]}',
+                   '{"version": 2, "exceptions": [{"protocol": "tcp", "port": 22, "family": null, "scope": "wildcard",'
+                   ' "executable": "sshd", "unit": null}]}',
+                   '{"version": 2, "exceptions": [{"protocol": "tcp", "port": 22, "family": null, "scope": "wildcard",'
+                   ' "executable": "/usr/sbin/../bin/sh", "unit": null}]}',
+                   '{"version": 2, "exceptions": "*"}',
+                   '{"version": 2, "exceptions": [{"port": 22}]}',
+                   '{"version": 2, "exceptions": [{"protocol": "sctp", "port": 22, "family": null, "scope": "wildcard"}]}',
+                   '{"version": 2, "exceptions": [{"protocol": "tcp", "port": 22, "family": "ipv6", "scope": "wildcard"}]}',
                    # Duplicate members must not silently keep the last value.
-                   '{"version": 1, "exceptions": [{"protocol": "tcp", "port": 443, "port": 22,'
+                   '{"version": 2, "exceptions": [{"protocol": "tcp", "port": 443, "port": 22,'
                    ' "family": null, "scope": "wildcard"}]}',
-                   '{"version": 1, "version": 1, "exceptions": []}',
-                   '{"version": 1, "exceptions": [{"protocol": "tcp", "port": 0, "family": null, "scope": "wildcard"}]}',
-                   '{"version": 1, "exceptions": [{"protocol": "tcp", "port": 22, "family": null, "scope": "any"}]}',
-                   '{"version": 1, "exceptions": [{"protocol": "tcp", "port": 22, "family": null, "scope": "wildcard"},'
+                   '{"version": 2, "version": 2, "exceptions": []}',
+                   '{"version": 2, "exceptions": [{"protocol": "tcp", "port": 0, "family": null, "scope": "wildcard"}]}',
+                   '{"version": 2, "exceptions": [{"protocol": "tcp", "port": 22, "family": null, "scope": "any"}]}',
+                   '{"version": 2, "exceptions": [{"protocol": "tcp", "port": 22, "family": null, "scope": "wildcard"},'
                    ' {"protocol": "tcp", "port": 22, "family": null, "scope": "wildcard"}]}',
                    # Well-formed but covering the dashboard port: invalid for this config.
-                   encode({ListenerException(443), SSH}),
+                   encode({exc(443), SSH}),
                    "x" * 5000)
         for value in corrupt:
             with self.subTest(value=value[:60]):
@@ -902,7 +945,7 @@ class ListenerExceptionPersistenceTests(ExceptionFixture):
 
     def test_unreadable_store_keeps_startup_closed_without_an_unexpected_listener(self):
         # The fail-closed verdict must not depend on a wildcard listener being present.
-        for value in ("not json", '{"version": 1, "exceptions": "*"}'):
+        for value in ("not json", '{"version": 2, "exceptions": "*"}'):
             with self.subTest(value=value):
                 self.store_raw(value)
                 _, check, sink = self.admin(Files())
@@ -943,7 +986,7 @@ class ListenerExceptionPersistenceTests(ExceptionFixture):
     def test_persist_failure_rolls_back_with_audit(self):
         admin, check, _ = self.admin(WILDCARD_SSH)
         admin.set_listener_exceptions("synthetic-owner-session", {SSH})
-        wider = {SSH, ListenerException(8443)}
+        wider = {SSH, exc(8443)}
         with patch.object(ListenerExceptionStore, "write_on", side_effect=OSError("synthetic write failure")):
             with self.assertRaises(OSError):
                 admin.set_listener_exceptions("synthetic-owner-session", wider)
@@ -1077,11 +1120,23 @@ class SessionRevocationTests(ExceptionFixture):
         with self.assertRaises(AccessValidationError):
             self.access.authorize(b"v" * 32, "viewer@example.invalid", Permission.LIVE_VIEW)
 
-    def test_missing_revoker_keeps_access_closed_after_violation(self):
-        check, clock, sink = self.breached(session_revoker=None)
-        self.assertFalse(check.tick().open)
-        self.assertEqual(check.verdict.reasons, (Reason.SESSION_REVOCATION_UNAVAILABLE,))
+    def test_missing_revoker_never_opens(self):
+        # Nothing durable could carry a revocation requirement across a restart.
+        check, _, _, sink = checker(exception_store=self.exception_store, session_revoker=None)
+        self.assertEqual(check.startup().reasons, (Reason.SESSION_REVOCATION_UNAVAILABLE,))
         self.assertEqual(sink.events[-1].reasons, (Reason.SESSION_REVOCATION_UNAVAILABLE,))
+        self.assertFalse(check._check(CheckKind.RETRY).open)
+
+    def test_restart_without_revoker_after_exposure_keeps_old_sessions_out(self):
+        self.session("viewer@example.invalid", b"v" * 32)
+        files = Files(tcp=self.EXTRA)
+        check, _, _, _ = checker(files=files, exception_store=self.exception_store, session_revoker=None)
+        self.assertEqual(check.startup().reasons,
+                         (Reason.UNEXPECTED_LISTENER, Reason.SESSION_REVOCATION_UNAVAILABLE))
+        files.files["tcp"] = proc(("127.0.0.1", 8080, "0A"))
+        restarted, _, _, _ = checker(files=files, exception_store=self.exception_store, session_revoker=None)
+        self.assertFalse(restarted.startup().open)
+        self.assertFalse(restarted.access_open)
 
     def test_restart_with_pending_revocation_revokes_before_opening(self):
         self.session("viewer@example.invalid", b"v" * 32)
@@ -1299,3 +1354,157 @@ class HostnameResolutionTests(TestCase):
         self.assertEqual(reasons, (Reason.RESERVED_ADDRESSES_CHANGED, Reason.UNEXPECTED_LISTENER))
         self.assertEqual(count, 1)
         self.assertEqual(evaluate(config(), listeners, (config().expected_route,))[0], ())
+
+
+class ListenerOwnershipTests(ExceptionFixture):
+    """Owner decision 2026-10-01: an exception is a port plus its owning process."""
+
+    def opened(self, owners, **kwargs):
+        admin, check, sink = self.admin(WILDCARD_SSH, socket_owners=owners, **kwargs)
+        return admin.set_listener_exceptions("synthetic-owner-session", {SSH}), check, sink
+
+    def test_port_only_or_ambiguous_exception_is_refused(self):
+        for kwargs in (dict(port=22), dict(port=22, executable=SSHD, unit="ssh.service"),
+                       dict(port=22, executable="sshd"), dict(port=22, executable="/usr/sbin/../sbin/sshd"),
+                       dict(port=22, executable="/usr/sbin/sshd (deleted)"), dict(port=22, executable=""),
+                       dict(port=22, unit="ssh"), dict(port=22, unit="../ssh.service"), dict(port=22, unit=7)):
+            with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
+                ListenerException(**kwargs)
+        admin, check, _ = self.admin(WILDCARD_SSH)
+        with self.assertRaises(ValueError):
+            admin.set_listener_exceptions("synthetic-owner-session", {22})
+        self.assertIsNone(self.stored())
+
+    def test_matching_owner_opens(self):
+        owners = Owners()
+        verdict, _, _ = self.opened(owners)
+        self.assertTrue(verdict.open)
+        self.assertEqual(owners.calls[-1], frozenset({1001, 1000}))
+
+    def test_other_process_on_excepted_port_is_an_exposure(self):
+        intruder = SocketOwner("/usr/bin/python3.12", "user@1000.service")
+        for holders in (intruder, frozenset({SSHD_OWNER, intruder})):
+            with self.subTest(holders=holders):
+                revoker = FakeRevoker()
+                verdict, _, sink = self.opened(Owners(overrides={1000: holders}), session_revoker=revoker)
+                self.assertEqual(verdict.reasons, (Reason.UNEXPECTED_LISTENER,))
+                self.assertTrue(revoker.pending)
+                self.assertNotIn("python", repr(sink.events[-1]))
+
+    def test_unverifiable_owner_is_an_exposure(self):
+        release = threading.Event()
+
+        class Hung:
+            def owners(self, inodes):
+                release.wait(5)
+                return {}
+
+        self.addCleanup(release.set)
+        cases = {"no owner found": dict(socket_owners=Owners(overrides={1000: None})),
+                 "resolver fails": dict(socket_owners=Owners(default=OSError("synthetic /proc failure"))),
+                 "no resolver": dict(socket_owners=None),
+                 "hung resolver": dict(socket_owners=Hung(), timeout=0.05),
+                 "unknown exe": dict(socket_owners=Owners(default=SocketOwner(None, None)))}
+        for name, kwargs in cases.items():
+            with self.subTest(name):
+                revoker = FakeRevoker()
+                admin, check, _ = self.admin(WILDCARD_SSH, session_revoker=revoker, **kwargs)
+                verdict = admin.set_listener_exceptions("synthetic-owner-session", {SSH})
+                self.assertFalse(verdict.open)
+                self.assertTrue(set(verdict.reasons) & {Reason.LISTENER_OWNER_UNVERIFIED,
+                                                         Reason.UNEXPECTED_LISTENER})
+                self.assertTrue(revoker.pending)
+
+    def test_unknown_inode_is_unverified(self):
+        listeners = (HUMAN, Listener(ipaddress.IPv4Address("0.0.0.0"), 22, inode=0))
+        reasons, count, _ = evaluate(config(), listeners, (config().expected_route,), {SSH},
+                                     owners={0: frozenset({SSHD_OWNER})})
+        self.assertEqual(reasons, (Reason.LISTENER_OWNER_UNVERIFIED,))
+        self.assertEqual(count, 1)
+
+    def test_unit_exception_matches_the_unit_only(self):
+        by_unit = ListenerException(22, unit="ssh.service")
+        self.assertTrue(by_unit.owned_by(SocketOwner("/usr/sbin/sshd", "ssh.service")))
+        self.assertFalse(by_unit.owned_by(SocketOwner("/usr/sbin/sshd", "other.service")))
+        self.assertFalse(SSH.owned_by(SocketOwner("/usr/bin/sshd", "ssh.service")))
+        admin, check, _ = self.admin(WILDCARD_SSH, socket_owners=Owners(SocketOwner(None, "ssh.service")))
+        self.assertTrue(admin.set_listener_exceptions("synthetic-owner-session", {by_unit}).open)
+        self.assertEqual(decode(self.stored()), frozenset({by_unit}))
+
+    def test_port_only_stored_exceptions_fail_closed_as_outdated(self):
+        self.store_raw('{"version":1,"exceptions":[{"protocol":"tcp","port":22,"family":null,"scope":"wildcard"}]}')
+        admin, check, sink = self.admin(WILDCARD_SSH)
+        verdict = check.startup()
+        self.assertEqual(verdict.reasons[0], Reason.LISTENER_EXCEPTIONS_OUTDATED)
+        self.assertFalse(verdict.open)
+        self.assertEqual(check.listener_exceptions, frozenset())
+        # The Owner re-enters the exception with its owner through the audited path.
+        self.assertTrue(admin.set_listener_exceptions("synthetic-owner-session", {SSH}).open)
+        self.assertEqual(decode(self.stored()), frozenset({SSH}))
+
+    def test_round_trip_keeps_owner(self):
+        values = {SSH, ListenerException(41641, TransportProtocol.UDP, unit="tailscaled.service")}
+        self.assertEqual(decode(encode(values)), frozenset(values))
+        with self.assertRaises(ValueError):
+            encode({ListenerException(port, executable="/" + "x" * 1000) for port in range(1, 17)}
+                   | {ListenerException(17, executable="/" + "y" * 1023)})
+
+
+class ProcSocketOwnersTests(TestCase):
+    def setUp(self):
+        self.temporary = TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+
+    def process(self, pid, exe, fds, cgroup="0::/system.slice/ssh.service\n"):
+        base = self.root / str(pid)
+        (base / "fd").mkdir(parents=True)
+        (base / "exe").symlink_to(exe)
+        (base / "cgroup").write_text(cgroup)
+        for number, target in enumerate(fds):
+            (base / "fd" / str(number)).symlink_to(target)
+        return base
+
+    def test_maps_inodes_to_owning_processes(self):
+        self.process(100, "/usr/sbin/sshd", ["socket:[1000]", "/dev/null", "pipe:[5]"])
+        self.process(200, "/usr/bin/python3.12", ["socket:[1000]", "socket:[2000]"],
+                     cgroup="0::/user.slice/user-1000.slice/user@1000.service/app.slice/x.scope\n")
+        self.process(300, "/usr/sbin/other", ["socket:[3000]"])
+        (self.root / "self").mkdir()
+        owners = ProcSocketOwners(str(self.root)).owners(frozenset({1000, 2000, 4000}))
+        self.assertEqual(owners, {
+            1000: frozenset({SocketOwner("/usr/sbin/sshd", "ssh.service"),
+                             SocketOwner("/usr/bin/python3.12", "x.scope")}),
+            2000: frozenset({SocketOwner("/usr/bin/python3.12", "x.scope")}),
+        })
+
+    def test_unreadable_process_leaves_sockets_unverified(self):
+        base = self.process(100, "/usr/sbin/sshd", ["socket:[1000]"])
+        (base / "fd").chmod(0)
+        self.addCleanup((base / "fd").chmod, 0o700)
+        if os.access(base / "fd", os.R_OK):
+            self.skipTest("running with privilege that bypasses directory permissions")
+        self.assertEqual(ProcSocketOwners(str(self.root)).owners(frozenset({1000})), {})
+
+    def test_missing_exe_or_cgroup_unit(self):
+        base = self.process(100, "/usr/sbin/sshd", ["socket:[1000]"], cgroup="0::/\n")
+        (base / "exe").unlink()
+        self.assertEqual(ProcSocketOwners(str(self.root)).owners(frozenset({1000})),
+                         {1000: frozenset({SocketOwner(None, None)})})
+
+    def test_root_must_be_absolute(self):
+        with self.assertRaises(ValueError):
+            ProcSocketOwners("proc")
+
+
+class ProcNetInodeTests(TestCase):
+    def test_inode_is_parsed_and_not_part_of_identity(self):
+        parsed = parse_proc_net_tcp(proc(("0.0.0.0", 22, "0A")), ipv6=False, byteorder="little")
+        self.assertEqual(parsed[0].inode, 1000)
+        self.assertEqual(parsed[0], Listener(ipaddress.IPv4Address("0.0.0.0"), 22))
+
+    def test_missing_or_malformed_inode_is_rejected(self):
+        for line in ("   0: 0100007F:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000 0 0",
+                     "   0: 0100007F:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000 0 0 x 1"):
+            with self.subTest(line=line), self.assertRaises(ReservationEnumerationError):
+                parse_proc_net_tcp(HEADER + "\n" + line + "\n", ipv6=False, byteorder="little")
