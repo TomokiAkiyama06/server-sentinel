@@ -1541,6 +1541,10 @@ explicitly. Do not alter production protection to make a negative test pass.
 - [ ] a PR retarget, base change during either review, missing API page, provider/API error, malformed receipt and unavailable publisher each fail closed;
 - [ ] inspect the App's selected-repository grant and verify the publisher cannot alter source, workflows, branch protection, collaborators or repository administration;
 - [ ] demonstrate recovery from a stopped publisher without disabling protection, changing expected issuers or adding bypass actors;
+- [ ] collector: confirm the real Codex (and, if enabled, Claude) bot user ID/login/type on a synthetic test PR; confirm the configured pass/blocking/suggestion markers against real review bodies and inline comments; measure provider review duration against `max_review_runtime_seconds`; confirm review IDs increase over time;
+- [ ] collector: a same-repository workflow posting a PR review with the identical body through `GITHUB_TOKEN` is ignored as untrusted; a base update after the request invalidates it; a review finished before the runtime bound after a base update is not counted;
+- [ ] collector recovery: on a synthetic test PR, post a success then a superseding failure for the same check on the test-merge SHA and confirm `GET .../commits/{sha}/check-runs?check_name=...&app_id=...&filter=all` lists both, that the later run has the higher ID, and that a restarted publisher with a stale `success` ledger record posts a new success instead of reusing it;
+- [ ] token exchange (only after the Owner RS256 decision): the exchanged token is limited to this repository and the four fixed permissions, refreshes before expiry, and never appears in the publisher's journal, process environment or process arguments (`/proc/<pid>/environ`, `/proc/<pid>/cmdline`);
 - [ ] record public test PR/run/check IDs, non-secret context digests, rule snapshots and observed GitHub merge refusals, then re-read the production rule after activation.
 
 Never use a real secret as a fixture or publish an App key/token, reviewer token,
