@@ -25,6 +25,13 @@ def capture_profile(profile):
     return VideoProfile(profile.width, profile.height, profile.fps, profile.pixel_format)
 
 
+def _serial_shared(candidate, devices):
+    """True when another connected camera reports the candidate's serial identity."""
+    return candidate.strong_key is not None and sum(
+        device.strong_key == candidate.strong_key for device in devices
+    ) > 1
+
+
 @dataclass(frozen=True)
 class PreparedApproval:
     """One Owner selection already validated against a current device scan."""
@@ -49,6 +56,10 @@ class LocalUvcAdapter:
     # sustained SQLite write load. Health transitions are written immediately
     # by the controller; the last-seen timestamp is refreshed at most this often.
     LAST_SEEN_INTERVAL_SECONDS = 1.0
+    # While capture is live, a conflicting approval of another enabled source
+    # (a pre-existing duplicate re-enabled later) is rechecked at most this
+    # often; before any capture opens it is checked on every poll.
+    APPROVAL_CONFLICT_INTERVAL_SECONDS = 1.0
 
     def __init__(self, registry, *, emit_audit, on_frame,
                  discovery=None, capture_factory=MmapCapture, clock=None,
@@ -66,6 +77,7 @@ class LocalUvcAdapter:
         self.monotonic = monotonic
         self.sessions = {}
         self._approved_handoffs = {}
+        self._conflict_checked = {}
         self.closed = False
         # Sources whose latest health observation could not be persisted
         # (storage admission refused, database fault). The registry may then
@@ -158,7 +170,10 @@ class LocalUvcAdapter:
         """
         source = self._source(source_id)
         scan = self.discovery.scan()
-        if not source.enabled or scan.failures or scan.devices.count(candidate) != 1:
+        if (not source.enabled or scan.failures or scan.devices.count(candidate) != 1
+                or self.store.approved_elsewhere(
+                    source.id, candidate,
+                    serial_ambiguous=_serial_shared(candidate, scan.devices))):
             raise ValueError("candidate is unavailable or ambiguous")
         self.registry.update_source(source.id, capabilities={
             **source.capabilities, "uvc_formats": list(candidate.formats), "video_only": True,
@@ -177,19 +192,19 @@ class LocalUvcAdapter:
 
         Device discovery runs here, before the audited transaction opens, so a
         slow or blocking USB/UVC scan never holds the database write lock.
+        A camera already approved for another enabled source is refused with
+        the same generic reason; the transaction repeats that check.
         """
         source = self._source(source_id)
         scan = self.discovery.scan()
         session = self.sessions.get(source_id)
+        ambiguous = _serial_shared(candidate, scan.devices)
         if ((session is not None and not session.stopped) or not source.enabled
-                or scan.failures or scan.devices.count(candidate) != 1):
+                or scan.failures or scan.devices.count(candidate) != 1
+                or self.store.approved_elsewhere(source.id, candidate,
+                                                 serial_ambiguous=ambiguous)):
             raise ValueError("candidate is unavailable or approval session is active")
-        peers = sum(
-            candidate.strong_key is not None and device.strong_key == candidate.strong_key
-            for device in scan.devices
-        )
-        return PreparedApproval(source.id, candidate,
-                                candidate.strong_key is not None and peers > 1)
+        return PreparedApproval(source.id, candidate, ambiguous)
 
     def approve_source_on(self, connection, prepared):
         """Atomically persist a prepared idle Owner selection with its audit.
@@ -279,12 +294,36 @@ class LocalUvcAdapter:
         try:
             session.configure(enabled=source.enabled,
                               profile=capture_profile(source.desired_capture_profile))
+            if self._approval_conflict(source, session):
+                session.controller.approval_conflict()
+                session.close()
+                return False
             return session.step(timeout=timeout)
         except BaseException:
             # Downstream/store errors must not leave capture running as healthy.
             session.close()
             session.controller.capture_failed()
             raise
+
+    def _approval_conflict(self, source, session):
+        """True when another enabled source holds an approval for this camera.
+
+        Such duplicates can only predate the approval-time check. Every
+        conflicting source reports manual intervention, so which one captures
+        never depends on startup or polling order and nothing is rebound.
+        """
+        controller = session.controller
+        if not source.enabled or controller.requires_approval:
+            self._conflict_checked.pop(source.id, None)
+            return False
+        now = self.monotonic()
+        last = self._conflict_checked.get(source.id)
+        if (session.capture is not None and last is not None
+                and now - last < self.APPROVAL_CONFLICT_INTERVAL_SECONDS):
+            return False
+        self._conflict_checked[source.id] = now
+        return self.store.approved_elsewhere(source.id, controller.approved,
+                                             serial_ambiguous=controller.serial_ambiguous)
 
     def stop_source(self, source_id):
         """Stop one source on the same serialized worker that polls it.
@@ -295,6 +334,7 @@ class LocalUvcAdapter:
         """
         if not isinstance(source_id, UUID):
             raise ValueError("invalid source identity")
+        self._conflict_checked.pop(source_id, None)
         session = self.sessions.pop(source_id, None)
         if session is None:
             self._approved_handoffs.pop(source_id, None)
