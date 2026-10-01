@@ -2168,7 +2168,12 @@ class LifecycleInventoryTests(unittest.TestCase):
                              "WHERE node_id=?", ("8" * 64, nodes["restaged"]))
         code, report, _ = self.verify(baseline)
         self.assertEqual(code, inventory.EXIT_FAILED)
-        self.assertEqual(sorted(report["sections"]["security_state"]["failed"],
+        failed = report["sections"]["security_state"]["failed"]
+        # The key re-staged in the window, now replaced, stays bound with
+        # nothing left to explain it (keyed, so matched by reason).
+        bindings = [item for item in failed if item["id"].startswith("pairing_key_bindings:")]
+        self.assertEqual([item["reason"] for item in bindings], ["unexplained"])
+        self.assertEqual(sorted([item for item in failed if item not in bindings],
                                 key=lambda item: item["id"]),
                          sorted([{"id": f"pairing_renewals:{nodes['silent']}",
                                   "reason": "missing"},
@@ -2843,7 +2848,7 @@ class LifecycleInventoryTests(unittest.TestCase):
                 run("stage")
                 staged_source, recorded_staged = "recorded", staged_row()[0]
             approved_staged, revoked = False, False
-            pending_after_revoke, reactivated = False, False
+            pending_after_revoke, reactivated, orphaned = False, False, False
             saved, self.runtime = self.runtime, runtime
             try:
                 _, baseline = self.record(f"composition-{index}.json")
@@ -2861,6 +2866,17 @@ class LifecycleInventoryTests(unittest.TestCase):
                         pending_after_revoke = True
                     elif revoked and op == "fresh":
                         reactivated = True
+                    # A key staged inside the window and then superseded (a
+                    # re-stage, or an activation dropping its renewal; or a
+                    # promoted one replaced by a fresh key) stays bound with
+                    # nothing showing it was staged: fail closed until a
+                    # revoke revokes every binding of the node.
+                    if op in ("stage", "fresh", "retry") and staged_source == "window":
+                        orphaned = True
+                    if op == "fresh" and credential_source == "promoted-window":
+                        orphaned = True
+                    if op == "revoke":
+                        orphaned = False
                     run(op)
                     revoked |= op == "revoke"
                     if op in ("fresh", "retry"):
@@ -2875,7 +2891,7 @@ class LifecycleInventoryTests(unittest.TestCase):
             finally:
                 self.runtime = saved
             return (credential_source == "promoted-window" or approved_staged
-                    or pending_after_revoke or reactivated,
+                    or pending_after_revoke or reactivated or orphaned,
                     report["sections"]["security_state"])
 
         compositions = [(a, b) for a in operations for b in operations]
@@ -2957,6 +2973,9 @@ class LifecycleInventoryTests(unittest.TestCase):
             "renewal deleted": ("DELETE FROM pairing_node_renewals WHERE node_id=:node",),
             "renewal key replaced":
                 ("UPDATE pairing_node_renewals SET public_key_digest=:other WHERE node_id=:node",),
+            # Codex P1: a live binding no approval, staging or credential explains.
+            "orphan live binding":
+                ("INSERT INTO pairing_key_bindings VALUES (:other, :node, 0)",),
         }
         runtime, baseline, *_ = build(len(tampers))
         saved, self.runtime = self.runtime, runtime

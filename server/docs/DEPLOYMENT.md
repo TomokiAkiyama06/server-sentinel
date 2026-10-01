@@ -486,8 +486,14 @@ never deleted, rebound or un-revoked; a
 staged renewal stays, is retried with its own key while the credential is
 unchanged, is replaced by a key newly bound since the record, or leaves by
 promotion, revocation or a fresh pairing; a credential first seen now needs a
-fresh pairing of its key. Three ledger-reachable cases fail closed: a renewal
-both staged and promoted inside the window (its material cannot be shown),
+fresh pairing of its key; a live binding added since the record must be
+explained by an enrollment of that node and key, the node's staged renewal,
+or its current credential key (`unexplained` otherwise). Four ledger-reachable
+cases fail closed: a renewal both staged and promoted inside the window (its
+material cannot be shown), a key staged inside the window and then
+superseded by another staging or by an activation that drops its renewal
+(its binding stays live with nothing left showing it was staged; a later
+revocation of the node clears this),
 re-pairing or approving anything on a node already revoked, at record time
 (reported as a reversed revocation) or inside the window (an incomplete
 revocation), on the same node ID instead of a new one, and the Owner approving (including retrying through

@@ -1099,6 +1099,21 @@ def _compare_pairing(baseline: dict, current: dict) -> list:
         # by revoke() of its node since the record.
         revoked_nodes.update(binding["node_id"] for key_ref, binding in bindings.items()
                              if binding["revoked"] and key_ref not in recorded_bindings)
+        # A live binding added since the record comes from approve() (its
+        # enrollment stays, in some state), from stage_renewal() (the node's
+        # staged row), or is the credential key that renewal became. A key
+        # staged and then superseded (re-staged, or its renewal dropped by an
+        # activation) stays bound with nothing left to show it was staged:
+        # that is indistinguishable from a stray binding and fails closed.
+        enrollment_pairs = {(item["node_id"], item["key_ref"]) for item in enrollments_now.values()}
+        for key_ref, binding in sorted(bindings.items()):
+            node = binding["node_id"]
+            if key_ref in recorded_bindings or binding["revoked"]:
+                continue
+            if not ((node, key_ref) in enrollment_pairs
+                    or (renewals.get(node) or {}).get("key_ref") == key_ref
+                    or (credentials.get(node) or {}).get("key_ref") == key_ref):
+                fail("pairing_key_bindings", key_ref, "unexplained")
 
     # -- enrollment transitions and the operation that made them -----------
     recorded_states = {enrollment: item["state"]
