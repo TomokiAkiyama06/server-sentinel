@@ -254,10 +254,11 @@ class RingTests(unittest.TestCase):
         self.quota.capacity = 1 << 50
         self.ring = DiskRing(self.settings, self.store, ledger_maximum_bytes=8 * 1024**4,
                              authority=AllowControls(), ledger_space=self.quota)
-        profile = SegmentProfile(SOURCE, 1_000_000_000, 1_000_000_000, 100, 0)
+        # The shortest supported cadence with a 12,500-byte (16 KiB) segment.
+        profile = SegmentProfile(SOURCE, 100_000, 100_000, SECOND, 0)
         capacity = 128 * 1024**3
         result = self.configure("capacity", capacity, profiles=(profile,))
-        self.assertEqual(result["estimated_duration_us"], (capacity // 16384 - 2) * 100)
+        self.assertEqual(result["estimated_duration_us"], (capacity // 16384 - 2) * SECOND)
         self.assertLessEqual(result["projected_maximum_bytes"], capacity)
         self.assertEqual(self.ring.status(now_us=T0, clock_trusted=True)["estimated_duration_us"],
                          result["estimated_duration_us"])
@@ -558,6 +559,42 @@ class RingTests(unittest.TestCase):
         status = self.ring.status(now_us=T0, clock_trusted=True)
         self.assertEqual(("STORAGE_HARD_STOP", "segment_write_refused_at_reserve"),
                          (status["state"], status["reason"]))
+
+    def test_sub_second_segment_cadence_is_refused(self):
+        for duration in (1, 1000, SECOND - 1):
+            with self.subTest(duration=duration):
+                with self.assertRaisesRegex(RingRefused, "segment_duration_below_supported_cadence"):
+                    SegmentProfile(SOURCE, 800, 400, duration, 100)
+        self.assertEqual(SECOND, SegmentProfile(SOURCE, 800, 400, SECOND, 100).segment_duration_us)
+
+    def test_next_write_check_work_does_not_scale_with_cadence_ratio(self):
+        reads = [0]
+
+        class CountingProfile(SegmentProfile):
+            def __getattribute__(self, name):
+                if name == "segment_duration_us":
+                    reads[0] += 1
+                return super().__getattribute__(name)
+
+        fast = tuple(CountingProfile(UUID(int=330 + index), 800, 400, SECOND, 100) for index in range(3))
+        slow = CountingProfile(UUID(int=333), 80, 40, PRE, 100)
+        self.ring.close()
+        self.ring = DiskRing(self.settings, self.store, ledger_maximum_bytes=16 * LEDGER_BYTES,
+                             authority=AllowControls())
+        self.ring.configure(RingConfig("duration", 600), fast + (slow,), now_us=T0, clock_trusted=True)
+        self.ring.profiles = {profile.source_id: profile for profile in fast + (slow,)}
+        self.ring.append(slow.source_id, T0 - PRE, T0, PAYLOAD, now_us=T0, clock_trusted=True)
+        for profile in fast:
+            self.ring.append(profile.source_id, T0 - SECOND, T0, PAYLOAD, now_us=T0, clock_trusted=True)
+        budget = self.ring._budget(self.ring.profiles, T0, clock_trusted=True)
+        for at_bound in (False, True):
+            reads[0] = 0
+            self.ring._next_write_refused(T0, budget, clock_trusted=True, at_bound=at_bound)
+            # The fast sources append 600 times each before the slow source's
+            # next append; the check must not expand them one by one.
+            self.assertLess(reads[0], 200)
+        status = self.ring.status(now_us=T0, clock_trusted=True)
+        self.assertNotEqual("STORAGE_HARD_STOP", status["state"])
 
     def test_long_rollback_with_mixed_cadences_keeps_status_bounded(self):
         late = 61 * 86400 * SECOND

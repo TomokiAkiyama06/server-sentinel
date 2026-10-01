@@ -23,8 +23,11 @@ overhead default. `DiskRing` also requires an explicit `ledger_maximum_bytes`
 limit for the SQLite main database; it has no deployment default. Each complete input segment must match that duration and stay
 within its compressed byte bound. Different sources may have different profiles.
 Overlapping/out-of-order segments, unconfigured sources and violations of the
-profile bound are refused. Real segmenters must provide this bounded cadence
-contract; a maximum duration alone does not bound segment count/overhead.
+profile bound are refused. The segment duration is at least one second (the
+supported cadence) and at most `PRE`; a shorter profile is refused
+(`segment_duration_below_supported_cadence`). Real segmenters must provide this
+bounded cadence contract; a maximum duration alone does not bound segment
+count/overhead.
 
 `append(source_id, start_us, end_us, bytes, now_us=..., clock_trusted=...)` receives
 already encoded video-only data. The capture adapter is responsible for codec,
@@ -154,9 +157,13 @@ therefore predicts refusal by simulating the sources' next appends.
   is known (not overdue) and outside any retained incident.
 - **Charge `e`.** Each simulated append is charged, and frees once it ages
   out, that source's recent real allocation: the largest allocation among its
-  last eight stored segments, never above `round_up(max_segment)`, and
-  `round_up(max_segment)` without history. `max_segment` is the source's
-  largest bounded segment.
+  last eight stored segments, in whole allocation units, never above
+  `round_up(max_segment)`, and `round_up(max_segment)` without history.
+  `max_segment` is the source's largest bounded segment. Each source's appends
+  form an arithmetic sequence, so the charges through any instant are
+  computed directly and only the latest append between two credit changes
+  needs checking: the work is bounded by stored rows and sources, not by
+  cadence ratios.
 - **`STORAGE_HARD_STOP / segment_write_refused_at_reserve`** (writes refused
   at the recent real bitrate). Appends at the same instant form one batch that
   must fit as a whole, so the result never depends on profile order. Status
@@ -165,9 +172,14 @@ therefore predicts refusal by simulating the sources' next appends.
   `consumed_before(t)` sums `e` over earlier batches. Charging every chained
   append the bound here would make two or more sources writing ordinary VBR
   below the bound read as refused in a steady FIFO that accepts every write.
-  It is never reported as pressure or healthy while recording is refused at
-  the recent bitrate, and it clears without Owner action as soon as space
-  returns.
+  While the predicted next appends are refused at the recent bitrate it is
+  never reported as pressure or healthy, and it clears without Owner action
+  as soon as space returns. Two known gaps: right after a refusal the refused
+  segment's `missing` row counts as that source's last write, so until the
+  next refusal is imminent again status may read `STORAGE_PRESSURE`; and a
+  segment larger than the source's recent maximum can be refused while status
+  read only the at-risk pressure below. In both cases the append itself is
+  refused, never written past the reserve.
 - **`STORAGE_PRESSURE / segment_write_at_risk_at_maximum_bitrate`** (writes
   would be refused only if the bitrate rose to the bound). The same
   simulation with every `e` replaced by `round_up(max_segment)`, that is

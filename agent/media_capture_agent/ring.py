@@ -373,24 +373,27 @@ class DiskRing:
         may append at ``now``. Only media that ages out by that earliest time
         is credited, so another source's later expiry is never counted.
 
-        Appends are simulated chronologically up to the latest source's next
-        append, including repeated appends of shorter-cadence sources and
-        same-instant appends of synchronized sources. Free space and each
-        reclaimed segment are shared: every earlier simulated append consumes
-        its bounded allocation, and reclaimable media is credited only once.
-        A simulated append is itself ordinary media: once its end crosses a
-        later append's FIFO cutoff, its bounded allocation is credited too,
-        unless a retained incident would protect it or a loss is pending
-        (both of which also stop the append path from reclaiming it). Only a
-        source whose next segment interval is known (not overdue) is
-        credited; otherwise status errs toward pressure or a hard stop.
+        Appends are simulated up to the latest source's next append,
+        including repeated appends of shorter-cadence sources and same-instant
+        appends of synchronized sources. Free space and each reclaimed segment
+        are shared: every earlier simulated append consumes its charge, and
+        reclaimable media is credited only once. A simulated append is itself
+        ordinary media: once it ages out of the FIFO window its charge is
+        credited too, unless a retained incident would protect it or a loss
+        is pending (both of which also stop the append path from reclaiming
+        it). Only a source whose next segment interval is known (not overdue)
+        is credited; otherwise status errs toward pressure or a hard stop.
 
         Each simulated append is charged the largest real allocation among
-        that source's last ``RECENT_ALLOCATION_SEGMENTS`` stored segments,
-        never above its bound (the bound without history): a refusal here
-        means writes are refused at the recent real bitrate. Appends at the
-        same instant form one batch that must fit, with one ledger headroom,
-        as a whole, so the result does not depend on profile order.
+        that source's last ``RECENT_ALLOCATION_SEGMENTS`` stored segments, in
+        whole allocation units, never above its bound (the bound without
+        history): a refusal here means writes are refused at the recent real
+        bitrate. Appends at the same instant form one batch that must fit,
+        with one ledger headroom, as a whole, so the result does not depend
+        on profile order. Each source's appends form an arithmetic sequence,
+        so the charges through any instant are computed directly and only the
+        latest append between two credit changes is checked: the work is
+        bounded by stored rows and sources, not by cadence ratios.
 
         With ``at_bound`` every simulated append is charged its maximum bound
         instead: status uses that worst case only to warn (pressure) that a
@@ -424,63 +427,69 @@ class DiskRing:
         latest = max(next_append.values())
         rows = self._selected_reclaimable(latest, self.config) if clock_trusted else ()
         allocations = self.store.segment_allocations()
-        # Each simulated append is checked against the maximum bound (its own
-        # size is unknown), but the space it then consumes, and later frees,
-        # is estimated from the source's recent real allocations: charging
-        # every chained append the maximum turns ordinary VBR below the bound
-        # into a permanent false refusal. Without stored history the maximum
-        # is used.
+        # Each simulated append is charged, and later frees, the source's
+        # recent real allocation (whole allocation units, never above the
+        # bound; the bound without history, or for ``at_bound``): charging
+        # every chained append the maximum would turn ordinary VBR below the
+        # bound into a permanent false refusal.
         charge = {}
         for source, profile in self.profiles.items():
             bound = round_up(profile.segment_bytes(), unit)
             sizes = [allocations.get(UUID(row[0]), bound) for row in self.db.execute(
                 "SELECT id FROM segments WHERE source=? AND state='stored' "
                 "ORDER BY end DESC LIMIT ?", (str(source), RECENT_ALLOCATION_SEGMENTS))]
-            charge[source] = min(bound, max(sizes)) if sizes and not at_bound else bound
+            charge[source] = (min(bound, round_up(max(sizes), unit)) if sizes and not at_bound
+                              else bound)
         window = self.config.value * SECOND if self.config.mode == "duration" else PRE
-        events = []
-        for source, profile in self.profiles.items():
-            at = next_append[source]
-            while at <= latest:
-                events.append((at, profile))
-                at += profile.segment_duration_us
-        existing = sorted((row["end"], allocations.get(UUID(row["id"]), 0)) for row in rows)
-        may_credit = clock_trusted and not self._pending_loss()
-        protecting = []
-        if may_credit:
+        cadence = {source: profile.segment_duration_us for source, profile in self.profiles.items()}
+
+        def consumed_through(at):
+            """Charges of every simulated append at or before ``at``."""
+            return sum(charge[source] * ((at - next_append[source]) // cadence[source] + 1)
+                       for source in self.profiles if at >= next_append[source])
+
+        # Credits as (time from which they count, bytes): stored media ages out
+        # at ``end + window``; a simulated append ages out ``window`` after it
+        # is written. Because ``latest <= now + PRE <= now + window``, only an
+        # append at exactly ``now`` can age out within the simulation, so at
+        # most one simulated credit per source exists.
+        credits = [(max(row["end"] + window, now), allocations.get(UUID(row["id"]), 0)) for row in rows]
+        if clock_trusted and not self._pending_loss():
             protecting = [(row["start"], row["end"], set(json.loads(row["sources"])))
                           for row in self.db.execute(
                               "SELECT start, end, sources FROM incidents "
                               "WHERE state IN ('active','complete','partial') AND end>?", (now - window,))]
-        simulated = []
-        consumed = reclaim = 0
-        credited_existing = credited_simulated = 0
-        # Appends at the same instant form one batch evaluated as a whole, so
-        # the result never depends on profile order: whichever of them is
-        # written last needs the batch's charges plus one ledger headroom
-        # above the reserve. Both credit lists are in end order, so each
-        # entry is credited once.
-        batches = {}
-        for at, profile in events:
-            batches.setdefault(at, []).append(profile)
-        for at in sorted(batches):
-            cutoff = at - window
-            while credited_existing < len(existing) and existing[credited_existing][0] <= cutoff:
-                reclaim += existing[credited_existing][1]
-                credited_existing += 1
-            while credited_simulated < len(simulated) and simulated[credited_simulated][0] <= cutoff:
-                reclaim += simulated[credited_simulated][1]
-                credited_simulated += 1
-            charges = sum(charge[profile.source_id] for profile in batches[at])
-            if free + reclaim - consumed < reserve + round_up(charges + self.ledger_headroom, unit):
-                return True
-            consumed += charges
-            for profile in batches[at]:
-                source = str(profile.source_id)
-                if may_credit and profile.source_id in phased and not any(
-                        source in sources and start < at and end > at - profile.segment_duration_us
+            for source in phased:
+                at = next_append[source]
+                if at + window <= latest and not any(
+                        str(source) in sources and start < at and end > at - cadence[source]
                         for start, end, sources in protecting):
-                    simulated.append((at, charge[profile.source_id]))
+                    credits.append((at + window, charge[source]))
+        credits.sort()
+        # Appends at the same instant form one batch that must fit as a
+        # whole: whichever is written last needs the charges through that
+        # instant plus one ledger headroom above the reserve, so the result
+        # never depends on profile order. Charges are whole allocation units,
+        # so that is ``free + R(t) - consumed_through(t) >= reserve +
+        # round_up(L)``. Within an interval of constant credit ``R`` the
+        # latest append is the strictest, so only that one is checked: the
+        # work is bounded by the stored rows and sources, not by how many
+        # times a short-cadence source appends before the slowest one.
+        headroom = round_up(self.ledger_headroom, unit)
+        boundaries = sorted({time for time, _amount in credits if now < time <= latest})
+        starts = [now] + boundaries
+        ends = boundaries + [latest + 1]
+        reclaim = 0
+        index = 0
+        for begin, finish in zip(starts, ends):
+            while index < len(credits) and credits[index][0] <= begin:
+                reclaim += credits[index][1]
+                index += 1
+            consumed = consumed_through(finish - 1)
+            if consumed == consumed_through(begin - 1):
+                continue  # No append in this interval.
+            if free + reclaim - consumed < reserve + headroom:
+                return True
         return False
 
     def configure(self, config, profiles, *, now_us, clock_trusted):
