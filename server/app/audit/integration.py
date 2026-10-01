@@ -207,12 +207,13 @@ class AccessAdministration:
             operation=lambda connection: operation(connection, self.access.now()),
         )
 
-    def invite(self, actor_context, external_identity, display_name, permissions):
+    def invite(self, actor_context, display_name, permissions):
+        """Invite one person; the invitation, not a proxy login, identifies them."""
         target = uuid4()
         return self._execute(
             actor_context, AuditAction.INVITE_PRINCIPAL, target,
             lambda connection, at: self.access.invite_on(
-                connection, target, external_identity, display_name, permissions, at=at,
+                connection, target, display_name, permissions, at=at,
             ),
         )
 

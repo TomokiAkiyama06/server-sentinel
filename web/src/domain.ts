@@ -87,6 +87,11 @@ export interface DashboardServices {
   loadStorage?(signal: AbortSignal): Promise<StorageSummary>;
   starRecording?(id: string, starred: boolean, signal: AbortSignal): Promise<void>;
   deleteRecording?(id: string, signal: AbortSignal): Promise<void>;
+  /** Owner-only first-run wizard progress (no route serves it yet, #48/#10). */
+  loadWizard?(signal: AbortSignal): Promise<WizardSnapshot>;
+  /** One compare-and-swap transition; the server audits it and may refuse it. */
+  transitionWizard?(step: WizardStep, status: WizardStatus, expectedRevision: number,
+    signal: AbortSignal): Promise<WizardSnapshot>;
 }
 
 // No URL/query/localStorage switch can grant a production session. #10 must
@@ -95,7 +100,7 @@ export const deniedServices: DashboardServices = {
   async loadSession() { return { state: 'denied' }; },
 };
 
-export const views = ['overview', 'sources', 'nodes', 'live', 'recordings', 'timeline', 'presence', 'access', 'storage'] as const;
+export const views = ['overview', 'setup', 'sources', 'nodes', 'live', 'recordings', 'timeline', 'presence', 'access', 'storage'] as const;
 export type View = typeof views[number];
 
 export function canVisit(session: Session, view: View): boolean {
@@ -105,8 +110,8 @@ export function canVisit(session: Session, view: View): boolean {
   if (view === 'live') return session.permissions.includes('live:view');
   // Historical timeline/events stay with recordings:view; presence stays owner-only.
   if (view === 'recordings' || view === 'timeline') return session.permissions.includes('recordings:view');
-  // Storage, retention and notification settings stay owner-only; no viewer
-  // permission grants them, and the server repeats this check.
+  // Setup, storage, retention and notification settings stay owner-only; no
+  // viewer permission grants them, and the server repeats this check.
   return false;
 }
 
@@ -196,4 +201,59 @@ export interface PresenceAuditEntry {
 export interface PresenceReport {
   snapshot: PresenceSnapshot;
   audit: readonly PresenceAuditEntry[];
+}
+
+/** First-run wizard order; mirrors `server/app/setup_wizard/model.py`. */
+export const wizardSteps = ['welcome', 'deployment_owner', 'storage', 'hardware_and_recorder',
+  'locale_and_time', 'camera_sources', 'detection_profiles', 'owner_verification', 'slack',
+  'human_remote_access'] as const;
+export type WizardStep = typeof wizardSteps[number];
+export const wizardStatuses = ['pending', 'unavailable', 'skipped', 'completed'] as const;
+export type WizardStatus = typeof wizardStatuses[number];
+/** Only these may be skipped; the server refuses skipping any other step. */
+export const optionalWizardSteps: readonly WizardStep[] = ['owner_verification', 'slack', 'human_remote_access'];
+/** The shell itself can complete only the explanatory Welcome step. Every other
+ *  step is completed by its own integration, never by the shell, so an
+ *  unfinished area can be deferred as `unavailable` but never shown as done. */
+export const shellCompletableWizardSteps: readonly WizardStep[] = ['welcome'];
+
+/** Progress only: the backend state carries no setting or secret value. */
+export interface WizardStepState {
+  step: WizardStep;
+  status: WizardStatus;
+  revision: number;
+}
+export interface WizardSnapshot {
+  states: readonly WizardStepState[];
+}
+
+/** Copy only the bounded progress fields, in the documented order, or fail
+ *  closed. Any other property a provider returns is dropped, never rendered. */
+export function parseWizard(value: unknown): WizardSnapshot {
+  if (typeof value !== 'object' || value === null || !('states' in value) || !Array.isArray(value.states)
+      || value.states.length !== wizardSteps.length) throw new Error('invalid wizard state');
+  const states = value.states.map((item: unknown, index: number): WizardStepState => {
+    if (typeof item !== 'object' || item === null || !('step' in item) || !('status' in item) || !('revision' in item)) {
+      throw new Error('invalid wizard state');
+    }
+    const expected = wizardSteps[index];
+    const { step, status, revision } = item;
+    if (expected === undefined || step !== expected || !wizardStatuses.includes(status as WizardStatus)
+        || typeof revision !== 'number' || !Number.isSafeInteger(revision) || revision < 0) {
+      throw new Error('invalid wizard state');
+    }
+    if (status === 'skipped' && !optionalWizardSteps.includes(expected)) throw new Error('invalid wizard state');
+    return { step: expected, status: status as WizardStatus, revision };
+  });
+  return { states };
+}
+
+/** First unresolved step, or null once every step is acknowledged. */
+export function currentWizardStep(snapshot: WizardSnapshot): WizardStep | null {
+  return snapshot.states.find(state => state.status === 'pending')?.step ?? null;
+}
+
+/** True only when every required step is actually completed. */
+export function wizardDeploymentReady(snapshot: WizardSnapshot): boolean {
+  return snapshot.states.every(state => optionalWizardSteps.includes(state.step) || state.status === 'completed');
 }

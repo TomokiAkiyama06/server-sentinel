@@ -196,7 +196,7 @@ try {
       await scenario(viewport, { production: true, optIn }, async (page, requests) => {
         await page.heading('アクセスの確認が必要です');
         assert.equal(await page.evaluate('document.documentElement.lang'), 'ja');
-        assert.equal(await page.evaluate("document.querySelectorAll('nav button:disabled').length"), 9);
+        assert.equal(await page.evaluate("document.querySelectorAll('nav button:disabled').length"), 10);
         assert.equal(requests.some(path => path.startsWith('/api/')), false);
       });
       await scenario(viewport, { status: 500, optIn }, async page => {
@@ -210,7 +210,7 @@ try {
         await page.click('カメラソース');
         await page.wait(`document.querySelectorAll('[data-source-id]').length === ${count} && Boolean(document.querySelector('.source-count'))`);
         assert.equal(await page.evaluate('document.documentElement.scrollWidth <= window.innerWidth'), true, 'source collection fits viewport');
-        for (const title of ['概要', 'キャプチャノード', 'ライブ', '録画', 'ストレージと通知', 'アクセス']) {
+        for (const title of ['概要', '初期設定', 'キャプチャノード', 'ライブ', '録画', 'ストレージと通知', 'アクセス']) {
           await page.click(title); await page.heading(title);
           assert.equal(await page.evaluate('document.documentElement.scrollWidth <= window.innerWidth'), true, 'each screen fits viewport');
         }
@@ -341,7 +341,7 @@ try {
       await page.wait("document.querySelectorAll('[data-recording-id]').length === 0");
       await page.heading('アクセスを確認しています');
       assert.doesNotMatch(await page.evaluate('document.body.innerText'), /生成カメラ/);
-      assert.equal(await page.evaluate("document.querySelectorAll('nav button:disabled').length"), 9);
+      assert.equal(await page.evaluate("document.querySelectorAll('nav button:disabled').length"), 10);
     });
     // A recovered NORMAL state must still surface sticky backend faults.
     await scenario(viewport, { storageState: 'NORMAL', storageFaults: true }, async (page, requests) => {
@@ -543,6 +543,23 @@ try {
       assert.equal(requests.filter(path => path === '/api/mock/timeline').length, 2);
       assert.equal(requests.filter(path => path === '/api/mock/presence').length, 2);
     });
+    // First-run wizard shell: the Owner proceeds in order, the shell completes
+    // only Welcome, and an unfinished area is deferred, never shown as complete.
+    await scenario(viewport, {}, async page => {
+      await page.click('初期設定');
+      await page.wait("document.querySelectorAll('[data-wizard-step]').length === 10");
+      const current = "document.querySelector('[aria-current=\"step\"]').dataset.wizardStep";
+      assert.equal(await page.evaluate(current), 'welcome');
+      await page.evaluate("document.querySelector('[data-wizard-action=\"completed\"]').click()");
+      await page.wait("document.querySelector('[data-wizard-step=\"welcome\"]').dataset.wizardStatus === 'completed'");
+      assert.equal(await page.evaluate(current), 'deployment_owner');
+      assert.equal(await page.evaluate("document.querySelectorAll('[data-wizard-action=\"completed\"], [data-wizard-action=\"skipped\"]').length"), 0);
+      await page.evaluate("document.querySelector('[data-wizard-action=\"unavailable\"]').click()");
+      await page.wait("document.querySelector('[data-wizard-step=\"deployment_owner\"]').dataset.wizardStatus === 'unavailable'");
+      assert.equal(await page.evaluate("document.querySelector('[data-wizard-ready]').dataset.wizardReady"), 'false');
+      assert.equal(await page.evaluate("document.querySelectorAll('[data-wizard-status=\"completed\"]').length"), 1);
+      assert.equal(await page.evaluate('document.documentElement.scrollWidth <= window.innerWidth'), true, 'wizard fits viewport');
+    });
     for (const permissions of [[], ['live:view'], ['recordings:view'], ['live:view', 'recordings:view']]) {
       await scenario(viewport, { session: { state: 'allowed', role: 'viewer', permissions } }, async (page, requests) => {
         await page.heading('概要');
@@ -553,6 +570,9 @@ try {
         assert.equal(await page.enabled('プレゼンス'), false);
         assert.equal(await page.enabled('アクセス'), false);
         assert.equal(await page.enabled('ストレージと通知'), false);
+        // First-run setup stays owner-only: no wizard state or control for viewers.
+        assert.equal(await page.enabled('初期設定'), false);
+        assert.equal(await page.evaluate("document.querySelectorAll('[data-wizard-step], [data-wizard-action]').length"), 0);
         if (permissions.includes('recordings:view')) {
           await page.click('録画');
           await page.wait("document.querySelectorAll('[data-recording-id]').length === 3");
