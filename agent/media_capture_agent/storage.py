@@ -15,7 +15,16 @@ from .config import ExpectedMount
 
 
 class StorageRefused(RuntimeError):
-    """Fixed reason codes are safe to surface; underlying paths are never logged."""
+    """Fixed reason codes are safe to surface; underlying paths are never logged.
+
+    ``str(exc)`` is the stable runtime reason (heartbeat/ring contract).
+    ``diagnostic`` is an optional finer fixed code used only by the local
+    ``--check`` report; it never contains paths, identities, sizes or users.
+    """
+
+    def __init__(self, reason, *, diagnostic=None):
+        super().__init__(reason)
+        self.diagnostic = diagnostic or reason
 
 
 @dataclass(frozen=True)
@@ -29,16 +38,32 @@ def decode_mount(value):
     return re.sub(r"\\([0-7]{3})", lambda match: chr(int(match[1], 8)), value)
 
 
+def _inventory_unreadable():
+    """/proc mount inventory I/O failure.
+
+    The runtime reason stays ``storage_unavailable`` (heartbeat/ring contract);
+    ``--check`` reports the finer ``mount_inventory_unavailable`` diagnostic.
+    """
+    return StorageRefused("storage_unavailable", diagnostic="mount_inventory_unavailable")
+
+
 def read_mounts():
-    with open("/proc/self/mountinfo", encoding="utf-8") as stream:
-        return parse_mounts(stream.read())
+    try:
+        with open("/proc/self/mountinfo", encoding="utf-8") as stream:
+            text = stream.read()
+    except OSError as exc:
+        raise _inventory_unreadable() from exc
+    return parse_mounts(text)
 
 
 def descriptor_mount_id(descriptor):
-    with open(f"/proc/self/fdinfo/{descriptor}", encoding="utf-8") as stream:
-        for line in stream:
-            if line.startswith("mnt_id:"):
-                return int(line.split(":", 1)[1])
+    try:
+        with open(f"/proc/self/fdinfo/{descriptor}", encoding="utf-8") as stream:
+            for line in stream:
+                if line.startswith("mnt_id:"):
+                    return int(line.split(":", 1)[1])
+    except OSError as exc:
+        raise _inventory_unreadable() from exc
     raise StorageRefused("mount_inventory_unavailable")
 
 
@@ -107,7 +132,11 @@ class MediaStore:
         self.stable_device = stable_device
         self._lock = threading.Lock()
         self._mount_id = None
-        self._fd = open_directory(settings.media_root)
+        try:
+            self._fd = open_directory(settings.media_root)
+        except StorageRefused as exc:
+            exc.diagnostic = self._unavailable_root_diagnostic()
+            raise
         try:
             self.check(require_reserve=False)
         except Exception:
@@ -141,8 +170,12 @@ class MediaStore:
                     raise StorageRefused("media_root_replaced")
             finally:
                 os.close(current)
-            if info.st_uid != self.settings.service_uid or info.st_mode & 0o022:
-                raise StorageRefused("media_root_ownership")
+            if info.st_uid != self.settings.service_uid:
+                raise StorageRefused("media_root_ownership",
+                                     diagnostic="media_root_owner_mismatch")
+            if info.st_mode & 0o022:
+                raise StorageRefused("media_root_ownership",
+                                     diagnostic="media_root_permissions_too_open")
             if not info.st_mode & stat.S_IWUSR or not info.st_mode & stat.S_IXUSR:
                 raise StorageRefused("media_root_not_writable")
             actual_mount_id = self.mount_id(self._fd)
@@ -153,27 +186,72 @@ class MediaStore:
             if not applicable:
                 raise StorageRefused("mount_missing")
             mount = max(applicable, key=lambda entry: len(entry.identity.mount_point.parts))
-            if not self._approved_mount(mount.identity, mounts) or mount.readonly:
-                raise StorageRefused("mount_identity_mismatch")
+            approved = self._approved_mount(mount.identity, mounts)
+            if not approved or mount.readonly:
+                raise StorageRefused("mount_identity_mismatch", diagnostic=(
+                    "mount_readonly" if approved
+                    else self._mismatch_diagnostic(mount.identity, mounts)))
             if not self.stable_device(self.settings.expected_mount):
                 raise StorageRefused("stable_device_mismatch")
             if (os.major(info.st_dev), os.minor(info.st_dev)) != (
                 mount.identity.major, mount.identity.minor
             ):
-                raise StorageRefused("mount_device_mismatch")
+                # The pinned directory is not on the device mountinfo reports:
+                # a stacked/replaced mount, not an Owner configuration error.
+                raise StorageRefused("mount_device_mismatch", diagnostic="mount_replaced")
             if self._mount_id is not None and self._mount_id != mount.mount_id:
                 raise StorageRefused("mount_replaced")
             self._mount_id = mount.mount_id
             space = self.space(self._fd)
             if space.f_flag & os.ST_RDONLY:
-                raise StorageRefused("media_root_readonly")
+                raise StorageRefused("media_root_readonly", diagnostic="mount_readonly")
             available = space.f_bavail * space.f_frsize
             rounded = ((additional_bytes + space.f_frsize - 1) // space.f_frsize) * space.f_frsize
             if require_reserve and available < self.settings.safety_reserve_bytes + rounded:
-                raise StorageRefused("STORAGE_HARD_STOP")
+                raise StorageRefused("STORAGE_HARD_STOP", diagnostic="insufficient_free_space")
             return available
         except OSError as exc:
             raise StorageRefused("storage_unavailable") from exc
+
+    def _unavailable_root_diagnostic(self):
+        """Fixed code when the media root cannot be opened at startup."""
+        try:
+            mounts = self.mounts()
+        except (OSError, StorageRefused):
+            # The inventory itself could not be read or parsed.
+            return "mount_inventory_unavailable"
+        mount_point = self.settings.expected_mount.mount_point
+        if not any(entry.identity.mount_point == mount_point for entry in mounts):
+            return "mount_missing"
+        return "media_root_unavailable"
+
+    def _mismatch_diagnostic(self, actual, mounts):
+        """Name the first differing approved-mount property as one fixed code.
+
+        Diagnostic only: admission already refused. Precedence is fixed so each
+        refusal yields exactly one code, and no compared value is returned.
+        """
+        expected = self.settings.expected_mount
+        root = Path("/")
+        if actual.mount_point == root and expected.mount_point != root:
+            return "media_root_on_root_filesystem"
+        if expected.mount_point == root and actual.mount_point != root:
+            return "mount_point_is_root"
+        reference_root = expected.filesystem_root
+        if actual.mount_point != expected.mount_point:
+            if actual.mount_point != self.settings.media_root:
+                return "mount_identity_mismatch"
+            # Narrow service bind at media_root: compare with the approved parent.
+            reference_root = expected.filesystem_root / self.settings.media_root.relative_to(
+                expected.mount_point)
+        if actual.source != expected.source:
+            return "mount_source_mismatch"
+        if (actual.major, actual.minor) != (expected.major, expected.minor):
+            return "mount_device_mismatch"
+        if actual.filesystem != expected.filesystem or actual.filesystem_root != reference_root:
+            return "mount_identity_mismatch"
+        # Every field matches a bind, but the approved parent mount is not visible.
+        return "mount_missing"
 
     def _approved_mount(self, actual, mounts):
         """Allow only the exact approved filesystem or its narrow service bind.

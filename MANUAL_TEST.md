@@ -116,21 +116,125 @@ serials, by-id names and ports only in the private local test record.
     principal and after revoking `live:view`, confirm refusal and that no frame
     is retained without viewers.
 
-Results: **NOT RUN — hardware, authorized management route and browser viewer
-integration remain pending. Issue #11 is not closed by synthetic tests.**
+Results: **PARTIAL — 2026-09-30 に実機確認を一部実施（本節の 2026-09-30
+実機記録を参照。各記録の未実施・不合格項目はそれぞれの記録に記載）。
+非serial同型機・3–4 source・低照度・browser viewer（手順 10）・deployment
+launcher/systemd（手順 1, 2, 8）は未実施。Issue #11 はこれらの記録では close しない。**
 
 For each tested camera:
 
 - [ ] exact manufacturer/model and advertised UVC resolution/FPS/pixel-format/codec capabilities are recorded locally;
-- [ ] device is discovered;
-- [ ] stable identity evidence is shown where available;
+- [x] device is discovered;（2026-09-30 Issue #101 記録、serial 付き同型 2 台）
+- [x] stable identity evidence is shown where available;（同記録: serial 照合で復帰）
 - [ ] owner can enable/disable source;
 - [ ] preview works;
 - [ ] negotiated resolution/FPS/format is reported;
-- [ ] unplug creates `offline` event/state;
-- [ ] reconnect works when identity is unambiguous;
-- [ ] reboot/re-enumeration does not silently bind a different device through `/dev/videoN` reuse;
+- [x] unplug creates `offline` event/state;（同記録 手順 1。ただし触れていない
+      source の健全性表示は不合格。同記録を参照）
+- [x] reconnect works when identity is unambiguous;（同記録 手順 2・3）
+- [x] reboot/re-enumeration does not silently bind a different device through `/dev/videoN` reuse;
+      （同記録 手順 4: 逆順再列挙 + runtime 再起動。host 再起動は未実施）
 - [ ] no unnecessary privileged container is required.
+
+#### 実機記録 2026-09-30（Main Server 候補、serial 付き同型 UVC × 2）
+
+```text
+Date: 2026-09-30
+ServerSentinel version / Git commit: 83d387f (main)
+Main Ubuntu version / hardware: Ubuntu LTS の x86_64 desktop 機（multi-core CPU、
+  discrete GPU 搭載。desktop session 常駐の開発機で、専用 service account ではない）。
+  正確な OS/kernel・CPU・RAM・GPU は INTEGRITY-007 によりローカル記録のみ
+Capture-node: 未使用（remote_agent は対象外）
+Camera source(s) / model(s): serial 付き同型 USB UVC camera × 2（同一
+  vendor/product、各個体が一意の USB serial を報告。UVC 内蔵マイク付き）。
+  正確な model と advertised mode 一覧はローカル記録のみ。概略: MJPG は最大
+  1920x1080@30、YUYV は 640x480 以下 @30、4K 非対応
+USB topology: 2 台とも USB 2.0 high-speed 接続（controller・port はローカル記録のみ）
+Tester: Claude Code（Owner 指示による自動実行。実行ユーザーは video group の
+  非 root ユーザー、sudo/root 不使用）
+```
+
+実行方法: `create_app()` の lifespan を一時 SQLite（repository 外の一時
+directory、実行後削除）で起動し、既定の `LocalUvcDependencies`（実
+`LinuxDiscovery` + `MmapCapture`）で 2 source の `local_uvc` を構成した。
+Owner 承認は `LocalUvcRuntime.reapprove()` → `OwnerAdministration.approve_uvc()`
+の監査付き経路だが、**authorizer は stand-in**（Owner WebAuthn 経路が未接続の
+ため）。frame は件数・byte 数・JPEG SOI/EOI marker・V4L2 sequence だけを
+メモリ上で数えて破棄し、画像は保存・閲覧していない。serial・by-id 名・
+device path・USB port・source UUID は本記録に含めない（INTEGRITY-007 / PRIVACY）。
+以下「カメラA/B」は serial の hash 順で付けた一時ラベル。
+
+| # | 確認内容 | 結果 | 区分 |
+|---|---|---|---|
+| A-1 | discovery: sysfs の video node 4 個（各カメラ capture + metadata）のうち capture 対応 2 個だけを検出、失敗 0。両方 `MJPG`/`YUYV`、serial あり、by-id alias 1、topology あり | PASS | 実機確認済み |
+| A-2 | 同型判定: 2 台の `model_key` は同一、serial-backed `strong_key` は 2 個で相異なる | PASS | 実機確認済み |
+| A-3 | `/dev/videoN` 非依存: A の承認 evidence の node path/番号/by-id/topology を B のものに置換しても `identity_matched` で**実 A** を選び B を選ばない | PASS | 実機 evidence + 論理置換（物理抜線なし） |
+| A-4 | A 不在で同型 B のみ存在（A 抜線相当をメモリ上で再現）: `offline` / `approved_device_absent`、B を bind しない | PASS | 実機 evidence のサブセット（物理抜線なし） |
+| A-5 | 非 serial 同型（serial を除去した evidence）: 2 台でも 1 台でも `manual_intervention_required` / `identity_not_unique`。重複 serial: `duplicate_identity` | PASS | 実機 evidence 由来の mock（使用機は serial 付きのため物理再現不可） |
+| A-6 | `local_uvc` 未構成で起動: `unconfigured`、`local_uvc_unconfigured` log、video/audio descriptor 0 | PASS | 実機確認済み |
+| A-7 | 構成済み・未承認: 2 秒間 両 source `offline`、discovery scan 0 回、video descriptor 0。未承認 idle の process CPU 0.25%（1 core 比） | PASS | 実機確認済み |
+| A-8 | Owner 承認（stand-in authorizer）後 0.60–0.72 秒で `online`、negotiated `1920x1080 30fps MJPG`、`approve_camera` 監査 1 件。非 Owner actor の承認は拒否され source は `offline` のまま | PASS（authorizer は stand-in） | 実機確認済み（部分） |
+| A-9 | 承認経路の遷移は `offline → online`（`degraded` を経由しない）。clean restart 経路は `degraded(identity_matched) → online` | 手順 4 の期待（degraded until first frame）と差異 | 実機確認済み（下記 提案-3） |
+| A-10 | 2 source 同時 `online`。開いている video node は承認済み capture node 2 個だけ（metadata node・他 node は 0）。`/dev/snd` 等 audio descriptor は全工程で 0（内蔵マイクの ALSA capture device は存在） | PASS | 実機確認済み |
+| A-11 | source 1 を監査付き `update_source(enabled=False)`: `offline`、source 1 frame 0、source 2 は継続（3 秒で 90 frame）、source 1 の descriptor は閉じる。再有効化で `online` | PASS | 実機確認済み |
+| A-12 | lifespan 停止: 0.20–0.31 秒で `stopped`、両 source `offline`、video descriptor 0 | PASS | 実機確認済み |
+| A-13 | 同じ DB で clean restart: 再承認なしで両 source 0.69–0.80 秒で `online`（serial 一意） | PASS | 実機確認済み |
+| A-14 | log: 全工程の log に serial / device path / by-id / topology / source UUID の出現 0。出力は固定 event 名のみ | PASS | 実機確認済み |
+| A-15 | 非対応 profile 要求（4K MJPG、60fps、一覧外 15fps、H264、YUYV 1080p）: driver 調整後の profile（1080p / 30fps / MJPG / 640x480）を negotiated として正しく記録するが、health は `online` | 手順 6 の期待（visibly unavailable, never healthy）と不一致 | 実機確認済み（下記 重要-2） |
+| A-16 | 同じ物理カメラ A を source 2 にも Owner 承認: **受理される**。source 2 は EBUSY で `degraded ↔ offline` を反復し、restart 後もどちらの source が取得するかは起動順依存 | FAIL | 実機確認済み（下記 重要-1） |
+
+本記録で見つかった問題（修正は別 PR / Owner 判断）:
+
+- **重要-1**: `prepare_approval()` は候補が現 scan に 1 個あることだけを確認し、
+  別 source に承認済みの同一 physical camera（同一 `strong_key`）を拒否しない。
+  同型 serial 付きカメラで Owner が候補を取り違えると、1 source が恒常的に
+  flapping し、restart 後の割当が起動順に依存する。
+- **重要-2**: 非対応の desired profile が driver に黙って調整され、`online` のまま
+  になる（negotiated profile の記録自体は正確）。MANUAL_TEST 手順 6 の期待と
+  合わない。desired と negotiated の不一致を `degraded` / 拒否とするかは Owner 判断。
+- **提案-1**: registry の negotiated fps は driver の frame interval（30）で、実配信
+  fps は記録されない。1 回目の計測では両カメラとも実配信 16.65 fps（V4L2 sequence
+  の欠落 0、gstreamer の独立経路でも約 15 fps、`exposure_auto_priority=1`）だったが
+  health は `online`・negotiated 30 のままだった。2 回目（数十分後）は 30.0 fps。
+  照度の評価はしていない（映像を閲覧していないため）。露出優先による
+  frame rate 低下と推定されるため、L 節の低照度確認で実 fps を記録すること。
+- **提案-2**: `CaptureSession.step()` は frame ごとに `LinuxDiscovery.scan()` を実行する
+  （1 回 0.73–0.80 ms、2 source × 30 fps で 60 scan/s。capture CPU の約半分に相当）。
+  無効化された source も retry ごとに scan する。
+- **提案-3**: 監査付き承認経路では `degraded` を経由せず `offline → online`
+  （negotiated profile は `offline` の間に書かれる）。手順 4 の記述か実装を揃える。
+- **提案-4**: `MmapCapture` は Python `mmap` が fd を複製するため、1 source あたり
+  video descriptor が 5 個（本体 + buffer 4）になる。停止時にすべて閉じることは確認
+  済み。「one descriptor」という docstring とは差がある。
+
+**要人手**（物理操作が必要。下記の観測は Claude が観測用 script を起動した
+状態で行う想定。state directory は repository 外に置き、終了後に削除する）:
+
+1. **抜線（手順 5 / A-4 実機版）**: 2 source とも `online` の状態で、カメラ A の
+   USB ケーブルだけを抜く。期待: A の source だけが 1–2 秒以内に `offline`、
+   B は 30 fps 前後を維持、service は `running`、log に識別子なし、A の video
+   descriptor は閉じる。
+2. **別ポートへ再接続（手順 6）**: 抜いた A を、B とも元とも異なる USB ポートに
+   挿す（`/dev/videoN` 番号が変わることを期待）。期待: 同じ logical source が
+   新しい frame 受信後にだけ自動で `online` に戻り、B の source には影響しない。
+3. **2 台のポート入替**: 両方を抜き、互いのポートに入れ替えて挿す。期待: 各
+   logical source が port ではなく serial に従って元のカメラへ戻る。
+4. **再起動 / 再列挙**: 観測用 state を保持したまま host を再起動（または両方を
+   抜いて逆順に挿し直し node 番号を入れ替え）、service 相当を再起動。期待:
+   `/dev/videoN` の再利用で別カメラを黙って bind しない。
+5. **非 serial 同型機（手順 7 / Ambiguous identical-device test）**: 使用機は serial
+   付きのため不可。serial を報告しない同型 UVC 2 台を用意できる場合のみ実施し、
+   抜き差し・並べ替えで `manual_intervention_required`、restart 後も latch 維持、
+   明示再承認後にだけ復帰することを確認する。用意できなければ mock 確認のみのまま。
+6. **レンズ遮蔽・低照度（L 節と共通）**: 片方のレンズを覆う、および室内照明を
+   落とす。期待値を定めた上で、実配信 fps・health・image quality 表示を記録する
+   （提案-1 の再現確認を兼ねる）。
+7. **deployment launcher / systemd（手順 1, 2, 8）**: 管理者所有の deployment 設定
+   （root 所有ファイル）と systemd unit のインストールが必要なため Owner が実施。
+   `--check` の検証（未知 key・device path・重複 UUID・5 個目）、`systemctl stop`
+   中の descriptor close、hung driver 時の `local_uvc_stop_failed`。
+8. **3–4 source**: カメラが 2 台のため未実施。追加の UVC を接続して実施。
+9. **authorized preview（手順 10）**: 認可済み viewer route と browser 統合の完成後。
 
 ### Ambiguous identical-device test
 
@@ -141,6 +245,80 @@ Where possible use two identical UVC devices without a usable unique serial, or 
 - [ ] source enters `manual_intervention_required`;
 - [ ] owner can explicitly re-approve a physical mapping;
 - [ ] healthy monitoring resumes only after approval.
+
+### 実機記録 2026-09-30: 抜き差し・ポート入替・再列挙・遮蔽（Issue #101）
+
+```text
+Date: 2026-09-30
+ServerSentinel version / Git commit: runtime は PR #99 HEAD a0497ee、
+  観測 helper は PR #96 HEAD beab9f4 の scripts/manual/uvc_watch.py
+  （いずれも本記録時点で未マージ）
+Main Ubuntu version / hardware: Main Server 候補ホスト（正確な OS/kernel・
+  hardware はローカル記録のみ）
+Camera source(s) / model(s): 同一機種 USB UVC カメラ 2 台（シリアルあり、異なる）
+USB topology: 2 台とも同じ USB バス上（controller・port はローカル記録のみ）
+Tester: 物理操作（抜き差し・ポート入替・レンズ遮蔽）は人が実施。状態・fps・
+  descriptor・kernel log の観測と記録は Claude Code（video group の非 root
+  ユーザー、sudo 不使用）
+```
+
+`uvc_watch.py` は frame を件数だけ数えてメモリ上で破棄し、disk へは 1 frame も
+書いていない（画像の保存・閲覧なし）。serial・by-id 名・device path・USB port・
+source UUID は本記録に含めない。以下、カメラ A = `src1`、カメラ B = `src2`。
+「区分」の *人手* は人が物理操作した項目、*観測* は Claude が watch 出力と
+kernel log から確認した内容を示す。
+
+| 手順 | 操作（人手） | 観測結果（Claude） | 判定 |
+|---|---|---|---|
+| 0 | 片方のレンズを覆って A/B を判別 | 覆ったカメラの source だけ 30 → 約 17 fps、他方は 30 fps のまま。両方 `online` を維持 | PASS |
+| 1 | A だけを抜く | `src1` が `offline`（`approved_device_absent`）、service は継続。kernel log では A の抜線直後に同じ port で短い切断/再列挙の揺れがあり、約 7 秒後に**触れていない B** も切断・再列挙した。`src2` は `identity_matched` で自動復帰し 30 fps に戻った。ただし B の切断が表面化するまでの約 5 秒間、`src2` は **0 fps のまま `online`** を報告した | `src1` の `offline` 化・service 継続・`src2` の自動復帰（取り違えなし）は PASS。**「他 source が影響を受けず frame を出し続ける」は FAIL**: B の一時切断は同一バスの相互リセット（既知制約として許容、下記）だが、その間 0 fps を `online` と表示したのは **不具合**（下記） |
+| 2 | A を別ポートへ挿す | 1 回目は同じ kernel port に列挙されたため再試行。再試行では A が別 port・別 `/dev/video` node に列挙され、`src1` は serial 照合で再承認なしに `online` へ戻った | PASS |
+| 3 | A と B のポートを入れ替え、A を覆う | 両方 `online` に戻り、A を覆うと下がるのは `src1` だけ（割当は port ではなくカメラ個体に追従）。`manual_intervention_required` にならない。入替中に B 側で約 4 秒間 **0 fps のまま `online`** | 割当の追従は PASS。入替中の 0 fps `online` 表示は **FAIL**（手順 1 と同じ不具合） |
+| 4 | runtime 停止 → 両方抜いて逆順に挿し直し → `--approve` なしで再起動 → A を覆う | `/dev/video` 番号は承認時と逆順になったが、両方 `identity_matched` で正しい source に戻り、A を覆うと下がるのは `src1` だけ。遮蔽中に A が 1 回 USB 切断し、自動復帰した | PASS |
+| 5 | A のレンズを 30 秒覆う | fps は約 16–17 に低下（MJPEG frame size は約 150 → 220 KiB に増加）、状態は `online` のまま、V4L2 の error flag 付き frame なし、timeout なし。単体診断（1 台 / 2 台同時）と計装した runtime 実行でも同じ | 観測を記録（#22 の材料） |
+| 5 | 部屋の照明を落とす | **未実施**（室内照明を消せなかった） | 未実施 |
+
+全手順を通して `audio_fds=0`（video-only を維持）。停止時は `video_fds=0 audio_fds=0`。
+
+見つかった問題・未解決事項:
+
+- **不具合（#11）**: frame が届かなくなっても、切断が検出されるまで `online` を
+  報告し続ける（frame-stall watchdog なし。手順 1 で約 5 秒、手順 3 で約 4 秒）。
+  既知の loss を healthy と表示しない不変条件に反する。修正は PR #99 に積む
+  stacked PR #111（stall を `degraded`（`video_frame_stalled`）として表示）。
+  **#111 はまだ実機で検証していない**。#111 の実機確認で手順 1・3 を再実施する。
+- **原因未特定の flapping**: 再起動後の実行で A を覆っている間に、約 1 分間
+  `capture_failed` → reopen の反復と A の USB 切断 2 回が発生した。その後の
+  3 回の実行では再現しなかった。原因は特定していない。
+- **運用上の注意（既知制約）**: 同じ USB バス上で片方のカメラが列挙されるたびに、
+  約 1 秒後にもう片方がリセットされる事象を 3 回以上観測した（いずれも
+  software 側は取り違えなく自動復帰）。host 側の事象として #112 に記録したが、
+  Owner 判断（2026-09-30）により、取り違えなく自動復帰する限り既知制約として
+  許容し、#112 は not planned で close した。一時切断中の健全性表示が正しいことは
+  #111 側で確認する。別 controller / 給電付き hub での再確認は任意
+  （#101・#11 の close や merge を妨げない）。
+
+Issue #101 の要再確認項目:
+
+- [x] 手順 0: 識別・両 source `online`・`audio_fds=0`;
+- [x] 手順 1: 抜いた A の `src1` が `offline`（`approved_device_absent`）、service 継続、
+      同一バスの相互リセットで一時切断した B の `src2` は `identity_matched` で
+      取り違えなく自動復帰（影響を受けたのは `src1` だけではない。B の一時切断中に
+      `src2` が示した状態名は本記録に残しておらず、`src2` の isolation と切断中の
+      表示は下の 2 項目で不合格として扱う。この項目で合格とするのは `src1` の
+      `offline` 化・service 継続・取り違えのない復帰のみ）;
+- [ ] 手順 1: 触れていない `src2` が影響を受けず frame を出し続けること
+      （不合格: 同一バスの相互リセットで一時切断。相互リセット自体は既知制約として
+      許容。その間の表示は次項）;
+- [ ] 手順 1・3: 切断/入替中に 0 fps の source が `online` を表示しないこと
+      （不合格。#111 で修正中、#111 の実機確認で再実施）;
+- [x] 手順 2: 別 port・別 node で serial 照合により再承認なしで復帰;
+- [x] 手順 3: port 入替で割当がカメラ個体に追従;
+- [x] 手順 4: 再列挙・逆順 node でも再承認なしで正しい source に復帰;
+- [x] 手順 5: レンズ遮蔽 30 秒の fps・状態を記録;
+- [ ] 手順 5: 室内照明を落とした低照度での fps・状態（未実施）;
+- [ ] 遮蔽中の `capture_failed` / reopen flapping と USB 切断（原因未特定、再現せず）;
+- [ ] （任意）別 USB controller / 給電付き hub 構成での相互リセットの有無。
 
 ## B. Remote Linux capture node / `media-capture-agent`
 
@@ -194,6 +372,118 @@ Health:
 
 Apply the exact-model, UVC-capability, stable-identity, and reconnect checks in section A to capture-node cameras as well as Main Server cameras.
 
+### Record: Issue #12 sandboxed UVC capture re-run (2026-09-30, PR #88 head `4be6aa9`)
+
+Environment: remote capture node, Landlock ABI 4, GStreamer 1.24, one
+serial-bearing MJPEG UVC camera with a metadata node, non-root operator account
+(development harness, not the generated service unit).
+
+Checked (pass):
+
+- [x] traced launch: the child opens only `/proc/self/fd/<N>` (approved node);
+  `/dev`, `/sys/class`, `/sys/bus` enumeration fails with `EACCES`;
+- [x] the non-approved metadata node, other device nodes, `/etc` and `/proc`
+  outside the allowed paths, writes under `/tmp` and TCP connect fail with
+  `EACCES` inside the sandbox;
+- [x] only `coreelements` and `video4linux2` are loaded; no audio plugin or
+  library, no `gst-plugin-scanner`, no registry file (`GST_REGISTRY_DISABLE`
+  honoured);
+- [x] `v4l2src` streams with `/sys` denied: 1080p30, 720p30 and 360p30 MJPEG at
+  about 30 fps with no missing frames and no queue drops; Agent/GStreamer CPU
+  about 1-2 %; child memory slightly lower than before the sandbox;
+- [x] `close()` in about 0.02 s with no leftover process;
+- [x] `SIGSTOP` of the child: `capture_failed` after about 6.5 s, then relaunch;
+- [x] `SIGKILL` of the Agent: child exits in under 1 s; next start requires
+  re-approval;
+- [x] an unsupported 4K30 profile: `capture_failed` with backoff;
+- [x] an injected Landlock ABI of 0: the launcher refuses to start;
+- [x] lint, Agent unit tests and Agent ring/storage E2E pass on the node.
+
+Pending: dedicated service account; generated systemd unit (`DevicePolicy`
+allowlist, `ProtectHome`); USB unplug/replug; a second identical camera.
+
+### Record: Issue #12 pre-launch MJPEG profile check (2026-09-30, Main host)
+
+Environment: Main development host (not a deployed service), Landlock present,
+distribution GStreamer, one of two serial-bearing MJPEG UVC cameras of the same
+model, operator account in `video`, scratch harness with the production
+`LinuxDiscovery`, `open_video_device`, `match_mjpeg_profile` and
+`GStreamerLauncher` (only the sandbox helper file's root-ownership check was
+bypassed because the development checkout is user-writable). Frames were counted
+and discarded; no device values recorded.
+
+- [x] 3840x2160@30, 1920x1080@60 and 1280x720@25: one mode check, then
+  `offline`/`capture_unsupported` on every one of 24 polls over 12 s with zero
+  GStreamer launches;
+- [x] 1920x1080@30: mode check returns the requested profile, one launch,
+  `degraded`/`capture_starting` then `online`/`video_ready` after about 1 s,
+  about 30 fps with a draining consumer.
+
+Pending: replug and Owner re-approval re-evaluation on hardware; a camera
+advertising stepwise/continuous sizes or fractional (e.g. 30000/1001) intervals;
+a serial-less camera staying `capture_unsupported` across polls (mock-only so far);
+the remote capture node.
+
+### Capture-node verification record (2026-09-30, Issue #12)
+
+Environment (coarse by design; exact models, versions, serials, paths and host
+identifiers stay in the private local test record): remote capture node
+(x86_64 Linux), one serial-bearing UVC camera (MJPEG), non-root operator account.
+Code: PR #88 HEAD `7840f4a`, driven by a local harness around `UvcCapture` and
+`GStreamerLauncher`. Frames were counted and discarded in memory; nothing was
+stored or viewed. No systemd unit or dedicated service account was used, so the
+Installation/service checkboxes above remain open.
+
+- [x] discovery binds only the video capture node; the UVC metadata node is
+      excluded, audio is not enumerated, 0 probe failures;
+- [x] real hardware: the single camera was discovered as a source keyed by its
+      vendor/product/serial/interface identity (values in the private record),
+      and that source was approved and brought online (see below);
+- [x] synthetic (harness-injected enumeration, not physical): with a changed
+      node path, port or device number injected, the identity still matches;
+      an injected different serial is absent; an injected duplicate serial
+      requires manual intervention. This checks the matching logic on the
+      capture node only; the physical cases are the two pending items below;
+- [x] a never-approved source reports `manual_intervention_required` /
+      `owner_approval_required`, starts no process, and performs only read-only
+      `QUERYCAP`/`ENUM_FMT` probes;
+- [x] after approval the source is online in ~1.0 s; steady-state MJPEG
+      1080p30/720p30/360p30 measured 30.02/30.01/29.90 fps with 0 missing
+      frames and 0 queue drops, JPEG SOF dimensions matching the request;
+      agent+GStreamer CPU ≤ 2.9 %, RSS ≤ 33 MiB (agent) + 10 MiB (child);
+      camera warm-up is ~35 frames at ~13.5 fps followed by a pause of up to
+      336 ms before steady 30 fps;
+- [x] the child argv references video only through `/proc/self/fd/N`; its
+      environment is limited to `GST_REGISTRY`, `LC_ALL`, `PATH`; it runs in
+      its own process group;
+- [x] unsupported profiles (4K30, 1080p60, 720p25) never become online and
+      report `capture_failed` with 1/2/4/8 s backoff (not `capture_unsupported`);
+- [x] `close()` completes in 0.02 s leaving no child, no process-group member
+      and no video descriptor;
+- [x] `SIGSTOP` of the child yields `capture_failed` after the stall timeout
+      (~6.5 s); the child is reaped and relaunched to online;
+- [x] `SIGKILL` of the agent (no systemd): the child exits in < 1 s and the next
+      start requires re-approval;
+- [x] `/dev/snd` is never opened (strace over the full lifecycle, cold and warm
+      GStreamer registry);
+- [ ] **FAIL:** during v4l2 plugin initialisation the `gst-launch` child opens
+      every `/dev/video*` node `O_RDWR`, including non-approved and metadata
+      nodes; with a cold registry it also loads ALSA/PulseAudio/PipeWire plugin
+      libraries (no audio device or socket use observed). Observed at PR #88
+      HEAD `7840f4a`; fix in progress on PR #88. This record must be re-traced
+      and updated on the fixed HEAD after PR #88 merges (it stays FAIL until
+      then);
+- [ ] pending: dedicated service account and systemd unit with a
+      `DevicePolicy`/`DeviceAllow` video-node allowlist (check whether the
+      over-broad open above then fails with `EPERM` and whether capture still
+      starts) — requires root;
+- [ ] pending (real hardware): USB unplug and replug into another port (source
+      offline while the agent stays up; the same identity matches on the new
+      port/node; same source returns online only after a new frame);
+- [ ] pending (real hardware): a camera with a different serial is not bound
+      to the approved source, and a second identical camera
+      (duplicate/no-serial ambiguity) requires manual intervention.
+
 ## C. Room-overview camera placement
 
 For the intended wide room view:
@@ -227,6 +517,42 @@ Compare at minimum where camera capabilities allow:
 - [ ] person/entrance detection quality.
 
 Choose defaults from measurements, not assumptions.
+
+#### 実機記録 2026-09-30: Main Server 上の local UVC capture resource（Issue #17）
+
+環境は A 節の 2026-09-30 記録と同じ（serial 付き同型 UVC × 2、USB 2.0、非 root）。
+実 `LocalUvcRuntime`（V4L2 MMAP、transcode なし、frame はメモリ上で件数のみ数えて
+破棄）を各 profile で 20 秒計測（warm-up 3 秒）。CPU は process 全体の CPU 時間 /
+経過時間（**1 core = 100%**）、RSS は FastAPI app 込みの process
+全体。2 回目の計測（実配信 30 fps）を採用し、1 回目（露出で 16.65 fps に低下）は
+括弧内に示す。録画・encoder・viewer・推論・GPU 経路はまだ接続されていないため、
+これは **capture 取り込みだけ** の負荷であり、deployment default の根拠にはならない。
+
+| profile | source 数 | 実配信 fps / source | 平均 frame | 帯域 / source | process CPU | RSS |
+|---|---|---|---|---|---|---|
+| MJPG 1920x1080@30 | 1 | 30.0 (16.65) | 166 KiB | 40.7 Mbps | 8.1% (4.9%) | 66 MiB |
+| MJPG 1920x1080@30 | 2 | 30.0 / 30.0 | 150–166 KiB | 36.8–40.7 Mbps | 10.7% (5.6%) | 84 MiB |
+| MJPG 1280x720@30 | 1 | 30.0 | 100 KiB | 24.5 Mbps | 7.3% | 59 MiB |
+| MJPG 1280x720@30 | 2 | 30.0 / 30.0 | 102–103 KiB | 25.0–25.3 Mbps | 10.9% | 66 MiB |
+| MJPG 640x480@30 | 1 | 30.0 | 53 KiB | 13.0 Mbps | 7.2% | 55 MiB |
+| MJPG 640x480@30 | 2 | 30.0 / 30.0 | 50–53 KiB | 12.3–13.0 Mbps | 10.6% | 57 MiB |
+| YUYV 640x480@30 | 1 | 30.0 | 600 KiB | 147.5 Mbps | 7.3% | 55 MiB |
+| YUYV 640x480@30 | 2 | 30.0 / 30.0 | 600 KiB | 147.5 Mbps | 10.3% | 57 MiB |
+
+- 全ケースで V4L2 sequence の欠落 0、MJPG frame の SOI/EOI marker 異常 0。
+  1 source 時の数値には、無効化したもう 1 source の retry scan も含まれる。
+- 未承認 idle は 0.25%。CPU の大部分は frame ごとの discovery rescan（A 節 提案-2）。
+- 実機確認済み: 1080p/15 fps・4K は本カメラでは非対応（要求しても 1080p/30 に調整。
+  A 節 重要-2）。camera-native MJPG の取り込みで transcode なし。
+- 未確認: recording/viewer/inference 経路・codec・GPU/VRAM・LAN・capture node・
+  3–4 source・録画品質・検知品質（該当経路が未接続、またはハードウェア不足）。
+
+`python -m app.media.profiles.measure`（synthetic scheduler baseline、実カメラ・
+codec・GPU は測らない）を同 host で実行した結果: 3000 packet × 4096 byte /
+source、queue 64 packet、`prefer_hardware`（synthetic harness に hardware 候補がない
+ため全経路 `software_fallback` と正しく表示）で、CPU 時間は viewer 0 / 1 の順に
+1 source 18.8 / 24.1 ms、2 source 38.6 / 43.6 ms、3 source 62.4 / 68.3 ms、
+4 source 75.1 / 85.2 ms。RSS peak 約 20 MiB、drop 0、全 source `healthy`。
 
 The synthetic profile core tests do not satisfy the following integration checks:
 
@@ -337,6 +663,31 @@ Record:
 - audit event;
 - manual-intervention requirement if automatic recovery is unsafe.
 
+### LAN baseline measurement (2026-09-30, Issue #15; no transport candidate yet)
+
+This is a baseline of the private LAN path from the remote capture node to the
+Main Server, not a transport evaluation. It was a short measurement on an idle
+LAN; the transport comparison and the impairment matrix above remain pending.
+No checkbox above is completed by it.
+
+- RTT (200 ICMP echoes): p50/p95/p99/max 2.61/3.17/3.50/5.63 ms, 0 % loss;
+- TCP one-way throughput (10 s, two runs): 940.7 / 939.4 Mbps;
+- UDP constant rate, 1200-byte payload, 20 s each: 30/40/60/100 Mbps all 0 %
+  loss; reordered datagrams 0/0/19/1; RFC 3550 interarrival jitter
+  0.370/0.350/0.297/0.125 ms;
+- observed camera MJPEG bitrate: ≈ 60 Mbps (1080p30), ≈ 30 Mbps (720p30),
+  ≈ 26 Mbps (360p30).
+
+Pending once a transport exists (human/root steps; prefer a dedicated NIC or
+VLAN for `netem` so unrelated traffic is not impaired):
+
+- [ ] LAN cable pull for ~1 s, ~5 s and ~2 min;
+- [ ] switch/AP restart;
+- [ ] `netem` loss, delay and rate limits (including rates below the observed
+      MJPEG bitrate) to exercise backpressure;
+- [ ] Main ServerSentinel service restart;
+- [ ] capture-node reboot.
+
 ## H. Clock synchronization
 
 - [ ] main/capture node normally synchronize through NTP/chrony or equivalent;
@@ -344,6 +695,9 @@ Record:
 - [ ] controlled excessive skew causes degraded state/warning;
 - [ ] timeline does not silently present unreliable remote timestamps as exact;
 - [ ] recovery clears degraded state appropriately.
+
+Pending (2026-09-30): controlled clock skew on the capture node via
+`timedatectl` requires root and was not performed in the capture-host session.
 
 ## I. Live view from phone, Mac, and desktop
 
@@ -382,6 +736,7 @@ Use test identities/accounts appropriate for the deployment. ServerSentinel does
 The research-room Tailnet is shared, so run these with two people (or two browser profiles) using the **same** Tailscale login.
 
 - [ ] an invited person with a registered ServerSentinel credential passes authentication, and the authenticator asks for user verification each time;
+- [ ] invite two people, have both register and sign in with their own passkeys under the **same** Tailscale login, and confirm each lands in their own principal with their own permissions (for example one `live:view`-only, one `recordings:view`-only); then revoke one of them and confirm the other keeps working;
 - [ ] each credential is registered on an authenticator the invited person controls; confirm no credential is left in a shared OS profile or behind a shared device unlock;
 - [ ] with the invited person signed out, an uninvited person on the same Tailscale login and the same device is refused;
 - [ ] a session ends after its idle/absolute lifetime, and the explicit sign-out control works on a shared machine;
@@ -405,6 +760,18 @@ The research-room Tailnet is shared, so run these with two people (or two browse
   they contain only a keyed binding, never the raw login/device; a mismatched
   identity is refused, diagnostics/exports omit the binding, and sign-out,
   expiry and revocation clear it;
+- [ ] present a signed-in session's cookie with a different trusted-proxy
+  identity (for example through a second Tailscale login or a shared-in
+  device): the request gets the generic response, the original holder keeps
+  working, the audit log shows one `detect_session_proxy_identity_mismatch`
+  entry with no login/device value, and repeating the replay within ten
+  minutes adds no further entry;
+- [ ] on the Main Server, confirm the session-binding key file in the data
+  directory is a regular file of the service account with mode `0600`, that the
+  data directory is not group/other writable, that a changed mode, extra hard
+  link, symlink or wrong size makes startup refuse the key instead of replacing
+  it, and that the key does not appear in logs, the database or a diagnostic
+  export;
 - [ ] record that reachability is expected for every holder of the shared account and is not treated as a finding;
 - [ ] the dashboard origin is reserved for ServerSentinel and is a secure context (HTTPS, or `http://localhost` for a strictly local browser); confirm WebAuthn registration and sign-in actually work there, and record that an ordinary-HTTP non-loopback origin makes them impossible;
 - [ ] the startup and daily reservation check enumerates the real listeners and every proxy route for the whole name across all schemes and ports, and closes human access and notifies the Owner on any other answer; record that this bounds rather than prevents, so a process binding between checks can collect credentials until the next check;
@@ -417,6 +784,46 @@ The research-room Tailnet is shared, so run these with two people (or two browse
 - [ ] with a stale owner session open on a shared machine, a second invited person's own passkey cannot satisfy the step-up: the assertion is refused, the operation does not run, and the owner session's freshness is unchanged.
 
 Record the residual limits instead of testing them away: a credential its holder deliberately lends, and a session left unlocked on an unattended machine, are outside what the application can detect.
+
+### Issue #10 WebAuthn ceremony core with real browsers and authenticators (pending)
+
+`server/app/auth/passkeys.py` and `webauthn.py` are verified only against
+synthetic software authenticators in `server/tests/test_webauthn_ceremonies.py`.
+No real browser, passkey provider, security key or device has exercised them.
+Once the Issue #10 routes are mounted, run these checks at the reserved
+secure-context origin, using synthetic test identities (`*.invalid`):
+
+- [ ] register and sign in with at least one of each of the following, and
+  record the COSE algorithm each one actually used:
+  - a synced platform passkey (for example iCloud Keychain or Google Password
+    Manager);
+  - a device-bound platform authenticator;
+  - a roaming security key.
+- [ ] confirm each browser honours `attestation: "none"`: registration succeeds,
+  and record any authenticator whose statement is refused because it is not
+  `none` or `packed` self attestation;
+- [ ] confirm `userVerification: "required"` makes every registration, sign-in
+  and step-up prompt for a PIN, device unlock or on-device biometric, and that
+  a flow with UV declined or unavailable is refused with the generic response;
+- [ ] record the BE/BS flags each real authenticator reports at registration
+  and after it syncs, and confirm the owner view matches;
+- [ ] record the signature-counter behaviour of each authenticator (always 0,
+  or increasing). For a counting security key, confirm that replaying an older
+  captured assertion is refused (the challenge is single use). Do not claim
+  that a real clone was detected unless one was actually produced;
+- [ ] let a registration or sign-in prompt sit past the five-minute challenge
+  lifetime, then complete it and confirm it is refused. Cancel a prompt and
+  confirm nothing changes;
+- [ ] open the dashboard at `https://<reserved-host>:<other-port>`, and at an
+  origin that is not the reserved one, and confirm that neither a ceremony
+  started there nor its response completes;
+- [ ] with `http://localhost` on the Main Server's own browser, confirm the
+  local owner ceremony works, and confirm a plain-HTTP non-loopback origin
+  cannot use WebAuthn at all;
+- [ ] inspect the database after these runs. It holds only credential ids,
+  COSE public keys, counters, BE/BS flags, labels and timestamps, plus the
+  SHA-256 digests of challenges still pending. It holds no raw challenge,
+  client data, signature or biometric data. Logs contain none of these either.
 
 ### Uninvited ordinary Tailnet member
 
@@ -598,6 +1005,44 @@ intercepted Slack transport. On the deployment, additionally check:
 
 Never intentionally fill a production filesystem to zero free bytes.
 
+### Agent storage/ring verification record (2026-09-30, Issue #16)
+
+Environment: remote capture node (x86_64 Linux), non-root operator account,
+disposable loop-mounted ext4 volume. Synthetic segments and a synthetic trusted
+clock drove the real `MediaStore`; no camera media was written. Profile: 2
+sources, 10 s segments, 4 Mbps, safety reserve 256 MiB. Mount identity values
+stay in the private local record. Code: `main` at `83d387f` (the pre-fix base
+of PR #104; `agent/` unchanged on `main` since `bec201b`).
+
+- [x] `--check` passes on the approved mount and refuses a wrong filesystem
+      UUID, device minor or mount source, a reserve larger than free space, a
+      media root on the root filesystem and mount point `/` (no files created);
+- [x] duration mode 900 s keeps exactly 900 s per source (FIFO) after 30 min
+      written;
+- [x] unexpected loss produces a complete incident covering T−600..T+600 s per
+      source with no gaps, retained through a further 30 min of FIFO writes;
+      `STORAGE_PRESSURE` / `post_loss_headroom_reduced` is reported when the
+      next incident cannot fit; expiry is set to end + 60 days and is not
+      applied under an untrusted clock;
+- [x] oversized configurations (capacity 4 GiB, duration 3600 s) are refused
+      with `insufficient_simultaneous_pre_post_budget`;
+- [x] lazy unmount while running, an empty same-name directory on the root
+      filesystem, and a different filesystem at the mount path each refuse
+      writes with `STORAGE_HARD_STOP` (`storage_path_unavailable` /
+      `mount_replaced`) and create no fallback file; remounting the approved
+      volume recovers the ledger;
+- [ ] **FAIL:** capacity mode is not configurable at realistic sizes (the
+      ledger requirement is ≈ 48 × capacity). Fix in PR #104 (Refs #16);
+      re-verify on a real disk after it merges;
+- [ ] **FAIL:** a write refused because of the safety reserve is reported as
+      `STORAGE_PRESSURE` / `post_loss_headroom_reduced`, never
+      `STORAGE_HARD_STOP`. Fix in PR #104 (Refs #16); re-verify on a real disk
+      after it merges.
+
+The real segmenter/profile, authenticated transport, Owner UI and systemd
+deployment checks in section G and the Issue #16 note in *Test metadata* remain
+open.
+
 ## R. Long-duration / performance
 
 Run at least:
@@ -709,6 +1154,34 @@ For each condition below, verify the system does not wait only for the 23:00 dai
 
 Do not upload hardware serials, local mount identifiers, real temporary test media, or private infrastructure details to GitHub.
 
+#### 実機記録 2026-09-30: inventory probe のみ（Issue #23）
+
+A 節の同じ host で、非 root ユーザーのまま `LinuxProbe().collect()` と
+`compare()` を直接実行した（read-only。baseline 承認・startup/daily 実行・
+self-test・通知は runtime 未接続のため未実施）。識別子の値は記録していない。
+
+| 対象 | 結果 | 区分 |
+|---|---|---|
+| CPU | 1 socket、model/family/stepping/cores/logical CPU 数を取得。一意 ID なし → `UNVERIFIABLE` / `UNIQUE_ID_UNAVAILABLE`（誤って OK にしない） | 実機確認済み |
+| RAM | `dmidecode` は非 root で不可、DMI table は root 専用 0400 → `MEMORY` 全体 `UNVERIFIABLE` / `PROBE_UNAVAILABLE` | 実機確認済み（Owner 判断が必要） |
+| NVMe | serial / WWID と容量・model を取得。再取得との比較 `OK` | 実機確認済み |
+| SATA HDD | 容量・model のみ。`UNIQUE_ID_UNAVAILABLE` | **FAIL（下記 重要-3）** |
+| GPU | discrete GPU は UUID / serial / PCI を取得して `OK`。CPU 内蔵 GPU は一意 ID なしで `UNVERIFIABLE` | 実機確認済み |
+| SMART / NVMe health | 非 root で `smartctl` 不可 → 2 台とも `UNVERIFIABLE`（正常扱いしない） | 実機確認済み |
+| baseline なし | 全 kind `UNVERIFIABLE` / `BASELINE_REQUIRED` | 実機確認済み |
+| repr | `Component` の repr に location / 識別子を含まない | 実機確認済み |
+
+- **重要-3**: storage probe は `/sys/class/block/<dev>/wwid` と
+  `/sys/class/block/<dev>/device/serial` だけを読む。SATA/SCSI disk にはこの 2 つが
+  存在せず、非 root で読める `/sys/class/block/<dev>/device/wwid`（および
+  `device/vpd_pg80`）があるにもかかわらず、録画 volume 候補の HDD が
+  `UNIQUE_ID_UNAVAILABLE` になる。「取得できる最も強い stable identifier を使う」
+  という #23 の scope と合わない。
+- 要人手 / Owner 判断: RAM（DMI）と SMART を最小権限で読む方法（例: 専用 helper
+  や capability 付与）の決定。決定後、専用 service account で再実行する。
+- 未確認: Owner baseline 承認と監査、startup/24 時間比較、`CHANGED` / `MISSING` /
+  `NEW_DEVICE`、recording-health self-test（現状 `UNAVAILABLE`）、即時通知。
+
 
 ## T. No telemetry / developer reporting
 
@@ -747,11 +1220,111 @@ The synthetic CI tests do not complete these checks. On an isolated Capture Node
   pinning and no fallback-directory creation without altering production mounts.
 - [ ] Restart at storage hard stop: inventory and authorized cleanup remain
   possible; new allocations and installer `--check` fail until reserve is restored.
+- [ ] For each refused `--check` case above, confirm exit status 1 and exactly one
+  stderr line ending in the fixed reason code listed in `agent/README.md`
+  (`--check --json`: only `{"ok": false, "reason": ...}` on stdout), and that no
+  UUID, device number, path, mount source, size or username is printed. Expected
+  codes: wrong `filesystem_uuid` → `filesystem_uuid_mismatch`; wrong `major` or
+  `minor` → `mount_device_mismatch`; wrong `source` → `mount_source_mismatch`;
+  approved mount unmounted → `mount_missing` (media root absent) or
+  `media_root_on_root_filesystem` (media root path exists on `/`);
+  `mount_point` set to `/` while the media root is on a separate mount →
+  `mount_point_is_root`; mount replaced during checks → `mount_replaced`; a
+  same-device bind of another directory → `mount_identity_mismatch`; read-only
+  mount → `mount_readonly`; media root not writable by the service account →
+  `not_writable_by_service_account`; reserve above free space (including above
+  filesystem size) → `insufficient_free_space`; malformed/unprotected config →
+  `config_invalid`. A passing `--check` still prints the unchanged success line.
 - [ ] Confirm network observation after authenticated transport integration shows
   only Owner-configured Main communication, including error/reconnect paths.
 
 Publish only pass/fail summaries; keep configs, mount identity, host identifiers,
 credentials and captured media private.
+
+### Issue #12 Agent UVC capture adapter (pending physical execution)
+
+CI verifies `UvcCapture` only with synthetic JPEG-shaped bytes, fake sysfs/udev
+trees and fake or synthetic Python subprocess pipelines. None of the following is
+verified. Use an isolated Capture Node, a serial-bearing USB/UVC camera pointed at
+an empty wall or test chart (no people, no private room details), and a small
+local harness that constructs `UvcCapture` + `GStreamerLauncher`; the production
+CLI does not wire it yet. Never upload frames, serials, by-id names, topology or
+device numbers.
+
+Preparation:
+
+- [ ] Install the distribution GStreamer package providing `gst-launch-1.0`,
+  `v4l2src` and `fdsink`; confirm the executable and its parent directories are
+  root-owned and not group/world writable, and record the package versions and
+  licenses for the Owner dependency decision.
+- [ ] Create a dedicated non-root service account that is a member of the
+  `video` group (and not `audio`); confirm it can open the camera's `/dev/videoN`
+  read-write and cannot open `/dev/snd/*`.
+- [ ] Record, privately, that the camera exposes a non-empty USB serial and
+  advertises `MJPG` (`v4l2-ctl --list-formats-ext` as the service account).
+
+Capture:
+
+- [ ] As the service account, a never-approved source reports
+  `manual_intervention_required`/`owner_approval_required` and starts no process.
+- [ ] After `approve()` of the exact current candidate, the source reports
+  `degraded`/`capture_starting` and then `online`/`video_ready` only after frames
+  arrive; check actual frame size/rate against the requested MJPEG profile.
+- [ ] `ps`/`/proc/<pid>/cmdline` of the child show `device=/proc/self/fd/<N>`
+  and no `/dev/videoN`, serial or other private value; its environment contains
+  only the minimal variables; `/proc/<pid>/fd` of the child shows no audio device.
+- [ ] Verify `v4l2src` accepts the inherited descriptor path on this GStreamer
+  version; if it does not, record the failure (`capture_failed`) and stop.
+- [ ] Configure a profile the camera does not list in
+  `v4l2-ctl --list-formats-ext` (size and, separately, frame rate): the source
+  reports `offline`/`capture_unsupported` on every poll with no `gst-launch-1.0`
+  process ever started; unplug/replug (or Owner re-approval) re-evaluates once.
+  If the camera lists a fractional rate such as 29.97, a 30 fps profile starts at
+  that rate.
+- [ ] With no consumer draining frames, health shows `capture_overloaded` rather
+  than `video_ready`; with a consumer, drops stop and health returns to online.
+- [ ] Unplug the camera: the source becomes `offline`/`camera_missing` within one
+  heartbeat, the pipeline process group is gone, and node heartbeat stays online.
+  Replug into a different port: the serial camera rebinds automatically and
+  streams again.
+- [ ] Stop the stream by suspending the child (`SIGSTOP`): the
+  source reports `capture_failed` after the stall timeout, the stopped process
+  group is killed and reaped, and relaunch follows bounded backoff.
+- [ ] If a camera/driver fault can be reproduced that blocks V4L2 ioctls or
+  `open()`, confirm the node heartbeat keeps arriving on schedule while the
+  source reports `discovery_failed`/`capture_failed`, and that only one probe
+  thread remains blocked.
+- [ ] Connect a second camera of the same model and serial (or two identical
+  non-serial cameras): no automatic binding; `identity_ambiguous` persists across
+  a clean Agent restart until the Owner re-approves.
+- [ ] Kill the Agent with SIGKILL during capture: systemd removes the child with
+  the service cgroup, and the next start requires re-approval
+  (`owner_approval_required`).
+- [ ] Under the generated systemd unit (`DevicePolicy=closed`), confirm every
+  video node of the attached cameras (including UVC metadata nodes) is in the
+  device allowlist; otherwise discovery reports `discovery_failed` and never
+  binds. Record whether re-enumeration to another `/dev/videoN` breaks the
+  allowlist (an Owner decision for the installer device policy).
+- [ ] Confirm the kernel reports Landlock (`/sys/kernel/security/lsm` contains
+  `landlock`); on a kernel without it `GStreamerLauncher` must refuse to start.
+- [ ] With the camera plus its UVC metadata node (and, if available, a second
+  camera) attached, trace one launch as the service account
+  (`strace -f -e trace=openat,open,execve,connect`; the registry is disabled,
+  so one launch suffices): after
+  `landlock_restrict_self` the child opens only `/proc/self/fd/<N>` read-write;
+  `/dev`, `/sys/class`, `/sys/bus` and every other `/dev/video*`/`/dev/snd/*`
+  open fails or is absent; only `libgstcoreelements.so` and
+  `libgstvideo4linux2.so` are loaded (no ALSA/PulseAudio/PipeWire plugin or
+  library), no `gst-plugin-scanner` is executed, and no registry file is read
+  or created. Recheck frame rate/size against the earlier unsandboxed baseline.
+- [ ] Confirm the launcher refuses a sandbox helper or Python interpreter that
+  is not root-owned or is group/world writable (e.g. a development checkout).
+- [ ] Note that a stalled camera (frames stop without the pipeline exiting)
+  keeps reporting `online`/`video_ready` until the stall timeout expires
+  (`CaptureLimits.stall_timeout`, default 5 s), then `capture_failed`; confirm
+  the observed delay.
+
+Publish only pass/fail summaries.
 
 ## U. Privacy-safe diagnostic export / support bundle
 
@@ -768,9 +1341,12 @@ Run this only on the intended Main Server using synthetic, non-production diagno
 - [ ] the manifest records no excluded value, media ID, path, or other private deployment identifier, and the bundle stays deployment-local until the Owner separately chooses how to share it;
 - [ ] an export directed at a directory outside the approved storage filesystem, or attempted while the approved mount is missing or substituted, is refused before any space is reserved and never falls back to the root filesystem;
 - [ ] cancelling the Owner request or disconnecting mid-export leaves no bundle, partial file, or held reservation behind; repeat the disconnect and confirm archives do not accumulate;
+- [ ] with the production producers composed on the deployed Main Server, confirm the bundle's `diagnostics/*.json` holds only fixed states, reason codes, counts and the version: no camera name, role label, capture-node name, UVC/hardware serial, device path, pairing code, Slack webhook URL or Owner template bytes appear (search the bundle locally for the synthetic canaries you configured);
+- [ ] stop or leave unconfigured one subsystem at a time (monitoring runtime, camera registry, audit stores) and confirm its fields report `unavailable` with `not_configured` or `dependency_unavailable`, never `ok`, and that no invented counts appear for it;
+- [ ] select one synthetic recording segment by its `segment.<id>` media ID and confirm only that segment is copied; confirm Owner biometric or unknown IDs are refused and leave no bundle;
 - [ ] record only sanitized PASS/FAIL and aggregate results locally; do not retain the test bundle after the local verification policy permits deletion.
 
-Results: **NOT RUN — Owner authorization/UI integration and Main Server network observation remain pending. Synthetic tests do not complete this acceptance.**
+Results: **NOT RUN — Owner authorization/UI integration, production composition of the #49 producers and Main Server network observation remain pending. Synthetic tests do not complete this acceptance.**
 
 ## V. Deployed Main Server install / update / rollback lifecycle
 
@@ -802,6 +1378,10 @@ Issue #48 remains open. The synthetic CI and browser integration tests do not co
 - [ ] after Owner creation, re-opening the wizard does not re-run bootstrap, reset the deployment, or let an unauthenticated visitor claim ownership;
 - [ ] as the deployment Owner, run the wizard through Welcome, owner bootstrap, storage, hardware baseline / recorder self-check, locale/time, sources, profiles, optional verification/Slack, and private human-access steps;
 - [ ] interrupt the wizard at each step (close the browser, restart the service, reboot the host); it resumes at the same step, previously completed steps are preserved, and no step silently repeats Owner creation;
+- [ ] with the wizard open in two Owner browser tabs, advance a step in one tab and then act on the same step in the other: the stale tab's transition is refused, the tab reports that the result could not be confirmed and reloads the committed state, and no completed step is downgraded;
+- [ ] each wizard step change attempt by the Owner (including a no-op that requests the current status) appends exactly one `transition_setup_wizard_step` audit record carrying only the fixed action, the step's logical ID and the outcome (no requested status, setting value, secret or identifier); a refused change (stale tab, skipping a required step, a later step before an earlier one, completing a step other than Welcome without its integration) is recorded as `failed` and leaves the state unchanged;
+- [ ] an invited `live:view` / `recordings:view` test identity sees no Setup screen, and any wizard read or transition it attempts is refused with a generic denial, records a `denied` outcome for a transition attempt, and changes nothing;
+- [ ] a step whose integration is not yet available can be deferred as unavailable (or an optional step skipped) and resumed later; it is never shown as completed, and the screen does not report setup complete while any required step is not completed;
 - [ ] the storage step verifies the configured recording root's mount, write permission, free space, and safety reserve; on a disposable volume, a missing/unmounted or substituted filesystem is refused with a truthful error and no root-filesystem fallback is created;
 - [ ] the hardware-baseline / recorder self-check step records the Owner-approved baseline, reports unavailable identifiers as `UNVERIFIABLE` rather than as a guarantee, and audits the Owner approval;
 - [ ] the locale/time step records time configuration, and excessive clock offset/uncertainty stays visible instead of being presented as reliable event ordering;

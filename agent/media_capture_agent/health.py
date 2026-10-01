@@ -7,7 +7,11 @@ from uuid import UUID
 
 SOURCE_STATES = frozenset({"online", "degraded", "offline", "manual_intervention_required"})
 SOURCE_REASONS = frozenset({"video_ready", "camera_missing", "capture_failed",
-                            "identity_ambiguous", "capture_unconfigured"})
+                            "identity_ambiguous", "capture_unconfigured",
+                            # UVC capture adapter: every non-ready cause stays explicit.
+                            "capture_starting", "capture_overloaded", "capture_unsupported",
+                            "capture_cleanup_failed", "discovery_failed",
+                            "owner_approval_required", "approval_state_unavailable"})
 
 
 @dataclass(frozen=True)

@@ -1,1 +1,1 @@
-"""Human authorization boundary; identity policy awaits the Owner-approved ADR."""
+"""Human authorization boundary (ADR-0003/ADR-0004); no human route is mounted yet."""

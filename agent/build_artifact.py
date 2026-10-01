@@ -15,6 +15,16 @@ ROOT = Path(__file__).resolve().parent
 VERSION = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+(?:-[a-z0-9.]+)?")
 SOURCE_COMMIT = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?")
 RELEASE_METADATA = "MEDIA_CAPTURE_AGENT_RELEASE.json"
+# The capture sandbox helper cannot be executed from inside the archive, so the
+# root-installed artifact file doubles as the helper: its stdlib-only sandbox
+# entry is dispatched before any other agent module is imported.
+ARCHIVE_MAIN = """import sys
+from media_capture_agent import uvc_sandbox
+if sys.argv[1:2] == [uvc_sandbox.ARCHIVE_ENTRY]:
+    uvc_sandbox.main(sys.argv[2:])
+from media_capture_agent.cli import main
+raise SystemExit(main())
+"""
 
 
 def build(destination, *, version="0.1.0", source_commit="0" * 40):
@@ -30,7 +40,7 @@ def build(destination, *, version="0.1.0", source_commit="0" * 40):
                         ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
         shutil.copyfile(ROOT / "LICENSE", stage / "LICENSE")
         (stage / "__main__.py").write_text(
-            "from media_capture_agent.cli import main\nraise SystemExit(main())\n",
+            ARCHIVE_MAIN,
             encoding="utf-8",
         )
         (stage / RELEASE_METADATA).write_text(json.dumps({
