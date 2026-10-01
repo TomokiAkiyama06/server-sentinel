@@ -38,7 +38,8 @@ from app.cameras.remote_agent.pairing import HmacCodeVerifier, PairingError, Pai
 from app.cameras.remote_agent.renewal import (
     CaptureCredentialMonitor, RenewalRefused, renew_node_credential,
 )
-from app.notifications.service import NotificationKind
+from app.notifications.service import NotificationKind, NotificationService
+from app.notifications.slack import DeliveryResult
 from app.storage.database import Database
 from app.storage.migrations import migrate
 from app.storage.schema import APPLICATION_MIGRATIONS
@@ -423,7 +424,11 @@ class CaptureRenewalTests(CaptureTlsHarness):
         super().setUp()
         self.notifications = []
         self.monitor = CaptureCredentialMonitor(
-            self.ledger, lambda kind, at: self.notifications.append((kind, at)))
+            self.ledger, self._record_notification)
+
+    def _record_notification(self, kind, at, event_id):
+        self.notifications.append((kind, at))
+        return DeliveryResult.SUPPRESSED
 
     @staticmethod
     def _empty_csr(key, *names):
@@ -686,7 +691,8 @@ class CaptureRenewalTests(CaptureTlsHarness):
         self.monitor.check()
         self.assertEqual([NotificationKind.CAPTURE_CREDENTIAL_WARNING],
                          [kind for kind, _ in self.notifications])
-        expired = CaptureCredentialMonitor(self.ledger, lambda kind, at: self.notifications.append(kind),
+        expired = CaptureCredentialMonitor(self.ledger, lambda kind, at, event_id: (self.notifications.append(kind),
+                                                                        DeliveryResult.SUPPRESSED)[1],
                                            clock=lambda: utc_now() + 20 * DAY)
         self.assertEqual(["credential_expired"], [signal.reason for signal in expired.check()])
         self.assertEqual(NotificationKind.CAPTURE_CREDENTIAL_WARNING, self.notifications[-1])
@@ -699,10 +705,11 @@ class CaptureRenewalTests(CaptureTlsHarness):
         self._paired_node("soon", validity=10 * DAY)
         delivered, failures = [], [RuntimeError("hook unavailable")]
 
-        def notify(kind, at):
+        def notify(kind, at, event_id):
             if failures:
                 raise failures.pop()
             delivered.append(kind)
+            return DeliveryResult.SUPPRESSED
 
         monitor = CaptureCredentialMonitor(self.ledger, notify)
         monitor.check()
@@ -712,6 +719,52 @@ class CaptureRenewalTests(CaptureTlsHarness):
         self.assertEqual([NotificationKind.CAPTURE_CREDENTIAL_WARNING], delivered)
         monitor.check()  # delivered once; not repeated
         self.assertEqual(1, len(delivered))
+
+
+    def test_dropped_warning_notification_is_not_marked_reported(self):
+        # NotificationService.record does not raise when the local write is
+        # refused and the retry buffer is full: the warning is dropped. The
+        # monitor must treat that result as unconfirmed and retry.
+        self._paired_node("soon", validity=10 * DAY)
+        local, refuse = [], [True]
+
+        def sink(event):
+            if refuse[0]:
+                raise RuntimeError("synthetic refused write")
+            local.append(event)
+
+        service = NotificationService(sink, queue_capacity=1)
+        self.addCleanup(service.close)
+        now = utc_now()
+        service.record(NotificationKind.RECORDING_HEALTH_WARNING, at=now)  # fills the buffer
+        self.assertEqual(1, service.unpersisted_count)
+        monitor = CaptureCredentialMonitor(self.ledger, service.record)
+        monitor.check()
+        self.assertTrue(monitor.notification_failed)
+        self.assertEqual([], monitor.signals)
+        refuse[0] = False
+        monitor.check()
+        warnings = [event for event in local
+                    if event.kind == NotificationKind.CAPTURE_CREDENTIAL_WARNING]
+        self.assertEqual(1, len(warnings))
+        monitor.check()  # confirmed once; not written again
+        self.assertEqual(1, len([event for event in local
+                                 if event.kind == NotificationKind.CAPTURE_CREDENTIAL_WARNING]))
+
+    def test_unconfirmed_hook_results_are_retried_with_a_stable_event_id(self):
+        self._paired_node("soon", validity=10 * DAY)
+        calls, results = [], [DeliveryResult.FAILED, None, DeliveryResult.SUPPRESSED]
+
+        def notify(kind, at, event_id):
+            calls.append(event_id)
+            return results.pop(0)
+
+        monitor = CaptureCredentialMonitor(self.ledger, notify)
+        for _ in range(4):
+            monitor.check()
+        self.assertEqual(3, len(calls))
+        self.assertEqual(1, len(set(calls)))  # retries upsert the same event
+        self.assertEqual(1, len(monitor.signals))
 
 
 if __name__ == "__main__":

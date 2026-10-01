@@ -316,8 +316,14 @@ status or decision.
     hook in three cases: an active credential within 14 days of expiry (the
     Agent has retried for at least 16 days by then), an expired credential, or
     a refused renewal. Each is reported once per credential (or once per node,
-    reason and day for refusals), counted only once the hook succeeds, so a
-    failed notification is retried on the next check or refusal. It is not an immediate Slack alert; changing
+    reason and day for refusals), counted only once the hook confirms it:
+    the hook (`NotificationService.record`) must return a `DeliveryResult`, and
+    only `suppressed`/`pending`/`sent`/`disabled` (written locally, or retained
+    by the service for its own retry) confirm. `failed` (refused write with the
+    retry buffer full, so the event was dropped), any other value or an
+    exception leaves it unreported; the next check or refusal retries it with
+    the same deterministic `event_id`, so the local sink upserts rather than
+    duplicates. It is not an immediate Slack alert; changing
     that is a separate notification-policy decision.
   - *Not wired yet.* The renewal request and response travel over the ingest
     session that #14/#15 will carry. `ingest.py`/`continuity.py` are unchanged,
