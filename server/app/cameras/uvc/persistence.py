@@ -38,7 +38,7 @@ class ApprovalConflictError(ValueError):
 # Active Owner approvals of other enabled local UVC sources. A row that
 # requires approval (manual latch or never approved) holds no camera.
 _HELD_APPROVALS = (
-    "SELECT a.evidence FROM uvc_approvals AS a "
+    "SELECT a.evidence, a.serial_ambiguous FROM uvc_approvals AS a "
     "JOIN camera_sources AS s ON s.id = a.source_id "
     "WHERE a.requires_approval = 0 AND s.enabled = 1 "
     "AND s.source_type = 'local_uvc' AND a.source_id != ?"
@@ -93,7 +93,23 @@ class ApprovalStore:
     @staticmethod
     def _held_on(connection, source_id):
         rows = connection.execute(_HELD_APPROVALS, (str(source_id),)).fetchall()
-        return tuple(ApprovalStore._state((row[0], 0, None, 0, 0)).approved for row in rows)
+        return tuple(ApprovalStore._state((row[0], 0, None, row[1], 0)) for row in rows)
+
+    @staticmethod
+    def _conflicts(evidence, serial_ambiguous, held):
+        """True when either side's own comparison names the same camera.
+
+        Each source checks for conflicts with its own recorded comparison
+        mode, so a holder approved before a same-serial twin appeared still
+        compares by serial. Checking both directions keeps the approval-time
+        refusal consistent with what every holder's runtime check reports.
+        """
+        return any(
+            same_physical_camera(evidence, other.approved, serial_ambiguous=serial_ambiguous)
+            or same_physical_camera(other.approved, evidence,
+                                    serial_ambiguous=other.serial_ambiguous)
+            for other in held
+        )
 
     def approved_elsewhere(self, source_id, evidence, *, serial_ambiguous=False):
         """True when another enabled source holds an active approval for this camera.
@@ -104,8 +120,8 @@ class ApprovalStore:
         connection = None
         try:
             connection = self.database.connect()
-            return any(same_physical_camera(evidence, held, serial_ambiguous=serial_ambiguous)
-                       for held in self._held_on(connection, source_id))
+            return self._conflicts(evidence, serial_ambiguous,
+                                   self._held_on(connection, source_id))
         except (sqlite3.Error, ValueError, TypeError, KeyError):
             raise ApprovalStorageError("UVC approval state is unavailable") from None
         finally:
@@ -140,8 +156,7 @@ class ApprovalStore:
             raise ApprovalStorageError("UVC approval state could not be saved") from None
         # Checked again inside the write transaction, so two concurrent
         # approvals can never both bind one physical camera.
-        if any(same_physical_camera(approved, other, serial_ambiguous=serial_ambiguous)
-               for other in held):
+        if ApprovalStore._conflicts(approved, serial_ambiguous, held):
             raise ApprovalConflictError("camera approval is unavailable")
         try:
             evidence = json.dumps(asdict(approved), allow_nan=False, separators=(",", ":"))

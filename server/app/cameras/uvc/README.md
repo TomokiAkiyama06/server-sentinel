@@ -51,7 +51,9 @@ within 1% (`profile_satisfies()`). On a mismatch it records the negotiated
 profile, closes the descriptor and reports `degraded` with the fixed reason
 `capture_profile_unavailable`, never `online`; the same device instance is not
 reopened on every poll, only after the profile, enablement or device instance
-changes.
+changes. A camera without a serial is bound only while its descriptor is open,
+so after `capture_profile_unavailable` a profile change cannot rebind it: the
+source reports `identity_not_unique` and requires Owner reapproval.
 The caller supplies width, height, FPS and FourCC; there are no hardware profile
 defaults. Codec/bitrate controls and multi-planar-only capture are unsupported
 and fail explicitly. Camera drivers without a reportable frame rate also fail.
@@ -69,7 +71,10 @@ serial-backed identity, or the exact weak evidence) is approved for at most one
 enabled source. When several connected cameras share one serial, that serial
 cannot tell them apart, so each such (serial-ambiguous, exact live-instance)
 selection is compared by its exact evidence instead and every twin can be
-mapped to its own source. Approving a camera another enabled source holds an active
+mapped to its own source. The check applies both sides' comparison modes, so a
+source approved by serial before a twin appeared keeps its camera: approving
+the twin elsewhere is refused until the Owner reapproves the holder while both
+are connected. Approving a camera another enabled source holds an active
 approval for is refused with the generic reason and audited as failed, checked
 before and again inside the audited transaction. A disabled source or one that
 requires approval holds nothing. A duplicate that predates this check (or an
