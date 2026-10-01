@@ -63,7 +63,10 @@ and returns to `online` only on the next delivered frame. The window is
 reopen bound scales by the same factor), because a dark scene or slow profile
 legitimately lowers the delivered rate; on the real C960s the covered-lens rate
 dropped to about 16–17 fps, far inside a 1 s window. Each read waits at most the
-stall window. A stall lasting `frame_stall_reopen_seconds` closes the capture
+stall window. A read that only times out keeps the worker reading at once, without the
+supervisor's retry backoff, so a short `poll_timeout_seconds` or a dark scene
+whose frame interval exceeds it cannot leave the stall window elapsing with no
+read in flight (which would flap `video_frame_stalled` and `online`). A stall lasting `frame_stall_reopen_seconds` closes the capture
 (`offline`, `video_capture_failed`) and the next poll reopens it through the
 identity path, so a weak binding then needs the Owner again. The same check runs
 from `LocalUvcSupervisor`'s single watchdog thread through

@@ -188,7 +188,7 @@ class UvcRegistryTests(UvcRegistryFixture):
                          self.registry.get_source(self.source.id).health_state)
         self.assertFalse(self.adapter.health_unpersisted(self.source.id))
 
-    def test_health_is_unpersisted_while_an_uncontended_write_is_in_flight(self):
+    def test_routine_last_seen_write_in_flight_is_not_reported_unpersisted(self):
         now = self._approved_online()
         entered, release = threading.Event(), threading.Event()
         self.addCleanup(release.set)
@@ -206,13 +206,29 @@ class UvcRegistryTests(UvcRegistryFixture):
         worker.start()
         self.addCleanup(worker.join, 10)
         self.assertTrue(entered.wait(5))
-        # No other flush contends: the write in flight alone means the
-        # durable row may still be behind the in-memory state.
-        self.assertTrue(self.adapter.health_unpersisted(self.source.id))
+        # Only last_seen_at is refreshed; the durable health state already
+        # matches, so the reported health is not stale while it is in flight.
+        self.assertFalse(self.adapter.health_unpersisted(self.source.id))
         release.set()
         worker.join(10)
         self.assertFalse(worker.is_alive())
         self.assertFalse(self.adapter.health_unpersisted(self.source.id))
+
+    def test_failed_routine_last_seen_write_is_reported_unpersisted(self):
+        now = self._approved_online()
+        original = self.registry.update_source_health
+
+        def failing_write(source_id, **values):
+            if "last_seen_at" in values:
+                raise RuntimeError("synthetic storage failure")
+            return original(source_id, **values)
+
+        self.registry.update_source_health = failing_write
+        now[0] += 1.5
+        with self.assertRaises(RuntimeError):
+            self.adapter.poll_source(self.source.id)
+        # A refused write is a storage problem worth reporting.
+        self.assertTrue(self.adapter.health_unpersisted(self.source.id))
 
     def test_uvc_approval_rolls_back_when_audit_append_fails(self):
         class PermitOwner:

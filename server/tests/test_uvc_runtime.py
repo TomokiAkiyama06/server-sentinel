@@ -89,6 +89,8 @@ class CaptureFactory:
         self.discovery = discovery
         self.instances = []
         self.block = None
+        # Set once a read has entered ``block``.
+        self.blocked = threading.Event()
         # Set to an Event to make close() hang (STREAMOFF/unmap/close).
         self.close_block = None
         self.lock = threading.Lock()
@@ -111,6 +113,7 @@ class CaptureFactory:
             def read_frame(self, timeout):
                 block = factory.block
                 if block is not None:
+                    factory.blocked.set()
                     block.wait(10)
                 time.sleep(0.005)
                 if self.candidate not in factory.discovery.devices:
@@ -527,7 +530,7 @@ class RuntimeLifecycleTests(RuntimeFixture):
         self.assertTrue(self.wait_health(source.id, SourceHealthState.ONLINE))
         block = threading.Event()
         self.captures.block = block
-        time.sleep(0.05)
+        self.assertTrue(self.captures.blocked.wait(5))
         status = runtime.stop()
         self.assertIs(status.state, LocalUvcRuntimeState.STOP_FAILED)
         # The adapter was not closed from the stopping thread while the worker
@@ -598,7 +601,7 @@ class RuntimeLifecycleTests(RuntimeFixture):
         block = threading.Event()
         self.addCleanup(block.set)
         self.captures.block = block
-        time.sleep(0.05)
+        self.assertTrue(self.captures.blocked.wait(5))
         # The worker is blocked in a kernel call, so the stop for the
         # approval times out and the approval is refused; the source is
         # still RUNNING and its worker still registered with stop requested.

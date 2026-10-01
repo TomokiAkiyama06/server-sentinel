@@ -146,6 +146,15 @@ class CaptureSession:
         return self.controller.reconcile(scan.devices)
 
     def _stalled(self, candidate):
+        """A read timed out; True while the capture stays open.
+
+        An open capture must keep being read: a read timeout shorter than
+        the frame interval (a short poll timeout, or a dark scene lowering
+        the delivered rate) is not a failure, and backing off would leave no
+        read in flight while the stall window elapses, flapping the source
+        between ``degraded`` and ``online``. Only a stall past the reopen
+        bound closes the capture and returns False (the caller backs off).
+        """
         with self._progress_lock:
             live, last = self._live, self._last_progress
         if live is None or last is None:
@@ -157,9 +166,10 @@ class CaptureSession:
             # the identity path (a weak binding then needs the Owner again).
             self.close()
             self.controller.capture_failed()
-        elif age >= window:
+            return False
+        if age >= window:
             self.controller.frame_stalled(candidate)
-        return False
+        return self.capture is not None
 
     def check_frame_progress(self):
         """Off-worker check: lower an ``online`` claim when frames stopped.
@@ -203,7 +213,14 @@ class CaptureSession:
             return self._reopen_requested
 
     def step(self, *, timeout=1.0):
-        """Deliver at most one frame, returning False on offline/manual/failure."""
+        """Deliver at most one frame.
+
+        Returns True when the caller should poll again at once: a frame was
+        delivered, or a read of the open capture only timed out (keep
+        reading; a backoff could let the stall window elapse with no read in
+        flight). Returns False on offline/manual/failure, where the caller
+        backs off before retrying.
+        """
         if self.profile is None:
             self.close()
             if self.controller.requires_approval:

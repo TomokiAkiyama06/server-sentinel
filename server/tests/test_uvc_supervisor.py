@@ -278,12 +278,17 @@ class FrameProgressWatchdogTests(unittest.TestCase):
         while self.adapter.checked.get(source, 0) < count + 3 and time.monotonic() < deadline:
             time.sleep(0.005)
         self.assertGreaterEqual(self.adapter.checked.get(source, 0), count + 3)
-        # Once the worker actually exits it is no longer checked.
+        # Once the worker actually exits it is no longer checked. A second,
+        # live source paces the watchdog: once it has been checked twice
+        # more, at least one full watchdog pass ran after the exit.
+        other = uuid4()
+        self.adapter.prepare(other)
+        self.supervisor.start(other)
         self.adapter.release[source].set()
         self.assertTrue(wait_until(lambda: not self.supervisor.status(source).running))
-        time.sleep(0.03)
         count = self.adapter.checked.get(source, 0)
-        time.sleep(0.05)
+        paced = self.adapter.checked.get(other, 0)
+        self.assertTrue(wait_until(lambda: self.adapter.checked.get(other, 0) >= paced + 2))
         self.assertEqual(count, self.adapter.checked.get(source, 0))
 
     def test_watchdog_failure_is_contained_and_counted_without_text(self):

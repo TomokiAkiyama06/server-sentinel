@@ -40,9 +40,13 @@ class _HealthWriter:
     flush writes the merged latest values outside that lock; merging is
     equivalent to applying the partial updates in order. At most one write
     is in flight, and that writer re-reads the staged values after its write.
-    The source is marked unpersisted before any write begins and cleared only
-    once every staged value is durable, so the runtime reports the in-memory
-    state instead of a stale durable row while a write is in flight or hung.
+    The source is marked unpersisted before a material write begins (one
+    that changes anything but the routine ``last_seen_at`` refresh relative
+    to the last durable values) and cleared only once every staged value is
+    durable, so the runtime reports the in-memory state instead of a stale
+    durable health row while such a write is in flight or hung. A routine
+    refresh in flight leaves the reported health untouched; any failed write
+    marks the source unpersisted (storage is refusing writes).
 
     A non-blocking flush (the supervisor watchdog) never writes itself: even
     an uncontended registry write can hang in SQLite or storage, and the
@@ -59,6 +63,9 @@ class _HealthWriter:
         self._staged_lock = threading.Lock()
         self._io = threading.Lock()
         self._staged = None
+        # Values last made durable, to tell a material write from a routine
+        # last_seen_at refresh.
+        self._durable = {}
         self._handoff_lock = threading.Lock()
         self._handoff_running = False
         self._handoff_pending = False
@@ -69,6 +76,11 @@ class _HealthWriter:
     def stage(self, **values):
         with self._staged_lock:
             self._staged = {**(self._staged or {}), **values}
+
+    def _material(self, values):
+        # Called with _staged_lock held.
+        return any(key != "last_seen_at" and (key not in self._durable or self._durable[key] != value)
+                   for key, value in values.items())
 
     def _handoff(self):
         with self._handoff_lock:
@@ -116,7 +128,8 @@ class _HealthWriter:
             with self._staged_lock:
                 if self._staged is None:
                     return True
-                self._mark(True)
+                if self._material(self._staged):
+                    self._mark(True)
             self._handoff()
             return False
         while True:
@@ -127,9 +140,11 @@ class _HealthWriter:
                     if values is None:
                         return True
                     # Not durable until this write (and anything staged
-                    # meanwhile) completes; a write that blocks indefinitely
-                    # must not leave the source reported as persisted.
-                    self._mark(True)
+                    # meanwhile) completes; a material write that blocks
+                    # indefinitely must not leave the source reported as
+                    # persisted.
+                    if self._material(values):
+                        self._mark(True)
                 try:
                     self._write(**values)
                 except BaseException:
@@ -140,6 +155,7 @@ class _HealthWriter:
                         self._mark(True)
                     raise
                 with self._staged_lock:
+                    self._durable.update(values)
                     if self._staged is None:
                         self._mark(False)
                         return True
@@ -248,7 +264,13 @@ class LocalUvcAdapter:
         writer.flush()
 
     def health_unpersisted(self, source_id):
-        """True while this source's latest health write was refused or failed."""
+        """True while the durable health row may be behind the in-memory state.
+
+        That is while a material health write (a state, profile or quality
+        change) is in flight or hung, or after any write was refused or
+        failed, until a later write succeeds. A routine ``last_seen_at``
+        refresh in flight does not count.
+        """
         with self._unpersisted_lock:
             return source_id in self._unpersisted
 

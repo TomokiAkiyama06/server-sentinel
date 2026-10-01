@@ -306,11 +306,58 @@ class FrameProgressTests(unittest.TestCase):
         self.assertEqual(CameraState.ONLINE, self.controller.state)
         return self.session.capture
 
+    def test_short_poll_timeout_under_low_light_never_flaps_stalled(self):
+        """poll 0.1 s while a dark scene delivers 8 fps (profile 30 fps).
+
+        Deterministic replay of the supervisor loop: a step that returns
+        False sleeps the retry delay (1.0 s) while the 0.25 s watchdog keeps
+        checking; a step that returns True polls again at once.
+        """
+        clock = self.clock
+        interval = 1 / 8
+
+        class LowLight(SyntheticCapture):
+            next_frame = None
+
+            def read_frame(self, timeout):
+                if self.next_frame is None:
+                    self.next_frame = clock.now + interval
+                wait = self.next_frame - clock.now
+                if wait > timeout:
+                    clock.advance(timeout)
+                    raise FrameTimeout("synthetic dark-scene timeout")
+                clock.advance(max(wait, 0))
+                self.next_frame += interval
+                return VideoFrame(b"synthetic", 0, 1.0)
+
+        def factory(candidate, profile, *, verify_identity):
+            capture = LowLight(candidate, profile, verify_identity=verify_identity)
+            self.instances.append(capture)
+            return capture
+
+        session = CaptureSession(
+            self.controller, self.discovery, VideoProfile(1920, 1080, 30, "MJPG"),
+            on_frame=self.frames.append, on_profile=self.profiles.append,
+            capture_factory=factory, clock=clock,
+        )
+        end = clock.now + 60
+        while clock.now < end:
+            if not session.step(timeout=0.1):
+                for _ in range(4):
+                    clock.advance(0.25)
+                    session.check_frame_progress()
+            session.check_frame_progress()
+        reasons = [event.reason for event in self.events]
+        self.assertNotIn("video_frame_stalled", reasons)
+        self.assertNotIn("video_capture_failed", reasons)
+        self.assertEqual(CameraState.ONLINE, self.controller.state)
+        self.assertGreater(len(self.frames), 400)
+
     def test_stall_degrades_without_teardown_and_recovers_on_next_frame(self):
         capture = self.go_online()
         capture.stalled = True
         self.clock.advance(self.session.frame_stall_seconds)
-        self.assertFalse(self.session.step())
+        self.assertTrue(self.session.step())
         self.assertEqual(CameraState.DEGRADED, self.controller.state)
         self.assertEqual("video_frame_stalled", self.events[-1].reason)
         # The descriptor (and with it any live weak binding) is kept open.
@@ -329,14 +376,15 @@ class FrameProgressTests(unittest.TestCase):
                                          frame_stall_seconds=0.5)
         capture = self.go_online()
         capture.stalled = True
-        self.assertFalse(self.session.step(timeout=1.0))
+        self.assertTrue(self.session.step(timeout=1.0))
         self.assertLessEqual(capture.timeouts[-1], 0.5)
 
     def test_timeout_inside_the_window_stays_online(self):
         capture = self.go_online()
         capture.stalled = True
         self.clock.advance(self.session.frame_stall_seconds / 2)
-        self.assertFalse(self.session.step())
+        # A plain read timeout on an open capture: keep reading, no backoff.
+        self.assertTrue(self.session.step())
         self.assertEqual(CameraState.ONLINE, self.controller.state)
         self.assertFalse(capture.closed)
 
@@ -347,10 +395,10 @@ class FrameProgressTests(unittest.TestCase):
         capture = self.go_online()
         capture.stalled = True
         self.clock.advance(3.0)
-        self.assertFalse(self.session.step())
+        self.assertTrue(self.session.step())
         self.assertEqual(CameraState.ONLINE, self.controller.state)
         self.clock.advance(2.0)
-        self.assertFalse(self.session.step())
+        self.assertTrue(self.session.step())
         self.assertEqual(CameraState.DEGRADED, self.controller.state)
         self.assertEqual("video_frame_stalled", self.events[-1].reason)
 
@@ -358,7 +406,7 @@ class FrameProgressTests(unittest.TestCase):
         capture = self.go_online()
         capture.stalled = True
         self.clock.advance(self.session.frame_stall_seconds)
-        self.assertFalse(self.session.step())
+        self.assertTrue(self.session.step())
         self.clock.advance(self.session.frame_stall_reopen_seconds)
         self.assertFalse(self.session.step())
         self.assertTrue(capture.closed)
@@ -378,10 +426,10 @@ class FrameProgressTests(unittest.TestCase):
 
         self.session.capture_factory = stalled_factory
         self.clock.advance(0)
-        self.assertFalse(self.session.step())
+        self.assertTrue(self.session.step())
         self.assertEqual(CameraState.DEGRADED, self.controller.state)
         self.clock.advance(self.session.frame_stall_seconds)
-        self.assertFalse(self.session.step())
+        self.assertTrue(self.session.step())
         self.assertEqual(CameraState.DEGRADED, self.controller.state)
         self.assertEqual("video_frame_stalled", self.events[-1].reason)
         self.assertEqual([], self.frames)
