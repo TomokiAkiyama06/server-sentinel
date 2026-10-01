@@ -428,3 +428,53 @@ verification must include real IPv4/IPv6/LAN bypass attempts, exact installed
 Serve behavior, Docker exposure, clock/restart/session cases, and active
 phone/Mac/desktop playback revocation. Until these exist, no production-security
 or hardware/network/browser acceptance is claimed.
+
+Reservation-breach recovery (Owner decision, 2026-09-30, PR #91): a listener or
+route that answered for the reserved name may already hold a session cookie, so
+access that the reservation check closed for an unexpected listener or route
+reopens only after the deployment authorization generation has advanced and
+every human session, the Owner's included, has been invalidated, with that
+change and its `system` audit record committed. Everyone then signs in again
+with their own credential, and an enrollment authorization issued under the
+previous generation must be issued again. The same applies after a listener or
+route enumeration error or timeout, since it cannot rule an exposure out, and
+after the reserved name resolves to an address set other than the recorded one,
+since the name answered on an address the check did not cover. A missing or
+failing revocation keeps access closed and notifies the Owner; a pending
+revocation survives a restart, and when its marker cannot be written every
+human session is revoked at once instead.
+
+Owner decision, 2026-10-01 (PR #91): each check re-resolves the reserved name.
+A missing resolver, or a resolution that fails or times out, keeps access
+closed but is not treated as an exposure: it shows no other answer on the
+name, so access reopens without revocation once the name resolves to exactly
+the recorded addresses again, unless an exposure was seen in the meantime.
+
+Owner decision, 2026-10-01 (PR #91): a port number alone never exempts a
+listener, because browsers send the host-scoped session cookie to every HTTPS
+port of the reserved name and any service could take an excepted port. An
+Owner listener exception names the port together with its owning executable
+(for example `/usr/sbin/sshd`) or systemd unit, and each check verifies the
+socket's owning processes; a different process, or ownership that cannot be
+verified, is treated as an exposure. Port-only exceptions stored earlier are
+not migrated and keep access closed until the Owner enters them again.
+Without a durable revocation path the check never opens access, so a restart
+cannot reopen with sessions that an exposure may have leaked. ServerSentinel
+stays non-root: reading the owner of a root-owned socket is left to a small
+privileged helper running as a separate systemd service (Issue #126), and
+until it exists an excepted root-owned listener such as `sshd` keeps human
+access closed. The Main Server runs `sshd` as `ssh.service` without socket
+activation, since a socket held by the service manager identifies no single
+owner; its exception is `tcp/22` owned by `/usr/sbin/sshd`. A recorded proxy
+socket is verified the same way: it must be present and held only by the
+recorded proxy process (for example `tailscaled.service`); another holder or
+an unverifiable one is an exposure, while a missing recorded socket only
+keeps access closed, without revocation, until it returns. Until #126 exists,
+a root-owned proxy's sockets cannot be verified and keep access closed. The
+loopback human upstream is checked against the ServerSentinel process's own
+descriptors, which it can always read: a replacement bound by another process
+is an exposure. The missing-proxy-socket handling was accepted by the Owner
+on 2026-10-01.
+
+Clarification, 2026-10-01 (PR #91): where this record says the startup and daily check closes access "on any other answer", read "on any other answer it can see". The check enumerates listening sockets (`/proc/net`) and Tailscale Serve routes only; kernel forwarding to the reserved address (nftables/iptables DNAT or REDIRECT, TPROXY, eBPF `sk_lookup`, IPVS) is not visible to it and must be excluded by the deployment isolation and verified by the operator per `MANUAL_TEST.md`. The current contract is in `server/app/auth/README.md`. This is still detection: it bounds how long an exposed
+cookie stays usable, and does not prevent the exposure.

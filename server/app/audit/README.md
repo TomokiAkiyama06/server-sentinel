@@ -36,6 +36,24 @@ human dashboard listener behind the Owner boundary — never by the capture
 ingest listener — so that an invited `live:view` / `recordings:view` principal
 and a capture-node credential cannot read, alter, or delete audit records.
 
+After a reservation close that may have exposed a session cookie, the check
+revokes every human session before reopening and records it as `system`
+`invalidate_human_sessions` on `security_settings` with one fixed logical ID, in
+the same transaction as the generation advance (a new action value; the action
+column has no `CHECK` constraint, so no migration).
+
+Hostname-reservation listener exceptions (ADR-0003) change only through
+`ReservationAdministration.set_listener_exceptions()`, recorded as
+`change_security_setting` on `security_settings` with one fixed logical ID and
+no port, address or service name. The existing action column has no `CHECK`
+constraint and the action already existed, so no migration is involved. The
+persisted set (existing `application_metadata` row) commits in the same
+transaction as the record, and only then is it applied to the in-memory check;
+a non-Owner gets a `denied` record, and an invalid set or a failed write or
+append gets a `failed` record and rolls back, changing nothing. The check's
+own startup/daily/retry runs are serialized with that sequence, so no verdict
+based on a superseded set is published after the commit.
+
 Human-access administration runs through `AccessAdministration`, which wraps
 `OwnerAuditService.execute_transactional()` around the `AccessStore` `*_on`
 mutations: principal invitation (`invite_principal`), invitation issue

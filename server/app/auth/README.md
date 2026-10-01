@@ -6,7 +6,7 @@ Owns owner invitations/allowlists, independent `live:view` and `recordings:view`
 - Requires application authorization in addition to private-network reachability. Tailnet membership alone grants no access.
 - Treats a verified Tailscale/trusted-proxy identity as supplementary: the deployment shares one Tailscale account, so authorization requires the requesting principal's own ServerSentinel credential (WebAuthn/passkey, ADR 0004) on every human route. No route authorizes on an identity header alone.
 - Verifies the transient WebAuthn data a registration or assertion carries (challenge, client data, authenticator data, signature, signature counter, user-verification flag, relying-party id and origin) and persists only public credential material, the signature counter, the backup-eligibility and backup-state flags, and owner-visible metadata. No viewer biometric template reaches the server; it never leaves the authenticator.
-- Relies on the dashboard owning its browser origin, with no other application sharing it, and on that origin being a secure context (AUTH-012); browsers withhold WebAuthn elsewhere. Reserving the name is a deployment obligation (ADR-0003), and the startup/daily check over real listeners and proxy routes closes human access and notifies the Owner rather than preventing the bind.
+- Relies on the dashboard owning its browser origin, with no other application sharing it, and on that origin being a secure context (AUTH-012); browsers withhold WebAuthn elsewhere. Reserving the name is a deployment obligation (ADR-0003), and the startup/daily check over real listeners and proxy routes closes human access and notifies the Owner on what it can see rather than preventing the bind; kernel forwarding to the reserved address (nftables/iptables DNAT or REDIRECT, TPROXY, eBPF `sk_lookup`, IPVS) is outside it (see below).
 - Treats revocation as credential-scoped rather than device-scoped, and persists the last accepted signature counter so the clone check has something to compare against. The comparison runs whenever the stored or received counter is non-zero, so a received 0 after a stored non-zero is a regression; only a stored-and-received 0 is exempt.
 - Accepts `none` attestation at registration, verifying the challenge, origin/relying-party id, authenticator data, credential public key and user-verification flag instead; a present-but-invalid attestation statement fails.
 - Records the authenticator's backup-eligibility and backup-state flags with the credential so the owner UI can show whether it syncs, and refuses a backup-eligible registration where the deployment requires device-bound credentials. Eligibility is fixed at registration and a differing value in a later assertion is refused and reported; backup state is refreshed from every verified assertion.
@@ -145,3 +145,179 @@ not affect health; when a matched redemption's audit append or commit fails,
 the redemption rolls back and the lost outcome is counted in the store's
 `audit_delivery_failed` / `undelivered_audit_records` health instead of being
 appended separately. See `server/app/audit/README.md`.
+
+## Hostname reservation check (ADR-0003)
+
+`reservation.py` verifies, and does not prevent, the dedicated-hostname
+reservation. `HostnameReservationCheck.startup()` and the daily `tick()`
+re-resolve the reserved hostname through an injected `resolver`
+(`GetaddrinfoResolver` in production) and run an
+injected listener enumerator (`ProcNetListeners`, parsing `/proc/net/tcp`,
+`/proc/net/tcp6`, `/proc/net/udp` and `/proc/net/udp6` text from an injected
+reader) and an injected proxy-route
+enumerator (`ServeStatusRoutes`, parsing Tailscale Serve status JSON from an
+injected source). `access_open` is `False` until a check passes, and any of the
+following closes it:
+
+- a TCP LISTEN or unconnected UDP socket (for example HTTP/3/QUIC) other than
+  the recorded proxy sockets on a reserved address, a wildcard (`0.0.0.0` /
+  `::`) listener, or an IPv4-mapped equivalent, on any port, unless it is a
+  wildcard bind covered by an Owner listener exception. Recorded proxy sockets
+  are TCP at the configured origin port only; a proxy socket on any other port
+  of the reserved name is refused as configuration. Each recorded proxy socket
+  must be held by the configured `proxy_owner` (a `ProcessIdentity`:
+  executable or systemd unit, for example `tailscaled.service`) alone, verified
+  through `socket_owners` like a listener exception: another holder counts as
+  `UNEXPECTED_LISTENER` and an unverifiable one as `LISTENER_OWNER_UNVERIFIED`
+  (both exposures). Connected UDP client sockets answer only their peer and are
+  not counted;
+- a loopback human upstream that is not a socket of this ServerSentinel
+  process: each check reads its own `/proc/self/fd` (`OwnSocketInodes`, the
+  injected `own_sockets`), which needs no privilege and no #126 helper. A
+  single replacement bound by another process after the upstream released the
+  endpoint (no `SO_REUSEPORT` duplicate row) counts as `UNEXPECTED_LISTENER`;
+  an unreadable own fd table, a socket without an inode, or no `own_sockets`
+  counts as `LISTENER_OWNER_UNVERIFIED`; both are exposures. Python creates
+  non-inheritable descriptors, so a child process does not share the socket;
+- a recorded proxy socket that is absent (`PROXY_LISTENER_MISSING`). This is
+  proxy drift or failure with nothing else seen answering, so, like a
+  resolution failure, it closes access without revocation and reopens once
+  every recorded socket is back with its recorded owner;
+- any Serve route other than the single `https://<host>:<port>/` proxy to the
+  loopback human listener (other paths, ports, `http`, raw TCP forwards, empty
+  TLS listeners, Funnel), or a duplicate of it;
+- the expected mapping or the loopback human listener being absent;
+- the isolation mode (`IsolationMode`) not being stated;
+- a resolved address set that differs from the configured `reserved_addresses`
+  (`RESERVED_ADDRESSES_CHANGED`); listeners are checked against the union of
+  both sets, so a bind to an address the name gained is also counted;
+- a hostname resolution that is missing (no resolver), fails, returns nothing
+  usable or exceeds its timeout (`HOSTNAME_RESOLUTION_UNAVAILABLE` /
+  `HOSTNAME_RESOLUTION_TIMEOUT`);
+- an enumeration that raises, returns unrecognised output, or exceeds its
+  timeout; a hung enumeration is never stacked by a later check.
+
+A failing startup/daily check closes access before emitting an identifier-free
+`ReservationFault` (reasons and counts only) to the injected Owner sink; a
+failed delivery is counted and retried on the next tick. While closed the
+check is retried every five minutes, re-notifying only when the reasons change,
+and a later passing check reopens access. After a close that may have exposed
+a session cookie (an unexpected listener or route, a resolved address set that
+differs from the configuration, an excepted listener whose owner cannot be
+verified, or a listener/route enumeration error or timeout that cannot rule
+one out: `EXPOSURE_REASONS`), a passing check reopens
+only after the injected `session_revoker` has revoked every human session
+(Owner decision, 2026-09-30). `reservation_store.ReservationSessionRevocation`
+does that through `AccessStore.invalidate_all_sessions_on`, which advances the
+existing `access_deployment_state.authorization_generation` and invalidates
+every `access_sessions` row (no migration), in one transaction with a `system`
+`invalidate_human_sessions` audit record on a fixed logical ID. Everyone, the
+Owner included, signs in again with their credential, and pending enrollment
+authorizations from the previous generation must be reissued. The exposure is
+recorded as a marker in `application_metadata` first, so a restart before the
+revocation still revokes before opening (an unreadable marker also revokes).
+When the marker cannot be written, every human session is revoked at once
+instead (access is already closed, so none is issued until reopening revokes
+again); until one of the two commits, each check retries and keeps
+`SESSION_REVOCATION_FAILED` (Owner decision, 2026-10-01).
+A check without a revoker never opens access, before or after any exposure,
+and keeps `SESSION_REVOCATION_UNAVAILABLE`: nothing durable could carry a
+revocation requirement across a restart, so a restart after an exposure must
+not reopen with the earlier sessions still valid. When revocation or its audit
+append fails (rolled back together, with a `failed` record attempted), access
+stays closed with a `SESSION_REVOCATION_FAILED` fault; a failure to record the
+marker is reported the same way. Other closes (missing mapping,
+missing human listener, unstated isolation, unreadable exceptions, and a
+missing, failed or timed-out hostname resolution) show no other answer on the
+name and reopen without revocation. A resolution failure keeps access closed
+but is not an exposure (Owner decision, 2026-10-01): once the resolver answers
+again with exactly the configured set, access reopens with existing sessions
+intact, unless an exposure was seen meanwhile. A process binding the reserved
+address between two checks is not seen until the next check: detection bounds
+the exposure window, and only the Owner-recorded deployment isolation removes
+it. `/proc/net` covers one network namespace. The check sees only sockets in `/proc/net` and Serve status. Traffic the kernel redirects before it reaches a listening socket on the reserved address — nftables/iptables DNAT or REDIRECT (for example Docker with `userland-proxy=false`), TPROXY, eBPF `sk_lookup` or IPVS — is not visible to it, so it cannot claim that nothing else answers; the deployment isolation must exclude such forwarding, and the Owner verifies it manually.
+
+Owner listener exceptions (`ListenerException`: protocol `tcp` or `udp`, port,
+optional address family, bind scope `wildcard`, and the owning process) let a
+system service such as `sshd` on tcp/22 or `tailscaled` on its UDP port bind a
+wildcard address without closing access. An exception covers only its own
+protocol. A port alone never exempts a socket (Owner decision, 2026-10-01): each
+exception names its owner by exactly one of `executable` (the absolute,
+normalized path `/proc/<pid>/exe` resolves to, for example `/usr/sbin/sshd`) or
+`unit` (a system unit: the process's cgroup v2 path must be exactly
+`/system.slice/<unit>`, for example `ssh.service`; a `user.slice` path, whose
+user manager can create a unit of any name, a sub-cgroup or another slice names
+no unit and does not match), and a port-only, doubly identified or malformed entry is
+rejected. Each check reads the socket inode from `/proc/net` and the injected
+`socket_owners` (`ProcSocketOwners`, walking `/proc/<pid>/fd`) maps it to every
+process holding it; the socket is excepted only when every holder matches.
+Another process holding it (alone or alongside the named one) counts as
+`UNEXPECTED_LISTENER`; a socket with no inode or no holder found, an
+unreadable executable/unit, or an owner lookup that fails or times out counts
+as `LISTENER_OWNER_UNVERIFIED`; both are exposure reasons. The scan is all or
+nothing: any process whose fd table or descriptor cannot be read (other than
+one that exited or closed it during the scan) could hide another holder, so the
+lookup fails and every excepted listener stays unverified, even one whose
+readable holders all match. Reading another
+account's `/proc/<pid>/fd` and `exe` needs privilege the non-root service may
+not hold (root, or `CAP_DAC_READ_SEARCH` + `CAP_SYS_PTRACE`); without it an
+excepted root-owned `sshd` stays unverified and access stays closed. Owner
+decision (2026-10-01): ServerSentinel stays non-root, and a small privileged
+helper running as its own systemd service will answer the ownership lookup
+(Issue #126); it plugs in as the `SocketOwnerResolver` passed as
+`socket_owners`. Until #126 lands, an excepted root-owned listener such as
+`sshd`, and a recorded proxy socket held by root-owned `tailscaled`, keep
+human access closed. A
+deleted executable (`… (deleted)` after a package upgrade until the service
+restarts) does not match either. With socket activation (for example
+Ubuntu's `ssh.socket`) the listening socket is held by the service manager
+(PID 1, cgroup `init.scope`), which no exception identifies narrowly: naming
+`/usr/lib/systemd/systemd` would cover every socket unit. Such a service stays
+closed until it listens itself. Owner decision (2026-10-01): the Main Server
+runs `sshd` as `ssh.service` with `ssh.socket` disabled, and the exception is
+`tcp/22` owned by `/usr/sbin/sshd` (steps in `server/docs/DEPLOYMENT.md`). `/proc/net` does not
+show `IPV6_V6ONLY` and a `::` socket may also accept IPv4, so a `::` bind is
+treated as dual-stack: only an exception without a family covers it, an `ipv4`
+exception covers `0.0.0.0` only, and an `ipv6`-only exception is rejected. The set is empty
+by default, typed, bounded to 16 entries, and is never read from deployment
+configuration. An exception never matches the dashboard port, the loopback
+human listener port or a recorded proxy socket port (for either protocol, so
+UDP/443 is never exempt), and never matches a bind
+to a reserved address: `100.64.x.y:22` still closes access when `0.0.0.0:22`
+is allowed. The only runtime path that changes it is
+`app.audit.integration.ReservationAdministration`, which authorizes the Owner,
+writes the set and a `change_security_setting` audit record in one SQLite
+transaction, then applies the set and re-checks immediately so narrowing it
+closes access at once. Concurrent changes are serialized from staging through
+apply, so the live set always matches the latest committed one; startup, daily
+and retry checks take the same lock, so a check still evaluating a superseded
+set cannot publish its verdict after a change has committed. `reservation_store.ListenerExceptionStore` persists the
+set as versioned JSON under one fixed key of the foundation
+`application_metadata` key/value table (no migration), and `startup()` loads it
+before the first check. Format version 2 stores the owner; a version 1
+(port-only) value is not migrated, since its owner cannot be inferred, and
+loads as the empty set with `LISTENER_EXCEPTIONS_OUTDATED` in every verdict
+(access closed, Owner fault) until the Owner enters the exceptions again
+through the audited path. A missing row is the empty default; an unreadable,
+corrupt (including duplicate JSON members), or no longer valid value (for example one covering the dashboard
+port) loads as the empty set, never a wider set, and
+`LISTENER_EXCEPTIONS_UNREADABLE` stays in every verdict (access closed, Owner
+fault) until the stored value loads again on a later check or an audited Owner
+change rewrites it, whether or not any listener currently needs an exception.
+Faults still carry only reasons and counts.
+
+Each expected endpoint (the loopback human listener and each recorded proxy
+socket) passes as exactly one socket. Independent `SO_REUSEPORT` sockets show
+as identical `/proc/net` rows, and every extra copy is counted as an
+`UNEXPECTED_LISTENER` (an exposure reason): another process sharing the
+endpoint would receive requests and session cookies. The same applies to a
+wildcard endpoint covered by a listener exception: one exception allows one
+socket per distinct endpoint it covers (for example `0.0.0.0:22` and `:::22`),
+and each identical extra row is unexpected. An exception allows one socket per
+endpoint even for its own process, so a service that opens several
+`SO_REUSEPORT` sockets on an excepted port keeps access closed.
+
+Nothing here is wired into the application or a route yet, reads the host
+implicitly, runs `tailscale`, changes Tailscale ACLs/Grants, or needs Tailscale
+administrative credentials. The assumed `tailscale serve status --json` shape
+is unverified against an installed Tailscale; unrecognised keys fail closed.
