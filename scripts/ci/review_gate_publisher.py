@@ -5,19 +5,21 @@ PR checkout, executes git hooks, creates credentials, creates an App, or edits
 repository rules.  It obtains its App material at runtime from an external
 root/current-user-owned 0600 configuration and key path, re-reads GitHub's live
 PR state, and posts a policy-produced Check Run only when that entire state is
-unchanged.  Provider review collection and App-JWT token exchange deliberately
-remain separate deployment adapters.
+unchanged.  Provider review collection (``review_gate_collector``) and App-JWT
+token exchange (``review_gate_app_token``) are separate adapters.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections import OrderedDict
+from dataclasses import dataclass, field
 import hashlib
 import json
 import os
 from pathlib import Path
 import re
 import stat
+import threading
 from typing import Any, Mapping, Protocol
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote
@@ -25,7 +27,7 @@ from urllib.request import (HTTPRedirectHandler, HTTPSHandler, ProxyHandler,
                             Request, build_opener)
 import ssl
 
-from scripts.ci.review_gate_policy import (Context, Issuer, PolicyFailure,
+from scripts.ci.review_gate_policy import (CHECK_NAMES, Context, Issuer, PolicyFailure,
                                            successful_check_run_request)
 
 
@@ -35,6 +37,20 @@ GITHUB_API = "https://api.github.com"
 _HEX = re.compile(r"[0-9a-f]{40}")
 _MAX_ANCESTRY_COMMITS = 4096
 _MAX_COMMIT_PARENTS = 64
+_PAGE_QUERY = re.compile(r"per_page=100&page=[1-9][0-9]?")
+# The only other query: one App's runs of one check on one commit, paged.
+_CHECK_RUNS_ROUTE = re.compile(r"/repos/[^/?#%\\]+/[^/?#%\\]+/commits/[0-9a-f]{40}/check-runs")
+_CHECK_RUNS_QUERY = re.compile(r"check_name=[A-Za-z0-9._~%-]+&app_id=[1-9][0-9]{0,18}"
+                               r"&filter=all&per_page=100&page=[1-9][0-9]?")
+MAX_CHECK_RUN_PAGES = 10
+# Attempts of one check by the App on one commit that can still be listed
+# completely; no further success is posted beyond it (see check_run_attempts).
+MAX_CHECK_RUN_ATTEMPTS = MAX_CHECK_RUN_PAGES * 100
+# Content-addressed Git objects: a response for one of these paths can never change.
+_IMMUTABLE_GIT_OBJECT = re.compile(
+    r"/repos/[^/?#%\\]+/[^/?#%\\]+/git/(?:commits/(?P<commit>[0-9a-f]{40})"
+    r"|trees/(?P<tree>[0-9a-f]{40})\?recursive=1)")
+MAX_CACHED_GIT_OBJECTS = 2 * _MAX_ANCESTRY_COMMITS
 
 
 class PublisherFailure(RuntimeError):
@@ -65,8 +81,9 @@ class AppCredentials:
     """App key material from the trusted runtime boundary, never a checkout."""
 
     config: RuntimeConfig
-    private_key_pem: bytes
-    installation_token: str
+    # Never part of repr(), so a logged or raised credentials object is redacted.
+    private_key_pem: bytes = field(repr=False)
+    installation_token: str = field(repr=False)
 
 
 class GitHubTransport(Protocol):
@@ -74,6 +91,9 @@ class GitHubTransport(Protocol):
         ...
 
     def get_bytes(self, path: str, token: str, accept: str) -> bytes:
+        ...
+
+    def get_list(self, path: str, token: str) -> list[Any]:
         ...
 
     def post_json(self, path: str, token: str,
@@ -152,15 +172,8 @@ def load_runtime_config(environ: Mapping[str, str], checkout_root: Path) -> Runt
         raise PublisherFailure("invalid review gate configuration") from exc
 
 
-def load_app_credentials(config: RuntimeConfig, environ: Mapping[str, str],
-                         checkout_root: Path) -> AppCredentials:
-    """Load a private App key and short-lived installation token at runtime.
-
-    The key is loaded only to validate this trusted deployment boundary here.
-    A separately reviewed App-JWT exchange adapter may consume it to refresh the
-    installation token; this module never writes either value or returns it in
-    an error.  The token is intentionally an environment-only runtime input.
-    """
+def load_app_private_key(config: RuntimeConfig, checkout_root: Path) -> bytes:
+    """Load the external private App key after descriptor-level checks."""
     _, key = _secure_private_bytes(config.private_key_path, checkout_root)
     fence = b"-" * 5
     pem_markers = ((fence + b"BEGIN PRIVATE KEY" + fence,
@@ -171,7 +184,21 @@ def load_app_credentials(config: RuntimeConfig, environ: Mapping[str, str],
             and any(key.startswith(begin) and key.rstrip().endswith(end)
                     for begin, end in pem_markers)):
         raise PublisherFailure("invalid App private key material")
-    token = environ.get(TOKEN_ENV)
+    return key
+
+
+def load_app_credentials(config: RuntimeConfig, environ: Mapping[str, str],
+                         checkout_root: Path,
+                         installation_token: str | None = None) -> AppCredentials:
+    """Load a private App key and short-lived installation token at runtime.
+
+    ``installation_token`` comes from ``review_gate_app_token`` when the App-JWT
+    exchange adapter is used; otherwise the token is an environment-only
+    runtime input.  This module never writes either value or returns it in an
+    error.
+    """
+    key = load_app_private_key(config, checkout_root)
+    token = installation_token if installation_token is not None else environ.get(TOKEN_ENV)
     if not isinstance(token, str) or not re.fullmatch(r"[A-Za-z0-9_-]{20,512}", token):
         raise PublisherFailure("installation token is unavailable")
     return AppCredentials(config, key, token)
@@ -191,8 +218,14 @@ class UrllibGitHubTransport:
 
     @staticmethod
     def _url(path: str) -> str:
-        if (not isinstance(path, str) or not path.startswith("/")
-                or ("?" in path and not path.endswith("?recursive=1"))):
+        if not isinstance(path, str) or not path.startswith("/"):
+            raise PublisherFailure("invalid GitHub API path")
+        route, _, query = path.partition("?")
+        if ("?" in query or any(character in route for character in "#%\\")
+                or (query and query != "recursive=1"
+                    and not _PAGE_QUERY.fullmatch(query)
+                    and not (_CHECK_RUNS_ROUTE.fullmatch(route)
+                             and _CHECK_RUNS_QUERY.fullmatch(query)))):
             raise PublisherFailure("invalid GitHub API path")
         return GITHUB_API + path
 
@@ -221,10 +254,117 @@ class UrllibGitHubTransport:
     def get_bytes(self, path: str, token: str, accept: str) -> bytes:
         return self._request("GET", path, token, None, accept)
 
+    def get_list(self, path: str, token: str) -> list[Any]:
+        raw = self._request("GET", path, token, None, "application/vnd.github+json")
+        try:
+            value = json.loads(raw)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise PublisherFailure("invalid GitHub API JSON") from exc
+        if not isinstance(value, list):
+            raise PublisherFailure("unexpected GitHub API response")
+        return value
+
     def post_json(self, path: str, token: str, payload: dict[str, Any]) -> dict[str, Any]:
         body = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
         return _json_object(self._request("POST", path, token, body,
                                           "application/vnd.github+json"))
+
+
+class GitObjectCache:
+    """Bounded, thread-safe LRU of immutable Git commit and recursive tree responses.
+
+    Only content-addressed objects are held: a commit or tree SHA names exactly
+    one object, so a verified response can be reused by every later live
+    context read. Pull request, merge-ref and check-run state is mutable and is
+    never cached. Entries are stored serialized so callers cannot mutate them.
+    """
+
+    def __init__(self, max_entries: int = MAX_CACHED_GIT_OBJECTS) -> None:
+        if type(max_entries) is not int or max_entries <= 0:
+            raise PublisherFailure("invalid Git object cache bound")
+        self._max_entries = max_entries
+        self._entries: OrderedDict[str, str] = OrderedDict()
+        self._lock = threading.Lock()
+
+    def get(self, path: str) -> dict[str, Any] | None:
+        with self._lock:
+            raw = self._entries.get(path)
+            if raw is None:
+                return None
+            self._entries.move_to_end(path)
+        return json.loads(raw)
+
+    def put(self, path: str, value: dict[str, Any]) -> None:
+        try:
+            raw = json.dumps(value, separators=(",", ":"))
+        except (TypeError, ValueError, RecursionError):
+            return
+        with self._lock:
+            self._entries[path] = raw
+            self._entries.move_to_end(path)
+            while len(self._entries) > self._max_entries:
+                self._entries.popitem(last=False)
+
+
+def _verified_git_object(match: re.Match[str], value: Any,
+                         commit: dict[str, Any] | None = None) -> bool:
+    """Cache only a response that names the requested object and is complete.
+
+    Trees are requested by commit SHA, so a tree response names its root
+    tree's SHA, not the requested one. It is verified only against
+    ``commit``, the cached (already verified) commit response for that SHA:
+    its ``tree.sha`` must equal the response's ``sha``. A tree without that
+    binding, including one with no ``sha``, is returned but never cached.
+    """
+    if not isinstance(value, dict):
+        return False
+    if match.group("commit"):
+        return value.get("sha") == match.group("commit") and isinstance(value.get("parents"), list)
+    if not isinstance(commit, dict) or commit.get("sha") != match.group("tree"):
+        return False
+    root = commit.get("tree")
+    tree_sha = root.get("sha") if isinstance(root, dict) else None
+    return (isinstance(tree_sha, str) and _HEX.fullmatch(tree_sha) is not None
+            and value.get("sha") == tree_sha and value.get("truncated") is False
+            and isinstance(value.get("tree"), list))
+
+
+class CachingGitHubTransport:
+    """``GitHubTransport`` that reuses immutable Git objects from a ``GitObjectCache``.
+
+    Every other request, including all mutable state, goes to ``client``.
+    """
+
+    def __init__(self, client: GitHubTransport, cache: GitObjectCache) -> None:
+        if not isinstance(cache, GitObjectCache):
+            raise PublisherFailure("invalid Git object cache")
+        self._client = client
+        self._cache = cache
+
+    def get_json(self, path: str, token: str) -> dict[str, Any]:
+        match = _IMMUTABLE_GIT_OBJECT.fullmatch(path) if isinstance(path, str) else None
+        if match is None:
+            return self._client.get_json(path, token)
+        cached = self._cache.get(path)
+        if cached is not None:
+            return cached
+        value = self._client.get_json(path, token)
+        commit = None
+        if match.group("tree"):
+            prefix = path[:match.start("tree") - len("trees/")]
+            commit = self._cache.get(f"{prefix}commits/{match.group('tree')}")
+        if _verified_git_object(match, value, commit):
+            self._cache.put(path, value)
+        return value
+
+    def get_bytes(self, path: str, token: str, accept: str) -> bytes:
+        return self._client.get_bytes(path, token, accept)
+
+    def get_list(self, path: str, token: str) -> list[Any]:
+        return self._client.get_list(path, token)
+
+    def post_json(self, path: str, token: str, payload: dict[str, Any]) -> dict[str, Any]:
+        return self._client.post_json(path, token, payload)
 
 
 def _json_object(raw: bytes) -> dict[str, Any]:
@@ -417,4 +557,126 @@ def publish_success(client: GitHubTransport, credentials: AppCredentials,
     repo = "/repos/" + "/".join(_path_part(part) for part in credentials.config.repository.split("/"))
     response = client.post_json(f"{repo}/check-runs", credentials.installation_token, request)
     _validate_published_run(response, credentials.config, request)
+    return response
+
+
+def _check_runs_path(credentials: AppCredentials, test_merge_sha: str,
+                     reviewer: str) -> str:
+    name = CHECK_NAMES.get(reviewer) if isinstance(reviewer, str) else None
+    if name is None:
+        raise PublisherFailure("unsupported reviewer")
+    sha = _sha(test_merge_sha)
+    repo = "/repos/" + "/".join(_path_part(part) for part in credentials.config.repository.split("/"))
+    return (f"{repo}/commits/{sha}/check-runs?check_name={quote(name, safe='')}"
+            f"&app_id={credentials.config.issuer.app_id}&filter=all&per_page=100&page=")
+
+
+def check_run_attempts(client: GitHubTransport, credentials: AppCredentials,
+                       test_merge_sha: str, reviewer: str) -> int:
+    """How many attempts of ``reviewer``'s check the App has on the commit.
+
+    Beyond ``MAX_CHECK_RUN_ATTEMPTS`` the latest attempt can no longer be
+    verified (``success_is_latest_attempt`` would always answer False), so the
+    caller must stop posting successes there instead of superseding and
+    republishing on every poll.
+    """
+    body = client.get_json(_check_runs_path(credentials, test_merge_sha, reviewer) + "1",
+                           credentials.installation_token)
+    count = body.get("total_count") if isinstance(body, dict) else None
+    if type(count) is not int or count < 0:
+        raise PublisherFailure("unexpected GitHub API response")
+    return count
+
+
+def success_is_latest_attempt(client: GitHubTransport, credentials: AppCredentials,
+                              test_merge_sha: str, reviewer: str,
+                              check_run_id: int) -> bool:
+    """Whether ``check_run_id`` is still the App's newest run of ``reviewer``'s check.
+
+    A superseding failure attempt can be posted without the ledger recording
+    it (an unwritable state directory, seen by another worker or across a
+    restart), so a recorded success is reused only while GitHub still lists
+    it as the newest run of that check by the dedicated App on that commit and
+    it reads ``completed`` / ``success``. "Newest" is the highest run ID, as
+    run IDs are assigned in creation order. A listing that is incomplete or
+    changes while paging proves nothing and returns False (the caller then
+    supersedes and republishes); a failed or malformed read raises.
+    """
+    name = CHECK_NAMES.get(reviewer) if isinstance(reviewer, str) else None
+    if name is None:
+        raise PublisherFailure("unsupported reviewer")
+    if type(check_run_id) is not int or check_run_id <= 0:
+        return False
+    sha = _sha(test_merge_sha)
+    app_id = credentials.config.issuer.app_id
+    path = _check_runs_path(credentials, sha, reviewer)
+    runs: list[Any] = []
+    total = None
+    for page in range(1, MAX_CHECK_RUN_PAGES + 1):
+        body = client.get_json(path + str(page), credentials.installation_token)
+        count = body.get("total_count") if isinstance(body, dict) else None
+        items = body.get("check_runs") if isinstance(body, dict) else None
+        if type(count) is not int or count < 0 or not isinstance(items, list):
+            raise PublisherFailure("unexpected GitHub API response")
+        if total is None:
+            total = count
+        elif count != total:
+            return False
+        runs.extend(items)
+        if len(runs) >= total or not items:
+            break
+    if len(runs) != total:
+        return False
+    newest = None
+    for run in runs:
+        if not isinstance(run, dict) or type(run.get("id")) is not int:
+            raise PublisherFailure("unexpected GitHub API response")
+        app = run.get("app")
+        if (not isinstance(app, dict) or app.get("id") != app_id
+                or run.get("name") != name or run.get("head_sha") != sha):
+            continue
+        if newest is None or run["id"] > newest["id"]:
+            newest = run
+    return (newest is not None and newest["id"] == check_run_id
+            and newest.get("status") == "completed"
+            and newest.get("conclusion") == "success")
+
+
+def revocation_check_run_request(test_merge_sha: str, reviewer: str) -> dict[str, Any]:
+    """Build the fixed failure attempt that supersedes an earlier success.
+
+    ``failure`` (never ``neutral`` / ``skipped``, which satisfy a required
+    check) keeps the check unsatisfied until a new success is published.  The
+    output carries no review text or reason detail.
+    """
+    name = CHECK_NAMES.get(reviewer) if isinstance(reviewer, str) else None
+    if name is None:
+        raise PublisherFailure("unsupported reviewer")
+    return {
+        "name": name,
+        "head_sha": _sha(test_merge_sha),
+        "status": "completed",
+        "conclusion": "failure",
+        "output": {"title": f"{reviewer} review is not current",
+                   "summary": "superseded"},
+    }
+
+
+def publish_revocation(client: GitHubTransport, credentials: AppCredentials,
+                       test_merge_sha: str, reviewer: str) -> dict[str, Any]:
+    """Post a newer failure attempt for ``reviewer`` on ``test_merge_sha``.
+
+    No live re-read is needed: a failure attempt can only withhold approval.
+    """
+    request = revocation_check_run_request(test_merge_sha, reviewer)
+    repo = "/repos/" + "/".join(_path_part(part) for part in credentials.config.repository.split("/"))
+    response = client.post_json(f"{repo}/check-runs", credentials.installation_token, request)
+    app = response.get("app") if isinstance(response, dict) else None
+    if (not isinstance(app, dict) or app.get("id") != credentials.config.issuer.app_id
+            or app.get("slug") != credentials.config.issuer.app_slug
+            or response.get("name") != request["name"]
+            or response.get("head_sha") != request["head_sha"]
+            or response.get("status") != "completed"
+            or response.get("conclusion") != "failure"):
+        raise PublisherFailure("GitHub did not confirm the superseding check")
     return response
