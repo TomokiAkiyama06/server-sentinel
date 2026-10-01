@@ -13,6 +13,9 @@ unstated isolation mode, or an enumeration that fails or times out.
 It cannot stop a local process from binding the reserved address, and a bind
 between two checks is not seen until the next one: detection bounds the
 exposure window; only the deployment isolation removes it.
+It sees only sockets and proxy routes: kernel forwarding to the reserved
+address (nftables/iptables DNAT or REDIRECT, TPROXY, eBPF ``sk_lookup``, IPVS)
+is invisible to it and is verified by the operator (MANUAL_TEST.md).
 
 Enumerators and the Owner fault sink are injected. Nothing here reads the host
 implicitly, runs ``tailscale``, mounts a route, changes Tailscale ACLs/Grants,

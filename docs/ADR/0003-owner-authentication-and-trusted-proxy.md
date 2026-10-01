@@ -474,5 +474,7 @@ a root-owned proxy's sockets cannot be verified and keep access closed. The
 loopback human upstream is checked against the ServerSentinel process's own
 descriptors, which it can always read: a replacement bound by another process
 is an exposure. The missing-proxy-socket handling was accepted by the Owner
-on 2026-10-01. This is still detection: it bounds how long an exposed
+on 2026-10-01.
+
+Clarification, 2026-10-01 (PR #91): where this record says the startup and daily check closes access "on any other answer", read "on any other answer it can see". The check enumerates listening sockets (`/proc/net`) and Tailscale Serve routes only; kernel forwarding to the reserved address (nftables/iptables DNAT or REDIRECT, TPROXY, eBPF `sk_lookup`, IPVS) is not visible to it and must be excluded by the deployment isolation and verified by the operator per `MANUAL_TEST.md`. The current contract is in `server/app/auth/README.md`. This is still detection: it bounds how long an exposed
 cookie stays usable, and does not prevent the exposure.
