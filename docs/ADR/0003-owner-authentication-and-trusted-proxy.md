@@ -436,8 +436,17 @@ reopens only after the deployment authorization generation has advanced and
 every human session, the Owner's included, has been invalidated, with that
 change and its `system` audit record committed. Everyone then signs in again
 with their own credential, and an enrollment authorization issued under the
-previous generation must be issued again. The same applies after an enumeration
-error or timeout, since it cannot rule an exposure out. A missing or failing
-revocation keeps access closed and notifies the Owner; a pending revocation
-survives a restart. This is still detection: it bounds how long an exposed
+previous generation must be issued again. The same applies after a listener or
+route enumeration error or timeout, since it cannot rule an exposure out, and
+after the reserved name resolves to an address set other than the recorded one,
+since the name answered on an address the check did not cover. A missing or
+failing revocation keeps access closed and notifies the Owner; a pending
+revocation survives a restart, and when its marker cannot be written every
+human session is revoked at once instead.
+
+Owner decision, 2026-10-01 (PR #91): each check re-resolves the reserved name.
+A missing resolver, or a resolution that fails or times out, keeps access
+closed but is not treated as an exposure: it shows no other answer on the
+name, so access reopens without revocation once the name resolves to exactly
+the recorded addresses again, unless an exposure was seen in the meantime. This is still detection: it bounds how long an exposed
 cookie stays usable, and does not prevent the exposure.

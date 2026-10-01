@@ -1348,8 +1348,15 @@ the credential within its reach.
 The reservation itself is a deployment obligation, stated in full in §11.9 and
 ADR-0003: the name serves ServerSentinel alone on every scheme and port. The
 application verifies it at startup and at least daily by enumerating the host's
-real listeners and every proxy route for that name, and closes human access and
-notifies the Owner on any other answer. That bounds the exposure window rather
+real listeners and every proxy route for that name, re-resolving the name on
+each check, and closes human access and notifies the Owner on any other answer,
+a resolved address set that differs from the recorded one, or a check that
+cannot be completed. Reopening after an exposure reason (another listener or
+route, a changed address set, a listener/route enumeration failure) first
+revokes every human session; a hostname resolution failure alone keeps access
+closed and reopens without revocation once the name resolves to the recorded
+set again (Owner decision, 2026-10-01; details in `server/app/auth/README.md`).
+That bounds the exposure window rather
 than preventing the bind: a process that binds between two checks receives
 credentials and cookies for that origin until the next check.
 

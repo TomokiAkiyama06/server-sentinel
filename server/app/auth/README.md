@@ -149,7 +149,9 @@ appended separately. See `server/app/audit/README.md`.
 ## Hostname reservation check (ADR-0003)
 
 `reservation.py` verifies, and does not prevent, the dedicated-hostname
-reservation. `HostnameReservationCheck.startup()` and the daily `tick()` run an
+reservation. `HostnameReservationCheck.startup()` and the daily `tick()`
+re-resolve the reserved hostname through an injected `resolver`
+(`GetaddrinfoResolver` in production) and run an
 injected listener enumerator (`ProcNetListeners`, parsing `/proc/net/tcp`,
 `/proc/net/tcp6`, `/proc/net/udp` and `/proc/net/udp6` text from an injected
 reader) and an injected proxy-route
@@ -169,6 +171,12 @@ following closes it:
   TLS listeners, Funnel), or a duplicate of it;
 - the expected mapping or the loopback human listener being absent;
 - the isolation mode (`IsolationMode`) not being stated;
+- a resolved address set that differs from the configured `reserved_addresses`
+  (`RESERVED_ADDRESSES_CHANGED`); listeners are checked against the union of
+  both sets, so a bind to an address the name gained is also counted;
+- a hostname resolution that is missing (no resolver), fails, returns nothing
+  usable or exceeds its timeout (`HOSTNAME_RESOLUTION_UNAVAILABLE` /
+  `HOSTNAME_RESOLUTION_TIMEOUT`);
 - an enumeration that raises, returns unrecognised output, or exceeds its
   timeout; a hung enumeration is never stacked by a later check.
 
@@ -177,7 +185,8 @@ A failing startup/daily check closes access before emitting an identifier-free
 failed delivery is counted and retried on the next tick. While closed the
 check is retried every five minutes, re-notifying only when the reasons change,
 and a later passing check reopens access. After a close that may have exposed
-a session cookie (an unexpected listener or route, or an enumeration error or
+a session cookie (an unexpected listener or route, a resolved address set that
+differs from the configuration, or a listener/route enumeration error or
 timeout that cannot rule one out: `EXPOSURE_REASONS`), a passing check reopens
 only after the injected `session_revoker` has revoked every human session
 (Owner decision, 2026-09-30). `reservation_store.ReservationSessionRevocation`
@@ -189,12 +198,20 @@ Owner included, signs in again with their credential, and pending enrollment
 authorizations from the previous generation must be reissued. The exposure is
 recorded as a marker in `application_metadata` first, so a restart before the
 revocation still revokes before opening (an unreadable marker also revokes).
+When the marker cannot be written, every human session is revoked at once
+instead (access is already closed, so none is issued until reopening revokes
+again); until one of the two commits, each check retries and keeps
+`SESSION_REVOCATION_FAILED` (Owner decision, 2026-10-01).
 Without a revoker, or when revocation or its audit append fails (rolled back
 together, with a `failed` record attempted), access stays closed with a
 `SESSION_REVOCATION_UNAVAILABLE` / `SESSION_REVOCATION_FAILED` fault; a failure
 to record the marker is reported the same way. Other closes (missing mapping,
-missing human listener, unstated isolation, unreadable exceptions) show no
-other answer on the name and reopen without revocation. A process binding the reserved
+missing human listener, unstated isolation, unreadable exceptions, and a
+missing, failed or timed-out hostname resolution) show no other answer on the
+name and reopen without revocation. A resolution failure keeps access closed
+but is not an exposure (Owner decision, 2026-10-01): once the resolver answers
+again with exactly the configured set, access reopens with existing sessions
+intact, unless an exposure was seen meanwhile. A process binding the reserved
 address between two checks is not seen until the next check: detection bounds
 the exposure window, and only the Owner-recorded deployment isolation removes
 it. `/proc/net` covers one network namespace.
