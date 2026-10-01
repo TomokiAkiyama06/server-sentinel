@@ -1597,12 +1597,14 @@ by the Issue #6 synthetic policy model.
   at once, so a restart after removing the listener cannot reopen with an
   earlier session.
 - Listener exception ownership (Owner decision 2026-10-01; mock-only so far):
-  with `ProcSocketOwners` composed and the check running with the privilege it
-  needs to read `/proc/<pid>/fd` and `exe` of `sshd` (record which: root, or
-  `CAP_DAC_READ_SEARCH` + `CAP_SYS_PTRACE`), confirm `readlink /proc/<sshd
-  pid>/exe` matches the configured executable and access opens with `sshd`
-  on 22. Without that privilege, confirm access stays closed with
-  `LISTENER_OWNER_UNVERIFIED`. Stop `sshd`, start another process on the
+  first follow the `server/docs/DEPLOYMENT.md` SSH steps (`ssh.socket`
+  disabled, `ssh.service` enabled) and record `systemctl is-enabled ssh.socket
+  ssh.service`, `ss -ltnp 'sport = :22'` and `readlink /proc/<sshd pid>/exe`.
+  Before Issue #126 (privileged owner helper) lands, confirm the non-root
+  service reports `LISTENER_OWNER_UNVERIFIED` for the excepted `sshd` and
+  human access stays closed. Once #126 is composed as `socket_owners`,
+  confirm the helper's answer matches `readlink` and access opens with `sshd`
+  on 22. With #126 composed, stop `sshd`, start another process on the
   excepted port (for example `sudo python3 -m http.server 22`), and confirm
   access closes with `UNEXPECTED_LISTENER` and that reopening revokes every
   human session. Record whether the host uses `ssh.socket` (socket

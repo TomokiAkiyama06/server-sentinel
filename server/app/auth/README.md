@@ -238,14 +238,20 @@ unreadable executable/unit, or an owner lookup that fails or times out counts
 as `LISTENER_OWNER_UNVERIFIED`; both are exposure reasons. Reading another
 account's `/proc/<pid>/fd` and `exe` needs privilege the non-root service may
 not hold (root, or `CAP_DAC_READ_SEARCH` + `CAP_SYS_PTRACE`); without it an
-excepted root-owned `sshd` stays unverified and access stays closed. A
+excepted root-owned `sshd` stays unverified and access stays closed. Owner
+decision (2026-10-01): ServerSentinel stays non-root, and a small privileged
+helper running as its own systemd service will answer the ownership lookup
+(Issue #126); it plugs in as the `SocketOwnerResolver` passed as
+`socket_owners`. Until #126 lands, an excepted root-owned listener such as
+`sshd` keeps human access closed. A
 deleted executable (`… (deleted)` after a package upgrade until the service
 restarts) does not match either. With socket activation (for example
 Ubuntu's `ssh.socket`) the listening socket is held by the service manager
 (PID 1, cgroup `init.scope`), which no exception identifies narrowly: naming
 `/usr/lib/systemd/systemd` would cover every socket unit. Such a service stays
-closed until it listens itself (for example `ssh.service` without
-`ssh.socket`); whether to support socket activation is an open Owner decision. `/proc/net` does not
+closed until it listens itself. Owner decision (2026-10-01): the Main Server
+runs `sshd` as `ssh.service` with `ssh.socket` disabled, and the exception is
+`tcp/22` owned by `/usr/sbin/sshd` (steps in `server/docs/DEPLOYMENT.md`). `/proc/net` does not
 show `IPV6_V6ONLY` and a `::` socket may also accept IPv4, so a `::` bind is
 treated as dual-stack: only an exception without a family covers it, an `ipv4`
 exception covers `0.0.0.0` only, and an `ipv6`-only exception is rejected. The set is empty

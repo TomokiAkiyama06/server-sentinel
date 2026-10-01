@@ -459,5 +459,11 @@ socket's owning processes; a different process, or ownership that cannot be
 verified, is treated as an exposure. Port-only exceptions stored earlier are
 not migrated and keep access closed until the Owner enters them again.
 Without a durable revocation path the check never opens access, so a restart
-cannot reopen with sessions that an exposure may have leaked. This is still detection: it bounds how long an exposed
+cannot reopen with sessions that an exposure may have leaked. ServerSentinel
+stays non-root: reading the owner of a root-owned socket is left to a small
+privileged helper running as a separate systemd service (Issue #126), and
+until it exists an excepted root-owned listener such as `sshd` keeps human
+access closed. The Main Server runs `sshd` as `ssh.service` without socket
+activation, since a socket held by the service manager identifies no single
+owner; its exception is `tcp/22` owned by `/usr/sbin/sshd`. This is still detection: it bounds how long an exposed
 cookie stays usable, and does not prevent the exposure.
