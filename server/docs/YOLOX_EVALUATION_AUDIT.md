@@ -105,10 +105,15 @@ installed before the adapter is imported, loaded or evaluated
 (`worker_python_outbound_attempts`; a recorded worker attempt fails the start
 or evaluation). The worker-side hook was added after the first run and the
 container smoke was re-run with it on 2026-09-30. Since 2026-10-01 the smoke
-process installs its hook before any YOLOX import or setup, permitting only
-the worker spawn during start (`permitted_worker_launches`; CPython 3.12 raises
-no audit event for that spawn); the container smoke has not been re-run since
-this ordering change. `--network none` blocks
+process installs its hook before any YOLOX import or setup. CPython 3.12 raises
+no audit event for the multiprocessing spawn path (`_posixsubprocess.fork_exec`),
+so the smoke wraps that entry point to raise its own launch event, classified by
+argv, on every runtime; `os.fork`/`os.exec` are audited too. During worker start
+it permits exactly one spawn worker and at most one multiprocessing resource
+tracker (`permitted_worker_launches`, `process_launch_observed`); any other
+launch is recorded and fails the smoke. Native code that forks without these
+Python entry points is not observed. The container smoke results above
+predate these changes and have not been re-run. `--network none` blocks
 delivery; the hooks, not the network namespace, are the attempt evidence.
 The smoke's pass/fail checks raise unconditionally (`SmokeFailure`) rather
 than using `assert`, so `python -O` / `PYTHONOPTIMIZE` cannot turn a worker

@@ -131,6 +131,11 @@ class YoloxSessionDoubleTests(unittest.TestCase):
         below = self.output.copy()
         below[0, 0, 5] = -0.1
         cases.append(below)
+        # Non-person class columns are sigmoid scores too.
+        for column, value in ((6, 1.5), (84, -0.1), (40, np.inf)):
+            other = self.output.copy()
+            other[0, 7, column] = value
+            cases.append(other)
         cases.append(np.zeros((1, 3549, 85), dtype=np.float32))
         for output in cases:
             self.session.run.return_value = (output,)
@@ -276,12 +281,11 @@ class ModelSmokeWorkerAuditTests(unittest.TestCase):
 
     def test_parent_hook_audits_yolox_setup_and_permits_only_the_worker_spawn(self):
         # The smoke process installs its hook before any YOLOX import; the
-        # worker spawn is the only permitted launch, and only during start.
-        # CPython 3.12 raises no audit event for the multiprocessing spawn
-        # (newer versions raise _posixsubprocess.fork_exec), so 0 or 1.
+        # worker spawn is observed on every runtime (CPython 3.12 raises no
+        # native event for it) and is the only permitted launch.
         tests = Path(__file__).resolve().parent
         program = (
-            "import subprocess, sys\n"
+            "import multiprocessing, sys\n"
             f"sys.path[:0] = [{str(tests)!r}, {str(tests.parent)!r}]\n"
             "import detector_model_smoke as smoke\n"
             "install = sys.addaudithook\n"
@@ -298,15 +302,24 @@ class ModelSmokeWorkerAuditTests(unittest.TestCase):
             "    if stopped.code: raise\n"
             "result = real_check('yolox-tiny-onnx-cpu', '/unused', 4,\n"
             "    target='detector_worker_fakes:smoke_adapter')\n"
-            "if smoke._attempts or result['permitted_worker_launches'] > 1: sys.exit(5)\n"
-            "try:\n"
-            "    subprocess.run(['true'])\n"
-            "except RuntimeError:\n"
-            "    pass\n"
-            "sys.exit(0 if smoke._attempts else 6)\n")
+            "if smoke._attempts or result['permitted_worker_launches'].count('multiprocessing.spawn') != 1\\\n"
+            "        or result['process_launch_observed'] is not True: sys.exit(5)\n"
+            "def noop(): pass\n"
+            "if __name__ == '__main__':\n"
+            "    try:\n"
+            "        multiprocessing.get_context('spawn').Process(target=noop).start()\n"
+            "    except RuntimeError:\n"
+            "        pass\n"
+            "    if smoke._attempts != [smoke.LAUNCH_EVENT]: sys.exit(6)\n"
+            "    sys.exit(0)\n")
         completed = subprocess.run([sys.executable, "-c", program],
                                    cwd=tests.parent, capture_output=True, timeout=120)
         self.assertEqual(completed.returncode, 0, completed.stderr.decode(errors="replace"))
+
+    def test_unhooked_check_reports_launches_as_unobserved(self):
+        result = self.check("smoke_adapter")
+        self.assertIs(result["process_launch_observed"], False)
+        self.assertIsNone(result["permitted_worker_launches"])
 
     def test_worker_attempt_still_fails_the_smoke_under_python_optimize(self):
         # `python -O` strips `assert`; the failure must not depend on it.

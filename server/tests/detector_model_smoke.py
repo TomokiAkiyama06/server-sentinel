@@ -4,6 +4,7 @@ import argparse
 from contextlib import contextmanager
 import importlib
 import json
+import os
 from pathlib import Path
 import sys
 import time
@@ -14,19 +15,68 @@ YOLOX_FACTORY = "app.detection.foundation.yolox:create_yolox_person"
 # Every DNS entry point has its own audit event: gethostbyname(_ex) raise
 # socket.gethostbyname, reverse lookup socket.gethostbyaddr / getnameinfo.
 # An unconnected datagram send raises socket.sendto or socket.sendmsg.
+LAUNCH_EVENT = "serversentinel.smoke.fork_exec"
 OUTBOUND_EVENTS = frozenset({"socket.connect", "socket.getaddrinfo",
                              "socket.gethostbyname", "socket.gethostbyaddr",
                              "socket.getnameinfo", "socket.sendto", "socket.sendmsg",
                              "subprocess.Popen", "os.system", "os.posix_spawn",
-                             "_posixsubprocess.fork_exec"})
-# The multiprocessing "spawn" start of the IsolatedDetector worker raises only
-# this event (CPython 3.13+; 3.12 raises none for it); it is permitted solely
-# inside `permit_worker_launch()`.
-WORKER_LAUNCH_EVENTS = frozenset({"_posixsubprocess.fork_exec"})
+                             "os.fork", "os.forkpty", "os.exec",
+                             LAUNCH_EVENT})
+# The multiprocessing "spawn" start (the IsolatedDetector worker) calls
+# `_posixsubprocess.fork_exec` directly. CPython 3.12 raises no audit event for
+# it, so `observe_process_launches` wraps that module attribute to raise
+# LAUNCH_EVENT on every Python-level call, on every runtime; the native event
+# that newer runtimes add is then ignored to avoid double counting. Only the
+# expected worker spawn (and its resource tracker), inside
+# `permit_worker_launch()`, is permitted.
+# Native code forking without these entry points is not observed.
+WORKER_LAUNCH_EVENTS = frozenset({LAUNCH_EVENT})
+# The worker itself and the multiprocessing resource tracker that the spawn
+# context starts once per process, told apart by their fixed argv.
+PERMITTED_WORKER_LAUNCHES = frozenset({"multiprocessing.spawn",
+                                       "multiprocessing.resource_tracker"})
 # Per process: the smoke process and the spawned worker each record their own.
 _attempts = []
 _permitted_launches = []
 _worker_launch_open = False
+_audit_installed = False
+
+
+def observe_process_launches():
+    """Make the stdlib fork_exec path observable; idempotent, per process."""
+    import _posixsubprocess
+    native = _posixsubprocess.fork_exec
+    if getattr(native, "_smoke_observed", False):
+        return
+
+    def fork_exec(*args, **kwargs):
+        sys.audit(LAUNCH_EVENT, _launch_kind(args[0] if args else ()))
+        return native(*args, **kwargs)
+
+    fork_exec._smoke_observed = True
+    _posixsubprocess.fork_exec = fork_exec
+
+
+def _launch_kind(argv):
+    """Classify a launch by its argv: the two multiprocessing spawn children."""
+    try:
+        text = " ".join(os.fsdecode(part) for part in argv)
+    except (TypeError, ValueError):
+        return "other"
+    for kind in ("multiprocessing.spawn import spawn_main",
+                 "multiprocessing.resource_tracker import main"):
+        if kind in text:
+            return kind.split(" ")[0]
+    return "other"
+
+
+def install_audit():
+    """Observe launches, then record and refuse outbound/process attempts."""
+    global _audit_installed
+    observe_process_launches()
+    if not _audit_installed:
+        sys.addaudithook(reject_outbound)
+        _audit_installed = True
 
 
 class SmokeFailure(RuntimeError):
@@ -51,8 +101,9 @@ def permit_worker_launch():
 
 
 def reject_outbound(event, args):
-    if _worker_launch_open and event in WORKER_LAUNCH_EVENTS:
-        _permitted_launches.append(event)
+    if (_worker_launch_open and event in WORKER_LAUNCH_EVENTS
+            and args and args[0] in PERMITTED_WORKER_LAUNCHES):
+        _permitted_launches.append(args[0])
         return
     if event in OUTBOUND_EVENTS:
         # Recorded before refusing, so an attempt whose refusal a library
@@ -90,7 +141,7 @@ def audited_worker(target, **arguments):
     Runs inside the spawned child, so the child's own artifact loading and
     evaluation are observed; the parent's hook cannot see another process.
     """
-    sys.addaudithook(reject_outbound)
+    install_audit()
     module, _, name = target.partition(":")
     detector = getattr(importlib.import_module(module), name)(**arguments)
     if _attempts:
@@ -103,7 +154,9 @@ def isolated_check(implementation, artifact, size, target=YOLOX_FACTORY):
 
     `main` installs this process's audit hook first, so parent-side YOLOX
     import and setup are observed too; only the worker spawn during start is
-    explicitly permitted (`permit_worker_launch`) and counted. The child
+    explicitly permitted (`permit_worker_launch`): exactly one worker and at
+    most one multiprocessing resource tracker, identified by argv. Without `install_audit()` (unit tests that must not hook the test
+    runner) launches are reported as unobserved rather than as zero. The child
     applies its own rlimits and installs its own recording audit hook
     (`audited_worker`) before the adapter is imported; a recorded child
     attempt fails the start or the evaluation.
@@ -132,17 +185,26 @@ def isolated_check(implementation, artifact, size, target=YOLOX_FACTORY):
         require(state == "running", state)
         require(result.observation is not Observation.UNKNOWN, result.reason)
         require(not _attempts, "unexpected outbound/process attempt in the smoke process")
+        # Exactly the one expected worker; another launch during start (from
+        # the same stdlib path) would make this differ. Without this process's
+        # hook (unit tests only) launches are not observed and not claimed.
+        if _audit_installed:
+            require(_permitted_launches.count("multiprocessing.spawn") == 1
+                    and _permitted_launches.count("multiprocessing.resource_tracker") <= 1,
+                    "unexpected worker launch count")
         # Reaching here means the child's hook recorded no attempt.
         return {"worker_state": state, "worker_observation": result.observation.value,
                 "worker_evaluation_ns": elapsed, "worker_python_outbound_attempts": 0,
-                "permitted_worker_launches": len(_permitted_launches)}
+                "process_launch_observed": _audit_installed,
+                "permitted_worker_launches": (sorted(_permitted_launches)
+                                              if _audit_installed else None)}
     finally:
         detector.close()
 
 
 def main():
     # First, so parent-side YOLOX import and setup are audited as well.
-    sys.addaudithook(reject_outbound)
+    install_audit()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("artifact", type=Path)
     parser.add_argument("--adapter", default=RTDETR,

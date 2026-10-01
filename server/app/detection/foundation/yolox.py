@@ -116,9 +116,13 @@ class YoloxPersonDetector:
             (output,) = self._session.run(["output"], {"images": values})
             if output.shape != (1, pinned.anchors, 5 + CLASSES):
                 return Detection(Observation.UNKNOWN, Reason.FAILURE)
-            scores = output[0, :, 4:6]
-            if not np.isfinite(output).all() or (scores < 0).any() or (scores > 1).any():
+            # Every column from 4 on (objectness and all 80 classes) is a
+            # sigmoid score; any value outside [0, 1] is an out-of-contract
+            # result and must never become a trusted absence.
+            sigmoid = output[0, :, 4:]
+            if not np.isfinite(output).all() or (sigmoid < 0).any() or (sigmoid > 1).any():
                 return Detection(Observation.UNKNOWN, Reason.FAILURE)
+            scores = sigmoid[:, 0:2]
             # The exported head already applies sigmoid to objectness/classes;
             # the final score is objectness x class score, as upstream does
             # before NMS. NMS cannot raise the maximum, so it is not needed.
