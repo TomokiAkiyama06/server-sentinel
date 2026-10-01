@@ -50,7 +50,9 @@ constraint and the action already existed, so no migration is involved. The
 persisted set (existing `application_metadata` row) commits in the same
 transaction as the record, and only then is it applied to the in-memory check;
 a non-Owner gets a `denied` record, and an invalid set or a failed write or
-append gets a `failed` record and rolls back, changing nothing.
+append gets a `failed` record and rolls back, changing nothing. The check's
+own startup/daily/retry runs are serialized with that sequence, so no verdict
+based on a superseded set is published after the commit.
 
 Human-access administration runs through `AccessAdministration`, which wraps
 `OwnerAuditService.execute_transactional()` around the `AccessStore` `*_on`

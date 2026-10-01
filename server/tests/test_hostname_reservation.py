@@ -689,6 +689,77 @@ class ListenerExceptionTests(ExceptionFixture):
         self.assertEqual(check.listener_exceptions, frozenset())
         self.assertFalse(check.access_open)
 
+    def test_check_in_progress_is_serialized_with_exception_change(self):
+        # A daily/retry check evaluating the old, wider set must not publish its
+        # verdict after a narrower set has durably committed.
+        clock = Clock()
+        admin, check, _ = self.admin(WILDCARD_SSH, clock=clock)
+        self.assertTrue(admin.set_listener_exceptions("synthetic-owner-session", {SSH}).open)
+        entered, release = threading.Event(), threading.Event()
+        original = check._listeners.listeners
+        calls = []
+
+        def paused_listeners():
+            calls.append(None)
+            if len(calls) == 1:
+                entered.set()
+                release.wait(5)
+            return original()
+
+        published = []
+        errors = []
+
+        def run(call):
+            try:
+                published.append(call())
+            except BaseException as error:  # pragma: no cover - surfaced below
+                errors.append(error)
+
+        clock.value += DAILY_SECONDS
+        with patch.object(check._listeners, "listeners", side_effect=paused_listeners):
+            daily = threading.Thread(target=run, args=(check.tick,))
+            daily.start()
+            self.assertTrue(entered.wait(5))
+            change = threading.Thread(target=run, args=(
+                lambda: admin.set_listener_exceptions("synthetic-owner-session", ()),))
+            change.start()
+            change.join(0.3)
+            # The narrowing has not committed while the stale check is still running.
+            self.assertEqual(decode(self.stored()), frozenset({SSH}))
+            release.set()
+            daily.join(5)
+            change.join(5)
+        self.assertEqual(errors, [])
+        self.assertEqual(decode(self.stored()), frozenset())
+        self.assertEqual(check.listener_exceptions, frozenset())
+        self.assertFalse(check.access_open)
+        self.assertEqual(check.verdict.check, CheckKind.CONFIGURATION)
+        self.assertEqual(check.verdict.reasons, (Reason.UNEXPECTED_LISTENER,))
+
+    def test_duplicate_sockets_on_an_excepted_endpoint_close(self):
+        # An exception allows one socket per wildcard endpoint it covers; an
+        # identical SO_REUSEPORT copy is another process sharing that port.
+        udp = ListenerException(41641, TransportProtocol.UDP)
+        cases = {
+            "v4 wildcard twice": (Files(tcp=proc(("127.0.0.1", 8080, "0A"), ("0.0.0.0", 22, "0A"),
+                                                 ("0.0.0.0", 22, "0A"))), {SSH}),
+            "v6 wildcard twice": (Files(tcp6=proc(("::", 22, "0A"), ("::", 22, "0A"), ipv6=True)), {SSH}),
+            "both families, v6 doubled": (Files(tcp=proc(("127.0.0.1", 8080, "0A"), ("0.0.0.0", 22, "0A")),
+                                                tcp6=proc(("::", 22, "0A"), ("::", 22, "0A"), ipv6=True)),
+                                          {SSH}),
+            "udp wildcard twice": (Files(udp=proc(("0.0.0.0", 41641, "07"), ("0.0.0.0", 41641, "07"))), {udp}),
+        }
+        for name, (files, exceptions) in cases.items():
+            with self.subTest(name):
+                admin, check, sink = self.admin(files)
+                verdict = admin.set_listener_exceptions("synthetic-owner-session", exceptions)
+                self.assertFalse(verdict.open)
+                self.assertEqual(verdict.reasons, (Reason.UNEXPECTED_LISTENER,))
+                self.assertEqual(sink.events[-1].unexpected_listeners, 1)
+        # Distinct IPv4 and IPv6 wildcard endpoints covered by one exception still pass.
+        admin, check, _ = self.admin(WILDCARD_SSH)
+        self.assertTrue(admin.set_listener_exceptions("synthetic-owner-session", {SSH}).open)
+
     def test_same_port_on_reserved_address_still_closes(self):
         for files in (Files(tcp=proc(("127.0.0.1", 8080, "0A"), ("100.64.0.10", 22, "0A"))),
                       Files(tcp6=proc((str(V6), 22, "0A"), ipv6=True)),

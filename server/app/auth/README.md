@@ -166,7 +166,9 @@ is allowed. The only runtime path that changes it is
 writes the set and a `change_security_setting` audit record in one SQLite
 transaction, then applies the set and re-checks immediately so narrowing it
 closes access at once. Concurrent changes are serialized from staging through
-apply, so the live set always matches the latest committed one. `reservation_store.ListenerExceptionStore` persists the
+apply, so the live set always matches the latest committed one; startup, daily
+and retry checks take the same lock, so a check still evaluating a superseded
+set cannot publish its verdict after a change has committed. `reservation_store.ListenerExceptionStore` persists the
 set as versioned JSON under one fixed key of the foundation
 `application_metadata` key/value table (no migration), and `startup()` loads it
 before the first check. A missing row is the empty default; an unreadable,
@@ -181,7 +183,12 @@ Each expected endpoint (the loopback human listener and each recorded proxy
 socket) passes as exactly one socket. Independent `SO_REUSEPORT` sockets show
 as identical `/proc/net` rows, and every extra copy is counted as an
 `UNEXPECTED_LISTENER` (an exposure reason): another process sharing the
-endpoint would receive requests and session cookies.
+endpoint would receive requests and session cookies. The same applies to a
+wildcard endpoint covered by a listener exception: one exception allows one
+socket per distinct endpoint it covers (for example `0.0.0.0:22` and `:::22`),
+and each identical extra row is unexpected. Exceptions stay port-only; a
+service that opens several `SO_REUSEPORT` sockets on an excepted port keeps
+access closed.
 
 Nothing here is wired into the application or a route yet, reads the host
 implicitly, runs `tailscale`, changes Tailscale ACLs/Grants, or needs Tailscale

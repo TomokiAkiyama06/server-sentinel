@@ -1285,7 +1285,8 @@ by the Issue #6 synthetic policy model.
   present, and that access stays closed until the value is repaired. Start a
   second `SO_REUSEPORT` listener on the loopback human upstream port and
   confirm `ss -ltn` shows two rows and access closes with
-  `UNEXPECTED_LISTENER`. Record which wildcard UDP sockets
+  `UNEXPECTED_LISTENER`; likewise start a second `SO_REUSEPORT` wildcard
+  listener on the excepted port 22 and confirm access closes. Record which wildcard UDP sockets
   the node holds (for example `tailscaled`'s WireGuard port): confirm each
   closes access until the Owner adds a `udp` exception for that port, that a
   `tcp` exception on the same port does not cover it, and that a UDP socket

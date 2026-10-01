@@ -256,7 +256,10 @@ class ReservationAdministration:
     (``ListenerExceptionStore.write_on``) and the ``change_security_setting``
     audit record commit in one SQLite transaction; only after that commit is
     the set applied to the in-memory check, which immediately re-checks; the
-    check's ``exception_change_lock`` serializes that whole sequence. A
+    check's ``exception_change_lock`` serializes that whole sequence with
+    every other change and with the check's own startup/daily/retry runs, so
+    a verdict based on a superseded set is never published after the
+    durable commit. A
     refused actor gets a bounded ``denied`` record and changes nothing; an
     invalid set or a failed write/append gets a ``failed`` record, rolls back,
     and changes nothing. This class registers no route.

@@ -565,6 +565,7 @@ def evaluate(config: ReservationConfig, listeners, routes,
     else:
         seen_human = False
         seen_proxies: set[Listener] = set()
+        seen_excepted: set[Listener] = set()
         for listener in listeners:
             address = _normalize(listener.address)
             normalized = Listener(address, listener.port, listener.protocol)
@@ -577,8 +578,14 @@ def evaluate(config: ReservationConfig, listeners, routes,
                 seen_human = True
                 continue
             # A wildcard bind answers on every address, the reserved ones
-            # included, unless the Owner explicitly allowed that port.
+            # included, unless the Owner explicitly allowed that port. The
+            # exception allows one socket per covered endpoint (for example
+            # both ``0.0.0.0`` and ``::``); an identical extra row is another
+            # SO_REUSEPORT socket sharing the port and is unexpected.
             if any(item.matches(normalized) for item in exceptions):
+                if normalized in seen_excepted:
+                    unexpected_listeners += 1
+                seen_excepted.add(normalized)
                 continue
             if address.is_unspecified or address in config.reserved_addresses:
                 if normalized in config.proxy_listeners and normalized not in seen_proxies:
@@ -650,6 +657,9 @@ class HostnameReservationCheck:
         self._check_lock = threading.Lock()
         # Held by ``ReservationAdministration`` across stage, audited commit and
         # apply, so the applied set always follows the durable commit order.
+        # Startup/daily/retry checks also hold it (always acquired before
+        # ``_check_lock``), so no verdict computed from a superseded set can be
+        # published after a change has durably committed.
         self.exception_change_lock = threading.Lock()
         self._verdict = CLOSED
         self._last_check: float | None = None
@@ -709,7 +719,7 @@ class HostnameReservationCheck:
         whether or not any listener needs an exception. It is never widened to
         allow everything.
         """
-        with self._check_lock:
+        with self.exception_change_lock, self._check_lock:
             self._exceptions = frozenset()
             self._exceptions_loaded = False
             self._load_revocation_state()
@@ -799,7 +809,7 @@ class HostnameReservationCheck:
         return value
 
     def _check(self, kind: CheckKind) -> ReservationVerdict:
-        with self._check_lock:
+        with self.exception_change_lock, self._check_lock:
             return self._check_locked(kind)
 
     def _check_locked(self, kind: CheckKind) -> ReservationVerdict:
