@@ -201,5 +201,65 @@ class PairingKeyBindingMigrationTests(unittest.TestCase):
                 self.assertNotIn("pairing_key_bindings", tables)
 
 
+    def _legacy(self, credentials, enrollments):
+        """Migrate to just before renewal, then insert one node's legacy rows."""
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        database = Database(Path(temporary.name) / "synthetic.sqlite3")
+        renewal = APPLICATION_MIGRATIONS.index(next(
+            m for m in APPLICATION_MIGRATIONS if m.name == "pairing_credential_renewal"))
+        node = str(uuid4())
+        connection = database.connect()
+        self.addCleanup(connection.close)
+        migrate(connection, APPLICATION_MIGRATIONS[:renewal])
+        with connection:
+            connection.executemany(
+                "INSERT INTO pairing_node_credentials VALUES (?, ?, ?, ?)",
+                [(node, DIGEST_A, SERIAL_A, state) for state in credentials])
+            connection.executemany(
+                "INSERT INTO pairing_enrollments VALUES (?, ?, ?, ?, ?, ?, ?)",
+                [(str(uuid4()), node, DIGEST_A, "e" * 64, "x", 1.0, state)
+                 for state in enrollments])
+        return connection, node
+
+    def test_legacy_mixed_revoked_and_live_key_history_fails_migration_closed(self):
+        # The old schema allowed re-approving a revoked key for the same node.
+        # A revoked key that is still live (active credential, or a pending or
+        # consumed enrollment) contradicts "a revoked key is never reused", so
+        # the upgrade is blocked for Owner remediation instead of recording a
+        # revoked binding the live credential would ignore.
+        cases = {
+            "active_credential_revoked_enrollment": (["active"], ["revoked"]),
+            "revoked_credential_pending_enrollment": (["revoked"], ["pending"]),
+            "revoked_credential_consumed_enrollment": (["revoked"], ["consumed"]),
+        }
+        for name, (credentials, enrollments) in cases.items():
+            with self.subTest(name):
+                connection, _ = self._legacy(credentials, enrollments)
+                with self.assertRaises(MigrationError):
+                    migrate(connection, APPLICATION_MIGRATIONS)
+                applied = {row[0] for row in connection.execute(
+                    "SELECT name FROM schema_migrations")}
+                tables = {row[0] for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'")}
+                self.assertNotIn("pairing_credential_renewal", applied)
+                self.assertNotIn("pairing_key_bindings", tables)
+
+    def test_legacy_consistent_key_histories_still_migrate(self):
+        # A normally revoked node keeps its 'activated' enrollment; expired
+        # enrollments are history, not live use.
+        cases = {
+            "revoked_node": (["revoked"], ["activated", "revoked"], 1),
+            "active_node": (["active"], ["activated", "expired"], 0),
+        }
+        for name, (credentials, enrollments, revoked) in cases.items():
+            with self.subTest(name):
+                connection, node = self._legacy(credentials, enrollments)
+                migrate(connection, APPLICATION_MIGRATIONS)
+                rows = [tuple(row) for row in connection.execute(
+                    "SELECT public_key_digest, node_id, revoked FROM pairing_key_bindings")]
+                self.assertEqual([(DIGEST_A, node, revoked)], rows)
+
+
 if __name__ == "__main__":
     unittest.main()
