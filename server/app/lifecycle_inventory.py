@@ -543,8 +543,9 @@ def _presence(connection, tables, salt: str, live_outbox: bool | None) -> dict:
         # Observations the Owner released (clear_unresolved_critical_event()
         # appends this audit row in the same transaction).
         "cleared_events": None if "presence_audit" not in tables else sorted(
-            row[0] for row in connection.execute(
-                "SELECT target FROM presence_audit WHERE action='critical_event_cleared'")),
+            [row[0], row[1], row[2]] for row in connection.execute(
+                "SELECT target, at, state FROM presence_audit "
+                "WHERE action='critical_event_cleared'")),
         "deliveries": keyed_rows(
             "presence_deliveries",
             "SELECT observation, action, state, attempts, generation, requeued "
@@ -643,35 +644,59 @@ def _compare_presence(baseline: dict | None, current: dict | None,
     recorded_jobs: dict = {}
     for job in (baseline.get("deliveries") or {}).values():
         recorded_jobs.setdefault(job["observation"], []).append(job["state"])
-    cleared = set(current.get("cleared_events") or ()) - set(baseline.get("cleared_events") or ())
+    # clear_unresolved_critical_event() appends ('critical_event_cleared',
+    # actor, at=now, state NULL, target=id) in the transaction that writes
+    # the tombstone (expired_at=now): one clear row per target, new since
+    # the record.
+    def clears(section):
+        found: dict = {}
+        for target, at, state in (section.get("cleared_events") or ()):
+            found.setdefault(target, []).append((at, state))
+        return found
+    cleared_before, cleared_now = clears(baseline), clears(current)
     rules = rules or {}
+    path = {}
     for key, value in (baseline.get("observations") or {}).items():
         if key in observations:
             if observations[key] != value:
                 fail("observations", key)
             continue
         at, jobs = received.get(key), recorded_jobs.get(key, [])
+        unfinished = [state for state in jobs if state not in ("delivered", "disabled")]
+        # Owner release: at least one unfinished job (its precondition), a
+        # single new clear row naming it, and the tombstone it wrote then.
+        rows = cleared_now.get(key, [])
+        if (key not in cleared_before and len(rows) == 1 and rows[0][1] is None
+                and unfinished and completed.get(key) == rows[0][0]):
+            path[key] = "released"
+            continue
         # expire_history(): past the timeline cutoff with no unfinished
-        # critical job, or past the audit-retention horizon regardless.
+        # critical job, or past the audit-retention horizon regardless; it
+        # tombstones only an observation that had critical jobs.
         expired_out = (isinstance(at, str) and "presence_cutoff" in rules
                        and (at < rules["presence_horizon"]
-                            or (at < rules["presence_cutoff"]
-                                and all(state in ("delivered", "disabled") for state in jobs))))
-        released = key in cleared and bool(jobs)
-        if not (expired_out or released) or (jobs and key not in completed):
-            fail("observations", key, "missing")
+                            or (at < rules["presence_cutoff"] and not unfinished)))
+        if expired_out and not (jobs and key not in completed):
+            path[key] = "expired"
+            continue
+        fail("observations", key, "missing")
     deliveries = current.get("deliveries") or {}
     # Retention and the Owner's clear_unresolved_critical_event() both add
     # one expired-unresolved event per removed job that was not delivered,
     # in the same transaction as the tombstone. A job recorded unresolved
     # that is gone must be covered by that increase (one delivered and then
     # expired inside the window is also reported; do not run retention then).
+    # The paths count differently: expire_history() adds one event per job
+    # not delivered (disabled included); the Owner release one per job
+    # neither delivered nor disabled.
     needed = {}
     for key, job in (baseline.get("deliveries") or {}).items():
         if key not in deliveries:
+            uncounted = (("delivered", "disabled") if path.get(job["observation"]) == "released"
+                         else ("delivered",))
             if job["observation"] not in completed:
                 fail("deliveries", key, "missing")
-            elif job["state"] != "delivered":
+            elif job["state"] not in uncounted:
                 action = key.rsplit(":", 1)[1]
                 needed.setdefault(action, []).append(key)
         elif not _delivery_advanced(job, deliveries[key]):

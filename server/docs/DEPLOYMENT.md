@@ -394,10 +394,12 @@ receipt times, delivery jobs and source-fact digests (an observation may leave
 only through timeline retention once expired — received more than 20 days
 before verify with no unfinished critical job, or more than 90 days before
 regardless — or through the Owner's audited release of unresolved critical
-work, which appends a `critical_event_cleared` audit row naming it; one that
-carried critical jobs leaves only together with its completed tombstone, and
-a job that was not delivered only with the expired-unresolved event both
-paths add;
+work, which needs a recorded job neither delivered nor disabled and appends
+one `critical_event_cleared` audit row naming it (no state) at the same time
+as its tombstone; one that carried critical jobs leaves only together with
+its completed tombstone, and its jobs only with the expired-unresolved events
+the path adds (retention: one per job not delivered; Owner release: one per
+job neither delivered nor disabled);
 a job's state, attempts and generation may only move forward: a claim, a
 recorded outcome, or the audited Owner requeue back to pending, and a
 delivered job stays delivered; attempts rise only with a claim, which also

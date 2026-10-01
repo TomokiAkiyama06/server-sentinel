@@ -1230,6 +1230,51 @@ class LifecycleInventoryTests(unittest.TestCase):
         for label in ("cleared", "expired-resolved", "expired-plain"):
             self.assertNotIn({"id": f"observations:{ids[label]}", "reason": "missing"}, failed)
 
+    def test_owner_clear_mirrors_the_service_exactly(self):
+        # clear_unresolved_critical_event(): needs a job neither delivered nor
+        # disabled (Codex P1); writes the tombstone at the audit row's time,
+        # a NULL audit state, and one expired-unresolved event per such job
+        # (a disabled job adds none).
+        self.runtime.seed()
+        fresh = (self.now - timedelta(days=1)).isoformat(timespec="microseconds")
+        at = self.now.isoformat(timespec="microseconds")
+        cases = {"resolved": (("delivered", "delivered"), at, None),
+                 "late-tombstone": (("failed", "delivered"), "2099-01-01T00:00:00.000000+00:00",
+                                    None),
+                 "audit-state": (("failed", "delivered"), at, "away"),
+                 "disabled-and-failed": (("disabled", "failed"), at, None)}
+        ids = {}
+        for label, ((evidence, notification), _, _) in cases.items():
+            ids[label] = str(uuid4())
+            self.runtime.execute(
+                "INSERT INTO presence_observations (id, kind, source, received, payload) "
+                "VALUES (?, 'crossing', 'synthetic-source', ?, ?)",
+                (ids[label], fresh, json.dumps({"marker": "synthetic-" + label})))
+            for action, state in (("evidence", evidence), ("notification", notification)):
+                self.runtime.execute(
+                    "INSERT INTO presence_deliveries (observation, action, state, attempts, "
+                    "generation) VALUES (?, ?, ?, 1, 1)", (ids[label], action, state))
+        _, baseline = self.record()
+        notification_events = 0
+        for label, ((evidence, notification), tombstone, state) in cases.items():
+            for table, column in (("presence_deliveries", "observation"),
+                                  ("presence_observations", "id")):
+                self.runtime.execute(f"DELETE FROM {table} WHERE {column}=?", (ids[label],))
+            self.runtime.execute("INSERT INTO presence_completed_events VALUES (?, ?)",
+                                 (ids[label], tombstone))
+            self.runtime.execute("INSERT INTO presence_audit (action, actor, at, state, target) "
+                                 "VALUES ('critical_event_cleared', 'owner', ?, ?, ?)",
+                                 (at, state, ids[label]))
+            notification_events += notification not in ("delivered", "disabled")
+        self.runtime.execute("INSERT INTO presence_expired_unresolved VALUES ('notification', ?, ?)",
+                             (notification_events, at))
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_FAILED)
+        failed = report["sections"]["presence"]["failed"]
+        for label in ("resolved", "late-tombstone", "audit-state"):
+            self.assertIn({"id": f"observations:{ids[label]}", "reason": "missing"}, failed)
+        self.assertEqual([item for item in failed if ids["disabled-and-failed"] in item["id"]], [])
+
     def test_presence_clocks_sessions_and_override_follow_service_transitions(self):
         self.runtime.seed()
         self.runtime.execute("INSERT INTO presence_clock VALUES (1, "
