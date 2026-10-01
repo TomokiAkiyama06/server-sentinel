@@ -5,7 +5,7 @@ no real person, deployment value or playable media is involved.
 """
 
 from contextlib import closing, contextmanager, redirect_stderr, redirect_stdout
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 import io
 import json
@@ -196,6 +196,12 @@ def run(*arguments: str) -> tuple[int, str, str]:
 
 class LifecycleInventoryTests(unittest.TestCase):
     def setUp(self):
+        # Verify time for the service retention rules, a day after the
+        # synthetic audit clock starts; retention tests move it explicitly.
+        self.now = datetime.fromtimestamp(1_700_000_000 + 86_400, timezone.utc)
+        patcher = mock.patch.object(inventory, "_utcnow", lambda: self.now, create=True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
         self._directory = TemporaryDirectory()
         self.base = Path(self._directory.name)
         self.runtime = Runtime(self.base)
@@ -454,13 +460,146 @@ class LifecycleInventoryTests(unittest.TestCase):
         section = report["sections"]["camera_sources"]
         for label in ("steady", "health"):
             self.assertIn(ids[label], section["preserved"])
-        for label in ("disabled", "profile", "binding", "approval", "requires"):
+        for label in ("disabled", "profile", "binding", "approval"):
             self.assertIn({"id": ids[label], "reason": "changed"}, section["failed"])
+        # Only the durable re-approval latch differs: named, still a failure.
+        self.assertIn({"id": ids["requires"], "reason": "reapproval_required"},
+                      section["failed"])
         for path in self.notes.iterdir():
             text = path.read_text()
             for marker in (serial, device, "synthetic-by-id-marker", "synthetic-topology-marker",
                            "synthetic-session-", "synthetic-vendor-marker"):
                 self.assertNotIn(marker, text, path.name)
+
+    def test_weak_evidence_camera_after_restart_needs_reapproval(self):
+        # ReconnectController latches a camera without a unique serial for
+        # Owner re-approval after every restart; after a reboot its instance
+        # marker changes too. Reported as reapproval_required, never
+        # preserved; a further configuration change stays plain 'changed'.
+        self.runtime.seed()
+
+        def evidence(token) -> str:
+            return json.dumps({
+                "device_path": "/dev/video0", "vendor": "0001", "product": "0002",
+                "serial": None, "interface": "0", "by_id": [], "topology": "1-1",
+                "formats": ["MJPG"], "device_number": 3, "instance_token": token})
+        ids = {label: self.runtime.source() for label in ("restart", "reboot", "edited")}
+        for source_id in ids.values():
+            self.runtime.execute(
+                "INSERT INTO uvc_approvals (source_id, evidence, requires_approval, "
+                "session_token, serial_ambiguous, explicit_binding) VALUES (?, ?, 0, NULL, 0, 0)",
+                (source_id, evidence([1, 2, 3])))
+        _, baseline = self.record()
+        self.runtime.execute("UPDATE uvc_approvals SET requires_approval=1")
+        self.runtime.execute("UPDATE uvc_approvals SET evidence=? WHERE source_id=?",
+                             (evidence([9, 9, 9]), ids["reboot"]))
+        self.runtime.execute("UPDATE camera_sources SET enabled=0 WHERE id=?", (ids["edited"],))
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_FAILED)
+        failed = report["sections"]["camera_sources"]["failed"]
+        for label in ("restart", "reboot"):
+            self.assertIn({"id": ids[label], "reason": "reapproval_required"}, failed)
+        self.assertIn({"id": ids["edited"], "reason": "changed"}, failed)
+
+    def test_service_retention_deletions_are_listed_not_failed(self):
+        # The service's own retention runs at startup and on its schedule, so
+        # an update restart deletes what has expired. Exactly those rows are
+        # listed as retention_expired (never preserved); anything short of
+        # the rule, starred or still active stays a failure. Capacity-pressure
+        # deletion of the oldest recordings is not accepted.
+        self.runtime.seed()
+        now = self.now
+        audit_cutoff = now - timedelta(days=90)
+        cutoff_us = int(audit_cutoff.timestamp()) * 1_000_000 + audit_cutoff.microsecond
+        now_ms = int(now.timestamp() * 1000)
+        audit_ms, recording_ms = now_ms - 90 * 86_400_000, now_ms - 20 * 86_400_000
+        audit_ids = {"expired": str(uuid4()), "short": str(uuid4())}
+        for label, occurred in (("expired", cutoff_us - 1), ("short", cutoff_us + 1_000_000)):
+            self.runtime.execute(
+                "INSERT INTO security_admin_audit_records VALUES (?, 'owner', "
+                "'camera_source.update', 'camera_source', ?, ?, 'succeeded')",
+                (audit_ids[label], str(uuid4()), occurred))
+        for at in ((audit_cutoff - timedelta(seconds=1)).isoformat(),
+                   (audit_cutoff + timedelta(seconds=1)).isoformat()):
+            self.runtime.execute(
+                "INSERT INTO integrity_audit(at, actor, revision) VALUES (?, 'owner', 1)", (at,))
+        for at_ms in (audit_ms - 1, audit_ms):
+            self.runtime.execute("INSERT INTO storage_state_audit (at_ms, previous_state, "
+                                 "current_state) VALUES (?, 'normal', 'pressure')", (at_ms,))
+        recordings = {}
+        for label, (status, ended, starred, critical) in {
+                "expired": ("complete", recording_ms, False, False),
+                "expired-gapped-critical": ("gapped", recording_ms - 1, False, True),
+                "short": ("complete", recording_ms + 1000, False, False),
+                "starred": ("complete", recording_ms - 1, True, False),
+                "active": ("active", None, False, False)}.items():
+            recordings[label] = self.runtime.recording(
+                starred=starred, payload=b"generated-retention-" + label.encode(),
+                status="active")
+            self.runtime.execute("UPDATE recordings SET status=?, ended_ms=?, critical=? "
+                                 "WHERE id=?", (status, ended, int(critical), recordings[label]))
+        _, baseline = self.record()
+        with closing(sqlite3.connect(self.runtime.database)) as connection:
+            integrity_ids = [str(row[0]) for row in connection.execute(
+                "SELECT id FROM integrity_audit ORDER BY id DESC LIMIT 2")][::-1]
+            storage_ids = [str(row[0]) for row in connection.execute(
+                "SELECT id FROM storage_state_audit ORDER BY id DESC LIMIT 2")][::-1]
+        self.runtime.execute("DELETE FROM security_admin_audit_records WHERE id IN (?, ?)",
+                             tuple(audit_ids.values()))
+        self.runtime.execute("DELETE FROM integrity_audit WHERE id IN (?, ?)",
+                             tuple(integrity_ids))
+        self.runtime.execute("DELETE FROM storage_state_audit WHERE id IN (?, ?)",
+                             tuple(storage_ids))
+        for recording_id in recordings.values():
+            self.runtime.execute("DELETE FROM recording_links WHERE recording_id=?",
+                                 (recording_id,))
+            self.runtime.execute("DELETE FROM recordings WHERE id=?", (recording_id,))
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_FAILED)
+        sections = report["sections"]
+        self.assertEqual(sections["audit_security_admin"]["retention_expired"],
+                         [audit_ids["expired"]])
+        self.assertEqual(sections["audit_security_admin"]["failed"],
+                         [{"id": audit_ids["short"], "reason": "missing"}])
+        self.assertEqual(sections["audit_integrity"]["retention_expired"], [integrity_ids[0]])
+        self.assertEqual(sections["audit_integrity"]["failed"],
+                         [{"id": integrity_ids[1], "reason": "missing"}])
+        self.assertEqual(sections["audit_storage_state"]["retention_expired"], [storage_ids[0]])
+        self.assertEqual(sections["audit_storage_state"]["failed"],
+                         [{"id": storage_ids[1], "reason": "missing"}])
+        section = sections["recordings"]
+        # RecordingStore.retention_candidates() does not exclude critical work.
+        self.assertEqual(section["retention_expired"],
+                         sorted([recordings["expired"], recordings["expired-gapped-critical"]]))
+        for label in ("short", "starred", "active"):
+            self.assertIn({"id": recordings[label], "reason": "missing"}, section["failed"])
+            self.assertNotIn(recordings[label], section["preserved"])
+        # Judged at an earlier verify time, nothing had expired yet.
+        self.now = now - timedelta(days=1000)
+        code, report, _ = self.verify(baseline)
+        for name in ("recordings", "audit_security_admin", "audit_integrity",
+                     "audit_storage_state"):
+            self.assertEqual(report["sections"][name]["retention_expired"], [], name)
+
+    def test_only_retention_deletions_still_verify_as_preserved(self):
+        self.runtime.seed()
+        now_ms = int(self.now.timestamp() * 1000)
+        expired = self.runtime.recording(starred=False, payload=b"generated-retention-only",
+                                         status="active")
+        self.runtime.execute("UPDATE recordings SET status='complete', ended_ms=? WHERE id=?",
+                             (now_ms - 21 * 86_400_000, expired))
+        self.runtime.execute("INSERT INTO storage_state_audit (at_ms, previous_state, "
+                             "current_state) VALUES (?, 'normal', 'pressure')",
+                             (now_ms - 91 * 86_400_000,))
+        _, baseline = self.record()
+        self.runtime.execute("DELETE FROM recording_links WHERE recording_id=?", (expired,))
+        self.runtime.execute("DELETE FROM recordings WHERE id=?", (expired,))
+        self.runtime.execute("DELETE FROM storage_state_audit")
+        code, report, stdout = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_PRESERVED, report)
+        self.assertEqual(report["sections"]["recordings"]["retention_expired"], [expired])
+        self.assertNotIn(expired, report["sections"]["recordings"]["preserved"])
+        self.assertIn("retention_expired=1", stdout)
 
     def test_presence_and_storage_audit_rows_are_preserved(self):
         self.runtime.seed()
@@ -470,7 +609,8 @@ class LifecycleInventoryTests(unittest.TestCase):
                 "VALUES ('override', 'owner', ?, 'away', NULL)", (f"2026-01-0{index + 1}",))
             self.runtime.execute(
                 "INSERT INTO storage_state_audit (at_ms, previous_state, current_state) "
-                "VALUES (?, 'normal', 'pressure')", (index,))
+                "VALUES (?, 'normal', 'pressure')",
+                (int(self.now.timestamp() * 1000) - 3600_000 + index,))
         _, baseline = self.record()
         code, report, _ = self.verify(baseline)
         self.assertEqual(report["sections"]["audit_presence"]["preserved_rows"], 3)

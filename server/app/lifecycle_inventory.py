@@ -59,6 +59,7 @@ from __future__ import annotations
 import argparse
 from collections import Counter
 from dataclasses import dataclass
+from datetime import datetime, timezone
 import hashlib
 import hmac
 import json
@@ -72,12 +73,14 @@ from urllib.parse import quote
 from types import SimpleNamespace
 from uuid import UUID, uuid5
 
+from app.audit.store import DEFAULT_RETENTION as AUDIT_RETENTION
 from app.cameras.uvc.persistence import ApprovalStore
 from app.detection.owner import store as owner_store
 from app.integrity.model import Finding, Kind, State
 from app.monitoring.runtime import EVENT_NAMESPACE
 from app.presence.delivery import ActionResult
 from app.presence.service import PresenceService
+from app.storage.retention import DAY_MS, RetentionPeriods
 
 
 FORMAT = "server-sentinel-lifecycle-inventory"
@@ -296,14 +299,18 @@ def _chain(rows: list[tuple[str, str]]) -> str:
     return chain
 
 
-def _audit_table(connection, tables, table, columns, order) -> dict | None:
+def _audit_table(connection, tables, table, columns, order, time_column=None) -> dict | None:
     if table not in tables:
         return None
     rows = connection.execute(
         f"SELECT {', '.join(columns)} FROM {table} ORDER BY {order}").fetchall()
     digests = [(str(row[0]), _digest([table, *tuple(row)])) for row in rows]
-    return {"rows": [[row_id, digest] for row_id, digest in digests],
-            "chain_sha256": _chain(digests)}
+    result = {"rows": [[row_id, digest] for row_id, digest in digests],
+              "chain_sha256": _chain(digests)}
+    if time_column is not None:
+        # The row time the service's retention compares (not secret).
+        result["times"] = {str(row[0]): row[time_column] for row in rows}
+    return result
 
 
 def _audit(connection, tables) -> dict:
@@ -311,15 +318,16 @@ def _audit(connection, tables) -> dict:
         "security_admin": _audit_table(
             connection, tables, "security_admin_audit_records",
             ("id", "actor_category", "action", "target_kind", "target_logical_id",
-             "occurred_at_us", "outcome"), "occurred_at_us, id"),
+             "occurred_at_us", "outcome"), "occurred_at_us, id", "occurred_at_us"),
         "integrity": _audit_table(
-            connection, tables, "integrity_audit", ("id", "at", "actor", "revision"), "id"),
+            connection, tables, "integrity_audit", ("id", "at", "actor", "revision"), "id",
+            "at"),
         "presence": _audit_table(
             connection, tables, "presence_audit",
             ("sequence", "action", "actor", "at", "state", "target"), "sequence"),
         "storage_state": _audit_table(
             connection, tables, "storage_state_audit",
-            ("id", "at_ms", "previous_state", "current_state"), "id"),
+            ("id", "at_ms", "previous_state", "current_state"), "id", "at_ms"),
     }
 
 
@@ -368,7 +376,7 @@ def _sources(connection, tables, salt: str) -> dict | None:
     """Stable operational configuration per source; volatile health is excluded."""
     if "camera_sources" not in tables:
         return None
-    approvals = {}
+    approvals, latched = {}, {}
     if "uvc_approvals" in tables:
         for row in connection.execute(
                 "SELECT source_id, evidence, requires_approval, serial_ambiguous "
@@ -378,6 +386,9 @@ def _sources(connection, tables, salt: str) -> dict | None:
             except (ValueError, TypeError, KeyError, AttributeError):
                 # Never comparable as preserved; see compare().
                 approvals[row["source_id"]] = UNREADABLE_APPROVAL
+            # The durable Owner re-approval latch (already inside the digest),
+            # kept apart so a latch-only difference can be named.
+            latched[row["source_id"]] = bool(row["requires_approval"])
     bindings = {}
     if "detection_bindings" in tables:
         for row in connection.execute(
@@ -399,6 +410,7 @@ def _sources(connection, tables, salt: str) -> dict | None:
         "desired_capture_profile_sha256": _digest(row["desired_capture_profile"]),
         "detection_bindings_sha256": _digest(bindings.get(row["id"], [])),
         "uvc_approval_sha256": approvals.get(row["id"]),
+        "uvc_requires_approval": latched.get(row["id"]),
     } for row in connection.execute(
         "SELECT id, source_type, name, role_label, enabled, capture_node_id, capabilities, "
         "desired_capture_profile FROM camera_sources ORDER BY id")}
@@ -1326,10 +1338,29 @@ def _owner_template(root: Path | None, salt: str, owner: int) -> dict:
         connection.close()
 
 
+_UVC_APPROVAL_FIELDS = frozenset({"uvc_approval_sha256", "uvc_requires_approval"})
+
+
 def _compare_sources(baseline: dict | None, current: dict | None) -> dict:
-    """Keyed comparison; approval evidence the service cannot load never passes."""
+    """Keyed comparison; approval evidence the service cannot load never passes.
+
+    ReconnectController latches Owner re-approval for a camera without a
+    unique serial on every restart (only a live descriptor proves the same
+    camera), so such a source that differs only in its approval now held
+    for re-approval is reported ``reapproval_required``: still a failure,
+    resolved by the Owner re-approving and a new record.
+    """
     result = _compare_keyed(baseline, current)
     current = current or {}
+    for entry in result["failed"]:
+        before, after = (baseline or {}).get(entry["id"]), current.get(entry["id"])
+        if entry["reason"] != "changed" or before is None or after is None:
+            continue
+        differing = {key for key in set(before) | set(after) if before.get(key) != after.get(key)}
+        if (differing and differing <= _UVC_APPROVAL_FIELDS
+                and after.get("uvc_requires_approval") is True
+                and after.get("uvc_approval_sha256") != UNREADABLE_APPROVAL):
+            entry["reason"] = "reapproval_required"
     for key in list(result["preserved"]):
         if current[key].get("uvc_approval_sha256") == UNREADABLE_APPROVAL:
             result["preserved"].remove(key)
@@ -1718,14 +1749,31 @@ def _appended_publications_valid(base: dict, now: dict, remaining: Counter) -> b
     return +remaining == allowed
 
 
+def _retention_eligible(item: dict, cutoff_ms: int | None) -> bool:
+    """RecordingStore.retention_candidates() for RetentionService.expired()."""
+    return (cutoff_ms is not None and not item["starred"]
+            and item["status"] in ("complete", "gapped", "interrupted")
+            and isinstance(item["ended_ms"], int) and item["ended_ms"] <= cutoff_ms)
+
+
 def _compare_recordings(baseline: dict | None, current: dict | None, *,
-                        declared: frozenset[str]) -> dict:
+                        declared: frozenset[str], retention_cutoff_ms: int | None = None) -> dict:
     result = _compare_keyed(baseline, current, declared=declared,
                             rewrite_only=_declared_rewrite_only)
     if result["status"] == "empty":
+        result["retention_expired"] = []
         return result
     current = current or {}
-    preserved, failed, in_progress = [], list(result["failed"]), []
+    preserved, failed, in_progress = [], [], []
+    # A recording automatic retention deletes (with its links and markers,
+    # its unshared segments trimmed) is listed apart, never as preserved.
+    retained_out = []
+    for entry in result["failed"]:
+        if (entry["reason"] == "missing"
+                and _retention_eligible(baseline[entry["id"]], retention_cutoff_ms)):
+            retained_out.append(entry["id"])
+        else:
+            failed.append(entry)
     for key in result["preserved"]:
         if not _evidenced(current[key]):
             failed.append({"id": key, "reason": "no_readable_segment_evidence"})
@@ -1764,27 +1812,39 @@ def _compare_recordings(baseline: dict | None, current: dict | None, *,
     result.update(status="failed" if failed else "preserved",
                   preserved=sorted(preserved), failed=failed,
                   declared_rewrites=rewrites,
-                  in_progress_at_record=sorted(in_progress))
+                  in_progress_at_record=sorted(in_progress),
+                  retention_expired=sorted(retained_out))
     return result
 
 
-def _compare_audit(baseline: dict | None, current: dict | None) -> dict:
+def _compare_audit(baseline: dict | None, current: dict | None, expired=None) -> dict:
+    """Audit rows stay identical, except rows the service's retention removed.
+
+    ``expired`` judges a recorded row's time against the service's retention
+    rule at verify time; a missing row it accepts is listed under
+    ``retention_expired`` and never counted as preserved.
+    """
     if not baseline or not baseline["rows"]:
         return {"status": "empty", "preserved_rows": 0, "failed": [],
                 "appended": [row[0] for row in (current or {"rows": []})["rows"]],
-                "chain_match": None}
+                "chain_match": None, "retention_expired": []}
     current_rows = dict((row_id, digest) for row_id, digest in (current or {"rows": []})["rows"])
-    failed, kept = [], []
+    times = baseline.get("times") or {}
+    failed, kept, retained_out = [], [], []
     for row_id, digest in baseline["rows"]:
         if row_id not in current_rows:
-            failed.append({"id": row_id, "reason": "missing"})
+            if expired is not None and row_id in times and expired(times[row_id]):
+                retained_out.append(row_id)
+            else:
+                failed.append({"id": row_id, "reason": "missing"})
         elif current_rows[row_id] != digest:
             failed.append({"id": row_id, "reason": "changed"})
         else:
             kept.append((row_id, digest))
-    # The chain is recomputed over the baseline row order, so a reordering or
-    # a changed row anywhere in the retained set breaks it.
-    chain_match = not failed and _chain(kept) == baseline["chain_sha256"]
+    # The chain recomputed over the recorded rows must match the record, so
+    # a rewritten or reordered baseline row list is refused too.
+    chain_match = not failed and _chain(
+        [tuple(row) for row in baseline["rows"]]) == baseline["chain_sha256"]
     if not failed and not chain_match:
         failed.append({"id": None, "reason": "chain_mismatch"})
     baseline_ids = {row[0] for row in baseline["rows"]}
@@ -1792,10 +1852,41 @@ def _compare_audit(baseline: dict | None, current: dict | None) -> dict:
             "preserved_rows": len(kept),
             "failed": failed,
             "appended": [row_id for row_id in current_rows if row_id not in baseline_ids],
-            "chain_match": chain_match}
+            "chain_match": chain_match,
+            "retention_expired": retained_out}
 
 
-def compare(baseline: dict, current: dict, *, declared_rewrites=()) -> dict:
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _retention_rules(now: datetime) -> dict:
+    """The service's own retention cutoffs at ``now`` (verify time).
+
+    Main runs these with code defaults (no deployment setting changes them):
+    AuditStore.cleanup_expired_batch() deletes security/admin audit rows
+    with occurred_at_us below now - 90 days and integrity_audit rows with
+    ``at`` below that instant's ISO text; StorageAudit.expire() deletes
+    storage_state_audit rows with at_ms below now - 90 days;
+    RetentionService.expired() deletes unstarred complete / gapped /
+    interrupted recordings whose ended_ms is at most now - 20 days.
+    Presence and Owner-template audit retention does not run in Main, and
+    capacity-pressure deletion (RetentionService.oldest()) is never accepted.
+    """
+    periods = RetentionPeriods()
+    cutoff = now - AUDIT_RETENTION
+    cutoff_us = int(cutoff.timestamp()) * 1_000_000 + cutoff.microsecond
+    now_ms = int(now.timestamp() * 1000)
+    audit_ms = now_ms - periods.audit_days * DAY_MS
+    return {
+        "security_admin": lambda value: isinstance(value, int) and value < cutoff_us,
+        "integrity": lambda value: isinstance(value, str) and value < cutoff.isoformat(),
+        "storage_state": lambda value: isinstance(value, int) and value < audit_ms,
+        "recording_cutoff_ms": now_ms - periods.recording_days * DAY_MS,
+    }
+
+
+def compare(baseline: dict, current: dict, *, declared_rewrites=(), now=None) -> dict:
     if (not isinstance(baseline, dict) or baseline.get("format") != FORMAT
             or baseline.get("format_version") != FORMAT_VERSION):
         raise InventoryError("baseline is not a lifecycle inventory")
@@ -1807,17 +1898,22 @@ def compare(baseline: dict, current: dict, *, declared_rewrites=()) -> dict:
     access_now = current.get("access") or {}
     access_owner = any(item["role"] == "owner"
                        for item in (access_now.get("principals") or {}).values())
+    rules = _retention_rules(now or _utcnow())
     sections = {
         "recordings": _compare_recordings(baseline.get("recordings"),
-                                          current.get("recordings"), declared=declared),
+                                          current.get("recordings"), declared=declared,
+                                          retention_cutoff_ms=rules["recording_cutoff_ms"]),
         "audit_security_admin": _compare_audit(
-            baseline["audit"].get("security_admin"), current["audit"].get("security_admin")),
+            baseline["audit"].get("security_admin"), current["audit"].get("security_admin"),
+            rules["security_admin"]),
         "audit_integrity": _compare_audit(
-            baseline["audit"].get("integrity"), current["audit"].get("integrity")),
+            baseline["audit"].get("integrity"), current["audit"].get("integrity"),
+            rules["integrity"]),
         "audit_presence": _compare_audit(
             baseline["audit"].get("presence"), current["audit"].get("presence")),
         "audit_storage_state": _compare_audit(
-            baseline["audit"].get("storage_state"), current["audit"].get("storage_state")),
+            baseline["audit"].get("storage_state"), current["audit"].get("storage_state"),
+            rules["storage_state"]),
         "camera_sources": _compare_sources(baseline.get("camera_sources"),
                                            current.get("camera_sources")),
         "camera_registry_settings": _compare_keyed(
@@ -1982,7 +2078,8 @@ def _summary_verify(report: dict) -> list[str]:
         lines.append(
             f"{name}: {section['status']} preserved={preserved} "
             f"failed={len(section['failed'])} appended={len(section.get('appended', []))} "
-            f"declared_rewrites={len(section.get('declared_rewrites', []))}")
+            f"declared_rewrites={len(section.get('declared_rewrites', []))} "
+            f"retention_expired={len(section.get('retention_expired', []))}")
     for key in report["empty_coverage"]:
         lines.append(f"coverage {key}: empty (not counted as preserved)")
     for key, value in {**report["not_applicable"], **report["not_inventoried"],

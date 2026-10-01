@@ -356,7 +356,9 @@ unsubstitutable and searchable by the service account, a root of mode exactly
 `0700` (so SQLite can write its journal there) and a single-link regular
 database of mode exactly `0600` (so `0400`, `0200` or `0000`, which a root
 inspector could still read but the service cannot open read-write, are
-refused too), never a symlink, both owned by the service account that owns
+refused too), never a symlink (the search-permission check reads the classic
+owner / group / other bits only and ignores POSIX ACLs, so do not rely on
+ACLs to grant the service account access), both owned by the service account that owns
 the state database); any other layout is recorded as `unsafe`, is not read and
 always fails verification. Likewise a camera source whose stored UVC approval
 evidence the service could not load always fails as
@@ -509,7 +511,21 @@ covering them.
 It recomputes the same inventory and compares it. A missing or changed
 recording, audit row, source, principal or invitation is `failed` (exit 1);
 rows and recordings that exist only now are listed as `appended` and are never
-counted as preserved. A finished recording must be identical, including its
+counted as preserved. The one exception for missing rows is the service's own
+automatic retention, which runs at every startup (so the update restart itself
+triggers it) and on its schedule: judged against the verify time with the
+service's built-in periods (not deployment-configurable), a security/admin
+audit row older than 90 days, an `integrity_audit` row older than 90 days, a
+`storage_state_audit` row older than 90 days, and an unstarred `complete`,
+`gapped` or `interrupted` recording that ended at least 20 days earlier
+(critical recordings included, exactly as `RetentionService.expired()`
+selects them) may be gone; each is listed under `retention_expired`, never
+counted as preserved. Anything one second short of those periods, starred,
+still active, or removed by capacity-pressure deletion of the oldest
+recordings (`RetentionService.oldest()`), stays `missing`: if storage
+pressure deleted recordings during the window, investigate and re-record.
+Presence and Owner-template audit rows have no automatic retention in Main
+and must all remain. A finished recording must be identical, including its
 target and ended boundaries (a segment's retention `spool` flag and its cached
 `integrity` label, which playback recomputes from the file, are not compared),
 and every segment must be readable and match its
@@ -518,6 +534,8 @@ broken at record time (reported as `catalog_mismatch`; `record` prints a
 warning for such recordings). This gate applies to every accepted change,
 including a recording active at record time whose broken segment a later
 stop drops, and a declared rewrite. A recording that was still active when recorded
+with no linked segment yet always fails (it has no evidence to compare); record
+again once it has media. Otherwise it
 may gain segments, move its target end earlier but never later, and stay
 `active` with no end or become `complete` or `gapped` ending exactly at its
 (possibly earlier) target, or `interrupted` ending exactly at the earlier of
@@ -560,8 +578,17 @@ here (#16 / #28).
 Container duration probing and a decodable-playback sample need a codec and are
 not performed by the tool; the inventory marks them `manual`, and
 `MANUAL_TEST.md` section V covers them. Run `record` while no recording is being
-written if possible, since audit retention cleanup or a new recording between
-`record` and the lifecycle operation otherwise shows up in the comparison.
+written if possible: a recording started after `record` is only listed as
+`appended`, and one in progress at `record` is held to the growth rules above.
+
+A camera source without a unique serial (or with an ambiguous one) is held
+for Owner re-approval after every service restart, because only a live
+capture descriptor proves the same camera; its approval then differs from the
+record, and after a host reboot its device instance marker differs as well.
+Such a source is reported `reapproval_required` when nothing else changed,
+and that is still a failure: the Owner confirms the camera, re-approves it in
+the dashboard and takes a new baseline; an update that includes a reboot
+always reports these sources this way.
 
 Output files are created exclusively with mode `0600` and are refused inside
 the runtime root, anywhere in the installation destination (every
