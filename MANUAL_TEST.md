@@ -644,6 +644,46 @@ The research-room Tailnet is shared, so run these with two people (or two browse
 
 Record the residual limits instead of testing them away: a credential its holder deliberately lends, and a session left unlocked on an unattended machine, are outside what the application can detect.
 
+### Issue #10 WebAuthn ceremony core with real browsers and authenticators (pending)
+
+`server/app/auth/passkeys.py` and `webauthn.py` are verified only against
+synthetic software authenticators in `server/tests/test_webauthn_ceremonies.py`.
+No real browser, passkey provider, security key or device has exercised them.
+Once the Issue #10 routes are mounted, run these checks at the reserved
+secure-context origin, using synthetic test identities (`*.invalid`):
+
+- [ ] register and sign in with at least one of each of the following, and
+  record the COSE algorithm each one actually used:
+  - a synced platform passkey (for example iCloud Keychain or Google Password
+    Manager);
+  - a device-bound platform authenticator;
+  - a roaming security key.
+- [ ] confirm each browser honours `attestation: "none"`: registration succeeds,
+  and record any authenticator whose statement is refused because it is not
+  `none` or `packed` self attestation;
+- [ ] confirm `userVerification: "required"` makes every registration, sign-in
+  and step-up prompt for a PIN, device unlock or on-device biometric, and that
+  a flow with UV declined or unavailable is refused with the generic response;
+- [ ] record the BE/BS flags each real authenticator reports at registration
+  and after it syncs, and confirm the owner view matches;
+- [ ] record the signature-counter behaviour of each authenticator (always 0,
+  or increasing). For a counting security key, confirm that replaying an older
+  captured assertion is refused (the challenge is single use). Do not claim
+  that a real clone was detected unless one was actually produced;
+- [ ] let a registration or sign-in prompt sit past the five-minute challenge
+  lifetime, then complete it and confirm it is refused. Cancel a prompt and
+  confirm nothing changes;
+- [ ] open the dashboard at `https://<reserved-host>:<other-port>`, and at an
+  origin that is not the reserved one, and confirm that neither a ceremony
+  started there nor its response completes;
+- [ ] with `http://localhost` on the Main Server's own browser, confirm the
+  local owner ceremony works, and confirm a plain-HTTP non-loopback origin
+  cannot use WebAuthn at all;
+- [ ] inspect the database after these runs. It holds only credential ids,
+  COSE public keys, counters, BE/BS flags, labels and timestamps, plus the
+  SHA-256 digests of challenges still pending. It holds no raw challenge,
+  client data, signature or biometric data. Logs contain none of these either.
+
 ### Uninvited ordinary Tailnet member
 
 - [ ] if existing Tailnet policy makes the Main Server node visible/reachable, document that fact rather than claiming node invisibility;

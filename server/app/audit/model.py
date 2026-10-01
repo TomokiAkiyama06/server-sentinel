@@ -63,6 +63,10 @@ class AuditAction(StrEnum):
     CHANGE_PRINCIPAL_PERMISSIONS = "change_principal_permissions"
     REVOKE_PRINCIPAL_CREDENTIAL = "revoke_principal_credential"
     REVOKE_PRINCIPAL = "revoke_principal"
+    AUTHENTICATE_PRINCIPAL = "authenticate_principal"
+    VERIFY_PRINCIPAL_STEP_UP = "verify_principal_step_up"
+    MARK_PRINCIPAL_CREDENTIAL_INCONSISTENT = "mark_principal_credential_inconsistent"
+    DETECT_PRINCIPAL_CREDENTIAL_SIGN_COUNT_REGRESSION = "detect_principal_credential_sign_count_regression"
     DELETE_RECORDING = "delete_recording"
     DELETE_RECORDING_CLEANUP = "delete_recording_cleanup"
     UPDATE_RECORDING = "update_recording"
@@ -95,6 +99,10 @@ ACTION_TARGETS = {
     AuditAction.CHANGE_PRINCIPAL_PERMISSIONS: TargetKind.PRINCIPAL,
     AuditAction.REVOKE_PRINCIPAL_CREDENTIAL: TargetKind.PRINCIPAL,
     AuditAction.REVOKE_PRINCIPAL: TargetKind.PRINCIPAL,
+    AuditAction.AUTHENTICATE_PRINCIPAL: TargetKind.PRINCIPAL,
+    AuditAction.VERIFY_PRINCIPAL_STEP_UP: TargetKind.PRINCIPAL,
+    AuditAction.MARK_PRINCIPAL_CREDENTIAL_INCONSISTENT: TargetKind.PRINCIPAL,
+    AuditAction.DETECT_PRINCIPAL_CREDENTIAL_SIGN_COUNT_REGRESSION: TargetKind.PRINCIPAL,
     AuditAction.DELETE_RECORDING: TargetKind.RECORDING,
     AuditAction.DELETE_RECORDING_CLEANUP: TargetKind.RECORDING,
     AuditAction.UPDATE_RECORDING: TargetKind.RECORDING,
