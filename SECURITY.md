@@ -334,6 +334,11 @@ The current contract for that check (Owner decisions 2026-09-30 and
   access closed. The Main Server runs `sshd` as `ssh.service` without
   `ssh.socket`, with the exception `tcp/22` owned by `/usr/sbin/sshd`
   (`server/docs/DEPLOYMENT.md`).
+- Every recorded proxy socket must be present and held only by the recorded
+  proxy process (for example `tailscaled.service`), verified the same way.
+  Another or unverifiable holder is an exposure; a missing recorded socket
+  closes access without revocation until it returns. Until #126 lands, a
+  root-owned proxy's sockets keep human access closed.
 
 ## Shared Tailnet account
 

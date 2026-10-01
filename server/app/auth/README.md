@@ -164,8 +164,17 @@ following closes it:
   `::`) listener, or an IPv4-mapped equivalent, on any port, unless it is a
   wildcard bind covered by an Owner listener exception. Recorded proxy sockets
   are TCP at the configured origin port only; a proxy socket on any other port
-  of the reserved name is refused as configuration. Connected UDP client
-  sockets answer only their peer and are not counted;
+  of the reserved name is refused as configuration. Each recorded proxy socket
+  must be held by the configured `proxy_owner` (a `ProcessIdentity`:
+  executable or systemd unit, for example `tailscaled.service`) alone, verified
+  through `socket_owners` like a listener exception: another holder counts as
+  `UNEXPECTED_LISTENER` and an unverifiable one as `LISTENER_OWNER_UNVERIFIED`
+  (both exposures). Connected UDP client sockets answer only their peer and are
+  not counted;
+- a recorded proxy socket that is absent (`PROXY_LISTENER_MISSING`). This is
+  proxy drift or failure with nothing else seen answering, so, like a
+  resolution failure, it closes access without revocation and reopens once
+  every recorded socket is back with its recorded owner;
 - any Serve route other than the single `https://<host>:<port>/` proxy to the
   loopback human listener (other paths, ports, `http`, raw TCP forwards, empty
   TLS listeners, Funnel), or a duplicate of it;
@@ -247,7 +256,8 @@ decision (2026-10-01): ServerSentinel stays non-root, and a small privileged
 helper running as its own systemd service will answer the ownership lookup
 (Issue #126); it plugs in as the `SocketOwnerResolver` passed as
 `socket_owners`. Until #126 lands, an excepted root-owned listener such as
-`sshd` keeps human access closed. A
+`sshd`, and a recorded proxy socket held by root-owned `tailscaled`, keep
+human access closed. A
 deleted executable (`… (deleted)` after a package upgrade until the service
 restarts) does not match either. With socket activation (for example
 Ubuntu's `ssh.socket`) the listening socket is held by the service manager

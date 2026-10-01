@@ -18,7 +18,7 @@ from app.audit import (
 )
 from app.audit.integration import RESERVATION_LISTENER_EXCEPTIONS_ID, ReservationAdministration
 from app.auth.reservation import (
-    DAILY_SECONDS, AddressFamily, CheckKind, GetaddrinfoResolver, ProcSocketOwners, SocketOwner, HostnameReservationCheck, IsolationMode, Listener, ListenerException,
+    DAILY_SECONDS, AddressFamily, CheckKind, GetaddrinfoResolver, ProcSocketOwners, ProcessIdentity, SocketOwner, HostnameReservationCheck, IsolationMode, Listener, ListenerException,
     RETRY_WHILE_CLOSED_SECONDS, ProcNetListeners, ProxyRoute, Reason, ReservationConfig,
     ReservationEnumerationError,
     ReservationFault, RouteKind, ServeStatusRoutes, TransportProtocol, evaluate, parse_proc_net_tcp,
@@ -148,6 +148,8 @@ class Resolver:
 
 SSHD = "/usr/sbin/sshd"
 SSHD_OWNER = SocketOwner(SSHD, "ssh.service")
+TAILSCALED = ProcessIdentity(unit="tailscaled.service")
+TAILSCALED_OWNER = SocketOwner("/usr/sbin/tailscaled", "tailscaled.service")
 
 
 def exc(*args, **kwargs):
@@ -287,7 +289,7 @@ class ConfigTests(TestCase):
                 config(**overrides)
 
     def test_proxy_listener_must_be_at_the_configured_port(self):
-        cfg = config(port=8443, proxy_listeners=frozenset({Listener(V4, 8443)}))
+        cfg = config(port=8443, proxy_listeners=frozenset({Listener(V4, 8443)}), proxy_owner=TAILSCALED)
         self.assertEqual(cfg.proxy_listeners, frozenset({Listener(V4, 8443)}))
         with self.assertRaises(ValueError):
             config(proxy_listeners=frozenset({Listener(V4, 443), Listener(V4, 8443)}))
@@ -333,15 +335,15 @@ class ReservationCheckTests(TestCase):
     def test_expected_proxy_socket_on_reserved_address_passes(self):
         files = Files(tcp=proc(("127.0.0.1", 8080, "0A"), ("100.64.0.10", 443, "0A")),
                       tcp6=proc((str(V6), 443, "0A"), ipv6=True))
-        cfg = config(proxy_listeners=frozenset({Listener(V4, 443), Listener(V6, 443)}))
-        check, *_ = checker(files=files, cfg=cfg)
+        cfg = config(proxy_listeners=frozenset({Listener(V4, 443), Listener(V6, 443)}), proxy_owner=TAILSCALED)
+        check, *_ = checker(files=files, cfg=cfg, socket_owners=Owners(TAILSCALED_OWNER))
         self.assertTrue(check.startup().open)
 
     def test_duplicate_expected_listener_sockets_close(self):
         # Independent SO_REUSEPORT sockets show as identical /proc/net rows; a
         # second process sharing the upstream or proxy endpoint receives
         # requests and cookies, so only one socket per expected endpoint passes.
-        cfg = config(proxy_listeners=frozenset({Listener(V4, 443), Listener(V6, 443)}))
+        cfg = config(proxy_listeners=frozenset({Listener(V4, 443), Listener(V6, 443)}), proxy_owner=TAILSCALED)
         cases = {
             "human upstream twice": Files(tcp=proc(("127.0.0.1", 8080, "0A"), ("127.0.0.1", 8080, "0A"))),
             "human upstream via v4-mapped v6": Files(
@@ -354,9 +356,9 @@ class ReservationCheckTests(TestCase):
         }
         for name, files in cases.items():
             with self.subTest(name):
-                check, _, _, sink = checker(files=files, cfg=cfg)
+                check, _, _, sink = checker(files=files, cfg=cfg, socket_owners=Owners(TAILSCALED_OWNER))
                 self.assertFalse(check.startup().open)
-                self.assertEqual(check.verdict.reasons, (Reason.UNEXPECTED_LISTENER,))
+                self.assertEqual(check.verdict.reasons[0], Reason.UNEXPECTED_LISTENER)
                 self.assertEqual(sink.events[-1].unexpected_listeners, 1)
 
     def test_unrelated_listeners_elsewhere_do_not_answer_for_the_name(self):
@@ -1528,3 +1530,58 @@ class ProcNetInodeTests(TestCase):
                      "   0: 0100007F:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000 0 0 x 1"):
             with self.subTest(line=line), self.assertRaises(ReservationEnumerationError):
                 parse_proc_net_tcp(HEADER + "\n" + line + "\n", ipv6=False, byteorder="little")
+
+
+class ProxyListenerOwnershipTests(TestCase):
+    """Recorded proxy sockets must exist and be held by the recorded proxy alone."""
+
+    CFG = dict(proxy_listeners=frozenset({Listener(V4, 443), Listener(V6, 443)}), proxy_owner=TAILSCALED)
+
+    def files(self, v4=True, v6=True):
+        return Files(tcp=proc(("127.0.0.1", 8080, "0A"), *([("100.64.0.10", 443, "0A")] if v4 else [])),
+                     tcp6=proc(*([(str(V6), 443, "0A")] if v6 else []), ipv6=True))
+
+    def test_proxy_owner_is_required_with_proxy_listeners(self):
+        with self.assertRaises(ValueError):
+            config(proxy_listeners=frozenset({Listener(V4, 443)}))
+        with self.assertRaises(ValueError):
+            config(proxy_owner=TAILSCALED)
+        for kwargs in (dict(), dict(executable="/a", unit="b.service"), dict(executable="tailscaled")):
+            with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
+                ProcessIdentity(**kwargs)
+
+    def test_missing_proxy_listener_closes_without_revocation(self):
+        files = self.files(v6=False)
+        revoker = FakeRevoker()
+        check, *_ = checker(files=files, cfg=config(**self.CFG), session_revoker=revoker,
+                            socket_owners=Owners(TAILSCALED_OWNER))
+        self.assertEqual(check.startup().reasons, (Reason.PROXY_LISTENER_MISSING,))
+        self.assertFalse(revoker.pending)
+        files.files.update(self.files().files)
+        self.assertTrue(check._check(CheckKind.RETRY).open)
+        self.assertEqual(revoker.revocations, 0)
+
+    def test_replacement_process_on_proxy_socket_is_an_exposure(self):
+        intruder = SocketOwner("/usr/bin/python3.12", "user@1000.service")
+        for holders in (intruder, frozenset({TAILSCALED_OWNER, intruder})):
+            with self.subTest(holders=holders):
+                revoker = FakeRevoker()
+                check, *_ = checker(files=self.files(), cfg=config(**self.CFG), session_revoker=revoker,
+                                    socket_owners=Owners(TAILSCALED_OWNER, overrides={1001: holders}))
+                self.assertEqual(check.startup().reasons, (Reason.UNEXPECTED_LISTENER,))
+                self.assertTrue(revoker.pending)
+
+    def test_unverifiable_proxy_owner_is_an_exposure(self):
+        for owners in (None, Owners(OSError("synthetic /proc failure")), Owners(overrides={1001: None})):
+            with self.subTest(owners=owners):
+                revoker = FakeRevoker()
+                check, *_ = checker(files=self.files(), cfg=config(**self.CFG), session_revoker=revoker,
+                                    socket_owners=owners)
+                self.assertIn(Reason.LISTENER_OWNER_UNVERIFIED, check.startup().reasons)
+                self.assertTrue(revoker.pending)
+
+    def test_executable_identity(self):
+        cfg = config(proxy_listeners=frozenset({Listener(V4, 443)}),
+                     proxy_owner=ProcessIdentity(executable="/usr/sbin/tailscaled"))
+        check, *_ = checker(files=self.files(v6=False), cfg=cfg, socket_owners=Owners(TAILSCALED_OWNER))
+        self.assertTrue(check.startup().open)

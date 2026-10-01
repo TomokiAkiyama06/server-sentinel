@@ -1670,6 +1670,17 @@ by the Issue #6 synthetic policy model.
   disposable copy holding a version 1 (port-only) stored exception, confirm
   startup reports `LISTENER_EXCEPTIONS_OUTDATED` and access stays closed until
   the Owner re-enters the exception with its owner.
+- Proxy socket ownership (mock-only so far): record whether `tailscaled`
+  holds a visible socket on the Tailscale address at the origin port (`sudo ss
+  -ltnp`); if it does, record its executable and unit (`readlink
+  /proc/<pid>/exe`, `/proc/<pid>/cgroup`) as `proxy_owner`. Before Issue #126,
+  confirm access stays closed with `LISTENER_OWNER_UNVERIFIED`. Once #126 is
+  composed, confirm access opens, then (on a disposable node) stop the proxy,
+  bind another process to the same address and port while Serve status still
+  lists the route, and confirm `UNEXPECTED_LISTENER` closes access and that
+  reopening revokes every human session. Stop the proxy without a replacement
+  and confirm `PROXY_LISTENER_MISSING` closes access and that it reopens
+  without revocation once the proxy is back.
 - Hostname resolution (mock-only so far): with the production
   `GetaddrinfoResolver` composed, confirm on the host that it returns exactly
   the reserved name's Tailscale IPv4 and IPv6 addresses (compare with

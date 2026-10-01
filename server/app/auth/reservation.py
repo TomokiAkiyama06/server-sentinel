@@ -79,6 +79,7 @@ class Reason(StrEnum):
     LISTENER_EXCEPTIONS_UNREADABLE = "LISTENER_EXCEPTIONS_UNREADABLE"
     LISTENER_EXCEPTIONS_OUTDATED = "LISTENER_EXCEPTIONS_OUTDATED"
     LISTENER_OWNER_UNVERIFIED = "LISTENER_OWNER_UNVERIFIED"
+    PROXY_LISTENER_MISSING = "PROXY_LISTENER_MISSING"
     SESSION_REVOCATION_UNAVAILABLE = "SESSION_REVOCATION_UNAVAILABLE"
     SESSION_REVOCATION_FAILED = "SESSION_REVOCATION_FAILED"
     HOSTNAME_RESOLUTION_UNAVAILABLE = "HOSTNAME_RESOLUTION_UNAVAILABLE"
@@ -140,6 +141,34 @@ class SocketOwner:
     unit: str | None
 
 
+def _valid_identity(executable, unit) -> bool:
+    """Exactly one of an absolute normalized executable path or a systemd unit name."""
+    if (executable is None) == (unit is None):
+        return False
+    if executable is not None:
+        return (isinstance(executable, str) and executable.startswith("/")
+                and len(executable) <= MAX_EXECUTABLE_PATH and "\0" not in executable
+                and os.path.normpath(executable) == executable and not executable.endswith(" (deleted)"))
+    return isinstance(unit, str) and _UNIT.fullmatch(unit) is not None
+
+
+@dataclass(frozen=True)
+class ProcessIdentity:
+    """The process expected to hold a socket: an executable path or a systemd unit."""
+
+    executable: str | None = None
+    unit: str | None = None
+
+    def __post_init__(self):
+        if not _valid_identity(self.executable, self.unit):
+            raise ValueError("INVALID_PROCESS_IDENTITY")
+
+    def owned_by(self, owner: SocketOwner) -> bool:
+        if self.executable is not None:
+            return owner.executable == self.executable
+        return owner.unit == self.unit
+
+
 @dataclass(frozen=True)
 class ListenerException:
     """One Owner-allowed wildcard system listener, for example ``sshd`` on 22.
@@ -176,16 +205,8 @@ class ListenerException:
                 or self.family is AddressFamily.IPV6
                 or not isinstance(self.scope, BindScope)):
             raise ValueError("INVALID_LISTENER_EXCEPTION")
-        if (self.executable is None) == (self.unit is None):
+        if not _valid_identity(self.executable, self.unit):
             # Exactly one owner identity; a port-only exception is refused.
-            raise ValueError("INVALID_LISTENER_EXCEPTION")
-        if self.executable is not None and (
-                not isinstance(self.executable, str) or not self.executable.startswith("/")
-                or len(self.executable) > MAX_EXECUTABLE_PATH or "\0" in self.executable
-                or os.path.normpath(self.executable) != self.executable
-                or self.executable.endswith(" (deleted)")):
-            raise ValueError("INVALID_LISTENER_EXCEPTION")
-        if self.unit is not None and (not isinstance(self.unit, str) or not _UNIT.fullmatch(self.unit)):
             raise ValueError("INVALID_LISTENER_EXCEPTION")
 
     def owned_by(self, owner: SocketOwner) -> bool:
@@ -628,7 +649,12 @@ class ReservationConfig:
     forwards to. ``proxy_listeners`` are TCP sockets the proxy itself is
     expected to hold on a reserved address at the configured ``port`` (empty
     when the proxy intercepts without a visible socket); any other port on the
-    reserved name is another answer for its cookies, so it is never exempted. ``isolation`` stays ``None`` until the Owner states it;
+    reserved name is another answer for its cookies, so it is never exempted.
+    Every recorded proxy socket must be present (``PROXY_LISTENER_MISSING``
+    otherwise, closed without revocation), and ``proxy_owner`` (required
+    with ``proxy_listeners``) must be its only holder on every check: another
+    holder is ``UNEXPECTED_LISTENER``, an unverifiable one
+    ``LISTENER_OWNER_UNVERIFIED``. ``isolation`` stays ``None`` until the Owner states it;
     ``None`` or any non-``IsolationMode`` value keeps access closed.
     """
 
@@ -638,6 +664,7 @@ class ReservationConfig:
     human_listener: Listener
     proxy_listeners: frozenset = frozenset()
     isolation: IsolationMode | None = None
+    proxy_owner: ProcessIdentity | None = None
 
     def __post_init__(self):
         if not isinstance(self.hostname, str) or not _HOSTNAME.fullmatch(self.hostname):
@@ -659,6 +686,9 @@ class ReservationConfig:
         if any(not isinstance(item, Listener) or item.address not in addresses or item.port != self.port
                or item.protocol is not TransportProtocol.TCP
                for item in proxies):
+            raise ValueError("INVALID_RESERVATION_CONFIG")
+        if bool(proxies) != isinstance(self.proxy_owner, ProcessIdentity) or (
+                not proxies and self.proxy_owner is not None):
             raise ValueError("INVALID_RESERVATION_CONFIG")
         object.__setattr__(self, "proxy_listeners", proxies)
 
@@ -715,13 +745,16 @@ def validate_listener_exceptions(config: ReservationConfig, exceptions) -> froze
 
 
 def excepted_inodes(config: ReservationConfig, listeners, exceptions: frozenset) -> frozenset:
-    """Inodes of listeners whose endpoint an exception covers (ownership still unverified)."""
+    """Inodes whose owner a check verifies: excepted endpoints and recorded proxy sockets."""
     if isinstance(listeners, Reason):
         return frozenset()
-    return frozenset(
-        listener.inode for listener in listeners
-        if listener.inode and any(item.matches(Listener(_normalize(listener.address), listener.port,
-                                                        listener.protocol)) for item in exceptions))
+    inodes = set()
+    for listener in listeners:
+        normalized = Listener(_normalize(listener.address), listener.port, listener.protocol)
+        if listener.inode and (normalized in config.proxy_listeners
+                               or any(item.matches(normalized) for item in exceptions)):
+            inodes.add(listener.inode)
+    return frozenset(inodes)
 
 
 def evaluate(config: ReservationConfig, listeners, routes,
@@ -791,6 +824,11 @@ def evaluate(config: ReservationConfig, listeners, routes,
             if address.is_unspecified or address in reserved:
                 if normalized in config.proxy_listeners and normalized not in seen_proxies:
                     seen_proxies.add(normalized)
+                    holders = known.get(listener.inode) if listener.inode else None
+                    if not holders:
+                        unverified += 1
+                    elif not all(config.proxy_owner.owned_by(owner) for owner in holders):
+                        unexpected_listeners += 1
                     continue
                 unexpected_listeners += 1
         if unexpected_listeners:
@@ -798,6 +836,9 @@ def evaluate(config: ReservationConfig, listeners, routes,
         if unverified:
             reasons.append(Reason.LISTENER_OWNER_UNVERIFIED)
             unexpected_listeners += unverified
+        if config.proxy_listeners - seen_proxies:
+            # Proxy drift or failure; nothing else seen answering, so no revocation.
+            reasons.append(Reason.PROXY_LISTENER_MISSING)
         if not seen_human:
             reasons.append(Reason.HUMAN_LISTENER_MISSING)
     if isinstance(routes, Reason):

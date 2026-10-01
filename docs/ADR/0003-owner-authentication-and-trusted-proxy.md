@@ -465,5 +465,10 @@ privileged helper running as a separate systemd service (Issue #126), and
 until it exists an excepted root-owned listener such as `sshd` keeps human
 access closed. The Main Server runs `sshd` as `ssh.service` without socket
 activation, since a socket held by the service manager identifies no single
-owner; its exception is `tcp/22` owned by `/usr/sbin/sshd`. This is still detection: it bounds how long an exposed
+owner; its exception is `tcp/22` owned by `/usr/sbin/sshd`. A recorded proxy
+socket is verified the same way: it must be present and held only by the
+recorded proxy process (for example `tailscaled.service`); another holder or
+an unverifiable one is an exposure, while a missing recorded socket only
+keeps access closed, without revocation, until it returns. Until #126 exists,
+a root-owned proxy's sockets cannot be verified and keep access closed. This is still detection: it bounds how long an exposed
 cookie stays usable, and does not prevent the exposure.
