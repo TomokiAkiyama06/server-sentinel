@@ -59,14 +59,17 @@ and bounded, coalescing gap events for skips, capture restarts (recorded when
 first observed, even on a refused unit), clock regressions and refused units.
 After a Main Server restart each source resumes from the durable
 `CommittedWatermark` supplied by the deployment, so already recorded units
-are never reported as loss. Known loss keeps a source flow `degraded` and a
+are never reported as loss; while that lookup fails the source is reported
+`degraded` (bounded, slot-limited) and nothing is committed. Known loss keeps a source flow `degraded` and a
 closed or stale session makes it `interrupted`; after a reconnect each source
 stays `interrupted` until it delivers media on the new session. Session generations are never
 reissued (also after `forget_node` and re-enrollment), `forget_node` also
 discards the node's ingest rate window under the tracker lock (so a
 re-enrolled node UUID never inherits the old credential's rate/clock state),
 and `forget_source`
-releases a deactivated source's slot and returns its undrained gaps. The
+releases a deactivated source's slot and returns its undrained gaps; while
+that source's accepted units are still queued its committed position is kept
+outside the slot limit, so a retry after reactivation stays a `duplicate`. The
 node/source lifecycle commits a durable revocation or source deactivation
 inside `authorization_change` (tracker, or queue for direct queue users), so
 it is serialized with every grant, liveness refresh, charge and enqueue. On

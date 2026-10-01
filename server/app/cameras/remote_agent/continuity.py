@@ -47,6 +47,8 @@ _MAXIMUM_COUNTER = 2 ** 63 - 1
 # boundary's fail-closed Main clock regression) is transient: continuity is
 # left unchanged so the Agent can retry from its ring buffer.
 _PERMANENT_INGEST_REFUSALS = frozenset({"message_too_large"})
+# A committed-watermark lookup that raised; distinct from "nothing recorded".
+_UNAVAILABLE = object()
 
 
 class DeliveryOutcome(str, Enum):
@@ -217,6 +219,10 @@ class _Source:
     unit first showed it, so its retry never reports the restart twice; a
     retry that starts later than ``restart_before`` reports only the units
     in between.
+    ``unresolved`` marks an entry kept only because the durable watermark
+    lookup failed for the source's first unit: it holds the source slot and
+    reports ``degraded``, but carries no continuity, so the next attempt looks
+    the watermark up again.
     """
 
     node_id: UUID
@@ -231,6 +237,7 @@ class _Source:
     attempted_epoch: int = 0
     restart_epoch: int = 0
     restart_before: int = 0
+    unresolved: bool = False
 
 
 @dataclass
@@ -270,7 +277,14 @@ class ContinuityTracker:
     this tracker does not yet track, and must not call back into the tracker
     or its ingest queue.  A lookup that fails refuses the unit transiently
     (nothing is committed, so the Agent retries); it never falls back to
-    reporting the durably recorded units as loss.
+    reporting the durably recorded units as loss.  Until a lookup succeeds the
+    source is kept as a bounded unresolved entry reported ``degraded``.
+
+    Releasing a source (deactivation) frees its active-source slot.  While
+    accepted units of that source are still in the ingest queue, its committed
+    position is kept outside the slot table, so a retry after reactivation is
+    still a ``duplicate`` and never enqueued a second time.  Once the queue
+    no longer holds them, the durable watermark is the source of truth.
     """
 
     def __init__(self, limits: ContinuityLimits, authorizer: IngestAuthorizer,
@@ -291,6 +305,9 @@ class ContinuityTracker:
         self._committed_watermark = committed_watermark
         self._nodes: dict[UUID, _Node] = {}
         self._sources: dict[UUID, _Source] = {}
+        # Committed positions of released sources whose accepted units are
+        # still queued; bounded by the ingest queue and outside the slot limit.
+        self._released: dict[UUID, _Source] = {}
         # Monotonic across forget/re-enrollment; never reused for any node.
         self._generation = 0
         self._instance = uuid4()
@@ -605,21 +622,31 @@ class ContinuityTracker:
             if state is None and len(self._sources) >= self.limits.maximum_sources:
                 return self._charged(session, DeliveryOutcome.REJECTED, "source_capacity")
             if state is None:
+                released = self._released_locked(source_id)
+                if released is not None and released.node_id == node_id:
+                    # Reactivated while its accepted units are still queued:
+                    # that position is newer than the durable watermark.
+                    del self._released[source_id]
+                    state = self._sources[source_id] = released
+            if state is None or state.unresolved:
                 # First unit this tracker sees (for example after a Main
                 # Server restart): resume from the durable watermark so units
                 # already recorded by an earlier process are not loss.
                 try:
                     mark = self._committed_watermark(source_id)
                 except Exception:
+                    mark = _UNAVAILABLE
+                if mark is _UNAVAILABLE or (mark is not None
+                                            and not isinstance(mark, CommittedWatermark)):
+                    return self._unresolved(session, node, state, header, now)
+                if mark is not None and mark.node_id != node_id:
                     return self._charged(session, DeliveryOutcome.REJECTED,
-                                         "watermark_unavailable")
+                                         "source_identity_mismatch")
+                if state is not None:
+                    # The unresolved entry carried no continuity; drop it.
+                    del self._sources[source_id]
+                    state = None
                 if mark is not None:
-                    if not isinstance(mark, CommittedWatermark):
-                        return self._charged(session, DeliveryOutcome.REJECTED,
-                                             "watermark_unavailable")
-                    if mark.node_id != node_id:
-                        return self._charged(session, DeliveryOutcome.REJECTED,
-                                             "source_identity_mismatch")
                     state = self._sources[source_id] = _Source(
                         node_id, mark.capture_epoch, mark.sequence,
                         mark.capture_time_ns, now)
@@ -698,6 +725,27 @@ class ContinuityTracker:
                 return Delivery(DeliveryOutcome.REJECTED, admission.reason, tuple(gaps))
             return Delivery(DeliveryOutcome.ACCEPTED, None, tuple(gaps))
 
+    def _unresolved(self, session: AgentSession, node: _Node, state: _Source | None,
+                    header: MediaUnitHeader, now: int) -> Delivery:
+        """Refuse a unit whose durable watermark could not be read.
+
+        Nothing is committed and no loss is claimed, but the source keeps a
+        bounded (slot-limited) unresolved entry so monitoring reports it
+        ``degraded`` while the Agent retries.  An over-budget attempt or a
+        revoked node changes nothing beyond what ``_charged`` reports.
+        """
+        delivery = self._charged(session, DeliveryOutcome.REJECTED, "watermark_unavailable")
+        if delivery.reason != "watermark_unavailable":
+            return delivery
+        if state is None:
+            state = self._sources[header.source_id] = _Source(
+                session.node_id, header.capture_epoch, None, header.capture_time_ns, now,
+                refused=True, unresolved=True)
+        self._seen(state, now)
+        state.session_generation = node.generation
+        self._seen(node, now)
+        return delivery
+
     def snapshot(self) -> tuple[SourceContinuity, ...]:
         with self._lock:
             # Sampled under the lock: an older ``now`` than a concurrent
@@ -730,12 +778,35 @@ class ContinuityTracker:
                     result.append(state.gaps.popleft())
             return tuple(result)
 
+    def _released_locked(self, source_id: UUID) -> _Source | None:
+        """A released source's committed position while its units are queued."""
+        released = self._released.get(source_id)
+        if released is not None and not self._ingest.holds(released.node_id, source_id):
+            del self._released[source_id]
+            return None
+        return released
+
     def _forget_source_locked(self, source_id: UUID) -> tuple[GapEvent, ...]:
+        for released in tuple(self._released):
+            self._released_locked(released)
         state = self._sources.pop(source_id, None)
-        return () if state is None else tuple(state.gaps)
+        if state is None:
+            return ()
+        gaps = tuple(state.gaps)
+        if (state.last_sequence is not None and not state.unresolved
+                and self._ingest.holds(state.node_id, source_id)):
+            # Keep only the committed position (gaps are handed back), so a
+            # retry after reactivation cannot enqueue a queued unit again.
+            self._released[source_id] = _Source(
+                state.node_id, state.capture_epoch, state.last_sequence,
+                state.last_capture_time_ns, state.last_seen_ns)
+        return gaps
 
     def _forget_node_locked(self, node_id: UUID) -> tuple[GapEvent, ...]:
         self._nodes.pop(node_id, None)
+        for source_id in [source for source, state in self._released.items()
+                          if state.node_id == node_id]:
+            del self._released[source_id]
         owned = [source for source, state in self._sources.items()
                  if state.node_id == node_id]
         pending = []

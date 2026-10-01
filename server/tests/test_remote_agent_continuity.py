@@ -597,18 +597,58 @@ class ContinuityTrackerTests(unittest.TestCase):
         result = tracker.receive(session, unit(5), b"v")
         self.assertEqual((DeliveryOutcome.REJECTED, "watermark_unavailable", ()),
                          (result.outcome, result.reason, result.gaps))
-        self.assertEqual((), tracker.snapshot())
         self.assertEqual(0, ingest.snapshot().queued_messages)
-        for mark, reason in ((object(), "watermark_unavailable"),
-                             (CommittedWatermark(OTHER_NODE, 1, 4, 40),
-                              "source_identity_mismatch")):
-            with self.subTest(reason=reason):
-                tracker, ingest, _, _ = build(watermark=lambda source_id, mark=mark: mark)
+        # Mismatch stays a plain refusal and creates no source state.
+        tracker, ingest, _, _ = build(
+            watermark=lambda source_id: CommittedWatermark(OTHER_NODE, 1, 4, 40))
+        session = tracker.open_session(NODE)
+        result = tracker.receive(session, unit(5), b"v")
+        self.assertEqual((DeliveryOutcome.REJECTED, "source_identity_mismatch"),
+                         (result.outcome, result.reason))
+        self.assertEqual((), tracker.snapshot())
+
+    def test_watermark_lookup_failure_stays_visibly_degraded_until_resolved(self):
+        marks = {SOURCE: CommittedWatermark(NODE, 1, 4, 40)}
+        for broken in ("raises", "invalid"):
+            with self.subTest(broken=broken):
+                state = {"broken": True}
+
+                def lookup(source_id):
+                    if state["broken"]:
+                        if broken == "raises":
+                            raise OSError("durable store unavailable")
+                        return object()
+                    return marks.get(source_id)
+
+                tracker, ingest, _, _ = build(
+                    authorizer=Authorizer({(NODE, SOURCE), (NODE, OTHER_SOURCE)}),
+                    watermark=lookup, sources=1)
                 session = tracker.open_session(NODE)
+                for _ in range(2):
+                    result = tracker.receive(session, unit(5), b"v")
+                    self.assertEqual((DeliveryOutcome.REJECTED, "watermark_unavailable", ()),
+                                     (result.outcome, result.reason, result.gaps))
+                    # The active source is reported, degraded, with nothing
+                    # committed, never absent while retries continue.
+                    self.assertEqual(
+                        [(SOURCE, SourceFlow.DEGRADED, None, 0)],
+                        [(item.source_id, item.flow, item.last_sequence, item.pending_gaps)
+                         for item in tracker.snapshot()])
+                # The unresolved entry holds the bounded source slot.
+                self.assertEqual("source_capacity",
+                                 tracker.receive(session, unit(0, source=OTHER_SOURCE), b"v").reason)
+                self.assertEqual(0, ingest.snapshot().queued_messages)
+                self.assertEqual((), tracker.drain_gaps(10))
+                state["broken"] = False
+                # Continuity was not advanced: the retry resumes from the
+                # durable watermark, so a recorded unit is a duplicate and the
+                # next one is accepted without false loss.
+                self.assertEqual(DeliveryOutcome.DUPLICATE,
+                                 tracker.receive(session, unit(4), b"v").outcome)
                 result = tracker.receive(session, unit(5), b"v")
-                self.assertEqual((DeliveryOutcome.REJECTED, reason),
-                                 (result.outcome, result.reason))
-                self.assertEqual((), tracker.snapshot())
+                self.assertEqual((DeliveryOutcome.ACCEPTED, ()), (result.outcome, result.gaps))
+                self.assertEqual((SourceFlow.RECEIVING, 5),
+                                 (flow(tracker).flow, flow(tracker).last_sequence))
 
     def test_uncommitted_sources_stay_within_source_capacity(self):
         authorizer = Authorizer({(NODE, s) for s in SOURCES})
@@ -985,6 +1025,8 @@ class ContinuityTrackerTests(unittest.TestCase):
         session = tracker.open_session(NODE)
         tracker.receive(session, unit(5, at=10 ** 6), b"v")
         tracker.receive(session, unit(0, source=OTHER_SOURCE), b"v")
+        # The released source's queued work was consumed (and made durable).
+        ingest.drain(10)
         authorizer.pairs.discard((NODE, SOURCE))
         tracker.forget_source(SOURCE)
         authorizer.pairs.add((NODE, SOURCE))
@@ -997,6 +1039,39 @@ class ContinuityTrackerTests(unittest.TestCase):
         self.assertEqual(0, flow(tracker).last_sequence)
         self.assertEqual(0, flow(tracker, OTHER_SOURCE).last_sequence)
         self.assertEqual(1, ingest.snapshot().tracked_rate_windows)
+
+    def test_released_source_retry_is_duplicate_while_its_unit_is_still_queued(self):
+        for fenced in (False, True):
+            with self.subTest(fenced=fenced):
+                tracker, ingest, _, authorizer = build(
+                    authorizer=Authorizer({(NODE, SOURCE), (NODE, OTHER_SOURCE)}), sources=1)
+                session = tracker.open_session(NODE)
+                self.assertEqual(DeliveryOutcome.ACCEPTED,
+                                 tracker.receive(session, unit(0), b"v").outcome)
+                if fenced:
+                    with tracker.authorization_change(deactivated_source=SOURCE):
+                        authorizer.pairs.discard((NODE, SOURCE))
+                else:
+                    authorizer.pairs.discard((NODE, SOURCE))
+                    tracker.forget_source(SOURCE)
+                # The slot is released: the queued unit keeps no active slot.
+                self.assertEqual((), tracker.snapshot())
+                self.assertEqual(DeliveryOutcome.ACCEPTED,
+                                 tracker.receive(session, unit(0, source=OTHER_SOURCE),
+                                                 b"v").outcome)
+                authorizer.pairs.discard((NODE, OTHER_SOURCE))
+                tracker.forget_source(OTHER_SOURCE)
+                # Reauthorized while its accepted unit is still queued: the
+                # retry is an idempotent duplicate, never a second envelope.
+                authorizer.pairs.add((NODE, SOURCE))
+                self.assertEqual(DeliveryOutcome.DUPLICATE,
+                                 tracker.receive(session, unit(0), b"v").outcome)
+                self.assertEqual(2, ingest.snapshot().queued_messages)
+                result = tracker.receive(session, unit(1), b"v")
+                self.assertEqual((DeliveryOutcome.ACCEPTED, ()), (result.outcome, result.gaps))
+                drained = ingest.drain(10)
+                self.assertEqual([(SOURCE, 0), (OTHER_SOURCE, 0), (SOURCE, 1)],
+                                 [(m.source_id, m.sequence) for m in drained])
 
     def test_grant_from_another_tracker_lifetime_is_stale(self):
         before_restart, _, _, _ = build()

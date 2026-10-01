@@ -730,7 +730,9 @@ continuity resumes from the durable recording layer's committed watermark
 checked, so units already recorded by the earlier process are `duplicate`
 rather than leading loss and units lost after that watermark are an exact
 skip; a failed watermark lookup refuses the unit transiently rather than
-reporting loss or healthy flow. The full envelope travels with each
+reporting loss or healthy flow, and until a lookup succeeds the source is kept
+as a bounded, slot-limited entry reported `degraded` without advancing
+continuity. The full envelope travels with each
 admitted unit in the ingest queue, and the ingest boundary refuses a media
 unit with a missing or partial envelope. Known loss or backpressure keeps the
 source flow `degraded`, including pressure or a transient refusal on a
@@ -741,7 +743,10 @@ Tracked sources are bounded by the active-source limit (§3.4); tracked node
 sessions are hard-bounded separately, so live source-less node sessions never
 consume the active-source allowance. The active-source limit counts active sources, so durable deactivation or replacement of one
 source releases its slot (returning its undrained gap events to the caller)
-without discarding the node's other flows. A node that owns no tracked source
+without discarding the node's other flows. While accepted units of a released
+source are still in the ingest queue, its committed position is kept outside
+the slot limit, so a retry after reactivation is a `duplicate` and is never
+enqueued twice; once they are drained, the durable watermark applies. A node that owns no tracked source
 and whose session is closed, invalidated or stale does not keep a slot.
 Liveness time is sampled while the tracker state is locked and never moves
 backwards, so a delayed or regressed clock sample cannot make an active flow
