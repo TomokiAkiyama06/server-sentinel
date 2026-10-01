@@ -12,6 +12,7 @@ from unittest.mock import patch
 from uuid import UUID, uuid4
 import zlib
 
+from media_capture_agent import ring as ring_module
 from media_capture_agent.ring import DiskRing
 from media_capture_agent.ring_ledger import Ledger
 from media_capture_agent.ring_models import (POST, PRE, RETENTION, SECOND, RingConfig,
@@ -406,6 +407,24 @@ class RingTests(unittest.TestCase):
         result = self.ring.incident(identifier, now_us=T0 + POST)
         self.assertEqual(result["state"], "partial")
         self.assertTrue(result["clock_uncertain"])
+
+    def test_long_rollback_with_mixed_cadences_keeps_status_bounded(self):
+        late = 61 * 86400 * SECOND
+        slow = self.profile
+        fast = SegmentProfile(UUID(int=200), 800, 400, SECOND, 100)
+        self.ring.close()
+        self.ring = DiskRing(self.settings, self.store, ledger_maximum_bytes=16 * LEDGER_BYTES,
+                             authority=AllowControls())
+        self.ring.configure(RingConfig("duration", 600), (slow, fast), now_us=late, clock_trusted=True)
+        for start in range(late - PRE, late, 60 * SECOND):
+            self.ring.append(SOURCE, start, start + 60 * SECOND, PAYLOAD,
+                             now_us=start + 60 * SECOND, clock_trusted=True)
+        # A 60-day rollback: the slow source's phase stays near ``late`` while
+        # the fast source has no trusted phase and would start at ``now``.
+        with patch("media_capture_agent.ring.round_up", wraps=ring_module.round_up) as counted:
+            status = self.ring.status(now_us=late - 60 * 86400 * SECOND, clock_trusted=True)
+        self.assertEqual((status["state"], status["reason"]), ("degraded", "clock_uncertain"))
+        self.assertLess(counted.call_count, 100)
 
     def test_clock_uncertain_reconfiguration_never_trims_by_timestamp(self):
         self.configure(value=1200)

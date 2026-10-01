@@ -373,11 +373,20 @@ class DiskRing:
         same-instant appends of synchronized sources. Free space and each
         reclaimed segment are shared: every earlier simulated append consumes
         its bounded allocation, and reclaimable media is credited only once.
+
+        Under untrusted time the trusted phases are not comparable with
+        ``now`` (a rollback can leave them far in the future), and nothing is
+        credited as reclaimable. Every source's next append is then evaluated
+        at ``now`` together, so the work stays bounded by the source count
+        instead of growing with the rollback interval.
         """
         free, reserve = budget["filesystem_free"], budget["safety_reserve"]
         unit = self.store.allocation_unit
         next_append = {}
         for source, profile in self.profiles.items():
+            if not clock_trusted:
+                next_append[source] = now
+                continue
             last = self.db.execute("SELECT max(end) FROM segments WHERE source=? AND clock_trusted=1",
                                    (str(source),)).fetchone()[0]
             next_append[source] = now if last is None else max(now, last + profile.segment_duration_us)
