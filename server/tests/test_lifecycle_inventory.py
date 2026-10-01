@@ -124,6 +124,20 @@ class Runtime:
                 (recording_id,)).fetchone()[0]
         return self.root / "recordings" / (UUID(segment_id).hex + ".seg")
 
+    def pairing_audit(self, node: str, *actions: str, outcome: str = "succeeded") -> None:
+        """The security/admin audit rows PairingLedger writes with a change."""
+        actors = {"approve": "owner", "revoke": "owner", "redeem": "capture_node",
+                  "activate": "system"}
+        names = {"approve": "approve_capture_node_enrollment",
+                 "redeem": "redeem_capture_node_enrollment",
+                 "activate": "activate_capture_node_credential",
+                 "revoke": "revoke_capture_node_pairing"}
+        for action in actions:
+            self.execute(
+                "INSERT INTO security_admin_audit_records VALUES (?, ?, ?, 'capture_node', ?, ?, ?)",
+                (str(uuid4()), actors[action], names[action], str(node), self.clock, outcome))
+            self.clock += 1_000_000
+
     def audit(self) -> str:
         row_id = str(uuid4())
         self.execute(
@@ -2053,6 +2067,7 @@ class LifecycleInventoryTests(unittest.TestCase):
         for marker in ("1" * 64, "4" * 64, "5" * 64):
             self.assertNotIn(marker, baseline.read_text())
         # PairingLedger promotion: bind the staged key, swap it in, consume it.
+        self.runtime.pairing_audit(promoted, "activate")
         self.runtime.execute("INSERT INTO pairing_key_bindings VALUES (?, ?, 0)",
                              ("4" * 64, promoted))
         self.runtime.execute(
@@ -2091,6 +2106,9 @@ class LifecycleInventoryTests(unittest.TestCase):
         _, baseline = self.record()
         # Legitimate: revocation discards it; a fresh pairing replaces the
         # identity; re-staging binds the new key first; promotion consumes it.
+        self.runtime.pairing_audit(nodes["revoked"], "revoke")
+        self.runtime.pairing_audit(nodes["repaired"], "approve", "redeem", "activate")
+        self.runtime.pairing_audit(nodes["promoted"], "activate")
         self.runtime.execute("UPDATE pairing_node_credentials SET state='revoked' WHERE node_id=?",
                              (nodes["revoked"],))
         self.runtime.execute("UPDATE pairing_key_bindings SET revoked=1 WHERE node_id=?",
@@ -2234,6 +2252,7 @@ class LifecycleInventoryTests(unittest.TestCase):
                           {"id": f"pairing_renewals:{node}", "reason": "missing"}])
         # A pairing activated after the record does explain it.
         fresh = "9" * 64
+        self.runtime.pairing_audit(node, "approve", "redeem", "activate")
         self.runtime.execute("INSERT INTO pairing_key_bindings VALUES (?, ?, 0)", (fresh, node))
         self._activated(node, fresh)
         self.runtime.execute("UPDATE pairing_node_credentials SET public_key_digest=? "
@@ -2277,6 +2296,7 @@ class LifecycleInventoryTests(unittest.TestCase):
         self.assertNotIn(pending_key, baseline.read_text())
         self.runtime.execute("DELETE FROM pairing_enrollments WHERE id=?", (recorded,))
         self._activated(node, first)
+        self.runtime.pairing_audit(node, "approve", "redeem", "activate")
         self.runtime.execute("UPDATE pairing_node_credentials SET public_key_digest=?, "
                              "credential_serial_digest=? WHERE node_id=?",
                              (first, "e" * 64, node))
@@ -2332,7 +2352,9 @@ class LifecycleInventoryTests(unittest.TestCase):
             "public_key_digest FROM pairing_node_renewals WHERE node_id=?)", (nodes["promoted"],))
         self.runtime.execute("DELETE FROM pairing_node_renewals WHERE node_id=?",
                              (nodes["promoted"],))
+        self.runtime.pairing_audit(nodes["promoted"], "activate")
         # A fresh pairing whose new key binding is revoked.
+        self.runtime.pairing_audit(nodes["repaired"], "approve", "redeem", "activate")
         fresh = "e" * 64
         self.runtime.execute("INSERT INTO pairing_key_bindings VALUES (?, ?, 1)",
                              (fresh, nodes["repaired"]))
@@ -2369,7 +2391,10 @@ class LifecycleInventoryTests(unittest.TestCase):
                                  {"id": f"pairing_revocation:{nodes['repaired']}",
                                   "reason": "reopened"},
                                  {"id": f"pairing_revocation:{nodes['promoted']}",
-                                  "reason": "reopened"}],
+                                  "reason": "reopened"},
+                                 # No revoke() ran: no revocation audit row.
+                                 *({"id": f"pairing_audit:{node}:revoke_capture_node_pairing",
+                                    "reason": "unaudited"} for node in nodes.values())],
                                 key=lambda item: (item["id"], item["reason"])))
 
     def test_pairing_state_follows_the_ledger_invariants(self):
@@ -2540,7 +2565,10 @@ class LifecycleInventoryTests(unittest.TestCase):
         self.assertEqual(code, inventory.EXIT_FAILED)
         self.assertEqual(sorted(report["sections"]["security_state"]["failed"],
                                 key=lambda item: item["id"]),
-                         [{"id": f"pairing_enrollments:{approval.enrollment_id}",
+                         # The forged activation also has no audit row.
+                         [{"id": f"pairing_audit:{node}:activate_capture_node_credential",
+                           "reason": "unaudited"},
+                          {"id": f"pairing_enrollments:{approval.enrollment_id}",
                            "reason": "enrollment_key"},
                           {"id": f"pairing_renewals:{node}", "reason": "enrollment_key"}])
         # The same without the restored enrollment state: still refused.
@@ -2576,6 +2604,7 @@ class LifecycleInventoryTests(unittest.TestCase):
         self.runtime.execute(update, ("pending", ids["rewound"]))
         self.runtime.execute(update, ("activated", ids["revived"]))
         self.runtime.execute(update, ("expired", ids["expires"]))
+        self.runtime.pairing_audit(node, "redeem", outcome="failed")  # its expiry
         self.runtime.execute(update, ("revoked", ids["revoked"]))
         self.runtime.execute(update, ("activated", ids["completes"]))
         code, report, _ = self.verify(baseline)
@@ -2599,7 +2628,13 @@ class LifecycleInventoryTests(unittest.TestCase):
                                  {"id": f"pairing_enrollments:{ids['revoked']}",
                                   "reason": "unbound"},
                                  {"id": f"pairing_revocation:{node}", "reason": "incomplete"},
-                                 {"id": f"pairing_revocation:{node}", "reason": "reopened"}],
+                                 {"id": f"pairing_revocation:{node}", "reason": "reopened"},
+                                 # The forged transitions have no ledger audit rows.
+                                 *({"id": f"pairing_audit:{node}:{action}",
+                                    "reason": "unaudited"} for action in (
+                                        "activate_capture_node_credential",
+                                        "redeem_capture_node_enrollment",
+                                        "revoke_capture_node_pairing"))],
                                 key=lambda item: (item["id"], item["reason"])))
 
     def test_owner_retries_of_a_bound_key_are_preserved(self):
@@ -3018,6 +3053,64 @@ class LifecycleInventoryTests(unittest.TestCase):
         code, report, _ = self.verify(baseline)
         self.assertIn({"id": f"pairing_revocation:{node}", "reason": "reopened"},
                       report["sections"]["security_state"]["failed"])
+
+    def test_pairing_changes_without_their_ledger_audit_rows_fail(self):
+        # Codex P1: every PairingLedger change writes its audit row in the same
+        # transaction; the same end state written without it is not a ledger
+        # transition (revoke, a fresh activation, a staged promotion).
+        self.runtime.seed()
+        database = Database(self.runtime.database)
+        ledger = PairingLedger(database, HmacCodeVerifier(b"s" * 32),
+                               audit=AuditStore(database), clock=lambda: 100.0,
+                               process_epoch=uuid4())
+
+        class Owner:
+            def require_owner(self, actor_context):
+                if actor_context != "owner":
+                    raise PermissionError("synthetic denial")
+        owner = Owner()
+        nodes = {label: uuid4() for label in ("revoked", "activated", "promoted")}
+
+        def claim(node, key):
+            approval, code = ledger.approve(owner, "owner", node_id=node, public_key_digest=key)
+            return ledger.redeem(enrollment_id=approval.enrollment_id, public_key_digest=key,
+                                 code=code.value)
+        for index, node in enumerate(nodes.values()):
+            ledger.activate(claim(node, f"{index + 1:064x}"),
+                            credential_serial_digest="b" * 64, not_after=50.0)
+        pending = claim(nodes["activated"], "a" * 64)
+        ledger.stage_renewal(node_id=nodes["promoted"], current_public_key_digest=f"{3:064x}",
+                             current_credential_digest="b" * 64, public_key_digest="c" * 64,
+                             credential_serial_digest="d" * 64, not_after=90.0)
+        _, baseline = self.record()
+        execute = self.runtime.execute
+        # revoke() without its audit row.
+        execute("UPDATE pairing_node_credentials SET state='revoked' WHERE node_id=?",
+                (str(nodes["revoked"]),))
+        execute("UPDATE pairing_key_bindings SET revoked=1 WHERE node_id=?",
+                (str(nodes["revoked"]),))
+        # activate() of the consumed enrollment without its audit row.
+        execute("UPDATE pairing_enrollments SET state='activated' WHERE id=?",
+                (str(pending.enrollment_id),))
+        execute("UPDATE pairing_node_credentials SET public_key_digest=?, "
+                "credential_serial_digest=? WHERE node_id=?",
+                ("a" * 64, "e" * 64, str(nodes["activated"])))
+        # A promotion without its audit row.
+        execute("UPDATE pairing_node_credentials SET public_key_digest=?, "
+                "credential_serial_digest=?, not_after=90.0 WHERE node_id=?",
+                ("c" * 64, "d" * 64, str(nodes["promoted"])))
+        execute("DELETE FROM pairing_node_renewals WHERE node_id=?", (str(nodes["promoted"]),))
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_FAILED)
+        self.assertEqual(sorted(report["sections"]["security_state"]["failed"],
+                                key=lambda item: item["id"]),
+                         sorted([{"id": f"pairing_audit:{nodes['revoked']}:"
+                                        "revoke_capture_node_pairing", "reason": "unaudited"},
+                                 {"id": f"pairing_audit:{nodes['activated']}:"
+                                        "activate_capture_node_credential", "reason": "unaudited"},
+                                 {"id": f"pairing_audit:{nodes['promoted']}:"
+                                        "activate_capture_node_credential", "reason": "unaudited"}],
+                                key=lambda item: item["id"]))
 
     def test_a_staged_renewal_is_never_restaged_onto_a_superseded_key(self):
         # Codex P1: stage_renewal() accepts a key already bound to the node

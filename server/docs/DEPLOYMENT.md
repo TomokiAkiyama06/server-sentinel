@@ -441,7 +441,11 @@ every enrollment's key (any state) is bound to its node, a revoked
 enrollment's binding is revoked, and a staged renewal's
 key is never the key of any enrollment, recorded or current, in any state
 (stage renewal binds keys no enrollment names). From record to
-verify, each node may only change by a composition of those operations:
+verify, each node may only change by a composition of those operations,
+and each accepted operation must be matched by the security/admin audit row
+the ledger writes in the same transaction, appended since the record
+(approval, redemption or its expiry, activation or promotion, revocation;
+staging a renewal writes none), otherwise `unaudited`:
 every enrollment recorded (any state) stays with the same node and key and
 only moves forward: pending to consumed, expired, activated or revoked,
 consumed to activated or revoked, the other states final (a vanished one is

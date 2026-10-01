@@ -789,9 +789,10 @@ def _security_state(connection, tables, salt: str) -> dict:
     # evidence between them (node logical IDs and times, no key material).
     pairing_audit = query(
         "security_admin_audit_records",
-        "SELECT id, action, target_logical_id, occurred_at_us FROM security_admin_audit_records "
-        "WHERE outcome = 'succeeded' AND action IN "
-        "('activate_capture_node_credential', 'revoke_capture_node_pairing')")
+        "SELECT id, action, target_logical_id, occurred_at_us, outcome "
+        "FROM security_admin_audit_records WHERE action IN "
+        "('approve_capture_node_enrollment', 'redeem_capture_node_enrollment', "
+        "'activate_capture_node_credential', 'revoke_capture_node_pairing')")
     sessions = query("access_sessions", "SELECT id, invalidated_at_us FROM access_sessions")
     generation = query("access_deployment_state",
                        "SELECT authorization_generation FROM access_deployment_state")
@@ -823,7 +824,7 @@ def _security_state(connection, tables, salt: str) -> dict:
             _keyed(salt, ["pairing-key-v1", row[0]]): {"node_id": row[1], "revoked": bool(row[2])}
             for row in bindings},
         "pairing_audit": None if pairing_audit is None else sorted(
-            [row[0], row[1], row[2], row[3]] for row in pairing_audit),
+            [row[0], row[1], row[2], row[3], row[4]] for row in pairing_audit),
         "capture_nodes_revoked": None if nodes is None else {
             row[0]: row[1] == "revoked" for row in nodes},
         "sessions_invalidated": None if sessions is None else {
@@ -863,7 +864,7 @@ def _audited_before_revocation(node: str, baseline: dict, current: dict,
     if current.get("pairing_audit") is None:
         return False
     events = [row for row in current["pairing_audit"]
-              if row[0] not in recorded and row[2] == node]
+              if row[0] not in recorded and row[2] == node and row[4] == "succeeded"]
     revocations = [row[3] for row in events if row[1] == "revoke_capture_node_pairing"]
     activations_audited = [row[3] for row in events
                            if row[1] == "activate_capture_node_credential"]
@@ -1189,6 +1190,41 @@ def _compare_pairing(baseline: dict, current: dict) -> list:
             if accepted:
                 fresh.add(pair)
 
+
+    # -- every accepted transition has the audit row the ledger wrote ------
+    # PairingLedger appends, in the transaction that makes the change:
+    # approve() 'approve_capture_node_enrollment' succeeded; redeem()
+    # 'redeem_capture_node_enrollment' succeeded on consumption, failed on
+    # expiry; activate() and a promotion 'activate_capture_node_credential'
+    # succeeded; revoke() 'revoke_capture_node_pairing' succeeded.
+    # stage_renewal() writes none. Per node, each accepted kind needs at
+    # least as many such rows appended since the record.
+    required: Counter = Counter()
+    for enrollment, item in enrollments_now.items():
+        before = (recorded_enrollments or {}).get(enrollment)
+        state, node = item["state"], item["node_id"]
+        if before is None:
+            required[(node, "approve_capture_node_enrollment", "succeeded")] += 1
+        was = None if before is None else before["state"]
+        if was in (None, "pending") and state in ("consumed", "activated"):
+            required[(node, "redeem_capture_node_enrollment", "succeeded")] += 1
+        if was in (None, "pending") and state == "expired":
+            required[(node, "redeem_capture_node_enrollment", "failed")] += 1
+    for item in activated_since.values():
+        required[(item["node_id"], "activate_capture_node_credential", "succeeded")] += 1
+    for node, before in recorded_credentials.items():
+        after, staged_row = credentials.get(node), staged.get(node)
+        if (not before["revoked"] and staged_row is not None and after is not None
+                and after["material"] == staged_row["material"]):
+            required[(node, "activate_capture_node_credential", "succeeded")] += 1
+    for node in revoked_nodes:
+        required[(node, "revoke_capture_node_pairing", "succeeded")] += 1
+    recorded_audit = {row[0] for row in (baseline.get("pairing_audit") or ())}
+    appended_audit = Counter((row[2], row[1], row[4]) for row in (current.get("pairing_audit") or ())
+                             if row[0] not in recorded_audit)
+    for (node, action, outcome), count in sorted(required.items()):
+        if appended_audit[(node, action, outcome)] < count:
+            fail("pairing_audit", f"{node}:{action}", "unaudited")
 
     # -- credentials ------------------------------------------------------
     def installed(node, after):
