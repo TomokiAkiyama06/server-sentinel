@@ -319,6 +319,11 @@ sudo /opt/server-sentinel-main/current/venv/bin/python -I -m app.lifecycle_inven
   --report <private-notes-dir>/after-update.json
 ```
 
+When the deployment configures the separate private Owner-template store, add
+`--owner-template-root <owner-template-root>` to both commands. A baseline
+recorded with it fails a verification run without it (and the reverse), and
+the store database appearing or disappearing is a change.
+
 When the rolled-back release predates this tool, run the same commands with
 the newer release's interpreter under `releases/<version>/venv/bin/python`;
 both only read the runtime tree.
@@ -336,20 +341,31 @@ store treats a file with more than one link as corrupt); a per-row and a chained
 retained `security_admin_audit_records`, `integrity_audit`, `presence_audit`
 and `storage_state_audit` row; for each registered camera source its type,
 `enabled` flag, capture node, a digest of its desired capture profile and of
-its detection bindings, and a salted digest of its durable UVC approval (the
-approved vendor / product / serial / interface identity and the
-`requires_approval` / `serial_ambiguous` latches; never device paths, by-id
-aliases, topology, instance markers, session tokens or the serial itself;
-health, negotiated profile and timestamps are volatile and excluded; the
-random salt is stored in the baseline, so keep it deployment-local like the
-other digests); and Owner presence plus each principal's independent
-`live:view` / `recordings:view` grants, authorization revision and count of
-credentials that are neither revoked nor marked inconsistent, and each
+its detection bindings, and a keyed digest of its durable UVC approval (the
+identity `same_physical_camera()` compares: vendor / product / serial /
+interface for a unique serial, plus device node, topology, device number and
+instance marker for a camera without a serial or with an ambiguous one, so a
+swap to another same-model camera is a change; and the `requires_approval` /
+`serial_ambiguous` latches); the camera registry's
+`max_active_video_sources`; for a configured Owner-template store, whether its
+database exists, the enrollment generation and enrolled flag, keyed digests of
+the template and its model provenance, and per-row / chained evidence over
+`owner_template_audit`; and Owner presence plus each principal's independent
+`live:view` / `recordings:view` grants, authorization revision and, for every
+credential that is neither revoked nor marked inconsistent, a keyed digest of
+its credential ID, public key, algorithm and backup eligibility (sign count
+and backup state advance with use and are excluded), and each
 invitation's redemption and revocation state, principal revision and
 deployment generation bindings (and whether that generation is still
-current), issue and expiry times and redemption attempt count. It never writes principal external identities or display names,
+current), issue and expiry times and redemption attempt count. Keyed digests
+are HMAC-SHA-256 under a random salt drawn for each baseline and stored in it,
+so the raw values are never written and a digest cannot be matched across
+baselines; whoever holds a baseline can still test a guessed value, so keep it
+deployment-local and private. It never writes principal external identities or display names,
 credential IDs, public keys or labels, invitation or session secret/token
-digests, session identity bindings, permission-bearing URLs, media bytes, or audit row contents.
+digests, session identity bindings, permission-bearing URLs, media bytes,
+camera serials, device paths, topology or instance markers, Owner template
+bytes, embeddings or model provenance, or audit row contents.
 
 `verify` recomputes the same inventory and compares it. A missing or changed
 recording, audit row, source, principal or invitation is `failed` (exit 1);

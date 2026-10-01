@@ -15,12 +15,19 @@
   and ``storage_state_audit``), so a rewritten middle row is detected even
   when counts and boundary timestamps match;
 - per registered camera source: type, enabled flag, capture node, digests of
-  the desired capture profile and detection bindings, and a salted digest of
-  the durable UVC approval (never device facts; volatile health excluded);
+  the desired capture profile and detection bindings, and a keyed digest of
+  the durable UVC approval identity (never device facts; volatile health
+  excluded); the registry's ``max_active_video_sources``;
+- for a configured Owner-template store: whether it exists, its generation,
+  keyed digests of the template and provenance (never template bytes or
+  embeddings) and its audit rows / chain;
 - Owner presence and, per nonidentifying principal / invitation logical ID,
   the independent ``live:view`` / ``recordings:view`` grants, revocation
-  state, authorization revision, usable (unrevoked and consistent) credential
-  count, and every non-secret invitation validity field.
+  state, authorization revision, a keyed digest per usable (unrevoked and
+  consistent) credential, and every non-secret invitation validity field.
+
+Keyed digests are HMAC-SHA-256 under a random per-baseline salt stored in the
+baseline.
 
 ``verify`` recomputes the same inventory and compares it with a recorded one.
 Rows or recordings that exist only in the current state are listed as
@@ -268,21 +275,44 @@ def _audit(connection, tables) -> dict:
     }
 
 
-def _approval_digest(row, salt: str) -> str:
-    """A salted digest of the durable UVC approval, never the device facts.
+def _keyed(salt: str, value: object) -> str:
+    """HMAC-SHA-256 under the per-inventory random salt.
 
-    Only the physical identity the approval binds (vendor, product, serial,
-    interface: the strong key, or the model when there is no serial) and the
-    durable latch flags are covered. Device paths, by-id aliases, topology,
-    formats, instance markers and the session token change with re-enumeration
-    or a restart and are excluded. The per-inventory random salt keeps the
-    digest from being a stable cross-file identifier of a camera serial.
+    Used for stable but sensitive material (camera identity, credential
+    public material, the Owner template) so the baseline never holds the raw
+    value and the digest is no stable cross-file identifier. Whoever holds the
+    baseline (and so its salt) can still test a guessed value, so the file
+    stays deployment-local.
+    """
+    message = json.dumps(value, separators=(",", ":"), sort_keys=True, ensure_ascii=True)
+    return hmac.new(bytes.fromhex(salt), message.encode(), hashlib.sha256).hexdigest()
+
+
+_STRONG_IDENTITY = ("vendor", "product", "serial", "interface")
+# identity.DeviceEvidence.live_instance_key: the only identity of a camera
+# without a serial, or of one whose serial several connected cameras share.
+_LIVE_INSTANCE_IDENTITY = ("vendor", "product", "serial", "interface", "topology",
+                           "device_path", "device_number", "instance_token")
+
+
+def _approval_digest(row, salt: str) -> str:
+    """A keyed digest of the durable UVC approval, never the device facts.
+
+    It covers the identity identity.same_physical_camera() compares and the
+    durable latch flags. A unique serial binds by its strong key (vendor,
+    product, serial, interface), so a new device node or port is the same
+    camera. Without a serial, or when the serial is ambiguous, only the live
+    instance names the camera, so its node, topology, device number and
+    instance marker are covered too and a swap to another same-model camera
+    is a change. By-id aliases, advertised formats and the session token are
+    mutable or per-session and excluded.
     """
     evidence = json.loads(row["evidence"])
-    identity = [evidence.get(key) for key in ("vendor", "product", "serial", "interface")]
-    message = json.dumps(["uvc-approval-v1", identity, bool(row["requires_approval"]),
-                          bool(row["serial_ambiguous"])], separators=(",", ":"))
-    return hmac.new(bytes.fromhex(salt), message.encode(), hashlib.sha256).hexdigest()
+    ambiguous = bool(row["serial_ambiguous"])
+    strong = bool(evidence.get("serial") and evidence.get("vendor") and evidence.get("product"))
+    fields = _STRONG_IDENTITY if strong and not ambiguous else _LIVE_INSTANCE_IDENTITY
+    return _keyed(salt, ["uvc-approval-v2", [evidence.get(key) for key in fields],
+                         bool(row["requires_approval"]), ambiguous])
 
 
 def _sources(connection, tables, salt: str) -> dict | None:
@@ -318,15 +348,89 @@ def _sources(connection, tables, salt: str) -> dict | None:
         "FROM camera_sources ORDER BY id")}
 
 
-def _access(connection, tables) -> dict | None:
+def _registry_settings(connection, tables) -> dict | None:
+    if "camera_registry_settings" not in tables:
+        return None
+    row = connection.execute(
+        "SELECT max_active_video_sources FROM camera_registry_settings WHERE id = 1").fetchone()
+    return {"max_active_video_sources": None if row is None else row[0]}
+
+
+def _owner_template(root: Path | None, salt: str) -> dict:
+    """The separate private Owner-template store, as digests only.
+
+    Records whether the store was configured for this run and whether its
+    database exists, so its appearance or disappearance is a change; the
+    enrollment generation and enrolled flag; keyed digests of the template
+    and its model provenance (never the template bytes or any embedding);
+    and per-row / chained evidence over owner_template_audit.
+    """
+    if root is None:
+        return {"configured": False}
+    database = _absolute(root, "owner template root") / "owner-template.sqlite3"
+    if not os.path.lexists(database):
+        return {"configured": True, "state": "absent"}
+    try:
+        connection = _connect_read_only(database)
+    except InventoryError:
+        raise InventoryError("owner template database is unavailable") from None
+    try:
+        connection.execute("BEGIN")
+        tables = _tables(connection)
+        if not {"owner_template", "owner_template_audit"} <= tables:
+            return {"configured": True, "state": "uninitialized"}
+        row = connection.execute(
+            "SELECT generation, template, provenance FROM owner_template "
+            "WHERE singleton = 1").fetchone()
+        result = {
+            "configured": True, "state": "present",
+            "generation": None if row is None else row["generation"],
+            "enrolled": row is not None and row["template"] is not None,
+            "template_digest": None if row is None or row["template"] is None
+            else _keyed(salt, ["owner-template-v1", bytes(row["template"]).hex()]),
+            "provenance_digest": None if row is None or row["provenance"] is None
+            else _keyed(salt, ["owner-provenance-v1", row["provenance"]]),
+            "audit": _audit_table(connection, tables, "owner_template_audit",
+                                  ("id", "at", "actor", "operation", "generation"), "id"),
+        }
+        connection.execute("COMMIT")
+        return result
+    except sqlite3.Error:
+        raise InventoryError("owner template database could not be read") from None
+    finally:
+        connection.close()
+
+
+def _compare_owner_template(baseline: dict | None, current: dict | None) -> dict:
+    baseline = baseline or {"configured": False}
+    current = current or {"configured": False}
+    if not baseline["configured"] and not current["configured"]:
+        return {"status": "not_configured", "failed": []}
+    failed = [{"id": key, "reason": "changed"}
+              for key in ("configured", "state", "generation", "enrolled",
+                          "template_digest", "provenance_digest")
+              if baseline.get(key) != current.get(key)]
+    audit = None
+    if baseline.get("audit") is not None or current.get("audit") is not None:
+        audit = _compare_audit(baseline.get("audit"), current.get("audit"))
+        failed.extend({"id": f"audit:{item['id']}", "reason": item["reason"]}
+                      for item in audit["failed"])
+    return {"status": "failed" if failed else "preserved", "failed": failed,
+            "audit": audit}
+
+
+def _access(connection, tables, salt: str) -> dict | None:
     if not {"access_principals", "access_principal_permissions",
             "access_invitations", "access_credentials"} <= tables:
         return None
     principals = {}
     # Only logical IDs and authorization state: never external_identity,
     # display_name, credential IDs / keys, or secret / token digests.
+    credential_columns = _columns(connection, "access_credentials")
     consistent = (" AND inconsistent_at_us IS NULL"
-                  if "inconsistent_at_us" in _columns(connection, "access_credentials") else "")
+                  if "inconsistent_at_us" in credential_columns else "")
+    eligible = ("backup_eligible" if "backup_eligible" in credential_columns
+                else "NULL AS backup_eligible")
     generation = None
     if "access_deployment_state" in tables:
         generation = connection.execute(
@@ -340,15 +444,22 @@ def _access(connection, tables) -> dict | None:
             "SELECT permission FROM access_principal_permissions WHERE principal_id = ?",
             (row["id"],)))
         # A credential marked inconsistent is unusable, like a revoked one.
-        credentials = connection.execute(
-            "SELECT COUNT(*) FROM access_credentials "
-            "WHERE principal_id = ? AND revoked_at_us IS NULL" + consistent,
-            (row["id"],)).fetchone()[0]
+        # Each usable credential is kept as a keyed digest of its stable
+        # authentication material; the sign count and backup state advance
+        # with normal use and are excluded.
+        credentials = sorted(_keyed(salt, [
+            "credential-v1", bytes(item["credential_id"]).hex(), bytes(item["public_key"]).hex(),
+            item["algorithm"], None if item["backup_eligible"] is None
+            else bool(item["backup_eligible"])]) for item in connection.execute(
+                f"SELECT credential_id, public_key, algorithm, {eligible} FROM access_credentials "
+                "WHERE principal_id = ? AND revoked_at_us IS NULL" + consistent,
+                (row["id"],)))
         principals[row["id"]] = {
             "role": row["role"], "status": row["status"],
             "authorization_revision": row["authorization_revision"],
             "revoked": row["revoked_at_us"] is not None,
-            "permissions": permissions, "active_credential_count": credentials,
+            "permissions": permissions, "active_credential_count": len(credentials),
+            "active_credentials": credentials,
         }
     # Every non-secret field that decides whether the code can still be
     # redeemed; never the secret digest.
@@ -397,7 +508,8 @@ def _coverage(inventory: dict) -> dict:
     }
 
 
-def collect(runtime_root: Path, *, salt: str | None = None) -> dict:
+def collect(runtime_root: Path, *, salt: str | None = None,
+            owner_template_root: Path | None = None) -> dict:
     """Read the runtime tree without writing to it.
 
     ``salt`` is the baseline's approval-digest salt when verifying; a new
@@ -420,14 +532,16 @@ def collect(runtime_root: Path, *, salt: str | None = None) -> dict:
             "recordings": _recordings(connection, tables, tree.recordings),
             "audit": _audit(connection, tables),
             "camera_sources": _sources(connection, tables, salt),
-            "access": _access(connection, tables),
+            "access": _access(connection, tables, salt),
+            "camera_registry_settings": _registry_settings(connection, tables),
         }
         connection.execute("COMMIT")
     except sqlite3.Error:
         raise InventoryError("state database could not be read") from None
     finally:
         connection.close()
-    inventory["approval_salt"] = salt
+    inventory["owner_template"] = _owner_template(owner_template_root, salt)
+    inventory["inventory_salt"] = salt
     inventory["coverage"] = _coverage(inventory)
     inventory["not_applicable"] = dict(NOT_APPLICABLE)
     inventory["manual"] = dict(MANUAL)
@@ -671,6 +785,10 @@ def compare(baseline: dict, current: dict, *, declared_rewrites=()) -> dict:
             baseline["audit"].get("storage_state"), current["audit"].get("storage_state")),
         "camera_sources": _compare_keyed(baseline.get("camera_sources"),
                                          current.get("camera_sources")),
+        "camera_registry_settings": _compare_keyed(
+            baseline.get("camera_registry_settings"), current.get("camera_registry_settings")),
+        "owner_template": _compare_owner_template(baseline.get("owner_template"),
+                                                  current.get("owner_template")),
         "access_principals": _compare_keyed(access_base.get("principals"),
                                             access_now.get("principals")),
         "access_invitations": _compare_keyed(access_base.get("invitations"),
@@ -812,7 +930,7 @@ def _summary_verify(report: dict) -> list[str]:
         preserved = section.get("preserved_rows", len(section.get("preserved", [])))
         lines.append(
             f"{name}: {section['status']} preserved={preserved} "
-            f"failed={len(section['failed'])} appended={len(section['appended'])} "
+            f"failed={len(section['failed'])} appended={len(section.get('appended', []))} "
             f"declared_rewrites={len(section.get('declared_rewrites', []))}")
     for key in report["empty_coverage"]:
         lines.append(f"coverage {key}: empty (not counted as preserved)")
@@ -822,7 +940,7 @@ def _summary_verify(report: dict) -> list[str]:
 
 
 def _baseline_salt(baseline) -> str:
-    salt = baseline.get("approval_salt") if isinstance(baseline, dict) else None
+    salt = baseline.get("inventory_salt") if isinstance(baseline, dict) else None
     if not isinstance(salt, str) or len(salt) != 64 or any(
             character not in "0123456789abcdef" for character in salt):
         raise InventoryError("baseline is not a lifecycle inventory")
@@ -837,10 +955,14 @@ def main(arguments: list[str] | None = None) -> int:
     record = commands.add_parser("record")
     record.add_argument("--runtime-root", type=Path, required=True)
     record.add_argument("--output", type=Path, required=True)
+    owner_help = ("the private Owner-template store directory, when the deployment configures "
+                  "one; give it to both record and verify")
+    record.add_argument("--owner-template-root", type=Path, help=owner_help)
     verify = commands.add_parser("verify")
     verify.add_argument("--runtime-root", type=Path, required=True)
     verify.add_argument("--baseline", type=Path, required=True)
     verify.add_argument("--report", type=Path)
+    verify.add_argument("--owner-template-root", type=Path, help=owner_help)
     verify.add_argument("--declared-rewrite", action="append", default=[],
                         metavar="RECORDING_LOGICAL_ID")
     args = parser.parse_args(arguments)
@@ -848,7 +970,7 @@ def main(arguments: list[str] | None = None) -> int:
         if args.command == "record":
             # Validate the destination before reading anything.
             safe_output_path(args.output, args.runtime_root)
-            inventory = collect(args.runtime_root)
+            inventory = collect(args.runtime_root, owner_template_root=args.owner_template_root)
             write_private(args.output, args.runtime_root, inventory)
             print("\n".join(_summary_record(inventory)))
             empty = any(value != "present" for value in inventory["coverage"].values())
@@ -859,8 +981,9 @@ def main(arguments: list[str] | None = None) -> int:
             baseline = json.loads(_absolute(args.baseline, "baseline").read_text())
         except (OSError, ValueError):
             raise InventoryError("baseline could not be read") from None
-        report = compare(baseline, collect(args.runtime_root, salt=_baseline_salt(baseline)),
-                         declared_rewrites=args.declared_rewrite)
+        current = collect(args.runtime_root, salt=_baseline_salt(baseline),
+                          owner_template_root=args.owner_template_root)
+        report = compare(baseline, current, declared_rewrites=args.declared_rewrite)
         if args.report is not None:
             write_private(args.report, args.runtime_root, report)
         print("\n".join(_summary_verify(report)))

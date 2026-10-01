@@ -17,6 +17,7 @@ import unittest
 from uuid import UUID, uuid4
 
 from app import lifecycle_inventory as inventory
+from app.detection.owner import store as owner_store
 from app.storage.database import Database
 from app.storage.migrations import migrate
 from app.storage.schema import APPLICATION_MIGRATIONS
@@ -198,11 +199,28 @@ class LifecycleInventoryTests(unittest.TestCase):
     def tearDown(self):
         self._directory.cleanup()
 
-    def record(self, name="baseline.json") -> tuple[int, Path]:
+    def record(self, name="baseline.json", *extra: str) -> tuple[int, Path]:
         output = self.notes / name
         code, _, _ = run("record", "--runtime-root", str(self.runtime.root),
-                         "--output", str(output))
+                         "--output", str(output), *extra)
         return code, output
+
+    def owner_template_root(self, *, template: bytes | None = None) -> Path:
+        """A synthetic Owner-template store; the bytes are a generated marker."""
+        root = self.base / "owner-template"
+        root.mkdir(mode=0o700, exist_ok=True)
+        with closing(sqlite3.connect(root / "owner-template.sqlite3",
+                                     isolation_level=None)) as connection:
+            migrate(connection, owner_store._MIGRATIONS)
+            if template is not None:
+                connection.execute(
+                    "UPDATE owner_template SET generation=1, template=?, "
+                    "provenance='synthetic-provenance-marker' WHERE singleton=1", (template,))
+                for operation in ("enroll", "replace"):
+                    connection.execute(
+                        "INSERT INTO owner_template_audit(at, actor, operation, generation) "
+                        "VALUES ('2026-01-01T00:00:00+00:00', 'owner', ?, 1)", (operation,))
+        return root
 
     def verify(self, baseline: Path, *extra: str) -> tuple[int, dict, str]:
         report = self.notes / f"report-{uuid4().hex}.json"
@@ -478,6 +496,109 @@ class LifecycleInventoryTests(unittest.TestCase):
         section = report["sections"]["recordings"]
         self.assertEqual(section["in_progress_at_record"], [marked])
         self.assertIn({"id": unmarked, "reason": "changed"}, section["failed"])
+
+    def test_replaced_credential_key_with_unchanged_count_is_detected(self):
+        seeded = self.runtime.seed()
+        _, baseline = self.record()
+        # Normal use advances the sign count and backup state: not a change.
+        self.runtime.execute("UPDATE access_credentials SET sign_count=9, backup_state=1")
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_PRESERVED)
+        self.runtime.execute("UPDATE access_credentials SET public_key=X'0102' "
+                             "WHERE principal_id=?", (seeded["owner"],))
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_FAILED)
+        self.assertIn({"id": seeded["owner"], "reason": "changed"},
+                      report["sections"]["access_principals"]["failed"])
+
+    def test_live_instance_approval_swap_to_same_model_camera_is_detected(self):
+        # Without a usable serial, same_physical_camera() compares the live
+        # instance, so another same-model camera is not the approved one.
+        self.runtime.seed()
+
+        def evidence(serial, path, token) -> str:
+            return json.dumps({
+                "device_path": path, "vendor": "1d6b", "product": "0102", "serial": serial,
+                "interface": "0", "by_id": [], "topology": "synthetic-topology-a",
+                "formats": ["MJPG"], "device_number": 3, "instance_token": token})
+        cases = {"serial-less": (None, 0), "ambiguous": ("synthetic-shared-serial", 1)}
+        ids = {}
+        for label, (serial, ambiguous) in cases.items():
+            ids[label] = self.runtime.source()
+            self.runtime.execute(
+                "INSERT INTO uvc_approvals (source_id, evidence, requires_approval, "
+                "session_token, serial_ambiguous, explicit_binding) VALUES (?, ?, 0, NULL, ?, 0)",
+                (ids[label], evidence(serial, "/dev/synthetic-node-a", [1, 2, 3]), ambiguous))
+        _, baseline = self.record()
+        for label, (serial, _) in cases.items():
+            self.runtime.execute("UPDATE uvc_approvals SET evidence=? WHERE source_id=?",
+                                 (evidence(serial, "/dev/synthetic-node-b", [4, 5, 6]),
+                                  ids[label]))
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_FAILED)
+        for label in cases:
+            self.assertIn({"id": ids[label], "reason": "changed"},
+                          report["sections"]["camera_sources"]["failed"])
+        for path in self.notes.iterdir():
+            for marker in ("synthetic-node-", "synthetic-topology-a", "synthetic-shared-serial"):
+                self.assertNotIn(marker, path.read_text())
+
+    def test_camera_registry_source_limit_change_is_detected(self):
+        self.runtime.seed()
+        _, baseline = self.record()
+        self.runtime.execute("UPDATE camera_registry_settings SET max_active_video_sources=1")
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_FAILED)
+        self.assertEqual(report["sections"]["camera_registry_settings"]["failed"],
+                         [{"id": "max_active_video_sources", "reason": "changed"}])
+
+    def test_owner_template_store_is_inventoried_as_digests_only(self):
+        self.runtime.seed()
+        template = b"synthetic-owner-template-marker"
+        root = self.owner_template_root(template=template)
+        option = ("--owner-template-root", str(root))
+        _, baseline = self.record("baseline.json", *option)
+        code, report, _ = self.verify(baseline, *option)
+        self.assertEqual(code, inventory.EXIT_PRESERVED)
+        self.assertEqual(report["sections"]["owner_template"]["audit"]["preserved_rows"], 2)
+        for path in self.notes.iterdir():
+            text = path.read_text()
+            for marker in (template.decode(), template.hex(), "synthetic-provenance-marker"):
+                self.assertNotIn(marker, text, path.name)
+        # Omitting the configured store at verify is a change, not a pass.
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_FAILED)
+        database = root / "owner-template.sqlite3"
+        with closing(sqlite3.connect(database, isolation_level=None)) as connection:
+            connection.execute("UPDATE owner_template SET template=? WHERE singleton=1",
+                               (b"synthetic-other-template",))
+            connection.execute("DELETE FROM owner_template_audit WHERE id=1")
+        code, report, _ = self.verify(baseline, *option)
+        self.assertEqual(code, inventory.EXIT_FAILED)
+        failed = report["sections"]["owner_template"]["failed"]
+        self.assertIn({"id": "template_digest", "reason": "changed"}, failed)
+        self.assertIn({"id": "audit:1", "reason": "missing"}, failed)
+
+    def test_owner_template_store_appearing_or_disappearing_is_detected(self):
+        self.runtime.seed()
+        root = self.base / "owner-template"
+        root.mkdir(mode=0o700)
+        option = ("--owner-template-root", str(root))
+        _, absent = self.record("absent.json", *option)
+        self.owner_template_root()
+        code, report, _ = self.verify(absent, *option)
+        self.assertEqual(code, inventory.EXIT_FAILED)
+        self.assertIn({"id": "state", "reason": "changed"},
+                      report["sections"]["owner_template"]["failed"])
+        _, present = self.record("present.json", *option)
+        (root / "owner-template.sqlite3").unlink()
+        code, report, _ = self.verify(present, *option)
+        self.assertEqual(code, inventory.EXIT_FAILED)
+        # Unconfigured on both sides is reported as such, never failed.
+        _, unconfigured = self.record("unconfigured.json")
+        code, report, _ = self.verify(unconfigured)
+        self.assertEqual(code, inventory.EXIT_PRESERVED)
+        self.assertEqual(report["sections"]["owner_template"]["status"], "not_configured")
 
     def test_grant_and_revocation_state_is_preserved_by_logical_id(self):
         seeded = self.runtime.seed()
