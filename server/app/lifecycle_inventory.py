@@ -77,6 +77,7 @@ from app.audit.store import DEFAULT_RETENTION as AUDIT_RETENTION
 from app.cameras.uvc.persistence import ApprovalStore
 from app.detection.owner import store as owner_store
 from app.integrity.model import Finding, Kind, State
+from app.media.recording.model import Limits as RecordingLimits, Segment
 from app.monitoring.runtime import EVENT_NAMESPACE
 from app.presence.delivery import ActionResult
 from app.presence.service import PresenceService
@@ -104,6 +105,24 @@ NOT_INVENTORIED = (
     "recording_source_discontinuities", "recording_source_cursors",
     "roi_calibration_history", "notification_events", "uvc_approvals.session_token",
     "integrity_status", "recording_health_status",
+)
+
+# Every Main-database table the inventory reads. A table recorded present
+# must still exist at verify time, whatever its comparator does with an
+# empty or absent section (a table dropped while empty is still a loss).
+INVENTORIED_TABLES = (
+    "recordings", "recording_links", "recording_segments", "recording_discontinuities",
+    "security_admin_audit_records", "integrity_audit", "presence_audit", "storage_state_audit",
+    "camera_sources", "uvc_approvals", "detection_bindings", "camera_registry_settings",
+    "access_principals", "access_principal_permissions", "access_credentials",
+    "access_invitations", "access_deployment_state", "access_sessions",
+    "presence_timeline_gap", "presence_clock", "presence_control_clock",
+    "presence_source_clock", "presence_critical_source_clock", "presence_override",
+    "presence_completed_events", "presence_expired_unresolved", "presence_observations",
+    "presence_deliveries", "presence_source_facts", "presence_outbox_sessions",
+    "pairing_node_credentials", "pairing_enrollments", "pairing_node_renewals",
+    "pairing_key_bindings", "capture_nodes",
+    "integrity_outbox", "integrity_overflow", "notification_events", "integrity_baseline",
 )
 
 MANUAL = {
@@ -1539,6 +1558,7 @@ def collect(runtime_root: Path, *, salt: str | None = None,
         inventory = {
             "format": FORMAT, "format_version": FORMAT_VERSION,
             "schema_version": schema_version,
+            "tables": sorted(name for name in INVENTORIED_TABLES if name in tables),
             "recordings": _recordings(connection, tables),
             "audit": _audit(connection, tables),
             "camera_sources": _sources(connection, tables, salt),
@@ -1658,6 +1678,7 @@ def _valid_growth(base: dict, now: dict) -> bool:
         return False
     if not all(segment["catalog_match"] and segment["source_id"] == now["source_id"]
                and segment["start_ms"] < target and segment["end_ms"] > start
+               and _service_valid_segment(segment)
                for segment in now["segments"]):
         return False
     # The store adds markers while publishing and, on stop, drops only those
@@ -1697,6 +1718,37 @@ def _trimmed_by_stop(base: dict, now: dict, dropped: list) -> bool:
         return False
     return all(item["start_ms"] >= now["target_end_ms"] or item["end_ms"] <= now["start_ms"]
                for item in dropped)
+
+
+# Segment.validate() with the configuration-independent bounds: the hard
+# 20-minute segment ceiling Limits itself enforces and no byte ceiling (the
+# deployment's stricter recording_limits are not read here).
+_SEGMENT_BOUNDS = RecordingLimits(pre_roll_bytes=1, max_segment_bytes=2**63 - 1,
+                                  max_segment_ms=1_200_000, max_active_recordings=1,
+                                  max_spool_segments=1, max_segments_per_recording=1)
+
+
+def _service_valid_segment(segment: dict) -> bool:
+    """Whether a linked segment passes RecordingStore.append()'s own check.
+
+    The catalog row is rebuilt as the Segment the store validated (UUID
+    source, stream and capture node, sequence and timeline bounds, a
+    positive duration, codec / container names) and Segment.validate() runs
+    on it; the media bytes are represented by their positive byte length,
+    whose file the catalog match already ties to the stored digest.
+    """
+    catalog = segment["catalog"]
+    try:
+        Segment(source_id=UUID(segment["source_id"]), stream_id=UUID(catalog["stream_id"]),
+                sequence=catalog["sequence"], start_ms=segment["start_ms"],
+                end_ms=segment["end_ms"], codec=catalog["codec"],
+                container=catalog["container"], data=b"\0",
+                capture_node_id=(None if catalog["capture_node_id"] is None
+                                 else UUID(catalog["capture_node_id"]))
+                ).validate(_SEGMENT_BOUNDS)
+    except (ValueError, TypeError, AttributeError):
+        return False
+    return type(catalog["byte_length"]) is int and catalog["byte_length"] > 0
 
 
 def _expected_ended(now: dict) -> int | None:
@@ -1830,6 +1882,12 @@ def _compare_audit(baseline: dict | None, current: dict | None, expired=None) ->
     rule at verify time; a missing row it accepts is listed under
     ``retention_expired`` and never counted as preserved.
     """
+    if baseline is not None and current is None:
+        # The table existed at record time and is gone or unreadable now,
+        # even if it was empty then.
+        return {"status": "failed", "preserved_rows": 0,
+                "failed": [{"id": None, "reason": "table_missing"}],
+                "appended": [], "chain_match": None, "retention_expired": []}
     if not baseline or not baseline["rows"]:
         return {"status": "empty", "preserved_rows": 0, "failed": [],
                 "appended": [row[0] for row in (current or {"rows": []})["rows"]],
@@ -1910,7 +1968,14 @@ def compare(baseline: dict, current: dict, *, declared_rewrites=(), now=None) ->
     access_owner = any(item["role"] == "owner"
                        for item in (access_now.get("principals") or {}).values())
     rules = _retention_rules(now or _utcnow())
+    recorded_tables = baseline.get("tables")
+    present = set(current.get("tables") or ())
+    table_failures = ([{"id": None, "reason": "unverifiable"}] if recorded_tables is None else
+                      [{"id": name, "reason": "table_missing"}
+                       for name in recorded_tables if name not in present])
     sections = {
+        "tables": {"status": "failed" if table_failures else "preserved",
+                   "failed": table_failures, "preserved": sorted(set(recorded_tables or ()) & present)},
         "recordings": _compare_recordings(baseline.get("recordings"),
                                           current.get("recordings"), declared=declared,
                                           retention_cutoff_ms=rules["recording_cutoff_ms"]),

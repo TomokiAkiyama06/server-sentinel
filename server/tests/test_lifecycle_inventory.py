@@ -38,6 +38,12 @@ CREDENTIAL_LABEL = "synthetic-credential-label-marker"
 BINDING_DIGEST = bytes(range(64, 96))
 
 
+def stream(label: str) -> str:
+    """The stream UUID a synthetic stream label stands for (RecordingStore
+    writes str(UUID) stream identities)."""
+    return str(uuid5(EVENT_NAMESPACE, "synthetic-stream:" + label))
+
+
 class Runtime:
     """A disposable runtime tree: state/state.sqlite3 plus recordings/."""
 
@@ -62,8 +68,8 @@ class Runtime:
         self.execute(
             "INSERT INTO recording_segments (id, source_id, stream_id, sequence, start_ms, "
             "end_ms, codec, container, byte_length, sha256, state, spool) "
-            "VALUES (?, ?, 's', ?, 0, 10000, 'synthetic', 'deflate', ?, ?, 'ready', 0)",
-            (segment_id, source_id, self.clock, len(payload),
+            "VALUES (?, ?, ?, ?, 0, 10000, 'synthetic', 'deflate', ?, ?, 'ready', 0)",
+            (segment_id, source_id, stream("s"), self.clock, len(payload),
              hashlib.sha256(payload).hexdigest()))
         self.clock += 1
         self.execute(
@@ -82,6 +88,7 @@ class Runtime:
         as the recording store only links source-matched overlapping media,
         and continuing the latest linked segment's stream (no marker due)."""
         segment_id = str(uuid4())
+        stream_id = stream(stream_id)
         with closing(sqlite3.connect(self.database)) as connection:
             if source_id is None:
                 source_id = connection.execute(
@@ -633,6 +640,26 @@ class LifecycleInventoryTests(unittest.TestCase):
                 result = report["sections"][section]
                 self.assertEqual(result["retention_expired"], [], table)
                 self.assertIn({"id": None, "reason": "table_missing"}, result["failed"], table)
+
+    def test_dropping_any_inventoried_table_while_empty_fails(self):
+        # Codex P1: a table recorded present must still exist, even when it
+        # held no rows at record time, whatever its section comparator does
+        # with an empty baseline.
+        outcomes = {}
+        for index, table in enumerate(inventory.INVENTORIED_TABLES):
+            runtime = Runtime(self.base / f"empty-drop-{index}")
+            saved, self.runtime = self.runtime, runtime
+            try:
+                runtime.execute(f"DELETE FROM {table}")
+                _, baseline = self.record(f"empty-drop-{index}.json")
+                runtime.execute(f"DROP TABLE {table}")
+                code, report, _ = self.verify(baseline)
+            finally:
+                self.runtime = saved
+            outcomes[table] = (code, {"id": table, "reason": "table_missing"}
+                               in report["sections"]["tables"]["failed"])
+        self.assertEqual({table: outcome for table, outcome in outcomes.items()
+                          if outcome != (inventory.EXIT_FAILED, True)}, {})
 
     def test_presence_and_storage_audit_rows_are_preserved(self):
         self.runtime.seed()
@@ -3036,6 +3063,43 @@ class LifecycleInventoryTests(unittest.TestCase):
         self.assertIn({"id": active, "reason": "catalog_mismatch"}, section["failed"])
         self.assertNotIn(active, section["preserved"])
         self.assertEqual(section["in_progress_at_record"], [])
+
+    def test_in_progress_growth_requires_segments_the_store_would_accept(self):
+        # Codex P1: RecordingStore.append() runs Segment.validate(); a linked
+        # segment it would refuse (here: no positive duration, over the
+        # 20-minute ceiling, bad codec / container names, non-UUID stream or
+        # capture node, a negative sequence, no bytes) is not valid growth.
+        self.runtime.seed()
+        cases = {
+            "valid": {},
+            "zero-duration": {"start_ms": 22000, "end_ms": 22000},
+            "over-ceiling": {"start_ms": 22000, "end_ms": 22000 + 1_200_001},
+            "codec": {"sql": "codec='Bad Codec'"},
+            "container": {"sql": "container=''"},
+            "stream": {"sql": "stream_id='not-a-uuid'"},
+            "capture-node": {"sql": "capture_node_id='not-a-uuid'"},
+            "sequence": {"sql": "sequence=-1"},
+            "empty": {"payload": b""},
+        }
+        ids = {}
+        for label, change in cases.items():
+            ids[label] = self.runtime.recording(starred=False, payload=b"generated-" +
+                                                label.encode(), status="active",
+                                                target_end_ms=30000)
+        _, baseline = self.record()
+        for label, change in cases.items():
+            segment = self.runtime.add_segment(
+                ids[label], change.get("payload", b"generated-appended-" + label.encode()),
+                start_ms=change.get("start_ms", 12000), end_ms=change.get("end_ms", 20000))
+            if "sql" in change:
+                self.runtime.execute(f"UPDATE recording_segments SET {change['sql']} WHERE id=?",
+                                     (segment,))
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_FAILED)
+        section = report["sections"]["recordings"]
+        self.assertEqual(section["in_progress_at_record"], [ids["valid"]])
+        for label in list(cases)[1:]:
+            self.assertIn({"id": ids[label], "reason": "changed"}, section["failed"], label)
 
     def test_extra_hard_link_to_a_segment_is_detected(self):
         # RecordingStore._integrity() treats st_nlink != 1 as corrupt.

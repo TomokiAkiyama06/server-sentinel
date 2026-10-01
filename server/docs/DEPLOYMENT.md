@@ -508,7 +508,9 @@ covering them.
 
 `verify` reads the baseline only if it is still a private `0600` regular file
 (not a symlink) owned by the invoking user or root, and refuses otherwise.
-It recomputes the same inventory and compares it. A missing or changed
+It recomputes the same inventory and compares it. Every Main table the
+inventory reads that existed at record time must still exist, even if it was
+empty then (a dropped one is `table_missing` in the `tables` section). A missing or changed
 recording, audit row, source, principal or invitation is `failed` (exit 1);
 rows and recordings that exist only now are listed as `appended` and are never
 counted as preserved. The one exception for missing rows is the service's own
@@ -551,7 +553,11 @@ newly published segment that does not continue the previous linked segment's
 stream and sequence (from that segment's end to the new segment's start, one
 per such publication, none missing), every newly linked segment must pass the
 store's timeline guard (start no earlier than the previous segment's end, no
-repeated or rewound sequence on the same stream), every segment it already had must be
+repeated or rewound sequence on the same stream) and the store's own
+`Segment.validate()` (UUID source / stream / capture node, a positive
+duration within the 20-minute segment ceiling, valid codec and container
+names, a non-negative sequence and a non-empty file; the deployment's
+stricter configured limits are not read), every segment it already had must be
 identical except that a stop which closes the recording as `complete` or
 `gapped` at an earlier target may drop the segments starting at or after that
 target, as `RecordingStore.finish()` does (never for a starred or critical
