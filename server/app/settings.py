@@ -54,6 +54,15 @@ class Settings:
     def database_path(self) -> Path:
         return self.data_directory / "state.sqlite3"
 
+    @property
+    def session_binding_key_path(self) -> Path:
+        """Deployment-local HMAC key for proxy-identity session bindings.
+
+        Kept outside the database (ADR-0003/ADR-0004) and loaded or created
+        with mode 0600 by ``app.auth.session_binding.SessionBindingKey``.
+        """
+        return self.data_directory / "session-binding.key"
+
     @classmethod
     def from_env(cls, environ: Mapping[str, str] | None = None, *,
                  source_root: Path | None = None) -> "Settings":

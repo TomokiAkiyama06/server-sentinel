@@ -549,6 +549,43 @@ class DistributionTests(DeploymentCase):
             self.assertFalse(any("test" in name or name.endswith(".pyc")
                                  for name in archive.namelist()))
 
+    def test_capture_sandbox_helper_runs_from_the_installed_artifact_file(self):
+        # Inside the zipapp ``uvc_sandbox.__file__`` is a pseudo-path that no
+        # trust check can stat; the helper must be the artifact file itself.
+        version = self.root / "installation" / "0.1.0"
+        version.mkdir(parents=True)
+        artifact = version / "media-capture-agent"
+        build(artifact, version="0.1.0", source_commit="a" * 40)
+        probe = ("import sys; sys.path.insert(0, sys.argv[1]); "
+                 "from media_capture_agent import uvc_pipeline as p; "
+                 "print(p.SANDBOX_HELPER); print(' '.join(p.SANDBOX_HELPER_ARGS))")
+        result = subprocess.run([sys.executable, "-I", "-S", "-c", probe, str(artifact)],
+                                capture_output=True, text=True, check=True, cwd="/", timeout=10)
+        helper, helper_args = result.stdout.splitlines()
+        self.assertEqual(helper, str(artifact.resolve()))
+        self.assertTrue(Path(helper).is_file())
+        self.assertEqual(helper_args, "--uvc-sandbox")
+        # The archive entry dispatches to the sandbox (which refuses an invalid
+        # command with its own exit status) before any agent CLI code runs.
+        refused = subprocess.run([sys.executable, "-I", "-S", "-B", str(artifact),
+                                  "--uvc-sandbox", "--device-fd", "x", "--", "/bin/true"],
+                                 capture_output=True, cwd="/", timeout=10)
+        self.assertEqual(refused.returncode, 126)
+        self.assertEqual(refused.stdout, b"")
+        from media_capture_agent import uvc_sandbox
+        if uvc_sandbox.abi_version() < 1:
+            return
+        descriptor = os.open(os.devnull, os.O_RDONLY | os.O_CLOEXEC)
+        self.addCleanup(os.close, descriptor)
+        confined = subprocess.run([sys.executable, "-I", "-S", "-B", str(artifact),
+                                   "--uvc-sandbox", "--device-fd", str(descriptor), "--",
+                                   "/bin/sh", "-c", "cat /etc/passwd"],
+                                  capture_output=True, cwd="/", timeout=10,
+                                  pass_fds=(descriptor,))
+        # Landlock applied: the shell ran but could not read outside the allow list.
+        self.assertNotEqual(confined.returncode, 126)
+        self.assertNotEqual(confined.returncode, 0)
+
     def test_artifact_fifo_device_symlink_and_oversize_are_rejected_before_read(self):
         fifo = self.root / "artifact.fifo"
         os.mkfifo(fifo, mode=0o600)

@@ -315,6 +315,96 @@ Capture Node acceptance.
 
 MVP agent capture is video-only. Do not open microphone/audio devices. No event/detection logic depends on audio.
 
+### 5.3.1 Agent UVC capture adapter
+
+`agent/media_capture_agent/uvc_capture.py` implements the Agent `Capture`
+interface for 1–4 approved local UVC sources. Identity/discovery rules are a
+standalone port of the Main local adapter (§4): only a unique serial reconnects
+automatically, duplicate serials and every non-serial model match require Owner
+re-approval, and a durable approval/ambiguity latch plus active-session marker
+under the private `runtime_root` makes an unclean exit require re-approval.
+Discovery with any unreadable video node never binds a camera
+(`discovery_failed`). Two sources resolving to one device both require Owner
+re-approval.
+
+Capture runs one bounded subprocess pipeline per bound source behind an
+injectable launcher. The production launcher executes an operator-installed,
+root-controlled `gst-launch-1.0` restricted to `v4l2src ! image/jpeg,<explicit
+profile> ! fdsink fd=1`; the V4L2 descriptor opened and identity-rechecked by the
+Agent is passed to the child (`device=/proc/self/fd/N`) instead of a
+`/dev/videoN` path. Because GStreamer's `video4linux2` plugin opens every
+`/dev/video*` node read-write while it initializes (a device probe no option
+disables), the child is started through an unprivileged Landlock helper
+(`uvc_sandbox.py`) that denies all filesystem access except read/execute of
+system libraries, the executable and the two plugin files, and read/write/ioctl
+of the one approved device inode (plus TCP bind/connect where the kernel's
+Landlock ABI supports it); every other video node, `/dev`, `/sys`, `/run`, home
+and runtime directories are unreachable. Only `coreelements` and `video4linux2`
+are loaded (`--gst-plugin-load`, empty plugin search paths, registry cache
+disabled, no `gst-plugin-scanner`), so no audio plugin is ever loaded. Without
+Landlock the launcher refuses to run (fail closed). The helper file and the
+Python interpreter that runs it are checked like the executable and plugins
+(root-owned, not group/world writable, including parent directories) at every
+start, and the resolved interpreter path is executed. From the installed zipapp
+release the helper is the root-installed artifact file itself (its entry point
+dispatches a fixed `--uvc-sandbox` argument to the stdlib-only helper before any
+other agent module is imported), because a path inside the archive can be
+neither trust-checked nor executed. Residual limits: on
+Landlock ABI 4 ioctls on already reachable files are not restricted (ABI 5+
+limits device ioctls to the approved inode), abstract UNIX socket and signal
+scoping needs ABI 6+, and Landlock does not control UDP or connecting to a
+pathname UNIX socket; plugin selection is enforced by the fixed argv and
+environment, not by the kernel, because `/usr` stays readable. The child gets a minimal
+environment, its own process group, no stdin, discarded stderr, and is
+terminated with SIGTERM then SIGKILL of the whole group before reaping. MJPEG output is split structurally into complete
+JPEG frames with a per-frame byte bound and queued in a bounded drop-oldest queue.
+Before starting a pipeline the Agent checks the explicit profile against the MJPEG
+frame sizes and intervals the opened approved node advertises (read-only
+`VIDIOC_ENUM_FMT`/`ENUM_FRAMESIZES`/`ENUM_FRAMEINTERVALS` on that descriptor only,
+discrete/stepwise/continuous; an offered rate within 1 % satisfies the requested
+fps and is then requested exactly, e.g. 30000/1001 for 30). A profile not offered
+is a stable `capture_unsupported` with no pipeline and no backoff relaunch until
+the device evidence changes (e.g. replug) or the Owner re-approves. While that
+verdict holds, the approved binding is kept only as long as discovery returns the
+identical evidence (same kernel device instance), so a serial-less camera stays
+`capture_unsupported` instead of becoming an ambiguous reconnect; it never
+authorizes a launch, and a replug follows the normal identity rules (a serial-less
+camera then needs Owner re-approval). A driver that
+does not implement the enumeration, or advertises a mode it then refuses, is still
+caught by pipeline negotiation (`capture_failed`). The check is not identity
+evidence.
+
+Per-source health: `manual_intervention_required` (`owner_approval_required`,
+`identity_ambiguous`, `approval_state_unavailable`); `offline` (`camera_missing`,
+`capture_failed`, `capture_unsupported`, `capture_cleanup_failed`,
+`discovery_failed`); `degraded` (`capture_starting`, `capture_overloaded`);
+`online` (`video_ready`) only while frames actually arrive without recent drops.
+Startup/stall timeouts, malformed streams and pipeline exits retry with bounded
+exponential backoff; a pipeline that cannot be reaped blocks relaunch and keeps
+the recovery marker armed, and later polls retry reaping without waiting the full
+stop bound so heartbeats are not delayed; teardowns within one poll share one
+stop bound. The process-table check that proves the group gone is itself bounded
+by that stop bound (it runs off the tick thread, so a stalled `/proc` listing or
+read cannot overrun it; at most one check per pipeline is outstanding, and a
+retry-only poll only polls an outstanding check instead of waiting for it); a check
+that cannot finish in time counts as not reaped. Discovery scans and the capture-node
+open/close run off the tick thread and share one `device_timeout` per poll, so
+the heartbeat is delayed by at most `device_timeout + stop_timeout` regardless
+of how many sources hang; a hung driver call yields
+`discovery_failed`/`capture_failed` instead of stopping the heartbeat, starts no
+additional worker while still blocked, and a late descriptor is closed unused.
+If no close worker can start, the descriptor is retained for a bounded retry and
+the source reports `capture_cleanup_failed` instead of the failure escaping; a
+close that started but exceeded the bound also reports `capture_cleanup_failed`
+(relaunch and re-approval blocked) until the worker returns. Shutdown grants a
+still-blocked open/close one more `device_timeout` and otherwise fails, keeping
+the recovery marker armed.
+Queue drops are latched until one `capture_overloaded` snapshot has reported
+them, even when polls are slower than the stall window.
+Node health is unaffected by any source failure.
+Wiring into the production CLI, the Owner approval route (#13/#14), ring
+storage (#16) and transport (#15) is separate work.
+
 ### 5.4 Pairing
 
 Preferred flow:
@@ -1179,7 +1269,16 @@ session stores only the keyed binding described above. Each later request
 canonicalizes the newly verified identity, recomputes the binding and compares
 it in constant time; a mismatch is refused. The deployment-local HMAC secret is
 kept outside the database and is unrelated to Tailscale administrative
-credentials. Sign-out, idle/absolute expiry and revocation clear the binding and
+credentials. The refusal applies to that request only: the session is not
+revoked or moved to step-up on a mismatch, since under the shared account a
+mismatch cannot identify anyone. The mismatch is audited without any identity
+or binding value, at most once per session per ten minutes with the remainder
+counted on the session, and an audit failure still denies (Owner decision,
+2026-09-30; details in `server/app/auth/README.md`). Invitations carry no proxy
+identity, and `external_identity` is neither unique nor compared with the
+supplied identity: the enrollment code selects the invitation and the
+credential selects the principal, so several people behind one shared login
+each register and sign in with their own passkey. Sign-out, idle/absolute expiry and revocation clear the binding and
 invalidate the record, so a retained cookie or token authorizes nothing
 afterwards; the binding is never shown in the UI or included in diagnostics or
 exports. §11.5

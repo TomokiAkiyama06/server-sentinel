@@ -18,6 +18,7 @@ from app.audit import (
 )
 from app.audit.integration import AccessAdministration
 from app.auth.model import AccessValidationError, Permission, PrincipalStatus
+from app.auth.session_binding import SessionBindingKey
 from app.auth.store import AccessStorageError, AccessStore, UnauditedAccessWriteError
 from app.cameras.remote_agent.pairing import (
     HmacCodeVerifier, PairingAuthorizationError, PairingError, PairingLedger,
@@ -114,11 +115,12 @@ class _Base(unittest.TestCase):
 class AccessAuditTests(_Base):
     def setUp(self):
         super().setUp()
-        self.access = AccessStore(self.database, clock=lambda: NOW, audit=self.audit)
+        self.access = AccessStore(self.database, clock=lambda: NOW, audit=self.audit,
+                                  session_binding=SessionBindingKey.generate())
         self.admin = AccessAdministration(self.service, self.access)
 
     def invite_and_redeem(self, permissions=(Permission.LIVE_VIEW,)):
-        principal = self.admin.invite(OWNER_CONTEXT, IDENTITY, DISPLAY, permissions)
+        principal = self.admin.invite(OWNER_CONTEXT, DISPLAY, permissions)
         self.admin.issue_invitation(OWNER_CONTEXT, principal.id, SECRET, NOW + timedelta(minutes=5))
         credential = self.access.enroll_credential(SECRET, IDENTITY, CREDENTIAL, PUBLIC_KEY, -7, 0)
         return principal, credential
@@ -145,23 +147,23 @@ class AccessAuditTests(_Base):
 
     def test_credential_revocation_ends_only_that_credentials_sessions(self):
         principal, credential = self.invite_and_redeem()
-        self.access.establish_session(principal.id, credential.credential_id, TOKEN)
+        self.access.establish_session(principal.id, credential.credential_id, TOKEN, proxy_identity=IDENTITY)
         self.admin.revoke_credential(OWNER_CONTEXT, principal.id, credential.credential_id)
         with self.assertRaises(AccessValidationError):
             self.access.authorize(TOKEN, IDENTITY, Permission.LIVE_VIEW)
         with self.assertRaises(AccessValidationError):
-            self.access.establish_session(principal.id, credential.credential_id, b"n" * 32)
+            self.access.establish_session(principal.id, credential.credential_id, b"n" * 32, proxy_identity=IDENTITY)
         with self.assertRaises(AccessValidationError):
             self.admin.revoke_credential(OWNER_CONTEXT, principal.id, credential.credential_id)
         self.assertEqual(self.records()[-1].outcome, AuditOutcome.FAILED)
 
     def test_non_owner_owner_only_operations_are_denied_audited_and_not_run(self):
         principal, credential = self.invite_and_redeem()
-        self.access.establish_session(principal.id, credential.credential_id, TOKEN)
+        self.access.establish_session(principal.id, credential.credential_id, TOKEN, proxy_identity=IDENTITY)
         before = len(self.records())
         operations = (
             (AuditAction.INVITE_PRINCIPAL,
-             lambda actor: self.admin.invite(actor, "other@example.invalid", "Other", ())),
+             lambda actor: self.admin.invite(actor, "Other", ())),
             (AuditAction.ISSUE_PRINCIPAL_INVITATION,
              lambda actor: self.admin.issue_invitation(actor, principal.id, b"x" * 32,
                                                        NOW + timedelta(minutes=5))),
@@ -196,15 +198,15 @@ class AccessAuditTests(_Base):
     def test_plain_permission_error_is_classified_without_its_detail(self):
         admin = AccessAdministration(OwnerAuditService(self.audit, PlainDenial()), self.access)
         with self.assertRaises(OwnerAuthorizationError):
-            admin.invite(OWNER_CONTEXT, IDENTITY, DISPLAY, ())
+            admin.invite(OWNER_CONTEXT, DISPLAY, ())
         self.assertEqual(self.records()[-1].actor_category, ActorCategory.UNAUTHENTICATED)
         self.assertNotIn(IDENTITY, self.audit_text())
         self.assertEqual(self.count("SELECT count(*) FROM access_principals"), 0)
 
     def test_owner_only_wrappers_refuse_outside_the_audited_boundary(self):
-        principal = self.admin.invite(OWNER_CONTEXT, IDENTITY, DISPLAY, ())
+        principal = self.admin.invite(OWNER_CONTEXT, DISPLAY, ())
         calls = (
-            lambda: self.access.invite("other@example.invalid", "Other", ()),
+            lambda: self.access.invite("Other", ()),
             lambda: self.access.issue_enrollment(principal.id, SECRET, NOW + timedelta(minutes=5)),
             lambda: self.access.set_permissions(principal.id, (Permission.LIVE_VIEW,)),
             lambda: self.access.revoke_principal(principal.id),
@@ -218,21 +220,21 @@ class AccessAuditTests(_Base):
 
     def test_audit_write_failure_rolls_back_owner_mutation(self):
         principal, credential = self.invite_and_redeem()
-        self.access.establish_session(principal.id, credential.credential_id, TOKEN)
+        self.access.establish_session(principal.id, credential.credential_id, TOKEN, proxy_identity=IDENTITY)
         _fail_audit_inserts(self.database)
         with self.assertRaises(Exception):
             self.admin.set_permissions(OWNER_CONTEXT, principal.id, (Permission.RECORDINGS_VIEW,))
         with self.assertRaises(Exception):
             self.admin.revoke_principal(OWNER_CONTEXT, principal.id)
         with self.assertRaises(Exception):
-            self.admin.invite(OWNER_CONTEXT, "other@example.invalid", "Other", ())
+            self.admin.invite(OWNER_CONTEXT, "Other", ())
         self.assertEqual(self.access.authorize(TOKEN, IDENTITY, Permission.LIVE_VIEW).id, principal.id)
         self.assertEqual(self.count("SELECT count(*) FROM access_principals"), 1)
         # The separate failure records were also refused, and that loss is visible.
         self.assertTrue(self.service.audit_delivery_failed)
 
     def test_audit_write_failure_rolls_back_invitation_redemption(self):
-        principal = self.admin.invite(OWNER_CONTEXT, IDENTITY, DISPLAY, ())
+        principal = self.admin.invite(OWNER_CONTEXT, DISPLAY, ())
         self.admin.issue_invitation(OWNER_CONTEXT, principal.id, SECRET, NOW + timedelta(minutes=5))
         _fail_audit_inserts(self.database)
         with self.assertRaises(AccessStorageError):
@@ -242,11 +244,11 @@ class AccessAuditTests(_Base):
         self.assertEqual(self.count("SELECT count(*) FROM access_principals WHERE status='invited'"), 1)
 
     def test_redemption_audit_failure_is_visible_but_unmatched_attempts_are_not(self):
-        principal = self.admin.invite(OWNER_CONTEXT, IDENTITY, DISPLAY, ())
+        principal = self.admin.invite(OWNER_CONTEXT, DISPLAY, ())
         self.admin.issue_invitation(OWNER_CONTEXT, principal.id, SECRET, NOW + timedelta(minutes=5))
         before = len(self.records())
         _fail_audit_inserts(self.database)
-        for secret, identity in ((b"u" * 32, IDENTITY), (SECRET, "other@example.invalid")):
+        for secret, identity in ((b"u" * 32, IDENTITY), (SECRET, None)):
             with self.assertRaises(AccessValidationError):
                 self.access.enroll_credential(secret, identity, CREDENTIAL, PUBLIC_KEY, -7, 0)
         self.assertFalse(self.access.audit_delivery_failed)
@@ -262,7 +264,7 @@ class AccessAuditTests(_Base):
         self.assertEqual(len(self.records()), before)
 
     def test_redemption_storage_refusal_before_match_is_not_counted(self):
-        principal = self.admin.invite(OWNER_CONTEXT, IDENTITY, DISPLAY, ())
+        principal = self.admin.invite(OWNER_CONTEXT, DISPLAY, ())
         self.admin.issue_invitation(OWNER_CONTEXT, principal.id, SECRET, NOW + timedelta(minutes=5))
         self.reservation.refuse = True
         with self.assertRaises(RuntimeError):
@@ -274,7 +276,7 @@ class AccessAuditTests(_Base):
         self.assertEqual(self.access.undelivered_audit_records, 0)
 
     def test_redemption_is_admitted_by_storage_reservation_and_requires_audit(self):
-        principal = self.admin.invite(OWNER_CONTEXT, IDENTITY, DISPLAY, ())
+        principal = self.admin.invite(OWNER_CONTEXT, DISPLAY, ())
         self.admin.issue_invitation(OWNER_CONTEXT, principal.id, SECRET, NOW + timedelta(minutes=5))
         self.reservation.refuse = True
         with self.assertRaises(RuntimeError):
@@ -288,10 +290,10 @@ class AccessAuditTests(_Base):
         self.assertEqual(self.count("SELECT count(*) FROM access_credentials"), 1)
 
     def test_rejected_redemption_records_nothing(self):
-        principal = self.admin.invite(OWNER_CONTEXT, IDENTITY, DISPLAY, ())
+        principal = self.admin.invite(OWNER_CONTEXT, DISPLAY, ())
         self.admin.issue_invitation(OWNER_CONTEXT, principal.id, SECRET, NOW + timedelta(minutes=5))
         before = len(self.records())
-        for secret, identity in ((b"u" * 32, IDENTITY), (SECRET, "other@example.invalid")):
+        for secret, identity in ((b"u" * 32, IDENTITY), (SECRET, None)):
             with self.assertRaises(AccessValidationError):
                 self.access.enroll_credential(secret, identity, CREDENTIAL, PUBLIC_KEY, -7, 0)
         self.assertEqual(len(self.records()), before)

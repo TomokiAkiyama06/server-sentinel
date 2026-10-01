@@ -102,6 +102,21 @@ class IntegrityStore:
                            for item in data["components"])
         return row["revision"], Inventory(components, frozenset(Kind(kind) for kind in data["unavailable"]))
 
+    def latest(self) -> tuple[tuple[Finding, ...], bool] | None:
+        """Latest identifier-free verdicts and whether delivery is blocked.
+
+        Read-only and value-free: only fixed category/state findings are
+        returned, never baseline observations, serials, UUIDs or paths.
+        """
+        self._check()
+        row = self.db.execute(
+            "SELECT findings,delivery_blocked FROM integrity_status WHERE singleton=1").fetchone()
+        if row is None:
+            return None
+        findings = tuple(Finding(Kind(item["kind"]), State(item["state"]), item["reason"])
+                         for item in json.loads(row["findings"]))
+        return findings, bool(row["delivery_blocked"])
+
     def control_reservation(self):
         """Reserve storage for one caller-owned audited approval transaction."""
         self._check()
