@@ -388,7 +388,8 @@ start, latest time and loss counts; it is cleared only by an audited Owner
 action, so verification fails if it disappears or shrinks); the durable
 presence state whose loss would replay, duplicate or hide critical work, each
 allowed only the transitions the presence service performs: completed-event
-tombstones and expired-unresolved markers (kept; marker counts may only rise),
+tombstones and expired-unresolved markers (kept; a new tombstone and every
+added marker event must come from an Owner release below),
 retained observations as keyed digests (never their content) with their
 delivery jobs and source-fact digests (Main does not run timeline expiry, so
 an observation may leave only through the Owner's audited release of
@@ -449,10 +450,10 @@ staged at record time to be gone; a node is treated as revoked since the
 record when one of its recorded open enrollments became revoked (or one
 created since is revoked), one of its
 bindings became revoked, or its active credential became revoked, and then
-all of its recorded bindings and the keys of its newly revoked enrollments
-must be revoked, none of its recorded open enrollments may still be open,
-and its credential must be revoked (its key too) or hold the key of a
-re-pairing since the record; because revoke() refuses a node with nothing to
+every binding of the node (recorded or added since) must be revoked, no
+enrollment of it may be pending or consumed, and its credential must stay
+revoked (a revoked node is re-paired as a new node with a new key, Owner
+decision 2026-10-01, which is what the approve command does); because revoke() refuses a node with nothing to
 revoke, the node must also have had an active credential or an open
 enrollment for it to revoke; a revoked credential stays revoked with the
 same material; an active one stays, becomes the renewal staged at record
@@ -469,8 +470,9 @@ unchanged, is replaced by a key newly bound since the record, or leaves by
 promotion, revocation or a fresh pairing; a credential first seen now needs a
 fresh pairing of its key. Three ledger-reachable cases fail closed: a renewal
 both staged and promoted inside the window (its material cannot be shown),
-re-pairing a node that was already revoked at record time (reported as a
-reversed revocation), and the Owner approving (including retrying through
+re-pairing or approving anything on a node already revoked, at record time
+(reported as a reversed revocation) or inside the window (an incomplete
+revocation), on the same node ID instead of a new one, and the Owner approving (including retrying through
 the approve command) a key that was staged as a renewal at record time or is
 staged now (a key both staged and approved inside the window leaves no
 evidence and is not detected); verify before the next automatic renewal, or

@@ -1352,9 +1352,13 @@ class LifecycleInventoryTests(unittest.TestCase):
         self.runtime.seed()
         ids = self.presence_rows()
         _, baseline = self.record()
-        self.runtime.execute("UPDATE presence_expired_unresolved SET events=3")
         code, report, _ = self.verify(baseline)
         self.assertEqual(code, inventory.EXIT_PRESERVED, report["sections"]["presence"])
+        # Events rise only with an Owner release of unresolved work.
+        self.runtime.execute("UPDATE presence_expired_unresolved SET events=3")
+        code, report, _ = self.verify(baseline)
+        self.assertIn({"id": "expired_unresolved:evidence", "reason": "unexplained"},
+                      report["sections"]["presence"]["failed"])
         self.runtime.execute("DELETE FROM presence_completed_events WHERE id=?", (ids["done"],))
         self.runtime.execute("UPDATE presence_expired_unresolved SET events=1")
         code, report, _ = self.verify(baseline)
@@ -1432,7 +1436,7 @@ class LifecycleInventoryTests(unittest.TestCase):
         self.owner_clear(seeded["owner"], ids["lost"], "2026-02-01T00:00:00.000000+00:00")
         code, report, _ = self.verify(baseline)
         self.assertEqual(code, inventory.EXIT_FAILED)
-        self.assertIn({"id": f"deliveries:{ids['lost']}:notification", "reason": "missing"},
+        self.assertIn({"id": "expired_unresolved:notification", "reason": "unexplained"},
                       report["sections"]["presence"]["failed"])
         self.runtime.execute("INSERT INTO presence_expired_unresolved VALUES ('notification', 1, "
                              "'2026-02-01T00:00:00.000000+00:00')")
@@ -1546,6 +1550,28 @@ class LifecycleInventoryTests(unittest.TestCase):
         for label in ("resolved", "late-tombstone", "audit-state", "not-owner"):
             self.assertIn({"id": f"observations:{ids[label]}", "reason": "missing"}, failed)
         self.assertEqual([item for item in failed if ids["disabled-and-failed"] in item["id"]], [])
+
+    def test_jobs_tombstones_and_markers_change_only_with_a_release(self):
+        # Codex P1: with timeline expiry not run by Main, a job leaves only
+        # with its released observation, and tombstones / expired-unresolved
+        # events appear only for released observations.
+        self.runtime.seed()
+        ids = self.presence_rows()
+        _, baseline = self.record()
+        at = "2026-02-01T00:00:00.000000+00:00"
+        # Only the pending job of a kept observation, dressed as a release.
+        self.runtime.execute("DELETE FROM presence_deliveries WHERE observation=?", (ids["kept"],))
+        self.runtime.execute("INSERT INTO presence_completed_events VALUES (?, ?)",
+                             (ids["kept"], at))
+        self.runtime.execute("INSERT INTO presence_expired_unresolved VALUES ('notification', 1, ?)",
+                             (at,))
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_FAILED)
+        failed = report["sections"]["presence"]["failed"]
+        for item in ({"id": f"deliveries:{ids['kept']}:notification", "reason": "missing"},
+                     {"id": f"completed_events:{ids['kept']}", "reason": "unexplained"},
+                     {"id": "expired_unresolved:notification", "reason": "unexplained"}):
+            self.assertIn(item, failed)
 
     def test_presence_clocks_sessions_and_override_follow_service_transitions(self):
         self.runtime.seed()
@@ -2391,8 +2417,6 @@ class LifecycleInventoryTests(unittest.TestCase):
                                       credential_serial_digest=staged["promote-restage"][1]))
         stage(nodes["promote-restage"], credential(nodes["promote-restage"]), digest(), digest())
         ledger.activate(open_claim, credential_serial_digest=digest(), not_after=50.0)
-        ledger.revoke(owner, "owner", node_id=nodes["revoke-repair"])
-        pair(nodes["revoke-repair"], digest())
         pair(nodes["repair"], digest())
         pair(nodes["new"], digest())
         code, report, _ = self.verify(baseline)
@@ -2403,11 +2427,17 @@ class LifecycleInventoryTests(unittest.TestCase):
         stage(nodes["repair"], credential(nodes["repair"]), (late := digest()), (serial := digest()))
         self.assertTrue(ledger.admits(node_id=nodes["repair"], public_key_digest=late,
                                       credential_serial_digest=serial))
+        # Re-pairing a node revoked inside the window on the same node ID
+        # (the CLI uses a new node per the 2026-10-01 Owner decision).
+        ledger.revoke(owner, "owner", node_id=nodes["revoke-repair"])
+        pair(nodes["revoke-repair"], digest())
         _, revoked_baseline = self.record("revoked.json")
         pair(nodes["revoke"], digest())
         code, report, _ = self.verify(baseline)
         self.assertIn({"id": f"pairing_credentials:{nodes['repair']}", "reason": "changed"},
                       report["sections"]["security_state"]["failed"])
+        self.assertIn({"id": f"pairing_revocation:{nodes['revoke-repair']}",
+                       "reason": "incomplete"}, report["sections"]["security_state"]["failed"])
         code, report, _ = self.verify(revoked_baseline)
         self.assertEqual(report["sections"]["security_state"]["failed"],
                          [{"id": f"pairing_credentials:{nodes['revoke']}",
@@ -2606,10 +2636,10 @@ class LifecycleInventoryTests(unittest.TestCase):
         # record time (with or without a staged renewal), driven through the
         # real PairingLedger. Each must verify as preserved except the
         # documented fail-closed cases: the credential at verify time is a
-        # renewal both staged and promoted inside the window, or an
-        # enrollment since the record names the key staged at record time
-        # (a retry of the promoted key ends exactly where approving the
-        # still-staged key does).
+        # renewal both staged and promoted inside the window, an enrollment
+        # since the record names the key staged at record time (a retry of
+        # the promoted key ends exactly where approving the still-staged key
+        # does), or something was approved on the node after its revocation.
         operations = ("fresh", "retry", "stage", "promote", "revoke", "expiry")
 
         class Owner:
@@ -2690,14 +2720,21 @@ class LifecycleInventoryTests(unittest.TestCase):
             if base == "staged":
                 run("stage")
                 staged_source, recorded_staged = "recorded", staged_row()[0]
-            approved_staged = False
+            approved_staged, revoked, reopened = False, False, False
             saved, self.runtime = self.runtime, runtime
             try:
                 _, baseline = self.record(f"composition-{index}.json")
                 credential_source = "recorded"
                 for op in ops:
                     approved_staged |= op == "retry" and credential()[0] == recorded_staged
+                    # Anything approved on the node after its revocation
+                    # (the CLI re-pairs a revoked node as a new node).
+                    if op == "revoke":
+                        reopened = False
+                    elif revoked and op in ("fresh", "expiry"):
+                        reopened = True
                     run(op)
+                    revoked |= op == "revoke"
                     if op in ("fresh", "retry"):
                         credential_source, staged_source = "activation", None
                     elif op == "stage":
@@ -2709,7 +2746,7 @@ class LifecycleInventoryTests(unittest.TestCase):
                 _, report, _ = self.verify(baseline)
             finally:
                 self.runtime = saved
-            return (credential_source == "promoted-window" or approved_staged,
+            return (credential_source == "promoted-window" or approved_staged or reopened,
                     report["sections"]["security_state"])
 
         compositions = [(a, b) for a in operations for b in operations]
@@ -2817,6 +2854,34 @@ class LifecycleInventoryTests(unittest.TestCase):
                 finally:
                     self.runtime = saved
                 self.assertTrue(report["sections"]["security_state"]["failed"], label)
+
+    def test_a_node_revoked_in_the_window_keeps_nothing_open(self):
+        # Codex P1: revoke() revokes every open enrollment and binding of the
+        # node, and a revoked node is re-paired as a new node (Owner decision
+        # 2026-10-01); an approval left pending on it afterwards is not that.
+        self.runtime.seed()
+        database = Database(self.runtime.database)
+        ledger = PairingLedger(database, HmacCodeVerifier(b"s" * 32),
+                               audit=AuditStore(database), clock=lambda: 100.0,
+                               process_epoch=uuid4())
+
+        class Owner:
+            def require_owner(self, actor_context):
+                if actor_context != "owner":
+                    raise PermissionError("synthetic denial")
+        owner, node = Owner(), uuid4()
+        approval, code = ledger.approve(owner, "owner", node_id=node, public_key_digest="a" * 64)
+        claim = ledger.redeem(enrollment_id=approval.enrollment_id, public_key_digest="a" * 64,
+                              code=code.value)
+        ledger.activate(claim, credential_serial_digest="b" * 64, not_after=50.0)
+        _, baseline = self.record()
+        ledger.revoke(owner, "owner", node_id=node)
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(report["sections"]["security_state"]["failed"], [])
+        ledger.approve(owner, "owner", node_id=node, public_key_digest="c" * 64)
+        code, report, _ = self.verify(baseline)
+        self.assertIn({"id": f"pairing_revocation:{node}", "reason": "incomplete"},
+                      report["sections"]["security_state"]["failed"])
 
     def test_a_staged_renewal_is_never_restaged_onto_a_superseded_key(self):
         # Codex P1: stage_renewal() accepts a key already bound to the node

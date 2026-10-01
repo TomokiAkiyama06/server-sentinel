@@ -680,25 +680,31 @@ def _compare_presence(baseline: dict | None, current: dict | None,
     # The Owner release adds one expired-unresolved event per removed job
     # neither delivered nor disabled, in the transaction that writes the
     # tombstone; a removed job must be covered by that increase.
-    needed = {}
+    # A job leaves only with its released observation (the release deletes
+    # every job of it, delivered ones included).
+    needed: Counter = Counter()
     for key, job in (baseline.get("deliveries") or {}).items():
         if key not in deliveries:
-            uncounted = (("delivered", "disabled") if path.get(job["observation"]) == "released"
-                         else ("delivered",))
-            if job["observation"] not in completed:
+            if job["observation"] not in path:
                 fail("deliveries", key, "missing")
-            elif job["state"] not in uncounted:
-                action = key.rsplit(":", 1)[1]
-                needed.setdefault(action, []).append(key)
+            elif job["state"] not in ("delivered", "disabled"):
+                needed[key.rsplit(":", 1)[1]] += 1
         elif not _delivery_advanced(job, deliveries[key]):
             fail("deliveries", key)
+    # Tombstones and expired-unresolved events appear only through releases:
+    # no tombstone for anything else, and each action's events rise by
+    # exactly the released jobs neither delivered nor disabled.
+    for key in sorted(set(completed) - set(baseline.get("completed_events") or {})):
+        if key not in path:
+            fail("completed_events", key, "unexplained")
     recorded = baseline.get("expired_unresolved") or {}
-    for action, keys in needed.items():
+    for action in sorted(set(recorded) | set(expired) | set(needed)):
         added = ((expired.get(action) or {}).get("events", 0)
                  - (recorded.get(action) or {}).get("events", 0))
-        if added < len(keys):
-            for key in keys:
-                fail("deliveries", key, "missing")
+        if action in recorded and action not in expired:
+            continue  # reported missing above
+        if added != needed[action]:
+            fail("expired_unresolved", action, "unexplained")
     facts = current.get("source_facts") or {}
     for key, value in (baseline.get("source_facts") or {}).items():
         if key in facts:
@@ -1040,15 +1046,17 @@ def _compare_pairing(baseline: dict, current: dict) -> list:
         # those of its enrollments), every open enrollment, the active
         # credential, and deletes the staged row; afterwards only a fresh
         # approve() / activate() gives the node a live identity again.
+        # The Owner decision of 2026-10-01 re-pairs a revoked node as a new
+        # node with a new key (the pairing CLI approves an unbound key for a
+        # fresh node ID), so after revoke() the node itself keeps nothing
+        # open or live: every binding of it, recorded or added since, is
+        # revoked, no enrollment of it is pending or consumed, and its
+        # credential stays revoked.
         held = [key_ref for key_ref, binding in (recorded_bindings or {}).items()
                 if binding["node_id"] == node]
-        held += [item["key_ref"] for enrollment, item in (recorded_enrollments or {}).items()
-                 if item["node_id"] == node
-                 and (enrollments_now.get(enrollment) or {}).get("state") == "revoked"]
+        held += [key_ref for key_ref, binding in bindings.items() if binding["node_id"] == node]
         still_open = any(item["node_id"] == node and item["state"] in ("pending", "consumed")
-                         and (enrollments_now.get(enrollment) or {}).get("state")
-                         in ("pending", "consumed")
-                         for enrollment, item in (recorded_enrollments or {}).items())
+                         for item in enrollments_now.values())
         # revoke() aborts unless the node had something to revoke then: an
         # active credential or an open enrollment.
         recorded_credential = recorded_credentials.get(node)
@@ -1067,11 +1075,9 @@ def _compare_pairing(baseline: dict, current: dict) -> list:
             credential_ok = False
         elif after is None:
             credential_ok = True
-        elif after["revoked"]:
-            held.append(after["key_ref"])
-            credential_ok = True
         else:
-            credential_ok = after["key_ref"] in activated_keys.get(node, ())
+            held.append(after["key_ref"])
+            credential_ok = after["revoked"]
         if (recorded_bindings is None or still_open or not credential_ok
                 or not all((bindings.get(key_ref) or {}).get("revoked") for key_ref in held)):
             fail("pairing_revocation", node, "incomplete")
