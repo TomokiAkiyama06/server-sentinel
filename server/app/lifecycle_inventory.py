@@ -413,11 +413,13 @@ def _valid_growth(base: dict, now: dict) -> bool:
     Source, start, starred and critical flags are immutable; the status may only move to
     an allowed successor; the target end may only stay or move earlier (the
     store never extends target_end_ms); a still-active recording has no ended
-    boundary and a finished one ends after its start and no later than its
-    target; every recorded segment must be present and identical; and every
-    current segment, old or new, must come from the recording's own source,
-    overlap its current target window (the only segments the store links), be
-    readable and match its catalog digest.
+    boundary; a stopped (complete / gapped) one ends exactly at its target and
+    an interrupted one exactly where startup recovery puts it; every recorded
+    segment must be present and identical; every current segment, old or new,
+    must come from the recording's own source, overlap its current target
+    window (the only segments the store links), be readable and match its
+    catalog digest; and every marker not in the record must be one the store
+    could have added while publishing a newly linked segment.
     """
     if (base["status"] != "active" or now["status"] not in _ACTIVE_SUCCESSORS
             or not _evidenced(base) or not _evidenced(now)):
@@ -428,10 +430,7 @@ def _valid_growth(base: dict, now: dict) -> bool:
     start, target = now["start_ms"], now["target_end_ms"]
     if not start < target <= base["target_end_ms"]:
         return False
-    if now["status"] == "active":
-        if now["ended_ms"] is not None:
-            return False
-    elif now["ended_ms"] is None or not start < now["ended_ms"] <= target:
+    if now["ended_ms"] != _expected_ended(now):
         return False
     if not all(segment["catalog_match"] and segment["source_id"] == now["source_id"]
                and segment["start_ms"] < target and segment["end_ms"] > start
@@ -442,14 +441,60 @@ def _valid_growth(base: dict, now: dict) -> bool:
     # window still overlaps must remain.
     remaining = Counter(tuple(item) for item in now["discontinuities"])
     for marker_start, marker_end, reason in base["discontinuities"]:
-        if marker_start >= target or marker_end <= start:
-            continue
         key = (marker_start, marker_end, reason)
-        if not remaining[key]:
+        if remaining[key]:
+            remaining[key] -= 1
+        elif not (marker_start >= target or marker_end <= start):
             return False
-        remaining[key] -= 1
     now_segments = {item["segment_id"]: item for item in now["segments"]}
-    return all(now_segments.get(item["segment_id"]) == item for item in base["segments"])
+    if not all(now_segments.get(item["segment_id"]) == item for item in base["segments"]):
+        return False
+    return _appended_markers_valid(base, now, remaining)
+
+
+def _expected_ended(now: dict) -> int | None:
+    """The ended boundary the store writes for each status an active row reaches.
+
+    finish() (stop or deadline) writes ended_ms = target_end_ms for 'complete'
+    and only re-labels that row 'gapped'; startup recovery writes
+    MIN(target_end_ms, latest linked segment end) for 'interrupted'; an
+    'active' row has none.
+    """
+    if now["status"] == "active":
+        return None
+    if now["status"] in ("complete", "gapped"):
+        return now["target_end_ms"]
+    return min(now["target_end_ms"], max(item["end_ms"] for item in now["segments"]))
+
+
+def _appended_markers_valid(base: dict, now: dict, remaining: Counter) -> bool:
+    """Whether every marker absent from the record matches a store publication.
+
+    RecordingStore._publish() adds at most one marker per linked recording
+    while publishing a segment that does not continue the source cursor:
+    ('stream_discontinuity', prior cursor end, new segment start), where the
+    prior cursor ends no earlier than any segment published before it and no
+    later than the new segment starts. Such a marker ends after a recorded
+    segment and starts before a linked segment does, so it always overlaps
+    the target window and a stop never drops it.
+    """
+    recorded = {item["segment_id"] for item in base["segments"]}
+    appended = Counter(item["start_ms"] for item in now["segments"]
+                       if item["segment_id"] not in recorded)
+    used: Counter = Counter()
+    for (marker_start, marker_end, reason), count in remaining.items():
+        if count <= 0:
+            continue
+        if reason != "stream_discontinuity" or marker_end not in appended:
+            return False
+        earlier_end = max((item["end_ms"] for item in now["segments"]
+                           if item["start_ms"] < marker_end), default=None)
+        if marker_start > marker_end or (earlier_end is not None and marker_start < earlier_end):
+            return False
+        used[marker_end] += count
+        if used[marker_end] > appended[marker_end]:
+            return False
+    return True
 
 
 def _compare_recordings(baseline: dict | None, current: dict | None, *,

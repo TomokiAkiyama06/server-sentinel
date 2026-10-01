@@ -744,8 +744,11 @@ class LifecycleInventoryTests(unittest.TestCase):
                              "status='complete' WHERE id=?", (trimmed,))
         self.runtime.execute("DELETE FROM recording_discontinuities WHERE recording_id=? "
                              "AND start_ms>=15000", (trimmed,))
+        # Publishing a segment that does not continue the cursor adds
+        # (prior cursor end, new segment start) for every linked recording.
+        self.runtime.add_segment(trimmed, b"generated-trimmed-later", start_ms=11000, end_ms=15000)
         self.runtime.execute(
-            "INSERT INTO recording_discontinuities VALUES (?, 9000, 9500, 'stream_discontinuity')",
+            "INSERT INTO recording_discontinuities VALUES (?, 10000, 11000, 'stream_discontinuity')",
             (trimmed,))
         # A marker inside the window disappearing, or the event link moving,
         # is not growth.
@@ -757,6 +760,87 @@ class LifecycleInventoryTests(unittest.TestCase):
         section = report["sections"]["recordings"]
         self.assertEqual(section["in_progress_at_record"], [trimmed])
         for recording_id in (lost, relinked):
+            self.assertIn({"id": recording_id, "reason": "changed"}, section["failed"])
+
+    def test_in_progress_appended_markers_must_match_a_published_segment(self):
+        # RecordingStore._publish() only adds ('stream_discontinuity', prior
+        # cursor end, new segment start) while linking a newly published segment.
+        self.runtime.seed()
+
+        def active(label: str) -> str:
+            recording_id = self.runtime.recording(
+                starred=False, payload=b"generated-" + label.encode(),
+                status="active", target_end_ms=30000)
+            self.runtime.add_segment(recording_id, b"generated-later-" + label.encode(),
+                                     start_ms=12000, end_ms=20000)
+            return recording_id
+        published = active("published")
+        unanchored = active("unanchored")
+        old_anchor = active("old-anchor")
+        wrong_reason = active("reason")
+        before_prior = active("before-prior")
+        inverted = active("inverted")
+        duplicated = active("duplicated")
+        with closing(sqlite3.connect(self.runtime.database)) as connection:
+            recorded_start = connection.execute(
+                "SELECT MAX(s.start_ms) FROM recording_segments s JOIN recording_links l "
+                "ON l.segment_id=s.id WHERE l.recording_id=?", (old_anchor,)).fetchone()[0]
+        _, baseline = self.record()
+        for recording_id in (published, unanchored, old_anchor, wrong_reason, before_prior,
+                             inverted, duplicated):
+            self.runtime.add_segment(recording_id, b"generated-new-" + recording_id.encode(),
+                                     start_ms=22000, end_ms=26000)
+
+        def marker(recording_id: str, start: int, end: int,
+                   reason: str = "stream_discontinuity") -> None:
+            self.runtime.execute("INSERT INTO recording_discontinuities VALUES (?, ?, ?, ?)",
+                                 (recording_id, start, end, reason))
+        marker(published, 20000, 22000)
+        marker(unanchored, 20000, 21000)              # no segment starts at 21000
+        marker(old_anchor, 10000, recorded_start)     # anchors a recorded segment
+        marker(wrong_reason, 20000, 22000, "operator_note")
+        marker(before_prior, 15000, 22000)            # before an earlier segment's end
+        marker(inverted, 23000, 22000)
+        marker(duplicated, 20000, 22000)
+        marker(duplicated, 20000, 22000)              # one publication, one marker
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_FAILED)
+        section = report["sections"]["recordings"]
+        self.assertEqual(section["in_progress_at_record"], [published])
+        for recording_id in (unanchored, old_anchor, wrong_reason, before_prior,
+                             inverted, duplicated):
+            self.assertIn({"id": recording_id, "reason": "changed"}, section["failed"])
+
+    def test_in_progress_ended_boundary_is_status_specific(self):
+        # finish() always ends complete / gapped rows at target_end_ms; only
+        # startup recovery ends 'interrupted' rows at the latest linked media.
+        self.runtime.seed()
+
+        def active(label: str) -> str:
+            return self.runtime.recording(starred=False, payload=b"generated-" + label.encode(),
+                                          status="active", target_end_ms=20000)
+        stopped = active("stopped")
+        gapped = active("gapped")
+        early_complete = active("early-complete")
+        early_gapped = active("early-gapped")
+        recovered = active("recovered")
+        recovered_early = active("recovered-early")
+        recovered_late = active("recovered-late")
+        _, baseline = self.record()
+        update = "UPDATE recordings SET status=?, target_end_ms=?, ended_ms=? WHERE id=?"
+        self.runtime.execute(update, ("complete", 15000, 15000, stopped))
+        self.runtime.execute(update, ("gapped", 20000, 20000, gapped))
+        self.runtime.execute(update, ("complete", 20000, 1, early_complete))
+        self.runtime.execute(update, ("gapped", 20000, 15000, early_gapped))
+        # The recorded segment ends at 10000.
+        self.runtime.execute(update, ("interrupted", 20000, 10000, recovered))
+        self.runtime.execute(update, ("interrupted", 20000, 5000, recovered_early))
+        self.runtime.execute(update, ("interrupted", 20000, 20000, recovered_late))
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_FAILED)
+        section = report["sections"]["recordings"]
+        self.assertEqual(section["in_progress_at_record"], sorted([stopped, gapped, recovered]))
+        for recording_id in (early_complete, early_gapped, recovered_early, recovered_late):
             self.assertIn({"id": recording_id, "reason": "changed"}, section["failed"])
 
     def test_extra_hard_link_to_a_segment_is_detected(self):
