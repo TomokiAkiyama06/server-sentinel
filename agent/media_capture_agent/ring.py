@@ -376,7 +376,9 @@ class DiskRing:
         A simulated append is itself ordinary media: once its end crosses a
         later append's FIFO cutoff, its bounded allocation is credited too,
         unless a retained incident would protect it or a loss is pending
-        (both of which also stop the append path from reclaiming it).
+        (both of which also stop the append path from reclaiming it). Only a
+        source whose next segment interval is known (not overdue) is
+        credited; otherwise status errs toward pressure or a hard stop.
 
         Under untrusted time the trusted phases are not comparable with
         ``now`` (a rollback can leave them far in the future), and nothing is
@@ -387,6 +389,11 @@ class DiskRing:
         free, reserve = budget["filesystem_free"], budget["safety_reserve"]
         unit = self.store.allocation_unit
         next_append = {}
+        # Sources whose pending segments have a known interval. An overdue
+        # (or never written) source may next append a segment ending anywhere
+        # up to ``now``, possibly late media inside a retained incident, so
+        # its simulated allocations are never credited as reclaimable.
+        phased = set()
         for source, profile in self.profiles.items():
             if not clock_trusted:
                 next_append[source] = now
@@ -394,6 +401,8 @@ class DiskRing:
             last = self.db.execute("SELECT max(end) FROM segments WHERE source=? AND clock_trusted=1",
                                    (str(source),)).fetchone()[0]
             next_append[source] = now if last is None else max(now, last + profile.segment_duration_us)
+            if last is not None and last + profile.segment_duration_us >= now:
+                phased.add(source)
         # One membership/row pass at the latest next-append time, filtered
         # per source below, keeps the statement count independent of rows.
         latest = max(next_append.values())
@@ -434,7 +443,7 @@ class DiskRing:
             allocation = round_up(profile.segment_bytes(), unit)
             consumed += allocation
             source = str(profile.source_id)
-            if may_credit and not any(
+            if may_credit and profile.source_id in phased and not any(
                     source in sources and start < at and end > at - profile.segment_duration_us
                     for start, end, sources in protecting):
                 simulated.append((at, allocation))

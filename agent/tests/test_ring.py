@@ -408,28 +408,45 @@ class RingTests(unittest.TestCase):
         self.assertEqual(result["state"], "partial")
         self.assertTrue(result["clock_uncertain"])
 
-    def test_simulated_appends_that_age_out_are_credited_before_a_slow_source_appends(self):
+    def _mixed_cadence_ring(self, *, fast_end):
         unit, headroom = self.store.allocation_unit, self.ring.ledger_headroom
         slow = SegmentProfile(SOURCE, 80, 40, PRE, 100)
         fast = SegmentProfile(UUID(int=201), 800, 400, 60 * SECOND, 100)
         self.ring.configure(RingConfig("duration", 600), (slow, fast), now_us=T0, clock_trusted=True)
         self.ring.append(SOURCE, T0 - PRE, T0, PAYLOAD, now_us=T0, clock_trusted=True)
-        # The slow source next appends at T0 + PRE; the overdue fast source
-        # appends at T0, T0 + 60 s, ..., T0 + PRE. By T0 + PRE its own T0
-        # segment has crossed the FIFO cutoff and the real append path
-        # reclaims it, as it does the slow source's stored segment.
+        self.ring.append(fast.source_id, fast_end - 60 * SECOND, fast_end, PAYLOAD,
+                         now_us=T0, clock_trusted=True)
         stored = sum(self.store.segment_allocations().values())
         b = round_up(fast.segment_bytes(), unit)
         a = round_up(slow.segment_bytes(), unit)
+        # The slow source next appends at T0 + PRE; the fast source appends
+        # at T0, T0 + 60 s, ..., T0 + PRE. The budget binds at the fast
+        # source's last append exactly when its T0 segment is credited.
         target = (self.settings.safety_reserve_bytes + round_up(fast.segment_bytes() + headroom, unit)
-                  + 10 * b + a - stored - b)
+                  + 9 * b + a - stored)
         free = self.ring._budget(self.ring.profiles, T0, clock_trusted=True)["filesystem_free"]
         self.quota.other += free - target
         self.assertEqual(target, self.ring._budget(self.ring.profiles, T0, clock_trusted=True)["filesystem_free"])
+
+    def test_simulated_appends_that_age_out_are_credited_before_a_slow_source_appends(self):
+        # The fast source is exactly due, so its next segment is known to be
+        # [T0 - 60 s, T0]. By T0 + PRE it has crossed the FIFO cutoff and the
+        # real append path reclaims it, as it does the stored segments.
+        self._mixed_cadence_ring(fast_end=T0 - 60 * SECOND)
         status = self.ring.status(now_us=T0, clock_trusted=True)
         self.assertNotEqual("STORAGE_HARD_STOP", status["state"])
         # One allocation unit less is a real refusal at the last append.
-        self.quota.other += unit
+        self.quota.other += self.store.allocation_unit
+        status = self.ring.status(now_us=T0, clock_trusted=True)
+        self.assertEqual(("STORAGE_HARD_STOP", "segment_write_refused_at_reserve"),
+                         (status["state"], status["reason"]))
+
+    def test_overdue_source_simulated_appends_are_never_credited(self):
+        # An overdue source may next append a segment ending anywhere up to
+        # now, possibly late media inside a retained incident, so its pending
+        # interval is unknown and its simulated allocations are never
+        # credited: the same budget conservatively reports a hard stop.
+        self._mixed_cadence_ring(fast_end=T0 - 120 * SECOND)
         status = self.ring.status(now_us=T0, clock_trusted=True)
         self.assertEqual(("STORAGE_HARD_STOP", "segment_write_refused_at_reserve"),
                          (status["state"], status["reason"]))
