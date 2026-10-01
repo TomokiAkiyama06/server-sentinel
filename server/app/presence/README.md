@@ -116,6 +116,137 @@ durably disabled delivery, leaves a per-action degradation marker behind, so
 expiry cannot report that path as armed again while the tombstone stops a
 replay from re-queuing the work.
 
+## Producer adapters
+
+`adapters.py` connects the reviewed producers to `record()` without adding any
+route, worker thread or default timing policy:
+
+- `EntranceObservationAdapter` maps #25 `TrackUpdate` crossings. A crossing is
+  written only when the entrance quality gate was sufficient; an `UNKNOWN`
+  update writes nothing, because an empty crossing list is neither presence nor
+  absence. An Owner crossing keeps its verification confidence and is
+  `confirmed` only when the tracker confirmed it and its source latency and
+  clock uncertainty stay within the explicit `maximum_source_latency`. Every
+  Owner crossing carries the explicit `owner_presence_validity`, so an
+  unconfirmed one makes the Owner-observation slot `UNKNOWN` instead of letting
+  an earlier inference keep applying. Low-quality Owner verification reaches
+  the adapter as an anonymous crossing, because the tracker never names it as
+  the Owner. Anonymous crossings carry no confidence, no identifier beyond the
+  event UUID, and no presence effect; nothing links crossings across cameras.
+  Because `confirmed` also depends on receipt timing, a restamped replay
+  ignores it when payloads are compared; the adapter therefore passes a
+  SHA-256 digest of the crossing exactly as the tracker reported it
+  (`record(..., source_fact=...)`), kept in `presence_source_facts` and
+  removed with its observation. A replay of the same UUID with a different
+  tracker confirmation, trust or timing, whether still staged or already
+  written, is an identity conflict counted as rejected, never a silent
+  duplicate.
+- `CriticalTimelineRecorder` is the #24 `CriticalRecorder` for
+  `CriticalDelivery`. It records synchronously and raises on failure so the
+  staging retries the UUID. Receipt is stamped at write time from the shared
+  `TimelineOutbox.receipt()`; a replay of an already recorded UUID (a retry
+  after a write that committed and then failed, a repeated delivery, or a
+  replay after a restart) is a duplicate by the durable row, via
+  `record(..., restamped=True)`, never an identity conflict that would stay in
+  the bounded `CriticalDelivery` staging forever. Critical confirmation comes
+  from the detector rather than the receipt, so a confirmed delivery of a
+  critical UUID first stored unconfirmed is confirmed in place (keeping the
+  first receipt) and queues evidence and notification work exactly once; a
+  later unconfirmed replay never withdraws it. It refuses an unconfirmed or
+  insufficient-quality observation. Untrusted receipt clocks or excessive
+  latency mark the timing untrusted but never withdraw confirmation, so
+  evidence and notification work is queued in every presence and clock state.
+- `HealthTimeline` stages UVC `HealthEvent`s, registry source and node health
+  states, `MainStoragePolicy` transitions and `RecordingHealthService` results
+  as `camera_health`, `node_health`, `storage` and `recording` facts. It copies
+  only attribution and state, never free-form reasons, device evidence or
+  storage figures.
+- `TimelineOutbox` is the bounded staging those producers write to and the
+  single main-host receipt clock. `record()` treats a receipt older than the
+  newest one written as a clock step, which would make an Owner observation
+  `UNKNOWN`, so receipt is stamped at write time under one lock held across
+  the write and shared with `CriticalTimelineRecorder`; a staged crossing is
+  never distrusted merely because another source's fact or a critical
+  observation was written first. An Owner crossing therefore confirms only if
+  it is still within `maximum_source_latency` when presence receives it, and
+  its validity runs from that receipt. `stage()` never touches the database or
+  the receipt lock, so it is safe inside the storage policy's transition
+  audit, which runs while admission is being refused; the Main runtime drives
+  `flush()` from the storage owner's worker, because
+  `MainStoragePolicy.control` only admits writes from that thread. A flush
+  keeps staging order and stops at the first storage, database or clock
+  failure, including an unavailable database location and a naive or
+  otherwise unusable receipt time from the clock port (`ClockUnavailable`,
+  never `InvalidObservation`); a full outbox refuses
+  the new fact, and only a fact presence rejects as `InvalidObservation` is
+  removed. A UUID staged again while still pending is a duplicate only when
+  its source fact (every field except the receipt fields, plus any producer
+  source-fact digest) matches; a
+  different fact under that UUID is refused at `stage()` as an identity
+  conflict and counted as rejected. Both are counted and reported by `OutboxState.degraded`, never
+  dropped silently.
+
+Timeline loss is durable (`presence_timeline_gap` migration 20). The runtime calls
+`TimelineOutbox.open()` at startup, before it wires any producer, to open a
+durable outbox session (`open_timeline_session()`); `stage()` refuses facts
+until that succeeds, so no fact is held without a session row a restart would
+find, and `open()` raises for the runtime to retry. Every flush adds its
+refused and rejected counts to a singleton gap marker that holds counts and
+times only, never observation content. `TimelineOutbox.close()` records any
+still-staged fact as lost and ends the session; staging or flushing after close
+raises, so the runtime stops its producers first; a repeated close is a
+no-op. A process that exits without
+a successful close leaves its session row behind, and the next start records
+an interrupted gap: a restart is never assumed clean, and staged facts are not
+recovered. A failed close reopens the outbox only when a read proves its
+session row still in place. When the row is gone, the close committed before
+failing, and the outbox stays closed with its session ended; when the row
+cannot be read, the outbox stays closed with the session kept, and a retried
+close records a missing row as interrupted. Either way no fact is accepted
+without a session row a restart would find.
+Only one outbox session per database can be open: `open()` takes an exclusive
+advisory lock beside the database file, which the kernel releases when the
+process dies, and a second outbox is refused while it is held. The lock file is
+created and taken inside the same storage-admitted transaction as the session
+row, so a refused volume gains nothing from an outbox start. Status, history,
+audit and gap reads take no reservation and use a read-only SQLite open
+(`mode=ro`), so they never create a missing or replaced database. A session row
+found once the lock is free therefore belongs to an outbox that is gone. Owner
+status reports such rows as part of `timeline_gap`
+(`timeline_gap_orphaned_sessions`) even before a replacement session opens, so
+a restart whose `open()` is refused (for example `STORAGE_HARD_STOP` or a clock
+fault) never looks healthy. A row held by a live session is not counted. For
+a reader without its own session, that proof is a second, committed-session
+lock, which `open()` takes only after its transaction committed (both lock
+files are created inside that admitted transaction). A replacement whose open
+is still in flight holds only the session mutex and has not yet converted the
+stale rows, so they stay counted, and stay so if that open stalls or rolls
+back. The probe opens the committed lock file read-only and never creates it,
+and a lock that is free, missing or cannot be probed leaves the row counted. A
+clock fault while a producer hands a fact over is counted as a refused fact,
+because a one-shot producer callback will not re-emit it. A false positive is
+cleared only by the Owner through the audited
+`clear_timeline_gap()`, a domain operation with no route. `OutboxState.degraded`
+stays true while facts are pending, counts are not yet persisted, the session
+is not open, or the durable marker is set or unreadable; the Owner status
+reports it as `timeline_gap` and `timeline_gap_detail`. Loss a live outbox has
+counted but not yet written is part of `timeline_gap` too
+(`timeline_gap_unpersisted`), and it refuses `clear_timeline_gap()` until the
+outbox writes it, so a clear never makes Owner status look healthy while known
+loss is pending. Facts still staged because a transient storage, database or
+clock failure stopped the flush are not loss and are not counted in
+`timeline_gap`; Owner status reports them separately as `timeline_pending` and
+`timeline_pending_count`, which stay degraded until those facts are written
+(or, at a clean close, recorded as lost in the gap marker). The outbox reports
+its staged and unpersisted counts in one step, so a fact moving from staged to
+counted loss is never missed, and an unreadable backlog is reported as both
+pending and a gap. These in-memory counts are visible through the service
+instance that opened the session. Counts are only added,
+so a retried write that had committed overstates the gap rather than hiding it.
+
+`owner_presence_validity` and `maximum_source_latency` have no default; they
+are deployment decisions that need real-room and cross-host clock evaluation.
+
 Timeline ordering uses main-host receipt order, with the durable sequence only
 as a tie-break, as the single key for the SQL page, the cursor and the
 response, so concatenated pages stay complete and in the advertised order. It
@@ -124,5 +255,14 @@ unavailable. `ordering_degraded` describes the page it is returned with, so a
 caller that concatenates pages treats the window as degraded when any page
 reports it. Each source retains a trusted occurrence-time high-water mark, so
 an out-of-order event cannot later regain trust merely because it is newer than
-another untrusted delayed event. It reports observations and their temporal context only; it never
+another untrusted delayed event. Only source-dated kinds (person, motion,
+entry/exit and critical observations) use that mark; health, storage and
+recording facts are dated by the main host and neither advance nor are checked
+against it. Critical observations keep a separate per-source mark, because
+they are recorded synchronously while other source facts wait in the outbox:
+a later-occurring critical fact written first never makes a staged crossing
+from the same camera look reordered, and order within each path is still
+checked. An upgrade rebuilds both marks from the retained trusted observations
+of their own kinds, because the earlier shared mark also held critical and
+main-host dated health times and cannot be split. It reports observations and their temporal context only; it never
 infers cause, guilt, or identity.
