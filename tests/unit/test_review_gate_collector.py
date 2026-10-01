@@ -726,6 +726,12 @@ class CollectorTests(unittest.TestCase):
         self.assertEqual([post["conclusion"] for post in client.posts],
                          ["success", "failure"])
         self.assertIsNone(self.ledger()["published"])
+        # A pass collected directly from such a source is never published.
+        foreign_pass = self.collector.collect("codex", self.read_live, foreign)
+        self.assertEqual(foreign_pass.status, "pass")
+        with self.assertRaisesRegex(collector.CollectorFailure, "another repository"):
+            self.collector.publish(client, credentials, foreign_pass)
+        self.assertEqual(len(client.posts), 2)
         # GitHub repository names are case-insensitive.
         self.assertEqual(self.reconcile(
             client, credentials, source=FakeSource("Owner/Repository")).status,

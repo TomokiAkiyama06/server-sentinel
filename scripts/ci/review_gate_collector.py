@@ -192,7 +192,11 @@ class RequestOutcome:
 
 @dataclass(frozen=True)
 class CollectorDecision:
-    """``check_run_request`` is present only for ``status == "pass"``."""
+    """``check_run_request`` is present only for ``status == "pass"``.
+
+    ``source_repository`` is the repository the review source named when a
+    ``pass`` was collected; ``publish`` refuses a pass from another one.
+    """
 
     status: str
     reason: str
@@ -201,6 +205,7 @@ class CollectorDecision:
     check_run_request: dict[str, Any] | None = None
     ignored_untrusted_reviews: int = 0
     context: Context | None = None
+    source_repository: str | None = None
 
 
 class ReviewSource(Protocol):
@@ -208,7 +213,8 @@ class ReviewSource(Protocol):
 
     ``repository`` names the ``owner/name`` repository whose reviews the
     source reads; ``collect_and_publish`` refuses a source that does not name
-    the configured repository.
+    the configured repository, and ``publish`` refuses a pass collected from
+    one.
     """
 
     repository: str
@@ -641,6 +647,7 @@ class ReviewCollector:
         context = decision.context
         if context.repository_id != credentials.config.repository_id:
             raise CollectorFailure("decision targets another repository")
+        _require_repository(decision.source_repository, credentials.config.repository)
         return context
 
     def publish(self, client: GitHubTransport, credentials: AppCredentials,
@@ -914,15 +921,19 @@ class ReviewCollector:
         except PolicyFailure:
             raise CollectorFailure("receipt could not be produced") from None
         return CollectorDecision("pass", "trusted_clean_review", identity.reviewer,
-                                 request.request_id, check_run, untrusted, before)
+                                 request.request_id, check_run, untrusted, before,
+                                 getattr(source, "repository", None))
 
 
-def _require_source_repository(source: ReviewSource, repository: str) -> None:
+def _require_repository(named: Any, repository: str) -> None:
     # GitHub owner and repository names are case-insensitive.
-    named = getattr(source, "repository", None)
     if (not isinstance(named, str) or not isinstance(repository, str)
             or named.casefold() != repository.casefold()):
         raise CollectorFailure("review source targets another repository")
+
+
+def _require_source_repository(source: ReviewSource, repository: str) -> None:
+    _require_repository(getattr(source, "repository", None), repository)
 
 
 class GitHubReviewSource:
