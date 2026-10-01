@@ -510,7 +510,14 @@ covering them.
 (not a symlink) owned by the invoking user or root, and refuses otherwise.
 It recomputes the same inventory and compares it. Every Main table the
 inventory reads that existed at record time must still exist, even if it was
-empty then (a dropped one is `table_missing` in the `tables` section). A missing or changed
+empty then (a dropped one is `table_missing` in the `tables` section), and
+the applied migration history (`schema_migrations` version, name and
+checksum, which startup re-checks row by row) must keep every recorded row
+unchanged; rows added since must be exactly this release's own later
+migrations (migrations are forward-only, so a rollback adds or removes
+none). Session or derived tables (WebAuthn challenges, schedule and fairness
+cursors, live presence inputs, the self-test artifact pointer, setup wizard
+progress) are deliberately not inventoried. A missing or changed
 recording, audit row, source, principal or invitation is `failed` (exit 1);
 rows and recordings that exist only now are listed as `appended` and are never
 counted as preserved. The one exception for missing rows is the service's own

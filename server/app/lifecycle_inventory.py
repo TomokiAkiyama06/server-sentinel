@@ -82,6 +82,7 @@ from app.monitoring.runtime import EVENT_NAMESPACE
 from app.presence.delivery import ActionResult
 from app.presence.service import PresenceService
 from app.storage.retention import DAY_MS, RetentionPeriods
+from app.storage.schema import APPLICATION_MIGRATIONS
 
 
 FORMAT = "server-sentinel-lifecycle-inventory"
@@ -123,7 +124,21 @@ INVENTORIED_TABLES = (
     "pairing_node_credentials", "pairing_enrollments", "pairing_node_renewals",
     "pairing_key_bindings", "capture_nodes",
     "integrity_outbox", "integrity_overflow", "notification_events", "integrity_baseline",
+    "schema_migrations",
 )
+
+# Migration-created tables deliberately left out: per-session or derived
+# state whose loss replays nothing and hides no failure (beside the
+# NOT_INVENTORIED ones above, still to be covered by #132).
+TRANSIENT_TABLES = {
+    "access_webauthn_challenges": "short-lived single-use WebAuthn challenges",
+    "application_metadata": "foundation key/value scaffold, unused by stored evidence",
+    "notification_schedule": "daily-summary schedule cursor",
+    "presence_delivery_fairness": "round-robin cursor between delivery classes",
+    "presence_inputs": "live presence inputs with their own validity windows",
+    "recording_selftest": "identifier of the current self-test artifact",
+    "setup_wizard_steps": "setup wizard progress",
+}
 
 MANUAL = {
     "container_duration": "manual",
@@ -1551,13 +1566,16 @@ def collect(runtime_root: Path, *, salt: str | None = None,
         # held read lock would make service writers time out).
         connection.execute("BEGIN")
         tables = _tables(connection)
-        schema_version = None
+        schema_version, migrations = None, None
         if "schema_migrations" in tables:
-            schema_version = connection.execute(
-                "SELECT MAX(version) FROM schema_migrations").fetchone()[0]
+            # The applied history migrate() checks entry by entry on startup.
+            migrations = [[row[0], row[1], row[2]] for row in connection.execute(
+                "SELECT version, name, checksum FROM schema_migrations ORDER BY version")]
+            schema_version = migrations[-1][0] if migrations else None
         inventory = {
             "format": FORMAT, "format_version": FORMAT_VERSION,
             "schema_version": schema_version,
+            "schema_migrations": migrations,
             "tables": sorted(name for name in INVENTORIED_TABLES if name in tables),
             "recordings": _recordings(connection, tables),
             "audit": _audit(connection, tables),
@@ -1955,6 +1973,40 @@ def _retention_rules(now: datetime) -> dict:
     }
 
 
+def _compare_migrations(baseline: list | None, current: list | None) -> dict:
+    """The applied migration history only grows by this release's migrations.
+
+    migrate() refuses to start unless every applied row equals the code's
+    migration at that position, and only appends the code's later ones;
+    migrations are forward-only (a rollback never removes one). So every
+    recorded row must remain unchanged, and a row added since must be the
+    one APPLICATION_MIGRATIONS (of the release running verify) defines.
+    """
+    if baseline is None:
+        return {"status": "failed" if current is None else "empty",
+                "failed": [{"id": None, "reason": "unverifiable"}] if current is None else [],
+                "appended": []}
+    if current is None:
+        return {"status": "failed", "failed": [{"id": None, "reason": "table_missing"}],
+                "appended": []}
+    known = {migration.version: [migration.version, migration.name, migration.checksum]
+             for migration in APPLICATION_MIGRATIONS}
+    now = {row[0]: row for row in current}
+    failed = []
+    for row in baseline:
+        if row[0] not in now:
+            failed.append({"id": row[0], "reason": "missing"})
+        elif now[row[0]] != row:
+            failed.append({"id": row[0], "reason": "changed"})
+    recorded = {row[0] for row in baseline}
+    appended = [row[0] for row in current if row[0] not in recorded]
+    for version in appended:
+        if now[version] != known.get(version) or version < max(recorded, default=0):
+            failed.append({"id": version, "reason": "unknown_migration"})
+    return {"status": "failed" if failed else "preserved", "failed": failed,
+            "appended": appended}
+
+
 def compare(baseline: dict, current: dict, *, declared_rewrites=(), now=None) -> dict:
     if (not isinstance(baseline, dict) or baseline.get("format") != FORMAT
             or baseline.get("format_version") != FORMAT_VERSION):
@@ -1974,6 +2026,8 @@ def compare(baseline: dict, current: dict, *, declared_rewrites=(), now=None) ->
                       [{"id": name, "reason": "table_missing"}
                        for name in recorded_tables if name not in present])
     sections = {
+        "schema_migrations": _compare_migrations(baseline.get("schema_migrations"),
+                                                 current.get("schema_migrations")),
         "tables": {"status": "failed" if table_failures else "preserved",
                    "failed": table_failures, "preserved": sorted(set(recorded_tables or ()) & present)},
         "recordings": _compare_recordings(baseline.get("recordings"),

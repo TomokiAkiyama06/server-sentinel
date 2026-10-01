@@ -661,6 +661,54 @@ class LifecycleInventoryTests(unittest.TestCase):
         self.assertEqual({table: outcome for table, outcome in outcomes.items()
                           if outcome != (inventory.EXIT_FAILED, True)}, {})
 
+    def test_applied_migration_history_only_grows_by_known_migrations(self):
+        # Codex P1: migrate() re-checks every applied row on startup, so the
+        # history must persist; a dropped table would replay every migration.
+        self.runtime.seed()
+        with closing(sqlite3.connect(self.runtime.database)) as connection:
+            last = connection.execute("SELECT version, name, checksum FROM schema_migrations "
+                                      "ORDER BY version DESC LIMIT 1").fetchone()
+        # Recorded one release earlier: the last migration not yet applied.
+        self.runtime.execute("DELETE FROM schema_migrations WHERE version=?", (last[0],))
+        _, baseline = self.record()
+        self.runtime.execute("INSERT INTO schema_migrations VALUES (?, ?, ?)", tuple(last))
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_PRESERVED, report["sections"]["schema_migrations"])
+        self.assertEqual(report["sections"]["schema_migrations"]["appended"], [last[0]])
+        tampers = {
+            "dropped": ("DROP TABLE schema_migrations", None),
+            "row removed": ("DELETE FROM schema_migrations WHERE version=1",
+                            {"id": 1, "reason": "missing"}),
+            "row rewritten": ("UPDATE schema_migrations SET checksum='0' WHERE version=1",
+                              {"id": 1, "reason": "changed"}),
+            "unknown row": ("INSERT INTO schema_migrations VALUES (9999, 'x', 'y')",
+                            {"id": 9999, "reason": "unknown_migration"}),
+        }
+        for index, (label, (statement, expected)) in enumerate(tampers.items()):
+            with self.subTest(label):
+                runtime = Runtime(self.base / f"migrations-{index}")
+                saved, self.runtime = self.runtime, runtime
+                try:
+                    runtime.seed()
+                    _, recorded = self.record(f"migrations-{index}.json")
+                    runtime.execute(statement)
+                    code, report, _ = self.verify(recorded)
+                finally:
+                    self.runtime = saved
+                self.assertEqual(code, inventory.EXIT_FAILED)
+                failed = report["sections"]["schema_migrations"]["failed"]
+                self.assertIn(expected or {"id": None, "reason": "table_missing"}, failed)
+
+    def test_every_migration_table_is_inventoried_or_explained(self):
+        with closing(sqlite3.connect(self.runtime.database)) as connection:
+            created = {row[0] for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' "
+                "AND name != 'sqlite_sequence'")}
+        accounted = (set(inventory.INVENTORIED_TABLES) | set(inventory.TRANSIENT_TABLES)
+                     | {name for name in inventory.NOT_INVENTORIED if "." not in name})
+        self.assertEqual(created - accounted, set())
+        self.assertEqual(set(inventory.INVENTORIED_TABLES) - created, set())
+
     def test_presence_and_storage_audit_rows_are_preserved(self):
         self.runtime.seed()
         for index in range(3):
