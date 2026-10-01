@@ -384,8 +384,11 @@ Because commit and recursive tree objects are content-addressed, the
 collector keeps one bounded LRU `GitObjectCache` (at most 8192 objects) and
 `collect_and_publish()` routes every GitHub read through
 `CachingGitHubTransport`. A commit object is cached only when its `sha`
-matches the requested SHA, and a tree only when it is complete (not
-`truncated`); nothing mutable (the pull request, the test-merge ref, check
+matches the requested SHA. Trees are requested by commit SHA, so a tree is
+cached only when it is complete (not `truncated`) and its `sha` equals the
+`tree.sha` of that commit's already cached, verified object; a tree read
+before its commit, or one with a missing or different `sha`, is used once but
+never cached, so a later read can still detect the mismatch. Nothing mutable (the pull request, the test-merge ref, check
 runs) is ever cached. Passing `read_live_context=None` makes the before,
 after and mismatch-confirmation reads and the `publish_success` re-read all
 use `collect_live_context` over that transport, so one passing reconciliation

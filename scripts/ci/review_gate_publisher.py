@@ -303,13 +303,26 @@ class GitObjectCache:
                 self._entries.popitem(last=False)
 
 
-def _verified_git_object(match: re.Match[str], value: Any) -> bool:
-    """Cache only a response that names the requested object and is complete."""
+def _verified_git_object(match: re.Match[str], value: Any,
+                         commit: dict[str, Any] | None = None) -> bool:
+    """Cache only a response that names the requested object and is complete.
+
+    Trees are requested by commit SHA, so a tree response names its root
+    tree's SHA, not the requested one. It is verified only against
+    ``commit``, the cached (already verified) commit response for that SHA:
+    its ``tree.sha`` must equal the response's ``sha``. A tree without that
+    binding, including one with no ``sha``, is returned but never cached.
+    """
     if not isinstance(value, dict):
         return False
     if match.group("commit"):
         return value.get("sha") == match.group("commit") and isinstance(value.get("parents"), list)
-    return (value.get("sha") in (None, match.group("tree")) and value.get("truncated") is False
+    if not isinstance(commit, dict) or commit.get("sha") != match.group("tree"):
+        return False
+    root = commit.get("tree")
+    tree_sha = root.get("sha") if isinstance(root, dict) else None
+    return (isinstance(tree_sha, str) and _HEX.fullmatch(tree_sha) is not None
+            and value.get("sha") == tree_sha and value.get("truncated") is False
             and isinstance(value.get("tree"), list))
 
 
@@ -333,7 +346,11 @@ class CachingGitHubTransport:
         if cached is not None:
             return cached
         value = self._client.get_json(path, token)
-        if _verified_git_object(match, value):
+        commit = None
+        if match.group("tree"):
+            prefix = path[:match.start("tree") - len("trees/")]
+            commit = self._cache.get(f"{prefix}commits/{match.group('tree')}")
+        if _verified_git_object(match, value, commit):
             self._cache.put(path, value)
         return value
 

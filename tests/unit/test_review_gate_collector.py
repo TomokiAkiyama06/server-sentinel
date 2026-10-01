@@ -975,12 +975,15 @@ class FakeLiveGitHub(FakeCheckRuns):
         self.test_merge = sha(0xF0000 + 1)
         self.reads: dict[str, int] = {}
         self.corrupt: set[str] = set()
+        # Requested by commit SHA, as the publisher does; like GitHub, each
+        # response names the root tree's own SHA, never the commit's.
         self.trees = {
-            self.base: {"sha": self.base, "truncated": False, "tree": [
+            self.base: {"sha": sha(0xC0000 + 1), "truncated": False, "tree": [
                 {"path": "a.txt", "mode": "100644", "type": "blob", "sha": "1" * 40}]},
-            self.head: {"sha": self.head, "truncated": False, "tree": [
+            self.head: {"sha": sha(0xC0000 + 2), "truncated": False, "tree": [
                 {"path": "a.txt", "mode": "100644", "type": "blob", "sha": "2" * 40}]},
         }
+        self.tree_responses: dict[str, dict] = {}  # path -> overriding response
 
     def get_json(self, path, token):
         self.reads[path] = self.reads.get(path, 0) + 1
@@ -994,14 +997,22 @@ class FakeLiveGitHub(FakeCheckRuns):
         if path == f"{repo}/git/ref/pull/12/merge":
             return {"object": {"sha": self.test_merge}}
         if path == f"{repo}/git/commits/{self.test_merge}":
-            return {"sha": self.test_merge,
+            return {"sha": self.test_merge, "tree": {"sha": self.tree_sha(self.test_merge)},
                     "parents": [{"sha": self.base}, {"sha": self.head}]}
         if path.startswith(f"{repo}/git/commits/"):
             sha = path.rsplit("/", 1)[1]
-            return {"sha": sha, "parents": [{"sha": p} for p in self.graph[sha]]}
+            return {"sha": sha, "tree": {"sha": self.tree_sha(sha)},
+                    "parents": [{"sha": p} for p in self.graph[sha]]}
+        if path in self.tree_responses:
+            return json.loads(json.dumps(self.tree_responses[path]))
         if path.startswith(f"{repo}/git/trees/"):
             return json.loads(json.dumps(self.trees[path.rsplit("/", 1)[1].split("?")[0]]))
         return super().get_json(path, token)
+
+    def tree_sha(self, commit):
+        if commit in self.trees:
+            return self.trees[commit]["sha"]
+        return f"{int(commit, 16) + 0xD000000:040x}"
 
     def object_reads(self):
         return {path: count for path, count in self.reads.items() if "/git/" in path
@@ -1089,6 +1100,40 @@ class LiveContextCacheTests(unittest.TestCase):
         transport.get_json(paths[0], "t")  # evicted by the bound
         self.assertEqual(self.github.reads[paths[0]], 2)
         self.assertEqual(self.github.reads[paths[2]], 1)
+
+    def test_tree_is_cached_only_once_bound_to_its_commit_tree(self):
+        cache = publisher.GitObjectCache()
+        transport = publisher.CachingGitHubTransport(self.github, cache)
+        repo = "/repos/owner/repository"
+        commit = f"{repo}/git/commits/{self.github.head}"
+        tree = f"{repo}/git/trees/{self.github.head}?recursive=1"
+        genuine = self.github.trees[self.github.head]
+        # Before the commit is known, nothing binds the tree to it.
+        for _ in range(2):
+            transport.get_json(tree, "t")
+        self.assertEqual(self.github.reads[tree], 2)
+        transport.get_json(commit, "t")
+        unrelated = dict(genuine, sha=self.github.trees[self.github.base]["sha"])
+        identityless = {key: value for key, value in genuine.items() if key != "sha"}
+        for response in (identityless, unrelated, dict(genuine, sha=self.github.head)):
+            with self.subTest(response=response.get("sha")):
+                self.github.tree_responses[tree] = response
+                before = self.github.reads[tree]
+                for _ in range(2):
+                    self.assertEqual(transport.get_json(tree, "t"), response)
+                self.assertEqual(self.github.reads[tree], before + 2)
+        del self.github.tree_responses[tree]
+        before = self.github.reads[tree]
+        for _ in range(2):
+            self.assertEqual(transport.get_json(tree, "t"), genuine)
+        self.assertEqual(self.github.reads[tree], before + 1)
+        # A commit response without a usable tree identity binds nothing.
+        other = f"{repo}/git/trees/{self.github.base}?recursive=1"
+        base_commit = f"{repo}/git/commits/{self.github.base}"
+        cache.put(base_commit, {"sha": self.github.base, "parents": []})
+        for _ in range(2):
+            transport.get_json(other, "t")
+        self.assertEqual(self.github.reads[other], 2)
 
 
 logging.getLogger("server_sentinel").addHandler(logging.NullHandler())
