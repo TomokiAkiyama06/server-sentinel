@@ -43,6 +43,9 @@ _CHECK_RUNS_ROUTE = re.compile(r"/repos/[^/?#%\\]+/[^/?#%\\]+/commits/[0-9a-f]{4
 _CHECK_RUNS_QUERY = re.compile(r"check_name=[A-Za-z0-9._~%-]+&app_id=[1-9][0-9]{0,18}"
                                r"&filter=all&per_page=100&page=[1-9][0-9]?")
 MAX_CHECK_RUN_PAGES = 10
+# Attempts of one check by the App on one commit that can still be listed
+# completely; no further success is posted beyond it (see check_run_attempts).
+MAX_CHECK_RUN_ATTEMPTS = MAX_CHECK_RUN_PAGES * 100
 # Content-addressed Git objects: a response for one of these paths can never change.
 _IMMUTABLE_GIT_OBJECT = re.compile(
     r"/repos/[^/?#%\\]+/[^/?#%\\]+/git/(?:commits/(?P<commit>[0-9a-f]{40})"
@@ -557,6 +560,34 @@ def publish_success(client: GitHubTransport, credentials: AppCredentials,
     return response
 
 
+def _check_runs_path(credentials: AppCredentials, test_merge_sha: str,
+                     reviewer: str) -> str:
+    name = CHECK_NAMES.get(reviewer) if isinstance(reviewer, str) else None
+    if name is None:
+        raise PublisherFailure("unsupported reviewer")
+    sha = _sha(test_merge_sha)
+    repo = "/repos/" + "/".join(_path_part(part) for part in credentials.config.repository.split("/"))
+    return (f"{repo}/commits/{sha}/check-runs?check_name={quote(name, safe='')}"
+            f"&app_id={credentials.config.issuer.app_id}&filter=all&per_page=100&page=")
+
+
+def check_run_attempts(client: GitHubTransport, credentials: AppCredentials,
+                       test_merge_sha: str, reviewer: str) -> int:
+    """How many attempts of ``reviewer``'s check the App has on the commit.
+
+    Beyond ``MAX_CHECK_RUN_ATTEMPTS`` the latest attempt can no longer be
+    verified (``success_is_latest_attempt`` would always answer False), so the
+    caller must stop posting successes there instead of superseding and
+    republishing on every poll.
+    """
+    body = client.get_json(_check_runs_path(credentials, test_merge_sha, reviewer) + "1",
+                           credentials.installation_token)
+    count = body.get("total_count") if isinstance(body, dict) else None
+    if type(count) is not int or count < 0:
+        raise PublisherFailure("unexpected GitHub API response")
+    return count
+
+
 def success_is_latest_attempt(client: GitHubTransport, credentials: AppCredentials,
                               test_merge_sha: str, reviewer: str,
                               check_run_id: int) -> bool:
@@ -578,9 +609,7 @@ def success_is_latest_attempt(client: GitHubTransport, credentials: AppCredentia
         return False
     sha = _sha(test_merge_sha)
     app_id = credentials.config.issuer.app_id
-    repo = "/repos/" + "/".join(_path_part(part) for part in credentials.config.repository.split("/"))
-    path = (f"{repo}/commits/{sha}/check-runs?check_name={quote(name, safe='')}"
-            f"&app_id={app_id}&filter=all&per_page=100&page=")
+    path = _check_runs_path(credentials, sha, reviewer)
     runs: list[Any] = []
     total = None
     for page in range(1, MAX_CHECK_RUN_PAGES + 1):

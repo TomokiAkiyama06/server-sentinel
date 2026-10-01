@@ -1,7 +1,9 @@
 """Trusted provider review collector for the dedicated-App review gate (#4).
 
 This module converts authenticated Codex / Claude GitHub pull-request reviews
-into the fixed success Check Run request from ``review_gate_policy``.  It runs
+(and the provider's "no findings" issue comment, which Codex posts instead of a
+review when it finds nothing) into the fixed success Check Run request from
+``review_gate_policy``.  It runs
 only inside the Owner-controlled publisher deployment.  It never reads a PR
 checkout, never executes a provider, never posts a review trigger, and never
 publishes a check itself.
@@ -11,8 +13,8 @@ branch commit, merge base, diff digest or the request that triggered them.  The
 collector therefore binds a review to an exact ``Context`` indirectly:
 
 * before a trigger is posted, it durably records a *review request* holding the
-  complete live ``Context``, the highest review ID then visible on the PR (the
-  watermark) and the request time;
+  complete live ``Context``, the highest review ID and the highest issue
+  comment ID then visible on the PR (the watermarks) and the request time;
 * a review counts only when it comes from the exact Owner-configured provider
   bot identity, targets the recorded HEAD, has an ID above the watermark, and
   was submitted at least the configured maximum provider runtime (plus a clock
@@ -24,7 +26,12 @@ collector therefore binds a review to an exact ``Context`` indirectly:
   new request is recorded and a new review arrives;
 * every qualifying trusted review of the HEAD must be a clean pass.  An early
   (ambiguous) failing review, a blocking finding, a missing pass marker or an
-  unreadable review blocks.  Nothing here maps an error to success.
+  unreadable review blocks.  Nothing here maps an error to success;
+* a trusted issue comment carrying a pass marker is a result only for the
+  commit its single ``Reviewed commit`` short SHA names.  It counts for the
+  HEAD only if that short SHA is a prefix of the HEAD and GitHub resolves it
+  uniquely to exactly the HEAD; an edited, blocking or ambiguous result
+  comment blocks, and an ambiguous short SHA raises.
 
 Every decision reason is a fixed code.  Neither review text, source, tokens nor
 key material is logged or placed in an exception message.
@@ -51,15 +58,17 @@ from scripts.ci.review_gate_policy import (CHECK_NAMES, Context, PolicyFailure,
 from scripts.ci import review_gate_publisher
 from scripts.ci.review_gate_publisher import (AppCredentials, CachingGitHubTransport,
                                               GitHubTransport, GitObjectCache,
-                                              PublisherFailure, _secure_private_bytes,
+                                              MAX_CHECK_RUN_ATTEMPTS, PublisherFailure,
+                                              _secure_private_bytes, check_run_attempts,
                                               publish_revocation, publish_success,
                                               success_is_latest_attempt)
 
 
 LOG = logging.getLogger("server_sentinel.review_gate.collector")
 COLLECTOR_CONFIG_ENV = "SERVER_SENTINEL_REVIEW_COLLECTOR_CONFIG"
-LEDGER_SCHEMA_VERSION = 2
+LEDGER_SCHEMA_VERSION = 3
 MAX_REVIEWS = 1000
+MAX_ISSUE_COMMENTS = 1000
 MAX_REVIEW_COMMENTS = 300
 # Trusted same-HEAD reviews above one watermark; each costs comment API pages.
 MAX_CANDIDATE_REVIEWS = 20
@@ -79,6 +88,11 @@ _FORBIDDEN_LOGINS = frozenset({"github-actions[bot]", "dependabot[bot]"})
 _BOT_LOGIN = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})\[bot\]")
 _TIMESTAMP = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z")
 _SHA = re.compile(r"[0-9a-f]{40}")
+_SHORT_SHA = re.compile(r"[0-9a-f]{7,40}")
+# The commit a provider "no findings" issue comment names, e.g.
+# "**Reviewed commit:** `0123456789`".  Any other spelling is not a binding.
+_REVIEWED_COMMIT = re.compile(r"\*\*Reviewed commit:\*\*\s*`([^`\n]*)`")
+_REVIEWED_COMMIT_LABEL = "Reviewed commit"
 _REQUEST_ID = re.compile(r"[0-9a-f]{32}")
 _PASS_STATES = frozenset({"COMMENTED", "APPROVED"})
 _PUBLICATION_STATES = frozenset({"publishing", "success", "revoking"})
@@ -170,6 +184,8 @@ class ReviewRequest:
     requested_at: int
     # Carried across superseding requests until the success is revoked.
     published: Publication | None = None
+    # Highest issue comment ID listed when the request was recorded.
+    comment_watermark: int = 0
 
     def __post_init__(self) -> None:
         if (not isinstance(self.reviewer, str) or self.reviewer not in CHECK_NAMES
@@ -178,6 +194,7 @@ class ReviewRequest:
                 or self.state not in {"active", "invalidated"}
                 or not isinstance(self.context, Context)
                 or type(self.review_watermark) is not int or self.review_watermark < 0
+                or type(self.comment_watermark) is not int or self.comment_watermark < 0
                 or type(self.requested_at) is not int or self.requested_at <= 0
                 or not (self.published is None
                         or isinstance(self.published, Publication))):
@@ -226,9 +243,19 @@ class ReviewSource(Protocol):
                              review_id: int) -> list[dict[str, Any]]:
         ...
 
+    def list_issue_comments(self, pr_number: int) -> list[dict[str, Any]]:
+        ...
+
+    def resolve_commit(self, short_sha: str) -> str:
+        """The full SHA GitHub resolves ``short_sha`` to; raises if ambiguous."""
+        ...
+
 
 class ListTransport(Protocol):
     def get_list(self, path: str, token: str) -> list[Any]:
+        ...
+
+    def get_json(self, path: str, token: str) -> dict[str, Any]:
         ...
 
 
@@ -261,6 +288,18 @@ def _checked_reviews(reviews: Any) -> list[dict[str, Any]]:
             raise CollectorFailure("invalid provider review listing")
         seen.add(review["id"])
     return reviews
+
+
+def _checked_issue_comments(comments: Any) -> list[dict[str, Any]]:
+    if not isinstance(comments, list) or len(comments) > MAX_ISSUE_COMMENTS:
+        raise CollectorFailure("provider comment listing is unavailable or too large")
+    seen: set[int] = set()
+    for comment in comments:
+        if (not isinstance(comment, dict) or type(comment.get("id")) is not int
+                or comment["id"] <= 0 or comment["id"] in seen):
+            raise CollectorFailure("invalid provider comment listing")
+        seen.add(comment["id"])
+    return comments
 
 
 def _is_trusted(review: Mapping[str, Any], identity: ProviderIdentity) -> bool:
@@ -313,6 +352,23 @@ def _review_passes(review: Mapping[str, Any], comments: Any,
                 or not any(marker in text for marker in identity.non_blocking_markers)):
             return False
     return True
+
+
+def _result_comment_commit(body: str, identity: ProviderIdentity) -> str | None:
+    """The short SHA a trusted clean-result comment names, or None if ambiguous.
+
+    Only called for a comment carrying a pass marker.  Exactly one
+    ``Reviewed commit`` binding, spelled as 7-40 lowercase hex digits, and no
+    blocking marker are required; anything else cannot be attributed safely.
+    """
+    if any(marker in body for marker in identity.blocking_markers):
+        return None
+    if body.count(_REVIEWED_COMMIT_LABEL) != 1:
+        return None
+    bound = _REVIEWED_COMMIT.findall(body)
+    if len(bound) != 1 or not _SHORT_SHA.fullmatch(bound[0]):
+        return None
+    return bound[0]
 
 
 class LedgerStore:
@@ -399,7 +455,8 @@ class LedgerStore:
             data = json.loads(raw.decode("utf-8"), object_pairs_hook=_unique_pairs)
             if (not isinstance(data, dict) or set(data) != {
                     "schema_version", "reviewer", "request_id", "state",
-                    "context", "review_watermark", "requested_at", "published"}
+                    "context", "review_watermark", "comment_watermark",
+                    "requested_at", "published"}
                     or data["schema_version"] != LEDGER_SCHEMA_VERSION
                     or type(data["schema_version"]) is not int
                     or not isinstance(data["context"], dict)):
@@ -414,7 +471,8 @@ class LedgerStore:
                 reviewer=data["reviewer"], request_id=data["request_id"],
                 state=data["state"], context=Context(**data["context"]),
                 review_watermark=data["review_watermark"],
-                requested_at=data["requested_at"], published=published)
+                requested_at=data["requested_at"], published=published,
+                comment_watermark=data["comment_watermark"])
         except (UnicodeDecodeError, ValueError, TypeError, RecursionError,
                 PolicyFailure, CollectorFailure):
             raise CollectorFailure("review request ledger is corrupt") from None
@@ -432,6 +490,7 @@ class LedgerStore:
             "reviewer": request.reviewer, "request_id": request.request_id,
             "state": request.state, "context": asdict(request.context),
             "review_watermark": request.review_watermark,
+            "comment_watermark": request.comment_watermark,
             "requested_at": request.requested_at,
             "published": (None if request.published is None
                           else asdict(request.published)),
@@ -528,9 +587,16 @@ class ReviewCollector:
             watermark = max((review["id"] for review in reviews), default=0)
             if existing is not None and watermark < existing.review_watermark:
                 raise CollectorFailure("provider review listing regressed")
+            comments = _checked_issue_comments(source.list_issue_comments(live.pr_number))
+            # Issue comments can be deleted, so the comment maximum may drop;
+            # IDs only grow, so the larger of both still excludes older ones.
+            comment_watermark = max(
+                [comment["id"] for comment in comments]
+                + [existing.comment_watermark if existing is not None else 0])
             request = ReviewRequest(reviewer, secrets.token_hex(16), "active", live,
                                     watermark, self._now(),
-                                    existing.published if existing is not None else None)
+                                    existing.published if existing is not None else None,
+                                    comment_watermark)
             self._store.save(request)
         LOG.info("review request recorded reviewer=%s pr=%d request=%s superseded=%s",
                  reviewer, live.pr_number, request.request_id,
@@ -711,6 +777,12 @@ class ReviewCollector:
         request = self._revoke_locked(client, credentials, request)
         if not current:
             return {"published": False, "check_run_id": None}
+        if (check_run_attempts(client, credentials, context.test_merge_sha,
+                               decision.reviewer) >= MAX_CHECK_RUN_ATTEMPTS):
+            # The latest attempt could no longer be verified after this post,
+            # so every poll would supersede and republish without bound.  The
+            # check stays failed until the commit changes (fail closed).
+            raise CollectorFailure("check run attempt limit reached")
         request = replace(request, published=Publication(
             request.request_id, context.test_merge_sha, None, "publishing"))
         self._store.save(request)
@@ -903,6 +975,38 @@ class ReviewCollector:
                 passes += 1
             # A passing review submitted too soon may have been started under
             # an older base; it proves nothing and is not counted.
+        comments = _checked_issue_comments(source.list_issue_comments(before.pr_number))
+        resolved: dict[str, str] = {}
+        for comment in comments:
+            if comment["id"] <= request.comment_watermark:
+                continue
+            if not _is_trusted(comment, identity):
+                untrusted += 1
+                continue
+            body = _text(comment.get("body"))
+            if not any(marker in body for marker in identity.pass_markers):
+                continue  # Status, usage-limit and other non-result comments.
+            short_sha = _result_comment_commit(body, identity)
+            created = _parse_timestamp(comment.get("created_at"))
+            if comment.get("updated_at") != comment.get("created_at"):
+                short_sha = None  # Edited (possibly by a maintainer): unattributable.
+            if short_sha is None:
+                blocked = True
+                continue
+            if not before.head_sha.startswith(short_sha):
+                continue  # A result for another commit is irrelevant here.
+            candidates += 1
+            if candidates > MAX_CANDIDATE_REVIEWS:
+                raise CollectorFailure("too many provider reviews for one request")
+            if short_sha not in resolved:
+                full = source.resolve_commit(short_sha)
+                if not isinstance(full, str) or not _SHA.fullmatch(full):
+                    raise CollectorFailure("invalid provider review commit")
+                resolved[short_sha] = full
+            if resolved[short_sha] != before.head_sha:
+                blocked = True  # The short SHA does not name exactly the HEAD.
+            elif created >= earliest:
+                passes += 1
         after = read_live_context()
         if not isinstance(after, Context):
             raise CollectorFailure("invalid live context")
@@ -940,7 +1044,7 @@ class GitHubReviewSource:
     """Completely paginated PR reviews and review comments via the App client."""
 
     PAGE_SIZE = 100
-    MAX_PAGES = MAX_REVIEWS // PAGE_SIZE
+    MAX_PAGES = max(MAX_REVIEWS, MAX_ISSUE_COMMENTS) // PAGE_SIZE
 
     def __init__(self, client: ListTransport, repository: str, token: str) -> None:
         if (not isinstance(repository, str)
@@ -992,6 +1096,24 @@ class GitHubReviewSource:
             raise CollectorFailure("invalid review identity")
         return self._all(f"{self._repo}/pulls/{pr_number}/reviews/{review_id}/comments",
                          MAX_REVIEW_COMMENTS)
+
+    def list_issue_comments(self, pr_number: int) -> list[dict[str, Any]]:
+        if type(pr_number) is not int or pr_number <= 0:
+            raise CollectorFailure("invalid pull request number")
+        return self._all(f"{self._repo}/issues/{pr_number}/comments", MAX_ISSUE_COMMENTS)
+
+    def resolve_commit(self, short_sha: str) -> str:
+        """Resolve through GitHub, which refuses a short SHA that is ambiguous."""
+        if not isinstance(short_sha, str) or not _SHORT_SHA.fullmatch(short_sha):
+            raise CollectorFailure("invalid short commit SHA")
+        try:
+            body = self._client.get_json(f"{self._repo}/commits/{short_sha}", self._token)
+        except PublisherFailure:
+            raise CollectorFailure("short commit SHA could not be resolved") from None
+        full = body.get("sha") if isinstance(body, dict) else None
+        if not isinstance(full, str) or not _SHA.fullmatch(full):
+            raise CollectorFailure("short commit SHA could not be resolved")
+        return full
 
 
 def load_collector(environ: Mapping[str, str], checkout_root: Path,

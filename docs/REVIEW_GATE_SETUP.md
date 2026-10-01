@@ -148,8 +148,10 @@ attestation. Its secret must also be isolated before trusting additional writers
 Collect both reviewers from authenticated reviewer APIs or execute the reviewers
 in the isolated trusted process. Verify the actual issuer, exact request/run ID,
 successful complete response, and no unresolved important/critical findings.
-Codex's `Reviewed commit` alone lacks a base binding and is insufficient. Record
-the exact review request context before invoking either engine. Reactions, an
+Codex's `Reviewed commit` alone lacks a base binding and is insufficient; the
+collector below uses it only together with a recorded request, its watermark
+and the runtime delay. Record the exact review request context before invoking
+either engine. Reactions, an
 author display name, or a subsequent request comment do not establish that the
 review was performed against that context. Missing provider provenance fails
 closed.
@@ -157,7 +159,12 @@ closed.
 ### Provider review collector (`review_gate_collector.py`)
 
 The collector converts an authenticated Codex or Claude **GitHub pull-request
-review** into the fixed receipt from `successful_check_run_request`. It never
+review**, or the provider's **"no findings" issue comment**, into the fixed
+receipt from `successful_check_run_request`. Codex posts findings as a review,
+but when it finds nothing it posts only an issue comment (for example
+`Codex Review: Didn't find any major issues.` followed by
+``**Reviewed commit:** `0123456789` ``, a 10-digit short SHA); without reading
+those comments a clean Codex result would stay `pending` forever. It never
 executes a provider and never posts the trigger comment. Publication goes
 through `ReviewCollector.collect_and_publish()` (see "Publication and
 supersession" below); a success is posted only via `publish_success`, which
@@ -192,8 +199,8 @@ Flow and binding:
 
 1. Before posting any trigger (for example `@codex review`), call
    `request_review(reviewer, live_context, source)`. It durably records the
-   complete `Context`, the highest review ID currently listed on the PR
-   (watermark) and the request time, under a per-PR lock, with an atomic
+   complete `Context`, the highest review ID and the highest issue comment ID
+   currently listed on the PR (watermarks) and the request time, under a per-PR lock, with an atomic
    `0600` write and directory fsync in `state_dir` (a `0700` directory owned by
    the publisher account, outside every checkout). A repeated call for the same
    active context returns the same request (retrying trigger delivery never
@@ -232,12 +239,28 @@ Flow and binding:
    marker in the body, no blocking marker, and every inline comment carrying a
    non-blocking marker and no blocking marker. Any other trusted same-HEAD
    review above the watermark blocks. No clean review yet is `pending`.
+5. Issue comments follow the same author trust (bot ID, login, `type: "Bot"`,
+   not via the Actions App), the comment watermark and the same
+   `created_at` ≥ request + bound rule. A trusted comment without a pass
+   marker (status summary, usage-limit notice) is ignored. A trusted comment
+   with a pass marker is a *result comment*; it must contain exactly one
+   `Reviewed commit` binding spelled as 7–40 lowercase hex digits, no blocking
+   marker, and must never have been edited (`updated_at` = `created_at`; a
+   maintainer can edit a bot's comment). Otherwise it blocks. A result whose
+   short SHA is not a prefix of the recorded HEAD is for another commit and is
+   ignored. A matching short SHA is resolved through
+   `GET /repos/{owner}/{repo}/commits/{short_sha}`: GitHub refuses an
+   ambiguous short SHA, which raises (fail closed), and a resolution to any
+   commit other than the exact HEAD blocks. So a short SHA never attributes a
+   result to another commit, even one crafted to share the prefix. The PR's
+   issue comment listing and the commit lookup are covered by the **Pull
+   requests: read** and **Contents: read** permissions above.
 
 Decisions are `pass`, `pending`, `blocked` or `invalidated` with a fixed reason
 code; only `pass` carries a check-run request. Malformed or oversized evidence,
 a truncated listing (the watermark review must still be listed), a listing that
-regressed, more than 1000 reviews / 300 comments per review / 20 candidate
-reviews, a corrupt, foreign or non-private ledger record, an unavailable lock
+regressed, more than 1000 reviews / 1000 issue comments / 300 comments per
+review / 20 candidate reviews and result comments, a corrupt, foreign or non-private ledger record, an unavailable lock
 (30 s bound) and every API error raise `CollectorFailure`, leaving the check
 absent. Logs carry reviewer, PR, request ID, status and reason code only;
 review text is never logged.
@@ -246,7 +269,8 @@ review text is never logged.
 
 GitHub evaluates a required check by the **latest** attempt with that name on
 the test-merge SHA, and nothing removes an earlier success. The collector
-therefore records, in the same private ledger record (schema version 2), the
+therefore records, in the same private ledger record (schema version 3, which
+adds the issue comment watermark; a version 2 record fails closed as corrupt), the
 success it posted, or may have posted, per reviewer: request ID, test-merge
 SHA, Check Run ID (once confirmed) and state (`publishing` / `success` /
 `revoking`).
@@ -267,7 +291,16 @@ SHA, Check Run ID (once confirmed) and state (`publishing` / `success` /
   run ID among that App's runs of the check and read `completed` / `success`.
   An incomplete or changing listing is treated as "not latest" (supersede,
   then post a new success); a failed read raises and supersedes the standing
-  success (fail closed).
+  success (fail closed). Before any new success is posted, the App's attempt
+  count of that check on the test-merge SHA is read; at 1000 attempts (the most
+  the listing can verify) no further success is posted and the pass raises, so
+  an unverifiable latest attempt cannot cause a supersede-and-republish on
+  every poll. The check then stays failed until the test merge changes.
+- The review `source` must name the configured repository (case-insensitive);
+  a source for another repository is a collection error that supersedes the
+  standing success, and `publish()` refuses a pass collected from such a
+  source. `GitHubReviewSource.for_credentials()` builds the source from the
+  configured repository and App token.
 - The per-PR ledger lock is held for the **whole** pass (collection and the
   resulting publication or revocation), so a pass only ever publishes or
   revokes what its own collection observed. Overlapping passes cannot revoke a

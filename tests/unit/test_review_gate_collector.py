@@ -53,7 +53,12 @@ class FakeSource:
         self.repository = repository
         self.reviews: list[dict] = []
         self.comments: dict[int, list[dict]] = {}
+        self.issue_comments: list[dict] = []
+        # Full commit SHAs GitHub knows; a short SHA resolves only if unique.
+        self.commits: set[str] = {"a" * 40}
+        self.resolved: list[str] = []
         self.next_id = 5000
+        self.next_comment_id = 8000
 
     def add(self, head_sha, submitted, user=CODEX_BOT, body=PASS,
             state="COMMENTED", comments=(), **extra):
@@ -66,6 +71,29 @@ class FakeSource:
             {"id": 70000 + index, "pull_request_review_id": self.next_id, "body": text}
             for index, text in enumerate(comments)]
         return review
+
+    def add_comment(self, commit_prefix, created, user=CODEX_BOT, body=PASS,
+                    updated=None, reviewed=None):
+        self.next_comment_id += 1
+        if reviewed is None:
+            reviewed = f"\n\n**Reviewed commit:** `{commit_prefix}`\n\n<details>about</details>"
+        comment = {"id": self.next_comment_id,
+                   "user": None if user is None else dict(user),
+                   "body": f"Codex Review: {body}{reviewed}",
+                   "created_at": iso(created),
+                   "updated_at": iso(created if updated is None else updated)}
+        self.issue_comments.append(comment)
+        return comment
+
+    def list_issue_comments(self, pr_number):
+        return [dict(comment) for comment in self.issue_comments]
+
+    def resolve_commit(self, prefix):
+        self.resolved.append(prefix)
+        matches = [sha for sha in self.commits if sha.startswith(prefix)]
+        if len(matches) != 1:
+            raise collector.CollectorFailure("short commit SHA is ambiguous")
+        return matches[0]
 
     def list_reviews(self, pr_number):
         if not isinstance(self.reviews, list):
@@ -181,6 +209,72 @@ class CollectorTests(unittest.TestCase):
                  "app": {"id": issuer.app_id, "slug": issuer.app_slug}}
                 for name in gate.CHECK_NAMES]
         gate.validate_reviews(self.context, self.context, runs, issuer)
+
+    def test_trusted_clean_issue_comment_passes_for_the_exact_head(self):
+        # Codex reports "no findings" as an issue comment naming a short SHA.
+        self.source.add_comment("a" * 10, START - 10)  # before the request
+        self.collector.request_review("codex", self.live, self.source)
+        self.assertEqual(self.collect().status, "pending")
+        self.source.add_comment("a" * 10, self.late())
+        decision = self.collect()
+        self.assertEqual((decision.status, decision.reason), ("pass", "trusted_clean_review"))
+        self.assertEqual(decision.check_run_request,
+                         gate.successful_check_run_request(self.context, "codex"))
+        self.assertEqual(self.source.resolved, ["a" * 10])
+
+    def test_issue_comment_for_another_commit_or_too_early_never_passes(self):
+        self.collector.request_review("codex", self.live, self.source)
+        self.source.commits.add("b" * 40)
+        self.source.add_comment("b" * 10, self.late())  # another commit
+        self.source.add_comment("a" * 10, self.late() - 1)  # inside the runtime bound
+        for user in (None, ACTIONS_BOT, {**CODEX_BOT, "id": 1},
+                     {**CODEX_BOT, "type": "User"}):
+            self.source.add_comment("a" * 10, self.late(), user=user)
+        self.source.add_comment("a" * 10, self.late(), body="usage limit reached",
+                                reviewed="")  # not a result comment
+        decision = self.collect()
+        self.assertEqual(decision.status, "pending")
+        self.assertEqual(decision.ignored_untrusted_reviews, 4)
+
+    def test_ambiguous_issue_comment_fails_closed(self):
+        cases = {
+            # Another known commit shares the short SHA: never attributed.
+            "colliding_prefix": dict(prefix="a" * 10),
+            "edited_after_posting": dict(prefix="a" * 10, updated=self.late() + 60),
+            "blocking_marker": dict(prefix="a" * 10, body=PASS + " " + BLOCK),
+            "no_reviewed_commit": dict(prefix="a" * 10, reviewed=""),
+            "two_reviewed_commits": dict(
+                prefix="a" * 10,
+                reviewed=("\n**Reviewed commit:** `aaaaaaaaaa`"
+                          "\n**Reviewed commit:** `bbbbbbbbbb`")),
+            "uppercase_or_short_sha": dict(prefix="AAAAAAAAAA"),
+            "six_hex_digits": dict(prefix="a" * 6),
+        }
+        for name, case in cases.items():
+            with self.subTest(case=name):
+                self.source = FakeSource()
+                if name == "colliding_prefix":
+                    self.source.commits.add("a" * 10 + "e" * 30)
+                self.collector.request_review("codex", self.live, self.source,
+                                              force_new=True)
+                prefix = case.pop("prefix")
+                self.source.add_comment(prefix, self.late(), **case)
+                self.source.add(self.context.head_sha, self.late())  # a clean review
+                if name == "colliding_prefix":
+                    with self.assertRaises(collector.CollectorFailure):
+                        self.collect()
+                else:
+                    self.assertEqual(self.collect().status, "blocked")
+
+    def test_issue_comment_below_the_request_watermark_is_ignored(self):
+        self.collector.request_review("codex", self.live, self.source)
+        self.source.add_comment("a" * 10, self.late())
+        self.assertEqual(self.collect().status, "pass")
+        outcome = self.collector.request_review("codex", self.live, self.source,
+                                                force_new=True)
+        self.assertEqual(outcome.request.comment_watermark,
+                         self.source.issue_comments[-1]["id"])
+        self.assertEqual(self.collect().status, "pending")
 
     def test_claude_uses_the_same_contract_with_its_own_identity(self):
         self.collector.request_review("claude", self.live, self.source)
@@ -831,6 +925,24 @@ class CollectorTests(unittest.TestCase):
                 self.assertEqual(len(client.posts), posts)
                 self.tearDown()
 
+    def test_attempt_limit_stops_republishing_on_every_poll(self):
+        client, credentials = self.publication()
+        self.collector.request_review("codex", self.live, self.source)
+        self.source.add(self.context.head_sha, self.late())
+        self.reconcile(client, credentials)
+        # So many attempts exist that the latest one can never be verified.
+        client.hidden_runs = publisher.MAX_CHECK_RUN_ATTEMPTS
+        for _ in range(4):
+            with self.assertRaisesRegex(collector.CollectorFailure, "attempt limit"):
+                self.reconcile(client, credentials)
+        # The standing success was superseded once; nothing was posted after.
+        self.assertEqual([post["conclusion"] for post in client.posts],
+                         ["success", "failure"])
+        self.assertIsNone(self.ledger()["published"])
+        client.hidden_runs = publisher.MAX_CHECK_RUN_ATTEMPTS - 3
+        self.assertEqual(self.reconcile(client, credentials).status, "pass")
+        self.assertEqual(client.posts[-1]["conclusion"], "success")
+
     def test_unverifiable_latest_attempt_is_never_reused(self):
         client, credentials = self.publication()
         self.collector.request_review("codex", self.live, self.source)
@@ -968,6 +1080,39 @@ class GitHubReviewSourceTests(unittest.TestCase):
                 source.list_reviews(*args)
         with self.assertRaises(collector.CollectorFailure):
             collector.GitHubReviewSource(client, "owner/repo/extra", "t")
+
+    def test_issue_comments_and_short_sha_resolution(self):
+        full = [{"id": i} for i in range(1, 101)]
+        client = self.Client([full, [{"id": 101}]])
+        responses = {}
+
+        def get_json(path, token):
+            client.paths.append(path)
+            response = responses[path]
+            if isinstance(response, Exception):
+                raise response
+            return response
+        client.get_json = get_json
+        source = collector.GitHubReviewSource(client, "owner/repository", "t")
+        self.assertEqual(len(source.list_issue_comments(12)), 101)
+        self.assertEqual(client.paths[0],
+                         "/repos/owner/repository/issues/12/comments?per_page=100&page=1")
+        route = "/repos/owner/repository/commits/aaaaaaaaaa"
+        responses[route] = {"sha": "a" * 40}
+        self.assertEqual(source.resolve_commit("a" * 10), "a" * 40)
+        # GitHub refuses an ambiguous short SHA; a malformed answer is no answer.
+        for response in (publisher.PublisherFailure("GitHub API request failed"),
+                         {"sha": "a" * 10}, {}):
+            responses[route] = response
+            with self.assertRaises(collector.CollectorFailure):
+                source.resolve_commit("a" * 10)
+        for bad in ("a" * 6, "A" * 10, "a" * 41, "aaaaaaa/../x", 7):
+            with self.assertRaises(collector.CollectorFailure):
+                source.resolve_commit(bad)
+        client = self.Client([full] * collector.GitHubReviewSource.MAX_PAGES)
+        source = collector.GitHubReviewSource(client, "owner/repository", "t")
+        with self.assertRaisesRegex(collector.CollectorFailure, "verification limit"):
+            source.list_issue_comments(12)
 
     def test_source_built_from_credentials_reads_the_configured_repository(self):
         config = publisher.RuntimeConfig("owner/repository", 900002,
