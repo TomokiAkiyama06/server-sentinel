@@ -21,6 +21,14 @@ class PrincipalStatus(str, Enum):
     REVOKED = "revoked"
 
 
+class CredentialStatus(str, Enum):
+    """Credential-scoped state; a synced passkey is one credential on many devices."""
+
+    ACTIVE = "active"
+    REVOKED = "revoked"
+    INCONSISTENT = "inconsistent"
+
+
 class Permission(str, Enum):
     LIVE_VIEW = "live:view"
     RECORDINGS_VIEW = "recordings:view"
@@ -66,8 +74,31 @@ class Credential:
     sign_count: int
     enrolled_at: datetime
     revoked_at: datetime | None = None
+    backup_eligible: bool = False
+    backup_state: bool = False
+    inconsistent_at: datetime | None = None
+    label: str | None = None
+    last_used_at: datetime | None = None
+
+    @property
+    def status(self) -> CredentialStatus:
+        if self.revoked_at is not None:
+            return CredentialStatus.REVOKED
+        if self.inconsistent_at is not None:
+            return CredentialStatus.INCONSISTENT
+        return CredentialStatus.ACTIVE
 
     def __post_init__(self):
+        if type(self.backup_eligible) is not bool or type(self.backup_state) is not bool:
+            raise AccessValidationError("credential metadata is invalid")
+        if self.backup_state and not self.backup_eligible:
+            raise AccessValidationError("credential metadata is invalid")
+        if self.label is not None and (not isinstance(self.label, str) or not 1 <= len(self.label) <= 64
+                                       or any(ord(char) < 32 for char in self.label)):
+            raise AccessValidationError("credential label is invalid")
+        for name in ("inconsistent_at", "last_used_at"):
+            if getattr(self, name) is not None:
+                object.__setattr__(self, name, utc_time(getattr(self, name)))
         if not isinstance(self.credential_id, bytes) or not 1 <= len(self.credential_id) <= 1024:
             raise AccessValidationError("credential identifier is invalid")
         if not isinstance(self.principal_id, UUID) or not isinstance(self.public_key, bytes) or not 1 <= len(self.public_key) <= 8192:

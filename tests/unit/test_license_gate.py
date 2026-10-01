@@ -320,6 +320,19 @@ class LicenseGateTests(GateFixture):
                 with self.assertRaisesRegex(license_gate.GateError, "lacks exact owner approval"):
                     license_gate.audit(self.root)
 
+    def test_mit_0_is_an_exact_permissive_spdx_id(self):
+        """MIT-0 (Owner decision 2026-09-30) passes only as the exact SPDX id."""
+        self.components = [self.component(license="MIT-0")]
+        self.approvals = []
+        self.save()
+        self.assertEqual(license_gate.audit(self.root), (1, 1, 0, 0))
+        for near in ("mit-0", "MIT-0 ", "MIT-0-Modified", "MIT-0 OR GPL-3.0-only", "MIT No Attribution"):
+            with self.subTest(license=near):
+                self.components = [self.component(license=near)]
+                self.save()
+                with self.assertRaisesRegex(license_gate.GateError, "lacks exact owner approval"):
+                    license_gate.audit(self.root)
+
     def test_exact_recorded_owner_approval_allows_blocked_component(self):
         self.components = [self.component(
             license="GPL-3.0-only",

@@ -2,7 +2,9 @@
 
 Main Server runtime additions and the CI-only base image are reviewed separately
 in [`server/docs/DEPENDENCIES.md`](server/docs/DEPENDENCIES.md). That inventory
-includes all pinned Python wheels, Pydantic Core's Rust closure, image digests
+includes all pinned Python wheels, Pydantic Core's and cryptography's Rust
+closures, the OpenSSL and libffi code statically linked into the cryptography
+and cffi wheels, image digests
 and notice/source obligations. Preserve the bundled
 [`server/docs/BACKEND_THIRD_PARTY_LICENSE_TEXTS.md`](server/docs/BACKEND_THIRD_PARTY_LICENSE_TEXTS.md)
 with application deployments and redistributions.
