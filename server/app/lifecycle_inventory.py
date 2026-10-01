@@ -1980,9 +1980,10 @@ def _compare_migrations(baseline: list | None, current: list | None) -> dict:
     the code's migrations, and requires each row to equal the code's
     migration at the same position (version, name, checksum); it then only
     appends the code's later ones. Migrations are forward-only, so a
-    rollback removes none. Hence the current history must start with the
-    recorded rows unchanged and, as a whole, be a positional prefix of this
-    release's APPLICATION_MIGRATIONS: no gap, reorder or foreign row.
+    rollback removes none. verify runs after the release has started, so
+    the current history must start with the recorded rows unchanged and
+    equal this release's whole APPLICATION_MIGRATIONS: no gap, reorder,
+    foreign row or missing tail.
     """
     if baseline is None:
         return {"status": "failed" if current is None else "empty",
@@ -2003,6 +2004,11 @@ def _compare_migrations(baseline: list | None, current: list | None) -> dict:
     # The exact check migrate() runs on startup.
     if len(current) > len(code) or any(row != expected for row, expected in zip(current, code)):
         failed.append({"id": None, "reason": "history_rejected"})
+    elif len(current) < len(code):
+        # verify runs after the release started (systemd readiness follows
+        # migrate()), so its full catalog is applied. A shorter history means
+        # applied rows were removed and the next start would re-run DDL.
+        failed.append({"id": None, "reason": "not_migrated"})
     recorded = {row[0] for row in baseline}
     return {"status": "failed" if failed else "preserved", "failed": failed,
             "appended": [row[0] for row in current if row[0] not in recorded]}

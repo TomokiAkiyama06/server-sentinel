@@ -679,6 +679,9 @@ class LifecycleInventoryTests(unittest.TestCase):
         # migrations; migrate() would refuse every resulting history.
         rejected = {"id": None, "reason": "history_rejected"}
         tampers = {
+            # Codex P1: applied rows removed, leaving a strict prefix of the
+            # catalog; the next start would re-run their DDL.
+            "not migrated": ([], {"id": None, "reason": "not_migrated"}),
             "dropped": (["DROP TABLE schema_migrations"], {"id": None, "reason": "table_missing"}),
             "row removed": (["DELETE FROM schema_migrations WHERE version=1"],
                             {"id": 1, "reason": "missing"}),

@@ -335,7 +335,10 @@ fails closed if it cannot create the per-release environment.
 Counts, sizes and first/last timestamps cannot detect a same-size byte
 replacement or a rewritten middle audit row. Before every update and rollback,
 and again after each one, compare a content inventory taken with the installed
-release's own tool. It opens the state database read-only (SQLite `mode=ro`
+release's own tool. Run `verify` only after the updated or rolled-back release
+has started: the guarded restart reports success only after systemd readiness,
+which follows the release's database migration, so the applied migration
+history must then equal that release's full migration list. It opens the state database read-only (SQLite `mode=ro`
 with `query_only`), never creates or migrates it, and only reads segment files:
 
 ```sh
@@ -513,10 +516,15 @@ inventory reads that existed at record time must still exist, even if it was
 empty then (a dropped one is `table_missing` in the `tables` section), and
 the applied migration history (`schema_migrations` version, name and
 checksum, which startup re-checks row by row) must keep every recorded row
-unchanged, and the whole history must be exactly what the next startup's
-`migrate()` accepts: a positional prefix of this release's own migrations,
-with no gap, reordered, duplicated or foreign row (`history_rejected`;
-migrations are forward-only, so a rollback adds or removes none). Session or derived tables (WebAuthn challenges, schedule and fairness
+unchanged, and the whole history must be exactly this release's own
+migration list, in order, as the startup `migrate()` check that has just run
+requires: a gap, reordered, duplicated or foreign row is `history_rejected`,
+and a shorter history (applied rows removed, so the next start would re-run
+their schema changes) is `not_migrated`. Migrations are forward-only: a
+rollback succeeds only when the older release accepts the history, so when a
+release that predates this tool is verified with a newer release's
+interpreter (below) and that newer release defines further migrations, the
+result is `not_migrated` and must be investigated rather than accepted. Session or derived tables (WebAuthn challenges, schedule and fairness
 cursors, live presence inputs, the self-test artifact pointer, setup wizard
 progress) are deliberately not inventoried. A missing or changed
 recording, audit row, source, principal or invitation is `failed` (exit 1);
