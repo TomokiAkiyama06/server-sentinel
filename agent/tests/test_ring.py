@@ -16,7 +16,7 @@ from media_capture_agent import ring as ring_module
 from media_capture_agent.ring import DiskRing
 from media_capture_agent.ring_ledger import Ledger
 from media_capture_agent.ring_models import (POST, PRE, RETENTION, SECOND, RingConfig,
-                                            RingRefused, SegmentProfile)
+                                            RingRefused, SegmentProfile, round_up)
 from media_capture_agent.storage import MediaStore, StorageRefused
 from tests.support import SOURCE, settings
 
@@ -407,6 +407,32 @@ class RingTests(unittest.TestCase):
         result = self.ring.incident(identifier, now_us=T0 + POST)
         self.assertEqual(result["state"], "partial")
         self.assertTrue(result["clock_uncertain"])
+
+    def test_simulated_appends_that_age_out_are_credited_before_a_slow_source_appends(self):
+        unit, headroom = self.store.allocation_unit, self.ring.ledger_headroom
+        slow = SegmentProfile(SOURCE, 80, 40, PRE, 100)
+        fast = SegmentProfile(UUID(int=201), 800, 400, 60 * SECOND, 100)
+        self.ring.configure(RingConfig("duration", 600), (slow, fast), now_us=T0, clock_trusted=True)
+        self.ring.append(SOURCE, T0 - PRE, T0, PAYLOAD, now_us=T0, clock_trusted=True)
+        # The slow source next appends at T0 + PRE; the overdue fast source
+        # appends at T0, T0 + 60 s, ..., T0 + PRE. By T0 + PRE its own T0
+        # segment has crossed the FIFO cutoff and the real append path
+        # reclaims it, as it does the slow source's stored segment.
+        stored = sum(self.store.segment_allocations().values())
+        b = round_up(fast.segment_bytes(), unit)
+        a = round_up(slow.segment_bytes(), unit)
+        target = (self.settings.safety_reserve_bytes + round_up(fast.segment_bytes() + headroom, unit)
+                  + 10 * b + a - stored - b)
+        free = self.ring._budget(self.ring.profiles, T0, clock_trusted=True)["filesystem_free"]
+        self.quota.other += free - target
+        self.assertEqual(target, self.ring._budget(self.ring.profiles, T0, clock_trusted=True)["filesystem_free"])
+        status = self.ring.status(now_us=T0, clock_trusted=True)
+        self.assertNotEqual("STORAGE_HARD_STOP", status["state"])
+        # One allocation unit less is a real refusal at the last append.
+        self.quota.other += unit
+        status = self.ring.status(now_us=T0, clock_trusted=True)
+        self.assertEqual(("STORAGE_HARD_STOP", "segment_write_refused_at_reserve"),
+                         (status["state"], status["reason"]))
 
     def test_long_rollback_with_mixed_cadences_keeps_status_bounded(self):
         late = 61 * 86400 * SECOND

@@ -373,6 +373,10 @@ class DiskRing:
         same-instant appends of synchronized sources. Free space and each
         reclaimed segment are shared: every earlier simulated append consumes
         its bounded allocation, and reclaimable media is credited only once.
+        A simulated append is itself ordinary media: once its end crosses a
+        later append's FIFO cutoff, its bounded allocation is credited too,
+        unless a retained incident would protect it or a loss is pending
+        (both of which also stop the append path from reclaiming it).
 
         Under untrusted time the trusted phases are not comparable with
         ``now`` (a rollback can leave them far in the future), and nothing is
@@ -402,16 +406,38 @@ class DiskRing:
             while at <= latest:
                 events.append((at, profile))
                 at += profile.segment_duration_us
-        consumed = 0
+        existing = sorted((row["end"], allocations.get(UUID(row["id"]), 0)) for row in rows)
+        may_credit = clock_trusted and not self._pending_loss()
+        protecting = []
+        if may_credit:
+            protecting = [(row["start"], row["end"], set(json.loads(row["sources"])))
+                          for row in self.db.execute(
+                              "SELECT start, end, sources FROM incidents "
+                              "WHERE state IN ('active','complete','partial') AND end>?", (now - window,))]
+        simulated = []
+        consumed = reclaim = 0
+        credited_existing = credited_simulated = 0
         # Equal timestamps share one reclaim credit; their order within the
-        # instant does not matter because consumption is cumulative.
+        # instant does not matter because consumption is cumulative. Both
+        # credit lists are in end order, so each entry is credited once.
         for at, profile in sorted(events, key=lambda item: item[0]):
             cutoff = at - window
-            reclaim = sum(allocations.get(UUID(row["id"]), 0) for row in rows if row["end"] <= cutoff)
+            while credited_existing < len(existing) and existing[credited_existing][0] <= cutoff:
+                reclaim += existing[credited_existing][1]
+                credited_existing += 1
+            while credited_simulated < len(simulated) and simulated[credited_simulated][0] <= cutoff:
+                reclaim += simulated[credited_simulated][1]
+                credited_simulated += 1
             needed = round_up(profile.segment_bytes() + self.ledger_headroom, unit)
             if free + reclaim - consumed < reserve + needed:
                 return True
-            consumed += round_up(profile.segment_bytes(), unit)
+            allocation = round_up(profile.segment_bytes(), unit)
+            consumed += allocation
+            source = str(profile.source_id)
+            if may_credit and not any(
+                    source in sources and start < at and end > at - profile.segment_duration_us
+                    for start, end, sources in protecting):
+                simulated.append((at, allocation))
         return False
 
     def configure(self, config, profiles, *, now_us, clock_trusted):
