@@ -1974,13 +1974,15 @@ def _retention_rules(now: datetime) -> dict:
 
 
 def _compare_migrations(baseline: list | None, current: list | None) -> dict:
-    """The applied migration history only grows by this release's migrations.
+    """The applied migration history the next startup would still accept.
 
-    migrate() refuses to start unless every applied row equals the code's
-    migration at that position, and only appends the code's later ones;
-    migrations are forward-only (a rollback never removes one). So every
-    recorded row must remain unchanged, and a row added since must be the
-    one APPLICATION_MIGRATIONS (of the release running verify) defines.
+    migrate() reads the history ordered by version, refuses one longer than
+    the code's migrations, and requires each row to equal the code's
+    migration at the same position (version, name, checksum); it then only
+    appends the code's later ones. Migrations are forward-only, so a
+    rollback removes none. Hence the current history must start with the
+    recorded rows unchanged and, as a whole, be a positional prefix of this
+    release's APPLICATION_MIGRATIONS: no gap, reorder or foreign row.
     """
     if baseline is None:
         return {"status": "failed" if current is None else "empty",
@@ -1989,22 +1991,21 @@ def _compare_migrations(baseline: list | None, current: list | None) -> dict:
     if current is None:
         return {"status": "failed", "failed": [{"id": None, "reason": "table_missing"}],
                 "appended": []}
-    known = {migration.version: [migration.version, migration.name, migration.checksum]
-             for migration in APPLICATION_MIGRATIONS}
-    now = {row[0]: row for row in current}
     failed = []
-    for row in baseline:
-        if row[0] not in now:
+    by_version = {row[0]: row for row in current}
+    for position, row in enumerate(baseline):
+        if row[0] not in by_version:
             failed.append({"id": row[0], "reason": "missing"})
-        elif now[row[0]] != row:
+        elif position >= len(current) or current[position] != row:
             failed.append({"id": row[0], "reason": "changed"})
+    code = [[migration.version, migration.name, migration.checksum]
+            for migration in APPLICATION_MIGRATIONS]
+    # The exact check migrate() runs on startup.
+    if len(current) > len(code) or any(row != expected for row, expected in zip(current, code)):
+        failed.append({"id": None, "reason": "history_rejected"})
     recorded = {row[0] for row in baseline}
-    appended = [row[0] for row in current if row[0] not in recorded]
-    for version in appended:
-        if now[version] != known.get(version) or version < max(recorded, default=0):
-            failed.append({"id": version, "reason": "unknown_migration"})
     return {"status": "failed" if failed else "preserved", "failed": failed,
-            "appended": appended}
+            "appended": [row[0] for row in current if row[0] not in recorded]}
 
 
 def compare(baseline: dict, current: dict, *, declared_rewrites=(), now=None) -> dict:

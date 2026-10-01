@@ -675,29 +675,48 @@ class LifecycleInventoryTests(unittest.TestCase):
         code, report, _ = self.verify(baseline)
         self.assertEqual(code, inventory.EXIT_PRESERVED, report["sections"]["schema_migrations"])
         self.assertEqual(report["sections"]["schema_migrations"]["appended"], [last[0]])
+        # Each tamper starts from a baseline recorded before the last two
+        # migrations; migrate() would refuse every resulting history.
+        rejected = {"id": None, "reason": "history_rejected"}
         tampers = {
-            "dropped": ("DROP TABLE schema_migrations", None),
-            "row removed": ("DELETE FROM schema_migrations WHERE version=1",
+            "dropped": (["DROP TABLE schema_migrations"], {"id": None, "reason": "table_missing"}),
+            "row removed": (["DELETE FROM schema_migrations WHERE version=1"],
                             {"id": 1, "reason": "missing"}),
-            "row rewritten": ("UPDATE schema_migrations SET checksum='0' WHERE version=1",
-                              {"id": 1, "reason": "changed"}),
-            "unknown row": ("INSERT INTO schema_migrations VALUES (9999, 'x', 'y')",
-                            {"id": 9999, "reason": "unknown_migration"}),
+            "prefix row replaced": (["UPDATE schema_migrations SET checksum='0' WHERE version=1"],
+                                    {"id": 1, "reason": "changed"}),
+            "unknown row": (["INSERT INTO schema_migrations VALUES (9999, 'x', 'y')"], rejected),
+            "gap": (["INSERT INTO schema_migrations VALUES (:v2, :n2, :c2)"], rejected),
+            "reorder": (["INSERT INTO schema_migrations VALUES (:v1, :n2, :c2)",
+                         "INSERT INTO schema_migrations VALUES (:v2, :n1, :c1)"], rejected),
+            "duplicate": (["INSERT INTO schema_migrations VALUES (:v1, :n1, :c1)",
+                           "INSERT INTO schema_migrations VALUES (:v2, :n1, :c1)"], rejected),
         }
-        for index, (label, (statement, expected)) in enumerate(tampers.items()):
+        for index, (label, (statements, expected)) in enumerate(tampers.items()):
             with self.subTest(label):
                 runtime = Runtime(self.base / f"migrations-{index}")
                 saved, self.runtime = self.runtime, runtime
                 try:
                     runtime.seed()
+                    with closing(sqlite3.connect(runtime.database)) as connection:
+                        tail = connection.execute(
+                            "SELECT version, name, checksum FROM schema_migrations "
+                            "ORDER BY version DESC LIMIT 2").fetchall()[::-1]
+                    values = {"v1": tail[0][0], "n1": tail[0][1], "c1": tail[0][2],
+                              "v2": tail[1][0], "n2": tail[1][1], "c2": tail[1][2]}
+                    runtime.execute("DELETE FROM schema_migrations WHERE version >= ?",
+                                    (tail[0][0],))
                     _, recorded = self.record(f"migrations-{index}.json")
-                    runtime.execute(statement)
+                    with closing(sqlite3.connect(runtime.database,
+                                                 isolation_level=None)) as connection:
+                        for statement in statements:
+                            connection.execute(statement, {key: value for key, value in
+                                                           values.items()
+                                                           if f":{key}" in statement})
                     code, report, _ = self.verify(recorded)
                 finally:
                     self.runtime = saved
                 self.assertEqual(code, inventory.EXIT_FAILED)
-                failed = report["sections"]["schema_migrations"]["failed"]
-                self.assertIn(expected or {"id": None, "reason": "table_missing"}, failed)
+                self.assertIn(expected, report["sections"]["schema_migrations"]["failed"])
 
     def test_every_migration_table_is_inventoried_or_explained(self):
         with closing(sqlite3.connect(self.runtime.database)) as connection:
