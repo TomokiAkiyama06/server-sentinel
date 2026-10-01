@@ -110,7 +110,9 @@ class CaptureCredentialMonitor:
 
     ``notify(kind, at)`` is the injected existing notification hook, normally
     ``NotificationService.record``. Each (node, reason, expiry) is reported
-    once per process; the remembered set is bounded.
+    once per process, counted only once the hook succeeds, so a failed
+    notification is retried on the next check or refusal; the remembered set
+    is bounded.
     """
 
     def __init__(self, ledger: PairingLedger,
@@ -132,14 +134,16 @@ class CaptureCredentialMonitor:
     def _signal(self, key: tuple, signal: CredentialSignal, at: datetime.datetime) -> None:
         if key in self._reported:
             return
+        try:
+            self._notify(NotificationKind.CAPTURE_CREDENTIAL_WARNING, at=at)
+        except Exception:
+            # Not marked reported: the next check or refusal retries it.
+            self.notification_failed = True
+            return
         if len(self._reported) >= _MAX_REMEMBERED_SIGNALS:
             self._reported.clear()
         self._reported.add(key)
         self.signals = (self.signals + [signal])[-_MAX_REMEMBERED_SIGNALS:]
-        try:
-            self._notify(NotificationKind.CAPTURE_CREDENTIAL_WARNING, at=at)
-        except Exception:
-            self.notification_failed = True
 
     def check(self) -> tuple[CredentialSignal, ...]:
         """Report credentials inside the warning window or already expired."""

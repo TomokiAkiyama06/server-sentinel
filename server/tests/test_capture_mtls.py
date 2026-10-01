@@ -692,5 +692,27 @@ class CaptureRenewalTests(CaptureTlsHarness):
         self.assertEqual(NotificationKind.CAPTURE_CREDENTIAL_WARNING, self.notifications[-1])
 
 
+    def test_failed_warning_notification_is_retried_until_delivered(self):
+        # A raising notification hook must not mark the warning as reported,
+        # or the Owner-visible expiry warning would stay silent for the
+        # process lifetime.
+        self._paired_node("soon", validity=10 * DAY)
+        delivered, failures = [], [RuntimeError("hook unavailable")]
+
+        def notify(kind, at):
+            if failures:
+                raise failures.pop()
+            delivered.append(kind)
+
+        monitor = CaptureCredentialMonitor(self.ledger, notify)
+        monitor.check()
+        self.assertTrue(monitor.notification_failed)
+        self.assertEqual([], delivered)
+        monitor.check()
+        self.assertEqual([NotificationKind.CAPTURE_CREDENTIAL_WARNING], delivered)
+        monitor.check()  # delivered once; not repeated
+        self.assertEqual(1, len(delivered))
+
+
 if __name__ == "__main__":
     unittest.main()
