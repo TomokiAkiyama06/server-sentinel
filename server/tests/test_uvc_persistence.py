@@ -27,7 +27,12 @@ class PersistenceTests(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         self.database = SyntheticDatabase(Path(temporary.name) / "synthetic.sqlite")
         connection = self.database.connect()
-        connection.execute("CREATE TABLE camera_sources (id TEXT PRIMARY KEY)")
+        # Only the registry columns the approval store reads.
+        connection.execute(
+            "CREATE TABLE camera_sources (id TEXT PRIMARY KEY, "
+            "source_type TEXT NOT NULL DEFAULT 'local_uvc', "
+            "enabled INTEGER NOT NULL DEFAULT 1)"
+        )
         connection.execute(SCHEMA)
         connection.execute(EXPLICIT_BINDING_SCHEMA)
         connection.close()
