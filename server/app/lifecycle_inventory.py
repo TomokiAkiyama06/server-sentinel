@@ -23,8 +23,9 @@
   embeddings) and its audit rows / chain;
 - Owner presence and, per nonidentifying principal / invitation logical ID,
   the independent ``live:view`` / ``recordings:view`` grants, revocation
-  state, authorization revision, a keyed digest per usable (unrevoked and
-  consistent) credential, and every non-secret invitation validity field.
+  state, authorization revision, a keyed digest and the (only rising)
+  signature counter per usable (unrevoked and consistent) credential, every
+  invitation validity field and a keyed digest of its secret digest.
 
 Keyed digests are HMAC-SHA-256 under a random per-baseline salt stored in the
 baseline.
@@ -436,6 +437,37 @@ def _compare_sources(baseline: dict | None, current: dict | None) -> dict:
     return result
 
 
+def _sign_counts_advanced(base: dict, now: dict) -> bool:
+    """Whether a principal changed only by credential signature counters rising.
+
+    The same credentials must remain, each counter equal or higher; any
+    decrease rolls back the authenticator clone-detection floor.
+    """
+    if ({key: value for key, value in base.items() if key != "active_credentials"}
+            != {key: value for key, value in now.items() if key != "active_credentials"}):
+        return False
+    before, after = base["active_credentials"], now["active_credentials"]
+    return ([item[0] for item in before] == [item[0] for item in after]
+            and all(new[1] >= old[1] for old, new in zip(before, after)))
+
+
+def _compare_principals(baseline: dict | None, current: dict | None) -> dict:
+    """Keyed comparison where only credential signature counters may rise."""
+    result = _compare_keyed(baseline, current)
+    if result["status"] == "empty":
+        return result
+    advanced = []
+    for entry in list(result["failed"]):
+        key = entry["id"]
+        if entry["reason"] == "changed" and _sign_counts_advanced(baseline[key], current[key]):
+            result["failed"].remove(entry)
+            result["preserved"].append(key)
+            advanced.append(key)
+    result.update(status="failed" if result["failed"] else "preserved",
+                  preserved=sorted(result["preserved"]), sign_counts_advanced=sorted(advanced))
+    return result
+
+
 def _compare_owner_template(baseline: dict | None, current: dict | None) -> dict:
     baseline = baseline or {"configured": False}
     current = current or {"configured": False}
@@ -483,15 +515,17 @@ def _access(connection, tables, salt: str) -> dict | None:
             (row["id"],)))
         # A credential marked inconsistent is unusable, like a revoked one.
         # Each usable credential is kept as a keyed digest of its stable
-        # authentication material; the sign count and backup state advance
-        # with normal use and are excluded.
-        credentials = sorted(_keyed(salt, [
+        # authentication material plus its signature counter (not secret),
+        # which verification lets only advance: a lower counter would roll
+        # back the clone-detection floor. Backup state is excluded.
+        credentials = sorted([_keyed(salt, [
             "credential-v1", bytes(item["credential_id"]).hex(), bytes(item["public_key"]).hex(),
             item["algorithm"], None if item["backup_eligible"] is None
-            else bool(item["backup_eligible"])]) for item in connection.execute(
-                f"SELECT credential_id, public_key, algorithm, {eligible} FROM access_credentials "
-                "WHERE principal_id = ? AND revoked_at_us IS NULL" + consistent,
-                (row["id"],)))
+            else bool(item["backup_eligible"])]), item["sign_count"]]
+            for item in connection.execute(
+                f"SELECT credential_id, public_key, algorithm, sign_count, {eligible} "
+                "FROM access_credentials WHERE principal_id = ? AND revoked_at_us IS NULL"
+                + consistent, (row["id"],)))
         principals[row["id"]] = {
             "role": row["role"], "status": row["status"],
             "authorization_revision": row["authorization_revision"],
@@ -499,8 +533,9 @@ def _access(connection, tables, salt: str) -> dict | None:
             "permissions": permissions, "active_credential_count": len(credentials),
             "active_credentials": credentials,
         }
-    # Every non-secret field that decides whether the code can still be
-    # redeemed; never the secret digest.
+    # Every field that decides whether the code can still be redeemed. The
+    # secret digest itself is never written, only a keyed digest of it, so a
+    # replaced enrollment binding is a change.
     attempts = ("attempt_count" if "attempt_count" in _columns(connection, "access_invitations")
                 else "NULL AS attempt_count")
     invitations = {row["id"]: {
@@ -513,8 +548,10 @@ def _access(connection, tables, salt: str) -> dict | None:
         "issued_at_us": row["issued_at_us"],
         "expires_at_us": row["expires_at_us"],
         "attempt_count": row["attempt_count"],
+        "secret_binding": _keyed(salt, ["invitation-secret-v1", bytes(row["secret_digest"]).hex()]),
     } for row in connection.execute(
-        "SELECT id, principal_id, principal_revision, deployment_generation, issued_at_us, "
+        "SELECT id, secret_digest, principal_id, principal_revision, deployment_generation, "
+        "issued_at_us, "
         f"expires_at_us, redeemed_at_us, revoked_at_us, {attempts} "
         "FROM access_invitations ORDER BY id")}
     return {"principals": principals, "invitations": invitations}
@@ -828,8 +865,8 @@ def compare(baseline: dict, current: dict, *, declared_rewrites=()) -> dict:
             baseline.get("camera_registry_settings"), current.get("camera_registry_settings")),
         "owner_template": _compare_owner_template(baseline.get("owner_template"),
                                                   current.get("owner_template")),
-        "access_principals": _compare_keyed(access_base.get("principals"),
-                                            access_now.get("principals")),
+        "access_principals": _compare_principals(access_base.get("principals"),
+                                                 access_now.get("principals")),
         "access_invitations": _compare_keyed(access_base.get("invitations"),
                                              access_now.get("invitations")),
     }

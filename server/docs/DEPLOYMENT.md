@@ -360,11 +360,13 @@ the template and its model provenance, and per-row / chained evidence over
 `owner_template_audit`; and Owner presence plus each principal's independent
 `live:view` / `recordings:view` grants, authorization revision and, for every
 credential that is neither revoked nor marked inconsistent, a keyed digest of
-its credential ID, public key, algorithm and backup eligibility (sign count
-and backup state advance with use and are excluded), and each
+its credential ID, public key, algorithm and backup eligibility together with
+its signature counter, which may only stay or rise (a lower counter rolls back
+the clone-detection floor and is a change; backup state is excluded), and each
 invitation's redemption and revocation state, principal revision and
 deployment generation bindings (and whether that generation is still
-current), issue and expiry times and redemption attempt count. Keyed digests
+current), issue and expiry times, redemption attempt count and a keyed digest
+of its secret digest (so a replaced enrollment binding is a change). Keyed digests
 are HMAC-SHA-256 under a random salt drawn for each baseline and stored in it,
 so the raw values are never written and a digest cannot be matched across
 baselines; whoever holds a baseline can still test a guessed value, so keep it

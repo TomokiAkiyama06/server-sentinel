@@ -675,6 +675,49 @@ class LifecycleInventoryTests(unittest.TestCase):
         code, _, _ = self.verify(baseline, *option)
         self.assertEqual(code, inventory.EXIT_PRESERVED)
 
+    def test_credential_sign_count_may_only_advance(self):
+        # A lower counter rolls back the authenticator clone-detection floor.
+        seeded = self.runtime.seed()
+        self.runtime.execute("UPDATE access_credentials SET sign_count=5")
+        _, baseline = self.record()
+        recorded = json.loads(baseline.read_text())["access"]["principals"]
+        self.assertEqual(recorded[seeded["owner"]]["active_credentials"][0][1], 5)
+        self.runtime.execute("UPDATE access_credentials SET sign_count=8")
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_PRESERVED)
+        section = report["sections"]["access_principals"]
+        self.assertEqual(section["sign_counts_advanced"], [seeded["owner"]])
+        self.assertIn(seeded["owner"], section["preserved"])
+        self.runtime.execute("UPDATE access_credentials SET sign_count=4")
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_FAILED)
+        self.assertIn({"id": seeded["owner"], "reason": "changed"},
+                      report["sections"]["access_principals"]["failed"])
+        # A counter rising cannot hide another change to the principal.
+        self.runtime.execute("UPDATE access_credentials SET sign_count=9")
+        self.runtime.execute("UPDATE access_principals SET authorization_revision=4 WHERE id=?",
+                             (seeded["owner"],))
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_FAILED)
+
+    def test_replaced_invitation_secret_binding_is_detected_without_the_secret(self):
+        seeded = self.runtime.seed()
+        _, baseline = self.record()
+        replacement = bytes(range(100, 132))
+        self.runtime.execute(
+            "UPDATE access_invitations SET secret_digest=? WHERE principal_id=?",
+            (replacement, seeded["live"]))
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_FAILED)
+        failed = report["sections"]["access_invitations"]["failed"]
+        self.assertEqual(len(failed), 1)
+        self.assertEqual(failed[0]["reason"], "changed")
+        for path in self.notes.iterdir():
+            text = path.read_text()
+            for marker in (replacement.hex(), SECRET_DIGEST.hex(),
+                           bytes(reversed(SECRET_DIGEST)).hex()):
+                self.assertNotIn(marker, text, path.name)
+
     def test_grant_and_revocation_state_is_preserved_by_logical_id(self):
         seeded = self.runtime.seed()
         _, baseline = self.record()
