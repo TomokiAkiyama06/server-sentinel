@@ -439,7 +439,10 @@ re-pairing since the record; a revoked credential stays revoked with the
 same material; an active one stays, becomes the renewal staged at record
 time (promotion) or the identity a fresh pairing installed (an enrollment
 pending or consumed at record time with the same node and key, or a new one
-whose key was neither bound nor activated at record time); a binding is
+whose key was neither bound nor activated at record time, or, as the Owner's
+retry of an interrupted, expired or unacknowledged enrollment through the
+approve command does, a new one whose key was already bound live to the same
+node at record time and still is); a binding is
 never deleted, rebound or un-revoked; a
 staged renewal stays, is retried with its own key while the credential is
 unchanged, is replaced by a key newly bound since the record, or leaves by

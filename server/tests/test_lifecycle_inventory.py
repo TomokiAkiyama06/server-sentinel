@@ -20,7 +20,7 @@ from uuid import UUID, uuid4, uuid5
 
 from app import lifecycle_inventory as inventory
 from app.audit.store import AuditStore
-from app.cameras.remote_agent.pairing import HmacCodeVerifier, PairingLedger
+from app.cameras.remote_agent.pairing import HmacCodeVerifier, PairingError, PairingLedger
 from app.detection.owner import store as owner_store
 from app.monitoring.runtime import EVENT_NAMESPACE
 from app.presence.service import PresenceService
@@ -1411,16 +1411,17 @@ class LifecycleInventoryTests(unittest.TestCase):
         self.assertEqual(code, inventory.EXIT_FAILED)
         self.assertEqual(sorted(report["sections"]["security_state"]["failed"],
                                 key=lambda item: item["id"]),
-                         [{"id": f"pairing_credentials:{node}", "reason": "changed"},
-                          {"id": f"pairing_enrollments:{recorded}", "reason": "missing"}])
-        # The recorded activation restored: the reinserted copy still reuses
-        # a key bound at record time, so it is no fresh pairing.
+                         # The vanished recorded activation is what fails: the
+                         # reinserted copy alone would read as an Owner retry.
+                         [{"id": f"pairing_enrollments:{recorded}", "reason": "missing"}])
+        # With the recorded activation restored, the new copy is what
+        # command_approve() produces when the Owner retries this node's live
+        # key (approve() makes a new enrollment for it), so it is accepted.
         self.runtime.execute(
             "INSERT INTO pairing_enrollments VALUES (?, ?, ?, 'f', 'epoch', 0, 'activated')",
             (recorded, node, first))
         code, report, _ = self.verify(baseline)
-        self.assertEqual(report["sections"]["security_state"]["failed"],
-                         [{"id": f"pairing_credentials:{node}", "reason": "changed"}])
+        self.assertEqual(code, inventory.EXIT_PRESERVED, report["sections"]["security_state"])
         # The enrollment open at record time completing is a fresh pairing.
         self.runtime.execute("DELETE FROM pairing_enrollments WHERE state='activated' AND id!=?",
                              (recorded,))
@@ -1708,6 +1709,60 @@ class LifecycleInventoryTests(unittest.TestCase):
                                  # sets it, revoking the whole node.
                                  {"id": f"pairing_revocation:{node}", "reason": "incomplete"}],
                                 key=lambda item: (item["id"], item["reason"])))
+
+    def test_owner_retries_of_a_bound_key_are_preserved(self):
+        # Codex P1 (false failure): pairing_cli.command_approve() retries an
+        # interrupted, expired or unacknowledged enrollment by approving the
+        # same key for the node its live binding names; approve() then makes
+        # a new enrollment that activate() completes.
+        self.runtime.seed()
+        database = Database(self.runtime.database)
+
+        def ledger():
+            return PairingLedger(database, HmacCodeVerifier(b"s" * 32),
+                                 audit=AuditStore(database), clock=lambda: 100.0,
+                                 process_epoch=uuid4())
+
+        class Owner:
+            def require_owner(self, actor_context):
+                if actor_context != "owner":
+                    raise PermissionError("synthetic denial")
+        owner, before = Owner(), ledger()
+        keys = {label: f"{index + 1:064x}" for index, label in
+                enumerate(("interrupted", "expired", "unacknowledged", "superseded"))}
+        nodes = {label: uuid4() for label in keys}
+
+        def approve(on, label):
+            return on.approve(owner, "owner", node_id=nodes[label],
+                              public_key_digest=keys[label])
+
+        def complete(on, label, serial):
+            approval, code = approve(on, label)
+            claim = on.redeem(enrollment_id=approval.enrollment_id,
+                              public_key_digest=keys[label], code=code.value)
+            on.activate(claim, credential_serial_digest=serial, not_after=50.0)
+        approve(before, "interrupted")                       # never redeemed
+        stale, code = approve(before, "expired")
+        with self.assertRaises(PairingError):                # a restart expires it
+            ledger().redeem(enrollment_id=stale.enrollment_id,
+                            public_key_digest=keys["expired"], code=code.value)
+        complete(before, "unacknowledged", "a" * 64)         # Agent never got it
+        complete(before, "superseded", "b" * 64)
+        renewed = "f" * 64
+        before.stage_renewal(node_id=nodes["superseded"],
+                             current_public_key_digest=keys["superseded"],
+                             current_credential_digest="b" * 64,
+                             public_key_digest=renewed, credential_serial_digest="c" * 64,
+                             not_after=90.0)
+        self.assertTrue(before.admits(node_id=nodes["superseded"], public_key_digest=renewed,
+                                      credential_serial_digest="c" * 64))
+        _, baseline = self.record()
+        after = ledger()
+        for label in keys:
+            self.assertEqual(after.bound_node(keys[label]), nodes[label])
+            complete(after, label, "d" * 64)
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_PRESERVED, report["sections"]["security_state"])
 
     def test_a_staged_renewal_is_never_restaged_onto_a_superseded_key(self):
         # Codex P1: stage_renewal() accepts a key already bound to the node

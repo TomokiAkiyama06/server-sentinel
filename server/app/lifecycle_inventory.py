@@ -784,7 +784,9 @@ def _compare_pairing(baseline: dict, current: dict) -> list:
       credential stays revoked with the same material (re-pairing a node
       revoked at record time fails closed); an active one stays, becomes the
       staged renewal (promotion) or an identity a post-record activation
-      installed; a staged row stays exactly, is retried with its own key
+      installed (an enrollment open at record time, or a new one for a key
+      newly bound or, as command_approve() retries, already live for the
+      node at record time); a staged row stays exactly, is retried with its own key
       while the credential is unchanged, is replaced by a key newly bound
       since the record, or leaves by promotion, revocation or a fresh
       pairing; a credential first seen now needs a post-record activation of
@@ -856,20 +858,38 @@ def _compare_pairing(baseline: dict, current: dict) -> list:
         failed.append({"id": "pairing_enrollments", "reason": "unverifiable"})
     # Only an enrollment activated after the record explains a new identity:
     # one open at record time, unchanged, or one created since, whose key
-    # approve() newly bound (a key already recorded as bound or activated is
-    # a historical identity). A baseline without these lists accepts none.
+    # approve() newly bound or whose key was already live for the same node
+    # at record time (an Owner retry through command_approve()). A baseline
+    # without these lists accepts none.
     fresh = set()
     if (_by_enrollment(recorded_activations) and _by_enrollment(recorded_open)
             and _by_enrollment(activations_now) and recorded_bindings is not None):
         recorded_ids = {item[0] for item in recorded_activations}
         opened = {item[0]: tuple(item[1:]) for item in recorded_open}
         historical = {tuple(item[1:]) for item in recorded_activations}
+        def retried(enrollment, node, key_ref):
+            # pairing_cli.command_approve() retries an interrupted, expired
+            # or unacknowledged enrollment by approving the same key again
+            # for the node its live binding names (PairingLedger.bound_node());
+            # approve() then creates a new enrollment for that key. Such an
+            # enrollment is new since the record (every recorded one must
+            # persist, so an old one cannot be re-labelled) and its key was
+            # already live for the same node at record time and still is.
+            recorded = recorded_bindings.get(key_ref) or {}
+            return (isinstance(recorded_enrollments, dict)
+                    and enrollment not in recorded_enrollments
+                    and recorded.get("node_id") == node and recorded.get("revoked") is False
+                    and live(node, key_ref))
         for enrollment, node, key_ref in activations_now:
             pair = (node, key_ref)
             if enrollment in recorded_ids:
                 continue
-            if (opened.get(enrollment) == pair if enrollment in opened
-                    else pair not in historical and newly_bound(key_ref)):
+            if enrollment in opened:
+                accepted = opened[enrollment] == pair
+            else:
+                accepted = ((pair not in historical and newly_bound(key_ref))
+                            or retried(enrollment, node, key_ref))
+            if accepted:
                 fresh.add(pair)
 
     # -- bindings: never deleted, rebound or un-revoked --------------------
