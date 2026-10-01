@@ -301,7 +301,12 @@ status or decision.
     that existing enrollment and credential rows still record; if one legacy
     key digest appears under two node IDs (any state), the migration fails
     closed and blocks startup rather than silently picking one binding, and
-    the Owner must remediate the conflicting rows first. Keys superseded
+    the Owner must remediate the conflicting rows first. It also fails closed
+    when a key digest is revoked in one row yet still live in another (an
+    active credential, or a pending or consumed enrollment, which the old
+    schema allowed by re-approving a revoked key): recording a revoked binding
+    would not stop the live credential, so the Owner must first revoke or
+    remove the live use. Keys superseded
     before that migration are not recoverable.
   - *Agent rotation.* `NodeCredentialStore.rotate` atomically replaces the
     committed generation (rename over `current.json`) for the same node and

@@ -29,6 +29,11 @@ def pairing_renewal_migration(version: int) -> Migration:
     key digest under two node IDs (any states), the migration fails closed and
     startup is blocked instead of silently picking one binding; the conflicting
     legacy rows need explicit Owner remediation before the upgrade can proceed.
+    Likewise, a digest that is revoked somewhere yet still live elsewhere (an
+    active credential, or a pending or consumed enrollment; the old schema
+    allowed re-approving a revoked key) fails the migration closed: the Owner
+    must revoke the live use or remove it before upgrading, because a revoked
+    key is never reused.
     """
     return Migration(version, "pairing_credential_renewal", (
         "ALTER TABLE pairing_node_credentials ADD COLUMN not_after REAL",
@@ -39,6 +44,20 @@ def pairing_renewal_migration(version: int) -> Migration:
         "CREATE TABLE pairing_key_bindings ("
         "public_key_digest TEXT PRIMARY KEY, node_id TEXT NOT NULL, "
         "revoked INTEGER NOT NULL CHECK (revoked IN (0, 1)))",
+        # A revoked key that is still live (an active credential, or a pending
+        # or consumed enrollment) is a mixed history the old schema allowed by
+        # re-approving a revoked key. Any such digest violates CHECK (0) and
+        # fails the migration closed; the table never survives a migration.
+        "CREATE TABLE pairing_legacy_revoked_key_still_live ("
+        "public_key_digest TEXT NOT NULL CHECK (0))",
+        "INSERT INTO pairing_legacy_revoked_key_still_live (public_key_digest) "
+        "SELECT public_key_digest FROM pairing_node_credentials WHERE state = 'revoked' "
+        "UNION SELECT public_key_digest FROM pairing_enrollments WHERE state = 'revoked' "
+        "INTERSECT SELECT public_key_digest FROM ("
+        "SELECT public_key_digest FROM pairing_node_credentials WHERE state = 'active' "
+        "UNION ALL SELECT public_key_digest FROM pairing_enrollments "
+        "WHERE state IN ('pending', 'consumed'))",
+        "DROP TABLE pairing_legacy_revoked_key_still_live",
         # Deliberately not INSERT OR IGNORE: a legacy key digest held by two
         # node IDs violates the primary key and fails the migration closed.
         "INSERT INTO pairing_key_bindings (public_key_digest, node_id, revoked) "
