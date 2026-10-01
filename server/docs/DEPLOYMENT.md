@@ -408,23 +408,33 @@ reported `unverifiable` (a failure), never preserved: when overflow slots
 exist at record time, verify before the service delivers their promotions
 (e.g. while it is still stopped for the update), or after an `unverifiable`
 result check the Owner's hardware-integrity notifications for that window by
-hand and re-record the baseline; one-way security state: pairing credentials and capture nodes
-once revoked stay revoked, the active capture-node credential material
-(keyed digests of the public key and credential serial digests, and its
-expiry) changes only by promotion of the renewal staged at record time (whose
-key must then be bound to that node by a live, unrevoked binding, as for a
-fresh pairing or a re-staged key; an active credential whose key binding is
-revoked always fails) or by a fresh pairing activation (an
-enrollment activated after the record, identified by its enrollment ID:
-either one pending or consumed at record time with the same node and key, or
-a new one whose key was neither bound nor activated at record time; an
-enrollment already activated at record time never counts, and every such
-enrollment must remain activated with the same node and key), and
-each staged renewal leaves only by that promotion, the node's revocation or a
-fresh pairing, or is re-staged only as a retry of the same staged key or with
-a key newly bound to the node since the record (never a superseded or
-earlier key), pairing key bindings (as keyed digests) are never
-deleted, rebound or un-revoked, an invalidated human session never becomes
+hand and re-record the baseline; one-way security state: capture nodes once
+revoked stay revoked; the capture-node pairing ledger (keyed digests of keys
+and credential serials only) is checked against the operations
+`PairingLedger` performs (approve, redeem / expiry, activate, stage renewal,
+promotion, revoke). Every current state must satisfy the ledger's
+invariants: an active credential's key, a staged renewal's key (which differs
+from the credential's and belongs to an active credential) and an open
+enrollment's key are each bound to that node by a live, unrevoked binding,
+and an activated enrollment's key is bound to its node. From record to
+verify, each node may only change by a composition of those operations:
+enrollments activated at record time stay activated with the same node and
+key; a revoked credential stays revoked with the same material; an active one
+stays, becomes the renewal staged at record time (promotion) or the identity
+a fresh pairing installed (an enrollment pending or consumed at record time
+with the same node and key, or a new one whose key was neither bound nor
+activated at record time), and if it is then revoked, every binding the node
+held and its own key are revoked and nothing stays staged; a binding is never
+deleted, rebound or un-revoked, and when one of a node's bindings becomes
+revoked all of its recorded bindings are (revoke() revokes them together); a
+staged renewal stays, is retried with its own key while the credential is
+unchanged, is replaced by a key newly bound since the record, or leaves by
+promotion, revocation or a fresh pairing; a credential first seen now needs a
+fresh pairing of its key. Two ledger-reachable cases fail closed: a renewal
+both staged and promoted inside the window (its material cannot be shown),
+and re-pairing a node that was already revoked at record time (reported as a
+reversed revocation); verify before the next automatic renewal, or
+investigate and re-record. An invalidated human session never becomes
 valid again, and the authorization generation never decreases; for each
 registered camera source its type, keyed digests of
 its Owner-entered name and role label, a digest of its capabilities, its

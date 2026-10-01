@@ -19,6 +19,8 @@ from unittest import mock
 from uuid import UUID, uuid4, uuid5
 
 from app import lifecycle_inventory as inventory
+from app.audit.store import AuditStore
+from app.cameras.remote_agent.pairing import HmacCodeVerifier, PairingLedger
 from app.detection.owner import store as owner_store
 from app.monitoring.runtime import EVENT_NAMESPACE
 from app.presence.service import PresenceService
@@ -1188,6 +1190,8 @@ class LifecycleInventoryTests(unittest.TestCase):
         # identity; re-staging binds the new key first; promotion consumes it.
         self.runtime.execute("UPDATE pairing_node_credentials SET state='revoked' WHERE node_id=?",
                              (nodes["revoked"],))
+        self.runtime.execute("UPDATE pairing_key_bindings SET revoked=1 WHERE node_id=?",
+                             (nodes["revoked"],))
         fresh = "e" * 64
         self.runtime.execute("INSERT INTO pairing_key_bindings VALUES (?, ?, 0)",
                              (fresh, nodes["repaired"]))
@@ -1223,7 +1227,7 @@ class LifecycleInventoryTests(unittest.TestCase):
                          sorted([{"id": f"pairing_renewals:{nodes['silent']}",
                                   "reason": "missing"},
                                  {"id": f"pairing_renewals:{nodes['restaged']}",
-                                  "reason": "changed"}], key=lambda item: item["id"]))
+                                  "reason": "unbound"}], key=lambda item: item["id"]))
 
     def test_each_removed_overflow_slot_needs_its_own_promoted_row(self):
         # Two slots dropped while one unrelated warning is delivered must fail.
@@ -1445,18 +1449,152 @@ class LifecycleInventoryTests(unittest.TestCase):
         self.assertEqual(sorted(report["sections"]["security_state"]["failed"],
                                 key=lambda item: (item["id"], item["reason"])),
                          sorted([{"id": f"pairing_credentials:{nodes['promoted']}",
-                                  "reason": "changed"},
-                                 {"id": f"pairing_credentials:{nodes['promoted']}",
-                                  "reason": "binding_revoked"},
+                                  "reason": "unbound"},
                                  {"id": f"pairing_credentials:{nodes['repaired']}",
-                                  "reason": "changed"},
-                                 {"id": f"pairing_credentials:{nodes['repaired']}",
-                                  "reason": "binding_revoked"},
+                                  "reason": "unbound"},
                                  {"id": f"pairing_renewals:{nodes['restaged']}",
-                                  "reason": "changed"},
+                                  "reason": "unbound"},
                                  {"id": f"pairing_credentials:{nodes['unchanged']}",
-                                  "reason": "binding_revoked"}],
+                                  "reason": "unbound"},
+                                 # Only revoke() revokes a binding, and all of the node's.
+                                 {"id": f"pairing_key_bindings:{nodes['promoted']}",
+                                  "reason": "partially_revoked"},
+                                 {"id": f"pairing_key_bindings:{nodes['repaired']}",
+                                  "reason": "partially_revoked"},
+                                 {"id": f"pairing_key_bindings:{nodes['restaged']}",
+                                  "reason": "partially_revoked"}],
                                 key=lambda item: (item["id"], item["reason"])))
+
+    def test_pairing_state_follows_the_ledger_invariants(self):
+        # Codex P1s: an active credential with no live binding of its key to
+        # its node; a kept staged renewal whose binding is revoked; a
+        # credential revoked without what revoke() does with it.
+        self.runtime.seed()
+        nodes = {}
+        for index, label in enumerate(("revoked-alone", "revoked-staged", "staged-flip")):
+            key = f"{index}a".ljust(64, "0")
+            nodes[label] = node = self._paired_node(key, "c" * 64)
+            self.runtime.execute("INSERT INTO pairing_key_bindings VALUES (?, ?, 0)", (key, node))
+        for label in ("revoked-staged", "staged-flip"):
+            staged = f"{label}".encode().hex()[:64].ljust(64, "0")
+            self.runtime.execute("INSERT INTO pairing_key_bindings VALUES (?, ?, 0)",
+                                 (staged, nodes[label]))
+            self.runtime.execute("INSERT INTO pairing_node_renewals VALUES (?, ?, ?, 20.0)",
+                                 (nodes[label], staged, "d" * 64))
+        _, baseline = self.record()
+        # A node first seen now, with no binding at all, and one whose key
+        # is bound to another node.
+        unbound, foreign = self._paired_node("e" * 64, "c" * 64), \
+            self._paired_node("1a".ljust(64, "0"), "c" * 64)
+        for node, key in ((unbound, "e" * 64), (foreign, "1a".ljust(64, "0"))):
+            self._activated(node, key)
+        self.runtime.execute("INSERT INTO pairing_key_bindings VALUES (?, ?, 0)",
+                             ("e" * 64, str(uuid4())))
+        # Revoked without revoking the bindings (and keeping the renewal).
+        self.runtime.execute("UPDATE pairing_node_credentials SET state='revoked' "
+                             "WHERE node_id IN (?, ?)",
+                             (nodes["revoked-alone"], nodes["revoked-staged"]))
+        # The kept renewal's binding revoked under an active credential.
+        self.runtime.execute(
+            "UPDATE pairing_key_bindings SET revoked=1 WHERE public_key_digest=(SELECT "
+            "public_key_digest FROM pairing_node_renewals WHERE node_id=?)",
+            (nodes["staged-flip"],))
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_FAILED)
+        failed = report["sections"]["security_state"]["failed"]
+        for expected in (
+                {"id": f"pairing_credentials:{unbound}", "reason": "unbound"},
+                {"id": f"pairing_credentials:{foreign}", "reason": "unbound"},
+                {"id": f"pairing_credentials:{nodes['revoked-alone']}",
+                 "reason": "revocation_incomplete"},
+                {"id": f"pairing_credentials:{nodes['revoked-staged']}",
+                 "reason": "revocation_incomplete"},
+                {"id": f"pairing_renewals:{nodes['revoked-staged']}", "reason": "unbound"},
+                {"id": f"pairing_renewals:{nodes['staged-flip']}", "reason": "unbound"},
+                {"id": f"pairing_key_bindings:{nodes['staged-flip']}",
+                 "reason": "partially_revoked"}):
+            self.assertIn(expected, failed)
+
+    def test_ledger_operation_compositions_are_preserved(self):
+        # Drive the real PairingLedger across the record boundary: every
+        # composition below is a state the service produces.
+        self.runtime.seed()
+        ledger = PairingLedger(Database(self.runtime.database), HmacCodeVerifier(b"s" * 32),
+                               audit=AuditStore(Database(self.runtime.database)),
+                               clock=lambda: 100.0, process_epoch=uuid4())
+
+        class Owner:
+            def require_owner(self, actor_context):
+                if actor_context != "owner":
+                    raise PermissionError("synthetic denial")
+        owner, counter = Owner(), iter(range(1, 10_000))
+
+        def digest():
+            return f"{next(counter):064x}"
+
+        def pair(node, key):
+            approval, code = ledger.approve(owner, "owner", node_id=node, public_key_digest=key)
+            claim = ledger.redeem(enrollment_id=approval.enrollment_id,
+                                  public_key_digest=key, code=code.value)
+            ledger.activate(claim, credential_serial_digest=digest(), not_after=50.0)
+
+        def stage(node, current, key, serial):
+            ledger.stage_renewal(node_id=node, current_public_key_digest=current[0],
+                                 current_credential_digest=current[1],
+                                 public_key_digest=key, credential_serial_digest=serial,
+                                 not_after=90.0)
+
+        def credential(node):
+            with closing(sqlite3.connect(self.runtime.database)) as connection:
+                return connection.execute(
+                    "SELECT public_key_digest, credential_serial_digest FROM "
+                    "pairing_node_credentials WHERE node_id=?", (str(node),)).fetchone()
+        labels = ("promote", "restage", "retry", "revoke", "promote-restage", "activate-open",
+                  "revoke-repair", "repair", "new")
+        nodes = {label: uuid4() for label in labels}
+        staged = {}
+        for label in labels[:5] + ("revoke-repair", "repair"):
+            pair(nodes[label], digest())
+        for label in labels[:5]:
+            staged[label] = (digest(), digest())
+            stage(nodes[label], credential(nodes[label]), *staged[label])
+        approval, code = ledger.approve(owner, "owner", node_id=nodes["activate-open"],
+                                        public_key_digest=(open_key := digest()))
+        open_claim = ledger.redeem(enrollment_id=approval.enrollment_id,
+                                   public_key_digest=open_key, code=code.value)
+        _, baseline = self.record()
+        self.assertTrue(ledger.admits(node_id=nodes["promote"],
+                                      public_key_digest=staged["promote"][0],
+                                      credential_serial_digest=staged["promote"][1]))
+        stage(nodes["restage"], credential(nodes["restage"]), digest(), digest())
+        stage(nodes["retry"], credential(nodes["retry"]), staged["retry"][0], digest())
+        ledger.revoke(owner, "owner", node_id=nodes["revoke"])
+        self.assertTrue(ledger.admits(node_id=nodes["promote-restage"],
+                                      public_key_digest=staged["promote-restage"][0],
+                                      credential_serial_digest=staged["promote-restage"][1]))
+        stage(nodes["promote-restage"], credential(nodes["promote-restage"]), digest(), digest())
+        ledger.activate(open_claim, credential_serial_digest=digest(), not_after=50.0)
+        ledger.revoke(owner, "owner", node_id=nodes["revoke-repair"])
+        pair(nodes["revoke-repair"], digest())
+        pair(nodes["repair"], digest())
+        pair(nodes["new"], digest())
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_PRESERVED, report["sections"]["security_state"])
+        # Known fail-closed side effects: a renewal both staged and promoted
+        # after the record cannot show its material, and re-pairing a node
+        # already revoked at record time reads as a reversed revocation.
+        stage(nodes["repair"], credential(nodes["repair"]), (late := digest()), (serial := digest()))
+        self.assertTrue(ledger.admits(node_id=nodes["repair"], public_key_digest=late,
+                                      credential_serial_digest=serial))
+        _, revoked_baseline = self.record("revoked.json")
+        pair(nodes["revoke"], digest())
+        code, report, _ = self.verify(baseline)
+        self.assertIn({"id": f"pairing_credentials:{nodes['repair']}", "reason": "changed"},
+                      report["sections"]["security_state"]["failed"])
+        code, report, _ = self.verify(revoked_baseline)
+        self.assertEqual(report["sections"]["security_state"]["failed"],
+                         [{"id": f"pairing_credentials:{nodes['revoke']}",
+                           "reason": "revocation_reversed"}])
 
     def test_a_staged_renewal_is_never_restaged_onto_a_superseded_key(self):
         # Codex P1: stage_renewal() accepts a key already bound to the node
