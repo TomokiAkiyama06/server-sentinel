@@ -12,10 +12,11 @@ from unittest.mock import patch
 from uuid import UUID, uuid4
 import zlib
 
+from media_capture_agent import ring as ring_module
 from media_capture_agent.ring import DiskRing
 from media_capture_agent.ring_ledger import Ledger
 from media_capture_agent.ring_models import (POST, PRE, RETENTION, SECOND, RingConfig,
-                                            RingRefused, SegmentProfile)
+                                            RingRefused, SegmentProfile, round_up)
 from media_capture_agent.storage import MediaStore, StorageRefused
 from tests.support import SOURCE, settings
 
@@ -214,7 +215,12 @@ class RingTests(unittest.TestCase):
         with self.assertRaisesRegex(RingRefused, "segment_storage_refused"):
             self.append(T0)
         self.assertEqual(self.quota.used(), before)
-        self.assertEqual(self.ring.status(now_us=T0, clock_trusted=True)["state"], "STORAGE_PRESSURE")
+        # Free space still equals the reserve because the write was refused
+        # before crossing it. Recording is refused, which is a hard stop.
+        status = self.ring.status(now_us=T0, clock_trusted=True)
+        self.assertEqual(status["filesystem_free"], self.settings.safety_reserve_bytes)
+        self.assertEqual((status["state"], status["reason"]),
+                         ("STORAGE_HARD_STOP", "segment_write_refused_at_reserve"))
         self.ring.tick(now_us=T0 + POST, clock_trusted=True)
         result = self.ring.incident(identifier, now_us=T0 + POST)
         self.assertEqual(result["state"], "partial")
@@ -248,10 +254,11 @@ class RingTests(unittest.TestCase):
         self.quota.capacity = 1 << 50
         self.ring = DiskRing(self.settings, self.store, ledger_maximum_bytes=8 * 1024**4,
                              authority=AllowControls(), ledger_space=self.quota)
-        profile = SegmentProfile(SOURCE, 1_000_000_000, 1_000_000_000, 100, 0)
+        # The shortest supported cadence with a 12,500-byte (16 KiB) segment.
+        profile = SegmentProfile(SOURCE, 100_000, 100_000, SECOND, 0)
         capacity = 128 * 1024**3
         result = self.configure("capacity", capacity, profiles=(profile,))
-        self.assertEqual(result["estimated_duration_us"], (capacity // 16384 - 2) * 100)
+        self.assertEqual(result["estimated_duration_us"], (capacity // 16384 - 2) * SECOND)
         self.assertLessEqual(result["projected_maximum_bytes"], capacity)
         self.assertEqual(self.ring.status(now_us=T0, clock_trusted=True)["estimated_duration_us"],
                          result["estimated_duration_us"])
@@ -401,6 +408,211 @@ class RingTests(unittest.TestCase):
         result = self.ring.incident(identifier, now_us=T0 + POST)
         self.assertEqual(result["state"], "partial")
         self.assertTrue(result["clock_uncertain"])
+
+    def _steady_vbr_fifo(self, profiles, minutes):
+        """Sources whose real segments are below the max bound (ordinary VBR)
+        run a steady FIFO near the reserve: every append succeeds, so no
+        status sampled between appends may claim recording is refused."""
+        def due(at):
+            return [profile for profile in profiles if (at - T0) % profile.segment_duration_us == 0]
+
+        self.configure(profiles=profiles)
+        for at in range(T0 - PRE + 60 * SECOND, T0 + SECOND, 60 * SECOND):
+            for profile in due(at):
+                self.ring.append(profile.source_id, at - profile.segment_duration_us, at, PAYLOAD,
+                                 now_us=at, clock_trusted=True)
+        unit, reserve = self.store.allocation_unit, self.settings.safety_reserve_bytes
+        self.assertLess(round_up(len(PAYLOAD), unit), round_up(profiles[0].segment_bytes(), unit))
+        self.quota.other = (self.quota.capacity - self.quota.used() - reserve
+                            - self.ring.ledger_headroom - 1 * unit)
+        appended = 0
+        self.at_risk = False
+        for at in range(T0 + 60 * SECOND, T0 + (minutes + 1) * 60 * SECOND, 60 * SECOND):
+            status = self.ring.status(now_us=at - 60 * SECOND, clock_trusted=True)
+            self.assertNotEqual("STORAGE_HARD_STOP", status["state"], (at - T0) // SECOND)
+            budget = self.ring._budget(self.ring.profiles, at - 60 * SECOND, clock_trusted=True)
+            # Charging every chained append the bound is still the warning
+            # tier: a jump to the maximum bitrate would be refused.
+            self.at_risk |= self.ring._next_write_refused(at - 60 * SECOND, budget, clock_trusted=True,
+                                                          at_bound=True)
+            for profile in due(at):
+                self.ring.append(profile.source_id, at - profile.segment_duration_us, at, PAYLOAD,
+                                 now_us=at, clock_trusted=True)
+                appended += 1
+            status = self.ring.status(now_us=at, clock_trusted=True)
+            self.assertNotEqual("STORAGE_HARD_STOP", status["state"], (at - T0) // SECOND)
+        return appended
+
+    def test_two_same_phase_vbr_sources_steady_fifo_is_not_a_hard_stop(self):
+        profiles = tuple(SegmentProfile(UUID(int=300 + index), 800, 400, 60 * SECOND, 100)
+                         for index in range(2))
+        self.assertEqual(50, self._steady_vbr_fifo(profiles, 25))
+        self.assertTrue(self.at_risk)
+
+    def test_mixed_cadence_vbr_sources_steady_fifo_is_not_a_hard_stop(self):
+        profiles = (SegmentProfile(UUID(int=310), 800, 400, 60 * SECOND, 100),
+                    SegmentProfile(UUID(int=311), 80, 40, PRE, 100))
+        self.assertEqual(27, self._steady_vbr_fifo(profiles, 25))
+        self.assertTrue(self.at_risk)
+
+    def _same_instant_vbr(self, *, large_first):
+        large = SegmentProfile(UUID(int=320), 1600, 800, 60 * SECOND, 100)
+        small = SegmentProfile(UUID(int=321), 1600, 800, 60 * SECOND, 100)
+        profiles = (large, small) if large_first else (small, large)
+        self.configure(profiles=profiles)
+        big = b"x" * 12000
+        self.ring.append(large.source_id, T0 - 60 * SECOND, T0, big, now_us=T0, clock_trusted=True)
+        self.ring.append(small.source_id, T0 - 60 * SECOND, T0, PAYLOAD, now_us=T0, clock_trusted=True)
+        unit, reserve = self.store.allocation_unit, self.settings.safety_reserve_bytes
+        allocations = self.store.segment_allocations()
+        recent = sorted(allocations.values())
+        self.assertLess(recent[0], recent[1])
+        # Both next appends land at T0 + 60 s; at the recent real sizes the
+        # batch needs exactly this, whichever source is evaluated first.
+        target = reserve + round_up(sum(recent) + self.ring.ledger_headroom, unit)
+        free = self.ring._budget(self.ring.profiles, T0, clock_trusted=True)["filesystem_free"]
+        self.quota.other += free - target
+        fits = self.ring.status(now_us=T0, clock_trusted=True)
+        budget = self.ring._budget(self.ring.profiles, T0, clock_trusted=True)
+        at_risk = self.ring._next_write_refused(T0, budget, clock_trusted=True, at_bound=True)
+        self.quota.other += unit
+        refused = self.ring.status(now_us=T0, clock_trusted=True)
+        return (fits["state"], fits["reason"]), at_risk, (refused["state"], refused["reason"])
+
+    def test_same_instant_vbr_batch_is_independent_of_profile_order(self):
+        results = []
+        for large_first in (True, False):
+            with self.subTest(large_first=large_first):
+                self.tearDown_ring()
+                results.append(self._same_instant_vbr(large_first=large_first))
+                fits, at_risk, refused = results[-1]
+                self.assertNotEqual("STORAGE_HARD_STOP", fits[0])
+                # A jump of both to the bound would be refused: warning tier.
+                self.assertTrue(at_risk)
+                self.assertEqual(("STORAGE_HARD_STOP", "segment_write_refused_at_reserve"), refused)
+        self.assertEqual(results[0], results[1])
+
+    def tearDown_ring(self):
+        """Fresh media root, quota and ring, so one test can compare setups."""
+        self.ring.close()
+        self.store.close()
+        for path in self.settings.media_root.glob("*.segment"):
+            path.unlink()
+        for path in self.settings.runtime_root.glob("ring.sqlite3*"):
+            path.unlink()
+        self.quota = Quota(self.settings.media_root)
+        self.store = MediaStore(self.settings, space=self.quota, stable_device=lambda _expected: True)
+        self.addCleanup(self.store.close)
+        self.ring = DiskRing(self.settings, self.store, ledger_maximum_bytes=LEDGER_BYTES,
+                             authority=AllowControls())
+
+    def _mixed_cadence_ring(self, *, fast_end):
+        unit, headroom = self.store.allocation_unit, self.ring.ledger_headroom
+        slow = SegmentProfile(SOURCE, 80, 40, PRE, 100)
+        fast = SegmentProfile(UUID(int=201), 800, 400, 60 * SECOND, 100)
+        self.ring.configure(RingConfig("duration", 600), (slow, fast), now_us=T0, clock_trusted=True)
+        self.ring.append(SOURCE, T0 - PRE, T0, PAYLOAD, now_us=T0, clock_trusted=True)
+        self.ring.append(fast.source_id, fast_end - 60 * SECOND, fast_end, PAYLOAD,
+                         now_us=T0, clock_trusted=True)
+        allocations = self.store.segment_allocations()
+        stored = sum(allocations.values())
+
+        def recent(source):
+            row = self.ring.db.execute("SELECT id FROM segments WHERE source=?", (str(source),)).fetchone()
+            return allocations[UUID(row[0])]
+
+        # Simulated appends are charged (and later free) each source's recent
+        # real allocation; the slow source's single stored segment is that
+        # source's allocation, so stored = a + b.
+        b, a = recent(fast.source_id), recent(SOURCE)
+        self.assertEqual(stored, a + b)
+        # The slow source next appends at T0 + PRE together with the fast
+        # source, which appends alone at T0, T0 + 60 s, ... before. At the
+        # T0 + PRE batch everything stored has aged out, so it needs
+        # reserve + round_up(a + b + L) <= free + a + b + credit - 10 b,
+        # i.e. free >= reserve + round_up(L) + 9 b exactly when the fast
+        # source's T0 segment is credited (10 b otherwise).
+        target = self.settings.safety_reserve_bytes + round_up(headroom, unit) + 9 * b
+        free = self.ring._budget(self.ring.profiles, T0, clock_trusted=True)["filesystem_free"]
+        self.quota.other += free - target
+        self.assertEqual(target, self.ring._budget(self.ring.profiles, T0, clock_trusted=True)["filesystem_free"])
+
+    def test_simulated_appends_that_age_out_are_credited_before_a_slow_source_appends(self):
+        # The fast source is exactly due, so its next segment is known to be
+        # [T0 - 60 s, T0]. By T0 + PRE it has crossed the FIFO cutoff and the
+        # real append path reclaims it, as it does the stored segments.
+        self._mixed_cadence_ring(fast_end=T0 - 60 * SECOND)
+        status = self.ring.status(now_us=T0, clock_trusted=True)
+        self.assertNotEqual("STORAGE_HARD_STOP", status["state"])
+        # One allocation unit less is a real refusal at the last append.
+        self.quota.other += self.store.allocation_unit
+        status = self.ring.status(now_us=T0, clock_trusted=True)
+        self.assertEqual(("STORAGE_HARD_STOP", "segment_write_refused_at_reserve"),
+                         (status["state"], status["reason"]))
+
+    def test_overdue_source_simulated_appends_are_never_credited(self):
+        # An overdue source may next append a segment ending anywhere up to
+        # now, possibly late media inside a retained incident, so its pending
+        # interval is unknown and its simulated allocations are never
+        # credited: the same budget conservatively reports a hard stop.
+        self._mixed_cadence_ring(fast_end=T0 - 120 * SECOND)
+        status = self.ring.status(now_us=T0, clock_trusted=True)
+        self.assertEqual(("STORAGE_HARD_STOP", "segment_write_refused_at_reserve"),
+                         (status["state"], status["reason"]))
+
+    def test_sub_second_segment_cadence_is_refused(self):
+        for duration in (1, 1000, SECOND - 1):
+            with self.subTest(duration=duration):
+                with self.assertRaisesRegex(RingRefused, "segment_duration_below_supported_cadence"):
+                    SegmentProfile(SOURCE, 800, 400, duration, 100)
+        self.assertEqual(SECOND, SegmentProfile(SOURCE, 800, 400, SECOND, 100).segment_duration_us)
+
+    def test_next_write_check_work_does_not_scale_with_cadence_ratio(self):
+        reads = [0]
+
+        class CountingProfile(SegmentProfile):
+            def __getattribute__(self, name):
+                if name == "segment_duration_us":
+                    reads[0] += 1
+                return super().__getattribute__(name)
+
+        fast = tuple(CountingProfile(UUID(int=330 + index), 800, 400, SECOND, 100) for index in range(3))
+        slow = CountingProfile(UUID(int=333), 80, 40, PRE, 100)
+        self.ring.close()
+        self.ring = DiskRing(self.settings, self.store, ledger_maximum_bytes=16 * LEDGER_BYTES,
+                             authority=AllowControls())
+        self.ring.configure(RingConfig("duration", 600), fast + (slow,), now_us=T0, clock_trusted=True)
+        self.ring.profiles = {profile.source_id: profile for profile in fast + (slow,)}
+        self.ring.append(slow.source_id, T0 - PRE, T0, PAYLOAD, now_us=T0, clock_trusted=True)
+        for profile in fast:
+            self.ring.append(profile.source_id, T0 - SECOND, T0, PAYLOAD, now_us=T0, clock_trusted=True)
+        budget = self.ring._budget(self.ring.profiles, T0, clock_trusted=True)
+        for at_bound in (False, True):
+            reads[0] = 0
+            self.ring._next_write_refused(T0, budget, clock_trusted=True, at_bound=at_bound)
+            # The fast sources append 600 times each before the slow source's
+            # next append; the check must not expand them one by one.
+            self.assertLess(reads[0], 200)
+        status = self.ring.status(now_us=T0, clock_trusted=True)
+        self.assertNotEqual("STORAGE_HARD_STOP", status["state"])
+
+    def test_long_rollback_with_mixed_cadences_keeps_status_bounded(self):
+        late = 61 * 86400 * SECOND
+        slow = self.profile
+        fast = SegmentProfile(UUID(int=200), 800, 400, SECOND, 100)
+        self.ring.close()
+        self.ring = DiskRing(self.settings, self.store, ledger_maximum_bytes=16 * LEDGER_BYTES,
+                             authority=AllowControls())
+        self.ring.configure(RingConfig("duration", 600), (slow, fast), now_us=late, clock_trusted=True)
+        for start in range(late - PRE, late, 60 * SECOND):
+            self.ring.append(SOURCE, start, start + 60 * SECOND, PAYLOAD,
+                             now_us=start + 60 * SECOND, clock_trusted=True)
+        # A 60-day rollback: the slow source's phase stays near ``late`` while
+        # the fast source has no trusted phase and would start at ``now``.
+        with patch("media_capture_agent.ring.round_up", wraps=ring_module.round_up) as counted:
+            status = self.ring.status(now_us=late - 60 * 86400 * SECOND, clock_trusted=True)
+        self.assertEqual((status["state"], status["reason"]), ("degraded", "clock_uncertain"))
+        self.assertLess(counted.call_count, 100)
 
     def test_clock_uncertain_reconfiguration_never_trims_by_timestamp(self):
         self.configure(value=1200)
@@ -856,15 +1068,88 @@ class RingTests(unittest.TestCase):
         self.assertEqual(self.ring._rows(), [])
         self.assertEqual(self.store.list_segments(), {})
 
-    def test_capacity_admission_counts_512_byte_allocations_before_capture(self):
+    def test_capacity_admission_counts_expected_bitrate_horizon_rows_before_capture(self):
         self.ring.close()
-        self.ring = DiskRing(self.settings, self.store, ledger_maximum_bytes=1792 * 1024,
+        self.ring = DiskRing(self.settings, self.store, ledger_maximum_bytes=640 * 4096,
                              authority=AllowControls())
         minimum = self.profile.bytes_for(PRE, self.store.allocation_unit)
+        # A lower expected bitrate lengthens the capacity horizon, so the
+        # same byte limit needs more segment rows than this ledger can hold.
+        sparse = SegmentProfile(SOURCE, 800, 40, 60 * SECOND, 100)
         with self.assertRaisesRegex(RingRefused, "insufficient_ledger_capacity"):
-            self.configure("capacity", minimum)
+            self.configure("capacity", minimum, profiles=(sparse,))
         self.assertIsNone(self.ring.config)
         self.assertEqual(self.store.list_segments(), {})
+        status = self.configure("capacity", minimum)
+        self.assertLessEqual(status["ledger_required_bytes"], status["ledger_maximum_bytes"])
+        self.assertGreaterEqual(status["capacity_horizon_us"], PRE)
+
+    def test_capacity_mode_admits_realistic_capacity_within_a_small_ledger(self):
+        # Two sources, 4 Mbit/s bounded bitrate, 10 s segments: a 700 MiB
+        # capacity is required to fit the bounded ten-minute pre-loss window
+        # plus boundary segments. The former 512-byte row model demanded a
+        # ~33 GiB ledger (and ~33x that as journal headroom) for this.
+        self.ring.close()
+        self.store.close()
+        from dataclasses import replace
+        self.settings = replace(self.settings, max_segment_bytes=8 * 1024 * 1024)
+        self.quota.capacity = 8 * 1024**3
+        self.store = MediaStore(self.settings, space=self.quota, stable_device=lambda _expected: True)
+        self.addCleanup(self.store.close)
+        self.ring = DiskRing(self.settings, self.store, ledger_maximum_bytes=32 * 1024 * 1024,
+                             authority=AllowControls())
+        # Headroom is now about twice the cap, not ~34 times it.
+        self.assertLess(self.ring.ledger.headroom, 2 * 32 * 1024 * 1024 + 512 * 1024)
+        profiles = tuple(SegmentProfile(UUID(int=500 + index), 4_000_000, 4_000_000, 10 * SECOND, 0)
+                         for index in range(2))
+        with self.assertRaisesRegex(RingRefused, "insufficient_pre_loss_capacity"):
+            self.configure("capacity", 500 * 1024 * 1024, profiles=profiles)
+        status = self.configure("capacity", 700 * 1024 * 1024, profiles=profiles)
+        self.assertEqual(status["mode"], "capacity")
+        self.assertGreaterEqual(status["estimated_duration_us"], PRE)
+        self.assertGreaterEqual(status["capacity_horizon_us"], status["estimated_duration_us"])
+        self.assertLessEqual(status["ledger_required_bytes"], 32 * 1024 * 1024)
+        # A new T-10/T+10 incident still has its full metadata reservation.
+        self.assertNotEqual(status["reason"], "insufficient_ledger_capacity")
+
+    def test_capacity_horizon_bounds_rows_when_actual_segments_are_small(self):
+        profile = SegmentProfile(SOURCE, 2000, 1600, 60 * SECOND, 100)
+        limit = profile.bytes_for(PRE, self.store.allocation_unit)
+        status = self.configure("capacity", limit, profiles=(profile,))
+        horizon = status["capacity_horizon_us"]
+        self.assertGreaterEqual(horizon, PRE)
+        # Generated segments are far below the expected size, so the byte
+        # limit alone would keep ~48 one-block segments.
+        for index in range(60):
+            start = T0 + index * 60 * SECOND
+            self.ring.append(SOURCE, start, start + 60 * SECOND, PAYLOAD,
+                             now_us=start + 60 * SECOND, clock_trusted=True)
+        now = T0 + 60 * 60 * SECOND
+        rows = self.ring._rows()
+        self.assertLessEqual(len(rows), DiskRing._segment_count({SOURCE: profile}, horizon))
+        self.assertTrue(all(row["end"] > now - horizon for row in rows))
+        status = self.ring.status(now_us=now, clock_trusted=True)
+        self.assertEqual(status["state"], "healthy")
+        self.assertLessEqual(status["ordinary_allocated_bytes"], limit)
+        self.assertFalse(status["pre_loss_coverage"][str(SOURCE)]["gaps_us"])
+
+    def test_ledger_runs_without_cache_spill_so_the_journal_bound_holds(self):
+        self.assertEqual(self.ring.db.execute("PRAGMA cache_spill").fetchone()[0], 0)
+        with self.ring.ledger.transaction():
+            self.ring.db.executemany("INSERT INTO settings VALUES (?, ?)",
+                                     ((f"generated-{index}", "x" * 1000) for index in range(2000)))
+        pages = self.ring.db.execute("PRAGMA page_count").fetchone()[0]
+        journal = self.settings.runtime_root / "ring.sqlite3-journal"
+        # A tiny page cache would spill (and start new journal headers)
+        # many times while every original page is rewritten.
+        self.ring.db.execute("PRAGMA cache_size = 4")
+        with self.ring.ledger.transaction():
+            self.ring.db.execute("UPDATE settings SET value = replace(value, 'x', 'y') "
+                                 "WHERE key LIKE 'generated-%'")
+            size = journal.stat().st_size
+        self.assertGreater(size, 0)
+        self.assertLessEqual(size, pages * (4096 + 8) + 2 * 65536)
+        self.assertLessEqual(size, self.ring.ledger.journal_bound)
 
     def test_sufficient_ledger_completes_one_second_pre_and_post_through_restart(self):
         self.ring.close()
@@ -1074,10 +1359,10 @@ class RingTests(unittest.TestCase):
             self.ring.db.executemany("INSERT INTO segments VALUES (?,?,?,?,?,0,?,'missing',1)",
                                     ((str(UUID(int=index + 1)), str(SOURCE), index * 60 * SECOND,
                                       (index + 1) * 60 * SECOND, len(PAYLOAD), hashlib.sha256(PAYLOAD).hexdigest())
-                                     for index in range(100)))
+                                     for index in range(300)))
         with self.assertRaisesRegex(RingRefused, "insufficient_ledger_capacity"):
             self.configure("capacity", minimum)
-        self.assertEqual(len(self.ring._rows()), 100)
+        self.assertEqual(len(self.ring._rows()), 300)
 
     def test_zero_allocation_cannot_enter_capacity_accounting_or_healthy_recovery(self):
         self.configure()

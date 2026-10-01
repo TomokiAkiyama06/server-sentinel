@@ -39,6 +39,11 @@ class SegmentProfile:
         integer(self.maximum_bitrate, minimum=1)
         integer(self.expected_bitrate, minimum=1)
         integer(self.segment_duration_us, minimum=1)
+        if self.segment_duration_us < SECOND:
+            # The supported segment cadence is at least one second; shorter
+            # segments multiply ledger rows, protection references and the
+            # next-write check without bounding real capture.
+            raise RingRefused("segment_duration_below_supported_cadence")
         integer(self.overhead_bytes)
         if self.expected_bitrate > self.maximum_bitrate or self.segment_duration_us > PRE:
             raise RingRefused("invalid_profile_bound")

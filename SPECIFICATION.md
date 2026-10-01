@@ -537,7 +537,7 @@ buffer_limit_mode = duration | capacity
 **Capacity mode**
 - owner selects maximum bytes/GiB usable by the rolling buffer;
 - UI derives/displays estimated effective duration from the configured/negotiated bitrate;
-- FIFO overwrite keeps ordinary ring-buffer data within the selected capacity.
+- FIFO overwrite keeps ordinary ring-buffer data within the selected capacity, and within the capacity's duration horizon at the configured expected bitrate so segment metadata stays bounded; that horizon is never shorter than the 10-minute pre-loss window.
 
 In both modes the UI displays selected mode/value, estimated equivalent duration/capacity, current ring-buffer bytes, protected-incident bytes, filesystem free space, and safety reserve.
 
@@ -610,7 +610,7 @@ If space becomes unsafe:
 - reclaim eligible non-protected ring-buffer segments first;
 - do not auto-delete a protected incident before its 60-day default expiry merely to satisfy ordinary buffer demand;
 - surface `agent_storage_pressure`/equivalent state and an owner-visible warning;
-- stop/refuse unsafe writes before crossing the filesystem safety reserve;
+- stop/refuse unsafe writes before crossing the filesystem safety reserve. Status predicts refusal from the sources' next appends, charged at each source's recent real segment allocation, with same-instant appends evaluated as one batch: while they cannot be admitted without crossing the reserve at the recent real bitrate, report `STORAGE_HARD_STOP / segment_write_refused_at_reserve` (not pressure or healthy) until space returns. If they would be refused only were every segment to reach its maximum bound, report `STORAGE_PRESSURE / segment_write_at_risk_at_maximum_bitrate` (or an earlier pressure reason), never healthy. Segment cadence is at least one second; shorter profiles are refused (`segment_duration_below_supported_cadence`);
 - if the full 10-minute pre-loss target or 10-minute post-loss continuation cannot be maintained, report the exact degraded/gap state rather than claiming complete protection.
 
 ### 5.15 Media-root mount safety
