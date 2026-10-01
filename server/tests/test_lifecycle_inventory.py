@@ -959,6 +959,34 @@ class LifecycleInventoryTests(unittest.TestCase):
         code, _, _ = self.verify(baseline, *option)
         self.assertEqual(code, inventory.EXIT_PRESERVED)
 
+    def test_owner_template_audit_retention_is_honored(self):
+        # Codex P1: when the store is registered for audit retention,
+        # AuditRetentionRuntime.startup_cleanup() deletes its audit rows older
+        # than OwnerTemplateStore's own retention before readiness.
+        self.runtime.seed()
+        option = ("--owner-template-root", str(self.base / "owner-template"))
+        root = self.owner_template_root(template=b"synthetic-owner-template-marker")
+        database = root / "owner-template.sqlite3"
+        self.now = datetime(2026, 6, 1, tzinfo=timezone.utc)
+        recent = (self.now - owner_store.DEFAULT_AUDIT_RETENTION
+                  + timedelta(seconds=1)).isoformat()
+        with closing(sqlite3.connect(database, isolation_level=None)) as connection:
+            connection.execute("INSERT INTO owner_template_audit(at, actor, operation, generation) "
+                               "VALUES (?, 'owner', 'replace', 1)", (recent,))
+        _, baseline = self.record("template.json", *option)
+        with closing(sqlite3.connect(database, isolation_level=None)) as connection:
+            connection.execute("DELETE FROM owner_template_audit WHERE at < ?", (recent,))
+        code, report, _ = self.verify(baseline, *option)
+        section = report["sections"]["owner_template"]
+        self.assertEqual(code, inventory.EXIT_PRESERVED, section)
+        self.assertEqual(len(section["audit"]["retention_expired"]), 2)
+        with closing(sqlite3.connect(database, isolation_level=None)) as connection:
+            connection.execute("DELETE FROM owner_template_audit")
+        code, report, _ = self.verify(baseline, *option)
+        self.assertEqual(code, inventory.EXIT_FAILED)
+        self.assertIn({"id": "audit:3", "reason": "missing"},
+                      report["sections"]["owner_template"]["failed"])
+
     def test_credential_sign_count_may_only_advance(self):
         # A lower counter rolls back the authenticator clone-detection floor.
         seeded = self.runtime.seed()
@@ -1185,7 +1213,7 @@ class LifecycleInventoryTests(unittest.TestCase):
         # source fact) only in expire_history() once expired, or in the
         # audited clear_unresolved_critical_event(); a fresh unresolved one
         # removed with a forged tombstone and marker is not either.
-        self.runtime.seed()
+        seeded = self.runtime.seed()
         now = self.now
         fresh = (now - timedelta(days=1)).isoformat(timespec="microseconds")
         old = (now - timedelta(days=21)).isoformat(timespec="microseconds")
@@ -1219,9 +1247,11 @@ class LifecycleInventoryTests(unittest.TestCase):
                 unresolved += state != "delivered"
         self.runtime.execute("INSERT INTO presence_expired_unresolved VALUES ('notification', ?, ?)",
                              (unresolved, at))
+        # The Owner's clear: audited with the Owner identity, control clock advanced.
         self.runtime.execute("INSERT INTO presence_audit (action, actor, at, state, target) "
-                             "VALUES ('critical_event_cleared', 'owner', ?, NULL, ?)",
-                             (at, ids["cleared"]))
+                             "VALUES ('critical_event_cleared', ?, ?, NULL, ?)",
+                             (seeded["owner"], at, ids["cleared"]))
+        self.runtime.execute("INSERT INTO presence_control_clock VALUES (1, ?)", (at,))
         code, report, _ = self.verify(baseline)
         self.assertEqual(code, inventory.EXIT_FAILED)
         failed = report["sections"]["presence"]["failed"]
@@ -1235,16 +1265,19 @@ class LifecycleInventoryTests(unittest.TestCase):
         # disabled (Codex P1); writes the tombstone at the audit row's time,
         # a NULL audit state, and one expired-unresolved event per such job
         # (a disabled job adds none).
-        self.runtime.seed()
+        seeded = self.runtime.seed()
         fresh = (self.now - timedelta(days=1)).isoformat(timespec="microseconds")
         at = self.now.isoformat(timespec="microseconds")
-        cases = {"resolved": (("delivered", "delivered"), at, None),
+        owner, stranger = seeded["owner"], seeded["live"]
+        cases = {"resolved": (("delivered", "delivered"), at, None, owner),
                  "late-tombstone": (("failed", "delivered"), "2099-01-01T00:00:00.000000+00:00",
-                                    None),
-                 "audit-state": (("failed", "delivered"), at, "away"),
-                 "disabled-and-failed": (("disabled", "failed"), at, None)}
+                                    None, owner),
+                 "audit-state": (("failed", "delivered"), at, "away", owner),
+                 # Codex P1: an actor that is not an Owner.
+                 "not-owner": (("failed", "delivered"), at, None, stranger),
+                 "disabled-and-failed": (("disabled", "failed"), at, None, owner)}
         ids = {}
-        for label, ((evidence, notification), _, _) in cases.items():
+        for label, ((evidence, notification), _, _, _) in cases.items():
             ids[label] = str(uuid4())
             self.runtime.execute(
                 "INSERT INTO presence_observations (id, kind, source, received, payload) "
@@ -1256,22 +1289,30 @@ class LifecycleInventoryTests(unittest.TestCase):
                     "generation) VALUES (?, ?, ?, 1, 1)", (ids[label], action, state))
         _, baseline = self.record()
         notification_events = 0
-        for label, ((evidence, notification), tombstone, state) in cases.items():
+        for label, ((evidence, notification), tombstone, state, actor) in cases.items():
             for table, column in (("presence_deliveries", "observation"),
                                   ("presence_observations", "id")):
                 self.runtime.execute(f"DELETE FROM {table} WHERE {column}=?", (ids[label],))
             self.runtime.execute("INSERT INTO presence_completed_events VALUES (?, ?)",
                                  (ids[label], tombstone))
             self.runtime.execute("INSERT INTO presence_audit (action, actor, at, state, target) "
-                                 "VALUES ('critical_event_cleared', 'owner', ?, ?, ?)",
-                                 (at, state, ids[label]))
+                                 "VALUES ('critical_event_cleared', ?, ?, ?, ?)",
+                                 (actor, at, state, ids[label]))
             notification_events += notification not in ("delivered", "disabled")
         self.runtime.execute("INSERT INTO presence_expired_unresolved VALUES ('notification', ?, ?)",
                              (notification_events, at))
+        # Codex P1: the clear advanced the control clock to its own time; a
+        # clock behind it means the clear never ran as recorded.
+        self.runtime.execute("INSERT INTO presence_control_clock VALUES (1, ?)", (fresh,))
+        code, report, _ = self.verify(baseline)
+        failed = report["sections"]["presence"]["failed"]
+        self.assertIn({"id": f"observations:{ids['disabled-and-failed']}", "reason": "missing"},
+                      failed)
+        self.runtime.execute("UPDATE presence_control_clock SET latest=?", (at,))
         code, report, _ = self.verify(baseline)
         self.assertEqual(code, inventory.EXIT_FAILED)
         failed = report["sections"]["presence"]["failed"]
-        for label in ("resolved", "late-tombstone", "audit-state"):
+        for label in ("resolved", "late-tombstone", "audit-state", "not-owner"):
             self.assertIn({"id": f"observations:{ids[label]}", "reason": "missing"}, failed)
         self.assertEqual([item for item in failed if ids["disabled-and-failed"] in item["id"]], [])
 

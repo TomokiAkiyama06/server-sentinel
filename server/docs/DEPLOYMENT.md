@@ -395,8 +395,9 @@ only through timeline retention once expired — received more than 20 days
 before verify with no unfinished critical job, or more than 90 days before
 regardless — or through the Owner's audited release of unresolved critical
 work, which needs a recorded job neither delivered nor disabled and appends
-one `critical_event_cleared` audit row naming it (no state) at the same time
-as its tombstone; one that carried critical jobs leaves only together with
+one `critical_event_cleared` audit row naming it (no state, the actor an
+Owner principal, keyed) at the same time as its tombstone and advances the
+control clock to that time (which must not be behind it now); one that carried critical jobs leaves only together with
 its completed tombstone, and its jobs only with the expired-unresolved events
 the path adds (retention: one per job not delivered; Owner release: one per
 job neither delivered nor disabled);
@@ -551,8 +552,11 @@ second short of those periods, starred,
 still active, or removed by capacity-pressure deletion of the oldest
 recordings (`RetentionService.oldest()`), stays `missing`: if storage
 pressure deleted recordings during the window, investigate and re-record.
-Presence and Owner-template audit rows have no automatic retention in Main
-and must all remain. A finished recording must be identical, including its
+Owner-template audit rows older than the store's own 90-day audit retention
+may likewise be gone (listed under the section's `retention_expired`), since
+the store's cleanup runs at startup when it is registered for audit
+retention. Presence audit rows have no automatic retention in Main and must
+all remain. A finished recording must be identical, including its
 target and ended boundaries (a segment's retention `spool` flag and its cached
 `integrity` label, which playback recomputes from the file, are not compared),
 and every recorded and current segment of any accepted recording must come

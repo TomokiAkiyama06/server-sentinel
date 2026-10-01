@@ -543,9 +543,16 @@ def _presence(connection, tables, salt: str, live_outbox: bool | None) -> dict:
         # Observations the Owner released (clear_unresolved_critical_event()
         # appends this audit row in the same transaction).
         "cleared_events": None if "presence_audit" not in tables else sorted(
-            [row[0], row[1], row[2]] for row in connection.execute(
-                "SELECT target, at, state FROM presence_audit "
+            [row[0], row[1], row[2], _keyed(salt, ["presence-actor-v1", row[3]])]
+            for row in connection.execute(
+                "SELECT target, at, state, actor FROM presence_audit "
                 "WHERE action='critical_event_cleared'")),
+        # Owner principals (keyed), the identities PresenceService._owner()
+        # audits for an Owner-only action.
+        "owner_actors": None if "access_principals" not in tables else sorted(
+            _keyed(salt, ["presence-actor-v1", row[0]]) for row in connection.execute(
+                "SELECT id FROM access_principals WHERE role='owner' "
+                "AND revoked_at_us IS NULL")),
         "deliveries": keyed_rows(
             "presence_deliveries",
             "SELECT observation, action, state, attempts, generation, requeued "
@@ -650,10 +657,14 @@ def _compare_presence(baseline: dict | None, current: dict | None,
     # the record.
     def clears(section):
         found: dict = {}
-        for target, at, state in (section.get("cleared_events") or ()):
-            found.setdefault(target, []).append((at, state))
+        for target, at, state, actor in (section.get("cleared_events") or ()):
+            found.setdefault(target, []).append((at, state, actor))
         return found
     cleared_before, cleared_now = clears(baseline), clears(current)
+    # The clearing actor is an Owner (at record or verify time), and the
+    # control clock the clear advanced to its time has not moved back.
+    owners = set(baseline.get("owner_actors") or ()) | set(current.get("owner_actors") or ())
+    control = (current.get("clocks") or {}).get("control")
     rules = rules or {}
     path = {}
     for key, value in (baseline.get("observations") or {}).items():
@@ -667,6 +678,7 @@ def _compare_presence(baseline: dict | None, current: dict | None,
         # single new clear row naming it, and the tombstone it wrote then.
         rows = cleared_now.get(key, [])
         if (key not in cleared_before and len(rows) == 1 and rows[0][1] is None
+                and rows[0][2] in owners and isinstance(control, str) and control >= rows[0][0]
                 and unfinished and completed.get(key) == rows[0][0]):
             path[key] = "released"
             continue
@@ -1415,7 +1427,7 @@ def _owner_template(root: Path | None, salt: str, owner: int) -> dict:
             "provenance_digest": None if row is None or row["provenance"] is None
             else _keyed(salt, ["owner-provenance-v1", row["provenance"]]),
             "audit": _audit_table(connection, tables, "owner_template_audit",
-                                  ("id", "at", "actor", "operation", "generation"), "id"),
+                                  ("id", "at", "actor", "operation", "generation"), "id", "at"),
         }
         connection.execute("COMMIT")
         return result
@@ -1488,7 +1500,8 @@ def _compare_principals(baseline: dict | None, current: dict | None) -> dict:
     return result
 
 
-def _compare_owner_template(baseline: dict | None, current: dict | None) -> dict:
+def _compare_owner_template(baseline: dict | None, current: dict | None,
+                            expired=None) -> dict:
     baseline = baseline or {"configured": False}
     current = current or {"configured": False}
     if not baseline["configured"] and not current["configured"]:
@@ -1502,7 +1515,9 @@ def _compare_owner_template(baseline: dict | None, current: dict | None) -> dict
               if baseline.get(key) != current.get(key)]
     audit = None
     if baseline.get("audit") is not None or current.get("audit") is not None:
-        audit = _compare_audit(baseline.get("audit"), current.get("audit"))
+        # OwnerTemplateStore.cleanup_expired_batch() runs at startup when the
+        # store is registered for audit retention.
+        audit = _compare_audit(baseline.get("audit"), current.get("audit"), expired)
         failed.extend({"id": f"audit:{item['id']}", "reason": item["reason"]}
                       for item in audit["failed"])
     return {"status": "failed" if failed else "preserved", "failed": failed,
@@ -2041,6 +2056,9 @@ def _retention_rules(now: datetime) -> dict:
         "integrity": lambda value: isinstance(value, str) and value < cutoff.isoformat(),
         "storage_state": lambda value: isinstance(value, int) and value < audit_ms,
         "recording_cutoff_ms": now_ms - periods.recording_days * DAY_MS,
+        # OwnerTemplateStore's own default (Main constructs it with it).
+        "owner_template": lambda value: isinstance(value, str) and value < (
+            now - owner_store.DEFAULT_AUDIT_RETENTION).astimezone(timezone.utc).isoformat(),
         # PresenceService.expire_history(): timeline cutoff and the audit
         # horizon, in its own receipt-time text.
         "presence_cutoff": presence_timestamp(now - timedelta(days=periods.recording_days)),
@@ -2146,7 +2164,8 @@ def compare(baseline: dict, current: dict, *, declared_rewrites=(), now=None) ->
         "security_state": _compare_security_state(
             baseline.get("security_state"), current.get("security_state")),
         "owner_template": _compare_owner_template(baseline.get("owner_template"),
-                                                  current.get("owner_template")),
+                                                  current.get("owner_template"),
+                                                  rules["owner_template"]),
         "access_principals": _compare_principals(access_base.get("principals"),
                                                  access_now.get("principals")),
         "access_invitations": _compare_keyed(access_base.get("invitations"),
