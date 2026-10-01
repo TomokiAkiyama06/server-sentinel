@@ -32,6 +32,7 @@ from uuid import UUID, uuid4
 from app.audit.store import AuditStore
 from app.auth.live_access import BoundLiveAccess, authorize_live_access, live_view_validator
 from app.auth.model import AccessValidationError, Permission
+from app.auth.session_binding import SessionBindingKey
 from app.auth.store import AccessStore
 from app.cameras.remote_agent.pairing import HmacCodeVerifier, PairingLedger
 from app.media.live.sessions import LiveAccess
@@ -152,7 +153,7 @@ class AccessMatrixScenarios(unittest.TestCase):
         # Owner-only mutations use the unaudited fixture mode; the audited
         # Owner boundary is covered by server/tests/test_access_pairing_audit.py.
         self.store = AccessStore(self.database, clock=self.clock.utcnow, audit=self.audit,
-                                 unaudited_writes=True)
+                                 unaudited_writes=True, session_binding=SessionBindingKey.generate())
         self.identities = {
             "live_only": self.member("live_only", (LIVE,)),
             "recordings_only": self.member("recordings_only", (RECORDINGS,)),
@@ -174,13 +175,14 @@ class AccessMatrixScenarios(unittest.TestCase):
 
     def member(self, name, permissions):
         identity = Identity(name, f"synthetic-{name.replace('_', '-')}@example.invalid")
-        principal = self.store.invite(identity.external_identity, "Synthetic " + name, permissions)
+        principal = self.store.invite("Synthetic " + name, permissions)
         secret = secrets.token_bytes(32)
         self.store.issue_enrollment(principal.id, secret, self.clock.utcnow() + timedelta(minutes=10))
         credential_id = secrets.token_bytes(32)
         self.store.enroll_credential(secret, identity.external_identity, credential_id,
                                      b"synthetic-public-key-" + name.encode("ascii"), -7, 0)
-        identity.session_id = self.store.establish_session(principal.id, credential_id, identity.token)
+        identity.session_id = self.store.establish_session(
+            principal.id, credential_id, identity.token, proxy_identity=identity.external_identity)
         identity.principal = self.store.authorize(identity.token, identity.external_identity,
                                                   permissions[0])
         return identity
@@ -299,7 +301,8 @@ class AccessMatrixScenarios(unittest.TestCase):
         agent = self.identities["agent_credential"]
         # Node credential material is not a human WebAuthn credential or principal.
         with self.assertRaises(AccessValidationError):
-            self.store.establish_session(self.node_id, agent.token, secrets.token_bytes(32))
+            self.store.establish_session(self.node_id, agent.token, secrets.token_bytes(32),
+                                         proxy_identity=agent.external_identity)
         with closing(self.database.connect()) as connection:
             self.assertIsNone(connection.execute(
                 "SELECT 1 FROM access_principals WHERE id=?", (str(self.node_id),)).fetchone())

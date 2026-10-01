@@ -33,3 +33,24 @@ Primary license references:
 - https://hub.docker.com/_/python
 - https://github.com/PyCQA/pyflakes/blob/3.4.0/LICENSE
 - https://github.com/PyCQA/pycodestyle/blob/2.14.0/LICENSE
+
+## Operator-installed GStreamer (UVC capture adapter, not bundled)
+
+The UVC capture adapter (`media_capture_agent/uvc_pipeline.py`) executes an
+operator-installed `gst-launch-1.0` as a separate process; it does not import,
+link, bundle, download or redistribute GStreamer, and the Agent artifact and CI
+image do not contain it. CI tests use synthetic Python subprocesses; an optional
+local test runs GStreamer's `videotestsrc`/`jpegenc` only when it is installed.
+Only the `v4l2src` (gst-plugins-good) and `fdsink` (core) elements are named,
+and only their two plugin files (`video4linux2`, `coreelements`) are loaded.
+The child is confined with the kernel's Landlock LSM through the stdlib-only
+`uvc_sandbox.py` helper (Python `ctypes` system calls); no library is added.
+Upstream GStreamer core and gst-plugins-good are LGPL-2.1-or-later
+(https://gitlab.freedesktop.org/gstreamer/gstreamer/-/blob/main/subprojects/gstreamer/COPYING,
+https://gitlab.freedesktop.org/gstreamer/gstreamer/-/blob/main/subprojects/gst-plugins-good/COPYING).
+Running an unmodified distribution package as a separate program places no
+license obligation on Agent code. Distribution packages may be built with
+additional plugins/libraries under other terms; the deployment chooses and
+reviews the installed package set. Adopting GStreamer as the production capture
+runtime, and any future bundling, requires the Owner decision recorded in the
+introducing PR and inventory review before the adapter is wired into production.
