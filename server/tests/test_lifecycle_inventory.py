@@ -1165,6 +1165,101 @@ class LifecycleInventoryTests(unittest.TestCase):
         self.assertEqual(report["sections"]["security_state"]["failed"],
                          [{"id": f"pairing_credentials:{replaced}", "reason": "changed"}])
 
+    def test_each_staged_renewal_leaves_only_by_a_ledger_path(self):
+        self.runtime.seed()
+        nodes = {label: str(uuid4()) for label in
+                 ("silent", "revoked", "repaired", "restaged", "promoted")}
+        for index, (label, node_id) in enumerate(nodes.items()):
+            key, staged = f"{index}a".ljust(64, "0"), f"{index}b".ljust(64, "0")
+            self.runtime.execute(
+                "INSERT INTO capture_nodes VALUES (?, 'synthetic', 'online', NULL, "
+                "'2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00')", (node_id,))
+            self.runtime.execute(
+                "INSERT INTO pairing_node_credentials (node_id, public_key_digest, "
+                "credential_serial_digest, state, not_after) VALUES (?, ?, ?, 'active', 10.0)",
+                (node_id, key, "c" * 64))
+            for bound in (key, staged):
+                self.runtime.execute("INSERT INTO pairing_key_bindings VALUES (?, ?, 0)",
+                                     (bound, node_id))
+            self.runtime.execute("INSERT INTO pairing_node_renewals VALUES (?, ?, ?, 20.0)",
+                                 (node_id, staged, "d" * 64))
+        _, baseline = self.record()
+        # Legitimate: revocation discards it; a fresh pairing replaces the
+        # identity; re-staging binds the new key first; promotion consumes it.
+        self.runtime.execute("UPDATE pairing_node_credentials SET state='revoked' WHERE node_id=?",
+                             (nodes["revoked"],))
+        fresh = "e" * 64
+        self.runtime.execute("INSERT INTO pairing_key_bindings VALUES (?, ?, 0)",
+                             (fresh, nodes["repaired"]))
+        self.runtime.execute(
+            "INSERT INTO pairing_enrollments VALUES (?, ?, ?, 'f', 'epoch', 0, 'activated')",
+            (str(uuid4()), nodes["repaired"], fresh))
+        self.runtime.execute("UPDATE pairing_node_credentials SET public_key_digest=?, "
+                             "credential_serial_digest=? WHERE node_id=?",
+                             (fresh, "f" * 64, nodes["repaired"]))
+        restaged = "9" * 64
+        self.runtime.execute("INSERT INTO pairing_key_bindings VALUES (?, ?, 0)",
+                             (restaged, nodes["restaged"]))
+        self.runtime.execute("UPDATE pairing_node_renewals SET public_key_digest=? "
+                             "WHERE node_id=?", (restaged, nodes["restaged"]))
+        self.runtime.execute(
+            "UPDATE pairing_node_credentials SET public_key_digest=(SELECT public_key_digest "
+            "FROM pairing_node_renewals WHERE node_id=?), credential_serial_digest=?, "
+            "not_after=20.0 WHERE node_id=?", (nodes["promoted"], "d" * 64, nodes["promoted"]))
+        self.runtime.execute("DELETE FROM pairing_node_renewals WHERE node_id IN (?, ?, ?)",
+                             (nodes["revoked"], nodes["repaired"], nodes["promoted"]))
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_PRESERVED, report["sections"]["security_state"])
+        # Silently dropped while the active credential is unchanged.
+        self.runtime.execute("DELETE FROM pairing_node_renewals WHERE node_id=?",
+                             (nodes["silent"],))
+        # Re-staged with a key that was never bound to the node.
+        self.runtime.execute("UPDATE pairing_node_renewals SET public_key_digest=? "
+                             "WHERE node_id=?", ("8" * 64, nodes["restaged"]))
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_FAILED)
+        self.assertEqual(sorted(report["sections"]["security_state"]["failed"],
+                                key=lambda item: item["id"]),
+                         sorted([{"id": f"pairing_renewals:{nodes['silent']}",
+                                  "reason": "missing"},
+                                 {"id": f"pairing_renewals:{nodes['restaged']}",
+                                  "reason": "changed"}], key=lambda item: item["id"]))
+
+    def test_each_removed_overflow_slot_needs_its_own_promoted_row(self):
+        # Two slots dropped while one unrelated warning is delivered must fail.
+        self.runtime.seed()
+        when = "2026-01-01T00:00:00+00:00"
+        for kind in ("CPU", "MEMORY"):
+            self.runtime.execute("INSERT INTO integrity_overflow VALUES (?, 'CHANGED', ?)",
+                                 (kind, when))
+        _, baseline = self.record()
+
+        def outbox(findings, at, immediate=1):
+            self.runtime.execute("INSERT INTO integrity_outbox(at, immediate, findings) "
+                                 "VALUES (?, ?, ?)", (at, immediate, json.dumps(findings)))
+
+        def deliver(row_id, kind, at):
+            self.runtime.execute("DELETE FROM integrity_outbox WHERE id=?", (row_id,))
+            self.runtime.execute(
+                "INSERT INTO notification_events VALUES (?, ?, ?, 1, 'sent')",
+                (str(uuid5(EVENT_NAMESPACE, f"integrity-outbox:{row_id}")), kind, at))
+        self.runtime.execute("DELETE FROM integrity_overflow")
+        outbox([{"kind": "GPU", "state": "UNVERIFIABLE", "detail": "x"}],
+               "2026-01-05T00:00:00+00:00", 0)
+        deliver(1, "hardware_integrity_warning", "2026-01-05T00:00:00+00:00")
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_FAILED)
+        self.assertEqual(len(report["sections"]["integrity_delivery"]["failed"]), 2)
+        # The real promotions: one row per slot; one still pending, one
+        # delivered with the slot's time and the failure kind CHANGED implies.
+        outbox([{"kind": "CPU", "state": "CHANGED", "detail": "COALESCED_PENDING_WARNING"}], when)
+        outbox([{"kind": "MEMORY", "state": "CHANGED",
+                 "detail": "COALESCED_PENDING_WARNING"}], when)
+        deliver(3, "hardware_integrity_failure", when)
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_PRESERVED,
+                         report["sections"]["integrity_delivery"])
+
     def test_uncovered_durable_tables_are_listed_as_not_inventoried(self):
         self.runtime.seed()
         _, baseline = self.record()

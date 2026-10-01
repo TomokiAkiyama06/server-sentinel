@@ -399,12 +399,16 @@ its revision and a keyed digest of its inventory (never the hardware
 identifiers); pending hardware-integrity notifications (outbox rows as keyed
 digests, overflow slots by category and state): a pending row may leave only
 once its notification event (`uuid5(EVENT_NAMESPACE, "integrity-outbox:<id>")`)
-is durably recorded, and an overflow slot only by promotion into a new outbox
-row; one-way security state: pairing credentials and capture nodes
+is durably recorded, and each overflow slot only by its own promotion: a
+distinct new outbox row with the slot's time and single category / state,
+still pending or delivered with its notification event (the slot's time and
+the failure / warning kind its category implies); one-way security state: pairing credentials and capture nodes
 once revoked stay revoked, the active capture-node credential material
 (keyed digests of the public key and credential serial digests, and its
-expiry) changes only by promotion of the renewal staged at record time, whose
-key must then be bound to that node, pairing key bindings (as keyed digests) are never
+expiry) changes only by promotion of the renewal staged at record time (whose
+key must then be bound to that node) or by a fresh pairing activation, and
+each staged renewal leaves only by that promotion, the node's revocation or a
+fresh pairing, or is re-staged only with a key bound to the node, pairing key bindings (as keyed digests) are never
 deleted, rebound or un-revoked, an invalidated human session never becomes
 valid again, and the authorization generation never decreases; for each
 registered camera source its type, keyed digests of
