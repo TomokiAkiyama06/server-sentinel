@@ -240,6 +240,34 @@ detector observation remains `unknown`, never `absent`. An invalid object fails
 `--check` with the value-free validation message. Keep the artifact path in
 this private file only.
 
+### Host SSH and the reserved-hostname listener exception
+
+The hostname reservation check (ADR-0003, `server/app/auth/README.md`) excepts
+a wildcard system listener only by port plus owning process. On the Main
+Server, run `sshd` as `ssh.service` itself rather than socket-activated
+through `ssh.socket` (Owner decision, 2026-10-01): with socket activation PID 1
+holds the listening socket, which no exception identifies narrowly, so access
+would stay closed. The Owner exception is then `tcp/22` owned by
+`/usr/sbin/sshd`. These are host administration steps for the Owner; keep a
+console or second session open while changing SSH:
+
+```sh
+sudo systemctl disable --now ssh.socket
+sudo systemctl enable --now ssh.service
+systemctl is-enabled ssh.socket ssh.service   # expect: disabled / enabled
+sudo ss -ltnp 'sport = :22'                   # expect: users:(("sshd",pid=N,...))
+sudo readlink /proc/N/exe                     # expect: /usr/sbin/sshd
+```
+
+Repeat the `ss`/`readlink` check after each `openssh-server` upgrade and restart
+`ssh.service` once upgraded: until then the running executable shows as
+`(deleted)` and the check keeps access closed.
+
+Until the privileged socket-owner helper of Issue #126 lands, the non-root
+ServerSentinel service cannot read a root-owned `sshd`'s `/proc/<pid>/fd` and
+`exe`, so an excepted `sshd` stays `LISTENER_OWNER_UNVERIFIED` and human
+access stays closed. ServerSentinel itself is never given root for this.
+
 ## Install, update, and rollback
 
 Run the separately downloaded installer only after verifying its published

@@ -305,9 +305,44 @@ obligation — a dedicated network identity for ServerSentinel, or a
 single-purpose node enforced outside the application — because a local process
 can bind another port on that address without appearing in any proxy
 configuration. Startup and daily checks enumerate actual listeners and proxy
-routes for the whole name and close human access on any other answer, which
-bounds rather than removes that exposure; the application cannot prevent a
-local process from binding.
+routes for the whole name and close human access on any other answer they can
+see, which bounds rather than removes that exposure. The check sees only sockets in `/proc/net` and Serve status. Traffic the kernel redirects before it reaches a listening socket on the reserved address — nftables/iptables DNAT or REDIRECT (for example Docker with `userland-proxy=false`), TPROXY, eBPF `sk_lookup` or IPVS — is not visible to it, so it cannot claim that nothing else answers; the deployment isolation must exclude such forwarding, and the Owner verifies it manually. Even for
+sockets it sees, the check bounds the exposure rather than preventing it: the
+application cannot prevent a local process from binding.
+
+The current contract for that check (Owner decisions 2026-09-30 and
+2026-10-01; details in `server/app/auth/README.md` and ADR-0003):
+
+- Each check re-resolves the reserved name. A resolved address set that
+  differs from the recorded one is treated as an exposure. A missing resolver
+  or a resolution that fails or times out keeps human access closed but is not
+  an exposure: access reopens without revocation once the name resolves to the
+  recorded set again, unless an exposure was seen meanwhile.
+- After any exposure (another listener or route, a changed address set, an
+  excepted listener with an unverifiable owner, or a listener/route
+  enumeration that fails or times out) access reopens only after every human
+  session, the Owner's included, has been revoked by advancing the
+  authorization generation, with its `system` audit record committed. The
+  requirement is persisted as a marker before reopening; if the marker cannot
+  be written, every human session is revoked at once instead. A check without
+  a durable revoker never opens human access.
+- An Owner listener exception names a port together with its owning
+  executable or systemd unit, never a port alone, and every check verifies the
+  socket's owning processes. Another process, or ownership that cannot be read
+  completely, closes access as an exposure. ServerSentinel stays non-root;
+  reading root-owned sockets is left to a separate privileged helper service
+  (Issue #126), and until it exists an excepted root-owned `sshd` keeps human
+  access closed. The Main Server runs `sshd` as `ssh.service` without
+  `ssh.socket`, with the exception `tcp/22` owned by `/usr/sbin/sshd`
+  (`server/docs/DEPLOYMENT.md`).
+- Every recorded proxy socket must be present and held only by the recorded
+  proxy process (for example `tailscaled.service`), verified the same way.
+  Another or unverifiable holder is an exposure; a missing recorded socket
+  closes access without revocation until it returns. Until #126 lands, a
+  root-owned proxy's sockets keep human access closed.
+- The loopback human upstream must be a socket the ServerSentinel process
+  itself holds (checked in its own `/proc/self/fd`, without privilege); a
+  replacement bound by another process is an exposure.
 
 ## Shared Tailnet account
 
@@ -324,7 +359,7 @@ Consequences to keep in mind while reviewing code:
 - the server verifies the transient WebAuthn data a registration or assertion carries — its own challenge, client data, authenticator data, the signature counter, the user-verification flag, and the relying-party id and origin — and persists only the credential id, its public key, the last accepted signature counter, the backup-eligibility and backup-state flags, and owner-visible metadata; the rest is discarded once verified. An assertion's signature is always verified against the stored public key; a registration carries an attestation statement only sometimes, so `none` attestation is accepted while a present-but-invalid statement fails. The current implementation (`server/app/auth/webauthn.py`) verifies only `packed` self attestation among present statements and refuses every other format rather than accepting it unverified; the registration options request `attestation: "none"`. A review that sees those fields skipped, or accepted from an unexpected origin, is looking at a broken check, not at data minimization;
 - no fingerprint or face template reaches ServerSentinel: it never leaves the authenticator. Credential records are not an identity or biometric database;
 - relying-party checks only hold if the dashboard owns its browser origin, with no other application sharing it, as AUTH-012 requires; a co-hosted application on that origin would put the credential within its reach;
-- reserving the origin is a deployment obligation, described above and in ADR-0003. The startup and daily check closes human access and notifies the Owner when anything else answers on that name, which bounds the exposure window rather than preventing the bind: a process binding between two checks collects credentials and cookies for that origin until the next one;
+- reserving the origin is a deployment obligation, described above and in ADR-0003. The startup and daily check closes human access and notifies the Owner when it sees anything else answering on that name (listening sockets and proxy routes only; kernel forwarding to the reserved address (nftables/iptables DNAT or REDIRECT, TPROXY, eBPF `sk_lookup`, IPVS) is verified by the operator), which bounds the exposure window rather than preventing the bind: a process binding between two checks collects credentials and cookies for that origin until the next one;
 - the origin must be a secure context (HTTPS, or `http://localhost` for a strictly local browser). Browsers withhold WebAuthn otherwise, so plain HTTP on a non-loopback host is not a usable human path;
 - the pending challenge lives server-side for one bounded, single-use ceremony and is then dropped;
 - the signature counter persists as `principal_credential.sign_count` and advances only on an accepted assertion. The comparison applies whenever the stored or the received counter is non-zero, and the received value must be strictly greater: a received 0 after a stored non-zero is a regression, not an exemption. A regression refuses the assertion and notifies the Owner as a possible cloned authenticator. Only a stored-and-received 0 is exempt, which is the ordinary passkey case;

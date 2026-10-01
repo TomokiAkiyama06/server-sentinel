@@ -1429,8 +1429,29 @@ the credential within its reach.
 The reservation itself is a deployment obligation, stated in full in §11.9 and
 ADR-0003: the name serves ServerSentinel alone on every scheme and port. The
 application verifies it at startup and at least daily by enumerating the host's
-real listeners and every proxy route for that name, and closes human access and
-notifies the Owner on any other answer. That bounds the exposure window rather
+real listeners and every proxy route for that name, re-resolving the name on
+each check, and closes human access and notifies the Owner on any other answer
+it can see,
+a resolved address set that differs from the recorded one, or a check that
+cannot be completed. Reopening after an exposure reason (another listener or
+route, a changed address set, a listener/route enumeration failure) first
+revokes every human session; a hostname resolution failure alone keeps access
+closed and reopens without revocation once the name resolves to the recorded
+set again (Owner decision, 2026-10-01; details in `server/app/auth/README.md`).
+An Owner listener exception covers a wildcard system listener only by port
+plus owning executable or systemd unit, verified on every check through the
+socket's owning processes; another or unverifiable owner is an exposure
+reason, and stored port-only exceptions fail closed until re-entered (Owner
+decision, 2026-10-01). Each recorded proxy socket requires a recorded proxy
+process identity (`proxy_owner`) and must be present and held by that process
+alone: a missing recorded socket keeps access closed without revocation, and
+another or unverifiable holder is an exposure (Owner decision, 2026-10-01).
+The check sees only sockets in `/proc/net` and Serve status. Traffic the kernel redirects before it reaches a listening socket on the reserved address — nftables/iptables DNAT or REDIRECT (for example Docker with `userland-proxy=false`), TPROXY, eBPF `sk_lookup` or IPVS — is not visible to it, so it cannot claim that nothing else answers; the deployment isolation must exclude such forwarding, and the Owner verifies it manually.
+The loopback human upstream passes only as a socket in the ServerSentinel
+process's own `/proc/self/fd`; a single replacement bound by any other
+process is an exposure, and an unreadable own fd table keeps access closed as
+an exposure. A check without a durable session revoker never opens access.
+That bounds the exposure window rather
 than preventing the bind: a process that binds between two checks receives
 credentials and cookies for that origin until the next check.
 

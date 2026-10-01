@@ -2,6 +2,8 @@
 
 from uuid import UUID, uuid4
 
+from app.auth.reservation import HostnameReservationCheck
+from app.auth.reservation_store import ListenerExceptionStore
 from app.cameras.registry import NodeHealthState
 from .model import AuditAction, TargetKind
 
@@ -10,6 +12,9 @@ ACTIVE_SOURCE_LIMIT_ID = UUID("ed83d8b4-ec44-4e27-b197-8603c03d8fd2")
 # The Main Server holds one approved hardware baseline; this fixed logical ID
 # names it without exposing any hardware serial or device identifier.
 HARDWARE_BASELINE_ID = UUID("6f5f5a2e-3f0e-4a3a-9a4c-2b0f1c7d5e41")
+# Fixed logical ID for the Owner's hostname-reservation listener exceptions;
+# no port, address or service name reaches the audit log.
+RESERVATION_LISTENER_EXCEPTIONS_ID = UUID("1c18dba3-1e38-4e1d-9d2f-70e078205a41")
 
 
 class OwnerAdministration:
@@ -243,3 +248,48 @@ class AccessAdministration:
                 connection, principal_id, credential_id, at=at,
             ),
         )
+
+
+class ReservationAdministration:
+    """Owner-only change of the hostname-reservation listener exceptions.
+
+    Validation runs after Owner authorization. The persisted set
+    (``ListenerExceptionStore.write_on``) and the ``change_security_setting``
+    audit record commit in one SQLite transaction; only after that commit is
+    the set applied to the in-memory check, which immediately re-checks; the
+    check's ``exception_change_lock`` serializes that whole sequence with
+    every other change and with the check's own startup/daily/retry runs, so
+    a verdict based on a superseded set is never published after the
+    durable commit. A
+    refused actor gets a bounded ``denied`` record and changes nothing; an
+    invalid set or a failed write/append gets a ``failed`` record, rolls back,
+    and changes nothing. This class registers no route.
+    """
+
+    def __init__(self, service, check):
+        if not isinstance(check, HostnameReservationCheck):
+            raise ValueError("reservation check is required")
+        store = check.exception_store
+        if not isinstance(store, ListenerExceptionStore) or \
+                getattr(service.store, "database", None) != store.database:
+            raise ValueError("listener exceptions must persist with their audit record")
+        self.service = service
+        self.check = check
+        self.store = store
+
+    def set_listener_exceptions(self, actor_context, exceptions):
+        def persist(connection, staged):
+            self.store.write_on(connection, staged.exceptions)
+            return staged
+
+        # One change at a time from stage to apply: otherwise an older, wider
+        # set could be applied after a newer, narrower one had committed.
+        with self.check.exception_change_lock:
+            change = self.service.execute_transactional(
+                actor_context, action=AuditAction.CHANGE_SECURITY_SETTING,
+                target_kind=TargetKind.SECURITY_SETTINGS,
+                target_logical_id=RESERVATION_LISTENER_EXCEPTIONS_ID,
+                prepare=lambda: self.check.stage_listener_exceptions(exceptions),
+                operation=persist,
+            )
+            return self.check.apply_audited_listener_exceptions(change)

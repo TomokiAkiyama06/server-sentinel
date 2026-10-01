@@ -653,6 +653,19 @@ class AccessStore:
             raise AccessValidationError("credential is unavailable")
         connection.execute("UPDATE access_sessions SET invalidated_at_us=?, external_identity_binding=NULL WHERE credential_id=? AND invalidated_at_us IS NULL", (_us(at), credential_id))
 
+    def invalidate_all_sessions_on(self, connection, *, at: datetime) -> None:
+        """Advance the deployment authorization generation and end every human session.
+
+        Runs on a caller-owned (audited) transaction. Every session, the
+        Owner's included, stops being accepted, as does every enrollment
+        authorization issued under the previous generation. Principals, grants
+        and credentials are unchanged: each person signs in again with their
+        own credential, and a pending invitation must be issued again.
+        """
+        at = utc_time(at)
+        connection.execute("UPDATE access_deployment_state SET authorization_generation=authorization_generation+1 WHERE singleton=1")
+        connection.execute("UPDATE access_sessions SET invalidated_at_us=?, external_identity_binding=NULL WHERE invalidated_at_us IS NULL", (_us(at),))
+
     # --- WebAuthn ceremony state (Issue #10). Verification lives in app.auth.webauthn;
     # these methods persist only digests, flags and the accepted counter. ---
 
