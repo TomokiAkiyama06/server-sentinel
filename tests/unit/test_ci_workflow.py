@@ -27,6 +27,7 @@ class CIWorkflowTests(unittest.TestCase):
             "tests.e2e.test_detection_isolation_scenarios",
             "tests.e2e.test_no_telemetry_scenarios",
             "tests.e2e.test_capture_mtls_scenarios",
+            "tests.e2e.test_capture_enrollment_scenarios",
         ):
             self.assertIn(f"\n          {module}\n", repository)
             self.assertTrue((ROOT / (module.replace(".", "/") + ".py")).is_file(), module)

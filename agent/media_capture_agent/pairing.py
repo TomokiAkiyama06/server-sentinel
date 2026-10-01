@@ -13,6 +13,7 @@ import fcntl
 import getpass
 import hashlib
 import hmac
+import io
 import json
 import os
 from pathlib import Path
@@ -72,8 +73,15 @@ def prompt_pairing_code(*, prompt: str = "Pairing code: ",
         descriptor = opener("/dev/tty", os.O_RDWR | os.O_NOCTTY | os.O_CLOEXEC)
         if not os.isatty(descriptor):
             raise PairingRefused("secure_pairing_input_unavailable")
-        stream = os.fdopen(descriptor, "r+", encoding="utf-8", closefd=True)
+        # A terminal is not seekable, so a buffered "r+" file object cannot be
+        # used; wrap the raw descriptor the same way ``getpass`` does.
+        raw = io.FileIO(descriptor, "r+", closefd=True)
         descriptor = None
+        try:
+            stream = io.TextIOWrapper(raw, encoding="utf-8")
+        except BaseException:
+            raw.close()
+            raise
         with warnings.catch_warnings():
             warnings.simplefilter("error", getpass.GetPassWarning)
             value = reader(prompt, stream=stream)
@@ -84,6 +92,9 @@ def prompt_pairing_code(*, prompt: str = "Pairing code: ",
             stream.close()
         elif descriptor is not None:
             os.close(descriptor)
+    # The Main displays the code in hyphen-separated groups; accept it as typed.
+    if isinstance(value, str):
+        value = "".join(value.split()).replace("-", "").upper()
     return PairingCode(value)
 
 

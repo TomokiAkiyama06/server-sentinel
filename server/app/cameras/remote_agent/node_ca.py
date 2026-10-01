@@ -176,6 +176,8 @@ class PrivateDirectory:
                     0o600, dir_fd=directory)
             except FileExistsError:
                 raise CaptureAuthorityError("issuer material already exists") from None
+            except OSError:
+                raise CaptureAuthorityError("issuer material could not be written") from None
             try:
                 remaining = memoryview(value)
                 while remaining:
@@ -196,7 +198,17 @@ class PrivateDirectory:
             finally:
                 if descriptor is not None:
                     os.close(descriptor)
-            os.fsync(directory)
+            try:
+                os.fsync(directory)
+            except OSError:
+                # The entry is not known to be durable: remove it, so a
+                # failed setup never strands write-once material that blocks
+                # every corrected rerun.
+                try:
+                    os.unlink(name, dir_fd=directory)
+                except OSError:
+                    pass
+                raise CaptureAuthorityError("issuer material could not be written") from None
             return self.path / name
         finally:
             os.close(directory)
@@ -221,6 +233,23 @@ class PrivateDirectory:
                 return content
             finally:
                 os.close(descriptor)
+        finally:
+            os.close(directory)
+
+    def discard_created(self, name: str) -> None:
+        """Remove a file this process just created, to roll back an incomplete setup."""
+        directory = self._open_directory()
+        try:
+            try:
+                os.unlink(name, dir_fd=directory)
+            except FileNotFoundError:
+                return
+            except OSError:
+                raise CaptureAuthorityError("issuer material could not be removed") from None
+            try:
+                os.fsync(directory)
+            except OSError:
+                raise CaptureAuthorityError("issuer material could not be removed") from None
         finally:
             os.close(directory)
 
@@ -331,8 +360,62 @@ class DeploymentAuthority:
             .sign(key, hashes.SHA256())
         )
         directory.write_new(_CA_KEY, _private_pem(key))
-        directory.write_new(_CA_CERTIFICATE, _certificate_pem(certificate))
+        try:
+            directory.write_new(_CA_CERTIFICATE, _certificate_pem(certificate))
+        except BaseException:
+            # The key was created exclusively by this call; never strand it,
+            # or every corrected rerun is refused as existing issuer material.
+            try:
+                directory.discard_created(_CA_KEY)
+            except CaptureAuthorityError:
+                pass
+            raise
         return cls(deployment_id, certificate, key, clock=clock)
+
+    @classmethod
+    def initialize(cls, directory: PrivateDirectory, listener: PrivateDirectory,
+                   deployment_id: UUID, *, validity: datetime.timedelta, server_name: str,
+                   server_validity: datetime.timedelta,
+                   clock: Callable[[], datetime.datetime] = _utc_now) -> "DeploymentAuthority":
+        """Create the CA and the Main listener credential together, or neither.
+
+        Every input and both destinations are validated before the write-once
+        CA is persisted, so a typo never strands a CA without a listener
+        credential. If issuance still fails afterwards (I/O, clock), the files
+        this call created are removed and the same command can be rerun.
+        """
+        if not isinstance(deployment_id, UUID):
+            raise CaptureAuthorityError("invalid deployment identity")
+        lifetime = _validity(validity, MAX_CA_VALIDITY)
+        server_lifetime = _validity(server_validity, MAX_LEAF_VALIDITY)
+        if server_lifetime + _CLOCK_SKEW_ALLOWANCE > lifetime:
+            raise CaptureAuthorityError("certificate validity exceeds the deployment CA")
+        if not valid_server_name(server_name):
+            raise CaptureAuthorityError("invalid Main server name")
+        if not isinstance(listener, PrivateDirectory) or listener.path == directory.path:
+            raise CaptureAuthorityError("listener material must not share the CA directory")
+        _checked_now(clock)
+        directory.ensure()
+        listener.ensure()
+        if any(directory.exists(name) for name in (_CA_KEY, _CA_CERTIFICATE)):
+            raise CaptureAuthorityError("issuer material already exists")
+        if any(listener.exists(name)
+               for name in (_CA_KEY, _CA_CERTIFICATE, _SERVER_KEY, _SERVER_CERTIFICATE)):
+            raise CaptureAuthorityError("listener material already exists")
+        authority = cls.create(directory, deployment_id, validity=lifetime, clock=clock)
+        try:
+            authority.issue_main_server_credential(listener, server_name=server_name,
+                                                   validity=server_lifetime)
+        except BaseException:
+            for target, names in ((listener, (_SERVER_CERTIFICATE, _SERVER_KEY)),
+                                  (directory, (_CA_CERTIFICATE, _CA_KEY))):
+                for name in names:
+                    try:
+                        target.discard_created(name)
+                    except CaptureAuthorityError:
+                        pass
+            raise
+        return authority
 
     @classmethod
     def load(cls, directory: PrivateDirectory, deployment_id: UUID, *,
@@ -421,6 +504,16 @@ class DeploymentAuthority:
         if not hmac.compare_digest(key_digest, claim.public_key_digest):
             raise CaptureAuthorityError("enrollment request does not match the approved key")
         return self._sign_node(claim.node_id, public, key_digest, validity)
+
+    @staticmethod
+    def enrollment_key_digest(csr_pem: bytes) -> str:
+        """Verify an enrollment CSR's proof of possession and return its key digest.
+
+        Used by the local approval CLI (to bind the approval to the requested
+        key) and the bootstrap listener (to find the approval). Subject and
+        extensions are ignored, as for issuance.
+        """
+        return DeploymentAuthority._proof_of_possession(csr_pem)[1]
 
     @staticmethod
     def _proof_of_possession(csr_pem: bytes, *, strict: bool = False):
@@ -520,6 +613,45 @@ def _is_ca(certificate: x509.Certificate) -> bool:
         return certificate.extensions.get_extension_for_class(x509.BasicConstraints).value.ca
     except x509.ExtensionNotFound:
         return False
+
+
+def deployment_id_of(directory: PrivateDirectory) -> UUID:
+    """Read the deployment UUID from the CA certificate's deployment SAN URI.
+
+    ``DeploymentAuthority.load`` still checks the key and certificate match.
+    """
+    try:
+        certificate = x509.load_pem_x509_certificate(directory.read(_CA_CERTIFICATE))
+    except CaptureAuthorityError:
+        raise
+    except (ValueError, TypeError):
+        raise CaptureAuthorityError("issuer material is invalid") from None
+    deployments = [uri for uri in _uris(certificate) if uri.startswith(DEPLOYMENT_URI_PREFIX)]
+    try:
+        if len(deployments) != 1:
+            raise ValueError
+        text = deployments[0][len(DEPLOYMENT_URI_PREFIX):]
+        deployment = UUID(text)
+        if str(deployment) != text:
+            raise ValueError
+    except ValueError:
+        raise CaptureAuthorityError("issuer material is invalid") from None
+    return deployment
+
+
+def main_server_name(directory: PrivateDirectory) -> str:
+    """Return the single DNS name of the Main listener certificate in ``directory``."""
+    try:
+        certificate = x509.load_pem_x509_certificate(directory.read(_SERVER_CERTIFICATE))
+        names = certificate.extensions.get_extension_for_class(
+            x509.SubjectAlternativeName).value.get_values_for_type(x509.DNSName)
+    except CaptureAuthorityError:
+        raise
+    except (ValueError, TypeError, x509.ExtensionNotFound):
+        raise CaptureAuthorityError("listener material is invalid") from None
+    if len(names) != 1 or not valid_server_name(names[0]):
+        raise CaptureAuthorityError("listener material is invalid")
+    return names[0]
 
 
 def listener_material(directory: PrivateDirectory) -> MainServerCredential:
