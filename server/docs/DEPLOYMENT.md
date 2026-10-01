@@ -352,7 +352,8 @@ When the deployment configures the separate private Owner-template store, add
 recorded with it fails a verification run without it (and the reverse), and
 the store database appearing or disappearing is a change. The tool accepts the
 store only under the layout the store itself enforces (every path component
-unsubstitutable, a root with no group/other access and a single-link regular
+unsubstitutable and searchable by the service account, a root of mode exactly
+`0700` (so SQLite can write its journal there) and a single-link regular
 database of mode exactly `0600` (so `0400`, `0200` or `0000`, which a root
 inspector could still read but the service cannot open read-write, are
 refused too), never a symlink, both owned by the service account that owns
@@ -419,7 +420,8 @@ promotion, revoke). Every current state must satisfy the ledger's
 invariants: an active credential's key, a staged renewal's key (which differs
 from the credential's and belongs to an active credential) and an open
 enrollment's key are each bound to that node by a live, unrevoked binding,
-an activated enrollment's key is bound to its node, and a staged renewal's
+every enrollment's key (any state) is bound to its node, a revoked
+enrollment's binding is revoked, and a staged renewal's
 key is never the key of any enrollment, recorded or current, in any state
 (stage renewal binds keys no enrollment names). From record to
 verify, each node may only change by a composition of those operations:
@@ -430,7 +432,8 @@ consumed to activated or revoked, the other states final (a vanished one is
 makes it: an enrollment activated since the record needs the node's
 credential to hold the key of an activation since the record and the renewal
 staged at record time to be gone; a node is treated as revoked since the
-record when one of its recorded open enrollments became revoked, one of its
+record when one of its recorded open enrollments became revoked (or one
+created since is revoked), one of its
 bindings became revoked, or its active credential became revoked, and then
 all of its recorded bindings and the keys of its newly revoked enrollments
 must be revoked, none of its recorded open enrollments may still be open,

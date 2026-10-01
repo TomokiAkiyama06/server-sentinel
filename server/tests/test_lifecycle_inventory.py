@@ -672,6 +672,9 @@ class LifecycleInventoryTests(unittest.TestCase):
         os.chmod(database, 0o600)
         os.chmod(root, 0o750)
         unsafe_verify("group-root")
+        # Codex P2: a root the service account cannot write (no journal).
+        os.chmod(root, 0o500)
+        unsafe_verify("unwritable-root")
         os.chmod(root, 0o700)
         os.link(database, self.base / "second-link")
         unsafe_verify("hard-link")
@@ -1712,7 +1715,9 @@ class LifecycleInventoryTests(unittest.TestCase):
                                  {"id": f"pairing_enrollments:{ids['completes']}",
                                   "reason": "activation_unapplied"},
                                  # Codex P1: flipped to revoked alone; only revoke()
-                                 # sets it, revoking the whole node.
+                                 # sets it, revoking the whole node and its binding.
+                                 {"id": f"pairing_enrollments:{ids['revoked']}",
+                                  "reason": "unbound"},
                                  {"id": f"pairing_revocation:{node}", "reason": "incomplete"}],
                                 key=lambda item: (item["id"], item["reason"])))
 
@@ -1933,6 +1938,96 @@ class LifecycleInventoryTests(unittest.TestCase):
                 unexpected.append((base, ops, section["failed"]))
         self.assertGreater(ran, 100, ran)
         self.assertEqual(unexpected, [])
+
+    def test_single_row_tampers_of_a_ledger_state_fail(self):
+        # Mutation cases: a state the real PairingLedger produced across the
+        # record boundary, then one tampered row per table. Every one fails;
+        # the first is Codex's: an enrollment approved since the record,
+        # then marked revoked while its key binding stays live.
+        class Owner:
+            def require_owner(self, actor_context):
+                if actor_context != "owner":
+                    raise PermissionError("synthetic denial")
+        owner = Owner()
+
+        def build(index):
+            runtime = Runtime(self.base / f"tamper-{index}")
+            database = Database(runtime.database)
+            ledger = PairingLedger(database, HmacCodeVerifier(b"s" * 32),
+                                   audit=AuditStore(database), clock=lambda: 100.0,
+                                   process_epoch=uuid4())
+            node = uuid4()
+            keys = {name: f"{index:08x}{n:056x}" for n, name in
+                    enumerate(("active", "staged", "pending", "expired"), 1)}
+            approval, code = ledger.approve(owner, "owner", node_id=node,
+                                            public_key_digest=keys["active"])
+            claim = ledger.redeem(enrollment_id=approval.enrollment_id,
+                                  public_key_digest=keys["active"], code=code.value)
+            ledger.activate(claim, credential_serial_digest="b" * 64, not_after=50.0)
+            ledger.stage_renewal(node_id=node, current_public_key_digest=keys["active"],
+                                 current_credential_digest="b" * 64,
+                                 public_key_digest=keys["staged"],
+                                 credential_serial_digest="c" * 64, not_after=90.0)
+            stale, code = ledger.approve(owner, "owner", node_id=node,
+                                         public_key_digest=keys["expired"])
+            with self.assertRaises(PairingError):
+                PairingLedger(database, HmacCodeVerifier(b"s" * 32), audit=AuditStore(database),
+                              clock=lambda: 100.0, process_epoch=uuid4()).redeem(
+                    enrollment_id=stale.enrollment_id, public_key_digest=keys["expired"],
+                    code=code.value)
+            saved, self.runtime = self.runtime, runtime
+            try:
+                _, baseline = self.record(f"tamper-{index}.json")
+            finally:
+                self.runtime = saved
+            pending, _ = ledger.approve(owner, "owner", node_id=node,
+                                        public_key_digest=keys["pending"])
+            return runtime, baseline, node, keys, pending.enrollment_id, approval.enrollment_id
+        tampers = {
+            "new enrollment revoked, binding live":
+                ("UPDATE pairing_enrollments SET state='revoked' WHERE id=:pending",),
+            "enrollment deleted": ("DELETE FROM pairing_enrollments WHERE id=:activated",),
+            "activated enrollment rewound":
+                ("UPDATE pairing_enrollments SET state='consumed' WHERE id=:activated",),
+            "expired enrollment revived":
+                ("UPDATE pairing_enrollments SET state='pending' WHERE public_key_digest=:expired",),
+            "live binding revoked":
+                ("UPDATE pairing_key_bindings SET revoked=1 WHERE public_key_digest=:pending",),
+            "binding deleted": ("DELETE FROM pairing_key_bindings WHERE public_key_digest=:expired",),
+            "credential revoked alone":
+                ("UPDATE pairing_node_credentials SET state='revoked' WHERE node_id=:node",),
+            "credential serial changed":
+                ("UPDATE pairing_node_credentials SET credential_serial_digest=:other "
+                 "WHERE node_id=:node",),
+            "renewal deleted": ("DELETE FROM pairing_node_renewals WHERE node_id=:node",),
+            "renewal key replaced":
+                ("UPDATE pairing_node_renewals SET public_key_digest=:other WHERE node_id=:node",),
+        }
+        runtime, baseline, *_ = build(len(tampers))
+        saved, self.runtime = self.runtime, runtime
+        try:
+            _, report, _ = self.verify(baseline)
+        finally:
+            self.runtime = saved
+        self.assertEqual(report["sections"]["security_state"]["failed"], [])  # untampered
+        for index, (label, statements) in enumerate(tampers.items()):
+            with self.subTest(label):
+                runtime, baseline, node, keys, pending, activated = build(index)
+                values = {"node": str(node), "pending": str(pending),
+                          "activated": str(activated), "expired": keys["expired"],
+                          "other": "e" * 64}
+                values["pending"] = (str(pending) if "enrollment" in label
+                                     else keys["pending"])
+                with closing(sqlite3.connect(runtime.database, isolation_level=None)) as db:
+                    for statement in statements:
+                        db.execute(statement, {key: value for key, value in values.items()
+                                               if f":{key}" in statement})
+                saved, self.runtime = self.runtime, runtime
+                try:
+                    _, report, _ = self.verify(baseline)
+                finally:
+                    self.runtime = saved
+                self.assertTrue(report["sections"]["security_state"]["failed"], label)
 
     def test_a_staged_renewal_is_never_restaged_onto_a_superseded_key(self):
         # Codex P1: stage_renewal() accepts a key already bound to the node

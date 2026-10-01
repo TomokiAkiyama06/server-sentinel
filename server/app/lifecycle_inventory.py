@@ -760,8 +760,11 @@ def _compare_pairing(baseline: dict, current: dict) -> list:
       record may name a key staged at record time or now, so neither the
       retry path nor any other accepts it. A key both staged and approved
       inside the window, its renewal then gone, leaves no trace and passes;
-    - an open (pending / consumed) enrollment's key is live for its node; an
-      activated enrollment's key is bound (perhaps revoked) to its node.
+    - every enrollment's key, in any state, is bound to its node; an open
+      (pending / consumed) one's binding is live, a revoked one's is revoked
+      (expiry and activation change no binding state), and a revoked one
+      new or newly revoked since the record means revoke() of its node ran
+      in the window.
 
     And per node, record -> verify is a composition of those operations,
     each enrollment transition tied to the operation that produces it:
@@ -813,7 +816,6 @@ def _compare_pairing(baseline: dict, current: dict) -> list:
     recorded_activations = baseline.get("pairing_activations")
     recorded_open = baseline.get("pairing_enrollments_open")
     activations_now = current.get("pairing_activations") or ()
-    open_now = current.get("pairing_enrollments_open") or ()
 
     def live(node, key_ref):
         binding = bindings.get(key_ref) or {}
@@ -852,13 +854,19 @@ def _compare_pairing(baseline: dict, current: dict) -> list:
         if (item["key_ref"] in staged_keys and isinstance(recorded_enrollments, dict)
                 and enrollment not in recorded_enrollments):
             fail("pairing_enrollments", enrollment, "enrollment_key")
-    if _by_enrollment(open_now) and _by_enrollment(activations_now):
-        for enrollment, node, key_ref in open_now:
-            if not live(node, key_ref):
-                fail("pairing_enrollments", enrollment, "unbound")
-        for enrollment, node, key_ref in activations_now:
-            if (bindings.get(key_ref) or {}).get("node_id") != node:
-                fail("pairing_enrollments", enrollment, "unbound")
+    # Every enrollment, in every state: approve() bound its key to its node
+    # first; an open one's binding is live (revoke() revokes the open
+    # enrollments and the bindings together); a revoked one's binding is
+    # revoked (only revoke() revokes an enrollment, with every binding of
+    # its node); expiry (redeem()) and activation change no binding state.
+    for enrollment, item in sorted(enrollments_now.items()):
+        binding = bindings.get(item["key_ref"]) or {}
+        if binding.get("node_id") != item["node_id"]:
+            fail("pairing_enrollments", enrollment, "unbound")
+        elif item["state"] in ("pending", "consumed") and binding.get("revoked") is not False:
+            fail("pairing_enrollments", enrollment, "unbound")
+        elif item["state"] == "revoked" and binding.get("revoked") is not True:
+            fail("pairing_enrollments", enrollment, "unbound")
 
     # -- enrollments: never deleted, node / key fixed, states move forward --
     if isinstance(recorded_enrollments, dict):
@@ -910,12 +918,13 @@ def _compare_pairing(baseline: dict, current: dict) -> list:
         if (node in staged and node in renewals
                 and renewals[node]["key_ref"] == staged[node]["key_ref"]):
             fail("pairing_renewals", node, "changed")
-    for enrollment, item in sorted((recorded_enrollments or {}).items()):
-        after = enrollments_now.get(enrollment)
-        if (after is not None and after["state"] == "revoked"
-                and item["state"] in ("pending", "consumed")):
-            # Only revoke() sets 'revoked', revoking the node as a whole.
-            revoked_nodes.add(item["node_id"])
+    for enrollment, after in sorted(enrollments_now.items()):
+        # Only revoke() sets 'revoked', revoking the node as a whole: a
+        # recorded open enrollment now revoked, or one created since and
+        # already revoked, means revoke() ran in the window.
+        before = (recorded_enrollments or {}).get(enrollment)
+        if after["state"] == "revoked" and (before is None or before["state"] != "revoked"):
+            revoked_nodes.add(after["node_id"])
     for node, before in recorded_credentials.items():
         after = credentials.get(node)
         if not before["revoked"] and after is not None and after["revoked"]:

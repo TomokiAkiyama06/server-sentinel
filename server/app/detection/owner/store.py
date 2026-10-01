@@ -56,14 +56,44 @@ def _unsubstitutable(descriptor, owner=None):
         raise OwnerError("PRIVATE_TEMPLATE_ROOT_UNSAFE_PATH")
 
 
+def _service_groups(owner) -> frozenset:
+    """Group IDs of the service account, for the search-permission check."""
+    if owner is None:
+        return frozenset((os.getegid(), *os.getgroups()))
+    try:
+        import pwd
+        account = pwd.getpwuid(owner)
+        return frozenset(os.getgrouplist(account.pw_name, account.pw_gid))
+    except (ImportError, KeyError, OSError):
+        return frozenset()
+
+
+def _traversable(info, owner, groups) -> bool:
+    """Whether the service account may search this directory (its ``x`` bit).
+
+    A read-only inspector running as root can always traverse, so the bits
+    that would apply to the service account are checked explicitly.
+    """
+    uid = os.geteuid() if owner is None else owner
+    if info.st_uid == uid:
+        return bool(info.st_mode & stat.S_IXUSR)
+    if info.st_gid in groups:
+        return bool(info.st_mode & stat.S_IXGRP)
+    return bool(info.st_mode & stat.S_IXOTH)
+
+
 def _directory(path: Path, owner=None):
     if not path.is_absolute() or ".." in path.parts:
         raise OwnerError("PRIVATE_TEMPLATE_ROOT_UNAVAILABLE")
     flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    groups = _service_groups(owner)
     descriptor = os.open("/", flags)
     try:
         _unsubstitutable(descriptor, owner)
         for part in path.parts[1:]:
+            # The service account must be able to search every ancestor.
+            if not _traversable(os.fstat(descriptor), owner, groups):
+                raise OwnerError("PRIVATE_TEMPLATE_ROOT_UNAVAILABLE")
             next_descriptor = os.open(part, flags, dir_fd=descriptor)
             os.close(descriptor)
             descriptor = next_descriptor
@@ -75,7 +105,10 @@ def _directory(path: Path, owner=None):
 
 
 def _private_root(info, owner) -> bool:
-    return info.st_uid == owner and not info.st_mode & 0o077
+    # Exactly 0700, like the other runtime directories: no group / other
+    # access, and the service account can list, create and remove entries
+    # (SQLite writes its rollback journal beside the database).
+    return info.st_uid == owner and stat.S_IMODE(info.st_mode) == 0o700
 
 
 def _private_file(info, owner) -> bool:
@@ -90,8 +123,8 @@ def open_private_root(root: Path, *, owner: int):
     """Open an existing store root under the invariants the store enforces.
 
     For a read-only inspector (the lifecycle inventory) running as another
-    user: every path component is unsubstitutable, the root is owned by
-    ``owner`` with no group/other access, and an existing database is a
+    user: every path component is unsubstitutable and searchable by
+    ``owner``, the root is owned by ``owner`` with mode exactly 0700, and an existing database is a
     single-link regular file (never a symlink) owned by ``owner`` with mode
     exactly 0600. Returns the verified directory descriptor and whether
     the database exists; raises OwnerError otherwise.

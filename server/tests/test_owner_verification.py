@@ -399,6 +399,34 @@ class OwnerTests(TestCase):
         self.addCleanup(store.close)
         self.assertEqual(store.status(), EnrollmentStatus(False, 0))
 
+    def test_store_layout_requires_service_account_access(self):
+        # Codex P2: a root inspector can traverse anything, so the bits that
+        # apply to the service account are checked explicitly: ancestors
+        # searchable by it, the root exactly 0700 (SQLite writes its journal
+        # beside the database), the database exactly 0600.
+        from types import SimpleNamespace
+        from app.detection.owner import store as owner_store
+        service, other = 1000, 2000
+
+        def info(uid, gid, mode):
+            return SimpleNamespace(st_uid=uid, st_gid=gid, st_mode=stat.S_IFDIR | mode)
+        groups = frozenset({1000, 27})
+        cases = [((service, 0, 0o700), True), ((service, 0, 0o600), False),
+                 ((0, 27, 0o750), True), ((0, 27, 0o701), False),
+                 ((0, 0, 0o751), True), ((0, 0, 0o750), False), ((other, 0, 0o711), True)]
+        for (uid, gid, mode), expected in cases:
+            self.assertEqual(owner_store._traversable(info(uid, gid, mode), service, groups),
+                             expected, oct(mode))
+        for mode, expected in ((0o700, True), (0o500, False), (0o300, False), (0o750, False)):
+            self.assertEqual(owner_store._private_root(info(service, 0, mode), service),
+                             expected, oct(mode))
+        root = Path(self.temp.name) / "unwritable"
+        root.mkdir(mode=0o700)
+        root.chmod(0o500)
+        self.addCleanup(root.chmod, 0o700)
+        with self.assertRaisesRegex(OwnerError, "PRIVATE_TEMPLATE_ROOT_PERMISSIONS"):
+            owner_store.open_private_root(root, owner=os.geteuid())
+
     def test_ancestor_made_substitutable_later_fails_closed(self):
         shared = Path(self.temp.name) / "late"
         shared.mkdir(mode=0o700)
