@@ -16,10 +16,11 @@ import stat
 from tempfile import TemporaryDirectory
 import unittest
 from unittest import mock
-from uuid import UUID, uuid4
+from uuid import UUID, uuid4, uuid5
 
 from app import lifecycle_inventory as inventory
 from app.detection.owner import store as owner_store
+from app.monitoring.runtime import EVENT_NAMESPACE
 from app.presence.service import PresenceService
 from app.storage.database import Database
 from app.storage.migrations import migrate
@@ -1081,6 +1082,88 @@ class LifecycleInventoryTests(unittest.TestCase):
         code, report, _ = self.verify(baseline)
         self.assertIn("missing", [item["reason"] for item in
                                   report["sections"]["security_state"]["failed"]])
+
+    def test_pending_integrity_notifications_leave_only_once_accepted(self):
+        # IntegrityStore.deliver() deletes an outbox row only after the
+        # monitoring bridge recorded its notification event.
+        self.runtime.seed()
+        hardware = "synthetic-hardware-serial-marker"
+        findings = json.dumps([{"kind": "GPU", "state": "CHANGED", "detail": hardware}])
+        for _ in range(3):
+            self.runtime.execute("INSERT INTO integrity_outbox(at, immediate, findings) "
+                                 "VALUES ('2026-01-01T00:00:00+00:00', 1, ?)", (findings,))
+        self.runtime.execute("INSERT INTO integrity_overflow VALUES "
+                             "('CPU', 'MISSING', '2026-01-01T00:00:00+00:00')")
+        self.runtime.execute("INSERT INTO integrity_overflow VALUES "
+                             "('MEMORY', 'CHANGED', '2026-01-01T00:00:00+00:00')")
+        _, baseline = self.record()
+        self.assertNotIn(hardware, baseline.read_text())
+
+        def accept(row_id):
+            self.runtime.execute(
+                "INSERT INTO notification_events VALUES (?, 'hardware_integrity_failure', "
+                "'2026-01-01T00:00:00+00:00', 1, 'sent')",
+                (str(uuid5(EVENT_NAMESPACE, f"integrity-outbox:{row_id}")),))
+        # Row 1 delivered and accepted; the CPU slot promoted into row 4.
+        accept(1)
+        self.runtime.execute("DELETE FROM integrity_outbox WHERE id=1")
+        self.runtime.execute("DELETE FROM integrity_overflow WHERE kind='CPU'")
+        self.runtime.execute(
+            "INSERT INTO integrity_outbox(at, immediate, findings) VALUES "
+            "('2026-01-01T00:00:00+00:00', 1, ?)",
+            (json.dumps([{"kind": "CPU", "state": "MISSING",
+                          "detail": "COALESCED_PENDING_WARNING"}]),))
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_PRESERVED,
+                         report["sections"]["integrity_delivery"])
+        # Row 2 dropped without acceptance, row 3 rewritten, the MEMORY slot lost.
+        self.runtime.execute("DELETE FROM integrity_outbox WHERE id=2")
+        self.runtime.execute("UPDATE integrity_outbox SET immediate=0 WHERE id=3")
+        self.runtime.execute("DELETE FROM integrity_overflow")
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_FAILED)
+        self.assertEqual(sorted(report["sections"]["integrity_delivery"]["failed"],
+                                key=lambda item: item["id"]),
+                         [{"id": "overflow:MEMORY:CHANGED", "reason": "missing"},
+                          {"id": "pending:2", "reason": "missing"},
+                          {"id": "pending:3", "reason": "changed"}])
+
+    def test_active_pairing_material_changes_only_by_staged_promotion(self):
+        self.runtime.seed()
+        promoted, replaced = str(uuid4()), str(uuid4())
+        old = {promoted: "1" * 64, replaced: "2" * 64}
+        for node_id in (promoted, replaced):
+            self.runtime.execute(
+                "INSERT INTO capture_nodes VALUES (?, 'synthetic', 'online', NULL, "
+                "'2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00')", (node_id,))
+            self.runtime.execute(
+                "INSERT INTO pairing_node_credentials (node_id, public_key_digest, "
+                "credential_serial_digest, state, not_after) VALUES (?, ?, ?, 'active', 10.0)",
+                (node_id, old[node_id], "3" * 64))
+            self.runtime.execute("INSERT INTO pairing_key_bindings VALUES (?, ?, 0)",
+                                 (old[node_id], node_id))
+        self.runtime.execute("INSERT INTO pairing_node_renewals VALUES (?, ?, ?, 20.0)",
+                             (promoted, "4" * 64, "5" * 64))
+        _, baseline = self.record()
+        for marker in ("1" * 64, "4" * 64, "5" * 64):
+            self.assertNotIn(marker, baseline.read_text())
+        # PairingLedger promotion: bind the staged key, swap it in, consume it.
+        self.runtime.execute("INSERT INTO pairing_key_bindings VALUES (?, ?, 0)",
+                             ("4" * 64, promoted))
+        self.runtime.execute(
+            "UPDATE pairing_node_credentials SET public_key_digest=?, "
+            "credential_serial_digest=?, not_after=20.0 WHERE node_id=?",
+            ("4" * 64, "5" * 64, promoted))
+        self.runtime.execute("DELETE FROM pairing_node_renewals")
+        # A replacement that was never staged.
+        self.runtime.execute("INSERT INTO pairing_key_bindings VALUES (?, ?, 0)",
+                             ("6" * 64, replaced))
+        self.runtime.execute("UPDATE pairing_node_credentials SET public_key_digest=? "
+                             "WHERE node_id=?", ("6" * 64, replaced))
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_FAILED)
+        self.assertEqual(report["sections"]["security_state"]["failed"],
+                         [{"id": f"pairing_credentials:{replaced}", "reason": "changed"}])
 
     def test_uncovered_durable_tables_are_listed_as_not_inventoried(self):
         self.runtime.seed()

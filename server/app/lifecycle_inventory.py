@@ -70,10 +70,11 @@ import stat
 import sys
 from urllib.parse import quote
 from types import SimpleNamespace
-from uuid import UUID
+from uuid import UUID, uuid5
 
 from app.cameras.uvc.persistence import ApprovalStore
 from app.detection.owner import store as owner_store
+from app.monitoring.runtime import EVENT_NAMESPACE
 from app.presence.delivery import ActionResult
 from app.presence.service import PresenceService
 
@@ -641,8 +642,23 @@ def _security_state(connection, tables, salt: str) -> dict:
     """
     def query(table, sql):
         return connection.execute(sql).fetchall() if table in tables else None
+    not_after = ("not_after" if "pairing_node_credentials" in tables
+                 and "not_after" in _columns(connection, "pairing_node_credentials")
+                 else "NULL AS not_after")
     credentials = query("pairing_node_credentials",
-                        "SELECT node_id, state FROM pairing_node_credentials")
+                        "SELECT node_id, state, public_key_digest, credential_serial_digest, "
+                        f"{not_after} FROM pairing_node_credentials")
+    renewals = query("pairing_node_renewals",
+                     "SELECT node_id, public_key_digest, credential_serial_digest, not_after "
+                     "FROM pairing_node_renewals")
+
+    def material(row):
+        # What PairingLedger.admits() authenticates, as keyed digests; the
+        # key reference matches the pairing_key_bindings key below.
+        return {"material": _keyed(salt, ["pairing-credential-v1", row["public_key_digest"],
+                                          row["credential_serial_digest"]]),
+                "key_ref": _keyed(salt, ["pairing-key-v1", row["public_key_digest"]]),
+                "not_after": row["not_after"]}
     bindings = query("pairing_key_bindings",
                      "SELECT public_key_digest, node_id, revoked FROM pairing_key_bindings")
     nodes = query("capture_nodes", "SELECT id, health_state FROM capture_nodes")
@@ -651,7 +667,10 @@ def _security_state(connection, tables, salt: str) -> dict:
                        "SELECT authorization_generation FROM access_deployment_state")
     return {
         "pairing_credentials": None if credentials is None else {
-            row[0]: row[1] == "revoked" for row in credentials},
+            row["node_id"]: {"revoked": row["state"] == "revoked", **material(row)}
+            for row in credentials},
+        "pairing_renewals": None if renewals is None else {
+            row["node_id"]: material(row) for row in renewals},
         "pairing_key_bindings": None if bindings is None else {
             _keyed(salt, ["pairing-key-v1", row[0]]): {"node_id": row[1], "revoked": bool(row[2])}
             for row in bindings},
@@ -666,14 +685,35 @@ def _security_state(connection, tables, salt: str) -> dict:
 def _compare_security_state(baseline: dict | None, current: dict | None) -> dict:
     baseline, current = baseline or {}, current or {}
     failed = []
-    for name in ("pairing_credentials", "capture_nodes_revoked"):
-        now = current.get(name) or {}
-        for key, revoked in (baseline.get(name) or {}).items():
-            if key not in now:
-                failed.append({"id": f"{name}:{key}", "reason": "missing"})
-            elif revoked and not now[key]:
-                failed.append({"id": f"{name}:{key}", "reason": "revocation_reversed"})
-    now = current.get("pairing_key_bindings") or {}
+    now = current.get("capture_nodes_revoked") or {}
+    for key, revoked in (baseline.get("capture_nodes_revoked") or {}).items():
+        if key not in now:
+            failed.append({"id": f"capture_nodes_revoked:{key}", "reason": "missing"})
+        elif revoked and not now[key]:
+            failed.append({"id": f"capture_nodes_revoked:{key}", "reason": "revocation_reversed"})
+    bindings = current.get("pairing_key_bindings") or {}
+    credentials = current.get("pairing_credentials") or {}
+    staged = baseline.get("pairing_renewals") or {}
+    for key, before in (baseline.get("pairing_credentials") or {}).items():
+        after = credentials.get(key)
+        if after is None:
+            failed.append({"id": f"pairing_credentials:{key}", "reason": "missing"})
+            continue
+        if before["revoked"] and not after["revoked"]:
+            failed.append({"id": f"pairing_credentials:{key}", "reason": "revocation_reversed"})
+        elif before["material"] != after["material"] or before["not_after"] != after["not_after"]:
+            # Only promotion of the renewal staged at record time replaces
+            # the active material: it becomes exactly that staged credential,
+            # the staged row is consumed, and its key is bound to this node.
+            renewal = staged.get(key)
+            promoted = (renewal is not None and not after["revoked"]
+                        and key not in (current.get("pairing_renewals") or {})
+                        and after["material"] == renewal["material"]
+                        and after["not_after"] == renewal["not_after"]
+                        and (bindings.get(renewal["key_ref"]) or {}).get("node_id") == key)
+            if not promoted:
+                failed.append({"id": f"pairing_credentials:{key}", "reason": "changed"})
+    now = bindings
     for key, binding in (baseline.get("pairing_key_bindings") or {}).items():
         if key not in now:
             failed.append({"id": f"pairing_key_bindings:{key}", "reason": "missing"})
@@ -688,6 +728,87 @@ def _compare_security_state(baseline: dict | None, current: dict | None) -> dict
     before, after = baseline.get("authorization_generation"), current.get("authorization_generation")
     if before is not None and (after is None or after < before):
         failed.append({"id": "authorization_generation", "reason": "decreased"})
+    return {"status": "failed" if failed else "preserved", "failed": failed}
+
+
+_INTEGRITY_KINDS = ("hardware_integrity_failure", "hardware_integrity_warning")
+
+
+def _integrity_delivery(connection, tables, salt: str) -> dict | None:
+    """Pending hardware-integrity notifications and coalesced overflow.
+
+    Pending outbox rows are kept as keyed digests (findings may name
+    hardware). IntegrityStore.deliver() deletes a row only after the
+    monitoring bridge durably recorded its notification event, whose ID is
+    uuid5(EVENT_NAMESPACE, "integrity-outbox:<row id>"); the integrity event
+    IDs are kept so verify can require that acceptance. Overflow slots hold
+    only a category and state and leave only by promotion into a new outbox
+    row (above the recorded AUTOINCREMENT sequence).
+    """
+    if not {"integrity_outbox", "integrity_overflow"} <= tables:
+        return None
+    sequence = (connection.execute(
+        "SELECT seq FROM sqlite_sequence WHERE name = 'integrity_outbox'").fetchone()
+        if "sqlite_sequence" in tables else None)
+    events = []
+    if "notification_events" in tables:
+        events = sorted(row[0] for row in connection.execute(
+            "SELECT event_id FROM notification_events WHERE kind IN (?, ?)", _INTEGRITY_KINDS))
+    pending = connection.execute(
+        "SELECT id, at, immediate, findings FROM integrity_outbox WHERE delivered = 0").fetchall()
+    return {
+        "pending": {str(row["id"]): _keyed(salt, ["integrity-outbox-v1", row["at"],
+                                                  row["immediate"], row["findings"]])
+                    for row in pending},
+        # Category / state pairs only, to match promoted overflow slots.
+        "pending_findings": {str(row["id"]): _finding_categories(row["findings"])
+                             for row in pending},
+        "overflow": sorted([row[0], row[1], row[2]] for row in connection.execute(
+            "SELECT kind, state, at FROM integrity_overflow")),
+        "sequence": 0 if sequence is None else sequence[0],
+        "notification_events": events,
+    }
+
+
+def _finding_categories(findings: str) -> list:
+    try:
+        return sorted([item.get("kind"), item.get("state")] for item in json.loads(findings))
+    except (ValueError, TypeError, AttributeError):
+        return []
+
+
+def _integrity_event_id(row_id: int) -> str:
+    return str(uuid5(EVENT_NAMESPACE, f"integrity-outbox:{int(row_id)}"))
+
+
+def _compare_integrity_delivery(baseline: dict | None, current: dict | None) -> dict:
+    """A pending notification leaves only once its event was durably accepted."""
+    if not baseline or not (baseline["pending"] or baseline["overflow"]):
+        return {"status": "empty", "failed": []}
+    current = current or {"pending": {}, "pending_findings": {}, "overflow": [],
+                          "sequence": 0, "notification_events": []}
+    accepted = set(current["notification_events"])
+    failed = []
+    for row_id, digest in baseline["pending"].items():
+        if row_id in current["pending"]:
+            if current["pending"][row_id] != digest:
+                failed.append({"id": f"pending:{row_id}", "reason": "changed"})
+        elif _integrity_event_id(int(row_id)) not in accepted:
+            failed.append({"id": f"pending:{row_id}", "reason": "missing"})
+    # A promoted slot becomes a new outbox row: still pending with that
+    # category, or delivered with its event recorded.
+    new_ids = range(baseline["sequence"] + 1, current["sequence"] + 1)
+    remaining = {tuple(item) for item in current["overflow"]}
+    for kind, state, at in baseline["overflow"]:
+        if (kind, state, at) in remaining:
+            continue
+        promoted = any(
+            [kind, state] in current["pending_findings"].get(str(row_id), [])
+            or (str(row_id) not in current["pending"]
+                and _integrity_event_id(row_id) in accepted)
+            for row_id in new_ids)
+        if not promoted:
+            failed.append({"id": f"overflow:{kind}:{state}", "reason": "missing"})
     return {"status": "failed" if failed else "preserved", "failed": failed}
 
 
@@ -968,6 +1089,7 @@ def collect(runtime_root: Path, *, salt: str | None = None,
             "presence": _presence(connection, tables, salt, _outbox_live(tree.database)),
             "integrity_baseline": _integrity_baseline(connection, tables, salt),
             "security_state": _security_state(connection, tables, salt),
+            "integrity_delivery": _integrity_delivery(connection, tables, salt),
         }
         connection.execute("COMMIT")
     except sqlite3.Error:
@@ -1237,6 +1359,8 @@ def compare(baseline: dict, current: dict, *, declared_rewrites=()) -> dict:
             if baseline.get("integrity_baseline") is not None else None,
             {"baseline": current["integrity_baseline"]}
             if current.get("integrity_baseline") is not None else None),
+        "integrity_delivery": _compare_integrity_delivery(
+            baseline.get("integrity_delivery"), current.get("integrity_delivery")),
         "security_state": _compare_security_state(
             baseline.get("security_state"), current.get("security_state")),
         "owner_template": _compare_owner_template(baseline.get("owner_template"),
