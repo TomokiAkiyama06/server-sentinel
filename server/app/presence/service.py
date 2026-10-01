@@ -15,6 +15,7 @@ from .access import DenyAccess
 from .delivery import ActionResult
 from .models import (CRITICAL, InvalidObservation, Kind, Observation, PresenceState, Quality,
                      Value, timestamp, utc)
+from app.storage.database import PinnedDatabase
 from app.storage.retention import RetentionPeriods
 
 
@@ -129,7 +130,11 @@ class PresenceService:
         Reads take no storage reservation, so they must never create a
         database: SQLite's ``mode=ro`` opens an existing file or fails, with
         no check-then-create window if the file or its mount disappears.
+        A ``PinnedDatabase`` keeps its pin checks, so a replaced or unlinked
+        file at the same path is refused instead of read.
         """
+        if isinstance(self.database, PinnedDatabase):
+            return self.database.connect_read_only()
         path = self.database.path
         if not path.is_absolute() or path.is_symlink():
             raise ValueError("database location is unavailable")
