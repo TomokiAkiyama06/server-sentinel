@@ -520,7 +520,10 @@ audit row older than 90 days, an `integrity_audit` row older than 90 days, a
 `gapped` or `interrupted` recording that ended at least 20 days earlier
 (critical recordings included, exactly as `RetentionService.expired()`
 selects them) may be gone; each is listed under `retention_expired`, never
-counted as preserved. Anything one second short of those periods, starred,
+counted as preserved. Retention deletes rows, never a table: if the audit
+table or a recording catalog table is gone or unreadable, nothing in it counts
+as retention-expired and the section fails as `table_missing`. Anything one
+second short of those periods, starred,
 still active, or removed by capacity-pressure deletion of the oldest
 recordings (`RetentionService.oldest()`), stays `missing`: if storage
 pressure deleted recordings during the window, investigate and re-record.

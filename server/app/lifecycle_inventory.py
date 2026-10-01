@@ -1763,6 +1763,10 @@ def _compare_recordings(baseline: dict | None, current: dict | None, *,
     if result["status"] == "empty":
         result["retention_expired"] = []
         return result
+    if current is None:
+        # The recording tables are gone or unreadable: never retention.
+        retention_cutoff_ms = None
+        result["failed"].append({"id": None, "reason": "table_missing"})
     current = current or {}
     preserved, failed, in_progress = [], [], []
     # A recording automatic retention deletes (with its links and markers,
@@ -1786,10 +1790,12 @@ def _compare_recordings(baseline: dict | None, current: dict | None, *,
         else:
             preserved.append(key)
     for entry in list(failed):
+        if entry["reason"] != "changed":
+            continue
         key = entry["id"]
         base = baseline[key]
         now = current.get(key)
-        if entry["reason"] != "changed" or base["status"] != "active" or now is None:
+        if base["status"] != "active" or now is None:
             continue
         if _valid_growth(base, now):
             failed.remove(entry)
@@ -1828,9 +1834,14 @@ def _compare_audit(baseline: dict | None, current: dict | None, expired=None) ->
         return {"status": "empty", "preserved_rows": 0, "failed": [],
                 "appended": [row[0] for row in (current or {"rows": []})["rows"]],
                 "chain_match": None, "retention_expired": []}
+    failed, kept, retained_out = [], [], []
+    if current is None:
+        # The table itself is gone or unreadable: retention deletes rows,
+        # never the table, so nothing counts as retention-expired.
+        expired = None
+        failed.append({"id": None, "reason": "table_missing"})
     current_rows = dict((row_id, digest) for row_id, digest in (current or {"rows": []})["rows"])
     times = baseline.get("times") or {}
-    failed, kept, retained_out = [], [], []
     for row_id, digest in baseline["rows"]:
         if row_id not in current_rows:
             if expired is not None and row_id in times and expired(times[row_id]):

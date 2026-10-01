@@ -601,6 +601,39 @@ class LifecycleInventoryTests(unittest.TestCase):
         self.assertNotIn(expired, report["sections"]["recordings"]["preserved"])
         self.assertIn("retention_expired=1", stdout)
 
+    def test_dropping_a_table_of_expired_rows_is_never_retention(self):
+        # Codex P1: retention deletes rows, never a table. With every row past
+        # its period, dropping the table (or one the recording catalog needs)
+        # must fail instead of reading as an empty, fully expired table.
+        cases = {"security_admin_audit_records": "audit_security_admin",
+                 "integrity_audit": "audit_integrity",
+                 "storage_state_audit": "audit_storage_state",
+                 "recordings": "recordings", "recording_links": "recordings",
+                 "recording_segments": "recordings"}
+        self.now = datetime.fromtimestamp(1_700_000_000 + 400 * 86_400, timezone.utc)
+        for index, (table, section) in enumerate(cases.items()):
+            with self.subTest(table):
+                runtime = Runtime(self.base / f"dropped-{index}")
+                saved, self.runtime = self.runtime, runtime
+                try:
+                    runtime.seed()
+                    runtime.execute("INSERT INTO integrity_audit(at, actor, revision) VALUES "
+                                    "('2023-01-01T00:00:00+00:00', 'owner', 1)")
+                    runtime.execute("INSERT INTO storage_state_audit (at_ms, previous_state, "
+                                    "current_state) VALUES (1, 'normal', 'pressure')")
+                    runtime.execute("UPDATE recordings SET status='complete', ended_ms=1, "
+                                    "starred=0")
+                    _, baseline = self.record(f"dropped-{index}.json")
+                    # Every row here is past its retention period.
+                    runtime.execute(f"DROP TABLE {table}")
+                    code, report, _ = self.verify(baseline)
+                finally:
+                    self.runtime = saved
+                self.assertEqual(code, inventory.EXIT_FAILED, table)
+                result = report["sections"][section]
+                self.assertEqual(result["retention_expired"], [], table)
+                self.assertIn({"id": None, "reason": "table_missing"}, result["failed"], table)
+
     def test_presence_and_storage_audit_rows_are_preserved(self):
         self.runtime.seed()
         for index in range(3):
