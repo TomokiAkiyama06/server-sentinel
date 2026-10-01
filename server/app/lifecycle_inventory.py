@@ -1501,7 +1501,7 @@ def _compare_principals(baseline: dict | None, current: dict | None) -> dict:
 
 
 def _compare_owner_template(baseline: dict | None, current: dict | None,
-                            expired=None) -> dict:
+                            expired=None, fresh=None) -> dict:
     baseline = baseline or {"configured": False}
     current = current or {"configured": False}
     if not baseline["configured"] and not current["configured"]:
@@ -1517,7 +1517,7 @@ def _compare_owner_template(baseline: dict | None, current: dict | None,
     if baseline.get("audit") is not None or current.get("audit") is not None:
         # OwnerTemplateStore.cleanup_expired_batch() runs at startup when the
         # store is registered for audit retention.
-        audit = _compare_audit(baseline.get("audit"), current.get("audit"), expired)
+        audit = _compare_audit(baseline.get("audit"), current.get("audit"), expired, fresh)
         failed.extend({"id": f"audit:{item['id']}", "reason": item["reason"]}
                       for item in audit["failed"])
     return {"status": "failed" if failed else "preserved", "failed": failed,
@@ -1642,6 +1642,8 @@ def collect(runtime_root: Path, *, salt: str | None = None,
             schema_version = migrations[-1][0] if migrations else None
         inventory = {
             "format": FORMAT, "format_version": FORMAT_VERSION,
+            # When this snapshot was taken, to tell rows written after it.
+            "recorded_at": _utcnow().isoformat(),
             "schema_version": schema_version,
             "schema_migrations": migrations,
             "tables": sorted(name for name in INVENTORIED_TABLES if name in tables),
@@ -1979,12 +1981,17 @@ def _compare_recordings(baseline: dict | None, current: dict | None, *,
     return result
 
 
-def _compare_audit(baseline: dict | None, current: dict | None, expired=None) -> dict:
+def _compare_audit(baseline: dict | None, current: dict | None, expired=None,
+                   fresh=None) -> dict:
     """Audit rows stay identical, except rows the service's retention removed.
 
     ``expired`` judges a recorded row's time against the service's retention
     rule at verify time; a missing row it accepts is listed under
-    ``retention_expired`` and never counted as preserved.
+    ``retention_expired`` and never counted as preserved. Tables keyed by
+    INTEGER PRIMARY KEY without AUTOINCREMENT reuse the highest id once
+    retention removed it, so a recorded row that retention may have removed
+    whose id now holds a row written after the record (``fresh``) is that
+    case: the recorded row is retention-expired and the new one appended.
     """
     if baseline is not None and current is None:
         # The table existed at record time and is gone or unreadable now,
@@ -2004,6 +2011,8 @@ def _compare_audit(baseline: dict | None, current: dict | None, expired=None) ->
         failed.append({"id": None, "reason": "table_missing"})
     current_rows = dict((row_id, digest) for row_id, digest in (current or {"rows": []})["rows"])
     times = baseline.get("times") or {}
+    current_times = (current or {}).get("times") or {}
+    reused = []
     for row_id, digest in baseline["rows"]:
         if row_id not in current_rows:
             if expired is not None and row_id in times and expired(times[row_id]):
@@ -2011,7 +2020,14 @@ def _compare_audit(baseline: dict | None, current: dict | None, expired=None) ->
             else:
                 failed.append({"id": row_id, "reason": "missing"})
         elif current_rows[row_id] != digest:
-            failed.append({"id": row_id, "reason": "changed"})
+            if (expired is not None and fresh is not None and row_id in times
+                    and expired(times[row_id]) and row_id in current_times
+                    and fresh(current_times[row_id])
+                    and not expired(current_times[row_id])):
+                retained_out.append(row_id)
+                reused.append(row_id)
+            else:
+                failed.append({"id": row_id, "reason": "changed"})
         else:
             kept.append((row_id, digest))
     # The chain recomputed over the recorded rows must match the record, so
@@ -2024,13 +2040,31 @@ def _compare_audit(baseline: dict | None, current: dict | None, expired=None) ->
     return {"status": "failed" if failed else "preserved",
             "preserved_rows": len(kept),
             "failed": failed,
-            "appended": [row_id for row_id in current_rows if row_id not in baseline_ids],
+            "appended": [row_id for row_id in current_rows
+                         if row_id not in baseline_ids or row_id in reused],
             "chain_match": chain_match,
             "retention_expired": retained_out}
 
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _written_after(recorded_at) -> dict:
+    """Predicates for a row time written at or after the record (none if unknown)."""
+    try:
+        since = datetime.fromisoformat(recorded_at)
+    except (TypeError, ValueError):
+        return {"iso": None, "ms": None}
+    since_ms = int(since.timestamp() * 1000)
+
+    def iso(value):
+        try:
+            moment = datetime.fromisoformat(value)
+        except (TypeError, ValueError):
+            return False
+        return moment.tzinfo is not None and moment >= since
+    return {"iso": iso, "ms": lambda value: isinstance(value, int) and value >= since_ms}
 
 
 def _retention_rules(now: datetime) -> dict:
@@ -2120,6 +2154,7 @@ def compare(baseline: dict, current: dict, *, declared_rewrites=(), now=None) ->
     access_owner = any(item["role"] == "owner"
                        for item in (access_now.get("principals") or {}).values())
     rules = _retention_rules(now or _utcnow())
+    fresh = _written_after(baseline.get("recorded_at"))
     recorded_tables = baseline.get("tables")
     present = set(current.get("tables") or ())
     table_failures = ([{"id": None, "reason": "unverifiable"}] if recorded_tables is None else
@@ -2138,12 +2173,12 @@ def compare(baseline: dict, current: dict, *, declared_rewrites=(), now=None) ->
             rules["security_admin"]),
         "audit_integrity": _compare_audit(
             baseline["audit"].get("integrity"), current["audit"].get("integrity"),
-            rules["integrity"]),
+            rules["integrity"], fresh["iso"]),
         "audit_presence": _compare_audit(
             baseline["audit"].get("presence"), current["audit"].get("presence")),
         "audit_storage_state": _compare_audit(
             baseline["audit"].get("storage_state"), current["audit"].get("storage_state"),
-            rules["storage_state"]),
+            rules["storage_state"], fresh["ms"]),
         "camera_sources": _compare_sources(baseline.get("camera_sources"),
                                            current.get("camera_sources")),
         "camera_registry_settings": _compare_keyed(
@@ -2165,7 +2200,7 @@ def compare(baseline: dict, current: dict, *, declared_rewrites=(), now=None) ->
             baseline.get("security_state"), current.get("security_state")),
         "owner_template": _compare_owner_template(baseline.get("owner_template"),
                                                   current.get("owner_template"),
-                                                  rules["owner_template"]),
+                                                  rules["owner_template"], fresh["iso"]),
         "access_principals": _compare_principals(access_base.get("principals"),
                                                  access_now.get("principals")),
         "access_invitations": _compare_keyed(access_base.get("invitations"),

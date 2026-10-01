@@ -987,6 +987,84 @@ class LifecycleInventoryTests(unittest.TestCase):
         self.assertIn({"id": "audit:3", "reason": "missing"},
                       report["sections"]["owner_template"]["failed"])
 
+    def test_reused_audit_ids_after_retention_are_new_rows(self):
+        # Codex P1: integrity_audit, storage_state_audit and owner_template_audit
+        # use INTEGER PRIMARY KEY without AUTOINCREMENT, so once retention
+        # removes the highest row its id is reused by the next one. That reads
+        # as retention plus an appended row only when the recorded row was due
+        # for removal and the new row was written after the record.
+        recorded = self.now
+        later = recorded + timedelta(hours=1)
+        day = timedelta(days=1)
+        cases = {   # label: (recorded row age in days, new row time)
+            "reused": (91, later), "not-expired": (89, later),
+            "older-than-record": (91, recorded - timedelta(hours=1))}
+        for index, (label, (age, written)) in enumerate(cases.items()):
+            for table in ("storage_state_audit", "integrity_audit", "owner_template_audit"):
+                with self.subTest(label=label, table=table):
+                    runtime = Runtime(self.base / f"reuse-{index}-{table}")
+                    saved, saved_base = self.runtime, self.base
+                    self.runtime, self.base = runtime, runtime.root.parent
+                    # The store's ancestors must not be group-writable.
+                    os.chmod(self.base, 0o700)
+                    try:
+                        runtime.seed()
+                        extra = ()
+                        if table == "owner_template_audit":
+                            root = self.owner_template_root(template=b"synthetic-template")
+                            target, extra = root / "owner-template.sqlite3", (
+                                "--owner-template-root", str(root))
+                        else:
+                            target = runtime.database
+                        old_at = recorded - age * day
+                        with closing(sqlite3.connect(target, isolation_level=None)) as db:
+                            if table == "storage_state_audit":
+                                db.execute("INSERT INTO storage_state_audit (at_ms, "
+                                           "previous_state, current_state) VALUES (?, 'normal', "
+                                           "'pressure')", (int(old_at.timestamp() * 1000),))
+                            elif table == "integrity_audit":
+                                db.execute("INSERT INTO integrity_audit(at, actor, revision) "
+                                           "VALUES (?, 'owner', 1)", (old_at.isoformat(),))
+                            else:
+                                db.execute("DELETE FROM owner_template_audit")
+                                db.execute("INSERT INTO owner_template_audit(at, actor, "
+                                           "operation, generation) VALUES (?, 'owner', "
+                                           "'enroll', 1)", (old_at.isoformat(),))
+                            row_id = db.execute(f"SELECT MAX(id) FROM {table}").fetchone()[0]
+                        self.now = recorded
+                        _, baseline = self.record(f"reuse-{index}-{table}.json", *extra)
+                        with closing(sqlite3.connect(target, isolation_level=None)) as db:
+                            db.execute(f"DELETE FROM {table} WHERE id=?", (row_id,))
+                            if table == "storage_state_audit":
+                                db.execute("INSERT INTO storage_state_audit (at_ms, "
+                                           "previous_state, current_state) VALUES (?, "
+                                           "'pressure', 'normal')",
+                                           (int(written.timestamp() * 1000),))
+                            elif table == "integrity_audit":
+                                db.execute("INSERT INTO integrity_audit(at, actor, revision) "
+                                           "VALUES (?, 'owner', 2)", (written.isoformat(),))
+                            else:
+                                db.execute("INSERT INTO owner_template_audit(at, actor, "
+                                           "operation, generation) VALUES (?, 'owner', "
+                                           "'replace', 1)", (written.isoformat(),))
+                            self.assertEqual(db.execute(
+                                f"SELECT MAX(id) FROM {table}").fetchone()[0], row_id)
+                        self.now = later + timedelta(hours=1)
+                        code, report, _ = self.verify(baseline, *extra)
+                    finally:
+                        self.runtime, self.base = saved, saved_base
+                        self.now = recorded
+                    name = {"storage_state_audit": "audit_storage_state",
+                            "integrity_audit": "audit_integrity"}.get(table)
+                    section = (report["sections"][name] if name
+                               else report["sections"]["owner_template"]["audit"])
+                    if label == "reused":
+                        self.assertEqual(section["retention_expired"], [str(row_id)])
+                        self.assertIn(str(row_id), section["appended"])
+                        self.assertEqual(section["failed"], [])
+                    else:
+                        self.assertIn({"id": str(row_id), "reason": "changed"}, section["failed"])
+
     def test_credential_sign_count_may_only_advance(self):
         # A lower counter rolls back the authenticator clone-detection floor.
         seeded = self.runtime.seed()

@@ -545,7 +545,12 @@ audit row older than 90 days, an `integrity_audit` row older than 90 days, a
 `gapped` or `interrupted` recording that ended at least 20 days earlier
 (critical recordings included, exactly as `RetentionService.expired()`
 selects them) may be gone; each is listed under `retention_expired`, never
-counted as preserved. Retention deletes rows, never a table: if the audit
+counted as preserved. `integrity_audit`, `storage_state_audit` and
+`owner_template_audit` reuse the highest row id once retention removed it, so
+a recorded row due for removal whose id now holds a row written after the
+record is listed as `retention_expired` with the new row `appended`; a reused
+id whose recorded row was not yet due, or whose new row predates the record,
+stays `changed`. Retention deletes rows, never a table: if the audit
 table or a recording catalog table is gone or unreadable, nothing in it counts
 as retention-expired and the section fails as `table_missing`. Anything one
 second short of those periods, starred,
