@@ -340,13 +340,19 @@ starred flag, catalog start, target end and ended boundaries (recorded
 separately, since playback is clipped to the target end), critical flag, event
 link (`event_id`, which groups an event's recordings) and explicit
 `recording_discontinuities` markers, and
-for every linked segment its source, catalog bounds, the catalog fields that
+for every linked segment, whatever its state (a link to a segment that is not
+`ready` is never preserved), its source, catalog bounds, the catalog fields that
 control integrity, playback or retention (`byte_length`, `stream_id` /
 `sequence`, `codec`, `container`, capture node and critical flag) and the
 SHA-256, size and hard-link count of its file as read from disk (the recording
 store treats a file with more than one link as corrupt); a per-row and a chained SHA-256 over every
 retained `security_admin_audit_records`, `integrity_audit`, `presence_audit`
-and `storage_state_audit` row; for each registered camera source its type,
+and `storage_state_audit` row; the open presence timeline gap, if any (its
+start, latest time and loss counts; it is cleared only by an audited Owner
+action, so verification fails if it disappears or shrinks; the presence outbox
+tables are a transient dispatch queue, not retained history, and are not
+inventoried); for each registered camera source its type, keyed digests of
+its Owner-entered name and role label, a digest of its capabilities, its
 `enabled` flag, capture node, a digest of its desired capture profile and of
 its detection bindings, and a keyed digest of its durable UVC approval (the
 identity `same_physical_camera()` compares: vendor / product / serial /

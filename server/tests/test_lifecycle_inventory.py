@@ -718,6 +718,81 @@ class LifecycleInventoryTests(unittest.TestCase):
                            bytes(reversed(SECRET_DIGEST)).hex()):
                 self.assertNotIn(marker, text, path.name)
 
+    def test_hidden_non_ready_segment_link_is_never_preserved(self):
+        # manifest() reads every linked segment, whatever its state, so a
+        # linked pending segment later turns a complete recording gapped.
+        seeded = self.runtime.seed()
+        active = self.runtime.recording(starred=False, payload=b"generated-active-pending",
+                                        status="active", target_end_ms=20000)
+        _, baseline = self.record()
+        for recording_id in (seeded["ordinary"], active):
+            segment_id = self.runtime.add_segment(
+                recording_id, b"generated-pending-" + recording_id.encode(),
+                start_ms=10000, end_ms=12000, stream_id="hidden", sequence=0)
+            self.runtime.execute("UPDATE recording_segments SET state='pending' WHERE id=?",
+                                 (segment_id,))
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_FAILED)
+        section = report["sections"]["recordings"]
+        for recording_id in (seeded["ordinary"], active):
+            self.assertNotIn(recording_id, section["preserved"])
+            self.assertIn({"id": recording_id, "reason": "changed"}, section["failed"])
+        # Recorded with the hidden link already present: never preserved either.
+        _, tainted = self.record("tainted.json")
+        code, report, _ = self.verify(tainted)
+        self.assertEqual(code, inventory.EXIT_FAILED)
+        self.assertIn({"id": seeded["ordinary"], "reason": "no_readable_segment_evidence"},
+                      report["sections"]["recordings"]["failed"])
+
+    def test_owner_editable_source_metadata_is_preserved_by_keyed_digest(self):
+        self.runtime.seed()
+        name, role = "synthetic-camera-name-marker", "synthetic-role-marker"
+        ids = {label: self.runtime.source() for label in ("name", "role", "capabilities")}
+        for source_id in ids.values():
+            self.runtime.execute("UPDATE camera_sources SET name=?, role_label=? WHERE id=?",
+                                 (name, role, source_id))
+        _, baseline = self.record()
+        self.runtime.execute("UPDATE camera_sources SET name='renamed' WHERE id=?", (ids["name"],))
+        self.runtime.execute("UPDATE camera_sources SET role_label=NULL WHERE id=?", (ids["role"],))
+        self.runtime.execute("UPDATE camera_sources SET capabilities='{\"video_only\":true}' "
+                             "WHERE id=?", (ids["capabilities"],))
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_FAILED)
+        for source_id in ids.values():
+            self.assertIn({"id": source_id, "reason": "changed"},
+                          report["sections"]["camera_sources"]["failed"])
+        for path in self.notes.iterdir():
+            for marker in (name, role):
+                self.assertNotIn(marker, path.read_text(), path.name)
+
+    def test_open_presence_timeline_gap_may_only_grow(self):
+        # The gap is cleared only by an audited Owner action, never during an
+        # update; dropping or shrinking it would hide recorded timeline loss.
+        self.runtime.seed()
+        _, closed = self.record("closed.json")
+        self.runtime.execute(
+            "INSERT INTO presence_timeline_gap (singleton, since, latest, refused, rejected, "
+            "lost, interrupted) VALUES (1, '2026-01-01T00:00:00+00:00', "
+            "'2026-01-01T00:01:00+00:00', 1, 0, 2, 0)")
+        code, report, _ = self.verify(closed)
+        self.assertEqual(code, inventory.EXIT_PRESERVED)
+        self.assertEqual(report["sections"]["presence_timeline_gap"]["appended"], ["gap"])
+        _, baseline = self.record()
+        self.runtime.execute("UPDATE presence_timeline_gap SET lost=3, "
+                             "latest='2026-01-01T00:02:00+00:00'")
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_PRESERVED)
+        self.runtime.execute("UPDATE presence_timeline_gap SET lost=1")
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_FAILED)
+        self.assertEqual(report["sections"]["presence_timeline_gap"]["failed"],
+                         [{"id": "gap", "reason": "changed"}])
+        self.runtime.execute("DELETE FROM presence_timeline_gap")
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_FAILED)
+        self.assertEqual(report["sections"]["presence_timeline_gap"]["failed"],
+                         [{"id": "gap", "reason": "missing"}])
+
     def test_grant_and_revocation_state_is_preserved_by_logical_id(self):
         seeded = self.runtime.seed()
         _, baseline = self.record()

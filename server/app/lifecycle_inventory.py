@@ -14,7 +14,9 @@
   (``security_admin_audit_records``, ``integrity_audit``, ``presence_audit``
   and ``storage_state_audit``), so a rewritten middle row is detected even
   when counts and boundary timestamps match;
-- per registered camera source: type, enabled flag, capture node, digests of
+- the open presence timeline gap, which may only grow;
+- per registered camera source: type, keyed digests of the Owner-entered
+  name and role label, capabilities digest, enabled flag, capture node, digests of
   the desired capture profile and detection bindings, and a keyed digest of
   the durable UVC approval identity (never device facts; volatile health
   excluded); the registry's ``max_active_video_sources``;
@@ -187,16 +189,20 @@ def _recordings(connection, tables, directory: Path) -> dict | None:
     for row in rows:
         segments = connection.execute(
             "SELECT s.id, s.source_id, s.capture_node_id, s.stream_id, s.sequence, "
-            "s.start_ms, s.end_ms, s.codec, s.container, s.byte_length, s.sha256, s.critical "
+            "s.start_ms, s.end_ms, s.codec, s.container, s.byte_length, s.sha256, s.critical, "
+            "s.state "
             "FROM recording_segments s "
             "JOIN recording_links l ON l.segment_id = s.id "
-            "WHERE l.recording_id = ? AND s.state = 'ready' ORDER BY s.start_ms, s.id",
+            # Every linked segment, whatever its state, as manifest() reads
+            # them: a hidden non-ready link would later degrade playback.
+            "WHERE l.recording_id = ? ORDER BY s.start_ms, s.id",
             (row["id"],)).fetchall()
         items = []
         for segment in segments:
             digest, size, links = _file_digest(directory, segment["id"])
             items.append({
-                "segment_id": segment["id"], "sha256": digest, "bytes": size,
+                "segment_id": segment["id"], "state": segment["state"],
+                "sha256": digest, "bytes": size,
                 "link_count": links,
                 # RecordingStore._integrity() needs the digest and the catalog
                 # byte_length to match a file with exactly one hard link.
@@ -346,12 +352,55 @@ def _sources(connection, tables, salt: str) -> dict | None:
         "source_type": row["source_type"],
         "enabled": bool(row["enabled"]),
         "capture_node_id": row["capture_node_id"],
+        # Owner-entered text (name, role label) may name a person or place,
+        # so only keyed digests are kept; capabilities (advertised formats,
+        # video-only flag, written at Owner approval) are non-identifying.
+        "name_digest": _keyed(salt, ["source-name-v1", row["name"]]),
+        "role_digest": _keyed(salt, ["source-role-v1", row["role_label"]]),
+        "capabilities_sha256": _digest(row["capabilities"]),
         "desired_capture_profile_sha256": _digest(row["desired_capture_profile"]),
         "detection_bindings_sha256": _digest(bindings.get(row["id"], [])),
         "uvc_approval_sha256": approvals.get(row["id"]),
     } for row in connection.execute(
-        "SELECT id, source_type, enabled, capture_node_id, desired_capture_profile "
-        "FROM camera_sources ORDER BY id")}
+        "SELECT id, source_type, name, role_label, enabled, capture_node_id, capabilities, "
+        "desired_capture_profile FROM camera_sources ORDER BY id")}
+
+
+_GAP_COUNTS = ("refused", "rejected", "lost", "interrupted")
+
+
+def _timeline_gap(connection, tables) -> dict | None:
+    """The durable presence timeline-loss record (no observation content).
+
+    PresenceService keeps one open gap until the Owner clears it (audited);
+    it never clears automatically. The presence outbox tables
+    (observations, deliveries, source facts, sessions, completed / expired
+    events) are a transient dispatch queue drained by design, not retained
+    history, and are not inventoried; presence_audit is.
+    """
+    if "presence_timeline_gap" not in tables:
+        return None
+    row = connection.execute(
+        "SELECT since, latest, refused, rejected, lost, interrupted "
+        "FROM presence_timeline_gap WHERE singleton = 1").fetchone()
+    return {"open": False} if row is None else {"open": True, **dict(row)}
+
+
+def _compare_timeline_gap(baseline: dict | None, current: dict | None) -> dict:
+    """A recorded gap may only grow; losing or shrinking it hides timeline loss."""
+    if not baseline or not baseline.get("open"):
+        return {"status": "empty", "failed": [],
+                "appended": ["gap"] if current and current.get("open") else []}
+    current = current or {"open": False}
+    if not current.get("open"):
+        failed = [{"id": "gap", "reason": "missing"}]
+    elif (current["since"] != baseline["since"] or current["latest"] < baseline["latest"]
+          or any(current[key] < baseline[key] for key in _GAP_COUNTS)):
+        failed = [{"id": "gap", "reason": "changed"}]
+    else:
+        failed = []
+    return {"status": "failed" if failed else "preserved", "failed": failed,
+            "preserved": [] if failed else ["gap"]}
 
 
 def _registry_settings(connection, tables) -> dict | None:
@@ -609,6 +658,7 @@ def collect(runtime_root: Path, *, salt: str | None = None,
             "camera_sources": _sources(connection, tables, salt),
             "access": _access(connection, tables, salt),
             "camera_registry_settings": _registry_settings(connection, tables),
+            "presence_timeline_gap": _timeline_gap(connection, tables),
         }
         connection.execute("COMMIT")
     except sqlite3.Error:
@@ -676,8 +726,11 @@ def _declared_rewrite_only(base: dict, now: dict) -> bool:
 
 
 def _evidenced(item: dict) -> bool:
+    # A link to a segment that is not 'ready' (a publication never finished)
+    # is not servable evidence, so such a recording is never preserved.
     return bool(item["segments"]) and all(
-        segment["sha256"] is not None for segment in item["segments"])
+        segment.get("state") == "ready" and segment["sha256"] is not None
+        for segment in item["segments"])
 
 
 # Statuses an 'active' recording may reach (store.py: stop / reconcile /
@@ -863,6 +916,8 @@ def compare(baseline: dict, current: dict, *, declared_rewrites=()) -> dict:
                                            current.get("camera_sources")),
         "camera_registry_settings": _compare_keyed(
             baseline.get("camera_registry_settings"), current.get("camera_registry_settings")),
+        "presence_timeline_gap": _compare_timeline_gap(
+            baseline.get("presence_timeline_gap"), current.get("presence_timeline_gap")),
         "owner_template": _compare_owner_template(baseline.get("owner_template"),
                                                   current.get("owner_template")),
         "access_principals": _compare_principals(access_base.get("principals"),
