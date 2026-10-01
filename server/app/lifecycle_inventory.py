@@ -93,6 +93,14 @@ NOT_APPLICABLE = {
     # complete deployment acceptance of Issue #28 verifies these.
     "capture_agent_protected_incidents": "not_applicable (#16 / #28)",
 }
+# Durable tables this tool does not inventory yet (#132); the report lists
+# them so a pass is never read as covering them.
+NOT_INVENTORIED = (
+    "recording_source_discontinuities", "recording_source_cursors",
+    "roi_calibration_history", "notification_events", "uvc_approvals.session_token",
+    "integrity_status", "recording_health_status",
+)
+
 MANUAL = {
     "container_duration": "manual",
     "decode_verification": "manual",
@@ -186,7 +194,12 @@ def _columns(connection: sqlite3.Connection, table: str) -> set[str]:
     return {row[1] for row in connection.execute(f"PRAGMA table_info({table})")}
 
 
-def _recordings(connection, tables, directory: Path) -> dict | None:
+def _recordings(connection, tables) -> dict | None:
+    """The recording catalog, read inside the snapshot transaction.
+
+    Segment files are hashed afterwards by _hash_recordings(), outside the
+    transaction, so a long hash never blocks service writers.
+    """
     if not {"recordings", "recording_links", "recording_segments"} <= tables:
         return None
     result = {}
@@ -206,15 +219,11 @@ def _recordings(connection, tables, directory: Path) -> dict | None:
             (row["id"],)).fetchall()
         items = []
         for segment in segments:
-            digest, size, links = _file_digest(directory, segment["id"])
             items.append({
                 "segment_id": segment["id"], "state": segment["state"],
-                "sha256": digest, "bytes": size,
-                "link_count": links,
-                # RecordingStore._integrity() needs the digest and the catalog
-                # byte_length to match a file with exactly one hard link.
-                "catalog_match": (digest is not None and digest == segment["sha256"]
-                                  and size == segment["byte_length"] and links == 1),
+                # Filled by _hash_recordings() after the transaction.
+                "sha256": None, "bytes": None, "link_count": None, "catalog_match": False,
+                "_catalog_sha256": segment["sha256"],
                 "source_id": segment["source_id"],
                 "start_ms": segment["start_ms"], "end_ms": segment["end_ms"],
                 "media_ms": segment["end_ms"] - segment["start_ms"],
@@ -251,11 +260,31 @@ def _recordings(connection, tables, directory: Path) -> dict | None:
             "segment_media_ms": sum(item["media_ms"] for item in items),
             "segments": items,
             "discontinuities": discontinuities,
-            "content_sha256": _digest([[item["segment_id"], item["sha256"]] for item in items]),
+            "content_sha256": None,
             "container_duration": "manual",
             "decode_verification": "manual",
         }
     return result
+
+
+def _hash_recordings(recordings: dict | None, directory: Path) -> None:
+    """Hash every catalogued segment file, outside any database transaction.
+
+    A ready segment's bytes are immutable, so hashing after the snapshot is
+    equivalent; a file changed or removed meanwhile shows up as a change.
+    """
+    for recording in (recordings or {}).values():
+        for item in recording["segments"]:
+            digest, size, links = _file_digest(directory, item["segment_id"])
+            expected = item.pop("_catalog_sha256")
+            # RecordingStore._integrity() needs the digest and the catalog
+            # byte_length to match a file with exactly one hard link.
+            item.update(sha256=digest, bytes=size, link_count=links,
+                        catalog_match=(digest is not None and digest == expected
+                                       and size == item["catalog"]["byte_length"]
+                                       and links == 1))
+        recording["content_sha256"] = _digest(
+            [[item["segment_id"], item["sha256"]] for item in recording["segments"]])
 
 
 def _chain(rows: list[tuple[str, str]]) -> str:
@@ -546,12 +575,28 @@ def _compare_presence(baseline: dict | None, current: dict | None,
         elif key not in completed:
             fail("observations", key, "missing")
     deliveries = current.get("deliveries") or {}
+    # Retention and the Owner's clear_unresolved_critical_event() both add
+    # one expired-unresolved event per removed job that was not delivered,
+    # in the same transaction as the tombstone. A job recorded unresolved
+    # that is gone must be covered by that increase (one delivered and then
+    # expired inside the window is also reported; do not run retention then).
+    needed = {}
     for key, job in (baseline.get("deliveries") or {}).items():
         if key not in deliveries:
             if job["observation"] not in completed:
                 fail("deliveries", key, "missing")
+            elif job["state"] != "delivered":
+                action = key.rsplit(":", 1)[1]
+                needed.setdefault(action, []).append(key)
         elif not _delivery_advanced(job, deliveries[key]):
             fail("deliveries", key)
+    recorded = baseline.get("expired_unresolved") or {}
+    for action, keys in needed.items():
+        added = ((expired.get(action) or {}).get("events", 0)
+                 - (recorded.get(action) or {}).get("events", 0))
+        if added < len(keys):
+            for key in keys:
+                fail("deliveries", key, "missing")
     facts = current.get("source_facts") or {}
     for key, value in (baseline.get("source_facts") or {}).items():
         if key in facts:
@@ -584,6 +629,66 @@ def _compare_presence(baseline: dict | None, current: dict | None,
         "source_facts", "clocks", "outbox_sessions", "override"))
     status = "failed" if failed else ("preserved" if has_rows else "empty")
     return {"status": status, "failed": failed}
+
+
+def _security_state(connection, tables, salt: str) -> dict:
+    """Revocation and invalidation state that must only ever move one way.
+
+    Pairing credentials and capture nodes once revoked stay revoked; pairing
+    key bindings are never deleted, rebound or un-revoked (keys as keyed
+    digests); an invalidated human session never becomes valid again; the
+    access authorization generation never decreases.
+    """
+    def query(table, sql):
+        return connection.execute(sql).fetchall() if table in tables else None
+    credentials = query("pairing_node_credentials",
+                        "SELECT node_id, state FROM pairing_node_credentials")
+    bindings = query("pairing_key_bindings",
+                     "SELECT public_key_digest, node_id, revoked FROM pairing_key_bindings")
+    nodes = query("capture_nodes", "SELECT id, health_state FROM capture_nodes")
+    sessions = query("access_sessions", "SELECT id, invalidated_at_us FROM access_sessions")
+    generation = query("access_deployment_state",
+                       "SELECT authorization_generation FROM access_deployment_state")
+    return {
+        "pairing_credentials": None if credentials is None else {
+            row[0]: row[1] == "revoked" for row in credentials},
+        "pairing_key_bindings": None if bindings is None else {
+            _keyed(salt, ["pairing-key-v1", row[0]]): {"node_id": row[1], "revoked": bool(row[2])}
+            for row in bindings},
+        "capture_nodes_revoked": None if nodes is None else {
+            row[0]: row[1] == "revoked" for row in nodes},
+        "sessions_invalidated": None if sessions is None else {
+            row[0]: row[1] is not None for row in sessions},
+        "authorization_generation": generation[0][0] if generation else None,
+    }
+
+
+def _compare_security_state(baseline: dict | None, current: dict | None) -> dict:
+    baseline, current = baseline or {}, current or {}
+    failed = []
+    for name in ("pairing_credentials", "capture_nodes_revoked"):
+        now = current.get(name) or {}
+        for key, revoked in (baseline.get(name) or {}).items():
+            if key not in now:
+                failed.append({"id": f"{name}:{key}", "reason": "missing"})
+            elif revoked and not now[key]:
+                failed.append({"id": f"{name}:{key}", "reason": "revocation_reversed"})
+    now = current.get("pairing_key_bindings") or {}
+    for key, binding in (baseline.get("pairing_key_bindings") or {}).items():
+        if key not in now:
+            failed.append({"id": f"pairing_key_bindings:{key}", "reason": "missing"})
+        elif (now[key]["node_id"] != binding["node_id"]
+              or (binding["revoked"] and not now[key]["revoked"])):
+            failed.append({"id": f"pairing_key_bindings:{key}", "reason": "changed"})
+    # A session row may be purged, but an invalidated one never revives.
+    now = current.get("sessions_invalidated") or {}
+    for key, invalidated in (baseline.get("sessions_invalidated") or {}).items():
+        if invalidated and key in now and not now[key]:
+            failed.append({"id": f"sessions_invalidated:{key}", "reason": "revocation_reversed"})
+    before, after = baseline.get("authorization_generation"), current.get("authorization_generation")
+    if before is not None and (after is None or after < before):
+        failed.append({"id": "authorization_generation", "reason": "decreased"})
+    return {"status": "failed" if failed else "preserved", "failed": failed}
 
 
 def _integrity_baseline(connection, tables, salt: str) -> dict | None:
@@ -842,7 +947,9 @@ def collect(runtime_root: Path, *, salt: str | None = None,
     tree = RuntimeTree(_absolute(runtime_root, "runtime root"))
     connection = _connect_read_only(tree.database)
     try:
-        # One read transaction gives a consistent catalog snapshot.
+        # One short read transaction gives a consistent snapshot of every
+        # table; no file is hashed while it is open (DELETE journal mode: a
+        # held read lock would make service writers time out).
         connection.execute("BEGIN")
         tables = _tables(connection)
         schema_version = None
@@ -852,7 +959,7 @@ def collect(runtime_root: Path, *, salt: str | None = None,
         inventory = {
             "format": FORMAT, "format_version": FORMAT_VERSION,
             "schema_version": schema_version,
-            "recordings": _recordings(connection, tables, tree.recordings),
+            "recordings": _recordings(connection, tables),
             "audit": _audit(connection, tables),
             "camera_sources": _sources(connection, tables, salt),
             "access": _access(connection, tables, salt),
@@ -860,17 +967,20 @@ def collect(runtime_root: Path, *, salt: str | None = None,
             "presence_timeline_gap": _timeline_gap(connection, tables),
             "presence": _presence(connection, tables, salt, _outbox_live(tree.database)),
             "integrity_baseline": _integrity_baseline(connection, tables, salt),
+            "security_state": _security_state(connection, tables, salt),
         }
         connection.execute("COMMIT")
     except sqlite3.Error:
         raise InventoryError("state database could not be read") from None
     finally:
         connection.close()
+    _hash_recordings(inventory["recordings"], tree.recordings)
     inventory["owner_template"] = _owner_template(
         owner_template_root, salt, os.lstat(tree.database).st_uid)
     inventory["inventory_salt"] = salt
     inventory["coverage"] = _coverage(inventory)
     inventory["not_applicable"] = dict(NOT_APPLICABLE)
+    inventory["not_inventoried"] = {name: "not_inventoried (#132)" for name in NOT_INVENTORIED}
     inventory["manual"] = dict(MANUAL)
     return inventory
 
@@ -1127,6 +1237,8 @@ def compare(baseline: dict, current: dict, *, declared_rewrites=()) -> dict:
             if baseline.get("integrity_baseline") is not None else None,
             {"baseline": current["integrity_baseline"]}
             if current.get("integrity_baseline") is not None else None),
+        "security_state": _compare_security_state(
+            baseline.get("security_state"), current.get("security_state")),
         "owner_template": _compare_owner_template(baseline.get("owner_template"),
                                                   current.get("owner_template")),
         "access_principals": _compare_principals(access_base.get("principals"),
@@ -1159,6 +1271,7 @@ def compare(baseline: dict, current: dict, *, declared_rewrites=()) -> dict:
         "empty_coverage": empty_coverage,
         "sections": sections,
         "not_applicable": dict(NOT_APPLICABLE),
+        "not_inventoried": {name: "not_inventoried (#132)" for name in NOT_INVENTORIED},
         "manual": dict(MANUAL),
     }
 
@@ -1258,7 +1371,8 @@ def _summary_record(inventory: dict) -> list[str]:
                      "missing or differ from the catalog digest")
     for key, value in inventory["coverage"].items():
         lines.append(f"coverage {key}: {value}")
-    for key, value in {**inventory["not_applicable"], **inventory["manual"]}.items():
+    for key, value in {**inventory["not_applicable"], **inventory["not_inventoried"],
+                       **inventory["manual"]}.items():
         lines.append(f"{key}: {value}")
     return lines
 
@@ -1274,9 +1388,34 @@ def _summary_verify(report: dict) -> list[str]:
             f"declared_rewrites={len(section.get('declared_rewrites', []))}")
     for key in report["empty_coverage"]:
         lines.append(f"coverage {key}: empty (not counted as preserved)")
-    for key, value in {**report["not_applicable"], **report["manual"]}.items():
+    for key, value in {**report["not_applicable"], **report["not_inventoried"],
+                       **report["manual"]}.items():
         lines.append(f"{key}: {value}")
     return lines
+
+
+def read_private(path: Path) -> dict:
+    """Read a baseline only if it is still as private as write_private() left it.
+
+    A regular file, not a symlink, owned by the invoking user or root, with no
+    group/other access; anything else may have been read or replaced.
+    """
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NOCTTY)
+    except OSError:
+        raise InventoryError("baseline could not be read") from None
+    try:
+        info = os.fstat(descriptor)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid not in (os.geteuid(), 0)
+                or info.st_mode & 0o077):
+            raise InventoryError("baseline is not private (expected a 0600 regular file "
+                                 "owned by this user or root)")
+        with os.fdopen(descriptor, "rb", closefd=False) as handle:
+            return json.loads(handle.read())
+    except (OSError, ValueError):
+        raise InventoryError("baseline could not be read") from None
+    finally:
+        os.close(descriptor)
 
 
 def _baseline_salt(baseline) -> str:
@@ -1317,10 +1456,7 @@ def main(arguments: list[str] | None = None) -> int:
             return EXIT_EMPTY if empty else EXIT_PRESERVED
         if args.report is not None:
             safe_output_path(args.report, args.runtime_root)
-        try:
-            baseline = json.loads(_absolute(args.baseline, "baseline").read_text())
-        except (OSError, ValueError):
-            raise InventoryError("baseline could not be read") from None
+        baseline = read_private(_absolute(args.baseline, "baseline"))
         current = collect(args.runtime_root, salt=_baseline_salt(baseline),
                           owner_template_root=args.owner_template_root)
         report = compare(baseline, current, declared_rewrites=args.declared_rewrite)

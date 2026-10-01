@@ -15,6 +15,7 @@ import sqlite3
 import stat
 from tempfile import TemporaryDirectory
 import unittest
+from unittest import mock
 from uuid import UUID, uuid4
 
 from app import lifecycle_inventory as inventory
@@ -839,12 +840,15 @@ class LifecycleInventoryTests(unittest.TestCase):
         self.runtime.seed()
         ids = self.presence_rows()
         _, baseline = self.record()
-        # The retention path: observation, jobs and fact go, tombstone appears.
+        # The retention path: observation, jobs and fact go, the tombstone
+        # appears and the undelivered job adds an expired-unresolved event.
         for table, column in (("presence_deliveries", "observation"),
                               ("presence_observations", "id"), ("presence_source_facts", "id")):
             self.runtime.execute(f"DELETE FROM {table} WHERE {column}=?", (ids["expired"],))
         self.runtime.execute("INSERT INTO presence_completed_events VALUES (?, "
                              "'2026-02-01T00:00:00.000000+00:00')", (ids["expired"],))
+        self.runtime.execute("INSERT INTO presence_expired_unresolved VALUES ('notification', 1, "
+                             "'2026-02-01T00:00:00.000000+00:00')")
         self.runtime.execute("UPDATE presence_deliveries SET state='delivered', attempts=1 "
                              "WHERE observation=?", (ids["kept"],))
         code, report, _ = self.verify(baseline)
@@ -866,6 +870,28 @@ class LifecycleInventoryTests(unittest.TestCase):
             self.assertIn(item, failed)
         for path in self.notes.iterdir():
             self.assertNotIn("synthetic-presence-payload", path.read_text(), path.name)
+
+    def test_unresolved_job_removed_with_only_a_tombstone_is_detected(self):
+        # A tombstone alone would hide an undelivered critical action: both
+        # service paths also add its expired-unresolved event.
+        self.runtime.seed()
+        ids = self.presence_rows()
+        self.runtime.execute("UPDATE presence_deliveries SET state='failed', attempts=1, "
+                             "generation=1 WHERE observation=?", (ids["lost"],))
+        _, baseline = self.record()
+        for table, column in (("presence_deliveries", "observation"),
+                              ("presence_observations", "id"), ("presence_source_facts", "id")):
+            self.runtime.execute(f"DELETE FROM {table} WHERE {column}=?", (ids["lost"],))
+        self.runtime.execute("INSERT INTO presence_completed_events VALUES (?, "
+                             "'2026-02-01T00:00:00.000000+00:00')", (ids["lost"],))
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_FAILED)
+        self.assertIn({"id": f"deliveries:{ids['lost']}:notification", "reason": "missing"},
+                      report["sections"]["presence"]["failed"])
+        self.runtime.execute("INSERT INTO presence_expired_unresolved VALUES ('notification', 1, "
+                             "'2026-02-01T00:00:00.000000+00:00')")
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_PRESERVED, report["sections"]["presence"])
 
     def test_presence_clocks_sessions_and_override_follow_service_transitions(self):
         self.runtime.seed()
@@ -983,6 +1009,108 @@ class LifecycleInventoryTests(unittest.TestCase):
         self.assertEqual(code, inventory.EXIT_FAILED)
         for path in self.notes.iterdir():
             self.assertNotIn(hardware, path.read_text(), path.name)
+
+    def test_service_writer_can_commit_while_segment_files_are_hashed(self):
+        # The state database uses a rollback journal: a read transaction held
+        # across file hashing would make service writers hit "database is
+        # locked". Files are hashed only after the snapshot transaction ends.
+        self.runtime.seed()
+        hash_file = inventory._file_digest
+        outcomes = []
+
+        def hash_while_writing(directory, segment_id):
+            if not outcomes:
+                writer = sqlite3.connect(self.runtime.database, timeout=0.2,
+                                         isolation_level=None)
+                try:
+                    writer.execute("BEGIN IMMEDIATE")
+                    writer.execute("UPDATE camera_registry_settings "
+                                   "SET max_active_video_sources = max_active_video_sources")
+                    writer.execute("COMMIT")
+                    outcomes.append("committed")
+                except sqlite3.OperationalError as error:
+                    outcomes.append(str(error))
+                finally:
+                    writer.close()
+            return hash_file(directory, segment_id)
+        with mock.patch.object(inventory, "_file_digest", hash_while_writing):
+            code, _ = self.record()
+        self.assertEqual(code, inventory.EXIT_PRESERVED)
+        self.assertEqual(outcomes, ["committed"])
+
+    def test_revocations_and_invalidations_never_reverse(self):
+        self.runtime.seed()
+        node, revoked_node = str(uuid4()), str(uuid4())
+        key = "a" * 64
+        for node_id, health in ((node, "online"), (revoked_node, "revoked")):
+            self.runtime.execute(
+                "INSERT INTO capture_nodes VALUES (?, 'synthetic', ?, NULL, "
+                "'2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00')", (node_id, health))
+        self.runtime.execute("INSERT INTO pairing_node_credentials (node_id, public_key_digest, "
+                             "credential_serial_digest, state) VALUES (?, ?, ?, 'revoked')",
+                             (revoked_node, key, "b" * 64))
+        self.runtime.execute("INSERT INTO pairing_key_bindings VALUES (?, ?, 1)", (key, revoked_node))
+        # Invalidation clears the identity binding (schema CHECK).
+        self.runtime.execute("UPDATE access_sessions SET invalidated_at_us=5, "
+                             "external_identity_binding=NULL")
+        self.runtime.execute("UPDATE access_deployment_state SET authorization_generation=3")
+        _, baseline = self.record()
+        self.assertNotIn(key, baseline.read_text())
+        # Forward moves are fine: revoking more, advancing the generation.
+        self.runtime.execute("UPDATE capture_nodes SET health_state='revoked' WHERE id=?", (node,))
+        self.runtime.execute("UPDATE access_deployment_state SET authorization_generation=4")
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_PRESERVED, report["sections"]["security_state"])
+        self.runtime.execute("UPDATE capture_nodes SET health_state='online' WHERE id=?",
+                             (revoked_node,))
+        self.runtime.execute("UPDATE pairing_node_credentials SET state='active'")
+        self.runtime.execute("UPDATE pairing_key_bindings SET revoked=0")
+        self.runtime.execute("UPDATE access_sessions SET invalidated_at_us=NULL")
+        self.runtime.execute("UPDATE access_deployment_state SET authorization_generation=2")
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_FAILED)
+        reasons = {item["id"].split(":")[0]: item["reason"]
+                   for item in report["sections"]["security_state"]["failed"]}
+        self.assertEqual(reasons, {
+            "capture_nodes_revoked": "revocation_reversed",
+            "pairing_credentials": "revocation_reversed",
+            "pairing_key_bindings": "changed",
+            "sessions_invalidated": "revocation_reversed",
+            "authorization_generation": "decreased"})
+        self.runtime.execute("DELETE FROM pairing_key_bindings")
+        code, report, _ = self.verify(baseline)
+        self.assertIn("missing", [item["reason"] for item in
+                                  report["sections"]["security_state"]["failed"]])
+
+    def test_uncovered_durable_tables_are_listed_as_not_inventoried(self):
+        self.runtime.seed()
+        _, baseline = self.record()
+        code, report, stdout = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_PRESERVED)
+        for name in ("recording_source_discontinuities", "recording_source_cursors",
+                     "roi_calibration_history", "notification_events",
+                     "uvc_approvals.session_token", "integrity_status",
+                     "recording_health_status"):
+            self.assertEqual(report["not_inventoried"][name], "not_inventoried (#132)")
+            self.assertIn(f"{name}: not_inventoried (#132)", stdout)
+
+    def test_verify_refuses_a_baseline_that_is_not_private(self):
+        self.runtime.seed()
+        _, baseline = self.record()
+        os.chmod(baseline, 0o644)
+        code, _, stderr = run("verify", "--runtime-root", str(self.runtime.root),
+                              "--baseline", str(baseline))
+        self.assertEqual(code, inventory.EXIT_USAGE)
+        self.assertIn("not private", stderr)
+        os.chmod(baseline, 0o600)
+        link = self.notes / "linked.json"
+        link.symlink_to(baseline)
+        code, _, _ = run("verify", "--runtime-root", str(self.runtime.root),
+                         "--baseline", str(link))
+        self.assertEqual(code, inventory.EXIT_USAGE)
+        code, _, _ = run("verify", "--runtime-root", str(self.runtime.root),
+                         "--baseline", str(baseline))
+        self.assertEqual(code, inventory.EXIT_PRESERVED)
 
     def test_grant_and_revocation_state_is_preserved_by_logical_id(self):
         seeded = self.runtime.seed()

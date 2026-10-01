@@ -383,7 +383,9 @@ allowed only the transitions the presence service performs: completed-event
 tombstones and expired-unresolved markers (kept; marker counts may only rise),
 retained observations as keyed digests (never their content) with their
 delivery jobs and source-fact digests (they may leave only together with a
-completed tombstone, so do not run timeline retention during the window;
+completed tombstone, and a job that was not delivered only with the
+expired-unresolved event that retention and the Owner's release both add, so
+do not run timeline retention during the window;
 a job's state, attempts and generation may only move forward: a claim, a
 recorded outcome, or the audited Owner requeue back to pending, and a
 delivered job stays delivered), the high-water clocks (may only advance), open
@@ -394,7 +396,11 @@ clean close; a stale one only in an interrupted gap) and the Owner override
 `presence_delivery_fairness` (a round-robin cursor) replay nothing and hide no
 failure, so they are not inventoried; the Owner-approved hardware baseline as
 its revision and a keyed digest of its inventory (never the hardware
-identifiers); for each registered camera source its type, keyed digests of
+identifiers); one-way security state: pairing credentials and capture nodes
+once revoked stay revoked, pairing key bindings (as keyed digests) are never
+deleted, rebound or un-revoked, an invalidated human session never becomes
+valid again, and the authorization generation never decreases; for each
+registered camera source its type, keyed digests of
 its Owner-entered name and role label, a digest of its capabilities, its
 `enabled` flag, capture node, a digest of its desired capture profile and of
 its detection bindings, and a keyed digest of its durable UVC approval (the
@@ -425,7 +431,18 @@ digests, session identity bindings, permission-bearing URLs, media bytes,
 camera serials, device paths, topology or instance markers, Owner template
 bytes, embeddings or model provenance, or audit row contents.
 
-`verify` recomputes the same inventory and compares it. A missing or changed
+The database is read in one short read transaction; segment files are hashed
+only after it ends, so the running service's writers are not blocked (a file
+changed meanwhile shows as a change). Durable tables not yet inventoried are
+listed as `not_inventoried (#132)` in the record and verify output:
+`recording_source_discontinuities`, `recording_source_cursors`,
+`roi_calibration_history`, `notification_events`, `uvc_approvals.session_token`,
+`integrity_status` and `recording_health_status`; do not read a pass as
+covering them.
+
+`verify` reads the baseline only if it is still a private `0600` regular file
+(not a symlink) owned by the invoking user or root, and refuses otherwise.
+It recomputes the same inventory and compares it. A missing or changed
 recording, audit row, source, principal or invitation is `failed` (exit 1);
 rows and recordings that exist only now are listed as `appended` and are never
 counted as preserved. A finished recording must be identical, including its
