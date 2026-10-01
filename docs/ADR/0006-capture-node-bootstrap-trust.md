@@ -292,8 +292,12 @@ status or decision.
     1024 bindings; beyond that, staging is refused (`renewal_not_eligible`,
     which raises the Owner signal below) and the node must re-pair. The Agent
     retries at most about 40 times per 30-day renewal window, so a legitimate
-    node stays far below the cap. A retry with an already bound key is
-    accepted without a new binding. Migration 19 backfills the keys
+    node stays far below the cap. A key already bound to the node is
+    accepted only as a retry of the currently staged renewal (same key as the
+    staged row), without a new binding; a superseded key of the node, or an
+    earlier staged key arriving after a newer one, is refused, so a superseded
+    key is never re-staged and a newer staged renewal is never replaced by an
+    older one. Migration 19 backfills the keys
     that existing enrollment and credential rows still record; if one legacy
     key digest appears under two node IDs (any state), the migration fails
     closed and blocks startup rather than silently picking one binding, and

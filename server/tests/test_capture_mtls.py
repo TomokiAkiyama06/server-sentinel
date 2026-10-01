@@ -608,6 +608,46 @@ class CaptureRenewalTests(CaptureTlsHarness):
                 with self.subTest(digest=digest[:8]), self.assertRaises(PairingError):
                     self.ledger.approve(Owner(), "owner", node_id=node, public_key_digest=digest)
 
+    def test_renewal_refuses_historical_or_out_of_order_same_node_keys(self):
+        # Only a genuine retry of the currently staged key may reuse a key
+        # already bound to this node: a superseded key is never re-staged and
+        # an earlier staged key cannot replace a newer staged renewal.
+        claim, _, certificate, key = self._paired_node("a")
+        original = public_key_digest(serialization.load_pem_private_key(
+            key.read_bytes(), password=None).public_key())
+        session = self._session(certificate, key)
+        first, _ = self._node_key("first")
+        first_digest = public_key_digest(first.public_key())
+        self._renew(session.identity, first)
+        second, second_path = self._node_key("second")
+        second_digest = public_key_digest(second.public_key())
+        renewed = self._renew(session.identity, second)
+
+        def stage(identity, digest):
+            self.ledger.stage_renewal(
+                node_id=claim.node_id,
+                current_public_key_digest=identity.public_key_digest,
+                current_credential_digest=identity.credential_digest,
+                public_key_digest=digest, credential_serial_digest="e" * 64,
+                not_after=utc_now().timestamp() + 1000)
+
+        def staged():
+            with closing(self.database.connect()) as connection:
+                return connection.execute(
+                    "SELECT public_key_digest FROM pairing_node_renewals WHERE node_id = ?",
+                    (str(claim.node_id),)).fetchone()
+
+        with self.assertRaises(PairingError):
+            stage(session.identity, first_digest)  # out of order: earlier staged key
+        self.assertEqual(second_digest, staged()[0])
+        promoted = self._session(self._public_file("second.pem", renewed.certificate_pem),
+                                 second_path)
+        for digest in (original, first_digest):  # historical keys of this node
+            with self.subTest(digest=digest[:8]), self.assertRaises(PairingError):
+                stage(promoted.identity, digest)
+        self.assertIsNone(staged())
+        self.assertTrue(promoted.still_admitted())
+
     def test_staged_retry_with_same_key_is_idempotent_and_bindings_are_capped(self):
         from app.cameras.remote_agent import pairing as pairing_module
         claim, _, certificate, key = self._paired_node("a")
