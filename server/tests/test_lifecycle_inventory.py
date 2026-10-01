@@ -1065,6 +1065,49 @@ class LifecycleInventoryTests(unittest.TestCase):
                     else:
                         self.assertIn({"id": str(row_id), "reason": "changed"}, section["failed"])
 
+    def test_reused_audit_ids_follow_the_rowid_allocator(self):
+        # Codex P1: without AUTOINCREMENT a new row takes max(rowid) + 1, and
+        # retention frees an id only once every row above it is gone. Reused
+        # ids must be R+1..R+k above the highest remaining recorded id R,
+        # written after the record, with times rising with the id.
+        recorded = self.now
+        def ms(moment):
+            return int(moment.timestamp() * 1000)
+        old, recent = recorded - timedelta(days=91), recorded - timedelta(days=10)
+        first, second = recorded + timedelta(hours=1), recorded + timedelta(hours=2)
+        cases = {   # label: (recorded rows {id: time}, rows after {id: time}, accepted)
+            "rewritten-below-retained": ({1: old, 2: recent}, {1: first, 2: "keep"}, False),
+            "retained-kept": ({1: old, 2: recent}, {2: "keep", 3: first}, True),
+            "suffix-reuse": ({1: old, 2: old}, {1: first, 2: second}, True),
+            "gap": ({1: old, 2: old}, {1: first, 3: second}, False),
+            "out-of-order": ({1: old, 2: old}, {1: second, 2: first}, False),
+        }
+        for index, (label, (before, after, accepted)) in enumerate(cases.items()):
+            with self.subTest(label):
+                runtime = Runtime(self.base / f"rowid-{index}")
+                saved, self.runtime = self.runtime, runtime
+                try:
+                    runtime.seed()
+                    for row_id, moment in before.items():
+                        runtime.execute("INSERT INTO storage_state_audit VALUES "
+                                        "(?, ?, 'normal', 'pressure')", (row_id, ms(moment)))
+                    self.now = recorded
+                    _, baseline = self.record(f"rowid-{index}.json")
+                    for row_id in before:
+                        if after.get(row_id) != "keep":
+                            runtime.execute("DELETE FROM storage_state_audit WHERE id=?",
+                                            (row_id,))
+                    for row_id, moment in after.items():
+                        if moment != "keep":
+                            runtime.execute("INSERT INTO storage_state_audit VALUES "
+                                            "(?, ?, 'pressure', 'normal')", (row_id, ms(moment)))
+                    self.now = recorded + timedelta(hours=3)
+                    _, report, _ = self.verify(baseline)
+                finally:
+                    self.runtime, self.now = saved, recorded
+                section = report["sections"]["audit_storage_state"]
+                self.assertEqual(section["status"] == "preserved", accepted, section)
+
     def test_credential_sign_count_may_only_advance(self):
         # A lower counter rolls back the authenticator clone-detection floor.
         seeded = self.runtime.seed()

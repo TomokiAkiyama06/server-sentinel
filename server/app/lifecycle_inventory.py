@@ -2021,15 +2021,17 @@ def _compare_audit(baseline: dict | None, current: dict | None, expired=None,
                 failed.append({"id": row_id, "reason": "missing"})
         elif current_rows[row_id] != digest:
             if (expired is not None and fresh is not None and row_id in times
-                    and expired(times[row_id]) and row_id in current_times
-                    and fresh(current_times[row_id])
-                    and not expired(current_times[row_id])):
-                retained_out.append(row_id)
+                    and expired(times[row_id])):
                 reused.append(row_id)
             else:
                 failed.append({"id": row_id, "reason": "changed"})
         else:
             kept.append((row_id, digest))
+    if reused and not _reuse_consistent(baseline, current_rows, current_times, kept, reused,
+                                        expired, fresh):
+        failed.extend({"id": row_id, "reason": "changed"} for row_id in reused)
+        reused = []
+    retained_out.extend(reused)
     # The chain recomputed over the recorded rows must match the record, so
     # a rewritten or reordered baseline row list is refused too.
     chain_match = not failed and _chain(
@@ -2044,6 +2046,44 @@ def _compare_audit(baseline: dict | None, current: dict | None, expired=None,
                          if row_id not in baseline_ids or row_id in reused],
             "chain_match": chain_match,
             "retention_expired": retained_out}
+
+
+def _reuse_consistent(baseline, current_rows, current_times, kept, reused,
+                      expired, fresh) -> bool:
+    """Whether reused ids are exactly what SQLite's rowid allocator gives.
+
+    Without AUTOINCREMENT a new row takes max(rowid) + 1. Retention deletes
+    the oldest rows, so an id is freed for reuse only when every row above
+    it was removed. With R the highest recorded id still present unchanged,
+    every recorded row above R must have been due for removal, and the rows
+    now above R must all be new since the record, not themselves due,
+    numbered exactly R+1..R+k with times not decreasing in id order. Any
+    other arrangement (an interleaving that cannot be told apart included)
+    fails closed.
+    """
+    try:
+        remaining = max((int(row_id) for row_id, _ in kept), default=0)
+        recorded = {int(row_id): row_id for row_id, _ in baseline["rows"]}
+        above = sorted((int(row_id), row_id) for row_id in current_rows if int(row_id) > remaining)
+    except (TypeError, ValueError):
+        return False
+    times = baseline.get("times") or {}
+    if any(number > remaining and not expired(times.get(row_id))
+           for number, row_id in recorded.items() if row_id not in dict(kept)):
+        return False
+    if any(int(row_id) <= remaining for row_id in reused):
+        return False
+    if [number for number, _ in above] != list(range(remaining + 1, remaining + 1 + len(above))):
+        return False
+    moments = [current_times.get(row_id) for _, row_id in above]
+    if not all(value is not None and fresh(value) and not expired(value) for value in moments):
+        return False
+    try:
+        ordered = [datetime.fromisoformat(value) if isinstance(value, str) else value
+                   for value in moments]
+        return all(earlier <= later for earlier, later in zip(ordered, ordered[1:]))
+    except (TypeError, ValueError):
+        return False
 
 
 def _utcnow() -> datetime:
