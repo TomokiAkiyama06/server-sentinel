@@ -1806,6 +1806,134 @@ class LifecycleInventoryTests(unittest.TestCase):
                        "reason": "enrollment_key"}, failed)
         self.assertIn({"id": f"pairing_credentials:{node}", "reason": "changed"}, failed)
 
+    def test_window_operation_compositions_against_the_real_ledger(self):
+        # Every 2-operation composition inside the record -> verify window,
+        # and every 3-operation one involving revoke, over a node paired at
+        # record time (with or without a staged renewal), driven through the
+        # real PairingLedger. Each must verify as preserved except the
+        # documented fail-closed cases: the credential at verify time is a
+        # renewal both staged and promoted inside the window, or an
+        # enrollment since the record names the key staged at record time
+        # (a retry of the promoted key ends exactly where approving the
+        # still-staged key does).
+        operations = ("fresh", "retry", "stage", "promote", "revoke", "expiry")
+
+        class Owner:
+            def require_owner(self, actor_context):
+                if actor_context != "owner":
+                    raise PermissionError("synthetic denial")
+        owner = Owner()
+
+        class Inapplicable(Exception):
+            pass
+
+        def scenario(index, base, ops):
+            runtime = Runtime(self.base / f"composition-{index}")
+            database = Database(runtime.database)
+
+            def ledger():
+                return PairingLedger(database, HmacCodeVerifier(b"s" * 32),
+                                     audit=AuditStore(database), clock=lambda: 100.0,
+                                     process_epoch=uuid4())
+            main, node, counter = ledger(), uuid4(), iter(range(1, 1000))
+
+            def digest():
+                return f"{index:08x}{next(counter):056x}"
+
+            def credential():
+                with closing(sqlite3.connect(runtime.database)) as connection:
+                    return connection.execute(
+                        "SELECT public_key_digest, credential_serial_digest, state FROM "
+                        "pairing_node_credentials WHERE node_id=?", (str(node),)).fetchone()
+
+            def staged_row():
+                with closing(sqlite3.connect(runtime.database)) as connection:
+                    return connection.execute(
+                        "SELECT public_key_digest, credential_serial_digest FROM "
+                        "pairing_node_renewals WHERE node_id=?", (str(node),)).fetchone()
+
+            def complete(key):
+                approval, code = main.approve(owner, "owner", node_id=node,
+                                              public_key_digest=key)
+                claim = main.redeem(enrollment_id=approval.enrollment_id,
+                                    public_key_digest=key, code=code.value)
+                main.activate(claim, credential_serial_digest=digest(), not_after=50.0)
+
+            def run(op):
+                current = credential()
+                if op == "fresh":
+                    complete(digest())
+                elif op == "retry":
+                    if main.bound_node(current[0]) != node:
+                        raise Inapplicable
+                    complete(current[0])
+                elif op == "stage":
+                    if current[2] != "active":
+                        raise Inapplicable
+                    main.stage_renewal(node_id=node, current_public_key_digest=current[0],
+                                       current_credential_digest=current[1],
+                                       public_key_digest=digest(),
+                                       credential_serial_digest=digest(), not_after=90.0)
+                elif op == "promote":
+                    row = staged_row()
+                    if row is None or current[2] != "active":
+                        raise Inapplicable
+                    self.assertTrue(main.admits(node_id=node, public_key_digest=row[0],
+                                                credential_serial_digest=row[1]))
+                elif op == "revoke":
+                    if current[2] != "active":
+                        raise Inapplicable
+                    main.revoke(owner, "owner", node_id=node)
+                elif op == "expiry":
+                    approval, code = main.approve(owner, "owner", node_id=node,
+                                                  public_key_digest=digest())
+                    with self.assertRaises(PairingError):
+                        ledger().redeem(enrollment_id=approval.enrollment_id,
+                                        public_key_digest=approval.public_key_digest,
+                                        code=code.value)
+            complete(digest())
+            staged_source, recorded_staged = None, None
+            if base == "staged":
+                run("stage")
+                staged_source, recorded_staged = "recorded", staged_row()[0]
+            approved_staged = False
+            saved, self.runtime = self.runtime, runtime
+            try:
+                _, baseline = self.record(f"composition-{index}.json")
+                credential_source = "recorded"
+                for op in ops:
+                    approved_staged |= op == "retry" and credential()[0] == recorded_staged
+                    run(op)
+                    if op in ("fresh", "retry"):
+                        credential_source, staged_source = "activation", None
+                    elif op == "stage":
+                        staged_source = "window"
+                    elif op == "promote":
+                        credential_source, staged_source = f"promoted-{staged_source}", None
+                    elif op == "revoke":
+                        staged_source = None
+                _, report, _ = self.verify(baseline)
+            finally:
+                self.runtime = saved
+            return (credential_source == "promoted-window" or approved_staged,
+                    report["sections"]["security_state"])
+
+        compositions = [(a, b) for a in operations for b in operations]
+        compositions += [combo for a in operations for b in operations
+                         for combo in ((a, b, "revoke"), (a, "revoke", b), ("revoke", a, b))]
+        unexpected, ran = [], 0
+        for index, (base, ops) in enumerate(
+                (base, ops) for base in ("plain", "staged") for ops in dict.fromkeys(compositions)):
+            try:
+                fail_closed, section = scenario(index, base, ops)
+            except Inapplicable:
+                continue
+            ran += 1
+            if bool(section["failed"]) != fail_closed:
+                unexpected.append((base, ops, section["failed"]))
+        self.assertGreater(ran, 100, ran)
+        self.assertEqual(unexpected, [])
+
     def test_a_staged_renewal_is_never_restaged_onto_a_superseded_key(self):
         # Codex P1: stage_renewal() accepts a key already bound to the node
         # only as a retry of the currently staged key.

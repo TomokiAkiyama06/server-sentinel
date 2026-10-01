@@ -442,7 +442,8 @@ pending or consumed at record time with the same node and key, or a new one
 whose key was neither bound nor activated at record time, or, as the Owner's
 retry of an interrupted, expired or unacknowledged enrollment through the
 approve command does, a new one whose key was already bound live to the same
-node at record time and still is); a binding is
+node at record time and still is, or was revoked since only by a complete
+revocation of that node); a binding is
 never deleted, rebound or un-revoked; a
 staged renewal stays, is retried with its own key while the credential is
 unchanged, is replaced by a key newly bound since the record, or leaves by
