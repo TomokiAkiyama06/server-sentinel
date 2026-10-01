@@ -254,6 +254,37 @@ class RuntimeLifecycleTests(RuntimeFixture):
         release.set()
         self.assertTrue(self.wait_health(source.id, SourceHealthState.ONLINE))
 
+    def test_blocking_sink_on_a_watchdog_stall_does_not_stall_the_watchdog(self):
+        # The watchdog itself emits ``video_frame_stalled``. A sink that blocks
+        # on that event must not run on the watchdog thread, or the reopen
+        # deadline (and every other source) would never be checked again.
+        source = self.source()
+        entered, release = threading.Event(), threading.Event()
+        self.addCleanup(release.set)
+
+        def blocking_sink(event):
+            if event.reason == "video_frame_stalled" and not release.is_set():
+                entered.set()
+                release.wait(10)
+
+        runtime = self.runtime(source.id, health_sink=blocking_sink, configuration_timing=dict(
+            frame_stall_seconds=0.25, frame_stall_reopen_seconds=1.0))
+        runtime.start()
+        runtime.reapprove(self.admin, "synthetic-owner", source.id, self.camera)
+        self.assertTrue(self.wait_health(source.id, SourceHealthState.ONLINE))
+        block = threading.Event()
+        self.captures.block = block
+        self.addCleanup(block.set)
+        self.assertTrue(entered.wait(5))
+        # The sink is still blocked; the watchdog keeps enforcing the reopen
+        # deadline for the blocked worker.
+        self.assertTrue(wait_for(
+            lambda: runtime.status().sources[0].camera_state is CameraState.OFFLINE, 5.0))
+        release.set()
+        self.captures.block = None
+        block.set()
+        self.assertTrue(self.wait_health(source.id, SourceHealthState.ONLINE))
+
     def test_start_reapprove_stream_and_stop(self):
         source = self.source()
         runtime = self.runtime(source.id)

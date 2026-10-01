@@ -185,6 +185,15 @@ class ReconnectController:
         # order by one thread at a time.
         self._outbox = deque()
         self._delivery = threading.Lock()
+        # A non-blocking caller (the supervisor watchdog) never runs
+        # ``notify`` itself: a downstream sink may block indefinitely, and the
+        # single watchdog thread must keep enforcing reopen deadlines and
+        # checking other sources. At most one handoff thread per controller
+        # drains the outbox for it.
+        self._handoff_lock = threading.Lock()
+        self._handoff_running = False
+        self._handoff_pending = False
+        self.delivery_failures = 0
 
     def _persist(self):
         if self.store is not None:
@@ -205,10 +214,14 @@ class ReconnectController:
     def _deliver(self, blocking=True):
         """Hand queued events to ``notify`` outside the transition lock.
 
-        A non-blocking caller that finds another delivery running leaves its
-        events to that thread, which drains the queue before returning.
+        A blocking caller delivers in its own thread, in queue order. A
+        non-blocking caller never calls ``notify``: it hands the queue to a
+        background delivery thread, so a blocking sink cannot hold it.
         """
         if self.notify is None:
+            return
+        if not blocking:
+            self._handoff()
             return
         while self._outbox:
             if not self._delivery.acquire(blocking=blocking):
@@ -222,6 +235,40 @@ class ReconnectController:
                     self.notify(event)
             finally:
                 self._delivery.release()
+
+    def _handoff(self):
+        with self._handoff_lock:
+            if self._handoff_running:
+                # The running thread re-checks the queue before it exits.
+                self._handoff_pending = True
+                return
+            if not self._outbox:
+                return
+            self._handoff_running = True
+            self._handoff_pending = False
+        thread = threading.Thread(target=self._drain_handoff, daemon=True,
+                                  name="serversentinel-local-uvc-health-delivery")
+        try:
+            thread.start()
+        except BaseException:
+            with self._handoff_lock:
+                self._handoff_running = False
+            raise
+
+    def _drain_handoff(self):
+        while True:
+            while self._outbox:
+                try:
+                    self._deliver()
+                except Exception:
+                    # Counted only: exception text may carry private details.
+                    # Each failed attempt consumed one event, so this ends.
+                    self.delivery_failures += 1
+            with self._handoff_lock:
+                if not self._handoff_pending and not self._outbox:
+                    self._handoff_running = False
+                    return
+                self._handoff_pending = False
 
     def _flush(self, blocking=True):
         if self.flush is not None:
@@ -320,7 +367,8 @@ class ReconnectController:
         returns the source to ``online``. Offline/manual states and a changed
         binding are never raised to ``degraded`` here. The off-worker check
         passes ``only_online`` and ``blocking=False``: it only lowers an
-        ``online`` claim and skips a tick while the worker is transitioning.
+        ``online`` claim, skips a tick while the worker is transitioning, and
+        leaves event delivery to a background thread (see ``_deliver``).
         ``confirm`` is re-evaluated under the transition lock, so frame
         progress recorded after the caller's snapshot wins. ``capture_lost``
         reports a stall past the reopen bound as ``offline``
