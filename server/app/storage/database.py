@@ -133,9 +133,16 @@ class PinnedDatabase:
         return pinned
 
     def connect(self) -> sqlite3.Connection:
+        return self._open("rw")
+
+    def connect_read_only(self) -> sqlite3.Connection:
+        """A ``mode=ro`` connection with the same pin checks as ``connect()``."""
+        return self._open("ro")
+
+    def _open(self, mode: str) -> sqlite3.Connection:
         self._verify()
         connection = sqlite3.connect(
-            "file:" + quote(str(self.path)) + "?mode=rw", uri=True,
+            "file:" + quote(str(self.path)) + "?mode=" + mode, uri=True,
             timeout=5, isolation_level=None,
         )
         try:

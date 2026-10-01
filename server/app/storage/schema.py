@@ -11,7 +11,7 @@ from app.media.health.artifacts import recording_health_migration
 from app.media.recording.schema import recording_migration
 from app.monitoring.store import monitoring_migration
 from app.notifications.schedule import notification_migration
-from app.presence.schema import presence_migration
+from app.presence.schema import presence_gap_migration, presence_migration
 from app.storage.migrations import BUILTIN_MIGRATIONS
 from app.setup_wizard.schema import wizard_state_migration
 from app.storage.retention import storage_audit_migration
@@ -48,4 +48,7 @@ APPLICATION_MIGRATIONS = (
     # Issue #13 capture-node certificate renewal, after main's 17 and 18
     # (PR #83 also claims 17 and renumbers if it merges later).
     pairing_renewal_migration(19),
+    # Durable presence timeline-gap marker (#25/#26), after #97 (17), #107 (18)
+    # and #100 (19); the runner requires a contiguous sequence.
+    presence_gap_migration(20),
 )

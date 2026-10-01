@@ -23,11 +23,11 @@
     },
     {
       "path": "web/tests/compile.mjs",
-      "sha256": "sha256:0fb9e61b55956943885fdffe2b4edae44809c7da7231b7a198b712485bbb562e"
+      "sha256": "sha256:44b9062f329f67ac567dd7099c7246c426527803ee271b411f0d3449a4a6e555"
     },
     {
       "path": "web/tests/compile.test.mjs",
-      "sha256": "sha256:7b3049d81ef13193a45f1c54eec7cdb4a3b6d2d32a23daf671640e1f62c8d733"
+      "sha256": "sha256:231f849aef4caa02bf9ee34e890708b61bb187a6d3bf34f2b880d20e8ae12192"
     },
     {
       "path": "web/tests/core.test.mjs",
