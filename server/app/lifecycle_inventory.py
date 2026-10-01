@@ -529,7 +529,10 @@ def _delivery_advanced(before: dict, after: dict) -> bool:
     requeue mark never clears. A claim ('submitting') increments both; a
     return to 'pending' from any other state is only the audited Owner
     requeue, which sets the mark and advances the generation; any other
-    state is a recorded outcome of an attempt.
+    state is a recorded outcome of an attempt. Attempts rise only with a
+    claim, which also advances the generation, so they never rise by more
+    than the generation; a generation rising by more than the attempts
+    means a requeue, so the mark is set.
     """
     if after == before:
         return True
@@ -537,6 +540,13 @@ def _delivery_advanced(before: dict, after: dict) -> bool:
             or after["attempts"] < before["attempts"]
             or after["generation"] < before["generation"]
             or before["requeued"] > after["requeued"]):
+        return False
+    # A claim adds one attempt and one generation together; the Owner
+    # requeue adds a generation alone and sets the sticky requeue mark.
+    claims_or_requeues = after["generation"] - before["generation"]
+    attempts = after["attempts"] - before["attempts"]
+    if attempts > claims_or_requeues or (claims_or_requeues > attempts
+                                         and not after["requeued"]):
         return False
     if after["state"] == "submitting":
         return (after["attempts"] > before["attempts"]
@@ -786,7 +796,10 @@ def _compare_pairing(baseline: dict, current: dict) -> list:
       revoked enrollments are revoked, none of its recorded open
       enrollments is still open, and its credential is revoked (its key's
       binding too) or holds the key of an activation since the record (a
-      re-pairing after the revoke);
+      re-pairing after the revoke); and since revoke() aborts on a node with
+      nothing to revoke, the node had an active credential at record time,
+      a recorded open enrollment now revoked, an enrollment created since
+      and revoked, or a credential activated since and now revoked;
     - a recorded binding keeps its node and never un-revokes; a revoked
       credential stays revoked with the same material (re-pairing a node
       revoked at record time fails closed); an active one stays, becomes the
@@ -946,8 +959,23 @@ def _compare_pairing(baseline: dict, current: dict) -> list:
                          and (enrollments_now.get(enrollment) or {}).get("state")
                          in ("pending", "consumed")
                          for enrollment, item in (recorded_enrollments or {}).items())
+        # revoke() aborts unless the node had something to revoke then: an
+        # active credential or an open enrollment.
+        recorded_credential = recorded_credentials.get(node)
+        revocable = (
+            (recorded_credential is not None and not recorded_credential["revoked"])
+            or any(item["node_id"] == node and item["state"] in ("pending", "consumed")
+                   and (enrollments_now.get(enrollment) or {}).get("state") == "revoked"
+                   for enrollment, item in (recorded_enrollments or {}).items())
+            or any(item["node_id"] == node and item["state"] == "revoked"
+                   and enrollment not in (recorded_enrollments or {})
+                   for enrollment, item in enrollments_now.items())
+            or (credentials.get(node) or {}).get("revoked") is True
+            and credentials[node]["key_ref"] in activated_keys.get(node, ()))
         after = credentials.get(node)
-        if after is None:
+        if not revocable:
+            credential_ok = False
+        elif after is None:
             credential_ok = True
         elif after["revoked"]:
             held.append(after["key_ref"])

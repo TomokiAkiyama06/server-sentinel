@@ -860,7 +860,9 @@ class LifecycleInventoryTests(unittest.TestCase):
                              "'2026-02-01T00:00:00.000000+00:00')", (ids["expired"],))
         self.runtime.execute("INSERT INTO presence_expired_unresolved VALUES ('notification', 1, "
                              "'2026-02-01T00:00:00.000000+00:00')")
-        self.runtime.execute("UPDATE presence_deliveries SET state='delivered', attempts=1 "
+        # A claim (one attempt, one generation) and its delivered outcome.
+        self.runtime.execute("UPDATE presence_deliveries SET state='delivered', "
+                             "attempts=attempts+1, generation=generation+1 "
                              "WHERE observation=?", (ids["kept"],))
         code, report, _ = self.verify(baseline)
         self.assertEqual(code, inventory.EXIT_PRESERVED, report["sections"]["presence"])
@@ -1000,6 +1002,152 @@ class LifecycleInventoryTests(unittest.TestCase):
         for name in ("kept", "lost", "edited"):
             self.assertIn({"id": f"deliveries:{ids[name]}:notification", "reason": "changed"},
                           failed)
+
+    def test_single_column_tampers_of_service_state_fail(self):
+        # Mutation cases over a synthetic service-shaped state: one column of
+        # one row edited in a way no service path produces, per table and
+        # column the inventory compares. Not compared on purpose:
+        # recording_segments.spool (the retention spool flag; a linked
+        # segment is never trimmed) and recording_segments.integrity (a cache
+        # RecordingStore.manifest() recomputes from the file on every read).
+        def build(index):
+            runtime = Runtime(self.base / f"column-{index}")
+            saved, self.runtime = self.runtime, runtime
+            try:
+                seeded = runtime.seed()
+                ids = self.presence_rows()
+                update = ("UPDATE presence_deliveries SET state=?, attempts=?, generation=?, "
+                          "requeued=? WHERE observation=?")
+                runtime.execute(update, ("uncertain", 1, 1, 0, ids["edited"]))
+                runtime.execute(update, ("unavailable", 1, 2, 1, ids["lost"]))
+                runtime.execute("INSERT INTO integrity_outbox(at, immediate, findings) VALUES "
+                                "('2026-01-01T00:00:00+00:00', 1, ?)", (json.dumps(
+                                    [{"kind": "GPU", "state": "CHANGED", "detail": "x"}]),))
+                runtime.execute("INSERT INTO integrity_overflow VALUES "
+                                "('CPU', 'MISSING', '2026-01-01T00:00:00+00:00')")
+                active = runtime.recording(starred=False, payload=b"generated-column-active",
+                                           status="active", target_end_ms=30000)
+                runtime.add_segment(active, b"generated-column-tail", start_ms=12000,
+                                    end_ms=20000)
+                runtime.execute("INSERT INTO recording_discontinuities VALUES "
+                                "(?, 4000, 5000, 'stream_discontinuity')", (active,))
+                expired_node = str(uuid4())
+                runtime.execute("INSERT INTO pairing_key_bindings VALUES (?, ?, 0)",
+                                ("a" * 64, expired_node))
+                runtime.execute("INSERT INTO pairing_enrollments VALUES "
+                                "(?, ?, ?, 'f', 'epoch', 0, 'expired')",
+                                (str(uuid4()), expired_node, "a" * 64))
+                _, baseline = self.record(f"column-{index}.json")
+            finally:
+                self.runtime = saved
+            with closing(sqlite3.connect(runtime.database)) as connection:
+                segment = connection.execute(
+                    "SELECT segment_id FROM recording_links WHERE recording_id=?",
+                    (seeded["ordinary"],)).fetchone()[0]
+                other_segment = connection.execute(
+                    "SELECT segment_id FROM recording_links WHERE recording_id=?",
+                    (seeded["starred"],)).fetchone()[0]
+                active_segment = connection.execute(
+                    "SELECT segment_id FROM recording_links WHERE recording_id=? "
+                    "ORDER BY rowid DESC", (active,)).fetchone()[0]
+            values = {"edited": ids["edited"], "lost": ids["lost"], "recording": seeded["ordinary"],
+                      "segment": segment, "other_segment": other_segment, "active": active,
+                      "active_segment": active_segment, "expired_key": "a" * 64,
+                      "new_id": str(uuid4())}
+            return runtime, baseline, values
+        tampers = {
+            # presence_deliveries (edited: uncertain 1/1/0; lost: unavailable 1/2/1 requeued)
+            "deliveries.attempts inflated": "UPDATE presence_deliveries SET attempts=2 "
+                                            "WHERE observation=:edited",
+            "deliveries.generation without claim or requeue":
+                "UPDATE presence_deliveries SET generation=2 WHERE observation=:edited",
+            "deliveries.generation lowered": "UPDATE presence_deliveries SET generation=1 "
+                                             "WHERE observation=:lost",
+            "deliveries.requeued cleared": "UPDATE presence_deliveries SET requeued=0 "
+                                           "WHERE observation=:lost",
+            "deliveries.state unknown": "UPDATE presence_deliveries SET state='bogus' "
+                                        "WHERE observation=:edited",
+            "deliveries.action": "UPDATE presence_deliveries SET action='evidence' "
+                                 "WHERE observation=:edited",
+            "deliveries.observation": "UPDATE presence_deliveries SET observation=:new_id "
+                                      "WHERE observation=:edited",
+            # integrity_outbox / integrity_overflow
+            "outbox.id": "UPDATE integrity_outbox SET id=99",
+            "outbox.at": "UPDATE integrity_outbox SET at='2026-01-02T00:00:00+00:00'",
+            "outbox.immediate": "UPDATE integrity_outbox SET immediate=0",
+            "outbox.findings": "UPDATE integrity_outbox SET findings='[]'",
+            "outbox.delivered": "UPDATE integrity_outbox SET delivered=1",
+            "overflow.kind": "UPDATE integrity_overflow SET kind='GPU'",
+            "overflow.state": "UPDATE integrity_overflow SET state='CHANGED'",
+            "overflow.at": "UPDATE integrity_overflow SET at='2026-01-02T00:00:00+00:00'",
+            # recordings (finished)
+            "recordings.id": "UPDATE recordings SET id=:new_id WHERE id=:recording",
+            "recordings.source_id": "UPDATE recordings SET source_id=:new_id WHERE id=:recording",
+            "recordings.event_id": "UPDATE recordings SET event_id=:new_id WHERE id=:recording",
+            "recordings.start_ms": "UPDATE recordings SET start_ms=1 WHERE id=:recording",
+            "recordings.target_end_ms": "UPDATE recordings SET target_end_ms=9000 "
+                                        "WHERE id=:recording",
+            "recordings.ended_ms": "UPDATE recordings SET ended_ms=9000 WHERE id=:recording",
+            "recordings.status": "UPDATE recordings SET status='gapped' WHERE id=:recording",
+            "recordings.critical": "UPDATE recordings SET critical=1 WHERE id=:recording",
+            "recordings.starred": "UPDATE recordings SET starred=1 WHERE id=:recording",
+            # recording_segments
+            **{f"segments.{column}": f"UPDATE recording_segments SET {assignment} "
+               "WHERE id=:segment" for column, assignment in (
+                   ("source_id", "source_id=:new_id"), ("capture_node_id", "capture_node_id='n'"),
+                   ("stream_id", "stream_id='other'"), ("sequence", "sequence=sequence+1000"),
+                   ("start_ms", "start_ms=1"), ("end_ms", "end_ms=9000"),
+                   ("codec", "codec='other'"), ("container", "container='other'"),
+                   ("byte_length", "byte_length=byte_length+1"), ("sha256", "sha256='0'"),
+                   ("state", "state='pending'"), ("critical", "critical=1"))},
+            # recording_links / recording_discontinuities
+            "links.deleted": "DELETE FROM recording_links WHERE recording_id=:recording",
+            "links.repointed": "UPDATE recording_links SET segment_id=:other_segment "
+                               "WHERE recording_id=:recording",
+            "discontinuities.added": "INSERT INTO recording_discontinuities VALUES "
+                                     "(:recording, 1000, 2000, 'stream_discontinuity')",
+            "discontinuities.in-window removed":
+                "DELETE FROM recording_discontinuities WHERE recording_id=:active",
+            "discontinuities.reason": "UPDATE recording_discontinuities SET reason='other' "
+                                      "WHERE recording_id=:active",
+            # an active recording
+            "active.source_id": "UPDATE recordings SET source_id=:new_id WHERE id=:active",
+            "active.start_ms": "UPDATE recordings SET start_ms=1 WHERE id=:active",
+            "active.target extended": "UPDATE recordings SET target_end_ms=40000 WHERE id=:active",
+            "active.ended while active": "UPDATE recordings SET ended_ms=20000 WHERE id=:active",
+            "active.starred": "UPDATE recordings SET starred=1 WHERE id=:active",
+            "active.critical": "UPDATE recordings SET critical=1 WHERE id=:active",
+            "active.event_id": "UPDATE recordings SET event_id=:new_id WHERE id=:active",
+            "active.status unknown": "UPDATE recordings SET status='bogus' WHERE id=:active",
+            "active.segment sha256": "UPDATE recording_segments SET sha256='0' "
+                                     "WHERE id=:active_segment",
+            "active.segment link dropped": "DELETE FROM recording_links WHERE recording_id=:active "
+                                           "AND segment_id=:active_segment",
+            # pairing: Codex P1, a node with only an expired enrollment
+            "pairing.expired-only binding revoked":
+                "UPDATE pairing_key_bindings SET revoked=1 WHERE public_key_digest=:expired_key",
+        }
+        runtime, baseline, _ = build(len(tampers))
+        saved, self.runtime = self.runtime, runtime
+        try:
+            code, report, _ = self.verify(baseline)
+        finally:
+            self.runtime = saved
+        self.assertEqual(code, inventory.EXIT_PRESERVED, report)  # untampered control
+        passed = []
+        for index, (label, statement) in enumerate(tampers.items()):
+            runtime, baseline, values = build(index)
+            with closing(sqlite3.connect(runtime.database, isolation_level=None)) as db:
+                db.execute(statement, {key: value for key, value in values.items()
+                                       if f":{key}" in statement})
+            saved, self.runtime = self.runtime, runtime
+            try:
+                code, _, _ = self.verify(baseline)
+            finally:
+                self.runtime = saved
+            if code != inventory.EXIT_FAILED:
+                passed.append(label)
+        self.assertEqual(passed, [])
 
     def test_integrity_baseline_is_preserved_by_keyed_digest(self):
         self.runtime.seed()

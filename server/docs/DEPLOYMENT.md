@@ -391,7 +391,9 @@ expired-unresolved event that retention and the Owner's release both add, so
 do not run timeline retention during the window;
 a job's state, attempts and generation may only move forward: a claim, a
 recorded outcome, or the audited Owner requeue back to pending, and a
-delivered job stays delivered), the high-water clocks (may only advance), open
+delivered job stays delivered; attempts rise only with a claim, which also
+advances the generation, so they never rise more than the generation, and a
+generation rising more than the attempts requires the requeue mark), the high-water clocks (may only advance), open
 outbox session rows (a row a live outbox held at record time may end in its
 clean close; a stale one only in an interrupted gap) and the Owner override
 (dropped only once the control clock has reached its expiry);
@@ -438,7 +440,9 @@ bindings became revoked, or its active credential became revoked, and then
 all of its recorded bindings and the keys of its newly revoked enrollments
 must be revoked, none of its recorded open enrollments may still be open,
 and its credential must be revoked (its key too) or hold the key of a
-re-pairing since the record; a revoked credential stays revoked with the
+re-pairing since the record; because revoke() refuses a node with nothing to
+revoke, the node must also have had an active credential or an open
+enrollment for it to revoke; a revoked credential stays revoked with the
 same material; an active one stays, becomes the renewal staged at record
 time (promotion) or the identity a fresh pairing installed (an enrollment
 pending or consumed at record time with the same node and key, or a new one
@@ -506,7 +510,9 @@ It recomputes the same inventory and compares it. A missing or changed
 recording, audit row, source, principal or invitation is `failed` (exit 1);
 rows and recordings that exist only now are listed as `appended` and are never
 counted as preserved. A finished recording must be identical, including its
-target and ended boundaries, and every segment must be readable and match its
+target and ended boundaries (a segment's retention `spool` flag and its cached
+`integrity` label, which playback recomputes from the file, are not compared),
+and every segment must be readable and match its
 catalog digest and byte length with a single hard link even if it was already
 broken at record time (reported as `catalog_mismatch`; `record` prints a
 warning for such recordings). This gate applies to every accepted change,
