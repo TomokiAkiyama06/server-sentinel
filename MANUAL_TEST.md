@@ -116,8 +116,10 @@ serials, by-id names and ports only in the private local test record.
     principal and after revoking `live:view`, confirm refusal and that no frame
     is retained without viewers.
 
-Results: **NOT RUN — hardware, authorized management route and browser viewer
-integration remain pending. Issue #11 is not closed by synthetic tests.**
+Results: **PARTIAL — 2026-09-30 に実機確認を一部実施（本節の 2026-09-30
+実機記録を参照。各記録の未実施・不合格項目はそれぞれの記録に記載）。
+非serial同型機・3–4 source・低照度・browser viewer（手順 10）・deployment
+launcher/systemd（手順 1, 2, 8）は未実施。Issue #11 はこれらの記録では close しない。**
 
 For each tested camera:
 
@@ -131,6 +133,106 @@ For each tested camera:
 - [ ] reconnect works when identity is unambiguous;
 - [ ] reboot/re-enumeration does not silently bind a different device through `/dev/videoN` reuse;
 - [ ] no unnecessary privileged container is required.
+
+#### 実機記録 2026-09-30（Main Server 候補、serial 付き同型 UVC × 2）
+
+```text
+Date: 2026-09-30
+ServerSentinel version / Git commit: 83d387f (main)
+Main Ubuntu version / hardware: Ubuntu LTS の x86_64 desktop 機（multi-core CPU、
+  discrete GPU 搭載。desktop session 常駐の開発機で、専用 service account ではない）。
+  正確な OS/kernel・CPU・RAM・GPU は INTEGRITY-007 によりローカル記録のみ
+Capture-node: 未使用（remote_agent は対象外）
+Camera source(s) / model(s): serial 付き同型 USB UVC camera × 2（同一
+  vendor/product、各個体が一意の USB serial を報告。UVC 内蔵マイク付き）。
+  正確な model と advertised mode 一覧はローカル記録のみ。概略: MJPG は最大
+  1920x1080@30、YUYV は 640x480 以下 @30、4K 非対応
+USB topology: 2 台とも USB 2.0 high-speed 接続（controller・port はローカル記録のみ）
+Tester: Claude Code（Owner 指示による自動実行。実行ユーザーは video group の
+  非 root ユーザー、sudo/root 不使用）
+```
+
+実行方法: `create_app()` の lifespan を一時 SQLite（repository 外の一時
+directory、実行後削除）で起動し、既定の `LocalUvcDependencies`（実
+`LinuxDiscovery` + `MmapCapture`）で 2 source の `local_uvc` を構成した。
+Owner 承認は `LocalUvcRuntime.reapprove()` → `OwnerAdministration.approve_uvc()`
+の監査付き経路だが、**authorizer は stand-in**（Owner WebAuthn 経路が未接続の
+ため）。frame は件数・byte 数・JPEG SOI/EOI marker・V4L2 sequence だけを
+メモリ上で数えて破棄し、画像は保存・閲覧していない。serial・by-id 名・
+device path・USB port・source UUID は本記録に含めない（INTEGRITY-007 / PRIVACY）。
+以下「カメラA/B」は serial の hash 順で付けた一時ラベル。
+
+| # | 確認内容 | 結果 | 区分 |
+|---|---|---|---|
+| A-1 | discovery: sysfs の video node 4 個（各カメラ capture + metadata）のうち capture 対応 2 個だけを検出、失敗 0。両方 `MJPG`/`YUYV`、serial あり、by-id alias 1、topology あり | PASS | 実機確認済み |
+| A-2 | 同型判定: 2 台の `model_key` は同一、serial-backed `strong_key` は 2 個で相異なる | PASS | 実機確認済み |
+| A-3 | `/dev/videoN` 非依存: A の承認 evidence の node path/番号/by-id/topology を B のものに置換しても `identity_matched` で**実 A** を選び B を選ばない | PASS | 実機 evidence + 論理置換（物理抜線なし） |
+| A-4 | A 不在で同型 B のみ存在（A 抜線相当をメモリ上で再現）: `offline` / `approved_device_absent`、B を bind しない | PASS | 実機 evidence のサブセット（物理抜線なし） |
+| A-5 | 非 serial 同型（serial を除去した evidence）: 2 台でも 1 台でも `manual_intervention_required` / `identity_not_unique`。重複 serial: `duplicate_identity` | PASS | 実機 evidence 由来の mock（使用機は serial 付きのため物理再現不可） |
+| A-6 | `local_uvc` 未構成で起動: `unconfigured`、`local_uvc_unconfigured` log、video/audio descriptor 0 | PASS | 実機確認済み |
+| A-7 | 構成済み・未承認: 2 秒間 両 source `offline`、discovery scan 0 回、video descriptor 0。未承認 idle の process CPU 0.25%（1 core 比） | PASS | 実機確認済み |
+| A-8 | Owner 承認（stand-in authorizer）後 0.60–0.72 秒で `online`、negotiated `1920x1080 30fps MJPG`、`approve_camera` 監査 1 件。非 Owner actor の承認は拒否され source は `offline` のまま | PASS（authorizer は stand-in） | 実機確認済み（部分） |
+| A-9 | 承認経路の遷移は `offline → online`（`degraded` を経由しない）。clean restart 経路は `degraded(identity_matched) → online` | 手順 4 の期待（degraded until first frame）と差異 | 実機確認済み（下記 提案-3） |
+| A-10 | 2 source 同時 `online`。開いている video node は承認済み capture node 2 個だけ（metadata node・他 node は 0）。`/dev/snd` 等 audio descriptor は全工程で 0（内蔵マイクの ALSA capture device は存在） | PASS | 実機確認済み |
+| A-11 | source 1 を監査付き `update_source(enabled=False)`: `offline`、source 1 frame 0、source 2 は継続（3 秒で 90 frame）、source 1 の descriptor は閉じる。再有効化で `online` | PASS | 実機確認済み |
+| A-12 | lifespan 停止: 0.20–0.31 秒で `stopped`、両 source `offline`、video descriptor 0 | PASS | 実機確認済み |
+| A-13 | 同じ DB で clean restart: 再承認なしで両 source 0.69–0.80 秒で `online`（serial 一意） | PASS | 実機確認済み |
+| A-14 | log: 全工程の log に serial / device path / by-id / topology / source UUID の出現 0。出力は固定 event 名のみ | PASS | 実機確認済み |
+| A-15 | 非対応 profile 要求（4K MJPG、60fps、一覧外 15fps、H264、YUYV 1080p）: driver 調整後の profile（1080p / 30fps / MJPG / 640x480）を negotiated として正しく記録するが、health は `online` | 手順 6 の期待（visibly unavailable, never healthy）と不一致 | 実機確認済み（下記 重要-2） |
+| A-16 | 同じ物理カメラ A を source 2 にも Owner 承認: **受理される**。source 2 は EBUSY で `degraded ↔ offline` を反復し、restart 後もどちらの source が取得するかは起動順依存 | FAIL | 実機確認済み（下記 重要-1） |
+
+本記録で見つかった問題（修正は別 PR / Owner 判断）:
+
+- **重要-1**: `prepare_approval()` は候補が現 scan に 1 個あることだけを確認し、
+  別 source に承認済みの同一 physical camera（同一 `strong_key`）を拒否しない。
+  同型 serial 付きカメラで Owner が候補を取り違えると、1 source が恒常的に
+  flapping し、restart 後の割当が起動順に依存する。
+- **重要-2**: 非対応の desired profile が driver に黙って調整され、`online` のまま
+  になる（negotiated profile の記録自体は正確）。MANUAL_TEST 手順 6 の期待と
+  合わない。desired と negotiated の不一致を `degraded` / 拒否とするかは Owner 判断。
+- **提案-1**: registry の negotiated fps は driver の frame interval（30）で、実配信
+  fps は記録されない。1 回目の計測では両カメラとも実配信 16.65 fps（V4L2 sequence
+  の欠落 0、gstreamer の独立経路でも約 15 fps、`exposure_auto_priority=1`）だったが
+  health は `online`・negotiated 30 のままだった。2 回目（数十分後）は 30.0 fps。
+  照度の評価はしていない（映像を閲覧していないため）。露出優先による
+  frame rate 低下と推定されるため、L 節の低照度確認で実 fps を記録すること。
+- **提案-2**: `CaptureSession.step()` は frame ごとに `LinuxDiscovery.scan()` を実行する
+  （1 回 0.73–0.80 ms、2 source × 30 fps で 60 scan/s。capture CPU の約半分に相当）。
+  無効化された source も retry ごとに scan する。
+- **提案-3**: 監査付き承認経路では `degraded` を経由せず `offline → online`
+  （negotiated profile は `offline` の間に書かれる）。手順 4 の記述か実装を揃える。
+- **提案-4**: `MmapCapture` は Python `mmap` が fd を複製するため、1 source あたり
+  video descriptor が 5 個（本体 + buffer 4）になる。停止時にすべて閉じることは確認
+  済み。「one descriptor」という docstring とは差がある。
+
+**要人手**（物理操作が必要。下記の観測は Claude が観測用 script を起動した
+状態で行う想定。state directory は repository 外に置き、終了後に削除する）:
+
+1. **抜線（手順 5 / A-4 実機版）**: 2 source とも `online` の状態で、カメラ A の
+   USB ケーブルだけを抜く。期待: A の source だけが 1–2 秒以内に `offline`、
+   B は 30 fps 前後を維持、service は `running`、log に識別子なし、A の video
+   descriptor は閉じる。
+2. **別ポートへ再接続（手順 6）**: 抜いた A を、B とも元とも異なる USB ポートに
+   挿す（`/dev/videoN` 番号が変わることを期待）。期待: 同じ logical source が
+   新しい frame 受信後にだけ自動で `online` に戻り、B の source には影響しない。
+3. **2 台のポート入替**: 両方を抜き、互いのポートに入れ替えて挿す。期待: 各
+   logical source が port ではなく serial に従って元のカメラへ戻る。
+4. **再起動 / 再列挙**: 観測用 state を保持したまま host を再起動（または両方を
+   抜いて逆順に挿し直し node 番号を入れ替え）、service 相当を再起動。期待:
+   `/dev/videoN` の再利用で別カメラを黙って bind しない。
+5. **非 serial 同型機（手順 7 / Ambiguous identical-device test）**: 使用機は serial
+   付きのため不可。serial を報告しない同型 UVC 2 台を用意できる場合のみ実施し、
+   抜き差し・並べ替えで `manual_intervention_required`、restart 後も latch 維持、
+   明示再承認後にだけ復帰することを確認する。用意できなければ mock 確認のみのまま。
+6. **レンズ遮蔽・低照度（L 節と共通）**: 片方のレンズを覆う、および室内照明を
+   落とす。期待値を定めた上で、実配信 fps・health・image quality 表示を記録する
+   （提案-1 の再現確認を兼ねる）。
+7. **deployment launcher / systemd（手順 1, 2, 8）**: 管理者所有の deployment 設定
+   （root 所有ファイル）と systemd unit のインストールが必要なため Owner が実施。
+   `--check` の検証（未知 key・device path・重複 UUID・5 個目）、`systemctl stop`
+   中の descriptor close、hung driver 時の `local_uvc_stop_failed`。
+8. **3–4 source**: カメラが 2 台のため未実施。追加の UVC を接続して実施。
+9. **authorized preview（手順 10）**: 認可済み viewer route と browser 統合の完成後。
 
 ### Ambiguous identical-device test
 
@@ -227,6 +329,42 @@ Compare at minimum where camera capabilities allow:
 - [ ] person/entrance detection quality.
 
 Choose defaults from measurements, not assumptions.
+
+#### 実機記録 2026-09-30: Main Server 上の local UVC capture resource（Issue #17）
+
+環境は A 節の 2026-09-30 記録と同じ（serial 付き同型 UVC × 2、USB 2.0、非 root）。
+実 `LocalUvcRuntime`（V4L2 MMAP、transcode なし、frame はメモリ上で件数のみ数えて
+破棄）を各 profile で 20 秒計測（warm-up 3 秒）。CPU は process 全体の CPU 時間 /
+経過時間（**1 core = 100%**）、RSS は FastAPI app 込みの process
+全体。2 回目の計測（実配信 30 fps）を採用し、1 回目（露出で 16.65 fps に低下）は
+括弧内に示す。録画・encoder・viewer・推論・GPU 経路はまだ接続されていないため、
+これは **capture 取り込みだけ** の負荷であり、deployment default の根拠にはならない。
+
+| profile | source 数 | 実配信 fps / source | 平均 frame | 帯域 / source | process CPU | RSS |
+|---|---|---|---|---|---|---|
+| MJPG 1920x1080@30 | 1 | 30.0 (16.65) | 166 KiB | 40.7 Mbps | 8.1% (4.9%) | 66 MiB |
+| MJPG 1920x1080@30 | 2 | 30.0 / 30.0 | 150–166 KiB | 36.8–40.7 Mbps | 10.7% (5.6%) | 84 MiB |
+| MJPG 1280x720@30 | 1 | 30.0 | 100 KiB | 24.5 Mbps | 7.3% | 59 MiB |
+| MJPG 1280x720@30 | 2 | 30.0 / 30.0 | 102–103 KiB | 25.0–25.3 Mbps | 10.9% | 66 MiB |
+| MJPG 640x480@30 | 1 | 30.0 | 53 KiB | 13.0 Mbps | 7.2% | 55 MiB |
+| MJPG 640x480@30 | 2 | 30.0 / 30.0 | 50–53 KiB | 12.3–13.0 Mbps | 10.6% | 57 MiB |
+| YUYV 640x480@30 | 1 | 30.0 | 600 KiB | 147.5 Mbps | 7.3% | 55 MiB |
+| YUYV 640x480@30 | 2 | 30.0 / 30.0 | 600 KiB | 147.5 Mbps | 10.3% | 57 MiB |
+
+- 全ケースで V4L2 sequence の欠落 0、MJPG frame の SOI/EOI marker 異常 0。
+  1 source 時の数値には、無効化したもう 1 source の retry scan も含まれる。
+- 未承認 idle は 0.25%。CPU の大部分は frame ごとの discovery rescan（A 節 提案-2）。
+- 実機確認済み: 1080p/15 fps・4K は本カメラでは非対応（要求しても 1080p/30 に調整。
+  A 節 重要-2）。camera-native MJPG の取り込みで transcode なし。
+- 未確認: recording/viewer/inference 経路・codec・GPU/VRAM・LAN・capture node・
+  3–4 source・録画品質・検知品質（該当経路が未接続、またはハードウェア不足）。
+
+`python -m app.media.profiles.measure`（synthetic scheduler baseline、実カメラ・
+codec・GPU は測らない）を同 host で実行した結果: 3000 packet × 4096 byte /
+source、queue 64 packet、`prefer_hardware`（synthetic harness に hardware 候補がない
+ため全経路 `software_fallback` と正しく表示）で、CPU 時間は viewer 0 / 1 の順に
+1 source 18.8 / 24.1 ms、2 source 38.6 / 43.6 ms、3 source 62.4 / 68.3 ms、
+4 source 75.1 / 85.2 ms。RSS peak 約 20 MiB、drop 0、全 source `healthy`。
 
 The synthetic profile core tests do not satisfy the following integration checks:
 
@@ -708,6 +846,34 @@ For each condition below, verify the system does not wait only for the 23:00 dai
 - [ ] when Slack is disabled, dashboard/audit fault state remains visible.
 
 Do not upload hardware serials, local mount identifiers, real temporary test media, or private infrastructure details to GitHub.
+
+#### 実機記録 2026-09-30: inventory probe のみ（Issue #23）
+
+A 節の同じ host で、非 root ユーザーのまま `LinuxProbe().collect()` と
+`compare()` を直接実行した（read-only。baseline 承認・startup/daily 実行・
+self-test・通知は runtime 未接続のため未実施）。識別子の値は記録していない。
+
+| 対象 | 結果 | 区分 |
+|---|---|---|
+| CPU | 1 socket、model/family/stepping/cores/logical CPU 数を取得。一意 ID なし → `UNVERIFIABLE` / `UNIQUE_ID_UNAVAILABLE`（誤って OK にしない） | 実機確認済み |
+| RAM | `dmidecode` は非 root で不可、DMI table は root 専用 0400 → `MEMORY` 全体 `UNVERIFIABLE` / `PROBE_UNAVAILABLE` | 実機確認済み（Owner 判断が必要） |
+| NVMe | serial / WWID と容量・model を取得。再取得との比較 `OK` | 実機確認済み |
+| SATA HDD | 容量・model のみ。`UNIQUE_ID_UNAVAILABLE` | **FAIL（下記 重要-3）** |
+| GPU | discrete GPU は UUID / serial / PCI を取得して `OK`。CPU 内蔵 GPU は一意 ID なしで `UNVERIFIABLE` | 実機確認済み |
+| SMART / NVMe health | 非 root で `smartctl` 不可 → 2 台とも `UNVERIFIABLE`（正常扱いしない） | 実機確認済み |
+| baseline なし | 全 kind `UNVERIFIABLE` / `BASELINE_REQUIRED` | 実機確認済み |
+| repr | `Component` の repr に location / 識別子を含まない | 実機確認済み |
+
+- **重要-3**: storage probe は `/sys/class/block/<dev>/wwid` と
+  `/sys/class/block/<dev>/device/serial` だけを読む。SATA/SCSI disk にはこの 2 つが
+  存在せず、非 root で読める `/sys/class/block/<dev>/device/wwid`（および
+  `device/vpd_pg80`）があるにもかかわらず、録画 volume 候補の HDD が
+  `UNIQUE_ID_UNAVAILABLE` になる。「取得できる最も強い stable identifier を使う」
+  という #23 の scope と合わない。
+- 要人手 / Owner 判断: RAM（DMI）と SMART を最小権限で読む方法（例: 専用 helper
+  や capability 付与）の決定。決定後、専用 service account で再実行する。
+- 未確認: Owner baseline 承認と監査、startup/24 時間比較、`CHANGED` / `MISSING` /
+  `NEW_DEVICE`、recording-health self-test（現状 `UNAVAILABLE`）、即時通知。
 
 
 ## T. No telemetry / developer reporting
