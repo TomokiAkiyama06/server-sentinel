@@ -791,6 +791,28 @@ Record:
 - audit event;
 - manual-intervention requirement if automatic recovery is unsafe.
 
+### Agent-to-Main transport PoC (Issue #15, ADR-0007 — pending physical execution)
+
+Synthetic continuity tests do not verify any transport. For each candidate
+(WebRTC, SRT, QUIC, authenticated HTTP/WebSocket streaming) on the real Main
+Server, capture node and UVC camera over the private LAN, and for 1, 2, 3 and 4
+sources (record which sources are real cameras and which are synthetic input):
+
+- [ ] the session is mutually authenticated with the ADR-0006 mTLS identity; an unpaired, revoked or wrong-deployment certificate delivers no media;
+- [ ] the ingest listener is not the human dashboard listener and serves no human/admin route; the capture credential cannot call a human/admin API;
+- [ ] deterministic impairment matrix: 1 s, 5 s and ~2 min link loss; sustained packet loss; added jitter; a deliberately slow Main consumer;
+- [ ] after each impairment, reported gaps match the units actually missing (exact count when the capture epoch continued, unknown extent after a capture restart); a lossless reconnect reports no gap;
+- [ ] no interval with known loss is presented as healthy; flow shows degraded/interrupted during and after loss until the gap is recorded;
+- [ ] a retry after a lost acknowledgement never duplicates media in the recording;
+- [ ] sender and receiver queue depth and memory stay bounded under slow consumer and link loss;
+- [ ] a fifth source is refused by the active-source limit.
+
+Record per run: reconnect time, reported vs actual gap, maximum queue depth,
+CPU/GPU/VRAM on Main and Agent, bitrate, informational LAN latency,
+codec/container and recording-extraction impact, and the exact dependency
+versions/licences. Enter the results in the ADR-0007 validation table; do not
+attach private addresses, credentials or real footage.
+
 ### LAN baseline measurement (2026-09-30, Issue #15; no transport candidate yet)
 
 This is a baseline of the private LAN path from the remote capture node to the
