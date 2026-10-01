@@ -18,6 +18,11 @@ Invariants enforced here:
 - a credential is bound to exactly one invited principal through that
   principal's single-use invitation, and a session to the credential that
   created it;
+- the trusted-proxy identity is supplementary (ADR-0004 §1): it must be
+  present, but it never selects or authorizes a principal, and several
+  invited people behind one shared Tailscale login each register and sign in
+  with their own passkey. A session keeps only its keyed HMAC binding, and a
+  later request whose identity does not reproduce it is refused;
 - every refusal before success is the same ``CeremonyDenied`` with one fixed
   message. The only distinct outcomes are ``StepUpRequired`` (an already
   authenticated Owner session that must re-verify) and
@@ -105,6 +110,8 @@ class PasskeyCeremonies:
                  random_bytes: Callable[[int], bytes] = secrets.token_bytes):
         if not isinstance(store, AccessStore) or store.audit is None:
             raise ValueError("an audited access store is required")
+        if not store.session_binding_configured:
+            raise ValueError("a session binding key is required")
         if not isinstance(relying_party, webauthn.RelyingParty):
             raise ValueError("relying party is required")
         if (not isinstance(challenge_lifetime, timedelta)
@@ -148,7 +155,7 @@ class PasskeyCeremonies:
 
     # --- Registration (invitation redemption) ---
 
-    def begin_registration(self, enrollment_secret: bytes, external_identity: str) -> dict:
+    def begin_registration(self, enrollment_secret: bytes, proxy_identity: str) -> dict:
         """Return creation options for a valid invitation; generic denial otherwise.
 
         The options carry only what the browser ceremony needs: the reserved
@@ -159,7 +166,7 @@ class PasskeyCeremonies:
         try:
             challenge = self._challenge()
             subject = self.store.begin_registration(
-                enrollment_secret, external_identity, _digest(challenge),
+                enrollment_secret, proxy_identity, _digest(challenge),
                 at=self._now(), lifetime=self.challenge_lifetime)
         except Exception:
             raise CeremonyDenied() from None
@@ -177,7 +184,7 @@ class PasskeyCeremonies:
             "attestation": "none",
         }
 
-    def finish_registration(self, enrollment_secret: bytes, external_identity: str,
+    def finish_registration(self, enrollment_secret: bytes, proxy_identity: str,
                             credential: Mapping, *, label: str | None = None) -> Credential:
         """Verify a registration and redeem the invitation its challenge was bound to."""
         try:
@@ -192,7 +199,7 @@ class PasskeyCeremonies:
             raise DeviceBoundCredentialRequired()
         try:
             return self.store.enroll_credential(
-                enrollment_secret, external_identity, verified.credential_id, verified.public_key,
+                enrollment_secret, proxy_identity, verified.credential_id, verified.public_key,
                 verified.algorithm, verified.sign_count, now=at,
                 backup_eligible=verified.backup_eligible, backup_state=verified.backup_state,
                 label=label, invitation_id=consumed.invitation_id)
@@ -243,11 +250,14 @@ class PasskeyCeremonies:
             raise CeremonyDenied()
         return principal, stored, verified
 
-    def finish_authentication(self, external_identity: str, credential: Mapping) -> SessionGrant:
+    def finish_authentication(self, proxy_identity: str, credential: Mapping) -> SessionGrant:
         """Verify an assertion and establish a credential-bound session.
 
-        The verified proxy identity must still match the principal's recorded
-        identity (a supplementary check); it never authenticates on its own.
+        The discoverable credential alone selects the principal. The verified
+        proxy identity must be present; it is recorded as the principal's last
+        observed value and bound into the new session as a keyed HMAC, but it
+        is never compared with the principal: people sharing one Tailscale
+        login each sign in with their own passkey.
         """
         try:
             at = self._now()
@@ -258,7 +268,7 @@ class PasskeyCeremonies:
             if not isinstance(token, bytes) or len(token) != SESSION_TOKEN_BYTES:
                 raise CeremonyDenied()
             session_id = self.store.accept_assertion(
-                stored.credential_id, principal.id, external_identity,
+                stored.credential_id, principal.id, proxy_identity,
                 expected_sign_count=stored.sign_count, sign_count=verified.sign_count,
                 backup_state=verified.backup_state, at=self._now(), token=token)
         except Exception:
@@ -267,20 +277,20 @@ class PasskeyCeremonies:
 
     # --- Owner step-up (AUTH-008) ---
 
-    def authorize_owner_operation(self, token: bytes, external_identity: str) -> Principal:
+    def authorize_owner_operation(self, token: bytes, proxy_identity: str) -> Principal:
         """Generic denial, ``StepUpRequired`` for a stale Owner session, or the Owner."""
         try:
-            return self.store.authorize_owner(token, external_identity, now=self._now())
+            return self.store.authorize_owner(token, proxy_identity, now=self._now())
         except StepUpRequired:
             raise
         except Exception:
             raise CeremonyDenied() from None
 
-    def begin_step_up(self, token: bytes, external_identity: str) -> dict:
+    def begin_step_up(self, token: bytes, proxy_identity: str) -> dict:
         """Issue a challenge bound to this Owner session and its own credential only."""
         try:
             challenge = self._challenge()
-            credential_id = self.store.begin_step_up(token, external_identity, _digest(challenge),
+            credential_id = self.store.begin_step_up(token, proxy_identity, _digest(challenge),
                                                      at=self._now(), lifetime=self.challenge_lifetime)
         except Exception:
             raise CeremonyDenied() from None
@@ -288,7 +298,7 @@ class PasskeyCeremonies:
                 "timeout": self._timeout_ms(), "userVerification": "required",
                 "allowCredentials": [{"type": "public-key", "id": webauthn.b64url_encode(credential_id)}]}
 
-    def finish_step_up(self, token: bytes, external_identity: str, credential: Mapping) -> None:
+    def finish_step_up(self, token: bytes, proxy_identity: str, credential: Mapping) -> None:
         """Refresh the session's verification time, or change nothing and deny.
 
         The assertion must come from the credential that created this session.
@@ -300,7 +310,7 @@ class PasskeyCeremonies:
             at = self._now()
             claims = webauthn.assertion_claims(credential, self.rp)
             consumed = self.store.consume_challenge(_digest(claims.challenge), "step_up", at=at)
-            session = self.store.current_session(token, external_identity, at=at)
+            session = self.store.current_session(token, proxy_identity, at=at)
             if (session is None or consumed.session_id != session.session_id
                     or claims.credential_id != session.credential_id):
                 raise CeremonyDenied()
@@ -308,7 +318,7 @@ class PasskeyCeremonies:
             if principal.id != session.principal_id:
                 raise CeremonyDenied()
             self.store.accept_assertion(
-                stored.credential_id, principal.id, external_identity,
+                stored.credential_id, principal.id, proxy_identity,
                 expected_sign_count=stored.sign_count, sign_count=verified.sign_count,
                 backup_state=verified.backup_state, at=self._now(),
                 step_up_session_id=session.session_id)

@@ -1,15 +1,28 @@
 """Synthetic tests for transport-neutral first-run wizard state."""
 
-from contextlib import closing
+from contextlib import closing, contextmanager
+from datetime import datetime, timedelta, timezone
+from itertools import count
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
+from uuid import UUID
 
+from app.audit import (
+    ActorCategory, AuditAction, AuditOutcome, AuditStorageError, AuditStore,
+    OwnerAuditService,
+    OwnerAuthorizationError, TargetKind,
+)
 from app.setup_wizard import (
+    GENERIC_COMPLETABLE_STEPS,
     STEP_CATALOG,
+    WIZARD_STEP_TARGETS,
+    SetupWizardService,
+    UnauditedWizardWriteError,
     WizardStateStore,
     WizardStatus,
     WizardStep,
+    WizardStorageError,
     WizardValidationError,
 )
 from app.storage.database import Database
@@ -25,7 +38,7 @@ class SetupWizardTests(unittest.TestCase):
         self.database = Database(Path(self.temporary.name) / "synthetic.sqlite3")
         with closing(self.database.connect()) as connection:
             migrate(connection, APPLICATION_MIGRATIONS)
-        self.store = WizardStateStore(self.database)
+        self.store = WizardStateStore(self.database, unaudited_writes=True)
 
     def transition(self, step, status):
         revision = self.store.snapshot().state_for(step).revision
@@ -47,7 +60,7 @@ class SetupWizardTests(unittest.TestCase):
 
     def test_order_is_enforced_but_unavailable_integration_does_not_block_shell(self):
         with self.assertRaisesRegex(WizardValidationError, "earlier"):
-            self.transition(WizardStep.STORAGE, WizardStatus.COMPLETED)
+            self.transition(WizardStep.STORAGE, WizardStatus.UNAVAILABLE)
 
         for definition in STEP_CATALOG[:5]:
             self.transition(definition.step, WizardStatus.COMPLETED)
@@ -163,6 +176,321 @@ class SetupWizardTests(unittest.TestCase):
             )
         with self.assertRaisesRegex(WizardValidationError, "catalog"):
             self.store.snapshot()
+
+    def test_plain_transition_is_refused_outside_fixtures(self):
+        runtime = WizardStateStore(self.database)
+        with self.assertRaises(UnauditedWizardWriteError):
+            runtime.transition(WizardStep.WELCOME, WizardStatus.COMPLETED,
+                               expected_revision=0)
+        self.assertEqual(WizardStatus.PENDING,
+                         runtime.snapshot().state_for(WizardStep.WELCOME).status)
+        with self.assertRaises(WizardValidationError):
+            WizardStateStore(self.database, unaudited_writes=1)  # type: ignore[arg-type]
+
+    def test_transition_on_requires_a_caller_owned_transaction(self):
+        with closing(self.database.connect()) as connection:
+            with self.assertRaises(WizardStorageError):
+                self.store.transition_on(connection, WizardStep.WELCOME,
+                                         WizardStatus.COMPLETED, expected_revision=0)
+        self.assertEqual(WizardStatus.PENDING,
+                         self.store.snapshot().state_for(WizardStep.WELCOME).status)
+
+
+NOW = datetime(2026, 9, 30, tzinfo=timezone.utc)
+OWNER_CONTEXT = "synthetic-owner-session"
+VIEWER_CONTEXT = "synthetic-viewer-session"
+NODE_CONTEXT = "synthetic-capture-node-credential"
+
+
+class SyntheticOwnerAuthorizer:
+    """Only the synthetic Owner context passes; others fail with their category."""
+
+    def require_owner(self, actor_context):
+        if actor_context == OWNER_CONTEXT:
+            return
+        if actor_context == VIEWER_CONTEXT:
+            raise OwnerAuthorizationError(ActorCategory.INVITED_USER)
+        if actor_context == NODE_CONTEXT:
+            raise OwnerAuthorizationError(ActorCategory.CAPTURE_NODE)
+        raise OwnerAuthorizationError()
+
+
+class PlainDenial:
+    def require_owner(self, actor_context):
+        raise PermissionError("synthetic detail synthetic-viewer@example.invalid")
+
+
+class SyntheticReservation:
+    def __init__(self):
+        self.refuse = False
+
+    @contextmanager
+    def __call__(self):
+        if self.refuse:
+            raise RuntimeError("synthetic storage refusal")
+        yield
+
+
+class SetupWizardServiceTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.database = Database(Path(self.temporary.name) / "synthetic.sqlite3")
+        with closing(self.database.connect()) as connection:
+            migrate(connection, APPLICATION_MIGRATIONS)
+        self.reservation = SyntheticReservation()
+        ticks = count()
+        self.audit = AuditStore(self.database, reservation=self.reservation,
+                                clock=lambda: NOW + timedelta(microseconds=next(ticks)))
+        self.audit_service = OwnerAuditService(self.audit, SyntheticOwnerAuthorizer())
+        self.store = WizardStateStore(self.database)
+        self.wizard = SetupWizardService(self.audit_service, self.store)
+
+    def transition(self, step, status, actor=OWNER_CONTEXT):
+        revision = self.store.snapshot().state_for(step).revision
+        return self.wizard.transition(actor, step, status, expected_revision=revision)
+
+    def integration_complete(self, step):
+        """Stand-in for a future integration's own verified completion path.
+
+        No integration exists yet; the explicit fixture store marks the step
+        completed so later steps can be exercised. It is not the Owner path.
+        """
+        fixture = WizardStateStore(self.database, unaudited_writes=True)
+        revision = fixture.snapshot().state_for(step).revision
+        return fixture.transition(step, WizardStatus.COMPLETED, expected_revision=revision)
+
+    def complete(self, step):
+        if step in GENERIC_COMPLETABLE_STEPS:
+            return self.transition(step, WizardStatus.COMPLETED)
+        return self.integration_complete(step)
+
+    def summary(self):
+        return [(record.actor_category, record.action, record.target_kind,
+                 record.target_logical_id, record.outcome)
+                for record in reversed(self.audit.list_records(limit=1000))]
+
+    def audit_text(self):
+        with closing(self.database.connect()) as connection:
+            rows = connection.execute(
+                "SELECT * FROM security_admin_audit_records").fetchall()
+        return " ".join(str(value) for row in rows for value in row)
+
+    def record(self, step, outcome, actor=ActorCategory.OWNER):
+        return (actor, AuditAction.TRANSITION_SETUP_WIZARD_STEP,
+                TargetKind.SETUP_WIZARD_STEP, WIZARD_STEP_TARGETS[step], outcome)
+
+    def statuses(self):
+        return tuple(state.status for state in self.store.snapshot().states)
+
+    def test_owner_transition_commits_with_one_bounded_success_record(self):
+        after = self.transition(WizardStep.WELCOME, WizardStatus.COMPLETED)
+        self.assertEqual(WizardStatus.COMPLETED, after.state_for(WizardStep.WELCOME).status)
+        self.assertEqual(WizardStep.DEPLOYMENT_OWNER, after.current_step)
+        self.assertEqual([self.record(WizardStep.WELCOME, AuditOutcome.SUCCEEDED)],
+                         self.summary())
+        # The record names the step only; the requested status is not stored.
+        text = self.audit_text()
+        for status in WizardStatus:
+            self.assertNotIn(status.value, text)
+        self.assertNotIn(WizardStep.WELCOME.value, text)
+
+    def test_step_targets_are_fixed_distinct_logical_ids(self):
+        self.assertEqual({definition.step for definition in STEP_CATALOG},
+                         set(WIZARD_STEP_TARGETS))
+        self.assertEqual(len(STEP_CATALOG), len(set(WIZARD_STEP_TARGETS.values())))
+        self.assertEqual(UUID("f627abac-2bcf-5f96-b58d-5ff3f8941933"),
+                         WIZARD_STEP_TARGETS[WizardStep.WELCOME])
+        self.assertEqual(AuditAction.TRANSITION_SETUP_WIZARD_STEP.value,
+                         "transition_setup_wizard_step")
+
+    def test_step_order_is_enforced_and_audited_as_failed(self):
+        with self.assertRaisesRegex(WizardValidationError, "earlier"):
+            self.transition(WizardStep.STORAGE, WizardStatus.UNAVAILABLE)
+        self.assertTrue(all(status is WizardStatus.PENDING for status in self.statuses()))
+        self.assertEqual([self.record(WizardStep.STORAGE, AuditOutcome.FAILED)],
+                         self.summary())
+        for definition in STEP_CATALOG:
+            if definition.skippable:
+                break
+            self.complete(definition.step)
+        snapshot = self.wizard.snapshot(OWNER_CONTEXT)
+        self.assertTrue(snapshot.deployment_ready)
+        self.assertEqual(WizardStep.OWNER_VERIFICATION, snapshot.current_step)
+
+    def test_only_optional_steps_can_be_skipped(self):
+        for definition in STEP_CATALOG:
+            if definition.skippable:
+                continue
+            with self.subTest(step=definition.step):
+                before = self.statuses()
+                with self.assertRaisesRegex(WizardValidationError, "required"):
+                    self.transition(definition.step, WizardStatus.SKIPPED)
+                self.assertEqual(before, self.statuses())
+                self.complete(definition.step)
+        for definition in STEP_CATALOG:
+            if definition.skippable:
+                with self.subTest(step=definition.step):
+                    after = self.transition(definition.step, WizardStatus.SKIPPED)
+                    self.assertEqual(WizardStatus.SKIPPED,
+                                     after.state_for(definition.step).status)
+        final = self.store.snapshot()
+        self.assertIsNone(final.current_step)
+        self.assertTrue(final.deployment_ready)
+
+    def test_pending_and_unavailable_are_never_reported_as_completed(self):
+        for definition in STEP_CATALOG[:5]:
+            self.complete(definition.step)
+        self.transition(WizardStep.CAMERA_SOURCES, WizardStatus.UNAVAILABLE)
+        after = self.transition(WizardStep.DETECTION_PROFILES, WizardStatus.UNAVAILABLE)
+        self.assertFalse(after.deployment_ready)
+        for step in (WizardStep.CAMERA_SOURCES, WizardStep.DETECTION_PROFILES):
+            self.assertIs(WizardStatus.UNAVAILABLE, after.state_for(step).status)
+            with self.subTest(step=step), self.assertRaisesRegex(
+                    WizardValidationError, "integration"):
+                self.transition(step, WizardStatus.COMPLETED)
+            # Even an integration must retry through PENDING first.
+            with self.subTest(step=step), self.assertRaisesRegex(
+                    WizardValidationError, "retried"):
+                self.integration_complete(step)
+            self.assertIs(WizardStatus.UNAVAILABLE,
+                          self.store.snapshot().state_for(step).status)
+        for state in after.states[7:]:
+            self.assertIs(WizardStatus.PENDING, state.status)
+
+    def test_generic_owner_path_completes_only_welcome(self):
+        self.assertEqual(frozenset({WizardStep.WELCOME}), GENERIC_COMPLETABLE_STEPS)
+        self.transition(WizardStep.WELCOME, WizardStatus.COMPLETED)
+        expected = [self.record(WizardStep.WELCOME, AuditOutcome.SUCCEEDED)]
+        for definition in STEP_CATALOG[1:]:
+            with self.subTest(step=definition.step):
+                before = self.store.snapshot()
+                with self.assertRaisesRegex(WizardValidationError, "integration"):
+                    self.transition(definition.step, WizardStatus.COMPLETED)
+                self.assertEqual(before, self.store.snapshot())
+                expected.append(self.record(definition.step, AuditOutcome.FAILED))
+                self.assertEqual(expected, self.summary())
+                # Resolve the step the way a future integration would.
+                self.integration_complete(definition.step)
+                # An already completed integration step is not re-completable
+                # through the generic path either.
+                with self.assertRaisesRegex(WizardValidationError, "integration"):
+                    self.transition(definition.step, WizardStatus.COMPLETED)
+                expected.append(self.record(definition.step, AuditOutcome.FAILED))
+
+    def test_generic_owner_transitions_never_make_the_deployment_ready(self):
+        # Try every status on every step, in order, keeping whatever the
+        # generic Owner path accepts; readiness must never be claimed.
+        for definition in STEP_CATALOG:
+            for status in (WizardStatus.COMPLETED, WizardStatus.SKIPPED,
+                           WizardStatus.UNAVAILABLE):
+                try:
+                    after = self.transition(definition.step, status)
+                except WizardValidationError:
+                    continue
+                self.assertFalse(after.deployment_ready)
+                break
+        final = self.wizard.snapshot(OWNER_CONTEXT)
+        self.assertFalse(final.deployment_ready)
+        completed = {state.step for state in final.states
+                     if state.status is WizardStatus.COMPLETED}
+        self.assertEqual({WizardStep.WELCOME}, completed)
+
+    def test_no_op_transition_is_recorded_as_succeeded(self):
+        # Requesting the current status at the current revision changes
+        # nothing but is still one audited Owner attempt (documented in
+        # app/audit/README.md).
+        after = self.transition(WizardStep.WELCOME, WizardStatus.COMPLETED)
+        again = self.transition(WizardStep.WELCOME, WizardStatus.COMPLETED)
+        self.assertEqual(after, again)
+        self.assertEqual([self.record(WizardStep.WELCOME, AuditOutcome.SUCCEEDED)] * 2,
+                         self.summary())
+
+    def test_stale_revision_is_rejected_without_changing_state(self):
+        first = self.store.snapshot().state_for(WizardStep.WELCOME)
+        self.wizard.transition(OWNER_CONTEXT, WizardStep.WELCOME, WizardStatus.COMPLETED,
+                               expected_revision=first.revision)
+        before = self.store.snapshot()
+        with self.assertRaisesRegex(WizardValidationError, "changed"):
+            self.wizard.transition(OWNER_CONTEXT, WizardStep.WELCOME,
+                                   WizardStatus.COMPLETED,
+                                   expected_revision=first.revision)
+        self.assertEqual(before, self.store.snapshot())
+        self.assertEqual([self.record(WizardStep.WELCOME, AuditOutcome.SUCCEEDED),
+                          self.record(WizardStep.WELCOME, AuditOutcome.FAILED)],
+                         self.summary())
+
+    def test_non_owner_is_denied_audited_and_changes_nothing(self):
+        before = self.store.snapshot()
+        for actor, category in ((VIEWER_CONTEXT, ActorCategory.INVITED_USER),
+                                (NODE_CONTEXT, ActorCategory.CAPTURE_NODE),
+                                ("synthetic-unknown", ActorCategory.UNAUTHENTICATED)):
+            with self.subTest(actor=category):
+                with self.assertRaises(OwnerAuthorizationError) as caught:
+                    self.transition(WizardStep.WELCOME, WizardStatus.COMPLETED, actor)
+                self.assertIs(category, caught.exception.actor_category)
+                with self.assertRaises(OwnerAuthorizationError):
+                    self.wizard.snapshot(actor)
+        self.assertEqual(before, self.store.snapshot())
+        # Refused reads write nothing; each refused transition writes one denial.
+        self.assertEqual(
+            [self.record(WizardStep.WELCOME, AuditOutcome.DENIED, category)
+             for category in (ActorCategory.INVITED_USER, ActorCategory.CAPTURE_NODE,
+                              ActorCategory.UNAUTHENTICATED)],
+            self.summary(),
+        )
+
+    def test_plain_permission_error_is_classified_without_its_detail(self):
+        wizard = SetupWizardService(OwnerAuditService(self.audit, PlainDenial()), self.store)
+        for call in (lambda: wizard.transition("synthetic", WizardStep.WELCOME,
+                                               WizardStatus.COMPLETED, expected_revision=0),
+                     lambda: wizard.snapshot("synthetic")):
+            with self.assertRaises(OwnerAuthorizationError) as caught:
+                call()
+            self.assertIs(ActorCategory.UNAUTHENTICATED, caught.exception.actor_category)
+            self.assertNotIn("example.invalid", str(caught.exception))
+        self.assertNotIn("example.invalid", self.audit_text())
+        self.assertEqual(WizardStatus.PENDING,
+                         self.store.snapshot().state_for(WizardStep.WELCOME).status)
+
+    def test_audit_failure_rolls_back_the_transition(self):
+        with closing(self.database.connect()) as connection:
+            connection.execute(
+                "CREATE TRIGGER synthetic_audit_fault BEFORE INSERT ON "
+                "security_admin_audit_records BEGIN "
+                "SELECT RAISE(ABORT, 'synthetic audit fault'); END")
+        with self.assertRaises(AuditStorageError):
+            self.transition(WizardStep.WELCOME, WizardStatus.COMPLETED)
+        self.assertEqual(WizardStatus.PENDING,
+                         self.store.snapshot().state_for(WizardStep.WELCOME).status)
+        self.assertEqual(0, self.store.snapshot().state_for(WizardStep.WELCOME).revision)
+        # The separate failure record could not be written either; the loss is
+        # visible as bounded health rather than silently dropped.
+        self.assertTrue(self.audit_service.audit_delivery_failed)
+
+    def test_refused_storage_admission_changes_nothing(self):
+        self.reservation.refuse = True
+        with self.assertRaises(RuntimeError):
+            self.transition(WizardStep.WELCOME, WizardStatus.COMPLETED)
+        self.assertEqual(WizardStatus.PENDING,
+                         self.store.snapshot().state_for(WizardStep.WELCOME).status)
+        self.assertEqual([], self.summary())
+        self.assertTrue(self.audit_service.audit_delivery_failed)
+
+    def test_invalid_step_is_refused_before_authorization_without_a_record(self):
+        marker = "SYNTHETIC_PRIVATE_STEP"
+        with self.assertRaises(WizardValidationError) as caught:
+            self.wizard.transition(VIEWER_CONTEXT, marker, WizardStatus.COMPLETED,  # type: ignore[arg-type]
+                                   expected_revision=0)
+        self.assertNotIn(marker, str(caught.exception))
+        self.assertEqual([], self.summary())
+
+    def test_service_requires_the_audit_store_on_the_wizard_database(self):
+        other = Database(Path(self.temporary.name) / "other.sqlite3")
+        with self.assertRaises(ValueError):
+            SetupWizardService(self.audit_service, WizardStateStore(other))
+        with self.assertRaises(TypeError):
+            SetupWizardService(object(), self.store)  # type: ignore[arg-type]
 
 
 if __name__ == "__main__":
