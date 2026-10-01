@@ -29,6 +29,7 @@ import ipaddress
 import json
 import math
 import re
+import socket
 import sys
 import threading
 import time
@@ -77,17 +78,23 @@ class Reason(StrEnum):
     LISTENER_EXCEPTIONS_UNREADABLE = "LISTENER_EXCEPTIONS_UNREADABLE"
     SESSION_REVOCATION_UNAVAILABLE = "SESSION_REVOCATION_UNAVAILABLE"
     SESSION_REVOCATION_FAILED = "SESSION_REVOCATION_FAILED"
+    HOSTNAME_RESOLUTION_UNAVAILABLE = "HOSTNAME_RESOLUTION_UNAVAILABLE"
+    HOSTNAME_RESOLUTION_TIMEOUT = "HOSTNAME_RESOLUTION_TIMEOUT"
+    RESERVED_ADDRESSES_CHANGED = "RESERVED_ADDRESSES_CHANGED"
 
 
 # Something other than this deployment answered, or may have answered unseen,
 # for the reserved name, so a session cookie may have been exposed. Reopening
 # after any of these first revokes every human session (Owner decision,
 # 2026-09-30). An enumeration error or timeout is treated the same way: nothing
-# shows an exposure, but nothing rules one out either.
+# shows an exposure, but nothing rules one out either. That includes a failed
+# hostname resolution, since an address the name gained but the configuration
+# lacks would then go unchecked.
 EXPOSURE_REASONS = frozenset({
     Reason.UNEXPECTED_LISTENER, Reason.UNEXPECTED_ROUTE,
     Reason.LISTENER_ENUMERATION_UNAVAILABLE, Reason.LISTENER_ENUMERATION_TIMEOUT,
     Reason.ROUTE_ENUMERATION_UNAVAILABLE, Reason.ROUTE_ENUMERATION_TIMEOUT,
+    Reason.HOSTNAME_RESOLUTION_UNAVAILABLE, Reason.HOSTNAME_RESOLUTION_TIMEOUT,
 })
 
 
@@ -208,6 +215,11 @@ class ListenerEnumerator(Protocol):
 class ProxyRouteEnumerator(Protocol):
     def routes(self) -> Iterable[ProxyRoute]:
         """Return every proxy route on this node; raise when that cannot be established."""
+
+
+class AddressResolver(Protocol):
+    def resolve(self, hostname: str) -> Iterable[Address]:
+        """Return every address ``hostname`` resolves to on this node; raise when unknown."""
 
 
 class ListenerExceptionSource(Protocol):
@@ -448,6 +460,29 @@ class ServeStatusRoutes:
         return parse_serve_status(self._status())
 
 
+class GetaddrinfoResolver:
+    """Resolve through the node's resolver (``getaddrinfo``, injectable for tests).
+
+    It sees what this node's name service answers now (for example MagicDNS);
+    an empty answer or any error raises, so the check fails closed.
+    """
+
+    def __init__(self, getaddrinfo: Callable = socket.getaddrinfo):
+        if not callable(getaddrinfo):
+            raise ValueError("INVALID_RESOLVER")
+        self._getaddrinfo = getaddrinfo
+
+    def resolve(self, hostname: str) -> tuple[Address, ...]:
+        try:
+            answers = self._getaddrinfo(hostname, None, 0, socket.SOCK_STREAM)
+            addresses = {_normalize(ipaddress.ip_address(item[4][0].split("%", 1)[0])) for item in answers}
+        except Exception:
+            raise ReservationEnumerationError("HOSTNAME_RESOLUTION_UNAVAILABLE") from None
+        if not addresses:
+            raise ReservationEnumerationError("HOSTNAME_RESOLUTION_UNAVAILABLE")
+        return tuple(addresses)
+
+
 # -- Configuration and verdict ----------------------------------------------
 
 def _normalize(address: Address) -> Address:
@@ -462,7 +497,8 @@ class ReservationConfig:
 
     ``hostname``/``port`` form the configured ``https://<host>[:<port>]``.
     ``reserved_addresses`` are every address the name resolves to on this node
-    (IPv4 and IPv6). ``human_listener`` is the loopback TCP upstream the proxy
+    (IPv4 and IPv6); each check re-resolves the name and closes access when the
+    answer differs. ``human_listener`` is the loopback TCP upstream the proxy
     forwards to. ``proxy_listeners`` are TCP sockets the proxy itself is
     expected to hold on a reserved address at the configured ``port`` (empty
     when the proxy intercepts without a visible socket); any other port on the
@@ -553,12 +589,26 @@ def validate_listener_exceptions(config: ReservationConfig, exceptions) -> froze
 
 
 def evaluate(config: ReservationConfig, listeners, routes,
-             exceptions: frozenset = frozenset()) -> tuple[tuple[Reason, ...], int, int]:
-    """Pure comparison. ``listeners``/``routes`` are sequences or a ``Reason``."""
+             exceptions: frozenset = frozenset(),
+             resolved=None) -> tuple[tuple[Reason, ...], int, int]:
+    """Pure comparison. ``listeners``/``routes``/``resolved`` are sequences or a ``Reason``.
+
+    ``resolved`` is the hostname's current address set (``None``: the
+    configured set). Listeners are checked against the union with the
+    configured set, so a bind to an address the name gained is still seen.
+    """
     exceptions = validate_listener_exceptions(config, exceptions)
     reasons: list[Reason] = []
     if not isinstance(config.isolation, IsolationMode):
         reasons.append(Reason.ISOLATION_UNSTATED)
+    reserved = config.reserved_addresses
+    if isinstance(resolved, Reason):
+        reasons.append(resolved)
+    elif resolved is not None:
+        current = frozenset(_normalize(item) for item in resolved)
+        if current != reserved:
+            reasons.append(Reason.RESERVED_ADDRESSES_CHANGED)
+        reserved = reserved | current
     unexpected_listeners = unexpected_routes = 0
     if isinstance(listeners, Reason):
         reasons.append(listeners)
@@ -587,7 +637,7 @@ def evaluate(config: ReservationConfig, listeners, routes,
                     unexpected_listeners += 1
                 seen_excepted.add(normalized)
                 continue
-            if address.is_unspecified or address in config.reserved_addresses:
+            if address.is_unspecified or address in reserved:
                 if normalized in config.proxy_listeners and normalized not in seen_proxies:
                     seen_proxies.add(normalized)
                     continue
@@ -628,13 +678,22 @@ class HostnameReservationCheck:
     after an ``EXPOSURE_REASONS`` close: then it reopens only once the injected
     ``session_revoker`` has revoked every human session and committed its audit
     record. Without a revoker, or when revocation fails, access stays closed
-    with a ``SESSION_REVOCATION_*`` fault.
+    with a ``SESSION_REVOCATION_*`` fault. The requirement is made durable when
+    the exposure is seen: the revoker's marker, or, when that write fails, an
+    immediate revocation; until one commits, every check retries it and keeps
+    ``SESSION_REVOCATION_FAILED``. If both keep failing and the process
+    restarts, only the delivered Owner fault records the requirement.
+
+    Every check also re-resolves the hostname through ``resolver``; a missing
+    resolver, a failed or timed-out resolution (an exposure reason) or an
+    answer that differs from ``reserved_addresses`` keeps access closed.
     """
 
     def __init__(self, config: ReservationConfig, listeners: ListenerEnumerator,
                  routes: ProxyRouteEnumerator, sink: FaultSink, *,
                  exception_store: ListenerExceptionSource | None = None,
                  session_revoker: SessionRevoker | None = None,
+                 resolver: AddressResolver | None = None,
                  timeout: float = ENUMERATION_TIMEOUT_SECONDS,
                  retry_seconds: float = RETRY_WHILE_CLOSED_SECONDS,
                  monotonic: Callable[[], float] = time.monotonic,
@@ -674,7 +733,13 @@ class HostnameReservationCheck:
         # False until the stored set loads; a check first (re)tries the load.
         self._exceptions_loaded = False
         self.session_revoker = session_revoker
+        # Without a resolver every check fails closed: the frozen configured
+        # set alone cannot show an address the name gained.
+        self._resolver = resolver
         self._revocation_required = False
+        # True once the requirement is durable: the marker was written, or the
+        # revocation already committed while access was closed.
+        self._revocation_durable = True
         self.undelivered_faults = 0
 
     @property
@@ -735,16 +800,35 @@ class HostnameReservationCheck:
             pending = True
         self._revocation_required = self._revocation_required or pending
 
+    def _make_durable(self) -> bool:
+        """Ensure a restart cannot reopen without the required revocation.
+
+        Write the marker; when that fails, revoke now instead (access is closed,
+        so no session is issued until reopening revokes again). Retried on every
+        check until one of them commits.
+        """
+        if self.session_revoker is None:
+            return True
+        try:
+            self.session_revoker.record_exposure()
+            return True
+        except Exception:
+            pass
+        try:
+            self.session_revoker.revoke_all_human_sessions()
+            return True
+        except Exception:
+            return False
+
     def _after_evaluation(self, reasons: tuple[Reason, ...]) -> tuple[Reason, ...]:
         if any(reason in EXPOSURE_REASONS for reason in reasons):
             self._revocation_required = True
-            if self.session_revoker is not None:
-                try:
-                    self.session_revoker.record_exposure()
-                except Exception:
-                    # Still required in memory; a restart could lose it, so tell the Owner.
-                    return reasons + (Reason.SESSION_REVOCATION_FAILED,)
-            return reasons
+            self._revocation_durable = self._make_durable()
+        elif self._revocation_required and not self._revocation_durable:
+            self._revocation_durable = self._make_durable()
+        if not self._revocation_durable:
+            # Only memory holds the requirement; a restart could lose it.
+            return reasons + (Reason.SESSION_REVOCATION_FAILED,)
         if reasons or not self._revocation_required:
             return reasons
         if self.session_revoker is None:
@@ -754,6 +838,7 @@ class HostnameReservationCheck:
         except Exception:
             return (Reason.SESSION_REVOCATION_FAILED,)
         self._revocation_required = False
+        self._revocation_durable = True
         return ()
 
     def _load_exceptions(self) -> None:
@@ -784,7 +869,7 @@ class HostnameReservationCheck:
                                                self._verdict.check)
 
     def _enumerate(self, name: str, call: Callable[[], Iterable], timeout_reason: Reason,
-                   error_reason: Reason, item_type: type):
+                   error_reason: Reason, item_type: type | tuple[type, ...]):
         previous = self._inflight.get(name)
         if previous is not None and previous.is_alive():
             # A hung enumeration is never stacked; it keeps the check closed.
@@ -820,6 +905,15 @@ class HostnameReservationCheck:
             # Load (or retry) the stored set; until it loads, access stays closed.
             self._load_exceptions()
         try:
+            if self._resolver is None:
+                resolved = Reason.HOSTNAME_RESOLUTION_UNAVAILABLE
+            else:
+                resolved = self._enumerate("addresses", lambda: self._resolver.resolve(self.config.hostname),
+                                           Reason.HOSTNAME_RESOLUTION_TIMEOUT,
+                                           Reason.HOSTNAME_RESOLUTION_UNAVAILABLE,
+                                           (ipaddress.IPv4Address, ipaddress.IPv6Address))
+                if not isinstance(resolved, Reason) and not resolved:
+                    resolved = Reason.HOSTNAME_RESOLUTION_UNAVAILABLE
             listeners = self._enumerate("listeners", lambda: self._listeners.listeners(),
                                         Reason.LISTENER_ENUMERATION_TIMEOUT,
                                         Reason.LISTENER_ENUMERATION_UNAVAILABLE, Listener)
@@ -827,7 +921,7 @@ class HostnameReservationCheck:
                                      Reason.ROUTE_ENUMERATION_TIMEOUT,
                                      Reason.ROUTE_ENUMERATION_UNAVAILABLE, ProxyRoute)
             reasons, extra_listeners, extra_routes = evaluate(self.config, listeners, routes,
-                                                              self._exceptions)
+                                                              self._exceptions, resolved)
         except Exception:
             reasons, extra_listeners, extra_routes = (Reason.LISTENER_ENUMERATION_UNAVAILABLE,), 0, 0
         if not self._exceptions_loaded:

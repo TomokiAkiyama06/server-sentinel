@@ -664,7 +664,7 @@ class AccessStore:
         """
         at = utc_time(at)
         connection.execute("UPDATE access_deployment_state SET authorization_generation=authorization_generation+1 WHERE singleton=1")
-        connection.execute("UPDATE access_sessions SET invalidated_at_us=? WHERE invalidated_at_us IS NULL", (_us(at),))
+        connection.execute("UPDATE access_sessions SET invalidated_at_us=?, external_identity_binding=NULL WHERE invalidated_at_us IS NULL", (_us(at),))
 
     # --- WebAuthn ceremony state (Issue #10). Verification lives in app.auth.webauthn;
     # these methods persist only digests, flags and the accepted counter. ---

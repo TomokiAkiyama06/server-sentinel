@@ -1538,6 +1538,23 @@ by the Issue #6 synthetic policy model.
   disposable copy and confirm access stays closed with a
   `SESSION_REVOCATION_FAILED` Owner fault. Stop `tailscaled` briefly and
   record that the enumeration failure also forces everyone to sign in again.
+  Make only the marker write fail (for example a disposable copy whose
+  `application_metadata` row is locked by another writer) while the test
+  listener is up: confirm the `invalidate_human_sessions` record is committed
+  at once, so a restart after removing the listener cannot reopen with an
+  earlier session.
+- Hostname resolution (mock-only so far): with the production
+  `GetaddrinfoResolver` composed, confirm on the host that it returns exactly
+  the reserved name's Tailscale IPv4 and IPv6 addresses (compare with
+  `getent ahosts <reserved-host>`) and that access opens. Record whether
+  MagicDNS answers both families. Stop `tailscaled` (or point the resolver at a
+  non-answering server) and confirm access closes with
+  `HOSTNAME_RESOLUTION_UNAVAILABLE`/`_TIMEOUT` and that reopening revokes every
+  human session. Omit one configured address and confirm
+  `RESERVED_ADDRESSES_CHANGED` closes access until the configuration matches;
+  on a disposable node whose name gains an extra address (for example a test
+  `/etc/hosts` entry when the resolver honors it), bind a listener to that
+  address and confirm it is reported as `UNEXPECTED_LISTENER`.
 - Once the check is composed into startup and the daily worker, confirm an
   enumeration failure or timeout (for example stopping `tailscaled`, or making
   `/proc/net` unreadable) keeps human access closed and notifies the Owner,

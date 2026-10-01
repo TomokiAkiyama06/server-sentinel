@@ -17,7 +17,7 @@ from app.audit import (
 )
 from app.audit.integration import RESERVATION_LISTENER_EXCEPTIONS_ID, ReservationAdministration
 from app.auth.reservation import (
-    DAILY_SECONDS, AddressFamily, CheckKind, HostnameReservationCheck, IsolationMode, Listener, ListenerException,
+    DAILY_SECONDS, AddressFamily, CheckKind, GetaddrinfoResolver, HostnameReservationCheck, IsolationMode, Listener, ListenerException,
     RETRY_WHILE_CLOSED_SECONDS, ProcNetListeners, ProxyRoute, Reason, ReservationConfig,
     ReservationEnumerationError,
     ReservationFault, RouteKind, ServeStatusRoutes, TransportProtocol, evaluate, parse_proc_net_tcp,
@@ -28,6 +28,7 @@ from app.auth.reservation_store import (
     HUMAN_SESSIONS_ID, REVOCATION_PENDING_KEY, STORE_KEY, ListenerExceptionStore,
     ReservationSessionRevocation, decode, encode,
 )
+from app.auth.session_binding import SessionBindingKey
 from app.auth.store import AccessStore
 from app.storage.database import Database
 from app.storage.migrations import migrate
@@ -130,6 +131,20 @@ class FakeRevoker:
         self.revocations += 1
 
 
+class Resolver:
+    def __init__(self, answer=None):
+        self.answer = (V4, V6) if answer is None else answer
+        self.calls = 0
+
+    def resolve(self, hostname):
+        self.calls += 1
+        if hostname != HOST:
+            raise AssertionError(hostname)
+        if isinstance(self.answer, BaseException):
+            raise self.answer
+        return self.answer
+
+
 class Clock:
     def __init__(self):
         self.value = 1000.0
@@ -142,6 +157,7 @@ def checker(files=None, status=None, sink=None, cfg=None, clock=None, **kwargs):
     files = files or Files()
     status = status or Status()
     sink = sink if sink is not None else Sink()
+    kwargs.setdefault("resolver", Resolver())
     check = HostnameReservationCheck(
         cfg or config(), ProcNetListeners(files, byteorder="little"), ServeStatusRoutes(status), sink,
         monotonic=clock or Clock(), utcnow=lambda: NOW, **kwargs)
@@ -566,7 +582,7 @@ class ExceptionFixture(TestCase):
 
         self.exception_store = ListenerExceptionStore(self.database)
         self.access = AccessStore(self.database, clock=lambda: NOW, audit=self.store,
-                                  unaudited_writes=True)
+                                  unaudited_writes=True, session_binding=SessionBindingKey.generate())
         self.revoker = ReservationSessionRevocation(self.access)
 
     def admin(self, files, **kwargs):
@@ -971,13 +987,13 @@ class SessionRevocationTests(ExceptionFixture):
 
     def session(self, identity, token, *, owner=False):
         if owner:
-            principal = self.access.bootstrap_owner(identity, "Synthetic owner")
+            principal = self.access.bootstrap_owner("Synthetic owner")
         else:
-            principal = self.access.invite(identity, "Synthetic viewer", (Permission.LIVE_VIEW,))
+            principal = self.access.invite("Synthetic viewer", (Permission.LIVE_VIEW,))
         secret = hashlib.sha256(token).digest()
         self.access.issue_enrollment(principal.id, secret, NOW + timedelta(minutes=5))
         credential = self.access.enroll_credential(secret, identity, b"credential-" + token, b"synthetic-key", -7, 0)
-        self.access.establish_session(principal.id, credential.credential_id, token)
+        self.access.establish_session(principal.id, credential.credential_id, token, proxy_identity=identity)
         return principal, credential
 
     def marker(self):
@@ -1006,7 +1022,7 @@ class SessionRevocationTests(ExceptionFixture):
     def test_reopen_after_violation_revokes_every_session_with_audit_first(self):
         owner, owner_credential = self.session("owner@example.invalid", b"o" * 32, owner=True)
         self.session("viewer@example.invalid", b"v" * 32)
-        pending = self.access.invite("pending@example.invalid", "Synthetic pending", (Permission.LIVE_VIEW,))
+        pending = self.access.invite("Synthetic pending", (Permission.LIVE_VIEW,))
         self.access.issue_enrollment(pending.id, b"p" * 32, NOW + timedelta(minutes=5))
         check, clock, sink = self.breached()
         self.assertEqual(self.marker(), "1")
@@ -1034,7 +1050,8 @@ class SessionRevocationTests(ExceptionFixture):
         with self.assertRaises(AccessValidationError):
             self.access.enroll_credential(b"p" * 32, "pending@example.invalid", b"pending", b"k", -7, 0)
         # Signing in again with the same credential works.
-        self.access.establish_session(owner.id, owner_credential.credential_id, b"n" * 32)
+        self.access.establish_session(owner.id, owner_credential.credential_id, b"n" * 32,
+                                      proxy_identity="owner@example.invalid")
         self.assertEqual(self.access.authorize(b"n" * 32, "owner@example.invalid", Permission.LIVE_VIEW).id,
                          owner.id)
         # A later pass with nothing pending does not revoke again.
@@ -1096,13 +1113,55 @@ class SessionRevocationTests(ExceptionFixture):
         self.assertEqual(self.revocation_records(), [])
         self.access.authorize(b"v" * 32, "viewer@example.invalid", Permission.LIVE_VIEW)
 
-    def test_exposure_marker_failure_is_reported(self):
+    def test_exposure_marker_failure_revokes_immediately(self):
         revoker = FakeRevoker()
         revoker.record_exposure = lambda: (_ for _ in ()).throw(OSError("synthetic marker failure"))
         check, files, _, sink = checker(session_revoker=revoker, files=Files(tcp=self.EXTRA))
         check.startup()
-        self.assertEqual(check.verdict.reasons, (Reason.UNEXPECTED_LISTENER, Reason.SESSION_REVOCATION_FAILED))
+        # Access is closed and the revocation has committed, so a restart that
+        # finds no marker cannot reopen with a session issued before exposure.
+        self.assertEqual(check.verdict.reasons, (Reason.UNEXPECTED_LISTENER,))
+        self.assertEqual(revoker.revocations, 1)
         files.files["tcp"] = proc(("127.0.0.1", 8080, "0A"))
+        self.assertTrue(check._check(CheckKind.RETRY).open)
+        self.assertEqual(revoker.revocations, 2)
+
+    def test_restart_after_marker_failure_does_not_reopen_with_old_sessions(self):
+        self.session("viewer@example.invalid", b"v" * 32)
+        revoker = ReservationSessionRevocation(self.access)
+        files = Files(tcp=self.EXTRA)
+        with patch.object(revoker, "record_exposure", side_effect=OSError("synthetic marker failure")):
+            check, _, _, _ = checker(exception_store=self.exception_store, session_revoker=revoker, files=files)
+            self.assertFalse(check.startup().open)
+        self.assertIsNone(self.marker())
+        files.files["tcp"] = proc(("127.0.0.1", 8080, "0A"))
+        restarted, _, _, _ = checker(exception_store=self.exception_store, session_revoker=revoker, files=files)
+        self.assertTrue(restarted.startup().open)
+        with self.assertRaises(AccessValidationError):
+            self.access.authorize(b"v" * 32, "viewer@example.invalid", Permission.LIVE_VIEW)
+
+    def test_undurable_requirement_is_retried_on_every_check(self):
+        revoker = FakeRevoker(fail=True)
+        marker = {"fail": True}
+
+        def record():
+            if marker["fail"]:
+                raise OSError("synthetic marker failure")
+            revoker.pending = True
+
+        revoker.record_exposure = record
+        check, files, _, sink = checker(session_revoker=revoker, files=Files(tcp=self.EXTRA))
+        self.assertEqual(check.startup().reasons,
+                         (Reason.UNEXPECTED_LISTENER, Reason.SESSION_REVOCATION_FAILED))
+        files.files["tcp"] = proc(("127.0.0.1", 8080, "0A"))
+        # The listener is gone, but the requirement is still only in memory.
+        self.assertEqual(check._check(CheckKind.RETRY).reasons, (Reason.SESSION_REVOCATION_FAILED,))
+        self.assertFalse(revoker.pending)
+        marker["fail"] = False
+        # The marker now commits; reopening still waits for the revocation.
+        self.assertEqual(check._check(CheckKind.RETRY).reasons, (Reason.SESSION_REVOCATION_FAILED,))
+        self.assertTrue(revoker.pending)
+        revoker.fail = False
         self.assertTrue(check._check(CheckKind.RETRY).open)
         self.assertEqual(revoker.revocations, 1)
 
@@ -1110,3 +1169,93 @@ class SessionRevocationTests(ExceptionFixture):
         for store in (None, AccessStore(self.database), object()):
             with self.subTest(store=store), self.assertRaises(ValueError):
                 ReservationSessionRevocation(store)
+
+
+class HostnameResolutionTests(TestCase):
+    def test_matching_resolution_opens(self):
+        resolver = Resolver()
+        check, _, _, _ = checker(resolver=resolver)
+        self.assertTrue(check.startup().open)
+        check._check(CheckKind.RETRY)
+        self.assertEqual(resolver.calls, 2)
+
+    def test_mapped_answer_matches(self):
+        mapped = ipaddress.IPv6Address("::ffff:100.64.0.10")
+        check, _, _, _ = checker(resolver=Resolver((mapped, V6)))
+        self.assertTrue(check.startup().open)
+
+    def test_listener_on_unlisted_resolved_address_is_an_exposure(self):
+        extra = ipaddress.IPv4Address("100.64.0.11")
+        revoker = FakeRevoker()
+        check, _, _, sink = checker(resolver=Resolver((V4, V6, extra)), session_revoker=revoker,
+                                    files=Files(tcp=proc(("127.0.0.1", 8080, "0A"), (str(extra), 8443, "0A"))))
+        verdict = check.startup()
+        self.assertEqual(verdict.reasons, (Reason.RESERVED_ADDRESSES_CHANGED, Reason.UNEXPECTED_LISTENER))
+        self.assertTrue(revoker.pending)
+        self.assertEqual(sink.events[-1].unexpected_listeners, 1)
+        self.assertNotIn("100.64.0.11", repr(sink.events[-1]))
+
+    def test_changed_resolution_closes_without_revocation(self):
+        resolver = Resolver((V4,))
+        revoker = FakeRevoker()
+        check, _, _, _ = checker(resolver=resolver, session_revoker=revoker)
+        self.assertEqual(check.startup().reasons, (Reason.RESERVED_ADDRESSES_CHANGED,))
+        self.assertFalse(revoker.pending)
+        resolver.answer = (V4, V6)
+        self.assertTrue(check._check(CheckKind.RETRY).open)
+        self.assertEqual(revoker.revocations, 0)
+
+    def test_failed_or_missing_resolution_fails_closed_as_exposure(self):
+        for resolver, reason in ((Resolver(OSError("synthetic resolver failure")),
+                                  Reason.HOSTNAME_RESOLUTION_UNAVAILABLE),
+                                 (Resolver(()), Reason.HOSTNAME_RESOLUTION_UNAVAILABLE),
+                                 (Resolver(("100.64.0.10",)), Reason.HOSTNAME_RESOLUTION_UNAVAILABLE),
+                                 (None, Reason.HOSTNAME_RESOLUTION_UNAVAILABLE)):
+            with self.subTest(resolver=resolver):
+                revoker = FakeRevoker()
+                check, _, _, _ = checker(resolver=resolver, session_revoker=revoker)
+                self.assertEqual(check.startup().reasons, (reason,))
+                self.assertTrue(revoker.pending)
+
+    def test_hung_resolution_times_out(self):
+        release = threading.Event()
+
+        class Hung:
+            def resolve(self, hostname):
+                release.wait(5)
+                return (V4, V6)
+
+        try:
+            check, _, _, _ = checker(resolver=Hung(), timeout=0.05)
+            self.assertEqual(check.startup().reasons, (Reason.HOSTNAME_RESOLUTION_TIMEOUT,))
+        finally:
+            release.set()
+
+    def test_getaddrinfo_resolver(self):
+        answers = [(10, 1, 6, "", ("fd7a:115c:a1e0::10", 0, 0, 0)),
+                   (2, 1, 6, "", ("100.64.0.10", 0)),
+                   (10, 1, 6, "", ("::ffff:100.64.0.10", 0, 0, 0)),
+                   (10, 1, 6, "", ("fe80::1%eth0", 0, 0, 2))]
+        calls = []
+
+        def lookup(*args):
+            calls.append(args)
+            return answers
+
+        resolved = GetaddrinfoResolver(lookup).resolve(HOST)
+        self.assertEqual(set(resolved), {V4, V6, ipaddress.IPv6Address("fe80::1")})
+        self.assertEqual(calls[0][0], HOST)
+        for failing in (lambda *args: [], lambda *args: (_ for _ in ()).throw(OSError("synthetic")),
+                        lambda *args: [(2, 1, 6, "", ("not-an-address", 0))]):
+            with self.subTest(failing=failing), self.assertRaises(ReservationEnumerationError):
+                GetaddrinfoResolver(failing).resolve(HOST)
+        with self.assertRaises(ValueError):
+            GetaddrinfoResolver(None)
+
+    def test_pure_evaluate_uses_union_of_resolved_and_configured(self):
+        extra = ipaddress.IPv4Address("100.64.0.11")
+        listeners = (HUMAN, Listener(extra, 22))
+        reasons, count, _ = evaluate(config(), listeners, (config().expected_route,), resolved=(V4, V6, extra))
+        self.assertEqual(reasons, (Reason.RESERVED_ADDRESSES_CHANGED, Reason.UNEXPECTED_LISTENER))
+        self.assertEqual(count, 1)
+        self.assertEqual(evaluate(config(), listeners, (config().expected_route,))[0], ())
