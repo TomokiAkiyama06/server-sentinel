@@ -93,6 +93,42 @@ implements neither pairing nor mTLS. The eventual listener must independently
 limit bytes before constructing an `AgentMessage`, remain separate from human
 routes, and provide the revocable authenticated session required by Issue #13.
 
+## Transport-neutral continuity core
+
+`continuity.py` sits in front of `ingest.py` and implements the Proposed
+ADR-0007 contract: Main-assigned session generations for an already
+mTLS-authenticated node, the `(source_id, capture_epoch, sequence,
+capture_time_ns)` media envelope (carried in full on each queued
+`AgentMessage`), commit-after-admission so backpressure makes
+the Agent retry rather than lose media, idempotent duplicate acknowledgement
+(duplicates and other early refusals still consume the node's rate budget),
+and bounded, coalescing gap events for skips and capture restarts (both
+recorded when first observed, even on a refused unit, and never twice), clock
+regressions and refused units.
+After a Main Server restart each source resumes from the durable
+`CommittedWatermark` supplied by the deployment, so already recorded units
+are never reported as loss; while that lookup fails the source is reported
+`degraded` (bounded, slot-limited) and nothing is committed. Known loss keeps a source flow `degraded` and a
+closed or stale session makes it `interrupted`; after a reconnect each source
+stays `interrupted` until it delivers media on the new session. Session generations are never
+reissued (also after `forget_node` and re-enrollment), `forget_node` also
+discards the node's ingest rate window under the tracker lock (so a
+re-enrolled node UUID never inherits the old credential's rate/clock state),
+and `forget_source`
+releases a deactivated source's slot and returns its undrained gaps; while
+that source's accepted units are still queued its committed position is kept
+outside the slot limit, so a retry after reactivation stays a `duplicate`. The
+node/source lifecycle commits a durable revocation or source deactivation
+inside `authorization_change` (tracker, or queue for direct queue users), so
+it is serialized with every grant, liveness refresh, charge and enqueue. On
+success, before the lock is released, the block forgets a revoked node with
+its sources and rate window and releases a deactivated source's slot, handing
+undrained gaps back to the caller. Tracked node
+sessions have their own hard bound, separate from the 1-4 active-source limit;
+this is flow continuity, not
+camera or node health. It opens no listener, selects no protocol and performs
+no cryptography; tests are synthetic only.
+
 Accept only narrow agent actions with bounded input. Agent credentials grant no
 human/admin API rights; the ingest listener exposes no dashboard routes. Do not
 require SSH access to capture nodes, change Tailscale policy, or route browser
