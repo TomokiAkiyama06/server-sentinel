@@ -89,6 +89,8 @@ class CaptureFactory:
         self.discovery = discovery
         self.instances = []
         self.block = None
+        # Set to an Event to make close() hang (STREAMOFF/unmap/close).
+        self.close_block = None
         self.lock = threading.Lock()
 
     def __call__(self, candidate, profile, *, verify_identity):
@@ -117,6 +119,9 @@ class CaptureFactory:
                 return VideoFrame(b"synthetic-frame", self.sequence, 1.0)
 
             def close(self):
+                close_block = factory.close_block
+                if close_block is not None:
+                    close_block.wait(30)
                 self.closed = True
 
         capture = Capture()
@@ -602,6 +607,44 @@ class RuntimeLifecycleTests(RuntimeFixture):
         self.assertIs(runtime.status().sources[0].state, SourceRuntimeState.RUNNING)
         self.assertTrue(wait_for(lambda: self.health(source.id) is not SourceHealthState.ONLINE))
         self.captures.block = None
+
+    def test_hung_teardown_notifies_offline_and_reports_unpersisted_first(self):
+        source = self.source()
+        offline = threading.Event()
+
+        def sink(event):
+            # Production wiring: local_preview.on_health() runs first here.
+            if event.state is CameraState.OFFLINE:
+                offline.set()
+
+        runtime = self.runtime(source.id, health_sink=sink)
+        runtime.start()
+        runtime.reapprove(self.admin, "synthetic-owner", source.id, self.camera)
+        self.assertTrue(self.wait_health(source.id, SourceHealthState.ONLINE))
+        release = threading.Event()
+        self.addCleanup(release.set)
+        original = self.registry.update_source_health
+
+        def hanging_write(source_id, **values):
+            if values.get("health_state") is SourceHealthState.OFFLINE and not release.is_set():
+                release.wait(30)
+            return original(source_id, **values)
+
+        self.registry.update_source_health = hanging_write
+        self.captures.close_block = release
+        # Unplug: the worker starts the teardown and hangs in close().
+        self.discovery.devices = []
+        # Before the descriptor is closed, the offline transition already
+        # reached the sink (preview invalidation) and the stale ONLINE row is
+        # reported unpersisted.
+        self.assertTrue(offline.wait(5))
+        self.assertTrue(wait_for(lambda: not runtime.status().sources[0].health_persisted))
+        self.assertFalse(all(capture.closed for capture in self.captures.instances))
+        self.assertIs(self.health(source.id), SourceHealthState.ONLINE)
+        self.captures.close_block = None
+        release.set()
+        self.assertTrue(self.wait_health(source.id, SourceHealthState.OFFLINE))
+        self.assertTrue(wait_for(lambda: runtime.status().sources[0].health_persisted))
 
     def test_teardown_closes_the_descriptor_despite_hung_health_io(self):
         source = self.source()

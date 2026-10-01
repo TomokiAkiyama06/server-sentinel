@@ -92,9 +92,11 @@ deadlines or checking other sources. A
 transient stall keeps the recorded negotiated profile. Closing a capture lowers the source to `offline`
 (`video_capture_closed`) in memory before the potentially blocking
 `STREAMOFF`/unmap/close, so a hung kernel teardown never leaves it `online`;
-the registry write and health notification are handed to background threads
-only after the descriptor is closed, so hung storage or a hung health sink
-never keeps it open. Stopping a source then waits at most
+the registry write and health notification (live-preview invalidation) are
+handed to background threads at that point, before the teardown, so neither
+waits for a hanging close, the source is reported unpersisted until the
+offline row is durable, and hung storage or a hung health sink never keeps
+the descriptor open. Stopping a source then waits at most
 `HEALTH_SETTLE_SECONDS` (1 s, inside the supervisor join bound) for that
 write, so a clean shutdown normally leaves the row durable; a write still
 hung leaves the source reported unpersisted.

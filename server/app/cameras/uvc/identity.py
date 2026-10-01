@@ -194,9 +194,6 @@ class ReconnectController:
         self._handoff_running = False
         self._handoff_pending = False
         self.delivery_failures = 0
-        # A close transition recorded in memory by capture_closing() whose
-        # persistence and notification capture_closed() still owes.
-        self._close_pending = False
 
     def _persist(self):
         if self.store is not None:
@@ -440,32 +437,38 @@ class ReconnectController:
         self._transition(CameraState.OFFLINE, "video_capture_failed")
 
     def capture_closing(self):
-        """In-memory part of closing a capture, before the kernel teardown.
+        """Close transition before the kernel teardown, without blocking.
 
         Only a continuously open capture descriptor can retain a weak live
         binding, so it is invalidated here (even when a subsequent approval
         operation fails), and an ``online``/``degraded`` source is lowered to
-        ``offline``. Nothing here persists or notifies: that I/O can hang and
-        must not keep the descriptor open (see ``capture_closed``).
+        ``offline`` in memory. The teardown that follows may hang, so the
+        transition's I/O is handed off now rather than after it: the
+        non-blocking flush marks the source unpersisted at once (in memory)
+        and leaves the registry write to the background health writer, and
+        the notification (live-preview invalidation first) goes to the
+        background delivery thread. Neither can block the teardown.
         """
         self.bound = None
         with self.lock:
-            if self.state in (CameraState.DEGRADED, CameraState.ONLINE):
-                self._close_pending |= self._set_state(CameraState.OFFLINE, "video_capture_closed")
+            changed = (self.state in (CameraState.DEGRADED, CameraState.ONLINE)
+                       and self._set_state(CameraState.OFFLINE, "video_capture_closed"))
+        try:
+            if changed:
+                self._flush(blocking=False)
+        finally:
+            self._deliver(blocking=False)
 
     def capture_closed(self):
-        """After the descriptor is closed: persist and notify, never blocking.
+        """After the descriptor is closed; never blocks on health I/O.
 
-        Persistence goes to the background health writer and notification to
-        the background delivery thread, so a hung registry write or health
-        sink cannot keep a teardown (or a bounded shutdown) waiting.
+        Normally ``capture_closing`` already reported the transition. A close
+        reached without it is reported the same non-blocking way.
         """
         self.bound = None
         with self.lock:
-            changed = self._close_pending
-            self._close_pending = False
-            if self.state in (CameraState.DEGRADED, CameraState.ONLINE):
-                changed |= self._set_state(CameraState.OFFLINE, "video_capture_closed")
+            changed = (self.state in (CameraState.DEGRADED, CameraState.ONLINE)
+                       and self._set_state(CameraState.OFFLINE, "video_capture_closed"))
         try:
             if changed:
                 self._flush(blocking=False)

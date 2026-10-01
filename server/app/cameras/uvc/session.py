@@ -84,9 +84,10 @@ class CaptureSession:
         # close can block, and with progress tracking already cleared the
         # off-worker check could no longer lower an ``online`` claim. Dropping
         # the weak binding before the descriptor closes is only stricter. The
-        # potentially blocking registry write and health notification are
-        # handed off only after the descriptor is closed, so hung storage or
-        # a hung sink never keeps it open.
+        # registry write and health notification (live-preview invalidation)
+        # are handed to background threads right then, so neither waits for
+        # a hanging teardown, and hung storage or a hung sink never keeps
+        # the descriptor open.
         try:
             self.controller.capture_closing()
         finally:
