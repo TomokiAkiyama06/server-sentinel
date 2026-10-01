@@ -21,6 +21,9 @@ class NotificationKind(StrEnum):
     # recording-health verdict). They are never an immediate Slack message.
     HARDWARE_INTEGRITY_WARNING = "hardware_integrity_warning"
     RECORDING_HEALTH_WARNING = "recording_health_warning"
+    # Capture-node certificate approaching expiry without renewal, expired, or
+    # a refused renewal (Issue #13). Local Owner-visible warning only.
+    CAPTURE_CREDENTIAL_WARNING = "capture_credential_warning"
     PERSON = "person"
     MOTION = "motion"
     ENTRY = "entry"
@@ -141,11 +144,16 @@ class NotificationService:
             self.local_delivery_failed = True
             return False
 
-    def _retain(self, event: NotificationEvent) -> None:
-        """Keep a refused local write for retry; a full buffer stays visible."""
+    def _retain(self, event: NotificationEvent) -> bool:
+        """Keep a refused local write for retry; a full buffer stays visible.
+
+        Returns whether the event is retained (and so retried on poll).
+        """
         self.local_delivery_failed = True
         if event.event_id in self._unpersisted or len(self._unpersisted) < self._capacity:
             self._unpersisted[event.event_id] = event
+            return True
+        return False
 
     def _flush_unpersisted(self) -> None:
         for identifier, event in tuple(self._unpersisted.items()):
@@ -238,8 +246,11 @@ class NotificationService:
                      or confirmed and kind in {NotificationKind.SERVER_MOVEMENT,
                                                NotificationKind.CAMERA_TAMPER})
         if not immediate:
-            if not self._local(event):
-                self._retain(event)
+            # SUPPRESSED: written locally, or retained for the poll retry.
+            # FAILED: the write was refused and the retry buffer is full, so
+            # the event is dropped; the caller must not count it as recorded.
+            if not self._local(event) and not self._retain(event):
+                return DeliveryResult.FAILED
             return DeliveryResult.SUPPRESSED
         return self._enqueue(event, f"ServerSentinel critical alert: {kind.value}", on_complete,
                              retain=True)

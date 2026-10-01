@@ -193,3 +193,141 @@ camera, mount, account or network policy is modified by this proposal.
 ## Decision record
 
 Accepted by the repository Owner on 2026-09-21: local-CA public bundle and trusted transfer, local privileged Main approval plus non-root Agent pairing, approved-public-key binding, TLS 1.3, and a 128-bit/five-minute/one-use code. The existing #6 Owner-authentication and #4 GitHub-App decisions remain separate; this ADR neither repeats nor resolves them.
+
+## Follow-up notes (2026-09-30, Issue #13 mTLS adapters)
+
+These notes record implementation progress; they do not change this ADR's
+status or decision.
+
+- **Dependency.** The Owner approved `cryptography` 50.0.1 on 2026-09-30
+  (`docs/decisions/2026-09-30-cryptography-dependency.md`, the single approval
+  shared with Issue #10), resolving item 4 of the implementation plan above. The
+  exact release, wheel hashes, statically linked OpenSSL 4.0.2, Rust crate
+  closure and notices are audited in `server/docs/DEPENDENCIES.md` (Main) and
+  `agent/docs/DEPENDENCIES.md` (Agent lock). TLS remains stdlib `ssl`.
+- **Main issuer** (`server/app/cameras/remote_agent/node_ca.py`): EC P-256
+  deployment CA (`pathlen=0`) whose key lives in a 0700 directory with 0600
+  write-once files; a separate directory holds the serverAuth-only Main ingest
+  certificate/key, so the listener never needs the CA key. Node certificates are
+  issued only for a redeemed `EnrollmentClaim`; the CSR is proof of possession of
+  the approved key and its subject/extensions are ignored. The leaf carries
+  `CA=false`, `digitalSignature`, EKU `clientAuth` only, and exactly the SAN URIs
+  `urn:serversentinel:capture-node:<node UUID>` and
+  `urn:serversentinel:deployment:<deployment UUID>`. Validity is an explicit,
+  bounded parameter (at most 397 days for leaves, never beyond the CA). The
+  Owner later set the default and renewal policy; see the renewal note below.
+  Signing happens after ledger consumption; the ledger's
+  `credential_serial_digest` stores the SHA-256 of the exact DER certificate, and
+  activation happens only after signing succeeds.
+- **Trust bundle.** `export_trust_bundle` emits format version, deployment UUID,
+  CA certificate, Main server name and explicit endpoint, with its full SHA-256
+  digest; the Agent refuses a bundle whose digest does not match the value the
+  Owner verified independently.
+- **Ingest adapter** (`server/app/cameras/remote_agent/ingest_tls.py`): TLS 1.3
+  only, client certificate required, deployment CA as the only trust anchor,
+  `VERIFY_X509_STRICT`, no session tickets. Admission re-parses the peer leaf and
+  requires the ledger's current active record for node, key digest and
+  certificate digest on every connection; `still_admitted()` re-checks before
+  queued work commits and closes the session after revocation. Listener
+  configuration refuses wildcard binds and the human listener's address/port.
+  The application does not start this listener; it stays disabled until #14/#15
+  wire it with their byte, connection and rate limits.
+- **Agent** (`agent/media_capture_agent/node_tls.py`): non-root EC P-256 key
+  generation into a write-once 0600 file under a 0700 runtime directory, CSR with
+  an empty subject, trust-bundle parsing, issued-credential validation (own key,
+  deployment CA, capture-only scope) before `NodeCredentialStore.install`, and a
+  TLS 1.3 client context pinned to the deployment CA with hostname verification
+  and no key-log support.
+- **Evidence.** Real loopback TLS tests with temporary CAs cover mutual-auth
+  success; wrong CA (both directions), expired client and server certificates,
+  wrong server name, missing client certificate, plaintext, TLS 1.2 downgrade,
+  orphan (unactivated) certificate, revocation of new and open sessions, role
+  confusion between Main and node certificates, file modes, and absence of key
+  material in logs, argv, environment and key-log files. A cross-process E2E
+  (`tests/e2e/test_capture_mtls_scenarios.py`) runs the Agent side in separate
+  processes.
+- **Still open for #13 acceptance.** The bootstrap enrollment listener and wire
+  protocol, the local Main approval CLI and Agent pairing CLI, crash-boundary
+  fault injection, multi-process concurrent redemption over a real listener, and
+  real LAN interoperability (MANUAL_TEST §B) are not implemented or verified by
+  this change.
+- **Validity and automatic renewal (Owner decision 2026-09-30).** This answers
+  the "credential validity periods and future unattended renewal" policy that the
+  Atomicity section above required before renewal could ship. Node leaves default to 397 days (still capped at
+  397) and renew automatically; revocation and CA replacement rules above are
+  unchanged. Implementation (`server/app/cameras/remote_agent/renewal.py`,
+  `agent/media_capture_agent/node_tls.py`):
+  - *Window and retries.* The Agent starts renewing 30 days before expiry and
+    retries with exponential backoff from 1 hour, doubling to at most 24 hours.
+    It reuses one fresh renewal key (0600, `pending-renewal/`) across retries.
+  - *Eligibility.* The Main issues a renewal only for the node identity of the
+    presenting mTLS session. That exact credential must still be the ledger's
+    active, unexpired credential. The CSR must be for a new EC P-256 key that is
+    not bound to any node, with an empty subject and no extensions. Revoked,
+    expired or superseded credentials cannot renew; the node must re-pair with a
+    fresh Owner approval.
+  - *Supersession.* The renewed certificate is staged in the ledger (one per
+    node; a retry replaces it; staging writes no audit record, so repeated
+    requests cannot grow the audit table). The old certificate stays admitted
+    until the renewed one is first presented. That admission atomically promotes
+    it and appends an `activate_capture_node_credential` record (actor `system`).
+    From then on only the new certificate is admitted, even though the old one
+    has not expired. This keeps exactly one active credential per node, so
+    revocation and audit stay per node. An Agent that never received or
+    installed the response is not locked out: it keeps its old certificate and
+    retries. Revocation deletes any staged renewal.
+  - *Key uniqueness (Owner decision 2026-09-30).* A node public key is bound
+    to at most one node, for good. `pairing_key_bindings` records every key
+    the ledger approves, activates, stages or promotes and is never pruned. Approval,
+    activation, renewal staging and promotion each refuse, in their own write
+    transaction, a key that is bound to (or staged for) another node, whatever
+    that node's credential state. Revocation marks all of the node's keys
+    revoked, and a revoked key is never bound again, even to the same node.
+    Main issues the renewed certificate before staging, so staging binds the
+    new key permanently before the staged row is written. That binding
+    survives a retry that replaces the staged row and a revocation before
+    promotion (revocation marks it revoked like the node's other keys), so a
+    key Main issued a certificate for is never bound to another node. Because
+    each renewal retry with a fresh key adds a binding, a node may hold at most
+    1024 bindings; beyond that, staging is refused (`renewal_not_eligible`,
+    which raises the Owner signal below) and the node must re-pair. The Agent
+    retries at most about 40 times per 30-day renewal window, so a legitimate
+    node stays far below the cap. A key already bound to the node is
+    accepted only as a retry of the currently staged renewal (same key as the
+    staged row), without a new binding; a superseded key of the node, or an
+    earlier staged key arriving after a newer one, is refused, so a superseded
+    key is never re-staged and a newer staged renewal is never replaced by an
+    older one. Migration 19 backfills the keys
+    that existing enrollment and credential rows still record; if one legacy
+    key digest appears under two node IDs (any state), the migration fails
+    closed and blocks startup rather than silently picking one binding, and
+    the Owner must remediate the conflicting rows first. It also fails closed
+    when a key digest is revoked in one row yet still live in another (an
+    active credential, or a pending or consumed enrollment, which the old
+    schema allowed by re-approving a revoked key): recording a revoked binding
+    would not stop the live credential, so the Owner must first revoke or
+    remove the live use. Keys superseded
+    before that migration are not recoverable.
+  - *Agent rotation.* `NodeCredentialStore.rotate` atomically replaces the
+    committed generation (rename over `current.json`) for the same node and
+    deployment only, then removes the superseded files.
+  - *Owner signal.* `CaptureCredentialMonitor` raises the local, Owner-visible
+    `capture_credential_warning` notification through the injected notification
+    hook in three cases: an active credential within 14 days of expiry (the
+    Agent has retried for at least 16 days by then), an expired credential, or
+    a refused renewal. Each is reported once per credential (or once per node,
+    reason and day for refusals), counted only once the hook confirms it:
+    the hook (`NotificationService.record`) must return a `DeliveryResult`, and
+    only `suppressed`/`pending`/`sent`/`disabled` (written locally, or retained
+    by the service for its own retry) confirm. `failed` (refused write with the
+    retry buffer full, so the event was dropped), any other value or an
+    exception leaves it unreported; the next check or refusal retries it with
+    the same deterministic `event_id`, so the local sink upserts rather than
+    duplicates. It is not an immediate Slack alert; changing
+    that is a separate notification-policy decision.
+  - *Not wired yet.* The renewal request and response travel over the ingest
+    session that #14/#15 will carry. `ingest.py`/`continuity.py` are unchanged,
+    and no scheduler or listener runs the renewal or the monitor yet.
+  - The schema change is migration 19 (`pairing_credential_renewal`), after
+    main's 17 (`human_access_webauthn`, PR #97) and 18
+    (`human_access_shared_identity`, PR #107).
