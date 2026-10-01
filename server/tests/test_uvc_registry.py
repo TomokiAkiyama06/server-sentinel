@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import tempfile
 import threading
+import time
 import unittest
 from unittest.mock import patch
 from uuid import uuid4
@@ -98,14 +99,22 @@ class UvcRegistryTests(UvcRegistryFixture):
         # Past the stall window, still inside the reopen bound.
         now[0] += 2
         self.assertTrue(self.adapter.check_frame_progress(self.source.id))
+        self.assertEqual("video_frame_stalled", self.events[-1].reason)
+        # The watchdog hands the registry write to a background thread.
+        self._wait_persisted()
         self.assertEqual(SourceHealthState.DEGRADED,
                          self.registry.get_source(self.source.id).health_state)
-        self.assertEqual("video_frame_stalled", self.events[-1].reason)
         # Frames resuming is the only way back to online.
         self.assertTrue(self.adapter.poll_source(self.source.id))
         self.assertEqual(SourceHealthState.ONLINE,
                          self.registry.get_source(self.source.id).health_state)
         self.assertFalse(self.adapter.check_frame_progress(uuid4()))
+
+    def _wait_persisted(self, timeout=5.0):
+        deadline = time.monotonic() + timeout
+        while self.adapter.health_unpersisted(self.source.id) and time.monotonic() < deadline:
+            time.sleep(0.005)
+        self.assertFalse(self.adapter.health_unpersisted(self.source.id))
 
     def _approved_online(self):
         class PermitOwner:
@@ -130,6 +139,7 @@ class UvcRegistryTests(UvcRegistryFixture):
                          self.registry.get_source(self.source.id).negotiated_capture_profile)
         now[0] += 2
         self.assertTrue(self.adapter.check_frame_progress(self.source.id))
+        self._wait_persisted()
         stalled = self.registry.get_source(self.source.id)
         self.assertEqual(SourceHealthState.DEGRADED, stalled.health_state)
         # The descriptor stays open with the same profile during a stall.

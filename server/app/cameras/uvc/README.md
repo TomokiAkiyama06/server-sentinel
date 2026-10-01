@@ -84,8 +84,11 @@ each transition in memory under it; a per-source writer persists the merged
 latest values after the lock is released, one write at a time, and logging and
 the health sink receive the events (in order) after that, also outside the
 lock. The source is marked unpersisted from the start of a write until every
-staged value is durable, so a hung write never reads as persisted; a watchdog
-report that finds a write in flight leaves its values to that writer. A
+staged value is durable, so a hung write never reads as persisted. A watchdog
+report never writes the registry itself: it marks the source unpersisted and
+hands the write to at most one background writer thread per source, so a hung
+SQLite or storage write cannot stop the watchdog from enforcing reopen
+deadlines or checking other sources. A
 transient stall keeps the recorded negotiated profile. Closing a capture reports
 `offline` (`video_capture_closed`) before the potentially blocking
 `STREAMOFF`/unmap/close, so a hung kernel teardown never leaves the source

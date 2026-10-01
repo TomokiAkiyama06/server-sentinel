@@ -534,6 +534,50 @@ class RuntimeLifecycleTests(RuntimeFixture):
                                              for capture in self.captures.instances)))
         self.assertTrue(wait_for(lambda: self.health(source.id) is SourceHealthState.OFFLINE))
 
+    def test_hung_stall_write_does_not_stop_the_watchdog_for_other_sources(self):
+        second_camera = DeviceEvidence("/dev/video2", "synthetic", "model", "serial-b")
+        self.discovery.devices = [self.camera, second_camera]
+        first, second = self.source("First"), self.source("Second")
+        runtime = self.runtime(first.id, second.id)
+        runtime.start()
+        runtime.reapprove(self.admin, "synthetic-owner", first.id, self.camera)
+        runtime.reapprove(self.admin, "synthetic-owner", second.id, second_camera)
+        self.assertTrue(self.wait_health(first.id, SourceHealthState.ONLINE))
+        self.assertTrue(self.wait_health(second.id, SourceHealthState.ONLINE))
+        armed, hung, release = threading.Event(), [], threading.Event()
+        self.addCleanup(release.set)
+        original = self.registry.update_source_health
+
+        def hanging_write(source_id, **values):
+            if armed.is_set() and values.get("health_state") is not SourceHealthState.ONLINE:
+                with self.frame_lock:
+                    first_hang = not hung
+                    if first_hang:
+                        hung.append(source_id)
+                if first_hang:
+                    # SQLite/storage hangs indefinitely on the first stall write.
+                    release.wait(30)
+            return original(source_id, **values)
+
+        self.registry.update_source_health = hanging_write
+        block = threading.Event()
+        self.addCleanup(block.set)
+        armed.set()
+        # Both workers block in a kernel read, so only the watchdog can
+        # report their stalls.
+        self.captures.block = block
+        self.assertTrue(wait_for(lambda: bool(hung)))
+        other = second.id if hung[0] == first.id else first.id
+        self.assertTrue(wait_for(lambda: self.health(other) is not SourceHealthState.ONLINE, 8))
+        # The hung source's in-memory state left online too.
+        status = runtime.status()
+        hung_source = next(item for item in status.sources if item.source_id == hung[0])
+        self.assertFalse(hung_source.health_persisted)
+        self.assertIsNot(hung_source.camera_state, CameraState.ONLINE)
+        self.captures.block = None
+        block.set()
+        release.set()
+
     def test_worker_blocked_through_a_refused_reapproval_stays_watched(self):
         source = self.source()
         runtime = LocalUvcRuntime(

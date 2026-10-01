@@ -39,11 +39,18 @@ class _HealthWriter:
     transition lock, so staged values always follow transition order. A
     flush writes the merged latest values outside that lock; merging is
     equivalent to applying the partial updates in order. At most one write
-    is in flight: a non-blocking flush that finds one running leaves its
-    values to that writer, which re-reads the staged values after its write.
+    is in flight, and that writer re-reads the staged values after its write.
     The source is marked unpersisted before any write begins and cleared only
     once every staged value is durable, so the runtime reports the in-memory
     state instead of a stale durable row while a write is in flight or hung.
+
+    A non-blocking flush (the supervisor watchdog) never writes itself: even
+    an uncontended registry write can hang in SQLite or storage, and the
+    single watchdog thread must keep enforcing reopen deadlines and checking
+    other sources. It marks the source unpersisted and hands the write to at
+    most one background thread per source, which flushes until nothing new
+    is staged or a write fails (the failed values stay staged for the next
+    flush).
     """
 
     def __init__(self, write, mark):
@@ -52,18 +59,55 @@ class _HealthWriter:
         self._staged_lock = threading.Lock()
         self._io = threading.Lock()
         self._staged = None
+        self._handoff_lock = threading.Lock()
+        self._handoff_running = False
+        self._handoff_pending = False
 
     def stage(self, **values):
         with self._staged_lock:
             self._staged = {**(self._staged or {}), **values}
 
-    def flush(self, *, blocking=True):
+    def _handoff(self):
+        with self._handoff_lock:
+            if self._handoff_running:
+                # The running thread re-checks before it exits.
+                self._handoff_pending = True
+                return
+            self._handoff_running = True
+            self._handoff_pending = False
+        thread = threading.Thread(target=self._drain_handoff, daemon=True,
+                                  name="serversentinel-local-uvc-health-write")
+        try:
+            thread.start()
+        except BaseException:
+            with self._handoff_lock:
+                self._handoff_running = False
+            raise
+
+    def _drain_handoff(self):
         while True:
-            if not self._io.acquire(blocking=blocking):
-                with self._staged_lock:
-                    if self._staged is not None:
-                        self._mark(True)
-                return False
+            try:
+                self.flush()
+            except Exception:
+                # Values stay staged and the source unpersisted; the next
+                # flush retries. Exception text is never logged here.
+                pass
+            with self._handoff_lock:
+                if not self._handoff_pending:
+                    self._handoff_running = False
+                    return
+                self._handoff_pending = False
+
+    def flush(self, *, blocking=True):
+        if not blocking:
+            with self._staged_lock:
+                if self._staged is None:
+                    return True
+                self._mark(True)
+            self._handoff()
+            return False
+        while True:
+            self._io.acquire()
             try:
                 with self._staged_lock:
                     values, self._staged = self._staged, None
