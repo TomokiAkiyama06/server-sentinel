@@ -72,20 +72,27 @@ class Runtime:
                     start_ms: int = 10000, end_ms: int = 20000, stream_id: str = "s",
                     sequence: int | None = None) -> str:
         """Link a ready segment; by default from the recording's own source,
-        as the recording store only links source-matched overlapping media."""
+        as the recording store only links source-matched overlapping media,
+        and continuing the latest linked segment's stream (no marker due)."""
         segment_id = str(uuid4())
-        if source_id is None:
-            with closing(sqlite3.connect(self.database)) as connection:
+        with closing(sqlite3.connect(self.database)) as connection:
+            if source_id is None:
                 source_id = connection.execute(
                     "SELECT source_id FROM recordings WHERE id=?", (recording_id,)).fetchone()[0]
+            if sequence is None:
+                latest = connection.execute(
+                    "SELECT s.stream_id, s.sequence FROM recording_segments s "
+                    "JOIN recording_links l ON l.segment_id=s.id WHERE l.recording_id=? "
+                    "ORDER BY s.start_ms DESC, s.end_ms DESC LIMIT 1", (recording_id,)).fetchone()
+                sequence = (latest[1] + 1 if latest is not None and latest[0] == stream_id
+                            else self.clock)
         if write_file:
             self.segment_file(segment_id, payload)
         self.execute(
             "INSERT INTO recording_segments (id, source_id, stream_id, sequence, start_ms, "
             "end_ms, codec, container, byte_length, sha256, state, spool) "
             "VALUES (?, ?, ?, ?, ?, ?, 'synthetic', 'deflate', ?, ?, 'ready', 0)",
-            (segment_id, source_id, stream_id, self.clock if sequence is None else sequence,
-             start_ms, end_ms, len(payload),
+            (segment_id, source_id, stream_id, sequence, start_ms, end_ms, len(payload),
              hashlib.sha256(catalog_payload if catalog_payload is not None
                             else payload).hexdigest()))
         self.clock += 1
@@ -319,6 +326,158 @@ class LifecycleInventoryTests(unittest.TestCase):
                            "external_identity", "display_name", "secret_digest",
                            "token_digest", "public_key", "label"):
                 self.assertNotIn(marker, text, path.name)
+
+    def test_credential_marked_inconsistent_is_not_active(self):
+        # An inconsistent credential cannot authenticate (effective status
+        # INCONSISTENT), so it no longer counts as active.
+        seeded = self.runtime.seed()
+        _, baseline = self.record()
+        self.runtime.execute(
+            "UPDATE access_credentials SET inconsistent_at_us=5, "
+            "inconsistency_reason='backup_eligibility_changed' WHERE principal_id=?",
+            (seeded["owner"],))
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_FAILED)
+        self.assertIn({"id": seeded["owner"], "reason": "changed"},
+                      report["sections"]["access_principals"]["failed"])
+
+    def test_invitation_validity_changes_are_detected_without_secrets(self):
+        # Each change below makes an unredeemed code unusable; none involves
+        # the secret digest, which stays out of the output.
+        self.runtime.seed()
+        live = self.runtime.principal("invited_user", ("live:view",), status="invited")
+        changes = {
+            "attempts": "UPDATE access_invitations SET attempt_count=5 WHERE id=?",
+            "expiry": "UPDATE access_invitations SET expires_at_us=1 WHERE id=?",
+            "revision": "UPDATE access_invitations SET principal_revision=7 WHERE id=?",
+            "generation": "UPDATE access_invitations SET deployment_generation=7 WHERE id=?",
+        }
+        ids = {}
+        for index, label in enumerate(changes):
+            ids[label] = str(uuid4())
+            self.runtime.execute(
+                "INSERT INTO access_invitations (id, secret_digest, principal_id, "
+                "principal_revision, deployment_generation, issued_at_us, expires_at_us, "
+                "redeemed_at_us, revoked_at_us, attempt_count) "
+                "VALUES (?, ?, ?, 0, 0, 1, 10, NULL, NULL, 0)",
+                (ids[label], bytes([index + 1]) * 32, live))
+        _, baseline = self.record()
+        for label, statement in changes.items():
+            self.runtime.execute(statement, (ids[label],))
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_FAILED)
+        failed = report["sections"]["access_invitations"]["failed"]
+        for label in changes:
+            self.assertIn({"id": ids[label], "reason": "changed"}, failed)
+        for path in self.notes.iterdir():
+            for index in range(len(changes)):
+                self.assertNotIn((bytes([index + 1]) * 32).hex(), path.read_text())
+
+    def test_deployment_generation_advance_invalidates_recorded_invitations(self):
+        self.runtime.seed()
+        _, baseline = self.record()
+        recorded = json.loads(baseline.read_text())["access"]["invitations"]
+        self.runtime.execute(
+            "UPDATE access_deployment_state SET authorization_generation=1 WHERE singleton=1")
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_FAILED)
+        failed = report["sections"]["access_invitations"]["failed"]
+        for invitation_id in recorded:
+            self.assertIn({"id": invitation_id, "reason": "changed"}, failed)
+
+    def test_camera_source_configuration_and_approval_are_preserved_privately(self):
+        self.runtime.seed()
+        serial, device = "synthetic-serial-marker-0001", "/dev/synthetic-video-marker"
+
+        def evidence(serial_value: str, path: str = device, token=None) -> str:
+            return json.dumps({
+                "device_path": path, "vendor": "1d6b", "product": "0102",
+                "serial": serial_value, "interface": "0",
+                "by_id": ["usb-synthetic-by-id-marker"], "topology": "synthetic-topology-marker",
+                "formats": ["MJPG"], "device_number": 3, "instance_token": token})
+        labels = ("steady", "disabled", "profile", "binding", "approval", "requires", "health")
+        ids = {}
+        for label in labels:
+            ids[label] = self.runtime.source()
+            self.runtime.execute(
+                "INSERT INTO uvc_approvals (source_id, evidence, requires_approval, "
+                "session_token, serial_ambiguous, explicit_binding) VALUES (?, ?, 0, ?, 0, 0)",
+                (ids[label], evidence(serial + label), "synthetic-session-" + label))
+        _, baseline = self.record()
+        # Volatile live state: re-enumeration, a new session, health, timestamps.
+        self.runtime.execute(
+            "UPDATE uvc_approvals SET evidence=?, session_token=NULL WHERE source_id=?",
+            (evidence(serial + "steady", "/dev/synthetic-other", [1, 2, 3]), ids["steady"]))
+        self.runtime.execute(
+            "UPDATE camera_sources SET health_state='online', last_seen_at='2026-02-01', "
+            "updated_at='2026-02-01', negotiated_capture_profile='{}' WHERE id=?",
+            (ids["health"],))
+        # Operational configuration and durable approval changes.
+        self.runtime.execute("UPDATE camera_sources SET enabled=0 WHERE id=?", (ids["disabled"],))
+        self.runtime.execute("UPDATE camera_sources SET desired_capture_profile='{\"fps\":5}' "
+                             "WHERE id=?", (ids["profile"],))
+        self.runtime.execute(
+            "INSERT INTO detection_bindings VALUES (?, 'person', 'person', 1, 1, '{}', '{}')",
+            (ids["binding"],))
+        self.runtime.execute("UPDATE uvc_approvals SET evidence=? WHERE source_id=?",
+                             (evidence(serial + "replaced"), ids["approval"]))
+        self.runtime.execute("UPDATE uvc_approvals SET requires_approval=1 WHERE source_id=?",
+                             (ids["requires"],))
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_FAILED)
+        section = report["sections"]["camera_sources"]
+        for label in ("steady", "health"):
+            self.assertIn(ids[label], section["preserved"])
+        for label in ("disabled", "profile", "binding", "approval", "requires"):
+            self.assertIn({"id": ids[label], "reason": "changed"}, section["failed"])
+        for path in self.notes.iterdir():
+            text = path.read_text()
+            for marker in (serial, device, "synthetic-by-id-marker", "synthetic-topology-marker",
+                           "synthetic-session-", "1d6b"):
+                self.assertNotIn(marker, text, path.name)
+
+    def test_presence_and_storage_audit_rows_are_preserved(self):
+        self.runtime.seed()
+        for index in range(3):
+            self.runtime.execute(
+                "INSERT INTO presence_audit (action, actor, at, state, target) "
+                "VALUES ('override', 'owner', ?, 'away', NULL)", (f"2026-01-0{index + 1}",))
+            self.runtime.execute(
+                "INSERT INTO storage_state_audit (at_ms, previous_state, current_state) "
+                "VALUES (?, 'normal', 'pressure')", (index,))
+        _, baseline = self.record()
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(report["sections"]["audit_presence"]["preserved_rows"], 3)
+        self.assertEqual(report["sections"]["audit_storage_state"]["preserved_rows"], 3)
+        self.runtime.execute("UPDATE presence_audit SET state='home' WHERE sequence=2")
+        self.runtime.execute("DELETE FROM storage_state_audit WHERE id=1")
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_FAILED)
+        self.assertEqual(report["sections"]["audit_presence"]["failed"],
+                         [{"id": "2", "reason": "changed"}])
+        self.assertEqual(report["sections"]["audit_storage_state"]["failed"],
+                         [{"id": "1", "reason": "missing"}])
+
+    def test_in_progress_growth_requires_the_marker_of_a_discontinuous_publication(self):
+        # _publish() links the segment and adds its marker in one transaction.
+        self.runtime.seed()
+        marked = self.runtime.recording(starred=False, payload=b"generated-marked",
+                                        status="active", target_end_ms=20000)
+        unmarked = self.runtime.recording(starred=False, payload=b"generated-unmarked",
+                                          status="active", target_end_ms=20000)
+        _, baseline = self.record()
+        for recording_id in (marked, unmarked):
+            self.runtime.add_segment(recording_id, b"generated-restart-" + recording_id.encode(),
+                                     start_ms=11000, end_ms=20000, stream_id="restarted",
+                                     sequence=0)
+        self.runtime.execute(
+            "INSERT INTO recording_discontinuities VALUES (?, 10000, 11000, "
+            "'stream_discontinuity')", (marked,))
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_FAILED)
+        section = report["sections"]["recordings"]
+        self.assertEqual(section["in_progress_at_record"], [marked])
+        self.assertIn({"id": unmarked, "reason": "changed"}, section["failed"])
 
     def test_grant_and_revocation_state_is_preserved_by_logical_id(self):
         seeded = self.runtime.seed()

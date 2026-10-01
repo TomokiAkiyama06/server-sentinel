@@ -333,10 +333,21 @@ control integrity, playback or retention (`byte_length`, `stream_id` /
 `sequence`, `codec`, `container`, capture node and critical flag) and the
 SHA-256, size and hard-link count of its file as read from disk (the recording
 store treats a file with more than one link as corrupt); a per-row and a chained SHA-256 over every
-retained `security_admin_audit_records` and `integrity_audit` row; registered
-camera source IDs and types; and Owner presence plus each principal's independent
-`live:view` / `recordings:view` grants, invitation redemption and revocation
-state. It never writes principal external identities or display names,
+retained `security_admin_audit_records`, `integrity_audit`, `presence_audit`
+and `storage_state_audit` row; for each registered camera source its type,
+`enabled` flag, capture node, a digest of its desired capture profile and of
+its detection bindings, and a salted digest of its durable UVC approval (the
+approved vendor / product / serial / interface identity and the
+`requires_approval` / `serial_ambiguous` latches; never device paths, by-id
+aliases, topology, instance markers, session tokens or the serial itself;
+health, negotiated profile and timestamps are volatile and excluded; the
+random salt is stored in the baseline, so keep it deployment-local like the
+other digests); and Owner presence plus each principal's independent
+`live:view` / `recordings:view` grants, authorization revision and count of
+credentials that are neither revoked nor marked inconsistent, and each
+invitation's redemption and revocation state, principal revision and
+deployment generation bindings (and whether that generation is still
+current), issue and expiry times and redemption attempt count. It never writes principal external identities or display names,
 credential IDs, public keys or labels, invitation or session secret/token
 digests, session identity bindings, permission-bearing URLs, media bytes, or audit row contents.
 
@@ -351,11 +362,13 @@ may gain segments, move its target end earlier but never later, and stay
 its target and its latest linked segment end (startup recovery); its source,
 event link, start, starred and critical flags must not change, every recorded
 discontinuity marker that still overlaps its target window must remain (a stop
-drops only those wholly outside the new boundary), every new marker must be
-the `stream_discontinuity` the store adds when it links a newly published
-segment that does not continue the previous linked segment's stream and
-sequence (from that segment's end to the new segment's start, one per
-publication), every segment it already had must be
+drops only those wholly outside the new boundary), new markers must be
+exactly the `stream_discontinuity` markers the store adds when it links a
+newly published segment that does not continue the previous linked segment's
+stream and sequence (from that segment's end to the new segment's start, one
+per such publication, none missing), every newly linked segment must pass the
+store's timeline guard (start no earlier than the previous segment's end, no
+repeated or rewound sequence on the same stream), every segment it already had must be
 identical, and every current segment must
 come from the recording's own source, overlap its target window, be readable
 and match its catalog digest and byte length with a single hard link; anything

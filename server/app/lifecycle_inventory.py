@@ -11,12 +11,16 @@
   start, target end and ended boundaries (the manifest clips playback to the
   target end), the event link and the explicit discontinuity markers;
 - a per-row and a chained SHA-256 over every retained audit row
-  (``security_admin_audit_records`` and ``integrity_audit``), so a rewritten
-  middle row is detected even when counts and boundary timestamps match;
-- registered camera source logical IDs and types;
+  (``security_admin_audit_records``, ``integrity_audit``, ``presence_audit``
+  and ``storage_state_audit``), so a rewritten middle row is detected even
+  when counts and boundary timestamps match;
+- per registered camera source: type, enabled flag, capture node, digests of
+  the desired capture profile and detection bindings, and a salted digest of
+  the durable UVC approval (never device facts; volatile health excluded);
 - Owner presence and, per nonidentifying principal / invitation logical ID,
-  the independent ``live:view`` / ``recordings:view`` grants and revocation
-  state.
+  the independent ``live:view`` / ``recordings:view`` grants, revocation
+  state, authorization revision, usable (unrevoked and consistent) credential
+  count, and every non-secret invitation validity field.
 
 ``verify`` recomputes the same inventory and compares it with a recorded one.
 Rows or recordings that exist only in the current state are listed as
@@ -42,8 +46,10 @@ import argparse
 from collections import Counter
 from dataclasses import dataclass
 import hashlib
+import hmac
 import json
 import os
+import secrets
 from pathlib import Path
 import sqlite3
 import stat
@@ -156,6 +162,10 @@ def _tables(connection: sqlite3.Connection) -> set[str]:
         "SELECT name FROM sqlite_master WHERE type='table'")}
 
 
+def _columns(connection: sqlite3.Connection, table: str) -> set[str]:
+    return {row[1] for row in connection.execute(f"PRAGMA table_info({table})")}
+
+
 def _recordings(connection, tables, directory: Path) -> dict | None:
     if not {"recordings", "recording_links", "recording_segments"} <= tables:
         return None
@@ -249,14 +259,63 @@ def _audit(connection, tables) -> dict:
              "occurred_at_us", "outcome"), "occurred_at_us, id"),
         "integrity": _audit_table(
             connection, tables, "integrity_audit", ("id", "at", "actor", "revision"), "id"),
+        "presence": _audit_table(
+            connection, tables, "presence_audit",
+            ("sequence", "action", "actor", "at", "state", "target"), "sequence"),
+        "storage_state": _audit_table(
+            connection, tables, "storage_state_audit",
+            ("id", "at_ms", "previous_state", "current_state"), "id"),
     }
 
 
-def _sources(connection, tables) -> dict | None:
+def _approval_digest(row, salt: str) -> str:
+    """A salted digest of the durable UVC approval, never the device facts.
+
+    Only the physical identity the approval binds (vendor, product, serial,
+    interface: the strong key, or the model when there is no serial) and the
+    durable latch flags are covered. Device paths, by-id aliases, topology,
+    formats, instance markers and the session token change with re-enumeration
+    or a restart and are excluded. The per-inventory random salt keeps the
+    digest from being a stable cross-file identifier of a camera serial.
+    """
+    evidence = json.loads(row["evidence"])
+    identity = [evidence.get(key) for key in ("vendor", "product", "serial", "interface")]
+    message = json.dumps(["uvc-approval-v1", identity, bool(row["requires_approval"]),
+                          bool(row["serial_ambiguous"])], separators=(",", ":"))
+    return hmac.new(bytes.fromhex(salt), message.encode(), hashlib.sha256).hexdigest()
+
+
+def _sources(connection, tables, salt: str) -> dict | None:
+    """Stable operational configuration per source; volatile health is excluded."""
     if "camera_sources" not in tables:
         return None
-    return {row["id"]: {"source_type": row["source_type"]} for row in connection.execute(
-        "SELECT id, source_type FROM camera_sources ORDER BY id")}
+    approvals = {}
+    if "uvc_approvals" in tables:
+        for row in connection.execute(
+                "SELECT source_id, evidence, requires_approval, serial_ambiguous "
+                "FROM uvc_approvals"):
+            try:
+                approvals[row["source_id"]] = _approval_digest(row, salt)
+            except (ValueError, TypeError, AttributeError):
+                approvals[row["source_id"]] = "unreadable"
+    bindings = {}
+    if "detection_bindings" in tables:
+        for row in connection.execute(
+                "SELECT source_id, binding_id, kind, version, enabled, thresholds, config "
+                "FROM detection_bindings ORDER BY source_id, binding_id"):
+            bindings.setdefault(row["source_id"], []).append(
+                [row["binding_id"], row["kind"], row["version"], bool(row["enabled"]),
+                 row["thresholds"], row["config"]])
+    return {row["id"]: {
+        "source_type": row["source_type"],
+        "enabled": bool(row["enabled"]),
+        "capture_node_id": row["capture_node_id"],
+        "desired_capture_profile_sha256": _digest(row["desired_capture_profile"]),
+        "detection_bindings_sha256": _digest(bindings.get(row["id"], [])),
+        "uvc_approval_sha256": approvals.get(row["id"]),
+    } for row in connection.execute(
+        "SELECT id, source_type, enabled, capture_node_id, desired_capture_profile "
+        "FROM camera_sources ORDER BY id")}
 
 
 def _access(connection, tables) -> dict | None:
@@ -266,25 +325,48 @@ def _access(connection, tables) -> dict | None:
     principals = {}
     # Only logical IDs and authorization state: never external_identity,
     # display_name, credential IDs / keys, or secret / token digests.
+    consistent = (" AND inconsistent_at_us IS NULL"
+                  if "inconsistent_at_us" in _columns(connection, "access_credentials") else "")
+    generation = None
+    if "access_deployment_state" in tables:
+        generation = connection.execute(
+            "SELECT authorization_generation FROM access_deployment_state "
+            "WHERE singleton = 1").fetchone()
+        generation = None if generation is None else generation[0]
     for row in connection.execute(
-            "SELECT id, role, status, revoked_at_us FROM access_principals ORDER BY id"):
+            "SELECT id, role, status, authorization_revision, revoked_at_us "
+            "FROM access_principals ORDER BY id"):
         permissions = sorted(item[0] for item in connection.execute(
             "SELECT permission FROM access_principal_permissions WHERE principal_id = ?",
             (row["id"],)))
+        # A credential marked inconsistent is unusable, like a revoked one.
         credentials = connection.execute(
             "SELECT COUNT(*) FROM access_credentials "
-            "WHERE principal_id = ? AND revoked_at_us IS NULL", (row["id"],)).fetchone()[0]
+            "WHERE principal_id = ? AND revoked_at_us IS NULL" + consistent,
+            (row["id"],)).fetchone()[0]
         principals[row["id"]] = {
             "role": row["role"], "status": row["status"],
+            "authorization_revision": row["authorization_revision"],
             "revoked": row["revoked_at_us"] is not None,
             "permissions": permissions, "active_credential_count": credentials,
         }
+    # Every non-secret field that decides whether the code can still be
+    # redeemed; never the secret digest.
+    attempts = ("attempt_count" if "attempt_count" in _columns(connection, "access_invitations")
+                else "NULL AS attempt_count")
     invitations = {row["id"]: {
         "principal_id": row["principal_id"],
         "redeemed": row["redeemed_at_us"] is not None,
         "revoked": row["revoked_at_us"] is not None,
+        "principal_revision": row["principal_revision"],
+        "deployment_generation": row["deployment_generation"],
+        "deployment_generation_current": row["deployment_generation"] == generation,
+        "issued_at_us": row["issued_at_us"],
+        "expires_at_us": row["expires_at_us"],
+        "attempt_count": row["attempt_count"],
     } for row in connection.execute(
-        "SELECT id, principal_id, redeemed_at_us, revoked_at_us "
+        "SELECT id, principal_id, principal_revision, deployment_generation, issued_at_us, "
+        f"expires_at_us, redeemed_at_us, revoked_at_us, {attempts} "
         "FROM access_invitations ORDER BY id")}
     return {"principals": principals, "invitations": invitations}
 
@@ -315,8 +397,13 @@ def _coverage(inventory: dict) -> dict:
     }
 
 
-def collect(runtime_root: Path) -> dict:
-    """Read the runtime tree without writing to it."""
+def collect(runtime_root: Path, *, salt: str | None = None) -> dict:
+    """Read the runtime tree without writing to it.
+
+    ``salt`` is the baseline's approval-digest salt when verifying; a new
+    random one is drawn when recording.
+    """
+    salt = secrets.token_hex(32) if salt is None else salt
     tree = RuntimeTree(_absolute(runtime_root, "runtime root"))
     connection = _connect_read_only(tree.database)
     try:
@@ -332,7 +419,7 @@ def collect(runtime_root: Path) -> dict:
             "schema_version": schema_version,
             "recordings": _recordings(connection, tables, tree.recordings),
             "audit": _audit(connection, tables),
-            "camera_sources": _sources(connection, tables),
+            "camera_sources": _sources(connection, tables, salt),
             "access": _access(connection, tables),
         }
         connection.execute("COMMIT")
@@ -340,6 +427,7 @@ def collect(runtime_root: Path) -> dict:
         raise InventoryError("state database could not be read") from None
     finally:
         connection.close()
+    inventory["approval_salt"] = salt
     inventory["coverage"] = _coverage(inventory)
     inventory["not_applicable"] = dict(NOT_APPLICABLE)
     inventory["manual"] = dict(MANUAL)
@@ -418,8 +506,8 @@ def _valid_growth(base: dict, now: dict) -> bool:
     segment must be present and identical; every current segment, old or new,
     must come from the recording's own source, overlap its current target
     window (the only segments the store links), be readable and match its
-    catalog digest; and every marker not in the record must be one the store
-    could have added while publishing a newly linked segment.
+    catalog digest; and the markers not in the record must be exactly those the
+    store adds while publishing the newly linked segments.
     """
     if (base["status"] != "active" or now["status"] not in _ACTIVE_SUCCESSORS
             or not _evidenced(base) or not _evidenced(now)):
@@ -497,7 +585,9 @@ def _appended_publications_valid(base: dict, now: dict, remaining: Counter) -> b
                       and segment["catalog"]["sequence"] == prior["catalog"]["sequence"] + 1)
         if not contiguous:
             allowed[(prior["end_ms"], segment["start_ms"], "stream_discontinuity")] += 1
-    return all(count <= allowed[key] for key, count in remaining.items())
+    # The store adds the marker in the same transaction that links the
+    # segment, so each one must be present exactly once.
+    return +remaining == allowed
 
 
 def _compare_recordings(baseline: dict | None, current: dict | None, *,
@@ -575,6 +665,10 @@ def compare(baseline: dict, current: dict, *, declared_rewrites=()) -> dict:
             baseline["audit"].get("security_admin"), current["audit"].get("security_admin")),
         "audit_integrity": _compare_audit(
             baseline["audit"].get("integrity"), current["audit"].get("integrity")),
+        "audit_presence": _compare_audit(
+            baseline["audit"].get("presence"), current["audit"].get("presence")),
+        "audit_storage_state": _compare_audit(
+            baseline["audit"].get("storage_state"), current["audit"].get("storage_state")),
         "camera_sources": _compare_keyed(baseline.get("camera_sources"),
                                          current.get("camera_sources")),
         "access_principals": _compare_keyed(access_base.get("principals"),
@@ -727,6 +821,14 @@ def _summary_verify(report: dict) -> list[str]:
     return lines
 
 
+def _baseline_salt(baseline) -> str:
+    salt = baseline.get("approval_salt") if isinstance(baseline, dict) else None
+    if not isinstance(salt, str) or len(salt) != 64 or any(
+            character not in "0123456789abcdef" for character in salt):
+        raise InventoryError("baseline is not a lifecycle inventory")
+    return salt
+
+
 def main(arguments: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="python -m app.lifecycle_inventory",
@@ -757,7 +859,7 @@ def main(arguments: list[str] | None = None) -> int:
             baseline = json.loads(_absolute(args.baseline, "baseline").read_text())
         except (OSError, ValueError):
             raise InventoryError("baseline could not be read") from None
-        report = compare(baseline, collect(args.runtime_root),
+        report = compare(baseline, collect(args.runtime_root, salt=_baseline_salt(baseline)),
                          declared_rewrites=args.declared_rewrite)
         if args.report is not None:
             write_private(args.report, args.runtime_root, report)
