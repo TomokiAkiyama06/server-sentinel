@@ -77,7 +77,7 @@ camera, V4L2 node, udev rule or real frame was used.
 
 #### 実機記録 2026-09-30: 重複承認の拒否と非対応 profile の表示（Issue #11 修正後）
 
-同型 serial 付き UVC 2 台（EMEET SmartCam C960）を接続した Main Server 候補機で、
+serial 付き同型 USB UVC camera 2 台（正確な model はローカル記録のみ）を接続した Main Server 候補機で、
 修正後のコードを video group の非 root ユーザーが実行した。`create_app()` の
 lifespan、実 `LinuxDiscovery` / `MmapCapture`、`LocalUvcRuntime.reapprove()` →
 `OwnerAdministration.approve_uvc()` の監査付き経路を使用（Owner authorizer のみ
