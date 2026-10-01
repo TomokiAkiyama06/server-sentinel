@@ -114,5 +114,16 @@ pairing ledger and TLS 1.3 ingest acceptor in the test process and the real
 `media_capture_agent.node_tls` code in separate processes (key/CSR, bundle and
 credential install, mutual-TLS connect, reconnect after revocation). Everything
 is generated under a temporary directory over loopback; it is not LAN or
-real-host evidence, and the pairing code is redeemed in-process because the
-bootstrap listener does not exist yet.
+real-host evidence; this module redeems the pairing code in-process.
+
+`test_capture_enrollment_scenarios.py` (Issue #13) runs the Main approval CLI and
+the Agent pairing CLI as separate processes, each with its own pseudo-terminal
+as controlling terminal, and plays the Owner by reading the code from the Main's
+terminal and typing it into the Agent's non-echoing prompt. A recording relay
+stands in for a LAN observer. It checks enrollment followed by an admitted mTLS
+ingest connection, that the code never appears in relay bytes, argv,
+environment, `/proc` views, output, written files or audit rows, that impostor,
+wrong-protocol and plaintext endpoints receive no application byte and cause no
+prompt, and that a revoked key cannot be approved again. Loopback only; not LAN
+evidence. The Agent refuses UID 0, so a root run is skipped locally and fails
+under `E2E_REQUIRE_FULL_COVERAGE=1`.
