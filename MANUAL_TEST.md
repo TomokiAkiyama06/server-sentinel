@@ -411,48 +411,94 @@ Pairing/security:
 
 #### Issue #13 real-LAN pairing / mTLS procedure (not yet executed)
 
-Status: **unverified**. The adapters are covered only by loopback tests with
-temporary CAs (`server/tests/test_capture_mtls.py`, `agent/tests/test_node_tls.py`,
-`tests/e2e/test_capture_mtls_scenarios.py`). The bootstrap enrollment listener,
-Main approval CLI and Agent pairing CLI do not exist yet, so the steps marked
-*(needs CLI)* wait for them. Use a disposable deployment CA and synthetic
-server name; never paste keys, codes, certificates, bundle contents, LAN
-addresses or hostnames into Issues, PRs or CI artifacts.
+Status: **unverified**. Enrollment, the CLIs and mTLS are covered only by
+loopback tests with temporary CAs (`server/tests/test_capture_mtls.py`,
+`server/tests/test_capture_enrollment.py`, `agent/tests/test_node_tls.py`,
+`agent/tests/test_enroll.py`, `tests/e2e/test_capture_mtls_scenarios.py`,
+`tests/e2e/test_capture_enrollment_scenarios.py`). No real Main host, capture
+host or LAN has run these steps. The ingest listener is not started by the
+application yet, so the steps marked *(needs ingest wiring, #14/#15)* wait for
+that. Use a disposable deployment CA and synthetic server name; never paste
+keys, codes, certificates, bundle contents, LAN addresses or hostnames into
+Issues, PRs or CI artifacts. Below, `MAIN_CLI` means
+`python -m app.cameras.remote_agent.pairing_cli` run from the Main's `server/`
+code with the reviewed runtime installed. `AGENT_CLI` means
+`python -m media_capture_agent.enroll` run from the Agent's code with
+`cryptography` installed.
 
-1. On the Main host, as the local administrative account, create the deployment
-   CA in a dedicated private directory outside the checkout and media trees;
-   confirm the directory is 0700 and every file 0600, owned by that account.
-2. Issue the Main ingest certificate into a *separate* private directory for the
-   listener account; confirm that account cannot read the CA key.
-3. Export the trust bundle and note its full SHA-256 on the Main console.
-   Copy the bundle to the capture host over an Owner-trusted channel (for
-   example removable media); on the capture host recompute and compare the full
-   digest by eye before continuing.
-4. On the capture host, as the dedicated non-root `media-capture-agent` account,
-   generate the node key and enrollment request *(needs CLI)*; confirm
-   `<runtime_root>/pending-enrollment` is 0700, the key file 0600, and that no
-   root, GUI, Tailscale or admin credential was required.
-5. Transfer only the public request to the Main; approve it locally and read the
-   code from the controlling terminal only *(needs CLI)*.
-6. Enroll over the private LAN with the capture host **not** joined to
-   Tailscale *(needs bootstrap listener)*. Negative checks before the code is
-   typed: a wrong bundle, a Main certificate for another name, and a plaintext
-   endpoint each abort without prompting for the code.
-7. Confirm the installed credential directory is 0700 with 0600 files and that
-   the pending key was removed.
-8. Start the ingest listener bound to the Main's private-LAN IP and a port
-   distinct from the dashboard listener; confirm the dashboard listener still
-   binds loopback only and the ingest port answers no HTTP route.
-9. Connect from the Agent: expect a TLS 1.3 session admitted as that node.
-   From another LAN host without a node certificate, with a certificate from a
-   different CA, and with an expired certificate: expect refusal before any
-   capture message is accepted.
-10. Revoke the node on the Main: the open session closes on the next admission
-    check, and reconnecting is refused although the certificate has not expired.
-11. Inspect Main and Agent logs, `ps` output, service environment and shell
-    history on both hosts for key, code or certificate text; expect none.
+1. On the Main host, as the local administrative account that owns the
+   application database, run
+   `MAIN_CLI init --authority-dir <ca_dir> --listener-dir <listener_dir> --server-name <dns name>`
+   with both directories outside the checkout and media trees. Confirm both are
+   0700 and every file 0600, owned by that account, and that the two directories
+   differ. (A separate ingest service account that cannot read the CA key is
+   #14/#15 deployment work; the CLI itself keeps both under the admin account.)
+2. Choose the bootstrap endpoint: the Main's private-LAN IP and a port distinct
+   from the dashboard (loopback-only) and any ingest port. Run
+   `MAIN_CLI export-bundle --authority-dir <ca_dir> --listener-dir <listener_dir> --endpoint <ip>:<port> --output bundle.json`
+   and note the printed full `trust_bundle_sha256`.
+3. Copy `bundle.json` to the capture host over an Owner-trusted channel (for
+   example removable media). Do not copy the digest over the same channel.
+4. On the capture host, as the dedicated non-root `media-capture-agent`
+   account, run
+   `AGENT_CLI request --runtime-root <runtime_root> --output request.json`.
+   Confirm `<runtime_root>/pending-enrollment` is 0700 and its key file 0600,
+   that `request.json` contains no `PRIVATE KEY`, and that no root, GUI,
+   Tailscale or admin credential was needed. Confirm running it as root is
+   refused (`root_refused`). Note the printed `public_key_sha256`.
+5. Carry `request.json` (public) to the Main. Run
+   `MAIN_CLI approve --database <data_dir>/state.sqlite3 --authority-dir <ca_dir> --listener-dir <listener_dir> --request request.json --listen <ip>:<port>`
+   from an interactive terminal (add `--human-host`/`--human-port` when the
+   dashboard does not use the default `127.0.0.1:8000`, for example `::1`, and
+   confirm `--listen` on that exact socket is refused with
+   `enrollment_listener_must_differ_from_other_listeners`). Compare the displayed public-key SHA-256 with
+   step 4 and type `APPROVE`. Confirm the code appears only on that terminal,
+   not in the command's stdout/stderr (redirect both to files to check), and
+   that the same command from a non-interactive session (for example
+   `setsid ... </dev/null`) refuses with `controlling_terminal_required`.
+6. Confirm the capture host is **not** joined to Tailscale. Negative checks,
+   each expected to abort **without** showing `Pairing code:`:
+   `AGENT_CLI pair` with a wrong `--bundle-sha256` (no connection is made);
+   with `--endpoint` pointing at a host presenting a certificate from another CA
+   or for another name; with `--endpoint` pointing at a plaintext service or at
+   the dashboard port.
+7. Run `AGENT_CLI pair --runtime-root <runtime_root> --trust-bundle bundle.json --bundle-sha256 <digest from step 2>`.
+   At `Pairing code:` type the code from step 5 (the hyphen groups may be
+   kept). Confirm the typed code is not echoed, the Agent prints
+   `paired: node_id=...`, and the Main prints `enrollment completed` with the
+   same node UUID and closes the bootstrap port (`ss -ltn` no longer lists it).
+   Optionally capture the exchange with `tcpdump` on a disposable deployment and
+   confirm it shows only TLS records. Do not keep or upload the capture.
+8. Confirm `<runtime_root>/node-credentials` is 0700 with 0600 files and that
+   the pending key was removed. Run `MAIN_CLI list --database ...` and confirm
+   it shows the node as `activated`/`active` with no digests.
+9. With a fresh runtime root, repeat steps 4–5 and let the five minutes pass
+   before typing the code: expect `enrollment closed: reason=expired` on the
+   Main and a refused connection on the Agent. Reusing a code after success must
+   also fail (the listener has closed). A key stays bound to one node for
+   good: re-running `approve` with the same `request.json` after an
+   interrupted, expired or unacknowledged enrollment shows
+   `existing capture node: <uuid>` and re-enrolls that same node (a completed
+   enrollment replaces its current certificate); it never creates a second
+   node. After `revoke`, the key cannot be approved again (`approval_refused`).
+10. Start the ingest listener bound to the Main's private-LAN IP and a port
+    distinct from the dashboard and bootstrap listeners; confirm the dashboard
+    listener still binds loopback only and the ingest port answers no HTTP
+    route *(needs ingest wiring, #14/#15)*.
+11. Connect from the Agent: expect a TLS 1.3 session admitted as that node.
+    From another LAN host without a node certificate, with a certificate from a
+    different CA, and with an expired certificate: expect refusal before any
+    capture message is accepted *(needs ingest wiring)*.
+12. Run `MAIN_CLI revoke --database ... --node <uuid>` and type `REVOKE`. The
+    open session closes on the next admission check, and reconnecting is
+    refused although the certificate has not expired *(needs ingest wiring)*.
+    Approving the old `request.json` again must be refused
+    (`approval_refused`) without showing a code.
+13. Inspect Main and Agent logs, `ps` output, `/proc/<pid>/cmdline` and
+    `environ` during the exchange, service environment and shell history on both
+    hosts for key, code or certificate text; expect none.
 
-12. Renewal (Owner decision 2026-09-30: 397-day default, automatic renewal):
+14. Renewal (Owner decision 2026-09-30: 397-day default, automatic renewal):
     on a disposable deployment, issue a node certificate with a short explicit
     validity so it enters the 30-day window. Confirm that the Agent renews over
     its admitted session, that `pending-renewal/` is 0700 with a 0600 key, and
