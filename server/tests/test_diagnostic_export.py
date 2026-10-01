@@ -1,6 +1,7 @@
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 import asyncio
+import hashlib
 from io import BytesIO
 import json
 import os
@@ -1014,6 +1015,41 @@ class DiagnosticExportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(media.active, 0)
         self.assertEqual(list(self.output.iterdir()), [])
         self.assertEqual(self.policy.releases, 1)
+
+    async def test_media_digest_is_checked_over_the_copied_bytes(self):
+        class DigestMedia(SelectedMedia):
+            def __init__(inner_self, digest_of):
+                super().__init__()
+                inner_self.digest_of = digest_of
+
+            @contextmanager
+            def open_selected(inner_self, media_id):
+                with super().open_selected(media_id) as asset:
+                    yield MediaAsset(asset.reader, asset.media_type,
+                                     sha256=hashlib.sha256(
+                                         inner_self.digest_of(media_id)).hexdigest())
+
+        # The copied bytes differ from the authenticated content: no bundle.
+        media = DigestMedia(lambda _media_id: b"SYNTHETIC_MEDIA_OTHER")
+        with self.assertRaisesRegex(
+                DiagnosticExportError, "diagnostic bundle write failed"):
+            await self.make_service(Permit(), media=media).export(
+                DiagnosticExportAction(self.output, ("clip_a",)))
+        self.assertEqual(media.released, ["clip_a"])
+        self.assertEqual(list(self.output.iterdir()), [])
+        self.assertEqual(self.policy.releases, 1)
+
+        media = DigestMedia(lambda media_id: SelectedMedia.content(media_id))
+        result = await self.make_service(Permit(), media=media).export(
+            DiagnosticExportAction(self.output, ("clip_a",)))
+        with ZipFile(result.bundle_path) as archive:
+            self.assertEqual(archive.read("media/0001.bin"), b"SYNTHETIC_MEDIA_ALPHA")
+
+    def test_media_digest_must_be_lowercase_sha256_hex(self):
+        for digest in ("", "A" * 64, "0" * 63, b"0" * 64, "g" * 64):
+            with self.subTest(digest=digest):
+                with self.assertRaises(ValueError):
+                    MediaAsset(BytesIO(b"x"), sha256=digest)
 
     async def test_non_owner_caller_is_refused_before_collection_or_media_lookup(self):
         """Regression: a non-Owner cannot probe selected-media IDs for existence."""

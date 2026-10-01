@@ -42,8 +42,17 @@ def utc_time(value: datetime) -> datetime:
 
 @dataclass(frozen=True)
 class Principal:
+    """An invited person. ``id`` is the per-person key; the invitation and the
+    passkey credentials bound to it are what authorize.
+
+    ``external_identity`` is only the trusted-proxy identity last observed at
+    authentication (SPECIFICATION §11.4): optional, non-unique, owner-visible,
+    cleared on revocation and never an authorization input. In the
+    shared-Tailnet deployment every person presents the same value.
+    """
+
     id: UUID
-    external_identity: str
+    external_identity: str | None
     display_name: str
     role: PrincipalRole
     status: PrincipalStatus
@@ -54,7 +63,8 @@ class Principal:
     def __post_init__(self):
         if not isinstance(self.id, UUID):
             raise AccessValidationError("principal identity is invalid")
-        if not isinstance(self.external_identity, str) or not self.external_identity:
+        if self.external_identity is not None and (not isinstance(self.external_identity, str)
+                                                   or not self.external_identity):
             raise AccessValidationError("external identity is invalid")
         if not isinstance(self.display_name, str) or not self.display_name:
             raise AccessValidationError("display name is invalid")

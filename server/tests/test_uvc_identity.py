@@ -5,7 +5,7 @@ import unittest
 from uuid import UUID
 
 from app.cameras.uvc.identity import (
-    CameraState, DeviceEvidence, ReconnectController, match_reconnect,
+    CameraState, DeviceEvidence, ReconnectController, match_reconnect, same_physical_camera,
 )
 
 
@@ -28,6 +28,17 @@ class IdentityTests(unittest.TestCase):
         other = replace(self.camera, serial="another-synthetic-serial")
         self.assertIsNone(self.control.reconcile([other]))
         self.assertEqual(self.control.state, CameraState.OFFLINE)
+
+    def test_live_instance_comparison_ignores_mutable_metadata(self):
+        live = replace(self.camera, device_number=3, instance_token=(1, 2, 3))
+        refreshed = replace(live, by_id=("synthetic-alias",), formats=("MJPG",))
+        reused = replace(live, instance_token=(1, 2, 4))
+        weak = replace(live, serial=None)
+        for ambiguous in (True, False):
+            self.assertTrue(same_physical_camera(live, refreshed, serial_ambiguous=ambiguous))
+        self.assertFalse(same_physical_camera(live, reused, serial_ambiguous=True))
+        self.assertTrue(same_physical_camera(weak, replace(weak, by_id=("synthetic-alias",))))
+        self.assertFalse(same_physical_camera(weak, replace(weak, instance_token=(1, 2, 4))))
 
     def test_duplicate_serial_requires_owner_and_latches(self):
         other = replace(self.camera, device_path="/dev/video1")

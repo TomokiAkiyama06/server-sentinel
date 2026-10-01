@@ -52,6 +52,23 @@ class VideoProfile:
             raise ValueError("invalid video pixel format")
 
 
+# Relative frame-rate tolerance for comparing the negotiated rate with the
+# requested one, e.g. 30000/1001 (29.97) satisfies 30 but 30 never satisfies 15.
+FPS_TOLERANCE = 0.01
+
+
+def profile_satisfies(desired, negotiated):
+    """True when the driver-negotiated profile is the requested profile.
+
+    V4L2 drivers adjust unsupported sizes, FourCCs and frame intervals instead
+    of failing, so a successful negotiation alone never proves the request was
+    honoured. Dimensions and FourCC must match exactly.
+    """
+    return (negotiated.width == desired.width and negotiated.height == desired.height
+            and negotiated.pixel_format == desired.pixel_format
+            and abs(negotiated.fps - desired.fps) <= FPS_TOLERANCE * desired.fps)
+
+
 @dataclass(frozen=True)
 class NegotiatedVideo:
     profile: VideoProfile

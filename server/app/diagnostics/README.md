@@ -125,3 +125,67 @@ deployment condition, so they and every other failure become
 The manifest reports included categories, counts, exclusion reasons and the
 identifier transformation. It contains no excluded value, media ID, path,
 deployment hostname, or other private deployment value.
+
+## Production producers (`app.diagnostics.sources`)
+
+`compose_diagnostic_sources(...)` builds the production `DiagnosticSource` and,
+when the monitoring runtime and its owning worker are supplied, the
+recording-backed `MediaSource`. It mounts no route and changes no application
+composition; wiring it to `DiagnosticExportService` is a later slice.
+
+Each adapter reads an existing bounded, value-free health surface and maps it
+onto the reviewed field names and enums in `export.py`; every name is bound to
+exactly one value type (state enum, reason-code enum or bounded count), so no
+adapter can place a free-form string in the bundle. `CompositeDiagnosticSource`
+additionally refuses any field that is not of the SAFE kind, so the production
+producers contribute no value the export would have to hash or exclude.
+
+| Category | Adapter | Reads |
+| --- | --- | --- |
+| `runtime` | `VersionAdapter`, `MonitoringRuntimeAdapter` | `app.__version__`; `MonitoringRuntime.status` runtime state and retention / daily-summary / notification job flags |
+| `camera_health` | `CameraRegistryAdapter` | counts of sources by type and, for enabled sources, by health, plus the active-source limit |
+| `recording_health` | `RecordingHealthAdapter` | latest daily recording self-test verdict and self-test job health |
+| `storage` | `StorageAdapter` | storage state (`STORAGE_PRESSURE` / `STORAGE_HARD_STOP`), storage-audit delivery and recording filesystem verdict |
+| `hardware_inventory` | `IntegrityAdapter` | Hardware Integrity verdict per category (CPU / memory / storage / GPU) as fixed reason codes, check and delivery health |
+| `security` | `AuditDeliveryAdapter` x3, `AuditRetentionAdapter` | `audit_delivery_failed` / `undelivered_audit_records` of the Owner audit service, access store and pairing ledger; audit-retention health |
+
+Nothing else is read. Camera names, role labels, capability documents, serials,
+device paths, capture-node names, image-quality text, integrity baseline
+observations and finding reason text, pairing codes and digests, Slack endpoint
+values, credentials, WebAuthn material and the Owner template store are never
+touched, so they cannot reach a bundle even hashed.
+
+A subsystem that is not composed reports `unavailable` with `not_configured`
+and contributes no counts. A subsystem that raises reports `unavailable` with
+`dependency_unavailable`; its exception text is discarded. A monitoring job flag
+defaults to "not degraded" before the worker runs, so job states are reported
+`ok` only while the monitoring runtime is `running`; a missing verdict is
+`unknown`, and an integrity category the check did not report is
+`hardware_unverifiable`. A category with several baseline components (DIMMs,
+disks) reports its most severe component finding. A runtime whose startup
+failed keeps its explicit storage hard stop (`failed` / `storage_hard_stop`);
+a stopped or starting runtime reports storage `unavailable`. No absent or
+failing subsystem is ever reported `ok`.
+
+`RecordingStore` and `IntegrityStore` refuse calls off the monitoring worker, so
+`OwnerWorkerCalls` submits their reads to that worker with a bounded wait and
+refuses a worker that drifts to another thread. The supplied worker must be the
+same one the export service admits storage through.
+
+`RecordingSegmentMediaSource` cannot enumerate media. It resolves only IDs of
+the form `segment.<32 lowercase hex>` naming one published recording segment;
+no other namespace, including Owner biometric template/embedding, face crop or
+self-test artifact, is resolvable, so biometric data can never be selected. The
+segment is opened by `RecordingStore.open_segment` relative to the pinned,
+verified recording root without following symlinks, and must be a single-link
+regular file whose size matches the journal. The exporter hashes exactly the
+bytes it copies into the bundle and compares them with the journaled SHA-256
+before publishing, so a same-length rewrite, including one made after the file
+was opened, fails the export and no bundle is published. It is opened only on the owning
+worker, during the export's copy, after the Owner confirmed the selection.
+
+None of these producers opens a socket, schedules work or writes. Tests seed
+synthetic canary camera names, serials, device paths, a Slack webhook URL, a
+pairing code and Owner template bytes, and verify none appear in the bundle,
+that media is absent unless individually selected, and that no network call is
+attempted during export.
