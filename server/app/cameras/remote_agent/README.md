@@ -49,6 +49,10 @@ response never locks the Agent out. Revocation discards staged renewals.
 A node public key is bound to one node for good (`pairing_key_bindings`,
 Owner decision 2026-09-30). Approval, activation, staging and promotion refuse
 a key bound to or staged for another node, and a revoked key is never reused.
+Staging binds the key permanently before the staged row is written, so a key
+whose certificate Main issued stays bound even if a retry replaces the staged
+row or the node is revoked first. Bindings per node are capped (1024); beyond
+that renewal is refused and the node must re-pair.
 `CaptureCredentialMonitor` raises the local `capture_credential_warning`
 notification through an injected hook in three cases: a credential within
 14 days of expiry, an expired credential, or a refused renewal. The renewal

@@ -17,6 +17,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from unittest import mock
 from uuid import uuid4
 
 from cryptography import x509
@@ -582,6 +583,60 @@ class CaptureRenewalTests(CaptureTlsHarness):
         for digest in (original, renewed_key):
             approve_elsewhere(digest)
             approve_elsewhere(digest, claim.node_id)
+
+    def test_staged_renewal_key_stays_bound_after_replacement_or_revocation(self):
+        # Main issued a certificate for every staged key, so replacing the
+        # staged row with a retry, or revoking the node before promotion, must
+        # never free that key for another node (Owner decision 2026-09-30).
+        claim, _, certificate, key = self._paired_node("a")
+        session = self._session(certificate, key)
+        first, _ = self._node_key("first")
+        first_digest = public_key_digest(first.public_key())
+        self._renew(session.identity, first)
+        second, _ = self._node_key("second")
+        second_digest = public_key_digest(second.public_key())
+        self._renew(session.identity, second)  # replaces the staged row
+        with closing(self.database.connect()) as connection:
+            staged = connection.execute("SELECT public_key_digest FROM pairing_node_renewals "
+                                        "WHERE node_id = ?", (str(claim.node_id),)).fetchone()
+        self.assertEqual(second_digest, staged[0])
+        with self.assertRaises(PairingError):
+            self.ledger.approve(Owner(), "owner", node_id=uuid4(), public_key_digest=first_digest)
+        self.ledger.revoke(Owner(), "owner", node_id=claim.node_id)
+        for digest in (first_digest, second_digest):
+            for node in (uuid4(), claim.node_id):
+                with self.subTest(digest=digest[:8]), self.assertRaises(PairingError):
+                    self.ledger.approve(Owner(), "owner", node_id=node, public_key_digest=digest)
+
+    def test_staged_retry_with_same_key_is_idempotent_and_bindings_are_capped(self):
+        from app.cameras.remote_agent import pairing as pairing_module
+        claim, _, certificate, key = self._paired_node("a")
+        session = self._session(certificate, key)
+
+        def stage(digest):
+            self.ledger.stage_renewal(
+                node_id=claim.node_id,
+                current_public_key_digest=session.identity.public_key_digest,
+                current_credential_digest=session.identity.credential_digest,
+                public_key_digest=digest, credential_serial_digest="e" * 64,
+                not_after=utc_now().timestamp() + 1000)
+
+        def bindings():
+            with closing(self.database.connect()) as connection:
+                return connection.execute("SELECT COUNT(*) FROM pairing_key_bindings "
+                                          "WHERE node_id = ?", (str(claim.node_id),)).fetchone()[0]
+
+        stage("a" * 64)
+        stage("a" * 64)
+        held = bindings()
+        self.assertEqual(2, held)  # paired key + staged key
+        with mock.patch.object(pairing_module, "_MAX_KEY_BINDINGS_PER_NODE", held + 1):
+            stage("b" * 64)
+            with self.assertRaises(PairingError):
+                stage("c" * 64)
+            stage("b" * 64)  # already bound: a retry is still accepted
+        self.assertEqual(held + 1, bindings())
+        self.assertTrue(session.still_admitted())
 
     def test_near_expiry_without_renewal_raises_owner_signal_once(self):
         self._paired_node("soon", validity=10 * DAY)
