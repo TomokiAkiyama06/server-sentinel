@@ -330,7 +330,17 @@ cd server
 python -m tests.detector_model_smoke --adapter yolox-s-onnx-cpu /absolute/operator/yolox_s.onnx
 ```
 
-### Host measurement, 2026-09-30 (this development host, not target acceptance)
+### Host measurement, 2026-09-30 (pre-fix, superseded; this development host, not target acceptance)
+
+> **Superseded pre-fix measurement — do not use for detector comparison.**
+> These figures were recorded before `e6a9551` moved frame allocation and
+> zero-filling out of the timed interval of `person_benchmark`, so p50/p95/max
+> (and the replay outcomes derived from them) include per-call allocation and
+> zeroing that the current harness no longer times. They were **not** re-run
+> with the corrected harness: the learned weights are operator-supplied local
+> artifacts and are not present in the repository or the review environment.
+> Replacement results from the current harness are required before any
+> comparison or adoption decision; until then these rows are historical only.
 
 Host: 32 logical CPUs, NVIDIA RTX PRO 6000 Blackwell (unused for this table), CPython 3.12.14, ONNX Runtime 1.28.0 `CPUExecutionProvider`,
 generated all-zero S×S RGB frames, 10 warm-up + 200 measured cycles per source,
@@ -341,7 +351,7 @@ repeated run is reported). Replay policy (evaluation inputs, **not** defaults):
 capture every 66,666,667 ns (15 fps), cadence 500 ms, ceiling 4 s, budget
 250 ms, queue age 1 s, observation age 5 s, threshold 0.5.
 
-Latency, ms (aggregate nearest-rank over all sources):
+Pre-fix latency, ms (aggregate nearest-rank over all sources; superseded):
 
 | Adapter | threads | sources | p50 | p95 | max | replay |
 | --- | ---: | ---: | ---: | ---: | ---: | --- |
@@ -360,7 +370,17 @@ room footage, low light, occlusion and the target camera angles was not
 evaluated**. Cross-process contention between several isolated workers, and
 the target Main Server, were not measured.
 
-### Evaluation-only GPU measurement, 2026-09-30 (this host; production stays CPU-only)
+### Evaluation-only GPU measurement, 2026-09-30 (pre-fix, superseded; this host; production stays CPU-only)
+
+> **Superseded pre-fix measurement — do not use for detector comparison.**
+> These figures were recorded before `e6a9551` moved frame allocation and
+> zero-filling out of the timed interval of `person_benchmark`, so p50/p95/max on CUDA
+> (and the replay outcomes derived from them) include per-call allocation and
+> zeroing that the current harness no longer times. They were **not** re-run
+> with the corrected harness: the learned weights are operator-supplied local
+> artifacts and are not present in the repository or the review environment.
+> Replacement results from the current harness are required before any
+> comparison or adoption decision; until then these rows are historical only.
 
 The Owner approved `onnxruntime-gpu` **for evaluation only**. It ran from an
 uncommitted scratch venv (`onnxruntime-gpu==1.28.0` with NVIDIA CUDA 13.4 /
@@ -376,7 +396,7 @@ as the CPU table, one intra-op thread, 200 measured cycles per source. The host
 CPU was heavily loaded by other workloads (1-minute load ≈ 24–28), which affects
 host-side preprocessing and RT-DETRv2's CPU shape nodes.
 
-| Adapter (CUDA) | sources | p50 ms | p95 ms | max ms | replay |
+| Adapter (CUDA, pre-fix) | sources | p50 ms | p95 ms | max ms | replay |
 | --- | --- | --- | --- | --- | --- |
 | YOLOX-Tiny 416 | 1 / 2 / 3 / 4 | 1.35 / 1.37 / 1.40 / 1.47 | 1.39 / 1.41 / 1.45 / 1.51 | 1.47 / 1.70 / 1.92 / 2.04 | all healthy, 500 ms, 0 drops |
 | YOLOX-S 640 | 1 / 2 / 3 / 4 | 2.10 / 2.25 / 2.31 / 2.35 | 2.26 / 2.36 / 2.39 / 2.52 | 2.92 / 2.68 / 2.99 / 3.44 | all healthy, 500 ms, 0 drops |
