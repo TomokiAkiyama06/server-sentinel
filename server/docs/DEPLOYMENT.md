@@ -585,7 +585,13 @@ cursors, live presence inputs, the self-test artifact pointer, setup wizard
 progress) are deliberately not inventoried. A missing or changed
 recording, audit row, source, principal or invitation is `failed` (exit 1);
 rows and recordings that exist only now are listed as `appended` and are never
-counted as preserved. The one exception for missing rows is the service's own
+counted as preserved. Every time used as evidence (presence clocks, override
+expiry, timeline gap, Owner-release audit time, tombstone, integrity and
+Owner-template audit times) must be written exactly in the UTC format the
+owning service writes and is compared as an instant; a time at another
+offset, or otherwise formatted, is never accepted as evidence. Presence jobs
+and unresolved markers may name only the service's actions (`evidence`,
+`notification`). The one exception for missing rows is the service's own
 automatic retention, which runs at every startup (so the update restart itself
 triggers it) and on its schedule: judged against the verify time with the
 service's built-in periods (not deployment-configurable), a security/admin

@@ -1248,6 +1248,25 @@ class LifecycleInventoryTests(unittest.TestCase):
         self.assertEqual(len(sections["owner_template"]["audit"]["retention_expired"]), 1)
         self.assertEqual(sections["presence"]["released"], [str(released)])
 
+    def test_owner_template_audit_retention_needs_the_store_utc_format(self):
+        # Codex P1: an Owner-template audit time at another offset whose text
+        # sorts before the cutoff, though its instant is after it, is not due.
+        self.runtime.seed()
+        option = ("--owner-template-root", str(self.base / "owner-template"))
+        root = self.owner_template_root(template=b"synthetic-owner-template-marker")
+        with closing(sqlite3.connect(root / "owner-template.sqlite3",
+                                     isolation_level=None)) as db:
+            db.execute("DELETE FROM owner_template_audit")
+            db.execute("INSERT INTO owner_template_audit(at, actor, operation, generation) "
+                       "VALUES ('2023-08-17T20:00:00-05:00', 'owner', 'enroll', 1)")
+        _, baseline = self.record("offset.json", *option)
+        with closing(sqlite3.connect(root / "owner-template.sqlite3",
+                                     isolation_level=None)) as db:
+            db.execute("DELETE FROM owner_template_audit")
+        code, report, _ = self.verify(baseline, *option)
+        self.assertEqual(code, inventory.EXIT_FAILED)
+        self.assertEqual(report["sections"]["owner_template"]["audit"]["retention_expired"], [])
+
     def test_credential_sign_count_may_only_advance(self):
         # A lower counter rolls back the authenticator clone-detection floor.
         seeded = self.runtime.seed()
@@ -1345,14 +1364,14 @@ class LifecycleInventoryTests(unittest.TestCase):
         _, closed = self.record("closed.json")
         self.runtime.execute(
             "INSERT INTO presence_timeline_gap (singleton, since, latest, refused, rejected, "
-            "lost, interrupted) VALUES (1, '2026-01-01T00:00:00+00:00', "
-            "'2026-01-01T00:01:00+00:00', 1, 0, 2, 0)")
+            "lost, interrupted) VALUES (1, '2026-01-01T00:00:00.000000+00:00', "
+            "'2026-01-01T00:01:00.000000+00:00', 1, 0, 2, 0)")
         code, report, _ = self.verify(closed)
         self.assertEqual(code, inventory.EXIT_PRESERVED)
         self.assertEqual(report["sections"]["presence_timeline_gap"]["appended"], ["gap"])
         _, baseline = self.record()
         self.runtime.execute("UPDATE presence_timeline_gap SET lost=3, "
-                             "latest='2026-01-01T00:02:00+00:00'")
+                             "latest='2026-01-01T00:02:00.000000+00:00'")
         code, report, _ = self.verify(baseline)
         self.assertEqual(code, inventory.EXIT_PRESERVED)
         self.runtime.execute("UPDATE presence_timeline_gap SET lost=1")
@@ -1703,6 +1722,111 @@ class LifecycleInventoryTests(unittest.TestCase):
         code, report, _ = self.verify(baseline)
         self.assertIn({"id": "expired_unresolved", "reason": "unexplained"},
                       report["sections"]["presence"]["failed"])
+
+    def test_evidence_times_must_use_the_services_utc_format(self):
+        # Codex P1: times are compared as instants and must be written exactly
+        # as the service writes them; a non-UTC offset whose text sorts the
+        # other way is never accepted (each case would pass a text comparison).
+        z = "2026-01-01T10:00:00.000000+00:00"
+        later_text_earlier_instant = "2026-01-01T12:00:00.000000+09:00"   # 03:00Z
+        cases = {}
+
+        def case(name):
+            def register(function):
+                cases[name] = function
+                return function
+            return register
+
+        @case("presence clock")
+        def _(runtime, seeded, phase):
+            if phase == "before":
+                runtime.execute("INSERT INTO presence_clock VALUES (1, ?)", (z,))
+            else:
+                runtime.execute("UPDATE presence_clock SET latest=?", (later_text_earlier_instant,))
+            return "presence", {"id": "clocks:observation", "reason": "changed"}
+
+        @case("override expiry")
+        def _(runtime, seeded, phase):
+            if phase == "before":
+                runtime.execute("INSERT INTO presence_control_clock VALUES (1, ?)",
+                                ("2026-01-01T00:00:00.000000+00:00",))
+                runtime.execute("INSERT INTO presence_override VALUES (1, 'away', 'owner', ?, ?)",
+                                ("2026-01-01T00:00:00.000000+00:00",
+                                 "2026-01-01T00:30:00.000000+00:00"))
+            else:
+                runtime.execute("DELETE FROM presence_override")
+                runtime.execute("UPDATE presence_control_clock SET latest=?",
+                                ("2026-01-01T09:00:00.000000+09:00",))   # 00:00Z
+            return "presence", {"id": "override:owner", "reason": "changed"}
+
+        @case("timeline gap")
+        def _(runtime, seeded, phase):
+            if phase == "before":
+                runtime.execute("INSERT INTO presence_timeline_gap VALUES (1, ?, ?, 1, 0, 0, 0)",
+                                (z, z))
+            else:
+                runtime.execute("UPDATE presence_timeline_gap SET latest=?",
+                                (later_text_earlier_instant,))
+            return "presence_timeline_gap", {"id": "gap", "reason": "changed"}
+
+        @case("integrity audit retention")
+        def _(runtime, seeded, phase):
+            if phase == "before":
+                # 2023-08-17T20:00 at -05:00 is 2023-08-18T01:00Z, after the
+                # 90-day cutoff (2023-08-17T22:13Z), though its text sorts before.
+                runtime.execute("INSERT INTO integrity_audit(at, actor, revision) VALUES "
+                                "('2023-08-17T20:00:00-05:00', 'owner', 1)")
+            else:
+                runtime.execute("DELETE FROM integrity_audit")
+            return "audit_integrity", {"id": "1", "reason": "missing"}
+
+        @case("owner clear time")
+        def _(runtime, seeded, phase):
+            if phase == "before":
+                runtime.execute(
+                    "INSERT INTO presence_observations (id, kind, source, received, payload) "
+                    "VALUES ('00000000-0000-4000-8000-000000000001', 'crossing', 's', ?, '{}')",
+                    (z,))
+                runtime.execute("INSERT INTO presence_deliveries (observation, action, state, "
+                                "attempts) VALUES ('00000000-0000-4000-8000-000000000001', "
+                                "'notification', 'pending', 0)")
+            else:
+                at = "2026-01-02T09:00:00.000000+09:00"   # the clear, at a +09:00 offset
+                for table, column in (("presence_deliveries", "observation"),
+                                      ("presence_observations", "id")):
+                    runtime.execute(f"DELETE FROM {table} WHERE {column}=?",
+                                    ("00000000-0000-4000-8000-000000000001",))
+                runtime.execute("INSERT INTO presence_completed_events VALUES (?, ?)",
+                                ("00000000-0000-4000-8000-000000000001", at))
+                runtime.execute("INSERT INTO presence_expired_unresolved VALUES "
+                                "('notification', 1, ?)", (at,))
+                runtime.execute("INSERT INTO presence_audit (action, actor, at, state, target) "
+                                "VALUES ('critical_event_cleared', ?, ?, NULL, ?)",
+                                (seeded["owner"], at, "00000000-0000-4000-8000-000000000001"))
+                runtime.execute("INSERT INTO presence_control_clock VALUES (1, ?)", (at,))
+            return "presence", {"id": "observations:00000000-0000-4000-8000-000000000001",
+                                "reason": "missing"}
+
+        @case("unknown delivery action")
+        def _(runtime, seeded, phase):
+            if phase == "after":
+                runtime.execute("INSERT INTO presence_expired_unresolved VALUES ('bogus', 1, ?)",
+                                (z,))
+            return "presence", {"id": "expired_unresolved:bogus", "reason": "unknown_action"}
+
+        for index, (label, function) in enumerate(cases.items()):
+            with self.subTest(label):
+                runtime = Runtime(self.base / f"times-{index}")
+                saved, self.runtime = self.runtime, runtime
+                try:
+                    seeded = runtime.seed()
+                    function(runtime, seeded, "before")
+                    _, baseline = self.record(f"times-{index}.json")
+                    section, expected = function(runtime, seeded, "after")
+                    _, report, _ = self.verify(baseline)
+                finally:
+                    self.runtime = saved
+                self.assertIn(expected, report["sections"][section]["failed"])
 
     def test_presence_clocks_sessions_and_override_follow_service_transitions(self):
         self.runtime.seed()

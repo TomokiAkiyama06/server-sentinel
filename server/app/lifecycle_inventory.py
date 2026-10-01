@@ -82,6 +82,7 @@ from app.integrity.model import Finding, Kind, State
 from app.media.recording.model import Limits as RecordingLimits, Segment
 from app.monitoring.runtime import EVENT_NAMESPACE
 from app.presence.delivery import ActionResult
+from app.presence.models import InvalidObservation, timestamp as presence_timestamp
 from app.presence.service import PresenceService
 from app.storage.retention import DAY_MS, RetentionPeriods
 from app.storage.migrations import migrate
@@ -479,7 +480,10 @@ def _compare_timeline_gap(baseline: dict | None, current: dict | None) -> dict:
     current = current or {"open": False}
     if not current.get("open"):
         failed = [{"id": "gap", "reason": "missing"}]
-    elif (current["since"] != baseline["since"] or current["latest"] < baseline["latest"]
+    elif (current["since"] != baseline["since"]
+          or _presence_instant(current["latest"]) is None
+          or _presence_instant(baseline["latest"]) is None
+          or _presence_instant(current["latest"]) < _presence_instant(baseline["latest"])
           or any(current[key] < baseline[key] for key in _GAP_COUNTS)):
         failed = [{"id": "gap", "reason": "changed"}]
     else:
@@ -571,6 +575,33 @@ def _presence(connection, tables, salt: str, live_outbox: bool | None) -> dict:
     }
 
 
+# PresenceService queues and accepts only these delivery actions.
+_PRESENCE_ACTIONS = frozenset({"evidence", "notification"})
+
+
+def _presence_instant(value):
+    """A presence time as PresenceService writes it (models.timestamp():
+    UTC, microseconds), parsed; None for anything else, so evidence is
+    compared as instants and never as differently formatted text."""
+    try:
+        moment = datetime.fromisoformat(value)
+        return moment if presence_timestamp(moment) == value else None
+    except (TypeError, ValueError, AttributeError, InvalidObservation):
+        return None
+
+
+def _utc_instant(value):
+    """A time as the integrity, Owner-template and monitoring stores write it
+    (value.astimezone(utc).isoformat()), parsed; None for anything else."""
+    try:
+        moment = datetime.fromisoformat(value)
+        if moment.tzinfo is None or moment.astimezone(timezone.utc).isoformat() != value:
+            return None
+        return moment
+    except (TypeError, ValueError, AttributeError):
+        return None
+
+
 def _presence_clear_row(row) -> bool:
     """Whether a clear audit row has the shape the service writes.
 
@@ -580,9 +611,8 @@ def _presence_clear_row(row) -> bool:
     """
     target, at, _, actor = tuple(row)
     try:
-        moment = datetime.fromisoformat(at)
         return (str(UUID(target)) == target and str(UUID(actor)) == actor
-                and moment.tzinfo is not None)
+                and _presence_instant(at) is not None)
     except (TypeError, ValueError, AttributeError):
         return False
 
@@ -677,7 +707,7 @@ def _compare_presence(baseline: dict | None, current: dict | None,
     # The clearing actor is an Owner (at record or verify time), and the
     # control clock the clear advanced to its time has not moved back.
     owners = set(baseline.get("owner_actors") or ()) | set(current.get("owner_actors") or ())
-    control = (current.get("clocks") or {}).get("control")
+    control_at = _presence_instant((current.get("clocks") or {}).get("control"))
     path = {}
     for key, value in (baseline.get("observations") or {}).items():
         if key in observations:
@@ -690,7 +720,8 @@ def _compare_presence(baseline: dict | None, current: dict | None,
         # single new clear row naming it, and the tombstone it wrote then.
         rows = cleared_now.get(key, [])
         if (key not in cleared_before and len(rows) == 1 and rows[0][1] is None
-                and rows[0][2] in owners and isinstance(control, str) and control >= rows[0][0]
+                and rows[0][2] in owners and control_at is not None
+                and control_at >= _presence_instant(rows[0][0])
                 and unfinished and completed.get(key) == rows[0][0]):
             path[key] = "released"
             continue
@@ -703,7 +734,7 @@ def _compare_presence(baseline: dict | None, current: dict | None,
     for key, rows in sorted(cleared_now.items()):
         if (key in recorded_observations or key in observations or key in cleared_before
                 or len(rows) != 1 or rows[0][1] is not None or rows[0][2] not in owners
-                or not isinstance(control, str) or control < rows[0][0]
+                or control_at is None or control_at < _presence_instant(rows[0][0])
                 or completed.get(key) != rows[0][0]):
             continue
         path[key] = "released"
@@ -728,10 +759,16 @@ def _compare_presence(baseline: dict | None, current: dict | None,
             fail("deliveries", key, "retained")
         elif not _delivery_advanced(job, deliveries[key]):
             fail("deliveries", key)
-    # No job, recorded or new, may point at an observation that is gone.
+    # No job, recorded or new, may point at an observation that is gone,
+    # and jobs and unresolved markers name only the service's actions.
     for key, job in sorted(deliveries.items()):
         if job["observation"] not in observations:
             fail("deliveries", key, "orphaned")
+        if key.rsplit(":", 1)[1] not in _PRESENCE_ACTIONS:
+            fail("deliveries", key, "unknown_action")
+    for action in sorted(expired):
+        if action not in _PRESENCE_ACTIONS:
+            fail("expired_unresolved", action, "unknown_action")
     # Tombstones and expired-unresolved events appear only through releases:
     # no tombstone for anything else, and each action's events rise by
     # exactly the released jobs neither delivered nor disabled.
@@ -768,8 +805,11 @@ def _compare_presence(baseline: dict | None, current: dict | None,
             fail("source_facts", key, "orphaned")
     clocks = current.get("clocks") or {}
     for key, value in (baseline.get("clocks") or {}).items():
-        if key not in clocks or clocks[key] < value:
-            fail("clocks", key, "missing" if key not in clocks else "changed")
+        if key not in clocks:
+            fail("clocks", key, "missing")
+        elif (_presence_instant(clocks[key]) is None or _presence_instant(value) is None
+              or _presence_instant(clocks[key]) < _presence_instant(value)):
+            fail("clocks", key, "changed")
     # A row a live outbox held may end in its clean close; a stale row is
     # consumed only by converting it into an interrupted timeline gap.
     removed = set(baseline.get("outbox_sessions") or ()) - set(current.get("outbox_sessions") or ())
@@ -782,8 +822,10 @@ def _compare_presence(baseline: dict | None, current: dict | None,
     # (advanced in the same transaction) has reached its expiry.
     override = baseline.get("override")
     if override and current.get("override") != override:
-        expired_out = (current.get("override") is None and override["expires"] is not None
-                       and override["expires"] <= clocks.get("control", ""))
+        expires, control_now = (_presence_instant(override["expires"]),
+                                _presence_instant(clocks.get("control")))
+        expired_out = (current.get("override") is None and expires is not None
+                       and control_now is not None and expires <= control_now)
         if not expired_out:
             fail("override", "owner")
     has_rows = any(baseline.get(name) for name in (
@@ -2347,11 +2389,8 @@ def _written_after(recorded_at) -> dict:
     since_ms = int(since.timestamp() * 1000)
 
     def iso(value):
-        try:
-            moment = datetime.fromisoformat(value)
-        except (TypeError, ValueError):
-            return False
-        return moment.tzinfo is not None and moment >= since
+        moment = _utc_instant(value)
+        return moment is not None and moment >= since
     return {"iso": iso, "ms": lambda value: isinstance(value, int) and value >= since_ms}
 
 
@@ -2378,12 +2417,14 @@ def _retention_rules(now: datetime) -> dict:
     audit_ms = now_ms - periods.audit_days * DAY_MS
     return {
         "security_admin": lambda value: isinstance(value, int) and value < cutoff_us,
-        "integrity": lambda value: isinstance(value, str) and value < cutoff.isoformat(),
+        "integrity": lambda value: (_utc_instant(value) is not None
+                                    and _utc_instant(value) < cutoff),
         "storage_state": lambda value: isinstance(value, int) and value < audit_ms,
         "recording_cutoff_ms": now_ms - periods.recording_days * DAY_MS,
         # OwnerTemplateStore's own default (Main constructs it with it).
-        "owner_template": lambda value: isinstance(value, str) and value < (
-            now - owner_store.DEFAULT_AUDIT_RETENTION).astimezone(timezone.utc).isoformat(),
+        "owner_template": lambda value: (
+            _utc_instant(value) is not None
+            and _utc_instant(value) < now - owner_store.DEFAULT_AUDIT_RETENTION),
     }
 
 
