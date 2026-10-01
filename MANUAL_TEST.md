@@ -123,7 +123,13 @@ device scan を `presence_scan_seconds` 間隔へ抑制）は synthetic fake で
 4. 30 fps × 2 台で 60 秒取得し、live 中の全 device scan が概ね
    `presence_scan_seconds` ごと（既定 1 秒）に抑えられていること、frame 欠落・
    `capture_failed` が増えていないことを確認する（件数のみ記録）。
-5. 記録には serial・device path・by-id・USB port・UUID を含めない。
+5. 抜線時に `STREAMOFF`/unmap/close が戻るまでの時間が長い場合でも、teardown
+   開始時点で `offline`（`video_capture_closed`）になり、teardown 中に `online`
+   と表示されないことを確認する（teardown の所要時間も記録する）。teardown 中の
+   遷移は synthetic fake（close が戻らない capture）でのみ確認済み。
+6. 記録には serial・device path・by-id・USB port・UUID を含めない。
+
+PR #111 は、上記を実機 C960 で再確認してからマージする。
 
 #### Real-hardware runtime procedure (serial-bearing UVC cameras)
 
