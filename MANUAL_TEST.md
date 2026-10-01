@@ -746,6 +746,25 @@ Remote-agent scenarios:
 - [ ] capture-node restart;
 - [ ] bandwidth throttling/backpressure test in a controlled environment.
 
+Agent ring core on a real disk (capture host, 2026-09-30). The capture-host
+session ran the Issue #16 ring core with a disposable loop-mounted ext4 media
+filesystem, generated (synthetic) segment bytes, an injected clock and the real
+`MediaStore` mount/free-space/reserve checks. No camera, real segmenter,
+authenticated transport or UI was involved, so the product checklist items
+below stay unchecked. Private host details are kept out of the repository.
+
+- [x] duration-mode FIFO kept exactly the selected duration;
+- [x] a Main-loss incident covered T-600 s..T+600 s complete and was retained across further FIFO;
+- [x] 60-day expiry ran only under a trusted clock;
+- [x] lazy unmount, a substituted directory and another filesystem each became `STORAGE_HARD_STOP` (`storage_path_unavailable` / `mount_replaced`) with no fallback write; remounting the same device recovered the ledger;
+Before any re-verification that switches to a new ledger on the same media
+root, expire or delete the previous run's incidents and ordinary media through
+the previous ledger. Its segments are otherwise unknown orphans to the new
+ledger: they are never deleted automatically and block configuration.
+
+- [x] **capacity mode** — re-verified 2026-09-30 on the sizing-fix head (see section Q record). Originally: the run found every realistic capacity refused as `insufficient_ledger_capacity` (the former 512-byte row model needed a ledger ~48x the capacity and ~33x that again as journal headroom). Repeat with the same profile shape (two sources, 4 Mbit/s, 10 s segments, 700 MiB, 32 MiB ledger cap): configuration must be admitted, `ledger_required_bytes` must stay within the cap, and T-10/T+10 must complete;
+- [ ] **hard stop while writes are refused** — refusal side re-verified 2026-09-30 (see section Q record); steady-FIFO false hard stop fixed afterwards, pending re-verification. Originally: the run found 83 `segment_storage_refused` appends near exhaustion while status stayed `STORAGE_PRESSURE / post_loss_headroom_reduced`. Repeat the near-reserve fill with **at least two sources whose real bitrate is below the max bound** (single-source or max-size synthetic bytes cannot reveal a false steady-FIFO hard stop): every status sampled before a refused append must read `STORAGE_HARD_STOP / segment_write_refused_at_reserve`, or `STORAGE_PRESSURE / segment_write_at_risk_at_maximum_bitrate` when the refused segment is larger than that source's recent maximum (the refusal is announced before it happens, never as healthy); accepted steady-FIFO appends must not read hard stop; free space must stay at or above the reserve; and status must leave hard stop once space is released. Known limitation (also documented in `agent/docs/RING_BUFFER.md`): immediately after a refusal the refused segment's `missing` row counts as that source's last write, so status may show `STORAGE_PRESSURE / post_loss_headroom_reduced` until the next refusal is imminent again, and the refused interval's coverage gap is hidden behind pressure in the status priority; record the refused intervals from the append results.
+
 Ring-buffer configuration:
 
 - [ ] owner can select **duration mode** and UI shows projected/actual disk usage;
@@ -1192,6 +1211,22 @@ of PR #104; `agent/` unchanged on `main` since `bec201b`).
 The real segmenter/profile, authenticated transport, Owner UI and systemd
 deployment checks in section G and the Issue #16 note in *Test metadata* remain
 open.
+
+### Agent ring real-disk re-run (Issue #16, 2026-09-30)
+
+Environment: the capture host, a disposable loop-mounted ext4 media
+filesystem, generated (synthetic) segment bytes, an injected trusted clock and
+the real `MediaStore` mount/free-space/reserve checks. No camera, segmenter,
+transport or UI. Run on the PR #104 sizing/hard-stop fix head (`4fce0df`).
+
+- [x] capacity mode, two sources at 4 Mbit/s with 10 s segments, 700 MiB under a 32 MiB ledger cap: admitted, `ledger_required_bytes` 13,901,824, capacity horizon 710 s;
+- [x] capacity FIFO stayed within 700 MiB and the 710 s horizon;
+- [x] a capacity-mode Main-loss incident covered T-600 s..T+600 s complete and was retained (ledger file about 23.7 MB);
+- [x] near-reserve fill (duration 900 s, two sources): from minute 9 the refused appends (83 in total) read `STORAGE_HARD_STOP / segment_write_refused_at_reserve`;
+- [x] an external fill produced hard stop; deleting it cleared status to `degraded / pre_loss_coverage_gap` and appends resumed;
+- [x] regressions: 900 s duration FIFO, loss incident and 60-day expiry unchanged;
+- [ ] **FAIL, fixed — pending re-verification**: in the same near-reserve run, minutes 16–20 accepted every append (FIFO reclaimed segments older than 900 s at each append) while status still read `STORAGE_HARD_STOP / segment_write_refused_at_reserve`. Status credited reclaim only as of `now`, when the segment the next append reclaims was not yet eligible. Status now evaluates each source's next append at its own capture phase (`max(now, last trusted segment end + cadence)`); re-run and confirm that accepted steady-state appends read `STORAGE_PRESSURE` (short pre-loss headroom), not hard stop, while real refusals still read hard stop;
+- [x] regression on the fix head: lazy unmount / an empty same-name directory on the root filesystem / another filesystem each refused writes with `STORAGE_HARD_STOP` (`storage_path_unavailable` / `mount_replaced`), no fallback write; remounting the approved volume passed `--check` and resumed appends on the recovered ledger.
 
 ## R. Long-duration / performance
 

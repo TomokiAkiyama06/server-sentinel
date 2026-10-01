@@ -19,6 +19,11 @@ from .ring_models import (DenyControls, MAX_INTEGER, POST, PRE, RETENTION, SECON
 from .storage import StorageRefused
 
 
+# Stored segments per source whose largest real allocation estimates the
+# space each further simulated append consumes in the next-write check.
+RECENT_ALLOCATION_SEGMENTS = 8
+
+
 class DiskRing:
     def __init__(self, settings, store, *, ledger_maximum_bytes, authority=None, ledger_space=os.fstatvfs):
         self.settings, self.store = settings, store
@@ -198,9 +203,12 @@ class DiskRing:
         if self.config.mode == "capacity":
             allocations = self.store.segment_allocations()
             excess = self._ordinary_bytes(allocations, self._protected_segments()) - self.config.value
+            horizon = self._horizon_us(self.config, self.profiles)
             eligible = []
             for row in current:
-                if excess <= 0:
+                # Rows are ordered by end: beyond the current horizon or over
+                # the current byte limit are both already FIFO-eligible.
+                if excess <= 0 and row["end"] > now - horizon:
                     break
                 eligible.append(row)
                 excess -= allocations.get(UUID(row["id"]), 0)
@@ -217,6 +225,43 @@ class DiskRing:
     def _segment_count(profiles, duration):
         return sum((duration + item.segment_duration_us - 1) // item.segment_duration_us + 2
                    for item in profiles.values())
+
+    @staticmethod
+    def _horizon_us(config, profiles):
+        """Ordinary-ring time horizon that bounds retained segment rows.
+
+        Duration mode retains its selected duration. Capacity mode retains at
+        most ``config.value`` physical bytes *and* at most the duration those
+        bytes represent at the Owner-declared expected bitrate (unrounded
+        segment bytes, so the horizon never shrinks with block size). A
+        capacity row cannot be sized by the 512-byte ``st_blocks`` unit: that
+        would demand ledger metadata many times larger than the media itself.
+        Lower-than-expected actual bitrate therefore keeps this horizon rather
+        than more history, which never falls below the required pre-loss
+        window because admission already requires ``value`` to hold it at the
+        maximum bitrate.
+        """
+        if config.mode == "duration":
+            return config.value * SECOND
+        sizes = [(profile.segment_duration_us, profile.segment_bytes(expected=True))
+                 for profile in profiles.values()]
+
+        def fits(duration):
+            return sum(((duration + cadence - 1) // cadence + 2) * size
+                       for cadence, size in sizes) <= config.value
+
+        # Each profile alone bounds the horizon, so this is a valid ceiling.
+        left = PRE
+        right = max(PRE, min(max(0, config.value // size - 2) * cadence for cadence, size in sizes))
+        if not fits(left):
+            return PRE
+        while left < right:
+            middle = (left + right + 1) // 2
+            if fits(middle):
+                left = middle
+            else:
+                right = middle - 1
+        return left
 
     @staticmethod
     def _trusted_profile_row(row, profiles):
@@ -255,8 +300,9 @@ class DiskRing:
             if (row["state"] != "stored" or row["allocated"] < 512
                     or not self._trusted_profile_row(row, profiles)):
                 carryover += 1
-        selected = (self._segment_count(profiles, config.value * SECOND) if config.mode == "duration"
-                    else config.value // 512 + 1)
+        # Both modes bound ordinary rows by a time horizon at every source
+        # cadence; capacity mode FIFO enforces its horizon as well as bytes.
+        selected = self._segment_count(profiles, self._horizon_us(config, profiles))
         segments = protected + carryover + max(len(rows) - protected - carryover, selected) + additional_segments
         incidents = self.db.execute("SELECT count(*) FROM incidents").fetchone()[0]
         protections = self.db.execute("SELECT count(*) FROM protection").fetchone()[0] + additional_protections
@@ -308,6 +354,143 @@ class DiskRing:
             "required_pre_allocated": pre, "reclaimable_allocated": reclaimable,
             "safety_reserve": self.settings.safety_reserve_bytes, "ledger_headroom": self.ledger_headroom,
         }
+
+    def _next_write_refused(self, now, budget, *, clock_trusted, at_bound=False):
+        """Whether any source's next bounded segment would be refused.
+
+        Writes are refused before they would cross the reserve, so free space
+        alone never drops below it while capture is being refused. Evaluate
+        each source's next append the way the append path does: it first
+        reclaims selected-FIFO media that has become eligible by then (trusted
+        time only), then needs its segment plus ledger headroom above the
+        reserve.
+
+        The next append is dated by that source's own capture phase, not by a
+        cadence restarted at ``now``: a segment ends at least one cadence after
+        the source's last trusted segment end and is appended no earlier than
+        its end, so the earliest append time is ``max(now, last_end +
+        cadence)``. A source with no trusted segment yet, or an overdue one,
+        may append at ``now``. Only media that ages out by that earliest time
+        is credited, so another source's later expiry is never counted.
+
+        Appends are simulated up to the latest source's next append,
+        including repeated appends of shorter-cadence sources and same-instant
+        appends of synchronized sources. Free space and each reclaimed segment
+        are shared: every earlier simulated append consumes its charge, and
+        reclaimable media is credited only once. A simulated append is itself
+        ordinary media: once it ages out of the FIFO window its charge is
+        credited too, unless a retained incident would protect it or a loss
+        is pending (both of which also stop the append path from reclaiming
+        it). Only a source whose next segment interval is known (not overdue)
+        is credited; otherwise status errs toward pressure or a hard stop.
+
+        Each simulated append is charged the largest real allocation among
+        that source's last ``RECENT_ALLOCATION_SEGMENTS`` stored segments, in
+        whole allocation units, never above its bound (the bound without
+        history): a refusal here means writes are refused at the recent real
+        bitrate. Appends at the same instant form one batch that must fit,
+        with one ledger headroom, as a whole, so the result does not depend
+        on profile order. Each source's appends form an arithmetic sequence,
+        so the charges through any instant are computed directly and only the
+        latest append between two credit changes is checked: the work is
+        bounded by stored rows and sources, not by cadence ratios.
+
+        With ``at_bound`` every simulated append is charged its maximum bound
+        instead: status uses that worst case only to warn (pressure) that a
+        rise to the maximum bitrate would be refused.
+
+        Under untrusted time the trusted phases are not comparable with
+        ``now`` (a rollback can leave them far in the future), and nothing is
+        credited as reclaimable. Every source's next append is then evaluated
+        at ``now`` together, so the work stays bounded by the source count
+        instead of growing with the rollback interval.
+        """
+        free, reserve = budget["filesystem_free"], budget["safety_reserve"]
+        unit = self.store.allocation_unit
+        next_append = {}
+        # Sources whose pending segments have a known interval. An overdue
+        # (or never written) source may next append a segment ending anywhere
+        # up to ``now``, possibly late media inside a retained incident, so
+        # its simulated allocations are never credited as reclaimable.
+        phased = set()
+        for source, profile in self.profiles.items():
+            if not clock_trusted:
+                next_append[source] = now
+                continue
+            last = self.db.execute("SELECT max(end) FROM segments WHERE source=? AND clock_trusted=1",
+                                   (str(source),)).fetchone()[0]
+            next_append[source] = now if last is None else max(now, last + profile.segment_duration_us)
+            if last is not None and last + profile.segment_duration_us >= now:
+                phased.add(source)
+        # One membership/row pass at the latest next-append time, filtered
+        # per source below, keeps the statement count independent of rows.
+        latest = max(next_append.values())
+        rows = self._selected_reclaimable(latest, self.config) if clock_trusted else ()
+        allocations = self.store.segment_allocations()
+        # Each simulated append is charged, and later frees, the source's
+        # recent real allocation (whole allocation units, never above the
+        # bound; the bound without history, or for ``at_bound``): charging
+        # every chained append the maximum would turn ordinary VBR below the
+        # bound into a permanent false refusal.
+        charge = {}
+        for source, profile in self.profiles.items():
+            bound = round_up(profile.segment_bytes(), unit)
+            sizes = [allocations.get(UUID(row[0]), bound) for row in self.db.execute(
+                "SELECT id FROM segments WHERE source=? AND state='stored' "
+                "ORDER BY end DESC LIMIT ?", (str(source), RECENT_ALLOCATION_SEGMENTS))]
+            charge[source] = (min(bound, round_up(max(sizes), unit)) if sizes and not at_bound
+                              else bound)
+        window = self.config.value * SECOND if self.config.mode == "duration" else PRE
+        cadence = {source: profile.segment_duration_us for source, profile in self.profiles.items()}
+
+        def consumed_through(at):
+            """Charges of every simulated append at or before ``at``."""
+            return sum(charge[source] * ((at - next_append[source]) // cadence[source] + 1)
+                       for source in self.profiles if at >= next_append[source])
+
+        # Credits as (time from which they count, bytes): stored media ages out
+        # at ``end + window``; a simulated append ages out ``window`` after it
+        # is written. Because ``latest <= now + PRE <= now + window``, only an
+        # append at exactly ``now`` can age out within the simulation, so at
+        # most one simulated credit per source exists.
+        credits = [(max(row["end"] + window, now), allocations.get(UUID(row["id"]), 0)) for row in rows]
+        if clock_trusted and not self._pending_loss():
+            protecting = [(row["start"], row["end"], set(json.loads(row["sources"])))
+                          for row in self.db.execute(
+                              "SELECT start, end, sources FROM incidents "
+                              "WHERE state IN ('active','complete','partial') AND end>?", (now - window,))]
+            for source in phased:
+                at = next_append[source]
+                if at + window <= latest and not any(
+                        str(source) in sources and start < at and end > at - cadence[source]
+                        for start, end, sources in protecting):
+                    credits.append((at + window, charge[source]))
+        credits.sort()
+        # Appends at the same instant form one batch that must fit as a
+        # whole: whichever is written last needs the charges through that
+        # instant plus one ledger headroom above the reserve, so the result
+        # never depends on profile order. Charges are whole allocation units,
+        # so that is ``free + R(t) - consumed_through(t) >= reserve +
+        # round_up(L)``. Within an interval of constant credit ``R`` the
+        # latest append is the strictest, so only that one is checked: the
+        # work is bounded by the stored rows and sources, not by how many
+        # times a short-cadence source appends before the slowest one.
+        headroom = round_up(self.ledger_headroom, unit)
+        boundaries = sorted({time for time, _amount in credits if now < time <= latest})
+        starts = [now] + boundaries
+        ends = boundaries + [latest + 1]
+        reclaim = 0
+        index = 0
+        for begin, finish in zip(starts, ends):
+            while index < len(credits) and credits[index][0] <= begin:
+                reclaim += credits[index][1]
+                index += 1
+            consumed = consumed_through(finish - 1)
+            if consumed == consumed_through(begin - 1):
+                continue  # No append in this interval.
+            if free + reclaim - consumed < reserve + headroom:
+                return True
+        return False
 
     def configure(self, config, profiles, *, now_us, clock_trusted):
         self.authority.require_owner("configure_ring")
@@ -442,12 +625,13 @@ class DiskRing:
         # Reclamation removes only unprotected media, so one membership
         # snapshot stays accurate for the whole pass.
         ordinary = self._ordinary_bytes(allocations, self._protected_segments())
+        horizon = self._horizon_us(self.config, self.profiles)
         for row in self._selected_reclaimable(now, self.config):
-            outside = row["end"] <= now - self.config.value * SECOND
-            if self.config.mode == "duration" and not outside:
-                continue
-            if self.config.mode == "capacity" and ordinary <= self.config.value:
-                break
+            if row["end"] > now - horizon:
+                # Rows are ordered by end. Duration mode only trims outside
+                # its horizon; capacity mode also trims to its byte limit.
+                if self.config.mode == "duration" or ordinary <= self.config.value:
+                    break
             self._remove_segment(row["id"])
             ordinary -= allocations.get(UUID(row["id"]), 0)
 
@@ -548,7 +732,8 @@ class DiskRing:
             except StorageRefused as exc:
                 with self.ledger.transaction():
                     self.db.execute("UPDATE segments SET state='missing' WHERE id=?", (identifier,))
-                self.state, self.reason = "STORAGE_HARD_STOP", str(exc)
+                self.state, self.reason = "STORAGE_HARD_STOP", (
+                    "segment_write_refused_at_reserve" if str(exc) == "STORAGE_HARD_STOP" else str(exc))
                 raise RingRefused("segment_storage_refused") from exc
             with self.ledger.transaction():
                 self.db.execute("UPDATE segments SET state='stored', allocated=? WHERE id=?",
@@ -661,8 +846,7 @@ class DiskRing:
         # than asserting a FIFO cutoff. The next trusted tick applies limits.
         if self.config is None:
             return False
-        return (not trusted or self.config.mode == "capacity"
-                or row["end"] > now - self.config.value * SECOND)
+        return not trusted or row["end"] > now - self._horizon_us(self.config, self.profiles)
 
     def _delete_incident(self, identifier, *, now=None, trusted=False):
         incident = self.db.execute("SELECT * FROM incidents WHERE id=?", (identifier,)).fetchone()
@@ -741,14 +925,18 @@ class DiskRing:
         self.ledger.check_space()
         clock_trusted = self._clock(now, clock_trusted, record=False)
         budget = self._budget(self.profiles, now, clock_trusted=clock_trusted)
-        ledger_pressure = False
+        ledger_pressure, ledger_required = False, None
         try:
             active = self.db.execute("SELECT 1 FROM incidents WHERE state='active' LIMIT 1").fetchone()
-            self._ledger_capacity(self.config, self.profiles, proposal=None if active else (now - PRE, now + POST))
+            ledger_required = self._ledger_capacity(self.config, self.profiles,
+                                                    proposal=None if active else (now - PRE, now + POST))
         except RingRefused as exc:
             if str(exc) != "insufficient_ledger_capacity":
                 raise
             ledger_pressure = True
+            # The size that would admit the next incident, reported exactly
+            # when the configured cap is insufficient.
+            ledger_required = getattr(exc, "required_bytes", None)
         allocated = self.store.segment_allocations()
         rows = self._rows()
         known_ids = {UUID(row["id"]) for row in rows}
@@ -765,12 +953,16 @@ class DiskRing:
             coverage[str(source)] = {"intervals_us": intervals, "gaps_us": gaps}
         if budget["filesystem_free"] < budget["safety_reserve"]:
             self.state, self.reason = "STORAGE_HARD_STOP", "safety_reserve_unavailable"
+        elif self._next_write_refused(now, budget, clock_trusted=clock_trusted):
+            self.state, self.reason = "STORAGE_HARD_STOP", "segment_write_refused_at_reserve"
         elif self.config.mode == "capacity" and ordinary > self.config.value:
             self.state, self.reason = "STORAGE_PRESSURE", "ordinary_capacity_exhausted"
         elif ledger_pressure:
             self.state, self.reason = "STORAGE_PRESSURE", "insufficient_ledger_capacity"
         elif budget["filesystem_free"] + budget["reclaimable_allocated"] < budget["required_additional"] + budget["safety_reserve"]:
             self.state, self.reason = "STORAGE_PRESSURE", "post_loss_headroom_reduced"
+        elif self._next_write_refused(now, budget, clock_trusted=clock_trusted, at_bound=True):
+            self.state, self.reason = "STORAGE_PRESSURE", "segment_write_at_risk_at_maximum_bitrate"
         elif self._pending_loss():
             self.state, self.reason = "degraded", "loss_time_anchor_unavailable"
         elif not clock_trusted or self.db.execute(
@@ -815,6 +1007,10 @@ class DiskRing:
             expected_bytes = self._estimate(self.profiles, left, expected=True)
         return {**budget, "mode": self.config.mode, "selected_value": self.config.value,
                 "selected_unit": "seconds" if self.config.mode == "duration" else "bytes",
+                "capacity_horizon_us": (self._horizon_us(self.config, self.profiles)
+                                        if self.config.mode == "capacity" else None),
+                "ledger_maximum_bytes": self.ledger.maximum_bytes,
+                "ledger_required_bytes": ledger_required,
                 "projected_maximum_bytes": max_bytes, "projected_expected_bytes": expected_bytes,
                 "estimated_duration_us": estimated_duration, "ordinary_allocated_bytes": ordinary,
                 "protected_allocated_bytes": protected, "orphan_allocated_bytes": orphan_bytes,
