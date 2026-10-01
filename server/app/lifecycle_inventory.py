@@ -712,13 +712,19 @@ def _compare_presence(baseline: dict | None, current: dict | None,
             continue  # reported missing above
         if added != needed[action]:
             fail("expired_unresolved", action, "unexplained")
+    # A source fact is written with its observation and deleted with it.
     facts = current.get("source_facts") or {}
     for key, value in (baseline.get("source_facts") or {}).items():
         if key in facts:
-            if facts[key] != value:
+            if key in path:
+                fail("source_facts", key, "retained")
+            elif facts[key] != value:
                 fail("source_facts", key)
         elif key in observations:
             fail("source_facts", key, "missing")
+    for key in sorted(facts):
+        if key not in observations and key not in path:
+            fail("source_facts", key, "orphaned")
     clocks = current.get("clocks") or {}
     for key, value in (baseline.get("clocks") or {}).items():
         if key not in clocks or clocks[key] < value:
@@ -845,7 +851,7 @@ _ENROLLMENT_SUCCESSORS = {
 
 def _audited_before_revocation(node: str, baseline: dict, current: dict,
                                activations: int) -> bool:
-    """Whether the node's post-record activations all precede its revocation.
+    """Whether the node's post-record credential changes all precede its revocation.
 
     Uses the succeeded activate / revoke audit rows appended since the
     record. Without a revoke row, or with fewer activation rows than
@@ -1115,9 +1121,16 @@ def _compare_pairing(baseline: dict, current: dict) -> list:
         # revoked in the window must have happened before its first
         # revocation (otherwise it re-opened the node on the same ID), and
         # every such activation and the revocation must be audited.
+        # Every accepted credential change writes an activate audit row:
+        # each activation since the record and the promotion of the renewal
+        # staged at record time (which revoke() deletes, so it cannot follow).
+        recorded_credential, staged_row = recorded_credentials.get(node), staged.get(node)
+        promoted = int(recorded_credential is not None and not recorded_credential["revoked"]
+                       and staged_row is not None and node in credentials
+                       and credentials[node]["material"] == staged_row["material"])
         if not _audited_before_revocation(node, baseline, current,
-                                          sum(1 for item in activated_since.values()
-                                              if item["node_id"] == node)):
+                                          promoted + sum(1 for item in activated_since.values()
+                                                         if item["node_id"] == node)):
             fail("pairing_revocation", node, "reopened")
         after = credentials.get(node)
         if not revocable:

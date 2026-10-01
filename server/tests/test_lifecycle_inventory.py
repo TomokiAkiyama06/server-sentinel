@@ -1604,6 +1604,30 @@ class LifecycleInventoryTests(unittest.TestCase):
                       failed)
         self.assertIn({"id": f"deliveries:{ghost}:notification", "reason": "orphaned"}, failed)
 
+    def test_released_and_orphaned_source_facts_fail(self):
+        # Codex P2: a source fact is written with its observation and deleted
+        # with it, including by the Owner release.
+        seeded = self.runtime.seed()
+        ids = self.presence_rows()
+        _, baseline = self.record()
+        at = "2026-02-01T00:00:00.000000+00:00"
+        for table, column in (("presence_deliveries", "observation"),
+                              ("presence_observations", "id")):
+            self.runtime.execute(f"DELETE FROM {table} WHERE {column}=?", (ids["expired"],))
+        self.runtime.execute("INSERT INTO presence_completed_events VALUES (?, ?)",
+                             (ids["expired"], at))
+        self.runtime.execute("INSERT INTO presence_expired_unresolved VALUES ('notification', 1, "
+                             "?)", (at,))
+        self.owner_clear(seeded["owner"], ids["expired"], at)
+        ghost = str(uuid4())
+        self.runtime.execute("INSERT INTO presence_source_facts (id, digest) VALUES (?, ?)",
+                             (ghost, "0" * 64))
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_FAILED)
+        failed = report["sections"]["presence"]["failed"]
+        self.assertIn({"id": f"source_facts:{ids['expired']}", "reason": "retained"}, failed)
+        self.assertIn({"id": f"source_facts:{ghost}", "reason": "orphaned"}, failed)
+
     def test_presence_clocks_sessions_and_override_follow_service_transitions(self):
         self.runtime.seed()
         self.runtime.execute("INSERT INTO presence_clock VALUES (1, "
@@ -2343,6 +2367,8 @@ class LifecycleInventoryTests(unittest.TestCase):
                                  # An unaudited activation cannot be ordered
                                  # before the node's revocation.
                                  {"id": f"pairing_revocation:{nodes['repaired']}",
+                                  "reason": "reopened"},
+                                 {"id": f"pairing_revocation:{nodes['promoted']}",
                                   "reason": "reopened"}],
                                 key=lambda item: (item["id"], item["reason"])))
 
@@ -2960,6 +2986,38 @@ class LifecycleInventoryTests(unittest.TestCase):
         self.assertEqual(report["sections"]["security_state"]["failed"],
                          [{"id": f"pairing_revocation:{nodes['reopened']}",
                            "reason": "reopened"}])
+
+    def test_a_promotion_on_a_revoked_node_needs_its_audit_before_the_revoke(self):
+        # Codex P1: a promotion writes the activate audit row too and cannot
+        # follow a revocation (which deletes the staged renewal); a revoked
+        # credential showing the staged material without that row before
+        # the revoke row is not a promotion.
+        self.runtime.seed()
+        database = Database(self.runtime.database)
+        ledger = PairingLedger(database, HmacCodeVerifier(b"s" * 32),
+                               audit=AuditStore(database), clock=lambda: 100.0,
+                               process_epoch=uuid4())
+
+        class Owner:
+            def require_owner(self, actor_context):
+                if actor_context != "owner":
+                    raise PermissionError("synthetic denial")
+        owner, node = Owner(), uuid4()
+        approval, code = ledger.approve(owner, "owner", node_id=node, public_key_digest="a" * 64)
+        claim = ledger.redeem(enrollment_id=approval.enrollment_id, public_key_digest="a" * 64,
+                              code=code.value)
+        ledger.activate(claim, credential_serial_digest="b" * 64, not_after=50.0)
+        ledger.stage_renewal(node_id=node, current_public_key_digest="a" * 64,
+                             current_credential_digest="b" * 64, public_key_digest="c" * 64,
+                             credential_serial_digest="d" * 64, not_after=90.0)
+        _, baseline = self.record()
+        ledger.revoke(owner, "owner", node_id=node)
+        self.runtime.execute("UPDATE pairing_node_credentials SET public_key_digest=?, "
+                             "credential_serial_digest=?, not_after=90.0 WHERE node_id=?",
+                             ("c" * 64, "d" * 64, str(node)))
+        code, report, _ = self.verify(baseline)
+        self.assertIn({"id": f"pairing_revocation:{node}", "reason": "reopened"},
+                      report["sections"]["security_state"]["failed"])
 
     def test_a_staged_renewal_is_never_restaged_onto_a_superseded_key(self):
         # Codex P1: stage_renewal() accepts a key already bound to the node
