@@ -3226,6 +3226,42 @@ class LifecycleInventoryTests(unittest.TestCase):
         self.assertEqual(code, inventory.EXIT_FAILED)
         self.assertFalse(report["owner_present"])
 
+    def test_an_owner_who_cannot_authenticate_is_not_present(self):
+        # Codex P1: the passkey ceremony admits only an active, unrevoked
+        # Owner with an active (not revoked, not inconsistent) credential.
+        tampers = {
+            "revoked-owner": "UPDATE access_principals SET status='revoked', revoked_at_us=5 "
+                             "WHERE id=:owner",
+            "inactive-owner": "UPDATE access_principals SET status='invited' WHERE id=:owner",
+            "no-credential": "DELETE FROM access_credentials WHERE principal_id=:owner",
+            "revoked-credentials": "UPDATE access_credentials SET revoked_at_us=5 "
+                                   "WHERE principal_id=:owner",
+            "inconsistent-credentials": "UPDATE access_credentials SET inconsistent_at_us=5, "
+                                        "inconsistency_reason='backup_eligibility_changed' "
+                                        "WHERE principal_id=:owner",
+        }
+        for index, (label, statement) in enumerate(tampers.items()):
+            with self.subTest(label):
+                runtime = Runtime(self.base / f"owner-{index}")
+                saved, self.runtime = self.runtime, runtime
+                try:
+                    seeded = runtime.seed()
+                    _, baseline = self.record(f"owner-good-{index}.json")
+                    with closing(sqlite3.connect(runtime.database, isolation_level=None)) as db:
+                        db.execute("DELETE FROM access_sessions")
+                        db.execute(statement, {"owner": seeded["owner"]})
+                    # Recording such a state never succeeds ...
+                    code, recorded = self.record(f"owner-bad-{index}.json")
+                    self.assertEqual(code, inventory.EXIT_EMPTY)
+                    self.assertEqual(json.loads(recorded.read_text())["coverage"]["owner"],
+                                     "empty")
+                    # ... and reaching it from a good record is a failure.
+                    code, report, _ = self.verify(baseline)
+                finally:
+                    self.runtime = saved
+                self.assertEqual(code, inventory.EXIT_FAILED)
+                self.assertFalse(report["owner_present"])
+
     def test_refuses_output_inside_runtime_root(self):
         for target in (self.runtime.root / "inventory.json",
                        self.runtime.root / "state" / "inventory.json",

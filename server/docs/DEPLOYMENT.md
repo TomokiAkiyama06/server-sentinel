@@ -643,7 +643,12 @@ unchanged; otherwise the declared recording is still `changed`. The comparison i
 never success, while the baseline lacks any of: an ordinary recording, a
 starred recording, a camera source, a security/admin audit row, the Owner, a
 `live:view`-only grant, a `recordings:view`-only grant, or a revoked principal
-or invitation. Capture-agent protected incidents are recorded as not applicable
+or invitation. The Owner counts only if it can still authenticate as the
+passkey ceremony requires (an active, unrevoked principal with at least one
+credential neither revoked nor marked inconsistent), both for `record`
+coverage and for `verify`, where a recorded Owner that can no longer
+authenticate is a failure; a grant counts only on a principal that is not
+revoked. Capture-agent protected incidents are recorded as not applicable
 here (#16 / #28).
 
 Container duration probing and a decodable-playback sample need a codec and are

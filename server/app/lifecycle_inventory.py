@@ -1721,11 +1721,25 @@ def _access(connection, tables, salt: str) -> dict | None:
     return {"principals": principals, "invitations": invitations}
 
 
+def _usable_owner(item: dict) -> bool:
+    """An Owner who can still authenticate, as the passkey ceremony requires.
+
+    PasskeyService._verified_assertion() admits only an active principal
+    (store: status 'active', not revoked) with an active credential (not
+    revoked, not marked inconsistent), which is what active_credentials
+    holds.
+    """
+    return (item["role"] == "owner" and item["status"] == "active" and not item["revoked"]
+            and item["active_credential_count"] > 0)
+
+
 def _coverage(inventory: dict) -> dict:
     recordings = inventory["recordings"] or {}
     audit = inventory["audit"]["security_admin"] or {"rows": []}
     access = inventory["access"] or {"principals": {}, "invitations": {}}
-    others = [item for item in access["principals"].values() if item["role"] != "owner"]
+    # A grant counts only on a principal that is not revoked.
+    others = [item for item in access["principals"].values()
+              if item["role"] != "owner" and not item["revoked"] and item["status"] != "revoked"]
 
     def present(flag: bool) -> str:
         return "present" if flag else "empty"
@@ -1736,7 +1750,7 @@ def _coverage(inventory: dict) -> dict:
             r["starred"] and _evidenced(r) for r in recordings.values())),
         "camera_source": present(bool(inventory["camera_sources"])),
         "audit_record": present(bool(audit["rows"])),
-        "owner": present(any(item["role"] == "owner" for item in access["principals"].values())),
+        "owner": present(any(_usable_owner(item) for item in access["principals"].values())),
         "live_view_only_grant": present(any(
             item["permissions"] == ["live:view"] for item in others)),
         "recordings_view_only_grant": present(any(
@@ -2322,7 +2336,7 @@ def compare(baseline: dict, current: dict, *, declared_rewrites=(), now=None) ->
         raise InventoryError("declared rewrite is not a recorded recording logical ID")
     access_base = baseline.get("access") or {}
     access_now = current.get("access") or {}
-    access_owner = any(item["role"] == "owner"
+    access_owner = any(_usable_owner(item)
                        for item in (access_now.get("principals") or {}).values())
     rules = _retention_rules(now or _utcnow())
     fresh = _written_after(baseline.get("recorded_at"))
