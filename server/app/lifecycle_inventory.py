@@ -951,8 +951,18 @@ def _compare_pairing(baseline: dict, current: dict) -> list:
     Nothing deletes an enrollment, a credential or a binding, rebinds a key
     or un-revokes a binding. Hence every current state satisfies:
 
-    - each active credential's key is live for its node;
-    - a staged renewal belongs to an active credential, uses another key,
+    - credential: every credential's node has an activated enrollment
+      (only activate() creates one); an active credential's key is live for
+      its node; a revoked credential's node has every binding revoked, no
+      pending / consumed enrollment and no staged renewal (what revoke()
+      leaves; a revoked node is re-paired only as a new node);
+    - binding: every binding's node has an enrollment (approve() binds with
+      one; stage_renewal() needs an activated credential); a live binding
+      added since the record is an enrollment's key, the staged renewal's
+      key or the credential's key;
+    - enrollment: an activated one's node has a credential; a revoked one's
+      node has no active credential;
+    - renewal: a staged renewal belongs to an active credential, uses another key,
       and that key is live for its node and named by no enrollment, recorded
       or current, in any state (so no activated enrollment's key is staged:
       activate() deletes the renewal and that key can never be staged
@@ -962,7 +972,7 @@ def _compare_pairing(baseline: dict, current: dict) -> list:
       record may name a key staged at record time or now, so neither the
       retry path nor any other accepts it. A key both staged and approved
       inside the window, its renewal then gone, leaves no trace and passes;
-    - every enrollment's key, in any state, is bound to its node; an open
+    - enrollment: every enrollment's key, in any state, is bound to its node; an open
       (pending / consumed) one's binding is live, a revoked one's is revoked
       (expiry and activation change no binding state), and a revoked one
       new or newly revoked since the record means revoke() of its node ran
@@ -1030,9 +1040,38 @@ def _compare_pairing(baseline: dict, current: dict) -> list:
         return recorded_bindings is not None and key_ref not in recorded_bindings
 
     # -- invariants of every current state --------------------------------
+    enrollments_by_node: dict = {}
+    for item in (current.get("pairing_enrollments") or {}).values():
+        enrollments_by_node.setdefault(item["node_id"], []).append(item["state"])
     for node, after in sorted(credentials.items()):
         if not after["revoked"] and not live(node, after["key_ref"]):
             fail("pairing_credentials", node, "unbound")
+        # Only activate() creates a credential, and enrollments stay.
+        if "activated" not in enrollments_by_node.get(node, ()):
+            fail("pairing_credentials", node, "no_activation")
+        # revoke() leaves the node with every binding revoked, no open
+        # enrollment and no staged renewal (and, re-paired only as a new
+        # node, it gains none afterwards).
+        if after["revoked"] and (
+                any(binding["node_id"] == node and not binding["revoked"]
+                    for binding in bindings.values())
+                or any(state in ("pending", "consumed")
+                       for state in enrollments_by_node.get(node, ()))
+                or node in renewals):
+            fail("pairing_credentials", node, "revocation_incomplete")
+    for node, states in sorted(enrollments_by_node.items()):
+        after = credentials.get(node)
+        # activate() writes the credential; only revoke() writes 'revoked',
+        # revoking the credential with it.
+        if "activated" in states and after is None:
+            fail("pairing_enrollments", node, "no_credential")
+        if "revoked" in states and after is not None and not after["revoked"]:
+            fail("pairing_enrollments", node, "revocation_incomplete")
+    # A binding is made by approve() (an enrollment) or stage_renewal()
+    # (which needs an activated credential): its node has an enrollment.
+    for key_ref, binding in sorted(bindings.items()):
+        if binding["node_id"] not in enrollments_by_node:
+            fail("pairing_key_bindings", key_ref, "no_enrollment")
     for node, renewal in sorted(renewals.items()):
         owner = credentials.get(node)
         if (owner is None or owner["revoked"] or owner["key_ref"] == renewal["key_ref"]

@@ -434,9 +434,14 @@ revoked stay revoked; the capture-node pairing ledger (keyed digests of keys
 and credential serials only) is checked against the operations
 `PairingLedger` performs (approve, redeem / expiry, activate, stage renewal,
 promotion, revoke). Every current state must satisfy the ledger's
-invariants: an active credential's key, a staged renewal's key (which differs
-from the credential's and belongs to an active credential) and an open
-enrollment's key are each bound to that node by a live, unrevoked binding,
+invariants: every credential's node has an activated enrollment; a revoked
+credential's node has every binding revoked, no pending or consumed
+enrollment and no staged renewal; an activated enrollment's node has a
+credential and a revoked enrollment's node no active one; every binding's
+node has an enrollment; an active credential's key, a staged renewal's key
+(which differs from the credential's and belongs to an active credential)
+and an open enrollment's key are each bound to that node by a live,
+unrevoked binding,
 every enrollment's key (any state) is bound to its node, a revoked
 enrollment's binding is revoked, and a staged renewal's
 key is never the key of any enrollment, recorded or current, in any state
