@@ -204,7 +204,14 @@ class CollectorDecision:
 
 
 class ReviewSource(Protocol):
-    """Authenticated, completely paginated provider review evidence."""
+    """Authenticated, completely paginated provider review evidence.
+
+    ``repository`` names the ``owner/name`` repository whose reviews the
+    source reads; ``collect_and_publish`` refuses a source that does not name
+    the configured repository.
+    """
+
+    repository: str
 
     def list_reviews(self, pr_number: int) -> list[dict[str, Any]]:
         ...
@@ -801,7 +808,11 @@ class ReviewCollector:
         Collection is bound to ``pr_number`` and the configured repository:
         every live read that names another pull request or repository fails
         before any ledger is read or written, so a miswired reader can never
-        produce, for another PR, an outcome whose revocation lands here.
+        produce, for another PR, an outcome whose revocation lands here.  The
+        review ``source`` must name the same repository: a source built for
+        another repository (whose same-numbered PR may share the head commit,
+        e.g. a fork) is refused as a collection error, which revokes any
+        standing success instead of accepting reviews of another diff.
 
         With ``read_live_context=None`` (the production composition) every
         live read -- before, after, a mismatch confirmation and the re-read in
@@ -829,6 +840,7 @@ class ReviewCollector:
             return live
         with self._store.lock(repository_id, pr_number):
             try:
+                _require_source_repository(source, credentials.config.repository)
                 decision = self._collect_held(reviewer, bound_read, source)
                 if decision.status == "pass":
                     self._publish_locked(client, credentials, decision)
@@ -905,6 +917,14 @@ class ReviewCollector:
                                  request.request_id, check_run, untrusted, before)
 
 
+def _require_source_repository(source: ReviewSource, repository: str) -> None:
+    # GitHub owner and repository names are case-insensitive.
+    named = getattr(source, "repository", None)
+    if (not isinstance(named, str) or not isinstance(repository, str)
+            or named.casefold() != repository.casefold()):
+        raise CollectorFailure("review source targets another repository")
+
+
 class GitHubReviewSource:
     """Completely paginated PR reviews and review comments via the App client."""
 
@@ -912,11 +932,24 @@ class GitHubReviewSource:
     MAX_PAGES = MAX_REVIEWS // PAGE_SIZE
 
     def __init__(self, client: ListTransport, repository: str, token: str) -> None:
-        if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository):
+        if (not isinstance(repository, str)
+                or not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository)):
             raise CollectorFailure("invalid target repository")
         self._client = client
+        self._repository = repository
         self._repo = "/repos/" + repository
         self._token = token
+
+    @classmethod
+    def for_credentials(cls, client: ListTransport,
+                        credentials: AppCredentials) -> "GitHubReviewSource":
+        """The source for the configured repository, read with its App token."""
+        return cls(client, credentials.config.repository,
+                   credentials.installation_token)
+
+    @property
+    def repository(self) -> str:
+        return self._repository
 
     def __repr__(self) -> str:
         return f"GitHubReviewSource({self._repo!r})"

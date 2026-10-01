@@ -49,7 +49,8 @@ class Clock:
 
 
 class FakeSource:
-    def __init__(self):
+    def __init__(self, repository="owner/repository"):
+        self.repository = repository
         self.reviews: list[dict] = []
         self.comments: dict[int, list[dict]] = {}
         self.next_id = 5000
@@ -703,6 +704,33 @@ class CollectorTests(unittest.TestCase):
                          [("success", self.context.test_merge_sha),
                           ("failure", self.context.test_merge_sha)])
 
+    def test_reconciliation_refuses_a_source_for_another_repository(self):
+        client, credentials = self.publication()
+        self.collector.request_review("codex", self.live, self.source)
+        self.source.add(self.context.head_sha, self.late())
+        self.assertEqual(self.reconcile(client, credentials).status, "pass")
+        # Same PR number and head commit (e.g. a fork), but another repository's
+        # reviews: a trusted pass there must never count here.
+        foreign = FakeSource("other/repository")
+        foreign.add(self.context.head_sha, self.late())
+        unnamed = FakeSource()
+        del unnamed.repository
+        unnamed.add(self.context.head_sha, self.late())
+        for wrong in (foreign, unnamed):
+            with self.subTest(source=getattr(wrong, "repository", None)):
+                with self.assertRaisesRegex(collector.CollectorFailure,
+                                            "another repository"):
+                    self.reconcile(client, credentials, source=wrong)
+        # The standing success, which these passes could not verify, was
+        # superseded exactly once and no new success was published.
+        self.assertEqual([post["conclusion"] for post in client.posts],
+                         ["success", "failure"])
+        self.assertIsNone(self.ledger()["published"])
+        # GitHub repository names are case-insensitive.
+        self.assertEqual(self.reconcile(
+            client, credentials, source=FakeSource("Owner/Repository")).status,
+            "pending")
+
     def test_unwritable_ledger_still_supersedes_the_standing_success(self):
         client, credentials = self.publication()
         self.collector.request_review("codex", self.live, self.source)
@@ -934,6 +962,18 @@ class GitHubReviewSourceTests(unittest.TestCase):
                 source.list_reviews(*args)
         with self.assertRaises(collector.CollectorFailure):
             collector.GitHubReviewSource(client, "owner/repo/extra", "t")
+
+    def test_source_built_from_credentials_reads_the_configured_repository(self):
+        config = publisher.RuntimeConfig("owner/repository", 900002,
+                                         gate.Issuer(900001, "synthetic-review-gate"),
+                                         900003, Path("/nonexistent/key.pem"))
+        credentials = publisher.AppCredentials(config, b"synthetic-key", "t" * 40)
+        client = self.Client([[{"id": 1}]])
+        source = collector.GitHubReviewSource.for_credentials(client, credentials)
+        self.assertEqual(source.repository, "owner/repository")
+        self.assertEqual(len(source.list_reviews(12)), 1)
+        self.assertEqual(client.paths,
+                         ["/repos/owner/repository/pulls/12/reviews?per_page=100&page=1"])
 
     def test_publisher_transport_allows_only_fixed_queries(self):
         from scripts.ci.review_gate_publisher import PublisherFailure, UrllibGitHubTransport
