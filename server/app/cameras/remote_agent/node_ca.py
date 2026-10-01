@@ -198,7 +198,17 @@ class PrivateDirectory:
             finally:
                 if descriptor is not None:
                     os.close(descriptor)
-            os.fsync(directory)
+            try:
+                os.fsync(directory)
+            except OSError:
+                # The entry is not known to be durable: remove it, so a
+                # failed setup never strands write-once material that blocks
+                # every corrected rerun.
+                try:
+                    os.unlink(name, dir_fd=directory)
+                except OSError:
+                    pass
+                raise CaptureAuthorityError("issuer material could not be written") from None
             return self.path / name
         finally:
             os.close(directory)
@@ -236,7 +246,10 @@ class PrivateDirectory:
                 return
             except OSError:
                 raise CaptureAuthorityError("issuer material could not be removed") from None
-            os.fsync(directory)
+            try:
+                os.fsync(directory)
+            except OSError:
+                raise CaptureAuthorityError("issuer material could not be removed") from None
         finally:
             os.close(directory)
 

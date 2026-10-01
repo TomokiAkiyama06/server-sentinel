@@ -110,12 +110,20 @@ class EnrollmentLimits:
             raise EnrollmentConfigurationError("enrollment_limit_invalid")
 
 
+def _socket_identity(address: ipaddress.IPv4Address | ipaddress.IPv6Address):
+    """The address a reservation compares: IPv4-mapped IPv6 as its IPv4 form."""
+    mapped = getattr(address, "ipv4_mapped", None)
+    return address if mapped is None else mapped
+
+
 @dataclass(frozen=True)
 class EnrollmentListenerConfig:
     """Explicit private bind; no default address, port, wildcard or public address.
 
     ``reserved`` lists the socket addresses of the other listeners (human
     dashboard, capture ingest) so this listener can never share one of them.
+    IPv4-mapped IPv6 addresses (``::ffff:a.b.c.d``) are compared in their IPv4
+    form, because Linux treats both spellings as the same socket.
     """
 
     bind_host: str
@@ -143,7 +151,8 @@ class EnrollmentListenerConfig:
                 raise EnrollmentConfigurationError("enrollment_reserved_listeners_invalid") from None
             if type(port) is not int or not 1 <= port <= 65535:
                 raise EnrollmentConfigurationError("enrollment_reserved_listeners_invalid")
-            if port == self.port and (other == bind or other.is_unspecified):
+            if port == self.port and (_socket_identity(other) == _socket_identity(bind)
+                                      or other.is_unspecified):
                 raise EnrollmentConfigurationError("enrollment_listener_must_differ_from_other_listeners")
 
 

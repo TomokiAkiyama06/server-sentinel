@@ -5,6 +5,7 @@ listener runs in a thread of this process; clients are real TLS 1.3 sockets.
 """
 from contextlib import closing
 import datetime
+import errno
 import hashlib
 import io
 import json
@@ -14,6 +15,7 @@ from pathlib import Path
 import socket
 import sqlite3
 import ssl
+import stat
 import struct
 import tempfile
 import threading
@@ -333,6 +335,13 @@ class EnrollmentConfigurationTests(unittest.TestCase):
         with self.assertRaisesRegex(EnrollmentConfigurationError, "differ"):
             EnrollmentListenerConfig("10.0.0.5", 7443, reserved=(("0.0.0.0", 7443),))
         EnrollmentListenerConfig("10.0.0.5", 7443, reserved=(("127.0.0.1", 8000),))
+        # Linux treats an IPv4-mapped IPv6 address and its IPv4 form as the same
+        # socket, so the reservation compares them as equal in either direction.
+        for bind, other in (("::ffff:127.0.0.1", "127.0.0.1"), ("127.0.0.1", "::ffff:127.0.0.1"),
+                            ("::ffff:10.0.0.5", "10.0.0.5"), ("10.0.0.5", "::ffff:0.0.0.0")):
+            with self.subTest(bind=bind, other=other):
+                with self.assertRaisesRegex(EnrollmentConfigurationError, "differ"):
+                    EnrollmentListenerConfig(bind, 8000, reserved=((other, 8000),))
         EnrollmentListenerConfig("192.168.1.2", 7443)
         EnrollmentListenerConfig("fd00::2", 7443)
 
@@ -490,6 +499,45 @@ class PairingCliTests(EnrollmentHarness):
         status, _stdout, stderr = self.init(authority, listener, "--server-name", SERVER_NAME)
         self.assertEqual(0, status, stderr)
 
+    @staticmethod
+    def _failing_directory_fsync():
+        real_fsync = os.fsync
+
+        def fsync(descriptor):
+            if stat.S_ISDIR(os.fstat(descriptor).st_mode):
+                raise OSError(errno.EIO, "synthetic directory fsync failure")
+            return real_fsync(descriptor)
+        return patch("app.cameras.remote_agent.node_ca.os.fsync", fsync)
+
+    def test_directory_fsync_failure_removes_the_new_issuer_file(self):
+        directory = PrivateDirectory(self.root / f"dir-fsync-{uuid4()}")
+        directory.ensure()
+        with self._failing_directory_fsync():
+            with self.assertRaises(pairing_cli.CaptureAuthorityError):
+                directory.write_new("ca-certificate.pem", b"x")
+        self.assertFalse(directory.exists("ca-certificate.pem"))
+        directory.write_new("ca-certificate.pem", b"x")
+
+    def test_init_rolls_back_the_ca_when_the_certificate_directory_fsync_fails(self):
+        authority = self.root / f"init-ca-{uuid4()}"
+        listener = self.root / f"init-listener-{uuid4()}"
+        real_write = PrivateDirectory.write_new
+        failing_directory_fsync = self._failing_directory_fsync
+
+        def failing_write(directory, name, value):
+            if name == "ca-certificate.pem":
+                with failing_directory_fsync():
+                    return real_write(directory, name, value)
+            return real_write(directory, name, value)
+        with patch.object(PrivateDirectory, "write_new", failing_write):
+            status, _stdout, stderr = self.init(authority, listener, "--server-name", SERVER_NAME)
+        self.assertEqual(2, status)
+        self.assertIn("issuer_material_rejected", stderr)
+        self.assertEqual([], sorted(os.listdir(authority)))
+        self.assertEqual([], sorted(os.listdir(listener)))
+        status, _stdout, stderr = self.init(authority, listener, "--server-name", SERVER_NAME)
+        self.assertEqual(0, status, stderr)
+
     def test_issuer_file_open_failure_is_a_bounded_refusal(self):
         directory = PrivateDirectory(self.root / f"open-fail-{uuid4()}")
         directory.ensure()
@@ -529,6 +577,12 @@ class PairingCliTests(EnrollmentHarness):
                 "--listener-dir", str(self.root / "listener"), "--request", str(path)]
         cases = (
             (["--listen", "[::1]:8000", "--human-host", "::1", "--human-port", "8000"],
+             "enrollment_listener_must_differ_from_other_listeners"),
+            (["--listen", "[::ffff:127.0.0.1]:8000", "--human-host", "127.0.0.1",
+              "--human-port", "8000"],
+             "enrollment_listener_must_differ_from_other_listeners"),
+            (["--listen", "127.0.0.1:8000", "--human-host", "::ffff:127.0.0.1",
+              "--human-port", "8000"],
              "enrollment_listener_must_differ_from_other_listeners"),
             (["--listen", "[::1]:8000", "--human-host", "10.0.0.5", "--human-port", "8000"],
              "human_listener_must_be_loopback"),
