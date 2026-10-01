@@ -25,6 +25,12 @@ _CODE_BYTES = 16
 _CODE_LIFETIME_SECONDS = 5 * 60
 _DIGEST_LENGTH = 64
 _MAX_EXPIRY_ROWS = 256
+# Permanent key bindings one node may accumulate. Every staged renewal binds
+# its key for good, so this bounds ledger growth from repeated renewal
+# attempts; the Agent retries at most ~40 times per 30-day renewal window, so
+# a legitimate node stays far below it for decades. Beyond it renewal is
+# refused (Owner-visible warning) and the node must re-pair.
+_MAX_KEY_BINDINGS_PER_NODE = 1024
 
 
 class PairingError(RuntimeError):
@@ -505,9 +511,11 @@ class PairingLedger:
         transaction, that it is still the node's active credential. The new key
         must differ from the current one and must not be bound to another node
         by a credential, staged renewal or enrollment, nor be a revoked key.
-        At most one renewal is staged per node
-        (a retry replaces it), so repeated attempts cannot grow the ledger, and
-        staging writes no audit record for the same reason; promotion does.
+        At most one renewal is staged per node (a retry replaces it). The
+        staged key is bound to the node permanently before the row is written,
+        so neither a retry with a fresh key nor revocation frees it; bindings
+        per node are capped so repeated attempts cannot grow the ledger without
+        bound. Staging writes no audit record for the same reason; promotion does.
         """
         node = _identity(node_id, "node identity")
         current_key = _digest(current_public_key_digest, "public key digest")
@@ -537,9 +545,16 @@ class PairingLedger:
             ).fetchone()
             if reused:
                 raise PairingError("capture node is not eligible for renewal")
-            # Checked here, bound on promotion: retries with fresh keys must not
-            # grow the permanent binding table.
-            _refuse_foreign_key(connection, node, key)
+            # Main issues the certificate before staging, so the key is bound
+            # to this node for good now: replacing this staged row with a retry,
+            # or revoking the node, must not free it for another node.
+            if not _refuse_foreign_key(connection, node, key):
+                held = connection.execute(
+                    "SELECT COUNT(*) FROM pairing_key_bindings WHERE node_id = ?", (str(node),)
+                ).fetchone()[0]
+                if held >= _MAX_KEY_BINDINGS_PER_NODE:
+                    raise PairingError("capture node is not eligible for renewal")
+                _bind_key(connection, node, key)
             connection.execute(
                 "INSERT INTO pairing_node_renewals "
                 "(node_id, public_key_digest, credential_serial_digest, not_after) VALUES (?, ?, ?, ?) "

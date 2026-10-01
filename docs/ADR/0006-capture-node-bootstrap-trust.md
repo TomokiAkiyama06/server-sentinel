@@ -278,13 +278,22 @@ status or decision.
     retries. Revocation deletes any staged renewal.
   - *Key uniqueness (Owner decision 2026-09-30).* A node public key is bound
     to at most one node, for good. `pairing_key_bindings` records every key
-    the ledger approves, activates or promotes and is never pruned. Approval,
+    the ledger approves, activates, stages or promotes and is never pruned. Approval,
     activation, renewal staging and promotion each refuse, in their own write
     transaction, a key that is bound to (or staged for) another node, whatever
     that node's credential state. Revocation marks all of the node's keys
     revoked, and a revoked key is never bound again, even to the same node.
-    Staging only checks and does not bind, so renewal retries with fresh keys
-    do not grow the table; promotion binds. Migration 19 backfills the keys
+    Main issues the renewed certificate before staging, so staging binds the
+    new key permanently before the staged row is written. That binding
+    survives a retry that replaces the staged row and a revocation before
+    promotion (revocation marks it revoked like the node's other keys), so a
+    key Main issued a certificate for is never bound to another node. Because
+    each renewal retry with a fresh key adds a binding, a node may hold at most
+    1024 bindings; beyond that, staging is refused (`renewal_not_eligible`,
+    which raises the Owner signal below) and the node must re-pair. The Agent
+    retries at most about 40 times per 30-day renewal window, so a legitimate
+    node stays far below the cap. A retry with an already bound key is
+    accepted without a new binding. Migration 19 backfills the keys
     that existing enrollment and credential rows still record; if one legacy
     key digest appears under two node IDs (any state), the migration fails
     closed and blocks startup rather than silently picking one binding, and
