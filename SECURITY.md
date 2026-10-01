@@ -243,7 +243,7 @@ Application authorization remains mandatory even when the network path is reacha
 
 ### Application allowlist
 
-Even when a network connection reaches the trusted human proxy/backend, ServerSentinel serves no deployment metadata until the external identity is matched to an active application principal.
+Even when a network connection reaches the trusted human proxy/backend, ServerSentinel serves no deployment metadata until a credential-backed session of an active application principal is verified. The proxy identity never selects the principal: the shared Tailscale login is the same for every invited person.
 
 Unauthorized identities must not receive:
 
@@ -328,7 +328,7 @@ Consequences to keep in mind while reviewing code:
 - the origin must be a secure context (HTTPS, or `http://localhost` for a strictly local browser). Browsers withhold WebAuthn otherwise, so plain HTTP on a non-loopback host is not a usable human path;
 - the pending challenge lives server-side for one bounded, single-use ceremony and is then dropped;
 - the signature counter persists as `principal_credential.sign_count` and advances only on an accepted assertion. The comparison applies whenever the stored or the received counter is non-zero, and the received value must be strictly greater: a received 0 after a stored non-zero is a regression, not an exemption. A regression refuses the assertion and notifies the Owner as a possible cloned authenticator. Only a stored-and-received 0 is exempt, which is the ordinary passkey case;
-- a retained proxy identity is bounded: the principal keeps at most the last observed raw value, owner-visible, cleared on revocation or deletion and kept out of diagnostic exports, with longer history in the audit log. A session stores only a deployment-keyed HMAC binding for constant-time equality checks; it is cleared with session invalidation, never displayed and excluded from diagnostics/exports;
+- a retained proxy identity is bounded: the principal keeps at most the last observed raw value, owner-visible, cleared on revocation or deletion and kept out of diagnostic exports, with longer history in the audit log. A session stores only a deployment-keyed HMAC binding for constant-time equality checks; it is cleared with session invalidation, never displayed and excluded from diagnostics/exports. The key is a 32-byte file in the data directory, created once with mode `0600`, refused (not replaced) when its ownership, mode, link count or size is wrong, and never logged, exported or stored in the database;
 - ceremony material and enrollment codes stay out of logs, diagnostics and exports, and a failed verification is recorded as a typed outcome without the payload;
 - revocation is credential-scoped, not device-scoped. A synced passkey is one credential across several of its owner's devices, so revoking it applies everywhere it synced; a deployment that needs device-scoped control registers device-bound authenticators and refuses backup-eligible credentials;
 - backup eligibility is fixed at registration. A changed value atomically marks the credential inconsistent with a fixed reason/timestamp, revokes its sessions, refuses the assertion and notifies the Owner. The credential remains unusable until replaced; re-invitation recovers a non-owner with no usable credential, while an Owner with none uses privileged local bootstrap. Backup state is refreshed from every verified assertion, so a credential that syncs after registration stops being shown as not backed up.

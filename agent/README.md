@@ -14,6 +14,14 @@ its production capture/transport/Owner-UI integration is still pending. See
 [`docs/RING_BUFFER.md`](docs/RING_BUFFER.md) for bounds, safe admission, coverage,
 expiry, recovery and validation limits.
 
+Issue #12 also adds the Agent-side UVC capture adapter (`uvc_identity.py`,
+`uvc_discovery.py`, `uvc_approvals.py`, `uvc_pipeline.py`, `uvc_capture.py`):
+stable identity/ambiguity rules ported from the Main local adapter, a durable
+approval latch, and one bounded video-only subprocess pipeline per source
+(operator-installed GStreamer `v4l2src` MJPEG) with separate per-source health.
+It is not yet wired into the production CLI, Owner approval route or transport;
+see [`capture/README.md`](capture/README.md).
+
 Implemented runtime modules live in `media_capture_agent/`: `config.py`,
 `storage.py`, `health.py`, `runtime.py`, and `cli.py`. Existing responsibility
 folders describe subsequent capture/pairing/transport work. Synthetic adapters

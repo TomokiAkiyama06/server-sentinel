@@ -38,10 +38,10 @@ class BoundLiveAccess(LiveAccess):
             raise ValueError("access_session_id must be a UUID")
 
 
-def authorize_live_access(access_store: AccessStore, token: bytes, external_identity: str,
+def authorize_live_access(access_store: AccessStore, token: bytes, proxy_identity: str,
                           *, now: datetime | None = None) -> BoundLiveAccess:
     """Authorize ``live:view`` for a human request and bind it to its session."""
-    principal = access_store.authorize(token, external_identity, Permission.LIVE_VIEW, now=now)
+    principal = access_store.authorize(token, proxy_identity, Permission.LIVE_VIEW, now=now)
     with closing(access_store.database.connect()) as connection:
         row = connection.execute(
             "SELECT id FROM access_sessions WHERE token_digest=? AND principal_id=?",

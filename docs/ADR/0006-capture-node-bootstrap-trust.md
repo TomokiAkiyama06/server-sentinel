@@ -284,7 +284,7 @@ status or decision.
     that node's credential state. Revocation marks all of the node's keys
     revoked, and a revoked key is never bound again, even to the same node.
     Staging only checks and does not bind, so renewal retries with fresh keys
-    do not grow the table; promotion binds. Migration 18 backfills the keys
+    do not grow the table; promotion binds. Migration 19 backfills the keys
     that existing enrollment and credential rows still record; if one legacy
     key digest appears under two node IDs (any state), the migration fails
     closed and blocks startup rather than silently picking one binding, and
@@ -303,6 +303,6 @@ status or decision.
   - *Not wired yet.* The renewal request and response travel over the ingest
     session that #14/#15 will carry. `ingest.py`/`continuity.py` are unchanged,
     and no scheduler or listener runs the renewal or the monitor yet.
-  - The schema change is migration 18 (`pairing_credential_renewal`), after
-    PR #97's migration 17 (`human_access_webauthn`). PR #107 also numbers 18;
-    whichever merges later renumbers.
+  - The schema change is migration 19 (`pairing_credential_renewal`), after
+    main's 17 (`human_access_webauthn`, PR #97) and 18
+    (`human_access_shared_identity`, PR #107).

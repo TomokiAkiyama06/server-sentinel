@@ -24,6 +24,7 @@ from app.auth.model import AccessValidationError, CredentialStatus, Permission
 from app.auth.passkeys import (
     CeremonyDenied, CredentialFinding, DeviceBoundCredentialRequired, PasskeyCeremonies,
 )
+from app.auth.session_binding import SessionBindingKey
 from app.auth.store import AccessStore, StepUpRequired
 from app.auth.webauthn import EDDSA, ES256, RS256, RelyingParty
 from app.storage.database import Database
@@ -77,7 +78,8 @@ class CeremonyTestCase(unittest.TestCase):
             migrate(connection, APPLICATION_MIGRATIONS)
         self.clock = Clock()
         self.audit = AuditStore(self.database, clock=self.clock)
-        self.store = AccessStore(self.database, clock=self.clock, audit=self.audit, unaudited_writes=True)
+        self.store = AccessStore(self.database, clock=self.clock, audit=self.audit, unaudited_writes=True,
+                                 session_binding=SessionBindingKey.generate())
         self.findings = Findings()
         self.rp = RelyingParty(RP_ID, ORIGIN)
         self.ceremonies = self.make_ceremonies()
@@ -97,8 +99,9 @@ class CeremonyTestCase(unittest.TestCase):
             return [(row[0], row[1], row[2]) for row in connection.execute(
                 "SELECT action, actor_category, outcome FROM security_admin_audit_records ORDER BY occurred_at_us, rowid")]
 
-    def invite(self, identity=VIEWER, code=VIEWER_CODE, permissions=(Permission.LIVE_VIEW,), minutes=30):
-        principal = self.store.invite(identity, "Synthetic person", permissions)
+    def invite(self, code=VIEWER_CODE, permissions=(Permission.LIVE_VIEW,), minutes=30):
+        # The invitation, not a proxy login, names the person.
+        principal = self.store.invite("Synthetic person", permissions)
         self.store.issue_enrollment(principal.id, code, self.clock() + timedelta(minutes=minutes))
         return principal
 
@@ -109,7 +112,7 @@ class CeremonyTestCase(unittest.TestCase):
         return authenticator, credential
 
     def owner(self, authenticator=None):
-        owner = self.store.bootstrap_owner(OWNER, "Synthetic owner")
+        owner = self.store.bootstrap_owner("Synthetic owner")
         self.store.issue_enrollment(owner.id, OWNER_CODE, self.clock() + timedelta(minutes=10))
         authenticator, _ = self.register(authenticator, OWNER, OWNER_CODE)
         return owner, authenticator
@@ -136,7 +139,7 @@ class RegistrationTests(CeremonyTestCase):
         for index, algorithm in enumerate((ES256, EDDSA, RS256)):
             with self.subTest(algorithm=algorithm):
                 identity, code = f"synthetic-{index}@example.invalid", bytes([65 + index]) * 32
-                principal = self.invite(identity, code)
+                principal = self.invite(code)
                 authenticator, credential = self.register(SyntheticAuthenticator(algorithm), identity, code)
                 self.assertEqual(credential.principal_id, principal.id)
                 self.assertEqual(credential.algorithm, algorithm)
@@ -243,21 +246,21 @@ class RegistrationTests(CeremonyTestCase):
         self.assertGenericDenial(lambda: self.ceremonies.finish_registration(
             VIEWER_CODE, VIEWER, SyntheticAuthenticator().register(forged)))
 
-    def test_uninvited_expired_redeemed_and_mismatched_codes_get_the_same_denial(self):
+    def test_uninvited_expired_redeemed_codes_and_absent_identity_get_the_same_denial(self):
         self.invite(minutes=10)
         self.assertGenericDenial(lambda: self.ceremonies.begin_registration(b"u" * 32, VIEWER))
         self.assertGenericDenial(lambda: self.ceremonies.begin_registration(b"short", VIEWER))
-        self.assertGenericDenial(lambda: self.ceremonies.begin_registration(VIEWER_CODE, OTHER))
+        self.assertGenericDenial(lambda: self.ceremonies.begin_registration(VIEWER_CODE, None))
         self.assertGenericDenial(lambda: self.ceremonies.begin_registration(VIEWER_CODE, "not an identity"))
         self.register()
         self.assertGenericDenial(lambda: self.ceremonies.begin_registration(VIEWER_CODE, VIEWER))
-        self.invite(OTHER, b"q" * 32, minutes=1)
+        self.invite(b"q" * 32, minutes=1)
         self.clock.advance(minutes=1)
         self.assertGenericDenial(lambda: self.ceremonies.begin_registration(b"q" * 32, OTHER))
 
     def test_challenge_bound_to_one_invitation_cannot_redeem_another(self):
         self.invite()
-        self.invite(OTHER, b"q" * 32)
+        self.invite(b"q" * 32)
         creation = self.ceremonies.begin_registration(VIEWER_CODE, VIEWER)
         response = SyntheticAuthenticator().register(creation)
         self.assertGenericDenial(lambda: self.ceremonies.finish_registration(b"q" * 32, OTHER, response))
@@ -291,7 +294,7 @@ class RegistrationTests(CeremonyTestCase):
         _, credential = self.register(SyntheticAuthenticator(backup_eligible=True, backup_state=False))
         self.assertTrue(credential.backup_eligible)
         self.assertFalse(credential.backup_state)
-        self.invite(OTHER, b"q" * 32)
+        self.invite(b"q" * 32)
         self.assertGenericDenial(lambda: self.register(
             SyntheticAuthenticator(backup_eligible=False, backup_state=True), OTHER, b"q" * 32))
 
@@ -331,7 +334,7 @@ class AuthenticationTests(CeremonyTestCase):
         self.assertEqual(self.store.credentials_for(self.principal.id)[0].sign_count, 0)
 
     def test_counter_advances_and_regression_is_refused_and_reported(self):
-        self.invite(OTHER, b"q" * 32)
+        self.invite(b"q" * 32)
         counting, _ = self.register(SyntheticAuthenticator(sign_count=5), OTHER, b"q" * 32)
         other = self.store.credentials_for(self.store.assertion_subject(counting.credential_id)[0].id)[0]
         self.assertEqual(other.sign_count, 5)
@@ -387,9 +390,17 @@ class AuthenticationTests(CeremonyTestCase):
         self.assertGenericDenial(lambda: self.sign_in(SyntheticAuthenticator()))
 
     def test_proxy_identity_is_supplementary_and_never_sufficient(self):
-        # A valid assertion from another verified login is refused ...
-        self.assertGenericDenial(lambda: self.sign_in(self.authenticator, OTHER))
-        # ... and the right login without a credential-backed session authorizes nothing.
+        # The passkey selects the person; the login it arrived under does not.
+        grant = self.sign_in(self.authenticator, OTHER)
+        self.assertEqual(grant.principal_id, self.principal.id)
+        # That session is bound to the login it was created under ...
+        self.assertEqual(self.store.authorize(grant.token, OTHER, Permission.LIVE_VIEW).id, self.principal.id)
+        self.assertGenericDenial(lambda: self.ceremonies.authorize_owner_operation(grant.token, VIEWER))
+        with self.assertRaises(AccessValidationError):
+            self.store.authorize(grant.token, VIEWER, Permission.LIVE_VIEW)
+        # ... an absent identity never signs in ...
+        self.assertGenericDenial(lambda: self.sign_in(self.authenticator, None))
+        # ... and a login without a credential-backed session authorizes nothing.
         for token in (b"", b"t" * 32, b"\x00", "not-bytes", None):
             with self.subTest(token=token), self.assertRaises(AccessValidationError) as caught:
                 self.store.authorize(token, VIEWER, Permission.LIVE_VIEW)
@@ -420,7 +431,7 @@ class AuthenticationTests(CeremonyTestCase):
             self.store.authorize(grant.token, VIEWER, Permission.LIVE_VIEW)
 
     def test_backup_state_is_refreshed_from_each_verified_assertion(self):
-        self.invite(OTHER, b"q" * 32)
+        self.invite(b"q" * 32)
         syncing, credential = self.register(SyntheticAuthenticator(backup_eligible=True), OTHER, b"q" * 32)
         self.assertFalse(credential.backup_state)
         self.sign_in(syncing, OTHER, bs=True)
@@ -441,7 +452,7 @@ class AuthenticationTests(CeremonyTestCase):
         self.assertEqual(self.findings.items, [(CredentialFinding.BACKUP_ELIGIBILITY_CHANGED, self.principal.id)])
         self.assertIn(("mark_principal_credential_inconsistent", "system", "succeeded"), self.audit_actions())
         with self.assertRaises(AccessValidationError):
-            self.store.establish_session(self.principal.id, self.credential.credential_id, b"n" * 32)
+            self.store.establish_session(self.principal.id, self.credential.credential_id, b"n" * 32, proxy_identity=VIEWER)
 
     def test_capture_agent_key_cannot_authenticate_as_a_human(self):
         agent_key = ed25519.Ed25519PrivateKey.generate()
@@ -542,7 +553,7 @@ class StepUpTests(CeremonyTestCase):
 
     def test_session_without_verification_record_is_never_fresh(self):
         token = b"l" * 32
-        self.store.establish_session(self.owner_principal.id, self.owner_key.credential_id, token)
+        self.store.establish_session(self.owner_principal.id, self.owner_key.credential_id, token, proxy_identity=OWNER)
         with self.assertRaises(StepUpRequired):
             self.ceremonies.authorize_owner_operation(token, OWNER)
 
@@ -566,7 +577,8 @@ class DenialUniformityTests(CeremonyTestCase):
             lambda: self.ceremonies.finish_authentication(VIEWER, {}),
             lambda: self.ceremonies.finish_authentication(VIEWER, "not a mapping"),
             lambda: self.ceremonies.finish_authentication(VIEWER, authenticator.assertion(request, tamper=True)),
-            lambda: self.ceremonies.finish_authentication(OTHER, authenticator.assertion(request)),
+            lambda: self.ceremonies.finish_authentication(None, authenticator.assertion(request)),
+            lambda: self.ceremonies.finish_authentication("not an identity", authenticator.assertion(request)),
             lambda: self.ceremonies.begin_step_up(b"x" * 32, VIEWER),
             lambda: self.ceremonies.finish_step_up(b"x" * 32, VIEWER, {}),
             lambda: self.ceremonies.authorize_owner_operation(b"short", VIEWER),

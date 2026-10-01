@@ -16,6 +16,7 @@ from app.audit import AuditStore
 from app.auth.live_access import BoundLiveAccess, authorize_live_access, live_view_validator
 from app.auth.model import AccessValidationError
 from app.auth.model import Permission
+from app.auth.session_binding import SessionBindingKey
 from app.auth.store import AccessStore
 from app.cameras.uvc.capture import VideoFrame
 from app.media.live import (
@@ -43,7 +44,8 @@ class AccessFixture:
     def __init__(self, database):
         self.store = AccessStore(database, clock=lambda: NOW,
                                  audit=AuditStore(database, clock=lambda: NOW),
-                                 unaudited_writes=True)
+                                 unaudited_writes=True,
+                                 session_binding=SessionBindingKey.generate())
         self._next = 0
         self.tokens = {}
 
@@ -56,17 +58,17 @@ class AccessFixture:
         self.store.enroll_credential(secret, identity, credential,
                                      b"synthetic-public-key", -7, 0)
         token = bytes([self._next]) * 24
-        self.store.establish_session(principal_id, credential, token)
+        self.store.establish_session(principal_id, credential, token, proxy_identity=identity)
         self.tokens[principal_id] = (token, identity, credential)
         return authorize_live_access(self.store, token, identity)
 
     def principal(self, permissions):
         identity = f"viewer-{self._next + 1}@example.invalid"
-        principal = self.store.invite(identity, "Synthetic viewer", permissions)
+        principal = self.store.invite("Synthetic viewer", permissions)
         return self.enroll(principal.id, identity)
 
     def owner(self):
-        owner = self.store.bootstrap_owner("owner@example.invalid", "Synthetic owner")
+        owner = self.store.bootstrap_owner("Synthetic owner")
         return self.enroll(owner.id, "owner@example.invalid")
 
     def access(self, principal_id, session_id):
@@ -124,7 +126,7 @@ class LiveViewEnforcementTests(unittest.TestCase):
         bound access to show the per-read validator refuses it anyway."""
         fixture = fixture or self.access
         identity = f"recorder-{fixture._next + 1}@example.invalid"
-        principal = fixture.store.invite(identity, "Synthetic viewer", (Permission.RECORDINGS_VIEW,))
+        principal = fixture.store.invite("Synthetic viewer", (Permission.RECORDINGS_VIEW,))
         with self.assertRaises(AccessValidationError):
             fixture.enroll(principal.id, identity)
         with closing(self.database.connect()) as connection:
