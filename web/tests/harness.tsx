@@ -2,7 +2,7 @@
 import { createRoot } from 'react-dom/client';
 import { App } from '../src/App';
 import { createApiClient } from '../src/api';
-import { type CameraSourceSummary, type PresenceReport, type RecordingSummary, type Session, type StorageSummary, type TimelineCursor, type TimelinePage } from '../src/domain';
+import { optionalWizardSteps, wizardSteps, type CameraSourceSummary, type PresenceReport, type RecordingSummary, type Session, type StorageSummary, type TimelineCursor, type TimelinePage, type WizardSnapshot, type WizardStatus, type WizardStep } from '../src/domain';
 import '../src/style.css';
 
 const api = createApiClient(window.location.origin);
@@ -52,6 +52,22 @@ const runMutation = async (id: string, signal: AbortSignal) => {
   await new Promise<void>(resolve => setTimeout(resolve, entry.delay ?? 150));
   await accepted(entry.fail === true ? '/api/mock/mutation-refused' : syntheticMutationPath, signal);
 };
+// Synthetic in-memory wizard progress. It models the server's compare-and-swap
+// and ordering refusals so a refused transition exercises the reload path; it
+// has no route and carries no setting value.
+let wizard: WizardSnapshot = { states: wizardSteps.map(step => ({ step, status: 'pending' as WizardStatus, revision: 0 })) };
+const transitionWizard = async (step: WizardStep, status: WizardStatus, expectedRevision: number, signal: AbortSignal) => {
+  await new Promise<void>(resolve => setTimeout(resolve, 50));
+  if (signal.aborted) throw new Error();
+  const index = wizardSteps.indexOf(step);
+  const current = wizard.states[index];
+  if (!current || current.revision !== expectedRevision || current.status === 'completed') throw new Error();
+  if (status === 'skipped' && !optionalWizardSteps.includes(step)) throw new Error();
+  if (status !== 'pending' && wizard.states.slice(0, index).some(state => state.status === 'pending')) throw new Error();
+  wizard = { states: wizard.states.map(state => state.step === step
+    ? { step, status, revision: state.revision + 1 } : state) };
+  return wizard;
+};
 const services = {
   loadSession: (signal: AbortSignal) => api.read('/api/mock/session', session, signal),
   loadSources: (signal: AbortSignal) => api.read('/api/mock/sources', value => {
@@ -85,6 +101,8 @@ const services = {
   },
   loadPresence: (signal: AbortSignal) => api.read('/api/mock/presence', presence, signal),
   cancelPresenceOverride: (signal: AbortSignal) => api.read('/api/mock/presence-cancelled', presence, signal),
+  loadWizard: async () => wizard,
+  transitionWizard,
   // Synthetic local mutations: this harness has no write route and never gets one.
   starRecording: async (id: string, starred: boolean, signal: AbortSignal) => {
     await runMutation(id, signal);
