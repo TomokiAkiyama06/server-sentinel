@@ -54,6 +54,12 @@ def stream(label: str) -> str:
     return str(uuid5(EVENT_NAMESPACE, "synthetic-stream:" + label))
 
 
+# An enrollment row as PairingLedger.approve() writes it (a lowercase hex
+# code digest, a process-epoch UUID, a positive expiry); state appended.
+ENROLLMENT_INSERT = ("INSERT INTO pairing_enrollments VALUES (?, ?, ?, '" + "f" * 64
+                     + "', '00000000-0000-4000-8000-00000000e90c', 1, ")
+
+
 class Runtime:
     """A disposable runtime tree: state/state.sqlite3 plus recordings/."""
 
@@ -84,6 +90,7 @@ class Runtime:
             (segment_id, source_id, stream("s"), self.clock, len(payload),
              hashlib.sha256(payload).hexdigest()))
         self.clock += 1
+        self.sync_cursor(source_id)
         self.execute(
             "INSERT INTO recordings (id, source_id, start_ms, target_end_ms, ended_ms, "
             "status, critical, starred) VALUES (?, ?, 0, ?, ?, ?, 0, ?)",
@@ -122,8 +129,23 @@ class Runtime:
              hashlib.sha256(catalog_payload if catalog_payload is not None
                             else payload).hexdigest()))
         self.clock += 1
+        self.sync_cursor(source_id)
         self.execute("INSERT INTO recording_links VALUES (?, ?)", (recording_id, segment_id))
         return segment_id
+
+    def sync_cursor(self, source_id: str) -> None:
+        """Advance the source cursor as RecordingStore._publish() does: it
+        names the latest published segment and never moves back."""
+        self.execute(
+            "INSERT INTO recording_source_cursors (source_id, stream_id, sequence, end_ms, "
+            "capture_node_id, active) SELECT s.source_id, s.stream_id, "
+            "(SELECT MAX(o.sequence) FROM recording_segments o WHERE o.source_id = s.source_id "
+            "AND o.stream_id = s.stream_id), "
+            "(SELECT MAX(o.end_ms) FROM recording_segments o WHERE o.source_id = s.source_id), "
+            "NULL, 1 FROM recording_segments s WHERE s.source_id = ? "
+            "ORDER BY s.end_ms DESC, s.sequence DESC LIMIT 1 "
+            "ON CONFLICT(source_id) DO UPDATE SET stream_id = excluded.stream_id, "
+            "sequence = excluded.sequence, end_ms = excluded.end_ms", (source_id,))
 
     def segment_file(self, segment_id: str, payload: bytes) -> None:
         path = self.root / "recordings" / (UUID(segment_id).hex + ".seg")
@@ -2227,6 +2249,92 @@ class LifecycleInventoryTests(unittest.TestCase):
                 self.assertIn("invalid_value", [item["reason"] for item in
                                                 report["sections"][section].get("failed", [])])
 
+    def test_rows_without_a_builder_are_checked_as_their_service_writes_them(self):
+        # Codex P1: invitation, session, grant and pairing rows have no
+        # read-model builder, and spooled segments are linked later without
+        # re-validation; each is checked field by field as its service
+        # writes it (UUIDs, digests, enums, integer ranges, time order).
+        def one(runtime, sql):
+            with closing(sqlite3.connect(runtime.database)) as connection:
+                return connection.execute(sql).fetchone()[0]
+
+        def statement(sql, parameters=()):
+            return lambda runtime: runtime.execute(sql, parameters)
+        open_invitation = "SELECT id FROM access_invitations WHERE revoked_at_us IS NULL"
+        node, enrollment, segment = str(uuid4()), str(uuid4()), str(uuid4())
+        epoch = "00000000-0000-4000-8000-00000000e90c"
+
+        def spooled(start_ms, end_ms, *, state="ready", spool=1, sequence=0):
+            return lambda runtime: runtime.execute(
+                "INSERT INTO recording_segments (id, source_id, stream_id, sequence, start_ms, "
+                "end_ms, codec, container, byte_length, sha256, state, spool) VALUES "
+                "(?, (SELECT source_id FROM recordings LIMIT 1), ?, ?, ?, ?, 'synthetic', "
+                "'deflate', 1, ?, ?, ?)",
+                (segment, stream("s"), sequence, start_ms, end_ms, "0" * 64, state, spool))
+        cases = {
+            "appended invitation identity": (statement(
+                "INSERT INTO access_invitations VALUES ('x', ?, (SELECT id FROM "
+                "access_principals WHERE role='owner'), 0, 0, 1, 2, NULL, NULL, 0)",
+                (bytes(range(64, 96)),)), "access_invitations", lambda runtime: "x"),
+            "invitation secret digest": (statement(
+                f"UPDATE access_invitations SET secret_digest=X'00' WHERE id=({open_invitation})"),
+                "access_invitations", lambda runtime: one(runtime, open_invitation)),
+            "invitation attempts": (statement(
+                f"UPDATE access_invitations SET attempt_count=6 WHERE id=({open_invitation})"),
+                "access_invitations", lambda runtime: one(runtime, open_invitation)),
+            "invitation redeemed after expiry": (statement(
+                f"UPDATE access_invitations SET redeemed_at_us=5 WHERE id=({open_invitation})"),
+                "access_invitations", lambda runtime: one(runtime, open_invitation)),
+            "session idle expiry": (statement("UPDATE access_sessions SET idle_expires_at_us=12"),
+                                    "security_state", lambda runtime: "access_sessions:"
+                                    + one(runtime, "SELECT id FROM access_sessions")),
+            "session token digest": (statement("UPDATE access_sessions SET token_digest=X'00'"),
+                                     "security_state", lambda runtime: "access_sessions:"
+                                     + one(runtime, "SELECT id FROM access_sessions")),
+            "grant principal": (statement(
+                "INSERT INTO access_principal_permissions VALUES ('x', 'live:view')"),
+                "access_principals", lambda runtime: "x"),
+            "enrollment code digest": (statement(
+                "INSERT INTO pairing_enrollments VALUES (?, ?, ?, 'f', ?, 1, 'expired')",
+                (enrollment, node, "a" * 64, epoch)), "security_state",
+                lambda runtime: f"pairing_enrollments:{enrollment}"),
+            "credential serial digest": (statement(
+                "INSERT INTO pairing_node_credentials (node_id, public_key_digest, "
+                "credential_serial_digest, state) VALUES (?, ?, 'serial', 'revoked')",
+                (node, "b" * 64)), "security_state",
+                lambda runtime: f"pairing_node_credentials:{node}"),
+            "renewal expiry": (statement(
+                "INSERT INTO pairing_node_renewals VALUES (?, ?, ?, 0)",
+                (node, "c" * 64, "d" * 64)), "security_state",
+                lambda runtime: f"pairing_node_renewals:{node}"),
+            "key binding digest": (statement(
+                "INSERT INTO pairing_key_bindings VALUES (?, ?, 1)", ("A" * 64, node)),
+                "security_state", lambda runtime: f"pairing_key_bindings:{node}"),
+            "spooled segment duration": (spooled(5000, 5000), "recordings",
+                                         lambda runtime: f"segment:{segment}"),
+            "spooled segment past its cursor": (spooled(10000, 30000, sequence=2**40),
+                                                "recordings",
+                                                lambda runtime: f"segment:{segment}"),
+            "pending segment in the spool": (spooled(0, 5000, state="pending"), "recordings",
+                                             lambda runtime: f"segment:{segment}"),
+        }
+        for index, (label, (tamper, section, item)) in enumerate(cases.items()):
+            with self.subTest(label):
+                runtime = Runtime(self.base / f"rows-{index}")
+                saved, self.runtime = self.runtime, runtime
+                try:
+                    runtime.seed()
+                    _, baseline = self.record(f"rows-{index}.json")
+                    tamper(runtime)
+                    expected = item(runtime)
+                    code, report, _ = self.verify(baseline)
+                    self.assert_record_refused(f"{section}:invalid_value")
+                finally:
+                    self.runtime = saved
+                self.assertEqual(code, inventory.EXIT_FAILED)
+                self.assertIn({"id": expected, "reason": "invalid_value"},
+                              report["sections"][section].get("failed", []))
+
     def test_presence_clocks_sessions_and_override_follow_service_transitions(self):
         self.runtime.seed()
         self.runtime.execute("INSERT INTO presence_clock VALUES (1, "
@@ -2356,8 +2464,7 @@ class LifecycleInventoryTests(unittest.TestCase):
                 expired_node = str(uuid4())
                 runtime.execute("INSERT INTO pairing_key_bindings VALUES (?, ?, 0)",
                                 ("a" * 64, expired_node))
-                runtime.execute("INSERT INTO pairing_enrollments VALUES "
-                                "(?, ?, ?, 'f', 'epoch', 0, 'expired')",
+                runtime.execute(ENROLLMENT_INSERT + "'expired')",
                                 (str(uuid4()), expired_node, "a" * 64))
                 _, baseline = self.record(f"column-{index}.json")
             finally:
@@ -2541,7 +2648,7 @@ class LifecycleInventoryTests(unittest.TestCase):
                              (revoked_node, key, "b" * 64))
         # The activation that created the credential.
         self.runtime.execute(
-            "INSERT INTO pairing_enrollments VALUES (?, ?, ?, 'f', 'epoch', 0, 'activated')",
+            ENROLLMENT_INSERT + "'activated')",
             (str(uuid4()), revoked_node, key))
         self.runtime.execute("INSERT INTO pairing_key_bindings VALUES (?, ?, 1)", (key, revoked_node))
         # Invalidation clears the identity binding (schema CHECK).
@@ -2666,7 +2773,7 @@ class LifecycleInventoryTests(unittest.TestCase):
                 "credential_serial_digest, state, not_after) VALUES (?, ?, ?, 'active', 10.0)",
                 (node_id, old[node_id], "3" * 64))
             self.runtime.execute(
-                "INSERT INTO pairing_enrollments VALUES (?, ?, ?, 'f', 'epoch', 0, 'activated')",
+                ENROLLMENT_INSERT + "'activated')",
                 (str(uuid4()), node_id, old[node_id]))
             self.runtime.execute("INSERT INTO pairing_key_bindings VALUES (?, ?, 0)",
                                  (old[node_id], node_id))
@@ -2709,7 +2816,7 @@ class LifecycleInventoryTests(unittest.TestCase):
                 "credential_serial_digest, state, not_after) VALUES (?, ?, ?, 'active', 10.0)",
                 (node_id, key, "c" * 64))
             self.runtime.execute(
-                "INSERT INTO pairing_enrollments VALUES (?, ?, ?, 'f', 'epoch', 0, 'activated')",
+                ENROLLMENT_INSERT + "'activated')",
                 (str(uuid4()), node_id, key))
             for bound in (key, staged):
                 self.runtime.execute("INSERT INTO pairing_key_bindings VALUES (?, ?, 0)",
@@ -2730,7 +2837,7 @@ class LifecycleInventoryTests(unittest.TestCase):
         self.runtime.execute("INSERT INTO pairing_key_bindings VALUES (?, ?, 0)",
                              (fresh, nodes["repaired"]))
         self.runtime.execute(
-            "INSERT INTO pairing_enrollments VALUES (?, ?, ?, 'f', 'epoch', 0, 'activated')",
+            ENROLLMENT_INSERT + "'activated')",
             (str(uuid4()), nodes["repaired"], fresh))
         self.runtime.execute("UPDATE pairing_node_credentials SET public_key_digest=?, "
                              "credential_serial_digest=? WHERE node_id=?",
@@ -2838,13 +2945,13 @@ class LifecycleInventoryTests(unittest.TestCase):
             (node, key, serial))
         # The activation that created it (activate() is the only way).
         self.runtime.execute(
-            "INSERT INTO pairing_enrollments VALUES (?, ?, ?, 'f', 'epoch', 0, 'activated')",
+            ENROLLMENT_INSERT + "'activated')",
             (str(uuid4()), node, key))
         return node
 
     def _activated(self, node: str, key: str) -> None:
         self.runtime.execute(
-            "INSERT INTO pairing_enrollments VALUES (?, ?, ?, 'f', 'epoch', 0, 'activated')",
+            ENROLLMENT_INSERT + "'activated')",
             (str(uuid4()), node, key))
 
     def test_an_old_activated_enrollment_never_explains_a_new_identity(self):
@@ -2905,14 +3012,14 @@ class LifecycleInventoryTests(unittest.TestCase):
             self.runtime.execute("INSERT INTO pairing_key_bindings VALUES (?, ?, 0)", (key, node))
         recorded = str(uuid4())
         self.runtime.execute(
-            "INSERT INTO pairing_enrollments VALUES (?, ?, ?, 'f', 'epoch', 0, 'activated')",
+            ENROLLMENT_INSERT + "'activated')",
             (recorded, node, first))
         # Approved (key bound) but not yet activated at record time.
         opened, pending_key = str(uuid4()), "d" * 64
         self.runtime.execute("INSERT INTO pairing_key_bindings VALUES (?, ?, 0)",
                              (pending_key, node))
         self.runtime.execute(
-            "INSERT INTO pairing_enrollments VALUES (?, ?, ?, 'f', 'epoch', 0, 'consumed')",
+            ENROLLMENT_INSERT + "'consumed')",
             (opened, node, pending_key))
         _, baseline = self.record()
         self.assertNotIn(pending_key, baseline.read_text())
@@ -2933,7 +3040,7 @@ class LifecycleInventoryTests(unittest.TestCase):
         # command_approve() produces when the Owner retries this node's live
         # key (approve() makes a new enrollment for it), so it is accepted.
         self.runtime.execute(
-            "INSERT INTO pairing_enrollments VALUES (?, ?, ?, 'f', 'epoch', 0, 'activated')",
+            ENROLLMENT_INSERT + "'activated')",
             (recorded, node, first))
         code, report, _ = self.verify(baseline)
         self.assertEqual(code, inventory.EXIT_PRESERVED, report["sections"]["security_state"])
@@ -3218,7 +3325,7 @@ class LifecycleInventoryTests(unittest.TestCase):
             ids[label] = str(uuid4())
             self.runtime.execute("INSERT INTO pairing_key_bindings VALUES (?, ?, 0)", (key, node))
             self.runtime.execute(
-                "INSERT INTO pairing_enrollments VALUES (?, ?, ?, 'f', 'epoch', 0, ?)",
+                ENROLLMENT_INSERT + "?)",
                 (ids[label], node, key, state))
         _, baseline = self.record()
         self.runtime.execute("DELETE FROM pairing_enrollments WHERE id=?", (ids["deleted"],))

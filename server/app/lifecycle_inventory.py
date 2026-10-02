@@ -64,6 +64,7 @@ from datetime import datetime, timedelta, timezone
 import hashlib
 import hmac
 import json
+import math
 import os
 import secrets
 from pathlib import Path
@@ -76,7 +77,8 @@ from uuid import UUID, uuid5
 
 from app.audit.store import DEFAULT_RETENTION as AUDIT_RETENTION, AuditStore
 from app.cameras.remote_agent.pairing import _MAX_KEY_BINDINGS_PER_NODE
-from app.auth.store import AccessStore
+from app.auth.model import Permission
+from app.auth.store import MAX_REDEMPTION_ATTEMPTS, AccessStore
 from app.cameras.registry.repository import CameraRegistry
 from app.media.recording.store import RecordingStore
 from app.cameras.uvc.persistence import ApprovalStore
@@ -1715,7 +1717,8 @@ def _domain_errors(connection, tables) -> list:
     identities, statuses and boundaries, discontinuity bounds; integrity
     outbox findings and flag, the approved hardware baseline (as
     IntegrityStore.baseline() reads it); camera-source capability /
-    profile and binding JSON; pairing node and enrollment identities.
+    profile and binding JSON; every recording segment row; and the rows
+    with no read-model builder (invitations, sessions, grants, pairing).
     """
     errors = []
 
@@ -1867,21 +1870,185 @@ def _domain_errors(connection, tables) -> list:
             valid = False
         if not valid:
             bad("access_principals", str(row["principal_id"]))
-    # RecordingStore._name() turns each segment ID into its file name.
-    for row in rows("recording_segments", "SELECT id FROM recording_segments"):
-        try:
-            valid = bool(RecordingStore._name(row[0], ".seg")) and _canonical_uuid(row[0])
-        except Exception:
-            valid = False
-        if not valid:
-            bad("recordings", f"segment:{row[0]}")
-    for table, columns in (("pairing_node_credentials", ("node_id",)),
-                           ("pairing_node_renewals", ("node_id",)),
-                           ("pairing_key_bindings", ("node_id",)),
-                           ("pairing_enrollments", ("id", "node_id"))):
-        for row in rows(table, f"SELECT {', '.join(columns)} FROM {table}"):
-            if not all(_canonical_uuid(value) for value in tuple(row)):
-                bad("security_state", f"{table}:{tuple(row)[0]}")
+    # Every segment row, linked or only spooled (RecordingStore._start() links
+    # overlapping spool rows without re-validating them): the file identity
+    # RecordingStore._name() derives, the Segment.validate() bounds append()
+    # enforced, the digest / length / state values the store writes, and the
+    # source / stream position the publish cursor records.
+    cursors = ({row[0]: row for row in connection.execute(
+        "SELECT source_id, stream_id, sequence, end_ms FROM recording_source_cursors")}
+        if "recording_source_cursors" in tables else None)
+    for row in rows("recording_segments", "SELECT * FROM recording_segments"):
+        if not _service_valid_segment_row(row, cursors):
+            bad("recordings", f"segment:{row['id']}")
+    for message in _access_row_errors(connection, tables):
+        bad(*message)
+    for message in _pairing_row_errors(connection, tables):
+        bad(*message)
+    return errors
+
+
+_PAIRING_ENROLLMENT_STATES = frozenset({"pending", "expired", "consumed", "activated", "revoked"})
+_SEGMENT_INTEGRITY = frozenset({"unchecked", "verified", "corrupt", "missing", "unreadable"})
+
+
+def _int(value, low=0, high=2**63 - 1) -> bool:
+    return type(value) is int and low <= value <= high
+
+
+def _hex_digest(value) -> bool:
+    """A lowercase SHA-256 hex digest (pairing ``_digest()``, segment sha256)."""
+    return (isinstance(value, str) and len(value) == 64
+            and all(char in "0123456789abcdef" for char in value))
+
+
+def _service_valid_segment_row(row, cursors) -> bool:
+    try:
+        keys = row.keys()
+        node = row["capture_node_id"] if "capture_node_id" in keys else None
+        RecordingStore._name(row["id"], ".seg")
+        Segment(source_id=UUID(row["source_id"]), stream_id=UUID(row["stream_id"]),
+                sequence=row["sequence"], start_ms=row["start_ms"], end_ms=row["end_ms"],
+                codec=row["codec"], container=row["container"], data=b"\0",
+                capture_node_id=None if node is None else UUID(node)).validate(_SEGMENT_BOUNDS)
+    except (ValueError, TypeError, AttributeError, KeyError, IndexError):
+        return False
+    identities = [row["id"], row["source_id"], row["stream_id"]] + ([] if node is None else [node])
+    if not (all(_canonical_uuid(value) for value in identities)
+            and _int(row["byte_length"], 1) and _hex_digest(row["sha256"])
+            and row["state"] in ("pending", "ready") and row["spool"] in (0, 1)
+            and ("critical" not in keys or row["critical"] in (0, 1))
+            and ("integrity" not in keys or row["integrity"] in _SEGMENT_INTEGRITY)):
+        return False
+    if row["state"] == "pending":
+        # append() inserts pending rows unspooled and unchecked.
+        return row["spool"] == 0 and ("integrity" not in keys or row["integrity"] == "unchecked")
+    if cursors is None:
+        return True
+    # _publish() advances the source cursor with every ready segment and never
+    # moves it back: a ready segment lies at or before its source's cursor.
+    cursor = cursors.get(row["source_id"])
+    return (cursor is not None and row["end_ms"] <= cursor[3]
+            and (row["stream_id"] != cursor[1] or row["sequence"] <= cursor[2]))
+
+
+def _access_row_errors(connection, tables) -> list:
+    """Invitation, session and grant rows as AccessStore writes them."""
+    errors = []
+    generation = None
+    if "access_deployment_state" in tables:
+        found = connection.execute("SELECT authorization_generation FROM access_deployment_state "
+                                   "WHERE singleton = 1").fetchone()
+        generation = None if found is None else found[0]
+    revisions = ({row[0]: row[1] for row in connection.execute(
+        "SELECT id, authorization_revision FROM access_principals")}
+        if "access_principals" in tables else {})
+
+    def lineage(row) -> bool:
+        # The principal revision and deployment generation copied at issue
+        # time; both only ever advance afterwards.
+        revision = revisions.get(row["principal_id"])
+        return (_canonical_uuid(row["principal_id"])
+                and _int(row["principal_revision"]) and _int(row["deployment_generation"])
+                and (revision is None or (_int(revision) and row["principal_revision"] <= revision))
+                and (generation is None or (_int(generation)
+                                            and row["deployment_generation"] <= generation)))
+    if "access_principal_permissions" in tables:
+        grants = {item.value for item in Permission}
+        for row in connection.execute(
+                "SELECT principal_id, permission FROM access_principal_permissions"):
+            if not _canonical_uuid(row[0]) or row[1] not in grants:
+                errors.append(("access_principals", str(row[0])))
+    if "access_invitations" in tables:
+        for row in connection.execute("SELECT * FROM access_invitations"):
+            keys = row.keys()
+            issued, expires = row["issued_at_us"], row["expires_at_us"]
+            redeemed, revoked = row["redeemed_at_us"], row["revoked_at_us"]
+            attempts = row["attempt_count"] if "attempt_count" in keys else 0
+            valid = (_canonical_uuid(row["id"]) and lineage(row)
+                     and isinstance(row["secret_digest"], bytes) and len(row["secret_digest"]) == 32
+                     and _int(issued) and _int(expires) and issued < expires
+                     and _int(attempts, 0, MAX_REDEMPTION_ATTEMPTS)
+                     # Redemption needs an open, unexpired invitation;
+                     # revocation only touches unredeemed ones.
+                     and not (redeemed is not None and revoked is not None)
+                     and (redeemed is None or (_int(redeemed) and issued <= redeemed < expires))
+                     and (revoked is None or (_int(revoked) and issued <= revoked)))
+            if not valid:
+                errors.append(("access_invitations", str(row["id"])))
+    if {"access_sessions", "access_credentials"} <= tables:
+        owners = {bytes(row[0]): row[1] for row in connection.execute(
+            "SELECT credential_id, principal_id FROM access_credentials")}
+        for row in connection.execute("SELECT * FROM access_sessions"):
+            keys = row.keys()
+
+            def optional(name, low):
+                value = row[name] if name in keys else None
+                return value is None or _int(value, low)
+            established, seen = row["established_at_us"], row["last_seen_at_us"]
+            idle, absolute = row["idle_lifetime_us"], row["absolute_expires_at_us"]
+            binding = row["external_identity_binding"] if "external_identity_binding" in keys else None
+            credential = row["credential_id"]
+            try:
+                valid = (_canonical_uuid(row["id"]) and lineage(row)
+                         and isinstance(row["token_digest"], bytes) and len(row["token_digest"]) == 32
+                         and isinstance(credential, bytes)
+                         and owners.get(credential) == row["principal_id"]
+                         and _int(established) and _int(seen) and established <= seen
+                         and _int(idle, 1) and _int(absolute) and established < absolute
+                         and idle <= absolute - established
+                         # establish / touch: min(last seen + idle, absolute).
+                         and row["idle_expires_at_us"] == min(seen + idle, absolute)
+                         and optional("invalidated_at_us", established)
+                         and optional("last_user_verification_at_us", established)
+                         and optional("binding_mismatch_audited_at_us", established)
+                         and ("binding_mismatch_suppressed" not in keys
+                              or _int(row["binding_mismatch_suppressed"]))
+                         and (binding is None or (isinstance(binding, bytes) and len(binding) == 32
+                                                  and row["invalidated_at_us"] is None)))
+            except TypeError:
+                valid = False
+            if not valid:
+                errors.append(("security_state", f"access_sessions:{row['id']}"))
+    return errors
+
+
+def _pairing_row_errors(connection, tables) -> list:
+    """Pairing ledger rows as PairingLedger writes them (``_identity``,
+    ``_digest`` and ``_expiry``); raw key digests never appear in the report."""
+    errors = []
+
+    def expiry(value, optional) -> bool:
+        return ((optional and value is None)
+                or (type(value) in (int, float) and value > 0 and math.isfinite(value)))
+
+    def bad(table, item):
+        errors.append(("security_state", f"{table}:{item}"))
+    if "pairing_enrollments" in tables:
+        for row in connection.execute("SELECT * FROM pairing_enrollments"):
+            if not (_canonical_uuid(row["id"]) and _canonical_uuid(row["node_id"])
+                    and _hex_digest(row["public_key_digest"]) and _hex_digest(row["code_digest"])
+                    and _canonical_uuid(row["process_epoch"]) and expiry(row["expires_at"], False)
+                    and row["state"] in _PAIRING_ENROLLMENT_STATES):
+                bad("pairing_enrollments", row["id"])
+    if "pairing_node_credentials" in tables:
+        for row in connection.execute("SELECT * FROM pairing_node_credentials"):
+            if not (_canonical_uuid(row["node_id"]) and _hex_digest(row["public_key_digest"])
+                    and _hex_digest(row["credential_serial_digest"])
+                    and row["state"] in ("active", "revoked")
+                    and expiry(row["not_after"] if "not_after" in row.keys() else None, True)):
+                bad("pairing_node_credentials", row["node_id"])
+    if "pairing_node_renewals" in tables:
+        for row in connection.execute("SELECT * FROM pairing_node_renewals"):
+            if not (_canonical_uuid(row["node_id"]) and _hex_digest(row["public_key_digest"])
+                    and _hex_digest(row["credential_serial_digest"])
+                    and expiry(row["not_after"], False)):
+                bad("pairing_node_renewals", row["node_id"])
+    if "pairing_key_bindings" in tables:
+        for row in connection.execute("SELECT * FROM pairing_key_bindings"):
+            if not (_hex_digest(row["public_key_digest"]) and _canonical_uuid(row["node_id"])
+                    and row["revoked"] in (0, 1)):
+                bad("pairing_key_bindings", row["node_id"])
     return errors
 
 
