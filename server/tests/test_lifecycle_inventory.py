@@ -1767,7 +1767,7 @@ class LifecycleInventoryTests(unittest.TestCase):
             else:
                 runtime.execute("UPDATE presence_timeline_gap SET latest=?",
                                 (later_text_earlier_instant,))
-            return "presence_timeline_gap", {"id": "gap", "reason": "changed"}
+            return "presence_timeline_gap", {"id": "gap", "reason": "invalid_time"}
 
         @case("integrity audit retention")
         def _(runtime, seeded, phase):
@@ -1826,6 +1826,44 @@ class LifecycleInventoryTests(unittest.TestCase):
                     _, report, _ = self.verify(baseline)
                 finally:
                     self.runtime = saved
+                self.assertIn(expected, report["sections"][section]["failed"])
+
+    def test_every_current_service_time_is_well_formed(self):
+        # Codex P1: a time the service compares again must be in its format
+        # even when the row is new since the record (an unparsable control
+        # clock would block every Owner control operation).
+        cases = {
+            "control clock": ("INSERT INTO presence_control_clock VALUES (1, 'not-a-service-time')",
+                              "presence", {"id": "clocks:control", "reason": "invalid_time"}),
+            "source clock": ("INSERT INTO presence_source_clock VALUES ('s', "
+                             "'2026-01-01T09:00:00.000000+09:00')",
+                             "presence", {"id": "clocks:source:s", "reason": "invalid_time"}),
+            "tombstone": ("INSERT INTO presence_completed_events VALUES ("
+                          "'00000000-0000-4000-8000-000000000009', 'yesterday')",
+                          "presence", {"id": "completed_events:"
+                                             "00000000-0000-4000-8000-000000000009",
+                                       "reason": "invalid_time"}),
+            "override": ("INSERT INTO presence_override VALUES (1, 'away', 'owner', 'now', NULL)",
+                         "presence", {"id": "override:owner", "reason": "invalid_time"}),
+            "timeline gap": ("INSERT INTO presence_timeline_gap VALUES (1, 'x', 'y', 1, 0, 0, 0)",
+                             "presence_timeline_gap", {"id": "gap", "reason": "invalid_time"}),
+            "integrity outbox": ("INSERT INTO integrity_outbox(at, immediate, findings) "
+                                 "VALUES ('soon', 1, '[]')",
+                                 "integrity_delivery", {"id": "pending:1",
+                                                        "reason": "invalid_time"}),
+        }
+        for index, (label, (statement, section, expected)) in enumerate(cases.items()):
+            with self.subTest(label):
+                runtime = Runtime(self.base / f"well-formed-{index}")
+                saved, self.runtime = self.runtime, runtime
+                try:
+                    runtime.seed()
+                    _, baseline = self.record(f"well-formed-{index}.json")
+                    runtime.execute(statement)
+                    code, report, _ = self.verify(baseline)
+                finally:
+                    self.runtime = saved
+                self.assertEqual(code, inventory.EXIT_FAILED)
                 self.assertIn(expected, report["sections"][section]["failed"])
 
     def test_presence_clocks_sessions_and_override_follow_service_transitions(self):

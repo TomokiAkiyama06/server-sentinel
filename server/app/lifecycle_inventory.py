@@ -474,6 +474,11 @@ def _timeline_gap(connection, tables) -> dict | None:
 
 def _compare_timeline_gap(baseline: dict | None, current: dict | None) -> dict:
     """A recorded gap may only grow; losing or shrinking it hides timeline loss."""
+    if current and current.get("open") and (
+            _presence_instant(current.get("since")) is None
+            or _presence_instant(current.get("latest")) is None):
+        return {"status": "failed", "failed": [{"id": "gap", "reason": "invalid_time"}],
+                "appended": []}
     if not baseline or not baseline.get("open"):
         return {"status": "empty", "failed": [],
                 "appended": ["gap"] if current and current.get("open") else []}
@@ -674,6 +679,23 @@ def _compare_presence(baseline: dict | None, current: dict | None,
 
     def fail(name, key, reason="changed"):
         failed.append({"id": f"{name}:{key}", "reason": reason})
+    # Every time the service will compare again must be in its own format,
+    # recorded or new (an unparsable control clock would make
+    # _control_trust() refuse every Owner control operation).
+    for key, value in sorted((current.get("clocks") or {}).items()):
+        if _presence_instant(value) is None:
+            fail("clocks", key, "invalid_time")
+    for key, value in sorted((current.get("completed_events") or {}).items()):
+        if _presence_instant(value) is None:
+            fail("completed_events", key, "invalid_time")
+    for key, value in sorted((current.get("expired_unresolved") or {}).items()):
+        if _presence_instant(value["since"]) is None:
+            fail("expired_unresolved", key, "invalid_time")
+    override_now = current.get("override")
+    if override_now and (_presence_instant(override_now.get("started")) is None
+                         or (override_now.get("expires") is not None
+                             and _presence_instant(override_now["expires"]) is None)):
+        fail("override", "owner", "invalid_time")
     completed = current.get("completed_events") or {}
     for key, value in (baseline.get("completed_events") or {}).items():
         if completed.get(key) != value:
@@ -1569,6 +1591,15 @@ def _promotion_evidence(slot: tuple, row_id: int, current: dict) -> bool:
 
 def _compare_integrity_delivery(baseline: dict | None, current: dict | None) -> dict:
     """A pending notification leaves only once its event was durably accepted."""
+    # IntegrityStore.deliver() parses each pending row's time and promotion
+    # copies a slot's time into one: both must be in the store's format.
+    invalid = [] if not current else (
+        [{"id": f"pending:{row_id}", "reason": "invalid_time"}
+         for row_id, at in sorted(current["pending_at"].items()) if _utc_instant(at) is None]
+        + [{"id": f"overflow:{kind}:{state}", "reason": "invalid_time"}
+           for kind, state, at in current["overflow"] if _utc_instant(at) is None])
+    if invalid:
+        return {"status": "failed", "failed": invalid}
     if not baseline or not (baseline["pending"] or baseline["overflow"]):
         return {"status": "empty", "failed": []}
     current = current or {"pending": {}, "pending_findings": {}, "pending_at": {},
