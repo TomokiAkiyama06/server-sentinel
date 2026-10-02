@@ -54,7 +54,9 @@ class Runtime:
         self.database = self.root / "state" / "state.sqlite3"
         with closing(Database(self.database).connect()) as connection:
             migrate(connection, migrations)
-        self.clock = 1_700_000_000_000_000
+        # Synthetic audit times start a day before the wall clock, so the
+        # service retention and future-time checks judge them as recent.
+        self.clock = int((datetime.now(timezone.utc) - timedelta(days=1)).timestamp()) * 1_000_000
 
     def execute(self, sql: str, parameters=()):
         with closing(sqlite3.connect(self.database, isolation_level=None)) as connection:
@@ -217,9 +219,9 @@ def run(*arguments: str) -> tuple[int, str, str]:
 
 class LifecycleInventoryTests(unittest.TestCase):
     def setUp(self):
-        # Verify time for the service retention rules, a day after the
-        # synthetic audit clock starts; retention tests move it explicitly.
-        self.now = datetime.fromtimestamp(1_700_000_000 + 86_400, timezone.utc)
+        # Verify time for the service retention and future-time rules: the
+        # wall clock (real ledger audit rows use it); tests move it explicitly.
+        self.now = datetime.now(timezone.utc)
         patcher = mock.patch.object(inventory, "_utcnow", lambda: self.now, create=True)
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -238,7 +240,7 @@ class LifecycleInventoryTests(unittest.TestCase):
                          "--output", str(output), *extra)
         return code, output
 
-    def owner_template_root(self, *, template: bytes | None = None) -> Path:
+    def owner_template_root(self, *, template: bytes | None = None, at: str | None = None) -> Path:
         """A synthetic Owner-template store; the bytes are a generated marker."""
         root = self.base / "owner-template"
         root.mkdir(mode=0o700, exist_ok=True)
@@ -252,7 +254,9 @@ class LifecycleInventoryTests(unittest.TestCase):
                 for operation in ("enroll", "replace"):
                     connection.execute(
                         "INSERT INTO owner_template_audit(at, actor, operation, generation) "
-                        "VALUES ('2026-01-01T00:00:00+00:00', 'owner', ?, 1)", (operation,))
+                        "VALUES (?, 'owner', ?, 1)",
+                        (at or (datetime.now(timezone.utc) - timedelta(days=1)).isoformat(),
+                         operation))
         # OwnerTemplateStore creates the database 0600 in a 0700 root.
         os.chmod(root / "owner-template.sqlite3", 0o600)
         return root
@@ -631,7 +635,7 @@ class LifecycleInventoryTests(unittest.TestCase):
                  "storage_state_audit": "audit_storage_state",
                  "recordings": "recordings", "recording_links": "recordings",
                  "recording_segments": "recordings"}
-        self.now = datetime.fromtimestamp(1_700_000_000 + 400 * 86_400, timezone.utc)
+        self.now = datetime.now(timezone.utc) + timedelta(days=400)
         for index, (table, section) in enumerate(cases.items()):
             with self.subTest(table):
                 runtime = Runtime(self.base / f"dropped-{index}")
@@ -1004,9 +1008,9 @@ class LifecycleInventoryTests(unittest.TestCase):
         # than OwnerTemplateStore's own retention before readiness.
         self.runtime.seed()
         option = ("--owner-template-root", str(self.base / "owner-template"))
-        root = self.owner_template_root(template=b"synthetic-owner-template-marker")
+        root = self.owner_template_root(template=b"synthetic-owner-template-marker",
+                                        at=(self.now - timedelta(days=100)).isoformat())
         database = root / "owner-template.sqlite3"
-        self.now = datetime(2026, 6, 1, tzinfo=timezone.utc)
         recent = (self.now - owner_store.DEFAULT_AUDIT_RETENTION
                   + timedelta(seconds=1)).isoformat()
         with closing(sqlite3.connect(database, isolation_level=None)) as connection:
@@ -1865,6 +1869,48 @@ class LifecycleInventoryTests(unittest.TestCase):
                     self.runtime = saved
                 self.assertEqual(code, inventory.EXIT_FAILED)
                 self.assertIn(expected, report["sections"][section]["failed"])
+
+    def test_no_service_time_lies_beyond_the_verify_time(self):
+        # Codex P1: a well-formed but far-future time would refuse every later
+        # operation (a control clock in 9999 locks out Owner control); times
+        # may exceed the verify time only by the clock-skew allowance.
+        far = "9999-01-01T00:00:00.000000+00:00"
+        skewed = (self.now + inventory.CLOCK_SKEW_ALLOWANCE
+                  - timedelta(seconds=30)).isoformat(timespec="microseconds")
+        future_us = int((self.now + timedelta(days=1)).timestamp()) * 1_000_000
+        cases = {
+            "control clock": ("INSERT INTO presence_control_clock VALUES (1, ?)", (far,),
+                              "presence", "clocks:control"),
+            "within the allowance": ("INSERT INTO presence_control_clock VALUES (1, ?)",
+                                     (skewed,), "presence", None),
+            "clear row": ("INSERT INTO presence_audit (action, actor, at, state, target) VALUES "
+                          "('critical_event_cleared', '00000000-0000-4000-8000-000000000001', ?, "
+                          "NULL, '00000000-0000-4000-8000-000000000002')", (far,),
+                          "presence", "cleared_events:00000000-0000-4000-8000-000000000002"),
+            "integrity outbox": ("INSERT INTO integrity_outbox(at, immediate, findings) "
+                                 "VALUES (?, 1, '[]')", ("9999-01-01T00:00:00+00:00",),
+                                 "integrity_delivery", "pending:1"),
+            "security audit": ("INSERT INTO security_admin_audit_records VALUES (?, 'owner', "
+                               "'camera_source.update', 'camera_source', ?, ?, 'succeeded')",
+                               ("00000000-0000-4000-8000-000000000003",
+                                "00000000-0000-4000-8000-000000000004", future_us),
+                               "audit_security_admin", "00000000-0000-4000-8000-000000000003"),
+        }
+        for index, (label, (statement, values, section, item)) in enumerate(cases.items()):
+            with self.subTest(label):
+                runtime = Runtime(self.base / f"future-{index}")
+                saved, self.runtime = self.runtime, runtime
+                try:
+                    runtime.seed()
+                    _, baseline = self.record(f"future-{index}.json")
+                    runtime.execute(statement, values)
+                    _, report, _ = self.verify(baseline)
+                finally:
+                    self.runtime = saved
+                futures = [entry for entry in report["sections"][section].get("failed", [])
+                           if entry["reason"] == "future_time"]
+                self.assertEqual(futures, [] if item is None
+                                 else [{"id": item, "reason": "future_time"}])
 
     def test_presence_clocks_sessions_and_override_follow_service_transitions(self):
         self.runtime.seed()

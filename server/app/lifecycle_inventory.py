@@ -60,7 +60,7 @@ import argparse
 import functools
 from collections import Counter
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 import hmac
 import json
@@ -2407,6 +2407,71 @@ def _reuse_consistent(baseline, current_rows, current_times, kept, reused,
         return False
 
 
+# The clock skew tolerated between the services' clocks and the verify
+# time; the services define none of their own for these tables, so this is
+# the same 5 minutes the capture-node certificate profile allows.
+CLOCK_SKEW_ALLOWANCE = timedelta(minutes=5)
+
+
+def _future_times(current: dict, limit: datetime) -> dict:
+    """Times the services compare later that lie beyond ``limit``, by section.
+
+    Presence clocks, tombstones, unresolved-marker times, the override start,
+    the timeline gap and Owner-release audit times; pending integrity rows
+    and overflow slots; security/admin, integrity, storage-state and
+    Owner-template audit times; pairing audit times. An override expiry is
+    legitimately in the future and PresenceService sets no longest
+    duration, so it is not bounded.
+    """
+    found: dict = {}
+
+    def late(section, item, moment):
+        if moment is not None and moment > limit:
+            found.setdefault(section, []).append({"id": item, "reason": "future_time"})
+    presence = current.get("presence") or {}
+    for key, value in sorted((presence.get("clocks") or {}).items()):
+        late("presence", f"clocks:{key}", _presence_instant(value))
+    for key, value in sorted((presence.get("completed_events") or {}).items()):
+        late("presence", f"completed_events:{key}", _presence_instant(value))
+    for key, value in sorted((presence.get("expired_unresolved") or {}).items()):
+        late("presence", f"expired_unresolved:{key}", _presence_instant(value["since"]))
+    if presence.get("override"):
+        late("presence", "override:owner", _presence_instant(presence["override"].get("started")))
+    for target, at, _, _ in presence.get("cleared_events") or ():
+        late("presence", f"cleared_events:{target}", _presence_instant(at))
+    gap = current.get("presence_timeline_gap") or {}
+    if gap.get("open"):
+        late("presence_timeline_gap", "gap", max(
+            (moment for moment in (_presence_instant(gap.get("since")),
+                                   _presence_instant(gap.get("latest"))) if moment),
+            default=None))
+    integrity = current.get("integrity_delivery") or {}
+    for row_id, at in sorted((integrity.get("pending_at") or {}).items()):
+        late("integrity_delivery", f"pending:{row_id}", _utc_instant(at))
+    for kind, state, at in integrity.get("overflow") or ():
+        late("integrity_delivery", f"overflow:{kind}:{state}", _utc_instant(at))
+    audit = current.get("audit") or {}
+    epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+    for name, section, parse in (
+            ("security_admin", "audit_security_admin",
+             lambda value: epoch + timedelta(microseconds=value) if isinstance(value, int)
+             else None),
+            ("integrity", "audit_integrity", _utc_instant),
+            ("storage_state", "audit_storage_state",
+             lambda value: epoch + timedelta(milliseconds=value) if isinstance(value, int)
+             else None)):
+        for row_id, value in sorted(((audit.get(name) or {}).get("times") or {}).items()):
+            late(section, row_id, parse(value))
+    template_audit = (current.get("owner_template") or {}).get("audit") or {}
+    for row_id, value in sorted((template_audit.get("times") or {}).items()):
+        late("owner_template", f"audit:{row_id}", _utc_instant(value))
+    for row in (current.get("security_state") or {}).get("pairing_audit") or ():
+        if isinstance(row[3], int):
+            late("security_state", f"pairing_audit:{row[0]}",
+                 epoch + timedelta(microseconds=row[3]))
+    return found
+
+
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -2613,6 +2678,13 @@ def compare(baseline: dict, current: dict, *, declared_rewrites=(), now=None) ->
         "access_invitations": _compare_keyed(access_base.get("invitations"),
                                              access_now.get("invitations")),
     }
+    # No time the services compare later may lie beyond the verify time
+    # (plus a small clock-skew allowance): a far-future clock would refuse
+    # every later operation.
+    for name, items in _future_times(current, (now or _utcnow()) + CLOCK_SKEW_ALLOWANCE).items():
+        section = sections[name]
+        section.setdefault("failed", []).extend(items)
+        section["status"] = "failed"
     empty_coverage = sorted(key for key, value in baseline["coverage"].items()
                             if value != "present")
     failed = any(section["status"] == "failed" for section in sections.values())

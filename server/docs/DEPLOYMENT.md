@@ -593,7 +593,11 @@ offset, or otherwise formatted, is never accepted as evidence. The same holds
 for every such time present now, recorded or new (presence clocks,
 tombstones, unresolved markers, the override, the timeline gap, pending
 integrity rows and overflow slots), since the service compares them again
-(`invalid_time`). Presence jobs
+(`invalid_time`), and none of them, nor any audit or pairing audit time,
+may lie more than 5 minutes (the clock-skew allowance) beyond the verify
+time (`future_time`): a far-future control clock would refuse every later
+Owner control operation. An override's expiry is legitimately in the future
+and the presence service sets no longest duration, so it is not bounded. Presence jobs
 and unresolved markers may name only the service's actions (`evidence`,
 `notification`). The one exception for missing rows is the service's own
 automatic retention, which runs at every startup (so the update restart itself
