@@ -609,7 +609,16 @@ state and actor, observation payloads, recording identities, statuses and
 boundaries, discontinuity bounds, integrity outbox findings and flag, the
 approved hardware baseline, camera-source and detection-binding JSON, and
 pairing node and enrollment identities; the segments of a recording that
-appeared since the record must also be ones the store would link. An override's expiry is legitimately in the future
+appeared since the record must also be ones the store would link. Where a
+service rebuilds a model from a row, each stored column must be what it
+writes from that model: an observation's id, kind, source and receipt time
+match its payload; a recording's end matches its status (none while active,
+its target when complete or gapped, the recovery boundary when
+interrupted); an integrity outbox row's flag matches its findings; the
+hardware baseline must build the whole inventory (unique kind / location,
+at most 1024 components), and `record` refuses (exit 2) a baseline the
+service could not read. No enum value used by an earlier release has been
+retired, so older rows are not rejected by these checks. An override's expiry is legitimately in the future
 and the presence service sets no longest duration, so it is not bounded. Presence jobs
 and unresolved markers may name only the service's actions (`evidence`,
 `notification`). The one exception for missing rows is the service's own

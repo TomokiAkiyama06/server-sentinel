@@ -79,7 +79,7 @@ from app.cameras.remote_agent.pairing import _MAX_KEY_BINDINGS_PER_NODE
 from app.cameras.uvc.persistence import ApprovalStore
 from app.detection.owner import store as owner_store
 from app.detection.owner.contracts import Operation
-from app.integrity.model import Component, Finding, Kind, State
+from app.integrity.model import Component, Finding, Inventory, Kind, State
 from app.media.recording.model import Limits as RecordingLimits, Segment
 from app.monitoring.runtime import EVENT_NAMESPACE
 from app.presence.delivery import ActionResult
@@ -1723,8 +1723,13 @@ def _domain_errors(connection, tables) -> list:
         errors.append([section, item, "invalid_value"])
     for row in rows("security_admin_audit_records", "SELECT * FROM security_admin_audit_records"):
         try:
-            AuditStore._record(row)
+            record = AuditStore._record(row)
+            # AuditStore stores str() of the identities it validated.
+            valid = (str(record.id) == row["id"]
+                     and str(record.target_logical_id) == row["target_logical_id"])
         except (ValueError, TypeError, KeyError, OverflowError):
+            valid = False
+        if not valid:
             bad("audit_security_admin", str(row["id"]))
     for row in rows("integrity_audit", "SELECT id, actor, revision FROM integrity_audit"):
         if not _canonical_uuid(row[1]) or type(row[2]) is not int or row[2] < 1:
@@ -1751,19 +1756,42 @@ def _domain_errors(connection, tables) -> list:
     for row in rows("presence_override", "SELECT state, actor FROM presence_override"):
         if row[0] not in presence_states or not _canonical_uuid(row[1]):
             bad("presence", "override:owner")
-    for row in rows("presence_observations", "SELECT id, payload FROM presence_observations"):
+    for row in rows("presence_observations",
+                    "SELECT id, kind, source, received, payload FROM presence_observations"):
+        # PresenceService.record() stores these columns from the observation
+        # it keeps as the payload.
         try:
-            Observation.from_payload(json.loads(row[1]))
+            observation = Observation.from_payload(json.loads(row[4]))
+            valid = (row[0] == str(observation.identifier)
+                     and row[1] == observation.kind.value
+                     and row[2] == (str(observation.source_id) if observation.source_id
+                                    else None)
+                     and row[3] == presence_timestamp(observation.received_at))
         except Exception:
+            valid = False
+        if not valid:
             bad("presence", f"observations:{row[0]}")
-    for row in rows("recordings", "SELECT id, source_id, event_id, status, start_ms, "
-                    "target_end_ms, ended_ms, critical FROM recordings"):
+    # The boundary startup recovery writes for 'interrupted' (unknown when
+    # the catalog tables it reads are gone; the schema check reports that).
+    recovered = ("MIN(r.target_end_ms, COALESCE((SELECT MAX(s.end_ms) FROM recording_segments s "
+                 "JOIN recording_links l ON l.segment_id = s.id WHERE l.recording_id = r.id), "
+                 "r.start_ms))" if {"recording_segments", "recording_links"} <= tables else "NULL")
+    for row in rows("recordings", "SELECT r.id, r.source_id, r.event_id, r.status, r.start_ms, "
+                    f"r.target_end_ms, r.ended_ms, r.critical, {recovered} FROM recordings r"):
         ints = (row[4], row[5]) + (() if row[6] is None else (row[6],))
+        status, ended = row[3], row[6]
+        # finish() closes complete (re-labelled gapped) rows at their target;
+        # recovery ends interrupted ones at the expression above; an active
+        # row has no end; a deleting row keeps the end it had.
+        ended_ok = {"active": ended is None,
+                    "complete": ended == row[5], "gapped": ended == row[5],
+                    "interrupted": ended == row[8],
+                    "deleting": ended is not None}.get(status, False)
         if (not _canonical_uuid(row[0]) or not _canonical_uuid(row[1])
                 or not (row[2] is None or _canonical_uuid(row[2]))
-                or row[3] not in _RECORDING_STATUSES or row[7] not in (0, 1)
+                or status not in _RECORDING_STATUSES or row[7] not in (0, 1)
                 or any(type(value) is not int or value < 0 for value in ints)
-                or not row[4] < row[5]):
+                or not row[4] < row[5] or not ended_ok):
             bad("recordings", str(row[0]))
     for row in rows("recording_discontinuities",
                     "SELECT recording_id, start_ms, end_ms FROM recording_discontinuities"):
@@ -1773,19 +1801,23 @@ def _domain_errors(connection, tables) -> list:
         try:
             findings = [Finding(Kind(item["kind"]), State(item["state"]), item["reason"])
                         for item in json.loads(row[2])]
-            valid = row[1] in (0, 1) and bool(findings)
+            # IntegrityStore.record() / promotion derive the flag this way.
+            valid = bool(findings) and row[1] == int(any(item.immediate for item in findings))
         except Exception:
             valid = False
         if not valid:
             bad("integrity_delivery", f"pending:{row[0]}")
     for row in rows("integrity_baseline", "SELECT revision, inventory FROM integrity_baseline"):
         try:
+            # Exactly what IntegrityStore.baseline() builds, aggregate
+            # Inventory constraints (limit, unique kind / location) included.
             data = json.loads(row[1])
-            tuple(Component(Kind(item["kind"]), item["location"],
-                            tuple(tuple(pair) for pair in item["properties"]),
-                            tuple(tuple(pair) for pair in item["identity"]),
-                            item.get("complete", True)) for item in data["components"])
-            frozenset(Kind(kind) for kind in data["unavailable"])
+            Inventory(tuple(Component(Kind(item["kind"]), item["location"],
+                                      tuple(tuple(pair) for pair in item["properties"]),
+                                      tuple(tuple(pair) for pair in item["identity"]),
+                                      item.get("complete", True))
+                            for item in data["components"]),
+                      frozenset(Kind(kind) for kind in data["unavailable"]))
             valid = type(row[0]) is int and row[0] >= 1
         except Exception:
             valid = False
@@ -3070,6 +3102,9 @@ def main(arguments: list[str] | None = None) -> int:
                     f"(missing {len(schema.get('missing') or ())}, "
                     f"changed {len(schema.get('changed') or ())}, "
                     f"history {'ok' if schema.get('history_matches') else 'mismatch'})")
+            if any(error[0] == "integrity_baseline" for error in inventory["domain_errors"]):
+                # The service's startup integrity check would reject it too.
+                raise InventoryError("approved hardware baseline cannot be read by the service")
             write_private(args.output, args.runtime_root, inventory)
             print("\n".join(_summary_record(inventory)))
             empty = any(value != "present" for value in inventory["coverage"].values())

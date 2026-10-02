@@ -150,6 +150,15 @@ class Runtime:
                 (str(uuid4()), actors[action], names[action], str(node), self.clock, outcome))
             self.clock += 1_000_000
 
+    def observation(self, identifier, received: str = "2026-01-01T00:00:00.000000+00:00") -> None:
+        """A presence observation row as PresenceService.record() stores it."""
+        payload = presence_payload(identifier, received)
+        data = json.loads(payload)
+        self.execute("INSERT INTO presence_observations (id, kind, source, received, payload) "
+                     "VALUES (?, ?, ?, ?, ?)",
+                     (str(identifier), data["kind"], data["source_id"], data["received_at"],
+                      payload))
+
     def audit(self) -> str:
         row_id = str(uuid4())
         self.execute(
@@ -1222,11 +1231,8 @@ class LifecycleInventoryTests(unittest.TestCase):
                                     "generation) VALUES (?, 'owner', 'ENROLL', 1)", (at,))
         # An unresolved critical observation the Owner releases.
         released = uuid4()
-        self.runtime.execute(
-            "INSERT INTO presence_observations (id, kind, source, received, payload) "
-            "VALUES (?, 'crossing', 'synthetic-source', ?, ?)",
-            (str(released), (now - timedelta(days=1)).isoformat(timespec="microseconds"),
-             presence_payload(released)))
+        self.runtime.observation(released,
+                                 (now - timedelta(days=1)).isoformat(timespec="microseconds"))
         self.runtime.execute("INSERT INTO presence_deliveries (observation, action, state, "
                              "attempts) VALUES (?, 'notification', 'pending', 0)",
                              (str(released),))
@@ -1406,10 +1412,7 @@ class LifecycleInventoryTests(unittest.TestCase):
         """Synthetic durable presence state; payloads are generated markers."""
         ids = {name: str(uuid4()) for name in ("kept", "expired", "lost", "edited", "done")}
         for name in ("kept", "expired", "lost", "edited"):
-            self.runtime.execute(
-                "INSERT INTO presence_observations (id, kind, source, received, payload) "
-                "VALUES (?, 'crossing', 'synthetic-source', '2026-01-01T00:00:00.000000+00:00', ?)",
-                (ids[name], presence_payload(ids[name])))
+            self.runtime.observation(ids[name])
             self.runtime.execute(
                 "INSERT INTO presence_deliveries (observation, action, state, attempts) "
                 "VALUES (?, 'notification', 'pending', 0)", (ids[name],))
@@ -1533,10 +1536,7 @@ class LifecycleInventoryTests(unittest.TestCase):
         ids = {}
         for label, (received, state) in cases.items():
             ids[label] = str(uuid4())
-            self.runtime.execute(
-                "INSERT INTO presence_observations (id, kind, source, received, payload) "
-                "VALUES (?, 'crossing', 'synthetic-source', ?, ?)",
-                (ids[label], received, presence_payload(ids[label])))
+            self.runtime.observation(ids[label], received)
             self.runtime.execute("INSERT INTO presence_source_facts (id, digest) VALUES (?, ?)",
                                  (ids[label], hashlib.sha256(label.encode()).hexdigest()))
             if state is not None:
@@ -1589,10 +1589,7 @@ class LifecycleInventoryTests(unittest.TestCase):
         ids = {}
         for label, ((evidence, notification), _, _, _) in cases.items():
             ids[label] = str(uuid4())
-            self.runtime.execute(
-                "INSERT INTO presence_observations (id, kind, source, received, payload) "
-                "VALUES (?, 'crossing', 'synthetic-source', ?, ?)",
-                (ids[label], fresh, presence_payload(ids[label])))
+            self.runtime.observation(ids[label], fresh)
             for action, state in (("evidence", evidence), ("notification", notification)):
                 self.runtime.execute(
                     "INSERT INTO presence_deliveries (observation, action, state, attempts, "
@@ -1712,10 +1709,7 @@ class LifecycleInventoryTests(unittest.TestCase):
         seeded = self.runtime.seed()
         _, baseline = self.record()
         late = uuid4()
-        self.runtime.execute(
-            "INSERT INTO presence_observations (id, kind, source, received, payload) "
-            "VALUES (?, 'crossing', 'synthetic-source', ?, ?)",
-            (str(late), self.now.isoformat(timespec="microseconds"), presence_payload(late)))
+        self.runtime.observation(late, self.now.isoformat(timespec="microseconds"))
         for action, state in (("evidence", "delivered"), ("notification", "pending")):
             self.runtime.execute("INSERT INTO presence_deliveries (observation, action, state, "
                                  "attempts) VALUES (?, ?, ?, 0)", (str(late), action, state))
@@ -1800,10 +1794,7 @@ class LifecycleInventoryTests(unittest.TestCase):
         @case("owner clear time")
         def _(runtime, seeded, phase):
             if phase == "before":
-                runtime.execute(
-                    "INSERT INTO presence_observations (id, kind, source, received, payload) "
-                    "VALUES ('00000000-0000-4000-8000-000000000001', 'crossing', 's', ?, ?)",
-                    (z, presence_payload("00000000-0000-4000-8000-000000000001")))
+                runtime.observation("00000000-0000-4000-8000-000000000001", z)
                 runtime.execute("INSERT INTO presence_deliveries (observation, action, state, "
                                 "attempts) VALUES ('00000000-0000-4000-8000-000000000001', "
                                 "'notification', 'pending', 0)")
@@ -2035,6 +2026,70 @@ class LifecycleInventoryTests(unittest.TestCase):
                     _, baseline = self.record(f"domain-{index}.json")
                     runtime.execute(statement, parameters)
                     code, report, _ = self.verify(baseline)
+                finally:
+                    self.runtime = saved
+                self.assertEqual(code, inventory.EXIT_FAILED)
+                self.assertIn(reason, [item["reason"] for item in
+                                       report["sections"][section].get("failed", [])])
+
+    def test_stored_columns_match_the_model_the_service_rebuilds(self):
+        # Codex P1: where a service rebuilds a model from a row, every stored
+        # column must be what it would write from that model.
+        uid = "00000000-0000-4000-8000-0000000000cc"
+        baseline_text = json.dumps({"components": [
+            {"kind": "CPU", "location": "socket0", "properties": [], "identity": []},
+            {"kind": "CPU", "location": "socket0", "properties": [], "identity": []}],
+            "unavailable": []})
+        cases = {
+            "observation id column": (
+                "INSERT INTO presence_observations (id, kind, source, received, payload) "
+                "VALUES (?, ?, ?, ?, ?)", lambda: (
+                    str(uuid4()), "server_movement", str(UUID(int=1)),
+                    "2026-01-01T00:00:00.000000+00:00", presence_payload(uid)),
+                "presence", "invalid_value"),
+            "observation received column": (
+                "INSERT INTO presence_observations (id, kind, source, received, payload) "
+                "VALUES (?, ?, ?, ?, ?)", lambda: (
+                    uid, "server_movement", str(UUID(int=1)),
+                    "2026-01-02T00:00:00.000000+00:00", presence_payload(uid)),
+                "presence", "invalid_value"),
+            "active recording with an end": (
+                "INSERT INTO recordings (id, source_id, start_ms, target_end_ms, ended_ms, "
+                "status, critical) VALUES (?, ?, 0, 10, 10, 'active', 0)", lambda: (uid, uid),
+                "recordings", "invalid_value"),
+            "complete recording ending off its target": (
+                "INSERT INTO recordings (id, source_id, start_ms, target_end_ms, ended_ms, "
+                "status, critical) VALUES (?, ?, 0, 10, 5, 'complete', 0)", lambda: (uid, uid),
+                "recordings", "invalid_value"),
+            "interrupted recording off the recovery boundary": (
+                "INSERT INTO recordings (id, source_id, start_ms, target_end_ms, ended_ms, "
+                "status, critical) VALUES (?, ?, 0, 10, 10, 'interrupted', 0)",
+                lambda: (uid, uid), "recordings", "invalid_value"),
+            "outbox flag against its findings": (
+                "INSERT INTO integrity_outbox(at, immediate, findings) VALUES "
+                "('2026-01-01T00:00:00+00:00', 0, ?)", lambda: (json.dumps(
+                    [{"kind": "GPU", "state": "CHANGED", "reason": "x"}]),),
+                "integrity_delivery", "invalid_value"),
+            "ambiguous hardware baseline": (
+                "INSERT INTO integrity_baseline VALUES (1, 1, ?)", lambda: (baseline_text,),
+                "integrity_baseline", "invalid_value"),
+        }
+        for index, (label, (statement, values, section, reason)) in enumerate(cases.items()):
+            with self.subTest(label):
+                runtime = Runtime(self.base / f"model-{index}")
+                saved, self.runtime = self.runtime, runtime
+                try:
+                    runtime.seed()
+                    _, baseline = self.record(f"model-{index}.json")
+                    runtime.execute(statement, values())
+                    code, report, _ = self.verify(baseline)
+                    if section == "integrity_baseline":
+                        # record refuses a baseline the service could not read.
+                        code_record, _, stderr = run(
+                            "record", "--runtime-root", str(runtime.root),
+                            "--output", str(self.notes / f"model-bad-{index}.json"))
+                        self.assertEqual(code_record, inventory.EXIT_USAGE)
+                        self.assertIn("hardware baseline", stderr)
                 finally:
                     self.runtime = saved
                 self.assertEqual(code, inventory.EXIT_FAILED)
@@ -2432,7 +2487,10 @@ class LifecycleInventoryTests(unittest.TestCase):
                                 key=lambda item: item["id"]),
                          [{"id": "overflow:MEMORY:CHANGED", "reason": "missing"},
                           {"id": "pending:2", "reason": "missing"},
-                          {"id": "pending:3", "reason": "changed"}])
+                          {"id": "pending:3", "reason": "changed"},
+                          # immediate=0 for a CHANGED finding is not what
+                          # IntegrityStore.record() derives.
+                          {"id": "pending:3", "reason": "invalid_value"}])
 
     def test_accepted_integrity_event_matches_the_pending_row(self):
         # Codex P1: _integrity_sink() records the row's failure / warning
