@@ -76,6 +76,7 @@ from uuid import UUID, uuid5
 
 from app.audit.store import DEFAULT_RETENTION as AUDIT_RETENTION, AuditStore
 from app.cameras.remote_agent.pairing import _MAX_KEY_BINDINGS_PER_NODE
+from app.cameras.registry.repository import CameraRegistry
 from app.cameras.uvc.persistence import ApprovalStore
 from app.detection.owner import store as owner_store
 from app.detection.owner.contracts import Operation
@@ -1823,15 +1824,18 @@ def _domain_errors(connection, tables) -> list:
             valid = False
         if not valid:
             bad("integrity_baseline", "baseline")
-    for row in rows("camera_sources",
-                    "SELECT id, capabilities, desired_capture_profile FROM camera_sources"):
-        if (not _canonical_uuid(row[0]) or not _json(row[1])
-                or not (row[2] is None or _json(row[2]))):
-            bad("camera_sources", str(row[0]))
-    for row in rows("detection_bindings",
-                    "SELECT source_id, thresholds, config FROM detection_bindings"):
-        if not _json(row[1]) or not _json(row[2]):
-            bad("camera_sources", str(row[0]))
+    # CameraRegistry rebuilds each source (capabilities, desired and
+    # negotiated capture profiles, detection bindings, times) with
+    # CameraRegistry._source(); a row it cannot rebuild breaks source
+    # enumeration, so it is rebuilt here the same way.
+    if {"camera_sources", "detection_bindings"} <= tables:
+        for row in rows("camera_sources", "SELECT id FROM camera_sources"):
+            try:
+                valid = _canonical_uuid(row[0]) and bool(CameraRegistry._source(connection, row[0]))
+            except Exception:
+                valid = False
+            if not valid:
+                bad("camera_sources", str(row[0]))
     for table, columns in (("pairing_node_credentials", ("node_id",)),
                            ("pairing_node_renewals", ("node_id",)),
                            ("pairing_key_bindings", ("node_id",)),
@@ -3105,6 +3109,20 @@ def main(arguments: list[str] | None = None) -> int:
             if any(error[0] == "integrity_baseline" for error in inventory["domain_errors"]):
                 # The service's startup integrity check would reject it too.
                 raise InventoryError("approved hardware baseline cannot be read by the service")
+            # A baseline is written only if verifying this very state,
+            # unchanged, would pass: every current-state check runs here.
+            self_check = compare(inventory, inventory)
+            if self_check["status"] == "failed":
+                findings = Counter()
+                for name, section in self_check["sections"].items():
+                    for item in section.get("failed", ()):
+                        findings[f"{name}:{item['reason']}"] += 1
+                if not self_check["owner_present"] and inventory["coverage"].get("owner") == "present":
+                    findings["access:owner_unusable"] += 1
+                print("lifecycle inventory refused: the current state fails verification "
+                      "(" + ", ".join(f"{key}={count}" for key, count in sorted(findings.items()))
+                      + "); no baseline written", file=sys.stderr)
+                return EXIT_FAILED
             write_private(args.output, args.runtime_root, inventory)
             print("\n".join(_summary_record(inventory)))
             empty = any(value != "present" for value in inventory["coverage"].values())

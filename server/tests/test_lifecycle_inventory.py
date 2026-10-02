@@ -259,6 +259,15 @@ class LifecycleInventoryTests(unittest.TestCase):
                          "--output", str(output), *extra)
         return code, output
 
+    def assert_record_refused(self, finding: str, *extra: str) -> None:
+        """record writes nothing for a state an unchanged verify would fail."""
+        target = self.notes / f"refused-{uuid4().hex}.json"
+        code, _, stderr = run("record", "--runtime-root", str(self.runtime.root),
+                              "--output", str(target), *extra)
+        self.assertEqual(code, inventory.EXIT_FAILED, stderr)
+        self.assertIn(finding, stderr)
+        self.assertFalse(target.exists())
+
     def owner_template_root(self, *, template: bytes | None = None, at: str | None = None) -> Path:
         """A synthetic Owner-template store; the bytes are a generated marker."""
         root = self.base / "owner-template"
@@ -580,8 +589,10 @@ class LifecycleInventoryTests(unittest.TestCase):
             recordings[label] = self.runtime.recording(
                 starred=starred, payload=b"generated-retention-" + label.encode(),
                 status="active")
-            self.runtime.execute("UPDATE recordings SET status=?, ended_ms=?, critical=? "
-                                 "WHERE id=?", (status, ended, int(critical), recordings[label]))
+            # finish() closes a recording at its target.
+            self.runtime.execute("UPDATE recordings SET status=?, ended_ms=?, critical=?, "
+                                 "target_end_ms=COALESCE(?, target_end_ms) WHERE id=?",
+                                 (status, ended, int(critical), ended, recordings[label]))
         _, baseline = self.record()
         with closing(sqlite3.connect(self.runtime.database)) as connection:
             integrity_ids = [str(row[0]) for row in connection.execute(
@@ -630,8 +641,9 @@ class LifecycleInventoryTests(unittest.TestCase):
         now_ms = int(self.now.timestamp() * 1000)
         expired = self.runtime.recording(starred=False, payload=b"generated-retention-only",
                                          status="active")
-        self.runtime.execute("UPDATE recordings SET status='complete', ended_ms=? WHERE id=?",
-                             (now_ms - 21 * 86_400_000, expired))
+        self.runtime.execute("UPDATE recordings SET status='complete', ended_ms=?, "
+                             "target_end_ms=? WHERE id=?",
+                             (now_ms - 21 * 86_400_000, now_ms - 21 * 86_400_000, expired))
         self.runtime.execute("INSERT INTO storage_state_audit (at_ms, previous_state, "
                              "current_state) VALUES (?, 'NORMAL', 'STORAGE_PRESSURE')",
                              (now_ms - 91 * 86_400_000,))
@@ -666,7 +678,7 @@ class LifecycleInventoryTests(unittest.TestCase):
                     runtime.execute("INSERT INTO storage_state_audit (at_ms, previous_state, "
                                     "current_state) VALUES (1, 'NORMAL', 'STORAGE_PRESSURE')")
                     runtime.execute("UPDATE recordings SET status='complete', ended_ms=1, "
-                                    "starred=0")
+                                    "target_end_ms=1, starred=0")
                     _, baseline = self.record(f"dropped-{index}.json")
                     # Every row here is past its retention period.
                     runtime.execute(f"DROP TABLE {table}")
@@ -687,7 +699,8 @@ class LifecycleInventoryTests(unittest.TestCase):
             runtime = Runtime(self.base / f"empty-drop-{index}")
             saved, self.runtime = self.runtime, runtime
             try:
-                runtime.execute(f"DELETE FROM {table}")
+                if table != "schema_migrations":   # the service needs its history
+                    runtime.execute(f"DELETE FROM {table}")
                 _, baseline = self.record(f"empty-drop-{index}.json")
                 runtime.execute(f"DROP TABLE {table}")
                 code, report, _ = self.verify(baseline)
@@ -705,7 +718,9 @@ class LifecycleInventoryTests(unittest.TestCase):
         # the update's startup then applies it.
         self.runtime = Runtime(self.base / "one-release-earlier", APPLICATION_MIGRATIONS[:-1])
         self.runtime.seed()
-        _, baseline = self.record()
+        # record runs with the installed (earlier) release's own tool.
+        with mock.patch.object(inventory, "APPLICATION_MIGRATIONS", APPLICATION_MIGRATIONS[:-1]):
+            _, baseline = self.record()
         with closing(Database(self.runtime.database).connect()) as connection:
             migrate(connection, APPLICATION_MIGRATIONS)
         last = [APPLICATION_MIGRATIONS[-1].version]
@@ -740,7 +755,9 @@ class LifecycleInventoryTests(unittest.TestCase):
                     tail = APPLICATION_MIGRATIONS[-2:]
                     values = {"v1": tail[0].version, "n1": tail[0].name, "c1": tail[0].checksum,
                               "v2": tail[1].version, "n2": tail[1].name, "c2": tail[1].checksum}
-                    _, recorded = self.record(f"migrations-{index}.json")
+                    with mock.patch.object(inventory, "APPLICATION_MIGRATIONS",
+                                           APPLICATION_MIGRATIONS[:-2]):
+                        _, recorded = self.record(f"migrations-{index}.json")
                     with closing(sqlite3.connect(runtime.database,
                                                  isolation_level=None)) as connection:
                         for statement in statements:
@@ -968,15 +985,8 @@ class LifecycleInventoryTests(unittest.TestCase):
             "INSERT INTO uvc_approvals (source_id, evidence, requires_approval, session_token, "
             "serial_ambiguous, explicit_binding) VALUES (?, '{', 0, NULL, 0, 0)",
             (ids["not-json"],))
-        _, baseline = self.record()
-        code, report, _ = self.verify(baseline)
-        self.assertEqual(code, inventory.EXIT_FAILED)
-        section = report["sections"]["camera_sources"]
-        self.assertIn(ids["valid"], section["preserved"])
-        for label in (*broken, "not-json"):
-            self.assertIn({"id": ids[label], "reason": "unreadable_approval_evidence"},
-                          section["failed"])
-            self.assertNotIn(ids[label], section["preserved"])
+        # The service cannot restore them: no baseline is written.
+        self.assert_record_refused("camera_sources:unreadable_approval_evidence=5")
 
     def test_owner_template_store_with_unsafe_layout_is_never_preserved(self):
         # The store's own invariants: private root, 0600 single-link regular
@@ -986,15 +996,17 @@ class LifecycleInventoryTests(unittest.TestCase):
         root = self.owner_template_root(template=b"synthetic-owner-template-marker")
         database = root / "owner-template.sqlite3"
 
+        good_baseline = {}
+
         def unsafe_verify(label):
-            _, baseline = self.record(f"{label}.json", *option)
-            code, report, _ = self.verify(baseline, *option)
+            # An unsafe layout is never recorded, and from a safe record it
+            # always fails verification.
+            self.assert_record_refused("owner_template:unsafe=1", *option)
+            code, report, _ = self.verify(good_baseline["path"], *option)
             self.assertEqual(code, inventory.EXIT_FAILED, label)
             self.assertIn({"id": "state", "reason": "unsafe"},
                           report["sections"]["owner_template"]["failed"], label)
-            recorded = json.loads((self.notes / f"{label}.json").read_text())
-            self.assertEqual(recorded["owner_template"],
-                             {"configured": True, "state": "unsafe"}, label)
+        _, good_baseline["path"] = self.record("good.json", *option)
         os.chmod(database, 0o644)
         unsafe_verify("readable-database")
         # Codex P2: run as root, the inventory could read a file the service
@@ -1282,13 +1294,9 @@ class LifecycleInventoryTests(unittest.TestCase):
             db.execute("DELETE FROM owner_template_audit")
             db.execute("INSERT INTO owner_template_audit(at, actor, operation, generation) "
                        "VALUES ('2023-08-17T20:00:00-05:00', 'owner', 'ENROLL', 1)")
-        _, baseline = self.record("offset.json", *option)
-        with closing(sqlite3.connect(root / "owner-template.sqlite3",
-                                     isolation_level=None)) as db:
-            db.execute("DELETE FROM owner_template_audit")
-        code, report, _ = self.verify(baseline, *option)
-        self.assertEqual(code, inventory.EXIT_FAILED)
-        self.assertEqual(report["sections"]["owner_template"]["audit"]["retention_expired"], [])
+        # Not a time the store writes: no baseline is written at all, so its
+        # removal can never read as retention.
+        self.assert_record_refused("owner_template:invalid_time=1", *option)
 
     def test_credential_sign_count_may_only_advance(self):
         # A lower counter rolls back the authenticator clone-detection floor.
@@ -1352,12 +1360,8 @@ class LifecycleInventoryTests(unittest.TestCase):
         for recording_id in (seeded["ordinary"], active):
             self.assertNotIn(recording_id, section["preserved"])
             self.assertIn({"id": recording_id, "reason": "changed"}, section["failed"])
-        # Recorded with the hidden link already present: never preserved either.
-        _, tainted = self.record("tainted.json")
-        code, report, _ = self.verify(tainted)
-        self.assertEqual(code, inventory.EXIT_FAILED)
-        self.assertIn({"id": seeded["ordinary"], "reason": "no_readable_segment_evidence"},
-                      report["sections"]["recordings"]["failed"])
+        # With the hidden link already present, no baseline is written.
+        self.assert_record_refused("recordings:no_readable_segment_evidence")
 
     def test_owner_editable_source_metadata_is_preserved_by_keyed_digest(self):
         self.runtime.seed()
@@ -1761,7 +1765,7 @@ class LifecycleInventoryTests(unittest.TestCase):
             if phase == "before":
                 runtime.execute("INSERT INTO presence_control_clock VALUES (1, ?)",
                                 ("2026-01-01T00:00:00.000000+00:00",))
-                runtime.execute("INSERT INTO presence_override VALUES (1, 'away', 'owner', ?, ?)",
+                runtime.execute("INSERT INTO presence_override VALUES (1, 'ABSENT', '00000000-0000-4000-8000-0000000000aa', ?, ?)",
                                 ("2026-01-01T00:00:00.000000+00:00",
                                  "2026-01-01T00:30:00.000000+00:00"))
             else:
@@ -1780,16 +1784,15 @@ class LifecycleInventoryTests(unittest.TestCase):
                                 (later_text_earlier_instant,))
             return "presence_timeline_gap", {"id": "gap", "reason": "invalid_time"}
 
-        @case("integrity audit retention")
+        @case("integrity audit time")
         def _(runtime, seeded, phase):
-            if phase == "before":
-                # 2023-08-17T20:00 at -05:00 is 2023-08-18T01:00Z, after the
-                # 90-day cutoff (2023-08-17T22:13Z), though its text sorts before.
+            # A row at another offset is not a time the store writes (it is
+            # never recorded: record refuses such a state).
+            if phase == "after":
                 runtime.execute("INSERT INTO integrity_audit(at, actor, revision) VALUES "
-                                "('2023-08-17T20:00:00-05:00', '00000000-0000-4000-8000-0000000000aa', 1)")
-            else:
-                runtime.execute("DELETE FROM integrity_audit")
-            return "audit_integrity", {"id": "1", "reason": "missing"}
+                                "('2023-08-17T20:00:00-05:00', "
+                                "'00000000-0000-4000-8000-0000000000aa', 1)")
+            return "audit_integrity", {"id": "1", "reason": "invalid_time"}
 
         @case("owner clear time")
         def _(runtime, seeded, phase):
@@ -1851,7 +1854,7 @@ class LifecycleInventoryTests(unittest.TestCase):
                           "presence", {"id": "completed_events:"
                                              "00000000-0000-4000-8000-000000000009",
                                        "reason": "invalid_time"}),
-            "override": ("INSERT INTO presence_override VALUES (1, 'away', 'owner', 'now', NULL)",
+            "override": ("INSERT INTO presence_override VALUES (1, 'ABSENT', 'owner', 'now', NULL)",
                          "presence", {"id": "override:owner", "reason": "invalid_time"}),
             "timeline gap": ("INSERT INTO presence_timeline_gap VALUES (1, 'x', 'y', 1, 0, 0, 0)",
                              "presence_timeline_gap", {"id": "gap", "reason": "invalid_time"}),
@@ -2096,6 +2099,97 @@ class LifecycleInventoryTests(unittest.TestCase):
                 self.assertIn(reason, [item["reason"] for item in
                                        report["sections"][section].get("failed", [])])
 
+    def test_registry_rows_must_rebuild_as_the_registry_reads_them(self):
+        # Codex P1: CameraRegistry._source() builds CaptureProfile(**profile)
+        # and every DetectionBinding; JSON that parses but cannot build a
+        # source would break source enumeration at startup.
+        for index, statement in enumerate((
+                "UPDATE camera_sources SET desired_capture_profile='[]'",
+                "INSERT INTO detection_bindings SELECT id, 'not-a-uuid', 'person', 1, 1, '{}', "
+                "'{}' FROM camera_sources")):
+            with self.subTest(statement):
+                runtime = Runtime(self.base / f"registry-{index}")
+                saved, self.runtime = self.runtime, runtime
+                try:
+                    runtime.seed()
+                    _, baseline = self.record(f"registry-{index}.json")
+                    runtime.execute(statement)
+                    code, report, _ = self.verify(baseline)
+                    self.assert_record_refused("camera_sources:invalid_value")
+                finally:
+                    self.runtime = saved
+                self.assertEqual(code, inventory.EXIT_FAILED)
+                self.assertIn("invalid_value", [item["reason"] for item in
+                                                report["sections"]["camera_sources"]["failed"]])
+
+    def test_record_succeeds_exactly_when_an_unchanged_verify_passes(self):
+        # Codex P1: record runs every current-state check verify runs, so a
+        # baseline is written iff verifying the same state unchanged passes.
+        def presence(runtime):
+            self.presence_rows()
+
+        def paired(runtime):
+            node = self._paired_node("a" * 64, "c" * 64)
+            runtime.execute("INSERT INTO pairing_key_bindings VALUES (?, ?, 0)", ("a" * 64, node))
+
+        def outbox(runtime):
+            runtime.execute("INSERT INTO integrity_outbox(at, immediate, findings) VALUES "
+                            "('2026-01-01T00:00:00+00:00', 1, ?)", (json.dumps(
+                                [{"kind": "GPU", "state": "CHANGED", "reason": "x"}]),))
+
+        def active(runtime):
+            recording = runtime.recording(starred=False, payload=b"generated-property",
+                                          status="active", target_end_ms=30000)
+            runtime.add_segment(recording, b"generated-property-tail", start_ms=12000,
+                                end_ms=20000)
+        valid = {"seeded": lambda runtime: None, "presence": presence, "paired": paired,
+                 "outbox": outbox, "active recording": active}
+        invalid = {
+            "unbound credential": lambda runtime: self._paired_node("b" * 64, "c" * 64),
+            "outbox flag": lambda runtime: runtime.execute(
+                "INSERT INTO integrity_outbox(at, immediate, findings) VALUES "
+                "('2026-01-01T00:00:00+00:00', 0, ?)", (json.dumps(
+                    [{"kind": "GPU", "state": "CHANGED", "reason": "x"}]),)),
+            "control clock": lambda runtime: runtime.execute(
+                "INSERT INTO presence_control_clock VALUES (1, 'x')"),
+            "future clock": lambda runtime: runtime.execute(
+                "INSERT INTO presence_clock VALUES (1, '9999-01-01T00:00:00.000000+00:00')"),
+            "observation payload": lambda runtime: runtime.execute(
+                "INSERT INTO presence_observations (id, kind, source, received, payload) VALUES "
+                "('00000000-0000-4000-8000-0000000000dd', 'person', NULL, "
+                "'2026-01-01T00:00:00.000000+00:00', '{}')"),
+            "capture profile": lambda runtime: runtime.execute(
+                "UPDATE camera_sources SET desired_capture_profile='[]'"),
+            "corrupt segment": lambda runtime: next(
+                path.write_bytes(b"generated-altered") for path in
+                (runtime.root / "recordings").iterdir()),
+            "orphan job": lambda runtime: runtime.execute(
+                "INSERT INTO presence_deliveries (observation, action, state, attempts) "
+                "VALUES ('00000000-0000-4000-8000-0000000000ee', 'evidence', 'pending', 0)"),
+        }
+        for index, (label, setup) in enumerate({**valid, **invalid}.items()):
+            with self.subTest(label):
+                runtime = Runtime(self.base / f"property-{index}")
+                saved, self.runtime = self.runtime, runtime
+                try:
+                    runtime.seed()
+                    setup(runtime)
+                    target = self.notes / f"property-{index}.json"
+                    code, _, stderr = run("record", "--runtime-root", str(runtime.root),
+                                          "--output", str(target))
+                    if code in (inventory.EXIT_PRESERVED, inventory.EXIT_EMPTY):
+                        verified, report, _ = self.verify(target)
+                    else:
+                        verified, report = None, None
+                finally:
+                    self.runtime = saved
+                if label in valid:
+                    self.assertEqual(code, inventory.EXIT_PRESERVED, stderr)
+                    self.assertEqual(verified, inventory.EXIT_PRESERVED, report)
+                else:
+                    self.assertEqual(code, inventory.EXIT_FAILED, stderr)
+                    self.assertFalse(target.exists())
+
     def test_presence_clocks_sessions_and_override_follow_service_transitions(self):
         self.runtime.seed()
         self.runtime.execute("INSERT INTO presence_clock VALUES (1, "
@@ -2106,7 +2200,8 @@ class LifecycleInventoryTests(unittest.TestCase):
                              "('synthetic-source', '2026-01-01T00:00:00.000000+00:00')")
         self.runtime.execute("INSERT INTO presence_outbox_sessions VALUES "
                              "('synthetic-token', '2026-01-01T00:00:00.000000+00:00')")
-        self.runtime.execute("INSERT INTO presence_override VALUES (1, 'away', 'owner', "
+        self.runtime.execute("INSERT INTO presence_override VALUES (1, 'ABSENT', "
+                             "'00000000-0000-4000-8000-0000000000aa', "
                              "'2026-01-01T00:00:00.000000+00:00', "
                              "'2026-01-02T00:00:00.000000+00:00')")
         # No live outbox holds the committed lock: the session row is stale.
@@ -2498,10 +2593,14 @@ class LifecycleInventoryTests(unittest.TestCase):
         # deterministic event ID; another kind or time is not that event.
         self.runtime.seed()
         when = "2026-01-01T00:00:00+00:00"
-        findings = json.dumps([{"kind": "GPU", "state": "CHANGED", "reason": "x"}])
+        immediate_findings = json.dumps([{"kind": "GPU", "state": "CHANGED", "reason": "x"}])
+        warning_findings = json.dumps([{"kind": "GPU", "state": "UNVERIFIABLE", "reason": "x"}])
         for immediate in (1, 1, 0):
+            # IntegrityStore.record() derives the flag from the findings.
             self.runtime.execute("INSERT INTO integrity_outbox(at, immediate, findings) "
-                                 "VALUES (?, ?, ?)", (when, immediate, findings))
+                                 "VALUES (?, ?, ?)", (when, immediate,
+                                                      immediate_findings if immediate
+                                                      else warning_findings))
         _, baseline = self.record()
         events = {1: ("hardware_integrity_warning", when),            # wrong kind
                   2: ("hardware_integrity_failure", "2026-01-02T00:00:00+00:00"),  # wrong time
@@ -2534,15 +2633,16 @@ class LifecycleInventoryTests(unittest.TestCase):
                 (str(uuid4()), node_id, old[node_id]))
             self.runtime.execute("INSERT INTO pairing_key_bindings VALUES (?, ?, 0)",
                                  (old[node_id], node_id))
+        # stage_renewal() binds the staged key when it stages it.
+        self.runtime.execute("INSERT INTO pairing_key_bindings VALUES (?, ?, 0)",
+                             ("4" * 64, promoted))
         self.runtime.execute("INSERT INTO pairing_node_renewals VALUES (?, ?, ?, 20.0)",
                              (promoted, "4" * 64, "5" * 64))
         _, baseline = self.record()
         for marker in ("1" * 64, "4" * 64, "5" * 64):
             self.assertNotIn(marker, baseline.read_text())
-        # PairingLedger promotion: bind the staged key, swap it in, consume it.
+        # PairingLedger promotion: swap the staged key in, consume it.
         self.runtime.pairing_audit(promoted, "activate")
-        self.runtime.execute("INSERT INTO pairing_key_bindings VALUES (?, ?, 0)",
-                             ("4" * 64, promoted))
         self.runtime.execute(
             "UPDATE pairing_node_credentials SET public_key_digest=?, "
             "credential_serial_digest=?, not_after=20.0 WHERE node_id=?",
@@ -3728,10 +3828,7 @@ class LifecycleInventoryTests(unittest.TestCase):
             db.executemany("INSERT INTO pairing_key_bindings VALUES (?, ?, 1)",
                            [(f"{index:064x}", node)
                             for index in range(1, _MAX_KEY_BINDINGS_PER_NODE + 2)])
-        _, baseline = self.record()
-        code, report, _ = self.verify(baseline)
-        self.assertIn({"id": f"pairing_key_bindings:{node}", "reason": "over_capacity"},
-                      report["sections"]["security_state"]["failed"])
+        self.assert_record_refused("security_state:over_capacity=1")
 
     def test_a_staged_renewal_is_never_restaged_onto_a_superseded_key(self):
         # Codex P1: stage_renewal() accepts a key already bound to the node
@@ -4421,16 +4518,8 @@ class LifecycleInventoryTests(unittest.TestCase):
         seeded = self.runtime.seed()
         self.runtime.segment_path(seeded["ordinary"]).write_bytes(b"generated-altered-bytes!")
         os.link(self.runtime.segment_path(seeded["starred"]), self.notes / "extra-link")
-        code, baseline = self.record()
-        recorded = json.loads(baseline.read_text())["recordings"]
-        for key in ("ordinary", "starred"):
-            self.assertFalse(recorded[seeded[key]]["segments"][0]["catalog_match"])
-        code, report, stdout = self.verify(baseline)
-        self.assertEqual(code, inventory.EXIT_FAILED)
-        section = report["sections"]["recordings"]
-        for key in ("ordinary", "starred"):
-            self.assertIn({"id": seeded[key], "reason": "catalog_mismatch"}, section["failed"])
-            self.assertNotIn(seeded[key], section["preserved"])
+        # record refuses the state; verify would fail it unchanged.
+        self.assert_record_refused("recordings:catalog_mismatch=2")
 
     def test_a_stop_never_launders_a_segment_corrupt_at_record(self):
         # Codex P1: the active-recording path must also refuse a recording
@@ -4443,18 +4532,9 @@ class LifecycleInventoryTests(unittest.TestCase):
                                         start_ms=12000, end_ms=20000)
         path = self.runtime.root / "recordings" / (UUID(tail).hex + ".seg")
         path.write_bytes(b"generated-tail-altered")
-        _, baseline = self.record()
-        self.runtime.execute("UPDATE recordings SET status='complete', target_end_ms=11000, "
-                             "ended_ms=11000 WHERE id=?", (active,))
-        self.runtime.execute("DELETE FROM recording_links WHERE segment_id=?", (tail,))
-        self.runtime.execute("DELETE FROM recording_segments WHERE id=?", (tail,))
-        path.unlink()
-        code, report, _ = self.verify(baseline)
-        self.assertEqual(code, inventory.EXIT_FAILED)
-        section = report["sections"]["recordings"]
-        self.assertIn({"id": active, "reason": "catalog_mismatch"}, section["failed"])
-        self.assertNotIn(active, section["preserved"])
-        self.assertEqual(section["in_progress_at_record"], [])
+        # A baseline holding the corrupt segment is never written, so no
+        # later stop can drop it into a passing result.
+        self.assert_record_refused("recordings:catalog_mismatch=1")
 
     def test_in_progress_growth_requires_segments_the_store_would_accept(self):
         # Codex P1: RecordingStore.append() runs Segment.validate(); a linked
@@ -4506,13 +4586,7 @@ class LifecycleInventoryTests(unittest.TestCase):
                              (segments["ordinary"],))
         self.runtime.execute("UPDATE recording_segments SET source_id=? WHERE id=?",
                              (str(uuid4()), segments["starred"]))
-        _, baseline = self.record()
-        code, report, _ = self.verify(baseline)
-        self.assertEqual(code, inventory.EXIT_FAILED)
-        section = report["sections"]["recordings"]
-        for key in ("ordinary", "starred"):
-            self.assertIn({"id": seeded[key], "reason": "invalid_segment"}, section["failed"])
-            self.assertNotIn(seeded[key], section["preserved"])
+        self.assert_record_refused("recordings:invalid_segment=2")
 
     def test_extra_hard_link_to_a_segment_is_detected(self):
         # RecordingStore._integrity() treats st_nlink != 1 as corrupt.

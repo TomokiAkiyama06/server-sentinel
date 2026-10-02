@@ -557,6 +557,12 @@ listed as `not_inventoried (#132)` in the record and verify output:
 `integrity_status` and `recording_health_status`; do not read a pass as
 covering them.
 
+`record` writes a baseline only if verifying that very state, unchanged,
+would pass: it runs every current-state check `verify` runs (schema,
+values, times, pairing and presence invariants, segment integrity, a usable
+Owner and so on) and otherwise exits 1 without writing anything, naming
+only the failing categories and their counts.
+
 `verify` reads the baseline only if it is still a private `0600` regular file
 (not a symlink) owned by the invoking user or root, and refuses otherwise.
 It recomputes the same inventory and compares it. Every table, index and
@@ -662,8 +668,7 @@ and every recorded and current segment of any accepted recording must come
 from the recording's own source, overlap its target window and pass the
 store's `Segment.validate()` (`invalid_segment` otherwise), and be readable
 and match its catalog digest and byte length with a single hard link even if
-it was already broken at record time (reported as `catalog_mismatch`; `record` prints a
-warning for such recordings). This gate applies to every accepted change,
+it was already broken at record time (reported as `catalog_mismatch`). This gate applies to every accepted change,
 including a recording active at record time whose broken segment a later
 stop drops, and a declared rewrite. A recording that was still active when recorded
 with no linked segment yet always fails (it has no evidence to compare); record
