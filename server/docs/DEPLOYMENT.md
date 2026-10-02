@@ -623,7 +623,7 @@ its target when complete or gapped, the recovery boundary when
 interrupted); an integrity outbox row's flag matches its findings; the
 hardware baseline must build the whole inventory (unique kind / location,
 at most 1024 components), and `record` refuses (exit 2) a baseline the
-service could not read. No enum value used by an earlier release has been
+service could not read. Every current row a service rebuilds is passed through that service's own builder, plus the validator it applies when writing: camera sources (`CameraRegistry._source` and its config validator, so capabilities must be a JSON object), capture nodes (`CameraRegistry._node`), access principals and credentials (`AccessStore._principal` / `_credential`) and recording segment identities (`RecordingStore._name`). No enum value used by an earlier release has been
 retired, so older rows are not rejected by these checks. An override's expiry is legitimately in the future
 and the presence service sets no longest duration, so it is not bounded. Presence jobs
 and unresolved markers may name only the service's actions (`evidence`,

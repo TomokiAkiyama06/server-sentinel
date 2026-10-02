@@ -858,8 +858,9 @@ class LifecycleInventoryTests(unittest.TestCase):
     def test_replaced_credential_key_with_unchanged_count_is_detected(self):
         seeded = self.runtime.seed()
         _, baseline = self.record()
-        # Normal use advances the sign count and backup state: not a change.
-        self.runtime.execute("UPDATE access_credentials SET sign_count=9, backup_state=1")
+        # Normal use advances the sign count: not a change. (Backup state may
+        # flip only on a backup-eligible credential; the seeded one is not.)
+        self.runtime.execute("UPDATE access_credentials SET sign_count=9")
         code, report, _ = self.verify(baseline)
         self.assertEqual(code, inventory.EXIT_PRESERVED)
         self.runtime.execute("UPDATE access_credentials SET public_key=X'0102' "
@@ -2189,6 +2190,42 @@ class LifecycleInventoryTests(unittest.TestCase):
                 else:
                     self.assertEqual(code, inventory.EXIT_FAILED, stderr)
                     self.assertFalse(target.exists())
+
+    def test_rows_must_rebuild_through_the_service_builders(self):
+        # Codex P1 sweep: each row a service rebuilds is rebuilt here with the
+        # service's own builder (and its write-side validator where one exists).
+        cases = {
+            "capabilities not an object": (
+                "UPDATE camera_sources SET capabilities='[]'", "camera_sources"),
+            "capture node time": (
+                "INSERT INTO capture_nodes VALUES ('00000000-0000-4000-8000-0000000000f1', "
+                "'n', 'online', NULL, 'not-a-time', 'not-a-time')", "security_state"),
+            "principal time": (
+                "UPDATE access_principals SET created_at_us='soon' WHERE role='owner'",
+                "access_principals"),
+            "credential backup state": (
+                "UPDATE access_credentials SET backup_state=1", "access_principals"),
+            "segment identity": (
+                "INSERT INTO recording_segments (id, source_id, stream_id, sequence, start_ms, "
+                "end_ms, codec, container, byte_length, sha256, state, spool) VALUES ('x', "
+                "'00000000-0000-4000-8000-0000000000f2', 's', 1, 0, 1, 'synthetic', 'deflate', "
+                "1, '0', 'ready', 1)", "recordings"),
+        }
+        for index, (label, (statement, section)) in enumerate(cases.items()):
+            with self.subTest(label):
+                runtime = Runtime(self.base / f"builder-{index}")
+                saved, self.runtime = self.runtime, runtime
+                try:
+                    runtime.seed()
+                    _, baseline = self.record(f"builder-{index}.json")
+                    runtime.execute(statement)
+                    code, report, _ = self.verify(baseline)
+                    self.assert_record_refused(f"{section}:invalid_value")
+                finally:
+                    self.runtime = saved
+                self.assertEqual(code, inventory.EXIT_FAILED)
+                self.assertIn("invalid_value", [item["reason"] for item in
+                                                report["sections"][section].get("failed", [])])
 
     def test_presence_clocks_sessions_and_override_follow_service_transitions(self):
         self.runtime.seed()

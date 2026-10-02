@@ -76,7 +76,9 @@ from uuid import UUID, uuid5
 
 from app.audit.store import DEFAULT_RETENTION as AUDIT_RETENTION, AuditStore
 from app.cameras.remote_agent.pairing import _MAX_KEY_BINDINGS_PER_NODE
+from app.auth.store import AccessStore
 from app.cameras.registry.repository import CameraRegistry
+from app.media.recording.store import RecordingStore
 from app.cameras.uvc.persistence import ApprovalStore
 from app.detection.owner import store as owner_store
 from app.detection.owner.contracts import Operation
@@ -1831,11 +1833,48 @@ def _domain_errors(connection, tables) -> list:
     if {"camera_sources", "detection_bindings"} <= tables:
         for row in rows("camera_sources", "SELECT id FROM camera_sources"):
             try:
-                valid = _canonical_uuid(row[0]) and bool(CameraRegistry._source(connection, row[0]))
+                source = CameraRegistry._source(connection, row[0])
+                # And the registry's write-side validation of the same
+                # configuration (json_object(), CaptureProfile, bindings).
+                CameraRegistry._config(source.name, source.role_label, source.enabled,
+                                       source.capabilities, source.desired_capture_profile,
+                                       list(source.detection_bindings))
+                valid = _canonical_uuid(row[0])
             except Exception:
                 valid = False
             if not valid:
                 bad("camera_sources", str(row[0]))
+    # CameraRegistry._node() rebuilds every capture node it lists.
+    for row in rows("capture_nodes", "SELECT id FROM capture_nodes"):
+        try:
+            valid = _canonical_uuid(row[0]) and bool(CameraRegistry._node(connection, row[0]))
+        except Exception:
+            valid = False
+        if not valid:
+            bad("security_state", f"capture_nodes:{row[0]}")
+    # AccessStore._principal() / _credential() rebuild the access rows.
+    for row in rows("access_principals", "SELECT * FROM access_principals"):
+        try:
+            valid = bool(AccessStore._principal(row)) and _canonical_uuid(row["id"])
+        except Exception:
+            valid = False
+        if not valid:
+            bad("access_principals", str(row["id"]))
+    for row in rows("access_credentials", "SELECT * FROM access_credentials"):
+        try:
+            valid = bool(AccessStore._credential(row))
+        except Exception:
+            valid = False
+        if not valid:
+            bad("access_principals", str(row["principal_id"]))
+    # RecordingStore._name() turns each segment ID into its file name.
+    for row in rows("recording_segments", "SELECT id FROM recording_segments"):
+        try:
+            valid = bool(RecordingStore._name(row[0], ".seg")) and _canonical_uuid(row[0])
+        except Exception:
+            valid = False
+        if not valid:
+            bad("recordings", f"segment:{row[0]}")
     for table, columns in (("pairing_node_credentials", ("node_id",)),
                            ("pairing_node_renewals", ("node_id",)),
                            ("pairing_key_bindings", ("node_id",)),
