@@ -598,7 +598,18 @@ may lie more than 5 minutes (the clock-skew allowance) beyond the verify
 time (`future_time`): a far-future control clock would refuse every later
 Owner control operation. A time that does not parse (wrong type, malformed,
 negative or out of range) is `invalid_time`, never skipped, and never stops
-`verify` from writing its report. An override's expiry is legitimately in the future
+`verify` from writing its report. Values the services parse again that no
+schema CHECK constraint limits (the schema comparison keeps those
+constraints in place) are validated on every current row as the owning
+service writes them (`invalid_value`): audit rows through the audit store's
+record validation, integrity audit actors and revisions, storage-state audit
+states, Owner-template audit operations and generations, presence audit
+actions and actors, job states and counters, marker counts, the override
+state and actor, observation payloads, recording identities, statuses and
+boundaries, discontinuity bounds, integrity outbox findings and flag, the
+approved hardware baseline, camera-source and detection-binding JSON, and
+pairing node and enrollment identities; the segments of a recording that
+appeared since the record must also be ones the store would link. An override's expiry is legitimately in the future
 and the presence service sets no longest duration, so it is not bounded. Presence jobs
 and unresolved markers may name only the service's actions (`evidence`,
 `notification`). The one exception for missing rows is the service's own

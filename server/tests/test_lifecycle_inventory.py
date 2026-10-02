@@ -38,6 +38,16 @@ CREDENTIAL_LABEL = "synthetic-credential-label-marker"
 BINDING_DIGEST = bytes(range(64, 96))
 
 
+def presence_payload(identifier, at: str = "2026-01-01T00:00:00.000000+00:00") -> str:
+    """A payload PresenceService.record() would store (Observation.payload())."""
+    from app.presence.models import Kind as PresenceKind, Observation, Quality
+    moment = datetime.fromisoformat(at)
+    return json.dumps(Observation(PresenceKind.SERVER_MOVEMENT, moment, moment,
+                                  source_id=UUID(int=1), confidence=0.9,
+                                  quality=Quality.SUFFICIENT, clock_trusted=True, confirmed=True,
+                                  identifier=UUID(str(identifier))).payload(), sort_keys=True)
+
+
 def stream(label: str) -> str:
     """The stream UUID a synthetic stream label stands for (RecordingStore
     writes str(UUID) stream identities)."""
@@ -62,7 +72,7 @@ class Runtime:
         with closing(sqlite3.connect(self.database, isolation_level=None)) as connection:
             connection.execute(sql, parameters)
 
-    def recording(self, *, starred: bool, payload: bytes, status: str = "completed",
+    def recording(self, *, starred: bool, payload: bytes, status: str = "complete",
                   source_id: str | None = None, target_end_ms: int = 10000) -> str:
         recording_id, segment_id = str(uuid4()), str(uuid4())
         source_id = source_id or str(uuid4())
@@ -143,8 +153,8 @@ class Runtime:
     def audit(self) -> str:
         row_id = str(uuid4())
         self.execute(
-            "INSERT INTO security_admin_audit_records VALUES (?, 'owner', 'camera_source.update', "
-            "'camera_source', ?, ?, 'succeeded')", (row_id, str(uuid4()), self.clock))
+            "INSERT INTO security_admin_audit_records VALUES (?, 'owner', 'update_source', "
+            "'source', ?, ?, 'succeeded')", (row_id, str(uuid4()), self.clock))
         self.clock += 1_000_000
         return row_id
 
@@ -251,7 +261,7 @@ class LifecycleInventoryTests(unittest.TestCase):
                 connection.execute(
                     "UPDATE owner_template SET generation=1, template=?, "
                     "provenance='synthetic-provenance-marker' WHERE singleton=1", (template,))
-                for operation in ("enroll", "replace"):
+                for operation in ("ENROLL", "REPLACE"):
                     connection.execute(
                         "INSERT INTO owner_template_audit(at, actor, operation, generation) "
                         "VALUES (?, 'owner', ?, 1)",
@@ -542,15 +552,15 @@ class LifecycleInventoryTests(unittest.TestCase):
         for label, occurred in (("expired", cutoff_us - 1), ("short", cutoff_us + 1_000_000)):
             self.runtime.execute(
                 "INSERT INTO security_admin_audit_records VALUES (?, 'owner', "
-                "'camera_source.update', 'camera_source', ?, ?, 'succeeded')",
+                "'update_source', 'source', ?, ?, 'succeeded')",
                 (audit_ids[label], str(uuid4()), occurred))
         for at in ((audit_cutoff - timedelta(seconds=1)).isoformat(),
                    (audit_cutoff + timedelta(seconds=1)).isoformat()):
             self.runtime.execute(
-                "INSERT INTO integrity_audit(at, actor, revision) VALUES (?, 'owner', 1)", (at,))
+                "INSERT INTO integrity_audit(at, actor, revision) VALUES (?, '00000000-0000-4000-8000-0000000000aa', 1)", (at,))
         for at_ms in (audit_ms - 1, audit_ms):
             self.runtime.execute("INSERT INTO storage_state_audit (at_ms, previous_state, "
-                                 "current_state) VALUES (?, 'normal', 'pressure')", (at_ms,))
+                                 "current_state) VALUES (?, 'NORMAL', 'STORAGE_PRESSURE')", (at_ms,))
         recordings = {}
         for label, (status, ended, starred, critical) in {
                 "expired": ("complete", recording_ms, False, False),
@@ -614,7 +624,7 @@ class LifecycleInventoryTests(unittest.TestCase):
         self.runtime.execute("UPDATE recordings SET status='complete', ended_ms=? WHERE id=?",
                              (now_ms - 21 * 86_400_000, expired))
         self.runtime.execute("INSERT INTO storage_state_audit (at_ms, previous_state, "
-                             "current_state) VALUES (?, 'normal', 'pressure')",
+                             "current_state) VALUES (?, 'NORMAL', 'STORAGE_PRESSURE')",
                              (now_ms - 91 * 86_400_000,))
         _, baseline = self.record()
         self.runtime.execute("DELETE FROM recording_links WHERE recording_id=?", (expired,))
@@ -643,9 +653,9 @@ class LifecycleInventoryTests(unittest.TestCase):
                 try:
                     runtime.seed()
                     runtime.execute("INSERT INTO integrity_audit(at, actor, revision) VALUES "
-                                    "('2023-01-01T00:00:00+00:00', 'owner', 1)")
+                                    "('2023-01-01T00:00:00+00:00', '00000000-0000-4000-8000-0000000000aa', 1)")
                     runtime.execute("INSERT INTO storage_state_audit (at_ms, previous_state, "
-                                    "current_state) VALUES (1, 'normal', 'pressure')")
+                                    "current_state) VALUES (1, 'NORMAL', 'STORAGE_PRESSURE')")
                     runtime.execute("UPDATE recordings SET status='complete', ended_ms=1, "
                                     "starred=0")
                     _, baseline = self.record(f"dropped-{index}.json")
@@ -779,10 +789,11 @@ class LifecycleInventoryTests(unittest.TestCase):
         for index in range(3):
             self.runtime.execute(
                 "INSERT INTO presence_audit (action, actor, at, state, target) "
-                "VALUES ('override', 'owner', ?, 'away', NULL)", (f"2026-01-0{index + 1}",))
+                "VALUES ('override_set', '00000000-0000-4000-8000-0000000000aa', ?, 'away', NULL)",
+                (f"2026-01-0{index + 1}T00:00:00.000000+00:00",))
             self.runtime.execute(
                 "INSERT INTO storage_state_audit (at_ms, previous_state, current_state) "
-                "VALUES (?, 'normal', 'pressure')",
+                "VALUES (?, 'NORMAL', 'STORAGE_PRESSURE')",
                 (int(self.now.timestamp() * 1000) - 3600_000 + index,))
         _, baseline = self.record()
         code, report, _ = self.verify(baseline)
@@ -1015,7 +1026,7 @@ class LifecycleInventoryTests(unittest.TestCase):
                   + timedelta(seconds=1)).isoformat()
         with closing(sqlite3.connect(database, isolation_level=None)) as connection:
             connection.execute("INSERT INTO owner_template_audit(at, actor, operation, generation) "
-                               "VALUES (?, 'owner', 'replace', 1)", (recent,))
+                               "VALUES (?, 'owner', 'REPLACE', 1)", (recent,))
         _, baseline = self.record("template.json", *option)
         with closing(sqlite3.connect(database, isolation_level=None)) as connection:
             connection.execute("DELETE FROM owner_template_audit WHERE at < ?", (recent,))
@@ -1063,16 +1074,16 @@ class LifecycleInventoryTests(unittest.TestCase):
                         with closing(sqlite3.connect(target, isolation_level=None)) as db:
                             if table == "storage_state_audit":
                                 db.execute("INSERT INTO storage_state_audit (at_ms, "
-                                           "previous_state, current_state) VALUES (?, 'normal', "
-                                           "'pressure')", (int(old_at.timestamp() * 1000),))
+                                           "previous_state, current_state) VALUES (?, 'NORMAL', "
+                                           "'STORAGE_PRESSURE')", (int(old_at.timestamp() * 1000),))
                             elif table == "integrity_audit":
                                 db.execute("INSERT INTO integrity_audit(at, actor, revision) "
-                                           "VALUES (?, 'owner', 1)", (old_at.isoformat(),))
+                                           "VALUES (?, '00000000-0000-4000-8000-0000000000aa', 1)", (old_at.isoformat(),))
                             else:
                                 db.execute("DELETE FROM owner_template_audit")
                                 db.execute("INSERT INTO owner_template_audit(at, actor, "
                                            "operation, generation) VALUES (?, 'owner', "
-                                           "'enroll', 1)", (old_at.isoformat(),))
+                                           "'ENROLL', 1)", (old_at.isoformat(),))
                             row_id = db.execute(f"SELECT MAX(id) FROM {table}").fetchone()[0]
                         self.now = recorded
                         _, baseline = self.record(f"reuse-{index}-{table}.json", *extra)
@@ -1081,15 +1092,15 @@ class LifecycleInventoryTests(unittest.TestCase):
                             if table == "storage_state_audit":
                                 db.execute("INSERT INTO storage_state_audit (at_ms, "
                                            "previous_state, current_state) VALUES (?, "
-                                           "'pressure', 'normal')",
+                                           "'STORAGE_PRESSURE', 'NORMAL')",
                                            (int(written.timestamp() * 1000),))
                             elif table == "integrity_audit":
                                 db.execute("INSERT INTO integrity_audit(at, actor, revision) "
-                                           "VALUES (?, 'owner', 2)", (written.isoformat(),))
+                                           "VALUES (?, '00000000-0000-4000-8000-0000000000aa', 2)", (written.isoformat(),))
                             else:
                                 db.execute("INSERT INTO owner_template_audit(at, actor, "
                                            "operation, generation) VALUES (?, 'owner', "
-                                           "'replace', 1)", (written.isoformat(),))
+                                           "'REPLACE', 1)", (written.isoformat(),))
                             self.assertEqual(db.execute(
                                 f"SELECT MAX(id) FROM {table}").fetchone()[0], row_id)
                         self.now = later + timedelta(hours=1)
@@ -1133,7 +1144,7 @@ class LifecycleInventoryTests(unittest.TestCase):
                     runtime.seed()
                     for row_id, moment in before.items():
                         runtime.execute("INSERT INTO storage_state_audit VALUES "
-                                        "(?, ?, 'normal', 'pressure')", (row_id, ms(moment)))
+                                        "(?, ?, 'NORMAL', 'STORAGE_PRESSURE')", (row_id, ms(moment)))
                     self.now = recorded
                     _, baseline = self.record(f"rowid-{index}.json")
                     for row_id in before:
@@ -1143,7 +1154,7 @@ class LifecycleInventoryTests(unittest.TestCase):
                     for row_id, moment in after.items():
                         if moment != "keep":
                             runtime.execute("INSERT INTO storage_state_audit VALUES "
-                                            "(?, ?, 'pressure', 'normal')", (row_id, ms(moment)))
+                                            "(?, ?, 'STORAGE_PRESSURE', 'NORMAL')", (row_id, ms(moment)))
                     self.now = recorded + timedelta(hours=3)
                     _, report, _ = self.verify(baseline)
                 finally:
@@ -1193,14 +1204,14 @@ class LifecycleInventoryTests(unittest.TestCase):
             admin[label] = str(uuid4())
             self.runtime.execute(
                 "INSERT INTO security_admin_audit_records VALUES (?, 'owner', "
-                "'camera_source.update', 'camera_source', ?, ?, 'succeeded')",
+                "'update_source', 'source', ?, ?, 'succeeded')",
                 (admin[label], str(uuid4()), occurred))
         for at in ((audit_cutoff - timedelta(seconds=1)).isoformat(), audit_cutoff.isoformat()):
             self.runtime.execute("INSERT INTO integrity_audit(at, actor, revision) "
-                                 "VALUES (?, 'owner', 1)", (at,))
+                                 "VALUES (?, '00000000-0000-4000-8000-0000000000aa', 1)", (at,))
         for at_ms in (now_ms - 90 * day_ms - 1, now_ms - 90 * day_ms):
             self.runtime.execute("INSERT INTO storage_state_audit (at_ms, previous_state, "
-                                 "current_state) VALUES (?, 'normal', 'pressure')", (at_ms,))
+                                 "current_state) VALUES (?, 'NORMAL', 'STORAGE_PRESSURE')", (at_ms,))
         root = self.owner_template_root(template=b"synthetic-owner-template-marker")
         with closing(sqlite3.connect(root / "owner-template.sqlite3",
                                      isolation_level=None)) as template_db:
@@ -1208,20 +1219,22 @@ class LifecycleInventoryTests(unittest.TestCase):
             for at in ((audit_cutoff - timedelta(seconds=1)).isoformat(),
                        audit_cutoff.isoformat()):
                 template_db.execute("INSERT INTO owner_template_audit(at, actor, operation, "
-                                    "generation) VALUES (?, 'owner', 'enroll', 1)", (at,))
+                                    "generation) VALUES (?, 'owner', 'ENROLL', 1)", (at,))
         # An unresolved critical observation the Owner releases.
         released = uuid4()
         self.runtime.execute(
             "INSERT INTO presence_observations (id, kind, source, received, payload) "
-            "VALUES (?, 'crossing', 'synthetic-source', ?, '{}')",
-            (str(released), (now - timedelta(days=1)).isoformat(timespec="microseconds")))
+            "VALUES (?, 'crossing', 'synthetic-source', ?, ?)",
+            (str(released), (now - timedelta(days=1)).isoformat(timespec="microseconds"),
+             presence_payload(released)))
         self.runtime.execute("INSERT INTO presence_deliveries (observation, action, state, "
                              "attempts) VALUES (?, 'notification', 'pending', 0)",
                              (str(released),))
         option = ("--owner-template-root", str(root))
         _, baseline = self.record("real.json", *option)
         # The real service paths, at the verify time.
-        self.assertEqual(RetentionService(store).expired(now_ms, 100), 2)
+        # The seeded ordinary recording ended long ago and goes too.
+        self.assertEqual(RetentionService(store).expired(now_ms, 100), 3)
         store.close()
         connection.close()
         AuditStore(Database(self.runtime.database)).cleanup_expired(now=now)
@@ -1244,7 +1257,7 @@ class LifecycleInventoryTests(unittest.TestCase):
         sections = report["sections"]
         self.assertEqual(code, inventory.EXIT_PRESERVED, json.dumps(sections, indent=1)[:2000])
         self.assertEqual(sections["recordings"]["retention_expired"],
-                         sorted([made["old"], made["at-cutoff"]]))
+                         sorted([made["old"], made["at-cutoff"], seeded["ordinary"]]))
         self.assertIn(made["inside"], sections["recordings"]["preserved"])
         self.assertEqual(sections["audit_security_admin"]["retention_expired"], [admin["old"]])
         for name in ("audit_integrity", "audit_storage_state"):
@@ -1262,7 +1275,7 @@ class LifecycleInventoryTests(unittest.TestCase):
                                      isolation_level=None)) as db:
             db.execute("DELETE FROM owner_template_audit")
             db.execute("INSERT INTO owner_template_audit(at, actor, operation, generation) "
-                       "VALUES ('2023-08-17T20:00:00-05:00', 'owner', 'enroll', 1)")
+                       "VALUES ('2023-08-17T20:00:00-05:00', 'owner', 'ENROLL', 1)")
         _, baseline = self.record("offset.json", *option)
         with closing(sqlite3.connect(root / "owner-template.sqlite3",
                                      isolation_level=None)) as db:
@@ -1396,7 +1409,7 @@ class LifecycleInventoryTests(unittest.TestCase):
             self.runtime.execute(
                 "INSERT INTO presence_observations (id, kind, source, received, payload) "
                 "VALUES (?, 'crossing', 'synthetic-source', '2026-01-01T00:00:00.000000+00:00', ?)",
-                (ids[name], json.dumps({"marker": "synthetic-presence-payload-" + name})))
+                (ids[name], presence_payload(ids[name])))
             self.runtime.execute(
                 "INSERT INTO presence_deliveries (observation, action, state, attempts) "
                 "VALUES (?, 'notification', 'pending', 0)", (ids[name],))
@@ -1523,7 +1536,7 @@ class LifecycleInventoryTests(unittest.TestCase):
             self.runtime.execute(
                 "INSERT INTO presence_observations (id, kind, source, received, payload) "
                 "VALUES (?, 'crossing', 'synthetic-source', ?, ?)",
-                (ids[label], received, json.dumps({"marker": "synthetic-" + label})))
+                (ids[label], received, presence_payload(ids[label])))
             self.runtime.execute("INSERT INTO presence_source_facts (id, digest) VALUES (?, ?)",
                                  (ids[label], hashlib.sha256(label.encode()).hexdigest()))
             if state is not None:
@@ -1579,7 +1592,7 @@ class LifecycleInventoryTests(unittest.TestCase):
             self.runtime.execute(
                 "INSERT INTO presence_observations (id, kind, source, received, payload) "
                 "VALUES (?, 'crossing', 'synthetic-source', ?, ?)",
-                (ids[label], fresh, json.dumps({"marker": "synthetic-" + label})))
+                (ids[label], fresh, presence_payload(ids[label])))
             for action, state in (("evidence", evidence), ("notification", notification)):
                 self.runtime.execute(
                     "INSERT INTO presence_deliveries (observation, action, state, attempts, "
@@ -1701,8 +1714,8 @@ class LifecycleInventoryTests(unittest.TestCase):
         late = uuid4()
         self.runtime.execute(
             "INSERT INTO presence_observations (id, kind, source, received, payload) "
-            "VALUES (?, 'crossing', 'synthetic-source', ?, '{}')",
-            (str(late), self.now.isoformat(timespec="microseconds")))
+            "VALUES (?, 'crossing', 'synthetic-source', ?, ?)",
+            (str(late), self.now.isoformat(timespec="microseconds"), presence_payload(late)))
         for action, state in (("evidence", "delivered"), ("notification", "pending")):
             self.runtime.execute("INSERT INTO presence_deliveries (observation, action, state, "
                                  "attempts) VALUES (?, ?, ?, 0)", (str(late), action, state))
@@ -1779,7 +1792,7 @@ class LifecycleInventoryTests(unittest.TestCase):
                 # 2023-08-17T20:00 at -05:00 is 2023-08-18T01:00Z, after the
                 # 90-day cutoff (2023-08-17T22:13Z), though its text sorts before.
                 runtime.execute("INSERT INTO integrity_audit(at, actor, revision) VALUES "
-                                "('2023-08-17T20:00:00-05:00', 'owner', 1)")
+                                "('2023-08-17T20:00:00-05:00', '00000000-0000-4000-8000-0000000000aa', 1)")
             else:
                 runtime.execute("DELETE FROM integrity_audit")
             return "audit_integrity", {"id": "1", "reason": "missing"}
@@ -1789,8 +1802,8 @@ class LifecycleInventoryTests(unittest.TestCase):
             if phase == "before":
                 runtime.execute(
                     "INSERT INTO presence_observations (id, kind, source, received, payload) "
-                    "VALUES ('00000000-0000-4000-8000-000000000001', 'crossing', 's', ?, '{}')",
-                    (z,))
+                    "VALUES ('00000000-0000-4000-8000-000000000001', 'crossing', 's', ?, ?)",
+                    (z, presence_payload("00000000-0000-4000-8000-000000000001")))
                 runtime.execute("INSERT INTO presence_deliveries (observation, action, state, "
                                 "attempts) VALUES ('00000000-0000-4000-8000-000000000001', "
                                 "'notification', 'pending', 0)")
@@ -1891,7 +1904,7 @@ class LifecycleInventoryTests(unittest.TestCase):
                                  "VALUES (?, 1, '[]')", ("9999-01-01T00:00:00+00:00",),
                                  "integrity_delivery", "pending:1"),
             "security audit": ("INSERT INTO security_admin_audit_records VALUES (?, 'owner', "
-                               "'camera_source.update', 'camera_source', ?, ?, 'succeeded')",
+                               "'update_source', 'source', ?, ?, 'succeeded')",
                                ("00000000-0000-4000-8000-000000000003",
                                 "00000000-0000-4000-8000-000000000004", future_us),
                                "audit_security_admin", "00000000-0000-4000-8000-000000000003"),
@@ -1919,13 +1932,13 @@ class LifecycleInventoryTests(unittest.TestCase):
                   "max int": 9223372036854775807, "negative int": -1}
         inserts = {
             "audit_security_admin": "INSERT INTO security_admin_audit_records VALUES (?, 'owner', "
-                                    "'camera_source.update', 'camera_source', ?, ?, 'succeeded')",
+                                    "'update_source', 'source', ?, ?, 'succeeded')",
             "audit_integrity": "INSERT INTO integrity_audit(id, at, actor, revision) "
-                               "VALUES (?, ?, 'owner', 1)",
+                               "VALUES (?, ?, '00000000-0000-4000-8000-0000000000aa', 1)",
             "audit_storage_state": "INSERT INTO storage_state_audit (id, at_ms, previous_state, "
-                                   "current_state) VALUES (?, ?, 'normal', 'pressure')",
+                                   "current_state) VALUES (?, ?, 'NORMAL', 'STORAGE_PRESSURE')",
             "owner_template": "INSERT INTO owner_template_audit(id, at, actor, operation, "
-                              "generation) VALUES (?, ?, 'owner', 'enroll', 1)",
+                              "generation) VALUES (?, ?, 'owner', 'ENROLL', 1)",
         }
         index = 0
         for section, statement in inserts.items():
@@ -1957,6 +1970,76 @@ class LifecycleInventoryTests(unittest.TestCase):
                     item = {"id": (f"audit:{row_id}" if section == "owner_template"
                                    else str(row_id)), "reason": "invalid_time"}
                     self.assertIn(item, report["sections"][section]["failed"])
+
+    def test_values_the_services_parse_are_validated_on_the_current_state(self):
+        # Codex P1 sweep: every value a service parses or compares later, in
+        # rows recorded or new, must be one it writes; each case is one row.
+        uid = "00000000-0000-4000-8000-0000000000bb"
+        cases = {
+            # presence_audit was inventoried without its time (Codex)
+            "presence audit malformed time": (
+                "INSERT INTO presence_audit (action, actor, at) VALUES ('override_set', ?, 'x')",
+                (uid,), "audit_presence", "invalid_time"),
+            "presence audit future time": (
+                "INSERT INTO presence_audit (action, actor, at) VALUES ('override_set', ?, "
+                "'9999-01-01T00:00:00.000000+00:00')", (uid,), "audit_presence", "future_time"),
+            "presence audit unknown action": (
+                "INSERT INTO presence_audit (action, actor, at) VALUES ('bogus', ?, "
+                "'2026-01-01T00:00:00.000000+00:00')", (uid,), "audit_presence", "invalid_value"),
+            "security audit unknown action": (
+                "INSERT INTO security_admin_audit_records VALUES (?, 'owner', 'bogus', 'source', "
+                "?, ?, 'succeeded')", (uid, uid, 1), "audit_security_admin", "invalid_value"),
+            "integrity audit actor": (
+                "INSERT INTO integrity_audit(at, actor, revision) VALUES "
+                "('2026-01-01T00:00:00+00:00', 'owner', 1)", (), "audit_integrity",
+                "invalid_value"),
+            "storage audit state": (
+                "INSERT INTO storage_state_audit (at_ms, previous_state, current_state) "
+                "VALUES (1, 'normal', 'pressure')", (), "audit_storage_state", "invalid_value"),
+            "delivery state and counter": (
+                "INSERT INTO presence_deliveries (observation, action, state, attempts) "
+                "VALUES (?, 'evidence', 'bogus', -1)", (uid,), "presence", "invalid_value"),
+            "observation payload": (
+                "INSERT INTO presence_observations (id, kind, source, received, payload) "
+                "VALUES (?, 'person', 's', '2026-01-01T00:00:00.000000+00:00', '{}')",
+                (uid,), "presence", "invalid_value"),
+            "override state": (
+                "INSERT INTO presence_override VALUES (1, 'bogus', ?, "
+                "'2026-01-01T00:00:00.000000+00:00', NULL)", (uid,), "presence", "invalid_value"),
+            "marker count": (
+                "INSERT INTO presence_expired_unresolved VALUES ('evidence', 0, "
+                "'2026-01-01T00:00:00.000000+00:00')", (), "presence", "invalid_value"),
+            "recording status": (
+                "INSERT INTO recordings (id, source_id, start_ms, target_end_ms, status, critical) "
+                "VALUES (?, ?, 0, 10, 'bogus', 0)", (uid, uid), "recordings", "invalid_value"),
+            "integrity findings": (
+                "INSERT INTO integrity_outbox(at, immediate, findings) VALUES "
+                "('2026-01-01T00:00:00+00:00', 1, 'not json')", (), "integrity_delivery",
+                "invalid_value"),
+            "integrity baseline": (
+                "INSERT INTO integrity_baseline VALUES (1, 1, '{}')", (), "integrity_baseline",
+                "invalid_value"),
+            "camera capabilities": (
+                "UPDATE camera_sources SET capabilities='not json'", (), "camera_sources",
+                "invalid_value"),
+            "pairing node id": (
+                "INSERT INTO pairing_key_bindings VALUES (?, 'not-a-uuid', 1)", ("e" * 64,),
+                "security_state", "invalid_value"),
+        }
+        for index, (label, (statement, parameters, section, reason)) in enumerate(cases.items()):
+            with self.subTest(label):
+                runtime = Runtime(self.base / f"domain-{index}")
+                saved, self.runtime = self.runtime, runtime
+                try:
+                    runtime.seed()
+                    _, baseline = self.record(f"domain-{index}.json")
+                    runtime.execute(statement, parameters)
+                    code, report, _ = self.verify(baseline)
+                finally:
+                    self.runtime = saved
+                self.assertEqual(code, inventory.EXIT_FAILED)
+                self.assertIn(reason, [item["reason"] for item in
+                                       report["sections"][section].get("failed", [])])
 
     def test_presence_clocks_sessions_and_override_follow_service_transitions(self):
         self.runtime.seed()
@@ -2074,7 +2157,7 @@ class LifecycleInventoryTests(unittest.TestCase):
                 runtime.execute(update, ("unavailable", 1, 2, 1, ids["lost"]))
                 runtime.execute("INSERT INTO integrity_outbox(at, immediate, findings) VALUES "
                                 "('2026-01-01T00:00:00+00:00', 1, ?)", (json.dumps(
-                                    [{"kind": "GPU", "state": "CHANGED", "detail": "x"}]),))
+                                    [{"kind": "GPU", "state": "CHANGED", "reason": "x"}]),))
                 runtime.execute("INSERT INTO integrity_overflow VALUES "
                                 "('CPU', 'MISSING', '2026-01-01T00:00:00+00:00')")
                 active = runtime.recording(starred=False, payload=b"generated-column-active",
@@ -2102,8 +2185,11 @@ class LifecycleInventoryTests(unittest.TestCase):
                 active_segment = connection.execute(
                     "SELECT segment_id FROM recording_links WHERE recording_id=? "
                     "ORDER BY rowid DESC", (active,)).fetchone()[0]
-            values = {"edited": ids["edited"], "lost": ids["lost"], "recording": seeded["ordinary"],
-                      "segment": segment, "other_segment": other_segment, "active": active,
+            # The starred recording, which automatic retention never takes,
+            # so a re-identified row cannot read as retention plus an append.
+            values = {"edited": ids["edited"], "lost": ids["lost"], "recording": seeded["starred"],
+                      "ordinary": seeded["ordinary"],
+                      "segment": other_segment, "other_segment": segment, "active": active,
                       "active_segment": active_segment, "expired_key": "a" * 64,
                       "new_id": str(uuid4())}
             return runtime, baseline, values
@@ -2142,7 +2228,7 @@ class LifecycleInventoryTests(unittest.TestCase):
             "recordings.ended_ms": "UPDATE recordings SET ended_ms=9000 WHERE id=:recording",
             "recordings.status": "UPDATE recordings SET status='gapped' WHERE id=:recording",
             "recordings.critical": "UPDATE recordings SET critical=1 WHERE id=:recording",
-            "recordings.starred": "UPDATE recordings SET starred=1 WHERE id=:recording",
+            "recordings.starred": "UPDATE recordings SET starred=1 WHERE id=:ordinary",
             # recording_segments
             **{f"segments.{column}": f"UPDATE recording_segments SET {assignment} "
                "WHERE id=:segment" for column, assignment in (
@@ -2204,13 +2290,19 @@ class LifecycleInventoryTests(unittest.TestCase):
     def test_integrity_baseline_is_preserved_by_keyed_digest(self):
         self.runtime.seed()
         hardware = "synthetic-hardware-identifier-marker"
+        def inventory_text(marker):
+            # The shape IntegrityStore.baseline() reads.
+            return json.dumps({"components": [{"kind": "CPU", "location": "socket0",
+                                               "properties": [["model", marker]],
+                                               "identity": [["serial", marker]]}],
+                               "unavailable": []})
         self.runtime.execute("INSERT INTO integrity_baseline VALUES (1, 3, ?)",
-                             (json.dumps({"cpu": hardware}),))
+                             (inventory_text(hardware),))
         _, baseline = self.record()
         code, _, _ = self.verify(baseline)
         self.assertEqual(code, inventory.EXIT_PRESERVED)
         self.runtime.execute("UPDATE integrity_baseline SET inventory=?",
-                             (json.dumps({"cpu": "synthetic-replaced"}),))
+                             (inventory_text("synthetic-replaced"),))
         code, report, _ = self.verify(baseline)
         self.assertEqual(code, inventory.EXIT_FAILED)
         self.assertEqual(report["sections"]["integrity_baseline"]["failed"],
@@ -2302,7 +2394,7 @@ class LifecycleInventoryTests(unittest.TestCase):
         # monitoring bridge recorded its notification event.
         self.runtime.seed()
         hardware = "synthetic-hardware-serial-marker"
-        findings = json.dumps([{"kind": "GPU", "state": "CHANGED", "detail": hardware}])
+        findings = json.dumps([{"kind": "GPU", "state": "CHANGED", "reason": hardware}])
         for _ in range(3):
             self.runtime.execute("INSERT INTO integrity_outbox(at, immediate, findings) "
                                  "VALUES ('2026-01-01T00:00:00+00:00', 1, ?)", (findings,))
@@ -2326,7 +2418,7 @@ class LifecycleInventoryTests(unittest.TestCase):
             "INSERT INTO integrity_outbox(at, immediate, findings) VALUES "
             "('2026-01-01T00:00:00+00:00', 1, ?)",
             (json.dumps([{"kind": "CPU", "state": "MISSING",
-                          "detail": "COALESCED_PENDING_WARNING"}]),))
+                          "reason": "COALESCED_PENDING_WARNING"}]),))
         code, report, _ = self.verify(baseline)
         self.assertEqual(code, inventory.EXIT_PRESERVED,
                          report["sections"]["integrity_delivery"])
@@ -2348,7 +2440,7 @@ class LifecycleInventoryTests(unittest.TestCase):
         # deterministic event ID; another kind or time is not that event.
         self.runtime.seed()
         when = "2026-01-01T00:00:00+00:00"
-        findings = json.dumps([{"kind": "GPU", "state": "CHANGED", "detail": "x"}])
+        findings = json.dumps([{"kind": "GPU", "state": "CHANGED", "reason": "x"}])
         for immediate in (1, 1, 0):
             self.runtime.execute("INSERT INTO integrity_outbox(at, immediate, findings) "
                                  "VALUES (?, ?, ?)", (when, immediate, findings))
@@ -2500,7 +2592,7 @@ class LifecycleInventoryTests(unittest.TestCase):
                 "INSERT INTO notification_events VALUES (?, ?, ?, 1, 'sent')",
                 (str(uuid5(EVENT_NAMESPACE, f"integrity-outbox:{row_id}")), kind, at))
         self.runtime.execute("DELETE FROM integrity_overflow")
-        outbox([{"kind": "GPU", "state": "UNVERIFIABLE", "detail": "x"}],
+        outbox([{"kind": "GPU", "state": "UNVERIFIABLE", "reason": "x"}],
                "2026-01-05T00:00:00+00:00", 0)
         deliver(1, "hardware_integrity_warning", "2026-01-05T00:00:00+00:00")
         code, report, _ = self.verify(baseline)
@@ -2509,9 +2601,9 @@ class LifecycleInventoryTests(unittest.TestCase):
         # The real promotions: one row per slot. The still-pending one proves
         # its slot; the delivered one leaves only (failure kind, time), which
         # cannot name MEMORY / CHANGED, so that slot is unverifiable.
-        outbox([{"kind": "CPU", "state": "CHANGED", "detail": "COALESCED_PENDING_WARNING"}], when)
+        outbox([{"kind": "CPU", "state": "CHANGED", "reason": "COALESCED_PENDING_WARNING"}], when)
         outbox([{"kind": "MEMORY", "state": "CHANGED",
-                 "detail": "COALESCED_PENDING_WARNING"}], when)
+                 "reason": "COALESCED_PENDING_WARNING"}], when)
         deliver(3, "hardware_integrity_failure", when)
         code, report, _ = self.verify(baseline)
         self.assertEqual(code, inventory.EXIT_FAILED)
@@ -2529,7 +2621,7 @@ class LifecycleInventoryTests(unittest.TestCase):
         self.runtime.execute("DELETE FROM integrity_overflow")
         self.runtime.execute(
             "INSERT INTO integrity_outbox(at, immediate, findings) VALUES (?, 1, ?)",
-            (when, json.dumps([{"kind": "GPU", "state": "CHANGED", "detail": "x"}])))
+            (when, json.dumps([{"kind": "GPU", "state": "CHANGED", "reason": "x"}])))
         self.runtime.execute("DELETE FROM integrity_outbox WHERE id=1")
         self.runtime.execute(
             "INSERT INTO notification_events VALUES (?, 'hardware_integrity_failure', ?, 1, 'sent')",

@@ -78,11 +78,14 @@ from app.audit.store import DEFAULT_RETENTION as AUDIT_RETENTION, AuditStore
 from app.cameras.remote_agent.pairing import _MAX_KEY_BINDINGS_PER_NODE
 from app.cameras.uvc.persistence import ApprovalStore
 from app.detection.owner import store as owner_store
-from app.integrity.model import Finding, Kind, State
+from app.detection.owner.contracts import Operation
+from app.integrity.model import Component, Finding, Kind, State
 from app.media.recording.model import Limits as RecordingLimits, Segment
 from app.monitoring.runtime import EVENT_NAMESPACE
 from app.presence.delivery import ActionResult
-from app.presence.models import InvalidObservation, timestamp as presence_timestamp
+from app.presence.models import (InvalidObservation, Observation, PresenceState,
+                                 timestamp as presence_timestamp)
+from app.storage.policy import StorageState
 from app.presence.service import PresenceService
 from app.storage.retention import DAY_MS, RetentionPeriods
 from app.storage.migrations import migrate
@@ -362,7 +365,7 @@ def _audit(connection, tables) -> dict:
             "at"),
         "presence": _audit_table(
             connection, tables, "presence_audit",
-            ("sequence", "action", "actor", "at", "state", "target"), "sequence"),
+            ("sequence", "action", "actor", "at", "state", "target"), "sequence", "at"),
         "storage_state": _audit_table(
             connection, tables, "storage_state_audit",
             ("id", "at_ms", "previous_state", "current_state"), "id", "at_ms"),
@@ -1675,6 +1678,138 @@ def _registry_settings(connection, tables) -> dict | None:
     return {"max_active_video_sources": None if row is None else row[0]}
 
 
+def _canonical_uuid(value) -> bool:
+    try:
+        return isinstance(value, str) and str(UUID(value)) == value
+    except (ValueError, AttributeError):
+        return False
+
+
+def _json(value) -> bool:
+    try:
+        json.loads(value)
+        return isinstance(value, str)
+    except (TypeError, ValueError):
+        return False
+
+
+_PRESENCE_AUDIT_ACTIONS = frozenset({
+    "critical_action_requeued", "critical_degradation_cleared", "critical_event_cleared",
+    "hint_set", "override_cancelled", "override_expired", "override_set",
+    "timeline_gap_cleared"})
+_DELIVERY_STATES = frozenset({"pending", "submitting"}) | _DELIVERY_RESULTS
+_RECORDING_STATUSES = frozenset({"active", "complete", "gapped", "interrupted", "deleting"})
+
+
+def _domain_errors(connection, tables) -> list:
+    """Values the services parse or compare later, outside any CHECK.
+
+    Each is validated as the owning service writes it: audit rows through
+    AuditStore's record validation; integrity audit actors (UUID) and
+    revisions; storage-state audit states; presence audit actions and
+    actors, job states and counters, marker counts, the override state and
+    actor, observation payloads (Observation.from_payload()); recording
+    identities, statuses and boundaries, discontinuity bounds; integrity
+    outbox findings and flag, the approved hardware baseline (as
+    IntegrityStore.baseline() reads it); camera-source capability /
+    profile and binding JSON; pairing node and enrollment identities.
+    """
+    errors = []
+
+    def rows(table, sql):
+        return connection.execute(sql).fetchall() if table in tables else ()
+
+    def bad(section, item):
+        errors.append([section, item, "invalid_value"])
+    for row in rows("security_admin_audit_records", "SELECT * FROM security_admin_audit_records"):
+        try:
+            AuditStore._record(row)
+        except (ValueError, TypeError, KeyError, OverflowError):
+            bad("audit_security_admin", str(row["id"]))
+    for row in rows("integrity_audit", "SELECT id, actor, revision FROM integrity_audit"):
+        if not _canonical_uuid(row[1]) or type(row[2]) is not int or row[2] < 1:
+            bad("audit_integrity", str(row[0]))
+    states = {item.value for item in StorageState}
+    for row in rows("storage_state_audit",
+                    "SELECT id, previous_state, current_state FROM storage_state_audit"):
+        if row[1] not in states or row[2] not in states:
+            bad("audit_storage_state", str(row[0]))
+    for row in rows("presence_audit", "SELECT sequence, action, actor FROM presence_audit"):
+        if row[1] not in _PRESENCE_AUDIT_ACTIONS or (row[2] is not None
+                                                     and not _canonical_uuid(row[2])):
+            bad("audit_presence", str(row[0]))
+    for row in rows("presence_deliveries",
+                    "SELECT observation, action, state, attempts, generation FROM presence_deliveries"):
+        if (row[2] not in _DELIVERY_STATES or type(row[3]) is not int or row[3] < 0
+                or type(row[4]) is not int or row[4] < 0):
+            bad("presence", f"deliveries:{row[0]}:{row[1]}")
+    for row in rows("presence_expired_unresolved",
+                    "SELECT action, events FROM presence_expired_unresolved"):
+        if type(row[1]) is not int or row[1] < 1:
+            bad("presence", f"expired_unresolved:{row[0]}")
+    presence_states = {item.value for item in PresenceState}
+    for row in rows("presence_override", "SELECT state, actor FROM presence_override"):
+        if row[0] not in presence_states or not _canonical_uuid(row[1]):
+            bad("presence", "override:owner")
+    for row in rows("presence_observations", "SELECT id, payload FROM presence_observations"):
+        try:
+            Observation.from_payload(json.loads(row[1]))
+        except Exception:
+            bad("presence", f"observations:{row[0]}")
+    for row in rows("recordings", "SELECT id, source_id, event_id, status, start_ms, "
+                    "target_end_ms, ended_ms, critical FROM recordings"):
+        ints = (row[4], row[5]) + (() if row[6] is None else (row[6],))
+        if (not _canonical_uuid(row[0]) or not _canonical_uuid(row[1])
+                or not (row[2] is None or _canonical_uuid(row[2]))
+                or row[3] not in _RECORDING_STATUSES or row[7] not in (0, 1)
+                or any(type(value) is not int or value < 0 for value in ints)
+                or not row[4] < row[5]):
+            bad("recordings", str(row[0]))
+    for row in rows("recording_discontinuities",
+                    "SELECT recording_id, start_ms, end_ms FROM recording_discontinuities"):
+        if type(row[1]) is not int or type(row[2]) is not int or not row[1] < row[2]:
+            bad("recordings", str(row[0]))
+    for row in rows("integrity_outbox", "SELECT id, immediate, findings FROM integrity_outbox"):
+        try:
+            findings = [Finding(Kind(item["kind"]), State(item["state"]), item["reason"])
+                        for item in json.loads(row[2])]
+            valid = row[1] in (0, 1) and bool(findings)
+        except Exception:
+            valid = False
+        if not valid:
+            bad("integrity_delivery", f"pending:{row[0]}")
+    for row in rows("integrity_baseline", "SELECT revision, inventory FROM integrity_baseline"):
+        try:
+            data = json.loads(row[1])
+            tuple(Component(Kind(item["kind"]), item["location"],
+                            tuple(tuple(pair) for pair in item["properties"]),
+                            tuple(tuple(pair) for pair in item["identity"]),
+                            item.get("complete", True)) for item in data["components"])
+            frozenset(Kind(kind) for kind in data["unavailable"])
+            valid = type(row[0]) is int and row[0] >= 1
+        except Exception:
+            valid = False
+        if not valid:
+            bad("integrity_baseline", "baseline")
+    for row in rows("camera_sources",
+                    "SELECT id, capabilities, desired_capture_profile FROM camera_sources"):
+        if (not _canonical_uuid(row[0]) or not _json(row[1])
+                or not (row[2] is None or _json(row[2]))):
+            bad("camera_sources", str(row[0]))
+    for row in rows("detection_bindings",
+                    "SELECT source_id, thresholds, config FROM detection_bindings"):
+        if not _json(row[1]) or not _json(row[2]):
+            bad("camera_sources", str(row[0]))
+    for table, columns in (("pairing_node_credentials", ("node_id",)),
+                           ("pairing_node_renewals", ("node_id",)),
+                           ("pairing_key_bindings", ("node_id",)),
+                           ("pairing_enrollments", ("id", "node_id"))):
+        for row in rows(table, f"SELECT {', '.join(columns)} FROM {table}"):
+            if not all(_canonical_uuid(value) for value in tuple(row)):
+                bad("security_state", f"{table}:{tuple(row)[0]}")
+    return errors
+
+
 def _owner_template(root: Path | None, salt: str, owner: int) -> dict:
     """The separate private Owner-template store, as digests only.
 
@@ -1728,6 +1863,13 @@ def _owner_template(root: Path | None, salt: str, owner: int) -> dict:
             else _keyed(salt, ["owner-provenance-v1", row["provenance"]]),
             "audit": _audit_table(connection, tables, "owner_template_audit",
                                   ("id", "at", "actor", "operation", "generation"), "id", "at"),
+            # OwnerTemplateStore writes Operation values and a non-negative
+            # generation.
+            "invalid_audit": sorted(
+                str(row[0]) for row in connection.execute(
+                    "SELECT id, operation, generation FROM owner_template_audit")
+                if row[1] not in {item.value for item in Operation}
+                or type(row[2]) is not int or row[2] < 0),
         }
         connection.execute("COMMIT")
         return result
@@ -1968,6 +2110,9 @@ def collect(runtime_root: Path, *, salt: str | None = None,
             # missing or differ here (any table the service needs, including
             # ones this tool does not inventory).
             "schema": _schema_drift(connection, migrations),
+            # Values the services parse again later that no CHECK constraint
+            # (guarded by the schema comparison) already limits.
+            "domain_errors": _domain_errors(connection, tables),
             "recordings": _recordings(connection, tables),
             "audit": _audit(connection, tables),
             "camera_sources": _sources(connection, tables, salt),
@@ -2294,6 +2439,11 @@ def _compare_recordings(baseline: dict | None, current: dict | None, *,
         in_progress = [other for other in in_progress if other != key]
         rewrites = [other for other in rewrites if other != key]
         failed.append({"id": key, "reason": reason})
+    # A recording that appeared since the record is listed as appended,
+    # but its segments must still be ones the store would have linked.
+    for key in result.get("appended", ()):
+        if not _segments_consistent(current[key]):
+            failed.append({"id": key, "reason": "invalid_segment"})
     result.update(status="failed" if failed else "preserved",
                   preserved=sorted(preserved), failed=failed,
                   declared_rewrites=rewrites,
@@ -2458,6 +2608,7 @@ def _future_times(current: dict, limit: datetime) -> dict:
     for name, section, parse in (
             ("security_admin", "audit_security_admin", _epoch_instant(1000)),
             ("integrity", "audit_integrity", _utc_instant),
+            ("presence", "audit_presence", _presence_instant),
             ("storage_state", "audit_storage_state", _epoch_instant(1))):
         for row_id, value in sorted(((audit.get(name) or {}).get("times") or {}).items()):
             late(section, row_id, parse(value))
@@ -2693,7 +2844,13 @@ def compare(baseline: dict, current: dict, *, declared_rewrites=(), now=None) ->
     # No time the services compare later may lie beyond the verify time
     # (plus a small clock-skew allowance): a far-future clock would refuse
     # every later operation.
-    for name, items in _future_times(current, (now or _utcnow()) + CLOCK_SKEW_ALLOWANCE).items():
+    late_and_invalid = _future_times(current, (now or _utcnow()) + CLOCK_SKEW_ALLOWANCE)
+    for name, item, reason in current.get("domain_errors") or ():
+        late_and_invalid.setdefault(name, []).append({"id": item, "reason": reason})
+    for item in (current.get("owner_template") or {}).get("invalid_audit") or ():
+        late_and_invalid.setdefault("owner_template", []).append(
+            {"id": f"audit:{item}", "reason": "invalid_value"})
+    for name, items in late_and_invalid.items():
         section = sections[name]
         known = section.setdefault("failed", [])
         known.extend(item for item in items if item not in known)
