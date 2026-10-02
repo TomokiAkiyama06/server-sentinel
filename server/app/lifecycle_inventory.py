@@ -2426,7 +2426,11 @@ def _future_times(current: dict, limit: datetime) -> dict:
     found: dict = {}
 
     def late(section, item, moment):
-        if moment is not None and moment > limit:
+        # A time that does not parse (wrong type, malformed, out of range)
+        # is invalid; one that parses must not lie beyond the limit.
+        if moment is None:
+            found.setdefault(section, []).append({"id": item, "reason": "invalid_time"})
+        elif moment > limit:
             found.setdefault(section, []).append({"id": item, "reason": "future_time"})
     presence = current.get("presence") or {}
     for key, value in sorted((presence.get("clocks") or {}).items()):
@@ -2451,25 +2455,33 @@ def _future_times(current: dict, limit: datetime) -> dict:
     for kind, state, at in integrity.get("overflow") or ():
         late("integrity_delivery", f"overflow:{kind}:{state}", _utc_instant(at))
     audit = current.get("audit") or {}
-    epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
     for name, section, parse in (
-            ("security_admin", "audit_security_admin",
-             lambda value: epoch + timedelta(microseconds=value) if isinstance(value, int)
-             else None),
+            ("security_admin", "audit_security_admin", _epoch_instant(1000)),
             ("integrity", "audit_integrity", _utc_instant),
-            ("storage_state", "audit_storage_state",
-             lambda value: epoch + timedelta(milliseconds=value) if isinstance(value, int)
-             else None)):
+            ("storage_state", "audit_storage_state", _epoch_instant(1))):
         for row_id, value in sorted(((audit.get(name) or {}).get("times") or {}).items()):
             late(section, row_id, parse(value))
     template_audit = (current.get("owner_template") or {}).get("audit") or {}
     for row_id, value in sorted((template_audit.get("times") or {}).items()):
         late("owner_template", f"audit:{row_id}", _utc_instant(value))
     for row in (current.get("security_state") or {}).get("pairing_audit") or ():
-        if isinstance(row[3], int):
-            late("security_state", f"pairing_audit:{row[0]}",
-                 epoch + timedelta(microseconds=row[3]))
+        late("security_state", f"pairing_audit:{row[0]}", _epoch_instant(1000)(row[3]))
     return found
+
+
+def _epoch_instant(per_millisecond: int):
+    """Parse an integer epoch time (``per_millisecond`` units per ms: 1000 for
+    microseconds, 1 for milliseconds) as the services store it; None for a
+    wrong type, a negative value or one beyond the representable range."""
+    def parse(value):
+        if type(value) is not int or value < 0:
+            return None
+        try:
+            return datetime(1970, 1, 1, tzinfo=timezone.utc) + timedelta(
+                milliseconds=value / per_millisecond if per_millisecond != 1 else value)
+        except (OverflowError, ValueError):
+            return None
+    return parse
 
 
 def _utcnow() -> datetime:
@@ -2683,7 +2695,8 @@ def compare(baseline: dict, current: dict, *, declared_rewrites=(), now=None) ->
     # every later operation.
     for name, items in _future_times(current, (now or _utcnow()) + CLOCK_SKEW_ALLOWANCE).items():
         section = sections[name]
-        section.setdefault("failed", []).extend(items)
+        known = section.setdefault("failed", [])
+        known.extend(item for item in items if item not in known)
         section["status"] = "failed"
     empty_coverage = sorted(key for key, value in baseline["coverage"].items()
                             if value != "present")

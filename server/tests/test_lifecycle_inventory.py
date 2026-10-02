@@ -1912,6 +1912,52 @@ class LifecycleInventoryTests(unittest.TestCase):
                 self.assertEqual(futures, [] if item is None
                                  else [{"id": item, "reason": "future_time"}])
 
+    def test_malformed_audit_times_are_reported_not_fatal(self):
+        # Codex P1: a time that does not parse, has the wrong SQLite type or
+        # is out of range is an invalid_time finding; verify always reports.
+        values = {"malformed text": "not-a-time", "wrong type": 5.5,
+                  "max int": 9223372036854775807, "negative int": -1}
+        inserts = {
+            "audit_security_admin": "INSERT INTO security_admin_audit_records VALUES (?, 'owner', "
+                                    "'camera_source.update', 'camera_source', ?, ?, 'succeeded')",
+            "audit_integrity": "INSERT INTO integrity_audit(id, at, actor, revision) "
+                               "VALUES (?, ?, 'owner', 1)",
+            "audit_storage_state": "INSERT INTO storage_state_audit (id, at_ms, previous_state, "
+                                   "current_state) VALUES (?, ?, 'normal', 'pressure')",
+            "owner_template": "INSERT INTO owner_template_audit(id, at, actor, operation, "
+                              "generation) VALUES (?, ?, 'owner', 'enroll', 1)",
+        }
+        index = 0
+        for section, statement in inserts.items():
+            for label, value in values.items():
+                index += 1
+                with self.subTest(section=section, value=label):
+                    runtime = Runtime(self.base / f"bad-time-{index}")
+                    saved, saved_base = self.runtime, self.base
+                    self.runtime, self.base = runtime, runtime.root.parent
+                    os.chmod(self.base, 0o700)
+                    try:
+                        runtime.seed()
+                        extra, target, row_id = (), runtime.database, 900
+                        if section == "owner_template":
+                            root = self.owner_template_root(template=b"synthetic-template")
+                            extra = ("--owner-template-root", str(root))
+                            target = root / "owner-template.sqlite3"
+                        _, baseline = self.record(f"bad-time-{index}.json", *extra)
+                        with closing(sqlite3.connect(target, isolation_level=None)) as db:
+                            if section == "audit_security_admin":
+                                row_id = "00000000-0000-4000-8000-000000000099"
+                                db.execute(statement, (row_id, str(uuid4()), value))
+                            else:
+                                db.execute(statement, (row_id, value))
+                        code, report, _ = self.verify(baseline, *extra)
+                    finally:
+                        self.runtime, self.base = saved, saved_base
+                    self.assertEqual(code, inventory.EXIT_FAILED)
+                    item = {"id": (f"audit:{row_id}" if section == "owner_template"
+                                   else str(row_id)), "reason": "invalid_time"}
+                    self.assertIn(item, report["sections"][section]["failed"])
+
     def test_presence_clocks_sessions_and_override_follow_service_transitions(self):
         self.runtime.seed()
         self.runtime.execute("INSERT INTO presence_clock VALUES (1, "

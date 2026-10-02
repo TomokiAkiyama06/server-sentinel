@@ -596,7 +596,9 @@ integrity rows and overflow slots), since the service compares them again
 (`invalid_time`), and none of them, nor any audit or pairing audit time,
 may lie more than 5 minutes (the clock-skew allowance) beyond the verify
 time (`future_time`): a far-future control clock would refuse every later
-Owner control operation. An override's expiry is legitimately in the future
+Owner control operation. A time that does not parse (wrong type, malformed,
+negative or out of range) is `invalid_time`, never skipped, and never stops
+`verify` from writing its report. An override's expiry is legitimately in the future
 and the presence service sets no longest duration, so it is not bounded. Presence jobs
 and unresolved markers may name only the service's actions (`evidence`,
 `notification`). The one exception for missing rows is the service's own
