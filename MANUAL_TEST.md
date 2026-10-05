@@ -101,7 +101,7 @@ stand-in）。一時 DB は repository 外に作り実行後に削除した。fr
 未確認: 抜線・ポート入替・再起動を伴う物理操作、非 serial 同型機、3〜4 source、
 実配信 fps の記録（registry は driver の frame interval のみ保持）。
 
-#### フレーム停止 watchdog / presence scan 抑制の実機再確認（未実施）
+#### フレーム停止 watchdog / presence scan 抑制の実機再確認（PARTIAL: 2026-10-05 に非破壊部分のみ実施、下記記録）
 
 2026-09-30 の Main Server 候補機（C960 2 台）の抜き差し試験で、source が 0 fps の
 まま約 4〜5 秒 `online` と表示された。修正（frame-progress watchdog、live 中の全
@@ -130,6 +130,75 @@ device scan を `presence_scan_seconds` 間隔へ抑制）は synthetic fake で
 6. 記録には serial・device path・by-id・USB port・UUID を含めない。
 
 PR #111 は、上記を実機 C960 で再確認してからマージする。
+
+##### 実機記録 2026-10-05: 非破壊の実カメラ確認（PR #111 head `03bb04f`）
+
+```text
+Date: 2026-10-05
+ServerSentinel version / Git commit: PR #111 head 03bb04f（#122 の scan 間隔修正を含む、未マージ）
+Main Ubuntu version / hardware: 稼働中の Main Server（正確な OS/kernel・hardware は
+  INTEGRITY-007 によりローカル記録のみ）。ServerSentinel service は未稼働、
+  開始前に video node を保持する process がないことを確認
+Camera source(s) / model(s): 本節冒頭と同じ serial 付き同型 USB UVC × 2
+USB topology: 2 台とも同じ USB バス上（controller・port はローカル記録のみ）
+Tester: Claude Code（Owner 承認 2026-10-05 の非破壊確認。video group の非 root
+  ユーザー、sudo・systemd・udev・USB reset/unbind・抜線は不使用）
+```
+
+実行方法: repository 外の一時 directory に置いた driver script から、
+`create_app()` lifespan を一時 SQLite（実行後削除）で起動し、実 `LinuxDiscovery`
+と実 `MmapCapture` で 2 source を構成した（既定 timing: `frame_stall_seconds`
+1.0、`frame_stall_reopen_seconds` 5.0、`presence_scan_seconds` 1.0、
+`retry_delay_seconds` 0.5）。承認は `LocalUvcRuntime.reapprove()` →
+`OwnerAdministration.approve_uvc()` の監査付き経路（authorizer は stand-in）。
+discovery は scan 回数・所要時間だけを数える wrapper、capture は実
+`MmapCapture` を包み、指定時間だけ frame を source へ渡さない wrapper
+（**software 注入の停止**。実 device は開いたまま、USB には触れない）。frame は
+件数・byte 数・JPEG SOI/EOI・V4L2 sequence だけをメモリ上で数えて破棄し、
+画像の保存・閲覧はしていない。serial・by-id・device path・USB port・UUID は
+記録しない。カメラA/B（`src1`/`src2`）は serial の hash 順の一時ラベル。
+
+| # | 確認内容 | 結果 | 区分 |
+|---|---|---|---|
+| R-1 | discovery: capture node 2 個、失敗 0。両方 `MJPG`/`YUYV`・serial・by-id・topology あり。`model_key` 同一、serial-backed `strong_key` は 2 個で相異なる | PASS | 実機 |
+| R-2 | 承認後 `online` まで 0.57–0.71 秒。negotiated `1920x1080@30 MJPG` が registry に記録 | PASS | 実機 |
+| R-3 | 2 台同時 90.3 秒（1080p30 MJPG）: 各 2708 frame = 30.00 fps、V4L2 sequence 欠落 0、JPEG marker 異常 0、最大 frame 間隔 37 ms、health event 0、worker failure 0。別 process での再実行 60.2 秒も各 1805 frame = 30.00 fps・欠落 0 | PASS | 実機 |
+| R-4 | live 中の全 device scan（手順 4）: source ごとに 0.97–0.98 回/秒（90.3 秒で各 88 回、60.2 秒で各 59 回）、連続 scan の最小間隔 1002–1032 ms、1 回 0.8–1.0 ms（中央値）。修正前（2026-09-30）は frame ごとの scan で 2 source 計約 60 回/秒 | PASS | 実機 |
+| R-5 | `src1` に 2.5 秒の software 停止: 1.01 秒後に `degraded`（`video_frame_stalled`）、停止解除後の最初の frame で `online`（注入から 3.03 秒）。negotiated profile は registry に残存。`src2` は 30.09 fps・欠落 0 | PASS | 実機 + software 注入 |
+| R-6 | `src1` に 8 秒の software 停止: 1.03 秒で `degraded`（`video_frame_stalled`）、5.04 秒で `offline`（`video_capture_closed` → `video_capture_failed`）、5.6 秒で identity path から再 open（`degraded`/`identity_matched`）、停止継続中は再び `degraded`（`video_frame_stalled`）、frame 再開後 8.85 秒で `online`。停止中に `online` の区間なし。`src2` は 29.99 fps・欠落 0 | PASS | 実機 + software 注入 |
+| R-7 | `src2` の worker を read 内で 7 秒 block（watchdog 経路）: watchdog が 1.19 秒で `degraded`（`video_frame_stalled`）、5.19 秒で `offline`（`video_capture_failed`）。worker 復帰後に戻り値の frame を破棄して再 open、注入から 8.07 秒で `online`。`src1` は 30.02 fps・欠落 0 | PASS | 実機 + software 注入 |
+| R-8 | 停止・再 open 時の close（`STREAMOFF`/unmap/close）所要: 2–218 ms。lifespan 停止 0.20–0.24 秒、停止時は close 前に `offline`（`video_capture_closed`）を通知、停止後 video/audio descriptor 0/0、registry は両方 `offline` | PASS（hung teardown は未再現） | 実機 |
+| R-9 | 全工程で audio descriptor 0、video descriptor は 1 source あたり 5（本体 + mmap buffer 4、上記 提案-4） | PASS | 実機 |
+| R-10 | `src1` の scan に 0.6 秒の software 遅延を 15 秒注入（#122 の遅い scan の模擬）: scan 0.60 回/秒、連続 scan 最小間隔 1604 ms（= 完了から 1 秒）。frame 間隔の最大 603 ms（遅延中も scan は完了起点で間引かれ、frame ごとの scan にならない）。遅延中の配信は 21.14 fps（scan 中に driver が frame を破棄）で、窓 1 秒未満のため `online` のまま | PASS（scan 間隔）。scan 中の frame 欠落は注入による想定内 | 実機 + software 注入 |
+| R-11 | R-10 の注入終了直前に、**カメラA が自発的に USB 切断・再列挙した**（kernel log に disconnect → 再列挙。人も script も USB に触れていない）。`src1` は即座に `offline`（`video_capture_closed` → `video_capture_failed` → `approved_device_absent`）、再列挙後 `identity_matched` から新しい frame 受信で `online`（`offline` 検出から約 2.9 秒）。`src2` は継続（10 秒窓で 29.03 fps、sequence 欠落 10、再列挙中の scan 最大 274 ms）。今回はもう片方のリセット（#112）は発生せず | 状態表示・取り違えなしの復帰は PASS。切断原因は未特定 | 実機（偶発） |
+
+R-11 の切断は、2026-09-30 の「原因未特定の flapping」と同種の可能性がある。
+0.6 秒の DQBUF 停止が誘因かは判断できない（7 秒 block の R-7 では切断なし）。
+production 機での USB 再列挙を避けるため、遅延注入の再試行はしていない。
+
+本記録で満たした手順: 4（scan 抑制・欠落なし）。手順 2 の「`video_frame_stalled`
+から復帰した source の negotiated profile 残存」「reopen bound 超過で `offline` →
+再 open」は software 注入でのみ確認（物理停止ではない）。手順 5 の
+「close 前に `offline`」は通常 close でのみ確認。
+
+**要人手（Owner が物理操作。観測用 script は Claude が起動して記録する）**:
+
+1. 準備: ServerSentinel service を止めたまま、`fuser /dev/video*` で保持 process が
+   ないことを確認し、観測 script（2 source を承認して 0.05 秒ごとに状態・fps・
+   kernel の USB event を表示）を起動する。両方 `online`・30 fps を確認する。
+2. 手順 1: カメラA の USB ケーブルだけを抜く。抜いた時刻（秒単位）を声かけ/メモで
+   記録する。期待: `src1` が 1.5 秒以内に `online` 以外（`degraded`
+   `video_frame_stalled` または `offline`）になる。`src2` が同一バスの相互リセットで
+   一時切断した場合も、その間 `online` を表示しないこと。
+3. 30 秒待ってから同じポートに挿し直す。期待: 新しい frame 受信後にだけ
+   `src1` が `online` に戻る。カメラ B で 2〜3 を繰り返す。
+4. 手順 2: 2〜3 を交互に合計 10 回以上繰り返す（抜線間隔 30 秒以上）。各回の
+   `online` 以外になるまでの時間と、`online` に戻るまでの時間を記録する。
+5. 手順 3: 片方のレンズを不透明なもので 5 分以上覆い（可能なら室内照明も落とす）、
+   `video_frame_stalled` への遷移 0 回と実配信 fps を記録する。
+6. 手順 5: teardown が長い場合の `offline` 表示は抜線時の close 所要時間から確認する
+   （hung teardown の人工再現は行わない）。
+7. 終了後、script を止めて video descriptor 0 を確認し、一時 state を削除する。
 
 #### Real-hardware runtime procedure (serial-bearing UVC cameras)
 
