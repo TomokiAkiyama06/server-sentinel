@@ -99,12 +99,16 @@ class Reason(StrEnum):
 # address the check did not cover until now. A failed or missing hostname
 # resolution only keeps access closed (Owner decision, 2026-10-01): it reopens
 # without revocation once the answer matches again, unless an exposure was
-# seen meanwhile.
+# seen meanwhile. Ownership that cannot be verified (``LISTENER_OWNER_UNVERIFIED``:
+# no socket owner resolver, a helper that is absent, slow, rate-limited or
+# answers malformed, or no holder found) likewise only keeps access closed
+# (Owner decision, 2026-10-05): only an observed other holder
+# (``UNEXPECTED_LISTENER``, including one sharing the socket) is an exposure.
 EXPOSURE_REASONS = frozenset({
     Reason.UNEXPECTED_LISTENER, Reason.UNEXPECTED_ROUTE,
     Reason.LISTENER_ENUMERATION_UNAVAILABLE, Reason.LISTENER_ENUMERATION_TIMEOUT,
     Reason.ROUTE_ENUMERATION_UNAVAILABLE, Reason.ROUTE_ENUMERATION_TIMEOUT,
-    Reason.RESERVED_ADDRESSES_CHANGED, Reason.LISTENER_OWNER_UNVERIFIED,
+    Reason.RESERVED_ADDRESSES_CHANGED,
 })
 
 
@@ -185,8 +189,9 @@ class ListenerException:
     absolute path ``/proc/<pid>/exe`` resolves to, for example
     ``/usr/sbin/sshd``) or ``unit`` (a system unit: the process's cgroup v2
     path is exactly ``/system.slice/<unit>``, for example ``ssh.service``). Each check verifies that every process
-    holding the socket matches; another process, or ownership that cannot be
-    verified, closes access as a possible exposure.
+    holding the socket matches; another process closes access as a possible
+    exposure, and ownership that cannot be verified closes it without
+    revocation (Owner decision, 2026-10-05).
 
     ``/proc/net/{tcp6,udp6}`` does not show ``IPV6_V6ONLY``, and a ``::``
     socket also accepts IPv4 unless that option is set, so a ``::`` bind is
@@ -840,8 +845,9 @@ def evaluate(config: ReservationConfig, listeners, routes,
     ``sole_holders`` maps the upstream's inode to whether this process alone
     holds it (Issue #126): ``False`` is another holder sharing the socket (a
     forked child or a descriptor passed with ``SCM_RIGHTS``), and a ``Reason``
-    or a missing inode is unverifiable. ``None`` skips it, when no socket owner
-    resolver is composed.
+    or a missing inode is unverifiable. ``None`` skips it, for pure endpoint
+    evaluation only: a check without a socket owner resolver passes a
+    ``Reason`` (the resolver is mandatory, Owner decision 2026-10-05).
 
     ``resolved`` is the hostname's current address set (``None``: the
     configured set). Listeners are checked against the union with the
@@ -1024,9 +1030,10 @@ class HostnameReservationCheck:
         # Without a resolver every check fails closed: the frozen configured
         # set alone cannot show an address the name gained.
         self._resolver = resolver
-        # Without it no excepted listener's owner can be verified, so any
-        # listener an exception would cover closes access. With it, the human
-        # upstream must also be held by this process alone. Production passes
+        # Mandatory (Owner decision, 2026-10-05): without it neither an excepted
+        # listener's owner nor the human upstream's sole holding can be
+        # verified, so access stays closed (``LISTENER_OWNER_UNVERIFIED``,
+        # without revocation). Production passes
         # ``app.auth.socket_owner.SocketOwnerHelperClient`` (Issue #126).
         self._socket_owners = socket_owners
         # Without it the human upstream's owner is unverifiable and access stays closed.
@@ -1272,10 +1279,12 @@ class HostnameReservationCheck:
             if inodes and self._socket_owners is not None:
                 owners = self._enumerate_owners(inodes)
             own = self._enumerate_own()
-            sole = None
-            if self._socket_owners is not None:
-                # With a resolver composed, the upstream must also be held by
-                # this process alone (Issue #126); a failed lookup is unverified.
+            if self._socket_owners is None:
+                # The resolver is mandatory: the upstream's sole holding is unverifiable.
+                sole = Reason.LISTENER_OWNER_UNVERIFIED
+            else:
+                # The upstream must be held by this process alone (Issue #126);
+                # a failed lookup is unverified.
                 human = human_inodes(self.config, listeners, own)
                 sole = self._enumerate_sole_holders(human) if human else {}
             reasons, extra_listeners, extra_routes = evaluate(self.config, listeners, routes,

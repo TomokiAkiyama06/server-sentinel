@@ -1738,8 +1738,8 @@ by the Issue #6 synthetic policy model.
   disabled, `ssh.service` enabled) and record `systemctl is-enabled ssh.socket
   ssh.service`, `ss -ltnp 'sport = :22'` and `readlink /proc/<sshd pid>/exe`.
   Without the Issue #126 helper (socket stopped), confirm the non-root
-  service reports `LISTENER_OWNER_UNVERIFIED` for the excepted `sshd` and
-  human access stays closed. With the helper installed and composed as
+  service reports `LISTENER_OWNER_UNVERIFIED` and human access stays closed
+  without revoking sessions (the helper is mandatory). With the helper installed and composed as
   `socket_owners`, confirm the helper's answer matches `readlink` and access
   opens with `sshd` on 22. Then stop `sshd`, start another process on the
   excepted port (for example `sudo python3 -m http.server 22`), and confirm
@@ -1796,7 +1796,8 @@ by the Issue #6 synthetic policy model.
     server-sentinel-socket-owner.socket server-sentinel-socket-owner.service`)
     and confirm the next check reports `LISTENER_OWNER_UNVERIFIED` and human
     access stays closed; start the socket again and confirm the following
-    check reopens only after every human session has been revoked;
+    check reopens with no `invalidate_human_sessions` record and existing
+    sessions still accepted (Owner decision 2026-10-05);
   - run a release update and confirm the helper restarted with the new
     release (its `MainPID` changed, or it is inactive until the next
     connection) and that checks still pass;

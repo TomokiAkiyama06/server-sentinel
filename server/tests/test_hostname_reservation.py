@@ -1419,7 +1419,9 @@ class ListenerOwnershipTests(ExceptionFixture):
                 self.assertTrue(revoker.pending)
                 self.assertNotIn("python", repr(sink.events[-1]))
 
-    def test_unverifiable_owner_is_an_exposure(self):
+    def test_unverifiable_owner_closes_without_revocation(self):
+        # Owner decision 2026-10-05: unverifiable ownership only keeps access
+        # closed; an owner that does not match is an observed other holder.
         release = threading.Event()
 
         class Hung:
@@ -1431,17 +1433,34 @@ class ListenerOwnershipTests(ExceptionFixture):
         cases = {"no owner found": dict(socket_owners=Owners(overrides={1000: None})),
                  "resolver fails": dict(socket_owners=Owners(default=OSError("synthetic /proc failure"))),
                  "no resolver": dict(socket_owners=None),
-                 "hung resolver": dict(socket_owners=Hung(), timeout=0.05),
-                 "unknown exe": dict(socket_owners=Owners(default=SocketOwner(None, None)))}
+                 "hung resolver": dict(socket_owners=Hung(), timeout=0.05)}
         for name, kwargs in cases.items():
             with self.subTest(name):
                 revoker = FakeRevoker()
                 admin, check, _ = self.admin(WILDCARD_SSH, session_revoker=revoker, **kwargs)
                 verdict = admin.set_listener_exceptions("synthetic-owner-session", {SSH})
                 self.assertFalse(verdict.open)
-                self.assertTrue(set(verdict.reasons) & {Reason.LISTENER_OWNER_UNVERIFIED,
-                                                         Reason.UNEXPECTED_LISTENER})
-                self.assertTrue(revoker.pending)
+                self.assertIn(Reason.LISTENER_OWNER_UNVERIFIED, verdict.reasons)
+                self.assertNotIn(Reason.UNEXPECTED_LISTENER, verdict.reasons)
+                self.assertFalse(revoker.pending)
+                self.assertEqual(revoker.revocations, 0)
+        revoker = FakeRevoker()
+        admin, check, _ = self.admin(WILDCARD_SSH, session_revoker=revoker,
+                                     socket_owners=Owners(default=SocketOwner(None, None)))
+        verdict = admin.set_listener_exceptions("synthetic-owner-session", {SSH})
+        self.assertEqual(verdict.reasons, (Reason.UNEXPECTED_LISTENER,))
+        self.assertTrue(revoker.pending)
+
+    def test_helper_recovery_reopens_without_revocation(self):
+        revoker = FakeRevoker()
+        owners = Owners(default=ReservationEnumerationError("HELPER_UNAVAILABLE"),
+                        sole=ReservationEnumerationError("HELPER_UNAVAILABLE"))
+        check, _, _, _ = checker(files=WILDCARD_SSH, session_revoker=revoker, socket_owners=owners)
+        check._exceptions, check._exceptions_loaded = frozenset({SSH}), True
+        self.assertEqual(check._check(CheckKind.RETRY).reasons, (Reason.LISTENER_OWNER_UNVERIFIED,))
+        owners.default, owners.sole = SSHD_OWNER, True
+        self.assertTrue(check._check(CheckKind.RETRY).open)
+        self.assertEqual((revoker.pending, revoker.revocations), (False, 0))
 
     def test_unknown_inode_is_unverified(self):
         listeners = (HUMAN, Listener(ipaddress.IPv4Address("0.0.0.0"), 22, inode=0))
@@ -1641,14 +1660,16 @@ class ProxyListenerOwnershipTests(TestCase):
                 self.assertEqual(check.startup().reasons, (Reason.UNEXPECTED_LISTENER,))
                 self.assertTrue(revoker.pending)
 
-    def test_unverifiable_proxy_owner_is_an_exposure(self):
-        for owners in (None, Owners(OSError("synthetic /proc failure")), Owners(overrides={1001: None})):
+    def test_unverifiable_proxy_owner_closes_without_revocation(self):
+        # Synthetic inodes: the v4 proxy row is 1001, the v6 one 1000 (numbered per file).
+        for owners in (None, Owners(OSError("synthetic /proc failure")),
+                       Owners(TAILSCALED_OWNER, overrides={1000: None, 1001: None})):
             with self.subTest(owners=owners):
                 revoker = FakeRevoker()
                 check, *_ = checker(files=self.files(), cfg=config(**self.CFG), session_revoker=revoker,
                                     socket_owners=owners)
                 self.assertIn(Reason.LISTENER_OWNER_UNVERIFIED, check.startup().reasons)
-                self.assertTrue(revoker.pending)
+                self.assertFalse(revoker.pending)
 
     def test_executable_identity(self):
         cfg = config(proxy_listeners=frozenset({Listener(V4, 443)}),
@@ -1672,7 +1693,7 @@ class HumanListenerOwnershipTests(TestCase):
         self.assertEqual(sink.events[-1].unexpected_listeners, 1)
         self.assertTrue(revoker.pending)
 
-    def test_unverifiable_own_sockets_are_an_exposure(self):
+    def test_unverifiable_own_sockets_close_without_revocation(self):
         release = threading.Event()
         self.addCleanup(release.set)
 
@@ -1690,7 +1711,7 @@ class HumanListenerOwnershipTests(TestCase):
                 revoker = FakeRevoker()
                 check, *_ = checker(session_revoker=revoker, **kwargs)
                 self.assertEqual(check.startup().reasons, (Reason.LISTENER_OWNER_UNVERIFIED,))
-                self.assertTrue(revoker.pending)
+                self.assertFalse(revoker.pending)
 
     def test_sole_holding_is_verified_with_a_resolver(self):
         owners = Owners()
@@ -1709,7 +1730,8 @@ class HumanListenerOwnershipTests(TestCase):
         self.assertEqual(sink.events[-1].unexpected_listeners, 1)
         self.assertTrue(revoker.pending)
 
-    def test_unverifiable_sole_holding_is_an_exposure(self):
+    def test_unverifiable_sole_holding_closes_without_revocation(self):
+        # Owner decision 2026-10-05: helper absent, slow, rate-limited or malformed.
         release = threading.Event()
         self.addCleanup(release.set)
 
@@ -1734,11 +1756,16 @@ class HumanListenerOwnershipTests(TestCase):
                 revoker = FakeRevoker()
                 check, *_ = checker(own_sockets=lambda: frozenset({1000}), session_revoker=revoker, **kwargs)
                 self.assertEqual(check.startup().reasons, (Reason.LISTENER_OWNER_UNVERIFIED,))
-                self.assertTrue(revoker.pending)
+                self.assertFalse(revoker.pending)
+                self.assertEqual(revoker.revocations, 0)
 
-    def test_without_a_resolver_only_the_own_fd_table_is_compared(self):
-        check, *_ = checker(own_sockets=lambda: frozenset({1000}), socket_owners=None)
-        self.assertTrue(check.startup().open)
+    def test_missing_resolver_keeps_access_closed(self):
+        # Owner decision 2026-10-05: the socket owner resolver is mandatory.
+        revoker = FakeRevoker()
+        check, *_ = checker(own_sockets=lambda: frozenset({1000}), socket_owners=None, session_revoker=revoker)
+        self.assertEqual(check.startup().reasons, (Reason.LISTENER_OWNER_UNVERIFIED,))
+        self.assertFalse(check._check(CheckKind.RETRY).open)
+        self.assertEqual((revoker.pending, revoker.revocations), (False, 0))
 
     def test_sole_holding_evaluation(self):
         listener = Listener(HUMAN.address, HUMAN.port, inode=1000)

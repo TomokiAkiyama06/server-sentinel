@@ -489,5 +489,14 @@ ServerSentinel process alone, which closes the fork / `SCM_RIGHTS` gap noted
 for PR #91. Installation is an Owner host step (`server/docs/DEPLOYMENT.md`)
 verified per `MANUAL_TEST.md`.
 
+Owner decision, 2026-10-05 (PR #142): the socket owner resolver is mandatory,
+and a check without one never opens human access. Ownership that cannot be
+verified (no resolver, a helper that is absent, slow, rate-limited or answers
+malformed, or no holder found) keeps access closed without revocation and
+reopens once ownership verifies again; only an observed other holder,
+including another process sharing the socket, is an exposure that revokes
+every human session. This supersedes the 2026-10-01 wording above that
+treated unverifiable ownership as an exposure.
+
 Clarification, 2026-10-01 (PR #91): where this record says the startup and daily check closes access "on any other answer", read "on any other answer it can see". The check enumerates listening sockets (`/proc/net`) and Tailscale Serve routes only; kernel forwarding to the reserved address (nftables/iptables DNAT or REDIRECT, TPROXY, eBPF `sk_lookup`, IPVS) is not visible to it and must be excluded by the deployment isolation and verified by the operator per `MANUAL_TEST.md`. The current contract is in `server/app/auth/README.md`. This is still detection: it bounds how long an exposed
 cookie stays usable, and does not prevent the exposure.

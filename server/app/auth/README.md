@@ -168,8 +168,8 @@ following closes it:
   must be held by the configured `proxy_owner` (a `ProcessIdentity`:
   executable or systemd unit, for example `tailscaled.service`) alone, verified
   through `socket_owners` like a listener exception: another holder counts as
-  `UNEXPECTED_LISTENER` and an unverifiable one as `LISTENER_OWNER_UNVERIFIED`
-  (both exposures). Connected UDP client sockets answer only their peer and are
+  `UNEXPECTED_LISTENER` (an exposure) and an unverifiable one as
+  `LISTENER_OWNER_UNVERIFIED` (closed without revocation). Connected UDP client sockets answer only their peer and are
   not counted;
 - a loopback human upstream that is not a socket of this ServerSentinel
   process: each check reads its own `/proc/self/fd` (`OwnSocketInodes`, the
@@ -177,9 +177,11 @@ following closes it:
   single replacement bound by another process after the upstream released the
   endpoint (no `SO_REUSEPORT` duplicate row) counts as `UNEXPECTED_LISTENER`;
   an unreadable own fd table, a socket without an inode, or no `own_sockets`
-  counts as `LISTENER_OWNER_UNVERIFIED`; both are exposures. Python creates
+  counts as `LISTENER_OWNER_UNVERIFIED` (closed without revocation). Python creates
   non-inheritable descriptors, so a child process does not share the socket.
-  When a `socket_owners` resolver is composed, each check also asks it
+  The `socket_owners` resolver is mandatory (Owner decision, 2026-10-05):
+  without one the upstream stays `LISTENER_OWNER_UNVERIFIED` and access never
+  opens. Each check also asks it
   (`held_only_by_requester`) whether this process is the only process
   holding the upstream socket (Issue #126): a forked child or a process given
   the descriptor with `SCM_RIGHTS` shares the inode while `/proc/net` shows a
@@ -209,10 +211,10 @@ A failing startup/daily check closes access before emitting an identifier-free
 failed delivery is counted and retried on the next tick. While closed the
 check is retried every five minutes, re-notifying only when the reasons change,
 and a later passing check reopens access. After a close that may have exposed
-a session cookie (an unexpected listener or route, a resolved address set that
-differs from the configuration, an excepted listener whose owner cannot be
-verified, or a listener/route enumeration error or timeout that cannot rule
-one out: `EXPOSURE_REASONS`), a passing check reopens
+a session cookie (an unexpected listener or route, including another process
+holding or sharing an excepted, proxy or upstream socket, a resolved address
+set that differs from the configuration, or a listener/route enumeration error
+or timeout that cannot rule one out: `EXPOSURE_REASONS`), a passing check reopens
 only after the injected `session_revoker` has revoked every human session
 (Owner decision, 2026-09-30). `reservation_store.ReservationSessionRevocation`
 does that through `AccessStore.invalidate_all_sessions_on`, which advances the
@@ -261,7 +263,10 @@ process holding it; the socket is excepted only when every holder matches.
 Another process holding it (alone or alongside the named one) counts as
 `UNEXPECTED_LISTENER`; a socket with no inode or no holder found, an
 unreadable executable/unit, or an owner lookup that fails or times out counts
-as `LISTENER_OWNER_UNVERIFIED`; both are exposure reasons. The scan is all or
+as `LISTENER_OWNER_UNVERIFIED`. Only the first is an exposure reason; an
+unverifiable owner, including a socket-owner helper that is absent, slow,
+rate-limited or answers malformed, keeps access closed without revocation and
+reopens once ownership verifies again (Owner decision, 2026-10-05: unverifiable ownership keeps access closed without revocation; only an observed other holder is an exposure). The scan is all or
 nothing: any process whose fd table or descriptor cannot be read (other than
 one that exited or closed it during the scan) could hide another holder, so the
 lookup fails and every excepted listener stays unverified, even one whose

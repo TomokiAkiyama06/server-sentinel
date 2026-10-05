@@ -288,8 +288,12 @@ line, account or other process detail.
   minute.
 - Failure: a missing, stopped, slow, rate-limited or malformed helper makes
   the ServerSentinel client raise, so the reservation check reports
-  `LISTENER_OWNER_UNVERIFIED` and keeps human access closed (an exposure
-  reason, so reopening revokes every human session).
+  `LISTENER_OWNER_UNVERIFIED` and keeps human access closed. This alone does
+  not revoke sessions: access reopens once ownership verifies again (Owner
+  decision, 2026-10-05). Only an observed other holder (`UNEXPECTED_LISTENER`)
+  is an exposure that revokes every human session before reopening.
+- Mandatory: the reservation check never opens human access without a socket
+  owner resolver; production composes this helper's client.
 
 Install from the tagged release checkout as the Owner. These are host
 administration steps; nothing in the installer or the service performs them:

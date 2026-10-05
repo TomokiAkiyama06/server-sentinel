@@ -318,9 +318,9 @@ The current contract for that check (Owner decisions 2026-09-30 and
   or a resolution that fails or times out keeps human access closed but is not
   an exposure: access reopens without revocation once the name resolves to the
   recorded set again, unless an exposure was seen meanwhile.
-- After any exposure (another listener or route, a changed address set, an
-  excepted listener with an unverifiable owner, or a listener/route
-  enumeration that fails or times out) access reopens only after every human
+- After any exposure (another listener or route, including another process
+  holding or sharing a verified socket, a changed address set, or a
+  listener/route enumeration that fails or times out) access reopens only after every human
   session, the Owner's included, has been revoked by advancing the
   authorization generation, with its `system` audit record committed. The
   requirement is persisted as a marker before reopening; if the marker cannot
@@ -328,8 +328,9 @@ The current contract for that check (Owner decisions 2026-09-30 and
   a durable revoker never opens human access.
 - An Owner listener exception names a port together with its owning
   executable or systemd unit, never a port alone, and every check verifies the
-  socket's owning processes. Another process, or ownership that cannot be read
-  completely, closes access as an exposure. ServerSentinel stays non-root;
+  socket's owning processes. Another process closes access as an exposure;
+  ownership that cannot be read completely closes access without revocation
+  until it verifies again (Owner decision, 2026-10-05). ServerSentinel stays non-root;
   root-owned sockets are read by a separate helper service (Issue #126,
   `server/app/auth/socket_owner.py`, `infra/systemd/`) running as a transient
   non-root account with only `CAP_DAC_READ_SEARCH` and `CAP_SYS_PTRACE`
@@ -338,13 +339,14 @@ The current contract for that check (Owner decisions 2026-09-30 and
   service UID verified with `SO_PEERCRED`, only about sockets listening in the
   requester's network namespace, and only with each holder's executable and
   unit; requests are bounded and rate-limited, and answers and refusals are
-  journaled. A missing or failing helper keeps the listener unverified and
-  human access closed. The Main Server runs `sshd` as `ssh.service` without
+  journaled. The helper is mandatory: without it, or when it is missing, slow,
+  rate-limited or answers malformed, the listener stays unverified and human
+  access stays closed, without revoking sessions. The Main Server runs `sshd` as `ssh.service` without
   `ssh.socket`, with the exception `tcp/22` owned by `/usr/sbin/sshd`
   (`server/docs/DEPLOYMENT.md`).
 - Every recorded proxy socket must be present and held only by the recorded
   proxy process (for example `tailscaled.service`), verified the same way.
-  Another or unverifiable holder is an exposure; a missing recorded socket
+  Another holder is an exposure; an unverifiable one or a missing recorded socket
   closes access without revocation until it returns. Without the #126
   helper, a root-owned proxy's sockets keep human access closed.
 - The loopback human upstream must be a socket the ServerSentinel process
