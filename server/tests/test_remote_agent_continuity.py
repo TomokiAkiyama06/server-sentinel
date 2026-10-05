@@ -1021,26 +1021,46 @@ class ContinuityTrackerTests(unittest.TestCase):
                          (delivery.outcome, delivery.reason))
         self.assertEqual(1, ingest.snapshot().tracked_rate_windows)
 
-    def test_forget_source_keeps_other_node_state_and_resets_source_watermarks(self):
-        tracker, ingest, _, authorizer = build(
-            authorizer=Authorizer(((NODE, SOURCE), (NODE, OTHER_SOURCE))))
-        session = tracker.open_session(NODE)
-        tracker.receive(session, unit(5, at=10 ** 6), b"v")
-        tracker.receive(session, unit(0, source=OTHER_SOURCE), b"v")
-        # The released source's queued work was consumed (and made durable).
-        ingest.drain(10)
-        authorizer.pairs.discard((NODE, SOURCE))
-        tracker.forget_source(SOURCE)
-        authorizer.pairs.add((NODE, SOURCE))
-        # A reactivated source identity starts without the old sequence,
-        # epoch or capture-clock watermark, so an earlier capture time or
-        # lower sequence is neither a duplicate nor a clock regression.
-        delivery = tracker.receive(session, unit(0, at=1), b"v")
-        self.assertEqual((DeliveryOutcome.ACCEPTED, ()),
-                         (delivery.outcome, delivery.gaps))
-        self.assertEqual(0, flow(tracker).last_sequence)
-        self.assertEqual(0, flow(tracker, OTHER_SOURCE).last_sequence)
-        self.assertEqual(1, ingest.snapshot().tracked_rate_windows)
+    def test_forget_source_keeps_other_node_state_and_defers_to_durable_watermark(self):
+        for durable in (True, False):
+            with self.subTest(durable=durable):
+                marks, lookups = {}, []
+
+                def lookup(source_id):
+                    lookups.append(source_id)
+                    return marks.get(source_id)
+                tracker, ingest, _, authorizer = build(
+                    authorizer=Authorizer(((NODE, SOURCE), (NODE, OTHER_SOURCE))),
+                    watermark=lookup)
+                session = tracker.open_session(NODE)
+                tracker.receive(session, unit(5, at=10 ** 6), b"v")
+                tracker.receive(session, unit(0, source=OTHER_SOURCE), b"v")
+                lookups.clear()
+                # The released source's queued work was consumed and the
+                # durable layer acknowledged persisting it.
+                ingest.drain(10)
+                mark = CommittedWatermark(NODE, 1, 5, 10 ** 6)
+                tracker.acknowledge_persisted(SOURCE, mark)
+                if durable:
+                    marks[SOURCE] = mark
+                authorizer.pairs.discard((NODE, SOURCE))
+                tracker.forget_source(SOURCE)
+                authorizer.pairs.add((NODE, SOURCE))
+                # Covered by the durable acknowledgement, the released
+                # continuity is gone: the durable watermark is consulted.
+                delivery = tracker.receive(session, unit(0, at=1), b"v")
+                self.assertEqual([SOURCE], lookups)
+                if durable:
+                    self.assertEqual(DeliveryOutcome.DUPLICATE, delivery.outcome)
+                    self.assertEqual(5, flow(tracker).last_sequence)
+                else:
+                    # Nothing durable for the identity: it starts without the
+                    # old sequence, epoch or capture-clock watermark.
+                    self.assertEqual((DeliveryOutcome.ACCEPTED, ()),
+                                     (delivery.outcome, delivery.gaps))
+                    self.assertEqual(0, flow(tracker).last_sequence)
+                self.assertEqual(0, flow(tracker, OTHER_SOURCE).last_sequence)
+                self.assertEqual(1, ingest.snapshot().tracked_rate_windows)
 
     def test_released_source_retry_is_duplicate_while_its_unit_is_still_queued(self):
         for fenced in (False, True):
@@ -1668,6 +1688,224 @@ class ContinuityTrackerTests(unittest.TestCase):
         self.assertEqual([SOURCE], lookups)
         self.assertEqual((1, 1), (ingest.snapshot().queued_messages,
                                   ingest.snapshot().rate_limited))
+
+    def _shared_refusing_tracker(self, *, watermark=no_watermark, released=64):
+        """Like ``_refusing_tracker`` but one authorizer for deactivation tests."""
+        authorizer = Authorizer({(NODE, SOURCE), (NODE, OTHER_SOURCE)})
+        clock = Clock()
+        ingest = TransientRefusalQueue(IngestLimits(8, 1, 8, 1000, 10 ** 12),
+                                       authorizer, clock_ns=clock)
+        tracker = ContinuityTracker(
+            ContinuityLimits(4, 4, 100, maximum_released_sources=released), authorizer,
+            ingest, clock_ns=clock, committed_watermark=watermark)
+        return tracker, ingest, authorizer, tracker.open_session(NODE)
+
+    def _cycle(self, tracker, authorizer, source=SOURCE, *, fenced=True):
+        """Deactivate then reactivate ``source``; return the handed-back gaps."""
+        if fenced:
+            with tracker.authorization_change(deactivated_source=source) as change:
+                authorizer.pairs.discard((NODE, source))
+            released = change.released_gaps
+        else:
+            authorizer.pairs.discard((NODE, source))
+            released = tracker.forget_source(source)
+        authorizer.pairs.add((NODE, source))
+        return released
+
+    def test_late_unit_behind_a_noted_skip_is_duplicate_not_admitted(self):
+        for kind in ("backpressure", "transient_refusal"):
+            for leading in (False, True):
+                with self.subTest(kind=kind, leading=leading):
+                    tracker, ingest, session = self._refusing_tracker()
+                    if not leading:
+                        tracker.receive(session, unit(0), b"v")
+                        ingest.drain(10)
+                    refused = self._refuse(tracker, ingest, session, unit(5), kind)
+                    self.assertEqual([GapReason.SEQUENCE_SKIP],
+                                     [g.reason for g in refused.gaps])
+                    # Unit 3 is already reported missing: acknowledging it
+                    # keeps media and the recorded gap consistent.
+                    late = tracker.receive(session, unit(3), b"v")
+                    self.assertEqual((DeliveryOutcome.DUPLICATE, ()),
+                                     (late.outcome, late.gaps))
+                    self.assertEqual(0, ingest.snapshot().queued_messages)
+                    retry = tracker.receive(session, unit(5), b"v")
+                    self.assertEqual((DeliveryOutcome.ACCEPTED, ()),
+                                     (retry.outcome, retry.gaps))
+                    self.assertEqual([5], [m.sequence for m in ingest.drain(10)])
+                    self.assertEqual(1, len(tracker.drain_gaps(10)))
+
+    def test_late_unit_behind_a_noted_restart_is_duplicate_not_admitted(self):
+        tracker, ingest, session = self._refusing_tracker()
+        tracker.receive(session, unit(0, epoch=1), b"v")
+        ingest.drain(10)
+        refused = self._refuse(tracker, ingest, session, unit(3, epoch=2, at=30),
+                               "transient_refusal")
+        self.assertEqual([GapReason.CAPTURE_RESTART], [g.reason for g in refused.gaps])
+        late = tracker.receive(session, unit(1, epoch=2, at=10), b"v")
+        self.assertEqual(DeliveryOutcome.DUPLICATE, late.outcome)
+        self.assertEqual(0, ingest.snapshot().queued_messages)
+        retry = tracker.receive(session, unit(3, epoch=2, at=30), b"v")
+        self.assertEqual((DeliveryOutcome.ACCEPTED, ()), (retry.outcome, retry.gaps))
+
+    def test_noted_skip_survives_release_with_an_empty_queue(self):
+        for fenced in (True, False):
+            for leading in (False, True):
+                with self.subTest(fenced=fenced, leading=leading):
+                    tracker, ingest, authorizer, session = self._shared_refusing_tracker()
+                    if not leading:
+                        tracker.receive(session, unit(0), b"v")
+                        ingest.drain(10)
+                    self._refuse(tracker, ingest, session, unit(5), "transient_refusal")
+                    self.assertEqual(0, ingest.snapshot().queued_messages)
+                    released = self._cycle(tracker, authorizer, fenced=fenced)
+                    self.assertEqual([(GapReason.SEQUENCE_SKIP, 5 if leading else 4)],
+                                     [(g.reason, g.missing_units) for g in released])
+                    # The retry after reactivation must not durably record
+                    # the same gap a second time, nor admit a late unit.
+                    self.assertEqual(DeliveryOutcome.DUPLICATE,
+                                     tracker.receive(session, unit(3), b"v").outcome)
+                    retry = tracker.receive(session, unit(5), b"v")
+                    self.assertEqual((DeliveryOutcome.ACCEPTED, ()),
+                                     (retry.outcome, retry.gaps))
+                    self.assertEqual((), tracker.drain_gaps(10))
+                    self.assertEqual([5], [m.sequence for m in ingest.drain(10)])
+
+    def test_released_source_keeps_its_attempted_epoch(self):
+        for kind in ("backpressure", "transient_refusal"):
+            with self.subTest(kind=kind):
+                tracker, ingest, authorizer, session = self._shared_refusing_tracker()
+                tracker.receive(session, unit(0, epoch=1), b"v")
+                if kind == "backpressure":
+                    # The committed epoch-1 unit still fills the queue.
+                    refused = tracker.receive(session, unit(0, epoch=2, at=0), b"n")
+                else:
+                    ingest.drain(10)
+                    refused = self._refuse(tracker, ingest, session,
+                                           unit(0, epoch=2, at=0), kind)
+                self.assertEqual([GapReason.CAPTURE_RESTART], [g.reason for g in refused.gaps])
+                self._cycle(tracker, authorizer)
+                ingest.drain(10)
+                # An older-epoch unit still queued on the Agent is stale, as it
+                # would have been without the release.
+                old = tracker.receive(session, unit(1, epoch=1), b"o")
+                self.assertEqual((DeliveryOutcome.REJECTED, "stale_capture_epoch"),
+                                 (old.outcome, old.reason))
+                new = tracker.receive(session, unit(0, epoch=2, at=0), b"n")
+                self.assertEqual((DeliveryOutcome.ACCEPTED, ()), (new.outcome, new.gaps))
+                self.assertEqual([0], [m.sequence for m in ingest.drain(10)])
+
+    def test_released_position_is_kept_until_durable_acknowledgement(self):
+        marks = {}
+        tracker, ingest, authorizer, session = self._shared_refusing_tracker(
+            watermark=marks.get)
+        self.assertEqual(DeliveryOutcome.ACCEPTED,
+                         tracker.receive(session, unit(0), b"v").outcome)
+        # Drained, but not yet durably recorded: leaving the queue is not
+        # durability, so the reactivated retry must not enqueue it again.
+        drained = ingest.drain(10)
+        self.assertEqual([0], [m.sequence for m in drained])
+        self._cycle(tracker, authorizer)
+        self.assertEqual(DeliveryOutcome.DUPLICATE,
+                         tracker.receive(session, unit(0), b"v").outcome)
+        self.assertEqual(0, ingest.snapshot().queued_messages)
+        # An acknowledgement that does not cover the position keeps it.
+        self.assertEqual(DeliveryOutcome.ACCEPTED,
+                         tracker.receive(session, unit(1), b"v").outcome)
+        ingest.drain(10)
+        tracker.acknowledge_persisted(SOURCE, CommittedWatermark(NODE, 1, 0, 0))
+        self._cycle(tracker, authorizer)
+        tracker.acknowledge_persisted(SOURCE, CommittedWatermark(OTHER_NODE, 1, 9, 90))
+        self.assertEqual(DeliveryOutcome.DUPLICATE,
+                         tracker.receive(session, unit(1), b"v").outcome)
+        # Covered after release: the kept entry is dropped and the durable
+        # watermark applies on reactivation.
+        self._cycle(tracker, authorizer)
+        marks[SOURCE] = CommittedWatermark(NODE, 1, 1, 10)
+        tracker.acknowledge_persisted(SOURCE, marks[SOURCE])
+        self.assertEqual(DeliveryOutcome.DUPLICATE,
+                         tracker.receive(session, unit(1), b"v").outcome)
+        result = tracker.receive(session, unit(2), b"v")
+        self.assertEqual((DeliveryOutcome.ACCEPTED, ()), (result.outcome, result.gaps))
+        with self.assertRaises(ValueError):
+            tracker.acknowledge_persisted("x", marks[SOURCE])
+        with self.assertRaises(ValueError):
+            tracker.acknowledge_persisted(SOURCE, (NODE, 1, 1, 10))
+
+    def test_released_continuity_is_hard_bounded(self):
+        lookups = []
+
+        def lookup(source_id):
+            lookups.append(source_id)
+            return None
+        tracker, ingest, authorizer, session = self._shared_refusing_tracker(
+            watermark=lookup, released=1)
+        for source in (SOURCE, OTHER_SOURCE):
+            tracker.receive(session, unit(0, source=source), b"v")
+            ingest.drain(10)
+        lookups.clear()
+        self._cycle(tracker, authorizer, SOURCE)
+        self._cycle(tracker, authorizer, OTHER_SOURCE)
+        # The newest release is kept; the evicted one falls back to the
+        # durable watermark lookup.
+        self.assertEqual(DeliveryOutcome.DUPLICATE,
+                         tracker.receive(session, unit(0, source=OTHER_SOURCE), b"v").outcome)
+        self.assertEqual([], lookups)
+        tracker.receive(session, unit(0), b"v")
+        self.assertEqual([SOURCE], lookups)
+        with self.assertRaises(ValueError):
+            ContinuityLimits(4, 4, 100, maximum_released_sources=0)
+
+    def test_attempted_epoch_survives_watermark_lookup_resolving_to_nothing(self):
+        state = {"broken": True}
+
+        def lookup(source_id):
+            if state["broken"]:
+                raise OSError("durable store unavailable")
+            return None
+        tracker, ingest, _, _ = build(watermark=lookup)
+        session = tracker.open_session(NODE)
+        self.assertEqual("watermark_unavailable",
+                         tracker.receive(session, unit(0, epoch=3), b"v").reason)
+        state["broken"] = False
+        old = tracker.receive(session, unit(0, epoch=2), b"o")
+        self.assertEqual((DeliveryOutcome.REJECTED, "stale_capture_epoch"),
+                         (old.outcome, old.reason))
+        self.assertEqual(0, ingest.snapshot().queued_messages)
+        result = tracker.receive(session, unit(0, epoch=3), b"n")
+        self.assertEqual((DeliveryOutcome.ACCEPTED, ()), (result.outcome, result.gaps))
+
+    def test_clock_regression_against_an_uncommitted_refused_unit_is_reported(self):
+        for kind in ("backpressure", "transient_refusal"):
+            with self.subTest(kind=kind):
+                tracker, ingest, session = self._refusing_tracker()
+                self._refuse(tracker, ingest, session, unit(0, at=100), kind)
+                result = tracker.receive(session, unit(0, at=50), b"v")
+                self.assertEqual(DeliveryOutcome.ACCEPTED, result.outcome)
+                self.assertEqual([(GapReason.CAPTURE_CLOCK_REGRESSION, None, 0, 0)],
+                                 [(g.reason, g.after_sequence, g.before_sequence,
+                                   g.missing_units) for g in result.gaps])
+                # A plain retry of the same unit is not a regression.
+                tracker, ingest, session = self._refusing_tracker()
+                self._refuse(tracker, ingest, session, unit(0, at=100), kind)
+                result = tracker.receive(session, unit(0, at=100), b"v")
+                self.assertEqual((DeliveryOutcome.ACCEPTED, ()), (result.outcome, result.gaps))
+                ingest.drain(10)
+                follow = tracker.receive(session, unit(1, at=110), b"v")
+                self.assertEqual((DeliveryOutcome.ACCEPTED, ()), (follow.outcome, follow.gaps))
+
+    def test_slow_watermark_lookup_does_not_stamp_an_interrupted_flow(self):
+        holder = {}
+
+        def slow(source_id):
+            holder["clock"].now += 500  # longer than the stale bound
+            return None
+        tracker, _, clock, _ = build(watermark=slow, stale=100)
+        holder["clock"] = clock
+        session = tracker.open_session(NODE)
+        self.assertEqual(DeliveryOutcome.ACCEPTED,
+                         tracker.receive(session, unit(0), b"v").outcome)
+        self.assertEqual(SourceFlow.RECEIVING, flow(tracker).flow)
 
 if __name__ == "__main__":
     unittest.main()

@@ -755,10 +755,28 @@ Tracked sources are bounded by the active-source limit (§3.4); tracked node
 sessions are hard-bounded separately, so live source-less node sessions never
 consume the active-source allowance. The active-source limit counts active sources, so durable deactivation or replacement of one
 source releases its slot (returning its undrained gap events to the caller)
-without discarding the node's other flows. While accepted units of a released
-source are still in the ingest queue, its committed position is kept outside
-the slot limit, so a retry after reactivation is a `duplicate` and is never
-enqueued twice; once they are drained, the durable watermark applies. A node that owns no tracked source
+without discarding the node's other flows. A released source's continuity
+(committed position, highest attempted epoch, and loss already recorded from a
+refused unit) is kept outside the slot limit, also when the ingest queue holds
+none of its units, so after reactivation a retry is a `duplicate` and never
+enqueued twice, a lower epoch than one already attempted stays stale, and the
+same loss is never handed to the durable consumer twice. Leaving the ingest
+queue is not durability: that entry is dropped only after the durable
+recording layer acknowledges persisting a watermark at or past its committed
+position (and it carries no noted loss or uncommitted attempt), after which
+the durable watermark applies. These entries are hard-bounded (deployment
+setting); when full, the oldest is evicted and that source falls back to its
+durable watermark on reactivation, which can repeat an envelope or a gap report
+but never hides loss. A unit behind loss already recorded (below the first
+refused unit that showed a skip or restart) is acknowledged as `duplicate`
+and never admitted, so media never contradicts the recorded gap. An in-epoch
+capture clock regression is measured against the committed unit and the
+latest capture time observed on a refused unit of that epoch, so it is
+reported also before anything of the epoch commits; the epoch of a unit
+refused because the watermark lookup failed is kept when the lookup later
+succeeds, even when nothing durable exists, and activity time is re-sampled
+after the lookup and after admission so a slow durable lookup cannot make a
+just-accepted flow read `interrupted`. A node that owns no tracked source
 and whose session is closed, invalidated or stale does not keep a slot.
 Liveness time is sampled while the tracker state is locked and never moves
 backwards, so a delayed or regressed clock sample cannot make an active flow
