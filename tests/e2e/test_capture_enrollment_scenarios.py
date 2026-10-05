@@ -350,7 +350,16 @@ class CaptureEnrollmentScenario(unittest.TestCase):
         agent.type(grouped + b"\n")
         status, output, error = agent.finish()
         self.assertEqual(0, status, error)
-        return UUID(re.fullmatch(r"paired: node_id=(\S+)\n", output).group(1))
+        node = UUID(re.match(r"paired: node_id=(\S+)\n", output).group(1))
+        lines = output.splitlines()[1:]
+        if "revoked" in extra:
+            # The Agent states the exact manual configuration change.
+            self.assertEqual(1, len(lines), output)
+            self.assertTrue(lines[0].startswith(
+                f'config_update_required: set "node_id": "{node}"'), output)
+        else:
+            self.assertEqual([], lines, output)
+        return node
 
     def start_approval(self, request, listen_port, key_digest):
         main = self.main_cli("approve", "--database", self.database,

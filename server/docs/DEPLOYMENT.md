@@ -272,9 +272,12 @@ first to see whether the node is `credential=revoked`:
   camera sources stay the same.
 - revoked: the Agent runs `request --repair revoked` (a fresh key). `approve`
   refuses the old key (`public_key_revoked`) and shows `new capture node` for
-  the new one. After `pair --repair revoked` the Agent holds a new node UUID;
-  update `node_id` in the Agent's protected configuration, and approve that
-  node's camera sources again. The revoked node stays listed as revoked, and
+  the new one. After `pair --repair revoked` the Agent holds a new node UUID
+  and prints the exact change (`config_update_required: set "node_id": "<new
+  uuid>" ...`). Make that edit in the Agent's protected configuration by hand:
+  until then the Agent refuses to start (`node_identity_mismatch`, also from
+  `--check`), with no capture or ingest. Then approve that node's camera
+  sources again. The revoked node stays listed as revoked, and
   its recordings stay under it until normal retention removes them.
 
 Stop the Agent's `media-capture-agent` service before re-pairing and start it

@@ -116,8 +116,20 @@ Owner policy (2026-10-01). Check the node's state on the Main first
   deleted only after the swap commits. If the run stops after the swap but
   before the pending repair key is removed, rerunning `pair --repair revoked`
   finishes the cleanup without a second exchange and `request --repair revoked`
-  reports `repair_already_completed`. Afterwards set `node_id` in the protected
-  Agent configuration to the printed new UUID and restart the service. The Owner
+  reports `repair_already_completed`. `pair --repair revoked` prints the new
+  node and the exact configuration change:
+
+  ```text
+  paired: node_id=<new uuid>
+  config_update_required: set "node_id": "<new uuid>" in the media-capture-agent configuration, then start the service (it refuses to start with node_identity_mismatch until then)
+  ```
+
+  The configuration stays a manual Owner edit (Owner decision 2026-10-05).
+  Until `node_id` names the installed credential's node, the Agent refuses to
+  start, fail closed: service startup and `--check` both exit with the fixed
+  reason `node_identity_mismatch` before any capture or session is created. A
+  damaged or unreadable installed credential is reported as
+  `node_credential_unavailable`, never as unpaired. The Owner
   approves the new node's camera sources again on the Main; the old node's
   recordings stay under the old node until retention. The Agent's local ring
   buffer and protected incidents are not touched by re-pairing.

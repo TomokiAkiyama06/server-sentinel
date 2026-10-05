@@ -501,7 +501,14 @@ code with the reviewed runtime installed. `AGENT_CLI` means
        `AGENT_CLI pair ... --repair revoked`, confirm a new `node_id`, one
        credential generation, no `pending-repair/node-key.pem`, and that
        `MAIN_CLI list` shows the old node `credential=revoked` and the new one
-       `credential=active`. Update `node_id` in the Agent configuration. Confirm
+       `credential=active`. Confirm `pair` printed
+       `config_update_required: set "node_id": "<new uuid>" ...`. Before editing
+       the configuration, confirm `media-capture-agent --config <file> --check`
+       and a service start both exit with `node_identity_mismatch` and that no
+       capture process starts and no connection to the Main is opened
+       (`ss -tnp`). Then set `node_id` to the new UUID by hand and confirm
+       `--check` passes. Corrupt a copy of the credential in a disposable
+       runtime root and confirm `node_credential_unavailable`. Confirm
        the new node has no camera source until the Owner approves its sources,
        and that the old node's recordings stay listed under the old node until
        retention *(needs source/transport wiring, #14/#15)*.

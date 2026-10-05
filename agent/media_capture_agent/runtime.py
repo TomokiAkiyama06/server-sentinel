@@ -6,6 +6,7 @@ import time
 from typing import Protocol
 
 from .health import ClockExchange, SourceHealth, assess_clock
+from .pairing import NodeCredentialStore, PairingRefused
 from .storage import StorageRefused, open_directory
 
 
@@ -65,6 +66,17 @@ class Agent:
                 raise StorageRefused("runtime_root_not_writable")
         finally:
             os.close(runtime)
+        # Fail closed before any capture or session (#116): after re-pairing a
+        # revoked node, the Owner updates ``node_id`` by hand; until it names
+        # the installed credential's node the Agent does not start. A damaged
+        # credential is never treated as unpaired.
+        try:
+            installed = NodeCredentialStore(settings.runtime_root,
+                                            owner_uid=settings.service_uid).installed_node_id()
+        except PairingRefused:
+            raise StorageRefused("node_credential_unavailable") from None
+        if installed is not None and installed != settings.node_id:
+            raise StorageRefused("node_identity_mismatch")
         self.settings = settings
         self.store = store
         self.capture = capture or UnconfiguredCapture()

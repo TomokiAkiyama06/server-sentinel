@@ -78,6 +78,8 @@ is reported; fix it and rerun to reveal any later failure.
 | `runtime_root_unavailable` | The runtime root cannot be opened |
 | `runtime_root_permissions_unsafe` | The runtime root is not owned by `service_uid` or grants any group/world access |
 | `runtime_root_not_writable` | The owner lacks write or search permission on the runtime root |
+| `node_identity_mismatch` | An installed node credential names a different node than the configuration's `node_id` (for example after `enroll pair --repair revoked` before `node_id` was updated); the Agent starts no capture or session |
+| `node_credential_unavailable` | The installed node credential under the runtime root is damaged or unreadable (never treated as unpaired) |
 | `check_failed` | Any other internal error; exception text is suppressed |
 
 The deployment-local JSON configuration requires every field below. No private

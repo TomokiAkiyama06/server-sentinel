@@ -477,6 +477,29 @@ class RepairTests(EnrollFixture):
         self.assertEqual(connections, peer.connections, "no second enrollment exchange")
         self.assertFalse((self.runtime / "pending-repair" / "node-key.pem").exists())
 
+    def test_cli_prints_the_new_node_and_the_exact_config_change_after_revoked_repair(self):
+        bundle = self.root / "bundle.json"
+        bundle.write_bytes(self.authority.bundle(port=self.first.port))
+        digest = TrustBundle.parse(bundle.read_bytes()).sha256
+        new_node = uuid4()
+        arguments = ["pair", "--runtime-root", str(self.runtime), "--trust-bundle", str(bundle),
+                     "--bundle-sha256", digest]
+        for repair, expected in (("revoked", True), ("expired", False), (None, False)):
+            stdout = io.StringIO()
+            extra = [] if repair is None else ["--repair", repair]
+            with patch.object(enroll, "pair", return_value=new_node) as paired, \
+                    patch("sys.stdout", stdout):
+                self.assertEqual(0, enroll.main(arguments + extra))
+            self.assertEqual(repair, paired.call_args.kwargs["repair"])
+            lines = stdout.getvalue().splitlines()
+            self.assertEqual(f"paired: node_id={new_node}", lines[0])
+            if expected:
+                self.assertEqual([enroll.config_update_instruction(new_node)], lines[1:])
+                self.assertIn(f'set "node_id": "{new_node}"', lines[1])
+                self.assertIn("node_identity_mismatch", lines[1])
+            else:
+                self.assertEqual([], lines[1:])
+
     def test_repair_requires_an_installed_identity_and_a_known_mode(self):
         runtime = self.root / "fresh"
         runtime.mkdir(mode=0o700)

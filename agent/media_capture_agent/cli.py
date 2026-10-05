@@ -25,7 +25,8 @@ CHECK_REASONS = frozenset({
     "media_root_owner_mismatch", "media_root_permissions_too_open",
     "not_writable_by_service_account", "insufficient_free_space", "storage_unavailable",
     "service_account_mismatch", "runtime_root_unavailable", "runtime_root_permissions_unsafe",
-    "runtime_root_not_writable", "check_failed",
+    "runtime_root_not_writable", "node_identity_mismatch", "node_credential_unavailable",
+    "check_failed",
 })
 
 # MediaStore refusals (StorageRefused.diagnostic) -> public reason code.
@@ -58,6 +59,8 @@ _RUNTIME_REASONS = {
     "invalid_storage_path": "config_invalid",
     "runtime_root_ownership": "runtime_root_permissions_unsafe",
     "runtime_root_not_writable": "runtime_root_not_writable",
+    "node_identity_mismatch": "node_identity_mismatch",
+    "node_credential_unavailable": "node_credential_unavailable",
 }
 
 

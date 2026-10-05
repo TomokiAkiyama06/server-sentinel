@@ -333,6 +333,14 @@ class NodeCredentialStore:
         return generation, manifest_name
 
     def installed(self) -> bool:
+        return self.installed_node_id() is not None
+
+    def installed_node_id(self) -> UUID | None:
+        """The committed generation's node UUID after the full integrity check.
+
+        ``None`` means no identity is installed; a damaged or unreadable
+        generation raises ``PairingRefused`` (never treated as unpaired).
+        """
         root_fd = credentials_fd = None
         try:
             root_fd = open_directory(self.runtime_root)
@@ -344,14 +352,14 @@ class NodeCredentialStore:
                     dir_fd=root_fd,
                 )
             except FileNotFoundError:
-                return False
+                return None
             self._validate_directory(credentials_fd, "credential_directory_rejected")
             try:
                 manifest = self._read_file(credentials_fd, _CURRENT_MANIFEST,
                                            maximum=_MAX_MANIFEST_BYTES,
                                            expected_links=2)
             except FileNotFoundError:
-                return False
+                return None
             try:
                 value = json.loads(manifest.decode("utf-8"))
                 if (not isinstance(value, dict)
@@ -400,7 +408,7 @@ class NodeCredentialStore:
                     raise ValueError
             except (KeyError, TypeError, ValueError, UnicodeError):
                 raise PairingRefused("credential_identity_rejected") from None
-            return True
+            return UUID(value["node_id"])
         except (OSError, StorageRefused):
             raise PairingRefused("credential_storage_unavailable") from None
         finally:

@@ -435,7 +435,18 @@ def main(argv: list[str] | None = None) -> int:
         print("media-capture-agent pairing: stopped", file=sys.stderr)
         return 1
     print(f"paired: node_id={node}")
+    if args.command == "pair" and args.repair == REPAIR_REVOKED:
+        # The configuration stays a manual Owner edit; the service refuses to
+        # start (node_identity_mismatch) until it names this node.
+        print(config_update_instruction(node))
     return 0
+
+
+def config_update_instruction(node: UUID) -> str:
+    """The exact protected-configuration change after re-pairing as a new node."""
+    return (f'config_update_required: set "node_id": "{node}" in the media-capture-agent '
+            "configuration, then start the service (it refuses to start with "
+            "node_identity_mismatch until then)")
 
 
 if __name__ == "__main__":
