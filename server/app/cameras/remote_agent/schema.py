@@ -67,3 +67,19 @@ def pairing_renewal_migration(version: int) -> Migration:
         "SELECT public_key_digest, node_id, state = 'revoked' AS revoked "
         "FROM pairing_enrollments) GROUP BY public_key_digest, node_id",
     ))
+
+
+def pairing_renewal_certificate_migration(version: int) -> Migration:
+    """Issues #121/#123: keep the issued certificate of the staged renewal.
+
+    A renewal retry with the same pending key gets back the certificate that
+    was first staged for it instead of a freshly signed one, so a delayed first
+    response can never install a certificate the ledger no longer stages. The
+    column holds the public certificate PEM only (never a key or CSR) and is
+    deleted together with its staged row on promotion, re-pairing or
+    revocation. Rows staged before this migration have no certificate; their
+    next same-key retry signs and stages a certificate as before.
+    """
+    return Migration(version, "pairing_renewal_certificate", (
+        "ALTER TABLE pairing_node_renewals ADD COLUMN certificate_pem TEXT",
+    ))
