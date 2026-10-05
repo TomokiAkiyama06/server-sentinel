@@ -2335,6 +2335,365 @@ class LifecycleInventoryTests(unittest.TestCase):
                 self.assertIn({"id": expected, "reason": "invalid_value"},
                               report["sections"][section].get("failed", []))
 
+    def test_states_the_real_services_write_record_and_verify_unchanged(self):
+        # Codex P1 follow-up: the per-column rules for rows without a builder
+        # (invitations, sessions, grants, pairing) and for every segment row
+        # must accept every state the services write. Here only the real
+        # AccessStore, PairingLedger and RecordingStore write those rows, on a
+        # clock that moves forward between operations (plus one wall-clock
+        # step back, which AccessStore does not refuse), and the state must
+        # record and then verify unchanged without a single failure.
+        import zlib
+        from app.auth.model import AccessValidationError, Permission
+        from app.auth.session_binding import SessionBindingKey
+        from app.auth.store import AccessStore
+        from app.media.recording import RecordingError, RecordingStore, RootIdentity, Segment
+        from app.media.recording.model import Limits
+        from tests.test_recording import Reservation, SyntheticValidator
+        database = Database(self.runtime.database)
+        clock = [self.now - timedelta(days=3)]
+
+        def tick(**delta):
+            clock[0] += timedelta(**delta)
+            return clock[0]
+        audit = AuditStore(database, clock=lambda: clock[0])
+        access = AccessStore(database, clock=lambda: clock[0], audit=audit,
+                             unaudited_writes=True, session_binding=SessionBindingKey.generate())
+        # One shared Tailnet login for everybody: it selects no one.
+        identity = "shared-tailnet-login@example.invalid"
+        counts = {}
+
+        def material(label):
+            return hashlib.sha256(f"synthetic-{label}".encode()).digest()
+
+        def enroll(principal_id, label, *, attempts=1):
+            secret = material(f"{label}-enrollment-secret")
+            tick(minutes=1)
+            access.issue_enrollment(principal_id, secret, clock[0] + timedelta(minutes=15))
+            for attempt in range(attempts):
+                challenge = material(f"{label}-registration-{attempt}")
+                tick(seconds=20)
+                subject = access.begin_registration(secret, identity, challenge, at=clock[0],
+                                                    lifetime=timedelta(minutes=5))
+                tick(seconds=5)
+                access.consume_challenge(challenge, "registration", at=clock[0])
+            credential_id = material(f"{label}-credential-id")
+            access.enroll_credential(secret, identity, credential_id, material(f"{label}-key"),
+                                     -7, 0, invitation_id=subject.invitation_id)
+            counts[credential_id] = 0
+            return credential_id
+
+        def assertion(principal_id, credential_id, **effect):
+            counts[credential_id] += 1
+            return access.accept_assertion(
+                credential_id, principal_id, identity,
+                expected_sign_count=counts[credential_id] - 1,
+                sign_count=counts[credential_id], backup_state=False, at=clock[0], **effect)
+
+        def sign_in(principal_id, credential_id, token):
+            challenge = material(token.hex() + "-authentication")
+            tick(seconds=30)
+            access.issue_authentication_challenge(challenge, at=clock[0],
+                                                  lifetime=timedelta(minutes=5))
+            tick(seconds=3)
+            access.consume_challenge(challenge, "authentication", at=clock[0])
+            return assertion(principal_id, credential_id, token=token)
+
+        def owner_transaction(operation):
+            # What AccessAdministration runs inside its audited transaction.
+            with closing(database.connect()) as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                operation(connection)
+                connection.execute("COMMIT")
+
+        def session_rows():
+            with closing(sqlite3.connect(self.runtime.database)) as connection:
+                connection.row_factory = sqlite3.Row
+                return connection.execute("SELECT * FROM access_sessions").fetchall()
+        # The Owner signs in and steps up for an AUTH-008 operation.
+        owner = access.bootstrap_owner("Synthetic Owner")
+        owner_credential = enroll(owner.id, "owner")
+        owner_token = material("owner-session-token")
+        owner_session = sign_in(owner.id, owner_credential, owner_token)
+        tick(minutes=2)
+        access.authorize_owner(owner_token, identity)
+        tick(minutes=10)
+        challenge = material("owner-step-up")
+        access.begin_step_up(owner_token, identity, challenge, at=clock[0],
+                             lifetime=timedelta(minutes=5))
+        tick(seconds=4)
+        access.consume_challenge(challenge, "step_up", at=clock[0])
+        assertion(owner.id, owner_credential, step_up_session_id=owner_session)
+        # A principal whose credential turns inconsistent, then is revoked
+        # with a second, still open invitation.
+        gone = access.invite("Synthetic revoked viewer",
+                             (Permission.LIVE_VIEW, Permission.RECORDINGS_VIEW))
+        gone_credential = enroll(gone.id, "gone")
+        sign_in(gone.id, gone_credential, material("gone-session-token"))
+        tick(minutes=1)
+        access.issue_enrollment(gone.id, material("gone-second-secret"),
+                                clock[0] + timedelta(hours=1))
+        tick(minutes=3)
+        access.mark_credential_inconsistent(gone_credential, gone.id, at=clock[0])
+        tick(minutes=3)
+        access.revoke_principal(gone.id)
+        # An invitation attempted once, left to expire, then revoked; and one
+        # that simply lapses unredeemed.
+        pending = access.invite("Synthetic pending viewer", (Permission.LIVE_VIEW,))
+        tick(minutes=1)
+        access.issue_enrollment(pending.id, material("pending-secret"),
+                                clock[0] + timedelta(minutes=15))
+        tick(seconds=30)
+        access.begin_registration(material("pending-secret"), identity,
+                                  material("pending-challenge"), at=clock[0],
+                                  lifetime=timedelta(minutes=5))
+        tick(minutes=20)
+        access.revoke_principal(pending.id)
+        lapsed = access.invite("Synthetic lapsed viewer", (Permission.RECORDINGS_VIEW,))
+        tick(minutes=1)
+        access.issue_enrollment(lapsed.id, material("lapsed-secret"),
+                                clock[0] + timedelta(minutes=15))
+        # Every session ends and the deployment generation advances.
+        tick(minutes=1)
+        owner_transaction(lambda connection: access.invalidate_all_sessions_on(
+            connection, at=clock[0]))
+        sign_in(owner.id, owner_credential, material("owner-second-token"))
+        # A grant is withdrawn (live:view), a second credential is revoked.
+        viewer = access.invite("Synthetic recordings viewer",
+                               (Permission.LIVE_VIEW, Permission.RECORDINGS_VIEW))
+        viewer_credential = enroll(viewer.id, "viewer")
+        low_level = material("viewer-low-level-token")
+        tick(seconds=10)
+        access.establish_session(viewer.id, viewer_credential, low_level, proxy_identity=identity)
+        tick(minutes=4)
+        access.authorize(low_level, identity, Permission.LIVE_VIEW)
+        tick(minutes=4)
+        access.set_permissions(viewer.id, (Permission.RECORDINGS_VIEW,))
+        viewer_second = enroll(viewer.id, "viewer-second")
+        sign_in(viewer.id, viewer_second, material("viewer-second-token"))
+        tick(minutes=2)
+        owner_transaction(lambda connection: access.revoke_credential_on(
+            connection, viewer.id, viewer_second, at=clock[0]))
+        viewer_token = material("viewer-token")
+        sign_in(viewer.id, viewer_credential, viewer_token)
+        tick(minutes=5)
+        access.authorize(viewer_token, identity, Permission.RECORDINGS_VIEW)
+        with self.assertRaises(AccessValidationError):
+            access.authorize(viewer_token, identity, Permission.LIVE_VIEW)
+        # A live viewer (two registration attempts) whose session sees two
+        # binding mismatches (one audited, one coalesced), then is touched
+        # every 25 minutes until the idle expiry is clamped by the absolute
+        # one: touches at +2 + 25k minutes, the 28th at +702 of 720.
+        live = access.invite("Synthetic live viewer", (Permission.LIVE_VIEW,))
+        live_credential = enroll(live.id, "live", attempts=2)
+        live_token = material("live-token")
+        live_session = str(sign_in(live.id, live_credential, live_token))
+        for _ in range(2):
+            tick(minutes=1)
+            with self.assertRaises(AccessValidationError):
+                access.authorize(live_token, "another-login@example.invalid", Permission.LIVE_VIEW)
+        for _ in range(28):
+            tick(minutes=25)
+            access.authorize(live_token, identity, Permission.LIVE_VIEW)
+        # The wall clock steps back two minutes (an NTP correction) before a
+        # revocation: AccessStore keeps no monotonic floor, so the revocation
+        # and invalidation times precede the invitation and session.
+        skewed = access.invite("Synthetic skewed viewer", (Permission.LIVE_VIEW,))
+        skewed_credential = enroll(skewed.id, "skewed")
+        skewed_session = str(sign_in(skewed.id, skewed_credential, material("skewed-token")))
+        tick(seconds=30)
+        access.issue_enrollment(skewed.id, material("skewed-second-secret"),
+                                clock[0] + timedelta(minutes=15))
+        access.revoke_principal(skewed.id, now=clock[0] - timedelta(minutes=2))
+
+        # PairingLedger on its monotonic clock: renewed (one promoted, one
+        # staged), revoked, expired by a Main restart, consumed and pending.
+        monotonic = [7200.0]
+
+        def ledger():
+            return PairingLedger(database, HmacCodeVerifier(b"s" * 32), audit=audit,
+                                 clock=lambda: monotonic[0], process_epoch=uuid4())
+
+        class Owner:
+            def require_owner(self, actor_context):
+                if actor_context != "owner":
+                    raise PermissionError("synthetic denial")
+        gate = Owner()
+
+        def key(label):
+            return hashlib.sha256(f"synthetic-node-key-{label}".encode()).hexdigest()
+
+        def wait(seconds):
+            tick(seconds=seconds)
+            monotonic[0] += seconds
+        expiry = (self.now + timedelta(days=30)).timestamp()
+        main = ledger()
+
+        def approve(node, label):
+            wait(5)
+            approval, code = main.approve(gate, "owner", node_id=node,
+                                          public_key_digest=key(label))
+            wait(40)
+            return approval, code
+
+        def pair(node, label):
+            approval, code = approve(node, label)
+            claim = main.redeem(enrollment_id=approval.enrollment_id,
+                                public_key_digest=key(label), code=code.value)
+            wait(2)
+            main.activate(claim, credential_serial_digest=key(label + "-serial"),
+                          not_after=expiry)
+
+        def stage(node, current, label, not_after):
+            main.stage_renewal(node_id=node, current_public_key_digest=key(current),
+                               current_credential_digest=key(current + "-serial"),
+                               public_key_digest=key(label),
+                               credential_serial_digest=key(label + "-serial"),
+                               not_after=not_after)
+        renewed, revoked, expired, consumed, waiting = (uuid4() for _ in range(5))
+        pair(renewed, "renewed")
+        wait(3600)
+        stage(renewed, "renewed", "renewed-2", expiry + 86_400)
+        wait(30)
+        self.assertTrue(main.admits(node_id=renewed, public_key_digest=key("renewed-2"),
+                                    credential_serial_digest=key("renewed-2-serial")))
+        wait(3600)
+        stage(renewed, "renewed-2", "renewed-3", expiry + 2 * 86_400)
+        pair(revoked, "revoked")
+        wait(300)
+        main.revoke(gate, "owner", node_id=revoked)
+        approval, code = approve(expired, "expired")
+        # Main restarts before the agent redeems: the new epoch expires it.
+        main = ledger()
+        with self.assertRaises(PairingError):
+            main.redeem(enrollment_id=approval.enrollment_id, public_key_digest=key("expired"),
+                        code=code.value)
+        approval, code = approve(consumed, "consumed")
+        main.redeem(enrollment_id=approval.enrollment_id, public_key_digest=key("consumed"),
+                    code=code.value)
+        approve(waiting, "waiting")
+
+        # RecordingStore through its real publish path: spooled pre-roll, a
+        # two-source critical event with stream changes and gaps, manual
+        # clips, deadline closing and an interrupted publication.
+        media = self.runtime.root / "recordings"
+        info = media.stat()
+        connection = sqlite3.connect(self.runtime.database, isolation_level=None)
+        self.addCleanup(connection.close)
+        limits = Limits(pre_roll_bytes=4096, max_segment_bytes=512, max_segment_ms=30_000,
+                        max_active_recordings=8, max_spool_segments=16,
+                        max_segments_per_recording=100)
+
+        def open_store():
+            return RecordingStore(connection, media, RootIdentity(info.st_dev, info.st_ino),
+                                  limits, Reservation(), SyntheticValidator())
+        store = open_store()
+        self.addCleanup(lambda: store.close())
+        payload = zlib.compress(b"generated geometric test payload" * 4)
+        local, remote = UUID(self.runtime.source()), uuid4()
+        stream_a, stream_b, remote_stream = uuid4(), uuid4(), uuid4()
+        base = int((self.now - timedelta(days=2)).timestamp() * 1000)
+
+        def put(source, stream_id, sequence, start, end, node=None):
+            return store.append(Segment(source, stream_id, sequence, base + start, base + end,
+                                        "synthetic", "deflate", payload, capture_node_id=node))
+        for sequence in range(5):
+            put(local, stream_a, sequence, sequence * 10_000, (sequence + 1) * 10_000)
+        for sequence, (start, end) in enumerate(((30_000, 45_000), (45_000, 60_000))):
+            put(remote, remote_stream, sequence, start, end, renewed)
+        # Event window [40 s, 100 s] on both sources.
+        event = store.start_event(uuid4(), (local, remote), base + 55_000, pre_ms=15_000,
+                                  post_ms=45_000, critical=True)
+        put(local, stream_a, 5, 50_000, 60_000)
+        put(local, stream_b, 0, 60_000, 62_000)
+        put(local, stream_a, 10, 62_000, 70_000)
+        for sequence in range(11, 14):
+            put(local, stream_a, sequence, (sequence - 4) * 10_000, (sequence - 3) * 10_000)
+        put(remote, remote_stream, 2, 60_000, 75_000, renewed)
+        put(remote, remote_stream, 4, 77_000, 90_000, renewed)
+        put(remote, remote_stream, 5, 90_000, 100_000, renewed)
+        store.advance(base + 100_000 + limits.max_segment_ms)
+        # A starred manual clip stopped early, and one stopped inside a
+        # still-open segment (closed later by the deadline worker).
+        starred = store.start_manual(local, base + 105_000, duration_ms=20_000)
+        put(local, stream_a, 14, 100_000, 110_000)
+        put(local, stream_a, 15, 110_000, 120_000)
+        store.finish(starred, stop_ms=base + 115_000)
+        store.set_starred(starred, True)
+        late = store.start_manual(local, base + 125_000, duration_ms=30_000)
+        put(local, stream_a, 16, 120_000, 130_000)
+        self.assertEqual(store.finish(late, stop_ms=base + 135_000)["status"], "active")
+        put(local, stream_a, 17, 130_000, 140_000)
+        store.advance(base + 135_000 + limits.max_segment_ms)
+        # A remote manual clip interrupted by a crash in mid-publication:
+        # reopening removes the pending row and marks the clip interrupted.
+        crashed = store.start_manual(remote, base + 100_000, duration_ms=30_000)
+        put(remote, remote_stream, 6, 100_000, 110_000, renewed)
+        with mock.patch.object(RecordingStore, "_write", side_effect=OSError("synthetic")):
+            with self.assertRaises(RecordingError):
+                put(remote, remote_stream, 7, 110_000, 120_000, renewed)
+        store.close()
+        store = open_store()
+        store.release_source(remote)
+        # The local stream restarts as B and resumes A with its counter
+        # reset (A0 was trimmed long ago), both contiguous: zero-length
+        # markers, and linked A rows above the cursor's sequence.
+        put(local, stream_b, 1, 140_000, 142_000)
+        put(local, stream_a, 0, 142_000, 150_000)
+
+        with closing(sqlite3.connect(self.runtime.database)) as db:
+            db.row_factory = sqlite3.Row
+            statuses = {row["id"]: (row["status"], row["ended_ms"]) for row in db.execute(
+                "SELECT id, status, ended_ms FROM recordings")}
+            self.assertEqual(statuses[str(crashed)], ("interrupted", base + 110_000))
+            self.assertEqual(statuses[str(late)], ("complete", base + 135_000))
+            self.assertEqual(statuses[str(starred)], ("complete", base + 115_000))
+            self.assertTrue(all(statuses[str(item)][0] == "gapped" for item in event))
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM recording_segments "
+                                        "WHERE state='pending'").fetchone()[0], 0)
+            self.assertTrue(db.execute("SELECT 1 FROM recording_discontinuities "
+                                       "WHERE start_ms = end_ms").fetchone())
+            cursor = db.execute("SELECT stream_id, sequence FROM recording_source_cursors "
+                                "WHERE source_id=?", (str(local),)).fetchone()
+            self.assertTrue(db.execute(
+                "SELECT 1 FROM recording_segments WHERE source_id=? AND stream_id=? "
+                "AND sequence > ?", (str(local), cursor[0], cursor[1])).fetchone())
+            invitations = db.execute("SELECT * FROM access_invitations").fetchall()
+            self.assertIn(2, [row["attempt_count"] for row in invitations])
+            self.assertTrue(any(row["revoked_at_us"] is not None
+                                and row["revoked_at_us"] > row["expires_at_us"]
+                                for row in invitations))
+            self.assertTrue(any(row["revoked_at_us"] is not None
+                                and row["revoked_at_us"] < row["issued_at_us"]
+                                for row in invitations))
+        sessions = {row["id"]: row for row in session_rows()}
+        clamped = sessions[live_session]
+        self.assertGreater(clamped["last_seen_at_us"], clamped["established_at_us"])
+        self.assertLess(clamped["absolute_expires_at_us"],
+                        clamped["last_seen_at_us"] + clamped["idle_lifetime_us"])
+        self.assertEqual(clamped["idle_expires_at_us"], clamped["absolute_expires_at_us"])
+        self.assertIsNotNone(clamped["binding_mismatch_audited_at_us"])
+        self.assertEqual(clamped["binding_mismatch_suppressed"], 1)
+        self.assertGreater(sessions[str(owner_session)]["last_user_verification_at_us"],
+                           sessions[str(owner_session)]["established_at_us"])
+        self.assertLess(sessions[skewed_session]["invalidated_at_us"],
+                        sessions[skewed_session]["established_at_us"])
+        # Sessions ended by the expiry sweep keep no binding.
+        self.assertTrue(all(row["external_identity_binding"] is None
+                            for row in sessions.values() if row["invalidated_at_us"]))
+
+        baseline = self.notes / "real-services.json"
+        code, _, stderr = run("record", "--runtime-root", str(self.runtime.root),
+                              "--output", str(baseline))
+        self.assertEqual(code, inventory.EXIT_PRESERVED, stderr)
+        self.assertTrue(all(value == "present" for value in
+                            json.loads(baseline.read_text())["coverage"].values()))
+        code, report, _ = self.verify(baseline)
+        failures = {name: section.get("failed") for name, section in report["sections"].items()
+                    if isinstance(section, dict) and section.get("failed")}
+        self.assertEqual(failures, {})
+        self.assertEqual(code, inventory.EXIT_PRESERVED, report["status"])
+
     def test_presence_clocks_sessions_and_override_follow_service_transitions(self):
         self.runtime.seed()
         self.runtime.execute("INSERT INTO presence_clock VALUES (1, "

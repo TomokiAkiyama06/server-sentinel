@@ -1799,9 +1799,12 @@ def _domain_errors(connection, tables) -> list:
                 or any(type(value) is not int or value < 0 for value in ints)
                 or not row[4] < row[5] or not ended_ok):
             bad("recordings", str(row[0]))
+    # _publish() writes (cursor end, new segment start) and append() admits
+    # a segment starting exactly at the cursor end, so a stream change with
+    # no time gap leaves a zero-length marker.
     for row in rows("recording_discontinuities",
                     "SELECT recording_id, start_ms, end_ms FROM recording_discontinuities"):
-        if type(row[1]) is not int or type(row[2]) is not int or not row[1] < row[2]:
+        if type(row[1]) is not int or type(row[2]) is not int or not row[1] <= row[2]:
             bad("recordings", str(row[0]))
     for row in rows("integrity_outbox", "SELECT id, immediate, findings FROM integrity_outbox"):
         try:
@@ -1925,11 +1928,13 @@ def _service_valid_segment_row(row, cursors) -> bool:
         return row["spool"] == 0 and ("integrity" not in keys or row["integrity"] == "unchecked")
     if cursors is None:
         return True
-    # _publish() advances the source cursor with every ready segment and never
-    # moves it back: a ready segment lies at or before its source's cursor.
+    # _publish() advances the source cursor with every ready segment and
+    # append() only admits a segment starting at or after the cursor end, so
+    # a ready segment ends at or before its source's cursor. The sequence is
+    # not bounded: after a change to another stream, append() checks no
+    # sequence, so a resumed stream may restart below rows it already wrote.
     cursor = cursors.get(row["source_id"])
-    return (cursor is not None and row["end_ms"] <= cursor[3]
-            and (row["stream_id"] != cursor[1] or row["sequence"] <= cursor[2]))
+    return cursor is not None and row["end_ms"] <= cursor[3]
 
 
 def _access_row_errors(connection, tables) -> list:
@@ -1970,10 +1975,12 @@ def _access_row_errors(connection, tables) -> list:
                      and _int(issued) and _int(expires) and issued < expires
                      and _int(attempts, 0, MAX_REDEMPTION_ATTEMPTS)
                      # Redemption needs an open, unexpired invitation;
-                     # revocation only touches unredeemed ones.
+                     # revocation only touches unredeemed ones, at the
+                     # caller's clock reading with no floor (a wall clock
+                     # stepped back can revoke "before" the issue time).
                      and not (redeemed is not None and revoked is not None)
                      and (redeemed is None or (_int(redeemed) and issued <= redeemed < expires))
-                     and (revoked is None or (_int(revoked) and issued <= revoked)))
+                     and (revoked is None or _int(revoked)))
             if not valid:
                 errors.append(("access_invitations", str(row["id"])))
     if {"access_sessions", "access_credentials"} <= tables:
@@ -1999,7 +2006,11 @@ def _access_row_errors(connection, tables) -> list:
                          and idle <= absolute - established
                          # establish / touch: min(last seen + idle, absolute).
                          and row["idle_expires_at_us"] == min(seen + idle, absolute)
-                         and optional("invalidated_at_us", established)
+                         # Revocation, grant changes and invalidate-all use
+                         # the caller's clock with no floor; only user
+                         # verification and the mismatch audit need a
+                         # session current at that time.
+                         and optional("invalidated_at_us", 0)
                          and optional("last_user_verification_at_us", established)
                          and optional("binding_mismatch_audited_at_us", established)
                          and ("binding_mismatch_suppressed" not in keys
