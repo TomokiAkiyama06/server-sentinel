@@ -199,8 +199,12 @@ class ReconnectController:
         if self._profile_hold is not None:
             held, explicit = self._profile_hold
             peers = [d for d in devices if d.strong_key == held.strong_key]
-            if devices.count(held) == 1 and (explicit or held.strong_key is None
-                                               or not self.serial_ambiguous and len(peers) == 1):
+            # Compare the live instance, not the whole evidence: a rescan may
+            # refresh mutable metadata (by-id aliases, advertised formats)
+            # for the same device node, which must not release the hold.
+            instances = [d for d in devices if d.live_instance_key == held.live_instance_key]
+            if len(instances) == 1 and (explicit or held.strong_key is None
+                                        or not self.serial_ambiguous and len(peers) == 1):
                 # Same conditions as a live binding below. Nothing is opened
                 # until the profile or enablement changes (set_enabled) or
                 # the device instance changes.
