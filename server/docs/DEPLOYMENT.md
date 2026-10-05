@@ -670,13 +670,25 @@ store's `Segment.validate()` (`invalid_segment` otherwise), and be readable
 and match its catalog digest and byte length with a single hard link even if
 it was already broken at record time (reported as `catalog_mismatch`). This gate applies to every accepted change,
 including a recording active at record time whose broken segment a later
-stop drops, and a declared rewrite. A recording that was still active when recorded
-with no linked segment yet always fails (it has no evidence to compare); record
-again once it has media. Otherwise it
-may gain segments, move its target end earlier but never later, and stay
+stop drops, and a declared rewrite. A recording the store linked no segment
+to (interrupted before any segment arrived, an event over a source with no
+media, or one still active with nothing linked yet) never makes `record` fail
+(Owner decision 2026-10-05): the inventory marks it `"evidence": "no_evidence"`,
+`coverage_counts.recordings_without_evidence` counts it apart from coverage (it
+never makes an ordinary or starred recording `present`), and `verify` lists it
+under the recordings section's `no_evidence`, never as `preserved`. Only its row
+is verified: it must survive (a deleted row is `missing`) under the same
+identity, boundary, status and star rules as any other recording, and nothing
+about media is claimed for it. A recording linked to a segment that is not
+readable, ready evidence still fails as `no_readable_segment_evidence`. A
+recording active at record time
+may gain segments (one recorded with nothing linked stays under `no_evidence`,
+and its first new segment may bring one marker from an earlier, uninventoried
+cursor end to that segment's start), move its target end earlier but never later, and stay
 `active` with no end or become `complete` or `gapped` ending exactly at its
 (possibly earlier) target, or `interrupted` ending exactly at the earlier of
-its target and its latest linked segment end (startup recovery); its source,
+its target and its latest linked segment end, or at its start when none is
+linked (startup recovery); its source,
 event link, start, starred and critical flags must not change, every recorded
 discontinuity marker that still overlaps its target window must remain (a stop
 drops only those wholly outside the new boundary), new markers must be

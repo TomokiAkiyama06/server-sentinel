@@ -309,6 +309,11 @@ def _recordings(connection, tables) -> dict | None:
             "target_end_ms": row["target_end_ms"],
             "ended_ms": row["ended_ms"],
             "segment_media_ms": sum(item["media_ms"] for item in items),
+            # Owner decision 2026-10-05: a recording with no linked segment
+            # (interrupted before any segment, an event over a source with
+            # no media) is recorded explicitly as having no evidence; only
+            # its row is preserved, never media.
+            "evidence": "linked_segments" if items else "no_evidence",
             "segments": items,
             "discontinuities": discontinuities,
             "content_sha256": None,
@@ -2387,6 +2392,14 @@ def collect(runtime_root: Path, *, salt: str | None = None,
         owner_template_root, salt, os.lstat(tree.database).st_uid)
     inventory["inventory_salt"] = salt
     inventory["coverage"] = _coverage(inventory)
+    # Counted apart from coverage: a recording without evidence never makes
+    # an ordinary / starred recording "present".
+    inventory["coverage_counts"] = {
+        "recordings_with_evidence": sum(
+            1 for item in (inventory["recordings"] or {}).values() if item["segments"]),
+        "recordings_without_evidence": sum(
+            1 for item in (inventory["recordings"] or {}).values() if not item["segments"]),
+    }
     inventory["not_applicable"] = dict(NOT_APPLICABLE)
     inventory["not_inventoried"] = {name: "not_inventoried (#132)" for name in NOT_INVENTORIED}
     inventory["manual"] = dict(MANUAL)
@@ -2444,6 +2457,12 @@ def _declared_rewrite_only(base: dict, now: dict) -> bool:
             and _without_media_bytes(base) == _without_media_bytes(now))
 
 
+def _without_evidence(item: dict) -> bool:
+    """A recording the store linked no segment to (Owner decision 2026-10-05):
+    its row is kept and verified, but it is never preserved evidence."""
+    return not item["segments"]
+
+
 def _evidenced(item: dict) -> bool:
     # A link to a segment that is not 'ready' (a publication never finished)
     # is not servable evidence, so such a recording is never preserved.
@@ -2472,8 +2491,11 @@ def _valid_growth(base: dict, now: dict) -> bool:
     and the markers not in the record must be exactly those the store adds
     while publishing the newly linked segments.
     """
+    # A row without evidence may grow too (its first segment published, or
+    # closed with none); linked segments must all be readable evidence.
     if (base["status"] != "active" or now["status"] not in _ACTIVE_SUCCESSORS
-            or not _evidenced(base) or not _evidenced(now)):
+            or not (_without_evidence(base) or _evidenced(base))
+            or not (_without_evidence(now) or _evidenced(now))):
         return False
     if any(now.get(key) != base.get(key)
            for key in ("source_id", "event_id", "start_ms", "starred", "critical")):
@@ -2579,7 +2601,9 @@ def _expected_ended(now: dict) -> int | None:
         return None
     if now["status"] in ("complete", "gapped"):
         return now["target_end_ms"]
-    return min(now["target_end_ms"], max(item["end_ms"] for item in now["segments"]))
+    # COALESCE(latest linked end, start_ms): no linked segment ends it at its start.
+    return min(now["target_end_ms"], max((item["end_ms"] for item in now["segments"]),
+                                         default=now["start_ms"]))
 
 
 def _appended_publications_valid(base: dict, now: dict, remaining: Counter) -> bool:
@@ -2596,25 +2620,44 @@ def _appended_publications_valid(base: dict, now: dict, remaining: Counter) -> b
     published just before the new one. Such a marker always overlaps the
     target window, so a stop never drops it.
     """
-    recorded = {item["segment_id"] for item in base["segments"]}
     ordered = sorted(now["segments"], key=lambda item: (item["start_ms"], item["end_ms"]))
+    if not base["segments"]:
+        # Nothing was linked at record time, so the cursor before the first
+        # new segment is not inventoried: that publication may add one
+        # marker ending at the segment's start (from an earlier cursor end).
+        if not ordered:
+            return not +remaining
+        allowed = _publication_markers(ordered)
+        if allowed is None or +(allowed - remaining):
+            return False
+        extra = list((+remaining - allowed).elements())
+        return not extra or (len(extra) == 1 and extra[0][2] == "stream_discontinuity"
+                             and extra[0][0] <= extra[0][1] == ordered[0]["start_ms"])
+    recorded = {item["segment_id"] for item in base["segments"]}
     first_new = next((index for index, item in enumerate(ordered)
                       if item["segment_id"] not in recorded), len(ordered))
     if first_new == 0 or any(item["segment_id"] in recorded for item in ordered[first_new:]):
         return False
+    allowed = _publication_markers(ordered[first_new - 1:])
+    # The store adds the marker in the same transaction that links the
+    # segment, so each one must be present exactly once.
+    return allowed is not None and +remaining == allowed
+
+
+def _publication_markers(ordered: list) -> Counter | None:
+    """The markers publishing ``ordered[1:]`` after ``ordered[0]`` adds, or
+    None when that order is one append() refuses."""
     allowed: Counter = Counter()
-    for prior, segment in zip(ordered[first_new - 1:], ordered[first_new:]):
+    for prior, segment in zip(ordered, ordered[1:]):
         same_stream = segment["catalog"]["stream_id"] == prior["catalog"]["stream_id"]
         if segment["start_ms"] < prior["end_ms"] or (
                 same_stream and segment["catalog"]["sequence"] <= prior["catalog"]["sequence"]):
-            return False
+            return None
         contiguous = (same_stream
                       and segment["catalog"]["sequence"] == prior["catalog"]["sequence"] + 1)
         if not contiguous:
             allowed[(prior["end_ms"], segment["start_ms"], "stream_discontinuity")] += 1
-    # The store adds the marker in the same transaction that links the
-    # segment, so each one must be present exactly once.
-    return +remaining == allowed
+    return allowed
 
 
 def _retention_eligible(item: dict, cutoff_ms: int | None) -> bool:
@@ -2630,13 +2673,14 @@ def _compare_recordings(baseline: dict | None, current: dict | None, *,
                             rewrite_only=_declared_rewrite_only)
     if result["status"] == "empty":
         result["retention_expired"] = []
+        result["no_evidence"] = []
         return result
     if current is None:
         # The recording tables are gone or unreadable: never retention.
         retention_cutoff_ms = None
         result["failed"].append({"id": None, "reason": "table_missing"})
     current = current or {}
-    preserved, failed, in_progress = [], [], []
+    preserved, failed, in_progress, without = [], [], [], []
     # A recording automatic retention deletes (with its links and markers,
     # its unshared segments trimmed) is listed apart, never as preserved.
     retained_out = []
@@ -2647,7 +2691,10 @@ def _compare_recordings(baseline: dict | None, current: dict | None, *,
         else:
             failed.append(entry)
     for key in result["preserved"]:
-        if not _evidenced(current[key]):
+        if _without_evidence(current[key]):
+            # Its row survived unchanged; there is no media to preserve.
+            without.append(key)
+        elif not _evidenced(current[key]):
             failed.append({"id": key, "reason": "no_readable_segment_evidence"})
         elif not all(segment["catalog_match"] for segment in current[key]["segments"]):
             # Unchanged is not enough: a segment already missing its catalog
@@ -2667,7 +2714,8 @@ def _compare_recordings(baseline: dict | None, current: dict | None, *,
             continue
         if _valid_growth(base, now):
             failed.remove(entry)
-            preserved.append(key)
+            # Growth from a row without evidence keeps it out of preserved.
+            (without if _without_evidence(base) else preserved).append(key)
             in_progress.append(key)
     # The single gate every accepted transition passes (unchanged, valid
     # growth incl. an early stop's trim, declared rewrite): each segment the
@@ -2680,7 +2728,7 @@ def _compare_recordings(baseline: dict | None, current: dict | None, *,
     # store links and finish() keeps).
     rewrites = list(result["declared_rewrites"])
     for key, item in sorted(baseline.items()):
-        if key not in preserved and key not in rewrites:
+        if key not in preserved and key not in rewrites and key not in without:
             continue
         if not all(segment["catalog_match"] for segment in item["segments"]):
             reason = "catalog_mismatch"
@@ -2691,6 +2739,7 @@ def _compare_recordings(baseline: dict | None, current: dict | None, *,
         preserved = [other for other in preserved if other != key]
         in_progress = [other for other in in_progress if other != key]
         rewrites = [other for other in rewrites if other != key]
+        without = [other for other in without if other != key]
         failed.append({"id": key, "reason": reason})
     # A recording that appeared since the record is listed as appended,
     # but its segments must still be ones the store would have linked.
@@ -2699,6 +2748,7 @@ def _compare_recordings(baseline: dict | None, current: dict | None, *,
             failed.append({"id": key, "reason": "invalid_segment"})
     result.update(status="failed" if failed else "preserved",
                   preserved=sorted(preserved), failed=failed,
+                  no_evidence=sorted(without),
                   declared_rewrites=rewrites,
                   in_progress_at_record=sorted(in_progress),
                   retention_expired=sorted(retained_out))
@@ -3233,6 +3283,9 @@ def _summary_record(inventory: dict) -> list[str]:
                      "missing or differ from the catalog digest")
     for key, value in inventory["coverage"].items():
         lines.append(f"coverage {key}: {value}")
+    without = inventory.get("coverage_counts", {}).get("recordings_without_evidence", 0)
+    lines.append(f"coverage recordings_without_evidence: {without} "
+                 "(row only, not counted as preserved evidence)")
     for key, value in {**inventory["not_applicable"], **inventory["not_inventoried"],
                        **inventory["manual"]}.items():
         lines.append(f"{key}: {value}")
@@ -3249,7 +3302,9 @@ def _summary_verify(report: dict) -> list[str]:
             f"failed={len(section['failed'])} appended={len(section.get('appended', []))} "
             f"declared_rewrites={len(section.get('declared_rewrites', []))} "
             f"retention_expired={len(section.get('retention_expired', []) or (section.get('audit') or {}).get('retention_expired', []))} "
-            f"released={len(section.get('released', []))}")
+            f"released={len(section.get('released', []))}"
+            + (f" no_evidence={len(section['no_evidence'])}" if "no_evidence" in section
+               else ""))
     for key in report["empty_coverage"]:
         lines.append(f"coverage {key}: empty (not counted as preserved)")
     for key, value in {**report["not_applicable"], **report["not_inventoried"],

@@ -2694,6 +2694,114 @@ class LifecycleInventoryTests(unittest.TestCase):
         self.assertEqual(failures, {})
         self.assertEqual(code, inventory.EXIT_PRESERVED, report["status"])
 
+    def test_recordings_without_evidence_are_recorded_and_their_rows_verified(self):
+        # Owner decision 2026-10-05: a recording the real RecordingStore
+        # linked no segment to (interrupted before any segment, an event over
+        # a source with no media) never refuses record. It is listed as
+        # having no evidence, counted apart from coverage, never preserved
+        # evidence; verify only needs its row to survive under the usual
+        # identity / status rules (starring it during the update fails).
+        import zlib
+        from app.media.recording import RecordingStore, RootIdentity, Segment
+        from app.media.recording.model import Limits
+        from tests.test_recording import Reservation, SyntheticValidator
+        self.runtime.seed()
+        media = self.runtime.root / "recordings"
+        info = media.stat()
+        connection = sqlite3.connect(self.runtime.database, isolation_level=None)
+        self.addCleanup(connection.close)
+        limits = Limits(pre_roll_bytes=4096, max_segment_bytes=512, max_segment_ms=30_000,
+                        max_active_recordings=8, max_spool_segments=16,
+                        max_segments_per_recording=100)
+
+        def open_store():
+            return RecordingStore(connection, media, RootIdentity(info.st_dev, info.st_ino),
+                                  limits, Reservation(), SyntheticValidator())
+        store = open_store()
+        self.addCleanup(lambda: store.close())
+        payload = zlib.compress(b"generated geometric test payload" * 4)
+        base = int((self.now - timedelta(days=2)).timestamp() * 1000)
+        local, silent, remote, quiet, fresh = (uuid4() for _ in range(5))
+        stream_a, stream_b, fresh_stream = uuid4(), uuid4(), uuid4()
+
+        def put(source, stream_id, sequence, start, end):
+            store.append(Segment(source, stream_id, sequence, base + start, base + end,
+                                 "synthetic", "deflate", payload))
+        put(local, stream_a, 0, 0, 10_000)
+        # An event over a source with media and one with none.
+        with_media, without_media = store.start_event(uuid4(), (local, silent), base + 15_000,
+                                                      pre_ms=10_000, post_ms=10_000)
+        put(local, stream_a, 1, 10_000, 20_000)
+        put(local, stream_a, 2, 20_000, 30_000)
+        store.advance(base + 25_000 + limits.max_segment_ms)
+        # A clip interrupted (Main restart) before any segment arrived.
+        interrupted = store.start_manual(remote, base + 40_000, duration_ms=20_000)
+        store.close()
+        store = open_store()
+        # Still active at record time with nothing linked: one closes with
+        # no media, one gets its first segment on a fresh source, one on
+        # the local source after a stream change (a marker from an unlinked
+        # cursor end).
+        closes_empty = store.start_manual(quiet, base + 60_000, duration_ms=20_000)
+        grows = store.start_manual(fresh, base + 60_000, duration_ms=20_000)
+        switches = store.start_manual(local, base + 60_000, duration_ms=20_000)
+        without = sorted(str(item) for item in (without_media, interrupted, closes_empty,
+                                                 grows, switches))
+        with closing(sqlite3.connect(self.runtime.database)) as db:
+            rows = dict(db.execute("SELECT id, status FROM recordings"))
+        self.assertEqual(rows[str(without_media)], "gapped")
+        self.assertEqual(rows[str(interrupted)], "interrupted")
+
+        code, baseline = self.record("no-evidence.json")
+        self.assertEqual(code, inventory.EXIT_PRESERVED)
+        recorded = json.loads(baseline.read_text())
+        self.assertEqual(sorted(key for key, item in recorded["recordings"].items()
+                                if item["evidence"] == "no_evidence"), without)
+        self.assertEqual(recorded["coverage_counts"]["recordings_without_evidence"], 5)
+        code, report, stdout = self.verify(baseline)
+        section = report["sections"]["recordings"]
+        self.assertEqual(code, inventory.EXIT_PRESERVED, section)
+        self.assertEqual(section["no_evidence"], without)
+        self.assertFalse(set(without) & set(section["preserved"]))
+        self.assertIn(str(with_media), section["preserved"])
+        self.assertIn("no_evidence=5", stdout)
+        # The active rows move on as the store moves them.
+        put(fresh, fresh_stream, 0, 62_000, 70_000)
+        put(local, stream_b, 0, 64_000, 72_000)
+        store.advance(base + 80_000 + limits.max_segment_ms)
+        code, report, _ = self.verify(baseline)
+        section = report["sections"]["recordings"]
+        self.assertEqual(code, inventory.EXIT_PRESERVED, section)
+        self.assertEqual(section["no_evidence"], without)
+        self.assertEqual(sorted(section["in_progress_at_record"]),
+                         sorted(str(item) for item in (closes_empty, grows, switches)))
+        with closing(sqlite3.connect(self.runtime.database)) as db:
+            self.assertEqual(db.execute(
+                "SELECT start_ms, end_ms FROM recording_discontinuities WHERE recording_id=?",
+                (str(switches),)).fetchall(), [(base + 30_000, base + 64_000)])
+        # A marker no publication of the first segment adds is not growth.
+        self.runtime.execute("INSERT INTO recording_discontinuities VALUES "
+                             "(?, ?, ?, 'stream_discontinuity')",
+                             (str(grows), base + 60_000, base + 61_000))
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(report["sections"]["recordings"]["failed"],
+                         [{"id": str(grows), "reason": "changed"}])
+        self.runtime.execute("DELETE FROM recording_discontinuities WHERE recording_id=?",
+                             (str(grows),))
+        # Starring one during the update is a change; losing a row fails.
+        store.set_starred(interrupted, True)
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_FAILED)
+        self.assertEqual(report["sections"]["recordings"]["failed"],
+                         [{"id": str(interrupted), "reason": "changed"}])
+        store.set_starred(interrupted, False)
+        self.runtime.execute("DELETE FROM recordings WHERE id=?", (str(without_media),))
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_FAILED)
+        self.assertEqual(report["sections"]["recordings"]["failed"],
+                         [{"id": str(without_media), "reason": "missing"}])
+        self.assertNotIn(str(without_media), report["sections"]["recordings"]["no_evidence"])
+
     def test_presence_clocks_sessions_and_override_follow_service_transitions(self):
         self.runtime.seed()
         self.runtime.execute("INSERT INTO presence_clock VALUES (1, "
