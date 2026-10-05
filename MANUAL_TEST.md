@@ -401,8 +401,16 @@ code with the reviewed runtime installed. `AGENT_CLI` means
    `MAIN_CLI init --authority-dir <ca_dir> --listener-dir <listener_dir> --server-name <dns name>`
    with both directories outside the checkout and media trees. Confirm both are
    0700 and every file 0600, owned by that account, and that the two directories
-   differ. (A separate ingest service account that cannot read the CA key is
-   #14/#15 deployment work; the CLI itself keeps both under the admin account.)
+   differ. Separate-account variant (Issue #124, `server/docs/DEPLOYMENT.md`):
+   on a disposable deployment with a dedicated non-root ingest account, run the
+   same `init` as root with `--listener-owner <ingest account>`; confirm the
+   listener directory and both files are owned by the ingest account (0700 /
+   0600), that the ingest account can read them and cannot open `<ca_dir>`,
+   and that the same command run as a non-root account without
+   `CAP_CHOWN`/`CAP_DAC_OVERRIDE` refuses `listener_owner_requires_privilege`
+   and leaves no CA or listener file behind. If a non-root CA account with
+   only those ambient capabilities is used instead of root, record that it
+   works.
 2. Choose the bootstrap endpoint: the Main's private-LAN IP and a port distinct
    from the dashboard (loopback-only) and any ingest port. Run
    `MAIN_CLI export-bundle --authority-dir <ca_dir> --listener-dir <listener_dir> --endpoint <ip>:<port> --output bundle.json`
@@ -477,6 +485,33 @@ code with the reviewed runtime installed. `AGENT_CLI` means
     the credential expires, the node must re-pair. Block renewal (for example
     stop the Main) until the 14-day threshold and confirm the Owner sees a
     `capture_credential_warning`. *(needs transport wiring and a scheduler)*
+15. Main listener certificate rotation (Issue #125), on a disposable
+    deployment after step 7: record the listener `not_after`, run
+    `MAIN_CLI rotate-listener --authority-dir <ca_dir> --listener-dir <listener_dir>`
+    (plus `--listener-owner` if used in step 1) and confirm it prints a new
+    `not_after` about 397 days ahead, that `<ca_dir>` and the exported bundle's
+    SHA-256 are unchanged, that the listener directory again holds exactly the
+    two 0600 files with the expected owner and no `*.next` file, and that the
+    key file's SHA-256 changed (compare hashes; never print the key). Restart the listener process, then confirm the
+    already-paired Agent connects with its existing trust bundle and no Agent
+    change *(needs ingest wiring, #14/#15)*; until then, rerun `approve` with
+    a fresh request and confirm `AGENT_CLI pair` with the unchanged bundle
+    authenticates the rotated certificate. Negative checks: running
+    `rotate-listener` with another deployment's `--authority-dir` refuses
+    `listener_authority_mismatch` and changes nothing; two `rotate-listener`
+    (or `init`) runs started together on the same listener directory leave
+    exactly one winner and the other refuses `issuer_material_busy`. Re-running
+    `approve` within a minute of a completed one binds again (no
+    `enrollment_listener_bind_failed` from TIME_WAIT), while a second
+    `approve` on the same `--listen` socket during a running one is refused.
+16. CA validity (Issue #127), on a disposable deployment created with
+    `--ca-validity-days 100 --server-validity-days 30`: `rotate-listener`
+    with the default validity and `approve` refuse
+    `deployment_ca_validity_insufficient` before any approval or code is
+    shown; `rotate-listener --server-validity-days 30` succeeds. A node
+    renewal against such a CA is refused `renewal_ca_validity_insufficient`
+    and the Owner sees `capture_trust_warning`, not the per-node warning
+    *(needs transport wiring and a scheduler)*.
 
 Record the Main/Agent OS, Python, OpenSSL (`cryptography` reports 4.0.2 from its
 wheel) and architecture used, without private deployment values.

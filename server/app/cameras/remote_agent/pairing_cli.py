@@ -4,6 +4,7 @@ Run as the local account that owns the deployment CA directory, the Main
 listener directory and the application database::
 
     python -m app.cameras.remote_agent.pairing_cli init ...
+    python -m app.cameras.remote_agent.pairing_cli rotate-listener ...
     python -m app.cameras.remote_agent.pairing_cli export-bundle ...
     python -m app.cameras.remote_agent.pairing_cli approve ...
     python -m app.cameras.remote_agent.pairing_cli list ...
@@ -28,6 +29,20 @@ gate is the local host itself -- the operating-system account that can open the
 owner-only (0700/0600) issuer material and database -- plus an explicit typed
 confirmation on the controlling terminal for each approve/revoke. Each
 confirmation authorizes exactly one ledger call, which records the audit row.
+
+Separate accounts (Issue #124): ``--listener-owner`` names the OS account that
+owns the Main listener directory when it differs from the account running the
+CLI (for example a dedicated ingest service account that must never read the
+CA key). New listener files are then created owned by that account. Writing
+there needs effective ``CAP_CHOWN`` and ``CAP_DAC_OVERRIDE`` (root has both),
+and reading it needs ``CAP_DAC_OVERRIDE`` or ``CAP_DAC_READ_SEARCH``; without
+them the command refuses with ``listener_owner_requires_privilege`` before
+anything is written.
+
+``rotate-listener`` (Issue #125) replaces the Main listener key and
+certificate before the leaf expires. The deployment CA and the server name do
+not change, so Agents keep their trust bundle; restart the listener processes
+so they load the new pair.
 """
 from __future__ import annotations
 
@@ -39,6 +54,7 @@ import json
 import logging
 import os
 from pathlib import Path
+import pwd
 import secrets
 import stat
 import sys
@@ -55,8 +71,8 @@ from .enrollment import (
     EnrollmentService, build_enrollment_server_context,
 )
 from .node_ca import (
-    MAX_CA_VALIDITY, MAX_CSR_BYTES, MAX_LEAF_VALIDITY, CaptureAuthorityError,
-    DeploymentAuthority,
+    DEFAULT_NODE_VALIDITY, MAX_CA_VALIDITY, MAX_CSR_BYTES, MAX_LEAF_VALIDITY,
+    CaptureAuthorityError, DeploymentAuthority,
     PrivateDirectory, deployment_id_of, listener_material, main_server_name,
 )
 from .pairing import HmacCodeVerifier, PairingError, PairingLedger
@@ -162,11 +178,28 @@ def _ip_endpoint(value: str) -> tuple[str, int]:
     return host, port
 
 
-def _directory(value: Path) -> PrivateDirectory:
+def _account(value: str) -> int:
+    """An OS account name or numeric UID for ``--listener-owner``."""
+    if value.isascii() and value.isdecimal():
+        uid = int(value)
+        if uid >= 2 ** 32 - 1:
+            raise argparse.ArgumentTypeError("expected an account name or UID")
+        return uid
     try:
-        return PrivateDirectory(Path(value))
+        return pwd.getpwnam(value).pw_uid
+    except (KeyError, ValueError, OverflowError):
+        raise argparse.ArgumentTypeError("unknown account") from None
+
+
+def _directory(value: Path, *, owner_uid: int | None = None) -> PrivateDirectory:
+    try:
+        return PrivateDirectory(Path(value), owner_uid=owner_uid)
     except CaptureAuthorityError:
         raise CliRefused("private_directory_rejected") from None
+
+
+def _listener_directory(args) -> PrivateDirectory:
+    return _directory(args.listener_dir, owner_uid=args.listener_owner)
 
 
 def _ledger(database_path: Path) -> PairingLedger:
@@ -250,7 +283,7 @@ def _days(value: int, maximum: datetime.timedelta) -> datetime.timedelta:
 
 def command_init(args) -> int:
     authority_directory = _directory(args.authority_dir)
-    listener_directory = _directory(args.listener_dir)
+    listener_directory = _listener_directory(args)
     if authority_directory.path == listener_directory.path:
         raise CliRefused("listener_directory_must_differ")
     # Everything is validated before the write-once CA exists; a failed run
@@ -269,9 +302,25 @@ def _authority(args) -> DeploymentAuthority:
     return DeploymentAuthority.load(directory, deployment_id_of(directory))
 
 
+def command_rotate_listener(args) -> int:
+    listener_directory = _listener_directory(args)
+    if _directory(args.authority_dir).path == listener_directory.path:
+        raise CliRefused("listener_directory_must_differ")
+    authority = _authority(args)
+    rotation = authority.rotate_main_server_credential(
+        listener_directory, validity=_days(args.server_validity_days, MAX_LEAF_VALIDITY))
+    expiry = rotation.not_after.isoformat(timespec="seconds")
+    if rotation.recovered:
+        print(f"listener rotation completed (interrupted run): not_after={expiry}")
+    else:
+        print(f"listener rotated: not_after={expiry}")
+    print("restart the capture ingest listener to load the new certificate")
+    return 0
+
+
 def command_export_bundle(args) -> int:
     authority = _authority(args)
-    server_name = main_server_name(_directory(args.listener_dir))
+    server_name = main_server_name(_listener_directory(args))
     host, port = args.endpoint
     bundle = authority.export_trust_bundle(server_name=server_name, endpoint_host=host,
                                            endpoint_port=port)
@@ -286,7 +335,10 @@ def command_approve(args) -> int:
     terminal = ControllingTerminal()
     try:
         authority = _authority(args)
-        material = listener_material(_directory(args.listener_dir))
+        # Refuse before any approval when the CA can no longer cover a node
+        # leaf; the code would otherwise be burned by a failed issuance.
+        authority.check_leaf_validity(DEFAULT_NODE_VALIDITY)
+        material = listener_material(_listener_directory(args))
         csr, digest = parse_enrollment_request(
             _read_public_file(args.request, MAX_REQUEST_FILE_BYTES))
         del csr  # the Agent resubmits its CSR over TLS; the ledger stores only the digest
@@ -382,6 +434,9 @@ def _parser() -> argparse.ArgumentParser:
         prog="serversentinel-pairing",
         description="Local Owner administration of capture-node pairing (ADR-0006).")
     commands = parser.add_subparsers(dest="command", required=True)
+    listener_owner_help = ("account (name or UID) owning --listener-dir when it differs from "
+                           "the account running this command; needs CAP_CHOWN and "
+                           "CAP_DAC_OVERRIDE (for example root)")
 
     init = commands.add_parser("init", help="create the deployment CA and Main listener certificate")
     init.add_argument("--authority-dir", type=Path, required=True)
@@ -389,7 +444,17 @@ def _parser() -> argparse.ArgumentParser:
     init.add_argument("--server-name", required=True)
     init.add_argument("--ca-validity-days", type=int, default=3650)
     init.add_argument("--server-validity-days", type=int, default=MAX_LEAF_VALIDITY.days)
+    init.add_argument("--listener-owner", type=_account, default=None, help=listener_owner_help)
     init.set_defaults(handler=command_init)
+
+    rotate = commands.add_parser(
+        "rotate-listener",
+        help="replace the Main listener key and certificate; the CA and Agent trust are kept")
+    rotate.add_argument("--authority-dir", type=Path, required=True)
+    rotate.add_argument("--listener-dir", type=Path, required=True)
+    rotate.add_argument("--server-validity-days", type=int, default=MAX_LEAF_VALIDITY.days)
+    rotate.add_argument("--listener-owner", type=_account, default=None, help=listener_owner_help)
+    rotate.set_defaults(handler=command_rotate_listener)
 
     export = commands.add_parser("export-bundle", help="write the public trust bundle")
     export.add_argument("--authority-dir", type=Path, required=True)
@@ -397,6 +462,7 @@ def _parser() -> argparse.ArgumentParser:
     export.add_argument("--endpoint", type=_endpoint, required=True,
                         help="bootstrap enrollment endpoint HOST:PORT the Agent connects to")
     export.add_argument("--output", type=Path, required=True)
+    export.add_argument("--listener-owner", type=_account, default=None, help=listener_owner_help)
     export.set_defaults(handler=command_export_bundle)
 
     approve = commands.add_parser("approve", help="approve one enrollment request and serve it")
@@ -411,6 +477,7 @@ def _parser() -> argparse.ArgumentParser:
     approve.add_argument("--human-port", type=int, default=8000,
                          help="port of the human dashboard listener (SERVERSENTINEL_HUMAN_PORT)")
     approve.add_argument("--ingest-listen", type=_ip_endpoint, default=None)
+    approve.add_argument("--listener-owner", type=_account, default=None, help=listener_owner_help)
     approve.set_defaults(handler=command_approve)
 
     listing = commands.add_parser("list", help="list capture-node pairing states")
@@ -433,8 +500,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"serversentinel-pairing: refused: {error.reason}", file=sys.stderr)
     except EnrollmentError as error:
         print(f"serversentinel-pairing: refused: {error.reason}", file=sys.stderr)
-    except CaptureAuthorityError:
-        print("serversentinel-pairing: refused: issuer_material_rejected", file=sys.stderr)
+    except CaptureAuthorityError as error:
+        # A fixed word per failure class; never a path, key or certificate.
+        print(f"serversentinel-pairing: refused: {error.reason}", file=sys.stderr)
     except PairingError:
         print("serversentinel-pairing: refused: pairing_ledger_refused", file=sys.stderr)
     except KeyboardInterrupt:

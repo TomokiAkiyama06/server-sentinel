@@ -509,6 +509,52 @@ class CaptureEnrollmentScenario(unittest.TestCase):
         self.assertEqual(0, status, error)
         self.assertEqual(1, output.count("node_id="), "a retry creates no second pairing")
 
+    def test_listener_rotation_keeps_the_bundle_and_paired_agents(self):
+        # Issue #125: rotating the Main listener leaf keeps the CA, so the
+        # exported bundle is byte-identical and a paired Agent's existing
+        # trust authenticates the new certificate without any Agent change.
+        listen_port = free_port()
+        deployment, bundle, bundle_digest = self.initialise_main(listen_port)
+        request, key_digest = self.agent_request()
+        main, grouped = self.start_approval(request, listen_port, key_digest)
+        main.wait_for(b"Type it only")
+        agent = self.agent_cli("pair", "--runtime-root", self.runtime, "--trust-bundle", bundle,
+                               "--bundle-sha256", bundle_digest)
+        agent.wait_for(b"Pairing code: ")
+        agent.type(grouped + b"\n")
+        status, output, error = agent.finish()
+        self.assertEqual(0, status, error)
+        node = UUID(re.fullmatch(r"paired: node_id=(\S+)\n", output).group(1))
+        status, _main_output, main_error = main.finish()
+        self.assertEqual(0, status, main_error)
+
+        certificate = self.listener_dir / "main-server-certificate.pem"
+        before = certificate.read_bytes()
+        status, output, error = self.main_cli(
+            "rotate-listener", "--authority-dir", self.authority_dir,
+            "--listener-dir", self.listener_dir, tty=False).finish()
+        self.assertEqual(0, status, error)
+        self.assertRegex(output, r"^listener rotated: not_after=\S+\n")
+        self.assertNotEqual(before, certificate.read_bytes())
+        self.assertEqual(["main-server-certificate.pem", "main-server-key.pem"],
+                         sorted(os.listdir(self.listener_dir)))
+        again = self.exchange / "bundle-after-rotation.json"
+        status, output, error = self.main_cli(
+            "export-bundle", "--authority-dir", self.authority_dir,
+            "--listener-dir", self.listener_dir, "--endpoint", f"127.0.0.1:{listen_port}",
+            "--output", again, tty=False).finish()
+        self.assertEqual(0, status, error)
+        self.assertEqual(f"trust_bundle_sha256={bundle_digest}\n", output)
+        self.assertEqual(bundle.read_bytes(), again.read_bytes())
+
+        # The "restarted" ingest listener loads the rotated pair; the Agent
+        # connects with the trust it stored at pairing time.
+        session, result = self.ingest_connect(deployment)
+        self.assertEqual("ok", result)
+        self.assertNotIsInstance(session, str, session)
+        self.addCleanup(session.close)
+        self.assertEqual(node, session.identity.node_id)
+
     def test_untrusted_or_plaintext_main_never_receives_a_code(self):
         deployment, bundle, bundle_digest = self.initialise_main(free_port())
         self.agent_request()

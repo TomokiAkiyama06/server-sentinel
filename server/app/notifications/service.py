@@ -24,6 +24,10 @@ class NotificationKind(StrEnum):
     # Capture-node certificate approaching expiry without renewal, expired, or
     # a refused renewal (Issue #13). Local Owner-visible warning only.
     CAPTURE_CREDENTIAL_WARNING = "capture_credential_warning"
+    # The deployment capture-node CA or the Main ingest listener certificate is
+    # expiring, or the CA is too close to expiry to issue/renew node leaves at
+    # the configured validity (Issues #125/#127). Local Owner-visible warning.
+    CAPTURE_TRUST_WARNING = "capture_trust_warning"
     PERSON = "person"
     MOTION = "motion"
     ENTRY = "entry"
