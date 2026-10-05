@@ -123,6 +123,53 @@ class SessionTests(unittest.TestCase):
         self.assertEqual(self.controller.state, CameraState.MANUAL)
 
 
+    def test_weak_live_binding_survives_metadata_refresh(self):
+        weak = replace(self.camera, serial=None, instance_token=(1, 2, 3))
+        self.discovery.devices = [weak]
+        self.controller.approve(weak, [weak])
+        self.assertTrue(self.session.step())
+        capture = self.session.capture
+        refreshed = replace(weak, by_id=("synthetic-alias",), formats=("MJPG", "YUYV"))
+        self.discovery.devices = [refreshed]
+        for _ in range(3):
+            self.assertTrue(self.session.step())
+        self.assertIs(capture, self.session.capture)
+        self.assertFalse(capture.closed)
+        self.assertEqual(CameraState.ONLINE, self.controller.state)
+        self.assertFalse(self.controller.requires_approval)
+        # The stored binding evidence is refreshed from the scan entry.
+        self.assertEqual(refreshed, self.controller.bound)
+        # An actual instance change still ends the weak binding and never
+        # auto-binds the indistinguishable replacement.
+        self.discovery.devices = [replace(refreshed, instance_token=(4, 5, 6))]
+        self.assertFalse(self.session.step())
+        self.assertTrue(capture.closed)
+        self.assertFalse(self.session.step())
+        self.assertEqual(CameraState.MANUAL, self.controller.state)
+        self.assertIsNone(self.session.capture)
+
+    def test_metadata_refresh_during_open_verification_still_opens(self):
+        weak = replace(self.camera, serial=None, instance_token=(1, 2, 3))
+        refreshed = replace(weak, by_id=("synthetic-alias",))
+        scans = iter([[weak], [refreshed]])
+        self.discovery.scan = lambda: DiscoveryResult(tuple(next(scans, [refreshed])), 0)
+        self.controller.approve(weak, [weak])
+        self.assertTrue(self.session.step())
+        self.assertEqual(CameraState.ONLINE, self.controller.state)
+
+    def test_ambiguous_serial_live_binding_survives_metadata_refresh(self):
+        live = replace(self.camera, instance_token=(1, 2, 3))
+        twin = replace(live, device_path="/dev/video1", instance_token=(1, 3, 4))
+        self.discovery.devices = [live, twin]
+        self.controller.approve(twin, self.discovery.devices)
+        self.assertTrue(self.session.step())
+        capture = self.session.capture
+        self.discovery.devices = [live, replace(twin, formats=("MJPG",))]
+        self.assertTrue(self.session.step())
+        self.assertIs(capture, self.session.capture)
+        self.assertEqual(twin.live_instance_key, self.controller.bound.live_instance_key)
+        self.assertEqual(CameraState.ONLINE, self.controller.state)
+
 class CountingDiscovery(Discovery):
     def __init__(self, devices):
         super().__init__(devices)

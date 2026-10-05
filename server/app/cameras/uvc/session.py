@@ -2,6 +2,7 @@
 
 from .capture import CaptureError, MmapCapture, profile_satisfies
 from .discovery import ProbeError
+from .identity import current_live_instance, same_live_instance
 
 
 class CaptureSession:
@@ -48,7 +49,7 @@ class CaptureSession:
         current = self.discovery.scan()
         if current.failures:
             return False
-        return self.controller.reconcile(current.devices) == candidate
+        return same_live_instance(self.controller.reconcile(current.devices), candidate)
 
     def step(self, *, timeout=1.0):
         """Deliver at most one frame, returning False on offline/manual/failure."""
@@ -66,7 +67,8 @@ class CaptureSession:
             return False
         try:
             scan = self.discovery.scan()
-            if self.capture is not None and self.controller.bound not in scan.devices:
+            if (self.capture is not None and (self.controller.bound is None or current_live_instance(
+                    scan.devices, self.controller.bound) is None)):
                 self.close()
                 self.controller.disconnected()
                 return False
