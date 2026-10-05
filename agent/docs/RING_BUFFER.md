@@ -155,35 +155,63 @@ therefore predicts refusal by simulating the sources' next appends.
   a steady full ring that keeps accepting writes as refused. A simulated
   segment is credited once it ages out only for a source whose next interval
   is known (not overdue) and outside any retained incident.
-- **Charge `e`.** Each simulated append is charged, and frees once it ages
-  out, that source's recent real allocation: the largest allocation among its
-  last eight stored segments, in whole allocation units, never above
-  `round_up(max_segment)`, and `round_up(max_segment)` without history.
-  `max_segment` is the source's largest bounded segment. Each source's appends
-  form an arithmetic sequence, so the charges through any instant are
-  computed directly and only the latest append between two credit changes
-  needs checking: the work is bounded by stored rows and sources, not by
-  cadence ratios.
+- **Recent real allocations.** For each source the last eight stored
+  segments' real allocations give a mean `m`, a sample variance `v`, a
+  minimum and a maximum `c` in whole allocation units (`c` never above
+  `round_up(max_segment)`, where `max_segment` is the source's largest
+  bounded segment). With fewer than four stored segments `m = c` and `v = 0`
+  (a spread from so few samples is not trusted); without history
+  `m = c = round_up(max_segment)`. A simulated append that ages out is
+  credited the source's smallest recent allocation.
+- **Charge `C(t)`** (Issue #130). All simulated appends at or before `t`,
+  `n_s` of each source `s`, are charged together:
+  `C(t) = min(sum(n_s * c_s), round_up(ceil(sum(n_s * m_s)) + ceil(2 * sqrt(sum(n_s * v_s)))))`,
+  the mean of their total plus two standard deviations of that total
+  (variances add over appends), never above every append at its source's
+  recent maximum. Charging every append the recent maximum, as before
+  Issue #130, let segment-size variance compound across sources and chained
+  appends: with variable VBR near the reserve, status read a hard stop on
+  many samples while every write still succeeded. Each source's appends form
+  an arithmetic sequence, so the counts through any instant are computed
+  directly and only the latest append between two credit changes needs
+  checking: the work is bounded by stored rows and sources, not by cadence
+  ratios.
 - **`STORAGE_HARD_STOP / segment_write_refused_at_reserve`** (writes refused
   at the recent real bitrate). Appends at the same instant form one batch that
   must fit as a whole, so the result never depends on profile order. Status
   reports this hard stop when, at any simulated batch time `t`,
-  `free + R(t) - consumed_before(t) < reserve + round_up(sum(e) + L)`, where
-  `consumed_before(t)` sums `e` over earlier batches. Charging every chained
+  `free + R(t) - C(t) < reserve + round_up(L)`. Charging every chained
   append the bound here would make two or more sources writing ordinary VBR
   below the bound read as refused in a steady FIFO that accepts every write.
   While the predicted next appends are refused at the recent bitrate it is
   never reported as pressure or healthy, and it clears without Owner action
-  as soon as space returns. Two known gaps: right after a refusal the refused
-  segment's `missing` row counts as that source's last write, so until the
-  next refusal is imminent again status may read `STORAGE_PRESSURE`; and a
-  segment larger than the source's recent maximum can be refused while status
-  read only the at-risk pressure below. In both cases the append itself is
-  refused, never written past the reserve.
+  as soon as space returns. Appends whose real total through `t` is at most
+  `C(t)` are refused only after status read this hard stop. Two known gaps: right after
+  a refusal the refused segment's `missing` row counts as that source's last
+  write, so until the next refusal is imminent again status may read
+  `STORAGE_PRESSURE`; and a batch larger than `C(t)` (a bitrate spike above
+  the recent estimate) can be refused while status read only the at-risk
+  pressure below. In both cases the append itself is refused, never written
+  past the reserve, and status is never healthy beforehand.
+- **Measured trade-off** (seeded synthetic sizes, mock filesystem quota,
+  `agent/tests/test_ring_variable_sizes.py`; not a real-disk measurement).
+  Segments vary around half their bound (normal, standard deviation 8 % of
+  the bound) in a 600 s duration FIFO near the reserve. False hard stops
+  (hard stop read before a step whose every write succeeded), before → after:
+  two 60 s sources 47 → 41 of 400 samples, four 60 s sources 26 → 8 of 120,
+  a 10 s and a 60 s source 96 → 55 of 360. Every real refusal in those runs
+  (9, 1 and 5) was preceded by a hard stop both before and after. With 10 %
+  spikes up to the bound, 1 of 17 refusals followed only the maximum-bitrate
+  pressure, before and after. A wider exploratory sweep over more seeds and
+  margins found 1 refusal (mixed cadence) after pressure instead of hard stop
+  that the old charge had announced, and none healthy. Same-cadence two-source
+  rings gain least: the sum of two recent maxima is already close to the
+  two-deviation bound, and when segments differ by only one or two
+  allocation units, rounding leaves the charge unchanged.
 - **`STORAGE_PRESSURE / segment_write_at_risk_at_maximum_bitrate`** (writes
   would be refused only if the bitrate rose to the bound). The same
-  simulation with every `e` replaced by `round_up(max_segment)`, that is
-  `free + R(t) - consumed_before(t) < reserve + round_up(sum(round_up(max_segment)) + L)`,
+  simulation with every append charged `round_up(max_segment)`, that is
+  `free + R(t) - sum(n_s * round_up(max_segment_s)) < reserve + round_up(L)`,
   is not a hard stop. It is reported as this pressure reason unless an
   earlier pressure reason such as `post_loss_headroom_reduced` already
   applies, and never as healthy.

@@ -6,8 +6,10 @@ bitrate/cadence bounds. This module does not decode media or open camera devices
 
 from contextlib import contextmanager
 from dataclasses import asdict
+from fractions import Fraction
 import hashlib
 import json
+import math
 import os
 import sqlite3
 import threading
@@ -19,9 +21,15 @@ from .ring_models import (DenyControls, MAX_INTEGER, POST, PRE, RETENTION, SECON
 from .storage import StorageRefused
 
 
-# Stored segments per source whose largest real allocation estimates the
-# space each further simulated append consumes in the next-write check.
+# Stored segments per source whose real allocations estimate the space each
+# further simulated append consumes in the next-write check (Issue #130).
 RECENT_ALLOCATION_SEGMENTS = 8
+# Fewer recent allocations than this are charged their maximum: a spread
+# estimated from so few samples is not trusted.
+MINIMUM_SPREAD_SAMPLES = 4
+# Standard deviations of a simulated batch's total real allocation charged
+# above its mean (never above every append at its recent maximum).
+DEVIATION_FACTOR = Fraction(2)
 
 
 class DiskRing:
@@ -355,6 +363,58 @@ class DiskRing:
             "safety_reserve": self.settings.safety_reserve_bytes, "ledger_headroom": self.ledger_headroom,
         }
 
+    def _recent_allocations(self, allocations, unit, *, at_bound=False):
+        """Per-source ``(mean, variance, credit, cap)`` of one simulated append.
+
+        From the source's last ``RECENT_ALLOCATION_SEGMENTS`` stored
+        allocations: their mean and sample variance, the smallest of them
+        (credited when a simulated append ages out) and the largest in whole
+        allocation units (the per-append cap), all never above the bound.
+        With fewer than ``MINIMUM_SPREAD_SAMPLES`` the mean is the cap and the
+        variance zero, so a short or absent history is charged its recent
+        maximum (the bound without history). ``at_bound`` charges every
+        append its bound.
+        """
+        recent = {}
+        for source, profile in self.profiles.items():
+            bound = round_up(profile.segment_bytes(), unit)
+            sizes = [] if at_bound else [allocations.get(UUID(row[0]), bound) for row in self.db.execute(
+                "SELECT id FROM segments WHERE source=? AND state='stored' "
+                "ORDER BY end DESC LIMIT ?", (str(source), RECENT_ALLOCATION_SEGMENTS))]
+            if not sizes:
+                recent[source] = (Fraction(bound), Fraction(0), bound, bound)
+                continue
+            cap = min(bound, round_up(max(sizes), unit))
+            count = len(sizes)
+            if count < MINIMUM_SPREAD_SAMPLES:
+                recent[source] = (Fraction(cap), Fraction(0), min(cap, min(sizes)), cap)
+                continue
+            mean = Fraction(sum(sizes), count)
+            variance = sum((size - mean) ** 2 for size in sizes) / (count - 1)
+            recent[source] = (min(mean, Fraction(cap)), variance, min(cap, min(sizes)), cap)
+        return recent
+
+    @staticmethod
+    def _batch_charge(appends, unit):
+        """Space for ``(count, recent)`` simulated appends of every source.
+
+        The sum of the means plus ``DEVIATION_FACTOR`` standard deviations of
+        that sum (variances add over independent appends), in whole
+        allocation units, never above every append at its source's recent
+        maximum. One spread over the whole batch, not one per append, keeps
+        segment-size variance from compounding across sources and chained
+        appends into a false hard stop.
+        """
+        mean, variance, cap = Fraction(0), Fraction(0), 0
+        for count, (append_mean, append_variance, _credit, append_cap) in appends:
+            mean += count * append_mean
+            variance += count * append_variance
+            cap += count * append_cap
+        square = math.ceil(variance * DEVIATION_FACTOR * DEVIATION_FACTOR)
+        deviation = math.isqrt(square)
+        deviation += deviation * deviation < square
+        return min(cap, round_up(math.ceil(mean) + deviation, unit))
+
     def _next_write_refused(self, now, budget, *, clock_trusted, at_bound=False):
         """Whether any source's next bounded segment would be refused.
 
@@ -378,22 +438,30 @@ class DiskRing:
         appends of synchronized sources. Free space and each reclaimed segment
         are shared: every earlier simulated append consumes its charge, and
         reclaimable media is credited only once. A simulated append is itself
-        ordinary media: once it ages out of the FIFO window its charge is
-        credited too, unless a retained incident would protect it or a loss
-        is pending (both of which also stop the append path from reclaiming
-        it). Only a source whose next segment interval is known (not overdue)
+        ordinary media: once it ages out of the FIFO window the source's
+        smallest recent real allocation is credited for it (never more than
+        its share of the charge), unless a retained incident would protect it
+        or a loss is pending (both of which also stop the append path from
+        reclaiming it). Only a source whose next segment interval is known (not overdue)
         is credited; otherwise status errs toward pressure or a hard stop.
 
-        Each simulated append is charged the largest real allocation among
-        that source's last ``RECENT_ALLOCATION_SEGMENTS`` stored segments, in
-        whole allocation units, never above its bound (the bound without
-        history): a refusal here means writes are refused at the recent real
-        bitrate. Appends at the same instant form one batch that must fit,
+        The simulated appends through an instant are charged together at the
+        recent real bitrate (``_batch_charge``): the sum of each source's mean
+        recent real allocation plus ``DEVIATION_FACTOR`` standard deviations
+        of that sum, in whole allocation units, never above every append at
+        its source's recent maximum (the bound without history; the recent
+        maximum while the history is too short). Charging every append the
+        recent maximum instead let segment-size variance compound across
+        sources and chained appends into a hard stop while writes kept
+        succeeding near the reserve. A refusal here means writes are refused at the recent real
+        bitrate; a single segment above that estimate can still be refused
+        while status reads the ``at_bound`` pressure below, never healthy.
+        Appends at the same instant form one batch that must fit,
         with one ledger headroom, as a whole, so the result does not depend
         on profile order. Each source's appends form an arithmetic sequence,
-        so the charges through any instant are computed directly and only the
-        latest append between two credit changes is checked: the work is
-        bounded by stored rows and sources, not by cadence ratios.
+        so the append counts through any instant are computed directly and
+        only the latest append between two credit changes is checked: the
+        work is bounded by stored rows and sources, not by cadence ratios.
 
         With ``at_bound`` every simulated append is charged its maximum bound
         instead: status uses that worst case only to warn (pressure) that a
@@ -427,26 +495,18 @@ class DiskRing:
         latest = max(next_append.values())
         rows = self._selected_reclaimable(latest, self.config) if clock_trusted else ()
         allocations = self.store.segment_allocations()
-        # Each simulated append is charged, and later frees, the source's
-        # recent real allocation (whole allocation units, never above the
-        # bound; the bound without history, or for ``at_bound``): charging
-        # every chained append the maximum would turn ordinary VBR below the
-        # bound into a permanent false refusal.
-        charge = {}
-        for source, profile in self.profiles.items():
-            bound = round_up(profile.segment_bytes(), unit)
-            sizes = [allocations.get(UUID(row[0]), bound) for row in self.db.execute(
-                "SELECT id FROM segments WHERE source=? AND state='stored' "
-                "ORDER BY end DESC LIMIT ?", (str(source), RECENT_ALLOCATION_SEGMENTS))]
-            charge[source] = (min(bound, round_up(max(sizes), unit)) if sizes and not at_bound
-                              else bound)
+        recent = self._recent_allocations(allocations, unit, at_bound=at_bound)
         window = self.config.value * SECOND if self.config.mode == "duration" else PRE
         cadence = {source: profile.segment_duration_us for source, profile in self.profiles.items()}
 
-        def consumed_through(at):
-            """Charges of every simulated append at or before ``at``."""
-            return sum(charge[source] * ((at - next_append[source]) // cadence[source] + 1)
-                       for source in self.profiles if at >= next_append[source])
+        def counts_through(at):
+            """Simulated appends of each source at or before ``at``."""
+            return tuple((at - next_append[source]) // cadence[source] + 1
+                         if at >= next_append[source] else 0 for source in self.profiles)
+
+        def consumed_by(counts):
+            return self._batch_charge([(count, recent[source]) for count, source
+                                       in zip(counts, self.profiles)], unit)
 
         # Credits as (time from which they count, bytes): stored media ages out
         # at ``end + window``; a simulated append ages out ``window`` after it
@@ -464,15 +524,16 @@ class DiskRing:
                 if at + window <= latest and not any(
                         str(source) in sources and start < at and end > at - cadence[source]
                         for start, end, sources in protecting):
-                    credits.append((at + window, charge[source]))
+                    credits.append((at + window, recent[source][2]))
         credits.sort()
         # Appends at the same instant form one batch that must fit as a
         # whole: whichever is written last needs the charges through that
         # instant plus one ledger headroom above the reserve, so the result
-        # never depends on profile order. Charges are whole allocation units,
-        # so that is ``free + R(t) - consumed_through(t) >= reserve +
-        # round_up(L)``. Within an interval of constant credit ``R`` the
-        # latest append is the strictest, so only that one is checked: the
+        # never depends on profile order. The batch charge is whole allocation
+        # units, so that is ``free + R(t) - consumed(t) >= reserve +
+        # round_up(L)``. The charge never decreases as appends are added, so
+        # within an interval of constant credit ``R`` the latest append is the
+        # strictest, so only that one is checked: the
         # work is bounded by the stored rows and sources, not by how many
         # times a short-cadence source appends before the slowest one.
         headroom = round_up(self.ledger_headroom, unit)
@@ -485,10 +546,10 @@ class DiskRing:
             while index < len(credits) and credits[index][0] <= begin:
                 reclaim += credits[index][1]
                 index += 1
-            consumed = consumed_through(finish - 1)
-            if consumed == consumed_through(begin - 1):
+            counts = counts_through(finish - 1)
+            if counts == counts_through(begin - 1):
                 continue  # No append in this interval.
-            if free + reclaim - consumed < reserve + headroom:
+            if free + reclaim - consumed_by(counts) < reserve + headroom:
                 return True
         return False
 
