@@ -923,8 +923,9 @@ class HostnameReservationCheck:
     record. Without a revoker, or when revocation fails, access stays closed
     with a ``SESSION_REVOCATION_*`` fault. The requirement is made durable when
     the exposure is seen: the revoker's marker, or, when that write fails, an
-    immediate revocation; until one commits, every check retries it and keeps
-    ``SESSION_REVOCATION_FAILED``. If both keep failing and the process
+    immediate revocation; until one commits, every check retries both and keeps
+    ``SESSION_REVOCATION_FAILED``. After the immediate revocation commits, the
+    retries of the same closed period neither repeat it nor the marker write. If both keep failing and the process
     restarts, only the delivered Owner fault records the requirement.
 
     Every check also re-resolves the hostname through ``resolver``; a missing
@@ -992,6 +993,9 @@ class HostnameReservationCheck:
         # True once the requirement is durable: the marker was written, or the
         # revocation already committed while access was closed.
         self._revocation_durable = True
+        # True once the marker-failure fallback revocation has committed during
+        # the current closed period; cleared when access reopens.
+        self._revoked_while_closed = False
         self.undelivered_faults = 0
 
     @property
@@ -1059,8 +1063,16 @@ class HostnameReservationCheck:
 
         Write the marker; when that fails, revoke now instead (access is closed,
         so no session is issued until reopening revokes again). Retried on every
-        check until one of them commits.
+        check until one of them commits. Once that immediate revocation has
+        committed, later checks of the same closed period do not repeat it
+        (Issue #120): access has stayed closed since, so no session or cookie
+        exists that a repeat would remove, and every repeat would only advance
+        the authorization generation again, add an audit record and void the
+        enrollment authorizations issued during the outage. The revocation
+        before reopening still runs.
         """
+        if self._revoked_while_closed:
+            return True
         try:
             self.session_revoker.record_exposure()
             return True
@@ -1068,9 +1080,10 @@ class HostnameReservationCheck:
             pass
         try:
             self.session_revoker.revoke_all_human_sessions()
-            return True
         except Exception:
             return False
+        self._revoked_while_closed = True
+        return True
 
     def _after_evaluation(self, reasons: tuple[Reason, ...]) -> tuple[Reason, ...]:
         if self.session_revoker is None:
@@ -1093,6 +1106,7 @@ class HostnameReservationCheck:
             return (Reason.SESSION_REVOCATION_FAILED,)
         self._revocation_required = False
         self._revocation_durable = True
+        self._revoked_while_closed = False
         return ()
 
     def _load_exceptions(self) -> None:

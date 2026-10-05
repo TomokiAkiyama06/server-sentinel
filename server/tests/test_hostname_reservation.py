@@ -1236,6 +1236,94 @@ class SessionRevocationTests(ExceptionFixture):
         self.assertTrue(check._check(CheckKind.RETRY).open)
         self.assertEqual(revoker.revocations, 1)
 
+    def test_committed_fallback_revocation_is_not_repeated_while_closed(self):
+        # Issue #120: the marker keeps failing and the exposure persists, but the
+        # immediate revocation already committed; retries must not repeat it.
+        revoker = FakeRevoker()
+        markers = []
+
+        def record():
+            markers.append(True)
+            raise OSError("synthetic marker failure")
+
+        revoker.record_exposure = record
+        clock = Clock()
+        check, files, _, _ = checker(session_revoker=revoker, files=Files(tcp=self.EXTRA), clock=clock)
+        self.assertEqual(check.startup().reasons, (Reason.UNEXPECTED_LISTENER,))
+        self.assertEqual((revoker.revocations, len(markers)), (1, 1))
+        for _ in range(5):
+            clock.value += RETRY_WHILE_CLOSED_SECONDS
+            self.assertEqual(check.tick().reasons, (Reason.UNEXPECTED_LISTENER,))
+        self.assertEqual((revoker.revocations, len(markers)), (1, 1))
+        # The revocation before reopening still runs.
+        files.files["tcp"] = proc(("127.0.0.1", 8080, "0A"))
+        clock.value += RETRY_WHILE_CLOSED_SECONDS
+        self.assertTrue(check.tick().open)
+        self.assertEqual(revoker.revocations, 2)
+        # A new exposure after reopening is a new closed period: it revokes again.
+        files.files["tcp"] = self.EXTRA
+        clock.value += DAILY_SECONDS
+        self.assertFalse(check.tick().open)
+        self.assertEqual((revoker.revocations, len(markers)), (3, 2))
+        clock.value += RETRY_WHILE_CLOSED_SECONDS
+        self.assertFalse(check.tick().open)
+        self.assertEqual(revoker.revocations, 3)
+
+    def test_fallback_is_retried_only_while_both_fail(self):
+        revoker = FakeRevoker(fail=True)
+        attempts = {"marker": 0, "revoke": 0}
+
+        def record():
+            attempts["marker"] += 1
+            raise OSError("synthetic marker failure")
+
+        original = revoker.revoke_all_human_sessions
+
+        def revoke():
+            attempts["revoke"] += 1
+            original()
+
+        revoker.record_exposure = record
+        revoker.revoke_all_human_sessions = revoke
+        check, _, _, _ = checker(session_revoker=revoker, files=Files(tcp=self.EXTRA))
+        self.assertEqual(check.startup().reasons,
+                         (Reason.UNEXPECTED_LISTENER, Reason.SESSION_REVOCATION_FAILED))
+        self.assertEqual(check._check(CheckKind.RETRY).reasons,
+                         (Reason.UNEXPECTED_LISTENER, Reason.SESSION_REVOCATION_FAILED))
+        self.assertEqual(attempts, {"marker": 2, "revoke": 2})
+        revoker.fail = False
+        self.assertEqual(check._check(CheckKind.RETRY).reasons, (Reason.UNEXPECTED_LISTENER,))
+        self.assertEqual(attempts, {"marker": 3, "revoke": 3})
+        for _ in range(3):
+            self.assertEqual(check._check(CheckKind.RETRY).reasons, (Reason.UNEXPECTED_LISTENER,))
+        self.assertEqual(attempts, {"marker": 3, "revoke": 3})
+        self.assertEqual(revoker.revocations, 1)
+
+    def test_outage_enrollment_survives_retries_after_fallback_revocation(self):
+        self.session("viewer@example.invalid", b"v" * 32)
+        revoker = ReservationSessionRevocation(self.access)
+        clock = Clock()
+        with patch.object(revoker, "record_exposure", side_effect=OSError("synthetic marker failure")):
+            check, files, _, _ = checker(exception_store=self.exception_store, session_revoker=revoker,
+                                         files=Files(tcp=self.EXTRA), clock=clock)
+            self.assertFalse(check.startup().open)
+            self.assertEqual(len(self.revocation_records()), 1)
+            pending = self.access.invite("Synthetic pending", (Permission.LIVE_VIEW,))
+            secret = hashlib.sha256(b"p" * 32).digest()
+            self.access.issue_enrollment(pending.id, secret, NOW + timedelta(minutes=5))
+            for _ in range(3):
+                clock.value += RETRY_WHILE_CLOSED_SECONDS
+                self.assertFalse(check.tick().open)
+            # No repeated generation advance or audit record during the outage.
+            self.assertEqual(len(self.revocation_records()), 1)
+            self.access.enroll_credential(secret, "pending@example.invalid", b"pending", b"k", -7, 0)
+            files.files["tcp"] = proc(("127.0.0.1", 8080, "0A"))
+            clock.value += RETRY_WHILE_CLOSED_SECONDS
+            self.assertTrue(check.tick().open)
+        self.assertEqual(len(self.revocation_records()), 2)
+        with self.assertRaises(AccessValidationError):
+            self.access.authorize(b"v" * 32, "viewer@example.invalid", Permission.LIVE_VIEW)
+
     def test_resolution_failure_keeps_sessions_and_generation(self):
         self.session("viewer@example.invalid", b"v" * 32)
         resolver = Resolver(OSError("synthetic resolver failure"))
