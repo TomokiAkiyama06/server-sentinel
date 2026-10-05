@@ -116,7 +116,7 @@ export function canVisit(session: Session, view: View): boolean {
 }
 
 export type ObservationKind = 'person' | 'motion' | 'owner_entry' | 'owner_exit' | 'anonymous_entry'
-  | 'anonymous_exit' | 'server_movement' | 'camera_tamper' | 'camera_health' | 'node_health'
+  | 'anonymous_exit' | 'server_movement' | 'camera_tamper' | 'camera_health' | 'entrance_gate' | 'node_health'
   | 'recording' | 'storage' | 'presence' | 'configuration';
 // Superset of the presence Value/Quality enums: it also covers the source and
 // node health transitions and the detector quality states that reach the

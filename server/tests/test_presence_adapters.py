@@ -8,6 +8,8 @@ import json
 import os
 import sqlite3
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
 import threading
 from unittest import TestCase, mock
@@ -22,6 +24,7 @@ from app.detection.roi.contracts import CriticalKind, CriticalObservation
 from app.detection.roi.delivery import CriticalDelivery
 from app.detection.tracking.entrance import (AnonymousEntranceTracker, Crossing, CrossingKind, EntranceLine,
                                              PersonPoint, Point, TrackingPolicy, TrackUpdate)
+from app.logging import Event
 from app.media.health.service import HealthResult, HealthState
 from app.presence.access import AccessDenied
 from app.presence.adapters import (CriticalTimelineRecorder, EntranceObservationAdapter, HealthTimeline,
@@ -30,7 +33,7 @@ from app.presence.delivery import ActionResult
 from app.presence.models import InvalidObservation, Kind, Observation, PresenceState, Quality, Value, timestamp
 from app.presence.schema import CRITICAL_SOURCE_KINDS, STAGED_SOURCE_KINDS
 from app.presence.service import SOURCE_CLOCK, SOURCE_CLOCK_TABLES, PresenceService
-from app.storage.database import Database
+from app.storage.database import Database, PinnedDatabase
 from app.storage.migrations import migrate
 from app.storage.policy import StorageState, StorageTransition
 from app.storage.schema import APPLICATION_MIGRATIONS
@@ -133,8 +136,11 @@ def critical(kind=CriticalKind.SERVER_MOVEMENT, *, at=NOW, quality=DetectionQual
 class EntranceAdapterTests(PresenceFixture, TestCase):
     def setUp(self):
         self.make_presence()
-        self.adapter = EntranceObservationAdapter(self.outbox, owner_presence_validity=VALIDITY,
+        self.adapter = EntranceObservationAdapter(self.outbox, source_id=SOURCE, owner_presence_validity=VALIDITY,
                                                   maximum_source_latency=LATENCY)
+        # The gate is already known to be sufficient, so these tests see only
+        # crossings; `EntranceGateQualityTests` covers the gate-quality facts.
+        self.adapter._gate = Quality.SUFFICIENT
 
     def submit(self, *crossings, quality=DetectionQuality.SUFFICIENT, flush_at=None):
         # The main-host receipt is stamped when presence writes the fact.
@@ -151,7 +157,7 @@ class EntranceAdapterTests(PresenceFixture, TestCase):
         for values in ({}, {"owner_presence_validity": VALIDITY}, {"maximum_source_latency": LATENCY},
                        {"owner_presence_validity": timedelta(0), "maximum_source_latency": LATENCY}):
             with self.assertRaises((TypeError, ValueError)):
-                EntranceObservationAdapter(self.outbox, **values)
+                EntranceObservationAdapter(self.outbox, source_id=SOURCE, **values)
 
     def test_confirmed_owner_entry_and_exit_project_presence(self):
         self.submit(crossing(CrossingKind.OWNER_ENTRY))
@@ -181,8 +187,17 @@ class EntranceAdapterTests(PresenceFixture, TestCase):
     def test_anonymous_crossing_never_affects_presence_or_carries_identity(self):
         self.submit(crossing(CrossingKind.OWNER_ENTRY))
         later = NOW + timedelta(minutes=1)
-        self.submit(crossing(CrossingKind.ANONYMOUS_EXIT, received=later),
-                    crossing(CrossingKind.ANONYMOUS_ENTRY, received=later, source=UUID(int=909)))
+        self.submit(crossing(CrossingKind.ANONYMOUS_EXIT, received=later))
+        # Another camera has its own adapter; one adapter serves one source.
+        other = EntranceObservationAdapter(self.outbox, source_id=UUID(int=909),
+                                           owner_presence_validity=VALIDITY, maximum_source_latency=LATENCY)
+        self.assertTrue(other.submit(TrackUpdate((), (crossing(CrossingKind.ANONYMOUS_ENTRY, received=later,
+                                                                source=UUID(int=909)),),
+                                                 DetectionQuality.SUFFICIENT)))
+        self.outbox.flush()
+        with self.assertRaisesRegex(ValueError, "invalid crossing"):
+            self.adapter.submit(TrackUpdate((), (crossing(CrossingKind.ANONYMOUS_ENTRY, source=UUID(int=909)),),
+                                            DetectionQuality.SUFFICIENT))
         self.assertEqual(self.state(later), "PRESENT")
         items = self.history()["items"]
         anonymous = [item for item in items if item["kind"].startswith("anonymous")]
@@ -424,7 +439,7 @@ class OwnerTrackerEndToEndTests(PresenceFixture, TestCase):
     def setUp(self):
         self.setUp_owner()
         self.make_presence()
-        self.adapter = EntranceObservationAdapter(self.outbox, owner_presence_validity=VALIDITY,
+        self.adapter = EntranceObservationAdapter(self.outbox, source_id=SOURCE, owner_presence_validity=VALIDITY,
                                                   maximum_source_latency=LATENCY)
         self.enroll()
 
@@ -454,7 +469,8 @@ class OwnerTrackerEndToEndTests(PresenceFixture, TestCase):
         update = self.walk(stop_owner_quality=True)
         self.assertEqual(update.crossings[0].kind, CrossingKind.ANONYMOUS_ENTRY)
         self.assertEqual(self.presence.snapshot(now=NOW, clock_trusted=True)["state"], "UNKNOWN")
-        item, = self.history()["items"]
+        gate, item = self.history()["items"]
+        self.assertEqual((gate["kind"], gate["value"], gate["quality"]), ("entrance_gate", "ready", "sufficient"))
         self.assertEqual(item["kind"], "anonymous_entry")
         self.assertIsNone(item["confidence"])
 
@@ -479,7 +495,7 @@ class OwnerTrackerEndToEndTests(PresenceFixture, TestCase):
         self.assertEqual(snapshot["state"], "PRESENT")
         page = self.history()
         self.assertEqual([(item["kind"], item["value"]) for item in page["items"]],
-                         [("owner_entry", "observed"), ("server_movement", "observed"),
+                         [("entrance_gate", "ready"), ("owner_entry", "observed"), ("server_movement", "observed"),
                           ("camera_health", "offline")])
         self.assertTrue(all(item["source_id"] == str(SOURCE) for item in page["items"]))
         self.assertNeutral(page)
@@ -1222,7 +1238,7 @@ class TimelineGapDurabilityTests(PresenceFixture, TestCase):
         self.assertEqual(self.gap()[1]["interrupted"], 1)
 
     def test_clock_fault_before_staging_is_a_counted_gap(self):
-        adapter = EntranceObservationAdapter(self.outbox, owner_presence_validity=VALIDITY,
+        adapter = EntranceObservationAdapter(self.outbox, source_id=SOURCE, owner_presence_validity=VALIDITY,
                                              maximum_source_latency=LATENCY)
 
         def failing():
@@ -1235,9 +1251,360 @@ class TimelineGapDurabilityTests(PresenceFixture, TestCase):
                                                     DetectionQuality.SUFFICIENT)))
         self.assertFalse(self.health.node(NODE, NodeHealthState.OFFLINE))
         state = self.outbox.state()
-        self.assertEqual((state.refused, state.unpersisted, state.pending), (4, 4, 0))
+        # The crossing and the gate-quality change it carried are both refused.
+        self.assertEqual((state.refused, state.unpersisted, state.pending), (5, 5, 0))
         self.assertTrue(state.degraded)
         self.outbox.clock = self.clock
         self.clock.at, self.clock.trusted = NOW, True
         self.assertTrue(self.outbox.flush().degraded)
-        self.assertEqual(self.gap()[1]["refused"], 4)
+        self.assertEqual(self.gap()[1]["refused"], 5)
+
+
+class EntranceGateQualityTests(PresenceFixture, TestCase):
+    """Low-quality entrance periods stay distinguishable from periods with no crossing (#129)."""
+
+    def setUp(self):
+        self.make_presence()
+        self.adapter = EntranceObservationAdapter(self.outbox, source_id=SOURCE, owner_presence_validity=VALIDITY,
+                                                  maximum_source_latency=LATENCY)
+
+    def gate_facts(self):
+        return [(item["value"], item["quality"]) for item in self.history()["items"]
+                if item["kind"] == "entrance_gate"]
+
+    def update(self, quality, *crossings, at):
+        self.clock.at = at
+        result = self.adapter.submit(TrackUpdate((), crossings, quality))
+        self.outbox.flush()
+        return result
+
+    def test_gate_quality_changes_are_neutral_timeline_facts(self):
+        for minute, quality in enumerate((DetectionQuality.SUFFICIENT, DetectionQuality.SUFFICIENT,
+                                          DetectionQuality.UNKNOWN, DetectionQuality.UNKNOWN,
+                                          DetectionQuality.DEGRADED, DetectionQuality.INSUFFICIENT,
+                                          DetectionQuality.SUFFICIENT)):
+            self.assertTrue(self.update(quality, at=NOW + timedelta(minutes=minute)))
+        # Only changes are recorded: ready, unknown (unknown), unknown
+        # (insufficient, for degraded and insufficient alike), ready.
+        self.assertEqual(self.gate_facts(), [("ready", "sufficient"), ("unknown", "unknown"),
+                                             ("unknown", "insufficient"), ("ready", "sufficient")])
+        page = self.history()
+        self.assertNeutral(page)
+        for item in page["items"]:
+            self.assertEqual(item["source_id"], str(SOURCE))
+            self.assertIsNone(item["confidence"])
+            self.assertFalse(item["confirmed"])
+            self.assertEqual(item["label"], "Entrance gate quality")
+        # A gate fact is never a person, absence or presence conclusion.
+        self.assertFalse(any(item["value"] in {"observed", "not_observed"} for item in page["items"]))
+        self.assertEqual(self.presence.snapshot(now=NOW + timedelta(minutes=10), clock_trusted=True)["state"],
+                         "UNKNOWN")
+        with self.assertRaises(AccessDenied):
+            self.history("live")
+
+    def test_unknown_interval_brackets_the_period_without_conclusions(self):
+        self.assertTrue(self.update(DetectionQuality.SUFFICIENT, crossing(CrossingKind.ANONYMOUS_ENTRY), at=NOW))
+        self.assertTrue(self.update(DetectionQuality.UNKNOWN, at=NOW + timedelta(minutes=1)))
+        later = NOW + timedelta(minutes=5)
+        self.assertTrue(self.update(DetectionQuality.SUFFICIENT,
+                                    crossing(CrossingKind.ANONYMOUS_EXIT, received=later), at=later))
+        self.assertEqual([(item["kind"], item["value"]) for item in self.history()["items"]],
+                         [("entrance_gate", "ready"), ("anonymous_entry", "observed"),
+                          ("entrance_gate", "unknown"), ("entrance_gate", "ready"),
+                          ("anonymous_exit", "observed")])
+
+    def test_stopped_updates_are_recorded_as_unknown_once(self):
+        self.assertTrue(self.update(DetectionQuality.SUFFICIENT, at=NOW))
+        self.clock.at = NOW + timedelta(minutes=1)
+        self.assertTrue(self.adapter.gate_unavailable())
+        self.assertTrue(self.adapter.gate_unavailable())
+        self.outbox.flush()
+        self.assertEqual(self.gate_facts(), [("ready", "sufficient"), ("unknown", "unknown")])
+
+    def test_refused_gate_fact_is_retried_by_the_next_update(self):
+        self.clock.trusted = None  # the clock port fails the handoff
+        self.assertFalse(self.adapter.submit(TrackUpdate((), (), DetectionQuality.UNKNOWN)))
+        self.clock.trusted = True
+        self.assertTrue(self.update(DetectionQuality.UNKNOWN, at=NOW))
+        self.assertEqual(self.gate_facts(), [("unknown", "unknown")])
+        self.assertEqual(self.outbox.state().refused, 1)
+
+    def test_gate_fact_contract_is_ready_or_unknown_only(self):
+        for value, quality in ((Value.READY, Quality.INSUFFICIENT), (Value.UNKNOWN, Quality.SUFFICIENT),
+                               (Value.NOT_OBSERVED, Quality.UNKNOWN), (Value.OBSERVED, Quality.SUFFICIENT)):
+            with self.assertRaises(InvalidObservation):
+                Observation(Kind.ENTRANCE_GATE, NOW, NOW, value=value, quality=quality, source_id=SOURCE)
+        with self.assertRaises(InvalidObservation):
+            Observation(Kind.ENTRANCE_GATE, NOW, NOW, value=Value.READY, quality=Quality.SUFFICIENT)
+        with self.assertRaises(ValueError):
+            EntranceObservationAdapter(self.outbox, source_id=None, owner_presence_validity=VALIDITY,
+                                       maximum_source_latency=LATENCY)
+
+
+class OwnerTrackerGateTests(PresenceFixture, TestCase):
+    """A real stopped entrance gate is recorded as unknown, never as an empty entrance."""
+
+    def setUp(self):
+        self.make_presence()
+        self.adapter = EntranceObservationAdapter(self.outbox, source_id=SOURCE, owner_presence_validity=VALIDITY,
+                                                  maximum_source_latency=LATENCY)
+
+    def test_stopped_entrance_gate_is_unknown_not_an_empty_entrance(self):
+        tracker = AnonymousEntranceTracker(SOURCE, POLICY, LINE)
+        gate = QualityGate(SOURCE, calibrated_policy("entrance_crossing"))
+        assess(gate, synthetic_person(0))
+        gate.invalidate(execution=Execution.STOPPED)
+        sample = synthetic_person(1)
+        update = tracker.update(FrameIdentity.from_frame(sample), (), gate=gate,
+                                decision=assess(gate, sample), observed_ms=10, occurred_at=NOW,
+                                received_at=NOW, clock_trusted=True, uncertainty_us=0)
+        self.assertIs(update.quality, DetectionQuality.UNKNOWN)
+        self.assertTrue(self.adapter.submit(update))
+        self.outbox.flush()
+        item, = self.history()["items"]
+        self.assertEqual((item["kind"], item["value"], item["quality"]), ("entrance_gate", "unknown", "unknown"))
+
+
+class WalReadTests(PresenceFixture, TestCase):
+    """Status and history reads never create WAL sidecars outside a reservation (#129)."""
+
+    def setUp(self):
+        self.make_presence()
+        self.entered = []
+        refuse = self.presence.reservation
+
+        @contextmanager
+        def reservation():
+            self.entered.append(self.sidecars())
+            with refuse():
+                yield
+        self.presence.reservation = reservation
+        with closing(sqlite3.connect(self.database.path)) as db:
+            self.assertEqual(db.execute("PRAGMA journal_mode=WAL").fetchone()[0], "wal")
+        # The last connection to close removed both sidecars.
+        self.assertEqual(self.sidecars(), [])
+
+    def sidecars(self):
+        return sorted(suffix for suffix in ("-wal", "-shm")
+                      if self.database.path.with_name(self.database.path.name + suffix).exists())
+
+    def reads(self):
+        return (self.presence.timeline_gap, lambda: self.presence.snapshot(now=NOW, clock_trusted=True),
+                lambda: self.presence.audit("owner"), self.history,
+                lambda: self.presence.timeline_session_recorded(self.outbox._handle))
+
+    def test_refused_reservation_refuses_the_read_and_creates_no_sidecar(self):
+        self.refuse = True
+        for read in self.reads():
+            with self.assertRaisesRegex(RuntimeError, "STORAGE_HARD_STOP"):
+                read()
+            self.assertEqual(self.sidecars(), [])
+
+    def test_missing_admission_port_refuses_the_read_and_creates_no_sidecar(self):
+        self.presence.reservation = None
+        with self.assertRaisesRegex(RuntimeError, "storage admission required"):
+            self.presence.timeline_gap()
+        self.assertEqual(self.sidecars(), [])
+
+    def test_admitted_read_creates_sidecars_only_inside_the_reservation_and_removes_them(self):
+        for read in self.reads():
+            self.entered.clear()
+            read()
+            self.assertEqual(self.entered[0], [])
+            self.assertEqual(self.sidecars(), [])
+        self.assertEqual(self.presence.snapshot(now=NOW, clock_trusted=True)["state"], "UNKNOWN")
+
+    def test_admitted_read_is_query_only(self):
+        with self.presence._read() as db:
+            with self.assertRaises(sqlite3.OperationalError):
+                db.execute("DELETE FROM presence_audit")
+
+    def test_existing_sidecars_need_no_reservation(self):
+        # A connection held open elsewhere keeps both sidecars in place; a
+        # read then creates nothing and takes no reservation.
+        holder = sqlite3.connect(self.database.path)
+        self.addCleanup(holder.close)
+        holder.execute("SELECT count(*) FROM presence_audit").fetchone()
+        self.assertEqual(self.sidecars(), ["-shm", "-wal"])
+        self.refuse = True
+        self.assertIsNone(self.presence.timeline_gap())
+        self.assertEqual(self.entered, [])
+
+    def test_rollback_journal_read_needs_no_reservation(self):
+        with closing(sqlite3.connect(self.database.path)) as db:
+            self.assertEqual(db.execute("PRAGMA journal_mode=DELETE").fetchone()[0], "delete")
+        self.refuse = True
+        self.assertIsNone(self.presence.timeline_gap())
+        self.assertEqual((self.entered, self.sidecars()), ([], []))
+
+    def test_pinned_database_read_is_admitted_too(self):
+        pinned = PinnedDatabase(self.database)
+        pinned.pin()
+        self.addCleanup(pinned.release)
+        self.presence.database = pinned
+        self.refuse = True
+        with self.assertRaisesRegex(RuntimeError, "STORAGE_HARD_STOP"):
+            self.presence.timeline_gap()
+        self.assertEqual(self.sidecars(), [])
+        self.refuse = False
+        self.entered.clear()
+        self.assertIsNone(self.presence.timeline_gap())
+        self.assertEqual(self.entered, [[]])
+        self.assertEqual(self.sidecars(), [])
+
+
+class BuildFaultTests(PresenceFixture, TestCase):
+    """A permanent build fault never blocks the outbox silently (#129)."""
+
+    def setUp(self):
+        self.make_presence()
+        self.health = HealthTimeline(self.outbox)
+
+    def status(self):
+        return self.presence.owner_status("owner", now=NOW, clock_trusted=True)
+
+    @staticmethod
+    def faulty(identifier, error):
+        """A build that passes its stage-time contract check and then fails at flush."""
+        calls = []
+
+        def build(received, trusted):
+            calls.append(received)
+            if len(calls) > 1:
+                raise error
+            return Observation(Kind.NODE_HEALTH, NOW, received, value=Value.OFFLINE, node_id=NODE,
+                               identifier=identifier), None
+        return build
+
+    def test_build_fault_is_quarantined_and_later_facts_are_written(self):
+        identifier = uuid4()
+        self.assertTrue(self.outbox.stage(identifier, self.faulty(identifier,
+                                                                  AttributeError("synthetic programming error"))))
+        self.assertTrue(self.health.node(NODE, NodeHealthState.OFFLINE))
+        with self.assertLogs("app.presence.adapters", "ERROR") as logged:
+            state = self.outbox.flush()
+        self.assertEqual(logged.records[0].msg, Event.TIMELINE_FACT_QUARANTINED)
+        self.assertNotIn("synthetic programming error", "".join(logged.output))
+        self.assertEqual((state.recorded, state.pending, state.quarantined, state.rejected), (1, 0, 1, 0))
+        self.assertTrue(state.degraded)
+        status = self.status()
+        self.assertTrue(status["timeline_gap"])
+        self.assertEqual(status["timeline_quarantined_count"], 1)
+        self.assertFalse(status["timeline_pending"])
+        self.assertEqual([item["kind"] for item in self.history()["items"]], ["node_health"])
+        # A clean close records the quarantined fact as lost; it never vanishes.
+        self.outbox.close()
+        self.assertEqual(self.presence.timeline_gap()["lost"], 1)
+
+    def test_quarantine_counts_against_capacity_and_deduplicates(self):
+        identifier = uuid4()
+        self.assertTrue(self.outbox.stage(identifier, self.faulty(identifier, TypeError("synthetic"))))
+        self.assertEqual(self.outbox.flush().quarantined, 1)
+        self.assertTrue(self.outbox.stage(identifier, self.faulty(identifier, TypeError("synthetic"))))
+        self.assertEqual(self.outbox.state().pending, 0)
+        for _ in range(7):
+            self.assertTrue(self.health.node(NODE, NodeHealthState.OFFLINE))
+        self.assertFalse(self.health.node(NODE, NodeHealthState.ONLINE))
+        self.assertEqual(self.outbox.state().refused, 1)
+
+    def test_contract_error_in_build_is_still_rejected_not_quarantined(self):
+        identifier = uuid4()
+        self.assertTrue(self.outbox.stage(identifier, self.faulty(identifier,
+                                                                  InvalidObservation("synthetic contract error"))))
+        state = self.outbox.flush()
+        self.assertEqual((state.rejected, state.quarantined), (1, 0))
+
+    def test_transient_failures_are_counted_logged_and_cleared(self):
+        self.assertTrue(self.health.node(NODE, NodeHealthState.OFFLINE))
+        self.refuse = True
+        with self.assertLogs("app.presence.adapters", "WARNING") as logged:
+            for _ in range(3):
+                state = self.outbox.flush()
+        self.assertEqual((state.pending, state.failures, state.quarantined), (1, 3, 0))
+        # The first failure and each doubling are logged, not every attempt.
+        self.assertEqual([record.msg for record in logged.records], [Event.TIMELINE_FLUSH_FAILING] * 2)
+        status = self.status()
+        self.assertEqual((status["timeline_flush_failures"], status["timeline_pending_count"]), (3, 1))
+        self.refuse = False
+        with self.assertLogs("app.presence.adapters", "WARNING") as logged:
+            state = self.outbox.flush()
+        self.assertEqual([record.msg for record in logged.records], [Event.TIMELINE_FLUSH_RECOVERED])
+        self.assertEqual((state.pending, state.failures, state.recorded), (0, 0, 1))
+        self.assertEqual(self.status()["timeline_flush_failures"], 0)
+
+
+CHILD_OUTBOX = """
+import sys
+from contextlib import contextmanager
+from datetime import datetime, timezone
+from pathlib import Path
+from app.presence.adapters import TimelineOutbox
+from app.presence.service import PresenceService
+from app.storage.database import Database
+
+
+@contextmanager
+def reservation():
+    yield
+
+
+service = PresenceService(Database(Path(sys.argv[1])), reservation=reservation)
+outbox = TimelineOutbox(service, clock=lambda: (datetime(2026, 1, 1, tzinfo=timezone.utc), True), capacity=8)
+outbox.open()
+print("open", flush=True)
+sys.stdin.read()
+"""
+
+
+class SharedBacklogTests(PresenceFixture, TestCase):
+    """Owner status from another service or process never reports a hidden backlog as empty (#129)."""
+
+    def setUp(self):
+        self.make_presence()
+        self.health = HealthTimeline(self.outbox)
+
+    def other(self):
+        return PresenceService(self.database, access=MockAccess(), reservation=self.presence.reservation,
+                               detection=lambda: True, storage_status=lambda: True)
+
+    def mark_interrupted(self):
+        with closing(self.database.connect()) as db:
+            db.execute("INSERT INTO presence_timeline_gap(singleton,since,latest,refused,rejected,lost,interrupted) "
+                       "VALUES (1,?,?,0,0,0,1)", (timestamp(NOW), timestamp(NOW)))
+
+    def test_another_service_in_this_process_sees_the_backlog(self):
+        self.assertTrue(self.health.node(NODE, NodeHealthState.OFFLINE))
+        self.refuse = True
+        self.outbox.flush()
+        status = self.other().owner_status("owner", now=NOW, clock_trusted=True)
+        self.assertEqual((status["timeline_pending"], status["timeline_pending_count"]), (True, 1))
+        self.assertTrue(status["timeline_backlog_visible"])
+        # Counted but unwritten loss refuses a clear from that service too.
+        for _ in range(8):
+            self.health.node(NODE, NodeHealthState.OFFLINE)
+        self.refuse = False
+        self.mark_interrupted()
+        status = self.other().owner_status("owner", now=NOW, clock_trusted=True)
+        self.assertEqual(status["timeline_gap_unpersisted"], 1)
+        with self.assertRaisesRegex(ValueError, "unpersisted"):
+            self.other().clear_timeline_gap("owner", now=NOW, clock_trusted=True)
+
+    def test_an_outbox_in_another_process_is_reported_unknown_and_refuses_the_clear(self):
+        self.outbox.close()
+        self.mark_interrupted()
+        server = Path(__file__).resolve().parents[1]
+        child = subprocess.Popen([sys.executable, "-c", CHILD_OUTBOX, str(self.database.path)], cwd=server,
+                                 env={**os.environ, "PYTHONPATH": str(server)}, stdin=subprocess.PIPE,
+                                 stdout=subprocess.PIPE, text=True)
+        self.addCleanup(child.wait, 10)
+        self.addCleanup(child.stdout.close)
+        self.addCleanup(child.stdin.close)
+        self.assertEqual(child.stdout.readline().strip(), "open")
+        status = self.other().owner_status("owner", now=NOW, clock_trusted=True)
+        self.assertFalse(status["timeline_backlog_visible"])
+        self.assertEqual(status["timeline_gap_orphaned_sessions"], 0)
+        self.assertTrue(status["timeline_pending"])
+        self.assertTrue(status["timeline_gap"])
+        with self.assertRaisesRegex(ValueError, "another process"):
+            self.other().clear_timeline_gap("owner", now=NOW, clock_trusted=True)
+        self.assertIsNotNone(self.presence.timeline_gap())

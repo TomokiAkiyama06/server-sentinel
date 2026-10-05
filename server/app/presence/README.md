@@ -121,10 +121,13 @@ replay from re-queuing the work.
 `adapters.py` connects the reviewed producers to `record()` without adding any
 route, worker thread or default timing policy:
 
-- `EntranceObservationAdapter` maps #25 `TrackUpdate` crossings. A crossing is
-  written only when the entrance quality gate was sufficient; an `UNKNOWN`
-  update writes nothing, because an empty crossing list is neither presence nor
-  absence. An Owner crossing keeps its verification confidence and is
+- `EntranceObservationAdapter` maps #25 `TrackUpdate` crossings for one
+  entrance source (`source_id`; a crossing from another source is refused). A
+  crossing is written only when the entrance quality gate was sufficient; an
+  `UNKNOWN` update writes no crossing, because an empty crossing list is
+  neither presence nor absence. Each change of the gate quality is written
+  as a neutral `entrance_gate` fact instead (see "Entrance gate quality"
+  below). An Owner crossing keeps its verification confidence and is
   `confirmed` only when the tracker confirmed it and its source latency and
   clock uncertainty stay within the explicit `maximum_source_latency`. Every
   Owner crossing carries the explicit `owner_presence_validity`, so an
@@ -185,6 +188,45 @@ route, worker thread or default timing policy:
   different fact under that UUID is refused at `stage()` as an identity
   conflict and counted as rejected. Both are counted and reported by `OutboxState.degraded`, never
   dropped silently.
+- A staged fact's `build()` only constructs its observation from the receipt;
+  it touches no storage, database or clock. When it raises anything other
+  than `InvalidObservation` at flush time (it already passed the same check
+  at `stage()`), that is a programming error a retry would repeat forever, so
+  the flush moves the fact into a quarantine instead of treating it as
+  transient: later facts are written, the quarantined fact still counts
+  against the capacity and is deduplicated by UUID, `OutboxState.quarantined`
+  and Owner `timeline_quarantined_count` report it (it is part of
+  `timeline_gap`, because it will not be written without a fix), the event
+  `timeline_fact_quarantined` is logged with no content, and a clean close
+  records it as lost. Storage, database and clock failures stay transient and
+  keep the head staged; `OutboxState.failures` and Owner
+  `timeline_flush_failures` count consecutive failed flushes, and
+  `timeline_flush_failing` is logged at the first failure of a streak and at
+  every doubling, `timeline_flush_recovered` at the first later write, so a
+  stuck outbox is visible to the runtime and the Owner without flooding logs.
+
+### Entrance gate quality
+
+An empty crossing list from an `UNKNOWN` gate and one from a sufficient gate
+used to look the same in history, so a low-light period could not be told
+apart from a period in which nothing crossed. The detection health in the
+Owner status does not answer that: it is current, Owner-only and per
+detector path, not historical and not per entrance source. The adapter
+therefore records each change of the source's gate quality as an
+`entrance_gate` fact in the ordinary timeline (`recordings:view`, like every
+other historical fact): value `ready` with quality `sufficient`, or value
+`unknown` with the reported quality (`unknown`, or `insufficient` for a
+degraded or insufficient gate). The contract allows no other value, no
+confidence and no confirmation, so the fact can never read as a detection,
+a person or an absence. An interval runs from one fact to the next for that
+source; crossings are only possible inside `ready` intervals. Only changes are
+written, the first update after start always writes the current quality, and
+a refused fact is retried by the next update and counted as a gap. A gate that
+stops producing updates entirely (detector stop, source loss, shutdown) cannot
+be seen from the updates themselves, so the runtime calls
+`gate_unavailable()` then, which writes `unknown` once. Facts are dated by the
+main-host clock, like other health facts, because a `TrackUpdate` carries no
+frame time. Nothing here names a person, links sources or infers cause.
 
 Timeline loss is durable (`presence_timeline_gap` migration 20). The runtime calls
 `TimelineOutbox.open()` at startup, before it wires any producer, to open a
@@ -209,8 +251,20 @@ advisory lock beside the database file, which the kernel releases when the
 process dies, and a second outbox is refused while it is held. The lock file is
 created and taken inside the same storage-admitted transaction as the session
 row, so a refused volume gains nothing from an outbox start. Status, history,
-audit and gap reads take no reservation and use a read-only SQLite open
-(`mode=ro`), so they never create a missing or replaced database. A session row
+audit and gap reads normally take no reservation and use a read-only SQLite
+open (`mode=ro`), so they never create a missing or replaced database. A WAL
+database is the exception: when its `-wal`/`-shm` sidecars are absent (the
+last connection removed them), SQLite creates them even for a `mode=ro`
+connection in a writable directory, and a read-only connection cannot remove
+them again. Such a read therefore runs under the storage reservation, with a
+no-create read-write connection set to `query_only`, so the sidecars are
+created inside the reservation and removed when it closes as the last
+connection; a refused or missing reservation fails the read rather than
+writing outside it. `immutable` is not used, because it would read a file a
+live writer changes as if it could not change. The sidecar check precedes the
+open, so a writer that removes the sidecars in between can still make a
+read-only open recreate them (a few KiB, removed again by the next write's
+close); a rollback-journal database never creates a file on read. A session row
 found once the lock is free therefore belongs to an outbox that is gone. Owner
 status reports such rows as part of `timeline_gap`
 (`timeline_gap_orphaned_sessions`) even before a replacement session opens, so
@@ -240,8 +294,15 @@ clock failure stopped the flush are not loss and are not counted in
 (or, at a clean close, recorded as lost in the gap marker). The outbox reports
 its staged and unpersisted counts in one step, so a fact moving from staged to
 counted loss is never missed, and an unreadable backlog is reported as both
-pending and a gap. These in-memory counts are visible through the service
-instance that opened the session. Counts are only added,
+pending and a gap. Live sessions are registered per database file for the
+whole process, so Owner status and `clear_timeline_gap()` through any
+`PresenceService` over the same database in the same process see the
+owning outbox's counts. An outbox owned by another process cannot be read:
+its session is proven live by the committed lock, so its row is not
+orphaned, but its staged and unwritten counts are reported as unknown
+(`timeline_backlog_visible: false`, counted as pending and as a gap) and
+`clear_timeline_gap()` is refused there; the Owner clears it through the
+owning process. Counts are only added,
 so a retried write that had committed overstates the gap rather than hiding it.
 
 `owner_presence_validity` and `maximum_source_latency` have no default; they

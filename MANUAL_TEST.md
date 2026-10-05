@@ -1052,6 +1052,7 @@ Progressively degrade lighting/blur/visibility.
 - [ ] **person detection also becomes unknown/unavailable when its own quality prerequisites fail**;
 - [ ] insufficient person quality is never displayed/stored as trustworthy `no person`;
 - [ ] entrance/presence logic does not infer absence from skipped person inference;
+- [ ] once the runtime wires the entrance adapter: the historical timeline shows an `entrance_gate` `unknown` fact when the entrance gate stops being sufficient (and when its detector stops) and a `ready` fact when it recovers, so the dark period is distinguishable from a period without crossings; the fact never reads as `no person`;
 - [ ] recovery uses suitable hysteresis;
 - [ ] no automatic torch/light behavior exists.
 

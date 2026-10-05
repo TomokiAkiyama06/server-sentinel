@@ -26,6 +26,9 @@ class Event(StrEnum):
     LOCAL_UVC_STOPPED = "local_uvc_stopped"
     LOCAL_UVC_STOP_FAILED = "local_uvc_stop_failed"
     LOCAL_UVC_SOURCE_HEALTH_CHANGED = "local_uvc_source_health_changed"
+    TIMELINE_FACT_QUARANTINED = "timeline_fact_quarantined"
+    TIMELINE_FLUSH_FAILING = "timeline_flush_failing"
+    TIMELINE_FLUSH_RECOVERED = "timeline_flush_recovered"
     REQUEST_DENIED = "request_denied"
     UNSTRUCTURED = "unstructured_redacted"
 
