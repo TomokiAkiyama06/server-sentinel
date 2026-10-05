@@ -476,5 +476,18 @@ descriptors, which it can always read: a replacement bound by another process
 is an exposure. The missing-proxy-socket handling was accepted by the Owner
 on 2026-10-01.
 
+Implementation note (Issue #126): the privileged helper is
+`server-sentinel-socket-owner.service`, a socket-activated service running as
+a transient non-root account with only `CAP_DAC_READ_SEARCH` and
+`CAP_SYS_PTRACE`. It answers over a root-owned, group-restricted unix socket,
+only to the ServerSentinel service UID verified with `SO_PEERCRED`, only about
+sockets listening in that process's network namespace, and only with each
+holder's executable and systemd unit, or whether ServerSentinel alone holds its
+upstream socket; any helper failure keeps the listener unverified and access
+closed. With it composed, the human upstream must be held by the
+ServerSentinel process alone, which closes the fork / `SCM_RIGHTS` gap noted
+for PR #91. Installation is an Owner host step (`server/docs/DEPLOYMENT.md`)
+verified per `MANUAL_TEST.md`.
+
 Clarification, 2026-10-01 (PR #91): where this record says the startup and daily check closes access "on any other answer", read "on any other answer it can see". The check enumerates listening sockets (`/proc/net`) and Tailscale Serve routes only; kernel forwarding to the reserved address (nftables/iptables DNAT or REDIRECT, TPROXY, eBPF `sk_lookup`, IPVS) is not visible to it and must be excluded by the deployment isolation and verified by the operator per `MANUAL_TEST.md`. The current contract is in `server/app/auth/README.md`. This is still detection: it bounds how long an exposed
 cookie stays usable, and does not prevent the exposure.

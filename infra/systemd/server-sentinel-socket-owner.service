@@ -1,0 +1,74 @@
+# ServerSentinel listener socket-owner helper (Issue #126, Owner decision
+# 2026-10-01). It reports only who holds a listening socket (executable path
+# and system unit, or whether the requester alone holds it) to the non-root
+# ServerSentinel service, which never gains privilege itself.
+#
+# Privilege: a transient non-root account (DynamicUser) with exactly two
+# capabilities, the minimum the kernel requires to read another account's
+# /proc/<pid> socket ownership:
+#   CAP_DAC_READ_SEARCH  list /proc/<pid>/fd of processes of other accounts
+#                        (and read the root-owned, group-only deployment
+#                        configuration);
+#   CAP_SYS_PTRACE       pass ptrace_may_access(PTRACE_MODE_READ) for the
+#                        /proc/<pid>/fd/* and /proc/<pid>/exe links.
+# The ptrace-family system calls are filtered out (~@debug), so the helper
+# cannot attach to or read the memory of any process, and open_by_handle_at
+# (the CAP_DAC_READ_SEARCH escape) is filtered out with @privileged. It has
+# no network (PrivateNetwork, AF_UNIX only) and a read-only file system.
+# Do not add PrivateUsers= (capabilities would no longer apply to host
+# processes) or ProtectProc=invisible / PrivatePIDs= (other processes would be
+# hidden, so every scan would be incomplete and access would stay closed).
+#
+# The paths below are the documented defaults (server/docs/DEPLOYMENT.md);
+# when the installation root or configuration path differs, override
+# ExecStart= and WorkingDirectory= with `systemctl edit`, never by editing
+# this file in place.
+
+[Unit]
+Description=ServerSentinel listener socket-owner helper
+Requires=server-sentinel-socket-owner.socket
+After=server-sentinel-socket-owner.socket
+Before=server-sentinel.service
+# A release update or rollback restarts server-sentinel.service; the helper
+# restarts with it, so it always runs the current release's code.
+PartOf=server-sentinel.service
+
+[Service]
+Type=simple
+ExecStart=/opt/server-sentinel-main/current/venv/bin/python -E -s -B -m app.auth.socket_owner --config /etc/server-sentinel/deployment.json
+WorkingDirectory=/opt/server-sentinel-main/current
+Restart=on-failure
+RestartSec=2
+DynamicUser=yes
+CapabilityBoundingSet=CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
+AmbientCapabilities=CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
+NoNewPrivileges=yes
+UMask=0077
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateNetwork=yes
+PrivateIPC=yes
+IPAddressDeny=any
+RestrictAddressFamilies=AF_UNIX
+ProcSubset=pid
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RemoveIPC=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@debug @privileged @resources @mount
+SystemCallErrorNumber=EPERM
+TasksMax=4
+MemoryMax=128M
+LimitNOFILE=256

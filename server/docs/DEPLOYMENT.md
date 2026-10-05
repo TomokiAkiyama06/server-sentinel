@@ -252,10 +252,74 @@ Repeat the `ss`/`readlink` check after each `openssh-server` upgrade and restart
 `ssh.service` once upgraded: until then the running executable shows as
 `(deleted)` and the check keeps access closed.
 
-Until the privileged socket-owner helper of Issue #126 lands, the non-root
-ServerSentinel service cannot read a root-owned `sshd`'s `/proc/<pid>/fd` and
-`exe`, so an excepted `sshd` stays `LISTENER_OWNER_UNVERIFIED` and human
-access stays closed. ServerSentinel itself is never given root for this.
+The non-root ServerSentinel service cannot read a root-owned `sshd`'s
+`/proc/<pid>/fd` and `exe` itself, so the socket owner is looked up by the
+separate helper service below. Without it an excepted `sshd` stays
+`LISTENER_OWNER_UNVERIFIED` and human access stays closed. ServerSentinel
+itself is never given root or capabilities for this.
+
+### Listener socket-owner helper (Issue #126)
+
+`server-sentinel-socket-owner.service` (`app.auth.socket_owner`, standard
+library only) answers one question for ServerSentinel: which executable and
+system unit hold a listening socket, or whether ServerSentinel alone holds its
+own upstream socket. It never changes anything and returns no PID, command
+line, account or other process detail.
+
+- Privilege: a transient non-root account (`DynamicUser=yes`) with exactly
+  `CAP_DAC_READ_SEARCH` (list another account's `/proc/<pid>/fd`, read the
+  group-only deployment configuration) and `CAP_SYS_PTRACE` (the kernel's
+  `ptrace_may_access` read check on the `fd/*` and `exe` links). These are the
+  minimum the kernel requires; root is not used. The ptrace-family system
+  calls (`~@debug`) and `open_by_handle_at` (`~@privileged`) are filtered, so
+  the helper cannot attach to or read the memory of another process. It has no
+  network and a read-only file system.
+- Channel: systemd creates `/run/server-sentinel-socket-owner/socket`
+  `root:server-sentinel-socket-owner` mode `0660` in a root-owned `0755`
+  directory (socket activation). The helper answers only a peer whose
+  kernel-reported `SO_PEERCRED` UID is `service_uid` from the deployment
+  configuration and whose `/proc/<pid>/status` shows that UID; any other peer
+  is closed without reading its request. It answers only about sockets that
+  are listening in the requesting process's own network namespace.
+- Bounds and audit: one request per connection, at most 4096 bytes and 64
+  socket inodes, a 2-second read limit, 20 requests in a burst refilled at one
+  per 3 seconds. Every answer, failure and refusal is written to the journal
+  (`journalctl -u server-sentinel-socket-owner`); refusals are coalesced per
+  minute.
+- Failure: a missing, stopped, slow, rate-limited or malformed helper makes
+  the ServerSentinel client raise, so the reservation check reports
+  `LISTENER_OWNER_UNVERIFIED` and keeps human access closed (an exposure
+  reason, so reopening revokes every human session).
+
+Install from the tagged release checkout as the Owner. These are host
+administration steps; nothing in the installer or the service performs them:
+
+```sh
+sudo groupadd --system server-sentinel-socket-owner
+sudo usermod -aG server-sentinel-socket-owner <service-account>
+sudo install -m 0644 -o root -g root \
+  infra/systemd/server-sentinel-socket-owner.socket \
+  infra/systemd/server-sentinel-socket-owner.service /etc/systemd/system/
+# Only when the installation root or configuration path differs from
+# /opt/server-sentinel-main and /etc/server-sentinel/deployment.json:
+sudo systemctl edit server-sentinel-socket-owner.service   # override ExecStart=/WorkingDirectory=
+sudo systemctl daemon-reload
+sudo systemctl enable --now server-sentinel-socket-owner.socket
+sudo systemctl restart server-sentinel.service   # picks up the new group membership
+```
+
+The hostname reservation check is not yet composed in the running service
+(no human route is mounted); when it is, the composition passes
+`app.auth.socket_owner.SocketOwnerHelperClient()` as its `socket_owners`.
+
+Add only the ServerSentinel service account to the group. The service is
+started on demand by the socket and is `PartOf=server-sentinel.service`, so a
+release update or rollback, which restarts `server-sentinel.service`, also
+restarts the helper on the new release's code. Its unit has no `[Install]`
+section; enable the socket only. Check the result with the helper steps in
+`MANUAL_TEST.md` (Issue #126). Until those steps pass on the Main Server the
+helper's behaviour there is unverified; the repository tests run it only
+against synthetic `/proc` trees.
 
 ## Install, update, and rollback
 

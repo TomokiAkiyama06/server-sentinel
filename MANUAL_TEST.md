@@ -1737,11 +1737,11 @@ by the Issue #6 synthetic policy model.
   first follow the `server/docs/DEPLOYMENT.md` SSH steps (`ssh.socket`
   disabled, `ssh.service` enabled) and record `systemctl is-enabled ssh.socket
   ssh.service`, `ss -ltnp 'sport = :22'` and `readlink /proc/<sshd pid>/exe`.
-  Before Issue #126 (privileged owner helper) lands, confirm the non-root
+  Without the Issue #126 helper (socket stopped), confirm the non-root
   service reports `LISTENER_OWNER_UNVERIFIED` for the excepted `sshd` and
-  human access stays closed. Once #126 is composed as `socket_owners`,
-  confirm the helper's answer matches `readlink` and access opens with `sshd`
-  on 22. With #126 composed, stop `sshd`, start another process on the
+  human access stays closed. With the helper installed and composed as
+  `socket_owners`, confirm the helper's answer matches `readlink` and access
+  opens with `sshd` on 22. Then stop `sshd`, start another process on the
   excepted port (for example `sudo python3 -m http.server 22`), and confirm
   access closes with `UNEXPECTED_LISTENER` and that reopening revokes every
   human session. Record whether the host uses `ssh.socket` (socket
@@ -1767,13 +1767,49 @@ by the Issue #6 synthetic policy model.
   disposable node, stop the upstream only (keep the check running), bind
   another process to the same loopback address and port (one socket, no
   `SO_REUSEPORT`), and confirm `UNEXPECTED_LISTENER` closes access and that
-  reopening revokes every human session.
+  reopening revokes every human session. With the Issue #126 helper composed,
+  also confirm the upstream is reported as held by the service alone; a
+  descriptor shared with another process (fork or `SCM_RIGHTS`) is reported
+  as `UNEXPECTED_LISTENER` (synthetic tests only; reproducing it needs a
+  modified build on a disposable node).
+- Socket-owner helper (Issue #126; mock-only so far, never run on the Main
+  Server): follow the helper steps in `server/docs/DEPLOYMENT.md`, then record
+  - `systemctl is-enabled server-sentinel-socket-owner.socket` (enabled),
+    `stat -c '%U:%G %a' /run/server-sentinel-socket-owner
+    /run/server-sentinel-socket-owner/socket` (`root:root 755`,
+    `root:server-sentinel-socket-owner 660`) and that the service account's
+    running process lists the group (`grep Groups
+    /proc/<service pid>/status`);
+  - after the first check, `systemctl show -p User,MainPID
+    server-sentinel-socket-owner.service` (a dynamic user, not root) and
+    `grep -E 'Cap(Eff|Bnd)' /proc/<helper pid>/status`: both masks are
+    exactly `0000000000080004` (`CAP_DAC_READ_SEARCH` + `CAP_SYS_PTRACE`);
+    `journalctl -u server-sentinel-socket-owner` shows
+    `event=started capabilities=complete` and `event=answered` lines;
+  - `systemctl show -p SystemCallFilter server-sentinel-socket-owner.service`
+    excludes `ptrace`, `process_vm_readv` and `open_by_handle_at`;
+  - from an account that is neither root nor the service account (for
+    example a temporary test account added to the group on a disposable
+    node), a connection is closed without an answer and a coalesced
+    `event=refused reason=peer_uid` line appears;
+  - stop the socket and service (`systemctl stop
+    server-sentinel-socket-owner.socket server-sentinel-socket-owner.service`)
+    and confirm the next check reports `LISTENER_OWNER_UNVERIFIED` and human
+    access stays closed; start the socket again and confirm the following
+    check reopens only after every human session has been revoked;
+  - run a release update and confirm the helper restarted with the new
+    release (its `MainPID` changed, or it is inactive until the next
+    connection) and that checks still pass;
+  - record whether the host mounts `/proc` with `hidepid` or uses an LSM
+    policy that denies the helper; either makes every scan incomplete, so
+    access stays closed (`SOCKET_OWNERS_INCOMPLETE` in the journal).
 - Proxy socket ownership (mock-only so far): record whether `tailscaled`
   holds a visible socket on the Tailscale address at the origin port (`sudo ss
   -ltnp`); if it does, record its executable and unit (`readlink
-  /proc/<pid>/exe`, `/proc/<pid>/cgroup`) as `proxy_owner`. Before Issue #126,
-  confirm access stays closed with `LISTENER_OWNER_UNVERIFIED`. Once #126 is
-  composed, confirm access opens, then (on a disposable node) stop the proxy,
+  /proc/<pid>/exe`, `/proc/<pid>/cgroup`) as `proxy_owner`. Without the
+  Issue #126 helper, confirm access stays closed with
+  `LISTENER_OWNER_UNVERIFIED`. With it, confirm access opens, then (on a
+  disposable node) stop the proxy,
   bind another process to the same address and port while Serve status still
   lists the route, and confirm `UNEXPECTED_LISTENER` closes access and that
   reopening revokes every human session. Stop the proxy without a replacement

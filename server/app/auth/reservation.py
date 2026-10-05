@@ -297,6 +297,15 @@ class SocketOwnerResolver(Protocol):
     def owners(self, inodes: frozenset) -> dict:
         """Map each socket inode to the ``SocketOwner``s holding it; raise when unknown."""
 
+    def held_only_by_requester(self, inodes: frozenset) -> dict:
+        """Map each socket inode to whether this process alone holds it; raise when unknown.
+
+        ``True`` only when the calling ServerSentinel process is the single
+        process holding the socket; a forked child or a process that received
+        the descriptor (``SCM_RIGHTS``) is another holder. An inode left out is
+        unverified.
+        """
+
 
 class ListenerExceptionSource(Protocol):
     def load(self) -> Iterable["ListenerException"]:
@@ -437,7 +446,8 @@ class ProcSocketOwners:
     makes the scan incomplete: it may hide another holder of an excepted
     socket, so the lookup raises and every excepted listener stays unverified,
     even one whose readable holders all match. A non-root service therefore
-    needs the privileged helper of Issue #126.
+    uses the privileged helper of Issue #126 (``app.auth.socket_owner``), which
+    runs this scan on its behalf.
     """
 
     def __init__(self, proc: str = "/proc"):
@@ -446,8 +456,17 @@ class ProcSocketOwners:
         self._proc = proc
 
     def owners(self, inodes: frozenset) -> dict:
+        return {inode: frozenset(holders.values()) for inode, holders in self.scan(inodes).items()}
+
+    def held_only_by_requester(self, inodes: frozenset, requester: int | None = None) -> dict:
+        """Whether ``requester`` (default: this process) is the only process holding each inode."""
+        pid = os.getpid() if requester is None else requester
+        return {inode: set(holders) == {pid} for inode, holders in self.scan(inodes).items()}
+
+    def scan(self, inodes: frozenset) -> dict:
+        """Map each held inode to ``{pid: SocketOwner}`` for every process holding it."""
         wanted = {f"socket:[{inode}]": inode for inode in inodes}
-        found: dict[int, set[SocketOwner]] = {}
+        found: dict[int, dict[int, SocketOwner]] = {}
         try:
             pids = [pid for pid in os.listdir(self._proc) if pid.isdigit()]
         except OSError:
@@ -482,8 +501,8 @@ class ProcSocketOwners:
             except (OSError, ValueError):
                 unit = None
             for inode in held:
-                found.setdefault(inode, set()).add(SocketOwner(executable, unit))
-        return {inode: frozenset(owners) for inode, owners in found.items()}
+                found.setdefault(inode, {})[int(pid)] = SocketOwner(executable, unit)
+        return found
 
 
 class OwnSocketInodes:
@@ -796,9 +815,20 @@ def excepted_inodes(config: ReservationConfig, listeners, exceptions: frozenset)
     return frozenset(inodes)
 
 
+def human_inodes(config: ReservationConfig, listeners, own_inodes) -> frozenset:
+    """Inodes of human upstream rows this process holds, whose sole holding a check verifies."""
+    if isinstance(listeners, Reason) or not isinstance(own_inodes, frozenset):
+        return frozenset()
+    return frozenset(
+        listener.inode for listener in listeners
+        if listener.inode and listener.inode in own_inodes
+        and Listener(_normalize(listener.address), listener.port, listener.protocol) == config.human_listener)
+
+
 def evaluate(config: ReservationConfig, listeners, routes,
              exceptions: frozenset = frozenset(),
-             resolved=None, owners=None, own_inodes=None) -> tuple[tuple[Reason, ...], int, int]:
+             resolved=None, owners=None, own_inodes=None,
+             sole_holders=None) -> tuple[tuple[Reason, ...], int, int]:
     """Pure comparison. ``listeners``/``routes``/``resolved``/``owners`` are values or a ``Reason``.
 
     ``owners`` maps socket inodes to their ``SocketOwner``s; an excepted
@@ -807,6 +837,11 @@ def evaluate(config: ReservationConfig, listeners, routes,
     ``own_inodes`` are the sockets this process holds: the human upstream
     passes only as one of them (a ``Reason``: unverifiable; ``None`` skips the
     ownership comparison, for pure endpoint evaluation only).
+    ``sole_holders`` maps the upstream's inode to whether this process alone
+    holds it (Issue #126): ``False`` is another holder sharing the socket (a
+    forked child or a descriptor passed with ``SCM_RIGHTS``), and a ``Reason``
+    or a missing inode is unverifiable. ``None`` skips it, when no socket owner
+    resolver is composed.
 
     ``resolved`` is the hostname's current address set (``None``: the
     configured set). Listeners are checked against the union with the
@@ -848,6 +883,13 @@ def evaluate(config: ReservationConfig, listeners, routes,
                     elif listener.inode not in own_inodes:
                         # A single replacement: another process's socket on the upstream.
                         unexpected_listeners += 1
+                    elif sole_holders is not None:
+                        sole = sole_holders.get(listener.inode) if isinstance(sole_holders, dict) else None
+                        if sole is None:
+                            unverified += 1
+                        elif sole is not True:
+                            # The same socket is also held by another process.
+                            unexpected_listeners += 1
                 seen_human = True
                 continue
             # A wildcard bind answers on every address, the reserved ones
@@ -983,7 +1025,9 @@ class HostnameReservationCheck:
         # set alone cannot show an address the name gained.
         self._resolver = resolver
         # Without it no excepted listener's owner can be verified, so any
-        # listener an exception would cover closes access.
+        # listener an exception would cover closes access. With it, the human
+        # upstream must also be held by this process alone. Production passes
+        # ``app.auth.socket_owner.SocketOwnerHelperClient`` (Issue #126).
         self._socket_owners = socket_owners
         # Without it the human upstream's owner is unverifiable and access stays closed.
         self._own_sockets = own_sockets
@@ -1158,30 +1202,43 @@ class HostnameReservationCheck:
                                 Reason.LISTENER_OWNER_UNVERIFIED, Reason.LISTENER_OWNER_UNVERIFIED, int)
         return value if isinstance(value, Reason) else frozenset(value)
 
-    def _enumerate_owners(self, inodes: frozenset):
-        previous = self._inflight.get("owners")
+    def _enumerate_mapping(self, name: str, call: Callable[[], dict], valid: Callable[[object], bool]):
+        """A bounded ``dict`` lookup on a worker thread; ``None`` when unknown."""
+        previous = self._inflight.get(name)
         if previous is not None and previous.is_alive():
             return None
         box: dict[str, object] = {}
 
         def run():
             try:
-                box["value"] = self._socket_owners.owners(inodes)
+                box["value"] = call()
             except BaseException:
                 box["error"] = True
 
-        worker = threading.Thread(target=run, name="reservation-owners", daemon=True)
-        self._inflight["owners"] = worker
+        worker = threading.Thread(target=run, name=f"reservation-{name}", daemon=True)
+        self._inflight[name] = worker
         worker.start()
         worker.join(self._timeout)
         value = box.get("value")
         if worker.is_alive() or "error" in box or not isinstance(value, dict) or any(
-                type(inode) is not int or not isinstance(holders, frozenset)
-                or any(not isinstance(owner, SocketOwner) for owner in holders)
-                for inode, holders in value.items()):
-            # Unknown ownership: every excepted listener stays unverified.
+                type(key) is not int or not valid(item) for key, item in value.items()):
             return None
         return value
+
+    def _enumerate_owners(self, inodes: frozenset):
+        # Unknown ownership (None): every excepted listener stays unverified.
+        return self._enumerate_mapping(
+            "owners", lambda: self._socket_owners.owners(inodes),
+            lambda holders: isinstance(holders, frozenset)
+            and all(isinstance(owner, SocketOwner) for owner in holders))
+
+    def _enumerate_sole_holders(self, inodes: frozenset):
+        lookup = getattr(self._socket_owners, "held_only_by_requester", None)
+        if not callable(lookup):
+            return Reason.LISTENER_OWNER_UNVERIFIED
+        value = self._enumerate_mapping("sole-holders", lambda: lookup(inodes),
+                                        lambda sole: type(sole) is bool)
+        return Reason.LISTENER_OWNER_UNVERIFIED if value is None else value
 
     def _check(self, kind: CheckKind) -> ReservationVerdict:
         with self.exception_change_lock, self._check_lock:
@@ -1215,8 +1272,15 @@ class HostnameReservationCheck:
             if inodes and self._socket_owners is not None:
                 owners = self._enumerate_owners(inodes)
             own = self._enumerate_own()
+            sole = None
+            if self._socket_owners is not None:
+                # With a resolver composed, the upstream must also be held by
+                # this process alone (Issue #126); a failed lookup is unverified.
+                human = human_inodes(self.config, listeners, own)
+                sole = self._enumerate_sole_holders(human) if human else {}
             reasons, extra_listeners, extra_routes = evaluate(self.config, listeners, routes,
-                                                              self._exceptions, resolved, owners, own)
+                                                              self._exceptions, resolved, owners, own,
+                                                              sole)
         except Exception:
             reasons, extra_listeners, extra_routes = (Reason.LISTENER_ENUMERATION_UNAVAILABLE,), 0, 0
         if not self._exceptions_loaded:

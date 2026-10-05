@@ -1,0 +1,26 @@
+# ServerSentinel listener socket-owner helper endpoint (Issue #126).
+#
+# systemd creates the socket root:server-sentinel-socket-owner mode 0660 in a
+# root-owned 0755 directory, so only root and members of that group can
+# connect, and no other account can replace the endpoint. Add only the
+# ServerSentinel service account to the group. The helper additionally
+# answers only the service UID recorded in the deployment configuration
+# (SO_PEERCRED). See server/docs/DEPLOYMENT.md.
+
+[Unit]
+Description=ServerSentinel listener socket-owner helper endpoint
+Before=server-sentinel.service
+
+[Socket]
+ListenStream=/run/server-sentinel-socket-owner/socket
+SocketUser=root
+SocketGroup=server-sentinel-socket-owner
+SocketMode=0660
+DirectoryMode=0755
+RemoveOnStop=yes
+Accept=no
+Backlog=8
+PassCredentials=no
+
+[Install]
+WantedBy=sockets.target

@@ -173,12 +173,19 @@ following closes it:
   not counted;
 - a loopback human upstream that is not a socket of this ServerSentinel
   process: each check reads its own `/proc/self/fd` (`OwnSocketInodes`, the
-  injected `own_sockets`), which needs no privilege and no #126 helper. A
+  injected `own_sockets`), which needs no privilege. A
   single replacement bound by another process after the upstream released the
   endpoint (no `SO_REUSEPORT` duplicate row) counts as `UNEXPECTED_LISTENER`;
   an unreadable own fd table, a socket without an inode, or no `own_sockets`
   counts as `LISTENER_OWNER_UNVERIFIED`; both are exposures. Python creates
-  non-inheritable descriptors, so a child process does not share the socket;
+  non-inheritable descriptors, so a child process does not share the socket.
+  When a `socket_owners` resolver is composed, each check also asks it
+  (`held_only_by_requester`) whether this process is the only process
+  holding the upstream socket (Issue #126): a forked child or a process given
+  the descriptor with `SCM_RIGHTS` shares the inode while `/proc/net` shows a
+  single row, and counts as `UNEXPECTED_LISTENER`; a lookup that fails, times
+  out, leaves the inode out or is unsupported counts as
+  `LISTENER_OWNER_UNVERIFIED`;
 - a recorded proxy socket that is absent (`PROXY_LISTENER_MISSING`). This is
   proxy drift or failure with nothing else seen answering, so, like a
   resolution failure, it closes access without revocation and reopens once
@@ -263,11 +270,24 @@ account's `/proc/<pid>/fd` and `exe` needs privilege the non-root service may
 not hold (root, or `CAP_DAC_READ_SEARCH` + `CAP_SYS_PTRACE`); without it an
 excepted root-owned `sshd` stays unverified and access stays closed. Owner
 decision (2026-10-01): ServerSentinel stays non-root, and a small privileged
-helper running as its own systemd service will answer the ownership lookup
-(Issue #126); it plugs in as the `SocketOwnerResolver` passed as
-`socket_owners`. Until #126 lands, an excepted root-owned listener such as
-`sshd`, and a recorded proxy socket held by root-owned `tailscaled`, keep
-human access closed. A
+helper running as its own systemd service answers the ownership lookup
+(Issue #126, `socket_owner.py`). `SocketOwnerHelperClient` is the
+`SocketOwnerResolver` passed as `socket_owners`; it connects to the
+socket-activated `/run/server-sentinel-socket-owner/socket` only after
+checking that the socket and its directory are root-owned and not writable by
+others. The helper (`python -m app.auth.socket_owner`, unit files in
+`infra/systemd/`) runs as a transient non-root account with only
+`CAP_DAC_READ_SEARCH` and `CAP_SYS_PTRACE`, answers only a peer whose
+`SO_PEERCRED` UID is the deployment's `service_uid`, answers only about
+sockets listening in that peer's own network namespace, returns only each
+holder's executable and unit (or the single `held_only_by_requester` bit),
+bounds request size, inode count and rate, and writes each answer and refusal
+to the journal. Any helper failure raises in the client, so the listener stays
+`LISTENER_OWNER_UNVERIFIED`. Without the helper, an excepted root-owned
+listener such as `sshd`, and a recorded proxy socket held by root-owned
+`tailscaled`, keep human access closed. The check is not yet composed in the
+running service; installation and real-host verification are in
+`server/docs/DEPLOYMENT.md` and `MANUAL_TEST.md`. A
 deleted executable (`… (deleted)` after a package upgrade until the service
 restarts) does not match either. With socket activation (for example
 Ubuntu's `ssh.socket`) the listening socket is held by the service manager

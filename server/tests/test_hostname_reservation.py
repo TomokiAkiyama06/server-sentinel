@@ -162,10 +162,22 @@ def exc(*args, **kwargs):
 class Owners:
     """Synthetic socket ownership: every inode is held by ``default`` unless overridden."""
 
-    def __init__(self, default=SSHD_OWNER, overrides=None):
+    def __init__(self, default=SSHD_OWNER, overrides=None, sole=True):
         self.default = default
         self.overrides = dict(overrides or {})
         self.calls = []
+        # Whether this process alone holds the human upstream (Issue #126):
+        # a bool for every inode, a {inode: bool} mapping, or an exception.
+        self.sole = sole
+        self.sole_calls = []
+
+    def held_only_by_requester(self, inodes):
+        self.sole_calls.append(inodes)
+        if isinstance(self.sole, BaseException):
+            raise self.sole
+        if isinstance(self.sole, dict):
+            return {inode: self.sole[inode] for inode in inodes if inode in self.sole}
+        return {inode: self.sole for inode in inodes}
 
     def owners(self, inodes):
         self.calls.append(inodes)
@@ -1551,6 +1563,24 @@ class ProcSocketOwnersTests(TestCase):
                 owners = ProcSocketOwners(str(self.root)).owners(frozenset({5000 + number}))
                 self.assertEqual(owners[5000 + number], frozenset({SocketOwner("/usr/sbin/sshd", unit)}))
 
+    def test_held_only_by_requester(self):
+        # Issue #126: a forked child or SCM_RIGHTS receiver shares the inode.
+        self.process(100, "/usr/bin/python3.12", ["socket:[1000]", "socket:[2000]"])
+        self.process(101, "/usr/bin/python3.12", ["socket:[2000]"])
+        self.process(102, "/usr/sbin/other", ["socket:[3000]"])
+        resolver = ProcSocketOwners(str(self.root))
+        self.assertEqual(resolver.held_only_by_requester(frozenset({1000, 2000, 3000, 4000}), requester=100),
+                         {1000: True, 2000: False, 3000: False})
+        # By default the requester is this process.
+        self.process(os.getpid(), "/usr/bin/python3.12", ["socket:[5000]"])
+        self.assertEqual(resolver.held_only_by_requester(frozenset({5000})), {5000: True})
+
+    def test_held_only_by_requester_scan_is_all_or_nothing(self):
+        self.process(100, "/usr/bin/python3.12", ["socket:[1000]"])
+        self.unreadable(self.process(200, "/usr/bin/python3.12", []))
+        with self.assertRaises(ReservationEnumerationError):
+            ProcSocketOwners(str(self.root)).held_only_by_requester(frozenset({1000}), requester=100)
+
     def test_user_manager_impersonating_a_unit_does_not_match(self):
         self.process(100, "/usr/bin/python3.12", ["socket:[1001]"],
                      cgroup="0::/user.slice/user-1000.slice/user@1000.service/app.slice/ssh.service\n")
@@ -1661,6 +1691,65 @@ class HumanListenerOwnershipTests(TestCase):
                 check, *_ = checker(session_revoker=revoker, **kwargs)
                 self.assertEqual(check.startup().reasons, (Reason.LISTENER_OWNER_UNVERIFIED,))
                 self.assertTrue(revoker.pending)
+
+    def test_sole_holding_is_verified_with_a_resolver(self):
+        owners = Owners()
+        check, *_ = checker(own_sockets=lambda: frozenset({1000}), socket_owners=owners)
+        self.assertTrue(check.startup().open)
+        # Only the upstream's inode is asked about.
+        self.assertEqual(owners.sole_calls, [frozenset({1000})])
+
+    def test_shared_upstream_socket_is_an_exposure(self):
+        # A forked child or a process given the descriptor (SCM_RIGHTS) holds
+        # the same inode; /proc/net shows one row, so only the helper sees it.
+        revoker = FakeRevoker()
+        check, _, _, sink = checker(own_sockets=lambda: frozenset({1000}), socket_owners=Owners(sole={1000: False}),
+                                    session_revoker=revoker)
+        self.assertEqual(check.startup().reasons, (Reason.UNEXPECTED_LISTENER,))
+        self.assertEqual(sink.events[-1].unexpected_listeners, 1)
+        self.assertTrue(revoker.pending)
+
+    def test_unverifiable_sole_holding_is_an_exposure(self):
+        release = threading.Event()
+        self.addCleanup(release.set)
+
+        class Hung(Owners):
+            def held_only_by_requester(self, inodes):
+                release.wait(5)
+                return {inode: True for inode in inodes}
+
+        class Legacy:
+            def owners(self, inodes):
+                return {}
+
+        cases = {
+            "helper failure": dict(socket_owners=Owners(sole=ReservationEnumerationError("HELPER_UNAVAILABLE"))),
+            "inode left out": dict(socket_owners=Owners(sole={})),
+            "non-bool answer": dict(socket_owners=Owners(sole={1000: 1})),
+            "timeout": dict(socket_owners=Hung(), timeout=0.05),
+            "resolver without the query": dict(socket_owners=Legacy()),
+        }
+        for name, kwargs in cases.items():
+            with self.subTest(name):
+                revoker = FakeRevoker()
+                check, *_ = checker(own_sockets=lambda: frozenset({1000}), session_revoker=revoker, **kwargs)
+                self.assertEqual(check.startup().reasons, (Reason.LISTENER_OWNER_UNVERIFIED,))
+                self.assertTrue(revoker.pending)
+
+    def test_without_a_resolver_only_the_own_fd_table_is_compared(self):
+        check, *_ = checker(own_sockets=lambda: frozenset({1000}), socket_owners=None)
+        self.assertTrue(check.startup().open)
+
+    def test_sole_holding_evaluation(self):
+        listener = Listener(HUMAN.address, HUMAN.port, inode=1000)
+        route = (config().expected_route,)
+        own = frozenset({1000})
+        for sole, expected in ((None, ()), ({1000: True}, ()), ({1000: False}, (Reason.UNEXPECTED_LISTENER,)),
+                               ({}, (Reason.LISTENER_OWNER_UNVERIFIED,)),
+                               (Reason.LISTENER_OWNER_UNVERIFIED, (Reason.LISTENER_OWNER_UNVERIFIED,))):
+            with self.subTest(sole=sole):
+                reasons, _, _ = evaluate(config(), (listener,), route, own_inodes=own, sole_holders=sole)
+                self.assertEqual(reasons, expected)
 
     def test_unknown_inode_is_unverified(self):
         reasons, count, _ = evaluate(config(), (Listener(HUMAN.address, HUMAN.port, inode=0),),

@@ -330,19 +330,28 @@ The current contract for that check (Owner decisions 2026-09-30 and
   executable or systemd unit, never a port alone, and every check verifies the
   socket's owning processes. Another process, or ownership that cannot be read
   completely, closes access as an exposure. ServerSentinel stays non-root;
-  reading root-owned sockets is left to a separate privileged helper service
-  (Issue #126), and until it exists an excepted root-owned `sshd` keeps human
-  access closed. The Main Server runs `sshd` as `ssh.service` without
+  root-owned sockets are read by a separate helper service (Issue #126,
+  `server/app/auth/socket_owner.py`, `infra/systemd/`) running as a transient
+  non-root account with only `CAP_DAC_READ_SEARCH` and `CAP_SYS_PTRACE`
+  (ptrace and `open_by_handle_at` system calls filtered). It answers over a
+  `root:server-sentinel-socket-owner` `0660` unix socket, only to the
+  service UID verified with `SO_PEERCRED`, only about sockets listening in the
+  requester's network namespace, and only with each holder's executable and
+  unit; requests are bounded and rate-limited, and answers and refusals are
+  journaled. A missing or failing helper keeps the listener unverified and
+  human access closed. The Main Server runs `sshd` as `ssh.service` without
   `ssh.socket`, with the exception `tcp/22` owned by `/usr/sbin/sshd`
   (`server/docs/DEPLOYMENT.md`).
 - Every recorded proxy socket must be present and held only by the recorded
   proxy process (for example `tailscaled.service`), verified the same way.
   Another or unverifiable holder is an exposure; a missing recorded socket
-  closes access without revocation until it returns. Until #126 lands, a
-  root-owned proxy's sockets keep human access closed.
+  closes access without revocation until it returns. Without the #126
+  helper, a root-owned proxy's sockets keep human access closed.
 - The loopback human upstream must be a socket the ServerSentinel process
   itself holds (checked in its own `/proc/self/fd`, without privilege); a
-  replacement bound by another process is an exposure.
+  replacement bound by another process is an exposure. With the #126 helper
+  composed it must also be held by that process alone: a descriptor shared
+  with another process (fork or `SCM_RIGHTS`) is an exposure.
 
 ## Shared Tailnet account
 
