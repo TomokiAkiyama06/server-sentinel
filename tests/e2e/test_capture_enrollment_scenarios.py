@@ -39,6 +39,8 @@ from app.cameras.remote_agent.node_ca import (
 )
 from app.cameras.remote_agent.pairing import HmacCodeVerifier, PairingLedger
 from app.storage.database import Database
+from app.storage.migrations import migrate
+from app.storage.schema import APPLICATION_MIGRATIONS
 from tests.e2e.harness import require_non_root_agent
 
 
@@ -278,6 +280,10 @@ class CaptureEnrollmentScenario(unittest.TestCase):
         self.authority_dir = self.root / "main-ca"
         self.listener_dir = self.root / "main-listener"
         self.database = self.root / "state.sqlite3"
+        # The application creates its database; the pairing CLI only opens an
+        # existing one and never creates it (Issue #125).
+        with closing(Database(self.database).connect()) as connection:
+            migrate(connection, APPLICATION_MIGRATIONS)
         self.runtime = self.root / "agent-state"
         self.runtime.mkdir(mode=0o700)
         self.exchange = self.root / "exchange"
@@ -615,6 +621,7 @@ class CaptureEnrollmentScenario(unittest.TestCase):
     def test_main_approval_requires_a_controlling_terminal(self):
         self.initialise_main(free_port())
         request, _digest = self.agent_request()
+        before = self.database.read_bytes()
         status, output, error = self.main_cli(
             "approve", "--database", self.database, "--authority-dir", self.authority_dir,
             "--listener-dir", self.listener_dir, "--request", request,
@@ -622,7 +629,11 @@ class CaptureEnrollmentScenario(unittest.TestCase):
             tty=False).finish()
         self.assertEqual((2, ""), (status, output))
         self.assertIn("controlling_terminal_required", error)
-        self.assertFalse(self.database.exists(), "no state before the code can be shown")
+        # The application's database is untouched: no state before the code can be shown.
+        self.assertEqual(before, self.database.read_bytes())
+        with closing(sqlite3.connect(self.database)) as connection:
+            self.assertEqual(0, connection.execute(
+                "SELECT COUNT(*) FROM pairing_enrollments").fetchone()[0])
 
 
 if __name__ == "__main__":

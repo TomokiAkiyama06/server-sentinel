@@ -108,13 +108,23 @@ complete or expire, or after too many refused requests. Explicit
 `EnrollmentLimits` bound frame sizes, concurrent connections, a single
 per-connection deadline and attempts per source address. Logs carry fixed
 reason words only.
+Tailscale addresses (`100.64.0.0/10`, CGNAT) are also refused with
+`enrollment_bind_requires_private_address`: capture enrollment and ingest are
+designed for the private LAN and do not need Tailscale on either host.
 
 `pairing_cli.py` (`python -m app.cameras.remote_agent.pairing_cli`) is the local
 Owner CLI: `init`, `rotate-listener`, `export-bundle`, `approve`, `list`,
 `revoke`. `--listener-owner` names the listener directory's account when it
 differs from the CLI's (see `server/docs/DEPLOYMENT.md`). `rotate-listener`
 replaces the Main listener leaf before it expires and keeps the CA and server
-name; `approve` refuses `deployment_ca_validity_insufficient` before any
+name; `export-bundle` and `approve` refuse `listener_authority_mismatch` when
+the listener certificate was not issued by the selected CA directory (two
+deployments' directories mixed up); `approve`, `list` and `revoke` require
+`--database` to name the application's existing database (canonical path,
+regular file with one link, owned by the account running the CLI, not group-
+or other-writable) and refuse `database_not_found` / `database_rejected` /
+`database_path_rejected` instead of creating one; `approve` refuses
+`deployment_ca_validity_insufficient` before any
 approval when the CA can no longer cover a 397-day node leaf. The bootstrap
 listener sets `SO_REUSEADDR` (never `SO_REUSEPORT`) so a re-run binds while the
 previous run's connections are in TIME_WAIT. `init` validates

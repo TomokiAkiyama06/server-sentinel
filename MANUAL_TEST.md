@@ -412,9 +412,14 @@ code with the reviewed runtime installed. `AGENT_CLI` means
    only those ambient capabilities is used instead of root, record that it
    works.
 2. Choose the bootstrap endpoint: the Main's private-LAN IP and a port distinct
-   from the dashboard (loopback-only) and any ingest port. Run
+   from the dashboard (loopback-only) and any ingest port. Public addresses
+   and Tailscale addresses (`100.64.0.0/10`) are refused
+   (`enrollment_bind_requires_private_address`); enrollment and ingest use the
+   private LAN and need no Tailscale. Run
    `MAIN_CLI export-bundle --authority-dir <ca_dir> --listener-dir <listener_dir> --endpoint <ip>:<port> --output bundle.json`
-   and note the printed full `trust_bundle_sha256`.
+   and note the printed full `trust_bundle_sha256`. Running it with another
+   deployment's `--listener-dir` must refuse `listener_authority_mismatch`
+   and write no bundle.
 3. Copy `bundle.json` to the capture host over an Owner-trusted channel (for
    example removable media). Do not copy the digest over the same channel.
 4. On the capture host, as the dedicated non-root `media-capture-agent`
@@ -426,7 +431,9 @@ code with the reviewed runtime installed. `AGENT_CLI` means
    refused (`root_refused`). Note the printed `public_key_sha256`.
 5. Carry `request.json` (public) to the Main. Run
    `MAIN_CLI approve --database <data_dir>/state.sqlite3 --authority-dir <ca_dir> --listener-dir <listener_dir> --request request.json --listen <ip>:<port>`
-   from an interactive terminal (add `--human-host`/`--human-port` when the
+   from an interactive terminal; `<data_dir>/state.sqlite3` must be the
+   database the application already created (a mistyped path refuses
+   `database_not_found` and creates nothing) (add `--human-host`/`--human-port` when the
    dashboard does not use the default `127.0.0.1:8000`, for example `::1`, and
    confirm `--listen` on that exact socket is refused with
    `enrollment_listener_must_differ_from_other_listeners`). Compare the displayed public-key SHA-256 with

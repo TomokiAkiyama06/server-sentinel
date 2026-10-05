@@ -731,12 +731,24 @@ class DeploymentAuthority:
         stored listener key matches the certificate. Expiry is not checked, so
         an expired listener certificate can still be rotated.
         """
+        certificate = self.verify_listener_certificate(target)
+        if _key_digest(target, _SERVER_KEY) != public_key_digest(certificate.public_key()):
+            raise ListenerMaterialInconsistent("listener key does not match its certificate")
+        return certificate
+
+    def verify_listener_certificate(self, target: PrivateDirectory) -> x509.Certificate:
+        """Return ``target``'s listener certificate only if this CA issued it.
+
+        Used before exporting a trust bundle or serving enrollment, so a CA
+        directory of one deployment and a listener directory of another are
+        refused (``ListenerAuthorityMismatch``) instead of producing a bundle
+        whose CA cannot authenticate the listener (Issue #125). Reads only
+        the public certificate; expiry is not checked here.
+        """
         certificate = _load_certificate(target, _SERVER_CERTIFICATE, "listener material is invalid")
         if not self._issued(certificate):
             raise ListenerAuthorityMismatch("listener certificate is not from this deployment CA")
         _single_server_name(certificate)
-        if _key_digest(target, _SERVER_KEY) != public_key_digest(certificate.public_key()):
-            raise ListenerMaterialInconsistent("listener key does not match its certificate")
         return certificate
 
     def _issued(self, certificate: x509.Certificate) -> bool:

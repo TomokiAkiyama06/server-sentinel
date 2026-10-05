@@ -441,6 +441,10 @@ status or decision.
   enrollment listener process (#109).
 - **Concurrent `init`.** Both directories are locked for the whole run and the
   rollback removes only the entries the run created.
+- **Operator mistakes.** `export-bundle` and `approve` refuse a listener
+  certificate the selected CA did not issue (`listener_authority_mismatch`);
+  `approve`, `list` and `revoke` refuse a missing or unsafe `--database`
+  instead of creating and migrating an empty one.
 - **CA validity.** A leaf beyond the CA expiry raises a dedicated error. Node
   renewal reports `renewal_ca_validity_insufficient` and the deployment-wide
   local `capture_trust_warning`; `approve` and `rotate-listener` refuse

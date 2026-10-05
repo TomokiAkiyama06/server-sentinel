@@ -9,9 +9,11 @@ generated per test in a temporary directory; no real host, account change or
 network beyond loopback is involved.
 """
 import argparse
+from contextlib import closing
 import datetime
 import errno
 import io
+import json
 import os
 import pwd
 from pathlib import Path
@@ -25,6 +27,8 @@ from unittest.mock import patch
 from uuid import uuid4
 
 from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec
 
 from app.cameras.remote_agent import node_ca, pairing_cli
 from app.cameras.remote_agent.enrollment import (
@@ -36,12 +40,21 @@ from app.cameras.remote_agent.node_ca import (
     ListenerMaterialInconsistent, OwnershipPrivilegeRequired, PrivateDirectory,
     deployment_id_of, listener_material, main_server_name,
 )
+from app.storage.database import Database
+from app.storage.migrations import migrate
+from app.storage.schema import APPLICATION_MIGRATIONS
 
 
 SERVER_NAME = "capture-main.serversentinel.test"
 DAY = datetime.timedelta(days=1)
 LISTENER_FILES = ("main-server-certificate.pem", "main-server-key.pem")
 
+
+
+def node_request():
+    key = ec.generate_private_key(ec.SECP256R1())
+    csr = x509.CertificateSigningRequestBuilder().subject_name(x509.Name([])).sign(key, hashes.SHA256())
+    return key, csr.public_bytes(serialization.Encoding.PEM), node_ca.public_key_digest(key.public_key())
 
 def run_cli(*argv):
     stdout, stderr = io.StringIO(), io.StringIO()
@@ -480,6 +493,130 @@ class LockTests(ListenerLifecycleHarness):
                     pass
         with PrivateDirectory(directory.path).locked():
             pass
+
+
+class NoPromptTerminal:
+    """A controlling terminal that fails the test if anything is shown or asked."""
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def write(self, text):
+        raise AssertionError("nothing may be shown")
+
+    def read_line(self):
+        raise AssertionError("no confirmation may be requested")
+
+    def close(self):
+        pass
+
+
+class AuthorityConsistencyTests(ListenerLifecycleHarness):
+    """#125 item 4: a CA directory and a listener directory of different deployments."""
+
+    def test_export_bundle_refuses_a_listener_from_another_deployment(self):
+        authority_a, listener_a = self.fresh("a")
+        authority_b, listener_b = self.fresh("b")
+        self.init(authority_a, listener_a)
+        self.init(authority_b, listener_b)
+        output = self.root / f"bundle-{uuid4()}.json"
+        status, stdout, stderr = run_cli(
+            "export-bundle", "--authority-dir", str(authority_a), "--listener-dir", str(listener_b),
+            "--endpoint", "10.0.0.5:8443", "--output", str(output))
+        self.assertEqual(2, status)
+        self.assertEqual("", stdout)
+        self.assertIn("refused: listener_authority_mismatch", stderr)
+        self.assertFalse(output.exists())
+        status, stdout, stderr = run_cli(
+            "export-bundle", "--authority-dir", str(authority_a), "--listener-dir", str(listener_a),
+            "--endpoint", "10.0.0.5:8443", "--output", str(output))
+        self.assertEqual(0, status, stderr)
+        self.assertRegex(stdout, r"^trust_bundle_sha256=[0-9a-f]{64}\n$")
+
+    def test_approve_refuses_a_listener_from_another_deployment_before_any_approval(self):
+        authority_a, listener_a = self.fresh("a")
+        authority_b, listener_b = self.fresh("b")
+        self.init(authority_a, listener_a)
+        self.init(authority_b, listener_b)
+        database = existing_database(self.root)
+        with patch.object(pairing_cli, "ControllingTerminal", NoPromptTerminal):
+            status, _stdout, stderr = run_cli(
+                "approve", "--database", str(database), "--authority-dir", str(authority_a),
+                "--listener-dir", str(listener_b), "--request", str(self.root / "unused.json"),
+                "--listen", "127.0.0.1:18443")
+        self.assertEqual(2, status)
+        self.assertIn("refused: listener_authority_mismatch", stderr)
+
+
+def existing_database(root):
+    path = root / f"state-{uuid4()}.sqlite3"
+    with closing(Database(path).connect()) as connection:
+        migrate(connection, APPLICATION_MIGRATIONS)
+    return path
+
+
+class ExistingDatabaseTests(ListenerLifecycleHarness):
+    """#125 item 5: approve/list/revoke never create or migrate a mistyped database."""
+
+    def refused(self, database, *, command="list"):
+        argv = {"list": ["list", "--database", str(database)],
+                "revoke": ["revoke", "--database", str(database), "--node", str(uuid4())]}[command]
+        with patch.object(pairing_cli, "ControllingTerminal", NoPromptTerminal):
+            status, stdout, stderr = run_cli(*argv)
+        self.assertEqual(2, status)
+        self.assertEqual("", stdout)
+        return stderr
+
+    def test_missing_database_is_refused_and_not_created(self):
+        missing = self.root / f"typo-{uuid4()}.sqlite3"
+        for command in ("list", "revoke"):
+            with self.subTest(command=command):
+                self.assertIn("refused: database_not_found", self.refused(missing, command=command))
+                self.assertFalse(missing.exists())
+
+    def test_approve_with_a_missing_database_is_refused_before_any_approval(self):
+        authority, listener = self.fresh()
+        self.init(authority, listener)
+        _key, csr, digest = node_request()
+        request = self.root / f"request-{uuid4()}.json"
+        request.write_text(json.dumps({"format_version": 1, "csr": csr.decode(),
+                                       "public_key_digest": digest}))
+        missing = self.root / f"typo-{uuid4()}.sqlite3"
+        with patch.object(pairing_cli, "ControllingTerminal", NoPromptTerminal):
+            status, _stdout, stderr = run_cli(
+                "approve", "--database", str(missing), "--authority-dir", str(authority),
+                "--listener-dir", str(listener), "--request", str(request),
+                "--listen", "127.0.0.1:18443")
+        self.assertEqual(2, status)
+        self.assertIn("refused: database_not_found", stderr)
+        self.assertFalse(missing.exists())
+
+    def test_unsafe_database_paths_are_refused(self):
+        real = existing_database(self.root)
+        link = self.root / f"link-{uuid4()}.sqlite3"
+        link.symlink_to(real)
+        self.assertIn("refused: database_path_rejected", self.refused(link))
+        self.assertIn("refused: database_path_rejected",
+                      self.refused(Path("relative/state.sqlite3")))
+        directory = self.root / f"dir-{uuid4()}.sqlite3"
+        directory.mkdir()
+        self.assertIn("refused: database_rejected", self.refused(directory))
+        shared = existing_database(self.root)
+        os.chmod(shared, 0o664)
+        self.assertIn("refused: database_rejected", self.refused(shared))
+        linked = existing_database(self.root)
+        os.link(linked, self.root / f"hardlink-{uuid4()}")
+        self.assertIn("refused: database_rejected", self.refused(linked))
+        owned = existing_database(self.root)
+        real_uid = os.geteuid()
+        with patch.object(pairing_cli.os, "geteuid", lambda: real_uid + 4242):
+            self.assertIn("refused: database_rejected", self.refused(owned))
+
+    def test_existing_database_is_used(self):
+        database = existing_database(self.root)
+        status, stdout, stderr = run_cli("list", "--database", str(database))
+        self.assertEqual(0, status, stderr)
+        self.assertEqual("", stdout)
 
 
 if __name__ == "__main__":

@@ -202,15 +202,48 @@ def _listener_directory(args) -> PrivateDirectory:
     return _directory(args.listener_dir, owner_uid=args.listener_owner)
 
 
-def _ledger(database_path: Path) -> PairingLedger:
-    if not database_path.is_absolute():
+def _existing_database(database_path: Path) -> tuple[int, int]:
+    """Identity of the application's existing database file, or a refusal.
+
+    A mistyped ``--database`` must never silently create and migrate an empty
+    database that the server does not use (Issue #125): the path must be
+    canonical and absolute (no symlink, no ``..``) and name an existing
+    regular file with one link, owned by the account running the CLI and not
+    writable by group or others.
+    """
+    if not database_path.is_absolute() or os.path.realpath(database_path) != str(database_path):
         raise CliRefused("database_path_rejected")
+    try:
+        descriptor = os.open(database_path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
+                             | os.O_NOCTTY | os.O_NONBLOCK)
+    except FileNotFoundError:
+        raise CliRefused("database_not_found") from None
+    except OSError:
+        raise CliRefused("database_rejected") from None
+    try:
+        info = os.fstat(descriptor)
+    except OSError:
+        raise CliRefused("database_rejected") from None
+    finally:
+        os.close(descriptor)
+    if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
+            or info.st_mode & 0o022 or info.st_nlink != 1):
+        raise CliRefused("database_rejected")
+    return info.st_dev, info.st_ino
+
+
+def _ledger(database_path: Path) -> PairingLedger:
+    identity = _existing_database(database_path)
     database = Database(database_path)
     try:
         with closing(database.connect()) as connection:
             migrate(connection, APPLICATION_MIGRATIONS)
+        info = os.stat(database_path, follow_symlinks=False)
     except Exception:
         raise CliRefused("database_unavailable") from None
+    if (info.st_dev, info.st_ino) != identity:
+        # Replaced while opening: never keep using whatever is there now.
+        raise CliRefused("database_rejected")
     # Pending approvals are valid only in this process, so the verifier key is
     # per-process and never persisted.
     return PairingLedger(database, HmacCodeVerifier(secrets.token_bytes(32)),
@@ -320,7 +353,11 @@ def command_rotate_listener(args) -> int:
 
 def command_export_bundle(args) -> int:
     authority = _authority(args)
-    server_name = main_server_name(_listener_directory(args))
+    listener_directory = _listener_directory(args)
+    # A bundle is only exported for a listener certificate this CA issued,
+    # so mixed-up deployments fail here, not later at the Agent's TLS check.
+    authority.verify_listener_certificate(listener_directory)
+    server_name = main_server_name(listener_directory)
     host, port = args.endpoint
     bundle = authority.export_trust_bundle(server_name=server_name, endpoint_host=host,
                                            endpoint_port=port)
@@ -338,7 +375,9 @@ def command_approve(args) -> int:
         # Refuse before any approval when the CA can no longer cover a node
         # leaf; the code would otherwise be burned by a failed issuance.
         authority.check_leaf_validity(DEFAULT_NODE_VALIDITY)
-        material = listener_material(_listener_directory(args))
+        listener_directory = _listener_directory(args)
+        material = listener_material(listener_directory)
+        authority.verify_listener_certificate(listener_directory)
         csr, digest = parse_enrollment_request(
             _read_public_file(args.request, MAX_REQUEST_FILE_BYTES))
         del csr  # the Agent resubmits its CSR over TLS; the ledger stores only the digest

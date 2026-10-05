@@ -291,7 +291,14 @@ to load them (fail closed). `approve` still opens the CA key, the listener
 credential and the application database in one process (separating the CA key
 from the enrollment listener is #109), so the account running it needs the CA
 directory as its own, the read privilege above for the listener directory, and
-write access to the database; `list` and `revoke` need only the database.
+the database as its own; `list` and `revoke` need only the database.
+`approve`, `list` and `revoke` never create a database: `--database` must name
+the application's existing database file (canonical path, regular file with
+one link, owned by the account running the command, not group- or
+other-writable), otherwise they refuse `database_not_found`,
+`database_path_rejected` or `database_rejected`. `export-bundle` and `approve`
+refuse `listener_authority_mismatch` when the listener certificate was not
+issued by the selected CA directory.
 
 **Rotating the Main listener certificate (Issue #125).** The listener leaf
 defaults to 397 days and is not renewed automatically. Rotate it before it
