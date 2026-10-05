@@ -257,6 +257,31 @@ ServerSentinel service cannot read a root-owned `sshd`'s `/proc/<pid>/fd` and
 `exe`, so an excepted `sshd` stays `LISTENER_OWNER_UNVERIFIED` and human
 access stays closed. ServerSentinel itself is never given root for this.
 
+### Capture-node re-pairing (expired or revoked node)
+
+A `remote_agent` capture node whose credential expired, or that the Owner
+revoked, is re-paired with the Main's local pairing CLI and the Agent's
+`media_capture_agent.enroll --repair` mode (#116, Owner policy 2026-10-01);
+nothing is deleted from the Main database. Run
+`python -m app.cameras.remote_agent.pairing_cli list --database <data_dir>/state.sqlite3`
+first to see whether the node is `credential=revoked`:
+
+- not revoked, certificate expired: the Agent runs `request --repair expired`
+  (its same key); `approve` shows `existing capture node: <uuid>` and the Owner
+  types `APPROVE`; the Agent runs `pair --repair expired`. The node UUID and its
+  camera sources stay the same.
+- revoked: the Agent runs `request --repair revoked` (a fresh key). `approve`
+  refuses the old key (`public_key_revoked`) and shows `new capture node` for
+  the new one. After `pair --repair revoked` the Agent holds a new node UUID;
+  update `node_id` in the Agent's protected configuration, and approve that
+  node's camera sources again. The revoked node stays listed as revoked, and
+  its recordings stay under it until normal retention removes them.
+
+Stop the Agent's `media-capture-agent` service before re-pairing and start it
+afterwards. The full Agent-side procedure and its refusal words are in
+[`agent/pairing/README.md`](../../agent/pairing/README.md); the real-LAN
+checks are MANUAL_TEST §B step 15 (not yet executed on real hosts).
+
 ## Install, update, and rollback
 
 Run the separately downloaded installer only after verifying its published

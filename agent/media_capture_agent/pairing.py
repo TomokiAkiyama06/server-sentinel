@@ -31,6 +31,7 @@ _MAX_MATERIAL_BYTES = 256 * 1024
 _MAX_MANIFEST_BYTES = 16 * 1024
 _CREDENTIAL_DIRECTORY = "node-credentials"
 _CURRENT_MANIFEST = "current.json"
+_ENROLLMENT_LOCK = "node-enrollment.lock"
 _FILES = {
     "private_key": "private-key",
     "client_certificate": "client-certificate",
@@ -218,12 +219,26 @@ class NodeCredentialStore:
     def rotate(self, material: NodeCredentialMaterial) -> None:
         """Atomically replace the committed generation with a renewed one.
 
-        Only the same deployment/node identity may rotate; a different identity
-        needs a fresh pairing. The new generation is written and fsynced, linked
+        Only the same deployment/node identity may rotate (renewal, or re-pairing
+        an expired node with its same key); a different node needs
+        ``replace_identity``. The new generation is written and fsynced, linked
         as ``.current-next.json`` and renamed over ``current.json`` (an atomic
         replace), then the superseded generation is removed best-effort. A crash
         at any point leaves either the old or the new generation committed.
         """
+        self._swap(material, same_node=True)
+
+    def replace_identity(self, material: NodeCredentialMaterial) -> None:
+        """Atomically swap to a *new* node identity of the same deployment (#116).
+
+        Used only to re-pair after the Owner revoked the installed node: the
+        new material must name the same deployment but a different node. The
+        swap is the same atomic rename as ``rotate``; the revoked generation's
+        files are deleted only after the new generation is committed.
+        """
+        self._swap(material, same_node=False)
+
+    def _swap(self, material: NodeCredentialMaterial, *, same_node: bool) -> None:
         if not isinstance(material, NodeCredentialMaterial):
             raise PairingRefused("invalid_credential_material")
         if not self.installed():
@@ -241,9 +256,11 @@ class NodeCredentialStore:
             current = json.loads(self._read_file(credentials_fd, _CURRENT_MANIFEST,
                                                  maximum=_MAX_MANIFEST_BYTES,
                                                  expected_links=2).decode("utf-8"))
-            if (current["deployment_id"] != str(material.deployment_id)
-                    or current["node_id"] != str(material.node_id)):
+            if current["deployment_id"] != str(material.deployment_id):
                 raise PairingRefused("renewal_identity_mismatch")
+            if (current["node_id"] == str(material.node_id)) != same_node:
+                raise PairingRefused("renewal_identity_mismatch" if same_node
+                                     else "repair_identity_rejected")
             previous = [entry["name"] for entry in current["files"].values()]
             previous.append("manifest-" + previous[0].rsplit("-", 1)[1].replace(".pem", ".json"))
             try:
@@ -492,6 +509,69 @@ class NodeCredentialStore:
             return content
         finally:
             os.close(descriptor)
+
+
+class EnrollmentLock:
+    """Runtime-wide interprocess lock serializing pairing and re-pairing (#117).
+
+    ``pair`` holds it from the installed-identity check through the exchange,
+    install and pending-key cleanup, so two concurrent runs on one runtime root
+    cannot both pass the check and install different certificates for one
+    node. The lock is a ``flock`` on a 0600 regular file owned by the service
+    account directly in the validated 0700 runtime root; it needs no root. A
+    second holder is refused at once (``enrollment_in_progress``) instead of
+    waiting behind an interactive prompt. The lock file is never removed, so
+    every process locks the same inode; after locking, the name is re-checked
+    to still refer to the locked inode.
+    """
+
+    def __init__(self, runtime_root: Path, *, owner_uid: int | None = None):
+        self._files = NodeCredentialStore(runtime_root, owner_uid=owner_uid)
+        self._descriptor: int | None = None
+
+    def __enter__(self) -> "EnrollmentLock":
+        if self._descriptor is not None:
+            raise PairingRefused("enrollment_in_progress")
+        root_fd = descriptor = None
+        try:
+            root_fd = open_directory(self._files.runtime_root)
+            self._files._validate_directory(root_fd, "runtime_root_rejected")
+            descriptor = os.open(
+                _ENROLLMENT_LOCK,
+                os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK,
+                0o600, dir_fd=root_fd)
+            info = os.fstat(descriptor)
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != self._files.owner_uid
+                    or info.st_mode & 0o077 or info.st_nlink != 1):
+                raise PairingRefused("credential_lock_rejected")
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise PairingRefused("enrollment_in_progress") from None
+            named = os.stat(_ENROLLMENT_LOCK, dir_fd=root_fd, follow_symlinks=False)
+            if (named.st_dev, named.st_ino) != (info.st_dev, info.st_ino):
+                raise PairingRefused("credential_lock_rejected")
+        except PairingRefused:
+            if descriptor is not None:
+                os.close(descriptor)
+            raise
+        except (OSError, StorageRefused):
+            if descriptor is not None:
+                os.close(descriptor)
+            raise PairingRefused("credential_storage_unavailable") from None
+        finally:
+            if root_fd is not None:
+                os.close(root_fd)
+        self._descriptor = descriptor
+        return self
+
+    def __exit__(self, *_exc_info) -> None:
+        descriptor, self._descriptor = self._descriptor, None
+        if descriptor is not None:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            finally:
+                os.close(descriptor)
 
 
 def _valid_server_name(value: object) -> bool:

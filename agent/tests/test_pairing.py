@@ -108,6 +108,27 @@ class NodeCredentialStoreTests(unittest.TestCase):
             self.store.install(self.material(private_key=b"replacement"))
         self.assertEqual((self.root / "node-credentials" / "current.json").read_bytes(), manifest)
 
+    def test_identity_replacement_swaps_only_to_a_new_node_of_the_same_deployment(self):
+        self.store.install(self.material())
+        credentials = self.root / "node-credentials"
+        before = set(path.name for path in credentials.iterdir())
+        other = UUID("cccccccc-cccc-4ccc-8ccc-cccccccccccc")
+        for material, reason in (
+                (self.material(private_key=b"same-node"), "repair_identity_rejected"),
+                (self.material(node_id=other, deployment_id=other), "renewal_identity_mismatch")):
+            with self.assertRaisesRegex(PairingRefused, reason):
+                self.store.replace_identity(material)
+        with self.assertRaisesRegex(PairingRefused, "renewal_identity_mismatch"):
+            self.store.rotate(self.material(node_id=other))
+        self.assertEqual(before, set(path.name for path in credentials.iterdir()))
+        self.store.replace_identity(self.material(node_id=other, private_key=b"new-node-key"))
+        self.assertTrue(self.store.installed())
+        manifest = json.loads((credentials / "current.json").read_text(encoding="utf-8"))
+        self.assertEqual(str(other), manifest["node_id"])
+        after = set(path.name for path in credentials.iterdir())
+        self.assertEqual({".pairing.lock", "current.json"}, before & after,
+                         "the old generation is deleted after the swap commits")
+
     def test_symlinked_credential_directory_and_marker_are_refused(self):
         target = self.root / "target"
         target.mkdir(mode=0o700)

@@ -99,8 +99,16 @@ stored). It refuses before any state change when there is no controlling
 terminal. `--human-host` (loopback IP) and `--human-port` name the dashboard
 listener so the bootstrap listener can never take its socket. A key already
 bound to a live node is re-approved for that same node (shown on the prompt),
-so an interrupted, expired or unacknowledged enrollment can be retried; a
-revoked key is refused. Until #6 lands, Owner authority in this CLI is the local account that
+so an interrupted, expired or unacknowledged enrollment can be retried, and a
+node whose certificate expired without being revoked re-pairs with its same key
+and node (#116). A key ever held by a revoked node is refused with
+`public_key_revoked` before the Owner prompt or the listener opens
+(`PairingLedger.key_revoked`; `approve` refuses it again inside its write
+transaction). A revoked node re-pairs only as a new node with a new key: the
+prompt says `new capture node`, no camera source is carried over from the old
+node (the Owner approves the new node's sources again), and the old node's
+ledger rows stay `revoked` -- nothing is deleted, so its recordings stay
+attributed to the old node until normal retention removes them. Until #6 lands, Owner authority in this CLI is the local account that
 owns the issuer material and database plus one typed confirmation per
 approve/revoke; see the ADR-0006 follow-up notes.
 

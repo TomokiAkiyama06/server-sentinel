@@ -450,7 +450,8 @@ code with the reviewed runtime installed. `AGENT_CLI` means
    interrupted, expired or unacknowledged enrollment shows
    `existing capture node: <uuid>` and re-enrolls that same node (a completed
    enrollment replaces its current certificate); it never creates a second
-   node. After `revoke`, the key cannot be approved again (`approval_refused`).
+   node. After `revoke`, the key cannot be approved again: `approve` refuses
+   with `public_key_revoked` before showing the `APPROVE` prompt.
 10. Start the ingest listener bound to the Main's private-LAN IP and a port
     distinct from the dashboard and bootstrap listeners; confirm the dashboard
     listener still binds loopback only and the ingest port answers no HTTP
@@ -463,7 +464,7 @@ code with the reviewed runtime installed. `AGENT_CLI` means
     open session closes on the next admission check, and reconnecting is
     refused although the certificate has not expired *(needs ingest wiring)*.
     Approving the old `request.json` again must be refused
-    (`approval_refused`) without showing a code.
+    (`public_key_revoked`) without showing the prompt or a code.
 13. Inspect Main and Agent logs, `ps` output, `/proc/<pid>/cmdline` and
     `environ` during the exchange, service environment and shell history on both
     hosts for key, code or certificate text; expect none.
@@ -477,6 +478,39 @@ code with the reviewed runtime installed. `AGENT_CLI` means
     the credential expires, the node must re-pair. Block renewal (for example
     stop the Main) until the 14-day threshold and confirm the Owner sees a
     `capture_credential_warning`. *(needs transport wiring and a scheduler)*
+
+15. Re-pairing (#116, Owner policy 2026-10-01; mock-verified only by
+    `agent/tests/test_enroll.py` and
+    `tests/e2e/test_capture_enrollment_scenarios.py`). Stop the
+    `media-capture-agent` service first and start it again afterwards.
+    a. *Expired, not revoked.* On a disposable deployment, let a node
+       certificate expire (issue it with a short explicit validity). Confirm
+       `AGENT_CLI request --repair expired` is refused with
+       `node_identity_not_expired` before expiry and afterwards prints the same
+       `public_key_sha256` as the installed key. `MAIN_CLI approve` with that
+       request shows `existing capture node: <uuid>`; type `APPROVE`. Run
+       `AGENT_CLI pair ... --repair expired` and confirm it prints the same
+       `node_id`, that `node-credentials/` holds exactly one generation (the
+       expired files are gone), that `pending-renewal/` holds no key, and that
+       ingest admits the node again *(needs ingest wiring)*.
+    b. *Revoked.* `MAIN_CLI revoke` the node. Confirm approving its old request
+       is refused with `public_key_revoked`. Run
+       `AGENT_CLI request --repair revoked` and confirm a different
+       `public_key_sha256` and a 0700 `pending-repair/` with a 0600 key;
+       `MAIN_CLI approve` shows `new capture node`. After
+       `AGENT_CLI pair ... --repair revoked`, confirm a new `node_id`, one
+       credential generation, no `pending-repair/node-key.pem`, and that
+       `MAIN_CLI list` shows the old node `credential=revoked` and the new one
+       `credential=active`. Update `node_id` in the Agent configuration. Confirm
+       the new node has no camera source until the Owner approves its sources,
+       and that the old node's recordings stay listed under the old node until
+       retention *(needs source/transport wiring, #14/#15)*.
+    c. *Serialization (#117).* With one `AGENT_CLI pair` waiting at
+       `Pairing code:`, start a second `AGENT_CLI pair` (or `request`) on the
+       same runtime root from another terminal: it must exit with
+       `enrollment_in_progress` without connecting (check with `ss -tn`) or
+       prompting. Confirm `<runtime_root>/node-enrollment.lock` is a 0600
+       regular file owned by the service account and that no root was needed.
 
 Record the Main/Agent OS, Python, OpenSSL (`cryptography` reports 4.0.2 from its
 wheel) and architecture used, without private deployment values.

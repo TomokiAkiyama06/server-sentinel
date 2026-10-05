@@ -590,6 +590,21 @@ class PairingLedger:
                 "WHERE public_key_digest = ? AND revoked = 0", (key,)).fetchone()
         return None if row is None else UUID(row["node_id"])
 
+    def key_revoked(self, public_key_digest: str) -> bool:
+        """Whether ``public_key_digest`` was ever held by a revoked node.
+
+        Lets the local approval CLI refuse a revoked key before it prompts the
+        Owner or opens the enrollment listener (#116: a revoked node re-pairs
+        only with a new key and a new node). ``approve`` refuses such a key
+        independently inside its write transaction.
+        """
+        key = _digest(public_key_digest, "public key digest")
+        with self._transaction(write=False) as connection:
+            row = connection.execute(
+                "SELECT 1 FROM pairing_key_bindings WHERE public_key_digest = ? AND revoked != 0",
+                (key,)).fetchone()
+        return row is not None
+
     def pairing_summaries(self) -> tuple[PairingSummary, ...]:
         """Per-node enrollment/credential states for the local Owner CLI listing.
 

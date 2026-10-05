@@ -12,6 +12,8 @@ import socket
 import ssl
 import stat
 import struct
+import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -23,11 +25,14 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import ExtendedKeyUsageOID
 
 from media_capture_agent import enroll
-from media_capture_agent.node_tls import TrustBundle
-from media_capture_agent.pairing import (
-    NodeCredentialStore, PairingCode, PairingRefused, prompt_pairing_code,
+from media_capture_agent.node_tls import (
+    PendingNodeKeyStore, TrustBundle, installed_certificate_expiry, installed_credential,
+    prepare_renewal, public_key_digest,
 )
-from tests.tls_support import SERVER_NAME, SyntheticAuthority, key_pem, pem, write_private
+from media_capture_agent.pairing import (
+    EnrollmentLock, NodeCredentialStore, PairingCode, PairingRefused, prompt_pairing_code,
+)
+from tests.tls_support import DAY, SERVER_NAME, SyntheticAuthority, key_pem, pem, write_private
 
 
 FRAME = struct.Struct(">I")
@@ -110,7 +115,9 @@ class EnrollmentPeer:
         self._thread.join(5)
 
 
-class EnrollClientTests(unittest.TestCase):
+class EnrollFixture(unittest.TestCase):
+    """Runtime root with a pending request and a synthetic Main; defines no tests."""
+
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory(prefix="agent-enroll-")
         self.addCleanup(self.temporary.cleanup)
@@ -138,6 +145,8 @@ class EnrollClientTests(unittest.TestCase):
             return PairingCode(CODE)
         return prompt
 
+
+class EnrollClientTests(EnrollFixture):
     def test_request_file_is_public_and_key_stays_private(self):
         value = json.loads(self.request_path.read_text())
         self.assertEqual({"format_version", "csr", "public_key_digest"}, set(value))
@@ -251,6 +260,237 @@ class EnrollClientTests(unittest.TestCase):
         with self.assertRaises(SystemExit):
             with patch("sys.stderr", io.StringIO()):
                 enroll.main(arguments + ["--bundle-sha256", "0" * 64, "--code", CODE])
+
+
+def issuing(authority, node, *, lifetime=400 * DAY):
+    """A synthetic Main response issuing ``node`` a certificate for the request's key."""
+    def respond(request):
+        certificate = authority.node_certificate(request["csr"].encode(), node, lifetime=lifetime)
+        body = json.dumps({"status": "issued", "certificate": pem(certificate).decode()}).encode()
+        return FRAME.pack(len(body)) + body
+    return respond
+
+
+def installed_key_digest(runtime):
+    credential = installed_credential(NodeCredentialStore(runtime))
+    return public_key_digest(x509.load_pem_x509_certificate(
+        credential.certificate_path.read_bytes()).public_key())
+
+
+class EnrollmentLockTests(EnrollFixture):
+    """#117: one runtime-wide interprocess lock serializes enrollment."""
+
+    def test_concurrent_pair_runs_are_serialized_by_the_runtime_lock(self):
+        peer = self.peer()
+        bundle = self.bundle(peer.port)
+        in_prompt, release = threading.Event(), threading.Event()
+        results = {}
+
+        def first_prompt():
+            in_prompt.set()
+            self.assertTrue(release.wait(10))
+            return PairingCode(CODE)
+
+        def first():
+            try:
+                results["first"] = enroll.pair(self.runtime, bundle, prompt=first_prompt)
+            except BaseException as error:  # surfaced below
+                results["first"] = error
+        thread = threading.Thread(target=first)
+        thread.start()
+        self.addCleanup(thread.join, 10)
+        self.assertTrue(in_prompt.wait(10))
+        connections = peer.connections
+        # A second run while the first sits between its installed check and
+        # its install is refused before any network traffic or prompt.
+        with self.assertRaisesRegex(PairingRefused, "enrollment_in_progress"):
+            enroll.pair(self.runtime, bundle, prompt=self.prompt_after(peer))
+        with self.assertRaisesRegex(PairingRefused, "enrollment_in_progress"):
+            enroll.create_enrollment_request(self.runtime, self.root / "racing.json")
+        self.assertEqual(connections, peer.connections)
+        self.assertEqual([], self.prompts)
+        self.assertFalse((self.root / "racing.json").exists())
+        release.set()
+        thread.join(10)
+        self.assertEqual(peer.node, results["first"])
+        self.assertEqual(1, peer.received.count(b'"code"'), "exactly one code was submitted")
+        self.assertTrue(NodeCredentialStore(self.runtime).installed())
+        # The lock is released afterwards: the next run gets the normal refusal.
+        with self.assertRaisesRegex(PairingRefused, "node_identity_already_exists"):
+            enroll.pair(self.runtime, bundle, prompt=self.prompt_after(peer))
+
+    def test_lock_held_by_another_process_refuses_pairing(self):
+        peer = self.peer()
+        holder = subprocess.Popen(
+            [sys.executable, "-c",
+             "import sys; from pathlib import Path\n"
+             "from media_capture_agent.pairing import EnrollmentLock\n"
+             "with EnrollmentLock(Path(sys.argv[1])):\n"
+             "    print('held', flush=True); sys.stdin.readline()\n",
+             str(self.runtime)],
+            cwd=Path(__file__).resolve().parents[1], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            text=True)
+        self.addCleanup(holder.stdout.close)
+        self.addCleanup(holder.wait, 10)
+        try:
+            self.assertEqual("held\n", holder.stdout.readline())
+            with self.assertRaisesRegex(PairingRefused, "enrollment_in_progress"):
+                enroll.pair(self.runtime, self.bundle(peer.port), prompt=self.prompt_after(peer))
+            self.assertEqual(0, peer.connections)
+        finally:
+            holder.stdin.write("\n")
+            holder.stdin.close()
+        holder.wait(10)
+        enroll.pair(self.runtime, self.bundle(peer.port), prompt=self.prompt_after(peer))
+        self.assertTrue(NodeCredentialStore(self.runtime).installed())
+
+    def test_lock_file_is_private_and_unsafe_lock_files_are_refused(self):
+        with EnrollmentLock(self.runtime):
+            lock = self.runtime / "node-enrollment.lock"
+            info = os.lstat(lock)
+            self.assertEqual(0o600, stat.S_IMODE(info.st_mode))
+            self.assertEqual(os.geteuid(), info.st_uid)
+        os.chmod(lock, 0o660)
+        with self.assertRaisesRegex(PairingRefused, "credential_lock_rejected"):
+            enroll.create_enrollment_request(self.runtime, self.root / "unsafe.json")
+        lock.unlink()
+        lock.symlink_to(self.root / "elsewhere")
+        with self.assertRaisesRegex(PairingRefused, "credential_storage_unavailable"):
+            enroll.create_enrollment_request(self.runtime, self.root / "unsafe.json")
+        self.assertFalse((self.root / "elsewhere").exists())
+
+
+class RepairTests(EnrollFixture):
+    """#116: re-pairing an expired (same key/node) or revoked (new key/node) identity."""
+
+    def setUp(self):
+        super().setUp()
+        self.first = self.peer(respond=None)
+        self.old_node = enroll.pair(self.runtime, self.bundle(self.first.port),
+                                    prompt=self.prompt_after(self.first))
+        self.old_key = installed_key_digest(self.runtime)
+        self.old_files = sorted(p.name for p in (self.runtime / "node-credentials").iterdir())
+        self.expired = lambda: installed_certificate_expiry(NodeCredentialStore(self.runtime)) + DAY
+
+    def generations(self):
+        return sorted(p.name for p in (self.runtime / "node-credentials").glob("private-key-*.pem"))
+
+    def test_expired_identity_repairs_with_the_same_key_and_node(self):
+        with self.assertRaisesRegex(PairingRefused, "node_identity_not_expired"):
+            enroll.create_enrollment_request(self.runtime, self.root / "early.json",
+                                             repair="expired")
+        peer = self.peer(respond=issuing(self.authority, self.old_node))
+        with self.assertRaisesRegex(PairingRefused, "node_identity_not_expired"):
+            enroll.pair(self.runtime, self.bundle(peer.port), prompt=self.prompt_after(peer),
+                        repair="expired")
+        self.assertEqual(0, peer.connections)
+        digest = enroll.create_enrollment_request(self.runtime, self.root / "repair.json",
+                                                  repair="expired", now=self.expired)
+        self.assertEqual(self.old_key, digest, "an expired node proves its same key")
+        self.assertNotIn("PRIVATE KEY", (self.root / "repair.json").read_text())
+        # A renewal key staged before expiry is stale once the node re-pairs.
+        renewal = prepare_renewal(NodeCredentialStore(self.runtime))
+        self.assertNotEqual(self.old_key, renewal.public_key_digest)
+        old_expiry = installed_certificate_expiry(NodeCredentialStore(self.runtime))
+        node = enroll.pair(self.runtime, self.bundle(peer.port), prompt=self.prompt_after(peer),
+                           repair="expired", now=self.expired)
+        self.assertEqual(self.old_node, node)
+        self.assertEqual(self.old_key, installed_key_digest(self.runtime))
+        self.assertGreater(installed_certificate_expiry(NodeCredentialStore(self.runtime)),
+                           old_expiry)
+        current = sorted(p.name for p in (self.runtime / "node-credentials").iterdir())
+        self.assertEqual(1, len(self.generations()))
+        self.assertFalse(set(self.old_files) - {".pairing.lock", "current.json"} & set(current),
+                         "the expired generation is deleted after the swap")
+        self.assertFalse((self.runtime / "pending-renewal" / "node-key.pem").exists())
+
+    def test_expired_repair_rejects_another_node_or_a_certificate_that_does_not_outlive(self):
+        for respond in (issuing(self.authority, uuid4()),
+                        issuing(self.authority, self.old_node, lifetime=DAY)):
+            peer = self.peer(respond=respond)
+            with self.assertRaisesRegex(PairingRefused, "issued_credential_rejected"):
+                enroll.pair(self.runtime, self.bundle(peer.port), prompt=self.prompt_after(peer),
+                            repair="expired", now=self.expired)
+        self.assertEqual(self.old_files,
+                         sorted(p.name for p in (self.runtime / "node-credentials").iterdir()))
+        self.assertEqual(self.old_key, installed_key_digest(self.runtime))
+
+    def test_revoked_identity_repairs_with_a_new_key_and_a_new_node(self):
+        new_node = uuid4()
+        digest = enroll.create_enrollment_request(self.runtime, self.root / "revoked.json",
+                                                  repair="revoked")
+        self.assertNotEqual(self.old_key, digest, "a revoked key is never reused")
+        self.assertEqual(digest, enroll.create_enrollment_request(
+            self.runtime, self.root / "revoked-again.json", repair="revoked"),
+            "a retry re-exports the same pending repair key")
+        pending = self.runtime / "pending-repair" / "node-key.pem"
+        self.assertEqual(0o600, stat.S_IMODE(os.lstat(pending).st_mode))
+        self.assertEqual(0o700, stat.S_IMODE(os.lstat(pending.parent).st_mode))
+        prepare_renewal(NodeCredentialStore(self.runtime))
+        peer = self.peer(respond=issuing(self.authority, new_node))
+        node = enroll.pair(self.runtime, self.bundle(peer.port), prompt=self.prompt_after(peer),
+                           repair="revoked")
+        self.assertEqual(new_node, node)
+        self.assertEqual(new_node, installed_credential(NodeCredentialStore(self.runtime)).node_id)
+        self.assertEqual(digest, installed_key_digest(self.runtime))
+        self.assertEqual(1, len(self.generations()))
+        current = set(p.name for p in (self.runtime / "node-credentials").iterdir())
+        self.assertFalse((set(self.old_files) - {".pairing.lock", "current.json"}) & current,
+                         "the revoked generation is deleted after the swap")
+        self.assertFalse(pending.exists())
+        self.assertFalse((self.runtime / "pending-renewal" / "node-key.pem").exists())
+
+    def test_revoked_repair_refuses_the_same_node_and_other_deployments(self):
+        enroll.create_enrollment_request(self.runtime, self.root / "revoked.json", repair="revoked")
+        peer = self.peer(respond=issuing(self.authority, self.old_node))
+        with self.assertRaisesRegex(PairingRefused, "issued_credential_rejected"):
+            enroll.pair(self.runtime, self.bundle(peer.port), prompt=self.prompt_after(peer),
+                        repair="revoked")
+        other = SyntheticAuthority()
+        foreign = self.peer(authority=other, respond=issuing(other, uuid4()))
+        with self.assertRaisesRegex(PairingRefused, "repair_deployment_mismatch"):
+            enroll.pair(self.runtime, TrustBundle.parse(other.bundle(port=foreign.port)),
+                        prompt=self.prompt_after(foreign), repair="revoked")
+        self.assertEqual(0, foreign.connections, "refused before any network traffic")
+        self.assertEqual(self.old_files,
+                         sorted(p.name for p in (self.runtime / "node-credentials").iterdir()))
+        self.assertTrue((self.runtime / "pending-repair" / "node-key.pem").exists())
+
+    def test_interrupted_revoked_repair_completes_without_a_second_new_node(self):
+        enroll.create_enrollment_request(self.runtime, self.root / "revoked.json", repair="revoked")
+        new_node = uuid4()
+        peer = self.peer(respond=issuing(self.authority, new_node))
+        original = PendingNodeKeyStore.discard
+
+        def interrupted(store):
+            if store._name == "pending-repair":
+                raise PairingRefused("credential_storage_unavailable")
+            original(store)
+        with patch.object(PendingNodeKeyStore, "discard", interrupted):
+            with self.assertRaisesRegex(PairingRefused, "credential_storage_unavailable"):
+                enroll.pair(self.runtime, self.bundle(peer.port), prompt=self.prompt_after(peer),
+                            repair="revoked")
+        self.assertEqual(new_node, installed_credential(NodeCredentialStore(self.runtime)).node_id)
+        connections = peer.connections
+        self.assertEqual(new_node, enroll.pair(self.runtime, self.bundle(peer.port),
+                                               prompt=self.prompt_after(peer), repair="revoked"))
+        self.assertEqual(connections, peer.connections, "no second enrollment exchange")
+        self.assertFalse((self.runtime / "pending-repair" / "node-key.pem").exists())
+
+    def test_repair_requires_an_installed_identity_and_a_known_mode(self):
+        runtime = self.root / "fresh"
+        runtime.mkdir(mode=0o700)
+        for mode in ("expired", "revoked"):
+            with self.assertRaisesRegex(PairingRefused, "node_identity_unavailable"):
+                enroll.create_enrollment_request(runtime, self.root / f"{mode}.json", repair=mode)
+        with self.assertRaisesRegex(PairingRefused, "repair_mode_rejected"):
+            enroll.pair(self.runtime, self.bundle(self.first.port), prompt=self.prompt_after(self.first),
+                        repair="other")
+        with self.assertRaises(SystemExit):
+            with patch("sys.stderr", io.StringIO()):
+                enroll.main(["request", "--runtime-root", str(self.runtime), "--output",
+                             str(self.root / "x.json"), "--repair", "other"])
+        self.assertFalse((runtime / "pending-repair").exists())
 
 
 class PromptTerminalTests(unittest.TestCase):

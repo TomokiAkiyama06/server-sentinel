@@ -306,14 +306,24 @@ def command_approve(args) -> int:
             limits=EnrollmentLimits())
         ledger = _ledger(args.database)
         # A key stays bound to its node for good, so a retry after an
-        # interrupted, expired or unacknowledged enrollment reuses that node.
+        # interrupted, expired or unacknowledged enrollment -- or re-pairing a
+        # node whose certificate expired without being revoked (#116) --
+        # reuses that node. A revoked node's keys are never accepted again:
+        # it re-pairs as a new node with a new key, refused here before the
+        # Owner prompt or the listener opens.
         try:
+            if ledger.key_revoked(digest):
+                raise CliRefused("public_key_revoked")
             bound = ledger.bound_node(digest)
         except PairingError:
             raise CliRefused("approval_refused") from None
-        retry = "" if bound is None else (
+        retry = (
+            "  new capture node: camera sources are not carried over from any\n"
+            "  earlier (revoked) node; approve its sources again after pairing\n"
+            if bound is None else
             f"  existing capture node: {bound}\n"
-            "  (retry: completing it replaces that node's current certificate)\n")
+            "  (retry or re-pairing with the same key: completing it replaces\n"
+            "  that node's current certificate; its camera sources are unchanged)\n")
         listener.open()
         try:
             owner = LocalConsoleOwner()
