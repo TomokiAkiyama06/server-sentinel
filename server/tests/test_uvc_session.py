@@ -609,6 +609,33 @@ class PresenceScanTests(unittest.TestCase):
         self.assertLessEqual(self.discovery.scans - opened, 2)
         self.assertEqual(31 + 1, len(self.frames))
 
+    def test_slow_presence_scan_does_not_rescan_after_every_frame(self):
+        # Issue #122: a scan that outlasts the interval (USB re-enumeration
+        # stalling open/ioctl) must count the interval from its completion.
+        self.assertTrue(self.session.step())
+        clock, discovery = self.clock, self.discovery
+        slow = 2 * self.session.presence_scan_seconds
+
+        class SlowDiscovery:
+            def scan(self):
+                result = discovery.scan()
+                clock.advance(slow)
+                return result
+
+        self.session.discovery = SlowDiscovery()
+        self.clock.advance(self.session.presence_scan_seconds)
+        self.assertTrue(self.session.step())
+        after_slow_scan = self.discovery.scans
+        for _ in range(10):
+            self.clock.advance(1 / 30)
+            self.assertTrue(self.session.step())
+        self.assertEqual(after_slow_scan, self.discovery.scans)
+        # The bounded rescan still happens once a full interval has elapsed.
+        self.clock.advance(self.session.presence_scan_seconds)
+        self.assertTrue(self.session.step())
+        self.assertEqual(after_slow_scan + 1, self.discovery.scans)
+        self.assertEqual(CameraState.ONLINE, self.controller.state)
+
     def test_closed_capture_always_rescans_before_binding(self):
         self.assertTrue(self.session.step())
         self.session.close()

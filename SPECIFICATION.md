@@ -285,7 +285,9 @@ outside the transition lock; while a newer state is not yet durable the source
 is reported unpersisted.
 A stall is capture health, not scene evidence, and is never reported as an
 empty scene. While a capture is live the full device scan runs at most every
-`presence_scan_seconds` (an unplug surfaces through the open descriptor); a
+`presence_scan_seconds`, counted from the previous scan's completion so a slow
+scan does not trigger another after every frame (an unplug surfaces through
+the open descriptor); a
 scan with probe failures that no longer lists the bound device is treated as
 inconclusive, not as an unplug. A closed capture always rescans before binding
 and the post-open identity re-verification is unchanged.

@@ -105,7 +105,9 @@ write, so a clean shutdown normally leaves the row durable; a write still
 hung leaves the source reported unpersisted.
 
 While a capture is open, `LinuxDiscovery.scan()` (which opens every video node)
-runs at most every `presence_scan_seconds` instead of on every frame; an unplug
+runs at most every `presence_scan_seconds` instead of on every frame; the
+interval counts from the previous scan's completion, so a scan slowed by USB
+re-enumeration does not cause a full scan after every frame. An unplug
 surfaces as a descriptor error. A scan with probe failures that no longer lists
 the bound device is inconclusive and keeps the live descriptor. A duplicate
 serial that appears while capturing is still detected at the next due scan.

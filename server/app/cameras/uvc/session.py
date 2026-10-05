@@ -36,10 +36,10 @@ class CaptureSession:
     worker performs (closing its own descriptor) as soon as it returns.
 
     Presence: while a capture is open, the full discovery scan (which opens
-    every video node) runs at most every ``presence_scan_seconds``; a real
-    unplug surfaces through the open descriptor. A scan with probe failures
-    that no longer lists the bound device is inconclusive and does not tear
-    down the live descriptor. A closed capture always rescans before binding,
+    every video node) runs at most once per ``presence_scan_seconds``, counted
+    from the completion of the previous scan; a real unplug surfaces through
+    the open descriptor. A scan with probe failures that no longer lists the
+    bound device is inconclusive and does not tear down the live descriptor. A closed capture always rescans before binding,
     and the identity re-verification after opening is unchanged.
     """
 
@@ -134,7 +134,10 @@ class CaptureSession:
         if live and self._last_scan is not None and now - self._last_scan < self.presence_scan_seconds:
             return self.controller.bound
         scan = self.discovery.scan()
-        self._last_scan = now
+        # Count the interval from completion: a scan slower than the interval
+        # (USB re-enumeration stalling open/ioctl) must not leave the next
+        # frame already due for another full scan.
+        self._last_scan = self.clock()
         if self.capture is not None and self.controller.bound not in scan.devices:
             if scan.failures and self.controller.bound is not None:
                 # A failed probe can hide the bound node; the open descriptor
