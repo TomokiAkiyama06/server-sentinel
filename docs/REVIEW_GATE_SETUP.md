@@ -198,7 +198,13 @@ path needs its own App identity or an isolated trusted process (Owner decision).
 Flow and binding:
 
 1. Before posting any trigger (for example `@codex review`), call
-   `request_review(reviewer, live_context, source)`. It durably records the
+   `request_review(reviewer, live_context, source, config=runtime_config)`.
+   Before any ledger or provider listing is read, it refuses (as
+   `review source targets another repository` / `live context names another
+   repository`) a `source` that does not name the configured repository
+   (case-insensitive) or a `live_context` with another repository ID, the same
+   binding reconciliation and publication apply; a miswired source therefore
+   cannot record another repository's review ID as the watermark. It durably records the
    complete `Context`, the highest review ID and the highest issue comment ID
    currently listed on the PR (watermarks) and the request time, under a per-PR lock, with an atomic
    `0600` write and directory fsync in `state_dir` (a `0700` directory owned by
