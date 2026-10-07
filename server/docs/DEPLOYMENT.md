@@ -591,7 +591,9 @@ restores the directory from the backup.
 put the CA directory under root (or the CLI account) and had no public CA
 copy or issuance log. With the service stopped: add `"capture_ca_directory"`
 (the CA directory path, or `null` on a host without a capture CA) to the
-deployment configuration, which this release requires; create
+deployment configuration, which this release requires (and remove it again
+before any rollback to an earlier release; see "`capture_ca_directory` across
+update and rollback"); create
 `serversentinel-ca` as above, `chown -R serversentinel-ca:serversentinel-ca <ca_dir>` and keep the
 modes `0700`/`0600`; make sure the listener directory and its files belong to
 the service account; then run `sudo serversentinel-pairing rotate-listener`
@@ -765,11 +767,23 @@ checks are MANUAL_TEST §B step 15 (not yet executed on real hosts).
 
 ## Install, update, and rollback
 
-Before updating to a release with Issue #109, add `"capture_ca_directory"`
-(the CA directory path, or `null` on a host without a capture CA) to the
-deployment configuration: without it the new release refuses to start, and
-the installer refuses the update before staging it with `ServerSentinel
-release operation failed: capture_ca_directory is required ...`.
+**`capture_ca_directory` across update and rollback (Issue #109).**
+Releases with Issue #109 declare `CAPTURE_CA_DIRECTORY_SETTING` in
+`app/release_capabilities.py` and require the key; earlier releases refuse it
+as an unknown key. The installer therefore checks the configuration against
+the release it switches to -- not against its own loader -- before staging an
+update and before a rollback changes anything, and prints the exact steps
+instead of switching to a release that could not start:
+
+- updating from an earlier release: add `"capture_ca_directory"` (the CA
+  directory path, or `null` on a host without a capture CA) to the
+  deployment configuration, then run the same `update` again;
+- rolling back to an earlier release: remove the `"capture_ca_directory"`
+  entry (note its value), then run the same `rollback` again;
+- returning from there to a release with Issue #109: add the entry back,
+  then run `update` (or `rollback --version <that release>`).
+
+The configuration is never rewritten by the installer.
 
 Run the separately downloaded installer only after verifying its published
 SHA-256. Global arguments precede the operation:

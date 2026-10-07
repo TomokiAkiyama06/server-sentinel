@@ -607,7 +607,11 @@ unchanged.
   both dying) and checks that the next run of every command converges
   without removing committed material. `approve` opens nothing of the
   listener directory before the drop and loads its TLS material from
-  verified descriptors.
+  verified descriptors. Round 7: releases declare
+  `CAPTURE_CA_DIRECTORY_SETTING`; the installer checks the configuration
+  against the release it switches to (required for those, refused for
+  earlier ones) before any change, so update and rollback across the
+  boundary print the Owner steps instead of failing.
 - **Still open (PR2).** Automatic renewal still has only an in-process
   signing primitive, used by tests and called by nothing in the application;
   wiring renewal into the ingest listener waits for the socket-activated,

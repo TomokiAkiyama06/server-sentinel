@@ -42,6 +42,7 @@ SOCKET_UNIT_FILE = Path("/etc/systemd/system") / UPSTREAM_SOCKET_UNIT
 PARKED_SOCKET_DIRECTORY = Path("/etc/server-sentinel/disabled")
 RELEASE_CAPABILITIES = Path("app/release_capabilities.py")
 SOCKET_ACTIVATION_CAPABILITY = re.compile(r"^HUMAN_UPSTREAM_SOCKET_ACTIVATION = True$", re.MULTILINE)
+CAPTURE_CA_SETTING_CAPABILITY = re.compile(r"^CAPTURE_CA_DIRECTORY_SETTING = True$", re.MULTILINE)
 UNPRIVILEGED_PORT_START = Path("/proc/sys/net/ipv4/ip_unprivileged_port_start")
 MAX_CAPABILITIES_BYTES = 16 * 1024
 
@@ -239,6 +240,19 @@ def _supports_socket_activation(release: Path) -> bool:
     A release without the capability file predates socket activation. The
     file was extracted from a verified artifact into a root-owned release.
     """
+    return _has_capability(release, SOCKET_ACTIVATION_CAPABILITY)
+
+
+def _supports_capture_ca_setting(release: Path) -> bool:
+    """Whether a release expects ``capture_ca_directory`` (Issue #109; text check, no import).
+
+    Releases before it validate the configuration against an exact key list
+    and refuse the key; releases with it require the key.
+    """
+    return _has_capability(release, CAPTURE_CA_SETTING_CAPABILITY)
+
+
+def _has_capability(release: Path, capability: re.Pattern) -> bool:
     try:
         descriptor = os.open(release / RELEASE_CAPABILITIES,
                              os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK)
@@ -254,7 +268,40 @@ def _supports_socket_activation(release: Path) -> bool:
         text = content.decode("utf-8")
     except UnicodeDecodeError:
         raise ValueError("release capabilities are invalid") from None
-    return SOCKET_ACTIVATION_CAPABILITY.search(text) is not None
+    return capability.search(text) is not None
+
+
+def _require_capture_ca_setting(args, release: Path, target: str, deployment: Deployment) -> None:
+    """Refuse, before anything changes, a switch whose release would reject the configuration.
+
+    A release with ``CAPTURE_CA_DIRECTORY_SETTING`` requires the key
+    (a path, or null); an earlier release refuses it as an unknown key and
+    would neither pass its own ``--check`` nor start. The installer never
+    rewrites the administrator configuration; it prints the exact steps.
+    """
+    supports = _supports_capture_ca_setting(release)
+    if supports == deployment.capture_ca_configured:
+        return
+    rerun = ("rollback" + (f" --version {args.version}" if args.version else "")
+             if args.command == "rollback" else args.command + " ...")
+    if supports:
+        raise ActivationBoundaryRefused(
+            "ServerSentinel release operation refused before any change: release "
+            f"{target} requires \"capture_ca_directory\" in {args.config}.\n"
+            "As the Owner:\n"
+            f"  1. edit {args.config}: add \"capture_ca_directory\": the capture-node CA\n"
+            "     directory (for example \"/var/lib/serversentinel-ca\"), or null when this host\n"
+            "     keeps no capture-node CA\n"
+            f"  2. rerun the same command ({rerun})\n")
+    raise ActivationBoundaryRefused(
+        "ServerSentinel release operation refused before any change: release "
+        f"{target} predates the \"capture_ca_directory\" setting and refuses it as an\n"
+        "unknown key, so it could not start with the current configuration.\n"
+        "To switch to it, as the Owner, in this order:\n"
+        f"  1. edit {args.config}: remove the \"capture_ca_directory\" entry (note its value)\n"
+        f"  2. rerun the same command ({rerun})\n"
+        "To return later to a release that has the setting: first add the entry back\n"
+        f"to {args.config}, then run update.\n")
 
 
 def _names_upstream_socket(unit: str) -> bool:
@@ -597,6 +644,9 @@ def _stage(args, deployment: Deployment, account: pwd.struct_passwd, runner,
         staging.mkdir(mode=0o755)
         try:
             _extract(content, staging, args.version)
+            # Before the release's own --check, which would only fail without
+            # saying why (Issue #109).
+            _require_capture_ca_setting(args, staging, "releases/" + args.version, deployment)
             # The unit follows the staged release's own capability, never the
             # installer's: see render_unit.
             unit_content = render(_supports_socket_activation(staging))
@@ -704,8 +754,11 @@ def execute(args, *, runner=subprocess.run) -> None:
 def _execute_locked(args, runner) -> None:
     _reachable_deployment_path(args.config, "deployment configuration")
     _reachable_deployment_path(args.destination, "installation destination")
+    # The key is checked against the release being switched to, not against
+    # this installer's own (newer) loader: a release from before Issue #109
+    # refuses it, a later one requires it (see _require_capture_ca_setting).
     deployment = Deployment.load(args.config, code_root=Path(__file__).resolve().parent,
-                                 install_root=args.destination)
+                                 install_root=args.destination, capture_ca_setting="optional")
     _reachable_deployment_path(deployment.runtime_root, "runtime root")
     account = pwd.getpwuid(deployment.service_uid)
     if account.pw_uid == 0:
@@ -787,6 +840,7 @@ def _execute_locked(args, runner) -> None:
         if current is None or _installed_unit(_release_unit(args.destination, current)) != previous_unit:
             raise ValueError("installed service configuration differs")
         target_unit = _installed_unit(_release_unit(args.destination, target))
+        _require_capture_ca_setting(args, args.destination / target, target, deployment)
         _require_startable(args, args.destination, target, deployment, runner)
         if (not _supports_socket_activation(args.destination / target)
                 and _names_upstream_socket(target_unit)):

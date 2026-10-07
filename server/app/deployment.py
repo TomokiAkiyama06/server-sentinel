@@ -306,6 +306,10 @@ class Deployment:
     # The capture-node CA directory. When configured, the launcher refuses to
     # run if the service account can open it (Issue #109).
     capture_ca_directory: Path | None = field(default=None, repr=False)
+    # Whether the configuration contains the ``capture_ca_directory`` key at
+    # all (``null`` counts). The installer compares it with the release it
+    # switches to (Issue #109, review of PR #177).
+    capture_ca_configured: bool = field(default=True, repr=False)
 
     @property
     def state_directory(self) -> Path:
@@ -313,7 +317,17 @@ class Deployment:
 
     @classmethod
     def load(cls, path: Path, *, code_root: Path | None = None,
-             install_root: Path | None = None) -> "Deployment":
+             install_root: Path | None = None,
+             capture_ca_setting: str = "required") -> "Deployment":
+        """Load and validate the configuration.
+
+        ``capture_ca_setting`` is ``"required"`` for the service itself. The
+        installer passes ``"optional"`` and then requires or forbids the key
+        according to the release it switches to: a release from before
+        Issue #109 refuses the key as unknown (``capture_ca_configured``).
+        """
+        if capture_ca_setting not in ("required", "optional"):
+            raise ConfigurationError("invalid deployment configuration")
         value, info = _read_configuration(path)
         code_root = code_root or Path(__file__).resolve().parents[1]
         allowed = {
@@ -329,7 +343,8 @@ class Deployment:
         # Required (Owner decision 2026-10-07, Issue #109): every configuration
         # states where the capture-node CA lives, or ``null`` for none, so the
         # start-time check can never be skipped by omission.
-        if "capture_ca_directory" not in value:
+        configured = "capture_ca_directory" in value
+        if not configured and capture_ca_setting == "required":
             raise CaptureCaSettingMissing("capture_ca_directory is required")
         uid = value["service_uid"]
         if uid <= 0:
@@ -408,13 +423,14 @@ class Deployment:
             )
         local_uvc = parse_local_uvc(value["local_uvc"]) if "local_uvc" in value else None
         detection = parse_detection(value["detection"]) if "detection" in value else None
-        capture_ca = (None if value["capture_ca_directory"] is None
+        capture_ca = (None if value.get("capture_ca_directory") is None
                       else _capture_ca_directory(value["capture_ca_directory"]))
         if capture_ca is not None and (capture_ca.is_relative_to(runtime_root)
                                        or any(capture_ca.is_relative_to(root) for root in roots)):
             raise ConfigurationError("capture CA directory must be outside runtime data and code")
         return cls(runtime_root, uid, settings, directories[1], directories[2], monitoring,
-                   local_uvc=local_uvc, detection=detection, capture_ca_directory=capture_ca)
+                   local_uvc=local_uvc, detection=detection, capture_ca_directory=capture_ca,
+                   capture_ca_configured=configured)
 
 
 def main(arguments: list[str] | None = None) -> int:
