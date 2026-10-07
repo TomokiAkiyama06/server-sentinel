@@ -15,7 +15,7 @@ const { PresenceBody, refreshDelay, scheduleExpiryRefresh, withFailure, withRepo
 
 // Synthetic only: no real person, deployment, camera or identity value appears here.
 const kinds = ['person', 'motion', 'owner_entry', 'owner_exit', 'anonymous_entry', 'anonymous_exit',
-  'server_movement', 'camera_tamper', 'camera_health', 'node_health', 'recording', 'storage',
+  'server_movement', 'camera_tamper', 'camera_health', 'entrance_gate', 'node_health', 'recording', 'storage',
   'presence', 'configuration'];
 // Mirrors the backend enumerations the timeline projects.
 const values = ['observed', 'not_observed', 'unknown', 'online', 'offline', 'degraded',
@@ -129,6 +129,19 @@ test('low-quality detector positives are not presented as factual results', () =
     assert.equal(detectorObservation(kind), false);
     assert.equal(displayValue(observation(kind, { value, quality: 'unknown' })), value);
   }
+});
+
+test('entrance gate quality periods read as undeterminable, never as an empty entrance', () => {
+  assert.equal(detectorObservation('entrance_gate'), false);
+  for (const quality of ['unknown', 'insufficient']) {
+    const item = observation('entrance_gate', { value: 'unknown', quality, confidence: null });
+    assert.equal(displayValue(item), 'unknown');
+    const markup = timeline(page([item]));
+    assert.match(markup, /入口ゲートの判定品質: 判定できません/);
+    assert.doesNotMatch(markup, /観測されず|: 検出/);
+  }
+  const ready = observation('entrance_gate', { value: 'ready', quality: 'sufficient', confidence: null });
+  assert.match(timeline(page([ready])), /入口ゲートの判定品質: 準備完了を観測/);
 });
 
 test('rows are ordered by receipt and still carry their own observation time', () => {

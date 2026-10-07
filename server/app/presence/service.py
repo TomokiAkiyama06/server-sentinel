@@ -15,7 +15,7 @@ from .access import DenyAccess
 from .delivery import ActionResult
 from .models import (CRITICAL, InvalidObservation, Kind, Observation, PresenceState, Quality,
                      Value, timestamp, utc)
-from app.storage.database import PinnedDatabase
+from app.storage.database import PinnedDatabase, read_database_prefix
 from app.storage.retention import RetentionPeriods
 
 
@@ -49,6 +49,37 @@ COMMITTED_LOCK_WAIT = 2.0
 COMMITTED_LOCK_POLL = 0.005
 
 
+# The first 16 bytes of every SQLite database file. Header bytes 18 and 19
+# are the file-format write and read versions: 2 selects WAL, which is
+# persistent in the file itself rather than per connection.
+SQLITE_MAGIC = b"SQLite format 3\x00"
+WAL_FORMAT = 2
+
+
+def _wal_database(path):
+    """Whether the file at ``path`` is a SQLite database in WAL mode.
+
+    A missing file is not WAL here: the read-only open that follows fails
+    instead of creating it. An empty or foreign file is not WAL either, and a
+    rollback-journal read never creates a file beside the database.
+
+    The header is read through the process-wide held descriptor, never a
+    fresh ``open``/``close``: closing a descriptor on the database would drop
+    the POSIX locks this process's own SQLite connections hold on it.
+    """
+    header = read_database_prefix(path, 20)
+    if header is None:
+        return False
+    return len(header) == 20 and header[:16] == SQLITE_MAGIC and WAL_FORMAT in (header[18], header[19])
+
+
+# Outbox sessions that are live in this process, per database file. A status
+# or clear from another `PresenceService` instance over the same database in
+# this process reads the owning outbox's in-memory backlog from here.
+_LIVE_SESSIONS = {}
+_LIVE_SESSIONS_LOCK = threading.Lock()
+
+
 def _lock_committed(descriptor):
     """Take the committed-session lock exclusively, waiting out status probes."""
     deadline = time.monotonic() + COMMITTED_LOCK_WAIT
@@ -78,10 +109,14 @@ class TimelineSession:
         # written to the durable marker. The outbox replaces it with a reader
         # of its own counts, so Owner status sees that loss before it lands.
         self.unpersisted = lambda: 0
-        # Staged facts awaiting a successful write together with that loss
-        # count, read in one critical section of the outbox so a fact moving
-        # from staged to counted loss is never missed by a status read.
-        self.backlog = lambda: (0, self.unpersisted())
+        # Staged facts awaiting a successful write, that loss count and the
+        # facts quarantined after a permanent build fault, read in one critical
+        # section of the outbox so a fact moving between them is never missed
+        # by a status read.
+        self.backlog = lambda: (0, self.unpersisted(), 0)
+        # Consecutive flushes a transient storage, database or clock failure
+        # stopped before the head fact was written.
+        self.failures = lambda: 0
 
     @property
     def live(self):
@@ -120,55 +155,93 @@ class PresenceService:
         # Injected by the reviewed #24 detector supervisor. Absent means unknown
         # detection health here; this module never claims a detector is running.
         self.detection = detection
-        # Outbox sessions this service opened and that are still live.
-        self._sessions = []
-        self._sessions_lock = threading.Lock()
 
+    @contextmanager
     def _read(self):
-        """A genuinely read-only connection for status and history reads.
+        """A connection for status and history reads that never writes unadmitted.
 
-        Reads take no storage reservation, so they must never create a
-        database: SQLite's ``mode=ro`` opens an existing file or fails, with
-        no check-then-create window if the file or its mount disappears.
-        A ``PinnedDatabase`` keeps its pin checks, so a replaced or unlinked
-        file at the same path is refused instead of read.
+        Reads must never create a database: SQLite's ``mode=ro`` opens an
+        existing file or fails, with no check-then-create window if the file
+        or its mount disappears. A ``PinnedDatabase`` keeps its pin checks, so
+        a replaced or unlinked file at the same path is refused instead of read.
+
+        A read normally takes no storage reservation. A WAL database is the
+        exception: whenever its ``-wal``/``-shm`` sidecars are missing, empty
+        or truncated at the moment SQLite opens it, SQLite creates or resizes
+        them even for a ``mode=ro`` connection, and a read-only connection can
+        never remove them again. Sidecars seen present beforehand prove
+        nothing, since the last other connection can close and delete them
+        before this open. Every WAL read therefore runs under the storage
+        reservation, through a no-create read-write connection with
+        ``query_only`` set, so any sidecars it creates are removed again when
+        it closes as the last connection. A refused or missing reservation
+        fails the read instead of writing outside it. The application never
+        switches its database to WAL, so its rollback-journal reads, which
+        never create a file, keep working during a storage hard stop.
+        ``immutable`` is never used: it would read a file a live writer is
+        changing as if nothing could change it.
         """
-        if isinstance(self.database, PinnedDatabase):
-            return self.database.connect_read_only()
-        path = self.database.path
-        if not path.is_absolute() or path.is_symlink():
-            raise ValueError("database location is unavailable")
-        connection = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=5, isolation_level=None)
-        connection.row_factory = sqlite3.Row
-        return connection
+        with ExitStack() as held:
+            path = self.database.path
+            if not path.is_absolute() or path.is_symlink():
+                raise ValueError("database location is unavailable")
+            admitted = _wal_database(path)
+            if admitted:
+                held.enter_context(self._admission())
+            if isinstance(self.database, PinnedDatabase):
+                connection = self.database.connect() if admitted else self.database.connect_read_only()
+            else:
+                connection = sqlite3.connect(path.as_uri() + ("?mode=rw" if admitted else "?mode=ro"),
+                                             uri=True, timeout=5, isolation_level=None)
+            held.enter_context(closing(connection))
+            if admitted:
+                connection.execute("PRAGMA query_only=ON")
+            connection.row_factory = sqlite3.Row
+            yield connection
+
+    def _session_key(self):
+        return os.path.realpath(self.database.path)
 
     def _live_sessions(self):
-        with self._sessions_lock:
-            self._sessions = [session for session in self._sessions if session.live]
-            return tuple(self._sessions)
+        """Live outbox sessions of this process over this service's database."""
+        key = self._session_key()
+        with _LIVE_SESSIONS_LOCK:
+            sessions = [session for session in _LIVE_SESSIONS.get(key, ()) if session.live]
+            if sessions:
+                _LIVE_SESSIONS[key] = sessions
+            else:
+                _LIVE_SESSIONS.pop(key, None)
+            return tuple(sessions)
 
     def _unpersisted_loss(self):
         """Timeline loss counted by a live outbox of this process but not yet written."""
         return self._outbox_backlog()[1]
 
     def _outbox_backlog(self):
-        """``(pending, unpersisted)`` across the live outboxes of this process.
+        """``(pending, unpersisted, quarantined, failures)`` across this process's live outboxes.
 
         Pending facts are staged and await a successful write; they are not
-        loss. Each session reports both counts atomically, so a fact that is
-        rejected between two reads is never seen in neither count.
+        loss. Quarantined facts failed to build with a permanent programming
+        fault: they are held, not dropped, but will not be written without a
+        fix, so they are possible loss. Each session reports its counts
+        atomically, so a fact that moves between them between two reads is
+        never seen in none of them. Sessions are shared by every
+        `PresenceService` over the same database file in this process.
         """
-        pending = unpersisted = 0
+        pending = unpersisted = quarantined = failures = 0
         for session in self._live_sessions():
             try:
-                staged, lost = session.backlog()
+                staged, lost, held = session.backlog()
+                failed = session.failures()
             except Exception:
                 # An unreadable backlog proves neither an empty queue nor the
                 # absence of loss.
-                staged, lost = 1, 1
+                staged, lost, held, failed = 1, 1, 0, 0
             pending += staged
             unpersisted += lost
-        return pending, unpersisted
+            quarantined += held
+            failures += failed
+        return pending, unpersisted, quarantined, failures
 
     def _admission(self):
         """Obtain one storage reservation context for a single durable write.
@@ -634,6 +707,10 @@ class PresenceService:
     def _orphaned_sessions(self, db):
         """Session rows no live outbox holds: evidence of an interrupted gap.
 
+        Returns ``(orphaned, foreign)``. ``foreign`` is True when the rows are
+        owned by a live outbox in another process: its in-memory backlog
+        (staged facts and counted but unwritten loss) cannot be read from here.
+
         `open_timeline_session()` converts such rows into the durable marker,
         but a restart whose replacement session cannot open (a refused
         volume, a clock or database fault) never gets there. Status must not
@@ -650,8 +727,8 @@ class PresenceService:
         tokens = [row[0] for row in db.execute("SELECT token FROM presence_outbox_sessions")]
         orphaned = [token for token in tokens if token not in live]
         if orphaned and not live and self._committed_session_held() is True:
-            return 0
-        return len(orphaned)
+            return 0, True
+        return len(orphaned), False
 
     def open_timeline_session(self, *, now):
         """Start the durable outbox session; returns ``(session, gap marker or None)``.
@@ -689,8 +766,8 @@ class PresenceService:
             if session is not None:
                 session.release()
             raise
-        with self._sessions_lock:
-            self._sessions.append(session)
+        with _LIVE_SESSIONS_LOCK:
+            _LIVE_SESSIONS.setdefault(self._session_key(), []).append(session)
         return session, gap
 
     def record_timeline_gap(self, *, now, refused=0, rejected=0, lost=0, close=None):
@@ -725,7 +802,7 @@ class PresenceService:
         """
         if not isinstance(session, TimelineSession):
             raise ValueError("timeline session required")
-        with closing(self._read()) as db:
+        with self._read() as db:
             return db.execute("SELECT 1 FROM presence_outbox_sessions WHERE token=?",
                               (session.token,)).fetchone() is not None
 
@@ -735,7 +812,7 @@ class PresenceService:
         A missing database is an unreadable marker, never created here: this
         read takes no storage reservation.
         """
-        with closing(self._read()) as db:
+        with self._read() as db:
             return self._gap(db)
 
     def clear_timeline_gap(self, context, *, now, clock_trusted):
@@ -755,6 +832,11 @@ class PresenceService:
                 raise ValueError("trusted control timestamp required")
             if self._unpersisted_loss():
                 raise ValueError("unpersisted timeline loss pending")
+            if self._orphaned_sessions(db)[1]:
+                # The owning outbox is in another process: loss it has counted
+                # but not yet written cannot be seen from here, so the Owner
+                # cannot accept the gap through this process.
+                raise ValueError("timeline outbox is owned by another process")
             gap = self._gap(db)
             if gap is None:
                 raise ValueError("no timeline gap")
@@ -955,7 +1037,7 @@ class PresenceService:
         `owner_status()` and must never expose this payload to a `live:view`
         identity or to any unauthenticated surface.
         """
-        with closing(self._read()) as db:
+        with self._read() as db:
             control_trusted = self._control_trust(db, now, clock_trusted)
             override = db.execute("SELECT * FROM presence_override WHERE singleton=1").fetchone()
         expired = bool(override and override["expires"] and control_trusted
@@ -969,8 +1051,8 @@ class PresenceService:
         # Staged facts are read in the same step: a staged fact leaves the
         # backlog only after its write committed, so it is either still
         # pending here or already in the timeline read below.
-        pending, unpersisted = self._outbox_backlog()
-        with closing(self._read()) as db:
+        pending, unpersisted, quarantined, failures = self._outbox_backlog()
+        with self._read() as db:
             trusted = self._clock_trust(db, now, clock_trusted)
             control_trusted = self._control_trust(db, now, clock_trusted)
             state, basis, expires = self._effective(db, now, trusted, control_trusted)
@@ -990,7 +1072,7 @@ class PresenceService:
                 "SELECT action FROM presence_expired_unresolved")}
             # Session rows are read before the marker: an open that converts
             # them commits both at once, so they are seen in one of the two.
-            orphaned = self._orphaned_sessions(db)
+            orphaned, foreign = self._orphaned_sessions(db)
             # A durable timeline gap stays visible across restarts until the
             # Owner clears it; it is Owner information like the paths below.
             gap = self._gap(db)
@@ -999,6 +1081,11 @@ class PresenceService:
         # an inferred owner observation. A skewed source timestamp must not
         # withhold the suppression an accepted Owner override asks for, and the
         # separate observation flag keeps that skew visible.
+        if foreign:
+            # A live outbox in another process owns the session: its staged
+            # facts and unwritten loss are invisible here, which proves
+            # neither an empty queue nor the absence of loss.
+            pending, unpersisted = pending + 1, unpersisted + 1
         timing = {"manual_override": control_trusted, "hint": control_trusted,
                   "owner_observation": trusted}.get(basis, trusted and control_trusted)
         return {"state": state.value, "basis": basis, "override_expires_at": expires,
@@ -1008,7 +1095,7 @@ class PresenceService:
                 **self._critical_paths(unresolved, not admitted),
                 "override_expiry_pending": not retired,
                 "pending_critical_actions": failed,
-                "timeline_gap": gap is not None or unpersisted > 0 or orphaned > 0,
+                "timeline_gap": gap is not None or unpersisted > 0 or orphaned > 0 or quarantined > 0,
                 "timeline_gap_detail": gap,
                 "timeline_gap_unpersisted": unpersisted,
                 # Sessions that never closed cleanly and that no replacement
@@ -1018,7 +1105,16 @@ class PresenceService:
                 # holds back: not loss, so not part of timeline_gap, but the
                 # timeline is incomplete until they are written.
                 "timeline_pending": pending > 0,
-                "timeline_pending_count": pending}
+                "timeline_pending_count": pending,
+                # Facts held back after a permanent build fault (a programming
+                # error, not storage): possible loss until fixed, never dropped.
+                "timeline_quarantined_count": quarantined,
+                # Consecutive flushes a transient failure stopped; a growing
+                # count is a stuck outbox rather than a passing refusal.
+                "timeline_flush_failures": failures,
+                # False when the owning outbox lives in another process and
+                # its in-memory backlog is reported as unknown rather than empty.
+                "timeline_backlog_visible": not foreign}
 
     def owner_status(self, context, *, now, clock_trusted):
         self._owner(context)
@@ -1026,7 +1122,7 @@ class PresenceService:
 
     def audit(self, context):
         self._owner(context)
-        with closing(self._read()) as db:
+        with self._read() as db:
             return [dict(row) for row in db.execute("SELECT * FROM presence_audit ORDER BY sequence")]
 
     def expire_audit(self, *, now, limit=1000):
@@ -1125,7 +1221,7 @@ class PresenceService:
         if cursor is not None:
             page = "AND (received>? OR (received=? AND sequence>?)) "
             window += [cursor[0], cursor[0], cursor[1]]
-        with closing(self._read()) as db:
+        with self._read() as db:
             rows = db.execute("SELECT sequence,received,payload FROM presence_observations "
                               "WHERE received>=? AND received<? " + page
                               + "ORDER BY received,sequence LIMIT ?", (*window, limit)).fetchall()
