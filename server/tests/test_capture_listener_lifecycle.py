@@ -734,6 +734,22 @@ class AuthorityConsistencyTests(ListenerLifecycleHarness):
         self.assertEqual(0, status, stderr)
         self.assertRegex(stdout, r"^trust_bundle_sha256=[0-9a-f]{64}\n$")
 
+    def test_export_bundle_refuses_a_tailscale_endpoint_without_writing(self):
+        # Issue #150 (Owner decision 2026-10-07).
+        authority, listener = self.fresh()
+        self.init(authority, listener)
+        for endpoint in ("100.64.0.1:8443", "[fd7a:115c:a1e0::1]:8443"):
+            output = self.root / f"bundle-{uuid4()}.json"
+            with self.subTest(endpoint=endpoint):
+                status, stdout, stderr = run_cli(
+                    "export-bundle", "--authority-dir", str(authority),
+                    "--listener-dir", str(listener), "--endpoint", endpoint,
+                    "--output", str(output))
+                self.assertEqual(2, status)
+                self.assertEqual("", stdout)
+                self.assertIn("refused: trust_bundle_endpoint_tailscale_address_refused", stderr)
+                self.assertFalse(output.exists())
+
     def test_approve_refuses_a_listener_from_another_deployment_before_any_approval(self):
         authority_a, listener_a = self.fresh("a")
         authority_b, listener_b = self.fresh("b")

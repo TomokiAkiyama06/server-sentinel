@@ -345,6 +345,30 @@ class EnrollmentConfigurationTests(unittest.TestCase):
         EnrollmentListenerConfig("192.168.1.2", 7443)
         EnrollmentListenerConfig("fd00::2", 7443)
 
+    def test_bind_refuses_tailscale_addresses_in_both_families(self):
+        # Issue #150: Tailscale's IPv6 range is a ULA (is_private) and used to
+        # pass; both Tailscale ranges are refused, including their edges and
+        # the IPv4-mapped spelling of the IPv4 range.
+        for host in ("100.64.0.0", "100.64.0.1", "100.100.100.100", "100.127.255.255",
+                     "::ffff:100.64.0.1", "::ffff:100.127.255.255",
+                     "fd7a:115c:a1e0::", "fd7a:115c:a1e0::1", "fd7a:115c:a1e0::53",
+                     "fd7a:115c:a1e0:ab12:4843:cd96:6258:b240",
+                     "fd7a:115c:a1e0:b1a::a00:1",
+                     "fd7a:115c:a1e0:ffff:ffff:ffff:ffff:ffff"):
+            with self.subTest(host=host), \
+                    self.assertRaisesRegex(EnrollmentConfigurationError, "private"):
+                EnrollmentListenerConfig(host, 7443)
+        # Just outside the IPv6 range: still private-LAN ULAs and accepted.
+        for host in ("fd7a:115c:a1df:ffff:ffff:ffff:ffff:ffff", "fd7a:115c:a1e1::",
+                     "fd00::1", "10.64.0.1", "::ffff:10.0.0.5"):
+            with self.subTest(host=host):
+                EnrollmentListenerConfig(host, 7443)
+        # Just outside the IPv4 range is not private either, so it stays refused.
+        for host in ("100.63.255.255", "100.128.0.0", "::ffff:8.8.8.8"):
+            with self.subTest(host=host), \
+                    self.assertRaisesRegex(EnrollmentConfigurationError, "private"):
+                EnrollmentListenerConfig(host, 7443)
+
     def test_limits_are_bounded(self):
         for changes in ({"max_concurrent_connections": 0}, {"connection_deadline_seconds": 0},
                         {"connection_deadline_seconds": 61}, {"max_refused_requests": True},

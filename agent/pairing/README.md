@@ -46,6 +46,16 @@ verification, sends the code and CSR once, and installs the returned certificate
 only after validating it. There is no code argument, environment variable, stdin
 or URL input, and no plaintext or insecure mode.
 
+Enrollment and ingest are private-LAN only (Issue #150, Owner decision
+2026-10-07): a Main endpoint in a Tailscale range, IPv4 `100.64.0.0/10` or IPv6
+`fd7a:115c:a1e0::/48` (including the IPv4-mapped spelling), is refused with
+`main_endpoint_tailscale_address_refused`. The bundle's endpoint is checked
+when it is parsed, an IP literal (bundle or `pair --endpoint`) before
+connecting, and a DNS name by the address it actually connected to, before the
+TLS handshake. The ranges are matched by address only
+(`media_capture_agent.addresses`), so another private network that reuses them
+is refused too.
+
 Automatic renewal (Owner decision 2026-09-30): `RenewalSchedule` starts 30 days
 before the installed certificate expires and backs off from 1 hour to at most
 24 hours. `prepare_renewal` keeps one fresh key in

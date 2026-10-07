@@ -51,6 +51,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
+from .addresses import is_tailscale_address
 from .pairing import EnrollmentClaim, PairingLedger
 
 
@@ -112,6 +113,16 @@ class ListenerAuthorityMismatch(CaptureAuthorityError):
     """The listener certificate was not issued by the selected deployment CA."""
 
     reason = "listener_authority_mismatch"
+
+
+class TrustBundleEndpointRefused(CaptureAuthorityError):
+    """The bundle endpoint is a Tailscale address (Issue #150).
+
+    Enrollment and ingest are private-LAN only, so ``export-bundle`` never
+    points an Agent at IPv4 ``100.64.0.0/10`` or IPv6 ``fd7a:115c:a1e0::/48``.
+    """
+
+    reason = "trust_bundle_endpoint_tailscale_address_refused"
 
 
 class ListenerMaterialInconsistent(CaptureAuthorityError):
@@ -217,6 +228,14 @@ def _valid_endpoint_host(value: object) -> bool:
     except ValueError:
         return valid_server_name(value)
     return not (address.is_unspecified or address.is_multicast)
+
+
+def _is_tailscale_literal(value: str) -> bool:
+    """True for an IP literal in a Tailscale range; a DNS name is not resolved."""
+    try:
+        return is_tailscale_address(ipaddress.ip_address(value))
+    except ValueError:
+        return False
 
 
 class PrivateDirectory:
@@ -990,11 +1009,18 @@ class DeploymentAuthority:
 
     def export_trust_bundle(self, *, server_name: str, endpoint_host: str,
                             endpoint_port: int) -> TrustBundleExport:
-        """Serialize the public bundle: no private key, code or credential."""
+        """Serialize the public bundle: no private key, code or credential.
+
+        An endpoint IP literal in a Tailscale range is refused with
+        ``TrustBundleEndpointRefused`` (Issue #150); a DNS name is not resolved
+        here, the Agent checks the address it actually connects to.
+        """
         if not valid_server_name(server_name) or not _valid_endpoint_host(endpoint_host):
             raise CaptureAuthorityError("invalid trust bundle endpoint")
         if type(endpoint_port) is not int or not 1 <= endpoint_port <= 65535:
             raise CaptureAuthorityError("invalid trust bundle endpoint")
+        if _is_tailscale_literal(endpoint_host):
+            raise TrustBundleEndpointRefused("trust bundle endpoint is a Tailscale address")
         content = json.dumps({
             "format_version": TRUST_BUNDLE_FORMAT,
             "deployment_id": str(self.deployment_id),

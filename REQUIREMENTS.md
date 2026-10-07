@@ -112,6 +112,8 @@ At minimum support `online`, `degraded`, `offline`, and `manual_intervention_req
 ### CAM-011 Room-overview support
 A wide room-overview camera may be located physically closer to a separate Linux machine than to the main host. The architecture shall support forwarding that camera over the private LAN through `media-capture-agent` without requiring that capture machine to join Tailscale.
 
+Exception (Owner decision 2026-10-07, Issue #150): capture enrollment and ingest shall refuse the Tailscale address ranges IPv4 `100.64.0.0/10` and IPv6 `fd7a:115c:a1e0::/48` (including IPv4-mapped spellings) for the Main's enrollment bind, ingest bind and bundle endpoint, and the Agent shall refuse a Main endpoint in them. The refusal is by address range only, so it also applies when a private LAN that is not Tailscale uses those ranges; such a deployment shall give the Main another private address for capture traffic.
+
 ## 6. `media-capture-agent` requirements
 
 ### AGENT-001 Functional identity
@@ -131,6 +133,8 @@ Initial agent enrollment uses an owner-approved, 128-bit, five-minute, single-us
 
 ### AGENT-006 No Tailnet requirement
 The capture agent shall be able to operate over the same private LAN without being enrolled in the owner's Tailnet.
+
+Capture traffic shall not use Tailscale addresses: the private-LAN path excludes the Tailscale address ranges IPv4 `100.64.0.0/10` and IPv6 `fd7a:115c:a1e0::/48` (including IPv4-mapped spellings), even when a non-Tailscale LAN uses them (Owner decision 2026-10-07; see CAM-011).
 
 ### AGENT-007 Separate ingest boundary
 The main host's LAN ingest endpoint for capture agents shall be separate from the dashboard/API exposure used by human viewers. The ingest endpoint shall not expose dashboard routes.

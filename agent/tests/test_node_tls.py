@@ -126,6 +126,56 @@ class NodeTlsTests(NodeTlsHarness):
         with self.assertRaisesRegex(PairingRefused, "trust_bundle_rejected"):
             TrustBundle.parse(swapped)
 
+    def test_tailscale_bundle_endpoints_are_refused_with_a_dedicated_reason(self):
+        # Issue #150 (Owner decision 2026-10-07): enrollment and ingest are
+        # private-LAN only, so a bundle never points the Agent at Tailscale.
+        refused = ("100.64.0.0", "100.100.100.100", "100.127.255.255", "fd7a:115c:a1e0::",
+                   "fd7a:115c:a1e0::53", "fd7a:115c:a1e0:b1a::c0a8:1",
+                   "fd7a:115c:a1e0:ffff:ffff:ffff:ffff:ffff", "::ffff:100.64.0.1")
+        for host in refused:
+            with self.subTest(host=host):
+                with self.assertRaisesRegex(PairingRefused,
+                                            "^main_endpoint_tailscale_address_refused$"):
+                    TrustBundle.parse(self.authority.bundle(host=host))
+        for host in ("100.63.255.255", "100.128.0.0", "fd7a:115c:a1df:ffff::1",
+                     "fd7a:115c:a1e1::", "192.168.250.10", "fd00::10"):
+            with self.subTest(host=host):
+                self.assertEqual(host, TrustBundle.parse(self.authority.bundle(host=host)).endpoint_host)
+
+    def test_connect_refuses_tailscale_literals_and_resolved_tailscale_peers(self):
+        context = build_capture_client_context(self.bundle.ca_certificate_pem)
+        with patch("media_capture_agent.node_tls.socket.create_connection") as connect:
+            for host in ("100.64.0.1", "fd7a:115c:a1e0::1", "::ffff:100.100.100.100"):
+                with self.subTest(host=host):
+                    with self.assertRaisesRegex(PairingRefused,
+                                                "^main_endpoint_tailscale_address_refused$"):
+                        connect_to_main(context, server_name=SERVER_NAME, host=host, port=7443)
+            connect.assert_not_called()
+
+        class Raw:
+            def __init__(self, peer):
+                self.peer, self.closed = peer, False
+
+            def getpeername(self):
+                return self.peer
+
+            def close(self):
+                self.closed = True
+
+        # A DNS name is judged by the address it actually connected to, before TLS.
+        for peer in (("100.101.102.103", 7443), ("fd7a:115c:a1e0::9", 7443, 0, 0)):
+            raw = Raw(peer)
+            with self.subTest(peer=peer[0]), \
+                    patch("media_capture_agent.node_tls.socket.create_connection",
+                          return_value=raw), \
+                    patch.object(ssl.SSLContext, "wrap_socket") as wrap:
+                with self.assertRaisesRegex(PairingRefused,
+                                            "^main_endpoint_tailscale_address_refused$"):
+                    connect_to_main(context, server_name=SERVER_NAME, host=SERVER_NAME,
+                                    port=7443)
+                wrap.assert_not_called()
+                self.assertTrue(raw.closed)
+
     def test_issued_credential_must_match_key_ca_scope_and_deployment(self):
         store = PendingNodeKeyStore(self.runtime)
         key = store.create()

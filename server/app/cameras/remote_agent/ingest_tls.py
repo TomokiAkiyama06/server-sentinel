@@ -38,6 +38,8 @@ import socket
 import ssl
 from pathlib import Path
 from typing import Callable
+
+from .addresses import is_tailscale_address
 from uuid import UUID
 
 from cryptography import x509
@@ -75,7 +77,10 @@ class IngestListenerConfig:
     """Explicit ingest bind; there is no default address, port or wildcard.
 
     ``human_host``/``human_port`` are the dashboard listener's values so the
-    two listeners can never share a socket address.
+    two listeners can never share a socket address. Ingest is private-LAN only
+    and needs no Tailscale, so a Tailscale address (IPv4 ``100.64.0.0/10``,
+    IPv6 ``fd7a:115c:a1e0::/48``, or the IPv4-mapped spelling) is refused
+    (Issue #150).
     """
 
     bind_host: str
@@ -93,6 +98,8 @@ class IngestListenerConfig:
             raise IngestConfigurationError("ingest_bind_requires_ip_literal") from None
         if bind.is_unspecified or bind.is_multicast:
             raise IngestConfigurationError("ingest_bind_wildcard_refused")
+        if is_tailscale_address(bind):
+            raise IngestConfigurationError("ingest_bind_tailscale_address_refused")
         for port in (self.port, self.human_port):
             if type(port) is not int or not 1 <= port <= 65535:
                 raise IngestConfigurationError("ingest_port_invalid")
