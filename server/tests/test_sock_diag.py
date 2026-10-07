@@ -365,15 +365,22 @@ class OwnersFixture(TestCase):
         (path / "cgroup.procs").write_text("".join(f"{pid}\n" for pid in pids))
         return path.stat().st_ino
 
-    def process(self, pid, fds):
+    def process(self, pid, fds, start=1000):
         directory = self.proc / str(pid) / "fd"
         directory.mkdir(parents=True)
         for number, target in enumerate(fds):
             (directory / str(number)).symlink_to(target)
+        self.stat(pid, start)
         return directory
+
+    def stat(self, pid, start):
+        # A comm with spaces and ")" checks the parser takes the last ")".
+        fields = ["S", "1", "1", "1", "0", "-1", "0"] + ["0"] * 12 + [str(start), "0"]
+        (self.proc / str(pid) / "stat").write_text(f"{pid} (py ) x) " + " ".join(fields) + "\n")
 
     def owners(self, sockets, **kwargs):
         kwargs.setdefault("probe", None)
+        kwargs.setdefault("sleep", lambda seconds: None)
         return SockDiagOwners(diag=FakeDiag(sockets), cgroup_root=str(self.cgroups), proc=str(self.proc),
                               proc_self=str(self.self_dir), getpid=lambda: self.PID,
                               geteuid=lambda: self.UID, **kwargs)
@@ -447,6 +454,58 @@ class CreatorTests(OwnersFixture):
 
 
 class SoleHolderTests(OwnersFixture):
+    def test_transient_holder_between_fork_and_exec_is_unverified_not_shared(self):
+        # PR #153 review B1: a child between fork and exec briefly shows the
+        # backend's descriptors (close-on-exec acts only at exec).
+        directory = self.process(501, ["socket:[77]"])
+        self.cgroup("system.slice/server-sentinel.service", [self.PID, 501])
+        delays = []
+
+        def child_execs(seconds):
+            delays.append(seconds)
+            for link in directory.iterdir():
+                link.unlink()  # exec closed the close-on-exec descriptor
+
+        resolver = self.owners([], sleep=child_execs)
+        self.assertEqual(resolver.held_only_by_requester(frozenset({77, 78})), {78: True})
+        self.assertEqual(delays, [0.1])
+
+    def test_holder_replaced_by_a_new_process_with_the_same_pid_is_unverified(self):
+        self.process(501, ["socket:[77]"], start=1000)
+        self.cgroup("system.slice/server-sentinel.service", [self.PID, 501])
+        resolver = self.owners([], sleep=lambda seconds: self.stat(501, 2000))
+        self.assertEqual(resolver.held_only_by_requester(frozenset({77})), {})
+
+    def test_holder_without_a_readable_start_time_is_unverified(self):
+        self.process(501, ["socket:[77]"])
+        (self.proc / "501" / "stat").write_text("garbage")
+        self.cgroup("system.slice/server-sentinel.service", [self.PID, 501])
+        self.assertEqual(self.owners([]).held_only_by_requester(frozenset({77})), {})
+
+    def test_holder_seen_only_in_the_second_scan_is_unverified(self):
+        self.cgroup("system.slice/server-sentinel.service", [self.PID, 501])
+        self.process(501, ["socket:[78]"])  # forces the second scan
+
+        def forks(seconds):
+            os.symlink("socket:[77]", self.proc / "501" / "fd" / "9")
+
+        self.assertEqual(self.owners([], sleep=forks).held_only_by_requester(frozenset({77, 78})), {78: False})
+
+    def test_briefly_unreadable_process_during_exec_is_not_an_error(self):
+        directory = self.process(501, ["socket:[78]"])
+        self.cgroup("system.slice/server-sentinel.service", [self.PID, 501])
+        directory.chmod(0)
+        self.addCleanup(directory.chmod, 0o755)
+        if os.access(directory, os.R_OK):
+            self.skipTest("running with privilege that bypasses directory permissions")
+        resolver = self.owners([], sleep=lambda seconds: directory.chmod(0o755))
+        self.assertEqual(resolver.held_only_by_requester(frozenset({77})), {77: True})
+
+    def test_persistent_other_holder_is_shared(self):
+        self.process(501, ["socket:[77]"])
+        self.cgroup("system.slice/server-sentinel.service", [self.PID, 501])
+        self.assertEqual(self.owners([]).held_only_by_requester(frozenset({77, 78})), {77: False, 78: True})
+
     def test_only_this_process_holds_the_upstream(self):
         self.process(self.PID, ["socket:[77]"])  # this process: ignored
         self.process(501, ["socket:[88]", "/dev/null"])
@@ -555,3 +614,36 @@ class HostIntegrationTests(TestCase):
             self.assertEqual(resolver.held_only_by_requester(frozenset({inode})), {inode: False})
         except ReservationEnumerationError:
             self.skipTest("another process in this cgroup cannot be read here")
+
+    def test_fork_exec_children_are_never_reported_as_sharing(self):
+        # PR #153 review B1: children spawned with close_fds=True (as the
+        # integrity probes and the detector worker are) briefly show the
+        # close-on-exec upstream between fork and exec.
+        import threading
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.addCleanup(listener.close)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        inode = os.fstat(listener.fileno()).st_ino
+        stop = threading.Event()
+
+        def spawn():
+            while not stop.is_set():
+                subprocess.run([sys.executable, "-c", "pass"], close_fds=True, check=False)
+
+        workers = [threading.Thread(target=spawn, daemon=True) for _ in range(4)]
+        for worker in workers:
+            worker.start()
+        self.addCleanup(stop.set)
+        resolver = SockDiagOwners()
+        answers = []
+        try:
+            for _ in range(10):
+                answers.append(resolver.held_only_by_requester(frozenset({inode})).get(inode))
+        except ReservationEnumerationError:
+            self.skipTest("another process in this cgroup cannot be read here")
+        finally:
+            stop.set()
+            for worker in workers:
+                worker.join(10)
+        self.assertNotIn(False, answers)

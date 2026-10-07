@@ -298,9 +298,25 @@ A socket created in another existing cgroup, or by another uid, counts as
 same check reports the same creator; a mismatch the second dump does not repeat
 (the socket went away or changed, or the dump failed) is
 `LISTENER_OWNER_UNVERIFIED`. So is every creator the check cannot establish: a
-socket in `/proc/net` that is not in the dump, no cgroup attribute, a cgroup id
-that names no existing cgroup (deleted), the root cgroup or `/init.scope`, and a
-lookup that fails, times out or fails its self-check. Unverified closes access
+socket in `/proc/net` that is not in the dump, and a lookup that fails, times
+out or fails its self-check. A creator whose cgroup cannot be resolved (no
+cgroup attribute, a cgroup id that names no existing cgroup, the root cgroup
+or `/init.scope`) is unverified while its uid is one of the expected
+identities' uids, and always for `/init.scope` with uid 0 (PID 1's own
+sockets); with a uid none of them has it is another creator, an exposure once
+the second dump confirms it (Owner decision, 2026-10-07). A unit matches a
+socket created in `/system.slice/<unit>` or below nested system slices
+(`/system.slice/system-cups.slice/cups.service`, every component in between a
+`.slice`); exceptions and proxy owners name `.service` or `.socket` units
+only. A kernel-owned socket (inode 0 in `/proc/net`, for example a kernel
+WireGuard UDP socket) has no creator to look up and stays unverified, so
+human access stays closed while one is on a covered port even with an
+exception. For the human upstream, another unit process holding the socket is
+an exposure only when the same process (pid and start time) still holds it in
+a second scan about 100 ms later: a child between `fork` and `exec` (for
+example a `subprocess` with `close_fds=True`) briefly holds every descriptor,
+because close-on-exec acts only at `exec`. Seen once only, or a process that
+is unreadable in one scan, is unverified. Unverified closes access
 without revocation and reopens once the creator verifies again (Owner
 decisions, 2026-10-05 and 2026-10-07). The resolver is mandatory: without
 `socket_owners` access never opens.

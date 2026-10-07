@@ -93,8 +93,10 @@ def activated_listener(host: str, port: int, environ: MutableMapping[str, str] |
         os.set_inheritable(listener.fileno(), False)
         bound = listener.getsockname()
         accepting = listener.getsockopt(socket.SOL_SOCKET, socket.SO_ACCEPTCONN)
+        protocol = listener.getsockopt(socket.SOL_SOCKET, socket.SO_PROTOCOL)
         if (listener.family not in (socket.AF_INET, socket.AF_INET6)
                 or listener.type != socket.SOCK_STREAM or accepting != 1
+                or protocol != socket.IPPROTO_TCP
                 or ipaddress.ip_address(bound[0]) != ipaddress.ip_address(host)
                 or bound[1] != port):
             raise SocketActivationError("activated socket does not match the human listener")

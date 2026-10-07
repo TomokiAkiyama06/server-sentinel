@@ -1455,8 +1455,10 @@ without revocation, and another creator is an exposure (Owner decision,
 (`LISTENER_OWNER_UNVERIFIED`: no socket-owner resolver, a sock_diag or cgroup
 lookup that is unavailable, times out or fails its self-check, a socket in
 `/proc/net` but not in the dump, a creating cgroup that cannot be resolved —
-deleted, the root cgroup or `/init.scope` — a mismatch the second dump does not
-confirm, an upstream port at or above `ip_unprivileged_port_start`, or an
+deleted, the root cgroup or `/init.scope` — while the socket's uid is one of the
+expected identities' uids, `/init.scope` with uid 0, a mismatch the second dump
+does not confirm, another upstream holder seen in only one of two scans of the
+same check (a child between `fork` and `exec`), a kernel-owned socket (inode 0), an upstream port at or above `ip_unprivileged_port_start`, or an
 unreadable own or unit descriptor table) is not an exposure reason: it keeps
 access closed without revocation and access reopens once ownership verifies
 again (Owner decisions, 2026-10-05 and 2026-10-07, superseding the 2026-10-01
@@ -1464,7 +1466,11 @@ wording that treated an unverifiable owner or holder as an exposure). The
 socket-owner resolver (`app.auth.sock_diag.SockDiagOwners` in production) is
 mandatory; a check without one never opens access. sock_diag reports the
 creator, not the current holder (residual risk accepted by the Owner,
-2026-10-07).
+2026-10-07). An unresolved creating cgroup with a uid none of the expected
+identities has counts as another creator (`UNEXPECTED_LISTENER` once the second
+dump confirms it; Owner decision, 2026-10-07). A unit matches a socket created
+in `/system.slice/<unit>` or below nested system slices
+(`/system.slice/system-cups.slice/cups.service`).
 The check sees only sockets in `/proc/net` and Serve status. Traffic the kernel redirects before it reaches a listening socket on the reserved address — nftables/iptables DNAT or REDIRECT (for example Docker with `userland-proxy=false`), TPROXY, eBPF `sk_lookup` or IPVS — is not visible to it, so it cannot claim that nothing else answers; the deployment isolation must exclude such forwarding, and the Owner verifies it manually.
 The loopback human upstream is created by systemd socket activation
 (`server-sentinel-upstream.socket`, `ListenStream=` a loopback port below 1024,

@@ -1600,7 +1600,9 @@ class ListenerOwnershipTests(ExceptionFixture):
                        dict(port=22, unit="../ssh.service", uid=0), dict(port=22, unit=7, uid=0),
                        dict(port=22, unit="ssh.socket", uid=-1), dict(port=22, unit="ssh.socket", uid=True),
                        dict(port=22, unit="ssh.socket", uid=0xFFFFFFFF), dict(port=22, unit="ssh.socket", uid="0"),
-                       dict(port=22, unit="ssh.target", uid=0)):
+                       dict(port=22, unit="ssh.target", uid=0),
+                       # Owner decision 2026-10-07: a service or socket unit only.
+                       dict(port=22, unit="session-2.scope", uid=0), dict(port=22, unit="x.slice", uid=0)):
             with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
                 ListenerException(**kwargs)
         # The executable-path identity is gone (Owner decision, 2026-10-07).
@@ -1699,6 +1701,45 @@ class ListenerOwnershipTests(ExceptionFixture):
                 self.assertFalse(revoker.pending)
                 self.assertEqual(revoker.revocations, 0)
 
+    def test_unresolved_creator_with_a_foreign_uid_is_an_exposure_once_confirmed(self):
+        # Owner decision 2026-10-07 (amended): an unresolved cgroup with a uid
+        # none of the expected identities has is another creator.
+        for creator in (SocketCreator(None, 1000), SocketCreator("/", 1000),
+                        SocketCreator("/init.scope", 1000)):
+            with self.subTest(creator=creator):
+                revoker = FakeRevoker()
+                owners = Owners(overrides={2000: creator})
+                verdict, _, _ = self.opened(owners, session_revoker=revoker)
+                self.assertEqual(verdict.reasons, (Reason.UNEXPECTED_LISTENER,))
+                self.assertTrue(revoker.pending)
+                self.assertEqual(owners.calls[-1], frozenset({2000}))
+        # Not repeated by the second dump: unverified.
+        revoker = FakeRevoker()
+        verdict, _, _ = self.opened(Owners(overrides={2000: [SocketCreator(None, 1000), None]}),
+                                    session_revoker=revoker)
+        self.assertEqual(verdict.reasons, (Reason.LISTENER_OWNER_UNVERIFIED,))
+        self.assertFalse(revoker.pending)
+
+    def test_unresolved_creator_with_an_expected_uid_or_pid1_stays_close_only(self):
+        avahi = ListenerException(22, unit="avahi-daemon.service", uid=103)
+        for exception, creator in ((SSH, SocketCreator(None, 0)), (avahi, SocketCreator(None, 103)),
+                                   (avahi, SocketCreator("/", 103)),
+                                   # PID 1's own sockets: close-only whatever the exception's uid.
+                                   (avahi, SocketCreator("/init.scope", 0))):
+            with self.subTest(exception=exception, creator=creator):
+                revoker = FakeRevoker()
+                admin, check, _ = self.admin(WILDCARD_SSH, session_revoker=revoker,
+                                             socket_owners=Owners(default=creator))
+                verdict = admin.set_listener_exceptions("synthetic-owner-session", {exception})
+                self.assertEqual(verdict.reasons, (Reason.LISTENER_OWNER_UNVERIFIED,))
+                self.assertFalse(revoker.pending)
+
+    def test_nested_slice_unit_exception_matches(self):
+        cups = ListenerException(22, unit="cups.service", uid=0)
+        creator = SocketCreator("/system.slice/system-cups.slice/cups.service", 0)
+        admin, check, _ = self.admin(WILDCARD_SSH, socket_owners=Owners(default=creator))
+        self.assertTrue(admin.set_listener_exceptions("synthetic-owner-session", {cups}).open)
+
     def test_resolver_recovery_reopens_without_revocation(self):
         revoker = FakeRevoker()
         owners = Owners(default=ReservationEnumerationError("SOCK_DIAG_UNAVAILABLE"),
@@ -1729,6 +1770,14 @@ class ListenerOwnershipTests(ExceptionFixture):
             None: None,
             "/system.slice/ssh.socket": "ssh.socket",
             "/system.slice/getty@tty1.service": "getty@tty1.service",
+            # Nested system slices (PR #153 review): the leaf unit, with every
+            # component in between a slice.
+            "/system.slice/system-cups.slice/cups.service": "cups.service",
+            "/system.slice/system-a.slice/system-a-b.slice/b.socket": "b.socket",
+            "/system.slice/ssh.service/x.slice/y.service": None,
+            "/system.slice/system-cups.slice": None,
+            "/system.slice/system-cups.slice/": None,
+            "/user.slice/system.slice/ssh.socket": None,
         }
         for path, unit in cases.items():
             with self.subTest(path=path):
@@ -1966,6 +2015,9 @@ class HumanListenerOwnershipTests(TestCase):
             (dict(sole_holders=Reason.LISTENER_OWNER_UNVERIFIED), unverified),
             (dict(owners={1000: UPSTREAM_CREATOR}), ()),
             (dict(owners={1000: other}), unexpected),
+            (dict(owners={1000: SocketCreator(None, 991)}), unexpected),
+            (dict(owners={1000: SocketCreator(None, 0)}), unverified),
+            (dict(owners={1000: SocketCreator("/init.scope", 0)}), unverified),
             (dict(owners={}), unverified),
             (dict(owners=Reason.LISTENER_OWNER_UNVERIFIED), unverified),
             (dict(owners={1000: other}, upstream_privileged=False), unverified),

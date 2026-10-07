@@ -147,6 +147,10 @@ MAX_LISTENER_EXCEPTIONS = 16
 MAX_PENDING_FAULTS = 8
 MAX_UID = 0xFFFFFFFE  # (uid_t)-1 is never a real account
 _UNIT = re.compile(r"[A-Za-z0-9:_.\\@-]{1,250}\.(service|socket|scope)")
+# Owner decision 2026-10-07: exceptions and proxy owners name a service or
+# socket unit; a transient scope is not an identity.
+_IDENTITY_UNIT = re.compile(r"[A-Za-z0-9:_.\\@-]{1,250}\.(service|socket)")
+_SLICE = re.compile(r"[A-Za-z0-9:_.\\@-]{1,250}\.slice")
 # A socket created in the root cgroup or PID 1's own scope names no unit: it
 # keeps the owner unverified rather than counting as another unit
 # (Owner decision, 2026-10-07).
@@ -155,21 +159,25 @@ UPSTREAM_SOCKET_UNIT = "server-sentinel-upstream.socket"
 
 
 def unit_from_cgroup(path: str | None) -> str | None:
-    """The system unit whose own cgroup v2 path is exactly ``/system.slice/<unit>``, else None.
+    """The system unit whose own cgroup v2 path this is, else None.
 
-    Only a socket created directly in a system unit's cgroup names a unit. A
-    path under ``user.slice`` is controlled by that user's own service manager,
+    Only a socket created directly in a system unit's cgroup names a unit:
+    ``/system.slice/<unit>``, or the same below nested system slices
+    (``/system.slice/system-cups.slice/cups.service``), where every component
+    between ``system.slice`` and the unit is itself a ``.slice``. A unit name
+    is unique on the host and its slice is fixed, so the leaf names it. A path
+    under ``user.slice`` is controlled by that user's own service manager,
     which can create a unit of any name (``.../user@1000.service/app.slice/
-    ssh.service``), and a sub-cgroup or another slice is not the unit itself,
-    so none of them names one; an exception or proxy identity then does not
-    match.
+    ssh.service``), and a sub-cgroup of a unit or another top-level slice is
+    not the unit itself, so none of them names one; an exception or proxy
+    identity then does not match.
     """
-    if not isinstance(path, str):
+    if not isinstance(path, str) or not path.startswith("/system.slice/"):
         return None
-    match = re.fullmatch(r"/system\.slice/([^/]+)", path)
-    if match and _UNIT.fullmatch(match.group(1)):
-        return match.group(1)
-    return None
+    parts = path.split("/")[2:]
+    if not parts or any(not _SLICE.fullmatch(part) for part in parts[:-1]):
+        return None
+    return parts[-1] if _UNIT.fullmatch(parts[-1]) else None
 
 
 @dataclass(frozen=True)
@@ -191,7 +199,7 @@ class SocketCreator:
 
 
 def _valid_unit_identity(unit, uid) -> bool:
-    return (isinstance(unit, str) and _UNIT.fullmatch(unit) is not None
+    return (isinstance(unit, str) and _IDENTITY_UNIT.fullmatch(unit) is not None
             and type(uid) is int and 0 <= uid <= MAX_UID)
 
 
@@ -833,27 +841,39 @@ def human_inodes(config: ReservationConfig, listeners, own_inodes) -> frozenset:
         and Listener(_normalize(listener.address), listener.port, listener.protocol) == config.human_listener)
 
 
+_PASS, _UNVERIFIED, _UNEXPECTED = 0, 1, 2
+
+
+def _creator_status(identities, creator) -> int:
+    """How a socket's creator compares with the identities expected for it.
+
+    A resolved creator passes only as one of them (unit and uid); another unit
+    or uid is unexpected. An unresolved creator (no cgroup attribute, a
+    deleted cgroup, the root cgroup or ``/init.scope``) is unverified while its
+    uid is one of the expected uids, and always for ``/init.scope`` with uid 0
+    (PID 1's own sockets); with a uid none of them has it is unexpected (Owner
+    decision, 2026-10-07). A socket not in the dump is unverified.
+    """
+    if not isinstance(creator, SocketCreator):
+        return _UNVERIFIED
+    if creator.resolved:
+        return _PASS if any(identity.created(creator) for identity in identities) else _UNEXPECTED
+    if creator.cgroup == "/init.scope" and creator.uid == 0:
+        return _UNVERIFIED
+    if any(identity.uid == creator.uid for identity in identities):
+        return _UNVERIFIED
+    return _UNEXPECTED
+
+
 def mismatched_creators(expected: dict, creators: dict) -> frozenset:
-    """Inodes whose resolved creator matches none of the expected identities.
+    """Inodes whose creator is unexpected for the identities expected for it.
 
     A check confirms each of them with an immediate second dump before
     treating it as another creator (Owner decision, 2026-10-07).
     """
     return frozenset(
         inode for inode, creator in creators.items()
-        if isinstance(creator, SocketCreator) and creator.resolved
-        and not any(identity.created(creator) for identity in expected.get(inode, ())))
-
-
-_PASS, _UNVERIFIED, _UNEXPECTED = 0, 1, 2
-
-
-def _creator_status(identities, creator) -> int:
-    if not isinstance(creator, SocketCreator) or not creator.resolved:
-        # Not in the dump, no cgroup attribute, a deleted cgroup, the root
-        # cgroup or ``/init.scope``: it may be anything, so unverified.
-        return _UNVERIFIED
-    return _PASS if any(identity.created(creator) for identity in identities) else _UNEXPECTED
+        if _creator_status(expected.get(inode, ()), creator) == _UNEXPECTED)
 
 
 def _human_status(config, listener, own_inodes, known, owners, sole_holders, upstream_privileged) -> int:

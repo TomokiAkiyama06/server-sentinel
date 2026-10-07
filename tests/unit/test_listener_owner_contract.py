@@ -107,6 +107,9 @@ class UnverifiedOwnershipContractTests(unittest.TestCase):
             "only when an immediate second lookup in the same check reports the same creator",
             "`server-sentinel-upstream.socket`",
             "residual risk the Owner accepted on 2026-10-07",
+            "An unresolved creating cgroup with a uid that none of the expected identities has is another creator",
+            "still holds it in a second scan of the same check",
+            "A kernel-owned socket (inode 0",
         ),
         "SPECIFICATION.md": (
             "(`LISTENER_OWNER_UNVERIFIED`: no socket-owner resolver",
@@ -115,6 +118,8 @@ class UnverifiedOwnershipContractTests(unittest.TestCase):
             "`NETLINK_SOCK_DIAG`",
             "`INET_DIAG_CGROUP_ID`",
             "`ip_unprivileged_port_start`",
+            "An unresolved creating cgroup with a uid none of the expected identities has counts as another creator",
+            "nested system slices",
         ),
     }
 
@@ -130,11 +135,20 @@ class DeploymentRequirementTests(unittest.TestCase):
         text = normalized(ROOT / "server" / "docs" / "DEPLOYMENT.md")
         for phrase in ("`AF_NETLINK`", "no `PrivateNetwork=`", "never `private` or `strict`",
                        "keep Ubuntu's default `ssh.socket`", "`server-sentinel-upstream.socket`",
-                       "`ip_unprivileged_port_start`", "`LISTENER_EXCEPTIONS_OUTDATED`"):
+                       "`ip_unprivileged_port_start`", "`LISTENER_EXCEPTIONS_OUTDATED`",
+                       "kernel WireGuard UDP socket", "`/system.slice/system-cups.slice/cups.service`"):
             self.assertTrue(phrase in text, phrase)
         # The 2026-10-01 "ssh.service only" step is reverted.
         self.assertFalse("sudo systemctl disable --now ssh.socket" in text)
         self.assertFalse("Until the privileged socket-owner helper of Issue #126 lands" in text)
+
+
+
+class SecurityNoteTests(unittest.TestCase):
+    def test_af_netlink_scope_is_disclosed(self):
+        text = normalized(ROOT / "SECURITY.md")
+        self.assertIn("`NETLINK_KOBJECT_UEVENT`", text)
+        self.assertIn("planned for when the check is wired into the running service", text)
 
 
 if __name__ == "__main__":

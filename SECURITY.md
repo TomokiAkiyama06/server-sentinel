@@ -404,18 +404,25 @@ and ADR-0003):
 - Ownership that cannot be verified (no resolver; a sock_diag or cgroup
   lookup that is denied, fails, times out or fails its self-check; a socket
   missing from the lookup; a creating cgroup that is deleted, the root cgroup
-  or `/init.scope`; an unconfirmed mismatch; an upstream port that is not
-  privileged; an unreadable descriptor table) keeps human access closed
-  without revoking sessions, and access reopens once ownership verifies.
+  or `/init.scope` while the socket's uid is an expected one, or
+  `/init.scope` with uid 0; an unconfirmed mismatch; an upstream holder seen
+  in only one of two scans; a kernel-owned socket; an upstream port that is
+  not privileged; an unreadable descriptor table) keeps human access closed
+  without revoking sessions, and access reopens once ownership verifies. An
+  unresolved creating cgroup with a uid none of the expected identities has
+  is an exposure once confirmed (Owner decision, 2026-10-07).
 - Residual risk accepted by the Owner (2026-10-07): the kernel reports the
   socket's creator, not its current holder. If a legitimately created
   socket's process is compromised and hands the descriptor to another process
   (`fork`, `SCM_RIGHTS`), the check does not see it, except for the human
   upstream's sharing within the ServerSentinel unit. The backend needs
   `AF_NETLINK` and the host network namespace for this lookup; `AF_NETLINK`
-  also lets a compromised backend read other unprivileged netlink information
-  (for example routes and addresses), which it can largely read from `/proc`
-  already.
+  also lets a compromised backend use every other netlink protocol open to an
+  unprivileged process, for example reading routes and addresses (largely
+  readable from `/proc` already) or listening to kernel uevents
+  (`NETLINK_KOBJECT_UEVENT`, device add/remove events). Narrowing this with a
+  `SystemCallFilter=`/socket-protocol restriction is planned for when the
+  check is wired into the running service.
 
 ## Shared Tailnet account
 

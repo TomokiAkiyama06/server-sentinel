@@ -87,6 +87,10 @@ DUMP_TIMEOUT_SECONDS = 5.0
 MAX_CGROUPS = 65_536
 MAX_CGROUP_PROCS_BYTES = 1_048_576
 MAX_SCANNED_PROCESSES = 4096
+# Gap between the two holder scans of one check. A child between fork and
+# exec still has every descriptor (close-on-exec closes them only at exec);
+# it is gone or past exec well within this.
+HOLDER_CONFIRM_SECONDS = 0.1
 CGROUP_ROOT = "/sys/fs/cgroup"
 
 
@@ -335,7 +339,9 @@ class SockDiagOwners:
                  proc: str = "/proc", proc_self: str = "/proc/self",
                  extra_units: tuple[str, ...] = (UPSTREAM_SOCKET_UNIT,),
                  probe: Callable[[], socket.socket] | None = _probe_listener,
-                 getpid: Callable[[], int] = os.getpid, geteuid: Callable[[], int] = os.geteuid):
+                 getpid: Callable[[], int] = os.getpid, geteuid: Callable[[], int] = os.geteuid,
+                 confirm_seconds: float = HOLDER_CONFIRM_SECONDS,
+                 sleep: Callable[[float], None] = time.sleep):
         if not isinstance(cgroup_root, str) or not cgroup_root.startswith("/") \
                 or not isinstance(proc, str) or not proc.startswith("/"):
             raise ValueError("INVALID_PROC_ROOT")
@@ -350,6 +356,8 @@ class SockDiagOwners:
         self._probe = probe
         self._getpid = getpid
         self._geteuid = geteuid
+        self._confirm_seconds = float(confirm_seconds)
+        self._sleep = sleep
 
     def creators(self, inodes: frozenset) -> dict:
         probe = self._probe() if self._probe is not None else None
@@ -374,9 +382,40 @@ class SockDiagOwners:
         return {inode: found[inode] for inode in inodes if inode in found}
 
     def held_only_by_requester(self, inodes: frozenset) -> dict:
+        """``True`` when no other unit process holds the inode; ``False`` only when confirmed.
+
+        Another holder counts only when the same process (pid and start time)
+        still holds the inode in a second scan ``confirm_seconds`` later. A
+        child between ``fork`` and ``exec`` briefly shows every descriptor of
+        the backend (close-on-exec acts only at exec), and its descriptors can
+        be briefly unreadable while it execs, so a holder or an unreadable
+        process that is gone or changed by then leaves the inode out
+        (unverified), never shared. A process whose descriptors stay unreadable
+        in both scans raises.
+        """
+        first, first_unreadable = self._holders(inodes)
+        if not any(first.values()) and not first_unreadable:
+            return {inode: True for inode in inodes}
+        self._sleep(self._confirm_seconds)
+        second, second_unreadable = self._holders(inodes)
+        if first_unreadable & second_unreadable:
+            raise ReservationEnumerationError("SOCKET_HOLDERS_UNREADABLE")
+        result = {}
+        for inode in inodes:
+            # A start time that could not be read never confirms a holder.
+            if any(start is not None for _, start in first[inode] & second[inode]):
+                result[inode] = False
+            elif not first[inode] and not second[inode] and not second_unreadable:
+                result[inode] = True
+            # else: seen once only, or not readable now: unverified (left out)
+        return result
+
+    def _holders(self, inodes: frozenset) -> tuple[dict, set]:
+        """Each inode's other holders and the unreadable processes, as ``(pid, start time)``."""
         wanted = {f"socket:[{inode}]": inode for inode in inodes}
         me = self._getpid()
-        shared: set[int] = set()
+        holders: dict[int, set] = {inode: set() for inode in inodes}
+        unreadable: set = set()
         for pid in self._unit_processes():
             if pid == me:
                 continue
@@ -386,17 +425,37 @@ class SockDiagOwners:
             except (FileNotFoundError, ProcessLookupError):
                 continue  # exited
             except OSError:
-                raise ReservationEnumerationError("SOCKET_HOLDERS_UNREADABLE") from None
+                unreadable.add((pid, self._start_time(pid)))
+                continue
+            held = set()
             for fd in descriptors:
                 try:
                     target = os.readlink(os.path.join(base, fd))
                 except (FileNotFoundError, ProcessLookupError):
                     continue
                 except OSError:
-                    raise ReservationEnumerationError("SOCKET_HOLDERS_UNREADABLE") from None
+                    unreadable.add((pid, self._start_time(pid)))
+                    break
                 if target in wanted:
-                    shared.add(wanted[target])
-        return {inode: inode not in shared for inode in inodes}
+                    held.add(wanted[target])
+            if held:
+                identity = (pid, self._start_time(pid))
+                for inode in held:
+                    holders[inode].add(identity)
+        return holders, unreadable
+
+    def _start_time(self, pid: int):
+        """The process start time (``/proc/<pid>/stat`` field 22), or None when unreadable."""
+        try:
+            with open(os.path.join(self._proc, str(pid), "stat"), "rb") as handle:
+                text = handle.read(4096)
+            fields = text[text.rindex(b")") + 2:].split()
+            value = fields[19]
+            if value.isdigit():
+                return int(value)
+        except (OSError, ValueError, IndexError):
+            pass
+        return None
 
     def _unit_processes(self) -> set[int]:
         roots = [(own_cgroup(self._proc_self), True)]

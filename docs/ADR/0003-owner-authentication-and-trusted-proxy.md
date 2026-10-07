@@ -504,9 +504,12 @@ systemd unit (and uid) matches":
   `ssh.service` only" step. Stored executable-path exceptions fail closed as
   outdated until the Owner re-enters them.
 - A creator that cannot be resolved (`/init.scope`, the root cgroup, a deleted
-  or unknown cgroup id, no cgroup attribute, a socket in `/proc/net` but not
-  in the dump, a failed or slow dump) is `LISTENER_OWNER_UNVERIFIED`: closed,
-  no revocation. A resolved different cgroup or uid is `UNEXPECTED_LISTENER`
+  or unknown cgroup id, no cgroup attribute) is `LISTENER_OWNER_UNVERIFIED`
+  (closed, no revocation) while the socket's uid is one of the expected
+  identities' uids, and always for `/init.scope` with uid 0; with a uid none
+  of them has it is another creator (amended by the Owner the same day). A
+  socket in `/proc/net` but not in the dump, or a failed or slow dump, is
+  unverified. A resolved different cgroup or uid is `UNEXPECTED_LISTENER`
   (revocation) only when an immediate second dump in the same check repeats
   it; otherwise it is unverified.
 - The human upstream moves to systemd socket activation:
@@ -517,7 +520,10 @@ systemd unit (and uid) matches":
   below `ip_unprivileged_port_start` (otherwise a configuration error that
   keeps access closed without revocation), and held by no other process of
   the ServerSentinel unit's cgroups (a same-uid `/proc/<pid>/fd` scan;
-  unreadable is unverified, sharing observed is an exposure).
+  sharing is an exposure only when the same process, by pid and start time,
+  still holds the socket in a second scan about 100 ms later, because a child
+  between `fork` and `exec` briefly holds every descriptor; otherwise, and
+  when a process stays unreadable, it is unverified).
 - Every lookup first verifies a loopback probe listener of its own appears
   with the backend's cgroup and uid (the startup self-check, repeated on every
   check), so a missing netlink permission, kernel attribute or a mismatched

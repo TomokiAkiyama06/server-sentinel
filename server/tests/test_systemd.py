@@ -2,6 +2,7 @@ import os
 import socket
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 from app.systemd import (
     SocketActivationError, activated_listener, build_server, listen_fds, notify_ready,
@@ -173,6 +174,21 @@ class SocketActivationTests(unittest.TestCase):
                 # The refused socket is closed rather than kept open unused.
                 with self.assertRaises(OSError):
                     os.fstat(number)
+        # A listening SOCK_STREAM socket of another protocol (for example
+        # SCTP or MPTCP) is not the TCP upstream.
+        number, port = self.bound()
+        real = socket.socket
+
+        class OtherProtocol(real):
+            def getsockopt(self, level, option, *args):
+                if (level, option) == (socket.SOL_SOCKET, socket.SO_PROTOCOL):
+                    return 132  # IPPROTO_SCTP
+                return super().getsockopt(level, option, *args)
+
+        with patch("app.systemd.socket.socket", OtherProtocol), self.assertRaises(SocketActivationError):
+            activated_listener("127.0.0.1", port, self.environ(), first_fd=number)
+        with self.assertRaises(OSError):
+            os.fstat(number)
         read, write = os.pipe()
         self.addCleanup(self.close_quietly, read)
         self.addCleanup(self.close_quietly, write)

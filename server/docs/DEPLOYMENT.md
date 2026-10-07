@@ -313,6 +313,13 @@ lowering that sysctl later keeps human access closed until it is restored.
 
 #### Host SSH and other system listeners
 
+Units in nested system slices are matched by their own name (for example
+`cups.service` created in `/system.slice/system-cups.slice/cups.service`);
+exceptions name `.service` or `.socket` units only. A socket the kernel itself
+owns (inode 0 in `/proc/net`, for example a kernel WireGuard UDP socket) has no
+creator to verify, so human access stays closed while one is on a port an
+exception covers; keep such sockets off the wildcard address or off the host.
+
 Socket-activated system services are allowed (Owner decision, 2026-10-07,
 reverting the 2026-10-01 step that disabled `ssh.socket`). On the Main Server,
 keep Ubuntu's default `ssh.socket`; systemd creates the tcp/22 sockets in the
