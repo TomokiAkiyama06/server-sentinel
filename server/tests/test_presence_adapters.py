@@ -1212,13 +1212,18 @@ class TimelineGapDurabilityTests(PresenceFixture, TestCase):
         def gap(db):
             result = original(db)
             if not fired and result is None:
-                # The outbox persists its count between the two status reads.
-                fired.append(True)
-                self.outbox.flush()
+                # The outbox persists its count while the status read is in
+                # progress. The read holds its read transaction (#151), so the
+                # flush commits as soon as that read ends.
+                flush = threading.Thread(target=self.outbox.flush)
+                fired.append(flush)
+                flush.start()
             return result
         self.presence._gap = gap
         status = self.presence.owner_status("owner", now=NOW, clock_trusted=True)
         self.assertTrue(fired)
+        fired[0].join(30)
+        self.assertFalse(fired[0].is_alive())
         self.assertTrue(status["timeline_gap"])
         del self.presence._gap
         self.assertEqual(self.gap()[1]["refused"], 1)
@@ -1609,6 +1614,134 @@ class WalReadTests(PresenceFixture, TestCase):
         self.assertIsNone(self.presence.timeline_gap())
         self.assertEqual(self.entered, [[]])
         self.assertEqual(self.sidecars(), [])
+
+
+# Tries to switch the database to WAL from another process without waiting.
+OTHER_PROCESS_SWITCH_TO_WAL = """
+import sqlite3, sys
+connection = sqlite3.connect(sys.argv[1], timeout=0, isolation_level=None)
+try:
+    print(connection.execute("PRAGMA journal_mode=WAL").fetchone()[0])
+except sqlite3.OperationalError:
+    print("locked")
+"""
+
+
+class WalSwitchRaceTests(PresenceFixture, TestCase):
+    """A switch to WAL after the header check never reads unadmitted (#151)."""
+
+    def setUp(self):
+        self.make_presence()
+        self.entered = []
+        refuse = self.presence.reservation
+
+        @contextmanager
+        def reservation():
+            self.entered.append(self.sidecars())
+            with refuse():
+                yield
+        self.presence.reservation = reservation
+        self.assertFalse(self.wal())
+
+    def sidecars(self):
+        return sorted(suffix for suffix in ("-wal", "-shm")
+                      if self.database.path.with_name(self.database.path.name + suffix).exists())
+
+    def wal(self):
+        header = read_database_prefix(self.database.path, 20)
+        return header[18] == 2
+
+    def switch_to_wal(self):
+        # Another writer of the file changes its mode; closing as the last
+        # connection removes the sidecars it created.
+        with closing(sqlite3.connect(self.database.path)) as db:
+            self.assertEqual(db.execute("PRAGMA journal_mode=WAL").fetchone()[0], "wal")
+        self.assertEqual(self.sidecars(), [])
+
+    def switch_on_header_read(self, number):
+        """Patch the header probe so the file turns WAL right after read ``number``."""
+        real = read_database_prefix
+        calls = []
+
+        def probe(path, size):
+            header = real(path, size)
+            calls.append(header)
+            if len(calls) == number:
+                self.switch_to_wal()
+            return header
+        return mock.patch("app.presence.service.read_database_prefix", probe)
+
+    def use_pinned(self):
+        pinned = PinnedDatabase(self.database)
+        pinned.pin()
+        self.addCleanup(pinned.release)
+        self.presence.database = pinned
+
+    def assert_switch_before_the_open_refuses_the_read(self):
+        self.refuse = True
+        with self.switch_on_header_read(1):
+            with self.assertRaisesRegex(RuntimeError, "STORAGE_HARD_STOP"):
+                self.presence.timeline_gap()
+        self.assertEqual((self.entered, self.sidecars()), ([[]], []))
+
+    def test_switch_before_the_open_refuses_the_read_without_sidecars(self):
+        self.assert_switch_before_the_open_refuses_the_read()
+
+    def test_switch_before_the_pinned_open_refuses_the_read_without_sidecars(self):
+        self.use_pinned()
+        self.assert_switch_before_the_open_refuses_the_read()
+
+    def test_switch_before_the_open_is_read_under_the_reservation(self):
+        with self.switch_on_header_read(1):
+            self.assertIsNone(self.presence.timeline_gap())
+        self.assertEqual((self.entered, self.sidecars()), ([[]], []))
+
+    def test_switch_after_the_reread_is_abandoned_and_retried_under_the_reservation(self):
+        # The file turns WAL after the post-open re-read but before the
+        # read's first statement. The connection reports WAL, the read is
+        # retried under the reservation and its close removes the sidecars.
+        for read in (self.presence.timeline_gap, lambda: self.presence.audit("owner"), self.history):
+            with self.subTest(read=read):
+                with closing(sqlite3.connect(self.database.path)) as db:
+                    self.assertEqual(db.execute("PRAGMA journal_mode=DELETE").fetchone()[0], "delete")
+                self.entered.clear()
+                with self.switch_on_header_read(2):
+                    read()
+                self.assertEqual(len(self.entered), 1)
+                self.assertEqual(self.sidecars(), [])
+
+    def test_switch_after_the_reread_under_a_refused_reservation_fails_the_read(self):
+        self.refuse = True
+        with self.switch_on_header_read(2):
+            with self.assertRaisesRegex(RuntimeError, "STORAGE_HARD_STOP"):
+                self.presence.timeline_gap()
+        # The residual race: SQLite created the sidecars before the read could
+        # see the mode. The next admitted read removes them again.
+        self.refuse = False
+        self.assertIsNone(self.presence.timeline_gap())
+        self.assertEqual(self.sidecars(), [])
+
+    def test_mode_cannot_change_while_a_read_is_open(self):
+        self.refuse = True
+        with self.presence._read() as db:
+            self.assertIsNone(self.presence._gap(db))
+            switched = subprocess.run([sys.executable, "-I", "-c", OTHER_PROCESS_SWITCH_TO_WAL,
+                                       os.fspath(self.database.path)],
+                                      capture_output=True, text=True, check=True, timeout=30).stdout.strip()
+            self.assertEqual(switched, "locked")
+            db.execute("SELECT count(*) FROM presence_audit").fetchone()
+        self.assertFalse(self.wal())
+        self.assertEqual((self.entered, self.sidecars()), ([], []))
+
+    def test_read_does_not_keep_the_database_locked(self):
+        self.refuse = True
+        self.assertIsNone(self.presence.timeline_gap())
+        self.assertEqual(other_process_begin_immediate(self.database.path), "acquired")
+        with self.assertRaises(ZeroDivisionError):
+            with self.presence._read() as db:
+                db.execute("SELECT count(*) FROM presence_audit").fetchone()
+                1 / 0
+        self.assertEqual(other_process_begin_immediate(self.database.path), "acquired")
 
 
 class BuildFaultTests(PresenceFixture, TestCase):

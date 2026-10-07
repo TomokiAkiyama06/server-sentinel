@@ -180,24 +180,75 @@ class PresenceService:
         never create a file, keep working during a storage hard stop.
         ``immutable`` is never used: it would read a file a live writer is
         changing as if nothing could change it.
+
+        Another process able to write the file can still switch it to WAL, or
+        replace it with a WAL database, after the header was classified
+        (#151). An unadmitted read therefore re-reads the header after its
+        open and then holds one read transaction for the whole read: its
+        SHARED lock keeps any other connection from taking the EXCLUSIVE lock
+        a switch to WAL needs, so the mode cannot change under it between
+        statements. Only a switch between that re-read and the lock remains;
+        the connection itself then reports WAL, and the read is abandoned
+        before the caller sees it and retried under the reservation, whose
+        closing read-write connection removes the sidecars the abandoned read
+        created. Under a refused reservation that retry fails the read, and
+        those sidecars (an empty ``-wal`` and one ``-shm`` region) stay until
+        the next admitted connection closes: SQLite exposes no step between
+        locking the file and opening its WAL where the read could stop first.
         """
+        path = self.database.path
+        if not path.is_absolute() or path.is_symlink():
+            raise ValueError("database location is unavailable")
+        connection = None if _wal_database(path) else self._unadmitted_connection(path)
+        if connection is not None:
+            with closing(connection):
+                try:
+                    yield connection
+                finally:
+                    if connection.in_transaction:
+                        connection.rollback()
+            return
         with ExitStack() as held:
-            path = self.database.path
-            if not path.is_absolute() or path.is_symlink():
-                raise ValueError("database location is unavailable")
-            admitted = _wal_database(path)
-            if admitted:
-                held.enter_context(self._admission())
+            held.enter_context(self._admission())
             if isinstance(self.database, PinnedDatabase):
-                connection = self.database.connect() if admitted else self.database.connect_read_only()
+                connection = self.database.connect()
             else:
-                connection = sqlite3.connect(path.as_uri() + ("?mode=rw" if admitted else "?mode=ro"),
-                                             uri=True, timeout=5, isolation_level=None)
+                connection = sqlite3.connect(path.as_uri() + "?mode=rw", uri=True, timeout=5,
+                                             isolation_level=None)
             held.enter_context(closing(connection))
-            if admitted:
-                connection.execute("PRAGMA query_only=ON")
+            connection.execute("PRAGMA query_only=ON")
             connection.row_factory = sqlite3.Row
             yield connection
+
+    def _unadmitted_connection(self, path):
+        """A ``mode=ro`` read of a rollback-journal database, or None if it is WAL.
+
+        The returned connection holds an open read transaction (and so the
+        SHARED lock) that the caller ends. None means the file turned out to
+        be WAL after the first classification and the read must be admitted.
+        """
+        if isinstance(self.database, PinnedDatabase):
+            connection = self.database.connect_read_only()
+        else:
+            connection = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=5,
+                                         isolation_level=None)
+        try:
+            # No statement has touched the file yet, so a switch seen here
+            # costs nothing: the connection closes before SQLite reads it.
+            if _wal_database(path):
+                connection.close()
+                return None
+            connection.execute("BEGIN")
+            connection.execute("SELECT count(*) FROM sqlite_master").fetchone()
+            if str(connection.execute("PRAGMA journal_mode").fetchone()[0]).lower() == "wal":
+                connection.rollback()
+                connection.close()
+                return None
+        except BaseException:
+            connection.close()
+            raise
+        connection.row_factory = sqlite3.Row
+        return connection
 
     def _session_key(self):
         return os.path.realpath(self.database.path)
