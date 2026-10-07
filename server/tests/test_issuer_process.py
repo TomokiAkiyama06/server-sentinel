@@ -1365,6 +1365,85 @@ class PartialCaInitTests(InitRecoveryTests):
                 self.assertEqual(["deployment_ca", "listener"], self.log_types())
 
 
+class InterruptedInstallLinkTests(Harness):
+    """Codex P2 (PR #177, round 5): an install stopped between link and unlink.
+
+    Both names then refer to one inode (two links), which every reader of the
+    final file would refuse. Each directory that uses ``install_new`` is
+    checked with the real readers.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.privileges = issuer_fakes.install(self)
+
+    def second_link(self, directory, final, suffix):
+        os.link(directory / final, directory / (final + suffix))
+        self.assertEqual(2, os.stat(directory / final).st_nlink)
+
+    def run_cli(self, *argv):
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with patch("sys.stdout", stdout), patch("sys.stderr", stderr):
+            status = pairing_cli.main(list(argv))
+        return status, stdout.getvalue(), stderr.getvalue()
+
+    def export(self):
+        return self.run_cli("export-bundle", "--listener-dir", str(self.listener_dir),
+                            "--endpoint", "10.0.0.5:8443",
+                            "--output", str(self.root / f"bundle-{uuid4()}.json"))
+
+    def assert_single_links(self, directory):
+        for name in os.listdir(directory):
+            self.assertFalse(name.endswith((".init", ".publish")), name)
+            self.assertEqual(1, os.stat(directory / name).st_nlink, name)
+
+    def test_ca_directory(self):
+        for final in ("ca-key.pem", "ca-certificate.pem"):
+            self.second_link(self.authority_dir, final, ".init")
+        issuer = self.issuer()
+        reply = issuer.handle({"op": "hello"})
+        issuer.close()
+        self.assertEqual("ok", reply["status"], reply)
+        self.assert_single_links(self.authority_dir)
+        status, _stdout, stderr = self.run_cli(
+            "rotate-listener", "--authority-dir", str(self.authority_dir),
+            "--listener-dir", str(self.listener_dir))
+        self.assertEqual(0, status, stderr)
+
+    def test_listener_directory(self):
+        for final in ("main-server-key.pem", "main-server-certificate.pem",
+                      "deployment-ca-certificate.pem"):
+            self.second_link(self.listener_dir, final, ".init")
+        status, _stdout, stderr = self.export()
+        self.assertEqual(0, status, stderr)
+        self.assert_single_links(self.listener_dir)
+        node_ca.listener_material(PrivateDirectory(self.listener_dir))
+
+    def test_listener_directory_read_first_by_listener_material(self):
+        self.second_link(self.listener_dir, "main-server-key.pem", ".init")
+        node_ca.listener_material(PrivateDirectory(self.listener_dir))
+        self.assert_single_links(self.listener_dir)
+
+    def test_public_copy(self):
+        self.second_link(self.listener_dir, "deployment-ca-certificate.pem", ".publish")
+        status, _stdout, stderr = self.export()
+        self.assertEqual(0, status, stderr)
+        self.assert_single_links(self.listener_dir)
+        self.second_link(self.listener_dir, "deployment-ca-certificate.pem", ".publish")
+        status, _stdout, stderr = self.run_cli(
+            "rotate-listener", "--authority-dir", str(self.authority_dir),
+            "--listener-dir", str(self.listener_dir))
+        self.assertEqual(0, status, stderr)
+        self.assert_single_links(self.listener_dir)
+
+    def test_a_staged_name_on_another_inode_is_left_to_its_writer(self):
+        # Not the interrupted-link state: never removed by a reader.
+        PrivateDirectory(self.listener_dir).write_new("main-server-key.pem.init", b"other")
+        status, _stdout, stderr = self.export()
+        self.assertEqual(0, status, stderr)
+        self.assertTrue((self.listener_dir / "main-server-key.pem.init").exists())
+
+
 class PublicCopyValidationTests(Harness):
     """Codex P2 (PR #177): a wrong --authority-dir never leaves its CA copy behind."""
 

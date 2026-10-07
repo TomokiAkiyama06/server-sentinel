@@ -535,7 +535,11 @@ log that cannot be read, nothing is removed and `init` refuses
 `issuer_material_incomplete` for the Owner to inspect. A log line torn by a
 crash during an append (no final newline) belongs to an operation that never
 answered; it is ignored and dropped by the next append. The public CA copy is
-also staged (`*.publish`) and installed without overwriting. If the CA already exists --
+also staged (`*.publish`) and installed without overwriting. Installing is a
+`link` of the staged name to the final name followed by an `unlink` of the
+staged name; a stop between the two leaves both names on one inode, and every
+later read of that directory first removes the staged name in exactly that
+case, so the one-link check on final files never wedges a command. If the CA already exists --
 for example the CA side committed but its reply was lost, so the listener
 side removed its files -- a rerun with an empty listener directory keeps the
 CA and issues only a new listener certificate for the server name the CA log

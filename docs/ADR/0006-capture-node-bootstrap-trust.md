@@ -595,7 +595,10 @@ unchanged.
   issuance record is cleaned and recreated, one with records is never
   removed (`issuer_material_incomplete`); access checks use `access(2)` with
   effective ids (ACLs included, fail closed where unsupported); a torn final
-  log line is ignored and dropped by the next append.
+  log line is ignored and dropped by the next append. Round 5: every read
+  of a directory that uses staged installs first removes a staged name that
+  is the second link of its final file (an install stopped between link
+  and unlink), before the one-link check runs.
 - **Still open (PR2).** Automatic renewal still has only an in-process
   signing primitive, used by tests and called by nothing in the application;
   wiring renewal into the ingest listener waits for the socket-activated,

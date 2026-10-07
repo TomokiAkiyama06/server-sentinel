@@ -446,6 +446,9 @@ class PrivateDirectory:
 
     def read(self, name: str, *, maximum: int = MAX_PEM_BYTES,
              allow_empty: bool = False) -> bytes:
+        # Complete an install interrupted between link and unlink before the
+        # one-link check below would refuse the final file (Issue #109).
+        self.recover_interrupted_installs()
         directory = self._open_directory()
         try:
             try:
@@ -624,7 +627,8 @@ class PrivateDirectory:
         ``link`` + ``unlink`` instead of ``rename``, so an existing ``name``
         (for example another process's file) is refused rather than
         overwritten. A stop between the two leaves both names on one inode;
-        the next ``init`` removes the staged name (Issue #109).
+        every later ``read`` in this directory first completes that with
+        ``recover_interrupted_installs`` (Issue #109).
         """
         directory = self._open_directory()
         try:
@@ -639,12 +643,68 @@ class PrivateDirectory:
             if created is not None:
                 self._created[name] = created
             try:
-                os.unlink(staged, dir_fd=directory)
+                try:
+                    os.unlink(staged, dir_fd=directory)
+                except FileNotFoundError:
+                    pass  # a concurrent reader already completed this install
                 os.fsync(directory)
             except OSError:
                 raise CaptureAuthorityError("issuer material could not be written") from None
         finally:
             os.close(directory)
+
+    def recover_interrupted_installs(self) -> list[str]:
+        """Finish ``install_new`` runs that stopped between ``link`` and ``unlink``.
+
+        Called at the top of every ``read`` of this directory, before any
+        validation (Issue #109): a staged name (``*.init``, ``*.publish``)
+        that refers to the same inode as its final name is that second link,
+        which would otherwise leave the final file with two links and make
+        every reader refuse it. Only that exact case is changed here, without
+        a lock, because unlinking the extra name is the step the interrupted
+        install still owed. A staged name on another inode (or with no final
+        name) is a leftover of an uncommitted write; it never blocks a reader
+        and is removed by the owning writer under its lock (``init`` or the
+        next publish). Returns the staged names removed.
+        """
+        directory = self._open_directory()
+        removed = []
+        try:
+            try:
+                names = os.listdir(directory)
+            except OSError:
+                raise CaptureAuthorityError("private directory is unavailable") from None
+            for staged in names:
+                final = next((staged[:-len(suffix)] for suffix in _STAGED_INSTALL_SUFFIXES
+                              if staged.endswith(suffix) and len(staged) > len(suffix)), None)
+                if final is None:
+                    continue
+                try:
+                    staged_info = os.stat(staged, dir_fd=directory, follow_symlinks=False)
+                    final_info = os.stat(final, dir_fd=directory, follow_symlinks=False)
+                except FileNotFoundError:
+                    continue
+                except OSError:
+                    raise CaptureAuthorityError("private directory is unavailable") from None
+                if ((staged_info.st_dev, staged_info.st_ino)
+                        != (final_info.st_dev, final_info.st_ino)
+                        or not stat.S_ISREG(final_info.st_mode)):
+                    continue
+                try:
+                    os.unlink(staged, dir_fd=directory)
+                except FileNotFoundError:
+                    continue
+                except OSError:
+                    raise CaptureAuthorityError("issuer material could not be removed") from None
+                removed.append(staged)
+            if removed:
+                try:
+                    os.fsync(directory)
+                except OSError:
+                    raise CaptureAuthorityError("issuer material could not be removed") from None
+        finally:
+            os.close(directory)
+        return removed
 
     def replace_with(self, staged: str, name: str) -> None:
         """Atomically rename ``staged`` over ``name``; call under ``locked()``."""
@@ -1308,6 +1368,8 @@ def require_empty_listener_directory(listener: PrivateDirectory) -> None:
 _INIT_SUFFIX = ".init"
 # Staged name of a public CA copy published outside init (approve, rotate).
 _PUBLISH_SUFFIX = ".publish"
+# Every staged suffix that ``install_new`` links to a final name.
+_STAGED_INSTALL_SUFFIXES = (_INIT_SUFFIX, _PUBLISH_SUFFIX)
 # Final names in install order: the key comes last, so a present final key
 # always means the whole credential was installed (Issue #109).
 _INSTALL_ORDER = (_PUBLIC_CA_CERTIFICATE, _SERVER_CERTIFICATE, _SERVER_KEY)
