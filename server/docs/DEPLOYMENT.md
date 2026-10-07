@@ -948,7 +948,10 @@ intact. The required invariants are:
   the cursor's stream and sequence are that segment's. A cursor whose end has
   not moved keeps every recorded column (`cursor_changed` otherwise), except
   `active` going from 1 to 0 (`release_source()`); only a publication, which
-  advances the end, sets it back to 1. A value of the wrong
+  advances the end, sets it back to 1. An advanced end must come with a
+  publication-shaped change: on the same stream a higher sequence (another
+  stream may start at any sequence). Once the segment it names has left the
+  catalog, the exact end value itself cannot be checked. A value of the wrong
   type anywhere is reported (`invalid_value`); verification never aborts on
   one and, if no rule anticipated it, still writes a failed report marked
   `unverifiable`. Every ready pre-roll spool segment (`state='ready'`,

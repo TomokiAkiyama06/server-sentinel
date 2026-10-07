@@ -3295,8 +3295,22 @@ def _compare_recordings(baseline: dict | None, current: dict | None, *,
     recorded_rows, current_rows = context.get("cursor_rows") or (None, None)
     for source_id, before in sorted((recorded_rows or {}).items()):
         after = (current_rows or {}).get(source_id)
-        if current_rows is None or after is None or after.get("end_ms") != before.get("end_ms"):
-            continue  # missing or moved: cursor_regressed / the domain checks
+        if current_rows is None or after is None:
+            continue  # missing: cursor_regressed
+        if after.get("end_ms") != before.get("end_ms"):
+            # Moved forward only with a publication: append() admits a
+            # same-stream segment only with a higher sequence, and
+            # _publish() writes the end with that segment's stream and
+            # sequence (another stream: any sequence). A backward move is
+            # cursor_regressed; a catalogued last segment is compared exactly
+            # by the domain checks.
+            same_stream = after.get("stream_id") == before.get("stream_id")
+            if (_int(after.get("end_ms")) and _int(before.get("end_ms"))
+                    and after["end_ms"] > before["end_ms"] and same_stream
+                    and not (_int(after.get("sequence")) and _int(before.get("sequence"))
+                             and after["sequence"] > before["sequence"])):
+                failed.append({"id": f"cursor:{source_id}", "reason": "cursor_changed"})
+            continue
         unchanged = all(after.get(key) == value for key, value in before.items()
                         if key != "active")
         released = after.get("active") == before.get("active") or (

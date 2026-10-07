@@ -6103,5 +6103,45 @@ class LifecycleInventoryTests(unittest.TestCase):
                 self.assertIn(expected, report["sections"]["recordings"]["failed"])
         self.runtime.database.write_bytes(original)
 
+    def test_an_advanced_cursor_must_follow_a_publication(self):
+        # Codex P1: _publish() advances the end together with the segment's
+        # stream / sequence; append() admits a same-stream segment only with
+        # a higher sequence. An end moved alone (its segment no longer
+        # catalogued to compare with) is no publication.
+        import zlib
+        from app.media.recording import Segment
+        self.runtime.seed()
+        connection = sqlite3.connect(self.runtime.database, isolation_level=None)
+        self.addCleanup(connection.close)
+        store = self._recording_store(connection)
+        payload = zlib.compress(b"generated geometric test payload" * 4)
+        base = int((self.now - timedelta(hours=1)).timestamp() * 1000)
+        source, stream_id = uuid4(), uuid4()
+        store.append(Segment(source, stream_id, 0, base, base + 10_000, "synthetic", "deflate",
+                             payload))
+        store.release_source(source)  # its segment leaves the catalog
+        code, baseline = self.record()
+        self.assertEqual(code, inventory.EXIT_PRESERVED)
+        original = self.runtime.database.read_bytes()
+        expected = {"id": f"cursor:{source}", "reason": "cursor_changed"}
+        self.runtime.execute("UPDATE recording_source_cursors SET end_ms=end_ms+1 "
+                             "WHERE source_id=?", (str(source),))
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_FAILED)
+        self.assertIn(expected, report["sections"]["recordings"]["failed"])
+        # Publication-shaped advances (segment since evicted) are accepted:
+        # the same stream with a higher sequence, or another stream.
+        for label, sql, values in (
+                ("same stream, next sequence", "sequence=sequence+1", ()),
+                ("another stream", "stream_id=?, sequence=0", (str(uuid4()),))):
+            with self.subTest(label):
+                self.runtime.database.write_bytes(original)
+                self.runtime.execute(f"UPDATE recording_source_cursors SET end_ms=end_ms+1, "
+                                     f"{sql} WHERE source_id=?", (*values, str(source)))
+                code, report, _ = self.verify(baseline)
+                self.assertEqual(code, inventory.EXIT_PRESERVED,
+                                 report["sections"]["recordings"])
+        self.runtime.database.write_bytes(original)
+
 if __name__ == "__main__":
     unittest.main()
