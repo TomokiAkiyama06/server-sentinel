@@ -17,6 +17,15 @@ _TIMING_BOUNDS = {
     "poll_timeout_seconds": (0.05, 30.0),
     "retry_delay_seconds": (0.05, 60.0),
     "join_timeout_seconds": (0.1, 60.0),
+    # Frame-progress watchdog: no frame for this long on a live capture reports
+    # ``degraded`` (``video_frame_stalled``) instead of ``online``. The
+    # effective window is never shorter than 10 negotiated frame intervals.
+    "frame_stall_seconds": (0.25, 30.0),
+    # A stall lasting this long closes and reopens the capture (``offline``).
+    "frame_stall_reopen_seconds": (0.5, 300.0),
+    # While capture is live, the full device scan (which opens every video
+    # node) runs at most this often; a closed capture always rescans first.
+    "presence_scan_seconds": (0.1, 10.0),
 }
 
 
@@ -30,6 +39,9 @@ class LocalUvcConfiguration:
     # the default keeps idle write load at about one row update per second.
     retry_delay_seconds: float = 1.0
     join_timeout_seconds: float = 3.0
+    frame_stall_seconds: float = 1.0
+    frame_stall_reopen_seconds: float = 5.0
+    presence_scan_seconds: float = 1.0
 
     def __post_init__(self) -> None:
         ids = self.source_ids
@@ -42,6 +54,9 @@ class LocalUvcConfiguration:
             if type(value) not in (int, float) or not low <= value <= high:
                 raise ConfigurationError("local UVC worker timing is out of range")
             object.__setattr__(self, name, float(value))
+        if self.frame_stall_reopen_seconds < self.frame_stall_seconds:
+            # Reopening before the stall is reported would hide the stall.
+            raise ConfigurationError("local UVC worker timing is out of range")
 
 
 def parse_local_uvc(value: object) -> LocalUvcConfiguration:

@@ -1,10 +1,14 @@
 from contextlib import closing, contextmanager
 from dataclasses import asdict, replace
+from itertools import count
 import json
 from pathlib import Path
 import tempfile
+import threading
+import time
 import unittest
 from unittest.mock import patch
+from uuid import uuid4
 
 from app.audit import (
     AuditAction, AuditOutcome, AuditStorageError, AuditStore, OwnerAuditService,
@@ -43,9 +47,15 @@ class UvcRegistryFixture(unittest.TestCase):
         self.addCleanup(self.adapter.close)
 
     def make_adapter(self):
+        # Each clock read advances one second, as if every poll came at least
+        # one presence-scan interval after the previous one: the synthetic
+        # capture does not fail on unplug the way a real descriptor does, so
+        # these fixtures observe device changes through the rescan.
+        ticks = count(1000.0)
         return LocalUvcAdapter(self.registry, emit_audit=self.events.append,
                                on_frame=lambda source_id, frame: self.frames.append((source_id, frame)),
-                               discovery=self.discovery, capture_factory=SyntheticCapture)
+                               discovery=self.discovery, capture_factory=SyntheticCapture,
+                               monotonic=lambda: next(ticks))
 
 
 class UvcRegistryTests(UvcRegistryFixture):
@@ -69,6 +79,156 @@ class UvcRegistryTests(UvcRegistryFixture):
         self.assertEqual(AuditAction.APPROVE_CAMERA, record.action)
         self.assertEqual(AuditOutcome.SUCCEEDED, record.outcome)
         self.assertTrue(self.adapter.poll_source(self.source.id))
+
+    def test_frame_stall_is_persisted_as_not_online_and_recovers(self):
+        class PermitOwner:
+            def require_owner(self, actor_context):
+                return None
+
+        admin = OwnerAdministration(
+            OwnerAuditService(AuditStore(self.database), PermitOwner()), self.registry,
+        )
+        now = [1000.0]
+        self.adapter.monotonic = lambda: now[0]
+        admin.approve_uvc("owner", self.adapter, self.source.id, self.camera)
+        self.assertTrue(self.adapter.poll_source(self.source.id))
+        self.assertEqual(SourceHealthState.ONLINE,
+                         self.registry.get_source(self.source.id).health_state)
+        # Off-worker check: no frame within the stall window.
+        self.assertFalse(self.adapter.check_frame_progress(self.source.id))
+        # Past the stall window, still inside the reopen bound.
+        now[0] += 2
+        self.assertTrue(self.adapter.check_frame_progress(self.source.id))
+        self.assertEqual("video_frame_stalled", self.events[-1].reason)
+        # The watchdog hands the registry write to a background thread.
+        self._wait_persisted()
+        self.assertEqual(SourceHealthState.DEGRADED,
+                         self.registry.get_source(self.source.id).health_state)
+        # Frames resuming is the only way back to online.
+        self.assertTrue(self.adapter.poll_source(self.source.id))
+        self.assertEqual(SourceHealthState.ONLINE,
+                         self.registry.get_source(self.source.id).health_state)
+        self.assertFalse(self.adapter.check_frame_progress(uuid4()))
+
+    def _wait_persisted(self, timeout=5.0):
+        deadline = time.monotonic() + timeout
+        while self.adapter.health_unpersisted(self.source.id) and time.monotonic() < deadline:
+            time.sleep(0.005)
+        self.assertFalse(self.adapter.health_unpersisted(self.source.id))
+
+    def _approved_online(self):
+        class PermitOwner:
+            def require_owner(self, actor_context):
+                return None
+
+        admin = OwnerAdministration(
+            OwnerAuditService(AuditStore(self.database), PermitOwner()), self.registry,
+        )
+        now = [1000.0]
+        self.adapter.monotonic = lambda: now[0]
+        admin.approve_uvc("owner", self.adapter, self.source.id, self.camera)
+        self.assertTrue(self.adapter.poll_source(self.source.id))
+        self.assertEqual(SourceHealthState.ONLINE,
+                         self.registry.get_source(self.source.id).health_state)
+        return now
+
+    def test_transient_stall_keeps_the_negotiated_profile_through_recovery(self):
+        now = self._approved_online()
+        negotiated = CaptureProfile(640, 480, 10, "MJPG")
+        self.assertEqual(negotiated,
+                         self.registry.get_source(self.source.id).negotiated_capture_profile)
+        now[0] += 2
+        self.assertTrue(self.adapter.check_frame_progress(self.source.id))
+        self._wait_persisted()
+        stalled = self.registry.get_source(self.source.id)
+        self.assertEqual(SourceHealthState.DEGRADED, stalled.health_state)
+        # The descriptor stays open with the same profile during a stall.
+        self.assertEqual(negotiated, stalled.negotiated_capture_profile)
+        now[0] += 1
+        self.assertTrue(self.adapter.poll_source(self.source.id))
+        recovered = self.registry.get_source(self.source.id)
+        self.assertEqual(SourceHealthState.ONLINE, recovered.health_state)
+        self.assertEqual(negotiated, recovered.negotiated_capture_profile)
+
+    def test_watchdog_reports_a_stall_while_the_worker_is_blocked_in_a_health_write(self):
+        now = self._approved_online()
+        entered, release = threading.Event(), threading.Event()
+        self.addCleanup(release.set)
+        original = self.registry.update_source_health
+
+        def blocking_write(source_id, **values):
+            if "last_seen_at" in values and not release.is_set():
+                # The worker holds a slow SQLite/storage write.
+                entered.set()
+                release.wait(10)
+            return original(source_id, **values)
+
+        self.registry.update_source_health = blocking_write
+        now[0] += 1.5
+        worker = threading.Thread(target=self.adapter.poll_source, args=(self.source.id,))
+        worker.start()
+        self.addCleanup(worker.join, 10)
+        self.assertTrue(entered.wait(5))
+        # No frame arrives while the worker is stuck in the write.
+        now[0] += 2
+        result = []
+        watchdog = threading.Thread(
+            target=lambda: result.append(self.adapter.check_frame_progress(self.source.id)))
+        watchdog.start()
+        watchdog.join(5)
+        self.assertFalse(watchdog.is_alive())
+        self.assertEqual([True], result)
+        self.assertEqual("video_frame_stalled", self.events[-1].reason)
+        # The durable row is behind the in-memory state until the write ends.
+        self.assertTrue(self.adapter.health_unpersisted(self.source.id))
+        release.set()
+        worker.join(10)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(SourceHealthState.DEGRADED,
+                         self.registry.get_source(self.source.id).health_state)
+        self.assertFalse(self.adapter.health_unpersisted(self.source.id))
+
+    def test_routine_last_seen_write_in_flight_is_not_reported_unpersisted(self):
+        now = self._approved_online()
+        entered, release = threading.Event(), threading.Event()
+        self.addCleanup(release.set)
+        original = self.registry.update_source_health
+
+        def blocking_write(source_id, **values):
+            if "last_seen_at" in values and not release.is_set():
+                entered.set()
+                release.wait(10)
+            return original(source_id, **values)
+
+        self.registry.update_source_health = blocking_write
+        now[0] += 1.5
+        worker = threading.Thread(target=self.adapter.poll_source, args=(self.source.id,))
+        worker.start()
+        self.addCleanup(worker.join, 10)
+        self.assertTrue(entered.wait(5))
+        # Only last_seen_at is refreshed; the durable health state already
+        # matches, so the reported health is not stale while it is in flight.
+        self.assertFalse(self.adapter.health_unpersisted(self.source.id))
+        release.set()
+        worker.join(10)
+        self.assertFalse(worker.is_alive())
+        self.assertFalse(self.adapter.health_unpersisted(self.source.id))
+
+    def test_failed_routine_last_seen_write_is_reported_unpersisted(self):
+        now = self._approved_online()
+        original = self.registry.update_source_health
+
+        def failing_write(source_id, **values):
+            if "last_seen_at" in values:
+                raise RuntimeError("synthetic storage failure")
+            return original(source_id, **values)
+
+        self.registry.update_source_health = failing_write
+        now[0] += 1.5
+        with self.assertRaises(RuntimeError):
+            self.adapter.poll_source(self.source.id)
+        # A refused write is a storage problem worth reporting.
+        self.assertTrue(self.adapter.health_unpersisted(self.source.id))
 
     def test_uvc_approval_rolls_back_when_audit_append_fails(self):
         class PermitOwner:
@@ -390,6 +550,8 @@ class UvcRegistryTests(UvcRegistryFixture):
                 self.adapter._approve_live_session(self.source.id, weak)
         self.assertTrue(closed_capture.closed)
         self.assertIsNone(self.adapter.sessions[self.source.id].controller.bound)
+        # Closing hands the registry write to the background health writer.
+        self._wait_persisted()
         self.assertEqual(self.registry.get_source(self.source.id).health_state, SourceHealthState.OFFLINE)
         self.assertFalse(self.adapter.poll_source(self.source.id))
         self.assertEqual(len(self.frames), 1)

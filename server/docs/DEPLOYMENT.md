@@ -166,7 +166,10 @@ The optional `local_uvc` object names the logical Camera Registry sources
   "source_ids": ["00000000-0000-4000-8000-000000000001"],
   "poll_timeout_seconds": 1.0,
   "retry_delay_seconds": 1.0,
-  "join_timeout_seconds": 3.0
+  "join_timeout_seconds": 3.0,
+  "frame_stall_seconds": 1.0,
+  "frame_stall_reopen_seconds": 5.0,
+  "presence_scan_seconds": 1.0
 }
 ```
 
@@ -175,7 +178,15 @@ The optional `local_uvc` object names the logical Camera Registry sources
 for each source is selected only by the audited Owner approval and stays in the
 private approval store. A listed source without that approval stays `offline`
 and never opens a device. The timing keys are optional (bounded; invalid values
-fail `--check`). A UUID that is not a `local_uvc` registry source is rejected at
+fail `--check`). `frame_stall_seconds` (0.25–30) is how long a live capture
+may deliver no frame before its source is reported `degraded`
+(`video_frame_stalled`) instead of `online`; the effective window is never
+shorter than 10 negotiated frame intervals, so a slow profile cannot flap.
+`frame_stall_reopen_seconds` (0.5–300, not less than `frame_stall_seconds`,
+scaled by the same factor) is how long a stall lasts before the source is
+reported `offline` and the capture is closed and reopened (also enforced by the
+watchdog while the worker is blocked). `presence_scan_seconds` (0.1–10) bounds how
+often the full device scan runs while a capture is live. A UUID that is not a `local_uvc` registry source is rejected at
 startup and reported, never silently skipped. Without the object the backend
 logs `local_uvc_unconfigured` and keeps an explicit `unconfigured` local capture
 state; remote-agent-only deployments need no `local_uvc` object.

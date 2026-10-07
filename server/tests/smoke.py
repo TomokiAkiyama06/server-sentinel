@@ -139,9 +139,14 @@ async def run(scenario):
                 candidate = DeviceEvidence("/dev/video0", "synthetic", "model", None)
                 discovery = Discovery([candidate])
                 events, frames = [], []
+                # Each clock read advances one second, so every poll is a due
+                # presence scan: the synthetic capture does not fail on unplug
+                # the way a real descriptor does.
+                ticks = iter(range(1000, 10**9))
                 adapter = LocalUvcAdapter(registry, emit_audit=events.append,
                                           on_frame=lambda identity, frame: frames.append(frame),
-                                          discovery=discovery, capture_factory=SyntheticCapture)
+                                          discovery=discovery, capture_factory=SyntheticCapture,
+                                          monotonic=lambda: float(next(ticks)))
                 # The Owner approval path is the audited boundary only.
                 administration.approve_uvc("synthetic-owner", adapter, source.id, candidate)
                 outcomes = [(record.action, record.outcome) for record in audit.list_records()]
