@@ -910,7 +910,11 @@ intact. The required invariants are:
   markers present at record time must stay, and whose first newly linked
   segment must carry the marker the store adds when that segment does not
   continue the source cursor recorded at record time (or a publication still
-  catalogued since). Every ready pre-roll spool segment (`state='ready'`,
+  catalogued since that did not overlap the recording). For any recording
+  active at record time, every segment of its source published since and
+  before its latest linked segment that overlaps its window (the rule
+  `RecordingStore._publish()` links by) must be linked to it; such a segment
+  never explains a cursor advance. Every ready pre-roll spool segment (`state='ready'`,
   `spool=1`), which a later recording links without re-checking it, must have
   a file matching its catalog digest, byte length and single link
   (`spool_file_mismatch` otherwise);

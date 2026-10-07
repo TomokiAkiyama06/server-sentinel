@@ -2690,7 +2690,10 @@ def _valid_growth(base: dict, now: dict, context: dict | None = None) -> bool:
         return False
     if dropped and not _trimmed_by_stop(base, now, dropped):
         return False
-    return _appended_publications_valid(base, now, remaining, context or {})
+    context = context or {}
+    if _unlinked_publication(now, context):
+        return False
+    return _appended_publications_valid(base, now, remaining, context)
 
 
 def _trimmed_by_stop(base: dict, now: dict, dropped: list) -> bool:
@@ -2797,7 +2800,7 @@ def _appended_publications_valid(base: dict, now: dict, remaining: Counter,
             return False
         extra = list((+remaining - allowed).elements())
         first = ordered[0]
-        found, prior = _prior_publication(first, now["source_id"], context)
+        found, prior = _prior_publication(first, now, context)
         if not found:
             # No recorded cursor (a baseline written before it was kept):
             # at most one marker ending at the segment's start.
@@ -2832,32 +2835,83 @@ def _appended_publications_valid(base: dict, now: dict, remaining: Counter,
     return allowed is not None and +remaining == allowed
 
 
-def _prior_publication(first: dict, source_id: str, context: dict) -> tuple:
-    """The cursor ``first`` was published after: ``(known, (stream, sequence, end) | None)``.
+def _published_since_record(source_id: str, context: dict) -> list | None:
+    """Segments of ``source_id`` published after the record, as catalogued now.
 
-    It is the source cursor recorded at record time, advanced by the latest
-    segment of the source still catalogued now (linked to any recording, or
-    in the ready spool) that was published after it and ends by ``first``'s
-    start. ``None`` as the cursor: the source had none and nothing was
-    published before ``first`` (its first publication adds no marker). Not
-    known when the baseline kept no cursors. A publication evicted from the
-    spool since is not visible; the caller allows for that.
+    Every one still catalogued (linked to any recording, or in the ready
+    spool) that starts at or after the source cursor recorded at record time
+    (append() admits nothing earlier), or every one when the source had no
+    cursor then: ``(start, end, stream, sequence, segment ID)``, deduplicated
+    by segment. ``None`` when the baseline kept no cursors.
     """
     cursors = context.get("cursors")
     if cursors is None:
+        return None
+    recorded = cursors.get(source_id)
+    floor = None if recorded is None else recorded[2]
+    found = {}
+    for recording in (context.get("recordings") or {}).values():
+        for item in recording["segments"]:
+            if item["source_id"] == source_id:
+                found[item["segment_id"]] = (item["start_ms"], item["end_ms"],
+                                             item["catalog"]["stream_id"],
+                                             item["catalog"]["sequence"], item["segment_id"])
+    for segment_id, item in (context.get("spool") or {}).items():
+        if item["source_id"] == source_id:
+            found.setdefault(segment_id, (item["start_ms"], item["end_ms"], item["stream_id"],
+                                          item["sequence"], segment_id))
+    return [entry for entry in found.values() if floor is None or entry[0] >= floor]
+
+
+def _overlaps(recording: dict, start_ms, end_ms) -> bool:
+    """RecordingStore._publish()'s rule: it links a publication to every
+    active recording of its source with ``start_ms < end`` and
+    ``target_end_ms > start``."""
+    return recording["start_ms"] < end_ms and recording["target_end_ms"] > start_ms
+
+
+def _unlinked_publication(now: dict, context: dict) -> bool:
+    """Whether a publication the store must have linked to ``now`` is unlinked.
+
+    ``now`` was active at record time and is active until it closes, so
+    every segment of its source published after the record and before its
+    latest linked segment was published while it was active; _publish()
+    linked each one overlapping its window. The window used is the current
+    one: an early stop only shortens it, and finish() unlinks only segments
+    wholly outside it, which start after every kept segment. Not checked
+    when the baseline kept no cursors or nothing is linked now.
+    """
+    if not now["segments"]:
+        return False
+    published = _published_since_record(now["source_id"], context)
+    if published is None:
+        return False
+    linked = {item["segment_id"] for item in now["segments"]}
+    latest = max(item["start_ms"] for item in now["segments"])
+    return any(segment_id not in linked and end <= latest and _overlaps(now, start, end)
+               for start, end, _, _, segment_id in published)
+
+
+def _prior_publication(first: dict, now: dict, context: dict) -> tuple:
+    """The cursor ``first`` was published after: ``(known, (stream, sequence, end) | None)``.
+
+    It is the source cursor recorded at record time, advanced by the latest
+    segment of the source published after it, still catalogued now and
+    ending by ``first``'s start, that _publish() did not have to link to
+    ``now`` (one overlapping its window is a required link, never a cursor
+    explanation; _unlinked_publication() fails it). ``None`` as the cursor:
+    the source had none and nothing was published before ``first`` (its
+    first publication adds no marker). Not known when the baseline kept no
+    cursors. A publication evicted from the spool since is not visible; the
+    caller allows for that.
+    """
+    published = _published_since_record(now["source_id"], context)
+    if published is None:
         return False, None
-    prior = cursors.get(source_id)
-    candidates = [(item["start_ms"], item["end_ms"], item["catalog"]["stream_id"],
-                   item["catalog"]["sequence"], item["segment_id"])
-                  for recording in (context.get("recordings") or {}).values()
-                  for item in recording["segments"] if item["source_id"] == source_id]
-    candidates += [(item["start_ms"], item["end_ms"], item["stream_id"], item["sequence"],
-                    segment_id) for segment_id, item in (context.get("spool") or {}).items()
-                   if item["source_id"] == source_id]
-    floor = None if prior is None else prior[2]
+    prior = context["cursors"].get(now["source_id"])
     later = [(end, stream_id, sequence) for start, end, stream_id, sequence, segment_id
-             in candidates if segment_id != first["segment_id"] and end <= first["start_ms"]
-             and (floor is None or start >= floor)]
+             in published if segment_id != first["segment_id"] and end <= first["start_ms"]
+             and not _overlaps(now, start, end)]
     if later:
         end, stream_id, sequence = max(later)
         prior = [stream_id, sequence, end]

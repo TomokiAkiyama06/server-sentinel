@@ -5474,5 +5474,96 @@ class LifecycleInventoryTests(unittest.TestCase):
         self.assertEqual(report["sections"]["recordings"]["failed"],
                          [{"id": str(switches), "reason": "changed"}])
 
+    def test_an_overlapping_publication_never_explains_a_cursor_advance(self):
+        # Codex P1: RecordingStore._publish() links every publication that
+        # overlaps an active recording's window. For a recording without
+        # evidence at record time, a still-spooled overlapping segment whose
+        # link was deleted must fail as a lost link, never stand in as the
+        # unlinked predecessor that excuses the next segment's marker.
+        import zlib
+        from app.media.recording import Segment
+        self.runtime.seed()
+        connection = sqlite3.connect(self.runtime.database, isolation_level=None)
+        self.addCleanup(connection.close)
+        store = self._recording_store(connection)
+        payload = zlib.compress(b"generated geometric test payload" * 4)
+        base = int((self.now - timedelta(hours=1)).timestamp() * 1000)
+        source, stream_id = uuid4(), uuid4()
+
+        def put(sequence, start, end):
+            return store.append(Segment(source, stream_id, sequence, base + start, base + end,
+                                        "synthetic", "deflate", payload))
+        for sequence in range(3):
+            put(sequence, sequence * 10_000, (sequence + 1) * 10_000)
+        recording = store.start_manual(source, base + 60_000, duration_ms=20_000)
+        code, baseline = self.record()
+        self.assertEqual(code, inventory.EXIT_PRESERVED)
+        # Both overlap the window, so _publish() links both; the first one,
+        # not continuing the recorded cursor (end 30 000), adds a marker.
+        overlapping = put(3, 60_000, 68_000)
+        put(4, 68_000, 76_000)
+        with closing(sqlite3.connect(self.runtime.database)) as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM recording_links WHERE "
+                                        "recording_id=?", (str(recording),)).fetchone()[0], 2)
+            self.assertEqual(db.execute("SELECT spool FROM recording_segments WHERE id=?",
+                                        (str(overlapping),)).fetchone()[0], 1)
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_PRESERVED, report["sections"]["recordings"])
+        # Codex's repro: only the first link is lost (its marker with it).
+        self.runtime.execute("DELETE FROM recording_links WHERE segment_id=?",
+                             (str(overlapping),))
+        self.runtime.execute("DELETE FROM recording_discontinuities WHERE recording_id=?",
+                             (str(recording),))
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_FAILED)
+        self.assertEqual(report["sections"]["recordings"]["failed"],
+                         [{"id": str(recording), "reason": "changed"}])
+        # Keeping the marker does not make the lost link acceptable either.
+        self.runtime.execute("INSERT INTO recording_discontinuities VALUES "
+                             "(?, ?, ?, 'stream_discontinuity')",
+                             (str(recording), base + 30_000, base + 60_000))
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(report["sections"]["recordings"]["failed"],
+                         [{"id": str(recording), "reason": "changed"}])
+
+    def test_a_publication_overlapping_a_grown_recording_must_stay_linked(self):
+        # The same _publish() rule for a recording that already had evidence
+        # at record time: a segment published while it was active and
+        # overlapping its window cannot leave it while later ones stay.
+        import zlib
+        from app.media.recording import Segment
+        self.runtime.seed()
+        connection = sqlite3.connect(self.runtime.database, isolation_level=None)
+        self.addCleanup(connection.close)
+        store = self._recording_store(connection)
+        payload = zlib.compress(b"generated geometric test payload" * 4)
+        base = int((self.now - timedelta(hours=1)).timestamp() * 1000)
+        source, stream_a, stream_b = uuid4(), uuid4(), uuid4()
+
+        def put(stream_id, sequence, start, end):
+            return store.append(Segment(source, stream_id, sequence, base + start, base + end,
+                                        "synthetic", "deflate", payload))
+        recording = store.start_manual(source, base, duration_ms=60_000)
+        put(stream_a, 0, 0, 10_000)
+        code, baseline = self.record()
+        self.assertEqual(code, inventory.EXIT_PRESERVED)
+        # A stream change then a continuation: the dropped middle link leaves
+        # the remaining publications looking like a single stream change.
+        middle = put(stream_b, 0, 10_000, 20_000)
+        put(stream_b, 1, 20_000, 30_000)
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_PRESERVED, report["sections"]["recordings"])
+        with closing(sqlite3.connect(self.runtime.database)) as db:
+            marker = db.execute("SELECT start_ms, end_ms FROM recording_discontinuities "
+                                "WHERE recording_id=?", (str(recording),)).fetchone()
+        self.runtime.execute("DELETE FROM recording_links WHERE segment_id=?", (str(middle),))
+        self.runtime.execute("UPDATE recording_discontinuities SET end_ms=? WHERE recording_id=?",
+                             (base + 20_000, str(recording)))
+        self.assertEqual(marker, (base + 10_000, base + 10_000))
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_FAILED)
+        self.assertEqual(report["sections"]["recordings"]["failed"],
+                         [{"id": str(recording), "reason": "changed"}])
+
 if __name__ == "__main__":
     unittest.main()
