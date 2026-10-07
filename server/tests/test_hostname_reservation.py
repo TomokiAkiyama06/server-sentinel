@@ -2176,8 +2176,11 @@ class HumanListenerOwnershipTests(TestCase):
         )
         for kwargs, expected in cases:
             with self.subTest(kwargs=kwargs):
-                reasons, _, _ = evaluate(config(), (listener,), route, own_inodes=own, **kwargs)
+                reasons, count, _ = evaluate(config(), (listener,), route, own_inodes=own, **kwargs)
                 self.assertEqual(reasons, expected)
+                # Issue #172: the one upstream socket is counted once, also
+                # when it is both unverified and created in /init.scope.
+                self.assertEqual(count, 1 if expected else 0)
 
     def test_upstream_created_by_pid1_closes_with_its_own_reason_without_revocation(self):
         # Issue #157: without cgroup-BPF support systemd listens from PID 1, so

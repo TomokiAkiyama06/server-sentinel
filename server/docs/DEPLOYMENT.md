@@ -377,14 +377,21 @@ sudo ss -ltn --cgroup 'sport = :22'  # expect: cgroup:/system.slice/ssh.socket
 ```
 
 If step 2 or the new SSH session fails, restore the earlier state from the
-console with `sudo systemctl enable --now ssh.service`.
+console. Disable the socket unit first: while `ssh.socket` is active it holds
+tcp/22, so `ssh.service` started on its own could not bind it (Issue #172):
+
+```sh
+sudo systemctl disable --now ssh.socket
+sudo systemctl enable --now ssh.service
+sudo ss -ltn --cgroup 'sport = :22'  # expect: cgroup:/system.slice/ssh.service
+```
 
 Running `sshd` as `ssh.service` alone also works: the exception is then
 `tcp/22` with unit `ssh.service` and uid `0`. Other wildcard system listeners
 are excepted the same way by unit and uid, for example `tailscaled` on its UDP
 port as `tailscaled.service` with uid `0`. Except only services that run as
-root or as a dedicated system account (a uid below `SYS_UID_MAX` in
-`/etc/login.defs`, normally 1000, with no login), never one whose `User=` is a
+root or as a dedicated system account (a uid at most `SYS_UID_MAX` in
+`/etc/login.defs`, normally 999, with no login), never one whose `User=` is a
 person's account (Issue #160): that person controls processes with the same
 uid, so they could for example create the socket in a cgroup they then delete
 and hold human access closed without revocation at will. Find the unit and uid of a listener

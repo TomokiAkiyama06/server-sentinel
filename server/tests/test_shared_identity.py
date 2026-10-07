@@ -37,7 +37,7 @@ from app.storage.migrations import MigrationError, migrate
 from app.storage.schema import APPLICATION_MIGRATIONS
 
 from tests.test_webauthn_ceremonies import GENERIC, OWNER_CONTEXT, START, CeremonyTestCase
-from tests.webauthn_fakes import ORIGIN, RP_ID, SyntheticAuthenticator
+from tests.webauthn_fakes import ORIGIN, RP_ID, OpenGate, SyntheticAuthenticator
 
 
 SHARED = "synthetic-lab-shared@example.invalid"
@@ -178,7 +178,7 @@ class ProxyIdentityCannotAuthorizeTests(CeremonyTestCase):
             unkeyed.establish_session(self.principal.id, self.credential.credential_id, b"k" * 32,
                                       proxy_identity=SHARED)
         with self.assertRaises(ValueError):
-            PasskeyCeremonies(unkeyed, self.rp)
+            PasskeyCeremonies(unkeyed, self.rp, session_gate=OpenGate())
 
     def test_invalidation_and_expiry_clear_the_binding(self):
         def bindings():
@@ -498,7 +498,7 @@ class SessionBindingKeyTests(unittest.TestCase):
 
         audit = AuditStore(database, clock=clock)
         store = AccessStore(database, clock=clock, audit=audit, unaudited_writes=True, session_binding=key)
-        ceremonies = PasskeyCeremonies(store, RelyingParty(RP_ID, ORIGIN), clock=clock)
+        ceremonies = PasskeyCeremonies(store, RelyingParty(RP_ID, ORIGIN), session_gate=OpenGate(), clock=clock)
         principal = store.invite("Synthetic person", (Permission.LIVE_VIEW,))
         store.issue_enrollment(principal.id, ALICE_CODE, START + timedelta(minutes=5))
         authenticator = SyntheticAuthenticator()

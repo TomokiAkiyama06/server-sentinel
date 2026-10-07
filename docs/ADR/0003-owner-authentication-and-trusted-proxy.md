@@ -534,16 +534,32 @@ systemd unit (and uid) matches":
   creating process is compromised and hands the descriptor to another process
   (`fork`, `SCM_RIGHTS`) outside the ServerSentinel unit is not detected.
 
-Clarification, 2026-10-07 (Issue #160): the upstream holder confirmation above
-("still holds the socket in a second scan about 100 ms later") is taken in
-three scans about 100 ms apart. Another holder is an exposure when the same
-process, by pid and start time, holds the socket in the second and the third
-scan as well, so a child that is slow to `exec` on a loaded host gets two gaps
-instead of one. The executable the holder runs is not part of the condition: a
-process that keeps the descriptor through all three scans, including a `fork`
-child that never execs, is an exposure as before; one not seen in all three is
-unverified (closed, no revocation). This only lengthens the confirmation
-window by one gap; it does not narrow which persistent holders are exposures.
-
 Clarification, 2026-10-01 (PR #91): where this record says the startup and daily check closes access "on any other answer", read "on any other answer it can see". The check enumerates listening sockets (`/proc/net`) and Tailscale Serve routes only; kernel forwarding to the reserved address (nftables/iptables DNAT or REDIRECT, TPROXY, eBPF `sk_lookup`, IPVS) is not visible to it and must be excluded by the deployment isolation and verified by the operator per `MANUAL_TEST.md`. The current contract is in `server/app/auth/README.md`. This is still detection: it bounds how long an exposed
 cookie stays usable, and does not prevent the exposure.
+
+Clarification and Owner decision, 2026-10-07 (Issue #160): the upstream
+holder confirmation above ("still holds the socket in a second scan about
+100 ms later") is taken in three scans about 100 ms apart. Another holder is
+an exposure when the same process, by pid and start time, holds the socket in
+the second and the third scan as well, so a child that is slow to `exec` on a
+loaded host gets two gaps instead of one. The executable the holder runs is
+not part of the condition: a process that keeps the descriptor through all
+three scans, including a `fork` child that never execs, is an exposure as
+before; one not seen in all three is unverified (closed, no revocation). This
+does change the outcome for one kind of holder, by Owner decision on
+2026-10-07: a process that holds the socket in the first and second scans but
+gives it up before the third was an exposure under the two-scan rule and is
+now unverified (closed without revocation). A process that is unreadable in
+the last scan also leaves the upstream unverified, and the same process
+unreadable in every scan fails the lookup (unverified).
+
+Owner decision, 2026-10-07 (Issue #144): the reservation check and every
+commit that creates or refreshes a human session or creates or redeems an
+enrollment authorization are serialized by one in-process lock. The commit
+re-checks that access is open inside the lock right before it writes; the
+check closes access, and later decides, revokes and publishes its verdict,
+inside the same lock. A request that saw access open before a check closed it
+can therefore no longer commit a session after that check's immediate
+revocation, so a restart that finds no revocation marker no longer keeps such
+a session. Enumeration and network I/O stay outside the lock. The lock order
+and the single-process requirement are in `server/app/auth/README.md`.

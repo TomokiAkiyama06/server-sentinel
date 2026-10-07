@@ -30,6 +30,14 @@ Invariants enforced here:
   verified authenticator is backup eligible in a deployment that requires
   device-bound credentials).
 
+Every commit that redeems an invitation, establishes a session or refreshes a
+session's verification time runs inside ``session_gate.admit()`` (in
+production the ``HostnameReservationCheck``), which re-checks under the gate
+lock that human access is still open, so a reservation check that closes
+access and revokes sessions cannot interleave with it (Issue #144). Only that
+local commit runs inside the gate; challenge consumption and WebAuthn
+verification run before it. A gate refusal is the same generic denial.
+
 Revocation is credential-scoped: revoking a credential disables it wherever a
 synced passkey exists, not on one device. Nothing here receives or stores a
 fingerprint or face template; user verification happens on the viewer's
@@ -43,7 +51,7 @@ from datetime import datetime, timedelta, timezone
 from enum import Enum
 import hashlib
 import secrets
-from typing import Callable, Mapping, Protocol
+from typing import Callable, ContextManager, Mapping, Protocol
 from uuid import UUID
 
 from . import webauthn
@@ -79,6 +87,11 @@ class CredentialFinding(str, Enum):
     BACKUP_ELIGIBILITY_CHANGED = "backup_eligibility_changed"
 
 
+class SessionGate(Protocol):
+    def admit(self) -> ContextManager[None]:
+        """Hold the gate and raise unless human access is open (Issue #144)."""
+
+
 class CredentialFindingSink(Protocol):
     def credential_finding(self, kind: CredentialFinding, principal_id: UUID) -> None:
         """Deliver an Owner notification; receives no credential material."""
@@ -102,6 +115,7 @@ def _digest(challenge: bytes) -> bytes:
 
 class PasskeyCeremonies:
     def __init__(self, store: AccessStore, relying_party: webauthn.RelyingParty, *,
+                 session_gate: SessionGate,
                  clock: Callable[[], datetime] | None = None,
                  challenge_lifetime: timedelta = DEFAULT_CHALLENGE_LIFETIME,
                  require_device_bound: bool = False,
@@ -114,6 +128,10 @@ class PasskeyCeremonies:
             raise ValueError("a session binding key is required")
         if not isinstance(relying_party, webauthn.RelyingParty):
             raise ValueError("relying party is required")
+        if not callable(getattr(session_gate, "admit", None)):
+            # Mandatory: without it a commit could land after a reservation
+            # check closed access and revoked every session (Issue #144).
+            raise ValueError("a session gate is required")
         if (not isinstance(challenge_lifetime, timedelta)
                 or not timedelta(0) < challenge_lifetime <= MAX_CHALLENGE_LIFETIME):
             raise ValueError("challenge lifetime is invalid")
@@ -124,6 +142,7 @@ class PasskeyCeremonies:
             raise ValueError("algorithm policy is invalid")
         self.store = store
         self.rp = relying_party
+        self.session_gate = session_gate
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self.challenge_lifetime = challenge_lifetime
         self.require_device_bound = require_device_bound
@@ -198,11 +217,12 @@ class PasskeyCeremonies:
         if self.require_device_bound and verified.backup_eligible:
             raise DeviceBoundCredentialRequired()
         try:
-            return self.store.enroll_credential(
-                enrollment_secret, proxy_identity, verified.credential_id, verified.public_key,
-                verified.algorithm, verified.sign_count, now=at,
-                backup_eligible=verified.backup_eligible, backup_state=verified.backup_state,
-                label=label, invitation_id=consumed.invitation_id)
+            with self.session_gate.admit():
+                return self.store.enroll_credential(
+                    enrollment_secret, proxy_identity, verified.credential_id, verified.public_key,
+                    verified.algorithm, verified.sign_count, now=at,
+                    backup_eligible=verified.backup_eligible, backup_state=verified.backup_state,
+                    label=label, invitation_id=consumed.invitation_id)
         except Exception:
             raise CeremonyDenied() from None
 
@@ -267,10 +287,11 @@ class PasskeyCeremonies:
             token = self._random(SESSION_TOKEN_BYTES)
             if not isinstance(token, bytes) or len(token) != SESSION_TOKEN_BYTES:
                 raise CeremonyDenied()
-            session_id = self.store.accept_assertion(
-                stored.credential_id, principal.id, proxy_identity,
-                expected_sign_count=stored.sign_count, sign_count=verified.sign_count,
-                backup_state=verified.backup_state, at=self._now(), token=token)
+            with self.session_gate.admit():
+                session_id = self.store.accept_assertion(
+                    stored.credential_id, principal.id, proxy_identity,
+                    expected_sign_count=stored.sign_count, sign_count=verified.sign_count,
+                    backup_state=verified.backup_state, at=self._now(), token=token)
         except Exception:
             raise CeremonyDenied() from None
         return SessionGrant(principal.id, session_id, token)
@@ -317,10 +338,11 @@ class PasskeyCeremonies:
             principal, stored, verified = self._verified_assertion(credential, claims, require_user_handle=False)
             if principal.id != session.principal_id:
                 raise CeremonyDenied()
-            self.store.accept_assertion(
-                stored.credential_id, principal.id, proxy_identity,
-                expected_sign_count=stored.sign_count, sign_count=verified.sign_count,
-                backup_state=verified.backup_state, at=self._now(),
-                step_up_session_id=session.session_id)
+            with self.session_gate.admit():
+                self.store.accept_assertion(
+                    stored.credential_id, principal.id, proxy_identity,
+                    expected_sign_count=stored.sign_count, sign_count=verified.sign_count,
+                    backup_state=verified.backup_state, at=self._now(),
+                    step_up_session_id=session.session_id)
         except Exception:
             raise CeremonyDenied() from None

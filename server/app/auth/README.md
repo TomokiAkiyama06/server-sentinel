@@ -241,22 +241,51 @@ not repeat it, even while the exposure and the marker failure continue
 (Issue #120): a repeat would advance the generation again, add an audit record
 and void the enrollment authorizations issued during the outage. The revocation
 before reopening still runs. The marker write itself keeps being retried on
-every check until it commits (PR #134): a session-establishing request that saw
-access open before the check closed it shares no lock with the check and can
-commit after the immediate revocation, so only the marker makes a restart (after
-the exposure has gone but before the clean check) revoke that session before
-reopening. If the marker never commits before such a restart, that session can
-survive; the delivered Owner fault is then the only record. Two cases do not
-revoke twice. A fallback revocation that commits in the same check that
-reopens access, while access has never been open in this process (a clean
-startup, for example with an unreadable marker), already is the reopening
-revocation: no request can have seen access open and committed a session
-after it (Issue #145). A fallback from an earlier check, or one after access
-has been open in this process, does not count, and reopening revokes again.
-And once the marker is known to be stored for the closed period (written in
-this period, or read as pending at startup), a failed rewrite neither revokes
-nor counts as a marker failure (Issue #144): the stored marker already
-carries the requirement across a restart.
+every check until it commits (PR #134); while it stays unsaved, the
+identifier-free log event `session_revocation_marker_unsaved` is written when
+the failure streak starts and each time it doubles, and
+`session_revocation_marker_saved` once it commits.
+
+Session gate (Issue #144, Owner decision 2026-10-07: serialize). The check and
+every commit that creates or refreshes a human session or creates or redeems an
+enrollment authorization share one lock, `HostnameReservationCheck.admit()`:
+`PasskeyCeremonies.finish_authentication()` (new session),
+`finish_step_up()` (verification refresh) and `finish_registration()`
+(invitation redemption) run their store commit inside it, and so does
+`AccessAdministration.issue_invitation()` when it is constructed with the
+check as `session_gate` (required for wiring a human route reaches; `None` only
+for a caller no human route reaches). `PasskeyCeremonies` cannot be constructed
+without a gate. Inside the lock the commit re-checks the published verdict right
+before its SQLite write transaction and is refused (generic denial; a `failed`
+audit record for the Owner operation) while access is closed. The check takes
+the same lock to close access at its start, and again to decide and commit:
+the marker, the fallback and reopening revocations and the published verdict.
+A request that saw access open before a check closed it therefore either
+committed before the close, so every later revocation covers it, or is refused;
+it can no longer commit after the immediate fallback revocation. A restart that
+finds no marker after a committed fallback revocation (the residual risk of PR
+#134) thus finds no session or enrollment authorization from before the close.
+Lock order, outermost first: `exception_change_lock`, `_check_lock`, the
+session gate lock, then the SQLite write lock (`BEGIN IMMEDIATE`). Session
+paths take only the last two, in that order. Enumeration, hostname resolution
+and Owner fault delivery run outside the gate lock; only local SQLite writes
+run under it. The verdict lives in the check's memory, so the check and every
+session-establishing path must run in one process (the backend runs a single
+`uvicorn.Server` from `app.systemd.build_server`, without worker processes); a
+second serving process would have no gate. The low-level
+`AccessStore.establish_session` / `issue_enrollment` wrappers are fixture and
+local entries outside the gate and must not be reached from a human route.
+
+Two cases do not revoke twice. A fallback revocation that commits in the same
+check that reopens access, while access has never been open in this process (a
+clean startup, for example with an unreadable marker), already is the reopening
+revocation (Issue #145). A fallback from an earlier check, or one after access
+has been open in this process, does not count, and reopening revokes again
+(kept as defense in depth for a commit outside the gate). And once the marker
+is known to be stored for the closed period (written in this period, or read as
+pending at startup), a failed rewrite neither revokes nor counts as a marker
+failure (Issue #144): the stored marker already carries the requirement across
+a restart.
 A check without a revoker never opens access, before or after any exposure,
 and keeps `SESSION_REVOCATION_UNAVAILABLE`: nothing durable could carry a
 revocation requirement across a restart, so a restart after an exposure must
@@ -333,9 +362,11 @@ after that (Issue #160): a child between `fork` and `exec` (for example a
 close-on-exec acts only at `exec`, and on a loaded host it can stay there
 longer than one gap, so the third scan gives it a second gap. The executable
 the holder runs does not matter: a process that keeps the descriptor through
-all three scans (also a `fork` child that never execs) is an exposure. Not
-seen in all three scans, or a process that is unreadable in a scan, is
-unverified. Unverified closes access
+all three scans (also a `fork` child that never execs) is an exposure. A
+holder not seen in all three scans is unverified, and so is the upstream while
+any process of the unit is unreadable in the last scan; the same process
+unreadable in every scan fails the lookup, which is unverified as well
+(Issue #172). Unverified closes access
 without revocation and reopens once the creator verifies again (Owner
 decisions, 2026-10-05 and 2026-10-07). The resolver is mandatory: without
 `socket_owners` access never opens.

@@ -378,7 +378,12 @@ and ADR-0003):
   authorization generation, with its `system` audit record committed. The
   requirement is persisted as a marker before reopening; if the marker cannot
   be written, every human session is revoked at once instead. A check without
-  a durable revoker never opens human access.
+  a durable revoker never opens human access. The check and every commit that
+  creates or refreshes a human session or creates or redeems an enrollment
+  authorization share one lock (Issue #144, Owner decision 2026-10-07): the
+  commit re-checks that access is open inside it, and the check closes access
+  and revokes inside it, so a request that saw access open before a check
+  closed it cannot commit a session after that check's revocation.
 - An Owner listener exception names a port together with its creating
   systemd unit (`.service` or `.socket`) and uid, never a port alone, and
   every check verifies the socket's creating unit and uid. The unprivileged
