@@ -268,10 +268,19 @@ class EnrollClientTests(EnrollFixture):
         bundle = self.root / "bundle.json"
         bundle.write_bytes(content)
         digest = TrustBundle.parse(content).sha256
+        # Like the other CLI tests, this runs as the real (non-root) test
+        # account that owns the runtime root; ``os.geteuid`` is not patched
+        # because the runtime-root owner check reads the same function.
+        for host in ("100.64.0.1", "fd7a:115c:a1e0::1"):
+            with self.subTest(layer="pair", host=host):
+                with self.assertRaisesRegex(PairingRefused,
+                                            "^main_endpoint_tailscale_address_refused$"):
+                    enroll.pair(self.runtime, TrustBundle.parse(content), host=host,
+                                port=peer.port, prompt=self.prompt_after(peer))
+        self.assertEqual([], self.prompts)
         for endpoint in ("100.64.0.1:7443", "[fd7a:115c:a1e0::1]:7443"):
             stderr = io.StringIO()
-            with self.subTest(endpoint=endpoint), patch("sys.stderr", stderr), \
-                    patch.object(enroll.os, "geteuid", return_value=1000):
+            with self.subTest(endpoint=endpoint), patch("sys.stderr", stderr):
                 self.assertEqual(1, enroll.main([
                     "pair", "--runtime-root", str(self.runtime), "--trust-bundle", str(bundle),
                     "--bundle-sha256", digest, "--endpoint", endpoint]))
