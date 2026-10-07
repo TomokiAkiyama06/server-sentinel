@@ -318,12 +318,23 @@ application data only when every one of these server-side conditions holds:
   authentication — and an active, unexpired server-side session created by
   that credential exists. The invitation and the permission the route needs
   (`live:view` or `recordings:view`, independently) are checked per route.
-- **Proxy identity binding.** Every ceremony and session check requires a
-  well-formed trusted-proxy identity (Owner decision, 2026-09-30), and the
-  request's identity must reproduce the session's deployment-keyed HMAC
-  binding, compared in constant time. A mismatch denies only that request
-  generically. The binding is a consistency signal, never an authorization
-  input: a Tailscale login or proxy identity header alone authorizes nothing.
+- **Proxy identity binding, where the deployment supplies one.** Where the
+  deployment supplies a verified trusted-proxy identity, the session stores
+  only a deployment-keyed HMAC binding of it, and every later request's
+  identity must reproduce that binding, compared in constant time. A mismatch
+  denies only that request generically. Per REQUIREMENTS AUTH-005 and
+  SPECIFICATION §11.8 the identity is accepted only on the trusted local path
+  and may be additionally required, and the Issue #10 acceptance criteria in
+  `docs/INITIAL_ISSUES.md` require that no route demand one where the
+  deployment supplies none.
+  The current access-layer code requires one on every ceremony and session
+  check only as an interim constraint until the routes are built (Owner
+  decision, 2026-09-30); whether a path such as a strictly local
+  `http://localhost` Owner may run without one is still undecided in
+  `server/app/auth/README.md`. Either way the per-person credential above is
+  always required, and the binding is a consistency signal, never an
+  authorization input: a Tailscale login or proxy identity header alone
+  authorizes nothing.
 - **Reserved secure-context origin.** The dashboard is served from its
   reserved origin over a secure context, and the latest startup/daily
   reservation check passed. That check detects; it does not prevent (below).
