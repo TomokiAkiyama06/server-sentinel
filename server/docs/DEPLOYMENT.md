@@ -490,10 +490,17 @@ What the check does and does not do:
   accept routes or use an exit node on capture hosts. This is a configuration
   check, not authentication or network isolation; capture traffic relies on
   TLS 1.3 and mTLS admission with the ledger's active record.
-- A bundle exported earlier with a Tailscale endpoint is refused when the Agent
-  parses it, even if `pair --endpoint` names a LAN address. Re-export the
-  bundle with `export-bundle --endpoint <LAN ip>:<port>` and copy it again
-  (with its new `trust_bundle_sha256`).
+- A bundle exported earlier whose stored endpoint is a Tailscale **IP
+  literal** is refused when the Agent parses it, even if `pair --endpoint`
+  names a LAN address. Re-export the bundle with
+  `export-bundle --endpoint <LAN ip>:<port>` and copy it again (with its new
+  `trust_bundle_sha256`).
+- A bundle whose stored endpoint is a **DNS name** (for example a MagicDNS
+  name that resolves to a Tailscale address) is not resolved at parse time and
+  is accepted. Used as is, its connection is refused after the TCP connect; a
+  LAN `pair --endpoint` override replaces the name and the bundle works. Prefer
+  re-exporting such a bundle with the LAN endpoint so the stored endpoint is
+  correct.
 
 **Rotating the Main listener certificate (Issue #125).** The listener leaf
 defaults to 397 days and is not renewed automatically. Rotate it before it
