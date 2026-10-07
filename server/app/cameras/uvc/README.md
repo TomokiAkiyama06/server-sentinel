@@ -79,7 +79,10 @@ after presence discovery before starting another read; a frame it returns with
 is discarded. The watchdog never opens, closes or rebinds a device
 itself. A requested stop does not end its checks: a worker still blocked after
 a timed-out stop (for example when a reapproval is refused because the worker
-could not stop) stays checked until its thread actually exits. It takes the controller's transition lock non-blockingly and re-checks
+could not stop, or a runtime stop whose supervisor `close()` timed out) stays
+checked until its thread actually exits; `close()` stops the watchdog only
+after every worker has been joined, and otherwise leaves it running until
+those workers exit. It takes the controller's transition lock non-blockingly and re-checks
 the frame age under it, so a frame delivered after its snapshot wins. That lock
 covers in-memory work only: transitions, the negotiated profile and
 `last_seen_at` stage their values in transition order, and the runtime records
@@ -197,7 +200,20 @@ and every remaining cleanup step before re-raising the cancellation. A UUID
 that is not a `local_uvc` source is `rejected`, never silently skipped; a worker
 that fails to start is `worker_failed` and its camera is written `offline`.
 Service state (`running` / `degraded` / `failed` / `stopped` / `stop_failed`)
-is separate from each camera's registry health. A worker that does not stop
+is separate from each camera's registry health. Workers stop in parallel under
+one total join bound, `join_timeout_seconds` (default 10 s, configurable
+0.1–60 s). It must cover a worker's `STREAMOFF`/unmap/close (up to 5.5 s
+observed on a real C960 after an unplug, MANUAL_TEST P-7) plus
+`HEALTH_SETTLE_SECONDS` (1 s); a bound below that can turn a clean shutdown of
+a camera mid-teardown into `stop_failed`. After the workers are joined,
+`close()` joins the watchdog for at least
+`LocalUvcSupervisor.WATCHDOG_JOIN_MINIMUM_SECONDS` (1 s) even when the shared
+bound is used up. A watchdog still inside a frame-progress check after that
+join makes `close()` fail: the stop is `stop_failed` and the runtime leaves the
+adapter open rather than closing it under that check (a later `close()` joins
+the watchdog again). A successful close therefore returns with no worker or
+watchdog thread left that could call into the adapter.
+A worker that does not stop
 within the join bound makes the stop `stop_failed`; the adapter is then left to
 that worker's own cleanup rather than closed from a second thread, and the
 durable session marker conservatively requires reapproval at next start.

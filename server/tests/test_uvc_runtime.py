@@ -542,6 +542,90 @@ class RuntimeLifecycleTests(RuntimeFixture):
                                              for capture in self.captures.instances)))
         self.assertTrue(wait_for(lambda: self.health(source.id) is SourceHealthState.OFFLINE))
 
+    def test_worker_blocked_through_a_timed_out_stop_is_not_left_online(self):
+        # Issue #122: runtime.stop() closes the supervisor. When the worker is
+        # blocked in a kernel call past the join bound, the worker and adapter
+        # are left alive; the watchdog must keep running so the stalled source
+        # leaves online in memory and in the registry.
+        source = self.source()
+        runtime = LocalUvcRuntime(
+            LocalUvcConfiguration((source.id,), poll_timeout_seconds=0.05,
+                                  retry_delay_seconds=0.05, join_timeout_seconds=0.1,
+                                  frame_stall_seconds=0.25,
+                                  frame_stall_reopen_seconds=30.0),
+            self.registry, on_frame=self.on_frame, discovery=self.discovery,
+            capture_factory=self.captures,
+        )
+        runtime.start()
+        runtime.reapprove(self.admin, "synthetic-owner", source.id, self.camera)
+        self.assertTrue(self.wait_health(source.id, SourceHealthState.ONLINE))
+        block = threading.Event()
+        self.addCleanup(block.set)
+        self.captures.block = block
+        self.assertTrue(self.captures.blocked.wait(5))
+        # The join bound (0.1 s) is shorter than the stall window (0.25 s), so
+        # the stall is reported only if the watchdog outlives the stop.
+        status = runtime.stop()
+        self.assertIs(status.state, LocalUvcRuntimeState.STOP_FAILED)
+        self.assertTrue(wait_for(
+            lambda: runtime.status().sources[0].camera_state is not CameraState.ONLINE, 3))
+        self.assertTrue(wait_for(
+            lambda: self.health(source.id) is not SourceHealthState.ONLINE, 3))
+        self.captures.block = None
+        block.set()
+        self.assertTrue(wait_for(lambda: all(capture.closed
+                                             for capture in self.captures.instances)))
+        self.assertTrue(wait_for(lambda: self.health(source.id) is SourceHealthState.OFFLINE))
+
+    def test_stop_never_closes_the_adapter_under_a_running_watchdog_check(self):
+        # Codex P2 on #168: when the frame-progress watchdog is still inside
+        # a check after the supervisor's finite join, the stop fails and the
+        # adapter is not closed under that check.
+        source = self.source()
+        released = threading.Event()
+        self.addCleanup(released.set)
+        in_check = threading.Event()
+        slow = {"on": False}
+        adapters = []
+
+        class SlowCheckAdapter(LocalUvcAdapter):
+            close_calls = 0
+
+            def check_frame_progress(self, source_id):
+                if slow["on"]:
+                    in_check.set()
+                    released.wait(5)
+                return super().check_frame_progress(source_id)
+
+            def close(self):
+                type(self).close_calls += 1
+                return super().close()
+
+        def adapter_factory(*args, **kwargs):
+            adapter = SlowCheckAdapter(*args, **kwargs)
+            adapters.append(adapter)
+            return adapter
+
+        runtime = LocalUvcRuntime(
+            LocalUvcConfiguration((source.id,), poll_timeout_seconds=0.05,
+                                  retry_delay_seconds=0.05, join_timeout_seconds=0.5),
+            self.registry, on_frame=self.on_frame, discovery=self.discovery,
+            capture_factory=self.captures, adapter_factory=adapter_factory,
+        )
+        runtime.start()
+        runtime.reapprove(self.admin, "synthetic-owner", source.id, self.camera)
+        self.assertTrue(self.wait_health(source.id, SourceHealthState.ONLINE))
+        runtime._supervisor.WATCHDOG_JOIN_MINIMUM_SECONDS = 0.1
+        slow["on"] = True
+        self.assertTrue(in_check.wait(5))
+        status = runtime.stop()
+        self.assertIs(status.state, LocalUvcRuntimeState.STOP_FAILED)
+        self.assertEqual(0, SlowCheckAdapter.close_calls)
+        self.assertFalse(adapters[0].closed)
+        # The worker itself stopped and closed its capture.
+        self.assertTrue(all(capture.closed for capture in self.captures.instances))
+        released.set()
+
     def test_hung_stall_write_does_not_stop_the_watchdog_for_other_sources(self):
         second_camera = DeviceEvidence("/dev/video2", "synthetic", "model", "serial-b")
         self.discovery.devices = [self.camera, second_camera]
@@ -1688,6 +1772,28 @@ class ConfigurationParsingTests(unittest.TestCase):
         self.assertEqual((2.0, 10.0, 0.5), (
             parsed.frame_stall_seconds, parsed.frame_stall_reopen_seconds,
             parsed.presence_scan_seconds))
+
+    def test_default_join_bound_covers_an_observed_real_close_and_settle(self):
+        # Issue #173 item 3: on the real C960 (MANUAL_TEST P-7, 2026-10-07)
+        # STREAMOFF/unmap/close took up to 5.5 s, and stopping a source then
+        # waits up to HEALTH_SETTLE_SECONDS for its offline health write. The
+        # default join bound must cover both with margin, or a clean shutdown
+        # of a camera mid-teardown ends in STOP_FAILED.
+        observed_close = 5.5
+        required = observed_close + LocalUvcAdapter.HEALTH_SETTLE_SECONDS + 2.0
+        parsed = parse_local_uvc({"source_ids": [str(uuid4())]})
+        self.assertGreaterEqual(parsed.join_timeout_seconds, required)
+        self.assertGreaterEqual(
+            LocalUvcConfiguration((uuid4(),)).join_timeout_seconds, required)
+        self.assertEqual(10.0, parsed.join_timeout_seconds)
+        # The bound stays configurable within the validated range.
+        identity = str(uuid4())
+        for value in (0.1, 30, 60):
+            self.assertEqual(float(value), parse_local_uvc(
+                {"source_ids": [identity], "join_timeout_seconds": value}).join_timeout_seconds)
+        for value in (0.05, 60.5, 0, -1, True, "10"):
+            with self.assertRaises(ConfigurationError):
+                parse_local_uvc({"source_ids": [identity], "join_timeout_seconds": value})
 
     def test_invalid_configuration_is_value_free(self):
         identity = str(uuid4())

@@ -362,6 +362,8 @@ class LocalUvcRuntime:
         that worker's own ``finally`` cleanup instead of being closed from this
         thread while a capture poll may still run; the durable active-session
         marker then conservatively requires Owner reapproval at next start.
+        A frame-progress watchdog still inside a check after its bounded join
+        likewise fails the stop and keeps the adapter open under that check.
         """
         with self._lock:
             if self._state in (LocalUvcRuntimeState.STOPPED, LocalUvcRuntimeState.STOP_FAILED):
@@ -379,7 +381,9 @@ class LocalUvcRuntime:
                 self._supervisor.close()
             except WorkerStopError:
                 failed = True
-                workers_alive = any(
+                # A watchdog still inside a frame-progress check may call into
+                # the adapter as well, so it keeps the adapter open too.
+                workers_alive = self._supervisor.watchdog_running or any(
                     (status := self._supervisor.status(source_id)) is not None and status.running
                     for source_id in self.configuration.source_ids
                 )
