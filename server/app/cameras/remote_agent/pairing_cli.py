@@ -66,7 +66,7 @@ from uuid import UUID, uuid4
 
 from app.audit.service import OwnerAuthorizationError
 from app.audit.store import AuditStore
-from app.storage.database import Database
+from app.storage.database import Database, held_descriptors, hold_database_file
 from app.storage.schema import APPLICATION_MIGRATIONS
 
 from .enrollment import (
@@ -322,8 +322,12 @@ class _PinnedLedgerDatabase(Database):
         to any other file rejects the connection. SQLite may reuse a
         descriptor it already holds for the same inode (while another
         connection in this process keeps a lock on it) instead of opening a
-        new one, so it is enough that some descriptor other than the pin
-        refers to the pinned file.
+        new one, so it is enough that some SQLite descriptor refers to the
+        pinned file. The pin and every other descriptor kept by the
+        process-wide holder in ``app.storage.database`` (which is where the
+        pin comes from, Issue #152) are never SQLite's and never count as
+        that witness; otherwise an application-held descriptor on the pinned
+        inode would satisfy the check whatever SQLite opened.
         """
         after = _regular_descriptors()
         gained = {identity for descriptor, identity in after.items()
@@ -336,7 +340,8 @@ class _PinnedLedgerDatabase(Database):
                 continue
             if stat.S_ISREG(info.st_mode):
                 sidecars.add((info.st_dev, info.st_ino))
-        opened = any(identity == self._identity and descriptor != self._descriptor
+        not_sqlite = held_descriptors() | {self._descriptor}
+        opened = any(identity == self._identity and descriptor not in not_sqlite
                      for descriptor, identity in after.items())
         if not opened or gained - sidecars - {self._identity}:
             self._reject()
@@ -366,9 +371,18 @@ class _PinnedLedgerDatabase(Database):
         return connection
 
     def release(self) -> None:
-        if not self._state["released"]:
-            self._state["released"] = True
-            os.close(self._descriptor)
+        """End the ledger's use of the file; later connections and commits refuse.
+
+        The pinned descriptor is not closed (Issue #152). It belongs to the
+        process-wide holder in ``app.storage.database``: closing any
+        descriptor on the file would drop every POSIX lock this process
+        holds on it, including those of a connection still open in an
+        enrollment worker that outlived ``EnrollmentListener.serve()``'s
+        bounded join, and let another process write mid-transaction. Such a
+        lingering worker's later commit is refused by ``verify()`` and rolls
+        back.
+        """
+        self._state["released"] = True
 
 
 def _existing_database(database_path: Path) -> _PinnedLedgerDatabase:
@@ -383,24 +397,22 @@ def _existing_database(database_path: Path) -> _PinnedLedgerDatabase:
     """
     if not database_path.is_absolute() or os.path.realpath(database_path) != str(database_path):
         raise CliRefused("database_path_rejected")
+    # The pin is the process-wide held descriptor (Issue #152): it is never
+    # closed, not even when the file is refused below, because closing a
+    # descriptor on a database file drops this process's SQLite locks on it.
     try:
-        descriptor = os.open(database_path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
-                             | os.O_NOCTTY | os.O_NONBLOCK)
+        descriptor, identity = hold_database_file(database_path)
     except FileNotFoundError:
         raise CliRefused("database_not_found") from None
-    except OSError:
+    except ValueError:
         raise CliRefused("database_rejected") from None
     try:
         info = os.fstat(descriptor)
-        if not _safe_database_file(info):
-            raise CliRefused("database_rejected")
     except OSError:
-        os.close(descriptor)
         raise CliRefused("database_rejected") from None
-    except BaseException:
-        os.close(descriptor)
-        raise
-    return _PinnedLedgerDatabase(database_path, descriptor, (info.st_dev, info.st_ino))
+    if not _safe_database_file(info) or (info.st_dev, info.st_ino) != identity:
+        raise CliRefused("database_rejected")
+    return _PinnedLedgerDatabase(database_path, descriptor, identity)
 
 
 def _require_current_schema(connection: sqlite3.Connection) -> None:
