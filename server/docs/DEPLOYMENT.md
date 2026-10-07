@@ -686,14 +686,25 @@ digests, session identity bindings, permission-bearing URLs, media bytes,
 camera serials, device paths, topology or instance markers, Owner template
 bytes, embeddings or model provenance, or audit row contents.
 
-The database is read in one short read transaction; segment files are hashed
-only after it ends, so the running service's writers are not blocked (a file
-changed meanwhile shows as a change). Durable tables not yet inventoried are
-listed as `not_inventoried (#132)` in the record and verify output:
-`recording_source_discontinuities`, `recording_source_cursors`,
-`roi_calibration_history`, `notification_events`, `uvc_approvals.session_token`,
-`integrity_status` and `recording_health_status`; do not read a pass as
-covering them.
+The database is copied into private memory with the SQLite online backup in
+a single step, the only time the tool holds the database's shared lock; every
+query, validation and digest then runs on that copy, and segment files are
+hashed afterwards. On the development host a synthetic database with 200 000
+linked segments (about 128 MB) held the lock for about 0.03 s (previously
+about 2.5 s, when validation ran inside the read transaction), well inside
+the service writers' 5 s busy timeout; the whole run took about 2.6 s and
+about 430 MB of resident memory. Expect memory of roughly the database size
+plus about 1.5 KB per segment, and run time growing linearly with the
+segment count and the media bytes hashed. A file changed meanwhile shows as
+a change, except a recording that the service's retention deleted after the
+copy: a fresh read shows its row gone and, if retention could delete it, it
+is retention (verify) or left out of the baseline (record). The state
+database uses the DELETE journal mode; against a database switched to WAL
+mode, even a read-only open creates the `-wal` / `-shm` files next to it.
+Durable tables not yet inventoried are listed as `not_inventoried (#132)` in
+the record and verify output: `recording_source_discontinuities`,
+`roi_calibration_history`, `uvc_approvals.session_token`, `integrity_status`
+and `recording_health_status`; do not read a pass as covering them.
 
 `record` writes a baseline only if verifying that very state, unchanged,
 would pass: it runs every current-state check `verify` runs (schema,

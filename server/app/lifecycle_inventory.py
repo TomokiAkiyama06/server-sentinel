@@ -128,8 +128,8 @@ NOT_APPLICABLE = {
 # Durable tables this tool does not inventory yet (#132); the report lists
 # them so a pass is never read as covering them.
 NOT_INVENTORIED = (
-    "recording_source_discontinuities", "recording_source_cursors",
-    "roi_calibration_history", "notification_events", "uvc_approvals.session_token",
+    "recording_source_discontinuities",
+    "roi_calibration_history", "uvc_approvals.session_token",
     "integrity_status", "recording_health_status",
 )
 
@@ -138,6 +138,7 @@ NOT_INVENTORIED = (
 # empty or absent section (a table dropped while empty is still a loss).
 INVENTORIED_TABLES = (
     "recordings", "recording_links", "recording_segments", "recording_discontinuities",
+    "recording_source_cursors",
     "security_admin_audit_records", "integrity_audit", "presence_audit", "storage_state_audit",
     "camera_sources", "uvc_approvals", "detection_bindings", "camera_registry_settings",
     "access_principals", "access_principal_permissions", "access_credentials",
@@ -261,6 +262,34 @@ def _connect_read_only(database: Path) -> sqlite3.Connection:
     return connection
 
 
+def _snapshot(database: Path) -> sqlite3.Connection:
+    """A private in-memory copy of the state database, taken in one step.
+
+    The SQLite online backup copies every page in a single step, so the
+    shared lock on the state database is held only for that page copy (well
+    under a second for 200 000 segments) and the copy is one consistent
+    snapshot. Every query, validation and digest then runs on the copy: a
+    service writer (DELETE journal mode, 5 s busy timeout) never waits for
+    them. The copy needs memory of about the database size and is itself
+    query-only.
+    """
+    source = _connect_read_only(database)
+    try:
+        snapshot = sqlite3.connect(":memory:", isolation_level=None)
+        try:
+            source.backup(snapshot)
+        except sqlite3.Error:
+            snapshot.close()
+            raise
+    except sqlite3.Error:
+        raise InventoryError("state database could not be read") from None
+    finally:
+        source.close()
+    snapshot.row_factory = sqlite3.Row
+    snapshot.execute("PRAGMA query_only = ON")
+    return snapshot
+
+
 def _file_digest(directory: Path, segment_id: str) -> tuple[str | None, int | None, int | None]:
     """SHA-256, size and hard-link count of a segment file as stored."""
     try:
@@ -295,10 +324,10 @@ def _columns(connection: sqlite3.Connection, table: str) -> set[str]:
 
 
 def _recordings(connection, tables) -> dict | None:
-    """The recording catalog, read inside the snapshot transaction.
+    """The recording catalog, read from the private snapshot (_snapshot()).
 
-    Segment files are hashed afterwards by _hash_recordings(), outside the
-    transaction, so a long hash never blocks service writers.
+    Segment files are hashed afterwards by _hash_recordings(); nothing here
+    holds a lock on the state database.
     """
     if not {"recordings", "recording_links", "recording_segments"} <= tables:
         return None
@@ -491,11 +520,15 @@ def _hash_spool(spool: dict | None, directory: Path, database: Path) -> list:
     return sorted(still)
 
 
-def _hash_recordings(recordings: dict | None, directory: Path) -> None:
+def _hash_recordings(recordings: dict | None, directory: Path, database: Path | None = None,
+                     recorded_at: str | None = None) -> None:
     """Hash every catalogued segment file, outside any database transaction.
 
     A ready segment's bytes are immutable, so hashing after the snapshot is
-    equivalent; a file changed or removed meanwhile shows up as a change.
+    equivalent; a file changed or removed meanwhile shows up as a change,
+    except when the service's retention deleted the whole recording after
+    the snapshot (_retention_gone()): such a recording is dropped, as if the
+    snapshot had been taken after the deletion.
     """
     for recording in (recordings or {}).values():
         for item in recording["segments"]:
@@ -509,6 +542,42 @@ def _hash_recordings(recordings: dict | None, directory: Path) -> None:
                                        and links == 1))
         recording["content_sha256"] = _digest(
             [[item["segment_id"], item["sha256"]] for item in recording["segments"]])
+    if database is not None and recordings:
+        for key in _retention_gone(recordings, database, recorded_at):
+            del recordings[key]
+
+
+def _retention_gone(recordings: dict, database: Path, recorded_at: str | None) -> list:
+    """Recordings whose files no longer match and that retention removed since.
+
+    Mirrors the spool recheck: a fresh short read shows whether the row is
+    gone (or being deleted); only one RetentionService could have removed
+    (_retention_eligible() at the snapshot time) counts. Any other mismatch
+    stays a failure.
+    """
+    suspects = [key for key, item in recordings.items()
+                if not all(segment["catalog_match"] for segment in item["segments"])]
+    if not suspects:
+        return []
+    try:
+        moment = datetime.fromisoformat(recorded_at) if recorded_at else _utcnow()
+    except (TypeError, ValueError):
+        moment = _utcnow()
+    cutoff = _retention_rules(moment)["recording_cutoff_ms"]
+    connection = _connect_read_only(database)
+    try:
+        gone = []
+        for key in suspects:
+            row = connection.execute(
+                "SELECT status FROM recordings WHERE id = ?", (key,)).fetchone()
+            if ((row is None or row[0] == "deleting")
+                    and _retention_eligible(recordings[key], cutoff)):
+                gone.append(key)
+        return gone
+    except sqlite3.Error:
+        raise InventoryError("state database could not be read") from None
+    finally:
+        connection.close()
 
 
 def _chain(rows: list[tuple[str, str]]) -> str:
@@ -2620,12 +2689,8 @@ def collect(runtime_root: Path, *, salt: str | None = None,
     # Taken before the snapshot, so a row written in between counts as
     # written after the record.
     recorded_at = _utcnow().isoformat()
-    connection = _connect_read_only(tree.database)
+    connection = _snapshot(tree.database)
     try:
-        # One short read transaction gives a consistent snapshot of every
-        # table; no file is hashed while it is open (DELETE journal mode: a
-        # held read lock would make service writers time out).
-        connection.execute("BEGIN")
         tables = _tables(connection)
         schema_version, migrations = None, None
         if "schema_migrations" in tables:
@@ -2663,12 +2728,11 @@ def collect(runtime_root: Path, *, salt: str | None = None,
             "security_state": _security_state(connection, tables, salt),
             "integrity_delivery": _integrity_delivery(connection, tables, salt),
         }
-        connection.execute("COMMIT")
     except sqlite3.Error:
         raise InventoryError("state database could not be read") from None
     finally:
         connection.close()
-    _hash_recordings(inventory["recordings"], tree.recordings)
+    _hash_recordings(inventory["recordings"], tree.recordings, tree.database, recorded_at)
     # A ready spool row whose file is missing or differs would hand the next
     # recording missing media: a current-state failure.
     for segment_id in _hash_spool(inventory["spool_segments"], tree.recordings, tree.database):

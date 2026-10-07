@@ -4499,12 +4499,16 @@ class LifecycleInventoryTests(unittest.TestCase):
         _, baseline = self.record()
         code, report, stdout = self.verify(baseline)
         self.assertEqual(code, inventory.EXIT_PRESERVED)
-        for name in ("recording_source_discontinuities", "recording_source_cursors",
-                     "roi_calibration_history", "notification_events",
+        for name in ("recording_source_discontinuities", "roi_calibration_history",
                      "uvc_approvals.session_token", "integrity_status",
                      "recording_health_status"):
             self.assertEqual(report["not_inventoried"][name], "not_inventoried (#132)")
             self.assertIn(f"{name}: not_inventoried (#132)", stdout)
+        # Inventoried now (source cursors; integrity notification events),
+        # so never listed as uncovered.
+        for name in ("recording_source_cursors", "notification_events"):
+            self.assertNotIn(name, report["not_inventoried"])
+            self.assertIn(name, inventory.INVENTORIED_TABLES)
 
     def test_verify_refuses_a_baseline_that_is_not_private(self):
         self.runtime.seed()
@@ -5858,6 +5862,186 @@ class LifecycleInventoryTests(unittest.TestCase):
             code, report, _ = self.verify(baseline)
         self.assertEqual(code, inventory.EXIT_FAILED)
         self.assertEqual((report["status"], report["unverifiable"]), ("failed", "TypeError"))
+
+    def test_the_state_database_is_locked_only_while_it_is_copied(self):
+        # Claude review: validation used to run inside the read transaction,
+        # so a service writer (DELETE journal, 5 s busy timeout) could hit
+        # "database is locked" and stop recording. Every check now runs on a
+        # private copy: a writer with no busy wait succeeds meanwhile.
+        self.runtime.seed()
+        validate = inventory._domain_errors
+        writes = []
+
+        def probe(connection, tables):
+            with closing(sqlite3.connect(self.runtime.database, timeout=0,
+                                         isolation_level=None)) as writer:
+                writer.execute("INSERT OR REPLACE INTO application_metadata VALUES "
+                               "('synthetic.lock-probe', ?)", (str(len(writes)),))
+            writes.append(True)
+            return validate(connection, tables)
+        with mock.patch.object(inventory, "_domain_errors", probe):
+            code, baseline = self.record()
+            self.assertEqual(code, inventory.EXIT_PRESERVED)
+            code, _, _ = self.verify(baseline)
+            self.assertEqual(code, inventory.EXIT_PRESERVED)
+        self.assertEqual(len(writes), 2)  # once while recording, once while verifying
+
+    def test_a_recording_removed_by_retention_while_hashing_is_retention(self):
+        # Claude review: retention may delete a recording after the snapshot
+        # and before its files are hashed. A fresh read then shows the row is
+        # gone: an eligible recording is retention (verify) or left out of the
+        # baseline (record), never a changed or corrupt one. A recording no
+        # retention could remove still fails.
+        seeded = self.runtime.seed()
+
+        def remove(recording_id):
+            with closing(sqlite3.connect(self.runtime.database, isolation_level=None)) as db:
+                segments = [row[0] for row in db.execute(
+                    "SELECT segment_id FROM recording_links WHERE recording_id=?",
+                    (recording_id,))]
+                db.execute("DELETE FROM recording_links WHERE recording_id=?", (recording_id,))
+                db.execute("DELETE FROM recordings WHERE id=?", (recording_id,))
+                for segment in segments:
+                    db.execute("DELETE FROM recording_segments WHERE id=?", (segment,))
+                    (self.runtime.root / "recordings" / (UUID(segment).hex + ".seg")).unlink()
+        hash_files = inventory._hash_recordings
+
+        def racing(recording_id):
+            def hashed(*args, **kwargs):
+                remove(recording_id)
+                return hash_files(*args, **kwargs)
+            return mock.patch.object(inventory, "_hash_recordings", hashed)
+        _, baseline = self.record()
+        with racing(seeded["ordinary"]):
+            code, report, _ = self.verify(baseline)
+        section = report["sections"]["recordings"]
+        self.assertEqual(section["failed"], [])
+        self.assertEqual(section["retention_expired"], [seeded["ordinary"]])
+        # The same race while recording: the baseline leaves it out.
+        other = self.runtime.recording(starred=False, payload=b"generated-retained-later",
+                                       source_id=None)
+        with racing(other):
+            code, later = self.record("later.json")
+        self.assertNotEqual(code, inventory.EXIT_FAILED)
+        self.assertNotIn(other, json.loads(later.read_text())["recordings"])
+        # A starred recording is never retention: still a failure.
+        with racing(seeded["starred"]):
+            code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_FAILED)
+        self.assertIn({"id": seeded["starred"], "reason": "changed"},
+                      report["sections"]["recordings"]["failed"])
+
+    def test_record_and_verify_never_write_the_runtime_tree(self):
+        # Mutation guard: the state database is opened mode=ro with
+        # query_only, and the copy the checks run on is query-only too.
+        self.runtime.seed()
+
+        def tree():
+            return {path: (path.stat().st_size, path.stat().st_mtime_ns,
+                           path.read_bytes() if path.is_file() else None)
+                    for path in sorted(self.runtime.root.rglob("*"))}
+        before = tree()
+        code, baseline = self.record()
+        self.assertEqual(code, inventory.EXIT_PRESERVED)
+        code, _, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_PRESERVED)
+        self.assertEqual(tree(), before)
+        source = inventory._connect_read_only(self.runtime.database)
+        try:
+            self.assertEqual(source.execute("PRAGMA query_only").fetchone()[0], 1)
+            source.execute("PRAGMA query_only = OFF")
+            with self.assertRaises(sqlite3.OperationalError):  # mode=ro still refuses
+                source.execute("INSERT INTO application_metadata VALUES ('x', 'y')")
+        finally:
+            source.close()
+        copy = inventory._snapshot(self.runtime.database)
+        try:
+            self.assertEqual(copy.execute("PRAGMA query_only").fetchone()[0], 1)
+            with self.assertRaises(sqlite3.OperationalError):
+                copy.execute("INSERT INTO application_metadata VALUES ('x', 'y')")
+        finally:
+            copy.close()
+        self.assertEqual(tree(), before)
+
+    def test_a_source_cursor_never_moves_back_or_disappears(self):
+        self.runtime.seed()
+        _, baseline = self.record()
+        source = next(iter(json.loads(baseline.read_text())["recording_source_cursors"]))
+        expected = {"id": f"cursor:{source}", "reason": "cursor_regressed"}
+        self.runtime.execute("UPDATE recording_source_cursors SET end_ms=end_ms-1 "
+                             "WHERE source_id=?", (source,))
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_FAILED)
+        self.assertIn(expected, report["sections"]["recordings"]["failed"])
+        self.runtime.execute("DELETE FROM recording_source_cursors WHERE source_id=?", (source,))
+        code, report, _ = self.verify(baseline)
+        self.assertIn(expected, report["sections"]["recordings"]["failed"])
+
+    def test_a_cleared_exposure_marker_needs_the_generation_advance(self):
+        # Sessions invalidated and the audit row written, but the
+        # authorization generation not advanced: not the service revocation.
+        from app.auth.reservation_store import (REVOCATION_PENDING_KEY,
+                                                ReservationSessionRevocation)
+        from app.auth.store import AccessStore
+        self.runtime.seed()
+        database = Database(self.runtime.database)
+        ReservationSessionRevocation(AccessStore(database, audit=AuditStore(database))
+                                     ).record_exposure()
+        _, baseline = self.record()
+        self.runtime.execute("DELETE FROM application_metadata WHERE key=?",
+                             (REVOCATION_PENDING_KEY,))
+        self.runtime.execute("UPDATE access_sessions SET invalidated_at_us=2, "
+                             "external_identity_binding=NULL")
+        self.runtime.execute(
+            "INSERT INTO security_admin_audit_records VALUES (?, 'system', "
+            "'invalidate_human_sessions', 'security_settings', "
+            "'0b6f3f64-54a9-4e0f-8f5e-7d2c9a4b1e37', ?, 'succeeded')",
+            (str(uuid4()), self.runtime.clock))
+        marker = {"id": "session_revocation_pending", "reason": "cleared_without_revocation"}
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(report["sections"]["security_state"]["failed"], [marker])
+        self.runtime.execute("UPDATE access_deployment_state SET "
+                             "authorization_generation=authorization_generation+1")
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(report["sections"]["security_state"]["failed"], [])
+
+    def test_a_spool_file_evicted_while_hashing_is_not_a_loss(self):
+        # _trim() clears spool=1 before it unlinks an unreferenced file: a
+        # file gone during hashing whose row has left the ready spool is no
+        # loss; one whose row is still spooled stays spool_file_mismatch.
+        import zlib
+        from app.media.recording import Segment
+        self.runtime.seed()
+        connection = sqlite3.connect(self.runtime.database, isolation_level=None)
+        self.addCleanup(connection.close)
+        store = self._recording_store(connection)
+        payload = zlib.compress(b"generated geometric test payload" * 4)
+        base = int((self.now - timedelta(hours=1)).timestamp() * 1000)
+        source, stream_id = uuid4(), uuid4()
+        spooled = str(store.append(Segment(source, stream_id, 0, base, base + 10_000,
+                                           "synthetic", "deflate", payload)))
+        _, baseline = self.record()
+        matches = inventory._spool_file_matches
+
+        def evicting(evict):
+            def hashed(directory, segment_id, catalog):
+                if segment_id == spooled and not hashed.done:
+                    hashed.done = True
+                    if evict:
+                        self.runtime.execute("UPDATE recording_segments SET spool=0 "
+                                             "WHERE id=?", (spooled,))
+                    return False  # the file vanished under the hash
+                return matches(directory, segment_id, catalog)
+            hashed.done = False
+            return mock.patch.object(inventory, "_spool_file_matches", hashed)
+        with evicting(evict=True):
+            code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_PRESERVED, report["sections"]["recordings"])
+        self.runtime.execute("UPDATE recording_segments SET spool=1 WHERE id=?", (spooled,))
+        # Still spooled: the recheck hashes again and finds it intact.
+        with evicting(evict=False):
+            code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_PRESERVED, report["sections"]["recordings"])
 
 if __name__ == "__main__":
     unittest.main()
