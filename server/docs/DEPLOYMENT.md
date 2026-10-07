@@ -525,6 +525,38 @@ the previous unit and restarts the release that was running before the attempt.
 One service-global lock covers each whole install, update, and rollback, so
 overlapping administrator invocations are serialized rather than interleaved.
 
+**Crossing the socket-activation boundary (Issue #126).** A release from before
+socket activation has no `app/release_capabilities.py` declaring
+`HUMAN_UPSTREAM_SOCKET_ACTIVATION`: it ignores the socket passed by
+`server-sentinel-upstream.socket` and binds `human_host:human_port` itself.
+It cannot start while that socket unit is active or enabled (it holds, or will
+hold again at boot, the endpoint), nor on a port below
+`ip_unprivileged_port_start`, which the non-root service may not bind. Before
+switching an `update`, `install` or `rollback` to such a release, the
+installer checks both (it only queries `systemctl is-active` / `is-enabled`
+for the socket unit; an unclear answer counts as in use) and, if either
+holds, refuses before changing anything: the running release, both pointers
+and the unit stay as they were, a staged release is removed, and it prints
+these Owner steps with the actual configuration path:
+
+```sh
+sudo systemctl disable --now server-sentinel-upstream.socket
+# edit the deployment configuration: "human_port" back to the port that release
+# used (at or above /proc/sys/net/ipv4/ip_unprivileged_port_start), and point
+# Tailscale Serve at http://127.0.0.1:<that port>
+sudo /tmp/server-sentinel-installer-<version>.pyz --destination ... --config ... \
+  --unit /etc/systemd/system/server-sentinel.service rollback   # the same command again
+```
+
+Run the rollback right after disabling the socket: while the newer release is
+still running, its `Sockets=` dependency starts the socket unit again if that
+service restarts. To return to socket activation later, update to a release
+that supports it, restore `"human_port"` to the privileged port and run
+`sudo systemctl enable --now server-sentinel-upstream.socket`. The installer
+never starts, stops, enables or disables the socket unit and never rewrites the
+deployment configuration: both are Owner-managed, and changing them inside the
+transaction would leave the human endpoint down if the restart then failed.
+
 Releases and runtime data are never deleted by these operations; only a staged
 release whose own installation failed is removed. Database migrations are
 forward-only, so an older application may reject a newer database; that failed
