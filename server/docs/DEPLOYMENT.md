@@ -532,51 +532,66 @@ overlapping administrator invocations are serialized rather than interleaved.
 socket activation has no `app/release_capabilities.py` declaring
 `HUMAN_UPSTREAM_SOCKET_ACTIVATION`: it ignores the socket passed by
 `server-sentinel-upstream.socket` and binds `human_host:human_port` itself.
-It cannot start while that socket unit is active or enabled (it holds, or will
-hold again at boot, the endpoint), nor on a port below
-`ip_unprivileged_port_start`, which the non-root service may not bind. Before
-switching an `update`, `install` or `rollback` to such a release, the
-installer checks both (it only queries `systemctl is-active` / `is-enabled`
-for the socket unit; an unclear answer, a timeout or a query that cannot run
-counts as in use) and, if either holds, refuses before changing anything: the
-running release, both pointers and the unit stay as they were, a staged release
-is removed, and it prints these Owner steps, in this order, with the actual
-configuration path:
+It cannot start while systemd still has that socket unit: a present unit file
+is pulled in again by the `Sockets=`/`Wants=` dependency of an activation
+release or at boot, and a socket that still runs keeps holding the endpoint.
+Nor can it start on a port below `ip_unprivileged_port_start`, which the
+non-root service may not bind. Before switching an `update`, `install` or
+`rollback` to such a release, the installer checks both. For the socket unit
+it only queries `systemctl show -p LoadState --value` and
+`-p ActiveState --value`, and treats the unit as gone only when they are
+`not-found` and `inactive`; anything else, an unclear answer, a timeout or a
+query that cannot run counts as in use. If either holds, it refuses before
+changing anything: the running release, both pointers and the unit stay as
+they were, a staged release is removed, and it prints these Owner steps, in
+this order, with the actual configuration path:
 
 ```sh
 # 1. edit the deployment configuration: "human_port" back to the port that
 #    release used (at or above /proc/sys/net/ipv4/ip_unprivileged_port_start)
-# 2. stop and mask the socket unit; masked, no unit's Sockets=/Wants= and no
-#    reboot can start it again. The running service keeps its passed socket
-#    until it is restarted, so the dashboard stays up until step 3
+# 2. stop the socket unit; the running service keeps its passed socket until
+#    it is restarted, so the dashboard stays up until step 4
 sudo systemctl disable --now server-sentinel-upstream.socket
-sudo systemctl mask server-sentinel-upstream.socket
-# 3. the same command again; it restarts the service on that release, which
+# 3. park the hand-placed unit file and reload; with no unit file nothing can
+#    start it (no Sockets=/Wants= pull, no boot), and systemd forgets it
+sudo mkdir -p /etc/server-sentinel/disabled
+sudo mv /etc/systemd/system/server-sentinel-upstream.socket /etc/server-sentinel/disabled/
+sudo systemctl daemon-reload
+systemctl show -p LoadState -p ActiveState server-sentinel-upstream.socket
+#    expect: LoadState=not-found, ActiveState=inactive
+# 4. the same command again; it restarts the service on that release, which
 #    binds the restored port itself (no separate restart is needed)
 sudo /tmp/server-sentinel-installer-<version>.pyz --destination ... --config ... \
   --unit /etc/systemd/system/server-sentinel.service rollback
-# 4. point the Tailscale Serve target at http://127.0.0.1:<that port>
-# 5. verify: ss -ltn shows the service on that port and the dashboard answers
+# 5. point the Tailscale Serve target at http://127.0.0.1:<that port>
+# 6. verify: ss -ltn shows the service on that port and the dashboard answers
 ```
 
-Mask, not only disable: a service unit with `Sockets=` also `Wants=` the
-socket unit, so a disabled but present socket unit would be started again by
-any start of an activation release (including the installer's own restart and
-its automatic recovery). The installer renders `Sockets=` only into the unit
-of a release that declares the capability, and a rollback refuses a stored
-unit of a release without it that still names the socket unit.
+Do not use `systemctl mask` for this: it refuses to mask a unit whose file is
+in `/etc/systemd/system` (where the mask link would go), and a masked socket
+that was not stopped still reports `active`. Stopping alone is not enough
+either: a disabled but present unit file is started again by any start of an
+activation release (including the installer's own restart and its automatic
+recovery). If the unit file is moved without `daemon-reload`, or the socket
+was not stopped first, systemd still reports it `loaded` or `active` and the
+installer keeps refusing. These states were measured with throwaway systemd
+259 user units. The installer renders `Sockets=` only into the unit of a
+release that declares the capability, and a rollback refuses a stored unit of
+a release without it that still names the socket unit.
 
 To return to socket activation later, in this order:
 
 ```sh
-# 1. update to a release that supports socket activation; the socket unit is
-#    still masked, so its Sockets= does not pull it in and the release binds
-#    the old, unprivileged port itself (the reservation check keeps human
-#    access closed without revocation until step 4)
+# 1. update to a release that supports socket activation; with the unit file
+#    parked nothing pulls the socket in, and the release binds the old,
+#    unprivileged port itself (the reservation check keeps human access closed
+#    without revocation until step 4)
 # 2. edit the deployment configuration: "human_port" back to the ListenStream
 #    port of server-sentinel-upstream.socket (below ip_unprivileged_port_start)
-# 3. bind the socket; starting it cannot hand it to the running service
-sudo systemctl unmask server-sentinel-upstream.socket
+# 3. put the unit file back and bind the socket; starting it cannot hand it to
+#    the running service
+sudo mv /etc/server-sentinel/disabled/server-sentinel-upstream.socket /etc/systemd/system/server-sentinel-upstream.socket
+sudo systemctl daemon-reload
 sudo systemctl enable --now server-sentinel-upstream.socket
 # 4. restart the service so systemd passes the socket and the new port applies
 sudo systemctl restart server-sentinel.service

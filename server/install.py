@@ -36,6 +36,10 @@ VERSION = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+(?:-[a-z0-9.]+)?")
 # Issue #126: the Owner places this socket unit by hand; the installer only
 # queries it and never starts, stops, enables or disables it.
 UPSTREAM_SOCKET_UNIT = "server-sentinel-upstream.socket"
+SOCKET_UNIT_FILE = Path("/etc/systemd/system") / UPSTREAM_SOCKET_UNIT
+# Where the Owner parks the hand-placed socket unit while a release from
+# before socket activation runs (Owner steps printed below).
+PARKED_SOCKET_DIRECTORY = Path("/etc/server-sentinel/disabled")
 RELEASE_CAPABILITIES = Path("app/release_capabilities.py")
 SOCKET_ACTIVATION_CAPABILITY = re.compile(r"^HUMAN_UPSTREAM_SOCKET_ACTIVATION = True$", re.MULTILINE)
 UNPRIVILEGED_PORT_START = Path("/proc/sys/net/ipv4/ip_unprivileged_port_start")
@@ -268,22 +272,32 @@ def _unprivileged_port_start() -> int | None:
     return int(value) if re.fullmatch(r"[0-9]{1,5}", value) else None
 
 
+def _socket_unit_state(runner, prop: str) -> str | None:
+    try:
+        result = runner(["systemctl", "show", "-p", prop, "--value", UPSTREAM_SOCKET_UNIT],
+                        check=False, timeout=30, stdout=subprocess.PIPE,
+                        stderr=subprocess.DEVNULL, text=True)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None  # timed out, not executable, or failed
+    if getattr(result, "returncode", None) != 0 or not isinstance(getattr(result, "stdout", None), str):
+        return None
+    return result.stdout.strip()
+
+
 def _socket_unit_in_use(runner) -> bool:
-    """Whether the upstream socket unit is active or enabled; unknown counts as in use."""
-    for query in ("is-active", "is-enabled"):
-        try:
-            result = runner(["systemctl", query, "--quiet", UPSTREAM_SOCKET_UNIT],
-                            check=False, timeout=30, stdout=subprocess.DEVNULL,
-                            stderr=subprocess.DEVNULL)
-        except (OSError, subprocess.SubprocessError, ValueError):
-            # Timed out, not executable, or failed: unknown, so in use.
-            return True
-        # 0 is active / enabled. Only "not enabled" (1, also "masked"),
-        # "inactive" (3) and "no such unit" (4) are a clear no; anything else
-        # counts as in use.
-        if getattr(result, "returncode", None) not in (1, 3, 4):
-            return True
-    return False
+    """Whether the upstream socket unit exists for systemd or still runs; unknown counts as in use.
+
+    It is clearly absent only when systemd finds no unit file
+    (``LoadState=not-found``) and the unit is not running
+    (``ActiveState=inactive``). A loaded, masked or otherwise present unit
+    can be pulled in again by a ``Sockets=``/``Wants=`` dependency or at boot,
+    and a socket whose file was removed while it ran stays ``active`` (also
+    after ``daemon-reload``) and keeps holding the endpoint. A failed or
+    unclear query counts as in use, so the refusal and its steps are kept.
+    """
+    load = _socket_unit_state(runner, "LoadState")
+    active = _socket_unit_state(runner, "ActiveState")
+    return not (load == "not-found" and active == "inactive")
 
 
 def _require_startable(args, root: Path, target: str, deployment: Deployment, runner) -> None:
@@ -309,7 +323,8 @@ def _require_startable(args, root: Path, target: str, deployment: Deployment, ru
         if args.command == "rollback" else args.command + " ..."
     reasons = []
     if socket_in_use:
-        reasons.append(f"{UPSTREAM_SOCKET_UNIT} is active or enabled and holds the human upstream")
+        reasons.append(f"{UPSTREAM_SOCKET_UNIT} is installed or running (systemd still finds its unit\n"
+                       "    file, or it still holds the human upstream), so the release could not bind it")
     if privileged_port:
         reasons.append(f"human_port {port} is below ip_unprivileged_port_start "
                        f"({'unreadable' if start is None else start}), which the non-root service cannot bind")
@@ -321,19 +336,24 @@ def _require_startable(args, root: Path, target: str, deployment: Deployment, ru
         f"  1. edit {args.config}: set \"human_port\" to the port that release used, at or\n"
         "     above /proc/sys/net/ipv4/ip_unprivileged_port_start\n"
         f"  2. sudo systemctl disable --now {UPSTREAM_SOCKET_UNIT}\n"
-        f"     sudo systemctl mask {UPSTREAM_SOCKET_UNIT}\n"
-        "     (masked, so no unit's Sockets=/Wants= can start it again; the running\n"
-        "     service keeps its passed socket until it is restarted)\n"
-        f"  3. run the same command again: ... {rerun}\n"
+        "     (the running service keeps its passed socket until it is restarted)\n"
+        f"  3. sudo mkdir -p {PARKED_SOCKET_DIRECTORY}\n"
+        f"     sudo mv {SOCKET_UNIT_FILE} {PARKED_SOCKET_DIRECTORY}/\n"
+        "     sudo systemctl daemon-reload\n"
+        "     (with no unit file, no Sockets=/Wants= dependency and no reboot can start it;\n"
+        f"     systemctl show -p LoadState -p ActiveState {UPSTREAM_SOCKET_UNIT}\n"
+        "     must show not-found and inactive)\n"
+        f"  4. run the same command again: ... {rerun}\n"
         "     (it restarts the service on that release, which binds the port itself)\n"
-        "  4. point the Tailscale Serve target at http://<human_host>:<that port>\n"
-        "  5. verify: ss -ltn shows the service on that port and the dashboard answers\n"
+        "  5. point the Tailscale Serve target at http://<human_host>:<that port>\n"
+        "  6. verify: ss -ltn shows the service on that port and the dashboard answers\n"
         "To return to socket activation later, in this order:\n"
-        "  1. update to a release that supports it (the socket unit is still masked, so it\n"
-        "     is not pulled in and the release still binds the old port itself)\n"
+        "  1. update to a release that supports it (with the socket unit parked, nothing pulls\n"
+        "     it in and the release still binds the old port itself)\n"
         f"  2. edit {args.config}: set \"human_port\" back to the ListenStream port of\n"
         f"     {UPSTREAM_SOCKET_UNIT} (below ip_unprivileged_port_start)\n"
-        f"  3. sudo systemctl unmask {UPSTREAM_SOCKET_UNIT}\n"
+        f"  3. sudo mv {PARKED_SOCKET_DIRECTORY / UPSTREAM_SOCKET_UNIT} {SOCKET_UNIT_FILE}\n"
+        "     sudo systemctl daemon-reload\n"
         f"     sudo systemctl enable --now {UPSTREAM_SOCKET_UNIT}\n"
         "  4. sudo systemctl restart server-sentinel.service\n"
         "     (starting the socket unit cannot hand its socket to the running service)\n"

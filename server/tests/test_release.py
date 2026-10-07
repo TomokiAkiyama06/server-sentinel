@@ -49,9 +49,10 @@ class Runner:
         self.root = root
         self.calls = []
         self.fail_version = None
-        # ``systemctl is-active/is-enabled --quiet server-sentinel-upstream.socket``
-        # exit codes: inactive (3) and not enabled (1) by default.
-        self.socket_codes = {"is-active": 3, "is-enabled": 1}
+        # ``systemctl show -p <property> --value server-sentinel-upstream.socket``:
+        # a value (exit 0), an ``(exit code, output)`` pair, or an exception.
+        # By default no unit file and not running.
+        self.socket_state = {"LoadState": "not-found", "ActiveState": "inactive"}
 
     def _check_foreign_account_access(self, options) -> None:
         if options.get("user") is None:
@@ -78,12 +79,13 @@ class Runner:
             python = Path(arguments[4]) / "bin/python"
             python.parent.mkdir(parents=True)
             python.write_text("synthetic")
-        if (arguments[:1] == ["systemctl"] and arguments[1] in self.socket_codes
-                and arguments[2:] == ["--quiet", install.UPSTREAM_SOCKET_UNIT]):
-            code = self.socket_codes[arguments[1]]
-            if isinstance(code, BaseException):
-                raise code
-            return SimpleNamespace(returncode=code)
+        if (arguments[:3] == ["systemctl", "show", "-p"] and arguments[3] in self.socket_state
+                and arguments[4:] == ["--value", install.UPSTREAM_SOCKET_UNIT]):
+            value = self.socket_state[arguments[3]]
+            if isinstance(value, BaseException):
+                raise value
+            code, output = value if isinstance(value, tuple) else (0, value + "\n")
+            return SimpleNamespace(returncode=code, stdout=output)
         if arguments[:2] == ["systemctl", "restart"] and self.fail_version:
             current = os.readlink(self.root / "current")
             if current == "releases/" + self.fail_version:
@@ -1165,12 +1167,23 @@ class ActivationBoundaryTests(unittest.TestCase):
         self.perform(self.arguments("install", "1.0.0"))
         self.assertTrue(install._supports_socket_activation(self.installation / "releases/1.0.0"))
 
-    def test_rollback_refuses_while_the_socket_unit_is_in_use(self):
-        for query in ("is-active", "is-enabled"):
-            with self.subTest(query=query):
+    # (LoadState, ActiveState) as systemd 259 reported them for a socket unit
+    # (throwaway user units, PR #153 round 5).
+    IN_USE = {
+        "enabled and running": ("loaded", "active"),
+        "disabled, file still present": ("loaded", "inactive"),
+        "file moved, no daemon-reload yet": ("loaded", "active"),
+        "file moved and reloaded, still running (stale)": ("not-found", "active"),
+        "masked": ("masked", "inactive"),
+        "failed": ("not-found", "failed"),
+    }
+
+    def test_rollback_refuses_while_the_socket_unit_is_present_or_running(self):
+        for name, (load, active) in self.IN_USE.items():
+            with self.subTest(name):
                 self.setUp()
                 self.installed_old_then_new()
-                self.runner.socket_codes[query] = 0
+                self.runner.socket_state.update(LoadState=load, ActiveState=active)
                 before, restarts = self.state(), len(self.restarts())
                 with self.assertRaises(install.ActivationBoundaryRefused) as refused:
                     self.perform(self.arguments("rollback"))
@@ -1178,14 +1191,15 @@ class ActivationBoundaryTests(unittest.TestCase):
                 self.assertEqual(self.state(), before)
                 self.assertEqual(len(self.restarts()), restarts)
                 message = str(refused.exception)
-                for phrase in ("before any change", "releases/1.0.0", "server-sentinel-upstream.socket is active",
+                for phrase in ("before any change", "releases/1.0.0",
+                               "server-sentinel-upstream.socket is installed or running",
                                "sudo systemctl disable --now server-sentinel-upstream.socket",
                                str(self.config), '"human_port"', "run the same command again: ... rollback"):
                     self.assertIn(phrase, message)
                 # The installer only queried the Owner's socket unit.
                 for arguments, _ in self.runner.calls:
                     if install.UPSTREAM_SOCKET_UNIT in arguments:
-                        self.assertIn(arguments[1], ("is-active", "is-enabled"))
+                        self.assertEqual(arguments[:3], ["systemctl", "show", "-p"])
 
     def test_rollback_refuses_a_privileged_port_the_old_launcher_cannot_bind(self):
         for start in (9000, None):
@@ -1202,24 +1216,29 @@ class ActivationBoundaryTests(unittest.TestCase):
 
     def test_rollback_proceeds_once_the_owner_steps_are_done(self):
         self.installed_old_then_new()
-        self.runner.socket_codes["is-active"] = 0
+        self.runner.socket_state.update(LoadState="loaded", ActiveState="active")
         with self.assertRaises(install.ActivationBoundaryRefused):
             self.perform(self.arguments("rollback"))
-        self.runner.socket_codes["is-active"] = 3  # Owner: disable --now the socket unit
+        # Owner: disable --now, only the stop done: still refused.
+        self.runner.socket_state.update(ActiveState="inactive")
+        with self.assertRaises(install.ActivationBoundaryRefused):
+            self.perform(self.arguments("rollback"))
+        # Owner: unit file parked and daemon-reload done.
+        self.runner.socket_state.update(LoadState="not-found")
         self.perform(self.arguments("rollback"))
         self.assertEqual(os.readlink(self.installation / "current"), "releases/1.0.0")
 
     def test_activation_releases_are_not_blocked(self):
         self.perform(self.arguments("install", "1.0.0"))
         self.perform(self.arguments("update", "1.1.0"))
-        self.runner.socket_codes.update({"is-active": 0, "is-enabled": 0})
+        self.runner.socket_state.update(LoadState="loaded", ActiveState="active")
         self.port_start.return_value = 9000
         self.perform(self.arguments("rollback"))
         self.assertEqual(os.readlink(self.installation / "current"), "releases/1.0.0")
 
     def test_update_to_a_pre_activation_release_is_refused_and_unstaged(self):
         self.perform(self.arguments("install", "1.0.0"))
-        self.runner.socket_codes["is-active"] = 0
+        self.runner.socket_state.update(LoadState="loaded", ActiveState="active")
         before = (os.readlink(self.installation / "current"), self.unit.read_text())
         with patch("install._supports_socket_activation", return_value=False), \
                 self.assertRaises(install.ActivationBoundaryRefused) as refused:
@@ -1245,7 +1264,7 @@ class ActivationBoundaryTests(unittest.TestCase):
     def test_activation_legacy_activation_cycle_renders_the_matching_unit(self):
         self.perform(self.arguments("install", "1.0.0"))
         self.assertTrue(self.unit_names_socket())
-        # Owner steps done (socket unit masked: inactive, not enabled; an
+        # Owner steps done (socket unit file parked: not-found, inactive; an
         # unprivileged human_port), then forward to a release without the capability.
         with self.legacy("1.1.0"):
             self.perform(self.arguments("update", "1.1.0"))
@@ -1272,11 +1291,15 @@ class ActivationBoundaryTests(unittest.TestCase):
             self.perform(self.arguments("rollback"))
         self.assertEqual(self.state(), before)
 
-    def test_unknown_socket_state_counts_as_in_use(self):
-        self.installed_old_then_new()
-        self.runner.socket_codes["is-active"] = 5
-        with self.assertRaises(install.ActivationBoundaryRefused):
-            self.perform(self.arguments("rollback"))
+    def test_unclear_socket_state_counts_as_in_use(self):
+        for prop, value in (("LoadState", (1, "")), ("LoadState", (0, None)), ("ActiveState", "")
+                            , ("LoadState", "bad-setting"), ("ActiveState", "activating")):
+            with self.subTest(prop=prop, value=value):
+                self.setUp()
+                self.installed_old_then_new()
+                self.runner.socket_state[prop] = value
+                with self.assertRaises(install.ActivationBoundaryRefused):
+                    self.perform(self.arguments("rollback"))
 
     def test_failed_socket_query_counts_as_in_use_with_the_owner_steps(self):
         # PR #153 review: a query that times out or cannot run is unknown, so
@@ -1286,16 +1309,16 @@ class ActivationBoundaryTests(unittest.TestCase):
                     "os error": PermissionError("synthetic"),
                     "subprocess error": subprocess.SubprocessError("synthetic")}
         for name, failure in failures.items():
-            for query in ("is-active", "is-enabled"):
-                with self.subTest(name=name, query=query):
+            for prop in ("LoadState", "ActiveState"):
+                with self.subTest(name=name, prop=prop):
                     self.setUp()
                     self.installed_old_then_new()
-                    self.runner.socket_codes[query] = failure
+                    self.runner.socket_state[prop] = failure
                     before = self.state()
                     with self.assertRaises(install.ActivationBoundaryRefused) as refused:
                         self.perform(self.arguments("rollback"))
                     self.assertEqual(self.state(), before)
-                    self.assertIn("server-sentinel-upstream.socket is active", str(refused.exception))
+                    self.assertIn("server-sentinel-upstream.socket is installed or running", str(refused.exception))
                     self.assertIn("sudo systemctl disable --now", str(refused.exception))
 
     def test_printed_steps_are_in_a_working_order(self):
@@ -1303,7 +1326,7 @@ class ActivationBoundaryTests(unittest.TestCase):
         # running service, so returning needs an explicit restart, and both
         # directions restore the Tailscale Serve target.
         self.installed_old_then_new()
-        self.runner.socket_codes["is-enabled"] = 0
+        self.runner.socket_state.update(LoadState="loaded")
         with self.assertRaises(install.ActivationBoundaryRefused) as refused:
             self.perform(self.arguments("rollback"))
         message = str(refused.exception)
@@ -1317,16 +1340,22 @@ class ActivationBoundaryTests(unittest.TestCase):
 
         ordered(switch, ['set "human_port" to the port that release used',
                          "sudo systemctl disable --now server-sentinel-upstream.socket",
-                         "sudo systemctl mask server-sentinel-upstream.socket",
+                         "sudo mv /etc/systemd/system/server-sentinel-upstream.socket /etc/server-sentinel/disabled/",
+                         "sudo systemctl daemon-reload",
                          "run the same command again: ... rollback",
                          "point the Tailscale Serve target at", "verify:"])
         ordered(back, ["update to a release that supports it",
                        'set "human_port" back to the ListenStream port',
-                       "sudo systemctl unmask server-sentinel-upstream.socket",
+                       "sudo mv /etc/server-sentinel/disabled/server-sentinel-upstream.socket"
+                       " /etc/systemd/system/server-sentinel-upstream.socket",
+                       "sudo systemctl daemon-reload",
                        "sudo systemctl enable --now server-sentinel-upstream.socket",
                        "sudo systemctl restart server-sentinel.service",
                        "point the Tailscale Serve target back at", "verify:"])
         self.assertNotIn("restart server-sentinel.service", switch)
+        # Round 5: mask fails for a unit file in /etc/systemd/system and a
+        # masked socket can still report active, so the steps never use it.
+        self.assertNotIn("mask", message)
 
     def test_capability_file_is_read_as_text_strictly(self):
         release = self.root / "release"
