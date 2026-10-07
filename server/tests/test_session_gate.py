@@ -18,13 +18,14 @@ from app.audit import AuditStore, OwnerAuditService
 from app.audit.integration import AccessAdministration, ReservationAdministration
 from app.audit.model import AuditAction, AuditOutcome
 from app.auth.model import AccessValidationError, Permission
-from app.auth.passkeys import CeremonyDenied, PasskeyCeremonies
+from app.auth import passkeys as passkeys_module
+from app.auth.passkeys import CeremonyDenied, DeviceBoundCredentialRequired, PasskeyCeremonies
 from app.auth.reservation import (
     DAILY_SECONDS, CheckKind, HumanAccessClosed, Reason,
 )
 from app.auth.reservation_store import ListenerExceptionStore, ReservationSessionRevocation
 from app.auth.session_binding import SessionBindingKey
-from app.auth.store import AccessStore
+from app.auth.store import AccessStore, StepUpRequired
 from app.auth.webauthn import RelyingParty
 from app.storage.database import Database
 from app.storage.migrations import migrate
@@ -422,6 +423,49 @@ class SessionCommitRaceTests(SessionGateFixture):
         subject.assert_not_called()
         mark.assert_not_called()
         self.assertEqual(self.challenges(), 1)
+
+    def test_device_bound_outcome_requires_an_unchanged_epoch(self):
+        # PR #174 review (Codex P2): the actionable DeviceBoundCredentialRequired
+        # is chosen only under the gate with the epoch unchanged; a cycle
+        # during verification yields the generic denial.
+        ceremonies = PasskeyCeremonies(self.access, RelyingParty(RP_ID, ORIGIN), session_gate=self.check,
+                                       clock=self.ceremony_clock, require_device_bound=True)
+        pending = self.access.invite("Synthetic pending", (Permission.LIVE_VIEW,))
+        self.access.issue_enrollment(pending.id, b"p" * 32, self.ceremony_clock() + timedelta(minutes=30))
+        identity = "pending@example.invalid"
+
+        def attempt():
+            response = SyntheticAuthenticator(backup_eligible=True).register(
+                ceremonies.begin_registration(b"p" * 32, identity))
+            return lambda: ceremonies.finish_registration(b"p" * 32, identity, response)
+
+        # Positive control: unpaused, the distinct outcome is returned.
+        with self.assertRaises(DeviceBoundCredentialRequired):
+            attempt()()
+        # Without an exposure first: the exposure's revocation voids the invitation.
+        for exposure in (False, True):
+            with self.subTest(exposure=exposure):
+                call = attempt()
+                box = self.paused_during(passkeys_module.webauthn, "verify_registration", call, exposure=exposure)
+                self.assertIs(type(box.get("error")), CeremonyDenied)
+
+    def test_step_up_required_outcome_requires_an_unchanged_epoch(self):
+        grant = self.owner_session()
+        self.ceremony_clock.advance(minutes=10)
+        # Positive control: a stale Owner session gets the distinct outcome.
+        with self.assertRaises(StepUpRequired):
+            self.ceremonies.authorize_owner_operation(grant.token, "owner@example.invalid")
+        box = self.paused_during(
+            self.access, "authorize_owner",
+            lambda: self.ceremonies.authorize_owner_operation(grant.token, "owner@example.invalid"),
+            exposure=False)
+        self.assertIs(type(box.get("error")), CeremonyDenied)
+        # And while closed it is refused at once, without touching the store.
+        self.check._resolver.answer = OSError("synthetic resolver failure")
+        self.assertFalse(self.check._check(CheckKind.RETRY).open)
+        with patch.object(self.access, "authorize_owner") as authorize, self.assertRaises(CeremonyDenied):
+            self.ceremonies.authorize_owner_operation(grant.token, "owner@example.invalid")
+        authorize.assert_not_called()
 
     def test_challenge_issued_before_a_revocation_cannot_be_used_after_it(self):
         # An assertion over a challenge issued before an exposure (for example

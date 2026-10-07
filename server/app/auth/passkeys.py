@@ -28,7 +28,9 @@ Invariants enforced here:
   authenticated Owner session that must re-verify) and
   ``DeviceBoundCredentialRequired`` (a holder of a valid invitation whose
   verified authenticator is backup eligible in a deployment that requires
-  device-bound credentials).
+  device-bound credentials). Each is returned only after the session gate
+  shows access open and unchanged since the request started; otherwise the
+  generic denial (PR #174 review).
 
 Every ``finish_*`` step that redeems an invitation, establishes a session or
 updates a session's user-verification time first takes
@@ -239,15 +241,21 @@ class PasskeyCeremonies:
                                                     allowed_algorithms=self.allowed_algorithms)
         except Exception:
             raise CeremonyDenied() from None
-        if self.require_device_bound and verified.backup_eligible:
-            raise DeviceBoundCredentialRequired()
         try:
             with self.session_gate.admit(epoch):
+                # The distinct, actionable outcome is chosen only under the
+                # gate with the epoch unchanged (PR #174 review): a close, or
+                # a close/revoke/reopen cycle, during verification yields the
+                # generic denial instead.
+                if self.require_device_bound and verified.backup_eligible:
+                    raise DeviceBoundCredentialRequired()
                 return self.store.enroll_credential(
                     enrollment_secret, proxy_identity, verified.credential_id, verified.public_key,
                     verified.algorithm, verified.sign_count, now=at,
                     backup_eligible=verified.backup_eligible, backup_state=verified.backup_state,
                     label=label, invitation_id=consumed.invitation_id)
+        except DeviceBoundCredentialRequired:
+            raise
         except Exception:
             raise CeremonyDenied() from None
 
@@ -334,11 +342,24 @@ class PasskeyCeremonies:
     # --- Owner step-up (AUTH-008) ---
 
     def authorize_owner_operation(self, token: bytes, proxy_identity: str) -> Principal:
-        """Generic denial, ``StepUpRequired`` for a stale Owner session, or the Owner."""
+        """Generic denial, ``StepUpRequired`` for a stale Owner session, or the Owner.
+
+        Refused at once while access is closed. ``StepUpRequired`` is returned
+        only when access stayed open since the request started (the gate epoch
+        is unchanged, checked under the gate); otherwise the generic denial.
+        """
         try:
+            epoch = self.session_gate.epoch()
+            if epoch is None:
+                raise CeremonyDenied()
             return self.store.authorize_owner(token, proxy_identity, now=self._now())
-        except StepUpRequired:
-            raise
+        except StepUpRequired as stale:
+            try:
+                with self.session_gate.admit(epoch):
+                    pass
+            except Exception:
+                raise CeremonyDenied() from None
+            raise stale
         except Exception:
             raise CeremonyDenied() from None
 
