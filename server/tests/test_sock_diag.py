@@ -8,7 +8,6 @@ sock_diag or a cgroup v2 hierarchy is unavailable, for example in a sandbox).
 
 import errno
 import os
-import shutil
 from pathlib import Path
 import socket
 import struct
@@ -344,8 +343,6 @@ class FakeDiag:
 class OwnersFixture(TestCase):
     UID = 991
     PID = 500
-    BACKEND_EXE = "/usr/bin/python3.12"
-    OTHER_EXE = "/usr/bin/synthetic-other"
 
     def setUp(self):
         self.temporary = TemporaryDirectory()
@@ -359,7 +356,6 @@ class OwnersFixture(TestCase):
         self.self_dir = base / "self"
         self.self_dir.mkdir()
         (self.self_dir / "cgroup").write_text("0::/system.slice/server-sentinel.service\n")
-        (self.self_dir / "exe").symlink_to(self.BACKEND_EXE)
         self.own = self.cgroup("system.slice/server-sentinel.service", [self.PID])
         self.upstream = self.cgroup("system.slice/server-sentinel-upstream.socket", [])
         self.ssh = self.cgroup("system.slice/ssh.socket", [])
@@ -370,21 +366,13 @@ class OwnersFixture(TestCase):
         (path / "cgroup.procs").write_text("".join(f"{pid}\n" for pid in pids))
         return path.stat().st_ino
 
-    def process(self, pid, fds, start=1000, exe=OTHER_EXE):
+    def process(self, pid, fds, start=1000):
         directory = self.proc / str(pid) / "fd"
         directory.mkdir(parents=True)
         for number, target in enumerate(fds):
             (directory / str(number)).symlink_to(target)
         self.stat(pid, start)
-        if exe is not None:
-            self.exe(pid, exe)
         return directory
-
-    def exe(self, pid, target):
-        link = self.proc / str(pid) / "exe"
-        if link.is_symlink():
-            link.unlink()
-        link.symlink_to(target)
 
     def stat(self, pid, start):
         # A comm with spaces and ")" checks the parser takes the last ")".
@@ -481,33 +469,57 @@ class SoleHolderTests(OwnersFixture):
 
         resolver = self.owners([], sleep=child_execs)
         self.assertEqual(resolver.held_only_by_requester(frozenset({77, 78})), {78: True})
-        self.assertEqual(delays, [0.1])
+        self.assertEqual(delays, [0.1, 0.1])
 
-    def test_slow_child_not_yet_execed_is_unverified_not_shared(self):
+    def test_slow_child_that_execs_before_the_third_scan_is_unverified_not_shared(self):
         # Issue #160: on a loaded host a child may stay between fork and exec
-        # for longer than the gap between the scans. It still runs the
-        # backend's own executable, so it never confirms sharing.
-        self.process(501, ["socket:[77]"], exe=self.BACKEND_EXE)
+        # for longer than one gap. Seen in the first two scans but gone by the
+        # third, it is unverified (closed without revocation), never shared.
+        directory = self.process(501, ["socket:[77]"])
         self.cgroup("system.slice/server-sentinel.service", [self.PID, 501])
-        self.assertEqual(self.owners([]).held_only_by_requester(frozenset({77, 78})), {78: True})
+        delays = []
 
-    def test_child_that_execs_and_keeps_the_descriptor_is_shared(self):
-        # Seen before exec in the first scan and still holding it after exec
-        # (no close-on-exec) in the second: the same process shares it.
-        self.process(501, ["socket:[77]"], exe=self.BACKEND_EXE)
-        self.cgroup("system.slice/server-sentinel.service", [self.PID, 501])
-        resolver = self.owners([], sleep=lambda seconds: self.exe(501, self.OTHER_EXE))
-        self.assertEqual(resolver.held_only_by_requester(frozenset({77})), {77: False})
+        def child_execs_late(seconds):
+            delays.append(seconds)
+            if len(delays) == 2:
+                for link in directory.iterdir():
+                    link.unlink()  # exec closed the close-on-exec descriptor
 
-    def test_unreadable_executable_never_confirms_sharing(self):
-        self.process(501, ["socket:[77]"], exe=None)
+        resolver = self.owners([], sleep=child_execs_late)
+        self.assertEqual(resolver.held_only_by_requester(frozenset({77, 78})), {78: True})
+        self.assertEqual(delays, [0.1, 0.1])
+
+    def test_holder_in_every_scan_is_shared_whatever_it_runs(self):
+        # ADR-0003: the same process (pid and start time) holding the upstream
+        # in every scan shares it, also a fork child that never execs and so
+        # still runs the backend's own executable.
+        directory = self.process(501, ["socket:[77]"])
+        (directory.parent / "exe").symlink_to(os.readlink("/proc/self/exe"))
         self.cgroup("system.slice/server-sentinel.service", [self.PID, 501])
-        self.assertEqual(self.owners([]).held_only_by_requester(frozenset({77})), {})
-        # This process's own executable unreadable: nothing can be compared.
-        self.process(502, ["socket:[78]"])
-        self.cgroup("system.slice/server-sentinel.service", [self.PID, 501, 502])
-        (self.self_dir / "exe").unlink()
-        self.assertEqual(self.owners([]).held_only_by_requester(frozenset({78})), {})
+        (self.self_dir / "exe").symlink_to(os.readlink("/proc/self/exe"))
+        self.assertEqual(self.owners([]).held_only_by_requester(frozenset({77})), {77: False})
+        # Neither does an unreadable executable keep it from being shared.
+        (directory.parent / "exe").unlink()
+        self.assertEqual(self.owners([]).held_only_by_requester(frozenset({77})), {77: False})
+
+    def test_unreadable_in_every_scan_raises_but_readable_in_the_last_does_not(self):
+        directory = self.process(501, ["socket:[78]"])
+        self.cgroup("system.slice/server-sentinel.service", [self.PID, 501])
+        directory.chmod(0)
+        self.addCleanup(directory.chmod, 0o755)
+        if os.access(directory, os.R_OK):
+            self.skipTest("running with privilege that bypasses directory permissions")
+        with self.assertRaises(ReservationEnumerationError):
+            self.owners([]).held_only_by_requester(frozenset({77}))
+        delays = []
+
+        def readable_in_the_third(seconds):
+            delays.append(seconds)
+            if len(delays) == 2:
+                directory.chmod(0o755)
+
+        resolver = self.owners([], sleep=readable_in_the_third)
+        self.assertEqual(resolver.held_only_by_requester(frozenset({77})), {77: True})
 
     def test_holder_replaced_by_a_new_process_with_the_same_pid_is_unverified(self):
         self.process(501, ["socket:[77]"], start=1000)
@@ -526,7 +538,9 @@ class SoleHolderTests(OwnersFixture):
         self.process(501, ["socket:[78]"])  # forces the second scan
 
         def forks(seconds):
-            os.symlink("socket:[77]", self.proc / "501" / "fd" / "9")
+            link = self.proc / "501" / "fd" / "9"
+            if not link.is_symlink():
+                os.symlink("socket:[77]", link)
 
         self.assertEqual(self.owners([], sleep=forks).held_only_by_requester(frozenset({77, 78})), {78: False})
 
@@ -645,13 +659,8 @@ class HostIntegrationTests(TestCase):
             self.skipTest("another process in this cgroup cannot be read here")
         if not alone[inode]:
             self.skipTest("another process in this cgroup already shares the socket")
-        cat = shutil.which("cat")
-        if cat is None or os.path.realpath(cat) == os.path.realpath(sys.executable):
-            self.skipTest("no executable other than this interpreter to run as the child")
-        # Issue #160: sharing is confirmed only for a holder that has exec'd
-        # an executable other than this process's own.
-        child = subprocess.Popen([cat], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
-                                 pass_fds=(listener.fileno(),))
+        child = subprocess.Popen([sys.executable, "-c", "import sys; sys.stdin.read()"],
+                                 stdin=subprocess.PIPE, pass_fds=(listener.fileno(),))
         self.addCleanup(child.wait)
         self.addCleanup(child.stdin.close)
         try:
@@ -659,9 +668,9 @@ class HostIntegrationTests(TestCase):
         except ReservationEnumerationError:
             self.skipTest("another process in this cgroup cannot be read here")
 
-    def test_forked_child_that_has_not_execed_is_never_reported_as_sharing(self):
-        # Issue #160: a child that stays between fork and exec for longer than
-        # the gap between the two scans still holds every descriptor.
+    def test_forked_child_that_keeps_the_descriptor_without_exec_is_sharing(self):
+        # Issue #160 / ADR-0003: a fork child that never execs and keeps the
+        # descriptor through every scan shares the socket, whatever it runs.
         listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.addCleanup(listener.close)
         listener.bind(("127.0.0.1", 0))
@@ -683,7 +692,7 @@ class HostIntegrationTests(TestCase):
             answer = resolver.held_only_by_requester(frozenset({inode}))
         except ReservationEnumerationError:
             self.skipTest("another process in this cgroup cannot be read here")
-        self.assertNotEqual(answer.get(inode), False)
+        self.assertEqual(answer.get(inode), False)
 
     def test_fork_exec_children_are_never_reported_as_sharing(self):
         # PR #153 review B1: children spawned with close_fds=True (as the

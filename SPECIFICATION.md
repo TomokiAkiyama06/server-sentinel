@@ -1457,9 +1457,8 @@ lookup that is unavailable, times out or fails its self-check, a socket in
 `/proc/net` but not in the dump, a creating cgroup that cannot be resolved —
 deleted, the root cgroup or `/init.scope` — while the socket's uid is one of the
 expected identities' uids, `/init.scope` with uid 0, a mismatch the second dump
-does not confirm, another upstream holder seen in only one of two scans of the
-same check or still running the backend's own executable (`/proc/<pid>/exe`;
-a child between `fork` and `exec`, Issue #160), a kernel-owned socket (inode 0), an upstream port at or above `ip_unprivileged_port_start`, or an
+does not confirm, another upstream holder not seen in all three scans of the
+same check (about 100 ms apart; a child between `fork` and `exec`, Issue #160), a kernel-owned socket (inode 0), an upstream port at or above `ip_unprivileged_port_start`, or an
 unreadable own or unit descriptor table) is not an exposure reason: it keeps
 access closed without revocation and access reopens once ownership verifies
 again (Owner decisions, 2026-10-05 and 2026-10-07, superseding the 2026-10-01

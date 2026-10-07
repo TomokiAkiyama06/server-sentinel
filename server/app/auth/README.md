@@ -327,13 +327,15 @@ WireGuard UDP socket) has no creator to look up and stays unverified, so
 human access stays closed while one is on a covered port even with an
 exception. For the human upstream, another unit process holding the socket is
 an exposure only when the same process (pid and start time) still holds it in
-a second scan about 100 ms later and, in that scan, runs an executable
-(`/proc/<pid>/exe`) other than the backend's own (Issue #160): a child between
-`fork` and `exec` (for example a `subprocess` with `close_fds=True`) holds
-every descriptor, because close-on-exec acts only at `exec`, and on a loaded
-host it can stay there longer than the gap between the scans. Seen once only,
-a holder still running the backend's executable or whose executable cannot be
-read, or a process that is unreadable in one scan, is unverified. Unverified closes access
+a second scan about 100 ms later and again in a third scan about 100 ms
+after that (Issue #160): a child between `fork` and `exec` (for example a
+`subprocess` with `close_fds=True`) holds every descriptor, because
+close-on-exec acts only at `exec`, and on a loaded host it can stay there
+longer than one gap, so the third scan gives it a second gap. The executable
+the holder runs does not matter: a process that keeps the descriptor through
+all three scans (also a `fork` child that never execs) is an exposure. Not
+seen in all three scans, or a process that is unreadable in a scan, is
+unverified. Unverified closes access
 without revocation and reopens once the creator verifies again (Owner
 decisions, 2026-10-05 and 2026-10-07). The resolver is mandatory: without
 `socket_owners` access never opens.

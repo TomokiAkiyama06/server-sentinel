@@ -1898,8 +1898,9 @@ by the Issue #6 synthetic policy model.
   10. Slow `exec` (Issue #160, mock and same-host loopback only so far): on a
       disposable node under heavy load, confirm that children the backend
       spawns never produce `UNEXPECTED_LISTENER` for the upstream; a child
-      that has not yet exec'd stays unverified (closed without revocation)
-      until the next check.
+      that has exec'd by the third scan (about 200 ms) stays unverified
+      (closed without revocation) until the next check. Record any
+      `UNEXPECTED_LISTENER` from a child that took longer, for the Owner.
 - Kernel forwarding (not covered by the check): on the Main Server, run
   `sudo nft list ruleset` and `sudo iptables-save -t nat` (and `-t mangle`),
   and confirm no DNAT, REDIRECT or TPROXY rule targets the reserved addresses

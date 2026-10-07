@@ -26,8 +26,8 @@ a same-uid descriptor scan of the ServerSentinel unit's own processes
 (``held_only_by_requester``) for the inheritance case it can see.
 
 This module only reads: it sends dump requests, ``stat``s and lists
-``/sys/fs/cgroup``, reads ``cgroup.procs`` and the ``/proc/<pid>/fd`` and
-``/proc/<pid>/exe`` links of processes in the ServerSentinel unit's cgroups. It needs no capability, no
+``/sys/fs/cgroup``, reads ``cgroup.procs`` and ``/proc/<pid>/fd`` links of
+processes in the ServerSentinel unit's cgroups. It needs no capability, no
 helper process and no root. Every failure raises, and the reservation check
 turns any failure into ``LISTENER_OWNER_UNVERIFIED`` (closed, no revocation).
 """
@@ -87,11 +87,13 @@ DUMP_TIMEOUT_SECONDS = 5.0
 MAX_CGROUPS = 65_536
 MAX_CGROUP_PROCS_BYTES = 1_048_576
 MAX_SCANNED_PROCESSES = 4096
-# Gap between the two holder scans of one check. A child between fork and
-# exec still has every descriptor (close-on-exec closes them only at exec);
-# it is usually gone or past exec well within this. One that is not (a loaded
-# host) still runs the backend's executable, which never confirms sharing.
+# Gap between consecutive holder scans of one check, and the number of scans
+# another holder must appear in. A child between fork and exec still has every
+# descriptor (close-on-exec closes them only at exec); it is usually gone or
+# past exec well within one gap, and a third scan gives a loaded host another
+# gap before a holder is confirmed (Issue #160).
 HOLDER_CONFIRM_SECONDS = 0.1
+HOLDER_CONFIRM_SCANS = 3
 CGROUP_ROOT = "/sys/fs/cgroup"
 
 
@@ -386,49 +388,48 @@ class SockDiagOwners:
         """``True`` when no other unit process holds the inode; ``False`` only when confirmed.
 
         Another holder counts only when the same process (pid and start time)
-        still holds the inode in a second scan ``confirm_seconds`` later and,
-        in that second scan, runs an executable other than this process's own
-        (``/proc/<pid>/exe``; Issue #160). A child between ``fork`` and
-        ``exec`` briefly shows every descriptor of the backend (close-on-exec
-        acts only at exec), possibly for longer than ``confirm_seconds`` on a
-        loaded host, and still runs the backend's executable until it execs;
-        its descriptors can also be briefly unreadable while it execs. So a
-        holder that is gone, changed, not yet exec'd or whose executable
-        cannot be read, or an unreadable process that is gone or changed by
-        then, leaves the inode out (unverified), never shared. A process whose
-        descriptors stay unreadable in both scans raises.
+        still holds the inode in every one of ``HOLDER_CONFIRM_SCANS`` scans
+        ``confirm_seconds`` apart (Issue #160: three scans, so a child that is
+        slow to exec on a loaded host gets two gaps, not one). A child between
+        ``fork`` and ``exec`` briefly shows every descriptor of the backend
+        (close-on-exec acts only at exec), and its descriptors can be briefly
+        unreadable while it execs, so a holder or an unreadable process that is
+        gone or changed in any later scan leaves the inode out (unverified),
+        never shared. A process whose descriptors stay unreadable in every scan
+        raises. Whatever executable the holder runs does not matter: a process
+        that keeps the descriptor through every scan shares the socket.
         """
         first, first_unreadable = self._holders(inodes)
         if not any(first.values()) and not first_unreadable:
             return {inode: True for inode in inodes}
-        self._sleep(self._confirm_seconds)
-        second, second_unreadable = self._holders(inodes)
-        if first_unreadable & second_unreadable:
+        confirmed = {inode: set(first[inode]) for inode in inodes}
+        seen = {inode: bool(first[inode]) for inode in inodes}
+        unreadable = set(first_unreadable)
+        last_unreadable = first_unreadable
+        for _ in range(HOLDER_CONFIRM_SCANS - 1):
+            self._sleep(self._confirm_seconds)
+            holders, last_unreadable = self._holders(inodes)
+            unreadable &= last_unreadable
+            for inode in inodes:
+                confirmed[inode] &= holders[inode]
+                seen[inode] = seen[inode] or bool(holders[inode])
+        if unreadable:
             raise ReservationEnumerationError("SOCKET_HOLDERS_UNREADABLE")
-        own_exe = self._executable(self._proc_self)
         result = {}
         for inode in inodes:
-            # A start time or executable that could not be read never confirms
-            # a holder, and neither does one still running this executable.
-            if own_exe is not None and any(
-                    start is not None and exe is not None and exe != own_exe
-                    for (pid, start), exe in second[inode].items()
-                    if (pid, start) in first[inode]):
+            # A start time that could not be read never confirms a holder.
+            if any(start is not None for _, start in confirmed[inode]):
                 result[inode] = False
-            elif not first[inode] and not second[inode] and not second_unreadable:
+            elif not seen[inode] and not last_unreadable:
                 result[inode] = True
-            # else: seen once only, or not readable now: unverified (left out)
+            # else: not in every scan, or not readable now: unverified (left out)
         return result
 
     def _holders(self, inodes: frozenset) -> tuple[dict, set]:
-        """Each inode's other holders and the unreadable processes, as ``(pid, start time)``.
-
-        Holders map each ``(pid, start time)`` to its executable (``None``
-        when unreadable).
-        """
+        """Each inode's other holders and the unreadable processes, as ``(pid, start time)``."""
         wanted = {f"socket:[{inode}]": inode for inode in inodes}
         me = self._getpid()
-        holders: dict[int, dict] = {inode: {} for inode in inodes}
+        holders: dict[int, set] = {inode: set() for inode in inodes}
         unreadable: set = set()
         for pid in self._unit_processes():
             if pid == me:
@@ -454,18 +455,9 @@ class SockDiagOwners:
                     held.add(wanted[target])
             if held:
                 identity = (pid, self._start_time(pid))
-                exe = self._executable(os.path.join(self._proc, str(pid)))
                 for inode in held:
-                    holders[inode][identity] = exe
+                    holders[inode].add(identity)
         return holders, unreadable
-
-    @staticmethod
-    def _executable(process: str) -> str | None:
-        """The ``exe`` link target of a ``/proc/<pid>`` directory, or None when unreadable."""
-        try:
-            return os.readlink(os.path.join(process, "exe"))
-        except OSError:
-            return None
 
     def _start_time(self, pid: int):
         """The process start time (``/proc/<pid>/stat`` field 22), or None when unreadable."""
