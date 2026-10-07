@@ -1965,5 +1965,94 @@ class ContinuityTrackerTests(unittest.TestCase):
         result = tracker.receive(session, unit(0, epoch=3, at=100), b"v")
         self.assertEqual([GapReason.CAPTURE_RESTART], [g.reason for g in result.gaps])
 
+    def _resolve_after_outage(self, mark, attempts, retry):
+        """Refuse ``attempts`` while SOURCE's watermark is unavailable, then
+        retry ``retry`` once the lookup resolves to ``mark``."""
+        state = {"broken": True}
+
+        def lookup(source_id):
+            if source_id != SOURCE:
+                return None
+            if state["broken"]:
+                raise OSError("durable store unavailable")
+            return mark
+        tracker, ingest, authorizer, session = self._shared_refusing_tracker(
+            watermark=lookup, released=1)
+        for header in attempts:
+            self.assertEqual("watermark_unavailable",
+                             tracker.receive(session, header, b"v").reason)
+        state["broken"] = False
+        result = tracker.receive(session, retry, b"v")
+        return tracker, ingest, authorizer, session, result
+
+    def test_watermark_covering_the_retry_drops_the_attempted_baseline(self):
+        # Issue #146: the watermark resolved on a retry already covers every
+        # attempted unit, so their capture times are superseded by the
+        # durable mark.  Churning the source must not occupy the bounded
+        # released table and evict a genuinely unpersisted source.
+        cases = {
+            # The durable mark is exactly the refused unit.
+            "same_unit": (CommittedWatermark(NODE, 1, 5, 50), (unit(5, at=50),)),
+            # The durable mark is past the refused unit with an earlier
+            # capture time (a regression the earlier process already saw).
+            "past_unit_earlier_time": (CommittedWatermark(NODE, 1, 6, 40),
+                                       (unit(5, at=50),)),
+            # An uncovered attempt that is no later than the mark's time adds
+            # nothing to the regression baseline.
+            "uncovered_but_earlier": (CommittedWatermark(NODE, 1, 6, 90),
+                                      (unit(5, at=50), unit(7, at=70))),
+        }
+        for name, (mark, attempts) in cases.items():
+            with self.subTest(case=name):
+                tracker, ingest, authorizer, session, result = \
+                    self._resolve_after_outage(mark, attempts, attempts[0])
+                self.assertEqual((DeliveryOutcome.DUPLICATE, "already_committed"),
+                                 (result.outcome, result.reason))
+                self.assertEqual(DeliveryOutcome.ACCEPTED, tracker.receive(
+                    session, unit(0, source=OTHER_SOURCE), b"o").outcome)
+                ingest.drain(10)
+                self._cycle(tracker, authorizer, OTHER_SOURCE)
+                for _ in range(3):
+                    self.assertEqual((), self._cycle(tracker, authorizer, SOURCE))
+                    self.assertEqual(DeliveryOutcome.DUPLICATE,
+                                     tracker.receive(session, attempts[0], b"v").outcome)
+                # OTHER_SOURCE's unpersisted continuity survived the churn.
+                retry = tracker.receive(session, unit(0, source=OTHER_SOURCE), b"o")
+                self.assertEqual(DeliveryOutcome.DUPLICATE, retry.outcome)
+                self.assertEqual(0, ingest.snapshot().queued_messages)
+
+    def test_dropped_attempted_baseline_reports_no_spurious_regression(self):
+        # Unit 5 (time 50) was refused; the durable mark is unit 6 at time
+        # 40.  Unit 7 at time 45 is later than the committed unit before it,
+        # so it is not a capture clock regression.
+        tracker, ingest, _, session, result = self._resolve_after_outage(
+            CommittedWatermark(NODE, 1, 6, 40), (unit(5, at=50),), unit(5, at=50))
+        self.assertEqual(DeliveryOutcome.DUPLICATE, result.outcome)
+        follow = tracker.receive(session, unit(7, at=45), b"v")
+        self.assertEqual((DeliveryOutcome.ACCEPTED, ()), (follow.outcome, follow.gaps))
+
+    def test_uncovered_later_attempt_still_reports_clock_regression(self):
+        # Issue #146 must not hide a genuine regression: unit 7 (time 70) was
+        # refused and the durable mark (unit 6, time 60) does not cover it,
+        # so unit 8 at time 65 regresses behind an observed capture time.
+        tracker, ingest, authorizer, session, result = self._resolve_after_outage(
+            CommittedWatermark(NODE, 1, 6, 60), (unit(5, at=50), unit(7, at=70)),
+            unit(5, at=50))
+        self.assertEqual(DeliveryOutcome.DUPLICATE, result.outcome)
+        follow = tracker.receive(session, unit(8, at=65), b"v")
+        self.assertEqual(DeliveryOutcome.ACCEPTED, follow.outcome)
+        self.assertEqual([(GapReason.SEQUENCE_SKIP, 6, 8, 1),
+                          (GapReason.CAPTURE_CLOCK_REGRESSION, 6, 8, 0)],
+                         [(g.reason, g.after_sequence, g.before_sequence, g.missing_units)
+                          for g in follow.gaps])
+        # Kept across a release too: the attempt is not durably covered.
+        tracker, ingest, authorizer, session, result = self._resolve_after_outage(
+            CommittedWatermark(NODE, 1, 6, 60), (unit(5, at=50), unit(7, at=70)),
+            unit(5, at=50))
+        self._cycle(tracker, authorizer, SOURCE)
+        follow = tracker.receive(session, unit(7, at=65), b"v")
+        self.assertEqual([GapReason.CAPTURE_CLOCK_REGRESSION],
+                         [g.reason for g in follow.gaps])
+
 if __name__ == "__main__":
     unittest.main()
