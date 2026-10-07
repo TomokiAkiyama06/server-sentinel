@@ -261,6 +261,25 @@ class EnrollClientTests(EnrollFixture):
             with patch("sys.stderr", io.StringIO()):
                 enroll.main(arguments + ["--bundle-sha256", "0" * 64, "--code", CODE])
 
+    def test_cli_refuses_a_tailscale_endpoint_override_without_network(self):
+        # Issue #150: ``--endpoint`` cannot redirect pairing onto Tailscale.
+        peer = self.peer()
+        content = self.authority.bundle(port=peer.port)
+        bundle = self.root / "bundle.json"
+        bundle.write_bytes(content)
+        digest = TrustBundle.parse(content).sha256
+        for endpoint in ("100.64.0.1:7443", "[fd7a:115c:a1e0::1]:7443"):
+            stderr = io.StringIO()
+            with self.subTest(endpoint=endpoint), patch("sys.stderr", stderr), \
+                    patch.object(enroll.os, "geteuid", return_value=1000):
+                self.assertEqual(1, enroll.main([
+                    "pair", "--runtime-root", str(self.runtime), "--trust-bundle", str(bundle),
+                    "--bundle-sha256", digest, "--endpoint", endpoint]))
+                self.assertIn("refused: main_endpoint_tailscale_address_refused",
+                              stderr.getvalue())
+        self.assertEqual(0, peer.connections)
+        self.assertFalse(NodeCredentialStore(self.runtime).installed())
+
 
 def issuing(authority, node, *, lifetime=400 * DAY):
     """A synthetic Main response issuing ``node`` a certificate for the request's key."""

@@ -39,6 +39,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import ExtendedKeyUsageOID
 
+from .addresses import is_tailscale_host
 from .pairing import EnrollmentLock, NodeCredentialMaterial, NodeCredentialStore, PairingRefused
 from .storage import StorageRefused, open_directory
 
@@ -59,6 +60,9 @@ RENEWAL_OVERDUE = datetime.timedelta(days=14)
 RENEWAL_FIRST_RETRY = datetime.timedelta(hours=1)
 RENEWAL_MAX_RETRY = datetime.timedelta(hours=24)
 _PENDING_KEY = "node-key.pem"
+# Fixed refusal for a Main endpoint (literal, override or connected peer) in a
+# Tailscale range: enrollment and ingest are private-LAN only (Issue #150).
+TAILSCALE_ENDPOINT_REFUSED = "main_endpoint_tailscale_address_refused"
 _DNS_LABEL = re.compile(r"(?!-)[a-z0-9-]{1,63}(?<!-)")
 
 
@@ -91,6 +95,14 @@ def _valid_endpoint_host(value: object) -> bool:
     except ValueError:
         return _valid_server_name(value)
     return not (address.is_unspecified or address.is_multicast)
+
+
+def _is_ip_literal(value: str) -> bool:
+    try:
+        ipaddress.ip_address(value)
+    except ValueError:
+        return False
+    return True
 
 
 def _san_uris(certificate: x509.Certificate) -> list[str]:
@@ -144,6 +156,9 @@ class TrustBundle:
                 raise ValueError
         except (ValueError, TypeError, KeyError, AttributeError, UnicodeError, x509.ExtensionNotFound):
             raise PairingRefused("trust_bundle_rejected") from None
+        if is_tailscale_host(host):
+            # Enrollment and ingest are private-LAN only (Issue #150).
+            raise PairingRefused(TAILSCALE_ENDPOINT_REFUSED)
         return cls(deployment_id=deployment, ca_certificate_pem=ca_pem,
                    server_name=value["server_name"], endpoint_host=host,
                    endpoint_port=port, sha256=digest)
@@ -539,16 +554,37 @@ def connect_to_main(context: ssl.SSLContext, *, server_name: str, host: str, por
     blocking with no timeout, like the Main acceptor's admitted session, so a
     long backpressure or response wait does not tear the session down. Any
     session-level timeout belongs to the protocol layer above.
+
+    A Main endpoint in a Tailscale range (IPv4 ``100.64.0.0/10``, IPv6
+    ``fd7a:115c:a1e0::/48``) is refused with ``main_endpoint_tailscale_address_refused``:
+    an IP literal before connecting, and a DNS name by its connected peer
+    address before the TLS handshake (Issue #150).
     """
     if not isinstance(context, ssl.SSLContext) or not context.check_hostname:
         raise PairingRefused("client_tls_context_rejected")
     if (not _valid_server_name(server_name) or not _valid_endpoint_host(host)
             or type(port) is not int or not 1 <= port <= 65535):
         raise PairingRefused("main_endpoint_rejected")
+    if is_tailscale_host(host):
+        raise PairingRefused(TAILSCALE_ENDPOINT_REFUSED)
     try:
         raw = socket.create_connection((host, port), timeout=timeout_seconds)
     except OSError:
         raise PairingRefused("main_unreachable") from None
+    # A DNS name (or the bundle/--endpoint literal) must not have led to a
+    # Tailscale peer: checked on the connected address before any TLS byte.
+    # Fail closed: a peer address that cannot be read or classified is refused.
+    try:
+        peer = raw.getpeername()[0]
+    except (OSError, IndexError, TypeError):
+        raw.close()
+        raise PairingRefused("main_unreachable") from None
+    if not isinstance(peer, str) or not _is_ip_literal(peer):
+        raw.close()
+        raise PairingRefused("main_endpoint_rejected")
+    if is_tailscale_host(peer):
+        raw.close()
+        raise PairingRefused(TAILSCALE_ENDPOINT_REFUSED)
     try:
         connection = context.wrap_socket(raw, server_hostname=server_name)
     except ssl.SSLCertVerificationError:

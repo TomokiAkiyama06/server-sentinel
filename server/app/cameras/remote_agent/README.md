@@ -124,6 +124,14 @@ either spelling of an IPv4-mapped address (Issue #150). Capture enrollment and
 ingest are designed for the private LAN and do not need Tailscale on either
 host. `addresses.py` holds these ranges for both listeners; it classifies by
 address only, so another network that reuses those ranges is refused too.
+The same ranges are refused as a bundle endpoint (Owner decision 2026-10-07):
+`export-bundle --endpoint` with an IP literal in them refuses
+`trust_bundle_endpoint_tailscale_address_refused` and writes no bundle. A DNS
+name is not resolved on the Main; the Agent refuses
+`main_endpoint_tailscale_address_refused` for a Tailscale bundle endpoint,
+`pair --endpoint` override or connected peer address (its copy of the ranges
+lives in `agent/media_capture_agent/addresses.py`, kept equal by
+`tests/unit/test_tailscale_ranges_match.py`).
 
 `pairing_cli.py` (`python -m app.cameras.remote_agent.pairing_cli`) is the local
 Owner CLI: `init`, `rotate-listener`, `export-bundle`, `approve`, `list`,

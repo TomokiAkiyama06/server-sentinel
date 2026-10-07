@@ -422,7 +422,13 @@ code with the reviewed runtime installed. `AGENT_CLI` means
    `MAIN_CLI export-bundle --authority-dir <ca_dir> --listener-dir <listener_dir> --endpoint <ip>:<port> --output bundle.json`
    and note the printed full `trust_bundle_sha256`. Running it with another
    deployment's `--listener-dir` must refuse `listener_authority_mismatch`
-   and write no bundle.
+   and write no bundle. On a Main that runs Tailscale, confirm
+   `export-bundle --endpoint` with its Tailscale IPv4 and IPv6 address
+   (`--endpoint [<ipv6>]:<port>`) each refuses
+   `trust_bundle_endpoint_tailscale_address_refused` and writes no bundle.
+   The check is by address range only: a non-Tailscale private network that
+   uses `100.64.0.0/10` or `fd7a:115c:a1e0::/48` is refused the same way and
+   must use another private address for the Main.
 3. Copy `bundle.json` to the capture host over an Owner-trusted channel (for
    example removable media). Do not copy the digest over the same channel.
 4. On the capture host, as the dedicated non-root `media-capture-agent`
@@ -451,7 +457,13 @@ code with the reviewed runtime installed. `AGENT_CLI` means
    `AGENT_CLI pair` with a wrong `--bundle-sha256` (no connection is made);
    with `--endpoint` pointing at a host presenting a certificate from another CA
    or for another name; with `--endpoint` pointing at a plaintext service or at
-   the dashboard port.
+   the dashboard port; with `--endpoint` set to a Tailscale address
+   (`100.64.0.0/10` or `[fd7a:115c:a1e0::...]`), which refuses
+   `main_endpoint_tailscale_address_refused` with no connection. If a DNS name
+   that resolves to a Tailscale address is available on a disposable setup,
+   confirm `--endpoint <name>:<port>` refuses the same reason before any TLS
+   handshake (no Tailscale is needed on the capture host for the literal
+   checks).
 7. Run `AGENT_CLI pair --runtime-root <runtime_root> --trust-bundle bundle.json --bundle-sha256 <digest from step 2>`.
    At `Pairing code:` type the code from step 5 (the hyphen groups may be
    kept). Confirm the typed code is not echoed, the Agent prints

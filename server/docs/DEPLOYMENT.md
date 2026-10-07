@@ -401,6 +401,20 @@ switched to another file only for the moment of the open is refused too. `export
 refuse `listener_authority_mismatch` when the listener certificate was not
 issued by the selected CA directory.
 
+**Bootstrap endpoint and Tailscale (Issue #150).** Capture enrollment and
+ingest are private-LAN only and need no Tailscale on either host. The
+enrollment bind (`approve --listen`), the ingest listener and the
+`export-bundle --endpoint` value all refuse Tailscale addresses, IPv4
+`100.64.0.0/10` and IPv6 `fd7a:115c:a1e0::/48` (including IPv4-mapped
+spellings); the bundle export refuses
+`trust_bundle_endpoint_tailscale_address_refused` and writes no file. The
+Agent refuses `main_endpoint_tailscale_address_refused` for such a bundle
+endpoint, `pair --endpoint` override, or a DNS name that connects to such an
+address. The check is by address range only (Owner decision 2026-10-07): a
+LAN that is not Tailscale but uses these ranges (another CGNAT or a ULA that
+happens to match) is refused too, so give the Main another private address
+for capture traffic.
+
 **Rotating the Main listener certificate (Issue #125).** The listener leaf
 defaults to 397 days and is not renewed automatically. Rotate it before it
 expires, as the account (and with the privileges) used for `init`:

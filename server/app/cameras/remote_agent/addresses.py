@@ -7,7 +7,10 @@ space ``100.64.0.0/10`` (RFC 6598 CGNAT) and the IPv6 ULA prefix
 ``fd7a:115c:a1e0::/48``. The IPv6 prefix is a ULA, so ``is_private`` alone
 does not exclude it; it is matched explicitly here. MagicDNS
 (``100.100.100.100``, ``fd7a:115c:a1e0::53``) and 4via6 subnet-router
-addresses (``fd7a:115c:a1e0:b1a::/64``) fall inside these ranges.
+addresses (``fd7a:115c:a1e0:b1a::/64``) fall inside these ranges. The trust
+bundle export refuses the same ranges as the Agent's Main endpoint (Owner
+decision 2026-10-07); the Agent keeps an equal copy in
+``agent/media_capture_agent/addresses.py``.
 
 The ranges are classified by address only: this module does not ask the
 Tailscale daemon or inspect interfaces, so it also refuses an address from
