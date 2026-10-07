@@ -615,9 +615,19 @@ code with the reviewed runtime installed. `AGENT_CLI` means
    (`100.64.0.0/10` or `[fd7a:115c:a1e0::...]`), which refuses
    `main_endpoint_tailscale_address_refused` with no connection. If a DNS name
    that resolves to a Tailscale address is available on a disposable setup,
-   confirm `--endpoint <name>:<port>` refuses the same reason before any TLS
-   handshake (no Tailscale is needed on the capture host for the literal
-   checks).
+   confirm `--endpoint <name>:<port>` refuses the same reason after the TCP
+   connect and before any TLS handshake (no Tailscale is needed on the capture
+   host for the literal checks). Because the Agent settles on the first
+   resolved address that connects, any capture endpoint name used in step 7
+   must resolve only to the Main's LAN addresses; confirm with
+   `getent ahosts <name>` on the capture host that no `100.64.0.0/10` or
+   `fd7a:115c:a1e0::/48` address is returned. If a bundle exported earlier
+   with a Tailscale IP literal endpoint is still around, confirm it is refused
+   with `main_endpoint_tailscale_address_refused` even with a LAN `--endpoint`
+   override, and re-export it. A bundle whose stored endpoint is a DNS name
+   that resolves to a Tailscale address is accepted at parse time: without an
+   override, confirm it refuses the same reason after the TCP connect; with a
+   LAN `--endpoint` override it proceeds (re-export it anyway).
 7. Run `AGENT_CLI pair --runtime-root <runtime_root> --trust-bundle bundle.json --bundle-sha256 <digest from step 2>`.
    At `Pairing code:` type the code from step 5 (the hyphen groups may be
    kept). Confirm the typed code is not echoed, the Agent prints
