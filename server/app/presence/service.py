@@ -7,7 +7,6 @@ import fcntl
 import json
 import os
 import sqlite3
-import stat
 import threading
 import time
 from uuid import UUID, uuid4
@@ -55,12 +54,6 @@ COMMITTED_LOCK_POLL = 0.005
 # persistent in the file itself rather than per connection.
 SQLITE_MAGIC = b"SQLite format 3\x00"
 WAL_FORMAT = 2
-WAL_SIDECARS = ("-wal", "-shm")
-# SQLite's unix VFS grows the ``-shm`` wal-index in whole 32 KiB regions, and
-# region 0 always exists once any connection has initialised it. A smaller or
-# partial file is empty, truncated or mid-initialisation: opening the database
-# would initialise or resize it.
-SHM_REGION = 32 * 1024
 
 
 def _wal_database(path):
@@ -78,33 +71,6 @@ def _wal_database(path):
     if header is None:
         return False
     return len(header) == 20 and header[:16] == SQLITE_MAGIC and WAL_FORMAT in (header[18], header[19])
-
-
-def _sidecars_present(path):
-    """Whether both WAL sidecars already exist beside ``path`` in a usable shape.
-
-    Both must be regular files, and the ``-shm`` wal-index must already span
-    whole 32 KiB regions. An empty, truncated or partly extended ``-shm`` (an
-    interrupted sidecar creation, or another opener's reset in progress) is
-    not trusted: SQLite would initialise or grow it even during a ``mode=ro``
-    open, so that read needs admission like a missing sidecar.
-
-    Only ``lstat`` is used. Opening and closing a sidecar here would release
-    every POSIX lock this process's own SQLite connections hold on it, so its
-    contents are never read. A full-sized wal-index left by a crashed process
-    may still be rebuilt by the read, but only in place: the unchanged WAL
-    needs no more regions than the file its writer already extended.
-    """
-    for suffix in WAL_SIDECARS:
-        try:
-            info = os.lstat(path.with_name(path.name + suffix))
-        except OSError:
-            return False
-        if not stat.S_ISREG(info.st_mode):
-            return False
-        if suffix == "-shm" and (info.st_size < SHM_REGION or info.st_size % SHM_REGION):
-            return False
-    return True
 
 
 # Outbox sessions that are live in this process, per database file. A status
@@ -200,23 +166,26 @@ class PresenceService:
         a replaced or unlinked file at the same path is refused instead of read.
 
         A read normally takes no storage reservation. A WAL database is the
-        exception: when its ``-wal``/``-shm`` sidecars are missing, SQLite
-        creates them even for a ``mode=ro`` connection whenever the directory
-        is writable, and a read-only connection can never remove them again.
-        That read therefore runs under the storage reservation, through a
-        no-create read-write connection with ``query_only`` set, so the
-        sidecars it creates are removed again when it closes as the last
-        connection. Sidecars that exist but cannot be trusted, such as an
-        empty or truncated ``-shm``, are treated the same way, since SQLite
-        would initialise or resize them. A refused or missing reservation fails the read instead of
-        writing outside it. ``immutable`` is never used: it would read a file
-        a live writer is changing as if nothing could change it.
+        exception: whenever its ``-wal``/``-shm`` sidecars are missing, empty
+        or truncated at the moment SQLite opens it, SQLite creates or resizes
+        them even for a ``mode=ro`` connection, and a read-only connection can
+        never remove them again. Sidecars seen present beforehand prove
+        nothing, since the last other connection can close and delete them
+        before this open. Every WAL read therefore runs under the storage
+        reservation, through a no-create read-write connection with
+        ``query_only`` set, so any sidecars it creates are removed again when
+        it closes as the last connection. A refused or missing reservation
+        fails the read instead of writing outside it. The application never
+        switches its database to WAL, so its rollback-journal reads, which
+        never create a file, keep working during a storage hard stop.
+        ``immutable`` is never used: it would read a file a live writer is
+        changing as if nothing could change it.
         """
         with ExitStack() as held:
             path = self.database.path
             if not path.is_absolute() or path.is_symlink():
                 raise ValueError("database location is unavailable")
-            admitted = _wal_database(path) and not _sidecars_present(path)
+            admitted = _wal_database(path)
             if admitted:
                 held.enter_context(self._admission())
             if isinstance(self.database, PinnedDatabase):

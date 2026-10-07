@@ -253,18 +253,22 @@ created and taken inside the same storage-admitted transaction as the session
 row, so a refused volume gains nothing from an outbox start. Status, history,
 audit and gap reads normally take no reservation and use a read-only SQLite
 open (`mode=ro`), so they never create a missing or replaced database. A WAL
-database is the exception: when its `-wal`/`-shm` sidecars are absent (the
-last connection removed them), SQLite creates them even for a `mode=ro`
-connection in a writable directory, and a read-only connection cannot remove
-them again. Such a read therefore runs under the storage reservation, with a
-no-create read-write connection set to `query_only`, so the sidecars are
-created inside the reservation and removed when it closes as the last
-connection; a refused or missing reservation fails the read rather than
-writing outside it. `immutable` is not used, because it would read a file a
-live writer changes as if it could not change. The sidecar check precedes the
-open, so a writer that removes the sidecars in between can still make a
-read-only open recreate them (a few KiB, removed again by the next write's
-close); a rollback-journal database never creates a file on read. A session row
+database is the exception: when its `-wal`/`-shm` sidecars are absent,
+empty or truncated at the moment SQLite opens it, SQLite creates or resizes
+them even for a `mode=ro` connection in a writable directory, and a read-only
+connection cannot remove them again. Sidecars seen present beforehand prove
+nothing, because the last other connection can close and delete them before
+the open. Every read of a WAL database therefore runs under the storage
+reservation, with a no-create read-write connection set to `query_only`, so
+any sidecars are created inside the reservation and removed when it closes as
+the last connection; a refused or missing reservation fails the read rather
+than writing outside it. `immutable` is not used, because it would read a file
+a live writer changes as if it could not change. The application never
+switches its database to WAL, and a rollback-journal database never creates a
+file on read, so those reads keep working during `STORAGE_HARD_STOP`. The WAL
+header probe reads through a descriptor held for the process lifetime
+(`app.storage.database`), never an `open`/`close` of the database file, which
+would release the POSIX locks of this process's own SQLite connections. A session row
 found once the lock is free therefore belongs to an outbox that is gone. Owner
 status reports such rows as part of `timeline_gap`
 (`timeline_gap_orphaned_sessions`) even before a replacement session opens, so

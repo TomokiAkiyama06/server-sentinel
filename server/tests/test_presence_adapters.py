@@ -32,8 +32,8 @@ from app.presence.adapters import (CriticalTimelineRecorder, EntranceObservation
 from app.presence.delivery import ActionResult
 from app.presence.models import InvalidObservation, Kind, Observation, PresenceState, Quality, Value, timestamp
 from app.presence.schema import CRITICAL_SOURCE_KINDS, STAGED_SOURCE_KINDS
-from app.presence.service import SHM_REGION, SOURCE_CLOCK, SOURCE_CLOCK_TABLES, PresenceService
-from app.storage.database import Database, PinnedDatabase
+from app.presence.service import SOURCE_CLOCK, SOURCE_CLOCK_TABLES, PresenceService
+from app.storage.database import Database, PinnedDatabase, read_database_prefix
 from app.storage.migrations import migrate
 from app.storage.policy import StorageState, StorageTransition
 from app.storage.schema import APPLICATION_MIGRATIONS
@@ -1378,6 +1378,23 @@ else:
 """
 
 
+# Opens the database now, and tries to take RESERVED once told to.
+OTHER_PROCESS_LATER_WRITE = """
+import sqlite3, sys
+connection = sqlite3.connect(sys.argv[1], timeout=0, isolation_level=None)
+connection.execute("SELECT count(*) FROM sqlite_master").fetchone()
+print("ready", flush=True)
+sys.stdin.readline()
+try:
+    connection.execute("BEGIN IMMEDIATE")
+except sqlite3.OperationalError:
+    print("locked", flush=True)
+else:
+    connection.execute("ROLLBACK")
+    print("acquired", flush=True)
+"""
+
+
 def other_process_begin_immediate(path):
     """Whether a separate process can take RESERVED on ``path`` right now."""
     return subprocess.run([sys.executable, "-I", "-c", OTHER_PROCESS_WRITE, os.fspath(path)],
@@ -1414,6 +1431,29 @@ class DatabaseLockTests(TestCase):
             with self.assertRaises(ValueError):
                 pinned.pin()
         self.assertEqual(other_process_begin_immediate(self.database.path), "locked")
+
+    def test_replaced_database_keeps_the_old_file_writer_lock(self):
+        # Another process already has the old file open. The path is then
+        # unlinked and a new database created there; holding or probing the
+        # new file must not close this process's descriptor on the old inode,
+        # which would drop the in-process writer's lock on it.
+        self.assertIsNotNone(read_database_prefix(self.database.path, 20))
+        child = subprocess.Popen([sys.executable, "-I", "-c", OTHER_PROCESS_LATER_WRITE,
+                                  os.fspath(self.database.path)],
+                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        self.addCleanup(child.wait, 30)
+        self.addCleanup(child.kill)
+        self.assertEqual(child.stdout.readline().strip(), "ready")
+        os.unlink(self.database.path)
+        with closing(self.database.connect()) as db:
+            db.execute("CREATE TABLE replacement (x)")
+        self.assertIsNotNone(read_database_prefix(self.database.path, 20))
+        pinned = PinnedDatabase(self.database)
+        pinned.pin()
+        pinned.release()
+        child.stdin.write("go\n")
+        child.stdin.flush()
+        self.assertEqual(child.stdout.readline().strip(), "locked")
 
     def test_connecting_to_an_existing_database_keeps_the_writer_lock(self):
         with closing(self.database.connect()) as db:
@@ -1475,23 +1515,48 @@ class WalReadTests(PresenceFixture, TestCase):
             with self.assertRaises(sqlite3.OperationalError):
                 db.execute("DELETE FROM presence_audit")
 
-    def test_existing_sidecars_need_no_reservation(self):
-        # A connection held open elsewhere keeps both sidecars in place; a
-        # read then creates nothing and takes no reservation.
+    def test_existing_sidecars_still_need_admission(self):
+        # Sidecars kept by a connection held open elsewhere prove nothing:
+        # that connection may close before this read opens. A refused
+        # reservation fails the read; an admitted one reads.
         holder = sqlite3.connect(self.database.path)
         self.addCleanup(holder.close)
         holder.execute("SELECT count(*) FROM presence_audit").fetchone()
         self.assertEqual(self.sidecars(), ["-shm", "-wal"])
         self.refuse = True
+        with self.assertRaisesRegex(RuntimeError, "STORAGE_HARD_STOP"):
+            self.presence.timeline_gap()
+        self.assertEqual(self.entered, [["-shm", "-wal"]])
+        self.refuse = False
         self.assertIsNone(self.presence.timeline_gap())
-        self.assertEqual(self.entered, [])
+        self.assertEqual(self.sidecars(), ["-shm", "-wal"])
+
+    def test_last_holder_closing_before_the_open_creates_no_sidecar(self):
+        # The last other connection closes (deleting both sidecars) after the
+        # read saw them but before SQLite opens the database. Under a refused
+        # reservation that open must never happen.
+        holder = sqlite3.connect(self.database.path)
+        holder.execute("SELECT count(*) FROM presence_audit").fetchone()
+        self.assertEqual(self.sidecars(), ["-shm", "-wal"])
+        real_connect = sqlite3.connect
+
+        def connect_after_holder_closes(*args, **kwargs):
+            holder.close()
+            return real_connect(*args, **kwargs)
+
+        self.refuse = True
+        with mock.patch.object(sqlite3, "connect", connect_after_holder_closes):
+            with self.assertRaisesRegex(RuntimeError, "STORAGE_HARD_STOP"):
+                self.presence.timeline_gap()
+        holder.close()
+        self.assertEqual(self.sidecars(), [])
 
     def test_malformed_sidecars_need_admission(self):
         # Both sidecar names are regular files, but the -shm is empty or a
         # partial region (an interrupted creation). SQLite would initialise or
         # resize it on open, so a refused reservation fails the read and the
         # files are left exactly as they were.
-        for size in (0, 1000, SHM_REGION + 4096):
+        for size in (0, 1000, 32 * 1024 + 4096):
             with self.subTest(size=size):
                 for suffix, length in (("-wal", 0), ("-shm", size)):
                     with open(self.database.path.with_name(self.database.path.name + suffix), "wb") as handle:

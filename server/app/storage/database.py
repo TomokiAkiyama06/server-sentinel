@@ -18,24 +18,20 @@ from urllib.parse import quote
 # application code would silently drop those locks and let another process
 # write concurrently, which can corrupt the database.
 #
-# Application code therefore never closes a descriptor on a database file
-# that may be in use. Every such descriptor is kept here, at most one per
-# (device, inode), for the life of the process, and reused. An entry is
-# closed only once its file is unlinked and no `PinnedDatabase` pins it: no
-# new connection can reach an unlinked file by its path, and its contents are
-# discarded once its last descriptor closes. The cost is one read-only
-# descriptor per live database file for the process lifetime.
+# Application code therefore never closes a descriptor it opened on a
+# database file. Each is kept here for the life of the process and reused:
+# one read-only descriptor per distinct (device, inode) this process has
+# opened or created through this module, never closed, not even once the
+# file is unlinked or replaced, because a connection may still be using the
+# old inode. The set is bounded by the database files the process uses; a
+# replaced database file costs one more descriptor and keeps the old file's
+# blocks allocated until the process restarts.
 _HELD_LOCK = threading.Lock()
-_HELD: dict[tuple[int, int], "_HeldFile"] = {}
+_HELD: dict[tuple[int, int], int] = {}
+# Descriptors that duplicate a held file (the path was swapped back to it
+# between stat and open). They are kept open too, never read from.
+_DUPLICATES: list[int] = []
 _HOLD_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NOCTTY | os.O_NONBLOCK
-
-
-class _HeldFile:
-    def __init__(self, descriptor: int) -> None:
-        # The first descriptor is read from; any further one (a path swapped
-        # back to a held file between stat and open) is only kept open.
-        self.descriptors = [descriptor]
-        self.pins = 0
 
 
 def _identity(info: os.stat_result) -> tuple[int, int]:
@@ -45,26 +41,11 @@ def _identity(info: os.stat_result) -> tuple[int, int]:
 def _adopt_locked(descriptor: int) -> tuple[int, int]:
     """Keep ``descriptor`` for the process lifetime; returns its file identity."""
     identity = _identity(os.fstat(descriptor))
-    held = _HELD.get(identity)
-    if held is None:
-        _HELD[identity] = _HeldFile(descriptor)
+    if identity in _HELD:
+        _DUPLICATES.append(descriptor)
     else:
-        held.descriptors.append(descriptor)
+        _HELD[identity] = descriptor
     return identity
-
-
-def _evict_unlinked_locked() -> None:
-    for identity, held in list(_HELD.items()):
-        if held.pins:
-            continue
-        try:
-            linked = os.fstat(held.descriptors[0]).st_nlink > 0
-        except OSError:
-            linked = True
-        if not linked:
-            del _HELD[identity]
-            for descriptor in held.descriptors:
-                os.close(descriptor)
 
 
 def _hold_locked(path: Path) -> tuple[int, tuple[int, int]]:
@@ -73,7 +54,6 @@ def _hold_locked(path: Path) -> tuple[int, tuple[int, int]]:
     Raises ``FileNotFoundError`` for a missing file and ``ValueError`` for
     anything else unusable. A file already held is never opened again.
     """
-    _evict_unlinked_locked()
     try:
         info = os.stat(path, follow_symlinks=False)
     except FileNotFoundError:
@@ -82,20 +62,20 @@ def _hold_locked(path: Path) -> tuple[int, tuple[int, int]]:
         raise ValueError("database location is unavailable") from None
     if not stat.S_ISREG(info.st_mode):
         raise ValueError("database location is unavailable")
-    held = _HELD.get(_identity(info))
-    if held is not None:
-        return held.descriptors[0], _identity(info)
+    descriptor = _HELD.get(_identity(info))
+    if descriptor is not None:
+        return descriptor, _identity(info)
     try:
-        descriptor = os.open(path, _HOLD_FLAGS)
+        opened = os.open(path, _HOLD_FLAGS)
     except FileNotFoundError:
         raise
     except OSError:
         raise ValueError("database location is unavailable") from None
-    identity = _adopt_locked(descriptor)
-    held = _HELD[identity]
-    if not stat.S_ISREG(os.fstat(held.descriptors[0]).st_mode):
+    identity = _adopt_locked(opened)
+    descriptor = _HELD[identity]
+    if not stat.S_ISREG(os.fstat(descriptor).st_mode):
         raise ValueError("database location is unavailable")
-    return held.descriptors[0], identity
+    return descriptor, identity
 
 
 def read_database_prefix(path: Path, size: int) -> bytes | None:
@@ -109,27 +89,18 @@ def read_database_prefix(path: Path, size: int) -> bytes | None:
             descriptor, _held_identity = _hold_locked(path)
         except FileNotFoundError:
             return None
-        try:
-            return os.pread(descriptor, size, 0)
-        except OSError:
-            raise ValueError("database location is unavailable") from None
+    try:
+        return os.pread(descriptor, size, 0)
+    except OSError:
+        raise ValueError("database location is unavailable") from None
 
 
-def _pin_file(path: Path) -> tuple[int, tuple[int, int]]:
+def _hold_file(path: Path) -> tuple[int, tuple[int, int]]:
     with _HELD_LOCK:
         try:
-            descriptor, identity = _hold_locked(path)
+            return _hold_locked(path)
         except FileNotFoundError:
             raise ValueError("database location is unavailable") from None
-        _HELD[identity].pins += 1
-        return descriptor, identity
-
-
-def _unpin_file(identity: tuple[int, int]) -> None:
-    with _HELD_LOCK:
-        held = _HELD.get(identity)
-        if held is not None and held.pins:
-            held.pins -= 1
 
 
 @dataclass(frozen=True)
@@ -221,31 +192,21 @@ class PinnedDatabase:
             # The descriptor comes from the process-wide holder and is never
             # closed here: closing it would drop the POSIX locks of this
             # process's open connections to the same file.
-            descriptor, identity = _pin_file(self.path)
-            try:
-                if self._held_identity(descriptor) != identity or self._path_identity() != identity:
-                    raise ValueError("database location is unavailable")
-            except BaseException:
-                _unpin_file(identity)
-                raise
+            descriptor, identity = _hold_file(self.path)
+            if self._held_identity(descriptor) != identity or self._path_identity() != identity:
+                raise ValueError("database location is unavailable")
         with self._lock:
-            previous = self._pinned
             self._pinned, self._descriptor = identity, descriptor
-        if previous is not None:
-            _unpin_file(previous)
 
     def release(self) -> None:
         """Drop the pin; later connections are refused until pinned again.
 
-        The held descriptor itself stays open (see ``_HELD``) until the file
-        is unlinked, so the locks of other connections in this process are
-        never released by a pin ending.
+        The held descriptor itself stays open for the process lifetime (see
+        ``_HELD``), so a pin ending never releases the locks of other
+        connections in this process.
         """
         with self._lock:
-            pinned = self._pinned
             self._pinned = self._descriptor = None
-        if pinned is not None:
-            _unpin_file(pinned)
 
     def _verify(self) -> tuple[int, int]:
         with self._lock:
