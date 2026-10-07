@@ -43,6 +43,20 @@ V6 = ipaddress.IPv6Address("fd7a:115c:a1e0::10")
 HUMAN = Listener(ipaddress.IPv4Address("127.0.0.1"), 8080)
 HEADER = ("  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt"
           "   uid  timeout inode")
+# Header lines captured verbatim (``head -1``) from /proc/net/{tcp,tcp6,udp,udp6}
+# on the Main host (Linux 7.0, Issue #154). IPv4 files name the peer column
+# ``rem_address``; the IPv6 files name it ``remote_address``.
+REAL_HEADERS = {
+    "tcp": "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt"
+           "   uid  timeout inode                                                     ",
+    "tcp6": "  sl  local_address                         remote_address                        "
+            "st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode",
+    "udp": "   sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt"
+           "   uid  timeout inode ref pointer drops            ",
+    "udp6": "  sl  local_address                         remote_address                        "
+            "st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops",
+}
+HEADER6 = REAL_HEADERS["tcp6"]
 
 
 def _hex(address, byteorder="little"):
@@ -55,7 +69,7 @@ def _hex(address, byteorder="little"):
 def proc(*sockets, ipv6=False, byteorder="little"):
     """Render (address, port, state) tuples as a synthetic /proc/net/tcp{,6} file."""
     zero = ipaddress.IPv6Address("::") if ipv6 else ipaddress.IPv4Address("0.0.0.0")
-    lines = [HEADER]
+    lines = [HEADER6 if ipv6 else HEADER]
     for number, (address, port, state) in enumerate(sockets):
         lines.append(
             f"{number:4d}: {_hex(ipaddress.ip_address(address), byteorder)}:{port:04X} "
@@ -233,6 +247,53 @@ class ProcNetParserTests(TestCase):
                 parse_proc_net_tcp(text, ipv6=False, byteorder="little")
         with self.assertRaises(ReservationEnumerationError):
             parse_proc_net_tcp(proc(("127.0.0.1", 1, "0A")), ipv6=True, byteorder="little")
+
+    def test_real_kernel_headers_are_accepted_per_family(self):
+        # Issue #154: tcp6/udp6 print ``remote_address``; rejecting it made every
+        # check report LISTENER_ENUMERATION_UNAVAILABLE on a real host.
+        v4_row = "   0: 0100007F:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000  0 0 1 1 0 0"
+        v6_row = ("   0: 00000000000000000000000001000000:1F90 00000000000000000000000000000000:0000 0A"
+                  " 00000000:00000000 00:00000000 00000000  0 0 2 1 0 0")
+        v6_loopback = Listener(ipaddress.IPv6Address("::1"), 8080)
+        cases = (("tcp", parse_proc_net_tcp, False, v4_row, HUMAN),
+                 ("tcp6", parse_proc_net_tcp, True, v6_row, v6_loopback),
+                 ("udp", parse_proc_net_udp, False, v4_row.replace(" 0A ", " 07 "),
+                  Listener(HUMAN.address, 8080, TransportProtocol.UDP)),
+                 ("udp6", parse_proc_net_udp, True, v6_row.replace(" 0A ", " 07 "),
+                  Listener(v6_loopback.address, 8080, TransportProtocol.UDP)))
+        for name, parse, ipv6, row, expected in cases:
+            with self.subTest(name=name):
+                self.assertEqual(parse(REAL_HEADERS[name] + "\n", ipv6=ipv6, byteorder="little"), ())
+                self.assertEqual(parse(REAL_HEADERS[name] + "\n" + row + "\n", ipv6=ipv6,
+                                       byteorder="little"), (expected,))
+
+    def test_header_of_the_other_family_or_unknown_header_fails_closed(self):
+        unknown = ("  sl  local_address peer_address st tx_queue rx_queue tr tm->when retrnsmt"
+                   "   uid  timeout inode")
+        for name, parse, ipv6, header in (
+                ("tcp", parse_proc_net_tcp, False, REAL_HEADERS["tcp6"]),
+                ("tcp6", parse_proc_net_tcp, True, REAL_HEADERS["tcp"]),
+                ("udp", parse_proc_net_udp, False, REAL_HEADERS["udp6"]),
+                ("udp6", parse_proc_net_udp, True, REAL_HEADERS["udp"]),
+                ("tcp unknown", parse_proc_net_tcp, False, unknown),
+                ("tcp6 unknown", parse_proc_net_tcp, True, unknown)):
+            with self.subTest(name=name), self.assertRaises(ReservationEnumerationError):
+                parse(header + "\n", ipv6=ipv6, byteorder="little")
+
+    def test_this_hosts_proc_net_files_parse(self):
+        # Exercises the live kernel format when the files are readable; the
+        # result depends on the host's sockets, so only success is asserted.
+        parsers = {"tcp": (parse_proc_net_tcp, False), "tcp6": (parse_proc_net_tcp, True),
+                   "udp": (parse_proc_net_udp, False), "udp6": (parse_proc_net_udp, True)}
+        for name, (parse, ipv6) in parsers.items():
+            with self.subTest(name=name):
+                try:
+                    with open(f"/proc/net/{name}", encoding="ascii") as stream:
+                        text = stream.read()
+                except OSError:
+                    self.skipTest(f"/proc/net/{name} is not readable on this host")
+                for listener in parse(text, ipv6=ipv6):
+                    self.assertEqual(listener.address.version, 6 if ipv6 else 4)
 
 
 class ServeStatusParserTests(TestCase):
