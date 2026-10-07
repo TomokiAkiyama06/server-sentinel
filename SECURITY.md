@@ -381,11 +381,13 @@ and ADR-0003):
   a durable revoker never opens human access. The check and every commit that
   creates a human session, updates a session's user-verification time, or
   creates or redeems an enrollment authorization share one lock (Issue #144,
-  Owner decision 2026-10-07): the commit re-checks that access is open inside
-  it, and the check closes access inside it and keeps the verdict closed until
-  any required revocation has committed, so a request that saw access open
-  before a check closed it cannot commit a session after that check's
-  revocation. The check also decides and revokes inside the lock as defense in
+  Owner decision 2026-10-07): each such request takes the gate epoch before it
+  verifies anything, and the commit re-checks inside the lock that access is
+  open and has not closed since; the check closes access inside the lock and
+  keeps the verdict closed until any required revocation has committed. So a
+  request that saw access open before a check closed it cannot commit a
+  session after that check's revocation, even if access has reopened in
+  between, and a revocation also deletes every pending WebAuthn challenge. The check also decides and revokes inside the lock as defense in
   depth. The idle-expiry touch of an existing session stays outside the lock;
   revocation advances the authorization generation, so a touch can never make
   a revoked session valid again.

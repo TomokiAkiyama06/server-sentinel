@@ -1109,18 +1109,22 @@ class HostnameReservationCheck:
     failed marker rewrite after the marker is already stored for the closed
     period does not revoke (Issue #144).
 
-    Session gate (Issue #144, Owner decision 2026-10-07: serialize). Every
-    commit that creates a human session, updates a session's
-    user-verification time, or creates or redeems an enrollment
-    authorization runs inside ``admit()``, which holds
-    ``_session_gate_lock`` and re-checks the published verdict right before
-    the commit. The check takes the same lock to close access (at its start)
-    and keeps the verdict closed until any required revocation has
-    committed; that is the essential property. Once a check has closed
-    access, no commit that observed the earlier open verdict can land
-    afterwards: it either committed before the close, and every later
-    revocation covers it, or it re-checks, finds access closed and is
-    refused with ``HumanAccessClosed``. Taking the lock again for decide +
+    Session gate (Issue #144, Owner decision 2026-10-07: serialize). A
+    request that may create a human session, update a session's
+    user-verification time, or create or redeem an enrollment authorization
+    first takes ``epoch()``, before it reads or verifies anything the commit
+    relies on, and then commits inside ``admit(epoch)``, which holds
+    ``_session_gate_lock`` and re-checks right before the commit that access
+    is open and that the epoch is unchanged. The epoch advances on every
+    close of an open verdict, under the same lock, and ``epoch()`` returns
+    ``None`` while access is closed. The check closes access (at its start)
+    under the lock and keeps the verdict closed until any required
+    revocation has committed; that is the essential property. A request
+    therefore commits only if access stayed open from its start to its
+    commit, so no revocation ran in between: either it committed before the
+    close, and every later revocation covers it, or it is refused with
+    ``HumanAccessClosed``, also when a whole close -> revoke -> reopen cycle
+    completed while it was verifying (PR #174 review). Taking the lock again for decide +
     commit (``_after_evaluation`` with the marker, fallback and reopening
     revocations, together with publishing the verdict) is defense in depth.
     The idle-expiry touch in ``AccessStore.authorize()`` /
@@ -1183,6 +1187,9 @@ class HostnameReservationCheck:
         # commit a verdict, and by every ``admit()`` commit. Innermost of the
         # check's locks; see the class docstring for the lock order.
         self._session_gate_lock = threading.Lock()
+        # Advanced (under the gate lock) every time an open verdict closes;
+        # ``admit()`` refuses a request whose epoch changed (PR #174 review).
+        self._epoch = 0
         self._check_lock = threading.Lock()
         # Held by ``ReservationAdministration`` across stage, audited commit and
         # apply, so the applied set always follows the durable commit order.
@@ -1252,19 +1259,32 @@ class HostnameReservationCheck:
         """
         return self._verdict.open
 
-    @contextmanager
-    def admit(self) -> Iterator[None]:
-        """Run one session or enrollment commit while access is open.
+    def epoch(self) -> int | None:
+        """The gate epoch at the start of a request; ``None`` while access is closed.
 
-        Holds the session gate lock for the whole block and raises
-        ``HumanAccessClosed`` when the published verdict is closed, so the
-        block cannot interleave with a check closing access or revoking
-        sessions. The caller enters it before opening its SQLite write
-        transaction and keeps only that local commit inside: no network
-        I/O, no WebAuthn verification and no other lock of this check.
+        Taken before the request reads or verifies anything its commit relies
+        on (a challenge, a credential, an Owner authorization), so a close
+        anywhere between that point and the commit is seen by ``admit()``.
         """
         with self._session_gate_lock:
-            if not self._verdict.open:
+            return self._epoch if self._verdict.open else None
+
+    @contextmanager
+    def admit(self, epoch: int | None) -> Iterator[None]:
+        """Run one session or enrollment commit while access is still open since ``epoch``.
+
+        Holds the session gate lock for the whole block and raises
+        ``HumanAccessClosed`` when the published verdict is closed, when
+        ``epoch`` is ``None`` (closed at the start) or when it differs from
+        the current epoch (access closed at least once since the request
+        started, even if it has reopened), so the block cannot interleave
+        with, or follow, a check closing access or revoking sessions. The
+        caller enters it before opening its SQLite write transaction and
+        keeps only that local commit inside: no network I/O, no WebAuthn
+        verification and no other lock of this check.
+        """
+        with self._session_gate_lock:
+            if (not self._verdict.open or type(epoch) is not int or epoch != self._epoch):
                 raise HumanAccessClosed()
             yield
 
@@ -1448,8 +1468,14 @@ class HostnameReservationCheck:
         # Under the gate lock: once this returns, no ``admit()`` block that
         # saw the earlier open verdict is still committing (Issue #144).
         with self._session_gate_lock:
-            self._verdict = ReservationVerdict(False, self._verdict.reasons, self._verdict.checked_at,
-                                               self._verdict.check)
+            self._publish(ReservationVerdict(False, self._verdict.reasons, self._verdict.checked_at,
+                                             self._verdict.check))
+
+    def _publish(self, verdict: ReservationVerdict) -> None:
+        """Replace the verdict; the caller holds the gate lock."""
+        if self._verdict.open and not verdict.open:
+            self._epoch += 1
+        self._verdict = verdict
 
     def _enumerate(self, name: str, call: Callable[[], Iterable], timeout_reason: Reason,
                    error_reason: Reason, item_type: type | tuple[type, ...]):
@@ -1608,7 +1634,7 @@ class HostnameReservationCheck:
             verdict = ReservationVerdict(not reasons, reasons, at, kind)
             if verdict.open:
                 self._ever_opened = True
-            self._verdict = verdict
+            self._publish(verdict)
         self._last_check = started if math.isfinite(started) else None
         if reasons:
             if kind != CheckKind.RETRY or reasons != self._last_notified:

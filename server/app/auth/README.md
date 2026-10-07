@@ -255,14 +255,27 @@ time, or creates or redeems an enrollment authorization share one lock, `Hostnam
 `AccessAdministration.issue_invitation()` when it is constructed with the
 check as `session_gate` (required for wiring a human route reaches; `None` only
 for a caller no human route reaches). `PasskeyCeremonies` cannot be constructed
-without a gate. Inside the lock the commit re-checks the published verdict right
-before its SQLite write transaction and is refused (generic denial; a `failed`
-audit record for the Owner operation) while access is closed. The check takes
-the same lock to close access at its start, and the verdict stays closed until
-any required revocation has committed. That is the essential property: a
-request that saw access open before a check closed it either committed before
-the close, so every later revocation covers it, or is refused; it can no longer
-commit after the immediate fallback revocation. The check also takes the lock
+without a gate. Each of these requests first takes the gate epoch
+(`HostnameReservationCheck.epoch()`), before it consumes its challenge,
+verifies an assertion or authorizes the Owner, and commits inside
+`admit(epoch)`. The epoch advances, under the lock, every time an open verdict
+closes, and is `None` while access is closed. Inside the lock the commit
+re-checks right before its SQLite write transaction that access is open and the
+epoch unchanged, and is refused otherwise (generic denial; a `failed` audit
+record for the Owner operation). The check takes the same lock to close access
+at its start, and the verdict stays closed until any required revocation has
+committed. That is the essential property: a request commits only if access
+stayed open from its start to its commit, so no revocation ran in between.
+It either committed before the close, so every later revocation covers it, or
+is refused, also when a whole close, revoke and reopen cycle completed while it
+was verifying (PR #174 review); it can no longer commit after the immediate
+fallback revocation, and an invitation can no longer commit on an Owner
+authorization that a revocation ended. The challenge was issued by an earlier
+request, before the epoch is taken; the revocation therefore also deletes every
+pending WebAuthn challenge, so an assertion over a challenge issued before it
+(for example one a listener answering during the exposure received) cannot
+establish a session afterwards. A request that merely spans a close without an
+exposure is refused too and simply starts again. The check also takes the lock
 again to decide and commit (the marker, the fallback and reopening revocations
 and the published verdict); doing that inside the gate is defense in depth. A restart that
 finds no marker after a committed fallback revocation (the residual risk of PR

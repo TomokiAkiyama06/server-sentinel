@@ -208,6 +208,12 @@ class DeploymentRequirementTests(unittest.TestCase):
         adr = normalized(ROOT / "docs" / "ADR" / "0003-owner-authentication-and-trusted-proxy.md")
         self.assertIn("Owner decision, 2026-10-07 (Issue #144)", adr)
         self.assertIn("share one lock (Issue #144, Owner decision 2026-10-07)", normalized(ROOT / "SECURITY.md"))
+        # PR #174 review: the gate epoch covers a whole close/revoke/reopen
+        # cycle during verification, and a revocation drops pending challenges.
+        self.assertIn("commits inside `admit(epoch)`", readme)
+        self.assertIn("whole close, revoke and reopen cycle", readme)
+        self.assertIn("deletes every pending WebAuthn challenge", readme)
+        self.assertIn("even if access reopened in between", adr)
 
 
 class SecurityNoteTests(unittest.TestCase):

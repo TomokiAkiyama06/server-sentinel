@@ -556,12 +556,16 @@ unreadable in every scan fails the lookup (unverified).
 Owner decision, 2026-10-07 (Issue #144): the reservation check and every
 commit that creates a human session, updates a session's user-verification
 time, or creates or redeems an enrollment authorization are serialized by one
-in-process lock. The commit re-checks that access is open inside the lock right
-before it writes; the check closes access inside the same lock and keeps the
-verdict closed until any required revocation has committed. That is the
-essential property: a request that saw access open before a check closed it
-can no longer commit a session after that check's immediate revocation, so a
-restart that finds no revocation marker no longer keeps such a session. The
+in-process lock. Such a request takes the gate epoch before it verifies
+anything, and its commit re-checks inside the lock, right before it writes,
+that access is open and has not closed since that epoch; the check closes
+access inside the same lock and keeps the verdict closed until any required
+revocation has committed. That is the essential property: a request that saw
+access open before a check closed it can no longer commit a session after
+that check's revocation, even if access reopened in between (PR #174 review),
+so a restart that finds no revocation marker no longer keeps such a session.
+A revocation also deletes every pending WebAuthn challenge, so an assertion
+over a challenge issued before it cannot establish a session afterwards. The
 check also decides, revokes and publishes its verdict inside the lock, as
 defense in depth. The idle-expiry touch of an existing session stays outside
 the lock, which is safe because revocation advances the authorization

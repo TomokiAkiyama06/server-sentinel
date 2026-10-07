@@ -30,13 +30,18 @@ Invariants enforced here:
   verified authenticator is backup eligible in a deployment that requires
   device-bound credentials).
 
-Every commit that redeems an invitation, establishes a session or updates a
-session's user-verification time runs inside ``session_gate.admit()`` (in
-production the ``HostnameReservationCheck``), which re-checks under the gate
-lock that human access is still open, so a reservation check that closes
-access and revokes sessions cannot interleave with it (Issue #144). Only that
-local commit runs inside the gate; challenge consumption and WebAuthn
-verification run before it. A gate refusal is the same generic denial.
+Every ``finish_*`` step that redeems an invitation, establishes a session or
+updates a session's user-verification time first takes
+``session_gate.epoch()`` (in production the ``HostnameReservationCheck``),
+before it consumes the challenge or verifies anything, and commits inside
+``session_gate.admit(epoch)``, which re-checks under the gate lock that human
+access is open and has not closed since that epoch (Issue #144, PR #174
+review). A reservation check that closes access and revokes sessions can
+therefore neither interleave with the commit nor complete a whole close ->
+revoke -> reopen cycle while the request is verifying. The challenge itself
+was issued by an earlier request; a revocation deletes every pending
+challenge, so one issued before it cannot be used afterwards. Only the local
+commit runs inside the gate. A gate refusal is the same generic denial.
 
 Revocation is credential-scoped: revoking a credential disables it wherever a
 synced passkey exists, not on one device. Nothing here receives or stores a
@@ -88,8 +93,11 @@ class CredentialFinding(str, Enum):
 
 
 class SessionGate(Protocol):
-    def admit(self) -> ContextManager[None]:
-        """Hold the gate and raise unless human access is open (Issue #144)."""
+    def epoch(self) -> int | None:
+        """The gate epoch at the start of a request; ``None`` while closed."""
+
+    def admit(self, epoch: int | None) -> ContextManager[None]:
+        """Hold the gate; raise unless access is open and unchanged since ``epoch``."""
 
 
 class CredentialFindingSink(Protocol):
@@ -128,7 +136,7 @@ class PasskeyCeremonies:
             raise ValueError("a session binding key is required")
         if not isinstance(relying_party, webauthn.RelyingParty):
             raise ValueError("relying party is required")
-        if not callable(getattr(session_gate, "admit", None)):
+        if not callable(getattr(session_gate, "admit", None)) or not callable(getattr(session_gate, "epoch", None)):
             # Mandatory: without it a commit could land after a reservation
             # check closed access and revoked every session (Issue #144).
             raise ValueError("a session gate is required")
@@ -207,6 +215,8 @@ class PasskeyCeremonies:
                             credential: Mapping, *, label: str | None = None) -> Credential:
         """Verify a registration and redeem the invitation its challenge was bound to."""
         try:
+            # First: a close after this point refuses the commit (Issue #144).
+            epoch = self.session_gate.epoch()
             at = self._now()
             challenge = webauthn.registration_challenge(credential, self.rp)
             consumed = self.store.consume_challenge(_digest(challenge), "registration", at=at)
@@ -217,7 +227,7 @@ class PasskeyCeremonies:
         if self.require_device_bound and verified.backup_eligible:
             raise DeviceBoundCredentialRequired()
         try:
-            with self.session_gate.admit():
+            with self.session_gate.admit(epoch):
                 return self.store.enroll_credential(
                     enrollment_secret, proxy_identity, verified.credential_id, verified.public_key,
                     verified.algorithm, verified.sign_count, now=at,
@@ -280,6 +290,8 @@ class PasskeyCeremonies:
         login each sign in with their own passkey.
         """
         try:
+            # First: a close after this point refuses the commit (Issue #144).
+            epoch = self.session_gate.epoch()
             at = self._now()
             claims = webauthn.assertion_claims(credential, self.rp)
             self.store.consume_challenge(_digest(claims.challenge), "authentication", at=at)
@@ -287,7 +299,7 @@ class PasskeyCeremonies:
             token = self._random(SESSION_TOKEN_BYTES)
             if not isinstance(token, bytes) or len(token) != SESSION_TOKEN_BYTES:
                 raise CeremonyDenied()
-            with self.session_gate.admit():
+            with self.session_gate.admit(epoch):
                 session_id = self.store.accept_assertion(
                     stored.credential_id, principal.id, proxy_identity,
                     expected_sign_count=stored.sign_count, sign_count=verified.sign_count,
@@ -328,6 +340,8 @@ class PasskeyCeremonies:
         verification time untouched.
         """
         try:
+            # First: a close after this point refuses the commit (Issue #144).
+            epoch = self.session_gate.epoch()
             at = self._now()
             claims = webauthn.assertion_claims(credential, self.rp)
             consumed = self.store.consume_challenge(_digest(claims.challenge), "step_up", at=at)
@@ -338,7 +352,7 @@ class PasskeyCeremonies:
             principal, stored, verified = self._verified_assertion(credential, claims, require_user_handle=False)
             if principal.id != session.principal_id:
                 raise CeremonyDenied()
-            with self.session_gate.admit():
+            with self.session_gate.admit(epoch):
                 self.store.accept_assertion(
                     stored.credential_id, principal.id, proxy_identity,
                     expected_sign_count=stored.sign_count, sign_count=verified.sign_count,

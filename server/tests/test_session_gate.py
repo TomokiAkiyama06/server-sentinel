@@ -30,7 +30,9 @@ from app.storage.database import Database
 from app.storage.migrations import migrate
 from app.storage.schema import APPLICATION_MIGRATIONS
 
-from tests.test_hostname_reservation import SSH, WILDCARD_SSH, Clock, Files, SyntheticOwnerAuthorizer, checker, proc
+from tests.test_hostname_reservation import (
+    SSH, V4, V6, WILDCARD_SSH, Clock, Files, SyntheticOwnerAuthorizer, checker, proc,
+)
 from tests.test_webauthn_ceremonies import Clock as CeremonyClock
 from tests.webauthn_fakes import ORIGIN, RP_ID, SyntheticAuthenticator
 
@@ -234,18 +236,143 @@ class SessionCommitRaceTests(SessionGateFixture):
         self.assertTrue(self.valid(grant))
 
     def test_admit_refuses_while_closed_and_after_close(self):
-        with self.check.admit():
+        epoch = self.check.epoch()
+        with self.check.admit(epoch):
             pass
         self.files.files["tcp"] = EXPOSED
         self.assertFalse(self.check._check(CheckKind.RETRY).open)
+        self.assertIsNone(self.check.epoch())
+        for stale in (None, epoch):
+            with self.subTest(epoch=stale), self.assertRaises(HumanAccessClosed):
+                with self.check.admit(stale):
+                    self.fail("admitted while closed")
+        # Reopened: an epoch taken before the close stays refused.
+        self.files.files["tcp"] = CLEAN
+        self.assertTrue(self.check._check(CheckKind.RETRY).open)
         with self.assertRaises(HumanAccessClosed):
-            with self.check.admit():
-                self.fail("admitted while closed")
+            with self.check.admit(epoch):
+                self.fail("admitted with an epoch from before the close")
+        with self.check.admit(self.check.epoch()):
+            pass
         unchecked = checker(session_revoker=self.revoker)[0]
         # Never opened: closed from construction.
+        self.assertIsNone(unchecked.epoch())
         with self.assertRaises(HumanAccessClosed):
-            with unchecked.admit():
+            with unchecked.admit(0):
                 self.fail("admitted before any check")
+
+    def cycle(self, *, exposure=True):
+        """A whole close -> (revoke) -> reopen cycle, run while a request is paused."""
+        self.files.files["tcp"] = EXPOSED if exposure else CLEAN
+        if not exposure:
+            self.check._resolver.answer = OSError("synthetic resolver failure")
+        self.assertFalse(self.check._check(CheckKind.RETRY).open)
+        self.files.files["tcp"] = CLEAN
+        self.check._resolver.answer = (V4, V6)
+        self.assertTrue(self.check._check(CheckKind.RETRY).open)
+
+    def paused_during(self, target, method, call, *, exposure=True):
+        """Pause ``call`` inside ``target.method`` and run a full cycle meanwhile."""
+        inside, proceed = threading.Event(), threading.Event()
+        original = getattr(target, method)
+
+        def paused(*args, **kwargs):
+            inside.set()
+            proceed.wait(WAIT)
+            return original(*args, **kwargs)
+
+        with patch.object(target, method, side_effect=paused):
+            worker, box = self.thread(call)
+            self.assertTrue(inside.wait(WAIT))
+            self.cycle(exposure=exposure)
+            proceed.set()
+            worker.join(WAIT)
+        self.assertFalse(worker.is_alive())
+        return box
+
+    def test_cycle_completed_during_verification_refuses_the_session(self):
+        # PR #174 review (Codex P1): the assertion is verified, the request
+        # pauses, a check closes access and revokes every session, a clean
+        # check reopens, and only then does the request reach the gate.
+        _, authenticator = self.enroll()
+        assertion = self.assertion(authenticator)
+        box = self.paused_during(self.access, "assertion_subject",
+                                 lambda: self.ceremonies.finish_authentication(VIEWER, assertion))
+        self.assertIsInstance(box.get("error"), CeremonyDenied)
+        self.assertEqual(len(self.revocations()), 1)
+        self.assertEqual(self.live_sessions(), 0)
+
+    def test_cycle_completed_during_registration_refuses_the_redemption(self):
+        # Without an exposure nothing is revoked, but the request still spans a
+        # close: it is refused and the invitation stays unredeemed.
+        principal = self.access.invite("Synthetic pending", (Permission.LIVE_VIEW,))
+        self.access.issue_enrollment(principal.id, b"p" * 32, self.ceremony_clock() + timedelta(minutes=30))
+        authenticator = SyntheticAuthenticator()
+        creation = self.ceremonies.begin_registration(b"p" * 32, "pending@example.invalid")
+        response = authenticator.register(creation)
+        box = self.paused_during(
+            self.access, "consume_challenge",
+            lambda: self.ceremonies.finish_registration(b"p" * 32, "pending@example.invalid", response),
+            exposure=False)
+        self.assertIsInstance(box.get("error"), CeremonyDenied)
+        self.assertEqual(self.revocations(), [])
+        with closing(self.database.connect()) as connection:
+            redeemed = connection.execute("SELECT redeemed_at_us FROM access_invitations WHERE principal_id=?",
+                                          (str(principal.id),)).fetchone()[0]
+        self.assertIsNone(redeemed)
+
+    def test_cycle_completed_during_step_up_refuses_the_update(self):
+        owner = self.access.bootstrap_owner("Synthetic owner")
+        self.access.issue_enrollment(owner.id, b"o" * 32, self.ceremony_clock() + timedelta(minutes=30))
+        owner_key = SyntheticAuthenticator()
+        creation = self.ceremonies.begin_registration(b"o" * 32, "owner@example.invalid")
+        self.ceremonies.finish_registration(b"o" * 32, "owner@example.invalid", owner_key.register(creation))
+        grant = self.ceremonies.finish_authentication("owner@example.invalid", self.assertion(owner_key))
+        step_up = owner_key.assertion(self.ceremonies.begin_step_up(grant.token, "owner@example.invalid"))
+        self.ceremony_clock.advance(minutes=1)
+        box = self.paused_during(
+            self.access, "assertion_subject",
+            lambda: self.ceremonies.finish_step_up(grant.token, "owner@example.invalid", step_up),
+            exposure=False)
+        self.assertIsInstance(box.get("error"), CeremonyDenied)
+        with closing(self.database.connect()) as connection:
+            verified, established = connection.execute(
+                "SELECT last_user_verification_at_us, established_at_us FROM access_sessions WHERE id=?",
+                (str(grant.session_id),)).fetchone()
+        self.assertEqual(verified, established)
+
+    def test_cycle_completed_after_owner_authorization_refuses_the_invitation(self):
+        # The Owner is authorized, a check closes access and revokes every
+        # session (the Owner's included), a clean check reopens; the
+        # invitation must not commit on that revoked authorization.
+        admin = AccessAdministration(self.service, self.access, session_gate=self.check)
+        principal = self.access.invite("Synthetic pending", (Permission.LIVE_VIEW,))
+        expires = self.ceremony_clock() + timedelta(minutes=30)
+        box = self.paused_during(
+            self.service.authorizer, "require_owner",
+            lambda: admin.issue_invitation(OWNER_SESSION, principal.id, b"a" * 32, expires))
+        self.assertIsInstance(box.get("error"), HumanAccessClosed)
+        with closing(self.database.connect()) as connection:
+            count = connection.execute("SELECT count(*) FROM access_invitations WHERE principal_id=?",
+                                       (str(principal.id),)).fetchone()[0]
+        self.assertEqual(count, 0)
+        issued = [record.outcome for record in self.audit.list_records()
+                  if record.action is AuditAction.ISSUE_PRINCIPAL_INVITATION]
+        self.assertEqual(issued, [AuditOutcome.FAILED])
+
+    def test_challenge_issued_before_a_revocation_cannot_be_used_after_it(self):
+        # An assertion over a challenge issued before an exposure (for example
+        # one a listener answering during it received) cannot establish a
+        # session after the revocation, even in a request started after reopen.
+        _, authenticator = self.enroll()
+        assertion = self.assertion(authenticator)
+        self.cycle()
+        self.assertEqual(len(self.revocations()), 1)
+        with self.assertRaises(CeremonyDenied):
+            self.ceremonies.finish_authentication(VIEWER, assertion)
+        self.assertEqual(self.live_sessions(), 0)
+        grant = self.ceremonies.finish_authentication(VIEWER, self.assertion(authenticator))
+        self.assertTrue(self.valid(grant))
 
     def test_registration_and_step_up_are_gated(self):
         # Invitation redemption and a step-up refresh are commits of the same kind.

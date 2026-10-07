@@ -30,8 +30,12 @@ class OpenGate:
     def __init__(self):
         self.admitted = 0
 
+    def epoch(self):
+        return 0
+
     @contextmanager
-    def admit(self):
+    def admit(self, epoch):
+        assert epoch == 0
         self.admitted += 1
         yield
 
