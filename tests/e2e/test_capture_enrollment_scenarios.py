@@ -13,6 +13,7 @@ directories; this is not a LAN or real-host verification (see MANUAL_TEST §B).
 from contextlib import closing
 import datetime
 import fcntl
+import json
 import os
 from pathlib import Path
 import re
@@ -27,7 +28,7 @@ import termios
 import threading
 import time
 import unittest
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from app.audit.store import AuditStore
 from app.cameras.remote_agent.enrollment import ENROLLMENT_ALPN
@@ -47,6 +48,14 @@ from tests.e2e.harness import require_non_root_agent
 ROOT = Path(__file__).resolve().parents[2]
 SERVER_NAME = "capture-main.serversentinel.test"
 GROUPED_CODE = re.compile(rb"([A-Z2-7]{5}-[A-Z2-7]{5}-[A-Z2-7]{5}-[A-Z2-7]{5}-[A-Z2-7]{6})")
+
+
+class _Owner:
+    """In-process Owner gate for the one step the CLIs cannot shorten (expiry)."""
+
+    def require_owner(self, actor_context):
+        if actor_context != "owner":
+            raise PermissionError("synthetic denial")
 
 
 def free_port() -> int:
@@ -331,12 +340,30 @@ class CaptureEnrollmentScenario(unittest.TestCase):
         digest = re.fullmatch(r"trust_bundle_sha256=([0-9a-f]{64})\n", output).group(1)
         return deployment, bundle, digest
 
-    def agent_request(self):
-        request = self.exchange / "request.json"
+    def agent_request(self, *extra, name="request.json"):
+        request = self.exchange / name
         code, output, error = self.agent_cli("request", "--runtime-root", self.runtime,
-                                             "--output", request, tty=False).finish()
+                                             "--output", request, *extra, tty=False).finish()
         self.assertEqual(0, code, error)
         return request, re.fullmatch(r"public_key_sha256=([0-9a-f]{64})\n", output).group(1)
+
+    def agent_pair(self, bundle, bundle_digest, grouped, *extra):
+        agent = self.agent_cli("pair", "--runtime-root", self.runtime, "--trust-bundle", bundle,
+                               "--bundle-sha256", bundle_digest, *extra)
+        agent.wait_for(b"Pairing code: ")
+        agent.type(grouped + b"\n")
+        status, output, error = agent.finish()
+        self.assertEqual(0, status, error)
+        node = UUID(re.match(r"paired: node_id=(\S+)\n", output).group(1))
+        lines = output.splitlines()[1:]
+        if "revoked" in extra:
+            # The Agent states the exact manual configuration change.
+            self.assertEqual(1, len(lines), output)
+            self.assertTrue(lines[0].startswith(
+                f'config_update_required: set "node_id": "{node}"'), output)
+        else:
+            self.assertEqual([], lines, output)
+        return node
 
     def start_approval(self, request, listen_port, key_digest):
         main = self.main_cli("approve", "--database", self.database,
@@ -462,11 +489,10 @@ class CaptureEnrollmentScenario(unittest.TestCase):
                               "--listener-dir", self.listener_dir, "--request", request,
                               "--listen", f"127.0.0.1:{free_port()}",
                               "--human-port", self.human_port)
-        again.wait_for(b"Type APPROVE")
-        again.type(b"APPROVE\n")
         status, output, error = again.finish()
         self.assertEqual(2, status)
-        self.assertIn("approval_refused", error)
+        self.assertIn("public_key_revoked", error)
+        self.assertNotIn(b"Type APPROVE", again.transcript, "refused before the Owner prompt")
         self.assertNotIn(b"One-time pairing code", again.transcript)
         listing = self.main_cli("list", "--database", self.database, tty=False)
         status, output, error = listing.finish()
@@ -514,6 +540,102 @@ class CaptureEnrollmentScenario(unittest.TestCase):
         status, output, error = listing.finish()
         self.assertEqual(0, status, error)
         self.assertEqual(1, output.count("node_id="), "a retry creates no second pairing")
+
+    def test_expired_then_revoked_node_repairs_over_the_real_clis(self):
+        # Issue #116, Owner policy 2026-10-01. The first credential is issued
+        # in-process with a three-second lifetime so it really expires; every
+        # re-pairing step then runs through the real Main and Agent CLIs.
+        listen_port = free_port()
+        deployment, bundle, bundle_digest = self.initialise_main(listen_port)
+        request, key_digest = self.agent_request()
+        database = Database(self.database)
+        with closing(database.connect()) as connection:
+            migrate(connection, APPLICATION_MIGRATIONS)
+        ledger = PairingLedger(database, HmacCodeVerifier(os.urandom(32)), audit=AuditStore(database))
+        node = uuid4()
+        approval, code = ledger.approve(_Owner(), "owner", node_id=node,
+                                        public_key_digest=key_digest)
+        claim = ledger.redeem(enrollment_id=approval.enrollment_id, public_key_digest=key_digest,
+                              code=code.value)
+        csr = json.loads(request.read_text())["csr"].encode()
+        authority = DeploymentAuthority.load(PrivateDirectory(self.authority_dir), deployment)
+        issued = authority.issue_and_activate(ledger, claim, csr,
+                                              validity=datetime.timedelta(seconds=3))
+        certificate = self.exchange / "short.pem"
+        certificate.write_bytes(issued.certificate_pem)
+        result = subprocess.run(
+            [sys.executable, "-m", "tests.e2e.capture_node_process", "install", str(self.runtime),
+             str(bundle), str(certificate), bundle_digest],
+            cwd=ROOT, env=self.environment, capture_output=True, timeout=30, check=False)
+        self.assertEqual(b"done", result.stdout.strip(), result.stderr)
+
+        # Before expiry the same key cannot re-pair (it renews instead).
+        early = self.agent_cli("request", "--runtime-root", self.runtime, "--output",
+                               self.exchange / "early.json", "--repair", "expired", tty=False)
+        status, _output, error = early.finish()
+        self.assertEqual(1, status)
+        self.assertIn("node_identity_not_expired", error)
+        while datetime.datetime.now(datetime.timezone.utc) <= issued.not_after:
+            time.sleep(0.2)
+        result, _output = self.ingest_connect(deployment)
+        self.assertIsInstance(result, str, "an expired certificate is not admitted")
+
+        # Expired, not revoked: same key, same node, the Owner types APPROVE.
+        repair, repair_digest = self.agent_request("--repair", "expired", name="expired.json")
+        self.assertEqual(key_digest, repair_digest)
+        main, grouped = self.start_approval(repair, listen_port, repair_digest)
+        self.assertIn(f"existing capture node: {node}".encode(), main.transcript)
+        main.wait_for(b"Type it only")
+        self.assertEqual(node, self.agent_pair(bundle, bundle_digest, grouped, "--repair", "expired"))
+        status, main_output, main_error = main.finish()
+        self.assertEqual(0, status, main_error)
+        session, result = self.ingest_connect(deployment)
+        self.assertEqual("ok", result)
+        self.assertNotIsInstance(session, str, session)
+        self.assertEqual(node, session.identity.node_id)
+        session.close()
+        self.assertEqual(1, len(list((self.runtime / "node-credentials").glob("private-key-*.pem"))))
+
+        # Revoked: the old key is refused, a new key pairs as a new node.
+        revoke = self.main_cli("revoke", "--database", self.database, "--node", node)
+        revoke.wait_for(b"Type REVOKE")
+        revoke.type(b"REVOKE\n")
+        self.assertEqual(0, revoke.finish()[0])
+        refused = self.main_cli("approve", "--database", self.database,
+                                "--authority-dir", self.authority_dir,
+                                "--listener-dir", self.listener_dir, "--request", repair,
+                                "--listen", f"127.0.0.1:{free_port()}",
+                                "--human-port", self.human_port)
+        status, _output, error = refused.finish()
+        self.assertEqual(2, status)
+        self.assertIn("public_key_revoked", error)
+        revoked_request, new_digest = self.agent_request("--repair", "revoked", name="revoked.json")
+        self.assertNotEqual(key_digest, new_digest)
+        # A fresh port: the first listener's port may still be in TIME_WAIT.
+        second_port = free_port()
+        main, grouped = self.start_approval(revoked_request, second_port, new_digest)
+        self.assertIn(b"new capture node", main.transcript)
+        main.wait_for(b"Type it only")
+        new_node = self.agent_pair(bundle, bundle_digest, grouped, "--repair", "revoked",
+                                   "--endpoint", f"127.0.0.1:{second_port}")
+        self.assertNotEqual(node, new_node)
+        status, main_output, main_error = main.finish()
+        self.assertEqual(0, status, main_error)
+        self.assertIn(f"enrollment completed: node_id={new_node}", main_output)
+        session, result = self.ingest_connect(deployment)
+        self.assertEqual("ok", result)
+        self.assertNotIsInstance(session, str, session)
+        self.assertEqual(new_node, session.identity.node_id)
+        session.close()
+        self.assertEqual(1, len(list((self.runtime / "node-credentials").glob("private-key-*.pem"))))
+        self.assertFalse((self.runtime / "pending-repair" / "node-key.pem").exists())
+        listing = self.main_cli("list", "--database", self.database, tty=False)
+        status, output, error = listing.finish()
+        self.assertEqual(0, status, error)
+        # The revoked node's history stays; the new node starts with no sources.
+        self.assertIn(f"node_id={node} enrollment=activated credential=revoked", output)
+        self.assertIn(f"node_id={new_node} enrollment=activated credential=active", output)
+        self.assertEqual(2, output.count("node_id="))
 
     def test_listener_rotation_keeps_the_bundle_and_paired_agents(self):
         # Issue #125: rotating the Main listener leaf keeps the CA, so the

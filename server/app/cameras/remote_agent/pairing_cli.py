@@ -579,14 +579,25 @@ def command_export_bundle(args) -> int:
 def _approve_and_serve(ledger, authority, listener, terminal, digest):
     """Confirm, approve and serve one enrollment on the pinned ledger database."""
     # A key stays bound to its node for good, so a retry after an
-    # interrupted, expired or unacknowledged enrollment reuses that node.
+    # interrupted, expired or unacknowledged enrollment -- or re-pairing a
+    # node whose certificate expired without being revoked (#116) -- reuses
+    # that node. A revoked node's keys are never accepted again: it re-pairs
+    # as a new node with a new key, refused here before the Owner prompt or
+    # the listener opens.
     try:
-        bound = ledger.bound_node(digest)
+        revoked = ledger.key_revoked(digest)
+        bound = None if revoked else ledger.bound_node(digest)
     except PairingError:
         raise _ledger_refusal(ledger, "approval_refused") from None
-    retry = "" if bound is None else (
+    if revoked:
+        raise _ledger_refusal(ledger, "public_key_revoked")
+    retry = (
+        "  new capture node: camera sources are not carried over from any\n"
+        "  earlier (revoked) node; approve its sources again after pairing\n"
+        if bound is None else
         f"  existing capture node: {bound}\n"
-        "  (retry: completing it replaces that node's current certificate)\n")
+        "  (retry or re-pairing with the same key: completing it replaces\n"
+        "  that node's current certificate; its camera sources are unchanged)\n")
     listener.open()
     try:
         owner = LocalConsoleOwner()

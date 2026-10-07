@@ -612,6 +612,52 @@ class PairingCliTests(EnrollmentHarness):
         with self.assertRaises(PairingError):
             self.ledger.bound_node("not-a-digest")
 
+    def test_revoked_node_repairs_only_as_a_new_node_with_a_new_key(self):
+        # Owner policy 2026-10-01 (#116): a revoked node never reuses its key or
+        # node; it re-pairs as a new node, and the old node's ledger history is
+        # kept (not deleted) so its recordings stay attributed to it.
+        _key, _csr, old_digest = node_request()
+        old_node = uuid4()
+        self.ledger.approve(Owner(), "owner", node_id=old_node, public_key_digest=old_digest)
+        self.assertFalse(self.ledger.key_revoked(old_digest))
+        self.ledger.revoke(Owner(), "owner", node_id=old_node)
+        self.assertTrue(self.ledger.key_revoked(old_digest))
+        for node in (old_node, uuid4()):
+            with self.assertRaises(PairingError):
+                self.ledger.approve(Owner(), "owner", node_id=node, public_key_digest=old_digest)
+        _key, _csr, new_digest = node_request()
+        self.assertFalse(self.ledger.key_revoked(new_digest))
+        self.assertIsNone(self.ledger.bound_node(new_digest))
+        new_node = uuid4()
+        self.ledger.approve(Owner(), "owner", node_id=new_node, public_key_digest=new_digest)
+        # The new key is unique to the new node: it cannot be re-bound to the old one.
+        with self.assertRaises(PairingError):
+            self.ledger.approve(Owner(), "owner", node_id=old_node, public_key_digest=new_digest)
+        states = {row.node_id: row.enrollment_state for row in self.ledger.pairing_summaries()}
+        self.assertEqual({old_node: "revoked", new_node: "pending"}, states)
+        with self.assertRaises(PairingError):
+            self.ledger.key_revoked("not-a-digest")
+
+    def test_approve_refuses_a_revoked_key_before_prompting_or_listening(self):
+        path, digest = self.request_file()
+        node = uuid4()
+        self.ledger.approve(Owner(), "owner", node_id=node, public_key_digest=digest)
+        self.ledger.revoke(Owner(), "owner", node_id=node)
+        terminal, written = self.fake_terminal()
+        stderr = io.StringIO()
+        with patch.object(pairing_cli, "ControllingTerminal", terminal), \
+                patch.object(pairing_cli.EnrollmentListener, "open") as opened, \
+                patch("sys.stderr", stderr):
+            status = pairing_cli.main([
+                "approve", "--database", str(self.database.path),
+                "--authority-dir", str(self.root / "ca"),
+                "--listener-dir", str(self.root / "listener"), "--request", str(path),
+                "--listen", "127.0.0.1:18443"])
+        self.assertEqual(2, status)
+        self.assertIn("public_key_revoked", stderr.getvalue())
+        self.assertEqual([], written, "no Owner prompt for a revoked key")
+        opened.assert_not_called()
+
     def test_list_shows_states_without_digests(self):
         _key, _csr, approval, _code = self.approve()
         stdout = io.StringIO()
