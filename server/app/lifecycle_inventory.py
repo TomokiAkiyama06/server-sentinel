@@ -196,8 +196,41 @@ class RuntimeTree:
         return self.root / "recordings"
 
 
+def _json_value(value):
+    """A stored value json cannot encode (a BLOB where text belongs) is
+    digested by its type and bytes, so a malformed row is a change, never a
+    crash."""
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return {"blob": bytes(value).hex()}
+    return {"unencodable": type(value).__name__}
+
+
+def _blob_hex(value):
+    """Hex of a BLOB column; a wrong-typed value is kept as its type and
+    repr (never through bytes(), which turns an int into zero bytes)."""
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return bytes(value).hex()
+    return {"not_blob": type(value).__name__, "value": repr(value)}
+
+
+def _fail_closed(default):
+    """A comparison rule given a malformed stored value fails closed
+    (``default``) instead of aborting verification; the current-state
+    checks report the malformed value itself."""
+    def wrap(function):
+        @functools.wraps(function)
+        def checked(*args, **kwargs):
+            try:
+                return function(*args, **kwargs)
+            except (TypeError, ValueError, OverflowError, AttributeError, KeyError, IndexError):
+                return default
+        return checked
+    return wrap
+
+
 def _digest(value: object) -> str:
-    encoded = json.dumps(value, separators=(",", ":"), sort_keys=True, ensure_ascii=True)
+    encoded = json.dumps(value, separators=(",", ":"), sort_keys=True, ensure_ascii=True,
+                         default=_json_value)
     return hashlib.sha256(encoded.encode()).hexdigest()
 
 
@@ -232,7 +265,7 @@ def _file_digest(directory: Path, segment_id: str) -> tuple[str | None, int | No
     """SHA-256, size and hard-link count of a segment file as stored."""
     try:
         name = UUID(segment_id).hex + ".seg"
-    except ValueError:
+    except (ValueError, TypeError, AttributeError):
         return None, None, None
     try:
         descriptor = os.open(directory / name,
@@ -293,7 +326,9 @@ def _recordings(connection, tables) -> dict | None:
                 "_catalog_sha256": segment["sha256"],
                 "source_id": segment["source_id"],
                 "start_ms": segment["start_ms"], "end_ms": segment["end_ms"],
-                "media_ms": segment["end_ms"] - segment["start_ms"],
+                "media_ms": (segment["end_ms"] - segment["start_ms"]
+                             if type(segment["end_ms"]) is int
+                             and type(segment["start_ms"]) is int else None),
                 # Catalog fields that control integrity, playback or retention:
                 # byte_length (integrity), stream_id / sequence (manifest
                 # discontinuities), codec / container (player selection),
@@ -324,7 +359,9 @@ def _recordings(connection, tables) -> dict | None:
             # clips segments and computes gaps against target_end_ms.
             "target_end_ms": row["target_end_ms"],
             "ended_ms": row["ended_ms"],
-            "segment_media_ms": sum(item["media_ms"] for item in items),
+            "segment_media_ms": (sum(item["media_ms"] for item in items)
+                                 if all(item["media_ms"] is not None for item in items)
+                                 else None),
             # Owner decision 2026-10-05: a recording with no linked segment
             # (interrupted before any segment, an event over a source with
             # no media) is recorded explicitly as having no evidence; only
@@ -369,6 +406,18 @@ def _source_cursors(connection, tables) -> dict | None:
                 "SELECT source_id, stream_id, sequence, end_ms FROM recording_source_cursors")}
 
 
+def _pending_segments(connection, tables) -> dict | None:
+    """Every pending catalog row: RecordingStore._recover() deletes each one
+    with its file at the next start, so none may be a published segment."""
+    if "recording_segments" not in tables:
+        return None
+    return {str(row["id"]): {"source_id": row["source_id"], "start_ms": row["start_ms"],
+                             "end_ms": row["end_ms"]}
+            for row in connection.execute(
+                "SELECT id, source_id, start_ms, end_ms FROM recording_segments "
+                "WHERE state = 'pending'")}
+
+
 def _publications_since(connection, tables, cursors) -> dict | None:
     """Every ready catalog segment published after the record, spool flag aside.
 
@@ -386,8 +435,13 @@ def _publications_since(connection, tables, cursors) -> dict | None:
             "SELECT id, source_id, stream_id, sequence, start_ms, end_ms "
             "FROM recording_segments WHERE state = 'ready'"):
         recorded = cursors.get(row["source_id"])
-        if (recorded is None or (isinstance(recorded, list) and len(recorded) == 3
-                                 and row["start_ms"] >= recorded[2])):
+        if type(row["start_ms"]) is not int or type(row["end_ms"]) is not int:
+            # Malformed bounds are compared nowhere: the segment row check
+            # already reports the row (invalid_value), failing verification.
+            continue
+        if recorded is None or (isinstance(recorded, list) and len(recorded) == 3
+                                and type(recorded[2]) is int
+                                and row["start_ms"] >= recorded[2]):
             result[row["id"]] = {
                 "source_id": row["source_id"], "stream_id": row["stream_id"],
                 "sequence": row["sequence"], "start_ms": row["start_ms"],
@@ -505,7 +559,8 @@ def _keyed(salt: str, value: object) -> str:
     baseline (and so its salt) can still test a guessed value, so the file
     stays deployment-local.
     """
-    message = json.dumps(value, separators=(",", ":"), sort_keys=True, ensure_ascii=True)
+    message = json.dumps(value, separators=(",", ":"), sort_keys=True, ensure_ascii=True,
+                         default=_json_value)
     return hmac.new(bytes.fromhex(salt), message.encode(), hashlib.sha256).hexdigest()
 
 
@@ -1657,7 +1712,7 @@ def _compare_security_state(baseline: dict | None, current: dict | None) -> dict
         if invalidated and key in now and not now[key]:
             failed.append({"id": f"sessions_invalidated:{key}", "reason": "revocation_reversed"})
     before, after = baseline.get("authorization_generation"), current.get("authorization_generation")
-    if before is not None and (after is None or after < before):
+    if before is not None and not (_int(before) and _int(after) and after >= before):
         failed.append({"id": "authorization_generation", "reason": "decreased"})
     # #134: a pending exposure marker leaves only with the revocation
     # ReservationSessionRevocation commits in the same transaction: a new
@@ -1669,7 +1724,7 @@ def _compare_security_state(baseline: dict | None, current: dict | None) -> dict
         audited = set(current.get("session_revocation_audit") or ()) - set(
             baseline.get("session_revocation_audit") or ())
         now = current.get("sessions_invalidated")
-        revoked = (bool(audited) and before is not None and after is not None and after > before
+        revoked = (bool(audited) and _int(before) and _int(after) and after > before
                    and now is not None
                    and all(now[key] for key in (baseline.get("sessions_invalidated") or {})
                            if key in now))
@@ -2045,8 +2100,34 @@ def _domain_errors(connection, tables) -> list:
     cursors = ({row[0]: row for row in connection.execute(
         "SELECT source_id, stream_id, sequence, end_ms FROM recording_source_cursors")}
         if "recording_source_cursors" in tables else None)
-    for row in rows("recording_segments", "SELECT * FROM recording_segments"):
+    # RecordingStore._publish() writes each source cursor from a validated
+    # segment (UUID stream and capture node, its sequence and end).
+    for row in rows("recording_source_cursors", "SELECT * FROM recording_source_cursors"):
+        node = row["capture_node_id"]
+        if not (_canonical_uuid(row["source_id"]) and _canonical_uuid(row["stream_id"])
+                and _int(row["sequence"]) and _int(row["end_ms"]) and row["active"] in (0, 1)
+                and (node is None or _canonical_uuid(node))):
+            bad("recordings", f"cursor:{row['source_id']}")
+    segment_rows = rows("recording_segments", "SELECT * FROM recording_segments")
+    for row in segment_rows:
         if not _service_valid_segment_row(row, cursors):
+            bad("recordings", f"segment:{row['id']}")
+    # The cursor names the last published segment: while that ready row is
+    # still catalogued (it ends exactly at the cursor end), the cursor's
+    # stream and sequence are its own.
+    last = {}
+    for row in segment_rows:
+        cursor = (cursors or {}).get(row["source_id"])
+        if row["state"] == "ready" and cursor is not None and row["end_ms"] == cursor[3]:
+            last.setdefault(row["source_id"], set()).add((row["stream_id"], row["sequence"]))
+    for source_id, named in sorted(last.items()):
+        cursor = cursors[source_id]
+        if (cursor[1], cursor[2]) not in named:
+            bad("recordings", f"cursor:{source_id}")
+    # append() refuses while any pending row exists (RECORDING_RECOVERY_REQUIRED).
+    pending = [row for row in segment_rows if row["state"] == "pending"]
+    if len(pending) > 1:
+        for row in pending:
             bad("recordings", f"segment:{row['id']}")
     for message in _access_row_errors(connection, tables):
         bad(*message)
@@ -2093,9 +2174,20 @@ def _service_valid_segment_row(row, cursors) -> bool:
             and ("critical" not in keys or row["critical"] in (0, 1))
             and ("integrity" not in keys or row["integrity"] in _SEGMENT_INTEGRITY)):
         return False
+    cursor = None if cursors is None else cursors.get(row["source_id"])
+    if cursor is not None and not (_int(cursor[2]) and _int(cursor[3])
+                                   and isinstance(cursor[1], str)):
+        return False
     if row["state"] == "pending":
-        # append() inserts pending rows unspooled and unchecked.
-        return row["spool"] == 0 and ("integrity" not in keys or row["integrity"] == "unchecked")
+        # append() inserts pending rows unspooled and unchecked, only past
+        # the source cursor (RECORDING_TIMELINE_REGRESSION otherwise), and
+        # _publish() advances the cursor only when the row turns ready. A
+        # pending row at or behind the cursor is a published segment that
+        # RecordingStore._recover() would delete with its file.
+        return (row["spool"] == 0
+                and ("integrity" not in keys or row["integrity"] == "unchecked")
+                and (cursor is None or (row["start_ms"] >= cursor[3] and not (
+                    row["stream_id"] == cursor[1] and row["sequence"] <= cursor[2]))))
     if cursors is None:
         return True
     # _publish() advances the source cursor with every ready segment and
@@ -2103,7 +2195,6 @@ def _service_valid_segment_row(row, cursors) -> bool:
     # a ready segment ends at or before its source's cursor. The sequence is
     # not bounded: after a change to another stream, append() checks no
     # sequence, so a resumed stream may restart below rows it already wrote.
-    cursor = cursors.get(row["source_id"])
     return cursor is not None and row["end_ms"] <= cursor[3]
 
 
@@ -2155,7 +2246,8 @@ def _access_row_errors(connection, tables) -> list:
                 errors.append(("access_invitations", str(row["id"])))
     if {"access_sessions", "access_credentials"} <= tables:
         owners = {bytes(row[0]): row[1] for row in connection.execute(
-            "SELECT credential_id, principal_id FROM access_credentials")}
+            "SELECT credential_id, principal_id FROM access_credentials")
+            if isinstance(row[0], (bytes, bytearray, memoryview))}
         for row in connection.execute("SELECT * FROM access_sessions"):
             keys = row.keys()
 
@@ -2362,7 +2454,8 @@ def _sign_counts_advanced(base: dict, now: dict) -> bool:
         return False
     before, after = base["active_credentials"], now["active_credentials"]
     return ([item[0] for item in before] == [item[0] for item in after]
-            and all(new[1] >= old[1] for old, new in zip(before, after)))
+            and all(_int(new[1]) and _int(old[1]) and new[1] >= old[1]
+                    for old, new in zip(before, after)))
 
 
 def _compare_principals(baseline: dict | None, current: dict | None) -> dict:
@@ -2436,7 +2529,7 @@ def _access(connection, tables, salt: str) -> dict | None:
         # which verification lets only advance: a lower counter would roll
         # back the clone-detection floor. Backup state is excluded.
         credentials = sorted([_keyed(salt, [
-            "credential-v1", bytes(item["credential_id"]).hex(), bytes(item["public_key"]).hex(),
+            "credential-v1", _blob_hex(item["credential_id"]), _blob_hex(item["public_key"]),
             item["algorithm"], None if item["backup_eligible"] is None
             else bool(item["backup_eligible"])]), item["sign_count"]]
             for item in connection.execute(
@@ -2557,6 +2650,7 @@ def collect(runtime_root: Path, *, salt: str | None = None,
             "recordings": _recordings(connection, tables),
             "spool_segments": _spool_segments(connection, tables),
             "recording_source_cursors": _source_cursors(connection, tables),
+            "pending_segments": _pending_segments(connection, tables),
             "publications_since_record": _publications_since(connection, tables,
                                                              since_cursors),
             "audit": _audit(connection, tables),
@@ -2642,6 +2736,7 @@ def _without_media_bytes(item: dict) -> dict:
             "segments": segments}
 
 
+@_fail_closed(False)
 def _declared_rewrite_only(base: dict, now: dict) -> bool:
     # The rewritten result must itself be servable: readable and matching its
     # catalog digest, byte length and single-link invariant.
@@ -2668,6 +2763,7 @@ def _evidenced(item: dict) -> bool:
 _ACTIVE_SUCCESSORS = frozenset({"active", "complete", "gapped", "interrupted"})
 
 
+@_fail_closed(False)
 def _valid_growth(base: dict, now: dict, context: dict | None = None) -> bool:
     """Whether a recording active at record time only grew as the store allows.
 
@@ -2722,6 +2818,7 @@ def _valid_growth(base: dict, now: dict, context: dict | None = None) -> bool:
     return _appended_publications_valid(base, now, remaining, context or {})
 
 
+@_fail_closed(False)
 def _trimmed_by_stop(base: dict, now: dict, dropped: list) -> bool:
     """Whether recorded segment links left only by a closing early stop.
 
@@ -2772,6 +2869,7 @@ def _service_valid_segment(segment: dict) -> bool:
     return type(catalog["byte_length"]) is int and catalog["byte_length"] > 0
 
 
+@_fail_closed(False)
 def _segments_consistent(item: dict) -> bool:
     """Every linked segment is one the store would have linked to ``item``."""
     return all(segment["source_id"] == item["source_id"]
@@ -2798,6 +2896,7 @@ def _expected_ended(now: dict) -> int | None:
                                          default=now["start_ms"]))
 
 
+@_fail_closed(False)
 def _appended_publications_valid(base: dict, now: dict, remaining: Counter,
                                  context: dict) -> bool:
     """Whether newly linked segments and markers match store publications.
@@ -2903,6 +3002,7 @@ def _overlaps(recording: dict, start_ms, end_ms) -> bool:
     return recording["start_ms"] < end_ms and recording["target_end_ms"] > start_ms
 
 
+@_fail_closed(True)
 def _unlinked_publication(base: dict, now: dict, context: dict) -> bool:
     """Whether a publication the store must have linked to a recording is unlinked.
 
@@ -2978,6 +3078,7 @@ def _publication_markers(ordered: list) -> Counter | None:
     return allowed
 
 
+@_fail_closed(False)
 def _retention_eligible(item: dict, cutoff_ms: int | None) -> bool:
     """RecordingStore.retention_candidates() for RetentionService.expired()."""
     return (cutoff_ms is not None and not item["starred"]
@@ -3071,6 +3172,32 @@ def _compare_recordings(baseline: dict | None, current: dict | None, *,
         rewrites = [other for other in rewrites if other != key]
         without = [other for other in without if other != key]
         failed.append({"id": key, "reason": reason})
+    # RecordingStore._recover() deletes every pending row with its file at
+    # the next start. A segment published at record time (linked or in the
+    # ready spool), or one starting behind the source cursor recorded then
+    # (append() admits nothing there), is never pending again.
+    context = context or {}
+    recorded_ready = {segment["segment_id"] for item in baseline.values()
+                      for segment in item["segments"] if segment.get("state") == "ready"}
+    recorded_ready |= set(context.get("recorded_spool") or ())
+    cursors = context.get("cursors") or {}
+    for segment_id, row in sorted((context.get("pending") or {}).items()):
+        floor = cursors.get(row.get("source_id"))
+        behind = (isinstance(floor, list) and len(floor) == 3 and type(floor[2]) is int
+                  and type(row.get("start_ms")) is int and row["start_ms"] < floor[2])
+        if segment_id in recorded_ready or behind:
+            failed.append({"id": f"segment:{segment_id}", "reason": "published_segment_pending"})
+    # A source cursor is never deleted and its end never moves back
+    # (_publish() only advances it; release_source() only clears active).
+    current_cursors = context.get("current_cursors")
+    if current_cursors is not None:
+        for source_id, recorded in sorted(cursors.items()):
+            now_cursor = current_cursors.get(source_id)
+            if not (isinstance(now_cursor, list) and len(now_cursor) == 3
+                    and isinstance(recorded, list) and len(recorded) == 3
+                    and _int(now_cursor[2]) and _int(recorded[2])
+                    and now_cursor[2] >= recorded[2]):
+                failed.append({"id": f"cursor:{source_id}", "reason": "cursor_regressed"})
     # A recording that appeared since the record is listed as appended,
     # but its segments must still be ones the store would have linked.
     for key in result.get("appended", ()):
@@ -3237,6 +3364,11 @@ def _future_times(current: dict, limit: datetime) -> dict:
         late("integrity_delivery", f"pending:{row_id}", _utc_instant(at))
     for kind, state, at in integrity.get("overflow") or ():
         late("integrity_delivery", f"overflow:{kind}:{state}", _utc_instant(at))
+    # A source cursor end beyond the verify time would make append() refuse
+    # every later segment (RECORDING_TIMELINE_REGRESSION).
+    for source_id, cursor in sorted((current.get("recording_source_cursors") or {}).items()):
+        end = cursor[2] if isinstance(cursor, list) and len(cursor) == 3 else None
+        late("recordings", f"cursor:{source_id}", _epoch_instant(1)(end))
     audit = current.get("audit") or {}
     for name, section, parse in (
             ("security_admin", "audit_security_admin", _epoch_instant(1000)),
@@ -3440,7 +3572,10 @@ def compare(baseline: dict, current: dict, *, declared_rewrites=(), now=None) ->
             context={"cursors": baseline.get("recording_source_cursors"),
                      "recordings": current.get("recordings"),
                      "spool": current.get("spool_segments"),
-                     "published": current.get("publications_since_record")}),
+                     "published": current.get("publications_since_record"),
+                     "pending": current.get("pending_segments"),
+                     "current_cursors": current.get("recording_source_cursors"),
+                     "recorded_spool": baseline.get("spool_segments")}),
         "audit_security_admin": _compare_audit(
             baseline["audit"].get("security_admin"), current["audit"].get("security_admin"),
             rules["security_admin"]),
@@ -3736,10 +3871,21 @@ def main(arguments: list[str] | None = None) -> int:
         if args.report is not None:
             safe_output_path(args.report, args.runtime_root)
         baseline = read_private(_absolute(args.baseline, "baseline"))
-        current = collect(args.runtime_root, salt=_baseline_salt(baseline),
-                          owner_template_root=args.owner_template_root,
-                          since_cursors=baseline.get("recording_source_cursors"))
-        report = compare(baseline, current, declared_rewrites=args.declared_rewrite)
+        try:
+            current = collect(args.runtime_root, salt=_baseline_salt(baseline),
+                              owner_template_root=args.owner_template_root,
+                              since_cursors=baseline.get("recording_source_cursors"))
+            report = compare(baseline, current, declared_rewrites=args.declared_rewrite)
+        except (TypeError, ValueError, OverflowError, KeyError, IndexError,
+                AttributeError) as exc:
+            # Last line of defence: a stored value no rule anticipated never
+            # aborts verification; it is a failed, unverifiable state.
+            report = {"format": FORMAT + "-verification", "format_version": FORMAT_VERSION,
+                      "status": "failed", "unverifiable": type(exc).__name__, "sections": {},
+                      "empty_coverage": [], "not_applicable": dict(NOT_APPLICABLE),
+                      "not_inventoried": {name: "not_inventoried (#132)"
+                                          for name in NOT_INVENTORIED},
+                      "manual": dict(MANUAL)}
         if args.report is not None:
             write_private(args.report, args.runtime_root, report)
         print("\n".join(_summary_verify(report)))

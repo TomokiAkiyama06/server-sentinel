@@ -15,6 +15,7 @@ import sqlite3
 import ssl
 import stat
 from tempfile import TemporaryDirectory
+import traceback
 import unittest
 from unittest import mock
 from uuid import UUID, uuid4, uuid5
@@ -5692,6 +5693,171 @@ class LifecycleInventoryTests(unittest.TestCase):
         self.assertEqual(code, inventory.EXIT_FAILED)
         self.assertEqual(report["sections"]["recordings"]["failed"],
                          [{"id": str(recording), "reason": "changed"}])
+
+    def test_a_published_segment_never_becomes_pending(self):
+        # Codex P1: RecordingStore._recover() deletes every pending row and
+        # its .seg file at the next start. A published segment reset to the
+        # pending shape (state, spool=0, integrity='unchecked') with its link
+        # dropped must fail before that startup makes the loss permanent.
+        import zlib
+        from app.media.recording import Segment
+        payload = zlib.compress(b"generated geometric test payload" * 4)
+
+        def scenario(label, after_record):
+            runtime = Runtime(self.base / f"pending-{label.replace(' ', '-')}")
+            saved, self.runtime = self.runtime, runtime
+            try:
+                runtime.seed()
+                connection = sqlite3.connect(runtime.database, isolation_level=None)
+                self.addCleanup(connection.close)
+                store = self._recording_store(connection)
+                base = int((self.now - timedelta(hours=1)).timestamp() * 1000)
+                source, stream_id = uuid4(), uuid4()
+
+                def put(sequence, start, end):
+                    return store.append(Segment(source, stream_id, sequence, base + start,
+                                                base + end, "synthetic", "deflate", payload))
+                spooled = put(0, 0, 10_000)
+                recording = store.start_manual(source, base + 10_000, duration_ms=40_000)
+                code, baseline = self.record(f"pending-{label.replace(' ', '-')}.json")
+                self.assertEqual(code, inventory.EXIT_PRESERVED)
+                target = spooled if after_record is None else put(1, 10_000, 20_000)
+                code, report, _ = self.verify(baseline)
+                self.assertEqual(code, inventory.EXIT_PRESERVED,
+                                 report["sections"]["recordings"])
+                runtime.execute("UPDATE recording_segments SET state='pending', spool=0, "
+                                "integrity='unchecked' WHERE id=?", (str(target),))
+                runtime.execute("DELETE FROM recording_links WHERE segment_id=?",
+                                (str(target),))
+                if label == "cursor dropped":
+                    # Also drop the cursor so the current state alone looks
+                    # like an append on a source never published.
+                    runtime.execute("DELETE FROM recording_source_cursors WHERE source_id=?",
+                                    (str(source),))
+                code, report, _ = self.verify(baseline)
+                return code, report, target, recording
+            finally:
+                self.runtime = saved
+
+        for label in ("spooled at record", "published since", "cursor dropped"):
+            with self.subTest(label):
+                code, report, target, recording = scenario(
+                    label, "published" if label == "published since" else None)
+                self.assertEqual(code, inventory.EXIT_FAILED)
+                failed = report["sections"]["recordings"]["failed"]
+                if label == "cursor dropped":
+                    # The record still shows it was published.
+                    self.assertIn({"id": f"segment:{target}",
+                                   "reason": "published_segment_pending"}, failed)
+                else:
+                    self.assertIn({"id": f"segment:{target}", "reason": "invalid_value"},
+                                  failed)
+
+    def test_malformed_values_never_abort_verification(self):
+        # Codex P1: a wrong-typed value must be reported, never raise. Every
+        # column of the in-scope tables gets each wrong type in turn on a
+        # state real services wrote; verify always writes its report. In the
+        # recording tables (rows, links, segments, markers, cursors) every
+        # such change fails; elsewhere a column outside the compared set
+        # (labels, display names, last-use times) may stay preserved.
+        import zlib
+        from app.auth.reservation_store import ReservationSessionRevocation
+        from app.auth.store import AccessStore
+        from app.media.recording import Segment
+        self.runtime.seed()
+        database = Database(self.runtime.database)
+        ReservationSessionRevocation(
+            AccessStore(database, audit=AuditStore(database))).record_exposure()
+        ledger = PairingLedger(database, HmacCodeVerifier(b"s" * 32), audit=AuditStore(database),
+                               clock=lambda: 100.0, process_epoch=uuid4())
+
+        class Owner:
+            def require_owner(self, actor_context):
+                if actor_context != "owner":
+                    raise PermissionError("synthetic denial")
+        node = uuid4()
+        approval, code = ledger.approve(Owner(), "owner", node_id=node,
+                                        public_key_digest="a" * 64)
+        ledger.activate(ledger.redeem(enrollment_id=approval.enrollment_id,
+                                      public_key_digest="a" * 64, code=code.value),
+                        credential_serial_digest="b" * 64, not_after=50.0)
+        stage_renewal(ledger, node_id=node, current_public_key_digest="a" * 64,
+                      current_credential_digest="b" * 64, public_key_digest="c" * 64,
+                      credential_serial_digest=renewal_serial("fuzz"), not_after=90.0)
+        connection = sqlite3.connect(self.runtime.database, isolation_level=None)
+        self.addCleanup(connection.close)
+        store = self._recording_store(connection)
+        payload = zlib.compress(b"generated geometric test payload" * 4)
+        base = int((self.now - timedelta(hours=1)).timestamp() * 1000)
+        source, stream_id = uuid4(), uuid4()
+        store.append(Segment(source, stream_id, 0, base, base + 10_000, "synthetic", "deflate",
+                             payload))
+        recording = store.start_manual(source, base + 5_000, duration_ms=40_000)
+        store.append(Segment(source, stream_id, 1, base + 10_000, base + 20_000, "synthetic",
+                             "deflate", payload))
+        connection.execute("INSERT INTO recording_discontinuities VALUES "
+                           "(?, ?, ?, 'stream_discontinuity')",
+                           (str(recording), base + 6_000, base + 7_000))
+        store.close()
+        connection.close()
+        code, baseline = self.record()
+        self.assertIn(code, (inventory.EXIT_PRESERVED, inventory.EXIT_FAILED))
+        self.assertTrue(baseline.exists())
+        tables = ("recordings", "recording_links", "recording_segments",
+                  "recording_discontinuities", "recording_source_cursors",
+                  "security_admin_audit_records", "integrity_audit", "presence_audit",
+                  "storage_state_audit", "access_principals", "access_principal_permissions",
+                  "access_credentials", "access_invitations", "access_sessions",
+                  "access_deployment_state", "pairing_node_credentials", "pairing_enrollments",
+                  "pairing_node_renewals", "pairing_key_bindings", "application_metadata",
+                  "schema_migrations")
+        recording_tables = {"recordings", "recording_links", "recording_segments",
+                            "recording_discontinuities", "recording_source_cursors"}
+        values = {"text": "synthetic-malformed", "blob": b"\x00\x01", "null": None,
+                  "real": 1.5, "huge": 2**63 - 1, "negative": -(2**63)}
+        original = self.runtime.database.read_bytes()
+        crashes, silent = [], []
+        with closing(sqlite3.connect(self.runtime.database)) as db:
+            columns = {table: [row[1] for row in db.execute(f"PRAGMA table_info({table})")]
+                       for table in tables}
+        for table in tables:
+            for column in columns[table]:
+                for label, value in values.items():
+                    self.runtime.database.write_bytes(original)
+                    try:
+                        with closing(sqlite3.connect(self.runtime.database,
+                                                     isolation_level=None)) as db:
+                            # Only rows the update really changes (value and
+                            # storage type); a no-op is not a tamper.
+                            changed = db.execute(
+                                f"UPDATE {table} SET {column}=?1 WHERE {column} IS NOT ?1 "
+                                f"OR typeof({column}) IS NOT typeof(?1)", (value,)).rowcount
+                    except sqlite3.Error:
+                        continue  # the schema itself refuses it
+                    if not changed:
+                        continue
+                    try:
+                        code, report, _ = self.verify(baseline)
+                    except Exception as exc:  # noqa: BLE001 - collected for the report
+                        frame = [item for item in traceback.extract_tb(exc.__traceback__)
+                                 if item.filename.endswith("lifecycle_inventory.py")][-1]
+                        crashes.append(f"{table}.{column}={label}: {type(exc).__name__} "
+                                       f"at {frame.name}:{frame.lineno}")
+                        continue
+                    if "unverifiable" in report:
+                        # Only the last-resort net caught it: a rule crashed.
+                        crashes.append(f"{table}.{column}={label}: {report['unverifiable']}")
+                    if code != inventory.EXIT_FAILED and table in recording_tables:
+                        silent.append(f"{table}.{column}={label}")
+        self.runtime.database.write_bytes(original)
+        self.maxDiff = None
+        self.assertEqual(crashes, [])
+        self.assertEqual(silent, [])
+        # The last-resort net: an unanticipated value still yields a failed report.
+        with mock.patch.object(inventory, "compare", side_effect=TypeError("synthetic")):
+            code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_FAILED)
+        self.assertEqual((report["status"], report["unverifiable"]), ("failed", "TypeError"))
 
 if __name__ == "__main__":
     unittest.main()

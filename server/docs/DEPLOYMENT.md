@@ -922,7 +922,18 @@ intact. The required invariants are:
   its `spool` flag (`release_source()` clears it on linked segments too); a
   publication whose catalog row was removed together with its link is not
   visible to this rule and is caught only through the stream / sequence
-  markers of the segments around it. Every ready pre-roll spool segment (`state='ready'`,
+  markers of the segments around it. A segment published at record time
+  (linked or in the ready spool), or one starting behind the source cursor
+  recorded then, is never `pending` afterwards (`RecordingStore._recover()`
+  deletes every pending row with its file at the next start:
+  `published_segment_pending`); a pending row must also be one `append()`
+  could have written (unspooled, unchecked, past the current cursor, at most
+  one). A source cursor is never deleted, its end never moves back or beyond
+  the verify time, and while the last published segment is still catalogued
+  the cursor's stream and sequence are that segment's. A value of the wrong
+  type anywhere is reported (`invalid_value`); verification never aborts on
+  one and, if no rule anticipated it, still writes a failed report marked
+  `unverifiable`. Every ready pre-roll spool segment (`state='ready'`,
   `spool=1`), which a later recording links without re-checking it, must have
   a file matching its catalog digest, byte length and single link
   (`spool_file_mismatch` otherwise);
