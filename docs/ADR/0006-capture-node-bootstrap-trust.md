@@ -590,7 +590,12 @@ unchanged.
   can write, for the directory, its CA files or a non-sticky path
   component) is exposed even while access is denied; the CA directory lock
   spans each whole CA conversation; listener files are staged and installed
-  key-last so an interrupted `init` is recognized and redone.
+  key-last so an interrupted `init` is recognized and redone. Round 4: the CA
+  pair is staged and installed key-last too; a partial CA without any
+  issuance record is cleaned and recreated, one with records is never
+  removed (`issuer_material_incomplete`); access checks use `access(2)` with
+  effective ids (ACLs included, fail closed where unsupported); a torn final
+  log line is ignored and dropped by the next append.
 - **Still open (PR2).** Automatic renewal still has only an in-process
   signing primitive, used by tests and called by nothing in the application;
   wiring renewal into the ingest listener waits for the socket-activated,

@@ -417,6 +417,37 @@ class TwoAccountSeparationTests(unittest.TestCase):
         os.chmod(moved, 0o711)
         self.assertTrue(self.exposed_as_service(moved))
 
+    def test_acl_granted_write_on_an_ancestor_is_exposed(self):
+        # Codex P2 (PR #177, round 4): a named POSIX ACL entry, not the mode
+        # bits, grants the service write access to a root-owned ancestor.
+        # The ACL is written as the raw ``system.posix_acl_access`` xattr, so
+        # no setfacl tool is needed; a filesystem without ACL support skips
+        # here and fails in CI (CA_SEPARATION_REQUIRE_ROOT=1).
+        import errno
+        import struct
+        self.init()
+        parent = self.root / "acl-parent"
+        parent.mkdir(mode=0o755)
+        moved = parent / "ca"
+        os.rename(self.authority, moved)
+        self.assertFalse(self.exposed_as_service(moved))
+        undefined = 0xFFFFFFFF
+        entries = ((0x01, 7, undefined), (0x02, 7, SERVICE_ID), (0x04, 5, undefined),
+                   (0x10, 7, undefined), (0x20, 5, undefined))
+        acl = struct.pack("<I", 2) + b"".join(struct.pack("<HHI", *entry) for entry in entries)
+        try:
+            os.setxattr(parent, "system.posix_acl_access", acl)
+        except OSError as error:
+            if error.errno in (errno.ENOTSUP, errno.EOPNOTSUPP):
+                self.skip_or_fail("filesystem without POSIX ACL support")
+            raise
+        info = os.stat(parent)
+        self.assertEqual((0, 0), (info.st_uid, info.st_gid), "owned by root, not the service")
+        self.assertTrue(self.exposed_as_service(moved))
+        os.removexattr(parent, "system.posix_acl_access")
+        os.chmod(parent, 0o755)
+        self.assertFalse(self.exposed_as_service(moved))
+
     def test_same_account_for_ca_and_service_is_refused(self):
         status, _stdout, stderr = self.run_cli(
             "init", "--authority-dir", self.authority, "--listener-dir", self.listener,

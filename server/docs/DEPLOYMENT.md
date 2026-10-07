@@ -504,7 +504,11 @@ currently refuses access: the service account must not own the directory, any
 component of its path, or `ca-key.pem` / `ca-certificate.pem` /
 `issuance-log.jsonl`, and must not be able to write the directory, those files
 or any path component (a sticky ancestor such as `/var/tmp` is tolerated, as
-for the deployment configuration); no component may be a symbolic link. The
+for the deployment configuration), and must not be able to read or search the
+directory or read a CA file; no component may be a symbolic link. Access is
+decided by the kernel's `access(2)` for the effective ids, so POSIX ACL
+entries count exactly like mode bits (where that check is unsupported, access
+is assumed and the start is refused). The
 pairing CLI applies the same rule after its drop (`ca_directory_exposed`),
 except that `revoke` treats a missing directory as not exposed. It must be an absolute path outside the
 runtime root and the code trees. Use `null` only on a host that keeps no
@@ -523,7 +527,15 @@ written under staged `*.init` names and then installed with the key last, so
 a run interrupted while writing them leaves either the complete credential or
 an incomplete set without `main-server-key.pem`; the next `init` removes only
 that incomplete set (and any `*.init` name) and writes it again. A directory
-with `main-server-key.pem` is never cleaned. If the CA already exists --
+with `main-server-key.pem` is never cleaned. The CA pair is staged the same
+way (certificate installed first, `ca-key.pem` last): a CA directory without a
+complete pair and without any issuance-log record (missing or empty log) is
+an uncommitted `init` and is removed and created again; with any record, or a
+log that cannot be read, nothing is removed and `init` refuses
+`issuer_material_incomplete` for the Owner to inspect. A log line torn by a
+crash during an append (no final newline) belongs to an operation that never
+answered; it is ignored and dropped by the next append. The public CA copy is
+also staged (`*.publish`) and installed without overwriting. If the CA already exists --
 for example the CA side committed but its reply was lost, so the listener
 side removed its files -- a rerun with an empty listener directory keeps the
 CA and issues only a new listener certificate for the server name the CA log

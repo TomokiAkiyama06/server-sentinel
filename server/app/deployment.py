@@ -115,12 +115,30 @@ def _capture_ca_directory(value: object) -> Path:
 _CA_FILES = ("ca-key.pem", "ca-certificate.pem", "issuance-log.jsonl")
 
 
-def _controlled_by_this_account(info: os.stat_result, uid: int, gids: set[int], *,
+def _effective_access(path: Path, mode: int) -> bool:
+    """``access(2)`` with this process's effective ids, ACLs included.
+
+    Fail closed: where effective-id checks are unsupported or the check
+    errors, access is assumed.
+    """
+    if os.access not in os.supports_effective_ids:
+        return True
+    try:
+        return os.access(path, mode, effective_ids=True, follow_symlinks=False)
+    except (OSError, NotImplementedError, ValueError, TypeError):
+        return True
+
+
+def _controlled_by_this_account(path: Path, info: os.stat_result, uid: int, *,
                                 allow_sticky: bool) -> bool:
-    """Whether this process's account owns ``info`` or may write to it."""
+    """Whether this process's account owns ``path`` or may write to it.
+
+    Write access is the kernel's answer for the effective ids (owner, group,
+    other bits and POSIX ACLs alike), not an interpretation of mode bits.
+    """
     if info.st_uid == uid:
         return True
-    writable = bool(info.st_mode & 0o002 or (info.st_mode & 0o020 and info.st_gid in gids))
+    writable = _effective_access(path, os.W_OK)
     if writable and allow_sticky and stat.S_ISDIR(info.st_mode) and info.st_mode & stat.S_ISVTX:
         # Like ``_administrator_directory``: in a sticky directory others
         # cannot rename or replace an entry they do not own.
@@ -140,7 +158,9 @@ def capture_ca_path_exposed(path: Path, *, missing_is_exposed: bool = True) -> b
       by this account;
     * this account can write the directory, a CA file, or a path component
       (an ancestor only counts when it is not sticky), so it could replace
-      what lies below;
+      what lies below -- decided by ``access(2)`` with the effective ids, so
+      POSIX ACLs count, and assumed where that is unsupported;
+    * this account may read or search the directory, or read a CA file;
     * a component is a symbolic link or the path is not a directory;
     * the directory or its key file can be opened.
 
@@ -154,7 +174,6 @@ def capture_ca_path_exposed(path: Path, *, missing_is_exposed: bool = True) -> b
     if not path.is_absolute():
         return True
     uid = os.geteuid()
-    gids = {os.getegid(), *os.getgroups()}
     current = Path(path.anchor)
     components = path.parts[1:]
     for index, part in enumerate(components):
@@ -170,7 +189,12 @@ def capture_ca_path_exposed(path: Path, *, missing_is_exposed: bool = True) -> b
             return True
         if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
             return True
-        if _controlled_by_this_account(info, uid, gids, allow_sticky=not last):
+        if _controlled_by_this_account(current, info, uid, allow_sticky=not last):
+            return True
+        if last and (_effective_access(current, os.R_OK)
+                     or _effective_access(current, os.X_OK)):
+            # The CA directory is 0700 for its own account: this account may
+            # neither list nor search it (ACLs included).
             return True
     for name in _CA_FILES:
         try:
@@ -180,7 +204,8 @@ def capture_ca_path_exposed(path: Path, *, missing_is_exposed: bool = True) -> b
         except OSError:
             return True
         if (not stat.S_ISREG(info.st_mode)
-                or _controlled_by_this_account(info, uid, gids, allow_sticky=False)):
+                or _controlled_by_this_account(path / name, info, uid, allow_sticky=False)
+                or _effective_access(path / name, os.R_OK)):
             return True
     for target, flags in ((path, os.O_RDONLY | os.O_DIRECTORY),
                           (path / "ca-key.pem", os.O_RDONLY | os.O_NONBLOCK)):

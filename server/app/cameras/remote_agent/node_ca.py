@@ -444,7 +444,8 @@ class PrivateDirectory:
         finally:
             os.close(directory)
 
-    def read(self, name: str, *, maximum: int = MAX_PEM_BYTES) -> bytes:
+    def read(self, name: str, *, maximum: int = MAX_PEM_BYTES,
+             allow_empty: bool = False) -> bytes:
         directory = self._open_directory()
         try:
             try:
@@ -456,7 +457,7 @@ class PrivateDirectory:
                 info = os.fstat(descriptor)
                 if (not stat.S_ISREG(info.st_mode) or info.st_uid != self.owner_uid
                         or info.st_mode & 0o077 or info.st_nlink != 1
-                        or not 0 < info.st_size <= maximum):
+                        or not (0 if allow_empty else 1) <= info.st_size <= maximum):
                     raise CaptureAuthorityError("issuer material is not a private file")
                 content = os.read(descriptor, maximum + 1)
                 if len(content) != info.st_size:
@@ -467,11 +468,12 @@ class PrivateDirectory:
         finally:
             os.close(directory)
 
-    def read_optional(self, name: str, *, maximum: int = MAX_PEM_BYTES) -> bytes | None:
+    def read_optional(self, name: str, *, maximum: int = MAX_PEM_BYTES,
+                      allow_empty: bool = False) -> bytes | None:
         """``read``, or ``None`` when ``name`` does not exist (never created here)."""
         if not self.exists(name):
             return None
-        return self.read(name, maximum=maximum)
+        return self.read(name, maximum=maximum, allow_empty=allow_empty)
 
     def append(self, name: str, value: bytes, *, maximum: int) -> None:
         """Durably append ``value`` to the private file ``name``, creating it if missing.
@@ -488,12 +490,12 @@ class PrivateDirectory:
         try:
             created = False
             try:
-                descriptor = os.open(name, os.O_WRONLY | os.O_APPEND | os.O_NOFOLLOW
+                descriptor = os.open(name, os.O_RDWR | os.O_APPEND | os.O_NOFOLLOW
                                      | os.O_CLOEXEC, dir_fd=directory)
             except FileNotFoundError:
                 try:
                     descriptor = os.open(
-                        name, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+                        name, os.O_RDWR | os.O_APPEND | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
                         | os.O_CLOEXEC, 0o600, dir_fd=directory)
                 except OSError:
                     raise IssuanceLogUnavailable("issuer log could not be written") from None
@@ -512,7 +514,21 @@ class PrivateDirectory:
                 if (not stat.S_ISREG(info.st_mode) or info.st_uid != self.owner_uid
                         or info.st_mode & 0o077 or info.st_nlink != 1):
                     raise IssuanceLogUnavailable("issuer log is not a private file")
-                if info.st_size + len(value) > maximum:
+                base = info.st_size
+                try:
+                    if base and os.pread(descriptor, 1, base - 1) != b"\n":
+                        # A record torn by a crash mid-append: its operation
+                        # never answered, so the partial line is dropped
+                        # before this record is appended (Issue #109).
+                        content = os.pread(descriptor, base, 0)
+                        if len(content) != base:
+                            raise OSError(errno.EIO, "short read")
+                        base = content.rfind(b"\n") + 1
+                        os.ftruncate(descriptor, base)
+                        os.fsync(descriptor)
+                except OSError:
+                    raise IssuanceLogUnavailable("issuer log could not be written") from None
+                if base + len(value) > maximum:
                     raise IssuanceLogUnavailable("issuer log is full")
                 try:
                     remaining = memoryview(value)
@@ -524,7 +540,7 @@ class PrivateDirectory:
                     os.fsync(descriptor)
                 except OSError:
                     try:
-                        os.ftruncate(descriptor, info.st_size)
+                        os.ftruncate(descriptor, base)
                         os.fsync(descriptor)
                     except OSError:
                         pass
@@ -1025,16 +1041,26 @@ class DeploymentAuthority(DeploymentTrust):
                 x509.UniformResourceIdentifier(deployment_uri(deployment_id))]), critical=False)
             .sign(key, hashes.SHA256())
         )
-        directory.write_new(_CA_KEY, _private_pem(key))
+        # Staged like the listener credential (Issue #109): both files are
+        # written and fsynced under ``*.init`` names, then installed
+        # certificate first and key LAST, never overwriting. A final
+        # ``ca-key.pem`` therefore always means a complete CA; anything less
+        # is an uncommitted partial that ``init`` may clean (see
+        # ``issuer_process.CaIssuer``). Nothing created by a failed call is
+        # stranded, so a corrected rerun is not refused.
+        staged = ((_CA_CERTIFICATE, _certificate_pem(certificate)), (_CA_KEY, _private_pem(key)))
         try:
-            directory.write_new(_CA_CERTIFICATE, _certificate_pem(certificate))
+            for name, value in staged:
+                directory.write_new(name + _INIT_SUFFIX, value)
+            for name, _value in staged:
+                directory.install_new(name + _INIT_SUFFIX, name)
         except BaseException:
-            # The key was created exclusively by this call; never strand it,
-            # or every corrected rerun is refused as existing issuer material.
-            try:
-                directory.discard_created(_CA_KEY)
-            except CaptureAuthorityError:
-                pass
+            for name, _value in staged:
+                for candidate in (name + _INIT_SUFFIX, name):
+                    try:
+                        directory.discard_created(candidate)
+                    except CaptureAuthorityError:
+                        pass
             raise
         return cls(deployment_id, certificate, key, clock=clock)
 
@@ -1278,8 +1304,10 @@ def require_empty_listener_directory(listener: PrivateDirectory) -> None:
         raise CaptureAuthorityError("listener material already exists")
 
 
-# Staged names used only while a new listener credential is written (init).
+# Staged names used only while a new listener credential or CA is written (init).
 _INIT_SUFFIX = ".init"
+# Staged name of a public CA copy published outside init (approve, rotate).
+_PUBLISH_SUFFIX = ".publish"
 # Final names in install order: the key comes last, so a present final key
 # always means the whole credential was installed (Issue #109).
 _INSTALL_ORDER = (_PUBLIC_CA_CERTIFICATE, _SERVER_CERTIFICATE, _SERVER_KEY)
@@ -1362,7 +1390,23 @@ def publish_public_certificate(target: PrivateDirectory, ca_certificate_pem: byt
         if not hmac.compare_digest(existing, ca_certificate_pem):
             raise ListenerAuthorityMismatch("public CA copy is from another deployment CA")
         return False
-    target.write_new(_PUBLIC_CA_CERTIFICATE, ca_certificate_pem)
+    # Staged and installed without overwriting, so a crash never leaves an
+    # empty or partial copy under the final name (Issue #109).
+    staged = _PUBLIC_CA_CERTIFICATE + _PUBLISH_SUFFIX
+    target.discard_stale(staged)
+    target.write_new(staged, ca_certificate_pem)
+    try:
+        target.install_new(staged, _PUBLIC_CA_CERTIFICATE)
+    except CaptureAuthorityError:
+        try:
+            target.discard_created(staged)
+        except CaptureAuthorityError:
+            pass
+        # Another run published it meanwhile: it must be the same copy.
+        require_matching_public_certificate(target, ca_certificate_pem)
+        if not target.exists(_PUBLIC_CA_CERTIFICATE):
+            raise
+        return False
     return True
 
 

@@ -417,7 +417,7 @@ class IssuerTests(Harness):
 
     def test_damaged_or_exposed_log_refuses_before_any_prompt(self):
         log = self.authority_dir / ISSUANCE_LOG
-        for content, mode in ((b'{"format":1,"type":"node"', 0o600), (b"not json\n", 0o600),
+        for content, mode in ((b"not json\n", 0o600),
                               (b'{"format":2,"type":"node"}\n', 0o600),
                               (b'{"format":1,"type":"node_revocation","node_id":"x"}\n', 0o600),
                               (b"", 0o644)):
@@ -429,6 +429,33 @@ class IssuerTests(Harness):
                 reply = self.issuer().handle({"op": "hello"})
                 self.assertEqual("refused", reply["status"])
                 self.assertNotIn("ca_certificate", reply)
+
+    def test_a_record_torn_by_a_crash_is_ignored_and_dropped_by_the_next_append(self):
+        # Round 4: the append is fsynced before any reply, so a final line
+        # without its newline belongs to an operation that never answered.
+        node = uuid4()
+        _key, csr, digest = node_request()
+        first = self.issuer()
+        first.handle({"op": "hello"})
+        self.assertEqual("ok", self.sign(first, node, csr, digest)["status"])
+        first.close()
+        log = self.authority_dir / ISSUANCE_LOG
+        complete = log.read_bytes()
+        with open(log, "ab") as stream:
+            stream.write(b'{"format":1,"type":"node_revocation","node_id":"' + str(node).encode())
+        issuer = self.issuer()
+        self.assertEqual("ok", issuer.handle({"op": "hello"})["status"])
+        self.assertEqual("ok", issuer.handle({"op": "revoke", "node_id": str(node)})["status"])
+        issuer.close()
+        lines = log.read_bytes()
+        self.assertTrue(lines.startswith(complete))
+        self.assertEqual(["node", "node_revocation"], [json.loads(line)["type"]
+                                                       for line in lines.splitlines()])
+        # An empty log (created by an append that crashed before writing) is empty.
+        log.write_bytes(b"")
+        empty = self.issuer()
+        self.assertEqual("ok", empty.handle({"op": "hello"})["status"])
+        empty.close()
 
     def test_initialize_is_provisional_until_committed(self):
         for ending in ("abort", "close", "commit"):
@@ -977,12 +1004,49 @@ class ControlledCaPathTests(unittest.TestCase):
         try:
             with first, second, third:
                 self.assertEqual((True, True, True), self.probes(ca))
-                # A sticky ancestor (like /tmp) cannot have its entries
-                # replaced: with nothing else controlled, the closed CA is
-                # not exposed (as root the open itself would succeed).
-                os.chmod(parent, 0o1777)
-                if os.getuid() != 0:
-                    self.assertEqual((False, False, False), self.probes(ca))
+        finally:
+            os.chmod(ca, 0o700)
+
+    def kernel_access(self, writable_paths):
+        """``access(2)`` as the kernel would answer for another account with ACLs."""
+        def access(path, mode, *, effective_ids=False, follow_symlinks=True):
+            self.assertTrue(effective_ids, "the effective ids must be checked")
+            return mode == os.W_OK and Path(path) in writable_paths
+        from contextlib import ExitStack
+        stack = ExitStack()
+        stack.enter_context(patch("app.deployment.os.access", access))
+        stack.enter_context(patch("app.deployment.os.supports_effective_ids", {access}))
+        return stack
+
+    def test_acl_granted_write_on_an_ancestor_is_exposed(self):
+        # Codex P2 (PR #177, round 4): mode bits say "not writable" (0755,
+        # owner is not the service), but a named ACL grants the service write
+        # access; the kernel's effective access check decides.
+        parent = self.root / "acl-parent"
+        parent.mkdir(mode=0o755)
+        ca = parent / "ca"
+        ca.mkdir(mode=0o700)
+        os.chmod(ca, 0)
+        first, second, third = self.as_other_account()
+        try:
+            with first, second, third:
+                with self.kernel_access({parent}):
+                    self.assertEqual((True, True, True), self.probes(ca))
+                with self.kernel_access(set()):
+                    if os.getuid() != 0:  # root could open it anyway
+                        self.assertEqual((False, False, False), self.probes(ca))
+        finally:
+            os.chmod(ca, 0o700)
+
+    def test_unsupported_effective_access_check_fails_closed(self):
+        ca = self.root / "ca"
+        ca.mkdir(mode=0o700)
+        os.chmod(ca, 0)
+        first, second, third = self.as_other_account()
+        try:
+            with first, second, third, \
+                    patch("app.deployment.os.supports_effective_ids", set()):
+                self.assertEqual((True, True, True), self.probes(ca))
         finally:
             os.chmod(ca, 0o700)
 
@@ -1191,6 +1255,116 @@ class InterruptedListenerWriteTests(InitRecoveryTests):
                 trust.issued_listener_certificate(PrivateDirectory(self.listener))
 
 
+class PartialCaInitTests(InitRecoveryTests):
+    """Codex P2 (PR #177, round 4): a CA left partial by a crashed ``init``."""
+
+    def ca_files(self):
+        source = self.root / f"source-ca-{uuid4()}"
+        DeploymentAuthority.create(PrivateDirectory(source), uuid4(), validity=3650 * DAY)
+        return {name: (source / name).read_bytes()
+                for name in ("ca-certificate.pem", "ca-key.pem")}
+
+    def build_ca(self, files, entries, log=None):
+        self.authority = self.root / f"ca-{uuid4()}"
+        self.listener = self.root / f"listener-{uuid4()}"
+        directory = PrivateDirectory(self.authority).ensure()
+        for entry in entries:
+            if " = " in entry:
+                staged, final = entry.split(" = ")
+                os.link(self.authority / final, self.authority / staged)
+                continue
+            final = entry[:-len(".init")] if entry.endswith(".init") else entry
+            directory.write_new(entry, files[final])
+        if log is not None:
+            path = self.authority / ISSUANCE_LOG
+            path.write_bytes(log)
+            os.chmod(path, 0o600)
+
+    def test_every_uncommitted_partial_ca_is_cleaned_and_redone(self):
+        files = self.ca_files()
+        cases = (
+            (["ca-certificate.pem.init"], None),
+            (["ca-certificate.pem.init", "ca-key.pem.init"], None),
+            (["ca-certificate.pem", "ca-key.pem.init"], None),
+            (["ca-certificate.pem", "ca-key.pem.init",
+              "ca-certificate.pem.init = ca-certificate.pem"], None),
+            (["ca-certificate.pem"], None),
+            (["ca-key.pem"], None),  # key-only (the order before round 4)
+            (["ca-key.pem"], b""),  # plus a log created empty by a crash
+            ([], b""),
+        )
+        for entries, log in cases:
+            with self.subTest(entries=entries, log=log):
+                self.build_ca(files, entries, log)
+                status, stdout, stderr = self.init()
+                self.assertEqual(0, status, stderr)
+                self.assertNotIn("init recovered", stderr)
+                self.assertEqual(["ca-certificate.pem", "ca-key.pem", ISSUANCE_LOG],
+                                 sorted(os.listdir(self.authority)))
+                self.assertNotEqual(files["ca-key.pem"],
+                                    (self.authority / "ca-key.pem").read_bytes())
+                self.assertEqual(["deployment_ca", "listener"], self.log_types())
+
+    def test_a_complete_ca_with_a_leftover_staged_name_is_kept(self):
+        files = self.ca_files()
+        self.build_ca(files, ["ca-certificate.pem", "ca-key.pem",
+                              "ca-key.pem.init = ca-key.pem"])
+        status, _stdout, stderr = self.init()
+        self.assertEqual(0, status, stderr)
+        self.assertIn("init recovered", stderr)
+        self.assertEqual(files["ca-key.pem"], (self.authority / "ca-key.pem").read_bytes())
+        self.assertFalse((self.authority / "ca-key.pem.init").exists())
+
+    def test_a_partial_ca_with_issuance_records_is_never_removed(self):
+        files = self.ca_files()
+        record = (b'{"at":"2026-10-07T00:00:00+00:00","format":1,"type":"node_revocation",'
+                  b'"node_id":"00000000-0000-4000-8000-000000000001"}\n')
+        for entries, log in ((["ca-key.pem"], record), (["ca-certificate.pem"], record),
+                             (["ca-key.pem"], b"not json\n")):
+            with self.subTest(entries=entries, log=log):
+                self.build_ca(files, entries, log)
+                before = {name: (self.authority / name).read_bytes()
+                          for name in os.listdir(self.authority)}
+                status, stdout, stderr = self.init()
+                self.assertEqual(2, status)
+                self.assertEqual("", stdout)
+                self.assertIn("refused: issuer_material_incomplete", stderr)
+                self.assertEqual(before, {name: (self.authority / name).read_bytes()
+                                          for name in os.listdir(self.authority)})
+
+    def test_create_stopped_at_every_step_is_redone(self):
+        steps = []
+        real_write, real_install = PrivateDirectory.write_new, PrivateDirectory.install_new
+
+        class Stop(BaseException):
+            pass
+
+        def counting(function, limit):
+            def wrapper(directory, *args):
+                result = function(directory, *args)
+                if args[0].startswith("ca-"):
+                    steps.append(args)
+                    if len(steps) == limit:
+                        raise Stop()
+                return result
+            return wrapper
+        for limit in range(1, 4):  # cert.init, key.init, cert installed
+            with self.subTest(limit=limit):
+                steps.clear()
+                self.authority = self.root / f"stopped-ca-{limit}"
+                self.listener = self.root / f"stopped-listener-{limit}"
+                with patch.object(PrivateDirectory, "write_new", counting(real_write, limit)), \
+                        patch.object(PrivateDirectory, "install_new",
+                                     counting(real_install, limit)), \
+                        patch.object(PrivateDirectory, "discard_created", lambda *args: None), \
+                        self.assertRaises(Stop):
+                    self.init()
+                self.assertFalse((self.authority / "ca-key.pem").exists())
+                status, _stdout, stderr = self.init()
+                self.assertEqual(0, status, stderr)
+                self.assertEqual(["deployment_ca", "listener"], self.log_types())
+
+
 class PublicCopyValidationTests(Harness):
     """Codex P2 (PR #177): a wrong --authority-dir never leaves its CA copy behind."""
 
@@ -1223,6 +1397,17 @@ class PublicCopyValidationTests(Harness):
         self.assertEqual(0, status, stderr)
         self.assertEqual(self.trust.ca_certificate_pem(),
                          (self.listener_dir / "deployment-ca-certificate.pem").read_bytes())
+
+    def test_a_stale_staged_copy_from_a_crashed_publish_is_replaced(self):
+        # Round 4: the public copy is staged (``*.publish``) and installed
+        # without overwriting; a crash leaves only the staged name.
+        PrivateDirectory(self.listener_dir).write_new("deployment-ca-certificate.pem.publish",
+                                                      b"partial")
+        status, _stdout, stderr = self.rotate(self.authority_dir)
+        self.assertEqual(0, status, stderr)
+        self.assertEqual(self.trust.ca_certificate_pem(),
+                         (self.listener_dir / "deployment-ca-certificate.pem").read_bytes())
+        self.assertFalse((self.listener_dir / "deployment-ca-certificate.pem.publish").exists())
 
     def test_wrong_authority_during_interrupted_rotation_recovery_writes_nothing(self):
         directory = PrivateDirectory(self.listener_dir)

@@ -54,7 +54,7 @@ from uuid import UUID
 from .node_ca import (
     DEFAULT_NODE_VALIDITY, MAX_CA_VALIDITY, MAX_LEAF_VALIDITY, CaptureAuthorityError,
     DeploymentAuthority, IssuanceLogUnavailable, IssuerRefusedRequest, PrivateDirectory,
-    _CA_CERTIFICATE, _CA_KEY, _certificate_pem, _single_server_name, certificate_digest,
+    _CA_CERTIFICATE, _CA_KEY, _INIT_SUFFIX, _certificate_pem, _single_server_name, certificate_digest,
     deployment_id_of, public_key_digest, valid_server_name,
 )
 
@@ -80,6 +80,12 @@ _PR_GET_DUMPABLE = 3
 _PR_SET_DUMPABLE = 4
 _PR_SET_NO_NEW_PRIVS = 38
 _PR_GET_NO_NEW_PRIVS = 39
+
+
+class IssuerMaterialIncomplete(CaptureAuthorityError):
+    """A partial CA that the issuance log shows may have issued; never removed."""
+
+    reason = "issuer_material_incomplete"
 
 
 class IssuerUnavailable(CaptureAuthorityError):
@@ -340,14 +346,18 @@ class IssuanceLog:
 
     def records(self) -> list[dict]:
         try:
-            content = self._directory.read_optional(ISSUANCE_LOG, maximum=MAX_ISSUANCE_LOG_BYTES)
+            content = self._directory.read_optional(ISSUANCE_LOG, maximum=MAX_ISSUANCE_LOG_BYTES,
+                                                    allow_empty=True)
         except CaptureAuthorityError:
             raise IssuanceLogUnavailable("issuer log is unavailable") from None
-        if content is None:
+        if not content:
+            # Missing, or created by an append that crashed before writing.
             return []
-        if not content.endswith(b"\n"):
-            raise IssuanceLogUnavailable("issuer log is invalid")
         records = []
+        # A final line without its newline is a record torn by a crash
+        # mid-append. Its operation never answered (the append is fsynced
+        # before any reply), so it is ignored here and dropped by the next
+        # ``append``. Any damaged complete line still invalidates the log.
         for line in content.split(b"\n")[:-1]:
             try:
                 value = json.loads(line.decode("ascii"))
@@ -543,10 +553,13 @@ class CaIssuer:
         deployment = _uuid(message.get("deployment_id"))
         self._directory.ensure()
         self._resources.enter_context(self._directory.locked())
-        if any(self._directory.exists(name) for name in (_CA_KEY, _CA_CERTIFICATE)):
+        if self._directory.exists(_CA_KEY) and self._directory.exists(_CA_CERTIFICATE):
+            # Complete (the key is installed last). Stale staged names left
+            # by a crash after the key was installed are only leftovers.
+            for name in (_CA_CERTIFICATE + _INIT_SUFFIX, _CA_KEY + _INIT_SUFFIX):
+                self._directory.discard_stale(name)
             return self._initialize_existing(csr, server_name, server_validity)
-        if self._directory.exists(ISSUANCE_LOG):
-            raise CaptureAuthorityError("issuer material already exists")
+        self._clear_uncommitted_ca()
         self._provisional = True
         try:
             authority = DeploymentAuthority.create(self._directory, deployment,
@@ -590,6 +603,32 @@ class CaIssuer:
                 "ca_certificate": authority.ca_certificate_pem().decode("ascii"),
                 "certificate": _certificate_pem(certificate).decode("ascii"),
                 "deployment_id": str(deployment)}
+
+    def _clear_uncommitted_ca(self) -> None:
+        """Remove an uncommitted, partial CA left by a crashed ``init``, or refuse.
+
+        A CA is complete only once ``ca-key.pem`` -- installed last -- and the
+        certificate exist. Anything less (staged ``*.init`` names, a
+        certificate without the key, or a key without its certificate) can
+        never have signed anything when the issuance log holds no record, so
+        it is removed and ``init`` starts over. With any log record, or a log
+        that cannot be read, nothing is removed and the run refuses
+        ``issuer_material_incomplete`` for the Owner to inspect: a CA that
+        may have issued anything is never deleted.
+        """
+        names = (_CA_CERTIFICATE + _INIT_SUFFIX, _CA_KEY + _INIT_SUFFIX, _CA_CERTIFICATE,
+                 _CA_KEY, ISSUANCE_LOG)
+        present = [name for name in names if self._directory.exists(name)]
+        if not present:
+            return
+        try:
+            recorded = self._log.records()
+        except CaptureAuthorityError:
+            recorded = None
+        if recorded != []:
+            raise IssuerMaterialIncomplete("partial CA with issuance records")
+        for name in present:
+            self._directory.discard_stale(name)
 
     def _finish(self, *, commit: bool) -> dict:
         if not self._provisional:
@@ -657,7 +696,7 @@ def checked_reply(channel: IssuerChannel, message: dict) -> dict:
 # from a broken issuer (busy directory, expiring CA, existing CA, log state).
 _OWNER_ACTIONABLE = frozenset({
     "deployment_ca_validity_insufficient", "issuer_material_busy", "issuer_material_rejected",
-    "issuance_log_unavailable", "issuer_refused_request",
+    "issuance_log_unavailable", "issuer_refused_request", "issuer_material_incomplete",
 })
 
 

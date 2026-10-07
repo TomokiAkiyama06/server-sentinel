@@ -729,7 +729,10 @@ wrapper is #180). `AGENT_CLI` means
        to the deployment configuration and confirm `--check` passes; then
        temporarily `chown <service account> <ca_dir>` with `chmod 000
        <ca_dir>` and confirm `--check` still fails (control, not current
-       access, decides; restore owner and mode); likewise
+       access, decides; restore owner and mode); give the service account
+       write access to `<ca_dir>`'s parent only through a named ACL
+       (`setfacl -m u:<service account>:rwx <parent>`) and confirm `--check`
+       fails, then remove the ACL (`setfacl -x u:<service account> <parent>`); likewise
        temporarily `chmod 0755 <ca_dir>` and confirm `--check` fails
        (`ServerSentinel deployment validation failed`) and the service does not
        start; restore `0700`.
