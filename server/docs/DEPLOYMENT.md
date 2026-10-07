@@ -590,6 +590,37 @@ LAN that is not Tailscale but uses these ranges (another CGNAT or a ULA that
 happens to match) is refused too, so give the Main another private address
 for capture traffic.
 
+What the check does and does not do:
+
+- An IP literal (bundle endpoint or `pair --endpoint`) is refused before any
+  traffic. A DNS name is refused only after the TCP connect to the resolved
+  peer, before the TLS handshake and before any secret is sent.
+- The Agent settles on the first resolved address that accepts the TCP
+  connection (`socket.create_connection`) and does not retry other addresses
+  after a refusal. A name that resolves to both LAN and Tailscale addresses
+  may therefore be refused depending on resolution order. Make the capture
+  endpoint name resolve **only** to the Main's LAN addresses (for example a
+  LAN-only DNS record or `/etc/hosts` entry on the capture host, not a
+  MagicDNS name).
+- The check looks at destination addresses only and does not inspect routing.
+  If a capture host optionally runs Tailscale and accepts subnet routes
+  (`--accept-routes`) or uses an exit node, LAN-addressed capture traffic can
+  still travel over `tailscale0`, and the check does not detect it. Do not
+  accept routes or use an exit node on capture hosts. This is a configuration
+  check, not authentication or network isolation; capture traffic relies on
+  TLS 1.3 and mTLS admission with the ledger's active record.
+- A bundle exported earlier whose stored endpoint is a Tailscale **IP
+  literal** is refused when the Agent parses it, even if `pair --endpoint`
+  names a LAN address. Re-export the bundle with
+  `export-bundle --endpoint <LAN ip>:<port>` and copy it again (with its new
+  `trust_bundle_sha256`).
+- A bundle whose stored endpoint is a **DNS name** (for example a MagicDNS
+  name that resolves to a Tailscale address) is not resolved at parse time and
+  is accepted. Used as is, its connection is refused after the TCP connect; a
+  LAN `pair --endpoint` override replaces the name and the bundle works. Prefer
+  re-exporting such a bundle with the LAN endpoint so the stored endpoint is
+  correct.
+
 **Rotating the Main listener certificate (Issue #125).** The listener leaf
 defaults to 397 days and is not renewed automatically. Rotate it before it
 expires, with `sudo` like `init`:

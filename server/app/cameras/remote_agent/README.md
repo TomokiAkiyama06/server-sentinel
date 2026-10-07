@@ -165,7 +165,12 @@ name is not resolved on the Main; the Agent refuses
 `main_endpoint_tailscale_address_refused` for a Tailscale bundle endpoint,
 `pair --endpoint` override or connected peer address (its copy of the ranges
 lives in `agent/media_capture_agent/addresses.py`, kept equal by
-`tests/unit/test_tailscale_ranges_match.py`).
+`tests/unit/test_tailscale_ranges_match.py`). The refusal checks addresses,
+not routing, and is not authentication or isolation (see `SECURITY.md`). The
+connected-peer check lives in the Agent's `connect_to_main`; the future ingest
+client (#14 / #15) must open its Main connections through `connect_to_main`
+(not its own `socket.create_connection`) so the same post-connect check
+applies.
 
 `pairing_cli.py` (`python -m app.cameras.remote_agent.pairing_cli`) is the local
 Owner CLI: `init`, `rotate-listener`, `export-bundle`, `approve`, `list`,

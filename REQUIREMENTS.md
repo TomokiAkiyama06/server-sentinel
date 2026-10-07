@@ -134,7 +134,7 @@ Initial agent enrollment uses an owner-approved, 128-bit, five-minute, single-us
 ### AGENT-006 No Tailnet requirement
 The capture agent shall be able to operate over the same private LAN without being enrolled in the owner's Tailnet.
 
-Capture traffic shall not use Tailscale addresses: the private-LAN path excludes the Tailscale address ranges IPv4 `100.64.0.0/10` and IPv6 `fd7a:115c:a1e0::/48` (including IPv4-mapped spellings), even when a non-Tailscale LAN uses them (Owner decision 2026-10-07; see CAM-011).
+Capture traffic shall not use Tailscale addresses: the private-LAN path excludes the Tailscale address ranges IPv4 `100.64.0.0/10` and IPv6 `fd7a:115c:a1e0::/48` (including IPv4-mapped spellings), even when a non-Tailscale LAN uses them (Owner decision 2026-10-07; see CAM-011). This is enforced as a check on configured and connected addresses, not on routing: it does not detect LAN-addressed traffic that a capture host which optionally runs Tailscale routes over `tailscale0` (subnet route or exit node), and it is not an authentication or isolation control.
 
 ### AGENT-007 Separate ingest boundary
 The main host's LAN ingest endpoint for capture agents shall be separate from the dashboard/API exposure used by human viewers. The ingest endpoint shall not expose dashboard routes.
