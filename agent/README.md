@@ -36,7 +36,12 @@ Use CPython 3.12 or 3.14 on Linux, the versions with reviewed wheel hashes in
 from a checkout, or invoke the installed `media-capture-agent` executable.
 `--check` validates the local account, storage
 identity, permissions and reserve without opening devices, writing media or
-connecting to any host. Normal service execution must use a dedicated non-root
+connecting to any host. Its only possible write is the installed-identity
+evidence: when a valid paired credential lacks
+`<runtime_root>/node-identity-installed` (paired by an earlier release, or
+stopped right after its commit), `--check` and service startup create that
+0600 file and fsync it; if they cannot, they fail with
+`node_credential_unavailable` (see `pairing/README.md`). Normal service execution must use a dedicated non-root
 account; configuration is a regular file with mode 0600, owned by that account.
 Agent and installer reject FIFOs/special files without waiting for a writer.
 Both read at most 65,537 bytes before parsing, enforce the 64 KiB configuration

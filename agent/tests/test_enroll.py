@@ -24,7 +24,7 @@ from cryptography import x509
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import ExtendedKeyUsageOID
 
-from media_capture_agent import enroll
+from media_capture_agent import enroll, node_tls
 from media_capture_agent.node_tls import (
     PendingNodeKeyStore, TrustBundle, installed_certificate_expiry, installed_credential,
     prepare_renewal, public_key_digest,
@@ -471,6 +471,58 @@ class RepairTests(EnrollFixture):
         self.assertEqual(self.old_files,
                          sorted(p.name for p in (self.runtime / "node-credentials").iterdir()))
         self.assertTrue((self.runtime / "pending-repair" / "node-key.pem").exists())
+
+    def test_repair_refuses_a_different_ca_for_the_same_deployment(self):
+        # Same deployment UUID, different CA key: _same_certificate refuses it
+        # before any network traffic, for both repair modes.
+        enroll.create_enrollment_request(self.runtime, self.root / "revoked.json", repair="revoked")
+        impostor = SyntheticAuthority(self.authority.deployment)
+        prompts = list(self.prompts)
+        foreign = self.peer(authority=impostor, respond=issuing(impostor, uuid4()))
+        bundle = TrustBundle.parse(impostor.bundle(port=foreign.port))
+        self.assertEqual(self.authority.deployment, bundle.deployment_id)
+        for mode, now in (("revoked", None), ("expired", self.expired)):
+            with self.subTest(mode=mode):
+                options = {} if now is None else {"now": now}
+                with self.assertRaisesRegex(PairingRefused, "repair_deployment_mismatch"):
+                    enroll.pair(self.runtime, bundle, prompt=self.prompt_after(foreign),
+                                repair=mode, **options)
+        self.assertEqual(0, foreign.connections, "refused before any network traffic")
+        self.assertEqual(prompts, self.prompts, "no code prompt")
+        self.assertEqual(self.old_files,
+                         sorted(p.name for p in (self.runtime / "node-credentials").iterdir()))
+
+    def test_renewal_steps_hold_the_enrollment_lock(self):
+        # A pair racing prepare_renewal / complete_renewal is refused at once.
+        prompts = list(self.prompts)
+        peer = self.peer()
+        outcomes = []
+
+        def racing_pair():
+            try:
+                enroll.pair(self.runtime, self.bundle(peer.port), prompt=self.prompt_after(peer),
+                            repair="expired", now=self.expired)
+                outcomes.append("paired")
+            except PairingRefused as error:
+                outcomes.append(str(error))
+
+        original_build = node_tls.build_enrollment_request
+
+        def racing_build(key):
+            racing_pair()
+            return original_build(key)
+        with patch.object(node_tls, "build_enrollment_request", racing_build):
+            prepare_renewal(NodeCredentialStore(self.runtime))
+
+        def racing_complete(store, certificate_pem):
+            racing_pair()
+            raise PairingRefused("renewed_credential_rejected")
+        with patch.object(node_tls, "_complete_renewal_locked", racing_complete):
+            with self.assertRaisesRegex(PairingRefused, "renewed_credential_rejected"):
+                node_tls.complete_renewal(NodeCredentialStore(self.runtime), b"unused")
+        self.assertEqual(["enrollment_in_progress"] * 2, outcomes)
+        self.assertEqual(0, peer.connections)
+        self.assertEqual(prompts, self.prompts, "no code prompt")
 
     def test_revoked_repair_request_is_written_before_a_concurrent_pair_can_run(self):
         # PR #139 review: a pair --repair revoked racing request must not

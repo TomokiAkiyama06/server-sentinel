@@ -126,6 +126,13 @@ Owner policy (2026-10-01). Check the node's state on the Main first
   config_update_required: set "node_id": "<new uuid>" in the media-capture-agent configuration, then start the service (it refuses to start with node_identity_mismatch until then)
   ```
 
+  `--repair revoked` does not revoke anything on the Main. If it is used for a
+  node that was not revoked (for example one that had only expired), the
+  replaced node stays active on the Main until the Owner revokes it with
+  `pairing_cli revoke`, which the Owner must then do. Each further
+  `request --repair revoked` after a completed swap prepares yet another new
+  node.
+
   The configuration stays a manual Owner edit (Owner decision 2026-10-05).
   Until `node_id` names the installed credential's node, the Agent refuses to
   start, fail closed: service startup and `--check` both exit with the fixed
@@ -144,7 +151,16 @@ Owner policy (2026-10-01). Check the node's state on the Main first
   never accepted without it. Residual: losing `current.json` after such a stop
   but before any validation still reads as unpaired; the file is deliberately
   not written before the commit, because an interrupted first install would
-  then look corrupted and could not be retried. The Owner
+  then look corrupted and could not be retried.
+
+  Recovery from `credential_commit_missing` (there is no in-place repair): the
+  Owner revokes the old node on the Main (`pairing_cli revoke`) -- until then
+  it stays active there. With the service stopped, the operator, as the service
+  account, moves aside `<runtime_root>/node-credentials/`,
+  `<runtime_root>/node-identity-installed` and any `pending-*` directories,
+  then pairs again from scratch (`request`, Owner `approve`, `pair`) as a new
+  node, sets the printed `node_id` in the configuration, and the Owner approves
+  its camera sources again (`server/docs/DEPLOYMENT.md`). The Owner
   approves the new node's camera sources again on the Main; the old node's
   recordings stay under the old node until retention. The Agent's local ring
   buffer and protected incidents are not touched by re-pairing.

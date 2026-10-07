@@ -367,7 +367,14 @@ def _validate_leaf(ca_certificate_pem: bytes, deployment_id: UUID,
 
 
 class RenewalSchedule:
-    """When the Agent renews: 30 days before expiry, backoff 1 h doubling to 24 h."""
+    """When the Agent renews: 30 days before expiry, backoff 1 h doubling to 24 h.
+
+    ``prepare_renewal`` and ``complete_renewal`` hold the runtime-wide
+    ``EnrollmentLock`` and raise ``PairingRefused("enrollment_in_progress")``
+    while a pairing CLI (or another renewal step) holds it. A future renewal
+    loop must treat that refusal as transient -- back off by this schedule and
+    retry -- never as a failed or rejected renewal, and must not alert on it.
+    """
 
     @staticmethod
     def status(now: datetime.datetime, not_after: datetime.datetime) -> str:
