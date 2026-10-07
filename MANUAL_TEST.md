@@ -1894,6 +1894,19 @@ by the Issue #6 synthetic policy model.
   8. Residual risk (not detectable, record only): sock_diag reports the
      creator, not the holder; a socket passed to another process with
      `SCM_RIGHTS` outside the ServerSentinel unit keeps its creator's cgroup.
+  9. cgroup-BPF prerequisite (Issue #157): record that
+     `sudo ss -ltn --cgroup 'sport = :<upstream port>'` shows
+     `cgroup:/system.slice/server-sentinel-upstream.socket` (not
+     `/init.scope`). Only on a host or VM without cgroup-BPF support (never
+     the production Main Server), confirm startup reports
+     `UPSTREAM_CREATED_IN_INIT_SCOPE`, human access stays closed and no
+     `invalidate_human_sessions` record is written (mock-only so far).
+  10. Slow `exec` (Issue #160, mock and same-host loopback only so far): on a
+      disposable node under heavy load, confirm that children the backend
+      spawns never produce `UNEXPECTED_LISTENER` for the upstream; a child
+      that has exec'd by the third scan (about 200 ms) stays unverified
+      (closed without revocation) until the next check. Record any
+      `UNEXPECTED_LISTENER` from a child that took longer, for the Owner.
 - Kernel forwarding (not covered by the check): on the Main Server, run
   `sudo nft list ruleset` and `sudo iptables-save -t nat` (and `-t mangle`),
   and confirm no DNAT, REDIRECT or TPROXY rule targets the reserved addresses

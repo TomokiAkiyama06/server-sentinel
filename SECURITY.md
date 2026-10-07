@@ -405,8 +405,8 @@ and ADR-0003):
   lookup that is denied, fails, times out or fails its self-check; a socket
   missing from the lookup; a creating cgroup that is deleted, the root cgroup
   or `/init.scope` while the socket's uid is an expected one, or
-  `/init.scope` with uid 0; an unconfirmed mismatch; an upstream holder seen
-  in only one of two scans; a kernel-owned socket; an upstream port that is
+  `/init.scope` with uid 0; an unconfirmed mismatch; an upstream holder not
+  seen in all three scans; a kernel-owned socket; an upstream port that is
   not privileged; an unreadable descriptor table) keeps human access closed
   without revoking sessions, and access reopens once ownership verifies. An
   unresolved creating cgroup with a uid none of the expected identities has

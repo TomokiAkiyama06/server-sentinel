@@ -90,6 +90,11 @@ class Reason(StrEnum):
     LISTENER_EXCEPTIONS_OUTDATED = "LISTENER_EXCEPTIONS_OUTDATED"
     LISTENER_OWNER_UNVERIFIED = "LISTENER_OWNER_UNVERIFIED"
     PROXY_LISTENER_MISSING = "PROXY_LISTENER_MISSING"
+    # The human upstream was created in ``/init.scope`` by uid 0: systemd
+    # listened from PID 1 instead of the socket unit's cgroup, which it does
+    # when the host has no cgroup-BPF (BPF firewall) support (Issue #157).
+    # Closed without revocation, like ``LISTENER_OWNER_UNVERIFIED``.
+    UPSTREAM_CREATED_IN_INIT_SCOPE = "UPSTREAM_CREATED_IN_INIT_SCOPE"
     SESSION_REVOCATION_UNAVAILABLE = "SESSION_REVOCATION_UNAVAILABLE"
     SESSION_REVOCATION_FAILED = "SESSION_REVOCATION_FAILED"
     HOSTNAME_RESOLUTION_UNAVAILABLE = "HOSTNAME_RESOLUTION_UNAVAILABLE"
@@ -851,6 +856,7 @@ def human_inodes(config: ReservationConfig, listeners, own_inodes) -> frozenset:
 
 
 _PASS, _UNVERIFIED, _UNEXPECTED = 0, 1, 2
+PID1_CREATOR = SocketCreator("/init.scope", 0)
 
 
 def _creator_status(identities, creator) -> int:
@@ -885,20 +891,33 @@ def mismatched_creators(expected: dict, creators: dict) -> frozenset:
         if _creator_status(expected.get(inode, ()), creator) == _UNEXPECTED)
 
 
-def _human_status(config, listener, own_inodes, known, owners, sole_holders, upstream_privileged) -> int:
+def _human_status(config, listener, own_inodes, known, owners, sole_holders,
+                  upstream_privileged) -> tuple[int, bool]:
+    """The upstream's status, and whether its creator is PID 1's ``/init.scope``.
+
+    A creator in ``/init.scope`` with uid 0 is reported apart (Issue #157): it
+    stays closed without revocation, as an unverified creator does, but with
+    its own reason, because it shows the host lacks the cgroup-BPF support
+    that makes systemd create a socket unit's sockets in the unit's cgroup.
+    """
     if isinstance(own_inodes, Reason) or not listener.inode:
-        return _UNVERIFIED
+        return _UNVERIFIED, False
     if listener.inode not in own_inodes:
         # A single replacement: another process's socket on the upstream.
-        return _UNEXPECTED
+        return _UNEXPECTED, False
     statuses = [_PASS]
+    init_scope = False
     if upstream_privileged is not None and upstream_privileged is not True:
         # Any account may bind an unprivileged port, so its creator proves
         # nothing: a configuration error (for example no socket activation)
         # that only keeps access closed.
         statuses.append(_UNVERIFIED)
     elif owners is not None:
-        statuses.append(_creator_status([config.upstream_owner], known.get(listener.inode)))
+        creator = known.get(listener.inode)
+        if creator == PID1_CREATOR:
+            init_scope = True
+        else:
+            statuses.append(_creator_status([config.upstream_owner], creator))
     if sole_holders is not None:
         sole = sole_holders.get(listener.inode) if isinstance(sole_holders, dict) else None
         if sole is None:
@@ -906,7 +925,8 @@ def _human_status(config, listener, own_inodes, known, owners, sole_holders, ups
         elif sole is not True:
             # The same socket is also held by another process of the unit.
             statuses.append(_UNEXPECTED)
-    return max(statuses)
+    status = max(statuses)
+    return status, init_scope and status != _UNEXPECTED
 
 
 def evaluate(config: ReservationConfig, listeners, routes,
@@ -960,6 +980,7 @@ def evaluate(config: ReservationConfig, listeners, routes,
         seen_proxies: set[Listener] = set()
         seen_excepted: set[Listener] = set()
         unverified = 0
+        init_scope = False
         known = owners if isinstance(owners, dict) else {}
         for listener in listeners:
             address = _normalize(listener.address)
@@ -971,8 +992,8 @@ def evaluate(config: ReservationConfig, listeners, routes,
                 if seen_human:
                     unexpected_listeners += 1
                 elif own_inodes is not None:
-                    status = _human_status(config, listener, own_inodes, known, owners,
-                                           sole_holders, upstream_privileged)
+                    status, init_scope = _human_status(config, listener, own_inodes, known, owners,
+                                                       sole_holders, upstream_privileged)
                     if status == _UNEXPECTED:
                         unexpected_listeners += 1
                     elif status == _UNVERIFIED:
@@ -1015,6 +1036,9 @@ def evaluate(config: ReservationConfig, listeners, routes,
         if unverified:
             reasons.append(Reason.LISTENER_OWNER_UNVERIFIED)
             unexpected_listeners += unverified
+        if init_scope:
+            reasons.append(Reason.UPSTREAM_CREATED_IN_INIT_SCOPE)
+            unexpected_listeners += 1
         if config.proxy_listeners - seen_proxies:
             # Proxy drift or failure; nothing else seen answering, so no revocation.
             reasons.append(Reason.PROXY_LISTENER_MISSING)
@@ -1061,7 +1085,11 @@ class HostnameReservationCheck:
     open before the check closed it can commit after that revocation, and only
     the marker carries its revocation across a restart. If both keep failing
     and the process restarts, only the delivered Owner fault records the
-    requirement.
+    requirement. A fallback revocation that commits in the same check that
+    would reopen access, while access has never been open in this process
+    (a clean startup), counts as the reopening revocation (Issue #145); a
+    failed marker rewrite after the marker is already stored for the closed
+    period does not revoke (Issue #144).
 
     Every check also re-resolves the hostname through ``resolver``; a missing
     resolver or a failed or timed-out resolution keeps access closed without
@@ -1150,6 +1178,11 @@ class HostnameReservationCheck:
         # True once the marker is known to be stored for the current closed
         # period; cleared when access reopens.
         self._exposure_recorded = False
+        # True when the fallback revocation committed during the check now
+        # being evaluated (Issue #145).
+        self._revoked_in_check = False
+        # True once any check has opened access in this process.
+        self._ever_opened = False
         self.undelivered_faults = 0
 
     @property
@@ -1230,6 +1263,10 @@ class HostnameReservationCheck:
         this check closed it shares no lock with the check and can commit after
         the immediate revocation. Only the marker makes a restart revoke that
         session before reopening.
+
+        Once the marker is known to be stored for the current closed period, a
+        failed rewrite neither revokes nor counts as undurable (Issue #144):
+        the stored marker already carries the requirement across a restart.
         """
         try:
             self.session_revoker.record_exposure()
@@ -1238,13 +1275,16 @@ class HostnameReservationCheck:
         else:
             self._exposure_recorded = True
             return True
-        if self._revoked_while_closed:
+        if self._exposure_recorded or self._revoked_while_closed:
+            # The marker is already stored for this closed period (Issue #144):
+            # a transient rewrite failure loses nothing a restart needs.
             return True
         try:
             self.session_revoker.revoke_all_human_sessions()
         except Exception:
             return False
         self._revoked_while_closed = True
+        self._revoked_in_check = True
         return True
 
     def _after_evaluation(self, reasons: tuple[Reason, ...]) -> tuple[Reason, ...]:
@@ -1252,6 +1292,7 @@ class HostnameReservationCheck:
             # Nothing durable could carry a revocation requirement across a
             # restart, so access never opens without a revoker.
             return reasons + (Reason.SESSION_REVOCATION_UNAVAILABLE,)
+        self._revoked_in_check = False
         if any(reason in EXPOSURE_REASONS for reason in reasons):
             self._revocation_required = True
             self._revocation_durable = self._make_durable()
@@ -1265,10 +1306,17 @@ class HostnameReservationCheck:
             return reasons + (Reason.SESSION_REVOCATION_FAILED,)
         if reasons or not self._revocation_required:
             return reasons
-        try:
-            self.session_revoker.revoke_all_human_sessions()
-        except Exception:
-            return (Reason.SESSION_REVOCATION_FAILED,)
+        if not (self._revoked_in_check and not self._ever_opened):
+            # Issue #145: the fallback revocation committed in this very check
+            # already satisfies the reopening one when access has never been
+            # open in this process (a clean startup), since no request can
+            # have seen it open and committed a session after that
+            # revocation. Otherwise (PR #134) a request that saw access open
+            # before the closed period may have committed a session since.
+            try:
+                self.session_revoker.revoke_all_human_sessions()
+            except Exception:
+                return (Reason.SESSION_REVOCATION_FAILED,)
         self._revocation_required = False
         self._revocation_durable = True
         self._revoked_while_closed = False
@@ -1458,6 +1506,8 @@ class HostnameReservationCheck:
         at = self._now()
         verdict = ReservationVerdict(not reasons, reasons, at, kind)
         with self._lock:
+            if verdict.open:
+                self._ever_opened = True
             self._verdict = verdict
         self._last_check = started if math.isfinite(started) else None
         if reasons:

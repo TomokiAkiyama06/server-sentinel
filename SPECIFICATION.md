@@ -1461,14 +1461,18 @@ lookup that is unavailable, times out or fails its self-check, a socket in
 `/proc/net` but not in the dump, a creating cgroup that cannot be resolved —
 deleted, the root cgroup or `/init.scope` — while the socket's uid is one of the
 expected identities' uids, `/init.scope` with uid 0, a mismatch the second dump
-does not confirm, another upstream holder seen in only one of two scans of the
-same check (a child between `fork` and `exec`), a kernel-owned socket (inode 0), an upstream port at or above `ip_unprivileged_port_start`, or an
+does not confirm, another upstream holder not seen in all three scans of the
+same check (about 100 ms apart; a child between `fork` and `exec`, Issue #160), a kernel-owned socket (inode 0), an upstream port at or above `ip_unprivileged_port_start`, or an
 unreadable own or unit descriptor table) is not an exposure reason: it keeps
 access closed without revocation and access reopens once ownership verifies
 again (Owner decisions, 2026-10-05 and 2026-10-07, superseding the 2026-10-01
 wording that treated an unverifiable owner or holder as an exposure). The
 socket-owner resolver (`app.auth.sock_diag.SockDiagOwners` in production) is
-mandatory; a check without one never opens access. sock_diag reports the
+mandatory; a check without one never opens access. A human upstream created
+in `/init.scope` by uid 0 (systemd listening from PID 1 on a host without
+cgroup-BPF support) closes access with its own reason,
+`UPSTREAM_CREATED_IN_INIT_SCOPE`, also without revocation (Issue #157).
+sock_diag reports the
 creator, not the current holder (residual risk accepted by the Owner,
 2026-10-07). An unresolved creating cgroup with a uid none of the expected
 identities has counts as another creator (`UNEXPECTED_LISTENER` once the second

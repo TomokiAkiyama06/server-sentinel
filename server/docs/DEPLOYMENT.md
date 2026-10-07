@@ -261,6 +261,26 @@ meets them; keep them in any drop-in):
 - the service stays in its own `server-sentinel.service` cgroup (no
   `Delegate=` sub-cgroups that hide processes from the same-uid scan).
 
+Host requirement: cgroup v2 with cgroup-BPF support (the kernel and systemd
+"BPF firewall"; Issue #157). systemd creates a `.socket` unit's sockets from
+a short-lived helper inside the socket unit's own cgroup only when the BPF
+firewall is supported; otherwise PID 1 listens itself and every such socket
+is created in `/init.scope`. A socket created in `/init.scope` names no unit,
+so human access then never opens: the check reports the human upstream as
+`UPSTREAM_CREATED_IN_INIT_SCOPE` (closed, no revocation), and excepted
+`.socket` listeners such as `ssh.socket` as `LISTENER_OWNER_UNVERIFIED`.
+`/init.scope` is never accepted instead, because every socket PID 1 creates
+would then match. Confirm the requirement on the host once, after the upstream
+socket is set up (the `ss` cgroup column needs iproute2 with `--cgroup`):
+
+```sh
+sudo ss -ltn --cgroup 'sport = :<port>'   # expect: cgroup:/system.slice/server-sentinel-upstream.socket
+sudo ss -ltn --cgroup 'sport = :22'       # with ssh.socket: cgroup:/system.slice/ssh.socket
+```
+
+`cgroup:/init.scope` on either row means this host lacks the support; use a
+kernel and systemd with cgroup-BPF enabled rather than weakening the check.
+
 Every lookup starts with a self-check: the backend opens a loopback probe
 listener of its own and requires the dump to report it with the backend's own
 cgroup and uid. If netlink is denied, the kernel lacks the cgroup attribute or
@@ -325,20 +345,38 @@ reverting the 2026-10-01 step that disabled `ssh.socket`). On the Main Server,
 keep Ubuntu's default `ssh.socket`; systemd creates the tcp/22 sockets in the
 `ssh.socket` cgroup as uid 0, so the Owner exception is `tcp/22` with unit
 `ssh.socket` and uid `0`. If `ssh.socket` was disabled for the earlier
-decision, it may be restored (keep a console or second session open while
-changing SSH):
+decision, it may be restored. Do this only with local console access (or an
+out-of-band console) at hand: between the first two steps nothing listens on
+tcp/22, and a failure in the second leaves the host without SSH until it is
+fixed from the console. `disable` alone only removes the enablement link and
+leaves the running daemon holding tcp/22, so `ssh.socket` could not bind it;
+stop the service first (Issue #158):
 
 ```sh
-sudo systemctl disable ssh.service
+# 1. stop and disable the standalone daemon; established SSH sessions stay up,
+#    but no new SSH connection is accepted until step 2
+sudo systemctl disable --now ssh.service
+# 2. bind tcp/22 through the socket unit
 sudo systemctl enable --now ssh.socket
-sudo systemctl restart ssh.service   # the running daemon releases :22 to the socket
+# 3. verify
 systemctl is-enabled ssh.socket      # expect: enabled
+systemctl is-active ssh.socket       # expect: active
+sudo ss -ltn --cgroup 'sport = :22'  # expect: cgroup:/system.slice/ssh.socket
+# then open a new SSH session from another terminal before closing the console
 ```
+
+If step 2 or the new SSH session fails, restore the earlier state from the
+console with `sudo systemctl enable --now ssh.service`.
 
 Running `sshd` as `ssh.service` alone also works: the exception is then
 `tcp/22` with unit `ssh.service` and uid `0`. Other wildcard system listeners
 are excepted the same way by unit and uid, for example `tailscaled` on its UDP
-port as `tailscaled.service` with uid `0`. Find the unit and uid of a listener
+port as `tailscaled.service` with uid `0`. Except only services that run as
+root or as a dedicated system account (a uid below `SYS_UID_MAX` in
+`/etc/login.defs`, normally 1000, with no login), never one whose `User=` is a
+person's account (Issue #160): that person controls processes with the same
+uid, so they could for example create the socket in a cgroup they then delete
+and hold human access closed without revocation at will. Find the unit and uid of a listener
 without privilege, as the service account, with the Issue #126 procedure in
 `MANUAL_TEST.md` (section "ADR-0003 follow-up: accepted human-access
 boundary").
