@@ -147,7 +147,7 @@ class VariableSegmentSizeTests(unittest.TestCase):
             totals.append(total)
         return totals
 
-    def test_batch_charge_is_mean_plus_two_deviations_of_the_sum_capped_at_recent_maxima(self):
+    def test_batch_charge_is_mean_plus_two_correlated_deviations_capped_at_recent_maxima(self):
         unit = 4096
         # Eight recent allocations of 30, 30, ..., 50 units: mean 32.5 units,
         # sample variance 50 units squared.
@@ -156,14 +156,17 @@ class VariableSegmentSizeTests(unittest.TestCase):
         variance = sum((size - mean) ** 2 for size in sizes) / 7
         recent = (mean, variance, 30 * unit, 50 * unit)
         self.assertEqual(variance, 50 * unit * unit)
-        # Two sources: 65 units + 2 * sqrt(100) units = 85 units, below the
-        # 100 units of both at their recent maximum.
-        self.assertEqual(85 * unit, DiskRing._batch_charge([(1, recent), (1, recent)], unit))
-        # Chained appends add variances, not deviations: 6 appends need
-        # 195 + 2 * sqrt(300) units, rounded up to whole units, not 6 * 50.
-        self.assertEqual(round_up(195 * unit + math.ceil(2 * math.sqrt(300) * unit), unit),
-                         DiskRing._batch_charge([(6, recent)], unit))
-        self.assertLess(DiskRing._batch_charge([(6, recent)], unit), 6 * 50 * unit)
+        # Two synchronized sources with this same history: their sizes may be
+        # perfectly correlated, so deviations add, 65 units + 2 * 2 *
+        # sqrt(50) units = 93.3, rounded up to 94 units. Adding variances
+        # (65 + 2 * sqrt(100) = 85 units) holds only for independent sources
+        # and undercharged this batch (Codex review of PR #143). Still below
+        # the 100 units of both at their recent maximum.
+        self.assertEqual(94 * unit, DiskRing._batch_charge([(1, recent), (1, recent)], unit))
+        # Chained appends of one source may be autocorrelated too: 6 appends
+        # need 195 + 2 * 6 * sqrt(50) = 279.9 units, rounded up to 280, not
+        # the 195 + 2 * sqrt(300) = 229.6 of independent appends, nor 6 * 50.
+        self.assertEqual(280 * unit, DiskRing._batch_charge([(6, recent)], unit))
         # Never above every append at its recent maximum.
         wide = (Fraction(10 * unit), Fraction(400 * unit * unit), 1 * unit, 20 * unit)
         self.assertEqual(20 * unit, DiskRing._batch_charge([(1, wide)], unit))
@@ -173,9 +176,11 @@ class VariableSegmentSizeTests(unittest.TestCase):
     def test_one_large_recent_segment_no_longer_reads_hard_stop_while_typical_writes_fit(self):
         # Each source's recent history: seven 30-unit segments and one
         # 50-unit segment. Charging both next appends the recent maximum
-        # (100 units) read a hard stop with 90 units available, although a
-        # typical batch (60 units) fits. At the recent real bitrate the batch
-        # is charged 85 units: not a hard stop, but still pressure.
+        # (100 units) read a hard stop with 94 to 99 units available, although
+        # a typical batch (60 units) fits. At the recent real bitrate the batch
+        # is charged 94 units (mean plus two deviations, the two sources'
+        # deviations added as if perfectly correlated): from there not a hard
+        # stop, but still pressure.
         settings, quota, store, ring = self.ring()
         unit = store.allocation_unit
         profiles = tuple(SegmentProfile(UUID(int=1400 + index), 34000, 17000, 60 * SECOND, 100)
@@ -197,17 +202,19 @@ class VariableSegmentSizeTests(unittest.TestCase):
             quota.other += free - (settings.safety_reserve_bytes + headroom + units * unit)
             return ring.status(now_us=T0, clock_trusted=True)
 
-        status = available(90)
+        status = available(94)
         self.assertEqual("STORAGE_PRESSURE", status["state"])
         with legacy_charge():
             legacy = ring.status(now_us=T0, clock_trusted=True)
         self.assertEqual(("STORAGE_HARD_STOP", "segment_write_refused_at_reserve"),
                          (legacy["state"], legacy["reason"]))
-        status = available(85)
-        self.assertEqual("STORAGE_PRESSURE", status["state"])
-        status = available(84)
-        self.assertEqual(("STORAGE_HARD_STOP", "segment_write_refused_at_reserve"),
-                         (status["state"], status["reason"]))
+        # With 85 to 93 units the correlated batch may need more than is
+        # available: a hard stop, not pressure (summing only the variances
+        # charged 85 units and read pressure here).
+        for units in (93, 85, 84):
+            status = available(units)
+            self.assertEqual(("STORAGE_HARD_STOP", "segment_write_refused_at_reserve"),
+                             (status["state"], status["reason"]), units)
         # Typical writes fit with 60 units available.
         available(60)
         for profile in profiles:
@@ -230,7 +237,11 @@ class VariableSegmentSizeTests(unittest.TestCase):
         self.assertEqual((bound, 0, bound, bound),
                          ring._recent_allocations(allocations, unit, at_bound=True)[profile.source_id])
 
-    def test_two_sources_variable_sizes_fewer_false_hard_stops_and_no_unannounced_refusal(self):
+    def test_two_sources_variable_sizes_no_more_false_hard_stops_and_no_unannounced_refusal(self):
+        # Normally distributed sizes: with two deviations, perfectly
+        # correlated, the charge per append is at least the sample maximum of
+        # eight recent sizes almost always, so it equals the pre-#130 charge
+        # here (47 false hard stops of 400 samples, both).
         current, legacy = self.compare([
             {"seed": 130, "cadences": (60, 60), "minutes": 200, "slack_units": 24},
             {"seed": 131, "cadences": (60, 60), "minutes": 200, "slack_units": 40},
@@ -240,27 +251,27 @@ class VariableSegmentSizeTests(unittest.TestCase):
         # Every real refusal of these seeded runs was announced by a hard stop.
         self.assertEqual(current["refused"], current["announced_hard_stop"])
         self.assertEqual(legacy["refused"], legacy["announced_hard_stop"])
-        self.assertLess(current["false_hard_stop"], legacy["false_hard_stop"])
+        self.assertLessEqual(current["false_hard_stop"], legacy["false_hard_stop"])
 
-    def test_four_sources_variable_sizes_false_hard_stops_drop_by_a_third(self):
+    def test_four_sources_variable_sizes_no_more_false_hard_stops(self):
         current, legacy = self.compare([
             {"seed": 130, "cadences": (60, 60, 60, 60), "minutes": 120, "slack_units": 48},
         ])
         self.assertGreater(legacy["refused"], 0)
         self.assertEqual(legacy["refused"], current["refused"])
         self.assertEqual(current["refused"], current["announced_hard_stop"])
-        self.assertLessEqual(3 * current["false_hard_stop"], 2 * legacy["false_hard_stop"])
+        self.assertLessEqual(current["false_hard_stop"], legacy["false_hard_stop"])
 
-    def test_mixed_cadence_chained_appends_false_hard_stops_drop_by_a_third(self):
-        # The 10 s source appends six times per 60 s source append: charging
-        # each chained append the recent maximum compounded its variance.
+    def test_mixed_cadence_chained_appends_no_more_false_hard_stops(self):
+        # The 10 s source appends six times per 60 s source append; its
+        # chained appends may be autocorrelated, so their deviations add.
         current, legacy = self.compare([
             {"seed": 130, "cadences": (10, 60), "minutes": 60, "slack_units": 24},
         ])
         self.assertGreater(legacy["refused"], 0)
         self.assertEqual(legacy["refused"], current["refused"])
         self.assertEqual(current["refused"], current["announced_hard_stop"])
-        self.assertLessEqual(3 * current["false_hard_stop"], 2 * legacy["false_hard_stop"])
+        self.assertLessEqual(current["false_hard_stop"], legacy["false_hard_stop"])
 
     def test_bitrate_spike_above_the_recent_estimate_is_never_refused_while_healthy(self):
         # One segment in ten jumps to between half and all of the bound. A
@@ -273,4 +284,4 @@ class VariableSegmentSizeTests(unittest.TestCase):
         ])
         self.assertGreater(current["refused"], current["announced_hard_stop"])
         self.assertGreater(legacy["refused"], legacy["announced_hard_stop"])
-        self.assertLess(current["false_hard_stop"], legacy["false_hard_stop"])
+        self.assertLessEqual(current["false_hard_stop"], legacy["false_hard_stop"])

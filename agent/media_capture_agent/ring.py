@@ -399,20 +399,28 @@ class DiskRing:
         """Space for ``(count, recent)`` simulated appends of every source.
 
         The sum of the means plus ``DEVIATION_FACTOR`` standard deviations of
-        that sum (variances add over independent appends), in whole
-        allocation units, never above every append at its source's recent
-        maximum. One spread over the whole batch, not one per append, keeps
-        segment-size variance from compounding across sources and chained
-        appends into a false hard stop.
+        that sum, in whole allocation units, never above every append at its
+        source's recent maximum. The deviation of the sum is bounded as if
+        every append were perfectly correlated (synchronized sources, and
+        temporally correlated VBR within one source): the per-append standard
+        deviations add, ``sum(count * sqrt(variance))``, rather than the
+        variances, which would hold only for independent appends and can
+        undercharge a correlated batch. One spread over the whole batch, not
+        one recent maximum per append, still keeps the sample maximum's excess
+        over ``mean + DEVIATION_FACTOR * deviation`` from compounding across
+        sources and chained appends into a false hard stop. Each source's
+        term is rounded up to whole bytes, so the result never falls below
+        the exact bound.
         """
-        mean, variance, cap = Fraction(0), Fraction(0), 0
+        mean, deviation, cap = Fraction(0), 0, 0
         for count, (append_mean, append_variance, _credit, append_cap) in appends:
             mean += count * append_mean
-            variance += count * append_variance
             cap += count * append_cap
-        square = math.ceil(variance * DEVIATION_FACTOR * DEVIATION_FACTOR)
-        deviation = math.isqrt(square)
-        deviation += deviation * deviation < square
+            # ceil(DEVIATION_FACTOR * count * sqrt(variance)), exactly: the
+            # smallest integer whose square is at least the (rational) square.
+            square = math.ceil(append_variance * (DEVIATION_FACTOR * count) ** 2)
+            root = math.isqrt(square)
+            deviation += root + (root * root < square)
         return min(cap, round_up(math.ceil(mean) + deviation, unit))
 
     def _next_write_refused(self, now, budget, *, clock_trusted, at_bound=False):
@@ -448,12 +456,13 @@ class DiskRing:
         The simulated appends through an instant are charged together at the
         recent real bitrate (``_batch_charge``): the sum of each source's mean
         recent real allocation plus ``DEVIATION_FACTOR`` standard deviations
-        of that sum, in whole allocation units, never above every append at
-        its source's recent maximum (the bound without history; the recent
-        maximum while the history is too short). Charging every append the
-        recent maximum instead let segment-size variance compound across
-        sources and chained appends into a hard stop while writes kept
-        succeeding near the reserve. A refusal here means writes are refused at the recent real
+        of that sum, bounded as if every append were perfectly correlated
+        (per-append deviations add), in whole allocation units, never above
+        every append at its source's recent maximum (the bound without
+        history; the recent maximum while the history is too short).
+        Charging every append the recent maximum instead let the sample
+        maximum's excess compound across sources and chained appends into a
+        hard stop while writes kept succeeding near the reserve. A refusal here means writes are refused at the recent real
         bitrate; a single segment above that estimate can still be refused
         while status reads the ``at_bound`` pressure below, never healthy.
         Appends at the same instant form one batch that must fit,

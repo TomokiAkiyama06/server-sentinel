@@ -165,13 +165,19 @@ therefore predicts refusal by simulating the sources' next appends.
   credited the source's smallest recent allocation.
 - **Charge `C(t)`** (Issue #130). All simulated appends at or before `t`,
   `n_s` of each source `s`, are charged together:
-  `C(t) = min(sum(n_s * c_s), round_up(ceil(sum(n_s * m_s)) + ceil(2 * sqrt(sum(n_s * v_s)))))`,
-  the mean of their total plus two standard deviations of that total
-  (variances add over appends), never above every append at its source's
-  recent maximum. Charging every append the recent maximum, as before
-  Issue #130, let segment-size variance compound across sources and chained
-  appends: with variable VBR near the reserve, status read a hard stop on
-  many samples while every write still succeeded. Each source's appends form
+  `C(t) = min(sum(n_s * c_s), round_up(ceil(sum(n_s * m_s)) + sum(ceil(2 * n_s * sqrt(v_s)))))`,
+  the mean of their total plus two standard deviations of that total, never
+  above every append at its source's recent maximum. The deviation of the
+  total is bounded as if every append were perfectly correlated
+  (`sum(n_s * sqrt(v_s))`, deviations add): synchronized sources filming the
+  same scene and temporally correlated VBR within one source make the
+  independent-appends figure `sqrt(sum(n_s * v_s))` undercharge the batch
+  (Codex review of PR #143: two sources with recent history 30, ..., 30, 50
+  units need 94 units at two deviations, not 85). The factor 2 is an Owner
+  decision (2026-10-05) to be tuned with real section Q data. Charging every
+  append the recent maximum, as before Issue #130, charges a source whose
+  recent history has one outlier the outlier on every append, which the
+  two-deviation bound need not. Each source's appends form
   an arithmetic sequence, so the counts through any instant are computed
   directly and only the latest append between two credit changes needs
   checking: the work is bounded by stored rows and sources, not by cadence
@@ -197,17 +203,19 @@ therefore predicts refusal by simulating the sources' next appends.
   `agent/tests/test_ring_variable_sizes.py`; not a real-disk measurement).
   Segments vary around half their bound (normal, standard deviation 8 % of
   the bound) in a 600 s duration FIFO near the reserve. False hard stops
-  (hard stop read before a step whose every write succeeded), before → after:
-  two 60 s sources 47 → 41 of 400 samples, four 60 s sources 26 → 8 of 120,
-  a 10 s and a 60 s source 96 → 55 of 360. Every real refusal in those runs
-  (9, 1 and 5) was preceded by a hard stop both before and after. With 10 %
-  spikes up to the bound, 1 of 17 refusals followed only the maximum-bitrate
-  pressure, before and after. A wider exploratory sweep over more seeds and
-  margins found 1 refusal (mixed cadence) after pressure instead of hard stop
-  that the old charge had announced, and none healthy. Same-cadence two-source
-  rings gain least: the sum of two recent maxima is already close to the
-  two-deviation bound, and when segments differ by only one or two
-  allocation units, rounding leaves the charge unchanged.
+  (hard stop read before a step whose every write succeeded), pre-#130 →
+  correlated two-deviation charge: two 60 s sources 47 → 47 of 400 samples,
+  four 60 s sources 26 → 26 of 120, a 10 s and a 60 s source 96 → 96 of 360;
+  with 10 % spikes up to the bound 47 → 46. For normally distributed sizes
+  the mean plus two deviations of eight samples is almost always at or above
+  their maximum, so the charge equals the pre-#130 recent maximum and these
+  runs gain nothing. (An earlier revision that added variances, valid only
+  for independent appends, measured 47 → 41, 26 → 8 and 96 → 55; it
+  undercharged correlated batches and was replaced.) The charge is lower
+  only for skewed recent histories, such as one outlier among eight
+  segments. Every real refusal in those runs (9, 1 and 5) was preceded by a
+  hard stop; with spikes, 1 of 17 refusals followed only the maximum-bitrate
+  pressure, as with the pre-#130 charge, and none followed a healthy status.
 - **`STORAGE_PRESSURE / segment_write_at_risk_at_maximum_bitrate`** (writes
   would be refused only if the bitrate rose to the bound). The same
   simulation with every append charged `round_up(max_segment)`, that is
