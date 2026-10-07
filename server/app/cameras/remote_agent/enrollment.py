@@ -53,8 +53,8 @@ from typing import Callable
 from uuid import UUID
 
 from .node_ca import (
-    DEFAULT_NODE_VALIDITY, MAX_CSR_BYTES, CaptureAuthorityError, DeploymentAuthority,
-    IssuedNodeCredential,
+    DEFAULT_NODE_VALIDITY, MAX_CSR_BYTES, AuthorityValidityExceeded, CaptureAuthorityError,
+    DeploymentAuthority, IssuedNodeCredential,
 )
 from .pairing import EnrollmentApproval, PairingError, PairingLedger
 
@@ -252,6 +252,10 @@ class EnrollmentService:
         except EnrollmentError as error:
             LOGGER.info("capture enrollment refused: reason=%s", error.reason)
             return REFUSED, None
+        except AuthorityValidityExceeded:
+            # Main-side log only; the peer still gets the generic refusal.
+            LOGGER.info("capture enrollment refused: reason=deployment_ca_validity_insufficient")
+            return REFUSED, None
         except (PairingError, CaptureAuthorityError):
             LOGGER.info("capture enrollment refused: reason=approval_unavailable")
             return REFUSED, None
@@ -343,6 +347,12 @@ class EnrollmentListener:
                   else socket.AF_INET)
         listener = socket.socket(family, socket.SOCK_STREAM)
         try:
+            # SO_REUSEADDR lets a re-run of ``approve`` bind while the previous
+            # run's connections sit in TIME_WAIT (Issue #125). On Linux it never
+            # lets a second socket bind a port that is already listening, so it
+            # does not enable port hijacking; SO_REUSEPORT, which would, is
+            # deliberately not set.
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             listener.bind((self._config.bind_host, self._config.port))
             listener.listen(self._limits.backlog)
         except OSError:

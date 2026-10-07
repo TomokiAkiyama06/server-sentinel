@@ -24,6 +24,7 @@ class Kind(StrEnum):
     SERVER_MOVEMENT = "server_movement"
     CAMERA_TAMPER = "camera_tamper"
     CAMERA_HEALTH = "camera_health"
+    ENTRANCE_GATE = "entrance_gate"
     NODE_HEALTH = "node_health"
     RECORDING = "recording"
     STORAGE = "storage"
@@ -59,7 +60,8 @@ LABELS = {
     Kind.OWNER_ENTRY: "Owner entry observation", Kind.OWNER_EXIT: "Owner exit observation",
     Kind.ANONYMOUS_ENTRY: "Anonymous entry observation", Kind.ANONYMOUS_EXIT: "Anonymous exit observation",
     Kind.SERVER_MOVEMENT: "Server movement observation", Kind.CAMERA_TAMPER: "Camera tamper observation",
-    Kind.CAMERA_HEALTH: "Camera health", Kind.NODE_HEALTH: "Capture node health",
+    Kind.CAMERA_HEALTH: "Camera health", Kind.ENTRANCE_GATE: "Entrance gate quality",
+    Kind.NODE_HEALTH: "Capture node health",
     Kind.RECORDING: "Recording state", Kind.STORAGE: "Storage state",
     Kind.PRESENCE: "Presence state", Kind.CONFIGURATION: "Configuration change",
 }
@@ -105,12 +107,20 @@ class Observation:
         if not isinstance(self.identifier, UUID):
             raise InvalidObservation("invalid observation identity")
         if self.kind in {Kind.PERSON, Kind.MOTION, Kind.OWNER_ENTRY, Kind.OWNER_EXIT,
-                         Kind.ANONYMOUS_ENTRY, Kind.ANONYMOUS_EXIT, *CRITICAL, Kind.CAMERA_HEALTH}:
+                         Kind.ANONYMOUS_ENTRY, Kind.ANONYMOUS_EXIT, *CRITICAL, Kind.CAMERA_HEALTH,
+                         Kind.ENTRANCE_GATE}:
             if self.source_id is None:
                 raise InvalidObservation("source attribution required")
         if self.presence_state is not None and (self.kind != Kind.PRESENCE
                                                  or not isinstance(self.presence_state, PresenceState)):
             raise InvalidObservation("invalid presence projection")
+        if self.kind == Kind.ENTRANCE_GATE and (
+                self.value not in {Value.READY, Value.UNKNOWN}
+                or (self.value == Value.READY) != (self.quality == Quality.SUFFICIENT)
+                or self.confidence is not None or self.confirmed):
+            # A gate-quality fact reports only whether the entrance gate could
+            # reach a conclusion: never a detection, a person or an absence.
+            raise InvalidObservation("entrance gate quality is ready or unknown")
         if self.kind == Kind.NODE_HEALTH and self.node_id is None:
             raise InvalidObservation("node attribution required")
         if self.confidence is not None and (type(self.confidence) not in (int, float)

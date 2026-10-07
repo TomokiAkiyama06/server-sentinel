@@ -289,14 +289,67 @@ Do not trust arbitrary forwarded identity headers.
 
 If Tailscale Serve/equivalent provides authenticated identity headers, the backend accepts them only on a non-bypassable local trusted-proxy path. Requests from LAN/other interfaces cannot directly set such headers and gain identity.
 
-The concrete Owner-bootstrap/session design is [ADR-0003](docs/ADR/0003-owner-authentication-and-trusted-proxy.md), which is **Accepted**.
+The concrete Owner-bootstrap/session design is [ADR-0003](docs/ADR/0003-owner-authentication-and-trusted-proxy.md), which is **Accepted** (2026-09-21).
 It states the trusted-host loopback limitation and upstream login-reuse risk,
-and defines recovery/revocation transitions. Human routes and dashboard assets
-remain closed until ADR-0004 is accepted and both records are implemented and
-tested under #10. Its model tests do not validate a
-real Tailscale installation, LAN bypass resistance, or active stream cancellation.
+and defines recovery/revocation transitions. The per-person authorization
+decision for the shared Tailnet account is
+[ADR-0004](docs/ADR/0004-shared-tailnet-account-authorization.md), **Accepted**
+on 2026-09-30 (see [Shared Tailnet account](#shared-tailnet-account)).
 
-That proposal also requires a hostname reserved for the human listener on every
+Accepting the two records does not open human access by itself. Human routes
+and dashboard assets stay closed — the backend shell denies them, including
+application assets, health/version/schema and SPA/error fallbacks — until
+Issue #10 implements and tests both records; the remaining work is listed in
+`server/app/auth/README.md`. Once they are open, a human request receives
+application data only when every one of these server-side conditions holds:
+
+- **Network gate.** The request arrived over the Owner-managed private network
+  / Tailscale path through the non-bypassable local trusted-proxy listener,
+  never as a header an ordinary LAN client supplied. This gate is necessary but
+  identifies nobody: the research room shares one Tailscale login, so the
+  login and any approved device name the shared account or a machine, not the
+  person using it. It is also not a barrier that keeps uninvited people out;
+  every holder of the shared account can reach the listener.
+- **Application gate: per-person credential.** The requester's own
+  ServerSentinel-issued WebAuthn/passkey credential, created from an Owner
+  invitation, was verified by the server — its challenge, client data,
+  authenticator data, signature and counter, relying-party id and origin, and
+  the user-verification flag, which is required at registration and at every
+  authentication — and an active, unexpired server-side session created by
+  that credential exists. The invitation and the permission the route needs
+  (`live:view` or `recordings:view`, independently) are checked per route.
+- **Proxy identity binding, where the deployment supplies one.** Where the
+  deployment supplies a verified trusted-proxy identity, the session stores
+  only a deployment-keyed HMAC binding of it, and every later request's
+  identity must reproduce that binding, compared in constant time. A mismatch
+  denies only that request generically. Per REQUIREMENTS AUTH-005 and
+  SPECIFICATION §11.8 the identity is accepted only on the trusted local path
+  and may be additionally required, and the Issue #10 acceptance criteria in
+  `docs/INITIAL_ISSUES.md` require that no route demand one where the
+  deployment supplies none.
+  The current access-layer code requires one on every ceremony and session
+  check only as an interim constraint until the routes are built (Owner
+  decision, 2026-09-30); whether a path such as a strictly local
+  `http://localhost` Owner may run without one is still undecided in
+  `server/app/auth/README.md`. Either way the per-person credential above is
+  always required, and the binding is a consistency signal, never an
+  authorization input: a Tailscale login or proxy identity header alone
+  authorizes nothing.
+- **Reserved secure-context origin.** The dashboard is served from its
+  reserved origin over a secure context, and the latest startup/daily
+  reservation check passed. That check detects; it does not prevent (below).
+- **Owner step-up.** Owner-only operations additionally require a fresh user
+  verification bound to the session's own credential.
+
+The only requests served without a credential are the enumerated
+pre-credential routes (enrollment-code redemption and authentication), which
+return no application data. Revocation stays credential-scoped: revoking a
+synced passkey applies everywhere it synced, and nothing here is per-device
+revocation. The ADR-0003 policy-model tests and the synthetic unit tests do not
+validate a real Tailscale installation, LAN bypass resistance, browser
+WebAuthn behaviour, or active stream cancellation.
+
+ADR-0003 also requires a hostname reserved for the human listener on every
 scheme and port. No other application, static tree, alias, port, or catch-all
 may answer for that name: one sharing a path would run in the same browser
 origin, and one on another HTTPS port would still receive the host-only session
@@ -310,39 +363,66 @@ see, which bounds rather than removes that exposure. The check sees only sockets
 sockets it sees, the check bounds the exposure rather than preventing it: the
 application cannot prevent a local process from binding.
 
-The current contract for that check (Owner decisions 2026-09-30 and
-2026-10-01; details in `server/app/auth/README.md` and ADR-0003):
+The current contract for that check (Owner decisions 2026-09-30,
+2026-10-01, 2026-10-05 and 2026-10-07; details in `server/app/auth/README.md`
+and ADR-0003):
 
 - Each check re-resolves the reserved name. A resolved address set that
   differs from the recorded one is treated as an exposure. A missing resolver
   or a resolution that fails or times out keeps human access closed but is not
   an exposure: access reopens without revocation once the name resolves to the
   recorded set again, unless an exposure was seen meanwhile.
-- After any exposure (another listener or route, a changed address set, an
-  excepted listener with an unverifiable owner, or a listener/route
-  enumeration that fails or times out) access reopens only after every human
+- After any exposure (another listener or route, a changed address set, or
+  a listener/route enumeration that fails or times out) access reopens only after every human
   session, the Owner's included, has been revoked by advancing the
   authorization generation, with its `system` audit record committed. The
   requirement is persisted as a marker before reopening; if the marker cannot
   be written, every human session is revoked at once instead. A check without
   a durable revoker never opens human access.
-- An Owner listener exception names a port together with its owning
-  executable or systemd unit, never a port alone, and every check verifies the
-  socket's owning processes. Another process, or ownership that cannot be read
-  completely, closes access as an exposure. ServerSentinel stays non-root;
-  reading root-owned sockets is left to a separate privileged helper service
-  (Issue #126), and until it exists an excepted root-owned `sshd` keeps human
-  access closed. The Main Server runs `sshd` as `ssh.service` without
-  `ssh.socket`, with the exception `tcp/22` owned by `/usr/sbin/sshd`
-  (`server/docs/DEPLOYMENT.md`).
-- Every recorded proxy socket must be present and held only by the recorded
-  proxy process (for example `tailscaled.service`), verified the same way.
-  Another or unverifiable holder is an exposure; a missing recorded socket
-  closes access without revocation until it returns. Until #126 lands, a
-  root-owned proxy's sockets keep human access closed.
-- The loopback human upstream must be a socket the ServerSentinel process
-  itself holds (checked in its own `/proc/self/fd`, without privilege); a
-  replacement bound by another process is an exposure.
+- An Owner listener exception names a port together with its creating
+  systemd unit (`.service` or `.socket`) and uid, never a port alone, and
+  every check verifies the socket's creating unit and uid. The unprivileged
+  backend asks the kernel's socket diagnostics (`NETLINK_SOCK_DIAG`) for each
+  socket's uid and creating cgroup and maps the cgroup id to its
+  `/sys/fs/cgroup` path; no helper, capability or root is used (Issue #126,
+  Owner decision 2026-10-07). A socket created by another unit or uid, when
+  an immediate second lookup confirms it, closes access as an exposure. The
+  Main Server keeps `ssh.socket`; the exception is `tcp/22` created by
+  `ssh.socket` as uid 0 (`server/docs/DEPLOYMENT.md`).
+- Every recorded proxy socket must be present and created by the recorded
+  proxy unit and uid (for example `tailscaled.service`, uid 0), verified the
+  same way. A confirmed other creator is an exposure; a missing recorded
+  socket closes access without revocation until it returns.
+- The loopback human upstream is created by systemd socket activation
+  (`server-sentinel-upstream.socket`, uid 0, a loopback port below 1024) and
+  passed to the unprivileged backend. It must be a socket the ServerSentinel
+  process holds (its own `/proc/self/fd`), created by that socket unit, on a
+  port below `ip_unprivileged_port_start`, and held by no other process of the
+  ServerSentinel unit (a same-uid descriptor scan); a replacement bound by
+  another process, a confirmed other creator, or the socket shared with
+  another unit process is an exposure.
+- Ownership that cannot be verified (no resolver; a sock_diag or cgroup
+  lookup that is denied, fails, times out or fails its self-check; a socket
+  missing from the lookup; a creating cgroup that is deleted, the root cgroup
+  or `/init.scope` while the socket's uid is an expected one, or
+  `/init.scope` with uid 0; an unconfirmed mismatch; an upstream holder not
+  seen in all three scans; a kernel-owned socket; an upstream port that is
+  not privileged; an unreadable descriptor table) keeps human access closed
+  without revoking sessions, and access reopens once ownership verifies. An
+  unresolved creating cgroup with a uid none of the expected identities has
+  is an exposure once confirmed (Owner decision, 2026-10-07).
+- Residual risk accepted by the Owner (2026-10-07): the kernel reports the
+  socket's creator, not its current holder. If a legitimately created
+  socket's process is compromised and hands the descriptor to another process
+  (`fork`, `SCM_RIGHTS`), the check does not see it, except for the human
+  upstream's sharing within the ServerSentinel unit. The backend needs
+  `AF_NETLINK` and the host network namespace for this lookup; `AF_NETLINK`
+  also lets a compromised backend use every other netlink protocol open to an
+  unprivileged process, for example reading routes and addresses (largely
+  readable from `/proc` already) or listening to kernel uevents
+  (`NETLINK_KOBJECT_UEVENT`, device add/remove events). Narrowing this with a
+  `SystemCallFilter=`/socket-protocol restriction is planned for when the
+  check is wired into the running service.
 
 ## Shared Tailnet account
 
@@ -396,7 +476,7 @@ Before sending the pairing code:
 - fail closed on missing/mismatched trust or certificate validation failure, without sending the code;
 - do not offer plaintext or unverified-certificate fallback.
 
-ADR-0006 selects the bootstrap trust profile: a deployment-local CA public trust bundle moves through an independently trusted Owner channel; the local Main approval binds a 128-bit, five-minute, one-use code to the Agent public-key digest; and TLS 1.3 authenticates the intended Main before code submission. The Issue #13 CA, node-certificate and mTLS ingest adapters exist; the application starts no ingest listener. The bootstrap enrollment listener runs only inside the local Main approval CLI (`pairing_cli approve`), on an explicit private IP literal, for that run's approval, and closes when it completes or its five minutes end. It uses TLS 1.3 with a required ALPN protocol, bounded frames, one deadline per connection, per-source attempt limits and a refusal cap, and returns only a generic refusal to unauthenticated peers. The Agent pairing CLI authenticates the Main (bundle CA, server name, ALPN, deployment URI) before it prompts for the code, and the Main CLI shows the code only on its controlling terminal. Until #6, Owner authority in that CLI is the local account owning the issuer material and database plus a typed confirmation per approve/revoke. A short-lived code and post-pairing mTLS do not replace confidentiality and intended-server authentication during initial enrollment. Pairing secrets are entered through a non-echoing prompt or protected automation input, never command arguments, environment variables, URLs, or logs.
+ADR-0006 selects the bootstrap trust profile: a deployment-local CA public trust bundle moves through an independently trusted Owner channel; the local Main approval binds a 128-bit, five-minute, one-use code to the Agent public-key digest; and TLS 1.3 authenticates the intended Main before code submission. The Issue #13 CA, node-certificate and mTLS ingest adapters exist; the application starts no ingest listener. The bootstrap enrollment listener runs only inside the local Main approval CLI (`pairing_cli approve`), on an explicit private IP literal, for that run's approval, and closes when it completes or its five minutes end. It uses TLS 1.3 with a required ALPN protocol, bounded frames, one deadline per connection, per-source attempt limits and a refusal cap, and returns only a generic refusal to unauthenticated peers. The Agent pairing CLI authenticates the Main (bundle CA, server name, ALPN, deployment URI) before it prompts for the code, and the Main CLI shows the code only on its controlling terminal. Until #6, Owner authority in that CLI is the local account owning the issuer material and database plus a typed confirmation per approve/revoke. A short-lived code and post-pairing mTLS do not replace confidentiality and intended-server authentication during initial enrollment. Pairing secrets are entered through a non-echoing prompt or protected automation input, never command arguments, environment variables, URLs, or logs. The Main listener leaf is rotated in place (`pairing_cli rotate-listener`) without changing the CA, and its files can be owned by a separate ingest account that cannot read the CA key; the CLI needs `CAP_CHOWN` + `CAP_DAC_OVERRIDE` only for that one command and refuses before writing without them. This does not yet remove the CA key from the enrollment-listener process (#109).
 
 After pairing:
 

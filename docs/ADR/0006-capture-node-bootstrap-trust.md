@@ -267,15 +267,30 @@ status or decision.
     expired or superseded credentials cannot renew; the node must re-pair with a
     fresh Owner approval.
   - *Supersession.* The renewed certificate is staged in the ledger (one per
-    node; a retry replaces it; staging writes no audit record, so repeated
-    requests cannot grow the audit table). The old certificate stays admitted
+    node; a retry with a fresh key replaces it; staging writes no audit record,
+    so repeated requests cannot grow the audit table). The old certificate stays admitted
     until the renewed one is first presented. That admission atomically promotes
     it and appends an `activate_capture_node_credential` record (actor `system`).
     From then on only the new certificate is admitted, even though the old one
     has not expired. This keeps exactly one active credential per node, so
     revocation and audit stay per node. An Agent that never received or
     installed the response is not locked out: it keeps its old certificate and
-    retries. Revocation deletes any staged renewal.
+    retries. Revocation deletes any staged renewal. A connection that loses a
+    concurrent promotion of the same staged renewal re-reads the active
+    credential in its write transaction and is admitted only if its exact key
+    and certificate are now active (Issue #121); it writes no second audit
+    record, and a revocation committed in between still refuses it.
+  - *Certificate-idempotent retries (Issue #123).* The staged row also keeps
+    the issued certificate's public PEM (migration 21; never a key or CSR),
+    checked against the staged certificate digest. A retry with the currently
+    staged key (the Agent reuses its pending key) leaves the row unchanged and
+    is answered with that first certificate, re-verified as this CA's leaf for
+    the same node and key; the certificate signed for the retry is never staged
+    or sent. So a delayed first response and every retry response name the one
+    staged credential. A stored certificate that fails these checks is refused
+    (`renewal_not_eligible`) rather than replaced. A row staged before
+    migration 21 has no certificate; its next same-key retry stages a new one as
+    before.
   - *Key uniqueness (Owner decision 2026-09-30).* A node public key is bound
     to at most one node, for good. `pairing_key_bindings` records every key
     the ledger approves, activates, stages or promotes and is never pruned. Approval,
@@ -417,4 +432,95 @@ acceptance" above except where listed at the end.
   separate processes (the concurrency test uses threads against the real
   listener); real LAN interoperability (MANUAL_TEST §B, unverified); a narrower
   issuance capability than the CLI process holding the CA key while it serves;
-  Main listener-certificate renewal; the #6 Owner-authentication boundary.
+  Main listener-certificate renewal (now a manual rotation command; see the 2026-10-05 notes); the #6
+  Owner-authentication boundary.
+
+## Follow-up notes (2026-10-05, Issues #124, #125, #127)
+
+These notes record implementation progress; they do not change this ADR's
+status or decision.
+
+- **Main listener rotation.** `pairing_cli rotate-listener` replaces the Main
+  listener key and leaf in place, signed by the unchanged deployment CA and
+  with the unchanged server name, so Agent trust bundles stay valid. It runs
+  under an exclusive directory lock, refuses a listener certificate that the
+  selected CA did not issue, writes the new pair under staged names and renames
+  each over the current file; an interrupted run is completed by the next one,
+  and readers refuse a mismatched key/certificate pair. Listener processes
+  reload the pair on restart. Rotation is manual (Owner command); the monitor
+  can warn 30 days before listener expiry once a scheduler runs it.
+- **Separate accounts.** Listener material can belong to a dedicated ingest
+  account: the CLI hands new files to that account before writing key bytes,
+  which needs `CAP_CHOWN` + `CAP_DAC_OVERRIDE` for that command only, and
+  refuses up front without them. This does not yet separate the CA key from the
+  enrollment listener process (#109).
+- **Concurrent `init`.** Both directories are locked for the whole run and the
+  rollback removes only the entries the run created.
+- **Operator mistakes.** `export-bundle` and `approve` refuse a listener
+  certificate the selected CA did not issue (`listener_authority_mismatch`);
+  `approve`, `list` and `revoke` refuse a missing or unsafe `--database`
+  instead of creating and migrating an empty one, refuse a schema that is not
+  exactly this release's instead of migrating it, and keep the validated file
+  pinned so a later replacement is refused rather than written to.
+- **CA validity.** A leaf beyond the CA expiry raises a dedicated error. Node
+  renewal reports `renewal_ca_validity_insufficient` and the deployment-wide
+  local `capture_trust_warning`; `approve` and `rotate-listener` refuse
+  `deployment_ca_validity_insufficient` before changing state. CA replacement
+  remains a new `init` plus re-pairing, as above.
+
+## Follow-up notes (2026-10-07, Issues #116/#117 re-pairing and enrollment serialization)
+
+These notes record the Owner decisions of 2026-10-01 and 2026-10-05 and their
+implementation; they refine "A node cannot renew or replace its identity after
+revocation" above without changing this ADR's status or bootstrap decision.
+Every re-pair is a full bootstrap enrollment (same trust bundle, verified TLS
+1.3 before the code, one-use code, typed local Owner approval) inside the
+installed deployment; a different CA is a fresh install, never an in-place swap.
+
+- **Expired, not revoked: same key, same node.** Allowed only once the installed
+  certificate has expired; an unexpired credential renews automatically. The
+  Main re-approves the key for the node it is already bound to after the Owner
+  types `APPROVE`. The Agent accepts only a certificate for that node and
+  deployment, for that key, outliving the expired one, and rotates it in
+  atomically. Node UUID and camera-source assignments are unchanged.
+- **Revoked: new key, new node.** A revoked key is never accepted again, even
+  for its own node (the Main refuses it as `public_key_revoked` before the Owner
+  prompt and inside the approval transaction). The Agent proves one fresh key
+  kept in `pending-repair/` and accepts only a certificate for a different node
+  of the same deployment, swapped in atomically. No camera source is carried
+  over: the Owner approves the new node's sources again. The old node's ledger
+  rows stay `revoked`; nothing is deleted, so its recordings stay attributed to
+  the old node until normal retention.
+- **Concurrent enrollment is refused immediately.** `request`, `pair` and the
+  renewal steps hold one non-blocking runtime-wide `flock`
+  (`<runtime_root>/node-enrollment.lock`, 0600, service account, no root):
+  `pair` from the installed-identity check through install and pending-key
+  cleanup, `request` through writing its public request file. A second run gets
+  `enrollment_in_progress` before any network traffic or code prompt; it is
+  never queued behind an interactive prompt.
+- **Configuration stays a manual Owner edit; start fails closed.** After a
+  revoked re-pair the CLI prints the exact `node_id` change. The Agent refuses to
+  start (service and `--check`) with `node_identity_mismatch` while the
+  configured `node_id` differs from the installed credential's node, and with
+  `node_credential_unavailable` when the installed credential is damaged,
+  unreadable, or its commit marker is lost after an identity was committed (a
+  durable, never-removed `node-identity-installed` file records the first
+  commit). Only a store without that evidence -- fresh, or a first install
+  interrupted before its commit -- reads as unpaired. Every validation of a
+  committed credential durably backfills missing evidence (identities paired
+  by an earlier release, or a stop between the commit and the evidence write)
+  and refuses the credential if it cannot be written. Writing the evidence
+  before the commit was rejected: an interrupted first install would then look
+  like a lost commit and could not be retried. Residual: a commit lost after
+  such a stop and before any validation still reads as unpaired.
+- **Atomicity.** Both modes write and fsync the new generation, then atomically
+  rename it over `current.json`; the old generation's files are deleted only
+  after that commit. A renewal key staged for the old credential is discarded
+  first (the Main drops staged renewals on activation). An interrupted revoked
+  re-pair is completed by rerunning `pair --repair revoked` without a second
+  exchange. The Agent's ring buffer and protected incidents are not touched.
+- **Evidence.** Mock and loopback only (`agent/tests/test_enroll.py`,
+  `agent/tests/test_pairing.py`, `agent/tests/test_check_reasons.py`,
+  `server/tests/test_capture_enrollment.py`,
+  `tests/e2e/test_capture_enrollment_scenarios.py`); real-host re-pairing is in
+  `MANUAL_TEST.md` and unverified.

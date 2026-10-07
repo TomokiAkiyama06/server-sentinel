@@ -7,7 +7,8 @@ export const kindGroup: Record<ObservationKind, TimelineGroup> = {
   person: 'activity', motion: 'activity', owner_entry: 'activity', owner_exit: 'activity',
   anonymous_entry: 'activity', anonymous_exit: 'activity',
   server_movement: 'critical', camera_tamper: 'critical',
-  camera_health: 'equipment', node_health: 'equipment', recording: 'equipment', storage: 'equipment',
+  camera_health: 'equipment', entrance_gate: 'equipment', node_health: 'equipment', recording: 'equipment',
+  storage: 'equipment',
   presence: 'configuration', configuration: 'configuration',
 };
 export const filters = ['all', 'activity', 'critical', 'equipment', 'configuration'] as const;

@@ -29,11 +29,13 @@ STORE_KEY = "auth.reservation.listener_exceptions"
 REVOCATION_PENDING_KEY = "auth.reservation.session_revocation_pending"
 # Fixed logical ID for "every human session"; the audit record names no person.
 HUMAN_SESSIONS_ID = UUID("0b6f3f64-54a9-4e0f-8f5e-7d2c9a4b1e37")
-# Version 1 held port-only exceptions. They are not migrated: an owner cannot
-# be inferred, so a stored version 1 set fails closed as outdated until the
-# Owner enters the exceptions again with their owning process (2026-10-01).
-FORMAT_VERSION = 2
-OUTDATED_VERSIONS = frozenset({1})
+# Version 1 held port-only exceptions, version 2 an owning executable path or
+# unit without a uid. Neither is migrated: the creating unit and uid cannot be
+# inferred, so a stored version 1 or 2 set fails closed as outdated until the
+# Owner enters the exceptions again with their creating unit and uid
+# (2026-10-01; 2026-10-07, Issue #126).
+FORMAT_VERSION = 3
+OUTDATED_VERSIONS = frozenset({1, 2})
 MAX_STORED_BYTES = 32768
 
 
@@ -42,7 +44,7 @@ class ListenerExceptionStoreError(RuntimeError):
 
 
 class OutdatedListenerExceptions(ListenerExceptionStoreError, ListenerExceptionsOutdated):
-    """Stored exceptions use the port-only format; the Owner must re-enter them."""
+    """Stored exceptions use an older format; the Owner must re-enter them."""
 
 
 def encode(exceptions) -> str:
@@ -52,10 +54,10 @@ def encode(exceptions) -> str:
     entries = sorted(
         ({"protocol": item.protocol.value, "port": item.port,
           "family": None if item.family is None else item.family.value, "scope": item.scope.value,
-          "executable": item.executable, "unit": item.unit}
+          "unit": item.unit, "uid": item.uid}
          for item in values),
         key=lambda entry: (entry["port"], entry["family"] or "", entry["protocol"], entry["scope"],
-                           entry["executable"] or "", entry["unit"] or ""),
+                           entry["unit"], entry["uid"]),
     )
     text = json.dumps({"version": FORMAT_VERSION, "exceptions": entries}, separators=(",", ":"))
     if len(text.encode()) > MAX_STORED_BYTES:
@@ -87,13 +89,13 @@ def decode(text) -> frozenset:
         result = []
         for entry in document["exceptions"]:
             if not isinstance(entry, dict) or set(entry) != {"protocol", "port", "family", "scope",
-                                                              "executable", "unit"}:
+                                                              "unit", "uid"}:
                 raise ValueError
             family = entry["family"]
             result.append(ListenerException(
                 entry["port"], TransportProtocol(entry["protocol"]),
                 None if family is None else AddressFamily(family), BindScope(entry["scope"]),
-                executable=entry["executable"], unit=entry["unit"],
+                unit=entry["unit"], uid=entry["uid"],
             ))
         values = frozenset(result)
         if len(values) != len(result):

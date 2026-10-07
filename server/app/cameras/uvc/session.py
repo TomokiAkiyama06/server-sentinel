@@ -5,6 +5,7 @@ import time
 
 from .capture import CaptureError, FrameTimeout, MmapCapture, profile_satisfies
 from .discovery import ProbeError
+from .identity import current_live_instance, same_live_instance
 
 
 # The stall window is never shorter than this many negotiated frame intervals,
@@ -117,7 +118,7 @@ class CaptureSession:
         current = self.discovery.scan()
         if current.failures:
             return False
-        return self.controller.reconcile(current.devices) == candidate
+        return same_live_instance(self.controller.reconcile(current.devices), candidate)
 
     def _windows(self, negotiated):
         interval = 1.0 / negotiated.fps
@@ -138,8 +139,11 @@ class CaptureSession:
         # (USB re-enumeration stalling open/ioctl) must not leave the next
         # frame already due for another full scan.
         self._last_scan = self.clock()
-        if self.capture is not None and self.controller.bound not in scan.devices:
-            if scan.failures and self.controller.bound is not None:
+        bound = self.controller.bound
+        if self.capture is not None and (bound is None or current_live_instance(scan.devices, bound) is None):
+            # Compare the live instance (#115): a rescan that only refreshes
+            # mutable metadata (by-id aliases, formats) is not an unplug.
+            if scan.failures and bound is not None:
                 # A failed probe can hide the bound node; the open descriptor
                 # still reports a real unplug, so keep it and rescan later.
                 return self.controller.bound

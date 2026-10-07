@@ -43,7 +43,7 @@
     },
     {
       "path": "web/tests/presence_views.test.mjs",
-      "sha256": "sha256:04f5e442690b0c69d5522ff7f8aa0b2af5213a2792e373f0861f04cb6af5a5cf"
+      "sha256": "sha256:74223d8f6e2a0a182519d1a053bafc8fa9fae4f5dc028137adbee93b6386dc77"
     },
     {
       "path": "web/tests/wizard.test.mjs",

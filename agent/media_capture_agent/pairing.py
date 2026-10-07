@@ -31,6 +31,11 @@ _MAX_MATERIAL_BYTES = 256 * 1024
 _MAX_MANIFEST_BYTES = 16 * 1024
 _CREDENTIAL_DIRECTORY = "node-credentials"
 _CURRENT_MANIFEST = "current.json"
+_ENROLLMENT_LOCK = "node-enrollment.lock"
+# Durable evidence that an identity was committed at least once. Written after
+# the first commit and never removed, so a later loss of ``current.json`` (or of
+# the whole credential directory) fails closed instead of reading as unpaired.
+_INSTALLED_MARKER = "node-identity-installed"
 _FILES = {
     "private_key": "private-key",
     "client_certificate": "client-certificate",
@@ -134,6 +139,19 @@ class NodeCredentialStore:
     manifest is the atomic commit point.  Readers must ignore every generation
     unless ``current.json`` names and hashes it.  An existing marker is never
     replaced, including after a competing process bypasses the advisory lock.
+
+    After the first commit a private ``node-identity-installed`` file in the
+    runtime root records that an identity exists; it is never removed. Without
+    ``current.json`` the store reads as unpaired only while that evidence is
+    absent (a fresh store, or a first install interrupted before its commit);
+    with the evidence present the missing commit is corruption
+    (``credential_commit_missing``), never "unpaired". Every validation of a
+    committed generation (startup, ``--check``, pairing) backfills missing
+    evidence durably and fails closed if it cannot, so identities committed
+    before the evidence existed, or just before a stop, gain it on first use.
+    The evidence is not written before the commit: an "install intent" file
+    would make an interrupted first install indistinguishable from a lost
+    commit and block its retry.
     """
 
     def __init__(self, runtime_root: Path, *, owner_uid: int | None = None):
@@ -154,6 +172,10 @@ class NodeCredentialStore:
             fcntl.flock(lock_fd, fcntl.LOCK_EX)
             if self._entry_exists(credentials_fd, _CURRENT_MANIFEST):
                 raise PairingRefused("node_identity_already_exists")
+            if self._entry_exists(root_fd, _INSTALLED_MARKER):
+                # An identity was committed before and its commit is gone:
+                # never install a second identity over the evidence.
+                raise PairingRefused("credential_commit_missing")
 
             generation = uuid4().hex
             values = {
@@ -190,6 +212,7 @@ class NodeCredentialStore:
                 raise PairingRefused("node_identity_already_exists") from None
             committed = True
             os.fsync(credentials_fd)
+            self._record_installed(root_fd)
         except PairingRefused:
             raise
         except (OSError, StorageRefused, ValueError, TypeError):
@@ -218,12 +241,26 @@ class NodeCredentialStore:
     def rotate(self, material: NodeCredentialMaterial) -> None:
         """Atomically replace the committed generation with a renewed one.
 
-        Only the same deployment/node identity may rotate; a different identity
-        needs a fresh pairing. The new generation is written and fsynced, linked
+        Only the same deployment/node identity may rotate (renewal, or re-pairing
+        an expired node with its same key); a different node needs
+        ``replace_identity``. The new generation is written and fsynced, linked
         as ``.current-next.json`` and renamed over ``current.json`` (an atomic
         replace), then the superseded generation is removed best-effort. A crash
         at any point leaves either the old or the new generation committed.
         """
+        self._swap(material, same_node=True)
+
+    def replace_identity(self, material: NodeCredentialMaterial) -> None:
+        """Atomically swap to a *new* node identity of the same deployment (#116).
+
+        Used only to re-pair after the Owner revoked the installed node: the
+        new material must name the same deployment but a different node. The
+        swap is the same atomic rename as ``rotate``; the revoked generation's
+        files are deleted only after the new generation is committed.
+        """
+        self._swap(material, same_node=False)
+
+    def _swap(self, material: NodeCredentialMaterial, *, same_node: bool) -> None:
         if not isinstance(material, NodeCredentialMaterial):
             raise PairingRefused("invalid_credential_material")
         if not self.installed():
@@ -241,9 +278,11 @@ class NodeCredentialStore:
             current = json.loads(self._read_file(credentials_fd, _CURRENT_MANIFEST,
                                                  maximum=_MAX_MANIFEST_BYTES,
                                                  expected_links=2).decode("utf-8"))
-            if (current["deployment_id"] != str(material.deployment_id)
-                    or current["node_id"] != str(material.node_id)):
+            if current["deployment_id"] != str(material.deployment_id):
                 raise PairingRefused("renewal_identity_mismatch")
+            if (current["node_id"] == str(material.node_id)) != same_node:
+                raise PairingRefused("renewal_identity_mismatch" if same_node
+                                     else "repair_identity_rejected")
             previous = [entry["name"] for entry in current["files"].values()]
             previous.append("manifest-" + previous[0].rsplit("-", 1)[1].replace(".pem", ".json"))
             try:
@@ -264,6 +303,9 @@ class NodeCredentialStore:
                 except OSError:
                     pass
             os.fsync(credentials_fd)
+            # Restores the evidence if a crash between the first commit and its
+            # evidence write left it missing.
+            self._record_installed(root_fd)
         except PairingRefused:
             raise
         except (OSError, StorageRefused, ValueError, TypeError, KeyError, IndexError):
@@ -316,6 +358,19 @@ class NodeCredentialStore:
         return generation, manifest_name
 
     def installed(self) -> bool:
+        return self.installed_node_id() is not None
+
+    def installed_node_id(self) -> UUID | None:
+        """The committed generation's node UUID after the full integrity check.
+
+        ``None`` means no identity is installed; a damaged or unreadable
+        generation raises ``PairingRefused`` (never treated as unpaired), and so
+        does a missing commit once ``node-identity-installed`` records that an
+        identity was committed (``credential_commit_missing``). A generation
+        that validates backfills missing evidence durably before it is
+        returned; if that write fails the result is
+        ``credential_storage_unavailable``.
+        """
         root_fd = credentials_fd = None
         try:
             root_fd = open_directory(self.runtime_root)
@@ -327,14 +382,14 @@ class NodeCredentialStore:
                     dir_fd=root_fd,
                 )
             except FileNotFoundError:
-                return False
+                return self._unpaired(root_fd)
             self._validate_directory(credentials_fd, "credential_directory_rejected")
             try:
                 manifest = self._read_file(credentials_fd, _CURRENT_MANIFEST,
                                            maximum=_MAX_MANIFEST_BYTES,
                                            expected_links=2)
             except FileNotFoundError:
-                return False
+                return self._unpaired(root_fd)
             try:
                 value = json.loads(manifest.decode("utf-8"))
                 if (not isinstance(value, dict)
@@ -383,7 +438,12 @@ class NodeCredentialStore:
                     raise ValueError
             except (KeyError, TypeError, ValueError, UnicodeError):
                 raise PairingRefused("credential_identity_rejected") from None
-            return True
+            # Backfill the evidence for an identity committed before it existed
+            # (an older release, or a stop between the commit and the evidence
+            # write). Fail closed if it cannot be made durable: a store whose
+            # loss could later read as unpaired is not accepted as installed.
+            self._record_installed(root_fd)
+            return UUID(value["node_id"])
         except (OSError, StorageRefused):
             raise PairingRefused("credential_storage_unavailable") from None
         finally:
@@ -391,6 +451,34 @@ class NodeCredentialStore:
                 os.close(credentials_fd)
             if root_fd is not None:
                 os.close(root_fd)
+
+    def _unpaired(self, root_fd: int) -> None:
+        if self._entry_exists(root_fd, _INSTALLED_MARKER):
+            raise PairingRefused("credential_commit_missing")
+        return None
+
+    def _record_installed(self, root_fd: int) -> None:
+        """Durably create the installed-identity evidence if it is missing.
+
+        Idempotent; any existing entry counts as evidence (its content is not
+        meaningful). The runtime root is fsynced on every call so an entry left
+        by an earlier, interrupted call is made durable too. Errors propagate.
+        """
+        try:
+            descriptor = os.open(
+                _INSTALLED_MARKER,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                0o600, dir_fd=root_fd)
+        except FileExistsError:
+            descriptor = None
+        if descriptor is not None:
+            try:
+                if os.write(descriptor, b"1\n") != 2:
+                    raise OSError(errno.EIO, "installed evidence write failed")
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+        os.fsync(root_fd)
 
     def _open_credentials_directory(self, root_fd: int) -> int:
         try:
@@ -492,6 +580,69 @@ class NodeCredentialStore:
             return content
         finally:
             os.close(descriptor)
+
+
+class EnrollmentLock:
+    """Runtime-wide interprocess lock serializing pairing and re-pairing (#117).
+
+    ``pair`` holds it from the installed-identity check through the exchange,
+    install and pending-key cleanup, so two concurrent runs on one runtime root
+    cannot both pass the check and install different certificates for one
+    node. The lock is a ``flock`` on a 0600 regular file owned by the service
+    account directly in the validated 0700 runtime root; it needs no root. A
+    second holder is refused at once (``enrollment_in_progress``) instead of
+    waiting behind an interactive prompt. The lock file is never removed, so
+    every process locks the same inode; after locking, the name is re-checked
+    to still refer to the locked inode.
+    """
+
+    def __init__(self, runtime_root: Path, *, owner_uid: int | None = None):
+        self._files = NodeCredentialStore(runtime_root, owner_uid=owner_uid)
+        self._descriptor: int | None = None
+
+    def __enter__(self) -> "EnrollmentLock":
+        if self._descriptor is not None:
+            raise PairingRefused("enrollment_in_progress")
+        root_fd = descriptor = None
+        try:
+            root_fd = open_directory(self._files.runtime_root)
+            self._files._validate_directory(root_fd, "runtime_root_rejected")
+            descriptor = os.open(
+                _ENROLLMENT_LOCK,
+                os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK,
+                0o600, dir_fd=root_fd)
+            info = os.fstat(descriptor)
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != self._files.owner_uid
+                    or info.st_mode & 0o077 or info.st_nlink != 1):
+                raise PairingRefused("credential_lock_rejected")
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise PairingRefused("enrollment_in_progress") from None
+            named = os.stat(_ENROLLMENT_LOCK, dir_fd=root_fd, follow_symlinks=False)
+            if (named.st_dev, named.st_ino) != (info.st_dev, info.st_ino):
+                raise PairingRefused("credential_lock_rejected")
+        except PairingRefused:
+            if descriptor is not None:
+                os.close(descriptor)
+            raise
+        except (OSError, StorageRefused):
+            if descriptor is not None:
+                os.close(descriptor)
+            raise PairingRefused("credential_storage_unavailable") from None
+        finally:
+            if root_fd is not None:
+                os.close(root_fd)
+        self._descriptor = descriptor
+        return self
+
+    def __exit__(self, *_exc_info) -> None:
+        descriptor, self._descriptor = self._descriptor, None
+        if descriptor is not None:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            finally:
+                os.close(descriptor)
 
 
 def _valid_server_name(value: object) -> bool:

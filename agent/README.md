@@ -36,7 +36,12 @@ Use CPython 3.12 or 3.14 on Linux, the versions with reviewed wheel hashes in
 from a checkout, or invoke the installed `media-capture-agent` executable.
 `--check` validates the local account, storage
 identity, permissions and reserve without opening devices, writing media or
-connecting to any host. Normal service execution must use a dedicated non-root
+connecting to any host. Its only possible write is the installed-identity
+evidence: when a valid paired credential lacks
+`<runtime_root>/node-identity-installed` (paired by an earlier release, or
+stopped right after its commit), `--check` and service startup create that
+0600 file and fsync it; if they cannot, they fail with
+`node_credential_unavailable` (see `pairing/README.md`). Normal service execution must use a dedicated non-root
 account; configuration is a regular file with mode 0600, owned by that account.
 Agent and installer reject FIFOs/special files without waiting for a writer.
 Both read at most 65,537 bytes before parsing, enforce the 64 KiB configuration
@@ -78,6 +83,8 @@ is reported; fix it and rerun to reveal any later failure.
 | `runtime_root_unavailable` | The runtime root cannot be opened |
 | `runtime_root_permissions_unsafe` | The runtime root is not owned by `service_uid` or grants any group/world access |
 | `runtime_root_not_writable` | The owner lacks write or search permission on the runtime root |
+| `node_identity_mismatch` | An installed node credential names a different node than the configuration's `node_id` (for example after `enroll pair --repair revoked` before `node_id` was updated); the Agent starts no capture or session |
+| `node_credential_unavailable` | The installed node credential under the runtime root is damaged or unreadable (never treated as unpaired) |
 | `check_failed` | Any other internal error; exception text is suppressed |
 
 The deployment-local JSON configuration requires every field below. No private

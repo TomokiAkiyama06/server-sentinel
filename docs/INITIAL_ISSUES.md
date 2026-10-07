@@ -309,10 +309,10 @@ Scope:
 - keep Tailnet policy separately Owner-managed outside ServerSentinel; existing ACLs/Grants may remain unchanged, and ServerSentinel performs no policy mutation or admin-credential storage.
 
 The authorization decision is written up in ADR 0004 (shared Tailnet account,
-per-person WebAuthn/passkey credentials), which remains Proposed and awaits the
-Owner. The surrounding owner-authentication and trusted-proxy boundary in ADR
-0003 is Accepted. This Issue closes only after ADR 0004 is accepted and both
-records are implemented and tested.
+per-person WebAuthn/passkey credentials), Accepted on 2026-09-30. The
+surrounding owner-authentication and trusted-proxy boundary in ADR 0003 is
+Accepted (2026-09-21). Acceptance does not open human access: this Issue closes
+only after both records are implemented and tested under #10.
 
 Acceptance:
 - Tailnet membership alone is insufficient;
@@ -333,9 +333,12 @@ Acceptance:
 - no developer-operated identity/cloud.
 
 Design progress: [ADR-0003](ADR/0003-owner-authentication-and-trusted-proxy.md)
-is Proposed with synthetic policy-model coverage. Owner decisions remain pending;
-this does not close #6 or permit #10 authentication activation. Actual proxy,
-session, recovery, and stream tests remain #10/#19/#27/#28 work.
+(Accepted 2026-09-21, with synthetic policy-model coverage) and
+[ADR-0004](ADR/0004-shared-tailnet-account-authorization.md) (Accepted
+2026-09-30) are both Accepted. Acceptance does not
+close #6 or activate #10 human routes, which stay closed until #10 implements
+and tests both records. Actual proxy, session, recovery, and stream tests
+remain #10/#19/#27/#28 work.
 
 ## Plan 5 — Local UVC discovery and stable identity
 

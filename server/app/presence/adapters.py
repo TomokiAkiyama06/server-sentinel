@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 import hashlib
 import json
+import logging
 import threading
 from typing import Callable
 from uuid import UUID, uuid4
@@ -25,6 +26,7 @@ from app.cameras.uvc.identity import CameraState, HealthEvent
 from app.detection.foundation import Quality as DetectionQuality
 from app.detection.roi.contracts import CriticalKind, CriticalObservation
 from app.detection.tracking.entrance import Crossing, CrossingKind, TrackUpdate
+from app.logging import Event
 from app.media.health.service import HealthResult, HealthState
 from app.storage.policy import StorageState, StorageTransition
 
@@ -114,6 +116,16 @@ def _stamp(clock):
     return received, trusted
 
 
+class _BuildFault(Exception):
+    """A staged fact's ``build()`` raised something other than a contract error.
+
+    ``build()`` only constructs an observation from the receipt; it touches no
+    storage, database or clock. Any failure other than `InvalidObservation`
+    is therefore a programming error that a retry repeats forever, not a
+    transient fault.
+    """
+
+
 def _timely(occurred, received, uncertainty_us, maximum_latency):
     """Deterministic source timing check; a replay reaches the same answer."""
     delay = utc(received) - utc(occurred)
@@ -134,10 +146,17 @@ class OutboxState:
     session: bool = False
     # The durable gap marker as last read: True, False, or None when unknown.
     gap: bool | None = None
+    # Facts held after their `build()` raised a permanent programming fault.
+    # They no longer block later facts, are never dropped silently, and are
+    # recorded as lost at a clean close.
+    quarantined: int = 0
+    # Consecutive flushes a transient storage, database or clock failure
+    # stopped before the head fact was written; 0 once a write succeeds.
+    failures: int = 0
 
     @property
     def degraded(self):
-        """Any pending, unpersisted, durable or unknown loss is a visible gap.
+        """Any pending, quarantined, unpersisted, durable or unknown loss is a visible gap.
 
         The durable marker is the source of truth across restarts: it stays
         set until the Owner clears it, and an outbox with no open session or an
@@ -145,12 +164,31 @@ class OutboxState:
         """
         # Persisted refused/rejected counts live in the durable marker, so
         # an Owner clear of that marker is what returns the outbox to healthy.
-        return bool(self.pending or self.unpersisted or not self.session or self.gap is not False)
+        return bool(self.pending or self.quarantined or self.unpersisted or not self.session
+                    or self.gap is not False)
 
 
 # Builds the observation for one staged fact from the main-host receipt taken
 # at write time; returns it together with its Owner presence validity or None.
 Build = Callable[[datetime, bool], tuple[Observation, datetime | None]]
+
+
+def _stage_main_dated(outbox, kind, value, **fields):
+    """Stage a state fact dated by the main clock when its producer reports it."""
+    try:
+        occurred, occurred_trusted = _stamp(outbox.clock)
+    except ClockUnavailable:
+        # A one-shot producer callback will not re-emit this transition,
+        # so a clock fault here is a counted gap, never silent loss.
+        return outbox._refuse()
+    identifier = uuid4()
+
+    def build(received, trusted):
+        ordered = utc(occurred) <= utc(received)
+        return Observation(kind, occurred, received, value=value, identifier=identifier,
+                           clock_trusted=occurred_trusted and trusted and ordered,
+                           **fields), None
+    return outbox.stage(identifier, build)
 
 
 class TimelineOutbox:
@@ -178,7 +216,19 @@ class TimelineOutbox:
     A full outbox refuses the new fact and counts it rather than displacing an
     already staged one. Only a fact presence rejects as a contract error
     (`InvalidObservation`) is counted and removed, so it cannot block every
-    later fact; an unavailable database location stays staged. Staging a UUID
+    later fact; an unavailable database location stays staged. A fact whose
+    `build()` raises anything else has a permanent programming fault, because
+    `build()` touches no storage, database or clock: it is moved into a
+    quarantine that still counts against the capacity, so it neither blocks
+    every later fact forever nor disappears. Quarantined facts degrade the
+    outbox and Owner status (`timeline_quarantined_count`, part of
+    `timeline_gap`), are logged as `timeline_fact_quarantined` without any
+    content, and are recorded as lost at a clean close. A storage, database or
+    clock failure keeps the head staged and counts a consecutive failure
+    (`OutboxState.failures`, Owner `timeline_flush_failures`); the first
+    failure of a streak and every doubling are logged as
+    `timeline_flush_failing`, and the first later write as
+    `timeline_flush_recovered`. Staging a UUID
     that is already pending is a duplicate only when its source fact matches
     the staged one; a different fact under that UUID is an identity conflict,
     refused and counted as rejected just as presence would reject it. Both
@@ -207,6 +257,8 @@ class TimelineOutbox:
         self.clock = clock
         self.capacity = capacity
         self._pending = []
+        self._quarantined = []
+        self._failures = 0
         self._lock = threading.Lock()
         self._flushing = threading.Lock()
         self._receipt = threading.RLock()
@@ -253,7 +305,7 @@ class TimelineOutbox:
         fact = (_fact(observation), source_fact)
         with self._lock:
             self._accepting_locked()
-            for item, _, staged, _ in self._pending:
+            for item, _, staged, _ in (*self._pending, *self._quarantined):
                 if item == identifier:
                     if staged == fact:
                         return True
@@ -261,7 +313,7 @@ class TimelineOutbox:
                     self._rejected += 1
                     self._unpersisted_rejected += 1
                     return False
-            if len(self._pending) >= self.capacity:
+            if len(self._pending) + len(self._quarantined) >= self.capacity:
                 self._refused += 1
                 self._unpersisted_refused += 1
                 return False
@@ -286,21 +338,35 @@ class TimelineOutbox:
                     _, build, _, source_fact = self._pending[0]
                 try:
                     with self.receipt() as (received, trusted):
-                        observation, valid_until = build(received, trusted)
+                        try:
+                            observation, valid_until = build(received, trusted)
+                        except (InvalidObservation, MemoryError):
+                            raise
+                        except Exception:
+                            raise _BuildFault() from None
                         self.service.record(observation, presence_valid_until=valid_until, restamped=True,
                                             source_fact=source_fact)
                 except InvalidObservation:
                     outcome = "rejected"
+                except _BuildFault:
+                    outcome = "quarantined"
                 except Exception:
                     # Storage refusal, an unavailable database or clock: keep
                     # it and everything after it for the next flush.
+                    self._failed()
                     break
                 else:
                     outcome = "recorded"
+                if outcome == "quarantined":
+                    logging.getLogger(__name__).error(Event.TIMELINE_FACT_QUARANTINED)
+                else:
+                    self._succeeded()
                 with self._lock:
-                    self._pending.pop(0)
+                    item = self._pending.pop(0)
                     if outcome == "recorded":
                         self._recorded += 1
+                    elif outcome == "quarantined":
+                        self._quarantined.append(item)
                     else:
                         self._rejected += 1
                         self._unpersisted_rejected += 1
@@ -311,6 +377,21 @@ class TimelineOutbox:
                 # the open session row keeps a restart from looking clean.
                 pass
         return self.state()
+
+    def _failed(self):
+        """Count a transient flush failure; log the first and every doubling."""
+        with self._lock:
+            self._failures += 1
+            failures = self._failures
+        if failures & (failures - 1) == 0:
+            logging.getLogger(__name__).warning(Event.TIMELINE_FLUSH_FAILING)
+
+    def _succeeded(self):
+        """Presence handled the head fact: any failure streak is over."""
+        with self._lock:
+            recovered, self._failures = self._failures > 0, 0
+        if recovered:
+            logging.getLogger(__name__).warning(Event.TIMELINE_FLUSH_RECOVERED)
 
     def _accepting_locked(self):
         if self._closed:
@@ -359,6 +440,7 @@ class TimelineOutbox:
             return False
         session.unpersisted = self._unpersisted
         session.backlog = self._backlog
+        session.failures = self._consecutive_failures
         with self._lock:
             self._handle = session
             self._session, self._gap = True, gap is not None
@@ -370,9 +452,14 @@ class TimelineOutbox:
             return self._unpersisted_refused + self._unpersisted_rejected
 
     def _backlog(self):
-        """Staged facts and unpersisted loss, read together for Owner status."""
+        """Staged facts, unpersisted loss and quarantined facts, read together for Owner status."""
         with self._lock:
-            return len(self._pending), self._unpersisted_refused + self._unpersisted_rejected
+            return (len(self._pending), self._unpersisted_refused + self._unpersisted_rejected,
+                    len(self._quarantined))
+
+    def _consecutive_failures(self):
+        with self._lock:
+            return self._failures
 
     def _persist(self, *, lost=0, close=False):
         """Add unpersisted counts to the durable marker, or re-read it."""
@@ -418,7 +505,7 @@ class TimelineOutbox:
                 # Staging stops before the durable write; a producer staging
                 # after this point gets an error rather than silent loss.
                 self._closed = True
-                lost = len(self._pending)
+                lost = len(self._pending) + len(self._quarantined)
             try:
                 if not self._open():
                     raise RuntimeError("timeline outbox session unavailable")
@@ -459,7 +546,7 @@ class TimelineOutbox:
         with self._lock:
             return OutboxState(self._recorded, len(self._pending), self._refused, self._rejected,
                                self._unpersisted_refused + self._unpersisted_rejected,
-                               self._session, self._gap)
+                               self._session, self._gap, len(self._quarantined), self._failures)
 
 
 class EntranceObservationAdapter:
@@ -475,13 +562,31 @@ class EntranceObservationAdapter:
     Anonymous crossings carry no confidence, no identity and no presence
     effect. Low-quality Owner verification never reaches this adapter as an
     Owner crossing: the tracker already reports it as anonymous.
+
+    One adapter serves one entrance source. Besides crossings it records each
+    change of that source's entrance gate quality as a neutral, main-host
+    dated `entrance_gate` fact: `ready` while the gate is sufficient, and
+    `unknown` (with the reported quality) while it is not. A period without
+    crossings therefore stays distinguishable in history from a period in
+    which the gate could not reach any conclusion, such as low light. The fact
+    names no person and asserts no absence: an `unknown` gate is not "nobody
+    crossed". The runtime calls `gate_unavailable()` when the tracker stops
+    delivering updates (detector stop, source loss or shutdown), so the last
+    `ready` fact never silently extends over a period with no updates at all.
     """
 
-    def __init__(self, outbox: TimelineOutbox, *, owner_presence_validity: timedelta,
+    def __init__(self, outbox: TimelineOutbox, *, source_id: UUID, owner_presence_validity: timedelta,
                  maximum_source_latency: timedelta):
+        if not isinstance(source_id, UUID):
+            raise ValueError("entrance source required")
         self.outbox = outbox
+        self.source_id = source_id
         self.owner_presence_validity = _positive(owner_presence_validity, "owner presence validity")
         self.maximum_source_latency = _positive(maximum_source_latency, "source latency bound")
+        # The gate quality last staged for this source; None until the first
+        # update after start, so every start records the current quality.
+        self._gate = None
+        self._gate_lock = threading.Lock()
 
     def crossings(self, update: TrackUpdate):
         """The crossings of a sufficient update; an `UNKNOWN` update has none."""
@@ -494,9 +599,29 @@ class EntranceObservationAdapter:
             return ()
         for crossing in update.crossings:
             if (not isinstance(crossing, Crossing) or not isinstance(crossing.kind, CrossingKind)
-                    or not isinstance(crossing.source_id, UUID)):
+                    or not isinstance(crossing.source_id, UUID) or crossing.source_id != self.source_id):
                 raise ValueError("invalid crossing")
         return update.crossings
+
+    def _gate_fact(self, quality):
+        """Stage a gate-quality fact when the quality changed; False if refused.
+
+        A refused fact leaves the last staged quality as it was, so the next
+        update retries the transition; the refusal itself is a counted gap.
+        """
+        with self._gate_lock:
+            if quality is self._gate:
+                return True
+            value = Value.READY if quality is Quality.SUFFICIENT else Value.UNKNOWN
+            staged = _stage_main_dated(self.outbox, Kind.ENTRANCE_GATE, value, quality=quality,
+                                       source_id=self.source_id)
+            if staged:
+                self._gate = quality
+            return staged
+
+    def gate_unavailable(self):
+        """Record that the gate can reach no conclusion now, e.g. its detector stopped."""
+        return self._gate_fact(Quality.UNKNOWN)
 
     def observation(self, crossing: Crossing, received: datetime, trusted: bool):
         owner = crossing.kind in OWNER_KINDS
@@ -515,13 +640,16 @@ class EntranceObservationAdapter:
         return observation, (received + self.owner_presence_validity if owner else None)
 
     def submit(self, update: TrackUpdate):
-        """Stage every crossing; returns False if the bounded outbox refused any."""
+        """Stage any gate-quality change, then every crossing; False if any was refused."""
+        crossings = self.crossings(update)
+        # Staged first, so the `ready` interval opens before its crossings.
+        gate = self._gate_fact(_DETECTION_QUALITY.get(update.quality, Quality.UNKNOWN))
         staged = [self.outbox.stage(crossing.identifier,
                                     lambda received, trusted, crossing=crossing:
                                     self.observation(crossing, received, trusted),
                                     source_fact=_crossing_fact(crossing))
-                  for crossing in self.crossings(update)]
-        return all(staged)
+                  for crossing in crossings]
+        return gate and all(staged)
 
 
 class CriticalTimelineRecorder:
@@ -585,20 +713,7 @@ class HealthTimeline:
         self.outbox = outbox
 
     def _stage(self, kind, value, **attribution):
-        try:
-            occurred, occurred_trusted = _stamp(self.outbox.clock)
-        except ClockUnavailable:
-            # A one-shot producer callback will not re-emit this transition,
-            # so a clock fault here is a counted gap, never silent loss.
-            return self.outbox._refuse()
-        identifier = uuid4()
-
-        def build(received, trusted):
-            ordered = utc(occurred) <= utc(received)
-            return Observation(kind, occurred, received, value=value, identifier=identifier,
-                               clock_trusted=occurred_trusted and trusted and ordered,
-                               **attribution), None
-        return self.outbox.stage(identifier, build)
+        return _stage_main_dated(self.outbox, kind, value, **attribution)
 
     def camera(self, event: HealthEvent):
         if not isinstance(event, HealthEvent) or not isinstance(event.state, CameraState) \

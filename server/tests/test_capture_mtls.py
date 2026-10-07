@@ -5,6 +5,7 @@ peer runs as a separate process that receives only file paths.
 """
 from contextlib import closing
 import datetime
+import hashlib
 import io
 import logging
 import os
@@ -31,8 +32,8 @@ from app.cameras.remote_agent.ingest_tls import (
     IngestListenerConfig, IngestTlsError, build_ingest_server_context, open_ingest_listener,
 )
 from app.cameras.remote_agent.node_ca import (
-    CaptureAuthorityError, DeploymentAuthority, PrivateDirectory, listener_material,
-    public_key_digest,
+    AuthorityValidityExceeded, CaptureAuthorityError, DeploymentAuthority, PrivateDirectory,
+    listener_material, public_key_digest,
 )
 from app.cameras.remote_agent.pairing import HmacCodeVerifier, PairingError, PairingLedger
 from app.cameras.remote_agent.renewal import (
@@ -62,6 +63,12 @@ def utc_now():
 
 def fixed_clock(value):
     return lambda: value
+
+
+def synthetic_certificate():
+    """A PEM-armored synthetic blob and its DER digest, for ledger-only staging."""
+    der = b"synthetic-renewal-" + os.urandom(16)
+    return ssl.DER_cert_to_PEM_cert(der).encode("ascii"), hashlib.sha256(der).hexdigest()
 
 
 class CaptureTlsHarness(unittest.TestCase):
@@ -537,13 +544,14 @@ class CaptureRenewalTests(CaptureTlsHarness):
         self.ledger.approve(Owner(), "owner", node_id=uuid4(), public_key_digest=pending)
         for reused in (other_issued.public_key_digest, consumed.public_key_digest, pending):
             self.assertNotEqual(reused, session.identity.public_key_digest)
+            pem, serial = synthetic_certificate()
             with self.subTest(reused=reused[:8]), self.assertRaises(PairingError):
                 self.ledger.stage_renewal(
                     node_id=claim.node_id,
                     current_public_key_digest=session.identity.public_key_digest,
                     current_credential_digest=session.identity.credential_digest,
-                    public_key_digest=reused, credential_serial_digest="e" * 64,
-                    not_after=utc_now().timestamp() + 1000)
+                    public_key_digest=reused, credential_serial_digest=serial,
+                    not_after=utc_now().timestamp() + 1000, certificate_pem=pem)
         self.assertTrue(session.still_admitted())
 
     def test_node_key_is_never_bound_to_a_second_node_or_reused_after_revocation(self):
@@ -629,12 +637,13 @@ class CaptureRenewalTests(CaptureTlsHarness):
         renewed = self._renew(session.identity, second)
 
         def stage(identity, digest):
+            pem, serial = synthetic_certificate()
             self.ledger.stage_renewal(
                 node_id=claim.node_id,
                 current_public_key_digest=identity.public_key_digest,
                 current_credential_digest=identity.credential_digest,
-                public_key_digest=digest, credential_serial_digest="e" * 64,
-                not_after=utc_now().timestamp() + 1000)
+                public_key_digest=digest, credential_serial_digest=serial,
+                not_after=utc_now().timestamp() + 1000, certificate_pem=pem)
 
         def staged():
             with closing(self.database.connect()) as connection:
@@ -659,12 +668,13 @@ class CaptureRenewalTests(CaptureTlsHarness):
         session = self._session(certificate, key)
 
         def stage(digest):
-            self.ledger.stage_renewal(
+            pem, serial = synthetic_certificate()
+            return self.ledger.stage_renewal(
                 node_id=claim.node_id,
                 current_public_key_digest=session.identity.public_key_digest,
                 current_credential_digest=session.identity.credential_digest,
-                public_key_digest=digest, credential_serial_digest="e" * 64,
-                not_after=utc_now().timestamp() + 1000)
+                public_key_digest=digest, credential_serial_digest=serial,
+                not_after=utc_now().timestamp() + 1000, certificate_pem=pem)
 
         def bindings():
             with closing(self.database.connect()) as connection:
@@ -682,6 +692,163 @@ class CaptureRenewalTests(CaptureTlsHarness):
             stage("b" * 64)  # already bound: a retry is still accepted
         self.assertEqual(held + 1, bindings())
         self.assertTrue(session.still_admitted())
+
+    def _staged_row(self, node_id):
+        with closing(self.database.connect()) as connection:
+            return connection.execute(
+                "SELECT public_key_digest, credential_serial_digest, certificate_pem "
+                "FROM pairing_node_renewals WHERE node_id = ?", (str(node_id),)).fetchone()
+
+    def _identity_of(self, certificate_pem):
+        der = x509.load_pem_x509_certificate(certificate_pem).public_bytes(
+            serialization.Encoding.DER)
+        return self.admission.identify(der)
+
+    def test_same_key_renewal_retry_resends_the_first_certificate(self):
+        # Issue #123: the Agent reuses its pending key across retries. Every
+        # response for that key must carry the one staged certificate, so a
+        # delayed first response is still the credential Main will promote.
+        claim, _, certificate, key = self._paired_node("a")
+        session = self._session(certificate, key)
+        new_key, new_key_path = self._node_key("renewed")
+        first = self._renew(session.identity, new_key)
+        retried = self._renew(session.identity, new_key)
+        self.assertEqual(first.certificate_pem, retried.certificate_pem)
+        self.assertEqual(first.credential_digest, retried.credential_digest)
+        self.assertEqual(first.not_after, retried.not_after)
+        self.assertEqual(first.credential_digest, self._staged_row(claim.node_id)[1])
+        # The first response arriving last is installed and promoted.
+        promoted = self._session(self._public_file("first.pem", first.certificate_pem),
+                                 new_key_path)
+        self.assertEqual(first.credential_digest, promoted.identity.credential_digest)
+        self.assertIsNone(self._staged_row(claim.node_id))
+        self.assertFalse(session.still_admitted())
+        self.assertEqual([], self.notifications)
+
+    def test_concurrent_same_key_renewal_retries_return_one_certificate(self):
+        claim, _, certificate, key = self._paired_node("a")
+        session = self._session(certificate, key)
+        new_key, _ = self._node_key("renewed")
+        results, errors = [], []
+
+        def renew():
+            try:
+                results.append(self._renew(session.identity, new_key).credential_digest)
+            except Exception as error:  # surfaced through the assertion below
+                errors.append(error)
+
+        threads = [threading.Thread(target=renew) for _ in range(4)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(30)
+        self.assertEqual([], errors)
+        self.assertEqual(4, len(results))
+        self.assertEqual({self._staged_row(claim.node_id)[1]}, set(results))
+
+    def test_pre_migration_staged_row_without_certificate_is_restaged_by_retry(self):
+        claim, _, certificate, key = self._paired_node("a")
+        session = self._session(certificate, key)
+        new_key, new_key_path = self._node_key("renewed")
+        self._renew(session.identity, new_key)
+        with closing(self.database.connect()) as connection, connection:
+            connection.execute("UPDATE pairing_node_renewals SET certificate_pem = NULL "
+                               "WHERE node_id = ?", (str(claim.node_id),))
+        retried = self._renew(session.identity, new_key)
+        staged = self._staged_row(claim.node_id)
+        self.assertEqual(retried.credential_digest, staged[1])
+        self.assertEqual(retried.certificate_pem.decode("ascii"), staged[2])
+        self._session(self._public_file("retried.pem", retried.certificate_pem), new_key_path)
+
+    def test_staged_certificate_must_match_its_digest_node_and_issuer(self):
+        claim, _, certificate, key = self._paired_node("a")
+        session = self._session(certificate, key)
+        new_key, _ = self._node_key("renewed")
+        issued = self.authority.issue_renewal_certificate(claim.node_id, self._empty_csr(new_key))
+        pem, serial = synthetic_certificate()
+        common = dict(node_id=claim.node_id,
+                      current_public_key_digest=session.identity.public_key_digest,
+                      current_credential_digest=session.identity.credential_digest,
+                      public_key_digest=issued.public_key_digest,
+                      not_after=issued.not_after.timestamp())
+        for bad_pem, bad_serial in ((pem, issued.credential_digest),
+                                    (issued.certificate_pem, serial),
+                                    (b"not a certificate", issued.credential_digest),
+                                    (issued.certificate_pem + issued.certificate_pem,
+                                     issued.credential_digest)):
+            with self.subTest(), self.assertRaises(PairingError):
+                self.ledger.stage_renewal(credential_serial_digest=bad_serial,
+                                          certificate_pem=bad_pem, **common)
+        self.assertIsNone(self._staged_row(claim.node_id))
+        # A stored certificate this CA issued for another node is never resent,
+        # even when its digest matches the staged row.
+        self._renew(session.identity, new_key)
+        foreign = self.authority.issue_renewal_certificate(uuid4(), self._empty_csr(new_key))
+        with closing(self.database.connect()) as connection, connection:
+            connection.execute(
+                "UPDATE pairing_node_renewals SET certificate_pem = ?, "
+                "credential_serial_digest = ? WHERE node_id = ?",
+                (foreign.certificate_pem.decode("ascii"), foreign.credential_digest,
+                 str(claim.node_id)))
+        with self.assertRaises(RenewalRefused) as raised:
+            self._renew(session.identity, new_key)
+        self.assertEqual("renewal_not_eligible", raised.exception.reason)
+        # A corrupt stored certificate fails closed instead of being replaced.
+        with closing(self.database.connect()) as connection, connection:
+            connection.execute("UPDATE pairing_node_renewals SET certificate_pem = 'corrupt' "
+                               "WHERE node_id = ?", (str(claim.node_id),))
+        with self.assertRaises(RenewalRefused):
+            self._renew(session.identity, new_key)
+        self.assertEqual("corrupt", self._staged_row(claim.node_id)[2])
+        self.assertTrue(session.still_admitted())
+
+    def test_connection_losing_a_concurrent_promotion_is_admitted(self):
+        # Issue #121: two connections present the same staged renewal; both
+        # read it as staged, the winner promotes it and deletes the staged
+        # row. The loser must then be admitted as the active credential.
+        claim, _, certificate, key = self._paired_node("a")
+        session = self._session(certificate, key)
+        new_key, _ = self._node_key("renewed")
+        renewed = self._renew(session.identity, new_key)
+        identity = self._identity_of(renewed.certificate_pem)
+        winner = PairingLedger(self.database, HmacCodeVerifier(os.urandom(32)),
+                               audit=AuditStore(self.database))
+        original = self.ledger._promote_renewal_once
+
+        def promote_after_concurrent_winner(node, key_digest, serial):
+            self.assertTrue(winner.admits(node_id=node, public_key_digest=key_digest,
+                                          credential_serial_digest=serial))
+            return original(node, key_digest, serial)
+
+        with mock.patch.object(self.ledger, "_promote_renewal_once",
+                               side_effect=promote_after_concurrent_winner):
+            self.assertTrue(self.admission.is_admitted(identity))
+        with closing(self.database.connect()) as connection:
+            activations = connection.execute(
+                "SELECT COUNT(*) FROM security_admin_audit_records WHERE action = ?",
+                ("activate_capture_node_credential",)).fetchone()[0]
+        self.assertEqual(2, activations)  # pairing + the winner's single promotion
+        self.assertFalse(session.still_admitted())
+
+    def test_promotion_race_loser_is_refused_after_revocation(self):
+        claim, _, certificate, key = self._paired_node("a")
+        session = self._session(certificate, key)
+        new_key, _ = self._node_key("renewed")
+        renewed = self._renew(session.identity, new_key)
+        identity = self._identity_of(renewed.certificate_pem)
+        winner = PairingLedger(self.database, HmacCodeVerifier(os.urandom(32)),
+                               audit=AuditStore(self.database))
+        original = self.ledger._promote_renewal_once
+
+        def promote_then_revoke(node, key_digest, serial):
+            self.assertTrue(winner.admits(node_id=node, public_key_digest=key_digest,
+                                          credential_serial_digest=serial))
+            winner.revoke(Owner(), "owner", node_id=node)
+            return original(node, key_digest, serial)
+
+        with mock.patch.object(self.ledger, "_promote_renewal_once",
+                               side_effect=promote_then_revoke):
+            self.assertFalse(self.admission.is_admitted(identity))
 
     def test_near_expiry_without_renewal_raises_owner_signal_once(self):
         self._paired_node("soon", validity=10 * DAY)
@@ -765,6 +932,146 @@ class CaptureRenewalTests(CaptureTlsHarness):
         self.assertEqual(3, len(calls))
         self.assertEqual(1, len(set(calls)))  # retries upsert the same event
         self.assertEqual(1, len(monitor.signals))
+
+
+class DeploymentCaValidityRenewalTests(CaptureTlsHarness):
+    """Issue #127: renewal refused because the CA expires first is distinct and Owner-visible."""
+
+    def setUp(self):
+        super().setUp()
+        self.notifications = []
+        self.monitor = CaptureCredentialMonitor(self.ledger, self._record)
+        # Same deployment, but this CA has less than the 397-day node validity left.
+        self.short = DeploymentAuthority.create(PrivateDirectory(self.root / "short-authority"),
+                                                self.deployment, validity=200 * DAY)
+
+    def _record(self, kind, at, event_id):
+        self.notifications.append(kind)
+        return DeliveryResult.SUPPRESSED
+
+    def _identity(self):
+        _, issued, _, _ = self._paired_node("short", authority=self.short, validity=30 * DAY)
+        der = x509.load_pem_x509_certificate(issued.certificate_pem).public_bytes(
+            serialization.Encoding.DER)
+        return self.admission.identify(der)
+
+    @staticmethod
+    def _empty_csr(key):
+        return (x509.CertificateSigningRequestBuilder().subject_name(x509.Name([]))
+                .sign(key, hashes.SHA256()).public_bytes(serialization.Encoding.PEM))
+
+    def test_ca_too_close_to_expiry_has_a_dedicated_reason_and_trust_warning(self):
+        identity = self._identity()
+        for _ in range(2):
+            with self.assertRaises(RenewalRefused) as raised:
+                renew_node_credential(self.short, self.ledger, self.admission, identity,
+                                      self._empty_csr(ec.generate_private_key(ec.SECP256R1())),
+                                      monitor=self.monitor)
+            self.assertEqual("renewal_ca_validity_insufficient", raised.exception.reason)
+        # One deployment-wide warning, not a per-node renewal_refused warning.
+        self.assertEqual([NotificationKind.CAPTURE_TRUST_WARNING], self.notifications)
+        self.assertEqual(["deployment_ca_validity_insufficient"],
+                         [signal.reason for signal in self.monitor.signals])
+        self.assertIsNone(self.monitor.signals[0].node_id)
+        # A malformed request against the same CA is still renewal_request_invalid.
+        with self.assertRaises(RenewalRefused) as raised:
+            renew_node_credential(self.short, self.ledger, self.admission, identity,
+                                  b"-----BEGIN CERTIFICATE REQUEST-----\n")
+        self.assertEqual("renewal_request_invalid", raised.exception.reason)
+        # A shorter validity the CA still covers renews normally.
+        renewed = renew_node_credential(self.short, self.ledger, self.admission, identity,
+                                        self._empty_csr(ec.generate_private_key(ec.SECP256R1())),
+                                        validity=30 * DAY)
+        self.assertEqual(identity.node_id, renewed.node_id)
+
+    def test_same_key_retry_after_the_ca_threshold_resends_the_staged_certificate(self):
+        # Issue #148 (comment): a retry with the pending key must be answered
+        # with the certificate staged while the CA still covered it, not
+        # refused because signing a new one is no longer possible.
+        identity = self._identity()
+        new_key = ec.generate_private_key(ec.SECP256R1())
+        first = renew_node_credential(self.short, self.ledger, self.admission, identity,
+                                      self._empty_csr(new_key), validity=150 * DAY,
+                                      monitor=self.monitor)
+        # Sixty days later the CA (about 140 days left) can no longer cover
+        # a 150-day leaf.
+        later = DeploymentAuthority(self.deployment, self.short.certificate,
+                                    self.short._private_key,
+                                    clock=fixed_clock(utc_now() + 60 * DAY))
+        with self.assertRaises(AuthorityValidityExceeded):
+            later.check_leaf_validity(150 * DAY)
+        retried = renew_node_credential(later, self.ledger, self.admission, identity,
+                                        self._empty_csr(new_key), validity=150 * DAY,
+                                        monitor=self.monitor)
+        self.assertEqual(first.certificate_pem, retried.certificate_pem)
+        self.assertEqual(first.credential_digest, retried.credential_digest)
+        self.assertEqual([], self.notifications)
+        # A fresh key still cannot be signed and keeps the dedicated reason.
+        with self.assertRaises(RenewalRefused) as raised:
+            renew_node_credential(later, self.ledger, self.admission, identity,
+                                  self._empty_csr(ec.generate_private_key(ec.SECP256R1())),
+                                  validity=150 * DAY, monitor=self.monitor)
+        self.assertEqual("renewal_ca_validity_insufficient", raised.exception.reason)
+
+    def test_staged_lookup_needs_the_presented_credential_to_be_current(self):
+        identity = self._identity()
+        new_key = ec.generate_private_key(ec.SECP256R1())
+        renew_node_credential(self.short, self.ledger, self.admission, identity,
+                              self._empty_csr(new_key), validity=30 * DAY)
+        digest = public_key_digest(new_key.public_key())
+        lookup = dict(node_id=identity.node_id,
+                      current_public_key_digest=identity.public_key_digest,
+                      current_credential_digest=identity.credential_digest)
+        self.assertIsNotNone(self.ledger.staged_renewal(public_key_digest=digest, **lookup))
+        other = public_key_digest(
+            ec.generate_private_key(ec.SECP256R1()).public_key())
+        self.assertIsNone(self.ledger.staged_renewal(public_key_digest=other, **lookup))
+        self.assertIsNone(self.ledger.staged_renewal(
+            public_key_digest=digest, **dict(lookup, current_credential_digest="0" * 64)))
+        self.assertIsNone(self.ledger.staged_renewal(
+            public_key_digest=identity.public_key_digest, **lookup))
+        self.ledger.revoke(Owner(), "owner", node_id=identity.node_id)
+        self.assertIsNone(self.ledger.staged_renewal(public_key_digest=digest, **lookup))
+
+    def test_monitor_warns_before_the_ca_stops_covering_node_leaves(self):
+        now = utc_now()
+        cases = (
+            (now + 500 * DAY, []),
+            (now + 420 * DAY, ["deployment_ca_expiring"]),
+            (now + 200 * DAY, ["deployment_ca_validity_insufficient"]),
+            (now - DAY, ["deployment_ca_expired"]),
+        )
+        for ca_not_after, expected in cases:
+            with self.subTest(expected=expected):
+                kinds = []
+
+                def notify(kind, at, event_id, kinds=kinds):
+                    kinds.append(kind)
+                    return DeliveryResult.SUPPRESSED
+                monitor = CaptureCredentialMonitor(self.ledger, notify, clock=lambda: now,
+                                                   ca_not_after=ca_not_after)
+                self.assertEqual(expected, [signal.reason for signal in monitor.check()])
+                monitor.check()
+                self.assertEqual([NotificationKind.CAPTURE_TRUST_WARNING] * len(expected), kinds)
+
+    def test_monitor_warns_before_the_listener_certificate_expires(self):
+        now = utc_now()
+        for listener_not_after, expected in ((now + 60 * DAY, []),
+                                             (now + 20 * DAY, ["listener_certificate_expiring"]),
+                                             (now - DAY, ["listener_certificate_expired"])):
+            with self.subTest(expected=expected):
+                kinds = []
+
+                def notify(kind, at, event_id, kinds=kinds):
+                    kinds.append(kind)
+                    return DeliveryResult.SUPPRESSED
+                monitor = CaptureCredentialMonitor(self.ledger, notify, clock=lambda: now,
+                                                   listener_not_after=listener_not_after)
+                self.assertEqual(expected, [signal.reason for signal in monitor.check()])
+                self.assertEqual([NotificationKind.CAPTURE_TRUST_WARNING] * len(expected), kinds)
+        with self.assertRaises(ValueError):
+            CaptureCredentialMonitor(self.ledger, lambda *a, **k: None,
+                                     listener_not_after=datetime.datetime(2030, 1, 1))
 
 
 if __name__ == "__main__":

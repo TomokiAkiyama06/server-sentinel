@@ -54,11 +54,51 @@ whose certificate Main issued stays bound even if a retry replaces the staged
 row or the node is revoked first. Bindings per node are capped (1024); beyond
 that renewal is refused and the node must re-pair. A key already bound to the
 node is accepted only as a retry of the currently staged key; a superseded or
-out-of-order earlier staged key is refused.
+out-of-order earlier staged key is refused. Such a retry is
+certificate-idempotent (Issue #123): the staged row keeps the issued
+certificate's public PEM, bound to its digest, and the retry is answered with
+that first certificate (re-verified as this CA's leaf for the node and key)
+instead of a newly signed one. The staged certificate is looked up before
+anything is signed, so a retry after the CA fell below the leaf validity still
+receives it (#148). A connection that loses a concurrent promotion
+of the same staged renewal is admitted if its exact key and certificate are by
+then the active credential (Issue #121).
 `CaptureCredentialMonitor` raises the local `capture_credential_warning`
 notification through an injected hook in three cases: a credential within
-14 days of expiry, an expired credential, or a refused renewal. The renewal
-exchange is not yet carried by any listener (#14/#15).
+14 days of expiry, an expired credential, or a refused renewal. A renewal
+refused because the deployment CA expires before the requested leaf would is
+reported as `renewal_ca_validity_insufficient` (not `renewal_request_invalid`)
+and raises the deployment-wide `capture_trust_warning` once per day instead of
+a per-node warning (#127). Given `ca_not_after` / `listener_not_after`, the
+monitor also raises `capture_trust_warning` 30 days before the CA stops
+covering a 397-day node leaf (`deployment_ca_expiring`), once it no longer
+does, when the CA expired, and 30 days before / after expiry of the Main
+listener certificate. The renewal exchange and the monitor are not yet run by
+any listener or scheduler (#14/#15); meanwhile `pairing_cli` `init`,
+`rotate-listener`, `export-bundle` and `approve` print the CA expiry and the
+same warning words on stderr (`ca_expiry_reason` / `listener_expiry_reason`).
+
+Listener credential lifecycle (#124/#125). `PrivateDirectory(owner_uid=...)`
+may name another account than the process: new entries get their final 0600
+mode and are then `fchown`-ed to it before any content is written (no mode
+change after the ownership change, which would need `CAP_FOWNER`, #149),
+which needs effective `CAP_CHOWN` and
+`CAP_DAC_OVERRIDE` (reading needs `CAP_DAC_OVERRIDE` or
+`CAP_DAC_READ_SEARCH`); without them every access refuses
+(`OwnershipPrivilegeRequired`) before anything is created.
+`DeploymentAuthority.initialize` locks both directories (`flock`, non-blocking,
+`IssuerMaterialBusy` for the loser) and its rollback removes only entries this
+run created (matched by device and inode). `rotate_main_server_credential`
+replaces the listener key and certificate in place under the listener lock:
+it verifies the current certificate was issued by this CA and matches its key,
+keeps its server name, writes the new pair under `*.next` names, then renames
+key and certificate over the current files. A run interrupted between the two
+renames -- or whose key rename took effect but could not be fsynced
+(`ReplacementNotDurable`, which keeps the staged certificate) -- is completed
+by the next rotation, before the new validity is checked against the CA
+expiry (#148); `listener_material` refuses a
+mismatched pair (`ListenerMaterialInconsistent`) meanwhile. The CA is never
+touched, so Agent trust bundles stay valid.
 
 `ingest_tls.py` builds the ingest server `ssl.SSLContext` (TLS 1.3 only, client
 certificate required, deployment CA only, strict X.509, no session tickets) and
@@ -83,9 +123,31 @@ complete or expire, or after too many refused requests. Explicit
 `EnrollmentLimits` bound frame sizes, concurrent connections, a single
 per-connection deadline and attempts per source address. Logs carry fixed
 reason words only.
+Tailscale addresses (`100.64.0.0/10`, CGNAT) are also refused with
+`enrollment_bind_requires_private_address`: capture enrollment and ingest are
+designed for the private LAN and do not need Tailscale on either host.
 
 `pairing_cli.py` (`python -m app.cameras.remote_agent.pairing_cli`) is the local
-Owner CLI: `init`, `export-bundle`, `approve`, `list`, `revoke`. `init` validates
+Owner CLI: `init`, `rotate-listener`, `export-bundle`, `approve`, `list`,
+`revoke`. `--listener-owner` names the listener directory's account when it
+differs from the CLI's (see `server/docs/DEPLOYMENT.md`). `rotate-listener`
+replaces the Main listener leaf before it expires and keeps the CA and server
+name; `export-bundle` and `approve` refuse `listener_authority_mismatch` when
+the listener certificate was not issued by the selected CA directory (two
+deployments' directories mixed up); `approve`, `list` and `revoke` require
+`--database` to name the application's existing database (canonical path,
+regular file with one link, owned by the account running the CLI, not group-
+or other-writable) and refuse `database_not_found` / `database_rejected` /
+`database_path_rejected` instead of creating one, refuse
+`database_schema_outdated` / `database_schema_unsupported` instead of
+migrating (migrations run only at application startup), and keep the validated
+file pinned so a later rename/replacement refuses `database_rejected` on every
+connection and before every commit (SQLite `mode=rw`, never created; the
+descriptor SQLite opened must be the pinned inode, checked via `/proc/self/fd`); `approve` refuses
+`deployment_ca_validity_insufficient` before any
+approval when the CA can no longer cover a 397-day node leaf. The bootstrap
+listener sets `SO_REUSEADDR` (never `SO_REUSEPORT`) so a re-run binds while the
+previous run's connections are in TIME_WAIT. `init` validates
 the server name, both validity periods and both destination directories before
 it writes the write-once CA, and removes what it created if listener issuance
 still fails, so a corrected rerun works without manual secret-file cleanup.
@@ -99,8 +161,16 @@ stored). It refuses before any state change when there is no controlling
 terminal. `--human-host` (loopback IP) and `--human-port` name the dashboard
 listener so the bootstrap listener can never take its socket. A key already
 bound to a live node is re-approved for that same node (shown on the prompt),
-so an interrupted, expired or unacknowledged enrollment can be retried; a
-revoked key is refused. Until #6 lands, Owner authority in this CLI is the local account that
+so an interrupted, expired or unacknowledged enrollment can be retried, and a
+node whose certificate expired without being revoked re-pairs with its same key
+and node (#116). A key ever held by a revoked node is refused with
+`public_key_revoked` before the Owner prompt or the listener opens
+(`PairingLedger.key_revoked`; `approve` refuses it again inside its write
+transaction). A revoked node re-pairs only as a new node with a new key: the
+prompt says `new capture node`, no camera source is carried over from the old
+node (the Owner approves the new node's sources again), and the old node's
+ledger rows stay `revoked` -- nothing is deleted, so its recordings stay
+attributed to the old node until normal retention removes them. Until #6 lands, Owner authority in this CLI is the local account that
 owns the issuer material and database plus one typed confirmation per
 approve/revoke; see the ADR-0006 follow-up notes.
 
@@ -148,9 +218,14 @@ reissued (also after `forget_node` and re-enrollment), `forget_node` also
 discards the node's ingest rate window under the tracker lock (so a
 re-enrolled node UUID never inherits the old credential's rate/clock state),
 and `forget_source`
-releases a deactivated source's slot and returns its undrained gaps; while
-that source's accepted units are still queued its committed position is kept
-outside the slot limit, so a retry after reactivation stays a `duplicate`. The
+releases a deactivated source's slot and returns its undrained gaps; its
+continuity (committed position, attempted epoch, loss already recorded from a
+refused unit) is kept outside the slot limit, hard-bounded by
+`maximum_released_sources`, until the durable recording layer calls
+`acknowledge_persisted` with a watermark covering it, so a retry after
+reactivation stays a `duplicate` and the same loss is never reported twice
+(leaving the ingest queue is not durability). A late unit behind loss already
+recorded from a refused unit is acknowledged as `duplicate`, never admitted. The
 node/source lifecycle commits a durable revocation or source deactivation
 inside `authorization_change` (tracker, or queue for direct queue users), so
 it is serialized with every grant, liveness refresh, charge and enqueue. On
