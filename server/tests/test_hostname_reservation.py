@@ -3,7 +3,6 @@
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
 import hashlib
-import os
 import ipaddress
 import json
 from pathlib import Path
@@ -18,7 +17,9 @@ from app.audit import (
 )
 from app.audit.integration import RESERVATION_LISTENER_EXCEPTIONS_ID, ReservationAdministration
 from app.auth.reservation import (
-    DAILY_SECONDS, AddressFamily, CheckKind, GetaddrinfoResolver, OwnSocketInodes, ProcSocketOwners, ProcessIdentity, SocketOwner, HostnameReservationCheck, IsolationMode, Listener, ListenerException,
+    DAILY_SECONDS, AddressFamily, CheckKind, GetaddrinfoResolver, OwnSocketInodes, ProcessIdentity,
+    SocketCreator, HostnameReservationCheck, IsolationMode, Listener, ListenerException,
+    UPSTREAM_SOCKET_UNIT, read_unprivileged_port_start, unit_from_cgroup,
     RETRY_WHILE_CLOSED_SECONDS, ProcNetListeners, ProxyRoute, Reason, ReservationConfig,
     ReservationEnumerationError,
     ReservationFault, RouteKind, ServeStatusRoutes, TransportProtocol, evaluate, parse_proc_net_tcp,
@@ -78,12 +79,33 @@ def config(isolation=IsolationMode.SINGLE_PURPOSE_NODE, **overrides):
     return ReservationConfig(**values)
 
 
+# ``proc`` numbers each file's rows from 1000; ``Files`` shifts tcp6, udp and
+# udp6 rows so every synthetic socket has a distinct inode, as on a real host:
+# tcp rows are 1000.., tcp6 2000.., udp 3000.., udp6 4000.. (the creator
+# lookup is keyed by inode).
+INODE_OFFSETS = {"tcp": 0, "tcp6": 1000, "udp": 2000, "udp6": 3000}
+
+
+def _renumber(text, offset):
+    if not offset or not isinstance(text, str):
+        return text
+    lines = text.splitlines()
+    rows = [line.split() for line in lines[1:] if line.strip()]
+    if not lines or any(len(fields) < 10 or not fields[9].isdigit() for fields in rows):
+        return text  # malformed on purpose; leave it untouched
+    for fields in rows:
+        fields[9] = str(int(fields[9]) + offset)
+    return "\n".join([lines[0]] + [" ".join(fields) for fields in rows]) + "\n"
+
+
 class Files:
     def __init__(self, tcp=None, tcp6=None, udp=None, udp6=None):
-        self.files = {"tcp": tcp if tcp is not None else proc(("127.0.0.1", 8080, "0A")),
-                      "tcp6": tcp6 if tcp6 is not None else proc(ipv6=True),
-                      "udp": udp if udp is not None else proc(),
-                      "udp6": udp6 if udp6 is not None else proc(ipv6=True)}
+        files = {"tcp": tcp if tcp is not None else proc(("127.0.0.1", 8080, "0A")),
+                 "tcp6": tcp6 if tcp6 is not None else proc(ipv6=True),
+                 "udp": udp if udp is not None else proc(),
+                 "udp6": udp6 if udp6 is not None else proc(ipv6=True)}
+        self.raw = dict(files)
+        self.files = {name: _renumber(value, INODE_OFFSETS[name]) for name, value in files.items()}
 
     def __call__(self, name):
         value = self.files[name]
@@ -146,37 +168,61 @@ class Resolver:
         return self.answer
 
 
-SSHD = "/usr/sbin/sshd"
-SSHD_OWNER = SocketOwner(SSHD, "ssh.service")
-TAILSCALED = ProcessIdentity(unit="tailscaled.service")
-TAILSCALED_OWNER = SocketOwner("/usr/sbin/tailscaled", "tailscaled.service")
+SSHD_CREATOR = SocketCreator("/system.slice/ssh.socket", 0)
+UPSTREAM_CREATOR = SocketCreator("/system.slice/" + UPSTREAM_SOCKET_UNIT, 0)
+TAILSCALED = ProcessIdentity("tailscaled.service", 0)
+TAILSCALED_CREATOR = SocketCreator("/system.slice/tailscaled.service", 0)
+INTRUDER = SocketCreator("/user.slice/user-1000.slice/session-2.scope", 1000)
+# The synthetic default upstream row (127.0.0.1:8080, first tcp row).
+HUMAN_INODE = 1000
 
 
 def exc(*args, **kwargs):
-    """A listener exception owned by the synthetic sshd unless stated otherwise."""
-    if "unit" not in kwargs:
-        kwargs.setdefault("executable", SSHD)
+    """A listener exception created by the synthetic ssh.socket unless stated otherwise."""
+    kwargs.setdefault("unit", "ssh.socket")
+    kwargs.setdefault("uid", 0)
     return ListenerException(*args, **kwargs)
 
 
 class Owners:
-    """Synthetic socket ownership: every inode is held by ``default`` unless overridden."""
+    """Synthetic sock_diag creators: the human upstream row is created by the
+    upstream ``.socket`` unit, every other inode by ``default`` unless
+    overridden. An override that is a list answers successive lookups in turn
+    (the last entry repeats), for the confirmation re-dump."""
 
-    def __init__(self, default=SSHD_OWNER, overrides=None):
+    def __init__(self, default=SSHD_CREATOR, overrides=None, sole=True, human=UPSTREAM_CREATOR,
+                 human_inodes=frozenset({HUMAN_INODE})):
         self.default = default
-        self.overrides = dict(overrides or {})
+        self.overrides = {inode: list(value) if isinstance(value, list) else value
+                          for inode, value in (overrides or {}).items()}
+        self.human = human
+        self.human_inodes = frozenset(human_inodes)
         self.calls = []
+        # Whether no other unit process holds the human upstream (Issue #126):
+        # a bool for every inode, a {inode: bool} mapping, or an exception.
+        self.sole = sole
+        self.sole_calls = []
 
-    def owners(self, inodes):
+    def creators(self, inodes):
         self.calls.append(inodes)
         if isinstance(self.default, BaseException):
             raise self.default
         result = {}
         for inode in inodes:
-            holders = self.overrides.get(inode, self.default)
-            if holders is not None:
-                result[inode] = holders if isinstance(holders, frozenset) else frozenset({holders})
+            creator = self.overrides.get(inode, self.human if inode in self.human_inodes else self.default)
+            if isinstance(creator, list):
+                creator = creator.pop(0) if len(creator) > 1 else creator[0]
+            if creator is not None:
+                result[inode] = creator
         return result
+
+    def held_only_by_requester(self, inodes):
+        self.sole_calls.append(inodes)
+        if isinstance(self.sole, BaseException):
+            raise self.sole
+        if isinstance(self.sole, dict):
+            return {inode: self.sole[inode] for inode in inodes if inode in self.sole}
+        return {inode: self.sole for inode in inodes}
 
 
 class Clock:
@@ -193,8 +239,11 @@ def checker(files=None, status=None, sink=None, cfg=None, clock=None, **kwargs):
     sink = sink if sink is not None else Sink()
     kwargs.setdefault("resolver", Resolver())
     kwargs.setdefault("socket_owners", Owners())
-    # Synthetic rows number their inodes from 1000; this process holds the upstream.
-    kwargs.setdefault("own_sockets", lambda: frozenset(range(1000, 1100)))
+    # Synthetic rows number their inodes from 1000 (see ``Files``); this
+    # process holds the upstream.
+    kwargs.setdefault("own_sockets", lambda: frozenset(range(1000, 5000)))
+    # The synthetic upstream port (8080) is privileged below this start.
+    kwargs.setdefault("unprivileged_port_start", lambda: 10000)
     kwargs.setdefault("session_revoker", FakeRevoker())
     check = HostnameReservationCheck(
         cfg or config(), ProcNetListeners(files, byteorder="little"), ServeStatusRoutes(status), sink,
@@ -338,7 +387,7 @@ class ReservationCheckTests(TestCase):
         files = Files(tcp=proc(("127.0.0.1", 8080, "0A"), ("100.64.0.10", 443, "0A")),
                       tcp6=proc((str(V6), 443, "0A"), ipv6=True))
         cfg = config(proxy_listeners=frozenset({Listener(V4, 443), Listener(V6, 443)}), proxy_owner=TAILSCALED)
-        check, *_ = checker(files=files, cfg=cfg, socket_owners=Owners(TAILSCALED_OWNER))
+        check, *_ = checker(files=files, cfg=cfg, socket_owners=Owners(TAILSCALED_CREATOR))
         self.assertTrue(check.startup().open)
 
     def test_duplicate_expected_listener_sockets_close(self):
@@ -358,7 +407,7 @@ class ReservationCheckTests(TestCase):
         }
         for name, files in cases.items():
             with self.subTest(name):
-                check, _, _, sink = checker(files=files, cfg=cfg, socket_owners=Owners(TAILSCALED_OWNER))
+                check, _, _, sink = checker(files=files, cfg=cfg, socket_owners=Owners(TAILSCALED_CREATOR))
                 self.assertFalse(check.startup().open)
                 self.assertEqual(check.verdict.reasons[0], Reason.UNEXPECTED_LISTENER)
                 self.assertEqual(sink.events[-1].unexpected_listeners, 1)
@@ -625,7 +674,7 @@ class ExceptionFixture(TestCase):
 
     def admin(self, files, **kwargs):
         kwargs.setdefault("session_revoker", self.revoker)
-        check, _, _, sink = checker(files=Files(**files.files),
+        check, _, _, sink = checker(files=Files(**files.raw),
                                     exception_store=self.exception_store, **kwargs)
         return ReservationAdministration(self.service, check), check, sink
 
@@ -912,29 +961,33 @@ class ListenerExceptionPersistenceTests(ExceptionFixture):
         self.assertEqual(sink.events, [])
 
     def test_corrupt_or_invalid_stored_value_fails_closed(self):
-        corrupt = ("", "not json", "[]", "null", '{"version": 2}',
-                   '{"version": 3, "exceptions": []}',
-                   # Both owner identities, neither, or a relative/unnormalized path.
-                   '{"version": 2, "exceptions": [{"protocol": "tcp", "port": 22, "family": null, "scope": "wildcard",'
-                   ' "executable": "/usr/sbin/sshd", "unit": "ssh.service"}]}',
-                   '{"version": 2, "exceptions": [{"protocol": "tcp", "port": 22, "family": null, "scope": "wildcard",'
-                   ' "executable": null, "unit": null}]}',
-                   '{"version": 2, "exceptions": [{"protocol": "tcp", "port": 22, "family": null, "scope": "wildcard",'
-                   ' "executable": "sshd", "unit": null}]}',
-                   '{"version": 2, "exceptions": [{"protocol": "tcp", "port": 22, "family": null, "scope": "wildcard",'
-                   ' "executable": "/usr/sbin/../bin/sh", "unit": null}]}',
-                   '{"version": 2, "exceptions": "*"}',
-                   '{"version": 2, "exceptions": [{"port": 22}]}',
-                   '{"version": 2, "exceptions": [{"protocol": "sctp", "port": 22, "family": null, "scope": "wildcard"}]}',
-                   '{"version": 2, "exceptions": [{"protocol": "tcp", "port": 22, "family": "ipv6", "scope": "wildcard"}]}',
+        corrupt = ("", "not json", "[]", "null", '{"version": 3}',
+                   '{"version": 4, "exceptions": []}',
+                   # Missing, extra (executable) or invalid creator identity.
+                   '{"version": 3, "exceptions": [{"protocol": "tcp", "port": 22, "family": null, "scope": "wildcard", "unit": "ssh.socket", "uid": 0,'
+                   ' "executable": "/usr/sbin/sshd"}]}',
+                   '{"version": 3, "exceptions": [{"protocol": "tcp", "port": 22, "family": null, "scope": "wildcard", "unit": null, "uid": null}]}',
+                   '{"version": 3, "exceptions": [{"protocol": "tcp", "port": 22, "family": null, "scope": "wildcard", "unit": "ssh.socket"}]}',
+                   '{"version": 3, "exceptions": [{"protocol": "tcp", "port": 22, "family": null, "scope": "wildcard", "unit": "ssh", "uid": 0}]}',
+                   '{"version": 3, "exceptions": [{"protocol": "tcp", "port": 22, "family": null, "scope": "wildcard", "unit": "ssh.socket", "uid": -1}]}',
+                   '{"version": 3, "exceptions": [{"protocol": "tcp", "port": 22, "family": null, "scope": "wildcard", "unit": "ssh.socket", "uid": true}]}',
+                   '{"version": 3, "exceptions": [{"protocol": "tcp", "port": 22, "family": null, "scope": "wildcard", "unit": "ssh.socket", "uid": "0"}]}',
+                   '{"version": 3, "exceptions": "*"}',
+                   '{"version": 3, "exceptions": [{"port": 22}]}',
+                   '{"version": 3, "exceptions": [{"protocol": "sctp", "port": 22, "family": null, "scope": "wildcard",'
+                   ' "unit": "ssh.socket", "uid": 0}]}',
+                   '{"version": 3, "exceptions": [{"protocol": "tcp", "port": 22, "family": "ipv6", "scope": "wildcard",'
+                   ' "unit": "ssh.socket", "uid": 0}]}',
                    # Duplicate members must not silently keep the last value.
-                   '{"version": 2, "exceptions": [{"protocol": "tcp", "port": 443, "port": 22,'
-                   ' "family": null, "scope": "wildcard"}]}',
-                   '{"version": 2, "version": 2, "exceptions": []}',
-                   '{"version": 2, "exceptions": [{"protocol": "tcp", "port": 0, "family": null, "scope": "wildcard"}]}',
-                   '{"version": 2, "exceptions": [{"protocol": "tcp", "port": 22, "family": null, "scope": "any"}]}',
-                   '{"version": 2, "exceptions": [{"protocol": "tcp", "port": 22, "family": null, "scope": "wildcard"},'
-                   ' {"protocol": "tcp", "port": 22, "family": null, "scope": "wildcard"}]}',
+                   '{"version": 3, "exceptions": [{"protocol": "tcp", "port": 443, "port": 22,'
+                   ' "family": null, "scope": "wildcard", "unit": "ssh.socket", "uid": 0}]}',
+                   '{"version": 3, "version": 3, "exceptions": []}',
+                   '{"version": 3, "exceptions": [{"protocol": "tcp", "port": 0, "family": null, "scope": "wildcard",'
+                   ' "unit": "ssh.socket", "uid": 0}]}',
+                   '{"version": 3, "exceptions": [{"protocol": "tcp", "port": 22, "family": null, "scope": "any",'
+                   ' "unit": "ssh.socket", "uid": 0}]}',
+                   '{"version": 3, "exceptions": [{"protocol": "tcp", "port": 22, "family": null, "scope": "wildcard", "unit": "ssh.socket", "uid": 0},'
+                   ' {"protocol": "tcp", "port": 22, "family": null, "scope": "wildcard", "unit": "ssh.socket", "uid": 0}]}',
                    # Well-formed but covering the dashboard port: invalid for this config.
                    encode({exc(443), SSH}),
                    "x" * 5000)
@@ -961,7 +1014,7 @@ class ListenerExceptionPersistenceTests(ExceptionFixture):
 
     def test_unreadable_store_keeps_startup_closed_without_an_unexpected_listener(self):
         # The fail-closed verdict must not depend on a wildcard listener being present.
-        for value in ("not json", '{"version": 2, "exceptions": "*"}'):
+        for value in ("not json", '{"version": 3, "exceptions": "*"}'):
             with self.subTest(value=value):
                 self.store_raw(value)
                 _, check, sink = self.admin(Files())
@@ -1533,190 +1586,179 @@ class HostnameResolutionTests(TestCase):
 
 
 class ListenerOwnershipTests(ExceptionFixture):
-    """Owner decision 2026-10-01: an exception is a port plus its owning process."""
+    """An exception is a port plus its creating systemd unit and uid (Owner
+    decisions 2026-10-01 and 2026-10-07). WILDCARD_SSH rows: the upstream is
+    inode 1000, ``0.0.0.0:22`` 1001 and ``:::22`` 2000."""
 
     def opened(self, owners, **kwargs):
         admin, check, sink = self.admin(WILDCARD_SSH, socket_owners=owners, **kwargs)
         return admin.set_listener_exceptions("synthetic-owner-session", {SSH}), check, sink
 
     def test_port_only_or_ambiguous_exception_is_refused(self):
-        for kwargs in (dict(port=22), dict(port=22, executable=SSHD, unit="ssh.service"),
-                       dict(port=22, executable="sshd"), dict(port=22, executable="/usr/sbin/../sbin/sshd"),
-                       dict(port=22, executable="/usr/sbin/sshd (deleted)"), dict(port=22, executable=""),
-                       dict(port=22, unit="ssh"), dict(port=22, unit="../ssh.service"), dict(port=22, unit=7)):
+        for kwargs in (dict(port=22, unit=None, uid=None), dict(port=22, unit="ssh.socket", uid=None),
+                       dict(port=22, unit=None, uid=0), dict(port=22, unit="ssh", uid=0),
+                       dict(port=22, unit="../ssh.service", uid=0), dict(port=22, unit=7, uid=0),
+                       dict(port=22, unit="ssh.socket", uid=-1), dict(port=22, unit="ssh.socket", uid=True),
+                       dict(port=22, unit="ssh.socket", uid=0xFFFFFFFF), dict(port=22, unit="ssh.socket", uid="0"),
+                       dict(port=22, unit="ssh.target", uid=0)):
             with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
                 ListenerException(**kwargs)
+        # The executable-path identity is gone (Owner decision, 2026-10-07).
+        with self.assertRaises(TypeError):
+            ListenerException(22, executable="/usr/sbin/sshd")
         admin, check, _ = self.admin(WILDCARD_SSH)
         with self.assertRaises(ValueError):
             admin.set_listener_exceptions("synthetic-owner-session", {22})
         self.assertIsNone(self.stored())
 
-    def test_matching_owner_opens(self):
+    def test_matching_creator_opens(self):
         owners = Owners()
         verdict, _, _ = self.opened(owners)
         self.assertTrue(verdict.open)
-        self.assertEqual(owners.calls[-1], frozenset({1001, 1000}))
+        # The excepted sockets and the upstream, in one lookup; no re-dump.
+        self.assertEqual(owners.calls, [frozenset({1000, 1001, 2000})] * len(owners.calls))
+        self.assertEqual(owners.calls[-1], frozenset({1000, 1001, 2000}))
 
-    def test_other_process_on_excepted_port_is_an_exposure(self):
-        intruder = SocketOwner("/usr/bin/python3.12", "user@1000.service")
-        for holders in (intruder, frozenset({SSHD_OWNER, intruder})):
-            with self.subTest(holders=holders):
+    def test_socket_and_service_units_are_both_allowed(self):
+        # Owner decision 2026-10-07 reverts "ssh.service only": tcp/22 is ssh.socket.
+        for unit, creator in (("ssh.socket", SSHD_CREATOR),
+                              ("ssh.service", SocketCreator("/system.slice/ssh.service", 0))):
+            with self.subTest(unit=unit):
+                exception = ListenerException(22, unit=unit, uid=0)
+                admin, check, _ = self.admin(WILDCARD_SSH, socket_owners=Owners(creator))
+                self.assertTrue(admin.set_listener_exceptions("synthetic-owner-session", {exception}).open)
+
+    def test_confirmed_other_creator_is_an_exposure(self):
+        for creator in (INTRUDER, SocketCreator("/system.slice/ssh.service", 0),
+                        SocketCreator("/system.slice/ssh.socket", 1000)):
+            with self.subTest(creator=creator):
                 revoker = FakeRevoker()
-                verdict, _, sink = self.opened(Owners(overrides={1000: holders}), session_revoker=revoker)
+                owners = Owners(overrides={2000: creator})
+                verdict, _, sink = self.opened(owners, session_revoker=revoker)
                 self.assertEqual(verdict.reasons, (Reason.UNEXPECTED_LISTENER,))
                 self.assertTrue(revoker.pending)
-                self.assertNotIn("python", repr(sink.events[-1]))
+                # The mismatch was confirmed by an immediate second dump of that socket.
+                self.assertEqual(owners.calls[-1], frozenset({2000}))
+                self.assertNotIn("user.slice", repr(sink.events[-1]))
 
-    def test_unverifiable_owner_is_an_exposure(self):
+    def test_unconfirmed_mismatch_closes_without_revocation(self):
+        # The second dump does not repeat the mismatch: the socket went away,
+        # its creator changed, or the lookup failed (Owner decision 2026-10-07).
+        cases = {"gone": [INTRUDER, None], "changed": [INTRUDER, SSHD_CREATOR],
+                 "other mismatch": [INTRUDER, SocketCreator("/system.slice/other.service", 0)]}
+        for name, sequence in cases.items():
+            with self.subTest(name):
+                revoker = FakeRevoker()
+                owners = Owners(overrides={2000: list(sequence)})
+                verdict, _, _ = self.opened(owners, session_revoker=revoker)
+                self.assertEqual(verdict.reasons, (Reason.LISTENER_OWNER_UNVERIFIED,))
+                self.assertEqual((revoker.pending, revoker.revocations), (False, 0))
+
+        class FailsSecond(Owners):
+            def creators(self, inodes):
+                if len(self.calls) == 1:
+                    self.calls.append(inodes)
+                    raise OSError("synthetic second dump failure")
+                return super().creators(inodes)
+
+        revoker = FakeRevoker()
+        verdict, _, _ = self.opened(FailsSecond(overrides={2000: INTRUDER}), session_revoker=revoker)
+        self.assertEqual(verdict.reasons, (Reason.LISTENER_OWNER_UNVERIFIED,))
+        self.assertFalse(revoker.pending)
+
+    def test_unverifiable_creator_closes_without_revocation(self):
+        # Owner decisions 2026-10-05 / 2026-10-07: only a confirmed other
+        # creator is an exposure; anything unknown only keeps access closed.
         release = threading.Event()
 
-        class Hung:
-            def owners(self, inodes):
+        class Hung(Owners):
+            def creators(self, inodes):
                 release.wait(5)
                 return {}
 
         self.addCleanup(release.set)
-        cases = {"no owner found": dict(socket_owners=Owners(overrides={1000: None})),
-                 "resolver fails": dict(socket_owners=Owners(default=OSError("synthetic /proc failure"))),
+        cases = {"not in the dump": dict(socket_owners=Owners(overrides={2000: None})),
+                 "no cgroup attribute or deleted cgroup": dict(
+                     socket_owners=Owners(overrides={2000: SocketCreator(None, 0)})),
+                 "root cgroup": dict(socket_owners=Owners(overrides={2000: SocketCreator("/", 0)})),
+                 "init.scope": dict(socket_owners=Owners(overrides={2000: SocketCreator("/init.scope", 0)})),
+                 "sock_diag fails": dict(socket_owners=Owners(default=OSError("synthetic netlink failure"))),
+                 "self-check fails": dict(socket_owners=Owners(
+                     default=ReservationEnumerationError("SOCK_DIAG_SELF_CHECK_FAILED"))),
                  "no resolver": dict(socket_owners=None),
                  "hung resolver": dict(socket_owners=Hung(), timeout=0.05),
-                 "unknown exe": dict(socket_owners=Owners(default=SocketOwner(None, None)))}
+                 "malformed answer": dict(socket_owners=Owners(overrides={2000: ("/system.slice/ssh.socket", 0)}))}
         for name, kwargs in cases.items():
             with self.subTest(name):
                 revoker = FakeRevoker()
                 admin, check, _ = self.admin(WILDCARD_SSH, session_revoker=revoker, **kwargs)
                 verdict = admin.set_listener_exceptions("synthetic-owner-session", {SSH})
                 self.assertFalse(verdict.open)
-                self.assertTrue(set(verdict.reasons) & {Reason.LISTENER_OWNER_UNVERIFIED,
-                                                         Reason.UNEXPECTED_LISTENER})
-                self.assertTrue(revoker.pending)
+                self.assertIn(Reason.LISTENER_OWNER_UNVERIFIED, verdict.reasons)
+                self.assertNotIn(Reason.UNEXPECTED_LISTENER, verdict.reasons)
+                self.assertFalse(revoker.pending)
+                self.assertEqual(revoker.revocations, 0)
+
+    def test_resolver_recovery_reopens_without_revocation(self):
+        revoker = FakeRevoker()
+        owners = Owners(default=ReservationEnumerationError("SOCK_DIAG_UNAVAILABLE"),
+                        sole=ReservationEnumerationError("SOCKET_HOLDERS_UNREADABLE"))
+        check, _, _, _ = checker(files=WILDCARD_SSH, session_revoker=revoker, socket_owners=owners)
+        check._exceptions, check._exceptions_loaded = frozenset({SSH}), True
+        self.assertEqual(check._check(CheckKind.RETRY).reasons, (Reason.LISTENER_OWNER_UNVERIFIED,))
+        owners.default, owners.sole = SSHD_CREATOR, True
+        self.assertTrue(check._check(CheckKind.RETRY).open)
+        self.assertEqual((revoker.pending, revoker.revocations), (False, 0))
 
     def test_unknown_inode_is_unverified(self):
         listeners = (HUMAN, Listener(ipaddress.IPv4Address("0.0.0.0"), 22, inode=0))
         reasons, count, _ = evaluate(config(), listeners, (config().expected_route,), {SSH},
-                                     owners={0: frozenset({SSHD_OWNER})})
+                                     owners={0: SSHD_CREATOR})
         self.assertEqual(reasons, (Reason.LISTENER_OWNER_UNVERIFIED,))
         self.assertEqual(count, 1)
 
-    def test_unit_exception_matches_the_unit_only(self):
-        by_unit = ListenerException(22, unit="ssh.service")
-        self.assertTrue(by_unit.owned_by(SocketOwner("/usr/sbin/sshd", "ssh.service")))
-        self.assertFalse(by_unit.owned_by(SocketOwner("/usr/sbin/sshd", "other.service")))
-        self.assertFalse(SSH.owned_by(SocketOwner("/usr/bin/sshd", "ssh.service")))
-        admin, check, _ = self.admin(WILDCARD_SSH, socket_owners=Owners(SocketOwner(None, "ssh.service")))
-        self.assertTrue(admin.set_listener_exceptions("synthetic-owner-session", {by_unit}).open)
-        self.assertEqual(decode(self.stored()), frozenset({by_unit}))
+    def test_only_a_direct_system_slice_unit_matches(self):
+        cases = {
+            # A non-root user can create ssh.socket in their own user@ manager.
+            "/user.slice/user-1000.slice/user@1000.service/app.slice/ssh.socket": None,
+            "/user.slice/user-1000.slice/user@1000.service": None,
+            "/system.slice/ssh.socket/child": None,
+            "/machine.slice/ssh.socket": None,
+            "/init.scope": None,
+            "/": None,
+            None: None,
+            "/system.slice/ssh.socket": "ssh.socket",
+            "/system.slice/getty@tty1.service": "getty@tty1.service",
+        }
+        for path, unit in cases.items():
+            with self.subTest(path=path):
+                self.assertEqual(unit_from_cgroup(path), unit)
+                self.assertEqual(SSH.owner.created(SocketCreator(path, 0)), unit == "ssh.socket")
 
-    def test_port_only_stored_exceptions_fail_closed_as_outdated(self):
-        self.store_raw('{"version":1,"exceptions":[{"protocol":"tcp","port":22,"family":null,"scope":"wildcard"}]}')
-        admin, check, sink = self.admin(WILDCARD_SSH)
-        verdict = check.startup()
-        self.assertEqual(verdict.reasons[0], Reason.LISTENER_EXCEPTIONS_OUTDATED)
-        self.assertFalse(verdict.open)
-        self.assertEqual(check.listener_exceptions, frozenset())
-        # The Owner re-enters the exception with its owner through the audited path.
-        self.assertTrue(admin.set_listener_exceptions("synthetic-owner-session", {SSH}).open)
-        self.assertEqual(decode(self.stored()), frozenset({SSH}))
+    def test_executable_and_unit_only_stored_exceptions_fail_closed_as_outdated(self):
+        for value in (
+                '{"version":1,"exceptions":[{"protocol":"tcp","port":22,"family":null,"scope":"wildcard"}]}',
+                '{"version":2,"exceptions":[{"protocol":"tcp","port":22,"family":null,"scope":"wildcard",'
+                '"executable":"/usr/sbin/sshd","unit":null}]}',
+                '{"version":2,"exceptions":[{"protocol":"tcp","port":22,"family":null,"scope":"wildcard",'
+                '"executable":null,"unit":"ssh.service"}]}'):
+            with self.subTest(value=value[:30]):
+                self.store_raw(value)
+                admin, check, sink = self.admin(WILDCARD_SSH)
+                verdict = check.startup()
+                self.assertEqual(verdict.reasons[0], Reason.LISTENER_EXCEPTIONS_OUTDATED)
+                self.assertFalse(verdict.open)
+                self.assertEqual(check.listener_exceptions, frozenset())
+                # The Owner re-enters the exception with its creating unit and uid.
+                self.assertTrue(admin.set_listener_exceptions("synthetic-owner-session", {SSH}).open)
+                self.assertEqual(decode(self.stored()), frozenset({SSH}))
 
     def test_round_trip_keeps_owner(self):
-        values = {SSH, ListenerException(41641, TransportProtocol.UDP, unit="tailscaled.service")}
+        values = {SSH, ListenerException(41641, TransportProtocol.UDP, unit="tailscaled.service", uid=0),
+                  ListenerException(5353, TransportProtocol.UDP, unit="avahi-daemon.service", uid=103)}
         self.assertEqual(decode(encode(values)), frozenset(values))
-        with self.assertRaises(ValueError):
-            encode({ListenerException(port, executable="/" + "x" * 1000) for port in range(1, 17)}
-                   | {ListenerException(17, executable="/" + "y" * 1023)})
-
-
-class ProcSocketOwnersTests(TestCase):
-    def setUp(self):
-        self.temporary = TemporaryDirectory()
-        self.addCleanup(self.temporary.cleanup)
-        self.root = Path(self.temporary.name)
-
-    def process(self, pid, exe, fds, cgroup="0::/system.slice/ssh.service\n"):
-        base = self.root / str(pid)
-        (base / "fd").mkdir(parents=True)
-        (base / "exe").symlink_to(exe)
-        (base / "cgroup").write_text(cgroup)
-        for number, target in enumerate(fds):
-            (base / "fd" / str(number)).symlink_to(target)
-        return base
-
-    def test_maps_inodes_to_owning_processes(self):
-        self.process(100, "/usr/sbin/sshd", ["socket:[1000]", "/dev/null", "pipe:[5]"])
-        self.process(200, "/usr/bin/python3.12", ["socket:[1000]", "socket:[2000]"],
-                     cgroup="0::/user.slice/user-1000.slice/user@1000.service/app.slice/x.scope\n")
-        self.process(300, "/usr/sbin/other", ["socket:[3000]"])
-        (self.root / "self").mkdir()
-        owners = ProcSocketOwners(str(self.root)).owners(frozenset({1000, 2000, 4000}))
-        self.assertEqual(owners, {
-            # A user-session scope is not a system unit, so it names none.
-            1000: frozenset({SocketOwner("/usr/sbin/sshd", "ssh.service"),
-                             SocketOwner("/usr/bin/python3.12", None)}),
-            2000: frozenset({SocketOwner("/usr/bin/python3.12", None)}),
-        })
-
-    def unreadable(self, base):
-        (base / "fd").chmod(0)
-        self.addCleanup((base / "fd").chmod, 0o700)
-        if os.access(base / "fd", os.R_OK):
-            self.skipTest("running with privilege that bypasses directory permissions")
-
-    def test_unreadable_process_makes_the_scan_incomplete(self):
-        self.unreadable(self.process(100, "/usr/sbin/sshd", ["socket:[1000]"]))
-        with self.assertRaises(ReservationEnumerationError):
-            ProcSocketOwners(str(self.root)).owners(frozenset({1000}))
-
-    def test_unreadable_holder_beside_a_matching_one_closes_access(self):
-        # An unreadable fd table may hide another holder of the excepted socket.
-        self.process(100, "/usr/sbin/sshd", ["socket:[1000]", "socket:[1001]"])
-        self.unreadable(self.process(200, "/usr/bin/python3.12", ["socket:[1000]"]))
-        with self.assertRaises(ReservationEnumerationError):
-            ProcSocketOwners(str(self.root)).owners(frozenset({1000, 1001}))
-        check, _, _, _ = checker(files=WILDCARD_SSH, socket_owners=ProcSocketOwners(str(self.root)))
-        check._exceptions, check._exceptions_loaded = frozenset({SSH}), True
-        verdict = check._check(CheckKind.RETRY)
-        self.assertEqual(verdict.reasons, (Reason.LISTENER_OWNER_UNVERIFIED,))
-
-    def test_process_that_exited_during_the_scan_is_skipped(self):
-        self.process(100, "/usr/sbin/sshd", ["socket:[1000]"])
-        (self.root / "200").mkdir()  # no fd directory: gone before it was read
-        self.assertEqual(ProcSocketOwners(str(self.root)).owners(frozenset({1000})),
-                         {1000: frozenset({SocketOwner("/usr/sbin/sshd", "ssh.service")})})
-
-    def test_missing_exe_or_cgroup_unit(self):
-        base = self.process(100, "/usr/sbin/sshd", ["socket:[1000]"], cgroup="0::/\n")
-        (base / "exe").unlink()
-        self.assertEqual(ProcSocketOwners(str(self.root)).owners(frozenset({1000})),
-                         {1000: frozenset({SocketOwner(None, None)})})
-
-    def test_root_must_be_absolute(self):
-        with self.assertRaises(ValueError):
-            ProcSocketOwners("proc")
-
-    def test_only_a_direct_system_slice_unit_is_reported(self):
-        cases = {
-            # A non-root user can create ssh.service in their own user@ manager.
-            "0::/user.slice/user-1000.slice/user@1000.service/app.slice/ssh.service\n": None,
-            "0::/user.slice/user-1000.slice/user@1000.service\n": None,
-            "0::/system.slice/ssh.service/child\n": None,
-            "0::/machine.slice/ssh.service\n": None,
-            "0::/init.scope\n": None,
-            "0::/system.slice/ssh.service\n": "ssh.service",
-            "0::/system.slice/getty@tty1.service\n": "getty@tty1.service",
-        }
-        for number, (cgroup, unit) in enumerate(cases.items()):
-            with self.subTest(cgroup=cgroup):
-                pid = 100 + number
-                self.process(pid, "/usr/sbin/sshd", [f"socket:[{5000 + number}]"], cgroup=cgroup)
-                owners = ProcSocketOwners(str(self.root)).owners(frozenset({5000 + number}))
-                self.assertEqual(owners[5000 + number], frozenset({SocketOwner("/usr/sbin/sshd", unit)}))
-
-    def test_user_manager_impersonating_a_unit_does_not_match(self):
-        self.process(100, "/usr/bin/python3.12", ["socket:[1001]"],
-                     cgroup="0::/user.slice/user-1000.slice/user@1000.service/app.slice/ssh.service\n")
-        owners = ProcSocketOwners(str(self.root)).owners(frozenset({1001}))
-        exception = ListenerException(22, unit="ssh.service")
-        self.assertFalse(any(exception.owned_by(owner) for owner in owners[1001]))
+        self.assertIn('"uid":103', encode(values))
+        self.assertNotIn("executable", encode(values))
 
 
 class ProcNetInodeTests(TestCase):
@@ -1733,7 +1775,8 @@ class ProcNetInodeTests(TestCase):
 
 
 class ProxyListenerOwnershipTests(TestCase):
-    """Recorded proxy sockets must exist and be held by the recorded proxy alone."""
+    """Recorded proxy sockets must exist and be created by the recorded proxy
+    unit. Rows: upstream 1000, ``V4:443`` 1001, ``V6:443`` 2000."""
 
     CFG = dict(proxy_listeners=frozenset({Listener(V4, 443), Listener(V6, 443)}), proxy_owner=TAILSCALED)
 
@@ -1746,53 +1789,60 @@ class ProxyListenerOwnershipTests(TestCase):
             config(proxy_listeners=frozenset({Listener(V4, 443)}))
         with self.assertRaises(ValueError):
             config(proxy_owner=TAILSCALED)
-        for kwargs in (dict(), dict(executable="/a", unit="b.service"), dict(executable="tailscaled")):
-            with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
-                ProcessIdentity(**kwargs)
+        for args in (("tailscaled.service", None), ("tailscaled", 0), (None, 0), ("a.service", -1)):
+            with self.subTest(args=args), self.assertRaises(ValueError):
+                ProcessIdentity(*args)
+        with self.assertRaises(TypeError):
+            ProcessIdentity(executable="/usr/sbin/tailscaled")
+
+    def test_matching_proxy_creator_opens(self):
+        check, *_ = checker(files=self.files(), cfg=config(**self.CFG),
+                            socket_owners=Owners(TAILSCALED_CREATOR))
+        self.assertTrue(check.startup().open)
 
     def test_missing_proxy_listener_closes_without_revocation(self):
         files = self.files(v6=False)
         revoker = FakeRevoker()
         check, *_ = checker(files=files, cfg=config(**self.CFG), session_revoker=revoker,
-                            socket_owners=Owners(TAILSCALED_OWNER))
+                            socket_owners=Owners(TAILSCALED_CREATOR))
         self.assertEqual(check.startup().reasons, (Reason.PROXY_LISTENER_MISSING,))
         self.assertFalse(revoker.pending)
         files.files.update(self.files().files)
         self.assertTrue(check._check(CheckKind.RETRY).open)
         self.assertEqual(revoker.revocations, 0)
 
-    def test_replacement_process_on_proxy_socket_is_an_exposure(self):
-        intruder = SocketOwner("/usr/bin/python3.12", "user@1000.service")
-        for holders in (intruder, frozenset({TAILSCALED_OWNER, intruder})):
-            with self.subTest(holders=holders):
+    def test_replacement_creator_on_proxy_socket_is_an_exposure(self):
+        for creator in (INTRUDER, SocketCreator("/system.slice/tailscaled.service", 1000)):
+            with self.subTest(creator=creator):
                 revoker = FakeRevoker()
                 check, *_ = checker(files=self.files(), cfg=config(**self.CFG), session_revoker=revoker,
-                                    socket_owners=Owners(TAILSCALED_OWNER, overrides={1001: holders}))
+                                    socket_owners=Owners(TAILSCALED_CREATOR, overrides={1001: creator}))
                 self.assertEqual(check.startup().reasons, (Reason.UNEXPECTED_LISTENER,))
                 self.assertTrue(revoker.pending)
 
-    def test_unverifiable_proxy_owner_is_an_exposure(self):
-        for owners in (None, Owners(OSError("synthetic /proc failure")), Owners(overrides={1001: None})):
+    def test_unverifiable_proxy_creator_closes_without_revocation(self):
+        for owners in (None, Owners(OSError("synthetic netlink failure")),
+                       Owners(TAILSCALED_CREATOR, overrides={1001: None, 2000: SocketCreator(None, 0)})):
             with self.subTest(owners=owners):
                 revoker = FakeRevoker()
                 check, *_ = checker(files=self.files(), cfg=config(**self.CFG), session_revoker=revoker,
                                     socket_owners=owners)
                 self.assertIn(Reason.LISTENER_OWNER_UNVERIFIED, check.startup().reasons)
-                self.assertTrue(revoker.pending)
-
-    def test_executable_identity(self):
-        cfg = config(proxy_listeners=frozenset({Listener(V4, 443)}),
-                     proxy_owner=ProcessIdentity(executable="/usr/sbin/tailscaled"))
-        check, *_ = checker(files=self.files(v6=False), cfg=cfg, socket_owners=Owners(TAILSCALED_OWNER))
-        self.assertTrue(check.startup().open)
+                self.assertFalse(revoker.pending)
 
 
 class HumanListenerOwnershipTests(TestCase):
-    """The loopback upstream must be a socket this ServerSentinel process holds."""
+    """The loopback upstream must be a socket this ServerSentinel process holds,
+    created by ``server-sentinel-upstream.socket`` as uid 0 on a privileged
+    port, and held by no other process of the unit (Issue #126)."""
 
     def test_own_socket_opens(self):
-        check, *_ = checker(own_sockets=lambda: frozenset({1000}))
+        owners = Owners()
+        check, *_ = checker(own_sockets=lambda: frozenset({1000}), socket_owners=owners)
         self.assertTrue(check.startup().open)
+        # Only the upstream's inode is asked about.
+        self.assertEqual(owners.calls, [frozenset({1000})])
+        self.assertEqual(owners.sole_calls, [frozenset({1000})])
 
     def test_single_replacement_is_an_exposure(self):
         # One row only (no SO_REUSEPORT duplicate), but not this process's socket.
@@ -1802,7 +1852,7 @@ class HumanListenerOwnershipTests(TestCase):
         self.assertEqual(sink.events[-1].unexpected_listeners, 1)
         self.assertTrue(revoker.pending)
 
-    def test_unverifiable_own_sockets_are_an_exposure(self):
+    def test_unverifiable_own_sockets_close_without_revocation(self):
         release = threading.Event()
         self.addCleanup(release.set)
 
@@ -1820,13 +1870,143 @@ class HumanListenerOwnershipTests(TestCase):
                 revoker = FakeRevoker()
                 check, *_ = checker(session_revoker=revoker, **kwargs)
                 self.assertEqual(check.startup().reasons, (Reason.LISTENER_OWNER_UNVERIFIED,))
+                self.assertFalse(revoker.pending)
+
+    def test_upstream_created_elsewhere_is_an_exposure_once_confirmed(self):
+        # For example a backend bound the port itself while it was privileged
+        # only through a capability: not the systemd-created socket.
+        for creator in (SocketCreator("/system.slice/server-sentinel.service", 991),
+                        SocketCreator("/system.slice/" + UPSTREAM_SOCKET_UNIT, 991)):
+            with self.subTest(creator=creator):
+                revoker = FakeRevoker()
+                owners = Owners(human=creator)
+                check, *_ = checker(own_sockets=lambda: frozenset({1000}), socket_owners=owners,
+                                    session_revoker=revoker)
+                self.assertEqual(check.startup().reasons, (Reason.UNEXPECTED_LISTENER,))
                 self.assertTrue(revoker.pending)
+                self.assertEqual(owners.calls, [frozenset({1000}), frozenset({1000})])
+
+    def test_unprivileged_upstream_port_closes_without_revocation(self):
+        # Owner decision 2026-10-07: a port at or above ip_unprivileged_port_start
+        # is a configuration error. The backend then binds the port itself, so
+        # the creator is not compared (it would never be the .socket unit).
+        def unreadable():
+            raise OSError("synthetic sysctl failure")
+
+        for name, start in {"equal": lambda: 8080, "below": lambda: 1024, "unreadable": unreadable,
+                            "malformed": lambda: "1024", "missing": None}.items():
+            with self.subTest(name):
+                revoker = FakeRevoker()
+                own_bind = Owners(human=SocketCreator("/system.slice/server-sentinel.service", 991))
+                check, *_ = checker(own_sockets=lambda: frozenset({1000}), socket_owners=own_bind,
+                                    unprivileged_port_start=start, session_revoker=revoker)
+                self.assertEqual(check.startup().reasons, (Reason.LISTENER_OWNER_UNVERIFIED,))
+                self.assertEqual((revoker.pending, revoker.revocations), (False, 0))
+        check, *_ = checker(own_sockets=lambda: frozenset({1000}), unprivileged_port_start=lambda: 8081)
+        self.assertTrue(check.startup().open)
+
+    def test_shared_upstream_socket_is_an_exposure(self):
+        # A forked child or a process given the descriptor (SCM_RIGHTS) within
+        # the unit holds the same inode; /proc/net shows one row.
+        revoker = FakeRevoker()
+        check, _, _, sink = checker(own_sockets=lambda: frozenset({1000}), socket_owners=Owners(sole={1000: False}),
+                                    session_revoker=revoker)
+        self.assertEqual(check.startup().reasons, (Reason.UNEXPECTED_LISTENER,))
+        self.assertEqual(sink.events[-1].unexpected_listeners, 1)
+        self.assertTrue(revoker.pending)
+
+    def test_unverifiable_sole_holding_closes_without_revocation(self):
+        release = threading.Event()
+        self.addCleanup(release.set)
+
+        class Hung(Owners):
+            def held_only_by_requester(self, inodes):
+                release.wait(5)
+                return {inode: True for inode in inodes}
+
+        class CreatorsOnly:
+            def creators(self, inodes):
+                return {inode: UPSTREAM_CREATOR for inode in inodes}
+
+        cases = {
+            "unit process unreadable": dict(socket_owners=Owners(
+                sole=ReservationEnumerationError("SOCKET_HOLDERS_UNREADABLE"))),
+            "inode left out": dict(socket_owners=Owners(sole={})),
+            "non-bool answer": dict(socket_owners=Owners(sole={1000: 1})),
+            "timeout": dict(socket_owners=Hung(), timeout=0.05),
+            "resolver without the query": dict(socket_owners=CreatorsOnly()),
+        }
+        for name, kwargs in cases.items():
+            with self.subTest(name):
+                revoker = FakeRevoker()
+                check, *_ = checker(own_sockets=lambda: frozenset({1000}), session_revoker=revoker, **kwargs)
+                self.assertEqual(check.startup().reasons, (Reason.LISTENER_OWNER_UNVERIFIED,))
+                self.assertFalse(revoker.pending)
+                self.assertEqual(revoker.revocations, 0)
+
+    def test_missing_resolver_keeps_access_closed(self):
+        # Owner decision 2026-10-05: the socket owner resolver is mandatory.
+        revoker = FakeRevoker()
+        check, *_ = checker(own_sockets=lambda: frozenset({1000}), socket_owners=None, session_revoker=revoker)
+        self.assertEqual(check.startup().reasons, (Reason.LISTENER_OWNER_UNVERIFIED,))
+        self.assertFalse(check._check(CheckKind.RETRY).open)
+        self.assertEqual((revoker.pending, revoker.revocations), (False, 0))
+
+    def test_upstream_evaluation(self):
+        listener = Listener(HUMAN.address, HUMAN.port, inode=1000)
+        route = (config().expected_route,)
+        own = frozenset({1000})
+        unverified, unexpected = (Reason.LISTENER_OWNER_UNVERIFIED,), (Reason.UNEXPECTED_LISTENER,)
+        other = SocketCreator("/system.slice/server-sentinel.service", 991)
+        cases = (
+            (dict(), ()),
+            (dict(sole_holders={1000: True}), ()),
+            (dict(sole_holders={1000: False}), unexpected),
+            (dict(sole_holders={}), unverified),
+            (dict(sole_holders=Reason.LISTENER_OWNER_UNVERIFIED), unverified),
+            (dict(owners={1000: UPSTREAM_CREATOR}), ()),
+            (dict(owners={1000: other}), unexpected),
+            (dict(owners={}), unverified),
+            (dict(owners=Reason.LISTENER_OWNER_UNVERIFIED), unverified),
+            (dict(owners={1000: other}, upstream_privileged=False), unverified),
+            (dict(owners={1000: other}, upstream_privileged=Reason.LISTENER_OWNER_UNVERIFIED), unverified),
+            (dict(owners={1000: UPSTREAM_CREATOR}, upstream_privileged=True), ()),
+            # An observed other holder still wins over a configuration error.
+            (dict(sole_holders={1000: False}, upstream_privileged=False), unexpected),
+        )
+        for kwargs, expected in cases:
+            with self.subTest(kwargs=kwargs):
+                reasons, _, _ = evaluate(config(), (listener,), route, own_inodes=own, **kwargs)
+                self.assertEqual(reasons, expected)
+
+    def test_upstream_owner_must_be_a_root_socket_unit(self):
+        self.assertEqual(config().upstream_owner, ProcessIdentity(UPSTREAM_SOCKET_UNIT, 0))
+        for owner in (ProcessIdentity("server-sentinel.service", 0), ProcessIdentity(UPSTREAM_SOCKET_UNIT, 991),
+                      ("server-sentinel-upstream.socket", 0)):
+            with self.subTest(owner=owner), self.assertRaises(ValueError):
+                config(upstream_owner=owner)
+        self.assertEqual(config(upstream_owner=ProcessIdentity("other-upstream.socket", 0)).upstream_owner.unit,
+                         "other-upstream.socket")
 
     def test_unknown_inode_is_unverified(self):
         reasons, count, _ = evaluate(config(), (Listener(HUMAN.address, HUMAN.port, inode=0),),
                                      (config().expected_route,), own_inodes=frozenset({0}))
         self.assertEqual(reasons, (Reason.LISTENER_OWNER_UNVERIFIED,))
         self.assertEqual(count, 1)
+
+    def test_unprivileged_port_start_reader(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "ip_unprivileged_port_start"
+            for text, expected in (("1024\n", 1024), ("0\n", 0), ("65536\n", 65536)):
+                path.write_text(text)
+                self.assertEqual(read_unprivileged_port_start(str(path)), expected)
+            for text in ("", "-1\n", "65537\n", "1024 1\n", "abc\n"):
+                with self.subTest(text=text):
+                    path.write_text(text)
+                    with self.assertRaises(ReservationEnumerationError):
+                        read_unprivileged_port_start(str(path))
+            with self.assertRaises(OSError):
+                read_unprivileged_port_start(str(Path(directory) / "missing"))
 
     def test_proc_self_fd_reader(self):
         with TemporaryDirectory() as directory:

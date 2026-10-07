@@ -603,6 +603,17 @@ class ReleaseLifecycleTests(unittest.TestCase):
                                     + '" "' + str(self.runtime / "audit") + '"'])
         self.assertNotIn('ReadWritePaths="' + str(self.runtime) + '"', unit)
         self.assertIn('RequiresMountsFor="' + str(self.runtime) + '"', unit)
+        # Issue #126: the upstream is passed by its .socket unit, and the
+        # unprivileged sock_diag lookup needs AF_NETLINK, the host network
+        # namespace and the host cgroup view.
+        lines = unit.splitlines()
+        self.assertIn("Sockets=server-sentinel-upstream.socket", lines)
+        self.assertIn("RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK", lines)
+        self.assertIn("ProtectControlGroups=true", lines)
+        self.assertFalse(any(line.startswith(("PrivateNetwork=", "NetworkNamespacePath=", "PrivateUsers="))
+                             for line in lines))
+        self.assertIn("CapabilityBoundingSet=", lines)
+        self.assertIn("AmbientCapabilities=", lines)
         # systemd would keep command-line quotes as part of this single path and
         # reject the unit with "path is not absolute".
         self.assertNotIn('"', working[0])

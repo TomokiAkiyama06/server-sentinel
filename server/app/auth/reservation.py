@@ -17,7 +17,14 @@ It sees only sockets and proxy routes: kernel forwarding to the reserved
 address (nftables/iptables DNAT or REDIRECT, TPROXY, eBPF ``sk_lookup``, IPVS)
 is invisible to it and is verified by the operator (MANUAL_TEST.md).
 
-Enumerators and the Owner fault sink are injected. Nothing here reads the host
+Which systemd unit and uid created an excepted, proxy or upstream socket is
+answered by an injected ``SocketOwnerResolver``; production uses the
+unprivileged sock_diag lookup in ``sock_diag.py`` (Issue #126). It reports a
+socket's creator, not its current holder.
+
+Enumerators and the Owner fault sink are injected. Apart from the overridable
+defaults for this process's own ``/proc/self/fd`` and
+``/proc/sys/net/ipv4/ip_unprivileged_port_start``, nothing here reads the host
 implicitly, runs ``tailscale``, mounts a route, changes Tailscale ACLs/Grants,
 or needs Tailscale administrative credentials. The Serve status parser follows
 the ``tailscale serve status --json`` shape as understood from upstream
@@ -99,12 +106,18 @@ class Reason(StrEnum):
 # address the check did not cover until now. A failed or missing hostname
 # resolution only keeps access closed (Owner decision, 2026-10-01): it reopens
 # without revocation once the answer matches again, unless an exposure was
-# seen meanwhile.
+# seen meanwhile. Ownership that cannot be verified (``LISTENER_OWNER_UNVERIFIED``:
+# no socket owner resolver, a sock_diag or cgroup lookup that fails, times out
+# or fails its self-check, a socket missing from the dump, a creator cgroup
+# that cannot be resolved, an unconfirmed mismatch, or a human upstream port
+# that is not privileged) likewise only keeps access closed (Owner decisions,
+# 2026-10-05 and 2026-10-07): only an observed other creator or holder
+# (``UNEXPECTED_LISTENER``) is an exposure.
 EXPOSURE_REASONS = frozenset({
     Reason.UNEXPECTED_LISTENER, Reason.UNEXPECTED_ROUTE,
     Reason.LISTENER_ENUMERATION_UNAVAILABLE, Reason.LISTENER_ENUMERATION_TIMEOUT,
     Reason.ROUTE_ENUMERATION_UNAVAILABLE, Reason.ROUTE_ENUMERATION_TIMEOUT,
-    Reason.RESERVED_ADDRESSES_CHANGED, Reason.LISTENER_OWNER_UNVERIFIED,
+    Reason.RESERVED_ADDRESSES_CHANGED,
 })
 
 
@@ -132,61 +145,95 @@ class BindScope(StrEnum):
 
 MAX_LISTENER_EXCEPTIONS = 16
 MAX_PENDING_FAULTS = 8
-MAX_EXECUTABLE_PATH = 1024
+MAX_UID = 0xFFFFFFFE  # (uid_t)-1 is never a real account
 _UNIT = re.compile(r"[A-Za-z0-9:_.\\@-]{1,250}\.(service|socket|scope)")
+# A socket created in the root cgroup or PID 1's own scope names no unit: it
+# keeps the owner unverified rather than counting as another unit
+# (Owner decision, 2026-10-07).
+UNRESOLVED_CGROUPS = frozenset({"/", "/init.scope"})
+UPSTREAM_SOCKET_UNIT = "server-sentinel-upstream.socket"
+
+
+def unit_from_cgroup(path: str | None) -> str | None:
+    """The system unit whose own cgroup v2 path is exactly ``/system.slice/<unit>``, else None.
+
+    Only a socket created directly in a system unit's cgroup names a unit. A
+    path under ``user.slice`` is controlled by that user's own service manager,
+    which can create a unit of any name (``.../user@1000.service/app.slice/
+    ssh.service``), and a sub-cgroup or another slice is not the unit itself,
+    so none of them names one; an exception or proxy identity then does not
+    match.
+    """
+    if not isinstance(path, str):
+        return None
+    match = re.fullmatch(r"/system\.slice/([^/]+)", path)
+    if match and _UNIT.fullmatch(match.group(1)):
+        return match.group(1)
+    return None
 
 
 @dataclass(frozen=True)
-class SocketOwner:
-    """One process holding a socket: its executable path and systemd unit, when known."""
+class SocketCreator:
+    """Where a socket was created: its cgroup v2 path and owning uid (sock_diag).
 
-    executable: str | None
-    unit: str | None
+    ``cgroup`` is None when the kernel reported no cgroup id or the id names no
+    existing cgroup (for example a deleted one). This is the creator, not the
+    current holder: a descriptor inherited or passed (``SCM_RIGHTS``) later
+    keeps the creator's cgroup.
+    """
+
+    cgroup: str | None
+    uid: int
+
+    @property
+    def resolved(self) -> bool:
+        return isinstance(self.cgroup, str) and self.cgroup not in UNRESOLVED_CGROUPS
 
 
-def _valid_identity(executable, unit) -> bool:
-    """Exactly one of an absolute normalized executable path or a systemd unit name."""
-    if (executable is None) == (unit is None):
-        return False
-    if executable is not None:
-        return (isinstance(executable, str) and executable.startswith("/")
-                and len(executable) <= MAX_EXECUTABLE_PATH and "\0" not in executable
-                and os.path.normpath(executable) == executable and not executable.endswith(" (deleted)"))
-    return isinstance(unit, str) and _UNIT.fullmatch(unit) is not None
+def _valid_unit_identity(unit, uid) -> bool:
+    return (isinstance(unit, str) and _UNIT.fullmatch(unit) is not None
+            and type(uid) is int and 0 <= uid <= MAX_UID)
 
 
 @dataclass(frozen=True)
 class ProcessIdentity:
-    """The process expected to hold a socket: an executable path or a systemd unit."""
+    """The expected creator of a socket: a systemd system unit and uid.
 
-    executable: str | None = None
-    unit: str | None = None
+    It matches a socket created in the cgroup ``/system.slice/<unit>`` by
+    ``uid``. A ``.socket`` unit's sockets are created by systemd (uid 0) in the
+    socket unit's cgroup (for example ``ssh.socket``); a service's own sockets
+    in the service's cgroup with its ``User=`` (Owner decision, 2026-10-07,
+    replacing the executable-path identity).
+    """
+
+    unit: str
+    uid: int
 
     def __post_init__(self):
-        if not _valid_identity(self.executable, self.unit):
+        if not _valid_unit_identity(self.unit, self.uid):
             raise ValueError("INVALID_PROCESS_IDENTITY")
 
-    def owned_by(self, owner: SocketOwner) -> bool:
-        if self.executable is not None:
-            return owner.executable == self.executable
-        return owner.unit == self.unit
+    def created(self, creator: "SocketCreator") -> bool:
+        return (isinstance(creator, SocketCreator) and creator.resolved
+                and unit_from_cgroup(creator.cgroup) == self.unit and creator.uid == self.uid)
 
 
 @dataclass(frozen=True)
 class ListenerException:
-    """One Owner-allowed wildcard system listener, for example ``sshd`` on 22.
+    """One Owner-allowed wildcard system listener, for example ``ssh.socket`` on 22.
 
     It matches only a wildcard (``0.0.0.0`` / ``::``) bind of ``protocol`` on
     ``port`` in ``family`` (``None`` for both). A bind of the same port to a
     reserved address still closes access, as does every port not listed.
 
     The port alone never exempts a socket (Owner decision, 2026-10-01): the
-    exception names the owning process by exactly one of ``executable`` (the
-    absolute path ``/proc/<pid>/exe`` resolves to, for example
-    ``/usr/sbin/sshd``) or ``unit`` (a system unit: the process's cgroup v2
-    path is exactly ``/system.slice/<unit>``, for example ``ssh.service``). Each check verifies that every process
-    holding the socket matches; another process, or ownership that cannot be
-    verified, closes access as a possible exposure.
+    exception names the creating systemd system ``unit`` and ``uid`` (Owner
+    decision, 2026-10-07: a ``.service`` or ``.socket`` unit, for example
+    ``ssh.socket`` with uid 0). Each check verifies, through sock_diag, that
+    the socket was created in ``/system.slice/<unit>`` by ``uid``; a socket
+    created elsewhere, confirmed by an immediate second dump, closes access as
+    a possible exposure, and a creator that cannot be resolved closes it
+    without revocation.
 
     ``/proc/net/{tcp6,udp6}`` does not show ``IPV6_V6ONLY``, and a ``::``
     socket also accepts IPv4 unless that option is set, so a ``::`` bind is
@@ -198,8 +245,8 @@ class ListenerException:
     protocol: TransportProtocol = TransportProtocol.TCP
     family: AddressFamily | None = None
     scope: BindScope = BindScope.WILDCARD
-    executable: str | None = None
     unit: str | None = None
+    uid: int | None = None
 
     def __post_init__(self):
         if (type(self.port) is not int or not 1 <= self.port <= 65535
@@ -208,14 +255,13 @@ class ListenerException:
                 or self.family is AddressFamily.IPV6
                 or not isinstance(self.scope, BindScope)):
             raise ValueError("INVALID_LISTENER_EXCEPTION")
-        if not _valid_identity(self.executable, self.unit):
-            # Exactly one owner identity; a port-only exception is refused.
+        if not _valid_unit_identity(self.unit, self.uid):
+            # A creator identity is required; a port-only exception is refused.
             raise ValueError("INVALID_LISTENER_EXCEPTION")
 
-    def owned_by(self, owner: SocketOwner) -> bool:
-        if self.executable is not None:
-            return owner.executable == self.executable
-        return owner.unit == self.unit
+    @property
+    def owner(self) -> ProcessIdentity:
+        return ProcessIdentity(self.unit, self.uid)
 
     def matches(self, listener: "Listener") -> bool:
         address = listener.address
@@ -294,8 +340,25 @@ class AddressResolver(Protocol):
 
 
 class SocketOwnerResolver(Protocol):
-    def owners(self, inodes: frozenset) -> dict:
-        """Map each socket inode to the ``SocketOwner``s holding it; raise when unknown."""
+    """Resolves socket creators and the human upstream's holders (Issue #126).
+
+    Production uses ``app.auth.sock_diag.SockDiagOwners``; tests inject fakes.
+    """
+
+    def creators(self, inodes: frozenset) -> dict:
+        """Map each socket inode to its ``SocketCreator``; raise when the lookup fails.
+
+        An inode left out (not in the dump) is unverified.
+        """
+
+    def held_only_by_requester(self, inodes: frozenset) -> dict:
+        """Map each socket inode to whether no other process of the ServerSentinel
+        unit(s) also holds it; raise when a process there cannot be read.
+
+        ``False`` is a forked child or a process that received the descriptor
+        (``SCM_RIGHTS``) within the scanned cgroups. An inode left out is
+        unverified.
+        """
 
 
 class ListenerExceptionSource(Protocol):
@@ -304,7 +367,8 @@ class ListenerExceptionSource(Protocol):
 
 
 class ListenerExceptionsOutdated(Exception):
-    """The stored exceptions predate owner binding (port-only); the Owner must re-enter them."""
+    """The stored exceptions predate the current owner identity (port-only, or
+    executable-path); the Owner must re-enter them."""
 
 
 class SessionRevoker(Protocol):
@@ -408,92 +472,36 @@ class ProcNetListeners:
                 + parse_proc_net_udp(self._read("udp6"), ipv6=True, byteorder=self._byteorder))
 
 
-def _unit_from_cgroup(text: str) -> str | None:
-    """The system unit of a cgroup v2 ``0::/system.slice/<unit>`` line, else None.
+UNPRIVILEGED_PORT_START = "/proc/sys/net/ipv4/ip_unprivileged_port_start"
 
-    Only a process directly in a system unit's cgroup names a unit. A path
-    under ``user.slice`` is controlled by that user's own service manager,
-    which can create a unit of any name (``.../user@1000.service/app.slice/
-    ssh.service``), and a sub-cgroup or another slice is not the unit itself,
-    so none of them names one; an exception or proxy identity by unit then
-    does not match and access closes.
+
+def read_unprivileged_port_start(path: str = UNPRIVILEGED_PORT_START) -> int:
+    """The first port a process without ``CAP_NET_BIND_SERVICE`` may bind.
+
+    Readable without privilege; the sysctl belongs to the reader's network
+    namespace and covers IPv4 and IPv6 binds. Raises when unreadable or not
+    understood.
     """
-    for line in text.splitlines():
-        if line.startswith("0::"):
-            match = re.fullmatch(r"/system\.slice/([^/]+)", line[3:])
-            if match and _UNIT.fullmatch(match.group(1)):
-                return match.group(1)
-            return None
-    return None
+    with open(path, encoding="ascii") as handle:
+        text = handle.read(16)
+    value = text.strip()
+    if not re.fullmatch(r"[0-9]{1,5}", value) or int(value) > 65536:
+        raise ReservationEnumerationError("UNPRIVILEGED_PORT_START_UNREADABLE")
+    return int(value)
 
 
-class ProcSocketOwners:
-    """Find the processes holding socket inodes by walking ``/proc/<pid>/fd``.
-
-    ``proc`` is the ``/proc`` root (a synthetic tree in tests). Reading another
-    account's ``fd``/``exe`` needs privilege (for example root or
-    ``CAP_DAC_READ_SEARCH`` + ``CAP_SYS_PTRACE``). Any fd table that cannot be
-    read, for a reason other than the process or descriptor having gone away,
-    makes the scan incomplete: it may hide another holder of an excepted
-    socket, so the lookup raises and every excepted listener stays unverified,
-    even one whose readable holders all match. A non-root service therefore
-    needs the privileged helper of Issue #126.
-    """
-
-    def __init__(self, proc: str = "/proc"):
-        if not isinstance(proc, str) or not proc.startswith("/"):
-            raise ValueError("INVALID_PROC_ROOT")
-        self._proc = proc
-
-    def owners(self, inodes: frozenset) -> dict:
-        wanted = {f"socket:[{inode}]": inode for inode in inodes}
-        found: dict[int, set[SocketOwner]] = {}
-        try:
-            pids = [pid for pid in os.listdir(self._proc) if pid.isdigit()]
-        except OSError:
-            raise ReservationEnumerationError("SOCKET_OWNERS_UNAVAILABLE") from None
-        for pid in pids:
-            base = os.path.join(self._proc, pid)
-            held = set()
-            try:
-                descriptors = os.listdir(os.path.join(base, "fd"))
-            except (FileNotFoundError, ProcessLookupError):
-                continue  # exited during the scan
-            except OSError:
-                raise ReservationEnumerationError("SOCKET_OWNERS_INCOMPLETE") from None
-            for fd in descriptors:
-                try:
-                    target = os.readlink(os.path.join(base, "fd", fd))
-                except (FileNotFoundError, ProcessLookupError):
-                    continue  # closed during the scan
-                except OSError:
-                    raise ReservationEnumerationError("SOCKET_OWNERS_INCOMPLETE") from None
-                if target in wanted:
-                    held.add(wanted[target])
-            if not held:
-                continue
-            try:
-                executable = os.readlink(os.path.join(base, "exe"))
-            except OSError:
-                executable = None
-            try:
-                with open(os.path.join(base, "cgroup"), encoding="utf-8") as handle:
-                    unit = _unit_from_cgroup(handle.read(65536))
-            except (OSError, ValueError):
-                unit = None
-            for inode in held:
-                found.setdefault(inode, set()).add(SocketOwner(executable, unit))
-        return {inode: frozenset(owners) for inode, owners in found.items()}
 
 
 class OwnSocketInodes:
     """Socket inodes this process holds, from ``/proc/self/fd``.
 
-    A process can always read its own fd table, so the human upstream check
-    needs no privilege (unlike ``ProcSocketOwners`` for other accounts). A
-    socket on the upstream endpoint that is not among these is another
-    process's, whoever owns it; this process's own sockets are not inherited by
-    children (Python creates non-inheritable descriptors).
+    A process can always read its own fd table, so this part of the human
+    upstream check needs no privilege. A socket on the upstream endpoint that
+    is not among these is another process's, whoever created it. Python
+    creates non-inheritable descriptors, and the launcher marks the
+    socket-activated upstream descriptor non-inheritable as well
+    (``app.systemd.activated_listener``); the resolver's
+    ``held_only_by_requester`` checks the unit's other processes anyway.
     """
 
     def __init__(self, proc_self: str = "/proc/self"):
@@ -691,10 +699,13 @@ class ReservationConfig:
     reserved name is another answer for its cookies, so it is never exempted.
     Every recorded proxy socket must be present (``PROXY_LISTENER_MISSING``
     otherwise, closed without revocation), and ``proxy_owner`` (required
-    with ``proxy_listeners``) must be its only holder on every check: another
-    holder is ``UNEXPECTED_LISTENER``, an unverifiable one
-    ``LISTENER_OWNER_UNVERIFIED``. ``isolation`` stays ``None`` until the Owner states it;
-    ``None`` or any non-``IsolationMode`` value keeps access closed.
+    with ``proxy_listeners``, a systemd unit and uid) must be its creator on
+    every check: a confirmed other creator is ``UNEXPECTED_LISTENER``, an
+    unverifiable one ``LISTENER_OWNER_UNVERIFIED``. ``upstream_owner`` is the
+    systemd ``.socket`` unit that creates the human upstream as uid 0 and
+    passes it to the backend (socket activation, the production requirement;
+    Owner decision, 2026-10-07). ``isolation`` stays ``None`` until the Owner
+    states it; ``None`` or any non-``IsolationMode`` value keeps access closed.
     """
 
     hostname: str
@@ -704,6 +715,7 @@ class ReservationConfig:
     proxy_listeners: frozenset = frozenset()
     isolation: IsolationMode | None = None
     proxy_owner: ProcessIdentity | None = None
+    upstream_owner: ProcessIdentity = ProcessIdentity(UPSTREAM_SOCKET_UNIT, 0)
 
     def __post_init__(self):
         if not isinstance(self.hostname, str) or not _HOSTNAME.fullmatch(self.hostname):
@@ -728,6 +740,10 @@ class ReservationConfig:
             raise ValueError("INVALID_RESERVATION_CONFIG")
         if bool(proxies) != isinstance(self.proxy_owner, ProcessIdentity) or (
                 not proxies and self.proxy_owner is not None):
+            raise ValueError("INVALID_RESERVATION_CONFIG")
+        if (not isinstance(self.upstream_owner, ProcessIdentity) or self.upstream_owner.uid != 0
+                or not self.upstream_owner.unit.endswith(".socket")):
+            # Only a socket created by systemd for the backend satisfies this.
             raise ValueError("INVALID_RESERVATION_CONFIG")
         object.__setattr__(self, "proxy_listeners", proxies)
 
@@ -783,30 +799,113 @@ def validate_listener_exceptions(config: ReservationConfig, exceptions) -> froze
     return values
 
 
-def excepted_inodes(config: ReservationConfig, listeners, exceptions: frozenset) -> frozenset:
-    """Inodes whose owner a check verifies: excepted endpoints and recorded proxy sockets."""
+def expected_creators(config: ReservationConfig, listeners, exceptions: frozenset) -> dict:
+    """The creator identities a check verifies, by inode.
+
+    Excepted endpoints expect the identity of any covering exception, recorded
+    proxy sockets ``proxy_owner``, and the human upstream ``upstream_owner``.
+    """
     if isinstance(listeners, Reason):
-        return frozenset()
-    inodes = set()
+        return {}
+    expected: dict[int, set[ProcessIdentity]] = {}
     for listener in listeners:
+        if not listener.inode:
+            continue
         normalized = Listener(_normalize(listener.address), listener.port, listener.protocol)
-        if listener.inode and (normalized in config.proxy_listeners
-                               or any(item.matches(normalized) for item in exceptions)):
-            inodes.add(listener.inode)
-    return frozenset(inodes)
+        identities = set()
+        if normalized == config.human_listener:
+            identities.add(config.upstream_owner)
+        if normalized in config.proxy_listeners:
+            identities.add(config.proxy_owner)
+        identities.update(item.owner for item in exceptions if item.matches(normalized))
+        if identities:
+            expected.setdefault(listener.inode, set()).update(identities)
+    return {inode: frozenset(identities) for inode, identities in expected.items()}
+
+
+def human_inodes(config: ReservationConfig, listeners, own_inodes) -> frozenset:
+    """Inodes of human upstream rows this process holds, whose other holders a check looks for."""
+    if isinstance(listeners, Reason) or not isinstance(own_inodes, frozenset):
+        return frozenset()
+    return frozenset(
+        listener.inode for listener in listeners
+        if listener.inode and listener.inode in own_inodes
+        and Listener(_normalize(listener.address), listener.port, listener.protocol) == config.human_listener)
+
+
+def mismatched_creators(expected: dict, creators: dict) -> frozenset:
+    """Inodes whose resolved creator matches none of the expected identities.
+
+    A check confirms each of them with an immediate second dump before
+    treating it as another creator (Owner decision, 2026-10-07).
+    """
+    return frozenset(
+        inode for inode, creator in creators.items()
+        if isinstance(creator, SocketCreator) and creator.resolved
+        and not any(identity.created(creator) for identity in expected.get(inode, ())))
+
+
+_PASS, _UNVERIFIED, _UNEXPECTED = 0, 1, 2
+
+
+def _creator_status(identities, creator) -> int:
+    if not isinstance(creator, SocketCreator) or not creator.resolved:
+        # Not in the dump, no cgroup attribute, a deleted cgroup, the root
+        # cgroup or ``/init.scope``: it may be anything, so unverified.
+        return _UNVERIFIED
+    return _PASS if any(identity.created(creator) for identity in identities) else _UNEXPECTED
+
+
+def _human_status(config, listener, own_inodes, known, owners, sole_holders, upstream_privileged) -> int:
+    if isinstance(own_inodes, Reason) or not listener.inode:
+        return _UNVERIFIED
+    if listener.inode not in own_inodes:
+        # A single replacement: another process's socket on the upstream.
+        return _UNEXPECTED
+    statuses = [_PASS]
+    if upstream_privileged is not None and upstream_privileged is not True:
+        # Any account may bind an unprivileged port, so its creator proves
+        # nothing: a configuration error (for example no socket activation)
+        # that only keeps access closed.
+        statuses.append(_UNVERIFIED)
+    elif owners is not None:
+        statuses.append(_creator_status([config.upstream_owner], known.get(listener.inode)))
+    if sole_holders is not None:
+        sole = sole_holders.get(listener.inode) if isinstance(sole_holders, dict) else None
+        if sole is None:
+            statuses.append(_UNVERIFIED)
+        elif sole is not True:
+            # The same socket is also held by another process of the unit.
+            statuses.append(_UNEXPECTED)
+    return max(statuses)
 
 
 def evaluate(config: ReservationConfig, listeners, routes,
              exceptions: frozenset = frozenset(),
-             resolved=None, owners=None, own_inodes=None) -> tuple[tuple[Reason, ...], int, int]:
+             resolved=None, owners=None, own_inodes=None,
+             sole_holders=None, upstream_privileged=None) -> tuple[tuple[Reason, ...], int, int]:
     """Pure comparison. ``listeners``/``routes``/``resolved``/``owners`` are values or a ``Reason``.
 
-    ``owners`` maps socket inodes to their ``SocketOwner``s; an excepted
-    endpoint passes only when its socket has a known inode and every owner
-    matches the exception (``None`` or a ``Reason``: none verified).
+    ``owners`` maps socket inodes to their ``SocketCreator`` (sock_diag); an
+    excepted endpoint or recorded proxy socket passes only when its socket has
+    a known inode whose creator matches the expected unit and uid (``None`` or
+    a ``Reason``: none verified). A mismatch here is one the check has
+    already confirmed with a second dump; unconfirmed ones are left out.
     ``own_inodes`` are the sockets this process holds: the human upstream
     passes only as one of them (a ``Reason``: unverifiable; ``None`` skips the
-    ownership comparison, for pure endpoint evaluation only).
+    ownership comparison, for pure endpoint evaluation only). With ``owners``
+    given (not ``None``), the upstream's creator must also be
+    ``config.upstream_owner``.
+    ``sole_holders`` maps the upstream's inode to whether no other process of
+    the ServerSentinel unit(s) holds it (Issue #126): ``False`` is another
+    holder sharing the socket (a forked child or a descriptor passed with
+    ``SCM_RIGHTS``), and a ``Reason`` or a missing inode is unverifiable.
+    ``upstream_privileged`` is whether the upstream port is below
+    ``ip_unprivileged_port_start`` (``False`` or a ``Reason``: a configuration
+    error that only keeps access closed; the creator is then not compared).
+    ``None`` skips either, for pure endpoint evaluation only: a check without
+    a socket owner resolver passes a ``Reason`` (the resolver is mandatory,
+    Owner decision 2026-10-05).
 
     ``resolved`` is the hostname's current address set (``None``: the
     configured set). Listeners are checked against the union with the
@@ -843,11 +942,12 @@ def evaluate(config: ReservationConfig, listeners, routes,
                 if seen_human:
                     unexpected_listeners += 1
                 elif own_inodes is not None:
-                    if isinstance(own_inodes, Reason) or not listener.inode:
-                        unverified += 1
-                    elif listener.inode not in own_inodes:
-                        # A single replacement: another process's socket on the upstream.
+                    status = _human_status(config, listener, own_inodes, known, owners,
+                                           sole_holders, upstream_privileged)
+                    if status == _UNEXPECTED:
                         unexpected_listeners += 1
+                    elif status == _UNVERIFIED:
+                        unverified += 1
                 seen_human = True
                 continue
             # A wildcard bind answers on every address, the reserved ones
@@ -857,12 +957,13 @@ def evaluate(config: ReservationConfig, listeners, routes,
             # SO_REUSEPORT socket sharing the port and is unexpected.
             covering = [item for item in exceptions if item.matches(normalized)]
             if covering:
-                holders = known.get(listener.inode) if listener.inode else None
-                if not holders:
-                    # No verified owner: it may be any process answering here.
+                creator = known.get(listener.inode) if listener.inode else None
+                status = _creator_status([item.owner for item in covering], creator)
+                if status == _UNVERIFIED:
+                    # No verified creator: it may be any process answering here.
                     unverified += 1
                     continue
-                if not any(all(item.owned_by(owner) for owner in holders) for item in covering):
+                if status == _UNEXPECTED:
                     unexpected_listeners += 1
                     continue
                 if normalized in seen_excepted:
@@ -872,10 +973,11 @@ def evaluate(config: ReservationConfig, listeners, routes,
             if address.is_unspecified or address in reserved:
                 if normalized in config.proxy_listeners and normalized not in seen_proxies:
                     seen_proxies.add(normalized)
-                    holders = known.get(listener.inode) if listener.inode else None
-                    if not holders:
+                    creator = known.get(listener.inode) if listener.inode else None
+                    status = _creator_status([config.proxy_owner], creator)
+                    if status == _UNVERIFIED:
                         unverified += 1
-                    elif not all(config.proxy_owner.owned_by(owner) for owner in holders):
+                    elif status == _UNEXPECTED:
                         unexpected_listeners += 1
                     continue
                 unexpected_listeners += 1
@@ -936,6 +1038,16 @@ class HostnameReservationCheck:
     resolver or a failed or timed-out resolution keeps access closed without
     requiring revocation; an answer that differs from ``reserved_addresses``
     keeps it closed as an exposure reason.
+
+    Listener owners (Issue #126, Owner decision 2026-10-07): ``socket_owners``
+    (mandatory; ``app.auth.sock_diag.SockDiagOwners`` in production) reports
+    the creating cgroup and uid of every excepted, proxy and human upstream
+    socket. A creator that matches no expected unit and uid is re-dumped at
+    once and counts as ``UNEXPECTED_LISTENER`` only when the second dump
+    reports the same creator; otherwise, and for any lookup failure or
+    unresolvable creator, the listener stays ``LISTENER_OWNER_UNVERIFIED``
+    (closed, no revocation). ``unprivileged_port_start`` must show the human
+    upstream port as privileged, or the upstream is unverified.
     """
 
     def __init__(self, config: ReservationConfig, listeners: ListenerEnumerator,
@@ -945,6 +1057,7 @@ class HostnameReservationCheck:
                  resolver: AddressResolver | None = None,
                  socket_owners: SocketOwnerResolver | None = None,
                  own_sockets: Callable[[], frozenset] | None = OwnSocketInodes(),
+                 unprivileged_port_start: Callable[[], int] | None = read_unprivileged_port_start,
                  timeout: float = ENUMERATION_TIMEOUT_SECONDS,
                  retry_seconds: float = RETRY_WHILE_CLOSED_SECONDS,
                  monotonic: Callable[[], float] = time.monotonic,
@@ -987,11 +1100,16 @@ class HostnameReservationCheck:
         # Without a resolver every check fails closed: the frozen configured
         # set alone cannot show an address the name gained.
         self._resolver = resolver
-        # Without it no excepted listener's owner can be verified, so any
-        # listener an exception would cover closes access.
+        # Mandatory (Owner decision, 2026-10-05): without it neither an
+        # excepted listener's, a proxy socket's nor the human upstream's
+        # creator can be verified, so access stays closed
+        # (``LISTENER_OWNER_UNVERIFIED``, without revocation). Production
+        # passes ``app.auth.sock_diag.SockDiagOwners`` (Issue #126).
         self._socket_owners = socket_owners
         # Without it the human upstream's owner is unverifiable and access stays closed.
         self._own_sockets = own_sockets
+        # Without it the upstream port cannot be shown to be privileged.
+        self._port_start = unprivileged_port_start
         self._exceptions_reason = Reason.LISTENER_EXCEPTIONS_UNREADABLE
         self._revocation_required = False
         # True once the requirement is durable: the marker was written, or the
@@ -1191,30 +1309,75 @@ class HostnameReservationCheck:
                                 Reason.LISTENER_OWNER_UNVERIFIED, Reason.LISTENER_OWNER_UNVERIFIED, int)
         return value if isinstance(value, Reason) else frozenset(value)
 
-    def _enumerate_owners(self, inodes: frozenset):
-        previous = self._inflight.get("owners")
+    def _enumerate_mapping(self, name: str, call: Callable[[], dict], valid: Callable[[object], bool]):
+        """A bounded ``dict`` lookup on a worker thread; ``None`` when unknown."""
+        previous = self._inflight.get(name)
         if previous is not None and previous.is_alive():
             return None
         box: dict[str, object] = {}
 
         def run():
             try:
-                box["value"] = self._socket_owners.owners(inodes)
+                box["value"] = call()
             except BaseException:
                 box["error"] = True
 
-        worker = threading.Thread(target=run, name="reservation-owners", daemon=True)
-        self._inflight["owners"] = worker
+        worker = threading.Thread(target=run, name=f"reservation-{name}", daemon=True)
+        self._inflight[name] = worker
         worker.start()
         worker.join(self._timeout)
         value = box.get("value")
         if worker.is_alive() or "error" in box or not isinstance(value, dict) or any(
-                type(inode) is not int or not isinstance(holders, frozenset)
-                or any(not isinstance(owner, SocketOwner) for owner in holders)
-                for inode, holders in value.items()):
-            # Unknown ownership: every excepted listener stays unverified.
+                type(key) is not int or not valid(item) for key, item in value.items()):
             return None
         return value
+
+    def _enumerate_creators(self, inodes: frozenset):
+        # Unknown creators (None): every listener they would verify stays unverified.
+        return self._enumerate_mapping(
+            "owners", lambda: self._socket_owners.creators(inodes),
+            lambda creator: isinstance(creator, SocketCreator)
+            and (creator.cgroup is None or isinstance(creator.cgroup, str))
+            and type(creator.uid) is int)
+
+    def _confirmed_creators(self, expected: dict):
+        """Creators by inode, keeping a mismatch only when a second dump repeats it.
+
+        A mismatch the immediate re-dump does not reproduce exactly (the
+        socket went away, its creator changed, or the dump failed) is dropped,
+        which leaves that listener unverified rather than an exposure (Owner
+        decision, 2026-10-07).
+        """
+        first = self._enumerate_creators(frozenset(expected))
+        if first is None:
+            return Reason.LISTENER_OWNER_UNVERIFIED
+        first = {inode: creator for inode, creator in first.items() if inode in expected}
+        mismatched = mismatched_creators(expected, first)
+        if not mismatched:
+            return first
+        second = self._enumerate_creators(mismatched) or {}
+        return {inode: creator for inode, creator in first.items()
+                if inode not in mismatched or second.get(inode) == creator}
+
+    def _enumerate_sole_holders(self, inodes: frozenset):
+        lookup = getattr(self._socket_owners, "held_only_by_requester", None)
+        if not callable(lookup):
+            return Reason.LISTENER_OWNER_UNVERIFIED
+        value = self._enumerate_mapping("sole-holders", lambda: lookup(inodes),
+                                        lambda sole: type(sole) is bool)
+        return Reason.LISTENER_OWNER_UNVERIFIED if value is None else value
+
+    def _upstream_privileged(self):
+        """Whether the upstream port is below ``ip_unprivileged_port_start``; a ``Reason`` when unknown."""
+        if not callable(self._port_start):
+            return Reason.LISTENER_OWNER_UNVERIFIED
+        try:
+            start = self._port_start()
+        except Exception:
+            return Reason.LISTENER_OWNER_UNVERIFIED
+        if type(start) is not int or not 0 <= start <= 65536:
+            return Reason.LISTENER_OWNER_UNVERIFIED
+        return self.config.human_listener.port < start
 
     def _check(self, kind: CheckKind) -> ReservationVerdict:
         with self.exception_change_lock, self._check_lock:
@@ -1243,13 +1406,20 @@ class HostnameReservationCheck:
             routes = self._enumerate("routes", lambda: self._routes.routes(),
                                      Reason.ROUTE_ENUMERATION_TIMEOUT,
                                      Reason.ROUTE_ENUMERATION_UNAVAILABLE, ProxyRoute)
-            owners = None
-            inodes = excepted_inodes(self.config, listeners, self._exceptions)
-            if inodes and self._socket_owners is not None:
-                owners = self._enumerate_owners(inodes)
             own = self._enumerate_own()
-            reasons, extra_listeners, extra_routes = evaluate(self.config, listeners, routes,
-                                                              self._exceptions, resolved, owners, own)
+            if self._socket_owners is None:
+                # The resolver is mandatory: no creator or holder can be verified.
+                owners = sole = Reason.LISTENER_OWNER_UNVERIFIED
+            else:
+                expected = expected_creators(self.config, listeners, self._exceptions)
+                owners = self._confirmed_creators(expected) if expected else {}
+                # No other process of the ServerSentinel unit(s) may hold the
+                # upstream (Issue #126); a failed lookup is unverified.
+                human = human_inodes(self.config, listeners, own)
+                sole = self._enumerate_sole_holders(human) if human else {}
+            reasons, extra_listeners, extra_routes = evaluate(
+                self.config, listeners, routes, self._exceptions, resolved, owners, own,
+                sole, self._upstream_privileged())
         except Exception:
             reasons, extra_listeners, extra_routes = (Reason.LISTENER_ENUMERATION_UNAVAILABLE,), 0, 0
         if not self._exceptions_loaded:

@@ -26,6 +26,7 @@ class Event(StrEnum):
     LOCAL_UVC_STOPPED = "local_uvc_stopped"
     LOCAL_UVC_STOP_FAILED = "local_uvc_stop_failed"
     LOCAL_UVC_SOURCE_HEALTH_CHANGED = "local_uvc_source_health_changed"
+    HUMAN_LISTENER_ACTIVATION_INVALID = "human_listener_activation_invalid"
     REQUEST_DENIED = "request_denied"
     UNSTRUCTURED = "unstructured_redacted"
 

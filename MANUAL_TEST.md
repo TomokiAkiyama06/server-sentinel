@@ -1741,8 +1741,8 @@ by the Issue #6 synthetic policy model.
   network identity isolation is used. A wildcard `sshd` or other system
   service on the node is reported as an unexpected listener unless the Owner
   adds a listener exception for that port. With a wildcard `sshd` on 22:
-  confirm access closes with no exception; add `tcp/22` owned by
-  `/usr/sbin/sshd` (or unit `ssh.service`) through the audited
+  confirm access closes with no exception; add `tcp/22` created by unit
+  `ssh.socket` (or `ssh.service`) with uid 0 through the audited
   Owner path and confirm access opens and a `change_security_setting` audit
   record exists; bind a test listener to the Tailscale address on port 22
   (not wildcard) and confirm access still closes; start a wildcard listener
@@ -1780,24 +1780,71 @@ by the Issue #6 synthetic policy model.
   listener is up: confirm the `invalidate_human_sessions` record is committed
   at once, so a restart after removing the listener cannot reopen with an
   earlier session.
-- Listener exception ownership (Owner decision 2026-10-01; mock-only so far):
-  first follow the `server/docs/DEPLOYMENT.md` SSH steps (`ssh.socket`
-  disabled, `ssh.service` enabled) and record `systemctl is-enabled ssh.socket
-  ssh.service`, `ss -ltnp 'sport = :22'` and `readlink /proc/<sshd pid>/exe`.
-  Before Issue #126 (privileged owner helper) lands, confirm the non-root
-  service reports `LISTENER_OWNER_UNVERIFIED` for the excepted `sshd` and
-  human access stays closed. Once #126 is composed as `socket_owners`,
-  confirm the helper's answer matches `readlink` and access opens with `sshd`
-  on 22. With #126 composed, stop `sshd`, start another process on the
-  excepted port (for example `sudo python3 -m http.server 22`), and confirm
-  access closes with `UNEXPECTED_LISTENER` and that reopening revokes every
-  human session. Record whether the host uses `ssh.socket` (socket
-  activation: PID 1 holds the listener, so access stays closed until `sshd`
-  listens itself), and that after upgrading `openssh-server` without
-  restarting `sshd` the `(deleted)` executable keeps access closed. On a
-  disposable copy holding a version 1 (port-only) stored exception, confirm
-  startup reports `LISTENER_EXCEPTIONS_OUTDATED` and access stays closed until
-  the Owner re-enters the exception with its owner.
+- Listener owners through sock_diag (Issue #126, Owner decision 2026-10-07;
+  mock and unprivileged local experiments only so far, not yet run on the
+  Main Server). Production check procedure, all as the ServerSentinel service
+  account unless `sudo` is shown, with a console or second session open:
+  1. Service requirements: `systemctl show server-sentinel.service -p
+     RestrictAddressFamilies -p PrivateNetwork -p ProtectControlGroups -p
+     NetworkNamespacePath` shows `AF_NETLINK` allowed, `PrivateNetwork=no`, no
+     namespace path, and `ProtectControlGroups=yes` (not `private`/`strict`).
+     `cat /proc/<service pid>/cgroup` is `0::/system.slice/server-sentinel.service`
+     and `readlink /proc/<service pid>/ns/net` equals `readlink /proc/1/ns/net`
+     (read as root).
+  2. Unprivileged lookup, as the service account (`<root>` is the
+     installation root):
+
+     ```sh
+     cd / && sudo -u <service account> <root>/current/venv/bin/python -I -c '
+     import sys; sys.path.insert(0, "<root>/current")
+     from app.auth.sock_diag import NetlinkSockDiag, cgroup_paths
+     paths = cgroup_paths()
+     for s in NetlinkSockDiag().dump():
+         print(s.family, s.protocol, s.inode, s.uid, paths.get(s.cgroup_id))'
+     ```
+
+     Record that the tcp/22 sockets resolve to `/system.slice/ssh.socket` uid
+     0, `tailscaled`'s sockets to `/system.slice/tailscaled.service` uid 0,
+     and the upstream port to `/system.slice/server-sentinel-upstream.socket`
+     uid 0; compare the inodes with `sudo ss -ltnpe` / `sudo ss -lunpe`.
+     Record whether the UDP tables needed the `udp_diag` module and whether it
+     was already loaded (`lsmod | grep diag`). This runs outside the unit
+     sandbox; step 1 covers the unit's restrictions.
+  3. Upstream activation: follow the `server/docs/DEPLOYMENT.md` socket
+     activation steps; confirm `/proc/sys/net/ipv4/ip_unprivileged_port_start`
+     is greater than the port, `ss -ltne 'sport = :<port>'` shows one row whose
+     inode is in `/proc/<service pid>/fd`, the backend runs without
+     capabilities (`grep Cap /proc/<service pid>/status` all zero), and access
+     opens with the `tcp/22` `ssh.socket` (uid 0) exception entered through
+     the audited Owner path.
+  4. Mismatching listener → revoke: on a disposable node or during a
+     maintenance window, with an Owner and an invited viewer signed in, stop
+     `ssh.socket` and `ssh.service`, start a wildcard listener on 22 from a
+     login session (for example `sudo python3 -m http.server 22`; it is
+     created in the session's `user.slice` scope), and confirm the check
+     closes access with `UNEXPECTED_LISTENER` (the second dump confirmed it),
+     that reopening after restoring `ssh.socket` revokes every human session
+     with a `system` `invalidate_human_sessions` audit record, and that a
+     `user.slice` process whose cgroup ends in `ssh.socket` does not satisfy
+     the exception. Repeat on the upstream port with the backend stopped
+     (`sudo python3 -m http.server --bind 127.0.0.1 <port>`) only if a
+     disposable node is available.
+  5. Netlink denied → close only: with a drop-in that removes `AF_NETLINK`
+     from `RestrictAddressFamilies=` (or `ProtectControlGroups=private` on
+     systemd 257+), restart the service and confirm human access stays closed
+     with `LISTENER_OWNER_UNVERIFIED` only, the Owner fault arrives, no
+     `invalidate_human_sessions` record is written and existing sessions stay
+     valid after the drop-in is removed and access reopens.
+  6. Unprivileged port: on a disposable node lower
+     `net.ipv4.ip_unprivileged_port_start` below the upstream port and confirm
+     `LISTENER_OWNER_UNVERIFIED` without revocation; restore it.
+  7. Outdated exceptions: on a disposable copy holding a version 1 (port-only)
+     or version 2 (executable path, or unit without uid) stored exception,
+     confirm startup reports `LISTENER_EXCEPTIONS_OUTDATED` and access stays
+     closed until the Owner re-enters the exception with unit and uid.
+  8. Residual risk (not detectable, record only): sock_diag reports the
+     creator, not the holder; a socket passed to another process with
+     `SCM_RIGHTS` outside the ServerSentinel unit keeps its creator's cgroup.
 - Kernel forwarding (not covered by the check): on the Main Server, run
   `sudo nft list ruleset` and `sudo iptables-save -t nat` (and `-t mangle`),
   and confirm no DNAT, REDIRECT or TPROXY rule targets the reserved addresses
@@ -1805,22 +1852,25 @@ by the Issue #6 synthetic policy model.
   BPF programs (`sudo bpftool prog show`) and IPVS services
   (`sudo ipvsadm -Ln`, if installed). Any such forwarding is outside what the
   check can see and must be removed or excluded by the deployment isolation.
-- Unit identity: confirm `cat /proc/<sshd pid>/cgroup` is exactly
-  `0::/system.slice/ssh.service`, and that a user-session process whose cgroup
-  ends in `ssh.service` under `user.slice` does not satisfy a unit exception.
+- Unit identity: confirm the tcp/22 sockets' sock_diag cgroup is exactly
+  `/system.slice/ssh.socket` (step 2 above), and that a user-session process
+  whose cgroup ends in `ssh.socket` under `user.slice` does not satisfy a unit
+  exception.
 - Human upstream ownership (mock-only so far): with the check composed in the
-  running service, confirm access opens and that the upstream's inode in
-  `ss -ltne 'sport = :8080'` appears in `/proc/<service pid>/fd`. On a
-  disposable node, stop the upstream only (keep the check running), bind
+  running service and socket activation in place, confirm access opens and
+  that the upstream's inode in `ss -ltne 'sport = :<port>'` appears in
+  `/proc/<service pid>/fd` and nowhere else in the unit's processes
+  (`cat /sys/fs/cgroup/system.slice/server-sentinel.service/cgroup.procs`).
+  On a disposable node, stop the upstream only (keep the check running), bind
   another process to the same loopback address and port (one socket, no
   `SO_REUSEPORT`), and confirm `UNEXPECTED_LISTENER` closes access and that
-  reopening revokes every human session.
+  reopening revokes every human session. Start the backend without the
+  socket unit on a port at or above `ip_unprivileged_port_start` and confirm
+  `LISTENER_OWNER_UNVERIFIED` without revocation.
 - Proxy socket ownership (mock-only so far): record whether `tailscaled`
   holds a visible socket on the Tailscale address at the origin port (`sudo ss
-  -ltnp`); if it does, record its executable and unit (`readlink
-  /proc/<pid>/exe`, `/proc/<pid>/cgroup`) as `proxy_owner`. Before Issue #126,
-  confirm access stays closed with `LISTENER_OWNER_UNVERIFIED`. Once #126 is
-  composed, confirm access opens, then (on a disposable node) stop the proxy,
+  -ltnp`); if it does, record its sock_diag cgroup and uid (step 2 above, for
+  example `tailscaled.service` uid 0) as `proxy_owner`. Confirm access opens, then (on a disposable node) stop the proxy,
   bind another process to the same address and port while Serve status still
   lists the route, and confirm `UNEXPECTED_LISTENER` closes access and that
   reopening revokes every human session. Stop the proxy without a replacement

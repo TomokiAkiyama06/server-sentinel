@@ -165,20 +165,33 @@ following closes it:
   wildcard bind covered by an Owner listener exception. Recorded proxy sockets
   are TCP at the configured origin port only; a proxy socket on any other port
   of the reserved name is refused as configuration. Each recorded proxy socket
-  must be held by the configured `proxy_owner` (a `ProcessIdentity`:
-  executable or systemd unit, for example `tailscaled.service`) alone, verified
-  through `socket_owners` like a listener exception: another holder counts as
-  `UNEXPECTED_LISTENER` and an unverifiable one as `LISTENER_OWNER_UNVERIFIED`
-  (both exposures). Connected UDP client sockets answer only their peer and are
-  not counted;
-- a loopback human upstream that is not a socket of this ServerSentinel
-  process: each check reads its own `/proc/self/fd` (`OwnSocketInodes`, the
-  injected `own_sockets`), which needs no privilege and no #126 helper. A
-  single replacement bound by another process after the upstream released the
-  endpoint (no `SO_REUSEPORT` duplicate row) counts as `UNEXPECTED_LISTENER`;
-  an unreadable own fd table, a socket without an inode, or no `own_sockets`
-  counts as `LISTENER_OWNER_UNVERIFIED`; both are exposures. Python creates
-  non-inheritable descriptors, so a child process does not share the socket;
+  must be created by the configured `proxy_owner` (a `ProcessIdentity`:
+  systemd unit and uid, for example `tailscaled.service` with uid 0), verified
+  through `socket_owners` like a listener exception: a confirmed other creator
+  counts as `UNEXPECTED_LISTENER` (an exposure) and an unverifiable one as
+  `LISTENER_OWNER_UNVERIFIED` (closed, no revocation). Connected UDP client
+  sockets answer only their peer and are not counted;
+- a loopback human upstream that is not the socket-activated upstream of this
+  ServerSentinel process (Issue #126, Owner decision 2026-10-07). systemd
+  creates it through `server-sentinel-upstream.socket` as uid 0 on a loopback
+  port below 1024 and passes it to the unprivileged backend
+  (`app.systemd.activated_listener`, which refuses a passed socket that is not
+  exactly the configured listening `human_host:human_port` and marks it
+  non-inheritable). Each check requires that socket to be in this process's
+  own `/proc/self/fd` (`OwnSocketInodes`, the injected `own_sockets`), created
+  in the `.socket` unit's cgroup by uid 0 (`ReservationConfig.upstream_owner`,
+  through `socket_owners`), on a port below
+  `/proc/sys/net/ipv4/ip_unprivileged_port_start` (the injected
+  `unprivileged_port_start`), and held by no other process in the
+  ServerSentinel unit's cgroups (`socket_owners.held_only_by_requester`, a
+  same-uid `/proc/<pid>/fd` scan). A single replacement bound by another
+  process (no `SO_REUSEPORT` duplicate row), a confirmed other creator, or the
+  socket shared with another unit process counts as `UNEXPECTED_LISTENER`
+  (an exposure). An unreadable own fd table or unit process, a socket without
+  an inode, no `own_sockets`, an unresolved creator, or a port at or above
+  `ip_unprivileged_port_start` (a configuration error: for example the backend
+  was not socket-activated and bound the port itself; the creator is then not
+  compared) counts as `LISTENER_OWNER_UNVERIFIED` (closed, no revocation);
 - a recorded proxy socket that is absent (`PROXY_LISTENER_MISSING`). This is
   proxy drift or failure with nothing else seen answering, so, like a
   resolution failure, it closes access without revocation and reopens once
@@ -203,9 +216,8 @@ failed delivery is counted and retried on the next tick. While closed the
 check is retried every five minutes, re-notifying only when the reasons change,
 and a later passing check reopens access. After a close that may have exposed
 a session cookie (an unexpected listener or route, a resolved address set that
-differs from the configuration, an excepted listener whose owner cannot be
-verified, or a listener/route enumeration error or timeout that cannot rule
-one out: `EXPOSURE_REASONS`), a passing check reopens
+differs from the configuration, or a listener/route enumeration error or
+timeout that cannot rule one out: `EXPOSURE_REASONS`), a passing check reopens
 only after the injected `session_revoker` has revoked every human session
 (Owner decision, 2026-09-30). `reservation_store.ReservationSessionRevocation`
 does that through `AccessStore.invalidate_all_sessions_on`, which advances the
@@ -249,44 +261,60 @@ the exposure window, and only the Owner-recorded deployment isolation removes
 it. `/proc/net` covers one network namespace. The check sees only sockets in `/proc/net` and Serve status. Traffic the kernel redirects before it reaches a listening socket on the reserved address — nftables/iptables DNAT or REDIRECT (for example Docker with `userland-proxy=false`), TPROXY, eBPF `sk_lookup` or IPVS — is not visible to it, so it cannot claim that nothing else answers; the deployment isolation must exclude such forwarding, and the Owner verifies it manually.
 
 Owner listener exceptions (`ListenerException`: protocol `tcp` or `udp`, port,
-optional address family, bind scope `wildcard`, and the owning process) let a
+optional address family, bind scope `wildcard`, and the creating unit and uid) let a
 system service such as `sshd` on tcp/22 or `tailscaled` on its UDP port bind a
 wildcard address without closing access. An exception covers only its own
 protocol. A port alone never exempts a socket (Owner decision, 2026-10-01): each
-exception names its owner by exactly one of `executable` (the absolute,
-normalized path `/proc/<pid>/exe` resolves to, for example `/usr/sbin/sshd`) or
-`unit` (a system unit: the process's cgroup v2 path must be exactly
-`/system.slice/<unit>`, for example `ssh.service`; a `user.slice` path, whose
-user manager can create a unit of any name, a sub-cgroup or another slice names
-no unit and does not match), and a port-only, doubly identified or malformed entry is
-rejected. Each check reads the socket inode from `/proc/net` and the injected
-`socket_owners` (`ProcSocketOwners`, walking `/proc/<pid>/fd`) maps it to every
-process holding it; the socket is excepted only when every holder matches.
-Another process holding it (alone or alongside the named one) counts as
-`UNEXPECTED_LISTENER`; a socket with no inode or no holder found, an
-unreadable executable/unit, or an owner lookup that fails or times out counts
-as `LISTENER_OWNER_UNVERIFIED`; both are exposure reasons. The scan is all or
-nothing: any process whose fd table or descriptor cannot be read (other than
-one that exited or closed it during the scan) could hide another holder, so the
-lookup fails and every excepted listener stays unverified, even one whose
-readable holders all match. Reading another
-account's `/proc/<pid>/fd` and `exe` needs privilege the non-root service may
-not hold (root, or `CAP_DAC_READ_SEARCH` + `CAP_SYS_PTRACE`); without it an
-excepted root-owned `sshd` stays unverified and access stays closed. Owner
-decision (2026-10-01): ServerSentinel stays non-root, and a small privileged
-helper running as its own systemd service will answer the ownership lookup
-(Issue #126); it plugs in as the `SocketOwnerResolver` passed as
-`socket_owners`. Until #126 lands, an excepted root-owned listener such as
-`sshd`, and a recorded proxy socket held by root-owned `tailscaled`, keep
-human access closed. A
-deleted executable (`… (deleted)` after a package upgrade until the service
-restarts) does not match either. With socket activation (for example
-Ubuntu's `ssh.socket`) the listening socket is held by the service manager
-(PID 1, cgroup `init.scope`), which no exception identifies narrowly: naming
-`/usr/lib/systemd/systemd` would cover every socket unit. Such a service stays
-closed until it listens itself. Owner decision (2026-10-01): the Main Server
-runs `sshd` as `ssh.service` with `ssh.socket` disabled, and the exception is
-`tcp/22` owned by `/usr/sbin/sshd` (steps in `server/docs/DEPLOYMENT.md`). `/proc/net` does not
+exception names its creating systemd system `unit` (a `.service` or `.socket`
+unit) and `uid` (Owner decision, 2026-10-07, replacing the executable-path
+identity: for example `ssh.socket` with uid 0 for tcp/22, `tailscaled.service`
+with uid 0 for its UDP port). A port-only, executable-path or malformed entry
+is rejected, and a stored executable-path or unit-without-uid set (store
+format version 1 or 2) fails closed as `LISTENER_EXCEPTIONS_OUTDATED` until the
+Owner re-enters it.
+
+Each check reads the socket inode from `/proc/net` (listener enumeration stays
+there) and asks the injected `socket_owners` for each verified socket's
+creator. In production that is `app.auth.sock_diag.SockDiagOwners`: the
+unprivileged backend sends `NETLINK_SOCK_DIAG` `inet_diag` dump requests for
+the TCP LISTEN and unconnected UDP tables (IPv4 and IPv6) of its own network
+namespace and reads each socket's uid and `INET_DIAG_CGROUP_ID`, the cgroup v2
+id of the cgroup the socket was created in, which it maps to a path by
+`stat`ing `/sys/fs/cgroup` (a cgroup id equals its directory's inode on a
+64-bit kernel). systemd creates a `.socket` unit's sockets in that unit's
+cgroup (`/system.slice/ssh.socket`) and a service's sockets in the service's
+cgroup; only root can move a process into a `system.slice` cgroup. The socket
+matches only when its cgroup path is exactly `/system.slice/<unit>` and its uid
+is the recorded one; a `user.slice` path (whose user manager can create a unit
+of any name), a sub-cgroup or another slice names no unit and does not match.
+Every dump first confirms that a loopback probe listener of the backend's own
+appears with the backend's cgroup and effective uid, so a refused netlink
+socket, a kernel without the cgroup attribute or a cgroup view that does not
+match (for example `ProtectControlGroups=private`) fails closed before any
+listener is judged.
+
+A socket created in another existing cgroup, or by another uid, counts as
+`UNEXPECTED_LISTENER` (an exposure) only when an immediate second dump in the
+same check reports the same creator; a mismatch the second dump does not repeat
+(the socket went away or changed, or the dump failed) is
+`LISTENER_OWNER_UNVERIFIED`. So is every creator the check cannot establish: a
+socket in `/proc/net` that is not in the dump, no cgroup attribute, a cgroup id
+that names no existing cgroup (deleted), the root cgroup or `/init.scope`, and a
+lookup that fails, times out or fails its self-check. Unverified closes access
+without revocation and reopens once the creator verifies again (Owner
+decisions, 2026-10-05 and 2026-10-07). The resolver is mandatory: without
+`socket_owners` access never opens.
+
+What this cannot show (residual risk accepted by the Owner, 2026-10-07): the
+cgroup is the socket's creator, recorded when it was created, not its current
+holder. A legitimate creator that is compromised and hands its listening
+descriptor to another process (`fork`, `SCM_RIGHTS`) is not detected; for the
+human upstream, the same-uid scan covers the ServerSentinel unit's own
+processes only. No privileged helper, capability or root is involved; the
+2026-10-01 plan for one (closed PR #142) was dropped because reading other
+processes' descriptors needs `CAP_SYS_PTRACE`. With socket activation
+allowed, the Main Server keeps Ubuntu's `ssh.socket`; the exception is
+`tcp/22` created by `ssh.socket` as uid 0 (steps in `server/docs/DEPLOYMENT.md`). `/proc/net` does not
 show `IPV6_V6ONLY` and a `::` socket may also accept IPv4, so a `::` bind is
 treated as dual-stack: only an exception without a family covers it, an `ipv4`
 exception covers `0.0.0.0` only, and an `ipv6`-only exception is rejected. The set is empty

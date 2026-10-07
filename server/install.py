@@ -121,6 +121,17 @@ def _unit_path(value: Path | str) -> str:
 
 def render_unit(root: Path, config: Path, deployment: Deployment,
                 account: pwd.struct_passwd) -> str:
+    """Render the Main Server service unit.
+
+    The human upstream is created by systemd through
+    ``server-sentinel-upstream.socket`` and passed with ``Sockets=`` (Issue
+    #126); a host without that unit only loses the passed socket, so the
+    reservation check keeps human access closed. ``AF_NETLINK`` is required
+    for the unprivileged sock_diag listener-creator lookup, and the unit keeps
+    the host network namespace (no ``PrivateNetwork=``) and
+    ``ProtectControlGroups=true`` (not ``private``/``strict``), which keep
+    sock_diag and ``/sys/fs/cgroup`` ids consistent.
+    """
     current = root / "current"
     python = current / "venv/bin/python"
     if not re.fullmatch(r"[a-z_][a-z0-9_-]*[$]?", account.pw_name):
@@ -146,6 +157,7 @@ Group={account.pw_gid}
 WorkingDirectory={_unit_path(current)}
 ExecStartPre={_quote(python)} -m app.deployment --config {_quote(config)} --check
 ExecStart={_quote(python)} -m app.deployment --config {_quote(config)}
+Sockets=server-sentinel-upstream.socket
 Restart=on-failure
 UMask=0077
 NoNewPrivileges=true
@@ -153,7 +165,7 @@ ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
 ReadWritePaths={writable}
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 CapabilityBoundingSet=
 AmbientCapabilities=
 ProtectKernelTunables=true
