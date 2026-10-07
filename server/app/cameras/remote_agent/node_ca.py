@@ -18,8 +18,10 @@ carry fixed messages and never include key, CSR or certificate bytes.
 
 A directory may belong to another OS account than the issuing process (for
 example a CA account writing the ingest listener's credential, Issue #124).
-New files are then handed to ``PrivateDirectory.owner_uid`` with ``fchown``
-before any secret byte is written. That needs effective ``CAP_CHOWN`` and
+New files get their final 0600 mode and are then handed to
+``PrivateDirectory.owner_uid`` with ``fchown`` before any secret byte is
+written, so no mode change is needed after the ownership change (which would
+need ``CAP_FOWNER``, Issue #149). That needs effective ``CAP_CHOWN`` and
 ``CAP_DAC_OVERRIDE`` (root has both); without them the access is refused
 before anything is created. The Main listener leaf can be rotated in place
 while the CA, and therefore every Agent's trust bundle, stays unchanged
@@ -343,6 +345,12 @@ class PrivateDirectory:
             except OSError:
                 raise CaptureAuthorityError("issuer material could not be written") from None
             try:
+                # The final mode is set while this process still owns the
+                # file: after ``fchown`` to another account, changing the
+                # mode would need ``CAP_FOWNER``, which the documented
+                # CAP_CHOWN + CAP_DAC_OVERRIDE set does not include (#149).
+                # It also undoes a umask that narrowed the creation mode.
+                os.fchmod(descriptor, 0o600)
                 if self.foreign_owner:
                     # Hand the still-empty file to the directory's account
                     # before any secret byte is written (Issue #124).
@@ -353,7 +361,6 @@ class PrivateDirectory:
                     if written <= 0:
                         raise OSError(errno.EIO, "short write")
                     remaining = remaining[written:]
-                os.fchmod(descriptor, 0o600)
                 os.fsync(descriptor)
             except OSError:
                 os.close(descriptor)
@@ -786,10 +793,16 @@ class DeploymentAuthority:
         certificate and refuses (``ssl`` and ``listener_material`` both check
         the pair). If the process stops between the renames, the next
         rotation completes the interrupted one instead of issuing again.
+
+        Recovery comes before the new leaf's window is checked against the
+        CA expiry (Issue #148): the staged certificate was already issued, so
+        a ``validity`` the CA can no longer cover must not leave the listener
+        with a mismatched pair. Only the range of ``validity`` is checked
+        before the lock; the CA coverage only when a new leaf is issued.
         """
         if not isinstance(target, PrivateDirectory):
             raise CaptureAuthorityError("invalid listener directory")
-        window = self._leaf_window(validity)
+        _validity(validity, MAX_LEAF_VALIDITY)
         # The directory must already exist (it is never created here), and
         # the privilege to write into it is checked before anything changes.
         target._require_privilege(assign=True)
@@ -801,6 +814,7 @@ class DeploymentAuthority:
                 return ListenerRotation(recovered.not_valid_after_utc, recovered=True)
             current = self.issued_listener_certificate(target)
             server_name = _single_server_name(current)
+            window = self._leaf_window(validity)
             key, certificate = self._main_server_leaf(server_name, window)
             try:
                 target.write_new(_STAGED_SERVER_KEY, _private_pem(key))
@@ -867,6 +881,15 @@ class DeploymentAuthority:
         extensions are ignored, as for issuance.
         """
         return DeploymentAuthority._proof_of_possession(csr_pem)[1]
+
+    @staticmethod
+    def renewal_key_digest(csr_pem: bytes) -> str:
+        """Verify a renewal CSR as ``issue_renewal_certificate`` does and return its key digest.
+
+        Lets the renewal path look up a certificate already staged for this
+        key before signing anything (Issue #148).
+        """
+        return DeploymentAuthority._proof_of_possession(csr_pem, strict=True)[1]
 
     @staticmethod
     def _proof_of_possession(csr_pem: bytes, *, strict: bool = False):

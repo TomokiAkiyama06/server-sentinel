@@ -32,8 +32,8 @@ from app.cameras.remote_agent.ingest_tls import (
     IngestListenerConfig, IngestTlsError, build_ingest_server_context, open_ingest_listener,
 )
 from app.cameras.remote_agent.node_ca import (
-    CaptureAuthorityError, DeploymentAuthority, PrivateDirectory, listener_material,
-    public_key_digest,
+    AuthorityValidityExceeded, CaptureAuthorityError, DeploymentAuthority, PrivateDirectory,
+    listener_material, public_key_digest,
 )
 from app.cameras.remote_agent.pairing import HmacCodeVerifier, PairingError, PairingLedger
 from app.cameras.remote_agent.renewal import (
@@ -983,6 +983,55 @@ class DeploymentCaValidityRenewalTests(CaptureTlsHarness):
                                         self._empty_csr(ec.generate_private_key(ec.SECP256R1())),
                                         validity=30 * DAY)
         self.assertEqual(identity.node_id, renewed.node_id)
+
+    def test_same_key_retry_after_the_ca_threshold_resends_the_staged_certificate(self):
+        # Issue #148 (comment): a retry with the pending key must be answered
+        # with the certificate staged while the CA still covered it, not
+        # refused because signing a new one is no longer possible.
+        identity = self._identity()
+        new_key = ec.generate_private_key(ec.SECP256R1())
+        first = renew_node_credential(self.short, self.ledger, self.admission, identity,
+                                      self._empty_csr(new_key), validity=150 * DAY,
+                                      monitor=self.monitor)
+        # Sixty days later the CA (about 140 days left) can no longer cover
+        # a 150-day leaf.
+        later = DeploymentAuthority(self.deployment, self.short.certificate,
+                                    self.short._private_key,
+                                    clock=fixed_clock(utc_now() + 60 * DAY))
+        with self.assertRaises(AuthorityValidityExceeded):
+            later.check_leaf_validity(150 * DAY)
+        retried = renew_node_credential(later, self.ledger, self.admission, identity,
+                                        self._empty_csr(new_key), validity=150 * DAY,
+                                        monitor=self.monitor)
+        self.assertEqual(first.certificate_pem, retried.certificate_pem)
+        self.assertEqual(first.credential_digest, retried.credential_digest)
+        self.assertEqual([], self.notifications)
+        # A fresh key still cannot be signed and keeps the dedicated reason.
+        with self.assertRaises(RenewalRefused) as raised:
+            renew_node_credential(later, self.ledger, self.admission, identity,
+                                  self._empty_csr(ec.generate_private_key(ec.SECP256R1())),
+                                  validity=150 * DAY, monitor=self.monitor)
+        self.assertEqual("renewal_ca_validity_insufficient", raised.exception.reason)
+
+    def test_staged_lookup_needs_the_presented_credential_to_be_current(self):
+        identity = self._identity()
+        new_key = ec.generate_private_key(ec.SECP256R1())
+        renew_node_credential(self.short, self.ledger, self.admission, identity,
+                              self._empty_csr(new_key), validity=30 * DAY)
+        digest = public_key_digest(new_key.public_key())
+        lookup = dict(node_id=identity.node_id,
+                      current_public_key_digest=identity.public_key_digest,
+                      current_credential_digest=identity.credential_digest)
+        self.assertIsNotNone(self.ledger.staged_renewal(public_key_digest=digest, **lookup))
+        other = public_key_digest(
+            ec.generate_private_key(ec.SECP256R1()).public_key())
+        self.assertIsNone(self.ledger.staged_renewal(public_key_digest=other, **lookup))
+        self.assertIsNone(self.ledger.staged_renewal(
+            public_key_digest=digest, **dict(lookup, current_credential_digest="0" * 64)))
+        self.assertIsNone(self.ledger.staged_renewal(
+            public_key_digest=identity.public_key_digest, **lookup))
+        self.ledger.revoke(Owner(), "owner", node_id=identity.node_id)
+        self.assertIsNone(self.ledger.staged_renewal(public_key_digest=digest, **lookup))
 
     def test_monitor_warns_before_the_ca_stops_covering_node_leaves(self):
         now = utc_now()

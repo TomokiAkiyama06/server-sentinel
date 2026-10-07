@@ -11,7 +11,9 @@ ledger-admitted mTLS session. This module is the Main side of that exchange:
   CSR requests no subject or extension. It stages the new certificate in the
   ledger. Revoked, expired, superseded or unknown credentials cannot renew and
   must re-pair. A retry with the same pending key is certificate-idempotent:
-  it is answered with the certificate first staged for that key (Issue #123).
+  it is answered with the certificate first staged for that key (Issue #123),
+  looked up before anything is signed, so a retry is not refused for CA
+  validity that the staged certificate already satisfied (Issue #148).
 * Supersession: the old certificate stays admitted until the new one is first
   presented; that first admission atomically promotes the new credential and
   the old certificate is no longer admitted, even though it has not expired.
@@ -94,6 +96,28 @@ def renew_node_credential(authority: DeploymentAuthority, ledger: PairingLedger,
         if not admission.is_admitted(identity):
             raise RenewalRefused("renewal_credential_not_admitted")
         try:
+            key_digest = authority.renewal_key_digest(csr_pem)
+        except CaptureAuthorityError:
+            raise RenewalRefused("renewal_request_invalid") from None
+        # A same-key retry is answered with the certificate already staged
+        # for that key before anything is signed (Issue #148): a retry after
+        # the CA has fallen below the leaf validity must still receive the
+        # certificate issued while it was covered.
+        try:
+            kept = ledger.staged_renewal(node_id=identity.node_id,
+                                         current_public_key_digest=identity.public_key_digest,
+                                         current_credential_digest=identity.credential_digest,
+                                         public_key_digest=key_digest)
+        except (PairingError, ValueError):
+            raise RenewalRefused("renewal_not_eligible") from None
+        if kept is not None:
+            try:
+                return authority.staged_renewal_credential(
+                    identity.node_id, key_digest, kept.credential_serial_digest,
+                    kept.certificate_pem)
+            except CaptureAuthorityError:
+                raise RenewalRefused("renewal_not_eligible") from None
+        try:
             issued = authority.issue_renewal_certificate(identity.node_id, csr_pem,
                                                          validity=validity)
         except AuthorityValidityExceeded:
@@ -127,6 +151,42 @@ def renew_node_credential(authority: DeploymentAuthority, ledger: PairingLedger,
             monitor.renewal_refused(identity if isinstance(identity, CaptureNodeIdentity) else None,
                                     refusal.reason)
         raise
+
+
+def ca_expiry_reason(now: datetime.datetime, ca_not_after: datetime.datetime | None, *,
+                     node_validity: datetime.timedelta = DEFAULT_NODE_VALIDITY) -> str | None:
+    """Fixed trust-warning word for the deployment CA expiry, or ``None``.
+
+    ``deployment_ca_expiring`` starts ``TRUST_WARNING_LEAD`` (30 days) before
+    the CA stops covering a ``node_validity`` leaf, the same lead as the
+    listener certificate warning; ``deployment_ca_validity_insufficient``
+    once it no longer covers one (renewal and enrollment are then refused,
+    Issue #127); ``deployment_ca_expired`` after its expiry. Shared by
+    ``CaptureCredentialMonitor`` and the local pairing CLI.
+    """
+    if ca_not_after is None:
+        return None
+    remaining = ca_not_after - now
+    if remaining <= datetime.timedelta(0):
+        return "deployment_ca_expired"
+    if remaining < node_validity:
+        return "deployment_ca_validity_insufficient"
+    if remaining < node_validity + TRUST_WARNING_LEAD:
+        return "deployment_ca_expiring"
+    return None
+
+
+def listener_expiry_reason(now: datetime.datetime,
+                           listener_not_after: datetime.datetime | None) -> str | None:
+    """Fixed trust-warning word for the Main listener certificate expiry, or ``None``."""
+    if listener_not_after is None:
+        return None
+    remaining = listener_not_after - now
+    if remaining <= datetime.timedelta(0):
+        return "listener_certificate_expired"
+    if remaining <= TRUST_WARNING_LEAD:
+        return "listener_certificate_expiring"
+    return None
 
 
 @dataclass(frozen=True)
@@ -231,25 +291,12 @@ class CaptureCredentialMonitor:
 
     def _check_trust(self, now: datetime.datetime) -> tuple[CredentialSignal, ...]:
         found = []
-        if self._ca_not_after is not None:
-            remaining = self._ca_not_after - now
-            if remaining <= datetime.timedelta(0):
-                reason = "deployment_ca_expired"
-            elif remaining < self._node_validity:
-                reason = "deployment_ca_validity_insufficient"
-            elif remaining < self._node_validity + TRUST_WARNING_LEAD:
-                reason = "deployment_ca_expiring"
-            else:
-                reason = None
-            if reason is not None:
-                found.append(self._trust_signal(reason, self._ca_not_after, now))
-        if self._listener_not_after is not None:
-            remaining = self._listener_not_after - now
-            reason = ("listener_certificate_expired" if remaining <= datetime.timedelta(0)
-                      else "listener_certificate_expiring" if remaining <= TRUST_WARNING_LEAD
-                      else None)
-            if reason is not None:
-                found.append(self._trust_signal(reason, self._listener_not_after, now))
+        reason = ca_expiry_reason(now, self._ca_not_after, node_validity=self._node_validity)
+        if reason is not None:
+            found.append(self._trust_signal(reason, self._ca_not_after, now))
+        reason = listener_expiry_reason(now, self._listener_not_after)
+        if reason is not None:
+            found.append(self._trust_signal(reason, self._listener_not_after, now))
         return tuple(found)
 
     def _trust_signal(self, reason: str, expiry: datetime.datetime,

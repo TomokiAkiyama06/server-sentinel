@@ -422,7 +422,9 @@ directory. The old key is removed by the rename; nothing is kept beside it.
 If a rotation is interrupted between replacing the key and the certificate,
 loading the listener refuses `listener_material_inconsistent`; rerun
 `rotate-listener`, which completes the interrupted rotation (`listener
-rotation completed (interrupted run)`) instead of issuing another one. The
+rotation completed (interrupted run)`) instead of issuing another one, even
+when the CA could no longer cover a new leaf of the requested validity
+(Issue #148). The
 same applies when the key rename took effect but the directory fsync after it
 failed (`issuer_material_replacement_unconfirmed`): the staged certificate is
 kept, and the rerun completes the pair.
@@ -436,7 +438,12 @@ Owner warning `capture_trust_warning` (not the per-node renewal warning).
 `CaptureCredentialMonitor` can also raise it ahead of time from the CA and
 listener expiry (30 days before the CA stops covering a 397-day node leaf, and
 30 days before the listener certificate expires); no scheduler runs the
-monitor yet (#14/#15), so until then track the printed `not_after` yourself.
+monitor yet (#14/#15). Until then `init`, `rotate-listener`, `export-bundle`
+and `approve` print `serversentinel-pairing: ca_not_after=<UTC time>` on
+stderr, plus `serversentinel-pairing: warning: deployment_ca_expiring` (or
+`deployment_ca_validity_insufficient` / `deployment_ca_expired`) and
+`listener_certificate_expiring` with the same 30-day lead as the monitor;
+a warning does not change the exit status or stdout.
 Replacing an expiring CA means a new `init` and re-pairing every Agent; plan
 it before the CA has 397 days left.
 

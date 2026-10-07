@@ -520,7 +520,12 @@ code with the reviewed runtime installed. `AGENT_CLI` means
     `--ca-validity-days 100 --server-validity-days 30`: `rotate-listener`
     with the default validity and `approve` refuse
     `deployment_ca_validity_insufficient` before any approval or code is
-    shown; `rotate-listener --server-validity-days 30` succeeds. A node
+    shown; `rotate-listener --server-validity-days 30` succeeds. `init` and
+    `rotate-listener` print `ca_not_after=` and
+    `warning: deployment_ca_validity_insufficient` on stderr (and
+    `listener_certificate_expiring` when the listener leaf has 30 days or
+    less), with stdout unchanged; a CA with 398 to 426 days left warns
+    `deployment_ca_expiring` instead. A node
     renewal against such a CA is refused `renewal_ca_validity_insufficient`
     and the Owner sees `capture_trust_warning`, not the per-node warning
     *(needs transport wiring and a scheduler)*.
