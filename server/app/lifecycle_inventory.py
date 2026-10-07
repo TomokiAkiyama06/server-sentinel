@@ -369,6 +369,32 @@ def _source_cursors(connection, tables) -> dict | None:
                 "SELECT source_id, stream_id, sequence, end_ms FROM recording_source_cursors")}
 
 
+def _publications_since(connection, tables, cursors) -> dict | None:
+    """Every ready catalog segment published after the record, spool flag aside.
+
+    ``cursors`` is the source cursor map the baseline kept: a segment of a
+    source starting at or after its recorded cursor end (append() admits
+    nothing earlier), or any segment of a source that had no cursor then,
+    was published since the record. Linked or not, spooled or released
+    (release_source() clears spool on linked segments too). ``None`` when
+    recording, or when the baseline kept no cursors.
+    """
+    if not isinstance(cursors, dict) or "recording_segments" not in tables:
+        return None
+    result = {}
+    for row in connection.execute(
+            "SELECT id, source_id, stream_id, sequence, start_ms, end_ms "
+            "FROM recording_segments WHERE state = 'ready'"):
+        recorded = cursors.get(row["source_id"])
+        if (recorded is None or (isinstance(recorded, list) and len(recorded) == 3
+                                 and row["start_ms"] >= recorded[2])):
+            result[row["id"]] = {
+                "source_id": row["source_id"], "stream_id": row["stream_id"],
+                "sequence": row["sequence"], "start_ms": row["start_ms"],
+                "end_ms": row["end_ms"]}
+    return result
+
+
 def _spool_file_matches(directory: Path, segment_id: str, catalog: list) -> bool:
     digest, size, links = _file_digest(directory, segment_id)
     return digest is not None and [digest, size] == catalog and links == 1
@@ -2489,11 +2515,12 @@ def _coverage(inventory: dict) -> dict:
 
 
 def collect(runtime_root: Path, *, salt: str | None = None,
-            owner_template_root: Path | None = None) -> dict:
+            owner_template_root: Path | None = None, since_cursors=None) -> dict:
     """Read the runtime tree without writing to it.
 
     ``salt`` is the baseline's approval-digest salt when verifying; a new
-    random one is drawn when recording.
+    random one is drawn when recording. ``since_cursors`` is the baseline's
+    recorded source cursor map when verifying (_publications_since()).
     """
     salt = secrets.token_hex(32) if salt is None else salt
     tree = RuntimeTree(_absolute(runtime_root, "runtime root"))
@@ -2530,6 +2557,8 @@ def collect(runtime_root: Path, *, salt: str | None = None,
             "recordings": _recordings(connection, tables),
             "spool_segments": _spool_segments(connection, tables),
             "recording_source_cursors": _source_cursors(connection, tables),
+            "publications_since_record": _publications_since(connection, tables,
+                                                             since_cursors),
             "audit": _audit(connection, tables),
             "camera_sources": _sources(connection, tables, salt),
             "access": _access(connection, tables, salt),
@@ -2835,15 +2864,22 @@ def _appended_publications_valid(base: dict, now: dict, remaining: Counter,
 def _published_since_record(source_id: str, context: dict) -> list | None:
     """Segments of ``source_id`` published after the record, as catalogued now.
 
-    Every one still catalogued (linked to any recording, or in the ready
-    spool) that starts at or after the source cursor recorded at record time
+    Every ready catalog row of the source, whatever its spool flag or links,
+    that starts at or after the source cursor recorded at record time
     (append() admits nothing earlier), or every one when the source had no
-    cursor then: ``(start, end, stream, sequence, segment ID)``, deduplicated
-    by segment. ``None`` when the baseline kept no cursors.
+    cursor then (_publications_since()): ``(start, end, stream, sequence,
+    segment ID)``. ``None`` when the baseline kept no cursors.
     """
     cursors = context.get("cursors")
     if cursors is None:
         return None
+    published = context.get("published")
+    if published is not None:
+        # The whole ready catalog past the recorded cursors (verify).
+        return [(item["start_ms"], item["end_ms"], item["stream_id"], item["sequence"],
+                 segment_id) for segment_id, item in published.items()
+                if item["source_id"] == source_id]
+    # Without that snapshot (a direct compare()), what the inventory lists.
     recorded = cursors.get(source_id)
     floor = None if recorded is None else recorded[2]
     found = {}
@@ -3403,7 +3439,8 @@ def compare(baseline: dict, current: dict, *, declared_rewrites=(), now=None) ->
             retention_cutoff_ms=rules["recording_cutoff_ms"],
             context={"cursors": baseline.get("recording_source_cursors"),
                      "recordings": current.get("recordings"),
-                     "spool": current.get("spool_segments")}),
+                     "spool": current.get("spool_segments"),
+                     "published": current.get("publications_since_record")}),
         "audit_security_admin": _compare_audit(
             baseline["audit"].get("security_admin"), current["audit"].get("security_admin"),
             rules["security_admin"]),
@@ -3700,7 +3737,8 @@ def main(arguments: list[str] | None = None) -> int:
             safe_output_path(args.report, args.runtime_root)
         baseline = read_private(_absolute(args.baseline, "baseline"))
         current = collect(args.runtime_root, salt=_baseline_salt(baseline),
-                          owner_template_root=args.owner_template_root)
+                          owner_template_root=args.owner_template_root,
+                          since_cursors=baseline.get("recording_source_cursors"))
         report = compare(baseline, current, declared_rewrites=args.declared_rewrite)
         if args.report is not None:
             write_private(args.report, args.runtime_root, report)

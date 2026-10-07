@@ -5658,5 +5658,40 @@ class LifecycleInventoryTests(unittest.TestCase):
         code, report, _ = self.verify(baseline)
         self.assertEqual(code, inventory.EXIT_PRESERVED, report["sections"]["recordings"])
 
+    def test_a_released_publication_still_needs_its_link(self):
+        # Codex P1: release_source() clears spool on every segment of the
+        # source, linked ones included. A link lost after that must still
+        # fail: the publications since the record are every ready catalog
+        # row of the source past the recorded cursor, whatever its spool flag.
+        import zlib
+        from app.media.recording import Segment
+        self.runtime.seed()
+        connection = sqlite3.connect(self.runtime.database, isolation_level=None)
+        self.addCleanup(connection.close)
+        store = self._recording_store(connection)
+        payload = zlib.compress(b"generated geometric test payload" * 4)
+        base = int((self.now - timedelta(hours=1)).timestamp() * 1000)
+        source, stream_id = uuid4(), uuid4()
+
+        def put(sequence, start, end):
+            return store.append(Segment(source, stream_id, sequence, base + start, base + end,
+                                        "synthetic", "deflate", payload))
+        put(0, 0, 10_000)
+        recording = store.start_manual(source, base + 10_000, duration_ms=40_000)
+        code, baseline = self.record()
+        self.assertEqual(code, inventory.EXIT_PRESERVED)
+        linked = put(1, 10_000, 20_000)
+        store.release_source(source)
+        with closing(sqlite3.connect(self.runtime.database)) as db:
+            self.assertEqual(db.execute("SELECT state, spool FROM recording_segments WHERE id=?",
+                                        (str(linked),)).fetchone(), ("ready", 0))
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_PRESERVED, report["sections"]["recordings"])
+        self.runtime.execute("DELETE FROM recording_links WHERE segment_id=?", (str(linked),))
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_FAILED)
+        self.assertEqual(report["sections"]["recordings"]["failed"],
+                         [{"id": str(recording), "reason": "changed"}])
+
 if __name__ == "__main__":
     unittest.main()

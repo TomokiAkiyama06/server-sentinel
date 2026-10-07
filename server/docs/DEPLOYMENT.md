@@ -916,7 +916,13 @@ intact. The required invariants are:
   stop, final) window, the rule `RecordingStore._publish()` links by, must
   be linked to it when it was certainly published while the recording was
   active: the recording is still active, was stopped early, or has a later
-  linked segment. Such a segment never explains a cursor advance. Every ready pre-roll spool segment (`state='ready'`,
+  linked segment. Such a segment never explains a cursor advance. The
+  publications since the record are every `ready` catalog row of the source
+  starting at or after the source cursor recorded at record time, whatever
+  its `spool` flag (`release_source()` clears it on linked segments too); a
+  publication whose catalog row was removed together with its link is not
+  visible to this rule and is caught only through the stream / sequence
+  markers of the segments around it. Every ready pre-roll spool segment (`state='ready'`,
   `spool=1`), which a later recording links without re-checking it, must have
   a file matching its catalog digest, byte length and single link
   (`spool_file_mismatch` otherwise);
