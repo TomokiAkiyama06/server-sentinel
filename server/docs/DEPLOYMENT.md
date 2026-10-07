@@ -910,11 +910,13 @@ intact. The required invariants are:
   markers present at record time must stay, and whose first newly linked
   segment must carry the marker the store adds when that segment does not
   continue the source cursor recorded at record time (or a publication still
-  catalogued since that did not overlap the recording). For any recording
-  active at record time, every segment of its source published since and
-  before its latest linked segment that overlaps its window (the rule
-  `RecordingStore._publish()` links by) must be linked to it; such a segment
-  never explains a cursor advance. Every ready pre-roll spool segment (`state='ready'`,
+  catalogued since that did not overlap the recording). For every recording
+  active at record time, changed or not, every still-catalogued segment of
+  its source published since the record that overlaps its current (after a
+  stop, final) window, the rule `RecordingStore._publish()` links by, must
+  be linked to it when it was certainly published while the recording was
+  active: the recording is still active, was stopped early, or has a later
+  linked segment. Such a segment never explains a cursor advance. Every ready pre-roll spool segment (`state='ready'`,
   `spool=1`), which a later recording links without re-checking it, must have
   a file matching its catalog digest, byte length and single link
   (`spool_file_mismatch` otherwise);
@@ -952,6 +954,15 @@ Out of scope, and not claimed by a passing verification:
   pairing ledger, presence delivery jobs and clocks, and similar service state
   are checked only as far as the rules above describe; the tables listed as
   `not_inventoried` are not compared at all.
+
+Not judged: for a recording that closed at its own deadline or was
+interrupted by a restart, a lost link to a segment published after its
+latest linked segment, because a lagging source may legitimately publish an
+overlapping segment after that close, which the store does not link. Its
+link is required only if a later linked segment shows it was published
+while the recording was active. A recording stopped early and then closed by
+its deadline before the source caught up is held to the stricter rule and may
+fail closed.
 
 Known fail-closed side effects (verification fails although the service did
 nothing wrong; investigate, then take a new baseline):

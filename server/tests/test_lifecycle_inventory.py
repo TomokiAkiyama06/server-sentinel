@@ -5565,5 +5565,98 @@ class LifecycleInventoryTests(unittest.TestCase):
         self.assertEqual(report["sections"]["recordings"]["failed"],
                          [{"id": str(recording), "reason": "changed"}])
 
+    def test_every_overlapping_publication_since_the_record_stays_linked(self):
+        # Codex P1: _publish() links every publication overlapping a recording
+        # that is active, so for each recording active at record time every
+        # still-catalogued publication since the record that overlaps its
+        # window (the final one after a stop) must be linked, whether the row
+        # changed or not and wherever the publication lies in the window.
+        import zlib
+        from app.media.recording import Segment
+        payload = zlib.compress(b"generated geometric test payload" * 4)
+
+        def scenario(label, prepare):
+            runtime = Runtime(self.base / f"links-{label}")
+            saved, self.runtime = self.runtime, runtime
+            try:
+                runtime.seed()
+                connection = sqlite3.connect(runtime.database, isolation_level=None)
+                self.addCleanup(connection.close)
+                store = self._recording_store(connection)
+                base = int((self.now - timedelta(hours=1)).timestamp() * 1000)
+                source, stream_id = uuid4(), uuid4()
+
+                def put(sequence, start, end):
+                    return store.append(Segment(source, stream_id, sequence, base + start,
+                                                base + end, "synthetic", "deflate", payload))
+                put(0, 0, 10_000)
+                recording = store.start_manual(source, base + 10_000, duration_ms=40_000)
+                code, baseline = self.record(f"links-{label}.json")
+                self.assertEqual(code, inventory.EXIT_PRESERVED)
+                lost = prepare(store, put, recording, base)
+                code, report, _ = self.verify(baseline)
+                self.assertEqual(code, inventory.EXIT_PRESERVED, report["sections"]["recordings"])
+                runtime.execute("DELETE FROM recording_links WHERE segment_id=?", (str(lost),))
+                code, report, _ = self.verify(baseline)
+                return code, report, recording
+            finally:
+                self.runtime = saved
+
+        def sole(store, put, recording, base):
+            # The only publication since the record: the row is unchanged
+            # again once its link is gone.
+            return put(1, 10_000, 20_000)
+
+        def trailing(store, put, recording, base):
+            put(1, 10_000, 20_000)
+            return put(2, 20_000, 30_000)
+
+        def stopped(store, put, recording, base):
+            put(1, 10_000, 20_000)
+            kept = put(2, 20_000, 30_000)
+            put(3, 30_000, 40_000)
+            # Early stop inside the third segment: finish() keeps the links
+            # overlapping the final window and drops the fourth one.
+            store.finish(recording, stop_ms=base + 25_000)
+            return kept
+
+        for label, prepare in (("sole", sole), ("trailing", trailing), ("stopped", stopped)):
+            with self.subTest(label):
+                code, report, recording = scenario(label, prepare)
+                self.assertEqual(code, inventory.EXIT_FAILED)
+                self.assertEqual(report["sections"]["recordings"]["failed"],
+                                 [{"id": str(recording), "reason": "changed"}])
+
+    def test_publications_outside_a_stopped_window_need_no_link(self):
+        # finish() drops the links of segments wholly outside the stopped
+        # window, so those stay catalogued without a link and still verify.
+        import zlib
+        from app.media.recording import Segment
+        self.runtime.seed()
+        connection = sqlite3.connect(self.runtime.database, isolation_level=None)
+        self.addCleanup(connection.close)
+        store = self._recording_store(connection)
+        payload = zlib.compress(b"generated geometric test payload" * 4)
+        base = int((self.now - timedelta(hours=1)).timestamp() * 1000)
+        source, stream_id = uuid4(), uuid4()
+
+        def put(sequence, start, end):
+            return store.append(Segment(source, stream_id, sequence, base + start, base + end,
+                                        "synthetic", "deflate", payload))
+        put(0, 0, 10_000)
+        recording = store.start_manual(source, base + 10_000, duration_ms=40_000)
+        code, baseline = self.record()
+        self.assertEqual(code, inventory.EXIT_PRESERVED)
+        put(1, 10_000, 20_000)
+        dropped = put(2, 20_000, 30_000)
+        store.finish(recording, stop_ms=base + 20_000)
+        with closing(sqlite3.connect(self.runtime.database)) as db:
+            self.assertIsNone(db.execute("SELECT 1 FROM recording_links WHERE segment_id=?",
+                                         (str(dropped),)).fetchone())
+            self.assertEqual(db.execute("SELECT spool FROM recording_segments WHERE id=?",
+                                        (str(dropped),)).fetchone()[0], 1)
+        code, report, _ = self.verify(baseline)
+        self.assertEqual(code, inventory.EXIT_PRESERVED, report["sections"]["recordings"])
+
 if __name__ == "__main__":
     unittest.main()

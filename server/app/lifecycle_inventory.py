@@ -2690,10 +2690,7 @@ def _valid_growth(base: dict, now: dict, context: dict | None = None) -> bool:
         return False
     if dropped and not _trimmed_by_stop(base, now, dropped):
         return False
-    context = context or {}
-    if _unlinked_publication(now, context):
-        return False
-    return _appended_publications_valid(base, now, remaining, context)
+    return _appended_publications_valid(base, now, remaining, context or {})
 
 
 def _trimmed_by_stop(base: dict, now: dict, dropped: list) -> bool:
@@ -2870,25 +2867,36 @@ def _overlaps(recording: dict, start_ms, end_ms) -> bool:
     return recording["start_ms"] < end_ms and recording["target_end_ms"] > start_ms
 
 
-def _unlinked_publication(now: dict, context: dict) -> bool:
-    """Whether a publication the store must have linked to ``now`` is unlinked.
+def _unlinked_publication(base: dict, now: dict, context: dict) -> bool:
+    """Whether a publication the store must have linked to a recording is unlinked.
 
-    ``now`` was active at record time and is active until it closes, so
-    every segment of its source published after the record and before its
-    latest linked segment was published while it was active; _publish()
-    linked each one overlapping its window. The window used is the current
-    one: an early stop only shortens it, and finish() unlinks only segments
-    wholly outside it, which start after every kept segment. Not checked
-    when the baseline kept no cursors or nothing is linked now.
+    One invariant over every recording active at record time (``base``) and
+    every publication of its source since the record still catalogued now:
+    RecordingStore._publish() links each publication overlapping the window
+    of every recording that is active then (_overlaps()), and finish()
+    unlinks only segments wholly outside the final window. A publication
+    overlapping the current window must therefore be linked whenever it was
+    made while the recording was still active, which is certain when
+
+    - the recording is still active now;
+    - it was stopped early (its target end moved before the recorded one):
+      finish() closes a stop only once the source cursor reaches the stop, so
+      every later publication starts at or after it and overlaps nothing; or
+    - a segment still linked to it was published later.
+
+    A recording closed at its own deadline or interrupted by a restart may
+    miss a late publication legitimately, so a publication after its latest
+    linked segment is not judged there (DEPLOYMENT.md limits). Not checked
+    when the baseline kept no cursors.
     """
-    if not now["segments"]:
-        return False
     published = _published_since_record(now["source_id"], context)
     if published is None:
         return False
     linked = {item["segment_id"] for item in now["segments"]}
-    latest = max(item["start_ms"] for item in now["segments"])
-    return any(segment_id not in linked and end <= latest and _overlaps(now, start, end)
+    certain = now["status"] == "active" or now["target_end_ms"] < base["target_end_ms"]
+    latest = max((item["start_ms"] for item in now["segments"]), default=None)
+    return any(segment_id not in linked and _overlaps(now, start, end)
+               and (certain or (latest is not None and end <= latest))
                for start, end, _, _, segment_id in published)
 
 
@@ -3002,6 +3010,17 @@ def _compare_recordings(baseline: dict | None, current: dict | None, *,
     # source, and an overlap with its target window (the only segments the
     # store links and finish() keeps).
     rewrites = list(result["declared_rewrites"])
+    # Every recording active at record time, changed or not: each overlapping
+    # publication since the record that the store linked is still linked.
+    for key, base in sorted(baseline.items()):
+        if (base["status"] == "active" and key in current
+                and _unlinked_publication(base, current[key], context or {})):
+            preserved = [other for other in preserved if other != key]
+            in_progress = [other for other in in_progress if other != key]
+            without = [other for other in without if other != key]
+            rewrites = [other for other in rewrites if other != key]
+            if not any(entry["id"] == key for entry in failed):
+                failed.append({"id": key, "reason": "changed"})
     for key, item in sorted(baseline.items()):
         if key not in preserved and key not in rewrites and key not in without:
             continue
