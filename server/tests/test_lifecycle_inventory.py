@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path
 import sqlite3
+import ssl
 import stat
 from tempfile import TemporaryDirectory
 import unittest
@@ -36,6 +37,30 @@ TOKEN_DIGEST = bytes(range(32, 64))
 CREDENTIAL_ID = b"synthetic-credential-id-marker"
 CREDENTIAL_LABEL = "synthetic-credential-label-marker"
 BINDING_DIGEST = bytes(range(64, 96))
+
+
+# Issue #136: stage_renewal() stores the issued certificate PEM, whose DER
+# SHA-256 must be the staged credential serial digest. Synthetic DER bytes
+# (never a real certificate) stand in for it.
+_RENEWAL_CERTIFICATES: dict[str, bytes] = {}
+
+
+def renewal_serial(tag) -> str:
+    """A credential serial digest backed by a synthetic certificate PEM."""
+    der = b"synthetic-renewal-certificate:" + str(tag).encode()
+    serial = hashlib.sha256(der).hexdigest()
+    _RENEWAL_CERTIFICATES[serial] = ssl.DER_cert_to_PEM_cert(der).encode("ascii")
+    return serial
+
+
+def renewal_certificate(serial: str) -> bytes:
+    return _RENEWAL_CERTIFICATES[serial]
+
+
+def stage_renewal(ledger, **kwargs):
+    """PairingLedger.stage_renewal() with the certificate of ``credential_serial_digest``."""
+    return ledger.stage_renewal(
+        certificate_pem=renewal_certificate(kwargs["credential_serial_digest"]), **kwargs)
 
 
 def presence_payload(identifier, at: str = "2026-01-01T00:00:00.000000+00:00") -> str:
@@ -2304,7 +2329,7 @@ class LifecycleInventoryTests(unittest.TestCase):
                 (node, "b" * 64)), "security_state",
                 lambda runtime: f"pairing_node_credentials:{node}"),
             "renewal expiry": (statement(
-                "INSERT INTO pairing_node_renewals VALUES (?, ?, ?, 0)",
+                "INSERT INTO pairing_node_renewals VALUES (?, ?, ?, 0, NULL)",
                 (node, "c" * 64, "d" * 64)), "security_state",
                 lambda runtime: f"pairing_node_renewals:{node}"),
             "key binding digest": (statement(
@@ -2541,22 +2566,22 @@ class LifecycleInventoryTests(unittest.TestCase):
             claim = main.redeem(enrollment_id=approval.enrollment_id,
                                 public_key_digest=key(label), code=code.value)
             wait(2)
-            main.activate(claim, credential_serial_digest=key(label + "-serial"),
+            main.activate(claim, credential_serial_digest=renewal_serial(label),
                           not_after=expiry)
 
         def stage(node, current, label, not_after):
-            main.stage_renewal(node_id=node, current_public_key_digest=key(current),
-                               current_credential_digest=key(current + "-serial"),
-                               public_key_digest=key(label),
-                               credential_serial_digest=key(label + "-serial"),
-                               not_after=not_after)
+            stage_renewal(main, node_id=node, current_public_key_digest=key(current),
+                          current_credential_digest=renewal_serial(current),
+                          public_key_digest=key(label),
+                          credential_serial_digest=renewal_serial(label),
+                          not_after=not_after)
         renewed, revoked, expired, consumed, waiting = (uuid4() for _ in range(5))
         pair(renewed, "renewed")
         wait(3600)
         stage(renewed, "renewed", "renewed-2", expiry + 86_400)
         wait(30)
         self.assertTrue(main.admits(node_id=renewed, public_key_digest=key("renewed-2"),
-                                    credential_serial_digest=key("renewed-2-serial")))
+                                    credential_serial_digest=renewal_serial("renewed-2")))
         wait(3600)
         stage(renewed, "renewed-2", "renewed-3", expiry + 2 * 86_400)
         pair(revoked, "revoked")
@@ -3247,7 +3272,7 @@ class LifecycleInventoryTests(unittest.TestCase):
         # stage_renewal() binds the staged key when it stages it.
         self.runtime.execute("INSERT INTO pairing_key_bindings VALUES (?, ?, 0)",
                              ("4" * 64, promoted))
-        self.runtime.execute("INSERT INTO pairing_node_renewals VALUES (?, ?, ?, 20.0)",
+        self.runtime.execute("INSERT INTO pairing_node_renewals VALUES (?, ?, ?, 20.0, NULL)",
                              (promoted, "4" * 64, "5" * 64))
         _, baseline = self.record()
         for marker in ("1" * 64, "4" * 64, "5" * 64):
@@ -3288,7 +3313,7 @@ class LifecycleInventoryTests(unittest.TestCase):
             for bound in (key, staged):
                 self.runtime.execute("INSERT INTO pairing_key_bindings VALUES (?, ?, 0)",
                                      (bound, node_id))
-            self.runtime.execute("INSERT INTO pairing_node_renewals VALUES (?, ?, ?, 20.0)",
+            self.runtime.execute("INSERT INTO pairing_node_renewals VALUES (?, ?, ?, 20.0, NULL)",
                                  (node_id, staged, "d" * 64))
         _, baseline = self.record()
         # Legitimate: revocation discards it; a fresh pairing replaces the
@@ -3433,7 +3458,7 @@ class LifecycleInventoryTests(unittest.TestCase):
         self._activated(node, first)
         staged = "d" * 64
         self.runtime.execute("INSERT INTO pairing_key_bindings VALUES (?, ?, 0)", (staged, node))
-        self.runtime.execute("INSERT INTO pairing_node_renewals VALUES (?, ?, ?, 20.0)",
+        self.runtime.execute("INSERT INTO pairing_node_renewals VALUES (?, ?, ?, 20.0, NULL)",
                              (node, staged, "e" * 64))
         _, baseline = self.record()
         self.runtime.execute("UPDATE pairing_node_credentials SET public_key_digest=?, "
@@ -3535,7 +3560,7 @@ class LifecycleInventoryTests(unittest.TestCase):
             staged = f"{label}".encode().hex().ljust(64, "0")
             self.runtime.execute("INSERT INTO pairing_key_bindings VALUES (?, ?, 0)",
                                  (staged, nodes[label]))
-            self.runtime.execute("INSERT INTO pairing_node_renewals VALUES (?, ?, ?, 20.0)",
+            self.runtime.execute("INSERT INTO pairing_node_renewals VALUES (?, ?, ?, 20.0, NULL)",
                                  (nodes[label], staged, "d" * 64))
         _, baseline = self.record()
         # Promotion of the staged renewal, but its binding is revoked.
@@ -3607,7 +3632,7 @@ class LifecycleInventoryTests(unittest.TestCase):
             staged = f"{label}".encode().hex()[:64].ljust(64, "0")
             self.runtime.execute("INSERT INTO pairing_key_bindings VALUES (?, ?, 0)",
                                  (staged, nodes[label]))
-            self.runtime.execute("INSERT INTO pairing_node_renewals VALUES (?, ?, ?, 20.0)",
+            self.runtime.execute("INSERT INTO pairing_node_renewals VALUES (?, ?, ?, 20.0, NULL)",
                                  (nodes[label], staged, "d" * 64))
         _, baseline = self.record()
         # A node first seen now, with no binding at all, and one whose key
@@ -3664,10 +3689,10 @@ class LifecycleInventoryTests(unittest.TestCase):
             ledger.activate(claim, credential_serial_digest=digest(), not_after=50.0)
 
         def stage(node, current, key, serial):
-            ledger.stage_renewal(node_id=node, current_public_key_digest=current[0],
-                                 current_credential_digest=current[1],
-                                 public_key_digest=key, credential_serial_digest=serial,
-                                 not_after=90.0)
+            stage_renewal(ledger, node_id=node, current_public_key_digest=current[0],
+                          current_credential_digest=current[1],
+                          public_key_digest=key, credential_serial_digest=serial,
+                          not_after=90.0)
 
         def credential(node):
             with closing(sqlite3.connect(self.runtime.database)) as connection:
@@ -3681,7 +3706,7 @@ class LifecycleInventoryTests(unittest.TestCase):
         for label in labels[:5] + ("revoke-repair", "repair"):
             pair(nodes[label], digest())
         for label in labels[:5]:
-            staged[label] = (digest(), digest())
+            staged[label] = (digest(), renewal_serial(digest()))
             stage(nodes[label], credential(nodes[label]), *staged[label])
         approval, code = ledger.approve(owner, "owner", node_id=nodes["activate-open"],
                                         public_key_digest=(open_key := digest()))
@@ -3691,13 +3716,16 @@ class LifecycleInventoryTests(unittest.TestCase):
         self.assertTrue(ledger.admits(node_id=nodes["promote"],
                                       public_key_digest=staged["promote"][0],
                                       credential_serial_digest=staged["promote"][1]))
-        stage(nodes["restage"], credential(nodes["restage"]), digest(), digest())
-        stage(nodes["retry"], credential(nodes["retry"]), staged["retry"][0], digest())
+        stage(nodes["restage"], credential(nodes["restage"]), digest(),
+              renewal_serial(digest()))
+        stage(nodes["retry"], credential(nodes["retry"]), staged["retry"][0],
+              renewal_serial(digest()))
         ledger.revoke(owner, "owner", node_id=nodes["revoke"])
         self.assertTrue(ledger.admits(node_id=nodes["promote-restage"],
                                       public_key_digest=staged["promote-restage"][0],
                                       credential_serial_digest=staged["promote-restage"][1]))
-        stage(nodes["promote-restage"], credential(nodes["promote-restage"]), digest(), digest())
+        stage(nodes["promote-restage"], credential(nodes["promote-restage"]), digest(),
+              renewal_serial(digest()))
         ledger.activate(open_claim, credential_serial_digest=digest(), not_after=50.0)
         pair(nodes["repair"], digest())
         pair(nodes["new"], digest())
@@ -3706,7 +3734,7 @@ class LifecycleInventoryTests(unittest.TestCase):
         # Known fail-closed side effects: a renewal both staged and promoted
         # after the record cannot show its material, and re-pairing a node
         # already revoked at record time reads as a reversed revocation.
-        stage(nodes["repair"], credential(nodes["repair"]), (late := digest()), (serial := digest()))
+        stage(nodes["repair"], credential(nodes["repair"]), (late := digest()), (serial := renewal_serial(digest())))
         self.assertTrue(ledger.admits(node_id=nodes["repair"], public_key_digest=late,
                                       credential_serial_digest=serial))
         # Re-pairing a node revoked inside the window on the same node ID
@@ -3747,13 +3775,13 @@ class LifecycleInventoryTests(unittest.TestCase):
                                            public_key_digest=key, code=code.value)
         ledger.activate(claim("a" * 64)[1], credential_serial_digest="b" * 64, not_after=50.0)
         _, baseline = self.record()
-        staged, serial = "c" * 64, "d" * 64
-        ledger.stage_renewal(node_id=node, current_public_key_digest="a" * 64,
-                             current_credential_digest="b" * 64, public_key_digest=staged,
-                             credential_serial_digest=serial, not_after=90.0)
+        staged, serial = "c" * 64, renewal_serial("d")
+        stage_renewal(ledger, node_id=node, current_public_key_digest="a" * 64,
+                      current_credential_digest="b" * 64, public_key_digest=staged,
+                      credential_serial_digest=serial, not_after=90.0)
         approval, _ = claim(staged)
         ledger.activate(claim("e" * 64)[1], credential_serial_digest="f" * 64, not_after=50.0)
-        self.runtime.execute("INSERT INTO pairing_node_renewals VALUES (?, ?, ?, 90.0)",
+        self.runtime.execute("INSERT INTO pairing_node_renewals VALUES (?, ?, ?, 90.0, NULL)",
                              (str(node), staged, serial))
         self.runtime.execute("UPDATE pairing_enrollments SET state='activated' WHERE id=?",
                              (str(approval.enrollment_id),))
@@ -3875,13 +3903,13 @@ class LifecycleInventoryTests(unittest.TestCase):
         complete(before, "unacknowledged", "a" * 64)         # Agent never got it
         complete(before, "superseded", "b" * 64)
         renewed = "f" * 64
-        before.stage_renewal(node_id=nodes["superseded"],
-                             current_public_key_digest=keys["superseded"],
-                             current_credential_digest="b" * 64,
-                             public_key_digest=renewed, credential_serial_digest="c" * 64,
-                             not_after=90.0)
+        stage_renewal(before, node_id=nodes["superseded"],
+                      current_public_key_digest=keys["superseded"],
+                      current_credential_digest="b" * 64,
+                      public_key_digest=renewed, credential_serial_digest=renewal_serial("c"),
+                      not_after=90.0)
         self.assertTrue(before.admits(node_id=nodes["superseded"], public_key_digest=renewed,
-                                      credential_serial_digest="c" * 64))
+                                      credential_serial_digest=renewal_serial("c")))
         _, baseline = self.record()
         after = ledger()
         for label in keys:
@@ -3913,9 +3941,9 @@ class LifecycleInventoryTests(unittest.TestCase):
             ledger.activate(claim, credential_serial_digest=serial, not_after=50.0)
             return approval
         complete("a" * 64, "b" * 64)
-        ledger.stage_renewal(node_id=node, current_public_key_digest="a" * 64,
-                             current_credential_digest="b" * 64, public_key_digest=staged,
-                             credential_serial_digest="d" * 64, not_after=90.0)
+        stage_renewal(ledger, node_id=node, current_public_key_digest="a" * 64,
+                      current_credential_digest="b" * 64, public_key_digest=staged,
+                      credential_serial_digest=renewal_serial("d"), not_after=90.0)
         _, baseline = self.record()
         self.assertEqual(ledger.bound_node(staged), node)
         approval = complete(staged, "e" * 64)
@@ -3990,10 +4018,11 @@ class LifecycleInventoryTests(unittest.TestCase):
                 elif op == "stage":
                     if current[2] != "active":
                         raise Inapplicable
-                    main.stage_renewal(node_id=node, current_public_key_digest=current[0],
-                                       current_credential_digest=current[1],
-                                       public_key_digest=digest(),
-                                       credential_serial_digest=digest(), not_after=90.0)
+                    stage_renewal(main, node_id=node, current_public_key_digest=current[0],
+                                  current_credential_digest=current[1],
+                                  public_key_digest=digest(),
+                                  credential_serial_digest=renewal_serial(digest()),
+                                  not_after=90.0)
                 elif op == "promote":
                     row = staged_row()
                     if row is None or current[2] != "active":
@@ -4104,10 +4133,10 @@ class LifecycleInventoryTests(unittest.TestCase):
             claim = ledger.redeem(enrollment_id=approval.enrollment_id,
                                   public_key_digest=keys["active"], code=code.value)
             ledger.activate(claim, credential_serial_digest="b" * 64, not_after=50.0)
-            ledger.stage_renewal(node_id=node, current_public_key_digest=keys["active"],
-                                 current_credential_digest="b" * 64,
-                                 public_key_digest=keys["staged"],
-                                 credential_serial_digest="c" * 64, not_after=90.0)
+            stage_renewal(ledger, node_id=node, current_public_key_digest=keys["active"],
+                          current_credential_digest="b" * 64,
+                          public_key_digest=keys["staged"],
+                          credential_serial_digest=renewal_serial("c"), not_after=90.0)
             stale, code = ledger.approve(owner, "owner", node_id=node,
                                          public_key_digest=keys["expired"])
             with self.assertRaises(PairingError):
@@ -4268,14 +4297,14 @@ class LifecycleInventoryTests(unittest.TestCase):
         claim = ledger.redeem(enrollment_id=approval.enrollment_id, public_key_digest="a" * 64,
                               code=code.value)
         ledger.activate(claim, credential_serial_digest="b" * 64, not_after=50.0)
-        ledger.stage_renewal(node_id=node, current_public_key_digest="a" * 64,
-                             current_credential_digest="b" * 64, public_key_digest="c" * 64,
-                             credential_serial_digest="d" * 64, not_after=90.0)
+        stage_renewal(ledger, node_id=node, current_public_key_digest="a" * 64,
+                      current_credential_digest="b" * 64, public_key_digest="c" * 64,
+                      credential_serial_digest=renewal_serial("d"), not_after=90.0)
         _, baseline = self.record()
         ledger.revoke(owner, "owner", node_id=node)
         self.runtime.execute("UPDATE pairing_node_credentials SET public_key_digest=?, "
                              "credential_serial_digest=?, not_after=90.0 WHERE node_id=?",
-                             ("c" * 64, "d" * 64, str(node)))
+                             ("c" * 64, renewal_serial("d"), str(node)))
         code, report, _ = self.verify(baseline)
         self.assertIn({"id": f"pairing_revocation:{node}", "reason": "reopened"},
                       report["sections"]["security_state"]["failed"])
@@ -4305,9 +4334,9 @@ class LifecycleInventoryTests(unittest.TestCase):
             ledger.activate(claim(node, f"{index + 1:064x}"),
                             credential_serial_digest="b" * 64, not_after=50.0)
         pending = claim(nodes["activated"], "a" * 64)
-        ledger.stage_renewal(node_id=nodes["promoted"], current_public_key_digest=f"{3:064x}",
-                             current_credential_digest="b" * 64, public_key_digest="c" * 64,
-                             credential_serial_digest="d" * 64, not_after=90.0)
+        stage_renewal(ledger, node_id=nodes["promoted"], current_public_key_digest=f"{3:064x}",
+                      current_credential_digest="b" * 64, public_key_digest="c" * 64,
+                      credential_serial_digest=renewal_serial("d"), not_after=90.0)
         _, baseline = self.record()
         execute = self.runtime.execute
         # revoke() without its audit row.
@@ -4324,7 +4353,7 @@ class LifecycleInventoryTests(unittest.TestCase):
         # A promotion without its audit row.
         execute("UPDATE pairing_node_credentials SET public_key_digest=?, "
                 "credential_serial_digest=?, not_after=90.0 WHERE node_id=?",
-                ("c" * 64, "d" * 64, str(nodes["promoted"])))
+                ("c" * 64, renewal_serial("d"), str(nodes["promoted"])))
         execute("DELETE FROM pairing_node_renewals WHERE node_id=?", (str(nodes["promoted"]),))
         code, report, _ = self.verify(baseline)
         self.assertEqual(code, inventory.EXIT_FAILED)
@@ -4449,7 +4478,7 @@ class LifecycleInventoryTests(unittest.TestCase):
         superseded, staged = "b" * 64, "d" * 64
         for key in ("a" * 64, superseded, staged):
             self.runtime.execute("INSERT INTO pairing_key_bindings VALUES (?, ?, 0)", (key, node))
-        self.runtime.execute("INSERT INTO pairing_node_renewals VALUES (?, ?, ?, 20.0)",
+        self.runtime.execute("INSERT INTO pairing_node_renewals VALUES (?, ?, ?, 20.0, NULL)",
                              (node, staged, "e" * 64))
         _, baseline = self.record()
         # A retry of the staged key with a reissued certificate is allowed.
