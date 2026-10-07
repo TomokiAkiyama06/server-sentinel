@@ -39,6 +39,8 @@ from app.cameras.remote_agent.node_ca import (
 )
 from app.cameras.remote_agent.pairing import HmacCodeVerifier, PairingLedger
 from app.storage.database import Database
+from app.storage.migrations import migrate
+from app.storage.schema import APPLICATION_MIGRATIONS
 from tests.e2e.harness import require_non_root_agent
 
 
@@ -278,6 +280,10 @@ class CaptureEnrollmentScenario(unittest.TestCase):
         self.authority_dir = self.root / "main-ca"
         self.listener_dir = self.root / "main-listener"
         self.database = self.root / "state.sqlite3"
+        # The application creates its database; the pairing CLI only opens an
+        # existing one and never creates it (Issue #125).
+        with closing(Database(self.database).connect()) as connection:
+            migrate(connection, APPLICATION_MIGRATIONS)
         self.runtime = self.root / "agent-state"
         self.runtime.mkdir(mode=0o700)
         self.exchange = self.root / "exchange"
@@ -509,6 +515,52 @@ class CaptureEnrollmentScenario(unittest.TestCase):
         self.assertEqual(0, status, error)
         self.assertEqual(1, output.count("node_id="), "a retry creates no second pairing")
 
+    def test_listener_rotation_keeps_the_bundle_and_paired_agents(self):
+        # Issue #125: rotating the Main listener leaf keeps the CA, so the
+        # exported bundle is byte-identical and a paired Agent's existing
+        # trust authenticates the new certificate without any Agent change.
+        listen_port = free_port()
+        deployment, bundle, bundle_digest = self.initialise_main(listen_port)
+        request, key_digest = self.agent_request()
+        main, grouped = self.start_approval(request, listen_port, key_digest)
+        main.wait_for(b"Type it only")
+        agent = self.agent_cli("pair", "--runtime-root", self.runtime, "--trust-bundle", bundle,
+                               "--bundle-sha256", bundle_digest)
+        agent.wait_for(b"Pairing code: ")
+        agent.type(grouped + b"\n")
+        status, output, error = agent.finish()
+        self.assertEqual(0, status, error)
+        node = UUID(re.fullmatch(r"paired: node_id=(\S+)\n", output).group(1))
+        status, _main_output, main_error = main.finish()
+        self.assertEqual(0, status, main_error)
+
+        certificate = self.listener_dir / "main-server-certificate.pem"
+        before = certificate.read_bytes()
+        status, output, error = self.main_cli(
+            "rotate-listener", "--authority-dir", self.authority_dir,
+            "--listener-dir", self.listener_dir, tty=False).finish()
+        self.assertEqual(0, status, error)
+        self.assertRegex(output, r"^listener rotated: not_after=\S+\n")
+        self.assertNotEqual(before, certificate.read_bytes())
+        self.assertEqual(["main-server-certificate.pem", "main-server-key.pem"],
+                         sorted(os.listdir(self.listener_dir)))
+        again = self.exchange / "bundle-after-rotation.json"
+        status, output, error = self.main_cli(
+            "export-bundle", "--authority-dir", self.authority_dir,
+            "--listener-dir", self.listener_dir, "--endpoint", f"127.0.0.1:{listen_port}",
+            "--output", again, tty=False).finish()
+        self.assertEqual(0, status, error)
+        self.assertEqual(f"trust_bundle_sha256={bundle_digest}\n", output)
+        self.assertEqual(bundle.read_bytes(), again.read_bytes())
+
+        # The "restarted" ingest listener loads the rotated pair; the Agent
+        # connects with the trust it stored at pairing time.
+        session, result = self.ingest_connect(deployment)
+        self.assertEqual("ok", result)
+        self.assertNotIsInstance(session, str, session)
+        self.addCleanup(session.close)
+        self.assertEqual(node, session.identity.node_id)
+
     def test_untrusted_or_plaintext_main_never_receives_a_code(self):
         deployment, bundle, bundle_digest = self.initialise_main(free_port())
         self.agent_request()
@@ -569,6 +621,7 @@ class CaptureEnrollmentScenario(unittest.TestCase):
     def test_main_approval_requires_a_controlling_terminal(self):
         self.initialise_main(free_port())
         request, _digest = self.agent_request()
+        before = self.database.read_bytes()
         status, output, error = self.main_cli(
             "approve", "--database", self.database, "--authority-dir", self.authority_dir,
             "--listener-dir", self.listener_dir, "--request", request,
@@ -576,7 +629,11 @@ class CaptureEnrollmentScenario(unittest.TestCase):
             tty=False).finish()
         self.assertEqual((2, ""), (status, output))
         self.assertIn("controlling_terminal_required", error)
-        self.assertFalse(self.database.exists(), "no state before the code can be shown")
+        # The application's database is untouched: no state before the code can be shown.
+        self.assertEqual(before, self.database.read_bytes())
+        with closing(sqlite3.connect(self.database)) as connection:
+            self.assertEqual(0, connection.execute(
+                "SELECT COUNT(*) FROM pairing_enrollments").fetchone()[0])
 
 
 if __name__ == "__main__":

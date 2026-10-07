@@ -257,6 +257,98 @@ ServerSentinel service cannot read a root-owned `sshd`'s `/proc/<pid>/fd` and
 `exe`, so an excepted `sshd` stays `LISTENER_OWNER_UNVERIFIED` and human
 access stays closed. ServerSentinel itself is never given root for this.
 
+### Capture-node CA and Main listener certificate
+
+The local pairing CLI (`python -m app.cameras.remote_agent.pairing_cli`, see
+`server/app/cameras/remote_agent/README.md`) keeps the deployment CA key and the
+Main capture listener credential in two different owner-only directories
+(0700, files 0600), both outside the checkout and media trees. The application
+does not start the ingest listener yet (#14/#15); these steps prepare it.
+
+**Separate accounts (Issue #124).** The CA directory belongs to the account
+that runs the CLI. The listener directory may belong to a different,
+non-root ingest service account that must never be able to read the CA key.
+Pass `--listener-owner <account or UID>` to `init`, `rotate-listener`,
+`export-bundle` and `approve`. The CLI then creates the listener directory and
+files already owned by that account (`fchown` happens before any key byte is
+written), so no manual `chown` is needed and the ingest service reads them as
+its own. Required privileges for that CLI run:
+
+- writing (`init`, `rotate-listener`): effective `CAP_CHOWN` and
+  `CAP_DAC_OVERRIDE`;
+- reading (`export-bundle`, `approve`): `CAP_DAC_OVERRIDE` or
+  `CAP_DAC_READ_SEARCH`.
+
+Root has both, so the simplest form is running the CLI as root with a
+root-owned CA directory. A non-root CA account can instead be given exactly
+these effective capabilities for that one administrative command (for example
+through systemd ambient capabilities); no service is given them. That variant
+is not yet verified on a real host (`MANUAL_TEST.md`). Without them
+the command refuses with `listener_owner_requires_privilege` before writing
+anything. Without `--listener-owner`, the listener files belong to the
+account running the CLI, and an ingest service under another account refuses
+to load them (fail closed). `approve` still opens the CA key, the listener
+credential and the application database in one process (separating the CA key
+from the enrollment listener is #109), so the account running it needs the CA
+directory as its own, the read privilege above for the listener directory, and
+the database as its own; `list` and `revoke` need only the database.
+`approve`, `list` and `revoke` never create a database: `--database` must name
+the application's existing database file (canonical path, regular file with
+one link, owned by the account running the command, not group- or
+other-writable), otherwise they refuse `database_not_found`,
+`database_path_rejected` or `database_rejected`. They never migrate either:
+the database must already carry exactly this release's schema history,
+otherwise they refuse `database_schema_outdated` (start the application once
+so its startup migration runs) or `database_schema_unsupported`. The validated
+file stays pinned for the whole command: if it is renamed, replaced or removed
+afterwards (for example while `approve`/`revoke` waits for the typed
+confirmation), every later ledger access and commit refuses
+`database_rejected`, nothing is written to whatever is now at the path and no
+file is recreated. Each connection is also checked against the inode SQLite
+actually opened (the process's descriptors in `/proc/self/fd`), so a path
+switched to another file only for the moment of the open is refused too. `export-bundle` and `approve`
+refuse `listener_authority_mismatch` when the listener certificate was not
+issued by the selected CA directory.
+
+**Rotating the Main listener certificate (Issue #125).** The listener leaf
+defaults to 397 days and is not renewed automatically. Rotate it before it
+expires, as the account (and with the privileges) used for `init`:
+
+```sh
+python -m app.cameras.remote_agent.pairing_cli rotate-listener \
+  --authority-dir <ca_dir> --listener-dir <listener_dir> [--listener-owner <account>]
+# prints: listener rotated: not_after=<UTC time>
+```
+
+then restart the process that serves the capture listener so it loads the new
+pair (a running listener keeps the pair it loaded at start). The CA and the
+server name do not change, so Agents keep their trust bundle and need no
+action; `export-bundle` output is unchanged. Rotation refuses
+`listener_authority_mismatch` when the listener certificate was not issued by
+the selected CA directory (for example two deployments' directories mixed up),
+and `issuer_material_busy` while another `init`/`rotate-listener` holds the
+directory. The old key is removed by the rename; nothing is kept beside it.
+If a rotation is interrupted between replacing the key and the certificate,
+loading the listener refuses `listener_material_inconsistent`; rerun
+`rotate-listener`, which completes the interrupted rotation (`listener
+rotation completed (interrupted run)`) instead of issuing another one. The
+same applies when the key rename took effect but the directory fsync after it
+failed (`issuer_material_replacement_unconfirmed`): the staged certificate is
+kept, and the rerun completes the pair.
+
+**CA validity.** A leaf is never issued beyond the deployment CA's own
+expiry. When the CA has less than the requested validity left, `init`,
+`rotate-listener` and `approve` refuse `deployment_ca_validity_insufficient`
+(a shorter `--server-validity-days` still rotates the listener), and node
+renewals are refused `renewal_ca_validity_insufficient` and raise the local
+Owner warning `capture_trust_warning` (not the per-node renewal warning).
+`CaptureCredentialMonitor` can also raise it ahead of time from the CA and
+listener expiry (30 days before the CA stops covering a 397-day node leaf, and
+30 days before the listener certificate expires); no scheduler runs the
+monitor yet (#14/#15), so until then track the printed `not_after` yourself.
+Replacing an expiring CA means a new `init` and re-pairing every Agent; plan
+it before the CA has 397 days left.
+
 ## Install, update, and rollback
 
 Run the separately downloaded installer only after verifying its published

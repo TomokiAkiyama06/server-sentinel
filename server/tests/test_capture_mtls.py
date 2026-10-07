@@ -934,5 +934,96 @@ class CaptureRenewalTests(CaptureTlsHarness):
         self.assertEqual(1, len(monitor.signals))
 
 
+class DeploymentCaValidityRenewalTests(CaptureTlsHarness):
+    """Issue #127: renewal refused because the CA expires first is distinct and Owner-visible."""
+
+    def setUp(self):
+        super().setUp()
+        self.notifications = []
+        self.monitor = CaptureCredentialMonitor(self.ledger, self._record)
+        # Same deployment, but this CA has less than the 397-day node validity left.
+        self.short = DeploymentAuthority.create(PrivateDirectory(self.root / "short-authority"),
+                                                self.deployment, validity=200 * DAY)
+
+    def _record(self, kind, at, event_id):
+        self.notifications.append(kind)
+        return DeliveryResult.SUPPRESSED
+
+    def _identity(self):
+        _, issued, _, _ = self._paired_node("short", authority=self.short, validity=30 * DAY)
+        der = x509.load_pem_x509_certificate(issued.certificate_pem).public_bytes(
+            serialization.Encoding.DER)
+        return self.admission.identify(der)
+
+    @staticmethod
+    def _empty_csr(key):
+        return (x509.CertificateSigningRequestBuilder().subject_name(x509.Name([]))
+                .sign(key, hashes.SHA256()).public_bytes(serialization.Encoding.PEM))
+
+    def test_ca_too_close_to_expiry_has_a_dedicated_reason_and_trust_warning(self):
+        identity = self._identity()
+        for _ in range(2):
+            with self.assertRaises(RenewalRefused) as raised:
+                renew_node_credential(self.short, self.ledger, self.admission, identity,
+                                      self._empty_csr(ec.generate_private_key(ec.SECP256R1())),
+                                      monitor=self.monitor)
+            self.assertEqual("renewal_ca_validity_insufficient", raised.exception.reason)
+        # One deployment-wide warning, not a per-node renewal_refused warning.
+        self.assertEqual([NotificationKind.CAPTURE_TRUST_WARNING], self.notifications)
+        self.assertEqual(["deployment_ca_validity_insufficient"],
+                         [signal.reason for signal in self.monitor.signals])
+        self.assertIsNone(self.monitor.signals[0].node_id)
+        # A malformed request against the same CA is still renewal_request_invalid.
+        with self.assertRaises(RenewalRefused) as raised:
+            renew_node_credential(self.short, self.ledger, self.admission, identity,
+                                  b"-----BEGIN CERTIFICATE REQUEST-----\n")
+        self.assertEqual("renewal_request_invalid", raised.exception.reason)
+        # A shorter validity the CA still covers renews normally.
+        renewed = renew_node_credential(self.short, self.ledger, self.admission, identity,
+                                        self._empty_csr(ec.generate_private_key(ec.SECP256R1())),
+                                        validity=30 * DAY)
+        self.assertEqual(identity.node_id, renewed.node_id)
+
+    def test_monitor_warns_before_the_ca_stops_covering_node_leaves(self):
+        now = utc_now()
+        cases = (
+            (now + 500 * DAY, []),
+            (now + 420 * DAY, ["deployment_ca_expiring"]),
+            (now + 200 * DAY, ["deployment_ca_validity_insufficient"]),
+            (now - DAY, ["deployment_ca_expired"]),
+        )
+        for ca_not_after, expected in cases:
+            with self.subTest(expected=expected):
+                kinds = []
+
+                def notify(kind, at, event_id, kinds=kinds):
+                    kinds.append(kind)
+                    return DeliveryResult.SUPPRESSED
+                monitor = CaptureCredentialMonitor(self.ledger, notify, clock=lambda: now,
+                                                   ca_not_after=ca_not_after)
+                self.assertEqual(expected, [signal.reason for signal in monitor.check()])
+                monitor.check()
+                self.assertEqual([NotificationKind.CAPTURE_TRUST_WARNING] * len(expected), kinds)
+
+    def test_monitor_warns_before_the_listener_certificate_expires(self):
+        now = utc_now()
+        for listener_not_after, expected in ((now + 60 * DAY, []),
+                                             (now + 20 * DAY, ["listener_certificate_expiring"]),
+                                             (now - DAY, ["listener_certificate_expired"])):
+            with self.subTest(expected=expected):
+                kinds = []
+
+                def notify(kind, at, event_id, kinds=kinds):
+                    kinds.append(kind)
+                    return DeliveryResult.SUPPRESSED
+                monitor = CaptureCredentialMonitor(self.ledger, notify, clock=lambda: now,
+                                                   listener_not_after=listener_not_after)
+                self.assertEqual(expected, [signal.reason for signal in monitor.check()])
+                self.assertEqual([NotificationKind.CAPTURE_TRUST_WARNING] * len(expected), kinds)
+        with self.assertRaises(ValueError):
+            CaptureCredentialMonitor(self.ledger, lambda *a, **k: None,
+                                     listener_not_after=datetime.datetime(2030, 1, 1))
+
+
 if __name__ == "__main__":
     unittest.main()

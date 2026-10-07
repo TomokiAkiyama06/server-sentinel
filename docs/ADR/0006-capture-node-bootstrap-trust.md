@@ -432,4 +432,38 @@ acceptance" above except where listed at the end.
   separate processes (the concurrency test uses threads against the real
   listener); real LAN interoperability (MANUAL_TEST §B, unverified); a narrower
   issuance capability than the CLI process holding the CA key while it serves;
-  Main listener-certificate renewal; the #6 Owner-authentication boundary.
+  Main listener-certificate renewal (now a manual rotation command; see the 2026-10-05 notes); the #6
+  Owner-authentication boundary.
+
+## Follow-up notes (2026-10-05, Issues #124, #125, #127)
+
+These notes record implementation progress; they do not change this ADR's
+status or decision.
+
+- **Main listener rotation.** `pairing_cli rotate-listener` replaces the Main
+  listener key and leaf in place, signed by the unchanged deployment CA and
+  with the unchanged server name, so Agent trust bundles stay valid. It runs
+  under an exclusive directory lock, refuses a listener certificate that the
+  selected CA did not issue, writes the new pair under staged names and renames
+  each over the current file; an interrupted run is completed by the next one,
+  and readers refuse a mismatched key/certificate pair. Listener processes
+  reload the pair on restart. Rotation is manual (Owner command); the monitor
+  can warn 30 days before listener expiry once a scheduler runs it.
+- **Separate accounts.** Listener material can belong to a dedicated ingest
+  account: the CLI hands new files to that account before writing key bytes,
+  which needs `CAP_CHOWN` + `CAP_DAC_OVERRIDE` for that command only, and
+  refuses up front without them. This does not yet separate the CA key from the
+  enrollment listener process (#109).
+- **Concurrent `init`.** Both directories are locked for the whole run and the
+  rollback removes only the entries the run created.
+- **Operator mistakes.** `export-bundle` and `approve` refuse a listener
+  certificate the selected CA did not issue (`listener_authority_mismatch`);
+  `approve`, `list` and `revoke` refuse a missing or unsafe `--database`
+  instead of creating and migrating an empty one, refuse a schema that is not
+  exactly this release's instead of migrating it, and keep the validated file
+  pinned so a later replacement is refused rather than written to.
+- **CA validity.** A leaf beyond the CA expiry raises a dedicated error. Node
+  renewal reports `renewal_ca_validity_insufficient` and the deployment-wide
+  local `capture_trust_warning`; `approve` and `rotate-listener` refuse
+  `deployment_ca_validity_insufficient` before changing state. CA replacement
+  remains a new `init` plus re-pairing, as above.
