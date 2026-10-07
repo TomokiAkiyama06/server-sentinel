@@ -236,7 +236,7 @@ class DeploymentDetectionTests(unittest.TestCase):
             base = {
                 "runtime_root": str(runtime), "runtime_mount_point": str(root),
                 "runtime_device": [os.major(device), os.minor(device)],
-                "runtime_filesystem_uuid": "00000000-1111-2222-3333-444444444444",
+                "runtime_filesystem_uuid": "00000000-1111-2222-3333-444444444444", "capture_ca_directory": None,
                 "service_uid": os.geteuid(),
                 "human_host": "127.0.0.1", "human_port": 8000, "log_level": "INFO",
             }

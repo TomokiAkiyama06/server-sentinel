@@ -828,5 +828,226 @@ class ServiceStartTests(unittest.TestCase):
                          deployment._capture_ca_directory("/var/lib/serversentinel-ca"))
 
 
+class RevokeWithoutCaTests(RevokeTests):
+    """Codex P1 (PR #177): a lost CA directory must not block the ledger revocation."""
+
+    def use_real_probe(self):
+        # The real post-drop probe, as the unprivileged test account.
+        self.privileges.require_ca_directory_closed = \
+            OsPrivileges().require_ca_directory_closed
+
+    def test_missing_ca_directory_still_revokes_in_the_ledger(self):
+        self.use_real_probe()
+        for missing in (self.root / "lost-ca", self.root / "lost-parent" / "ca"):
+            with self.subTest(missing=missing.name):
+                status, stdout, stderr = self.revoke(missing)
+                self.assertEqual(1, status, stderr)
+                self.assertEqual(f"revoked: node_id={self.node}\n", stdout)
+                self.assertNotIn("ca_directory_exposed", stderr)
+                self.assertIn("warning: ca_revocation_unrecorded", stderr)
+                self.assertEqual("revoked", self.states()[self.node])
+        # Idempotent rerun once the CA directory is back.
+        self.privileges.require_ca_directory_closed = lambda path: None
+        status, _stdout, stderr = self.revoke(self.authority_dir)
+        self.assertEqual(0, status, stderr)
+        self.assertEqual(["node_revocation"], [record["type"] for record in self.log_records()])
+
+    def test_an_existing_accessible_ca_directory_is_still_refused(self):
+        self.use_real_probe()
+        # The test account owns this CA directory, so it can open it: exposed.
+        status, stdout, stderr = self.revoke(self.authority_dir)
+        self.assertEqual(2, status)
+        self.assertEqual("", stdout)
+        self.assertIn("refused: ca_directory_exposed", stderr)
+        self.assertNotEqual("revoked", self.states()[self.node])
+        self.assertEqual([], self.log_records())
+
+    def test_exposure_probe_distinguishes_missing_from_reachable(self):
+        self.assertFalse(issuer_process.ca_directory_exposed(self.root / "missing"))
+        self.assertFalse(issuer_process.ca_directory_exposed(self.root / "missing" / "ca"))
+        self.assertTrue(issuer_process.ca_directory_exposed(self.authority_dir))
+        link = self.root / "linked-ca"
+        link.symlink_to(self.authority_dir)
+        self.assertTrue(issuer_process.ca_directory_exposed(link))
+        afile = self.root / "a-file"
+        afile.write_text("x")
+        # A file where a parent directory should be: nothing to expose.
+        self.assertFalse(issuer_process.ca_directory_exposed(afile / "ca"))
+        closed = self.root / "closed"
+        closed.mkdir(mode=0o700)
+        os.chmod(closed, 0)
+        try:
+            if os.geteuid() != 0:
+                self.assertFalse(issuer_process.ca_directory_exposed(closed))
+                self.assertFalse(issuer_process.ca_directory_exposed(closed / "ca"))
+        finally:
+            os.chmod(closed, 0o700)
+
+
+class InitRecoveryTests(unittest.TestCase):
+    """Codex P2 (PR #177): a lost ``commit`` reply leaves a recoverable state."""
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix="capture-init-")
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(os.path.realpath(temporary.name))
+        os.chmod(self.root, 0o700)
+        self.privileges = issuer_fakes.install(self)
+        self.authority = self.root / "ca"
+        self.listener = self.root / "listener"
+
+    def init(self, server_name=SERVER_NAME):
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with patch("sys.stdout", stdout), patch("sys.stderr", stderr):
+            status = pairing_cli.main(["init", "--authority-dir", str(self.authority),
+                                       "--listener-dir", str(self.listener),
+                                       "--server-name", server_name])
+        return status, stdout.getvalue(), stderr.getvalue()
+
+    def ca_state(self):
+        return {name: (self.authority / name).read_bytes()
+                for name in ("ca-key.pem", "ca-certificate.pem")}
+
+    def log_types(self):
+        return [json.loads(line)["type"] for line in
+                (self.authority / ISSUANCE_LOG).read_text().splitlines()]
+
+    def lose_commit_reply(self):
+        real = issuer_fakes.InProcessIssuer.request
+
+        def request(issuer, message):
+            reply = real(issuer, message)
+            if message.get("op") == "commit":
+                raise IssuerUnavailable("synthetic: commit reply lost")
+            return reply
+        return patch.object(issuer_fakes.InProcessIssuer, "request", request)
+
+    def test_rerun_after_a_lost_commit_reply_keeps_the_ca_and_completes(self):
+        with self.lose_commit_reply():
+            status, stdout, stderr = self.init()
+        self.assertEqual(2, status)
+        self.assertIn("refused: issuer_unavailable", stderr)
+        # The CA was committed; the listener side removed its own files.
+        kept = self.ca_state()
+        deployment = node_ca.deployment_id_of(PrivateDirectory(self.authority))
+        self.assertEqual([], os.listdir(self.listener))
+        status, stdout, stderr = self.init()
+        self.assertEqual(0, status, stderr)
+        self.assertEqual(f"deployment_id={deployment}\n", stdout)
+        self.assertIn("init recovered", stderr)
+        self.assertEqual(kept, self.ca_state(), "CA material is never replaced")
+        self.assertEqual(["deployment_ca", "listener", "listener"], self.log_types())
+        trust = DeploymentTrust.load_public(PrivateDirectory(self.listener))
+        self.assertEqual(deployment, trust.deployment_id)
+        trust.issued_listener_certificate(PrivateDirectory(self.listener))
+        # A further rerun is a no-op that reports the same deployment.
+        before = {name: (self.listener / name).read_bytes() for name in os.listdir(self.listener)}
+        status, stdout, stderr = self.init()
+        self.assertEqual((0, f"deployment_id={deployment}\n"), (status, stdout), stderr)
+        self.assertIn("init already complete", stderr)
+        self.assertEqual(before, {name: (self.listener / name).read_bytes()
+                                  for name in os.listdir(self.listener)})
+        self.assertEqual(kept, self.ca_state())
+
+    def test_recovery_refuses_another_server_name_and_never_touches_the_ca(self):
+        with self.lose_commit_reply():
+            self.init()
+        kept = self.ca_state()
+        status, stdout, stderr = self.init("other.serversentinel.test")
+        self.assertEqual(2, status)
+        self.assertEqual("", stdout)
+        self.assertIn("refused: issuer_refused_request", stderr)
+        self.assertEqual([], os.listdir(self.listener))
+        self.assertEqual(kept, self.ca_state())
+
+    def test_a_listener_of_another_ca_is_refused_without_changes(self):
+        self.assertEqual(0, self.init()[0])
+        other = DeploymentAuthority.create(PrivateDirectory(self.root / "other-ca"), uuid4(),
+                                           validity=3650 * DAY)
+        foreign = self.root / "foreign-listener"
+        other.issue_main_server_credential(PrivateDirectory(foreign), server_name=SERVER_NAME,
+                                           validity=30 * DAY)
+        before = {name: (foreign / name).read_bytes() for name in os.listdir(foreign)}
+        self.listener = foreign
+        status, _stdout, stderr = self.init()
+        self.assertEqual(2, status)
+        self.assertIn("refused: listener_authority_mismatch", stderr)
+        self.assertEqual(before, {name: (foreign / name).read_bytes()
+                                  for name in os.listdir(foreign)})
+
+
+class PublicCopyValidationTests(Harness):
+    """Codex P2 (PR #177): a wrong --authority-dir never leaves its CA copy behind."""
+
+    def setUp(self):
+        super().setUp()
+        self.privileges = issuer_fakes.install(self)
+        # A listener directory written before Issue #109: no public copy.
+        (self.listener_dir / "deployment-ca-certificate.pem").unlink()
+        self.other_dir = self.root / "other-ca"
+        DeploymentAuthority.create(PrivateDirectory(self.other_dir), uuid4(),
+                                   validity=3650 * DAY)
+
+    def rotate(self, authority):
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with patch("sys.stdout", stdout), patch("sys.stderr", stderr):
+            status = pairing_cli.main(["rotate-listener", "--authority-dir", str(authority),
+                                       "--listener-dir", str(self.listener_dir)])
+        return status, stdout.getvalue(), stderr.getvalue()
+
+    def test_wrong_authority_is_refused_before_the_copy_is_written(self):
+        before = {name: (self.listener_dir / name).read_bytes()
+                  for name in os.listdir(self.listener_dir)}
+        status, _stdout, stderr = self.rotate(self.other_dir)
+        self.assertEqual(2, status)
+        self.assertIn("refused: listener_authority_mismatch", stderr)
+        self.assertEqual(before, {name: (self.listener_dir / name).read_bytes()
+                                  for name in os.listdir(self.listener_dir)})
+        # The correct authority then still works, and publishes the copy.
+        status, stdout, stderr = self.rotate(self.authority_dir)
+        self.assertEqual(0, status, stderr)
+        self.assertEqual(self.trust.ca_certificate_pem(),
+                         (self.listener_dir / "deployment-ca-certificate.pem").read_bytes())
+
+    def test_wrong_authority_during_interrupted_rotation_recovery_writes_nothing(self):
+        directory = PrivateDirectory(self.listener_dir)
+        directory.write_new("main-server-key.pem.next", b"stale")
+        directory.write_new("main-server-certificate.pem.next", b"stale")
+        status, _stdout, stderr = self.rotate(self.other_dir)
+        self.assertEqual(2, status)
+        self.assertFalse((self.listener_dir / "deployment-ca-certificate.pem").exists())
+        self.assertTrue((self.listener_dir / "main-server-key.pem.next").exists())
+
+
+class CaptureCaSettingTests(unittest.TestCase):
+    """Owner decision 2026-10-07: ``capture_ca_directory`` must be present (path or null)."""
+
+    def run_check(self, value):
+        from app import deployment
+        stderr = io.StringIO()
+        with patch.object(deployment, "_runtime_roots", return_value=(Path("/nonexistent"), None)), \
+                patch.object(deployment, "_read_configuration",
+                             return_value=(value, Path(__file__).stat())), \
+                patch("sys.stderr", stderr), self.assertRaises(SystemExit) as stopped:
+            deployment.main(["--config", "/unused", "--check"])
+        return stopped.exception.code, stderr.getvalue()
+
+    def test_missing_setting_is_refused_with_its_reason(self):
+        base = {"runtime_root": "/srv/x", "runtime_mount_point": "/srv", "runtime_device": [8, 1],
+                "runtime_filesystem_uuid": "00000000-1111-2222-3333-444444444444",
+                "service_uid": 991, "human_host": "127.0.0.1", "human_port": 880,
+                "log_level": "INFO"}
+        code, stderr = self.run_check(dict(base))
+        self.assertEqual(1, code)
+        self.assertIn("capture_ca_directory is required", stderr)
+        self.assertIn("or null", stderr)
+        # Present (null or a path): this check passes and later ones decide.
+        for value in (None, "/var/lib/serversentinel-ca"):
+            with self.subTest(value=value):
+                code, stderr = self.run_check(dict(base, capture_ca_directory=value))
+                self.assertEqual(1, code)
+                self.assertNotIn("capture_ca_directory is required", stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

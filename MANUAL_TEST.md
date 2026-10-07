@@ -548,7 +548,8 @@ Issues, PRs or CI artifacts. Below, `MAIN_CLI` means
 `python -m app.cameras.remote_agent.pairing_cli` run from the Main's `server/`
 code with the reviewed runtime installed; `init`, `rotate-listener`, `approve`
 and `revoke` run as `sudo MAIN_CLI ...` (Issue #109) and `export-bundle` and
-`list` as `sudo -u <service account> MAIN_CLI ...`. `AGENT_CLI` means
+`list` as `sudo -u <service account> MAIN_CLI ...` (the `serversentinel-pairing`
+wrapper is #180). `AGENT_CLI` means
 `python -m media_capture_agent.enroll` run from the Agent's code with
 `cryptography` installed.
 
@@ -745,7 +746,17 @@ and `revoke` run as `sudo MAIN_CLI ...` (Issue #109) and `export-bundle` and
        `node_revocation` record; approving that node's old key again is
        refused by the ledger (`public_key_revoked`) and would also be refused
        by the CA log.
-    f. Migration (`server/docs/DEPLOYMENT.md`): on a copy of a pre-#109
+    f. With `<ca_dir>` renamed away, `sudo MAIN_CLI revoke ...` still
+       revokes in the ledger, prints `ca_revocation_unrecorded` and exits 1
+       (never `ca_directory_exposed`); after renaming it back a rerun records
+       the revocation. Remove `capture_ca_directory` from the deployment
+       configuration: `--check` fails with `capture_ca_directory is required`.
+    g. Kill `sudo MAIN_CLI init ...` on a disposable deployment right after
+       the CA side committed (or simulate a lost reply), then rerun the same
+       `init`: the CA files are unchanged and only a listener certificate is
+       issued (`init recovered`); a further rerun reports `init already
+       complete`.
+    h. Migration (`server/docs/DEPLOYMENT.md`): on a copy of a pre-#109
        deployment, after the `chown`, `export-bundle` refuses
        `deployment_ca_certificate_missing` until `sudo MAIN_CLI rotate-listener`
        has run once; existing nodes keep connecting.

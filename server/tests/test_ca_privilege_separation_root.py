@@ -348,6 +348,35 @@ class TwoAccountSeparationTests(unittest.TestCase):
         self.assertIn("refused: issuer_unavailable", stderr)
         self.assertNotIn(b"Type APPROVE", approve.transcript)
 
+    def test_revoke_still_revokes_in_the_ledger_when_the_ca_directory_is_lost(self):
+        # Codex P1 (PR #177): a missing CA directory is not "exposed".
+        from app.audit.store import AuditStore
+        from app.cameras.remote_agent.pairing import HmacCodeVerifier, PairingLedger
+        database = Database(self.database)
+        ledger = PairingLedger(database, HmacCodeVerifier(os.urandom(32)),
+                               audit=AuditStore(database))
+
+        class Owner:
+            def require_owner(self, actor_context):
+                pass
+        key = ec.generate_private_key(ec.SECP256R1())
+        node = __import__("uuid").uuid4()
+        ledger.approve(Owner(), object(), node_id=node,
+                       public_key_digest=public_key_digest(key.public_key()))
+        for path in self.state.iterdir():
+            os.chown(path, SERVICE_ID, SERVICE_ID)
+        revoke = TtyCommand(self.cli("revoke", "--database", self.database, "--authority-dir",
+                                     self.root / "lost-ca", "--node", node, "--ca-user", "ca",
+                                     "--service-user", "svc"), self.environment)
+        revoke.wait_for(b"Type REVOKE")
+        revoke.type(b"REVOKE\n")
+        status_code, stdout, stderr = revoke.finish()
+        self.assertEqual((1, f"revoked: node_id={node}\n"), (status_code, stdout), stderr)
+        self.assertIn("ca_revocation_unrecorded", stderr)
+        self.assertNotIn("ca_directory_exposed", stderr)
+        states = {row.node_id: row.enrollment_state for row in ledger.pairing_summaries()}
+        self.assertEqual("revoked", states[node])
+
     def test_same_account_for_ca_and_service_is_refused(self):
         status, _stdout, stderr = self.run_cli(
             "init", "--authority-dir", self.authority, "--listener-dir", self.listener,

@@ -95,6 +95,13 @@ def _administrator_directory(directory: Path) -> None:
         raise ConfigurationError("deployment configuration is unavailable") from None
 
 
+class CaptureCaSettingMissing(ConfigurationError):
+    """``capture_ca_directory`` is absent; it must be a path or an explicit ``null``."""
+
+    REASON = ("capture_ca_directory is required: the capture-node CA directory path, "
+              "or null when this host keeps no capture-node CA")
+
+
 def _capture_ca_directory(value: object) -> Path:
     """The configured capture-node CA directory (Issue #109): an absolute path."""
     if not isinstance(value, str) or not value or "\0" in value:
@@ -220,6 +227,11 @@ class Deployment:
                                                 "capture_ca_directory"}
                 or type(value.get("service_uid")) is not int):
             raise ConfigurationError("invalid deployment configuration")
+        # Required (Owner decision 2026-10-07, Issue #109): every configuration
+        # states where the capture-node CA lives, or ``null`` for none, so the
+        # start-time check can never be skipped by omission.
+        if "capture_ca_directory" not in value:
+            raise CaptureCaSettingMissing("capture_ca_directory is required")
         uid = value["service_uid"]
         if uid <= 0:
             raise ConfigurationError("deployment configuration must name a non-root account")
@@ -297,8 +309,8 @@ class Deployment:
             )
         local_uvc = parse_local_uvc(value["local_uvc"]) if "local_uvc" in value else None
         detection = parse_detection(value["detection"]) if "detection" in value else None
-        capture_ca = (_capture_ca_directory(value["capture_ca_directory"])
-                      if "capture_ca_directory" in value else None)
+        capture_ca = (None if value["capture_ca_directory"] is None
+                      else _capture_ca_directory(value["capture_ca_directory"]))
         if capture_ca is not None and (capture_ca.is_relative_to(runtime_root)
                                        or any(capture_ca.is_relative_to(root) for root in roots)):
             raise ConfigurationError("capture CA directory must be outside runtime data and code")
@@ -329,6 +341,9 @@ def main(arguments: list[str] | None = None) -> int:
         if (deployment.capture_ca_directory is not None
                 and capture_ca_directory_accessible(deployment.capture_ca_directory)):
             raise ConfigurationError("service account can open the capture CA directory")
+    except CaptureCaSettingMissing:
+        parser.exit(1, "ServerSentinel deployment validation failed: "
+                       + CaptureCaSettingMissing.REASON + "\n")
     except ConfigurationError:
         parser.exit(1, "ServerSentinel deployment validation failed\n")
     if args.check:

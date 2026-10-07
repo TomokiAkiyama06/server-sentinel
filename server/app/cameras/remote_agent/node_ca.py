@@ -1271,6 +1271,14 @@ def write_listener_credential(target: PrivateDirectory, key, certificate_pem: by
     return MainServerCredential(certificate_path=certificate_path, key_path=key_path)
 
 
+def require_matching_public_certificate(target: PrivateDirectory,
+                                       ca_certificate_pem: bytes) -> None:
+    """Refuse an existing public CA copy that differs; never writes anything."""
+    existing = target.read_optional(_PUBLIC_CA_CERTIFICATE)
+    if existing is not None and not hmac.compare_digest(existing, ca_certificate_pem):
+        raise ListenerAuthorityMismatch("public CA copy is from another deployment CA")
+
+
 def publish_public_certificate(target: PrivateDirectory, ca_certificate_pem: bytes) -> bool:
     """Keep the public CA copy in the listener directory; return whether it was written.
 
@@ -1285,6 +1293,25 @@ def publish_public_certificate(target: PrivateDirectory, ca_certificate_pem: byt
         return False
     target.write_new(_PUBLIC_CA_CERTIFICATE, ca_certificate_pem)
     return True
+
+
+def complete_listener_credential(trust: "DeploymentTrust", target: PrivateDirectory, *,
+                                 server_name: str) -> x509.Certificate | None:
+    """The existing listener credential if it is this CA's for ``server_name``.
+
+    Used by ``init`` recovery (Issue #109): returns ``None`` for an empty
+    listener directory, the verified certificate (publishing a missing public
+    CA copy only after verification) for a complete matching credential, and
+    refuses anything else without changing it.
+    """
+    if not any(target.exists(name) for name in _LISTENER_NAMES):
+        return None
+    require_matching_public_certificate(target, trust.ca_certificate_pem())
+    certificate = trust.issued_listener_certificate(target)
+    if _single_server_name(certificate) != server_name:
+        raise CaptureAuthorityError("listener material already exists")
+    publish_public_certificate(target, trust.ca_certificate_pem())
+    return certificate
 
 
 def rotate_listener_credential(trust: DeploymentTrust, target: PrivateDirectory, *,
@@ -1324,13 +1351,17 @@ def rotate_listener_credential(trust: DeploymentTrust, target: PrivateDirectory,
     if target.exists(_CA_KEY) or target.exists(_CA_CERTIFICATE):
         raise CaptureAuthorityError("listener material must not share the CA directory")
     with target.locked():
-        # A copy from another CA is refused before anything changes; a
-        # missing one (listener written before Issue #109) is published.
-        publish_public_certificate(target, trust.ca_certificate_pem())
+        # A copy from another CA is refused before anything changes. A missing
+        # one (listener written before Issue #109) is published only after the
+        # current or recovered listener certificate verified against ``trust``,
+        # so a wrong --authority-dir never leaves a mismatched copy behind.
+        require_matching_public_certificate(target, trust.ca_certificate_pem())
         recovered = _recover_interrupted_rotation(trust, target)
         if recovered is not None:
+            publish_public_certificate(target, trust.ca_certificate_pem())
             return ListenerRotation(recovered.not_valid_after_utc, recovered=True)
         current = trust.issued_listener_certificate(target)
+        publish_public_certificate(target, trust.ca_certificate_pem())
         server_name = _single_server_name(current)
         trust.check_leaf_validity(validity)
         key, csr = new_listener_key()

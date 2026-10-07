@@ -196,8 +196,14 @@ class OsPrivileges:
             raise PrivilegeSeparationError("privilege_drop_failed")
 
     def require_ca_directory_closed(self, path: Path) -> None:
-        """After the drop the service account must not be able to open the CA directory."""
-        if ca_directory_accessible(path):
+        """After the drop the service account must not be able to open the CA directory.
+
+        A CA directory that does not exist (as seen by this unprivileged
+        process) holds no CA material to expose, so it is not refused here:
+        ``revoke`` must still revoke in the ledger when the CA directory was
+        lost (the CA child then reports it unavailable on its own).
+        """
+        if ca_directory_exposed(path):
             raise PrivilegeSeparationError("ca_directory_exposed")
 
 
@@ -223,6 +229,32 @@ def ca_directory_accessible(path: Path) -> bool:
     """
     from app.deployment import capture_ca_directory_accessible
     return capture_ca_directory_accessible(Path(path))
+
+
+def ca_directory_exposed(path: Path) -> bool:
+    """Whether CA material at ``path`` is reachable by this (dropped) process.
+
+    Unlike the launcher's ``ca_directory_accessible``, a missing directory is
+    not exposure: ``ENOENT``/``ENOTDIR`` -- the path or one of its parents
+    does not exist, which this process can only learn because it may search
+    every existing parent -- means there is nothing there to read. A
+    permission refusal is closed. Anything else (an openable directory or key,
+    a symbolic link, any other error) counts as exposed (fail closed).
+    """
+    import errno
+    for target, flags in ((Path(path), os.O_RDONLY | os.O_DIRECTORY),
+                          (Path(path) / _CA_KEY, os.O_RDONLY | os.O_NONBLOCK)):
+        try:
+            descriptor = os.open(target, flags | os.O_CLOEXEC | os.O_NOFOLLOW)
+        except PermissionError:
+            continue
+        except OSError as error:
+            if error.errno in (errno.ENOENT, errno.ENOTDIR):
+                continue
+            return True
+        os.close(descriptor)
+        return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -518,7 +550,9 @@ class CaIssuer:
         deployment = _uuid(message.get("deployment_id"))
         self._directory.ensure()
         self._resources.enter_context(self._directory.locked())
-        if any(self._directory.exists(name) for name in (_CA_KEY, _CA_CERTIFICATE, ISSUANCE_LOG)):
+        if any(self._directory.exists(name) for name in (_CA_KEY, _CA_CERTIFICATE)):
+            return self._initialize_existing(csr, server_name, server_validity)
+        if self._directory.exists(ISSUANCE_LOG):
             raise CaptureAuthorityError("issuer material already exists")
         self._provisional = True
         try:
@@ -535,6 +569,32 @@ class CaIssuer:
             raise
         self._authority = authority
         return {"status": "ok", "ca_certificate": authority.ca_certificate_pem().decode("ascii"),
+                "certificate": _certificate_pem(certificate).decode("ascii"),
+                "deployment_id": str(deployment)}
+
+    def _initialize_existing(self, csr: bytes, server_name: str, server_validity) -> dict:
+        """Recover an ``init`` whose CA already exists (Issue #109).
+
+        For example the ``commit`` reply was lost, or the run stopped after
+        the CA was committed, so the listener side removed its files. The CA
+        is never replaced or removed: it must load and validate as a whole,
+        and only a new listener leaf is signed for it -- for the same server
+        name as the last listener this log recorded, if any. The caller sends
+        this only for an empty listener directory.
+        """
+        deployment = deployment_id_of(self._directory)
+        authority = DeploymentAuthority.load(self._directory, deployment, clock=self._clock)
+        recorded = [record.get("server_name") for record in self._log.records()
+                    if record["type"] == "listener"]
+        if recorded and recorded[-1] != server_name:
+            raise IssuerRefusedRequest("server name differs from the recorded listener")
+        certificate = authority.sign_listener_request(csr, server_name=server_name,
+                                                      validity=server_validity)
+        self._record_listener(certificate)
+        self._authority = authority
+        self.done = True
+        return {"status": "ok", "existing": True,
+                "ca_certificate": authority.ca_certificate_pem().decode("ascii"),
                 "certificate": _certificate_pem(certificate).decode("ascii"),
                 "deployment_id": str(deployment)}
 

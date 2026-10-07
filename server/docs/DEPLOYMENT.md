@@ -71,9 +71,20 @@ defaults):
   "service_uid": 991,
   "human_host": "127.0.0.1",
   "human_port": 880,
-  "log_level": "INFO"
+  "log_level": "INFO",
+  "capture_ca_directory": null
 }
 ```
+
+`capture_ca_directory` is required (Owner decision 2026-10-07, Issue #109):
+it is either the absolute path of the capture-node CA directory on this host
+or an explicit `null` when this host keeps no capture-node CA. A configuration
+without the key is refused by the launcher and `--check` with
+`ServerSentinel deployment validation failed: capture_ca_directory is required
+...`. An explicit `null` was chosen over a separate `capture_enabled` flag so
+there is a single key and no contradictory combination (a flag set to false
+next to a path); omission can never silently skip the start-time check
+described under "Capture-node CA and Main listener certificate".
 
 `runtime_filesystem_uuid` is the Owner-approved filesystem UUID, resolved
 through `/dev/disk/by-uuid`. It is the stable runtime-filesystem identity:
@@ -407,8 +418,11 @@ enters them again through the audited Owner path.
 
 ### Capture-node CA and Main listener certificate
 
-The local pairing CLI (`serversentinel-pairing`, that is
-`python -m app.cameras.remote_agent.pairing_cli`, see
+The local pairing CLI (`serversentinel-pairing` below; until the installer
+ships that wrapper (#180) run it with the installed release's interpreter,
+for example `sudo /opt/server-sentinel-main/current/venv/bin/python -I -m
+app.cameras.remote_agent.pairing_cli approve ...`, as for
+`app.lifecycle_inventory` below; see
 `server/app/cameras/remote_agent/README.md`) keeps the deployment CA key and
 the Main capture listener credential in two different owner-only directories
 owned by two different accounts, both outside the checkout and media trees.
@@ -475,9 +489,9 @@ final owner and no ownership change or capability is needed (the former
 `--listener-owner` option is gone). `export-bundle` and `list` need no root:
 they read only public material and the database.
 
-**Refusing to start with an exposed CA.** Add the CA directory to the
-deployment configuration so the service checks it at every start (and in
-`--check`):
+**Refusing to start with an exposed CA.** The required
+`capture_ca_directory` setting names the CA directory on a host that keeps
+one, so the service checks it at every start (and in `--check`):
 
 ```json
 "capture_ca_directory": "/var/lib/serversentinel-ca"
@@ -486,10 +500,26 @@ deployment configuration so the service checks it at every start (and in
 The launcher then refuses to start when the service account can open that
 directory or its key file, and also when the path does not exist (the check
 would otherwise prove nothing). It must be an absolute path outside the
-runtime root and the code trees.
+runtime root and the code trees. Use `null` only on a host that keeps no
+capture-node CA.
+
+**Repeating or recovering `init`.** `init` is idempotent for the same server
+name and never removes or replaces CA material. If the CA already exists --
+for example the CA side committed but its reply was lost, so the listener
+side removed its files -- a rerun with an empty listener directory keeps the
+CA and issues only a new listener certificate for the server name the CA log
+recorded (`init recovered` on stderr; another name refuses
+`issuer_refused_request`). If the listener directory already holds that CA's
+complete credential for that name, the rerun changes nothing (`init already
+complete`). A listener directory of another CA refuses
+`listener_authority_mismatch`. `rotate-listener` publishes a missing public
+CA copy only after the current (or recovered) listener certificate verified
+against the CA, so a wrong `--authority-dir` changes nothing.
 
 **Revocation is also recorded at the CA.** `revoke` revokes the node in the
-ledger first (admission stops at once) and then appends a `node_revocation`
+ledger first (admission stops at once) -- also when the CA directory is lost
+or missing, which the dropped command does not treat as exposed -- and then
+appends a `node_revocation`
 record to the CA issuance log, so the CA side refuses that node and its keys
 from then on. If the CA record cannot be written, the ledger revocation still
 stands, the command prints `ca_revocation_unrecorded` and exits 1; rerun the
@@ -509,8 +539,10 @@ incomplete line.
 
 **Migrating a deployment initialised before Issue #109.** Earlier releases
 put the CA directory under root (or the CLI account) and had no public CA
-copy or issuance log. With the service stopped: create `serversentinel-ca` as
-above, `chown -R serversentinel-ca:serversentinel-ca <ca_dir>` and keep the
+copy or issuance log. With the service stopped: add `"capture_ca_directory"`
+(the CA directory path, or `null` on a host without a capture CA) to the
+deployment configuration, which this release requires; create
+`serversentinel-ca` as above, `chown -R serversentinel-ca:serversentinel-ca <ca_dir>` and keep the
 modes `0700`/`0600`; make sure the listener directory and its files belong to
 the service account; then run `sudo serversentinel-pairing rotate-listener`
 once, which writes the public CA copy into the listener directory (until then

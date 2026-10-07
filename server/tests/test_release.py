@@ -113,7 +113,7 @@ class ReleaseLifecycleTests(unittest.TestCase):
             "runtime_root": str(self.runtime),
             "runtime_mount_point": str(self.root),
             "runtime_device": [os.major(device), os.minor(device)],
-            "runtime_filesystem_uuid": self.filesystem_uuid,
+            "runtime_filesystem_uuid": self.filesystem_uuid, "capture_ca_directory": None,
             "service_uid": self.uid,
             "human_host": "127.0.0.1",
             "human_port": 8000,
@@ -927,7 +927,7 @@ class DeploymentConfigurationTests(unittest.TestCase):
                 "runtime_root": str(runtime), "service_uid": os.geteuid(),
                 "runtime_mount_point": str(root),
                 "runtime_device": [os.major(device), os.minor(device)],
-                "runtime_filesystem_uuid": uuid,
+                "runtime_filesystem_uuid": uuid, "capture_ca_directory": None,
                 "human_host": "127.0.0.1", "human_port": 8000, "log_level": "INFO",
             }
 
@@ -1031,7 +1031,7 @@ class DeploymentConfigurationTests(unittest.TestCase):
                 "runtime_root": str(root / "runtime"), "service_uid": os.geteuid(),
                 "runtime_mount_point": str(root),
                 "runtime_device": [os.major(device), os.minor(device)],
-                "runtime_filesystem_uuid": "00000000-1111-2222-3333-444444444444",
+                "runtime_filesystem_uuid": "00000000-1111-2222-3333-444444444444", "capture_ca_directory": None,
                 "human_host": "127.0.0.1", "human_port": 8000, "log_level": "INFO",
             }))
             config.chmod(0o644)
@@ -1050,7 +1050,7 @@ class DeploymentConfigurationTests(unittest.TestCase):
                 "runtime_root": str(runtime), "service_uid": os.geteuid(),
                 "runtime_mount_point": str(root),
                 "runtime_device": [os.major(device), os.minor(device)],
-                "runtime_filesystem_uuid": "00000000-1111-2222-3333-444444444444",
+                "runtime_filesystem_uuid": "00000000-1111-2222-3333-444444444444", "capture_ca_directory": None,
                 "human_host": "127.0.0.1", "human_port": 8000, "log_level": "INFO",
             }
             (root / "code").mkdir()

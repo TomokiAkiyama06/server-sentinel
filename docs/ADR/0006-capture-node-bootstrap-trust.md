@@ -577,6 +577,16 @@ unchanged.
   `CAP_DAC_OVERRIDE` requirement of the 2026-10-05 notes (#149 no longer
   applies to the CLI). A public CA copy is kept in the listener directory so
   `export-bundle` runs as the service account with public material only.
+- **Review follow-ups (2026-10-07).** `capture_ca_directory` is a required
+  deployment setting (a path, or an explicit `null` without a capture CA). A
+  missing CA directory is not "exposed" for the dropped CLI, so `revoke`
+  keeps working on the ledger when the CA directory is lost. `init` is
+  idempotent and recovers a lost `commit` reply by keeping the existing CA
+  and issuing only a listener leaf; CA material is never removed. A public CA
+  copy is published only after the listener certificate verified. Known
+  limitation: the issuance log has no hash chain (deferred by the Owner);
+  only the CA account or root can modify it. The `serversentinel-pairing`
+  wrapper is #180.
 - **Still open (PR2).** Automatic renewal still has only an in-process
   signing primitive, used by tests and called by nothing in the application;
   wiring renewal into the ingest listener waits for the socket-activated,

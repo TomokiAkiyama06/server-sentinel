@@ -117,6 +117,7 @@ from .node_ca import (
     MAX_LEAF_VALIDITY, AuthorityValidityExceeded, CaptureAuthorityError, DeploymentTrust,
     PrivateDirectory, _certificate_pem, listener_material, main_server_name,
     main_server_not_after, new_listener_key, public_key_digest, publish_public_certificate,
+    complete_listener_credential,
     require_empty_listener_directory, rotate_listener_credential, valid_server_name,
     write_listener_credential,
 )
@@ -664,6 +665,16 @@ def _days(value: int, maximum: datetime.timedelta) -> datetime.timedelta:
 
 
 def command_init(args) -> int:
+    """Create the CA and the listener credential, or complete an earlier ``init``.
+
+    Recovery (Issue #109): ``init`` is idempotent for the same server name.
+    If the CA already exists -- for example the ``commit`` reply was lost, so
+    this side removed its listener files although the CA stayed -- the CA is
+    kept and only a new listener leaf is signed into the empty listener
+    directory. If the listener directory already holds a complete credential
+    of that CA for that name, nothing is signed and the run reports the
+    existing deployment. CA material is never removed or replaced here.
+    """
     ca_validity = _days(args.ca_validity_days, MAX_CA_VALIDITY)
     server_validity = _days(args.server_validity_days, MAX_LEAF_VALIDITY)
     # Everything is validated before the write-once CA exists; a failed run
@@ -679,51 +690,85 @@ def command_init(args) -> int:
         separation.drop()
         listener = _directory(args.listener_dir).ensure()
         with listener.locked():
+            if listener.exists("ca-key.pem") or listener.exists("ca-certificate.pem"):
+                raise CaptureAuthorityError("listener material must not share the CA directory")
+            if any(listener.exists(name) for name in _LISTENER_FILES):
+                # Only an already completed init of this CA and name is accepted.
+                trust = separation.hello()
+                certificate = complete_listener_credential(trust, listener,
+                                                           server_name=args.server_name)
+                if certificate is None:
+                    raise CaptureAuthorityError("listener material already exists")
+                print("serversentinel-pairing: init already complete; nothing changed",
+                      file=sys.stderr)
+                print(f"deployment_id={trust.deployment_id}")
+                _report_trust_expiry(trust, listener_not_after=certificate.not_valid_after_utc)
+                return 0
             require_empty_listener_directory(listener)
-            # The listener key is generated here, as the service account; the
-            # CA child only signs its CSR (Issue #109).
-            key, csr = new_listener_key()
-            try:
-                reply = checked_reply(separation.issuer, {
-                    "op": "initialize", "deployment_id": str(deployment),
-                    "csr": csr.decode("ascii"), "server_name": args.server_name,
-                    "ca_validity_days": args.ca_validity_days,
-                    "server_validity_days": args.server_validity_days})
-            except CaptureAuthorityError as error:
-                if error.reason == "issuer_unavailable":
-                    raise _issuer_refusal(error) from None
-                raise
-            try:
-                trust = DeploymentTrust.from_certificate_pem(
-                    reply["ca_certificate"].encode("ascii"), deployment_id=deployment)
-                certificate = trust.verify_issued_listener_certificate(
-                    reply["certificate"].encode("ascii"), server_name=args.server_name,
-                    public_key_digest_value=public_key_digest(key.public_key()))
-            except (KeyError, AttributeError, UnicodeError, CaptureAuthorityError):
-                _abort_initialize(separation)
-                raise CliRefused("issuer_unavailable") from None
-            try:
-                credential = write_listener_credential(listener, key,
-                                                       _certificate_pem(certificate),
-                                                       trust.ca_certificate_pem())
-            except BaseException:
-                _abort_initialize(separation)
-                raise
-            try:
-                checked_reply(separation.issuer, {"op": "commit"})
-            except CaptureAuthorityError as error:
-                # The CA child removes its provisional CA when it is not
-                # committed; remove the listener side too, so a rerun works.
-                for name in (credential.key_path.name, credential.certificate_path.name,
-                             "deployment-ca-certificate.pem"):
-                    try:
-                        listener.discard_created(name)
-                    except CaptureAuthorityError:
-                        pass
-                raise _issuer_refusal(error) from None
-    print(f"deployment_id={deployment}")
+            trust, certificate = _initialize_listener(separation, listener, args, deployment)
+    print(f"deployment_id={trust.deployment_id}")
     _report_trust_expiry(trust, listener_not_after=certificate.not_valid_after_utc)
     return 0
+
+
+_LISTENER_FILES = ("main-server-key.pem", "main-server-certificate.pem",
+                   "deployment-ca-certificate.pem")
+
+
+def _initialize_listener(separation: "_Separation", listener: PrivateDirectory, args,
+                         deployment: UUID):
+    # The listener key is generated here, as the service account; the CA
+    # child only signs its CSR (Issue #109).
+    key, csr = new_listener_key()
+    try:
+        reply = checked_reply(separation.issuer, {
+            "op": "initialize", "deployment_id": str(deployment),
+            "csr": csr.decode("ascii"), "server_name": args.server_name,
+            "ca_validity_days": args.ca_validity_days,
+            "server_validity_days": args.server_validity_days})
+    except CaptureAuthorityError as error:
+        if error.reason == "issuer_unavailable":
+            raise _issuer_refusal(error) from None
+        raise
+    existing = reply.get("existing") is True
+    try:
+        trust = DeploymentTrust.from_certificate_pem(
+            reply["ca_certificate"].encode("ascii"),
+            deployment_id=UUID(reply["deployment_id"]) if existing else deployment)
+        certificate = trust.verify_issued_listener_certificate(
+            reply["certificate"].encode("ascii"), server_name=args.server_name,
+            public_key_digest_value=public_key_digest(key.public_key()))
+    except (KeyError, AttributeError, TypeError, ValueError, UnicodeError,
+            CaptureAuthorityError):
+        if not existing:
+            _abort_initialize(separation)
+        raise CliRefused("issuer_unavailable") from None
+    try:
+        credential = write_listener_credential(listener, key, _certificate_pem(certificate),
+                                               trust.ca_certificate_pem())
+    except BaseException:
+        if not existing:
+            _abort_initialize(separation)
+        raise
+    if existing:
+        # The CA was already committed; only the listener side was missing.
+        print("serversentinel-pairing: init recovered: the existing deployment CA was kept "
+              "and a new listener certificate was issued", file=sys.stderr)
+        return trust, certificate
+    try:
+        checked_reply(separation.issuer, {"op": "commit"})
+    except CaptureAuthorityError as error:
+        # The commit may or may not have taken effect at the CA side. Remove
+        # the listener side either way: a rerun then either initializes from
+        # scratch (CA discarded) or recovers with the kept CA (CA committed).
+        for name in (credential.key_path.name, credential.certificate_path.name,
+                     "deployment-ca-certificate.pem"):
+            try:
+                listener.discard_created(name)
+            except CaptureAuthorityError:
+                pass
+        raise _issuer_refusal(error) from None
+    return trust, certificate
 
 
 def _abort_initialize(separation: _Separation) -> None:
