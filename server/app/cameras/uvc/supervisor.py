@@ -125,12 +125,16 @@ class LocalUvcSupervisor:
     def _watch(self):
         while not self._watchdog_stop.wait(self._watchdog_interval):
             # A requested stop is not an exit: a worker blocked in a kernel
-            # call past a timed-out stop() stays registered, and its source
-            # is still reported by that worker's last state. Keep checking
-            # it until the thread has actually exited or was removed.
+            # call past a timed-out stop() or close() stays registered, and
+            # its source is still reported by that worker's last state. Keep
+            # checking it until the thread has actually exited or was removed.
             with self._lock:
                 sources = [(source_id, worker) for source_id, worker in self._workers.items()
                            if worker.thread is not None and worker.thread.is_alive()]
+                if self._closed and not sources:
+                    # close() left this watchdog running for workers that
+                    # outlived its join bound; all of them have now exited.
+                    return
             for source_id, worker in sources:
                 if self._watchdog_stop.is_set():
                     return
@@ -215,22 +219,23 @@ class LocalUvcSupervisor:
         return True
 
     def close(self):
-        """Stop all sources within one total join deadline."""
+        """Stop all sources within one total join deadline.
+
+        The watchdog keeps running until every worker has been joined. A
+        worker blocked in a kernel call past the deadline stays registered
+        and watched, so its source cannot keep an ``online`` claim while it
+        delivers no frames; the watchdog exits on its own once such workers
+        have exited, or a later ``close()`` that joins them stops it.
+        """
         with self._lock:
             if self._closed and not self._workers:
                 return
             self._closed = True
-            self._watchdog_stop.set()
             watchdog = self._watchdog
             workers = tuple(self._workers.items())
             for _source_id, worker in workers:
                 worker.stop.set()
         deadline = self._clock() + self._join_timeout
-        if watchdog is not None:
-            # The watchdog only ever lowers a health claim under the source's
-            # transition lock, so a check still finishing a storage write after
-            # this bound cannot race capture cleanup into a wrong state.
-            watchdog.join(max(0.0, deadline - self._clock()))
         for _source_id, worker in workers:
             remaining = max(0.0, deadline - self._clock())
             worker.thread.join(remaining)
@@ -242,6 +247,14 @@ class LocalUvcSupervisor:
             for source_id, worker in workers:
                 if not worker.thread.is_alive():
                     self._workers.pop(source_id, None)
+            if not alive:
+                # Only now is no source left that the watchdog must report.
+                self._watchdog_stop.set()
+        if not alive and watchdog is not None:
+            # The watchdog only ever lowers a health claim under the source's
+            # transition lock, so a check still finishing a storage write after
+            # this bound cannot race capture cleanup into a wrong state.
+            watchdog.join(max(0.0, deadline - self._clock()))
         if alive:
             raise WorkerStopError("local UVC workers did not stop")
         if cleanup_failed:

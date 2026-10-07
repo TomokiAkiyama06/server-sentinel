@@ -315,6 +315,68 @@ class FrameProgressWatchdogTests(unittest.TestCase):
         time.sleep(0.05)
         self.assertEqual(count, self.adapter.checked)
 
+    def test_close_keeps_watching_a_worker_that_did_not_stop(self):
+        # Issue #122: close() must not stop the watchdog before the workers
+        # are joined. A worker blocked in a kernel call past the join bound
+        # stays registered and must remain watched, or its source keeps an
+        # online claim although it delivers no frames.
+        supervisor = LocalUvcSupervisor(
+            self.adapter, poll_timeout=5.0, retry_delay=0.01, join_timeout=0.05,
+            watchdog_interval=0.01,
+        )
+        self.addCleanup(self._close_other, supervisor)
+        source = uuid4()
+        self.adapter.prepare(source)
+        supervisor.start(source)
+        self.assertTrue(self.adapter.entered[source].wait(0.5))
+        with self.assertRaisesRegex(WorkerStopError, "did not stop"):
+            supervisor.close()
+        self.assertTrue(supervisor.status(source).running)
+        self.assertTrue(supervisor.watchdog_running)
+        count = self.adapter.checked.get(source, 0)
+        self.assertTrue(wait_until(lambda: self.adapter.checked.get(source, 0) >= count + 3))
+        # A closed supervisor never starts another worker.
+        with self.assertRaisesRegex(WorkerStopError, "closed"):
+            supervisor.start(uuid4())
+        # Once the blocked call returns, the worker exits and the watchdog
+        # exits on its own: nothing is left that it must report.
+        self.adapter.release[source].set()
+        self.assertTrue(wait_until(lambda: not supervisor.status(source).running))
+        self.assertTrue(wait_until(lambda: not supervisor.watchdog_running))
+        # A repeated close joins the exited worker and succeeds.
+        supervisor.close()
+        self.assertIsNone(supervisor.status(source))
+        self.assertEqual([source], self.adapter.stopped)
+
+    def test_repeated_close_stops_the_watchdog_after_joining(self):
+        supervisor = LocalUvcSupervisor(
+            self.adapter, poll_timeout=5.0, retry_delay=0.01, join_timeout=0.05,
+            watchdog_interval=0.01,
+        )
+        self.addCleanup(self._close_other, supervisor)
+        source = uuid4()
+        self.adapter.prepare(source)
+        supervisor.start(source)
+        self.assertTrue(self.adapter.entered[source].wait(0.5))
+        with self.assertRaises(WorkerStopError):
+            supervisor.close()
+        with self.assertRaises(WorkerStopError):
+            supervisor.close()
+        # Still blocked after the second timed-out close: still watched.
+        self.assertTrue(supervisor.watchdog_running)
+        self.adapter.release[source].set()
+        self.assertTrue(wait_until(lambda: not supervisor.status(source).running))
+        supervisor.close()
+        self.assertTrue(wait_until(lambda: not supervisor.watchdog_running))
+
+    def _close_other(self, supervisor):
+        for release in self.adapter.release.values():
+            release.set()
+        try:
+            supervisor.close()
+        except WorkerStopError:
+            pass
+
     def test_adapter_without_check_starts_no_watchdog(self):
         supervisor = LocalUvcSupervisor(SyntheticAdapter(), watchdog_interval=0.01)
         source = uuid4()

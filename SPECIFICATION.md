@@ -279,7 +279,10 @@ and past `frame_stall_reopen_seconds` it reports `offline`
 closes or rebinds a device itself, and the worker closes and reopens through
 the identity path when it returns (a frame it returns with is discarded). The
 stall age is re-checked under the transition lock, so a frame delivered after
-the watchdog's snapshot is never overwritten. A transient stall keeps the
+the watchdog's snapshot is never overwritten. The watchdog keeps checking a
+worker whose stop or supervisor shutdown timed out until that worker's thread
+exits, so a worker still blocked after a failed runtime stop is not left
+`online`. A transient stall keeps the
 recorded negotiated profile. Health writes are coalesced per source and run
 outside the transition lock; while a newer state is not yet durable the source
 is reported unpersisted.

@@ -79,7 +79,10 @@ after presence discovery before starting another read; a frame it returns with
 is discarded. The watchdog never opens, closes or rebinds a device
 itself. A requested stop does not end its checks: a worker still blocked after
 a timed-out stop (for example when a reapproval is refused because the worker
-could not stop) stays checked until its thread actually exits. It takes the controller's transition lock non-blockingly and re-checks
+could not stop, or a runtime stop whose supervisor `close()` timed out) stays
+checked until its thread actually exits; `close()` stops the watchdog only
+after every worker has been joined, and otherwise leaves it running until
+those workers exit. It takes the controller's transition lock non-blockingly and re-checks
 the frame age under it, so a frame delivered after its snapshot wins. That lock
 covers in-memory work only: transitions, the negotiated profile and
 `last_seen_at` stage their values in transition order, and the runtime records

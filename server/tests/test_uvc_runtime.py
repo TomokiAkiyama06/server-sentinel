@@ -542,6 +542,41 @@ class RuntimeLifecycleTests(RuntimeFixture):
                                              for capture in self.captures.instances)))
         self.assertTrue(wait_for(lambda: self.health(source.id) is SourceHealthState.OFFLINE))
 
+    def test_worker_blocked_through_a_timed_out_stop_is_not_left_online(self):
+        # Issue #122: runtime.stop() closes the supervisor. When the worker is
+        # blocked in a kernel call past the join bound, the worker and adapter
+        # are left alive; the watchdog must keep running so the stalled source
+        # leaves online in memory and in the registry.
+        source = self.source()
+        runtime = LocalUvcRuntime(
+            LocalUvcConfiguration((source.id,), poll_timeout_seconds=0.05,
+                                  retry_delay_seconds=0.05, join_timeout_seconds=0.1,
+                                  frame_stall_seconds=0.25,
+                                  frame_stall_reopen_seconds=30.0),
+            self.registry, on_frame=self.on_frame, discovery=self.discovery,
+            capture_factory=self.captures,
+        )
+        runtime.start()
+        runtime.reapprove(self.admin, "synthetic-owner", source.id, self.camera)
+        self.assertTrue(self.wait_health(source.id, SourceHealthState.ONLINE))
+        block = threading.Event()
+        self.addCleanup(block.set)
+        self.captures.block = block
+        self.assertTrue(self.captures.blocked.wait(5))
+        # The join bound (0.1 s) is shorter than the stall window (0.25 s), so
+        # the stall is reported only if the watchdog outlives the stop.
+        status = runtime.stop()
+        self.assertIs(status.state, LocalUvcRuntimeState.STOP_FAILED)
+        self.assertTrue(wait_for(
+            lambda: runtime.status().sources[0].camera_state is not CameraState.ONLINE, 3))
+        self.assertTrue(wait_for(
+            lambda: self.health(source.id) is not SourceHealthState.ONLINE, 3))
+        self.captures.block = None
+        block.set()
+        self.assertTrue(wait_for(lambda: all(capture.closed
+                                             for capture in self.captures.instances)))
+        self.assertTrue(wait_for(lambda: self.health(source.id) is SourceHealthState.OFFLINE))
+
     def test_hung_stall_write_does_not_stop_the_watchdog_for_other_sources(self):
         second_camera = DeviceEvidence("/dev/video2", "synthetic", "model", "serial-b")
         self.discovery.devices = [self.camera, second_camera]
