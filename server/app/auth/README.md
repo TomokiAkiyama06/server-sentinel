@@ -191,7 +191,11 @@ following closes it:
   an inode, no `own_sockets`, an unresolved creator, or a port at or above
   `ip_unprivileged_port_start` (a configuration error: for example the backend
   was not socket-activated and bound the port itself; the creator is then not
-  compared) counts as `LISTENER_OWNER_UNVERIFIED` (closed, no revocation);
+  compared) counts as `LISTENER_OWNER_UNVERIFIED` (closed, no revocation). An
+  upstream created in `/init.scope` by uid 0 (systemd listened from PID 1
+  because the host has no cgroup-BPF support, Issue #157) has its own reason,
+  `UPSTREAM_CREATED_IN_INIT_SCOPE`, also closed without revocation; PID 1's
+  `/init.scope` is never accepted as the socket unit;
 - a recorded proxy socket that is absent (`PROXY_LISTENER_MISSING`). This is
   proxy drift or failure with nothing else seen answering, so, like a
   resolution failure, it closes access without revocation and reopens once
@@ -242,7 +246,17 @@ access open before the check closed it shares no lock with the check and can
 commit after the immediate revocation, so only the marker makes a restart (after
 the exposure has gone but before the clean check) revoke that session before
 reopening. If the marker never commits before such a restart, that session can
-survive; the delivered Owner fault is then the only record.
+survive; the delivered Owner fault is then the only record. Two cases do not
+revoke twice. A fallback revocation that commits in the same check that
+reopens access, while access has never been open in this process (a clean
+startup, for example with an unreadable marker), already is the reopening
+revocation: no request can have seen access open and committed a session
+after it (Issue #145). A fallback from an earlier check, or one after access
+has been open in this process, does not count, and reopening revokes again.
+And once the marker is known to be stored for the closed period (written in
+this period, or read as pending at startup), a failed rewrite neither revokes
+nor counts as a marker failure (Issue #144): the stored marker already
+carries the requirement across a restart.
 A check without a revoker never opens access, before or after any exposure,
 and keeps `SESSION_REVOCATION_UNAVAILABLE`: nothing durable could carry a
 revocation requirement across a restart, so a restart after an exposure must
@@ -313,10 +327,13 @@ WireGuard UDP socket) has no creator to look up and stays unverified, so
 human access stays closed while one is on a covered port even with an
 exception. For the human upstream, another unit process holding the socket is
 an exposure only when the same process (pid and start time) still holds it in
-a second scan about 100 ms later: a child between `fork` and `exec` (for
-example a `subprocess` with `close_fds=True`) briefly holds every descriptor,
-because close-on-exec acts only at `exec`. Seen once only, or a process that
-is unreadable in one scan, is unverified. Unverified closes access
+a second scan about 100 ms later and, in that scan, runs an executable
+(`/proc/<pid>/exe`) other than the backend's own (Issue #160): a child between
+`fork` and `exec` (for example a `subprocess` with `close_fds=True`) holds
+every descriptor, because close-on-exec acts only at `exec`, and on a loaded
+host it can stay there longer than the gap between the scans. Seen once only,
+a holder still running the backend's executable or whose executable cannot be
+read, or a process that is unreadable in one scan, is unverified. Unverified closes access
 without revocation and reopens once the creator verifies again (Owner
 decisions, 2026-10-05 and 2026-10-07). The resolver is mandatory: without
 `socket_owners` access never opens.

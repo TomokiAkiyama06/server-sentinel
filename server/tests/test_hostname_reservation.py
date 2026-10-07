@@ -17,7 +17,7 @@ from app.audit import (
 )
 from app.audit.integration import RESERVATION_LISTENER_EXCEPTIONS_ID, ReservationAdministration
 from app.auth.reservation import (
-    DAILY_SECONDS, AddressFamily, CheckKind, GetaddrinfoResolver, OwnSocketInodes, ProcessIdentity,
+    DAILY_SECONDS, EXPOSURE_REASONS, AddressFamily, CheckKind, GetaddrinfoResolver, OwnSocketInodes, ProcessIdentity,
     SocketCreator, HostnameReservationCheck, IsolationMode, Listener, ListenerException,
     UPSTREAM_SOCKET_UNIT, read_unprivileged_port_start, unit_from_cgroup,
     RETRY_WHILE_CLOSED_SECONDS, ProcNetListeners, ProxyRoute, Reason, ReservationConfig,
@@ -166,6 +166,10 @@ class FakeRevoker:
             raise OSError("synthetic revocation failure")
         self.pending = False
         self.revocations += 1
+
+
+def failing_marker():
+    raise OSError("synthetic marker failure")
 
 
 class Resolver:
@@ -1485,6 +1489,82 @@ class SessionRevocationTests(ExceptionFixture):
         self.assertEqual(attempts, {"marker": 6, "revoke": 3})
         self.assertEqual(revoker.revocations, 1)
 
+    def test_clean_startup_fallback_revocation_is_not_repeated_to_reopen(self):
+        # Issue #145: the marker is unreadable at startup, the check passes,
+        # the marker write fails and the fallback revocation commits. Access
+        # has never been open in this process, so that revocation already
+        # satisfies reopening: one revocation and one audit record.
+        self.session("viewer@example.invalid", b"v" * 32)
+        with closing(self.database.connect()) as connection:
+            connection.execute("INSERT INTO application_metadata VALUES (?, 'corrupt')", (REVOCATION_PENDING_KEY,))
+            connection.commit()
+        with patch.object(self.revoker, "record_exposure", side_effect=OSError("synthetic marker failure")):
+            check, *_ = checker(exception_store=self.exception_store, session_revoker=self.revoker)
+            self.assertTrue(check.startup().open)
+        self.assertEqual(len(self.revocation_records()), 1)
+        self.assertIsNone(self.marker())
+        with self.assertRaises(AccessValidationError):
+            self.access.authorize(b"v" * 32, "viewer@example.invalid", Permission.LIVE_VIEW)
+
+    def test_fallback_in_the_reopening_check_still_revokes_after_access_was_open(self):
+        # PR #134 kept: once access has been open in this process, a request
+        # that saw it open may commit a session after the fallback revocation,
+        # so reopening revokes again even when the fallback ran in that check.
+        revoker = FakeRevoker(fail=True)
+        revoker.record_exposure = failing_marker
+        clock = Clock()
+        check, files, _, _ = checker(session_revoker=revoker, clock=clock)
+        self.assertTrue(check.startup().open)
+        files.files["tcp"] = self.EXTRA
+        clock.value += DAILY_SECONDS
+        self.assertEqual(check.tick().reasons, (Reason.UNEXPECTED_LISTENER, Reason.SESSION_REVOCATION_FAILED))
+        files.files["tcp"] = proc(("127.0.0.1", 8080, "0A"))
+        revoker.fail = False
+        clock.value += RETRY_WHILE_CLOSED_SECONDS
+        self.assertTrue(check.tick().open)
+        self.assertEqual(revoker.revocations, 2)
+
+    def test_fallback_in_an_earlier_closed_check_is_not_reused_to_reopen(self):
+        # Only the check in which the fallback committed may count it: a later
+        # check reopens with its own revocation (PR #134).
+        revoker = FakeRevoker()
+        revoker.record_exposure = failing_marker
+        check, files, _, _ = checker(session_revoker=revoker, files=Files(tcp=self.EXTRA))
+        self.assertEqual(check.startup().reasons, (Reason.UNEXPECTED_LISTENER,))
+        self.assertEqual(revoker.revocations, 1)
+        files.files["tcp"] = proc(("127.0.0.1", 8080, "0A"))
+        self.assertTrue(check._check(CheckKind.RETRY).open)
+        self.assertEqual(revoker.revocations, 2)
+
+    def test_stored_marker_rewrite_failure_does_not_fall_back_to_revocation(self):
+        # Issue #144: the marker is already stored for this closed period; a
+        # transient failure to rewrite it must not revoke every session now.
+        revoker = FakeRevoker()
+        marker = {"fail": False, "attempts": 0}
+
+        def record():
+            marker["attempts"] += 1
+            if marker["fail"]:
+                raise OSError("synthetic marker failure")
+            revoker.pending = True
+
+        revoker.record_exposure = record
+        check, _, _, _ = checker(session_revoker=revoker, files=Files(tcp=self.EXTRA))
+        self.assertEqual(check.startup().reasons, (Reason.UNEXPECTED_LISTENER,))
+        self.assertTrue(revoker.pending)
+        marker["fail"] = True
+        for _ in range(3):
+            self.assertEqual(check._check(CheckKind.RETRY).reasons, (Reason.UNEXPECTED_LISTENER,))
+        self.assertEqual((marker["attempts"], revoker.revocations, revoker.pending), (4, 0, True))
+        # After a restart, a marker read as stored counts as recorded too.
+        restarted, restarted_files, _, _ = checker(session_revoker=revoker, files=Files(tcp=self.EXTRA))
+        self.assertEqual(restarted.startup().reasons, (Reason.UNEXPECTED_LISTENER,))
+        self.assertEqual((revoker.revocations, revoker.pending), (0, True))
+        # Reopening still revokes once.
+        restarted_files.files["tcp"] = proc(("127.0.0.1", 8080, "0A"))
+        self.assertTrue(restarted._check(CheckKind.RETRY).open)
+        self.assertEqual((revoker.revocations, revoker.pending), (1, False))
+
     def test_outage_enrollment_survives_retries_after_fallback_revocation(self):
         self.session("viewer@example.invalid", b"v" * 32)
         revoker = ReservationSessionRevocation(self.access)
@@ -2078,7 +2158,14 @@ class HumanListenerOwnershipTests(TestCase):
             (dict(owners={1000: other}), unexpected),
             (dict(owners={1000: SocketCreator(None, 991)}), unexpected),
             (dict(owners={1000: SocketCreator(None, 0)}), unverified),
-            (dict(owners={1000: SocketCreator("/init.scope", 0)}), unverified),
+            # Issue #157: PID 1 created the upstream (no cgroup-BPF support):
+            # its own reason, still closed without revocation.
+            (dict(owners={1000: SocketCreator("/init.scope", 0)}), (Reason.UPSTREAM_CREATED_IN_INIT_SCOPE,)),
+            (dict(owners={1000: SocketCreator("/init.scope", 0)}, sole_holders={}),
+             unverified + (Reason.UPSTREAM_CREATED_IN_INIT_SCOPE,)),
+            (dict(owners={1000: SocketCreator("/init.scope", 0)}, sole_holders={1000: False}), unexpected),
+            (dict(owners={1000: SocketCreator("/init.scope", 0)}, upstream_privileged=False), unverified),
+            (dict(owners={1000: SocketCreator("/init.scope", 1000)}), unexpected),
             (dict(owners={}), unverified),
             (dict(owners=Reason.LISTENER_OWNER_UNVERIFIED), unverified),
             (dict(owners={1000: other}, upstream_privileged=False), unverified),
@@ -2091,6 +2178,23 @@ class HumanListenerOwnershipTests(TestCase):
             with self.subTest(kwargs=kwargs):
                 reasons, _, _ = evaluate(config(), (listener,), route, own_inodes=own, **kwargs)
                 self.assertEqual(reasons, expected)
+
+    def test_upstream_created_by_pid1_closes_with_its_own_reason_without_revocation(self):
+        # Issue #157: without cgroup-BPF support systemd listens from PID 1, so
+        # the upstream's creator is /init.scope. The startup check says so
+        # explicitly and stays close-only (Owner rule, 2026-10-07).
+        revoker = FakeRevoker()
+        owners = Owners(human=SocketCreator("/init.scope", 0))
+        check, _, _, sink = checker(own_sockets=lambda: frozenset({1000}), socket_owners=owners,
+                                    session_revoker=revoker)
+        self.assertEqual(check.startup().reasons, (Reason.UPSTREAM_CREATED_IN_INIT_SCOPE,))
+        self.assertEqual(sink.events[-1].reasons, (Reason.UPSTREAM_CREATED_IN_INIT_SCOPE,))
+        self.assertNotIn(Reason.UPSTREAM_CREATED_IN_INIT_SCOPE, EXPOSURE_REASONS)
+        # Not re-dumped as a mismatch, never revoked, reopens once fixed.
+        self.assertEqual(owners.calls, [frozenset({1000})])
+        owners.human = UPSTREAM_CREATOR
+        self.assertTrue(check._check(CheckKind.RETRY).open)
+        self.assertEqual((revoker.pending, revoker.revocations), (False, 0))
 
     def test_upstream_owner_must_be_a_root_socket_unit(self):
         self.assertEqual(config().upstream_owner, ProcessIdentity(UPSTREAM_SOCKET_UNIT, 0))

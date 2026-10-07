@@ -142,6 +142,25 @@ class DeploymentRequirementTests(unittest.TestCase):
         self.assertFalse("sudo systemctl disable --now ssh.socket" in text)
         self.assertFalse("Until the privileged socket-owner helper of Issue #126 lands" in text)
 
+    def test_ssh_socket_switch_stops_the_service_before_binding_the_socket(self):
+        # Issue #158: ``disable`` alone leaves the running daemon on tcp/22.
+        text = normalized(ROOT / "server" / "docs" / "DEPLOYMENT.md")
+        stop = text.find("sudo systemctl disable --now ssh.service")
+        bind = text.find("sudo systemctl enable --now ssh.socket")
+        self.assertGreaterEqual(stop, 0)
+        self.assertGreater(bind, stop)
+        self.assertIn("console", text[stop - 600:stop])
+        self.assertNotIn("sudo systemctl disable ssh.service", text)
+        self.assertNotIn("sudo systemctl restart ssh.service", text)
+
+    def test_cgroup_bpf_prerequisite_and_system_account_exceptions(self):
+        # Issues #157 and #160.
+        text = normalized(ROOT / "server" / "docs" / "DEPLOYMENT.md")
+        for phrase in ("cgroup-BPF support", "`UPSTREAM_CREATED_IN_INIT_SCOPE`",
+                       "`/init.scope` is never accepted instead",
+                       "dedicated system account", "never one whose `User=` is a person's account"):
+            self.assertIn(phrase, text)
+
 
 
 class SecurityNoteTests(unittest.TestCase):
