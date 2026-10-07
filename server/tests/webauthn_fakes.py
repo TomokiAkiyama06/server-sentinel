@@ -5,6 +5,7 @@ certificate, authenticator identifier or biometric data is used or committed.
 """
 
 import base64
+from contextlib import contextmanager
 import hashlib
 import json
 import os
@@ -20,6 +21,23 @@ ORIGIN = "https://sentinel.example.invalid"
 RP_ID = "sentinel.example.invalid"
 # Pass as a client-data field value to omit that field entirely.
 _DROP = object()
+
+
+class OpenGate:
+    """Synthetic always-open session gate (Issue #144) for ceremony tests
+    that do not exercise the hostname reservation check; counts admissions."""
+
+    def __init__(self):
+        self.admitted = 0
+
+    def epoch(self):
+        return 0
+
+    @contextmanager
+    def admit(self, epoch):
+        assert epoch == 0
+        self.admitted += 1
+        yield
 
 
 def b64(value: bytes) -> str:

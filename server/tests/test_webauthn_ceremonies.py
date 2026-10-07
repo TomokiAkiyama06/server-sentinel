@@ -31,7 +31,7 @@ from app.storage.database import Database
 from app.storage.migrations import migrate
 from app.storage.schema import APPLICATION_MIGRATIONS
 
-from tests.webauthn_fakes import ORIGIN, RP_ID, SyntheticAuthenticator, _DROP, b64, cbor
+from tests.webauthn_fakes import ORIGIN, RP_ID, OpenGate, SyntheticAuthenticator, _DROP, b64, cbor
 
 
 START = datetime(2026, 9, 30, 9, 0, tzinfo=timezone.utc)
@@ -82,10 +82,13 @@ class CeremonyTestCase(unittest.TestCase):
                                  session_binding=SessionBindingKey.generate())
         self.findings = Findings()
         self.rp = RelyingParty(RP_ID, ORIGIN)
+        self.gate = OpenGate()
         self.ceremonies = self.make_ceremonies()
-        self.admin = AccessAdministration(OwnerAuditService(self.audit, OwnerOnly()), self.store)
+        self.admin = AccessAdministration(OwnerAuditService(self.audit, OwnerOnly()), self.store,
+                                          session_gate=self.gate)
 
     def make_ceremonies(self, **options):
+        options.setdefault("session_gate", self.gate)
         return PasskeyCeremonies(self.store, self.rp, clock=self.clock, findings=self.findings, **options)
 
     # -- helpers --

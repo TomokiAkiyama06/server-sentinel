@@ -1,5 +1,6 @@
 """Runtime integration for Owner-authorized administrative mutations."""
 
+from functools import partial
 from uuid import UUID, uuid4
 
 from app.auth.reservation import HostnameReservationCheck
@@ -192,19 +193,40 @@ class AccessAdministration:
     logical UUID reaches the audit log; external identities, display names,
     invitation secrets, credential identifiers and public keys never do.
     This class registers no route.
+
+    ``session_gate`` must be stated. Wiring reached from a human route passes
+    the ``HostnameReservationCheck``: issuing an enrollment authorization
+    takes the gate epoch before Owner authorization and commits inside
+    ``admit(epoch)`` before the write transaction opens, so it cannot land
+    after a reservation check has closed access, even if access has reopened
+    since, and so cannot rest on an Owner authorization that such a check
+    revoked (Issue #144, PR #174 review); a closed gate is a failed operation
+    with its ``failed`` record. ``None`` is only for a caller
+    that no human route reaches.
     """
 
-    def __init__(self, service, access_store):
+    def __init__(self, service, access_store, *, session_gate):
         if getattr(service.store, "database", None) != access_store.database:
             raise ValueError("access audit must share the access database")
+        if session_gate is not None and not (callable(getattr(session_gate, "admit", None))
+                                             and callable(getattr(session_gate, "epoch", None))):
+            raise ValueError("session gate is invalid")
         self.service = service
         self.access = access_store
+        self.session_gate = session_gate
 
-    def _execute(self, actor_context, action, principal_id, operation):
+    def _execute(self, actor_context, action, principal_id, operation, *, gated=False):
+        reservation = None
+        if gated and self.session_gate is not None:
+            # The epoch is taken before authorization; the gate is entered
+            # after it and held until the commit: gate lock before the SQLite
+            # write lock (the check's lock order).
+            reservation = partial(self.session_gate.admit, self.session_gate.epoch())
         return self.service.execute_transactional(
             actor_context, action=action, target_kind=TargetKind.PRINCIPAL,
             target_logical_id=principal_id,
             operation=lambda connection: operation(connection, self.access.now()),
+            reservation=reservation,
         )
 
     def invite(self, actor_context, display_name, permissions):
@@ -223,6 +245,7 @@ class AccessAdministration:
             lambda connection, at: self.access.issue_enrollment_on(
                 connection, principal_id, secret, expires_at, at=at,
             ),
+            gated=True,
         )
 
     def set_permissions(self, actor_context, principal_id, permissions):

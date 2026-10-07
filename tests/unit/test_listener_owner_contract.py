@@ -138,8 +138,15 @@ class DeploymentRequirementTests(unittest.TestCase):
                        "`ip_unprivileged_port_start`", "`LISTENER_EXCEPTIONS_OUTDATED`",
                        "kernel WireGuard UDP socket", "`/system.slice/system-cups.slice/cups.service`"):
             self.assertTrue(phrase in text, phrase)
-        # The 2026-10-01 "ssh.service only" step is reverted.
-        self.assertFalse("sudo systemctl disable --now ssh.socket" in text)
+        # The 2026-10-01 "ssh.service only" step is reverted: disabling
+        # ssh.socket appears only in the rollback, after the switch to it and
+        # before ssh.service is started again (Issue #172).
+        bind = text.find("sudo systemctl enable --now ssh.socket")
+        rollback = text.find("sudo systemctl disable --now ssh.socket")
+        self.assertEqual(text.count("sudo systemctl disable --now ssh.socket"), 1)
+        self.assertGreater(rollback, bind)
+        self.assertGreater(text.find("sudo systemctl enable --now ssh.service", rollback), rollback)
+        self.assertIn("restore the earlier state from the console", text[rollback - 400:rollback])
         self.assertFalse("Until the privileged socket-owner helper of Issue #126 lands" in text)
 
     def test_ssh_socket_switch_stops_the_service_before_binding_the_socket(self):
@@ -160,13 +167,24 @@ class DeploymentRequirementTests(unittest.TestCase):
                        "`/init.scope` is never accepted instead",
                        "dedicated system account", "never one whose `User=` is a person's account"):
             self.assertIn(phrase, text)
+        # Issue #172: system accounts are at most SYS_UID_MAX (normally 999).
+        self.assertIn("a uid at most `SYS_UID_MAX`", text)
+        self.assertIn("normally 999", text)
+        self.assertNotIn("normally 1000", text)
 
     def test_upstream_holder_confirmation_matches_adr_0003(self):
         # Issue #160 / PR #170 review: the holder rule follows ADR-0003 (any
         # executable), confirmed in three scans, and the ADR records it.
         adr = normalized(ROOT / "docs" / "ADR" / "0003-owner-authentication-and-trusted-proxy.md")
-        self.assertIn("Clarification, 2026-10-07 (Issue #160)", adr)
+        self.assertIn("Clarification and Owner decision, 2026-10-07 (Issue #160)", adr)
         self.assertIn("The executable the holder runs is not part of the condition", adr)
+        # Issue #172: the third scan moves a holder that leaves between the
+        # second and third scans from exposure to unverified, and the
+        # clarifications are in date order.
+        self.assertIn("was an exposure under the two-scan rule and is now unverified", adr)
+        self.assertNotIn("does not narrow which persistent holders are exposures", adr)
+        self.assertLess(adr.index("Clarification, 2026-10-01 (PR #91)"),
+                        adr.index("Clarification and Owner decision, 2026-10-07 (Issue #160)"))
         for name in ("REQUIREMENTS.md", "SPECIFICATION.md", "SECURITY.md"):
             text = normalized(ROOT / name)
             self.assertNotIn("backend's own executable", text, name)
@@ -174,6 +192,30 @@ class DeploymentRequirementTests(unittest.TestCase):
         readme = normalized(ROOT / "server" / "app" / "auth" / "README.md")
         self.assertIn("again in a third scan", readme)
         self.assertNotIn("other than the backend's own", readme)
+        # Issue #172: unreadable in the last scan is unverified; the same
+        # process unreadable in every scan fails the lookup.
+        self.assertIn("unreadable in the last scan", readme)
+        self.assertIn("unreadable in every scan fails the lookup", readme)
+
+    def test_session_gate_replaces_the_unlocked_race_residual_risk(self):
+        # Issue #144 (Owner decision 2026-10-07: serialize).
+        readme = normalized(ROOT / "server" / "app" / "auth" / "README.md")
+        self.assertIn("Session gate (Issue #144, Owner decision 2026-10-07: serialize)", readme)
+        self.assertIn("Lock order, outermost first: `exception_change_lock`, `_check_lock`, the session gate lock",
+                      readme)
+        self.assertNotIn("shares no lock with the check", readme)
+        self.assertNotIn("that session can survive", readme)
+        adr = normalized(ROOT / "docs" / "ADR" / "0003-owner-authentication-and-trusted-proxy.md")
+        self.assertIn("Owner decision, 2026-10-07 (Issue #144)", adr)
+        self.assertIn("share one lock (Issue #144, Owner decision 2026-10-07)", normalized(ROOT / "SECURITY.md"))
+        # PR #174 review: the gate epoch covers a whole close/revoke/reopen
+        # cycle during verification, and a revocation drops pending challenges.
+        self.assertIn("commits inside `admit(epoch)`", readme)
+        self.assertIn("whole close, revoke and reopen cycle", readme)
+        self.assertIn("deletes every pending WebAuthn challenge", readme)
+        self.assertIn("even if access reopened in between", adr)
+        self.assertIn("store theirs the same way", readme)
+        self.assertIn("Every WebAuthn challenge is stored under the same lock and epoch", adr)
 
 
 class SecurityNoteTests(unittest.TestCase):

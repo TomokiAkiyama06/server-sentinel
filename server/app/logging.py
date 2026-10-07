@@ -30,6 +30,8 @@ class Event(StrEnum):
     TIMELINE_FACT_QUARANTINED = "timeline_fact_quarantined"
     TIMELINE_FLUSH_FAILING = "timeline_flush_failing"
     TIMELINE_FLUSH_RECOVERED = "timeline_flush_recovered"
+    SESSION_REVOCATION_MARKER_UNSAVED = "session_revocation_marker_unsaved"
+    SESSION_REVOCATION_MARKER_SAVED = "session_revocation_marker_saved"
     REQUEST_DENIED = "request_denied"
     UNSTRUCTURED = "unstructured_redacted"
 

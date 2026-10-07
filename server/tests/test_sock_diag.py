@@ -521,6 +521,45 @@ class SoleHolderTests(OwnersFixture):
         resolver = self.owners([], sleep=readable_in_the_third)
         self.assertEqual(resolver.held_only_by_requester(frozenset({77})), {77: True})
 
+    def test_unreadable_in_the_last_scan_is_unverified_not_sole(self):
+        # Issue #172: readable in the second scan but unreadable again in the
+        # third. Not unreadable in every scan, so no error, but the process
+        # may hold the socket now: unverified, never ``True``.
+        directory = self.process(501, ["socket:[78]"])
+        self.cgroup("system.slice/server-sentinel.service", [self.PID, 501])
+        directory.chmod(0)
+        self.addCleanup(directory.chmod, 0o755)
+        if os.access(directory, os.R_OK):
+            self.skipTest("running with privilege that bypasses directory permissions")
+        delays = []
+
+        def readable_only_in_the_second(seconds):
+            delays.append(seconds)
+            directory.chmod(0o755 if len(delays) == 1 else 0)
+
+        resolver = self.owners([], sleep=readable_only_in_the_second)
+        self.assertEqual(resolver.held_only_by_requester(frozenset({77})), {})
+        self.assertEqual(len(delays), 2)
+
+    def test_unreadable_only_in_later_scans_is_unverified_not_an_error(self):
+        # Issue #172: an error needs the same process unreadable in every
+        # scan. Readable in the first scan (where another holder forces the
+        # later scans) and unreadable in the second and third is unverified.
+        self.process(502, ["socket:[78]"])
+        directory = self.process(501, ["/dev/null"])
+        self.cgroup("system.slice/server-sentinel.service", [self.PID, 501, 502])
+        self.addCleanup(directory.chmod, 0o755)
+        directory.chmod(0)
+        if os.access(directory, os.R_OK):
+            self.skipTest("running with privilege that bypasses directory permissions")
+        directory.chmod(0o755)
+
+        def unreadable_from_the_second(seconds):
+            directory.chmod(0)
+
+        resolver = self.owners([], sleep=unreadable_from_the_second)
+        self.assertEqual(resolver.held_only_by_requester(frozenset({77, 78})), {78: False})
+
     def test_holder_replaced_by_a_new_process_with_the_same_pid_is_unverified(self):
         self.process(501, ["socket:[77]"], start=1000)
         self.cgroup("system.slice/server-sentinel.service", [self.PID, 501])

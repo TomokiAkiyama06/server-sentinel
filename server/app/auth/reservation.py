@@ -32,11 +32,13 @@ sources; the real installed output format is unverified (see MANUAL_TEST.md).
 """
 
 from collections import deque
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import StrEnum
 import ipaddress
 import json
+import logging
 import math
 import os
 import re
@@ -44,7 +46,9 @@ import socket
 import sys
 import threading
 import time
-from typing import Callable, Iterable, Protocol
+from typing import Callable, Iterable, Iterator, Protocol
+
+from app.logging import Event
 
 
 DAILY_SECONDS = 86400
@@ -67,6 +71,16 @@ class ReservationEnumerationError(Exception):
 
     def __init__(self, code: str = "ENUMERATION_UNAVAILABLE"):
         super().__init__(code)
+
+
+class HumanAccessClosed(Exception):
+    """A session or enrollment commit refused because human access is closed.
+
+    Carries no reason: callers map it to their own generic denial.
+    """
+
+    def __init__(self) -> None:
+        super().__init__("access is unavailable")
 
 
 class IsolationMode(StrEnum):
@@ -981,6 +995,9 @@ def evaluate(config: ReservationConfig, listeners, routes,
         seen_excepted: set[Listener] = set()
         unverified = 0
         init_scope = False
+        # Whether the upstream is already counted as unverified, so an
+        # ``/init.scope`` upstream is counted once (Issue #172).
+        human_unverified = False
         known = owners if isinstance(owners, dict) else {}
         for listener in listeners:
             address = _normalize(listener.address)
@@ -998,6 +1015,7 @@ def evaluate(config: ReservationConfig, listeners, routes,
                         unexpected_listeners += 1
                     elif status == _UNVERIFIED:
                         unverified += 1
+                        human_unverified = True
                 seen_human = True
                 continue
             # A wildcard bind answers on every address, the reserved ones
@@ -1038,7 +1056,8 @@ def evaluate(config: ReservationConfig, listeners, routes,
             unexpected_listeners += unverified
         if init_scope:
             reasons.append(Reason.UPSTREAM_CREATED_IN_INIT_SCOPE)
-            unexpected_listeners += 1
+            if not human_unverified:
+                unexpected_listeners += 1
         if config.proxy_listeners - seen_proxies:
             # Proxy drift or failure; nothing else seen answering, so no revocation.
             reasons.append(Reason.PROXY_LISTENER_MISSING)
@@ -1081,15 +1100,46 @@ class HostnameReservationCheck:
     immediate revocation; until one commits, every check retries both and keeps
     ``SESSION_REVOCATION_FAILED``. After the immediate revocation commits, the
     retries of the same closed period do not repeat it, but keep retrying the
-    marker until it commits: a session established by a request that saw access
-    open before the check closed it can commit after that revocation, and only
-    the marker carries its revocation across a restart. If both keep failing
+    marker until it commits (PR #134), logging a marker that stays unsaved
+    when the streak starts and each time it doubles. If both keep failing
     and the process restarts, only the delivered Owner fault records the
     requirement. A fallback revocation that commits in the same check that
     would reopen access, while access has never been open in this process
     (a clean startup), counts as the reopening revocation (Issue #145); a
     failed marker rewrite after the marker is already stored for the closed
     period does not revoke (Issue #144).
+
+    Session gate (Issue #144, Owner decision 2026-10-07: serialize). A
+    request that may create a human session, update a session's
+    user-verification time, create or redeem an enrollment authorization, or
+    store a WebAuthn challenge first takes ``epoch()``, before it reads or verifies anything the commit
+    relies on, and then commits inside ``admit(epoch)``, which holds
+    ``_session_gate_lock`` and re-checks right before the commit that access
+    is open and that the epoch is unchanged. The epoch advances on every
+    close of an open verdict, under the same lock, and ``epoch()`` returns
+    ``None`` while access is closed. The check closes access (at its start)
+    under the lock and keeps the verdict closed until any required
+    revocation has committed; that is the essential property. A request
+    therefore commits only if access stayed open from its start to its
+    commit, so no revocation ran in between: either it committed before the
+    close, and every later revocation covers it, or it is refused with
+    ``HumanAccessClosed``, also when a whole close -> revoke -> reopen cycle
+    completed while it was verifying (PR #174 review). Taking the lock again for decide +
+    commit (``_after_evaluation`` with the marker, fallback and reopening
+    revocations, together with publishing the verdict) is defense in depth.
+    The idle-expiry touch in ``AccessStore.authorize()`` /
+    ``authorize_owner()`` stays outside the gate: revocation advances the
+    authorization generation, so a touch never makes a revoked session valid.
+
+    Lock order (outermost first): ``exception_change_lock`` ->
+    ``_check_lock`` -> ``_session_gate_lock`` -> the SQLite write lock
+    (``BEGIN IMMEDIATE``). Session paths take only the last two, in that
+    order, and never take the gate lock while already inside a write
+    transaction. Enumeration, resolution and Owner fault delivery run outside
+    the gate lock; under it run only local SQLite write transactions, their
+    storage admission and the marker log event. The verdict lives
+    in this object's memory, so the gate and every session-establishing path
+    must share one process.
 
     Every check also re-resolves the hostname through ``resolver``; a missing
     resolver or a failed or timed-out resolution keeps access closed without
@@ -1133,7 +1183,13 @@ class HostnameReservationCheck:
         self._retry = float(retry_seconds)
         self._monotonic = monotonic
         self._utcnow = utcnow
-        self._lock = threading.Lock()
+        # The session gate (Issue #144): held to close access, to decide and
+        # commit a verdict, and by every ``admit()`` commit. Innermost of the
+        # check's locks; see the class docstring for the lock order.
+        self._session_gate_lock = threading.Lock()
+        # Advanced (under the gate lock) every time an open verdict closes;
+        # ``admit()`` refuses a request whose epoch changed (PR #174 review).
+        self._epoch = 0
         self._check_lock = threading.Lock()
         # Held by ``ReservationAdministration`` across stage, audited commit and
         # apply, so the applied set always follows the durable commit order.
@@ -1183,6 +1239,9 @@ class HostnameReservationCheck:
         self._revoked_in_check = False
         # True once any check has opened access in this process.
         self._ever_opened = False
+        # Consecutive marker write failures while the marker is not stored;
+        # logged when the streak starts and each time it doubles.
+        self._marker_failures = 0
         self.undelivered_faults = 0
 
     @property
@@ -1191,8 +1250,43 @@ class HostnameReservationCheck:
 
     @property
     def access_open(self) -> bool:
-        """Precedes identity, session and permission evaluation (ADR-0003)."""
+        """Precedes identity, session and permission evaluation (ADR-0003).
+
+        A request-time read only: a commit that creates a session, updates its
+        user-verification time, or creates or redeems an enrollment
+        authorization goes through ``admit()`` instead, which
+        re-checks under the gate lock (Issue #144).
+        """
         return self._verdict.open
+
+    def epoch(self) -> int | None:
+        """The gate epoch at the start of a request; ``None`` while access is closed.
+
+        Taken before the request reads or verifies anything its commit relies
+        on (a challenge, a credential, an Owner authorization), so a close
+        anywhere between that point and the commit is seen by ``admit()``.
+        """
+        with self._session_gate_lock:
+            return self._epoch if self._verdict.open else None
+
+    @contextmanager
+    def admit(self, epoch: int | None) -> Iterator[None]:
+        """Run one session or enrollment commit while access is still open since ``epoch``.
+
+        Holds the session gate lock for the whole block and raises
+        ``HumanAccessClosed`` when the published verdict is closed, when
+        ``epoch`` is ``None`` (closed at the start) or when it differs from
+        the current epoch (access closed at least once since the request
+        started, even if it has reopened), so the block cannot interleave
+        with, or follow, a check closing access or revoking sessions. The
+        caller enters it before opening its SQLite write transaction and
+        keeps only that local commit inside: no network I/O, no WebAuthn
+        verification and no other lock of this check.
+        """
+        with self._session_gate_lock:
+            if (not self._verdict.open or type(epoch) is not int or epoch != self._epoch):
+                raise HumanAccessClosed()
+            yield
 
     @property
     def listener_exceptions(self) -> frozenset:
@@ -1259,10 +1353,11 @@ class HostnameReservationCheck:
         issued during the outage. The revocation before reopening still runs.
 
         The marker itself is still retried on every check until it commits
-        (PR #134): a session-establishing request that saw access open before
-        this check closed it shares no lock with the check and can commit after
-        the immediate revocation. Only the marker makes a restart revoke that
-        session before reopening.
+        (PR #134). Since the session gate (Issue #144) no gated commit can land
+        after the close, so the immediate revocation already covers every
+        session and enrollment authorization a restart could otherwise keep;
+        the stored marker remains the durable record of the requirement, and a
+        marker that stays unsaved is logged (``_marker_failed``).
 
         Once the marker is known to be stored for the current closed period, a
         failed rewrite neither revokes nor counts as undurable (Issue #144):
@@ -1271,8 +1366,9 @@ class HostnameReservationCheck:
         try:
             self.session_revoker.record_exposure()
         except Exception:
-            pass
+            self._marker_failed()
         else:
+            self._marker_saved()
             self._exposure_recorded = True
             return True
         if self._exposure_recorded or self._revoked_while_closed:
@@ -1287,6 +1383,23 @@ class HostnameReservationCheck:
         self._revoked_in_check = True
         return True
 
+    def _marker_failed(self) -> None:
+        """Log a marker that stays unsaved: the first failure and every doubling.
+
+        Only while the marker is not known to be stored; a failed rewrite of a
+        stored marker loses nothing a restart needs (Issue #144).
+        """
+        if self._exposure_recorded:
+            return
+        self._marker_failures += 1
+        if self._marker_failures & (self._marker_failures - 1) == 0:
+            logging.getLogger(__name__).warning(Event.SESSION_REVOCATION_MARKER_UNSAVED)
+
+    def _marker_saved(self) -> None:
+        if self._marker_failures:
+            self._marker_failures = 0
+            logging.getLogger(__name__).warning(Event.SESSION_REVOCATION_MARKER_SAVED)
+
     def _after_evaluation(self, reasons: tuple[Reason, ...]) -> tuple[Reason, ...]:
         if self.session_revoker is None:
             # Nothing durable could carry a revocation requirement across a
@@ -1298,8 +1411,8 @@ class HostnameReservationCheck:
             self._revocation_durable = self._make_durable()
         elif self._revocation_required and (not self._revocation_durable
                                             or not self._exposure_recorded):
-            # Also retry the marker after a committed immediate revocation: a
-            # session committed after it must not survive a restart.
+            # Also retry the marker after a committed immediate revocation
+            # (PR #134), kept with the session gate as the durable record.
             self._revocation_durable = self._make_durable()
         if not self._revocation_durable:
             # Only memory holds the requirement; a restart could lose it.
@@ -1311,8 +1424,9 @@ class HostnameReservationCheck:
             # already satisfies the reopening one when access has never been
             # open in this process (a clean startup), since no request can
             # have seen it open and committed a session after that
-            # revocation. Otherwise (PR #134) a request that saw access open
-            # before the closed period may have committed a session since.
+            # revocation. Otherwise (PR #134) reopening revokes again; with
+            # the session gate (Issue #144) that is defense in depth for a
+            # commit that bypassed ``admit()``.
             try:
                 self.session_revoker.revoke_all_human_sessions()
             except Exception:
@@ -1321,6 +1435,7 @@ class HostnameReservationCheck:
         self._revocation_durable = True
         self._revoked_while_closed = False
         self._exposure_recorded = False
+        self._marker_failures = 0
         return ()
 
     def _load_exceptions(self) -> None:
@@ -1350,9 +1465,17 @@ class HostnameReservationCheck:
         return None
 
     def _close(self) -> None:
-        with self._lock:
-            self._verdict = ReservationVerdict(False, self._verdict.reasons, self._verdict.checked_at,
-                                               self._verdict.check)
+        # Under the gate lock: once this returns, no ``admit()`` block that
+        # saw the earlier open verdict is still committing (Issue #144).
+        with self._session_gate_lock:
+            self._publish(ReservationVerdict(False, self._verdict.reasons, self._verdict.checked_at,
+                                             self._verdict.check))
+
+    def _publish(self, verdict: ReservationVerdict) -> None:
+        """Replace the verdict; the caller holds the gate lock."""
+        if self._verdict.open and not verdict.open:
+            self._epoch += 1
+        self._verdict = verdict
 
     def _enumerate(self, name: str, call: Callable[[], Iterable], timeout_reason: Reason,
                    error_reason: Reason, item_type: type | tuple[type, ...]):
@@ -1501,14 +1624,17 @@ class HostnameReservationCheck:
             reasons, extra_listeners, extra_routes = (Reason.LISTENER_ENUMERATION_UNAVAILABLE,), 0, 0
         if not self._exceptions_loaded:
             reasons = (self._exceptions_reason,) + reasons
-        # Access is still closed here: reopening waits for any required revocation.
-        reasons = self._after_evaluation(reasons)
-        at = self._now()
-        verdict = ReservationVerdict(not reasons, reasons, at, kind)
-        with self._lock:
+        # Decide + commit under the session gate (Issue #144): the marker,
+        # fallback and reopening revocations and the published verdict.
+        # Access is still closed here: reopening waits for any required
+        # revocation, and no session commit can interleave with either.
+        with self._session_gate_lock:
+            reasons = self._after_evaluation(reasons)
+            at = self._now()
+            verdict = ReservationVerdict(not reasons, reasons, at, kind)
             if verdict.open:
                 self._ever_opened = True
-            self._verdict = verdict
+            self._publish(verdict)
         self._last_check = started if math.isfinite(started) else None
         if reasons:
             if kind != CheckKind.RETRY or reasons != self._last_notified:

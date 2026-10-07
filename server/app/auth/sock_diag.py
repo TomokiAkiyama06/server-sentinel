@@ -393,11 +393,14 @@ class SockDiagOwners:
         slow to exec on a loaded host gets two gaps, not one). A child between
         ``fork`` and ``exec`` briefly shows every descriptor of the backend
         (close-on-exec acts only at exec), and its descriptors can be briefly
-        unreadable while it execs, so a holder or an unreadable process that is
-        gone or changed in any later scan leaves the inode out (unverified),
-        never shared. A process whose descriptors stay unreadable in every scan
-        raises. Whatever executable the holder runs does not matter: a process
-        that keeps the descriptor through every scan shares the socket.
+        unreadable while it execs. So a holder that is gone or changed in any
+        later scan leaves the inode out (unverified), never shared. Any process
+        whose descriptors are unreadable in the last scan also leaves the inode
+        out (unverified), since it may hold the socket; the same process
+        (pid and start time) unreadable in every scan raises, so the lookup
+        fails (Issue #172). Whatever executable the holder runs does not
+        matter: a process that keeps the descriptor through every scan shares
+        the socket.
         """
         first, first_unreadable = self._holders(inodes)
         if not any(first.values()) and not first_unreadable:

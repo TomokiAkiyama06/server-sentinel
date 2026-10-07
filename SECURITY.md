@@ -380,7 +380,21 @@ and ADR-0003):
   authorization generation, with its `system` audit record committed. The
   requirement is persisted as a marker before reopening; if the marker cannot
   be written, every human session is revoked at once instead. A check without
-  a durable revoker never opens human access.
+  a durable revoker never opens human access. The check and every commit that
+  creates a human session, updates a session's user-verification time, or
+  creates or redeems an enrollment authorization share one lock (Issue #144,
+  Owner decision 2026-10-07): each such request takes the gate epoch before it
+  verifies anything, and the commit re-checks inside the lock that access is
+  open and has not closed since; the check closes access inside the lock and
+  keeps the verdict closed until any required revocation has committed. So a
+  request that saw access open before a check closed it cannot commit a
+  session after that check's revocation, even if access has reopened in
+  between. WebAuthn challenges are stored under the same lock and epoch, and a
+  revocation deletes every pending one, so a challenge issued before a
+  revocation cannot be used after it. The check also decides and revokes inside the lock as defense in
+  depth. The idle-expiry touch of an existing session stays outside the lock;
+  revocation advances the authorization generation, so a touch can never make
+  a revoked session valid again.
 - An Owner listener exception names a port together with its creating
   systemd unit (`.service` or `.socket`) and uid, never a port alone, and
   every check verifies the socket's creating unit and uid. The unprivileged
